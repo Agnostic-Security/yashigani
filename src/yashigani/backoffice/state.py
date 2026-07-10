@@ -4,7 +4,7 @@ Holds references to shared services injected at startup.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any
 
 from yashigani.auth.local_auth import LocalAuthService  # noqa: F401 — back-compat
@@ -36,6 +36,8 @@ class BackofficeState:
     resource_monitor: Optional[ResourceMonitor] = None
     rate_limiter: Optional[RateLimiter] = None
     rbac_store: Optional[RBACStore] = None
+    binding_store: Optional[Any] = None    # #16 — client-policy BindingStore (Redis db/3)
+    cloud_override_manager: Optional[Any] = None  # #25 — dual-admin cloud-LLM override (Redis db/0)
     agent_registry: Optional[AgentRegistry] = None
     identity_broker: Optional[IdentityBroker] = None    # v2.1 — SSO
     identity_registry: Optional[Any] = None              # v2.1 — SSO identity resolution
@@ -55,10 +57,29 @@ class BackofficeState:
     event_bus: Optional[Any] = None                      # EventBus (v0.9.0)
     response_inspection_pipeline: Optional[Any] = None   # ResponseInspectionPipeline (v1.0)
     model_alias_store: Optional[Any] = None               # ModelAliasStore (v2.3)
+    model_allocation_store: Optional[Any] = None          # ModelAllocationStore (Track B1)
     auth_settings_store: Optional[Any] = None             # AuthSettingsStore (v2.23.3)
+    document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
+    document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
+    envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
+    dp_weaken_store: Optional[Any] = None                 # DpWeakenPendingStore (4.0 dual-admin data-protection maker-checker)
+    capability_policy_store: Optional[Any] = None         # CapabilityPolicyStore (3.0 browser Permissions-Policy)
+    user_plane_durable: Optional[Any] = None              # UserPlaneDurableStore (4.0 user-plane durability)
+    # YSG-RISK-076 (DP-Y-003 §3.4) — semantic-intent classifier sidecar for
+    # MCP import screening (day-one-poison screen).  Wired at startup when
+    # YASHIGANI_SEMANTIC_INTENT_SIDECAR=true and a classifier backend is
+    # available.  None when not configured — the import route degrades safely
+    # (records "not_configured" in the envelope scan verdict).
+    semantic_intent_sidecar: Optional[Any] = None    # SemanticIntentSidecar | None
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None
+    # v2.25.2 — DB audit sink (PostgresSink) + daily checkpoint scheduler.
+    # Wired in the FastAPI lifespan after create_pool(); held here so the
+    # lifespan shutdown can drain + stop them. None when the DB sink is
+    # disabled (YASHIGANI_AUDIT_DB_SINK=false) or no DB is configured.
+    db_audit_sink: Optional[Any] = None              # PostgresSink instance
+    audit_checkpoint_scheduler: Optional[Any] = None  # AuditCheckpointScheduler
     # SIEM sink runtime config (updated via /admin/audit/siem/config)
     siem_backend: str = "none"
     siem_endpoint: Optional[str] = None

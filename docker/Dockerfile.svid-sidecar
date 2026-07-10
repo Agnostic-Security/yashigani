@@ -1,0 +1,95 @@
+# Yashigani SVID sidecar — per-agent cert provisioning + rotation (4.0 Phase 0)
+#
+# PURPOSE
+#   Long-running sidecar container that:
+#     1. Init phase: copies the agent's initial cert+key from the install.sh-provisioned
+#        /init/ bind-mount into the shared tmpfs at /run/secrets/svid/, then writes
+#        /run/ringfence/ready to signal the agent container that certs are available.
+#     2. Rotation phase: polls the cert's not_after field every POLL_INTERVAL_SECONDS
+#        (default 3600). When less than RENEWAL_THRESHOLD_FRACTION (default 0.33) of
+#        the cert lifetime remains, calls the backoffice /admin/agents/{agent_id}/cert/rotate
+#        endpoint over mTLS. On success, atomically replaces the cert+key in the tmpfs.
+#     3. Fail-closed: on any unrecoverable error (rotation HTTP error, write failure,
+#        cert parse failure) the sidecar exits non-zero. The compose/K8s restart policy
+#        retries the sidecar; the agent container remains up with the existing cert
+#        until the sidecar recovers.
+#
+# SHARED VOLUME CONTRACT
+#   The sidecar and the agent container share a tmpfs volume mounted at:
+#     sidecar:  /run/secrets/svid  (rw — writes cert+key)
+#     agent:    /run/secrets/svid  (ro — reads cert+key)
+#     sidecar:  /run/ringfence     (rw — writes ready flag)
+#     agent:    /run/ringfence     (ro — wait-for-ready poll by pool/manager.py)
+#
+#   /init/ is a read-only bind-mount from the host secrets dir:
+#     - /init/client.crt  — initial cert PEM bundle (leaf + intermediate)
+#     - /init/client.key  — initial key PEM
+#     - /init/ca.crt      — CA root PEM
+#   Populated by install.sh using the output of mint_agent_leaf().
+#
+# SECURITY CONTEXT
+#   - Non-root UID 1002 (no DAC_OVERRIDE needed; tmpfs owned by same UID via compose
+#     tmpfs uid= mount option or Podman :U flag).
+#   - cap_drop: [ALL] — no capabilities required.
+#   - no-new-privileges: true.
+#   - read_only: true on the container root fs (tmpfs for /run mounted in compose/K8s).
+#   - No internet egress (ringfence internal bridge; only speaks to backoffice:8443).
+#
+# BASE IMAGE
+#   Alpine 3.21.3 — matches ringfence-init for consistency + supply-chain coherence.
+#   Digest not pinned here (pre-runtime). Pin after first build:
+#     docker manifest inspect docker.io/library/alpine:3.21.3 \
+#       | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
+#   Then: FROM docker.io/library/alpine:3.21.3@sha256:<digest>
+#
+# BUILD (verify before pinning)
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     -f docker/Dockerfile.svid-sidecar \
+#     -t ghcr.io/agnosticsec/svid-sidecar:0.1.0 \
+#     docker/
+#   docker run --rm ghcr.io/agnosticsec/svid-sidecar:0.1.0 sh -c 'curl --version && openssl version'
+#   docker run --rm ghcr.io/agnosticsec/svid-sidecar:0.1.0 sh -c 'id'  # expect uid=1002
+
+FROM docker.io/library/alpine:3.21.3
+
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars so apk respects them.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+# openssl: cert parse + expiry calculation (openssl x509 -enddate -noout)
+# curl: mTLS POST to backoffice /admin/agents/*/cert/rotate
+# No package manager retained after install.
+RUN apk add --no-cache \
+    curl \
+    openssl \
+    && rm -rf /var/cache/apk/*
+
+# Create a non-root user for the sidecar process.
+# UID 1002 chosen to avoid collisions with:
+#   UID 1000 — host captain user
+#   UID 1001 — gateway/backoffice container user (see Dockerfile.gateway)
+# GID 1002 matches UID for simplicity; no group privileges required.
+RUN addgroup -g 1002 svid-sidecar \
+    && adduser -D -u 1002 -G svid-sidecar svid-sidecar
+
+# Copy the rotation script.
+# Build context is docker/ (docker buildx -f docker/Dockerfile.svid-sidecar docker/)
+# so svid-sidecar/rotate.sh is at COPY svid-sidecar/rotate.sh.
+COPY svid-sidecar/rotate.sh /usr/local/bin/rotate.sh
+RUN chmod 0550 /usr/local/bin/rotate.sh \
+    && chown svid-sidecar:svid-sidecar /usr/local/bin/rotate.sh
+
+USER 1002
+
+# Healthcheck: the sidecar is "healthy" once the ready flag exists.
+# The ready flag is written at the end of the init phase (before rotation loop).
+# Probe settings: 5s start-period (init usually completes in <1s on same-host
+# bind-mount copy); 10s interval; 3 retries before marking unhealthy.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD test -f /run/ringfence/ready
+
+ENTRYPOINT ["/usr/local/bin/rotate.sh"]

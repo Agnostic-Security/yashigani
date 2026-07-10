@@ -1,6 +1,6 @@
-# Yashigani v2.24.0 — Umbrella Chart Top-Level Values
+# Yashigani v2.25.0 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-17 (feat: internalBearer per-install secret — Captain Bucket-C; remove hardcoded yashigani-internal)
+# Last updated: 2026-05-27 (v2.25.0 P2 wave 2 — B10/B11/B12/B13/B14-captain/A6 + Iris coord)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -20,6 +20,13 @@ global:
   acmeEmail: "admin@example.com"
   environment: "production"
   useExternalSecrets: false
+  # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust-domain
+  # authority. On K8s the tenancy boundary is the namespace/release, so a
+  # second instance is a separate namespace + a distinct trust domain (e.g.
+  # "apac.yashigani.internal"). Set this per release so a sibling instance's
+  # SPIFFE identity does not validate. Leave at the default for a single
+  # instance — preserves "yashigani.internal" byte-for-byte (no rotation).
+  spiffeTrustDomain: "yashigani.internal"
 
   keda:
     enabled: true
@@ -39,8 +46,11 @@ global:
 # On install/upgrade a Helm pre-install hook Job boots the two-tier PKI
 # (root → intermediate → per-service leaves) using the gateway image's
 # `python -m yashigani.pki.issuer` CLI, then writes the resulting certs and
-# trust bundle into a namespace-scoped Secret (yashigani-pki-certs) that
-# every core-plane pod mounts at /run/secrets.
+# trust bundle into a namespace-scoped Secret (yashigani-pki-certs).
+# Core-plane pods mount it at /run/secrets via per-pod Secret-volume `items:`
+# projections (YSG-RISK-053): each pod sees ONLY its own leaf + bootstrap
+# token + the trust anchors it verifies with — never another service's
+# private key and never caddy_internal_hmac.
 #
 # A CronJob rotates leaf certs weekly (default Sun 02:00). Pods pick up
 # the new cert on the next roll/restart — no in-place reload in v2.23.1.
@@ -99,6 +109,24 @@ networkPolicies:
 # sign-off, referencing YSG-RISK-008.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# Image policy (A6 — Captain MEDIUM + Nico N-003)
+# ---------------------------------------------------------------------------
+# Yashigani-owned images (gateway, backoffice, caddy) are tag-only by default.
+# Production deployments SHOULD pin to @sha256: digests for supply-chain
+# attestation. The attestation workflow:
+#   1. Build images: install.sh builds yashigani-gateway + yashigani-backoffice
+#      from source and tags them with the release version.
+#   2. Inspect digest: `docker inspect --format='{{index .RepoDigests 0}}' <image>`
+#      or `docker images --digests <image>`.
+#   3. Set in values: gateway.image.tag="2.25.0@sha256:<digest>" etc.
+#
+# requireImageDigests: when true, helm template/install/upgrade fails if any
+# Yashigani-owned image tag does not contain @sha256:. Enforce post-build.
+# Default: false — operators must opt in after running their own image build.
+imagePolicy:
+  requireImageDigests: false
+
+# ---------------------------------------------------------------------------
 # LIC-002 SECURITY NOTICE — YASHIGANI_LICENSE_TIER is NOT an operator-settable
 # value and MUST NOT appear anywhere in this values file, in extraEnv blocks,
 # or in any Kubernetes Secret/ConfigMap managed by this chart. Setting it via
@@ -151,9 +179,11 @@ mtls:
     # Backoff before the rotation CronJob gives up on a failing run.
     backoffLimit: 2
 
-  # Name of the leaves-Secret the bootstrap job writes into. Every core-plane
-  # Deployment/StatefulSet mounts this at /run/secrets. After retro #3aj this
-  # Secret contains LEAF material only:
+  # Name of the leaves-Secret the bootstrap job writes into. Core-plane
+  # Deployments/StatefulSets mount this at /run/secrets — since YSG-RISK-053
+  # each mount carries an `items:` projection so a pod only receives its own
+  # leaf/token + trust anchors (mirrors the compose-side scoped-secrets fix
+  # f7d792d5). After retro #3aj this Secret contains LEAF material only:
   #   * <service>_client.crt + <service>_client.key (the per-service leaves)
   #   * ca_root.crt + ca_intermediate.crt (public certs — workloads use intermediate only, Pattern B)
   #   * caddy_internal_hmac (EX-231-10 Layer B) — per-install shared secret
@@ -216,7 +246,7 @@ adminBootstrap:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.24.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -259,7 +289,7 @@ gateway:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.24.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -284,6 +314,50 @@ gateway:
   pdb:
     enabled: true
     minAvailable: 1
+  # ---------------------------------------------------------------------------
+  # v2.25.0 P3: MCP broker server list.  JSON-serialised into YASHIGANI_MCP_SERVERS.
+  # Default empty list = no MCP servers registered (gateway behaves as v2.24.x).
+  # Each entry: {agent_name, upstream_url, tenant_id, is_filesystem_agent (opt)}.
+  # NOTE: gateway.mcpServers MUST NOT be set unless agentBundles.filesystemMcp.enabled=true.
+  # Setting mcpServers without the bundle enabled is a configuration error — the Helm
+  # chart will fail at template time (validate-security.yaml MCP-GUARD-001).
+  # Example (pair with agentBundles.filesystemMcp.enabled=true):
+  #   gateway:
+  #     mcpServers:
+  #       - agent_name: filesystem-mcp
+  #         upstream_url: http://filesystem-mcp:8000
+  #         tenant_id: acme
+  #         is_filesystem_agent: true
+  # ---------------------------------------------------------------------------
+  mcpServers: []
+  # ---------------------------------------------------------------------------
+  # K8s SB-2 fix: MCP identity signing key delivery for Kubernetes deployments.
+  #
+  # Choice: Option B (separate Secret, separate mount — logically distinct from mTLS PKI).
+  # Rationale: mcp_identity_signing_key is a JWT signing secret, not a TLS certificate.
+  # Mixing it into the mTLS PKI Secret (Option A) couples two distinct key-management
+  # lifecycles (TLS cert rotation vs JWT key rotation) and risks conflating their
+  # security properties. A standalone Secret follows least-privilege and allows
+  # independent rotation without touching the mTLS bundle.
+  #
+  # In Docker/Compose: install.sh writes the key to a host path and bind-mounts it.
+  # In Kubernetes: the operator must pre-create a K8s Secret containing the key, then
+  # reference it here via mcpSigningKey.existingSecretName + mcpSigningKey.secretKey.
+  # The gateway pod mounts the key via subPath to /run/secrets/mcp_identity_signing_key.
+  #
+  # Pre-create the Secret:
+  #   kubectl create secret generic yashigani-mcp-signing-key \
+  #     -n <namespace> \
+  #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
+  # Then set:
+  #   --set gateway.mcpSigningKey.existingSecretName=yashigani-mcp-signing-key
+  #
+  # Only required when agentBundles.filesystemMcp.enabled=true.
+  # Leave existingSecretName empty if not using MCP bundles.
+  # ---------------------------------------------------------------------------
+  mcpSigningKey:
+    existingSecretName: ""   # name of the pre-created K8s Secret
+    secretKey: "mcp_identity_signing_key"  # key inside the Secret
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
@@ -295,6 +369,38 @@ gateway:
     agentTokenMinLength: "64"
     # v0.5.0
     deploymentStream: "opensource"
+    # YSG-RISK-076 / DP-Y-003 §3.4: semantic-intent import classifier sidecar.
+    # Default "true" — every MCP tool import is screened by the Ollama-backed
+    # semantic-intent classifier before operator approval (day-one-poison close).
+    # Set to "false" to disable (e.g. air-gapped deployments without Ollama).
+    # Backend: ollamaUrl (http://yashigani-ollama:11434 above). No extra service.
+    semanticIntentSidecar: "true"
+    # --- Orchestration caps (build-sheet §9 — operator-tunable; MF3 helm parity) ---
+    # Mirrors docker-compose.yml x-gateway env exactly so Docker and K8s gateways
+    # are config-equivalent. Read by src/yashigani/gateway/orchestrator.py via
+    # configure_openai_router().
+    #   orchMaxDepth=9 is the §0.1 9-level hop invariant — do NOT lower below 9.
+    #   orchMaxIters is floored at 9 in code so a 9-deep chain isn't truncated.
+    #   orchDeadlineS is the orchestration wall-clock budget (seconds).
+    #   orchMaxFanout caps parallel sub-calls per level.
+    orchMaxDepth: "9"
+    orchMaxIters: "9"
+    orchDeadlineS: "300"
+    orchMaxFanout: "4"
+    # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
+    # derives from prior tool-RESULT content (injection-originated hops). An
+    # over-budget result-steered hop is REFUSED so a result-steering injection
+    # loop cannot amplify. Keep low (default 2); raise only with care.
+    orchInjectionBudget: "2"
+    # ORCH-PHASE2 (Design A, letta-as-brain): per-letta-turn HTTP timeout (s). A
+    # letta agentic turn does multi-step reasoning + its own gateway LLM call
+    # (~2 min on the 3B brain); keep above per-turn latency and below orchDeadlineS.
+    orchLettaTurnTimeoutS: "240"
+    # SELFCALL_BASE — internal mesh self-call target. Same-pod loopback to the
+    # http-mesh container port (8081, no Caddy, internal bearer, NetworkPolicy-
+    # isolated). orchestrator._mesh_base() reads the key directly (empty string
+    # would NOT fall through to the code default), so set the real value here.
+    orchSelfcallBase: "http://127.0.0.1:8081"
     # M-01 fix: overridden to grpcs:// by gateway.yaml when mtls.enabled=true.
     # This value applies only when mTLS is disabled (non-default, testing only).
     otelEndpoint: "http://otel-collector:4317"
@@ -319,13 +425,18 @@ backoffice:
     - langflow
     - letta
     - openclaw
+    # v4.1 §2.5 ingress-fronting: registered agent upstream URLs point at the
+    # Caddy mesh-front ClusterIP Service (https://yashigani-caddy-mesh:
+    # <meshPort>/agents/<tenant>/<system>) instead of the raw agent service.
+    # The raw names above stay during the transition (rollback lever).
+    - yashigani-caddy-mesh
   image:
     # Built locally by install.sh from the v2.24.0 tagged source.
     # For K8s deployments: push to your own private registry and update
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "2.24.0"
+    tag: "4.1.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -340,6 +451,27 @@ backoffice:
     port: 8443
     type: ClusterIP
   existingSecretName: ""
+  # Iris coord #1 (v2.25.0 P2 wave 2): backoffice.dbAesKey — operator-supplied
+  # AES key for pgcrypto pgp_sym_encrypt on the auth_settings table.
+  # When non-empty, secrets.yaml writes this value into yashigani-backoffice-secrets
+  # under the db_aes_key key instead of auto-generating via randAlphaNum.
+  # This retires the install.sh _write_helm_values `kubectl create secret --dry-run`
+  # workaround which pre-seeded the Secret before helm install.
+  #
+  # Key format: 64-char hex (32 bytes) — generate with: openssl rand -hex 32
+  # On upgrade: re-supply the SAME key or the db_aes_key value in the existing
+  # Secret will be preserved by Helm's lookup() regardless of this field.
+  # Missing key → RuntimeError at backoffice startup (fail-closed per SOP 1).
+  #
+  # Helm-only deployments: set via --set backoffice.dbAesKey="$(openssl rand -hex 32)"
+  # install.sh path: install.sh generates DB_AES_KEY and sets this value
+  # in _write_helm_values (removing the pre-seeding workaround).
+  dbAesKey: ""
+  # YSG-RISK-076 / DP-Y-003 §3.4: semantic-intent import classifier sidecar (backoffice).
+  # Backoffice MCP import screen uses the same Ollama-backed classifier as the gateway.
+  # Default "true". Set to "false" to disable across both gateway and backoffice.
+  # Mirrors docker-compose.yml YASHIGANI_SEMANTIC_INTENT_SIDECAR on the backoffice service.
+  semanticIntentSidecar: "true"
   # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
   # "yashigani-backoffice-secrets") must contain the following keys:
   #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by
@@ -362,6 +494,59 @@ backoffice:
   # Empty string = skip the mount (endpoints return empty state gracefully).
   # Example: /opt/yashigani/backups
   backupsHostPath: ""
+
+# ---------------------------------------------------------------------------
+# Audit log persistence — B7 fix (v2.25.0 P2, Lu P0-#3)
+# SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /
+# EU AI Act Art.12: operator-visible audit log persistence in K8s.
+#
+# Prior state: varlog volume was emptyDir{sizeLimit:50Mi} on gateway + backoffice.
+# Pod restart wiped the file sink; audit env vars were absent from helm entirely.
+#
+# When enabled: gateway + backoffice replace the emptyDir with a PVC-backed
+# audit-data volume at /var/log/yashigani. The audit env vars are injected on
+# both containers so the application writes to the configured path + rotation.
+#
+# storageClass: "" uses the cluster default StorageClass (standard / gp2 / etc.)
+# Set to a specific class for NFS, Longhorn, etc. that supports ReadWriteMany
+# if replicaCount > 1 (each replica writes its own audit log shard).
+# ---------------------------------------------------------------------------
+auditLog:
+  # Set to true to enable PVC-backed audit log persistence on gateway + backoffice.
+  # false = prior behaviour (emptyDir 50Mi, no persistence).
+  enabled: false
+  persistence:
+    size: "5Gi"
+    storageClass: ""
+    # AccessMode: ReadWriteOnce works for single-replica; ReadWriteMany needed
+    # when replicaCount > 1 and the StorageClass supports it (e.g. NFS, EFS).
+    accessMode: "ReadWriteOnce"
+  # Audit log configuration injected as env vars (mirrors compose .env defaults).
+  # YASHIGANI_AUDIT_LOG_PATH: path inside the container (must be under /var/log/yashigani)
+  logPath: "/var/log/yashigani/audit.log"
+  # YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: rotate after this many MB (0 = disabled)
+  maxFileSizeMB: "100"
+  # YASHIGANI_AUDIT_RETENTION_DAYS: prune rotated files older than N days (0 = disabled)
+  retentionDays: "90"
+
+# ---------------------------------------------------------------------------
+# audit — tamper-evident hash-chain checkpoint signing (Lu wire-sink-gate P2)
+# ---------------------------------------------------------------------------
+audit:
+  signingKey:
+    # When true, mount the audit-chain checkpoint signing key (RO) into BACKOFFICE
+    # ONLY and set YASHIGANI_AUDIT_SIGNING_KEY_PATH so daily merkle-root
+    # checkpoints are ECDSA-signed (non-repudiation; NIST AU-10). When false,
+    # checkpoints are written UNSIGNED (still tamper-evident via the merkle root).
+    # CRITICAL: the signing key is never mounted into the gateway/runtime path, so
+    # a held yashigani_app DB credential cannot forge a signed checkpoint.
+    enabled: false
+    # Secret name holding the internal-CA ECDSA leaf private key under the
+    # `audit_signing.key` data key. Create it with the leaf produced by the same
+    # internal CA (see install.sh _provision_audit_signing_key for the issuance
+    # pattern). Marked optional in the mount so a missing Secret => unsigned, not
+    # a pod-start failure.
+    existingSecretName: ""
 
 # ---------------------------------------------------------------------------
 # Backup — age-encrypted CronJob (MP.L2-3.8.9 / CMMC L2)
@@ -426,6 +611,28 @@ backup:
   # History limits
   failedJobsHistoryLimit: 3
   successfulJobsHistoryLimit: 3
+  # B5 fix (v2.25.0 P2): agent bundle state directories.
+  # Each entry mounts the named PVC into the backup CronJob pod and includes
+  # the mountPath in the YASHIGANI_BACKUP_EXTRA_DIRS list passed to backup.sh.
+  # Without this, agent bundle state (langflow flows, letta memories, openclaw
+  # policies) is silently excluded from every encrypted backup.
+  #
+  # Disable an entry by setting pvcName: "" — the mount is skipped entirely.
+  # If an agent bundle PVC does not exist, the CronJob pod will fail to start.
+  # Only enable entries for agent bundles that are actually deployed.
+  #
+  # Example — enable langflow backup when agentBundles.langflow.enabled=true:
+  #   backup:
+  #     agentBundlePaths:
+  #       - pvcName: "yashigani-langflow-data"
+  #         mountPath: "/var/lib/yashigani-agents/langflow"
+  #       - pvcName: "yashigani-letta-data"
+  #         mountPath: "/var/lib/yashigani-agents/letta"
+  #
+  # Default: empty list — no agent bundle state included in backup.
+  # Set explicitly when agent bundles are enabled and you want their state
+  # included in the encrypted backup tarball.
+  agentBundlePaths: []
 
 # ---------------------------------------------------------------------------
 # Policy — Open Policy Agent
@@ -522,6 +729,10 @@ ollama:
     minReplicas: 1
     maxReplicas: 4
   model: "qwen2.5:3b"
+  # keepAlive: how long a loaded model stays resident in VRAM after last use.
+  # -1 = never evict (recommended — cold load is 37-46s, exceeds classifier timeout).
+  # Set to "5m" to restore Ollama default idle-eviction behaviour.
+  keepAlive: "-1"
   env:
     ollamaHost: "0.0.0.0"
     # HOME=/data routes ollama's key + state (~/.ollama) to the persistent
@@ -534,14 +745,17 @@ ollama:
   # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
   #   chat surface shows it as an available backend.
   # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
-  #   Set to "skip" after an upstream model update that changes the digest.
+  #   Default is "skip" — Ollama republishes models on upstream updates, which
+  #   changes the manifest SHA and hard-fails every clean install if a stale
+  #   digest is pinned. Prod operators who need strict enforcement set an explicit
+  #   prefix here; mismatches are always logged as loud WARNINGs.
   # minDiskGiB: minimum free gigabytes required on the ollama volume before pull.
   #   If free space < minDiskGiB the Job logs a warning and exits 0 (warn-only).
   initJob:
     # defaultModel: qwen2.5:3b — 1.9 GB, Qwen 2.5 3B-parameter instruct model.
     # Good balance of size and capability for a single-node deployment.
     defaultModel: "qwen2.5:3b"
-    modelDigest: "357c53fb659c"
+    modelDigest: "skip"
     minDiskGiB: 3
     resources:
       requests:
@@ -550,6 +764,25 @@ ollama:
       limits:
         cpu: "500m"
         memory: "256Mi"
+  # gpu: Kubernetes GPU resource configuration (source: docs.ollama.com/gpu).
+  # Apple Metal (apple_metal) is NOT applicable to Kubernetes — it is a macOS-only
+  # host-native path handled by the compose overlay (docker-compose.gpu-mac-metal.yml).
+  #
+  # Supported K8s paths:
+  #   nvidia  — requires NVIDIA device plugin (k8s.io/nvidia-device-plugin)
+  #             sets: resources.limits."nvidia.com/gpu": "1"
+  #   amd_rocm— requires AMD device plugin (github.com/ROCm/k8s-device-plugin)
+  #             sets: resources.limits."amd.com/gpu": "1"
+  #   vulkan  — no standard K8s device plugin; manual device mount required
+  #             (extraDevices not yet implemented — fall back to CPU or use hostPath)
+  #   none    — CPU-only (default)
+  #
+  # additionalResourceLimits: merged into ollama.resources.limits when non-empty.
+  # Example for NVIDIA:  additionalResourceLimits: {"nvidia.com/gpu": "1"}
+  # Example for AMD:     additionalResourceLimits: {"amd.com/gpu": "1"}
+  gpu:
+    type: "none"
+    additionalResourceLimits: {}
 
 # ---------------------------------------------------------------------------
 # Prometheus — metrics collection
@@ -756,12 +989,67 @@ caddy:
   internalMetricsListenerBackoffice:
     enabled: true
     port: 8445
+  # v4.1 SU-SEAM-1d-04 — mesh-mTLS caddy admin relay for the K8s MCP
+  # approve-transaction reload path (mcp_onboard._reload_via_admin_api).
+  # NOT the raw admin API (that stays unix-socket-only per MUST-4): an mTLS
+  # require_and_verify site block admitting ONLY POST /load from the
+  # backoffice SPIFFE URI, proxied to the caddy-pod-local admin socket.
+  # Requires mtls.enabled=true (templates gate on both). NetworkPolicy
+  # restricts ingress on this port to backoffice pods.
+  adminRelay:
+    enabled: true
+    port: 2019
   # YSG-RISK-061 (v2.24.1): operator ACME / external egress allowlist.
   # Comma-separated list of additional host:port pairs to allow in the
   # caddy-entrypoint.sh iptables OUTPUT rules. Default is empty (only the
   # built-in defaults — LE ACME + OCSP — are applied by the entrypoint).
   # Example: "acme.corp.example:443,ocsp.corp.example:80"
   egressAllowlist: ""
+
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar Phase 2a — per-system egress forwarders
+# (templates/egress-forwarders.yaml; design §2.2(c/d), §2.3, §2.6)
+#
+# Empty by default. Codegen emits a values-<system>-egress.yaml overlay per
+# onboarded system that declares spec.egress.needs != []; apply it with -f.
+# The map keys are unique camelCase per (system, tenant), so multiple
+# overlays merge additively (same rationale as mcpSvid).
+#
+# openclaw (transitional, pin-AND-grant OVERLAP phase): the codegen-emitted
+# overlay lives at helm/yashigani/values-openclaw-egress.yaml — apply with
+#   helm upgrade yashigani ./helm/yashigani \
+#     -f helm/yashigani/values-openclaw-egress.yaml
+# alongside agentBundles.openclaw.enabled=true. The static :18790 caller/
+# destination pins remain in force; pin deletion is a later, Laura-gated
+# step (unified-sidecar synthesis must-fix #1).
+# ---------------------------------------------------------------------------
+egressForwarders: {}
+
+# ---------------------------------------------------------------------------
+# v4.1 unified-sidecar §2.5 — agent INGRESS fronts (bidirectional wrap)
+#
+# Empty by default. Codegen emits a values-<system>-ingress.yaml overlay per
+# wrapped system with spec.ingress.surface in {openai-api, http-api}; apply
+# with -f alongside the matching agentBundles.<system>.enabled=true. Map
+# keys are unique camelCase per (system, tenant) — additive merges.
+#
+# Rendered by:
+#   templates/caddy-agents-configmap.yaml — mesh-listener snippet into the
+#     yashigani-caddy-agents ConfigMap (semantic parity with the compose
+#     artifact docker/caddy/agents/<system>-ingress.caddy; documented K8s
+#     hostname deltas only: yashigani-backoffice / yashigani-<system>).
+#   templates/agent-ingress-fronts.yaml — yashigani-caddy-mesh ClusterIP
+#     Service (mesh ports are NEVER on the public LoadBalancer Service —
+#     admin-relay rationale) + additive NetworkPolicies
+#     (gateway/backoffice → caddy:<meshPort>; caddy → system:<shimPort>).
+#
+# Gateway/backoffice dispatch to bundled agents rides these fronts — never a
+# direct pod dial (§2.6: the ingress ringfence is strictly 2-member
+# {system, caddy}; K8s analogue: agent ingress NP admits the caddy pod only).
+#   helm upgrade yashigani ./helm/yashigani \
+#     -f helm/yashigani/values-langflow-ingress.yaml
+# ---------------------------------------------------------------------------
+agentIngressFronts: {}
 
 # ---------------------------------------------------------------------------
 # Optional Agent Bundles (v0.8.0)
@@ -813,6 +1101,25 @@ agentBundles:
     # Integration: OpenClaw Gateway -> Yashigani Gateway -> LLM providers.
     # License: MIT (github.com/openclaw/openclaw)
     enabled: false
+    # FP-06 Phase 2: Telegram bot-ID pin. Set to the bot's numeric ID (e.g. "123456789")
+    # to restrict the :18790 egress gateway to one specific Telegram bot account.
+    # Empty string (default) = inert; enforcement begins when non-empty.
+    telegramBotId: ""
+    # FP-06 Phase 2: Slack channel pins (operator-supplied; inert-until-set).
+    # Stored in K8s Secret yashigani-openclaw-slack-secrets; injected as env vars
+    # into the Caddy pod (YASHIGANI_OPENCLAW_SLACK_{WEBHOOK_PATH,BOT_TOKEN}).
+    # Caddy reads them at parse time via {$YASHIGANI_OPENCLAW_SLACK_*:} in the
+    # :18790 egress Caddyfile block.
+    slack:
+      # CHANNEL 1: incoming-webhook path pin (/services/T.../B.../<secret>).
+      # Set to the path component of the operator's Slack incoming-webhook URL.
+      # Empty (default) = feature OFF (no enforcement).
+      webhookPath: ""
+      # CHANNEL 2: Web API bot-token pin (xoxb-..., scoped to one workspace).
+      # Set to the operator's Slack bot token. Empty (default) = feature OFF.
+      # WARNING: this value is stored in the Helm release secret. Use a K8s
+      # ExternalSecret / SealedSecret for production hardening.
+      botToken: ""
     image:
       # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified
       # 2026-05-07 via crane digest — multi-arch (linux/amd64 + linux/arm64).
@@ -821,14 +1128,28 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # BUG-V241-OPENCLAW-EXTENDED: gateway:8080 is mTLS-only — openclaw has no
-      # client cert; route to plain-HTTP mesh port :8081. Same class as e4f38f8.
-      OPENCLAW_UPSTREAM_URL: "http://yashigani-gateway:8081"
       OPENCLAW_SERVER_MODE: "true"
       OPENCLAW_DISABLE_AUDIO: "true"
       OPENCLAW_DISABLE_CAMERA: "true"
       OPENCLAW_DISABLE_LOCATION: "true"
       OPENCLAW_DISABLE_VOICE_WAKE: "true"
+      # REMOVED 2026-07-07 (v4.1 three-agent wrap — schema-verified against
+      # the pinned ghcr.io/openclaw/openclaw:2026.5.6 image):
+      #   OPENCLAW_UPSTREAM_URL, OPENCLAW_{SLACK_API,SLACK_HOOKS,
+      #   TELEGRAM_API}_BASE_URL were FABRICATED env vars — the binary never
+      #   reads any of them (grep of /app/dist + /app/extensions). openclaw's
+      #   REAL wiring mechanism is its config file (openclaw.json:
+      #   models.providers.<name>.baseUrl for LLM,
+      #   channels.telegram.apiRoot for Telegram; Slack has NO base-URL
+      #   config in 2026.5.6 — CONNECT proxy only).
+      # KNOWN K8s PARITY GAP (flagged, Captain/agent-bundles.yaml): the K8s
+      # openclaw Deployment does not yet mount an openclaw.json ConfigMap —
+      # K8s openclaw therefore has NO working LLM/Telegram repoint (and never
+      # had one: the removed env vars were no-ops). Compose carries the
+      # canonical config at docker/openclaw/openclaw.runtime.json; the K8s
+      # equivalent (ConfigMap + OPENCLAW_CONFIG_PATH + bearer substitution)
+      # must be added by the bundle template for the forwarder path
+      # (yashigani-egress-openclaw:9400/{llm,telegram}) to carry traffic.
     service:
       # Expose OpenClaw's own gateway port for incoming messaging webhooks
       port: 18789
@@ -849,8 +1170,11 @@ agentBundles:
   # Single container, embedded SQLite. OpenAI-compatible API on port 7860.
   # Users build custom agent workflows visually via the Langflow UI.
   # All LLM calls route through Yashigani gateway (OpenAI-compatible).
+  #
+  # DEFAULT: enabled=true (v4.1 — first-class Yashigani UX).
+  # Operators who do not want langflow should set enabled=false explicitly.
   langflow:
-    enabled: false
+    enabled: true
     image:
       # Pinned to 1.9.2 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
@@ -859,12 +1183,15 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # Route all LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route langflow
-      # through gateway's internal mesh port (8081, plain HTTP). NetworkPolicy is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      # open-webui got this fix at v2.23.4 BUG-2 (values.yaml line 1175).
-      OPENAI_API_BASE: "http://yashigani-gateway:8081/v1"
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial langflow's
+      # egress-forwarder Service (templates/egress-forwarders.yaml, rendered
+      # from the values-langflow-egress.yaml overlay — install.sh layers it
+      # whenever this bundle is enabled via --agent-bundles). The forwarder
+      # holds the langflow SVID and presents the leaf to
+      # yashigani-caddy:18790/llm → /egress/eval → /deliver/llm →
+      # yashigani-gateway:8081/v1 (same surface as before, governance in
+      # front). Bearer via secretKeyRef STAYS (pin-AND-grant overlap).
+      OPENAI_API_BASE: "http://yashigani-egress-langflow:9400/llm/v1"
       # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
       # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
@@ -946,10 +1273,15 @@ agentBundles:
   # Agent with long-term memory, tool use, and conversation persistence.
   # Exposes REST API on port 8283. Uses shared Postgres (separate `letta` DB).
   # Dependency: Postgres must be available and the `letta` database must exist.
-  # The install.sh installer creates the `letta` database; for K8s deployments
-  # run `CREATE DATABASE letta OWNER yashigani_app;` before enabling this bundle.
+  # The install.sh installer creates the `letta` database and yashigani_app role
+  # idempotently (v4.1 F-B fix). For K8s deployments a pre-install Job or manual
+  # init is still required: `CREATE ROLE yashigani_app LOGIN; CREATE DATABASE letta
+  # OWNER yashigani_app; GRANT ALL ON SCHEMA public TO yashigani_app;`
+  #
+  # DEFAULT: enabled=true (v4.1 — first-class Yashigani UX).
+  # Operators who do not want letta should set enabled=false explicitly.
   letta:
-    enabled: false
+    enabled: true
     image:
       # Pinned to 0.16.7 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
@@ -958,16 +1290,28 @@ agentBundles:
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
-      # Route LLM calls through Yashigani gateway (OpenAI-compatible)
-      # BUG-V241-LANGFLOW-LETTA-BASE-URL: gateway:8080 is mTLS-only — route letta
-      # through gateway's internal mesh port (8081, plain HTTP). NetworkPolicy is the
-      # transport guard; AgentAuthMiddleware enforces token auth at the app layer.
-      # open-webui got this fix at v2.23.4 BUG-2 (values.yaml line 1175).
-      OPENAI_API_BASE: "http://yashigani-gateway:8081/v1"
+      # v4.1 three-agent wrap (2026-07-07): ALL LLM calls dial letta's
+      # egress-forwarder Service (templates/egress-forwarders.yaml, rendered
+      # from the values-letta-egress.yaml overlay — install.sh layers it
+      # whenever this bundle is enabled via --agent-bundles). The forwarder
+      # holds the letta SVID and presents the leaf to
+      # yashigani-caddy:18790/llm → /egress/eval → /deliver/llm →
+      # yashigani-gateway:8081/v1 (same surface as before, governance in
+      # front). Bearer via secretKeyRef STAYS (pin-AND-grant overlap).
+      OPENAI_API_BASE: "http://yashigani-egress-letta:9400/llm/v1"
       # OPENAI_API_KEY is injected via secretKeyRef (internalBearer Secret) in
       # agent-bundles.yaml — do NOT set it here (Captain Bucket-C fix).
       LETTA_LLM_MODEL: "qwen2.5:3b"
       LETTA_EMBEDDING_MODEL: "qwen2.5:3b"
+    # ORCH-PHASE2-REDIS (K8s parity with the docker-compose letta entrypoint):
+    # pre-launch letta's bundled redis on the writable /root/.letta PVC with
+    # bgsave-errors non-fatal, then run the normal startup.sh. Without this, the
+    # default redis dir (/app) is read-only under readOnlyRootFilesystem:true →
+    # bgsave fails → writes disabled → 500 on every messages call → the
+    # letta-as-orchestrating-brain (Design A) path cannot take a turn.
+    command: ["/bin/sh", "-c"]
+    args:
+      - 'mkdir -p /root/.letta/redis && redis-server --daemonize yes --bind 127.0.0.1 --dir /root/.letta/redis --stop-writes-on-bgsave-error no && export LETTA_REDIS_HOST=localhost && export LETTA_REDIS_PORT=6379 && exec /app/letta/server/startup.sh'
     # Letta connects to Postgres via the letta-pgbouncer sidecar (pod loopback).
     # The URI is assembled from the postgres secret by agent-bundles.yaml:
     #   LETTA_PG_URI=postgresql://yashigani_app:<pw>@127.0.0.1:5432/letta
@@ -1049,10 +1393,26 @@ agentBundles:
       # PKI secrets volume — provides ca_root.crt + letta-pgbouncer_client.crt/key
       # to the letta-pgbouncer sidecar for mTLS toward postgres.
       # auth_type=plain: no pgbouncer_userlist Secret needed (YSG-RISK-049 revert).
+      #
+      # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+      # WITHOUT items: this pod (letta app container included — volumes are
+      # pod-scoped) could read every service's leaf key, all bootstrap tokens
+      # and caddy_internal_hmac (the Layer-B forgery secret) from the flat
+      # Secret. Exactly the 3 files pgbouncer-letta.ini references
+      # (server_tls_ca_file=/run/secrets/ca_root.crt + the sidecar's own leaf)
+      # are projected. Note: the sidecar's trust anchor is ca_root.crt, NOT
+      # ca_bundle.crt — see files/pgbouncer-letta.ini:138.
       - name: letta-pgbouncer-pki
         secret:
           secretName: "yashigani-pki-certs"
           defaultMode: 0400
+          items:
+            - key: letta-pgbouncer_client.crt
+              path: letta-pgbouncer_client.crt
+            - key: letta-pgbouncer_client.key
+              path: letta-pgbouncer_client.key
+            - key: ca_root.crt
+              path: ca_root.crt
       # letta-pgbouncer-ini — ConfigMap with pgbouncer-letta.ini content.
       # Mounted at /etc/pgbouncer/pgbouncer.ini:ro inside the sidecar.
       # ConfigMap is generated by the Helm chart from docker/pgbouncer/pgbouncer-letta.ini.
@@ -1136,6 +1496,41 @@ agentBundles:
             mountPath: /run/secrets
             readOnly: true
 
+  # filesystem-mcp — Shape-C MCP server bundle (codegen-emitted; placeholder here for
+  # label verification only).  Real values are emitted by _gen_values_yaml_shape_c()
+  # at agent-onboard time.  shape: "c" causes agent-bundles.yaml to emit the
+  # yashigani.io/shape=c pod label that networkpolicy.yaml gateway-egress rule selects on.
+  filesystemMcp:
+    enabled: false
+    shape: "c"
+    image:
+      # Placeholder — replaced by codegen with the pinned digest at onboard time.
+      repository: ghcr.io/agnosticsec/filesystem-mcp
+      tag: "not-yet-available"
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    env: {}
+    service:
+      port: 8000
+      type: ClusterIP
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+    # Shape-C bundles run as non-root, read-only rootfs, all caps dropped.
+    # No persistence — MCP servers are stateless (workspace is a bind-mount volume).
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+
 # ---------------------------------------------------------------------------
 # Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
 # Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).
@@ -1151,6 +1546,10 @@ agentBundles:
 # ---------------------------------------------------------------------------
 openWebui:
   enabled: false
+  # B12 fix (TOM-K8S-001): existingSecretName for OWUI_SECRET_KEY injection
+  # into backoffice. Leave empty to use the chart-managed yashigani-open-webui-secrets.
+  # Set to a pre-created Secret name if managing the secret out-of-band.
+  existingSecretName: ""
   image:
     # Pinned to v0.9.1 to match docker-compose.yml (was floating :main — fixed
     # in v2.23.2 image-pin sweep 2026-05-02).
@@ -1182,7 +1581,19 @@ openWebui:
     webuiAuth: "false"
     webuiAuthTrustedEmailHeader: "X-Forwarded-User"
     webuiAuthTrustedNameHeader: "X-Forwarded-Name"
+    # Phase 2 / 2.25.5-auth-ingress: OWUI served under /app/webui.
+    # See docker-compose.yml for full rationale.
+    webuiUrl: "/app/webui"
+    webuiBaseUrl: "/app/webui"
+    # Single-logout: OWUI signout redirects to /auth/logout-redirect which
+    # clears the Yashigani session cookie and redirects to /login.
+    webuiAuthSignoutRedirectUrl: "/auth/logout-redirect"
     enableSignup: "true"
+    # Track C (F-B): forward the authenticated OWUI user to the gateway so OWUI
+    # emits X-OpenWebUI-User-Email/-Id/-Name/-Role on upstream calls. The
+    # gateway trusted-forwarder resolver maps the email -> per-user Yashigani
+    # identity so per-user/group/org RBAC applies (compose parity).
+    enableForwardUserInfoHeaders: "true"
     webuiSecretKeySecretName: "yashigani-open-webui-secrets"
     webuiSecretKeySecretKey: "secret_key"
     # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
@@ -1227,6 +1638,29 @@ budgetRedis:
     enabled: true
     size: 1Gi
     storageClass: ""
+
+# ---------------------------------------------------------------------------
+# Wazuh SIEM integration (B11 fix — DRIFT-001 / Lu A.8.15/A.8.16)
+# ---------------------------------------------------------------------------
+# Compose ships a 3-container Wazuh stack (manager, indexer, dashboard).
+# Kubernetes does NOT support Wazuh in this chart version — no Helm templates
+# exist for Wazuh resources. Setting wazuh.enabled=true has NO effect; it is
+# retained as an explicit operator-visible declaration so that:
+#   1. The operator knows Wazuh is NOT running (vs. silently absent).
+#   2. The backoffice UI "Wazuh: active" status can be gated on this value in
+#      a future release to prevent misleading the operator.
+#   3. Auditors reviewing chart values find an explicit NOT-SUPPORTED declaration
+#      rather than inference-by-absence (ISO 27001 A.8.15/A.8.16 audit trail).
+#
+# If you need SIEM on Kubernetes, use an external Wazuh deployment and
+# configure the agents to forward logs externally. This is tracked as a
+# future K8s integration item.
+#
+# AUDIT NOTE: Any compliance control that lists "Wazuh SIEM" as implemented
+# MUST reference a running external Wazuh cluster, NOT this chart value.
+# The compose-side Wazuh stack is a Docker/Podman deployment concern only.
+wazuh:
+  enabled: false  # NOT SUPPORTED on Kubernetes in this chart version.
 
 # ---------------------------------------------------------------------------
 # PostgreSQL 16 — primary durable store
@@ -1450,9 +1884,16 @@ poolManager:
 #
 # Set to true ONLY if you have deployed a FIPS-configured base image.
 # Default false: FIPS_MODE env is not injected; containers use standard OpenSSL.
+#
+# cmvpCert: operator-supplied CMVP certificate number for the FIPS-validated
+# OpenSSL provider in the base image (e.g. "#4985" for the CMVP-validated
+# OpenSSL FIPS Provider, ACTIVE FIPS 140-3, sunset 2030-03-10). Surfaced by
+# /admin/crypto/inventory as runtime attestation evidence for auditors.
+# Leave empty if no CMVP certificate applies — the attestation field reports null.
 # ---------------------------------------------------------------------------
 fips:
   mode: false
+  cmvpCert: ""
 
 # ---------------------------------------------------------------------------
 # Licensing — Petra P0-1 (v2.24.4)
@@ -1485,3 +1926,20 @@ licensing:
   # Leave empty to run in COMMUNITY tier.
   # Example: licenseKey: "$(cat /path/to/my.ysg)"
   licenseKey: ""
+
+# ---------------------------------------------------------------------------
+# Document-OPA enforcement (2.26 feature) — sandboxed extractor (B1, Captain).
+# Ships DARK: enabled=false means no extractor RBAC/NetworkPolicy is rendered
+# and the gateway never invokes the document path. Set enabled=true to opt in.
+# ---------------------------------------------------------------------------
+documentEnforcement:
+  enabled: false
+  # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
+  # Pin a digest in production (Verification Protocol §7).
+  image:
+    repository: yashigani/extractor
+    tag: ""            # defaults to .Chart.AppVersion when empty
+  # Per-job resource caps for the ephemeral extractor pods (fail-closed defaults).
+  timeoutSeconds: 20   # activeDeadlineSeconds — wall-clock kill
+  memLimit: "512Mi"    # cgroup memory limit — host never OOM'd
+  cpuLimit: "1"        # cpu quota

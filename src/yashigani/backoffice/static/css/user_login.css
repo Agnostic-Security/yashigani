@@ -7,8 +7,8 @@ label { display: block; font-size: 0.85rem; font-weight: 500; color: #475569; ma
 input[type="text"], input[type="password"] { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.95rem; outline: none; }
 input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
 .totp-input { text-align: center; font-size: 1.3rem; letter-spacing: 0.3em; }
-button { width: 100%; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 500; cursor: pointer; }
-button:hover { background: #1d4ed8; }
+button { width: 100%; padding: 12px; background: #1F5F8E; color: #fff; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 500; cursor: pointer; }
+button:hover { background: #163F5E; }
 button:disabled { background: #93c5fd; cursor: not-allowed; }
 .msg { padding: 10px 14px; border-radius: 8px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
 .msg.error { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; }

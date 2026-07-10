@@ -1,0 +1,90 @@
+# Yashigani v4.1 unified-sidecar — letta egress-forwarder descriptor
+#
+# TRANSITIONAL, OVERLAP PHASE (design §3.3; three-agent wrap directive
+# 2026-07-07): wires letta onto the unified egress-forwarder TEMPLATE.
+# letta's ONLY governed outbound is LLM traffic (OpenAI-SDK env config,
+# OPENAI_API_BASE — compose docker-compose.yml letta stanza). Under the
+# template that traffic becomes egress class `llm` (design §2.4):
+#   letta → egress-letta:9400/llm/v1/* (plain HTTP, 2-member
+#   ringfence_letta_eg) → caddy:18790/llm/* (forwarder presents the letta
+#   leaf) → gateway /egress/eval/llm/* (body inspection + OPA)
+#   → caddy:18790/deliver/llm/* → gateway:8081/v1/* (today's inference
+#   surface; §2.4 open item (i) — :8080 openai_router cutover is Tom's).
+#
+# NOT egress-governed here: letta → letta-pgbouncer:5432 (DB path). That
+# is the mTLS DB sidecar leg (YSG-RISK-048 design), carried on the
+# dedicated 2-member `letta_db` bridge in the base compose — NOT through
+# the forwarder (a DB wire protocol is not HTTP egress).
+#
+# deliver_to `gateway-inference` is the reserved INTERNAL delivery class
+# (codegen _EGRESS_INTERNAL_DELIVER_CLASSES) — no account pins required.
+#
+# The shared yashigani_internal_bearer (OPENAI_API_KEY shim) STAYS —
+# pin-AND-grant overlap. Bearer retirement for letta is the per-instance
+# /agents/ migration step (design §3.3), Laura-gated.
+#
+# RETIRES when letta migrates to a per-instance /agents/ identity.
+#
+# Regenerating the committed artifacts (drift-gated by
+# tests/contracts/test_v41_egress_forwarder_template.py +
+# tests/contracts/test_v41_agent_ingress_template.py):
+#   PYTHONPATH=src python3 -c "
+#     import yaml, pathlib
+#     from yashigani.manifest import (render_egress_forwarder_artifacts,
+#                                     render_agent_ingress_artifacts)
+#     parsed = yaml.safe_load(open('bundles/letta-egress.yaml'))
+#     arts = render_egress_forwarder_artifacts(parsed, 'docker')
+#     arts.update(render_agent_ingress_artifacts(parsed, 'docker'))
+#     for rel, content in arts.items():
+#         pathlib.Path(rel).write_text(content)"
+#
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+
+metadata:
+  name: letta
+  tenant_id: default
+  category: other
+  description: >-
+    Transitional egress-forwarder wiring for the bundled letta agent
+    (pin-AND-grant overlap phase). Not a full onboard manifest.
+  vendor: "Letta"
+  licence: Apache-2.0
+  upstream: "https://github.com/letta-ai/letta"
+
+spec:
+  image:
+    repository: docker.io/letta/letta
+    tag: "0.16.7"
+    digest: "sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+
+  ingress:
+    surface: http-api
+    # letta's API port — the intra-zone-deny tuple is
+    # egress-letta -> letta:8283 (REFUSED).
+    shim_port: 8283
+    # §2.5 INGRESS FRONT mesh-listener port — PINNED to the deterministic
+    # allocator value (sha256("default/letta") in [9500,9900)) so the
+    # install.sh registered upstream URL
+    # (https://caddy:9775/agents/default/letta) is stable + reviewable.
+    # Drift-gated by tests/contracts/test_v41_agent_ingress_template.py.
+    mesh_port: 9775
+
+  egress:
+    needs:
+      # LLM class (design §2.4): internal delivery to the gateway inference
+      # surface. No pins — reserved internal class, not internet-facing.
+      - prefix: llm
+        deliver_to: gateway-inference
+
+    # TRANSITIONAL identity: letta's hand-minted service leaf
+    # (spiffe://<td>/letta, service_identities.yaml `letta` entry).
+    # Bound read-only at the standard SVID paths so the forwarder config is
+    # mode-agnostic. Mirrors the openclaw descriptor exactly. owner_uid 1000
+    # is the FORWARDER container user (yashigani/caddy non-root), not letta's
+    # own UID — the forwarder, not letta, holds this mount (synthesis #2).
+    svid_files:
+      cert: ./secrets/letta_client.crt
+      key: ./secrets/letta_client.key
+      ca: ./secrets/ca_root.crt
+      owner_uid: 1000

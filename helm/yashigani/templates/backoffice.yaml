@@ -149,6 +149,11 @@ spec:
               value: "/etc/yashigani/service_identities.yaml"
             - name: YASHIGANI_INTERNAL_CA_DIR
               value: "/run/secrets"
+            # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust domain
+            # for the app-layer validators. Default yashigani.internal (single
+            # instance). Compose parity: x-common-env YASHIGANI_SPIFFE_TRUST_DOMAIN.
+            - name: YASHIGANI_SPIFFE_TRUST_DOMAIN
+              value: {{ .Values.global.spiffeTrustDomain | default "yashigani.internal" | quote }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -178,13 +183,32 @@ spec:
               # ca_bundle.crt: postgres also serves chain-bundle cert; libpq
               # requires bundle CA to verify (internal integration finding).
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            # v2.25.2 (Lu wire-sink-gate P1): DDL / Alembic run as the admin
+            # superuser yashigani_admin; runtime pool stays on yashigani_app.
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key"
+            {{- end }}
+            # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): the daily
+            # audit-chain checkpoint scheduler runs in backoffice. The ECDSA signing
+            # key is mounted RO via the audit-signing Secret (backoffice ONLY — NOT
+            # mounted into gateway/runtime), so a held yashigani_app credential
+            # cannot forge a signed checkpoint. Absent key => unsigned (still
+            # tamper-evident). Gated on a values flag so air-gapped/community
+            # deployments without the Secret still schedule (unsigned) checkpoints.
+            {{- if .Values.audit.signingKey.enabled }}
+            - name: YASHIGANI_AUDIT_SIGNING_KEY_PATH
+              value: "/run/audit-signing/audit_signing.key"
+            - name: YASHIGANI_AUDIT_SIGNING_SPIFFE_ID
+              value: "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/audit/checkpoint-signer"
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: YASHIGANI_DEPLOYMENT_STREAM
-              value: {{ .Values.gateway.env.deploymentStream | quote }}
+              value: {{ (.Values.gateway.env | default dict).deploymentStream | quote }}
             {{- if .Values.mtls.enabled }}
             # M-01 fix: backoffice exports OTLP traces via mTLS. Python OTEL
             # exporter uses Python ssl — Pattern A (ca_root.crt) per gate #58a
@@ -207,13 +231,42 @@ spec:
             - name: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
               value: {{ .Values.backoffice.agentUpstreamHostnames | join "," | quote }}
             {{- end }}
-            - name: OWUI_API_URL
-              value: "http://open-webui:8080"
+            {{- range $frontID, $front := .Values.agentIngressFronts }}
+            {{- if and $front.enabled (eq $front.systemName "langflow") }}
+            # v4.1 §2.5 INGRESS-FRONTING: backoffice POST /user/agents/generate
+            # (langflow_client.create_flow) dials langflow's Caddy mesh front —
+            # never the agent pod directly (§2.6 K8s analogue: langflow ingress
+            # NP admits the caddy pod only). Mirrors compose
+            # YASHIGANI_LANGFLOW_URL. Port sourced from the codegen overlay
+            # values-langflow-ingress.yaml (single source, drift-gated).
+            - name: YASHIGANI_LANGFLOW_URL
+              value: "https://yashigani-caddy-mesh:{{ int $front.meshPort }}/agents/{{ $front.tenantId }}/{{ $front.systemName }}"
+            # TRACK1-F-04 — langflow flow-discovery reconciler. Points at the
+            # same mesh front as YASHIGANI_LANGFLOW_URL; reconciler appends
+            # /api/v1/flows. Auth: backoffice mTLS leaf (backoffice_client.crt)
+            # → forward_auth verify-mcp ALLOW (subject=backoffice, server=langflow).
+            # NO new NetworkPolicy needed — caddy↔langflow already allowed by
+            # the agentIngressFronts NP (agent-ingress-fronts.yaml).
+            - name: YASHIGANI_LANGFLOW_INTERNAL_URL
+              value: "https://yashigani-caddy-mesh:{{ int $front.meshPort }}/agents/{{ $front.tenantId }}/{{ $front.systemName }}"
+            {{- end }}
+            {{- end }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.redis.existingSecretName | default "yashigani-redis-secrets" }}
                   key: redis_password
+            # v4.1 F-03: backoffice _registry_store() reads YASHIGANI_REDIS_URL and
+            # passes it directly to redis.Redis.from_url(). Uses $(REDIS_PASSWORD) via
+            # K8s dependent env-var substitution (Kubelet replaces before container
+            # start). REDIS_PASSWORD must appear before this entry in the list.
+            # Note: if the Redis password contains URL sub-delimiters (e.g. ','), the
+            # K8s Redis secret should store a URL-encoded variant as redis_password_urlenc
+            # and reference that key instead. Compose uses REDIS_PASSWORD_URLENC written
+            # by install.sh; Helm operators must ensure the password is URL-safe OR
+            # override this value with a pre-encoded reference.
+            - name: YASHIGANI_REDIS_URL
+              value: "rediss://:$(REDIS_PASSWORD)@yashigani-redis:6380/3?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/ca_root.crt&ssl_certfile=/run/secrets/backoffice_client.crt&ssl_keyfile=/run/secrets/backoffice_client.key"
             # v2.23.3 (#59) — W6 fix: YASHIGANI_DB_AES_KEY required for pgcrypto
             # pgp_sym_encrypt on auth_settings table (HIBP API key at rest).
             # Sourced from backoffice secret (same secret as install.sh writes).
@@ -234,6 +287,33 @@ spec:
                   name: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
                   key: caddy_internal_hmac
             {{- end }}
+            # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar
+            # (backoffice MCP import screen). Same Ollama backend as the gateway
+            # (OLLAMA_BASE_URL). Backoffice is on the data network and reaches
+            # ollama:11434 directly. Default ON; set "false" to disable.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
+            # MCP approve-transaction env vars.
+            # v4.1 SU-SEAM-1d-04 RESOLVED: the unix-socket admin path cannot
+            # span pods (emptyDir is pod-local), so on K8s
+            # default_caddy_reloader() branches on
+            # YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs the Caddyfile to
+            # Caddy's mesh-mTLS admin relay (:2019 site block, configmaps.yaml)
+            # via YASHIGANI_CADDY_ADMIN_URL, authenticating with the
+            # backoffice ServiceIdentity leaf (internal_httpx_client — no
+            # identity-less fallback, fail-closed). YASHIGANI_CADDY_ADMIN_SOCKET
+            # is intentionally NOT set here: it is the compose-only transport.
+            - name: YASHIGANI_MCP_ARTIFACT_ROOT
+              value: {{ .Values.backoffice.mcpArtifactRoot | default "/mnt/install" | quote }}
+            - name: YASHIGANI_CONTAINER_RUNTIME
+              value: {{ .Values.containerRuntime | default "k8s" | quote }}
+            {{- if and .Values.caddy.enabled .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+            - name: YASHIGANI_CADDY_ADMIN_URL
+              value: "https://yashigani-caddy-admin:{{ .Values.caddy.adminRelay.port }}"
+            {{- end }}
+            - name: YASHIGANI_CADDY_CADDYFILE
+              value: "/etc/caddy/Caddyfile"
             # YSG-COMPOSE-ENV-001 Helm parity: backoffice reads YASHIGANI_INTERNAL_BEARER
             # from env (os.environ.get) — must be injected via secretKeyRef, not only
             # present in yashigani-agent-bearer for agent-bundle shims.
@@ -250,6 +330,21 @@ spec:
             # set fips.mode=true without swapping to a FIPS-configured image.
             - name: FIPS_MODE
               value: "1"
+            {{- end }}
+            {{- if .Values.fips.cmvpCert }}
+            - name: YASHIGANI_CMVP_CERT
+              value: {{ .Values.fips.cmvpCert | quote }}
+            {{- end }}
+            {{- if .Values.auditLog.enabled }}
+            # B7 fix (v2.25.0 P2): audit env vars injected for PVC-backed audit log.
+            # SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /
+            # EU AI Act Art.12. Council finding B7: Lu P0-#3.
+            - name: YASHIGANI_AUDIT_LOG_PATH
+              value: {{ .Values.auditLog.logPath | quote }}
+            - name: YASHIGANI_AUDIT_MAX_FILE_SIZE_MB
+              value: {{ .Values.auditLog.maxFileSizeMB | quote }}
+            - name: YASHIGANI_AUDIT_RETENTION_DAYS
+              value: {{ .Values.auditLog.retentionDays | quote }}
             {{- end }}
           envFrom:
             - secretRef:
@@ -335,13 +430,41 @@ spec:
               subPath: license_key
               readOnly: true
             {{- end }}
+            {{- if .Values.audit.signingKey.enabled }}
+            # v2.25.2 (Lu wire-sink-gate P2): audit-chain signing key — RO, backoffice
+            # ONLY. Distinct mountPath (/run/audit-signing) NOT under /run/secrets so
+            # the gateway (which mounts the PKI secret) never sees it.
+            - name: audit-signing
+              mountPath: /run/audit-signing
+              readOnly: true
+            {{- end }}
+            {{- if .Values.caddy.enabled }}
+            # v4.1 SU-SEAM-1d-04: the K8s reload path reads the monolith
+            # Caddyfile (YASHIGANI_CADDY_CADDYFILE) and POSTs it to the caddy
+            # admin relay. Same ConfigMap the caddy pod mounts — one source,
+            # no drift. Read-only: backoffice never renders the monolith
+            # (agent routes live in snippets; see caddy-agents design note).
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        # B7 fix (v2.25.0 P2): replace emptyDir with PVC when auditLog.enabled.
+        # emptyDir is wiped on pod restart — operator-visible audit log file sink
+        # is lost. PVC persists across restarts for SOC 2 / ISO 27001 / NIST AU-9.
+        # Council finding B7: Lu P0-#3.
         - name: varlog
+          {{- if .Values.auditLog.enabled }}
+          persistentVolumeClaim:
+            claimName: yashigani-backoffice-audit-log
+          {{- else }}
           emptyDir:
             sizeLimit: 50Mi
+          {{- end }}
         {{- if .Values.mtls.enabled }}
         # Writable /run/secrets seeded by initContainer.
         - name: secrets
@@ -354,6 +477,25 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # only these keys are projected into /pki-ro, so the initContainer's
+            # `cp -L /pki-ro/*` copies exactly this set into the /run/secrets
+            # emptyDir: own leaf + own bootstrap token + the two trust anchors
+            # (ca_root for Python ssl / probes / OTLP, ca_bundle for libpq DSN
+            # chain verify). caddy_internal_hmac comes via the
+            # CADDY_INTERNAL_HMAC env secretKeyRef, never the file. No other
+            # service's leaf key or bootstrap token is projected.
+            items:
+              - key: backoffice_client.crt
+                path: backoffice_client.crt
+              - key: backoffice_client.key
+                path: backoffice_client.key
+              - key: backoffice_bootstrap_token
+                path: backoffice_bootstrap_token
+              - key: ca_root.crt
+                path: ca_root.crt
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
         {{- if .Values.adminBootstrap.enabled }}
         - name: admin-bootstrap-ro
           secret:
@@ -384,6 +526,26 @@ spec:
           secret:
             secretName: yashigani-license
             defaultMode: 0440
+        {{- end }}
+        {{- if .Values.caddy.enabled }}
+        # v4.1 SU-SEAM-1d-04: monolith Caddyfile for the K8s reload path.
+        - name: caddyfile
+          configMap:
+            name: yashigani-caddy-config
+        {{- end }}
+        {{- if .Values.audit.signingKey.enabled }}
+        # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): audit-chain
+        # checkpoint signing key Secret. Mounted RO into backoffice ONLY (the
+        # scheduler runs here) — never into gateway/runtime, so a held
+        # yashigani_app DB credential cannot read it / forge a signed checkpoint.
+        # Populate the Secret (key audit_signing.key) with the internal-CA ECDSA
+        # leaf; see install.sh _provision_audit_signing_key for the compose
+        # equivalent. defaultMode 0400 — owner-read only.
+        - name: audit-signing
+          secret:
+            secretName: {{ .Values.audit.signingKey.existingSecretName | default "yashigani-audit-signing" }}
+            defaultMode: 0400
+            optional: true
         {{- end }}
 ---
 apiVersion: v1

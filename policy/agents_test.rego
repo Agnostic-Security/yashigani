@@ -244,20 +244,29 @@ test_deny_reason_target_agent_empty_string_no_deny_reason_fires if {
     }
 }
 
-# 4c. agent_id absent with no matching group: OPA eval_conflict_error
-# POLICY GAP FINDING (UA-07-GAP-003):
-# When target_agent.agent_id is absent AND caller group does not match, both
-# target_agent_not_in_data and caller_group_not_in_allowed_caller_groups conditions
-# are simultaneously true. agent_call_deny_reason is a complete rule (:=) with
-# multiple heads — OPA raises eval_conflict_error (multiple outputs). Gateway must
-# catch this OPA exception and treat it as DENY. Policy should be restructured to
-# use prioritised ordered rules (default + override) to avoid the conflict.
-# Routing: file against Tom for rule restructure (policy/agents.rego — contract layer,
-# Iris owns the contract gap filing; rule restructure is Tom's implementation).
-# Test documents the conflict: the deny_reason evaluation MUST NOT succeed cleanly.
-test_deny_reason_conflict_when_target_id_absent_and_group_mismatch if {
-    # We verify agent_call_allowed is false (no allow fires without group match)
+# 4c. agent_id absent with no matching group — UA-07-GAP-003 RESOLVED (2.25.2).
+# Previously: target_agent_not_in_data AND caller_group_not_in_allowed_caller_groups
+# both fired → agent_call_deny_reason eval_conflict_error (OPA 500). The class-fix
+# folds target_agent_not_in_data behind `_caller_group_allowed` (precedence 4), so
+# caller-not-authorised (precedence 1) now wins cleanly. The deny_reason MUST now
+# evaluate to a single value with NO eval_conflict.
+test_deny_reason_conflict_resolved_when_target_id_absent_and_group_mismatch if {
+    # Decision unchanged: still denied.
     not data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-alpha",
+            "groups": ["unrelated-group"],
+        },
+        "target_agent": {
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["**"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+    # Reason is now single-valued (no eval_conflict) and deterministic:
+    # caller authorisation (precedence 1) wins over target-data (precedence 4).
+    data.yashigani.agent_call_deny_reason == "caller_group_not_in_allowed_caller_groups" with input as {
         "principal": {
             "type": "agent",
             "agent_id": "agent-alpha",
@@ -561,9 +570,12 @@ test_edge_both_empty_deny_reason_is_caller_group if {
 #   7d. Empty string is also caught by the catch-all (rank 4 → block)
 # ---------------------------------------------------------------------------
 
-# 7a. Unknown sensitivity string gets rank 4
+# 7a. Unknown sensitivity string gets rank 5
+# R14/R15 (v2.25.5): GAP-1 catch-all updated from rank 4 → rank 5 so numeric
+# level 4 (RESTRICTED) is a valid content rank without collision with the
+# unknown-string sentinel. Unknown strings still fail-closed (rank 5 > all ceilings).
 test_sensitivity_rank_unknown_string_is_4 if {
-    data.yashigani.v1.sensitivity_rank("FOO_BAR") == 4
+    data.yashigani.v1.sensitivity_rank("FOO_BAR") == 5
 }
 
 # 7b. Unknown sensitivity → DENY for INTERNAL-ceiling identity
@@ -613,4 +625,668 @@ test_response_decision_empty_sensitivity_denies_internal_ceiling if {
     }
     d.allow == false
     d.reason == "response_sensitivity_exceeds_ceiling"
+}
+
+# ---------------------------------------------------------------------------
+# LAURA-OPA-001 (2.25.2) — path-traversal confused-deputy regression tests
+#
+# An agent scoped to "/do/**" must NOT reach "/admin" via "/do/../admin".
+# httpx collapses dot-segments on the wire; the OPA gate previously matched the
+# un-collapsed path with literal startswith. The _agent_path_safe guard now
+# rejects any traversal sequence (raw or percent-encoded).
+# PoC: testing_runs/yashigani/opa-bypass-audit-20260604/inputs/proof_004_agent_path_traversal.json
+# ---------------------------------------------------------------------------
+
+test_deny_path_traversal_dotdot_to_admin if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/../admin"},
+    }
+}
+
+test_deny_reason_path_traversal if {
+    data.yashigani.agent_call_deny_reason == "path_traversal_attempt" with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/../admin"},
+    }
+}
+
+test_deny_path_traversal_encoded_dots if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/%2e%2e/admin"},
+    }
+}
+
+test_deny_path_traversal_encoded_slash if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do%2f..%2fadmin"},
+    }
+}
+
+test_deny_path_traversal_double_encoded if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/%252e%252e/admin"},
+    }
+}
+
+test_deny_path_traversal_backslash if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/..\\admin"},
+    }
+}
+
+# Legit traffic that LOOKS dotty but is not traversal must still ALLOW.
+test_allow_legit_path_under_prefix_unchanged if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/run"},
+    }
+}
+
+test_allow_filename_with_embedded_dots if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g1"]},
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": ["g1"],
+            "allowed_paths": ["/do/**"],
+        },
+        "request": {"remainder_path": "/do/report..final.pdf"},
+    }
+}
+
+# ===========================================================================
+# 8. LAURA-OPA-005 closure — top-level `allow` eval_conflict on agent + MCP path
+#
+# Before fix: an agent principal hitting /mcp/* with a valid session fired BOTH
+# the human-MCP-session `allow if {...}` (true) AND `allow := false if
+# {deny_agent_call}` (false) → two complete-rule outputs → OPA eval_conflict_error
+# (HTTP 500 → opaque fail-closed deny). After fix the human-MCP rule is gated to
+# non-agent principals and a positive `allow if {agent_call_allowed}` lifts legit
+# agent calls, so the path evaluates cleanly for every combination.
+#
+# 8a. legit agent + /mcp/* (group allowed) → allow == true, no conflict
+# 8b. illegit agent + /mcp/* (group not allowed) → allow == false, no conflict
+# 8c. human MCP session (no principal) → allow == true (unchanged)
+# 8d. agent + /mcp/* with empty allowed_caller_groups (Laura's exact repro) → false
+# ===========================================================================
+
+# 8a. Legit agent reaching /mcp/* ALLOWs cleanly (no eval_conflict).
+test_opa005_legit_agent_mcp_allows if {
+    data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g-yes"]},
+        "target_agent": {
+            "agent_id": "a1",
+            "allowed_caller_groups": ["g-yes"],
+            "allowed_paths": ["/mcp/**"],
+        },
+        "request": {"remainder_path": "/mcp/filesystem-mcp"},
+    }
+}
+
+# 8b. Illegit agent (group not in allowed_caller_groups) → DENY, no conflict.
+test_opa005_illegit_agent_mcp_denies if {
+    not data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+        "principal": {"type": "agent", "agent_id": "a1", "groups": ["g-nope"]},
+        "target_agent": {
+            "agent_id": "a1",
+            "allowed_caller_groups": ["g-yes"],
+            "allowed_paths": ["/mcp/**"],
+        },
+        "request": {"remainder_path": "/mcp/filesystem-mcp"},
+    }
+}
+
+# 8c. Human MCP session (no principal object) still ALLOWs — the non-agent guard
+# must not break the human path.
+test_opa005_human_mcp_session_allows if {
+    data.yashigani.allow with input as {
+        "session_id": "s1",
+        "method": "POST",
+        "path": "/mcp/filesystem-mcp",
+    }
+}
+
+# 8d. Laura's exact eval_conflict repro (agent, empty allowed_caller_groups) →
+# clean DENY (was eval_conflict_error before fix).
+test_opa005_laura_repro_denies_cleanly if {
+    not data.yashigani.allow with input as {
+        "principal": {"type": "agent", "agent_id": "a1"},
+        "session_id": "s",
+        "method": "GET",
+        "path": "/mcp/x",
+        "target_agent": {
+            "agent_id": "a2",
+            "allowed_caller_groups": [],
+            "allowed_paths": ["**"],
+        },
+        "request": {"remainder_path": "/y"},
+    }
+}
+
+# ===========================================================================
+# 9. sensitivity_rank catch-all hardening — UNKNOWN CEILING string fails closed
+#
+# Laura residual (2.25.2): sensitivity_rank maps an unknown CEILING string to
+# rank 4 (the highest), making a garbage ceiling the MOST permissive — so
+# RESTRICTED content (rank 3) <= garbage-ceiling (rank 4) would ALLOW. The
+# ceiling operand now uses _ceiling_rank, which is UNDEFINED for non-canonical
+# strings → comparison undefined → positive allow does not fire → default-deny.
+#
+# 9a. agents: garbage ceiling + RESTRICTED response → agent_response_allowed false
+# 9b. agents: garbage ceiling deny reason is invalid_caller_ceiling
+# 9c. valid ceiling still allows (regression)
+# ===========================================================================
+
+# 9a. Unknown ceiling string + RESTRICTED → DENY (was ALLOW via permissive rank-4).
+test_unknown_ceiling_restricted_denies_agents if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "GARBAGE_CEILING"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# 9b. Deny carries an explicit invalid_caller_ceiling reason (audit clarity).
+test_unknown_ceiling_reason_is_invalid_agents if {
+    d := data.yashigani.agent_response_decision with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "GARBAGE_CEILING"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+    d.reason == "invalid_caller_ceiling"
+}
+
+# 9c. Regression: a VALID ceiling still allows within-clearance content.
+test_valid_ceiling_still_allows_agents if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 9d. Empty-string ceiling is also caught (rank undefined → DENY).
+test_empty_ceiling_denies_agents if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "a1", "sensitivity_ceiling": ""},
+        "target_agent": {"agent_id": "a2"},
+        "response_sensitivity": "PUBLIC",
+        "response_pii_detected": false,
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 10. #47 / G-NEW-5 / R3 — verified signed-principal contract.
+#
+# The orchestration principal is verified at the GATEWAY (ES384 signature +
+# SPIFFE binding + jti replay dedup) BEFORE OPA is queried — a forged or
+# replayed principal never reaches OPA (the gateway returns 403 fail-closed,
+# proven by test_g_new_5_agent_principal_signing.py).  These tests assert the
+# rego CONTRACT: it adjudicates on input.principal (now the VERIFIED principal
+# id) and the carried `verified` provenance fact is non-load-bearing (it does
+# not, on its own, change the allow/deny — authority is group + path).
+# ---------------------------------------------------------------------------
+
+# 10a. A relay hop: verified principal feeds OPA as a verified fact → ALLOW by
+# group + path exactly as before (the verified id is just the principal).
+test_verified_relay_principal_allows if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-orig",
+            "groups": ["analytics-agents"],
+            "verified": true,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}
+
+# 10b. First hop: the gateway is the asserting authority and mints the signed
+# claim on forward, so a verified=false principal still adjudicates normally by
+# group + path (the gateway has already authenticated the immediate caller).
+test_first_hop_unverified_principal_still_adjudicates if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-alpha",
+            "groups": ["analytics-agents"],
+            "verified": false,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}
+
+# 10c. The verified principal is still bound by group: a verified principal NOT
+# in the allowed caller groups is DENIED (verification ≠ authorisation).
+test_verified_principal_wrong_group_denied if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-orig",
+            "groups": ["other-agents"],
+            "verified": true,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}
+
+# ===========================================================================
+# 11. Phase 5 §C §E.11 — _langflow_callee_ceiling_ok hard-cap tests
+#
+# agent__langflow has a HARD POLICY CAP: response sensitivity must not
+# exceed INTERNAL.  This is independent of the caller's registered
+# sensitivity_ceiling — the cap is enforced in policy so it cannot be
+# bypassed via a misconfigured registry entry.
+#
+# 11a. INTERNAL response to agent__langflow → ALLOW (within cap)
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap)
+#      deny reason == "langflow_callee_ceiling_hard_cap" (not generic)
+# 11c. RESTRICTED response to agent__langflow → DENY (hard-cap)
+# 11d. Non-langflow target unaffected: CONFIDENTIAL within CONFIDENTIAL ceiling → ALLOW
+# 11e. Regression: langflow hard-cap does not suppress other deny reasons
+#      (PII gate still fires for langflow when response is within cap)
+# ===========================================================================
+
+# 11a. INTERNAL response to agent__langflow with CONFIDENTIAL caller ceiling → ALLOW.
+#      The hard-cap (≤ INTERNAL) is satisfied; caller ceiling (CONFIDENTIAL ≥ INTERNAL) satisfied.
+test_langflow_callee_internal_response_allows if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b. CONFIDENTIAL response to agent__langflow → DENY (hard-cap: rank 2 > INTERNAL rank 1).
+test_langflow_callee_confidential_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11b-reason. deny reason is "langflow_callee_ceiling_hard_cap" (distinguishable
+# from generic "response_sensitivity_exceeds_caller_ceiling").
+test_langflow_callee_confidential_response_deny_reason if {
+    d := data.yashigani.agent_response_decision with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+    d.allow == false
+    d.reason == "langflow_callee_ceiling_hard_cap"
+}
+
+# 11c. RESTRICTED response to agent__langflow → DENY (rank 3 > INTERNAL rank 1).
+test_langflow_callee_restricted_response_denies if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "RESTRICTED"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "RESTRICTED",
+        "response_pii_detected": false,
+    }
+}
+
+# 11d. Non-langflow target: hard-cap rule is trivially true, normal ceiling applies.
+#      A CONFIDENTIAL response to a non-langflow target with CONFIDENTIAL ceiling → ALLOW.
+test_non_langflow_target_unaffected_by_hard_cap if {
+    data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent-other"},
+        "response_sensitivity": "CONFIDENTIAL",
+        "response_pii_detected": false,
+    }
+}
+
+# 11e. PII gate still fires for langflow when response is within the hard-cap.
+#      (PII beats the hard-cap — both conditions contribute to the deny.)
+test_langflow_callee_pii_still_blocks_within_cap if {
+    not data.yashigani.agent_response_allowed with input as {
+        "caller": {"agent_id": "agent-alpha", "sensitivity_ceiling": "CONFIDENTIAL"},
+        "target_agent": {"agent_id": "agent__langflow"},
+        "response_sensitivity": "INTERNAL",
+        "response_pii_detected": true,
+    }
+}
+
+# ===========================================================================
+# 12. NHI request enforcement (4.0 Phase 3 — RISK-097/108)
+#
+# Tests nhi_tool_allowed, nhi_budget_ok, nhi_ceiling_ok,
+# nhi_request_allowed, nhi_request_decision, and nhi_deny_reason rules.
+#
+# 12a. Allowed tool — nhi_tool_allowed = true
+# 12b. Out-of-scope tool — nhi_tool_allowed = false; deny_reason = tool_not_in_allowed_tools
+# 12c. Budget tokens exceeded — nhi_budget_ok = false; deny_reason = nhi_budget_exceeded
+# 12d. Budget tool_calls exceeded — nhi_budget_ok = false
+# 12e. Sensitivity ceiling exceeded — nhi_ceiling_ok = false; deny_reason = nhi_sensitivity_ceiling_exceeded
+# 12f. All gates pass — nhi_request_allowed = true; deny_reason = ok
+# 12g. Empty tool string (direct LLM chat) → nhi_tool_allowed = true
+# 12h. Empty allowed_tools list → nhi_tool_allowed = false (fail-closed)
+# 12i. Non-NHI identity → nhi_tool_allowed = false; nhi_request_allowed = false
+# ===========================================================================
+
+# Shared NHI fixture helper fields (repeated inline per test — OPA test idiom)
+# NHI identity: allowed_tools=["search", "database.read"], ceiling=INTERNAL,
+#               budget: max_tokens=8192, max_tool_calls=20
+
+# 12a. Allowed tool passes nhi_tool_allowed.
+test_nhi_tool_allowed_passes if {
+    data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12b. Out-of-scope tool — DENY + deny_reason = tool_not_in_allowed_tools.
+test_nhi_tool_out_of_scope_denies if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "admin.write",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_tool_out_of_scope_deny_reason if {
+    data.yashigani.nhi_deny_reason == "tool_not_in_allowed_tools" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "admin.write",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12c. Budget tokens exceeded — nhi_budget_ok = false; deny_reason = nhi_budget_exceeded.
+test_nhi_budget_tokens_exceeded if {
+    not data.yashigani.nhi_budget_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 1000, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 1001,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_budget_tokens_exceeded_deny_reason if {
+    data.yashigani.nhi_deny_reason == "nhi_budget_exceeded" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 1000, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 1001,
+            "tool_calls_used": 1,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12d. Budget tool_calls exceeded — nhi_budget_ok = false.
+test_nhi_budget_tool_calls_exceeded if {
+    not data.yashigani.nhi_budget_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 5},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 6,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12e. Sensitivity ceiling exceeded — nhi_ceiling_ok = false;
+#      deny_reason = nhi_sensitivity_ceiling_exceeded.
+test_nhi_ceiling_exceeded if {
+    not data.yashigani.nhi_ceiling_ok with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "CONFIDENTIAL",
+        },
+    }
+}
+
+test_nhi_ceiling_exceeded_deny_reason if {
+    data.yashigani.nhi_deny_reason == "nhi_sensitivity_ceiling_exceeded" with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 100,
+            "tool_calls_used": 1,
+            "response_sensitivity": "CONFIDENTIAL",
+        },
+    }
+}
+
+# 12f. All gates pass — nhi_request_allowed = true; deny_reason = "ok".
+test_nhi_all_gates_pass_allows if {
+    data.yashigani.nhi_request_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "CONFIDENTIAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "database.read",
+            "tokens_used": 500,
+            "tool_calls_used": 3,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_all_gates_pass_deny_reason_ok if {
+    d := data.yashigani.nhi_request_decision with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search", "database.read"],
+            "sensitivity_ceiling": "CONFIDENTIAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "database.read",
+            "tokens_used": 500,
+            "tool_calls_used": 3,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+    d.allow == true
+    d.tool_ok == true
+    d.budget_ok == true
+    d.ceiling_ok == true
+    d.deny_reason == "ok"
+}
+
+# 12g. Empty tool string (direct LLM chat, no explicit tool) → nhi_tool_allowed = true.
+test_nhi_empty_tool_string_allowed if {
+    data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12h. Empty allowed_tools list → fail-closed (nhi_tool_allowed = false).
+test_nhi_empty_allowed_tools_fail_closed if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "nhi",
+            "allowed_tools": [],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+# 12i. Non-NHI identity → nhi rules do not fire.
+test_nhi_non_nhi_identity_not_allowed if {
+    not data.yashigani.nhi_request_allowed with input as {
+        "identity": {
+            "kind": "agent",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
+}
+
+test_nhi_non_nhi_identity_tool_not_allowed if {
+    not data.yashigani.nhi_tool_allowed with input as {
+        "identity": {
+            "kind": "agent",
+            "allowed_tools": ["search"],
+            "sensitivity_ceiling": "INTERNAL",
+            "budget_cap": {"max_tokens_per_run": 8192, "max_tool_calls_per_run": 20},
+        },
+        "request": {
+            "tool": "search",
+            "tokens_used": 0,
+            "tool_calls_used": 0,
+            "response_sensitivity": "INTERNAL",
+        },
+    }
 }

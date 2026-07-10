@@ -1,9 +1,9 @@
 """
 Yashigani Backoffice — PII configuration and test routes (v2.2).
 
-License gating:
-  pii_log    — required for LOG mode (detection only).
-  pii_redact — required for REDACT and BLOCK modes.
+ENT-001 (2026-06-14): PII detection (LOG / REDACT / BLOCK) is available on ALL tiers
+including Community/free.  There is no license gate on PII.  The _require_pii_feature()
+helper is retained as a no-op stub so call-sites need no change, but it no longer raises.
 
 Routes:
   GET  /admin/pii/config          — current PII config (mode, enabled types)
@@ -17,7 +17,6 @@ Cloud bypass (OFF by default):
   When enabled, PII filtering is skipped for cloud-routed requests only.
   Local (Ollama) traffic is ALWAYS filtered regardless of this setting.
   This is an explicit admin opt-in to allow PII to reach cloud LLMs.
-  Enabling this requires pii_redact license tier.
 """
 from __future__ import annotations
 
@@ -27,9 +26,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
-from yashigani.licensing.enforcer import LicenseFeatureGated, require_feature
+# ENT-001: LicenseFeatureGated / require_feature no longer used in this module
+#          (PII is always available); imports removed to keep ruff clean.
 from yashigani.pii.detector import PiiDetector, PiiMode, PiiType
 
 logger = logging.getLogger(__name__)
@@ -72,8 +72,8 @@ def _set_cloud_bypass(enabled: bool) -> None:
 
 class PiiConfigRequest(BaseModel):
     mode: str = Field(
-        description="Detection mode: log | redact | block",
-        pattern=r"^(log|redact|block)$",
+        description="Detection mode: pass | log | redact | pseudonymize | block",
+        pattern=r"^(pass|log|redact|pseudonymize|block)$",
     )
     enabled_types: list[str] = Field(
         description="List of PiiType values to enable. Empty list enables all.",
@@ -94,9 +94,9 @@ class PiiTestRequest(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
     mode: Optional[str] = Field(
         default=None,
-        description="Override mode for this test call (log | redact | block). "
+        description="Override mode for this test call (pass | log | redact | pseudonymize | block). "
                     "Defaults to the currently configured mode.",
-        pattern=r"^(log|redact|block)$",
+        pattern=r"^(pass|log|redact|pseudonymize|block)$",
     )
 
 
@@ -114,25 +114,17 @@ class PiiCloudBypassRequest(BaseModel):
 # License helpers
 # ---------------------------------------------------------------------------
 
-def _require_pii_feature(mode: str) -> None:
-    """Raise HTTP 402 if the active license does not cover the requested mode."""
-    try:
-        if mode in ("redact", "block"):
-            require_feature("pii_redact")
-        else:
-            require_feature("pii_log")
-    except LicenseFeatureGated as exc:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "error": "LICENSE_FEATURE_GATED",
-                "feature": exc.feature,
-                "message": (
-                    "PII detection requires Professional Plus or higher. "
-                    "Upgrade at https://agnosticsec.com/pricing"
-                ),
-            },
-        ) from exc
+def _require_pii_feature(mode: str) -> None:  # noqa: ARG001
+    """No-op stub (ENT-001, 2026-06-14).
+
+    PII detection is available on ALL tiers including Community.  This function
+    previously raised HTTP 402 for tiers below Professional Plus; that gate is
+    removed.  The stub is retained so call-sites in this module need no change.
+    """
+    # require_feature("pii_log"/"pii_redact") now short-circuits in enforcer.py
+    # via _ALWAYS_AVAILABLE_FEATURES and will never raise LicenseFeatureGated —
+    # but calling it here is equally correct.  We keep the body empty to make the
+    # intent explicit: this is intentionally a no-op.
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +146,77 @@ async def get_pii_config(session: AdminSession):
 @router.put("/config")
 async def update_pii_config(
     body: PiiConfigRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,  # LAURA-V400-R2-001: disabling PII scanning is a data-protection control change
 ):
-    """Update PII detection mode and enabled types."""
+    """Update PII detection mode and enabled types.
+
+    STRENGTHEN direction (redact/pseudonymize/block) — applied immediately.
+    WEAKEN direction (pass/log) — creates a pending dual-admin weaken request
+    instead of applying immediately (LAURA-V400-R2-001 dual-admin requirement).
+    """
     _require_pii_feature(body.mode)
 
     enabled = body.enabled_types if body.enabled_types else [t.value for t in PiiType]
+
+    # DUAL-ADMIN: weaken direction (pass or log) requires a second admin to approve.
+    _WEAKENED_MODES = frozenset({"pass", "log"})
+    if body.mode in _WEAKENED_MODES:
+        from yashigani.backoffice.routes.dp_weaken import (
+            _dp_store,
+            _current_pii_config,
+            _install_tenant,
+            _require_at_least_two_active_admins,
+        )
+        from yashigani.audit.schema import DataProtectionWeakenRequestedEvent
+
+        await _require_at_least_two_active_admins()
+
+        from_state = _current_pii_config()
+        to_state = {"mode": body.mode, "enabled_types": enabled}
+        store = _dp_store()
+        row = store.create_request(
+            tenant_id=_install_tenant(),
+            requester_id=session.account_id,
+            control="pii_config",
+            from_state=from_state,
+            to_state=to_state,
+        )
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(DataProtectionWeakenRequestedEvent(
+                    admin_account=session.account_id,
+                    request_id=row["request_id"],
+                    control="pii_config",
+                    from_state=from_state,
+                    to_state=to_state,
+                ))
+            except Exception as exc:
+                logger.error("Failed to write DataProtectionWeakenRequestedEvent: %s", exc)
+
+        logger.warning(
+            "pii_config WEAKEN REQUESTED (not applied): mode=%s requester=%s request_id=%s",
+            body.mode, session.account_id, row["request_id"],
+        )
+        from fastapi import Response
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "request_id": row["request_id"],
+                "control": "pii_config",
+                "from_state": from_state,
+                "to_state": to_state,
+                "message": (
+                    f"Setting PII mode to {body.mode!r} is a data-protection weakening. "
+                    "A second admin must approve via POST "
+                    f"/admin/data-protection/weaken-requests/{row['request_id']}/approve. "
+                    "The change has NOT been applied."
+                ),
+            },
+        )
+
+    # STRENGTHEN direction — apply immediately (single-admin step-up sufficient).
     cfg = {"mode": body.mode, "enabled_types": enabled}
     _set_config(cfg)
 
@@ -224,8 +281,8 @@ async def test_pii_detection(
         "mode": result.mode.value,
         "finding_count": len(findings_out),
         "findings": findings_out,
-        # Return redacted text only in REDACT mode so admins can preview output.
-        "output_text": output_text if test_mode == PiiMode.REDACT else None,
+        # Return transformed text for REDACT and PSEUDONYMIZE so admins can preview output.
+        "output_text": output_text if test_mode in (PiiMode.REDACT, PiiMode.PSEUDONYMIZE) else None,
     }
 
 
@@ -249,21 +306,79 @@ async def get_pii_cloud_bypass(session: AdminSession):
 @router.put("/cloud-bypass")
 async def update_pii_cloud_bypass(
     body: PiiCloudBypassRequest,
-    session: AdminSession,
+    session: StepUpAdminSession,  # LAURA-V400-R2-001: enabling cloud bypass disables PII scanning for cloud paths
 ):
     """Toggle the PII cloud bypass setting.
 
-    Requires pii_redact license tier (same as REDACT/BLOCK modes) because
-    enabling bypass has equivalent data exposure implications.
+    ENT-001: no license gate — PII bypass is available on all tiers.
 
     Local (Ollama) traffic is NEVER affected — it is always filtered.
     This setting only controls whether PII filtering runs for requests
     that the optimization engine routes to cloud providers.
-    """
-    # Enabling cloud bypass has the same data-exposure risk as BLOCK mode —
-    # require pii_redact so community-tier users cannot accidentally expose PII.
-    _require_pii_feature("redact" if body.enabled else "log")
 
+    WEAKEN direction (enabled=True) — creates a pending dual-admin weaken
+    request (LAURA-V400-R2-001).
+    STRENGTHEN direction (enabled=False) — applied immediately.
+    """
+    _require_pii_feature("redact" if body.enabled else "log")  # no-op (ENT-001)
+
+    # DUAL-ADMIN: enabling bypass is a weakening — requires second admin approval.
+    if body.enabled:
+        from yashigani.backoffice.routes.dp_weaken import (
+            _dp_store,
+            _current_pii_cloud_bypass,
+            _install_tenant,
+            _require_at_least_two_active_admins,
+        )
+        from yashigani.audit.schema import DataProtectionWeakenRequestedEvent
+
+        await _require_at_least_two_active_admins()
+
+        from_state = _current_pii_cloud_bypass()
+        to_state = {"enabled": True}
+        store = _dp_store()
+        row = store.create_request(
+            tenant_id=_install_tenant(),
+            requester_id=session.account_id,
+            control="pii_cloud_bypass",
+            from_state=from_state,
+            to_state=to_state,
+        )
+        if backoffice_state.audit_writer is not None:
+            try:
+                backoffice_state.audit_writer.write(DataProtectionWeakenRequestedEvent(
+                    admin_account=session.account_id,
+                    request_id=row["request_id"],
+                    control="pii_cloud_bypass",
+                    from_state=from_state,
+                    to_state=to_state,
+                ))
+            except Exception as exc:
+                logger.error("Failed to write DataProtectionWeakenRequestedEvent for pii_cloud_bypass: %s", exc)
+
+        logger.warning(
+            "pii_cloud_bypass ENABLE REQUESTED (not applied): requester=%s request_id=%s",
+            session.account_id, row["request_id"],
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "request_id": row["request_id"],
+                "control": "pii_cloud_bypass",
+                "from_state": from_state,
+                "to_state": to_state,
+                "message": (
+                    "Enabling PII cloud bypass is a data-protection weakening. "
+                    "A second admin must approve via POST "
+                    f"/admin/data-protection/weaken-requests/{row['request_id']}/approve. "
+                    "Cloud bypass has NOT been enabled."
+                ),
+            },
+        )
+
+    # STRENGTHEN direction (disable bypass) — apply immediately.
     previous = _get_cloud_bypass()
     _set_cloud_bypass(body.enabled)
 
@@ -289,8 +404,5 @@ async def update_pii_cloud_bypass(
     return {
         "status": "ok",
         "cloud_bypass_enabled": body.enabled,
-        "warning": (
-            "PII may now reach cloud LLM providers. "
-            "Local (Ollama) traffic remains filtered at all times."
-        ) if body.enabled else None,
+        "warning": None,
     }

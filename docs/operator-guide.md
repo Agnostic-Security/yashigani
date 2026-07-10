@@ -358,4 +358,68 @@ The gateway logs `"K8s backend: pod <name> phase=Pending, waiting..."` every 2 s
 2. Pod events: `kubectl describe pod <ysg-*> -n <namespace>`
 3. Increase `podReadyTimeoutSeconds` if image pull is consistently slow
 
+---
+
+## 7. OpenWebUI (end-user chat surface)
+
+### 7.1 Served at the site root
+OpenWebUI (v0.9.2) is served at the **site root** (`https://<domain>/`), not under a
+subpath. OWUI hardcodes the SvelteKit `base=""` and ignores `WEBUI_BASE_URL`, so a
+`/app/webui` subpath renders a blank page. The Caddy root catch-all reverse-proxies
+OWUI behind `forward_auth /auth/verify-user` (+ anti-spoof header strip, WebSocket
+pass-through, and an admin→`/admin` bounce). The legacy `/app/webui*` path 302-redirects
+to `/` for back-compat. Do **not** set `WEBUI_BASE_URL`/`WEBUI_URL`.
+
+### 7.2 Access is opt-in (owui-users group)
+Yashigani is API-first: a user-tier account gets API access by default, but reaching
+OpenWebUI additionally requires membership of the **`owui-users`** RBAC group. A user
+not in `owui-users` is denied with a clear 403 (`X-Authz-Reason: owui_access_required`).
+Add a user to OWUI access via the admin console (Groups → `owui-users`) or the API.
+The check skip-allows when the RBAC store / `owui-users` group is absent (community
+deploys are never locked out).
+
+### 7.3 Default user role + RAG embeddings
+`WEBUI_DEFAULT_USER_ROLE=user` makes non-first OWUI users active (not "pending").
+RAG retrieval uses an Ollama embedding model — `RAG_EMBEDDING_MODEL=nomic-embed-text`
+(pulled by `ollama-init`); the OWUI default `sentence-transformers/...` is not an Ollama
+model and 404s on every retrieval.
+
+> Demo-reliability note (YSG-RISK-089, tracked for v3.0.1): on some fresh deploys an
+> OWUI user may still appear in the "pending" role on first login despite
+> `WEBUI_DEFAULT_USER_ROLE=user`. If a demo/end user cannot access chat, an admin can
+> activate them in the OWUI Admin Panel → Users (set role to "user").
+
+### 7.4 cloud-9 MCP-injection demo (demo mode)
+`install.sh --deploy demo` wires the headline cloud-9 demo: the `cloud9-orchestrate`
+virtual model appears in the OWUI model picker; selecting it and sending a tool call
+whose argument trips the bundled rogue `demo-mcp` causes the upstream to return a
+credential-exfil payload, which the gateway's ResponseInspection + egress OPA **block**
+before it reaches the user. A benign tool call passes through normally. This requires
+`YASHIGANI_INSPECT_RESPONSES=true` (demo mode sets it; off by default in prod —
+YSG-RISK-057).
+
+---
+
+## 8. Logging, audit + SIEM storage encryption
+
+Yashigani emits operational logs (`/var/log/yashigani`, Loki), the tamper-evident
+**audit chain** (Postgres `audit_events`, SHA-384 hash-chain + daily ECDSA-signed
+Merkle checkpoints), and forwards events to your SIEM (Wazuh/Splunk/Elasticsearch).
+
+Some log/audit records intentionally retain sensitive material **in clear text**
+for forensics — e.g. the flagged high-entropy tokens that floored a request to
+RESTRICTED (YSG-RISK-092). This is required: support + the SIEM need the values
+as-is to investigate *what* was flagged.
+
+**Operator requirement — encrypt log + audit storage at rest.** Because logs can
+contain sensitive content, the deployment MUST provide encryption-at-rest for:
+
+- the Docker/host volumes backing `postgres` (audit DB), `loki`, and any
+  file-log mounts (use an encrypted filesystem / LUKS / cloud-provider volume
+  encryption);
+- the SIEM's own datastore (Wazuh indexer / Splunk / Elasticsearch).
+
+Access to these stores is already restricted to the audit/SIEM plane (mTLS,
+RBAC); encryption-at-rest closes the residual disk-theft / snapshot exposure.
+
 *Operator guide — Yashigani. Maintained by Agnostic Security.*

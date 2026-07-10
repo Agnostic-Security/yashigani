@@ -1,5 +1,5 @@
 # Yashigani — Caddy TLS edge (self-signed certificate mode)
-# Last updated: 2026-05-18T00:00:00+00:00 (v2.23.4: add handle /openapi.json + /docs blocks — close Iris Seam 15 — openapi+docs edge routing)
+# Last updated: 2026-06-27T00:00:00+00:00 (v4.0-phase1: strict CSP/TT — import csp-policies snippet from Caddyfile.csp)
 #
 # ╔══════════════════════════════════════════════════════════╗
 # ║  WARNING: SELF-SIGNED MODE — LOCAL / DEMO USE ONLY      ║
@@ -18,22 +18,74 @@
     # Use Caddy's internal CA for self-signed certs (no ACME)
     local_certs
 
+    # ── Public-edge SNI defaulting (TLS fix, 2026-06-11) ───────────────────
+    # The public :443 site sets client_auth (verify_if_given) to extract a SPIFFE
+    # URI from an optionally-presented client cert on /agents/* + /v1/*. Caddy
+    # then compiles an SNI-matched TLS connection policy ({sni:[<domain>]}) plus an
+    # EMPTY catch-all. Any handshake with NO SNI, or an SNI != <domain> (a browser/
+    # curl/in-network client reaching the edge by IP, the real hostname, or no SNI)
+    # falls to the empty catch-all and aborts with `tlsv1 alert internal error` /
+    # RECORD_LAYER_FAILURE — which took the public /v1 + admin/OWUI UI down over
+    # TLS for everything except a literal SNI=<domain>. default_sni folds the
+    # no-SNI ("") case into the cert-bearing policy; fallback_sni serves the
+    # <domain> cert when a connection presents a non-matching SNI. Together they
+    # make the self-signed/internal edge cert reachable for every client. Safe:
+    # single path-routed edge, no host-based vhosting. verify_if_given SPIFFE
+    # extraction unchanged; mesh listeners :8444/:8445 (port-matched) unaffected.
+    default_sni {$YASHIGANI_TLS_DOMAIN}
+    fallback_sni {$YASHIGANI_TLS_DOMAIN}
+
     # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
     # TCP :2019 removed. Filesystem permissions are the auth gate.
     # In-container tooling (healthcheck, reload) uses the socket directly.
     # No other service on any network can reach this surface.
-    admin unix//run/caddy/admin.sock
+    # |0666: socket lives on a named volume mounted ONLY in caddy + backoffice
+    # (caddy_admin_sock). No third container can reach this path, so world-write
+    # on the socket is equivalent to 0660 with a shared group — no external
+    # process can access it. Allows backoffice UID 1001 to POST /load via
+    # default_caddy_reloader() (mcp_onboard.py:135) without requiring group_add.
+    admin unix//run/caddy/admin.sock|0666
 
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {
         timeouts {
             read_body   10s
             read_header 5s
-            write       30s
+            write       120s  # raised 30→120s: accommodates local LLM generations; warm models keep normal responses ~8s
             idle        120s
         }
+        # ── SNI-host enforcement (public-edge TLS fix, 2026-06-11) ──────────
+        # The public localhost:443 site configures client_auth (verify_if_given)
+        # to extract a SPIFFE URI from an optionally-presented client cert on the
+        # /agents/* and /v1/* paths. Caddy AUTO-ENABLES strict SNI-host enforcement
+        # on any server that has client_auth configured. With strict enforcement,
+        # Caddy REJECTS the TLS handshake (`tlsv1 alert internal error` /
+        # RECORD_LAYER_FAILURE) for every connection whose SNI != the site host
+        # (localhost) — i.e. browsers/curl/in-network clients reaching the edge by
+        # IP, by the real hostname, or with NO SNI all fail. This broke the public
+        # /v1 + admin/OWUI UI over TLS for everything except literal SNI=localhost.
+        # `insecure_off` disables the SNI-host *match* gate. It is safe here: this
+        # edge serves a SINGLE site and routes purely on path — there is no
+        # host-based virtual hosting to confuse, so the host-confusion class the
+        # "insecure" label warns about does not apply. mTLS verify_if_given (the
+        # SPIFFE extraction) is unaffected. Mesh listeners :8444/:8445 are
+        # single-cert, port-matched, no vhosting — also unaffected.
+        strict_sni_host insecure_off
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSP policy snippet — defines the four path matchers and their Content-Security-
+# Policy header values as the (csp-policies) named snippet. Imported at the site
+# level with `import csp-policies`. Source of truth: docker/Caddyfile.csp.
+# The Helm chart (configmaps.yaml) hand-codes the equivalent; the parity-check
+# script (scripts/check-caddyfile-csp-parity.sh) enforces drift-prevention.
+import /etc/caddy/Caddyfile.csp
+
+# openclaw inbound-webhook snippet — defines (openclaw-webhooks); pulled into
+# the :443 site block below via `import openclaw-webhooks`. Single source:
+# docker/Caddyfile.openclaw-webhooks (v4.1 Phase 1c, LAURA-I1-03 / FP-05).
+import /etc/caddy/Caddyfile.openclaw-webhooks
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal mTLS snippet — imported by every reverse_proxy / forward_auth block
@@ -110,6 +162,60 @@
 # with /run/secrets/caddy_internal_hmac mounted, so a forged header cannot
 # match.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Strip orchestration-context headers at the public edge (LAURA/IRIS drift).
+# X-Yashigani-Orchestration-* carry the agent-orchestration identity context
+# (depth, principal, root-request-id) the gateway uses for model-RBAC. A real
+# external user proved they can FORGE X-Yashigani-Orchestration-Depth at the
+# public edge to bypass model-RBAC. These headers are LEGITIMATE only on the
+# internal mesh self-call path (gateway:8081), exactly like X-OpenWebUI-User-*.
+# Imported into EVERY public handle that reaches the gateway (direct or via the
+# OWUI catch-all). Single-source snippet = no per-handle drift across renders.
+# Pairs with Tom's gateway-side identity-gate (the two halves ship together).
+# `request_header -X` (delete) runs unconditionally here; no inbound value
+# survives to the gateway, so it can only ever see an internally-set value.
+# ─────────────────────────────────────────────────────────────────────────────
+(strip-orchestration-headers) {
+    request_header -X-Yashigani-Orchestration-Depth
+    request_header -X-Yashigani-Orchestration-Principal
+    request_header -X-Yashigani-Orchestration-Root-Request-Id
+    # Defence-in-depth catch for any future X-Yashigani-Orchestration-* header.
+    request_header -X-Yashigani-Orchestration-*
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strip internal-trust headers at the public edge (T-1 belt-and-suspenders).
+# Three classes of header MUST NOT arrive from external clients unchallenged:
+#
+#   X-Yashigani-User-Id / X-Yashigani-Identity-Id — set by the trusted internal
+#     backoffice forwarder on the mesh path (gateway:8081). An external client MUST
+#     NOT be able to inject either to spoof an internal identity.
+#
+#   X-Caddy-Verified-Secret — set ONLY by Caddy (inject-caddy-verified snippet) on
+#     every reverse_proxy upstream call. The gateway/backoffice middleware verifies
+#     this header to confirm the request was forwarded by the trusted Caddy edge
+#     (YSG-RISK-108 / EX-231-10 Layer B). Stripping inbound prevents an attacker
+#     on the public network from presenting a forged value before Caddy overwrites
+#     it — belt-and-suspenders on top of the `header_up set` overwrite in
+#     inject-caddy-verified (the overwrite is the primary control; this strip is T-1
+#     depth). NOT applied on :8444/:8445 (internal-mesh listeners).
+#
+# Applied at the public-site level so ALL handle blocks are covered with no
+# per-handle drift risk. NOT applied on :8444/:8445 (separate internal-mesh
+# site blocks) where the trusted backoffice forwarder legitimately sets them.
+# X-Yashigani-User-Id     — 3.x identity forward header
+# X-Yashigani-Identity-Id — 4.0 identity forward header (Tom's rename, 4.0 port)
+# ─────────────────────────────────────────────────────────────────────────────
+(strip-identity-headers) {
+    request_header -X-Yashigani-User-Id
+    request_header -X-Yashigani-Identity-Id
+    # YSG-RISK-108 / EX-231-10 Layer B — strip any client-supplied Caddy secret.
+    # inject-caddy-verified (header_up set) overwrites it on the upstream call,
+    # but stripping here prevents the raw header from persisting in forward_auth
+    # sub-requests where no inject-caddy-verified is called.
+    request_header -X-Caddy-Verified-Secret
+}
+
 (inject-caddy-verified) {
     # Inject the per-install shared secret from the mounted secrets file.
     # {$CADDY_INTERNAL_HMAC} is a parse-time env substitution (NOT a request-time
@@ -150,28 +256,66 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     # - HSTS: Strict-Transport-Security enforced (preload-ready)
     # - CSP: Content-Security-Policy with strict directives
     # - X-Content-Type-Options: nosniff (prevents MIME sniffing)
-    # - X-Frame-Options: DENY (prevents clickjacking)
+    # - X-Frame-Options: DENY (prevents clickjacking — scoped away from monitoring
+    #   embed paths: Grafana/Alertmanager must be iframeable from the admin shell.
+    #   Modern browsers honour CSP frame-ancestors over XFO; the @lenient_subapp
+    #   CSP sets frame-ancestors 'self' on those paths. XFO: DENY covers all else.)
     # - COOP: Cross-Origin-Opener-Policy: same-origin
+    # - COEP: Cross-Origin-Embedder-Policy: require-corp
+    # - CORP: Cross-Origin-Resource-Policy: same-origin (ZAP 90004; single-origin app; pairs with COEP require-corp)
     # - Referrer-Policy: no-referrer
     # Fallback: if a browser lacks these features, Yashigani's
     # server-side controls (OPA, session validation, CSRF via SameSite)
     # provide equivalent protection without client-side enforcement.
+    #
+    # X-Frame-Options scoped: monitoring sub-apps (/admin/grafana/* and
+    # /admin/alertmanager/*) are iframed by the admin shell on the SAME origin.
+    # XFO: DENY on those responses prevents embedding. CSP frame-ancestors 'self'
+    # (set by @lenient_subapp in Caddyfile.csp) is the primary guard; this matcher
+    # ensures XFO is also absent on embed paths for legacy-browser belt-and-suspenders.
+    @not_embed not path /admin/grafana/* /admin/alertmanager/*
+    header @not_embed X-Frame-Options "DENY"
     header {
         X-Content-Type-Options    "nosniff"
-        X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
-        Cross-Origin-Opener-Policy "same-origin"
+        # CSP is set per-path below (strict everywhere except the Wazuh SIEM
+        # subpath, whose OSD bundles need unsafe-eval). Not set here to avoid the
+        # global SET shadowing the per-path override.
+        Cross-Origin-Opener-Policy  "same-origin"
+        # Single-origin deployment (no cross-origin subresources, no iframes,
+        # no external CDN/fonts) → require-corp is safe. Closes ZAP 90004.
+        Cross-Origin-Embedder-Policy "require-corp"
+        # CORP: single-origin app; ZAP 90004; pairs with COEP require-corp.
+        Cross-Origin-Resource-Policy "same-origin"
         # Product / fingerprint hygiene (QA Wave 2 observations 5 + 6).
         -Server
         -Via
         -Alt-Svc
     }
 
+    # CSP matchers and headers — strict-by-default (4.0 / RISK-102 / SC-NEW-001)
+    # Source of truth: docker/Caddyfile.csp  (defines the (csp-policies) snippet)
+    # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
+    # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
+    # See Caddyfile.csp for full design rationale.
+    import csp-policies
+
+    # T-1 edge strip: remove any client-supplied identity-forwarding headers
+    # before they reach any handle block (backoffice or gateway). Site-level
+    # placement covers ALL paths — no per-handle drift. Internal mesh listeners
+    # (:8444/:8445) are separate site blocks and are NOT affected.
+    import strip-identity-headers
+
     # ── Request body size limit (OWASP ASVS 4.1.7) ──────────────────────────
     request_body {
         max_size 10MB
     }
+
+    # ── openclaw inbound webhooks — /webhooks/{slack,telegram} (FP-05) ─────
+    # Exact POST paths only; forward_auth signature verify (fail-closed);
+    # replay/rate enforcement in the verifier; 1MB body cap; /webhooks/* 404
+    # default-deny. Single source: docker/Caddyfile.openclaw-webhooks.
+    import openclaw-webhooks
 
     # ── RFC 9116 security.txt — vulnerability disclosure ──────────────────
     handle /.well-known/security.txt {
@@ -187,6 +331,7 @@ Hiring: https://agnosticsec.com/careers
 
     # ── Gateway health check — /healthz ──────────────────────────────────
     handle /healthz {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -201,6 +346,7 @@ Hiring: https://agnosticsec.com/careers
     handle /agents/* {
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -214,6 +360,34 @@ Hiring: https://agnosticsec.com/careers
     handle /v1/* {
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        # Track C (F-B) anti-spoof: strip any client-supplied forwarded-user
+        # identity headers on the public /v1 path so an external caller cannot
+        # impersonate an OWUI user. ONLY OWUI (internal, via gateway:8081) may
+        # set these; the gateway honours them solely under the internal bearer.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
+        import strip-orchestration-headers
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # ── MCP JWKS — /.well-known/yashigani-mcp-jwks.json (PUBLIC, no auth) ──
+    # This endpoint is intentionally unauthenticated — upstream MCP verifiers
+    # (bridge containers, external JWT validators) must be able to fetch the
+    # JWKS without holding a Yashigani session cookie.
+    # ASVS V2.6.3: public key material must be publicly retrievable.
+    # Must appear BEFORE the catch-all handle {} block; Caddy matches handles
+    # in declaration order and first-match wins for non-path-prefix handles.
+    # Last updated: 2026-05-30 (P3 broker E2E gate — J8-JWKS fix)
+    handle /.well-known/yashigani-mcp-jwks.json {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -224,6 +398,17 @@ Hiring: https://agnosticsec.com/careers
 
     # ── MCP proxy — /mcp/* ─────────────────────────────────────────────
     handle /mcp/* {
+        # FIND-3.1-003 (LOW, defense-in-depth): strip inbound identity headers to
+        # close the X-Forwarded-User spoof vector at the edge. Mirrors /v1/* treatment.
+        # OPA blocks /mcp/* before these headers are consulted, but stripping here
+        # removes the spoof surface entirely rather than relying solely on the
+        # application-layer gate.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -232,12 +417,14 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Gateway OpenAPI surface — /openapi.json + /docs ───────────────
+    # ── Gateway OpenAPI surface — /openapi.json + /docs + /redoc ────────
     # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
     # GET /docs (Swagger UI) via gateway identity-resolution middleware.
+    # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
     # Without explicit handles these requests fell through to the Open WebUI
     # catch-all and were functionally unreachable.
     handle /openapi.json {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -247,6 +434,17 @@ Hiring: https://agnosticsec.com/careers
     }
 
     handle /docs {
+        import strip-orchestration-headers
+        reverse_proxy https://gateway:8080 {
+        import internal-mtls
+        import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /redoc {
+        import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -266,8 +464,9 @@ Hiring: https://agnosticsec.com/careers
     # service_identities.yaml endpoint_acls["/admin/agents"].
     handle /admin/* {
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -277,6 +476,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /auth/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -286,6 +486,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /me/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -295,6 +496,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /dashboard/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -304,6 +506,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /scim/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -317,7 +520,16 @@ Hiring: https://agnosticsec.com/careers
     # ASVS V9.1, API5 BFLA — fix for v2.23.3 release blocker.
     # Last updated: 2026-05-09T00:00:00+00:00 (v2.23.3)
     handle /api/v1/admin/* {
+        # SIDE-001 (Iris drift gate v2.25.0 P2 wave 3, DRIFT-B4-SPIFFE-COMPOSE-API-ADMIN):
+        # strip any inbound X-SPIFFE-ID before reverse-proxy so a client cannot
+        # spoof the identity header to backoffice on this path. Mirrors /admin/*
+        # treatment. Helm chart already does this in v2.25.0 P2 B4 closure;
+        # compose was missing SIDE-001 on this block (added v2.23.3, predates
+        # SIDE-001 hardening).
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -329,11 +541,22 @@ Hiring: https://agnosticsec.com/careers
     # retro #83: Grafana now serves HTTPS on port 3443 with mTLS (Pattern B).
     # Caddy presents caddy_client.crt to Grafana; Grafana verifies via
     # ca_intermediate.crt. The forward_auth check still applies (admin only).
-    handle_path /admin/grafana/* {
+    handle /admin/grafana/* {
+        # Normalise misrouted asset requests: Grafana's static assets always live
+        # at /public/... regardless of the dashboard URL the browser was on, but
+        # some browsers resolve the relative asset refs against the dashboard path
+        # (e.g. /admin/grafana/d/x/public/build/… → 404). Collapse any extra
+        # segment between /admin/grafana/ and /public/ back to the canonical path.
+        # Only a spurious dashboard-path prefix (…/d/<uid>[/<slug>]/) before a
+        # Grafana root path gets stripped. Canonical /admin/grafana/api|public/…
+        # (no /d/ prefix) is NOT matched, so it passes through untouched — earlier
+        # greedy/lazy variants mangled nested api/ paths like the alert ruler API.
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login?next=/admin/grafana/ 302
@@ -343,21 +566,52 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
+            # Strip Grafana's own X-Frame-Options / CSP so the edge CSP
+            # (Caddyfile.csp @lenient_subapp) is the sole governing policy
+            # and same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
         }
     }
 
     # ── Wazuh Dashboard — admin-authenticated access via /admin/wazuh/* ────
-    handle_path /admin/wazuh/* {
+    handle /admin/wazuh/* {
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
             }
         }
         reverse_proxy wazuh-dashboard:5601 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            # Strip Wazuh Dashboard's own X-Frame-Options / CSP so
+            # same-origin iframe embedding works from /admin/*.
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
+    # ── Loki — admin-authenticated access via /admin/loki/* ──────────────
+    # Exposes Loki's HTTP query API for direct admin use.  The primary consumer
+    # is Grafana (datasource) — /admin/loki/* also allows admin curl/API access.
+    # Loki has no UI; the @lenient_subapp CSP matcher covers this path.
+    # Loki serves HTTPS on :3100 with mTLS (Pattern B).
+    handle /admin/loki/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy https://loki:3100 {
+            import internal-mtls
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
@@ -369,7 +623,7 @@ Hiring: https://agnosticsec.com/careers
         forward_auth https://backoffice:8443 {
         import internal-mtls
         import inject-caddy-verified
-            uri /auth/verify
+            uri /auth/verify-admin
             @unauthorized status 401
             handle_response @unauthorized {
                 redir * /admin/login 302
@@ -382,9 +636,34 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
+    # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+    # Alertmanager serves plain HTTP on port 9093 (no mTLS). Caddy is on the
+    # obs network and can reach it directly. forward_auth gate mirrors the
+    # grafana/loki/prometheus pattern (verify-admin). @lenient_subapp CSP covers
+    # this path; X-Frame-Options + CSP stripped from upstream so same-origin
+    # iframe embedding from /admin/ works.
+    handle_path /admin/alertmanager/* {
+        forward_auth https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify-admin
+            @unauthorized status 401
+            handle_response @unauthorized {
+                redir * /admin/login 302
+            }
+        }
+        reverse_proxy http://alertmanager:9093 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            header_down -X-Frame-Options
+            header_down -Content-Security-Policy
+        }
+    }
+
     # ── Static assets — public, no auth required (CSS/JS for admin UI) ────
     handle /static/* {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -395,11 +674,17 @@ Hiring: https://agnosticsec.com/careers
     # ── User login page — /login (before catch-all) ────────────────────────
     handle /login {
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
         }
+    }
+
+    # ── /app/webui — legacy OWUI path (4.0: removed, redirect to /chat) ──────
+    handle /app/webui* {
+        redir * /chat 302
     }
 
     handle /metrics-federate* {
@@ -415,52 +700,40 @@ Hiring: https://agnosticsec.com/careers
         }
     }
 
-    # ── Open WebUI — catch-all (only active when --with-openwebui is used) ──
-    # When Open WebUI is not deployed, Caddy returns 502 on / which is
-    # acceptable — admin UI at /admin/ and API at /v1/ still work.
+    # ── Root catch-all — 4.0: portal redirect + ui4 proxy ────────────────────
+    #
+    # OWUI removed in 4.0. ui4 (Lit-based chat/agents/builder/workflows) is
+    # served directly by the backoffice. Backoffice enforces its own session
+    # checks on all ui4 routes — no Caddy-level forward_auth required here.
+    #
+    # / → /chat (302, back-compat for existing bookmarks)
+    # All other unmatched paths → backoffice (returns 404 for unknown routes).
     handle {
-        # Strip any externally-supplied identity headers (anti-spoofing)
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
+        import strip-orchestration-headers
 
-        # Forward auth: validate session cookie against backoffice.
-        # On 200: copies X-Forwarded-User/Name from response into the request.
-        # On 401: redirects to login page.
-        forward_auth https://backoffice:8443 {
-        import internal-mtls
-        import inject-caddy-verified
-            uri /auth/verify
-            copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-            @unauthorized status 401
-            handle_response @unauthorized {
-                redir * /login?next={http.request.uri} 302
-            }
+        @root_path path /
+        handle @root_path {
+            redir * /chat 302
         }
 
-        # inject-caddy-verified: open-webui does not validate the header but
-
-        # we inject it uniformly across all reverse_proxy blocks. Auth is
-
-        # enforced by the forward_auth block above. Closes LU-231-10-A.
-
-        reverse_proxy open-webui:8080 {
-
+        handle {
+            reverse_proxy https://backoffice:8443 {
+                header_down -Content-Security-Policy  # single CSP at edge
+            import internal-mtls
             import inject-caddy-verified
-            header_up X-Forwarded-Proto https
-            header_up X-Real-IP {remote_host}
-            # Explicitly pass the trusted identity headers from forward_auth
-            header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-            header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-            header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+            }
         }
     }
 }
 
 # Also serve on HTTP for local convenience (self-signed mode only)
 http://{$YASHIGANI_TLS_DOMAIN}:80 {
-    redir https://{$YASHIGANI_TLS_DOMAIN}{uri} permanent
+    # Redirect to HTTPS on the PUBLISHED port (not bare 443) — on a non-standard
+    # deploy (e.g. host :8456) bare https://host lands on :443 (dead). Include the
+    # published https port so the redirect actually reaches the running edge.
+    redir https://{$YASHIGANI_TLS_DOMAIN}:{$YASHIGANI_HTTPS_PORT:443}{uri} permanent
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,6 +818,7 @@ http://{$YASHIGANI_TLS_DOMAIN}:80 {
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
 
         reverse_proxy https://backoffice:8443 {
+            header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -556,3 +830,38 @@ http://{$YASHIGANI_TLS_DOMAIN}:80 {
         respond "Not Found" 404
     }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S4 — Agent import sentinel (P1 W3 Phase 2a)
+# Last updated: 2026-05-29T00:00:00+00:00
+#
+# DESIGN: onboarded-agent Caddyfile snippets are generated by the ringfence-init
+# codegen engine (src/yashigani/manifest/codegen.py) and written to
+# docker/caddy/agents/<agent>.caddy (compose) or mounted from a per-agent
+# ConfigMap projection (K8s). Each snippet is a top-level `:443 { handle_path
+# /agents/<tenant>/<agent>/* { ... } }` site block. Caddy merges multiple
+# `:443` blocks at parse time — agent routes are appended after the base routes
+# defined above, so they never shadow base handles.
+#
+# IDEMPOTENCY: Caddy `import` with a wildcard glob is idempotent — if the
+# directory contains no .caddy files (no agents onboarded yet) Caddy logs a
+# warning and continues normally. A .gitkeep file in docker/caddy/agents/
+# is NOT imported (non-.caddy extension).
+#
+# SECURITY: the bind-mount (docker-compose.yml) and ConfigMap (Helm) are both
+# read-only. Agent snippets are generated by install.sh/ringfence-init; an
+# operator cannot inject arbitrary Caddy config by dropping a file here without
+# access to the host filesystem (compose) or K8s RBAC (Helm).
+#
+# NEVER regenerate the Caddyfile monolith — agent routes live in snippets only.
+# ─────────────────────────────────────────────────────────────────────────────
+# v4.1 Phase 1b-ii (LAURA-I1-01): Ollama inference-plane mesh front (:11435).
+# Single-source snippet, byte-identical to the Helm caddy ConfigMap render.
+import /etc/caddy/Caddyfile.ollama-front
+
+# v4.1 Phase 1c (LAURA-I1-03): openclaw egress gateway (:18790) — fixed-upstream
+# reverse_proxy allowlist (slack.com / hooks.slack.com / api.telegram.org),
+# mTLS-bound to openclaw's leaf SAN on the openclaw_ringfence bridge.
+import /etc/caddy/Caddyfile.openclaw-egress
+
+import /etc/caddy/agents/*.caddy

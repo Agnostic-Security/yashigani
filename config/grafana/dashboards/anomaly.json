@@ -1,89 +1,320 @@
 {
   "uid": "yashigani-anomaly",
-  "title": "Yashigani — Anomaly Detection",
-  "tags": ["yashigani", "anomaly", "inference"],
+  "title": "Yashigani \u2014 Anomaly Detection",
+  "tags": [
+    "yashigani",
+    "anomaly",
+    "inference"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
+    {
+      "id": 9,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Flags behavioural anomalies: repeated small calls (token-probing), inference queue depth, audit overflow, and SIEM delivery errors. High values here indicate evasion attempts or infrastructure stress."
+      }
+    },
     {
       "id": 1,
       "type": "stat",
       "title": "Repeated Small Calls (1h)",
-      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_repeated_small_calls_total[1h])", "legendFormat": "{{tenant_id}}"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "orange", "value": 5}, {"color": "red", "value": 20}]}}}
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_repeated_small_calls_total[1h])",
+          "legendFormat": "{{tenant_id}}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 2,
       "type": "stat",
       "title": "Inference Queue Depth",
-      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "yashigani_inference_payload_log_queue_depth", "legendFormat": "Queue Depth"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1000}, {"color": "red", "value": 5000}]}}}
+      "gridPos": {
+        "x": 6,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "yashigani_inference_payload_log_queue_depth",
+          "legendFormat": "Queue Depth"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 3,
       "type": "stat",
       "title": "Audit Queue Overflow (1h)",
-      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_audit_queue_overflow_total[1h])", "legendFormat": "Overflow"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+      "gridPos": {
+        "x": 12,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_audit_queue_overflow_total[1h])",
+          "legendFormat": "Overflow"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 4,
       "type": "stat",
       "title": "SIEM Forward Errors (1h)",
-      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "increase(yashigani_siem_forward_errors_total[1h])", "legendFormat": "{{siem}}"}],
-      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
-      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+      "gridPos": {
+        "x": 18,
+        "y": 3,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(yashigani_siem_forward_errors_total[1h])",
+          "legendFormat": "{{siem}}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Repeated Small Calls Rate (per minute, by tenant)",
-      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
-        {"expr": "rate(yashigani_repeated_small_calls_total[1m])", "legendFormat": "tenant={{tenant_id}}"}
+        {
+          "expr": "rate(yashigani_repeated_small_calls_total[1m])",
+          "legendFormat": "tenant={{tenant_id}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "short"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Inference Payload Length Distribution (p50/p95/p99)",
-      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
-        {"expr": "histogram_quantile(0.50, rate(yashigani_inference_payload_bytes_bucket[5m]))", "legendFormat": "p50"},
-        {"expr": "histogram_quantile(0.95, rate(yashigani_inference_payload_bytes_bucket[5m]))", "legendFormat": "p95"},
-        {"expr": "histogram_quantile(0.99, rate(yashigani_inference_payload_bytes_bucket[5m]))", "legendFormat": "p99"}
+        {
+          "expr": "histogram_quantile(0.50, rate(yashigani_inference_payload_bytes_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yashigani_inference_payload_bytes_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yashigani_inference_payload_bytes_bucket[5m]))",
+          "legendFormat": "p99"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2}, "unit": "bytes"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2
+          },
+          "unit": "bytes"
+        }
+      }
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "Inference Payload Log Queue Depth",
-      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 6},
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
       "targets": [
-        {"expr": "yashigani_inference_payload_log_queue_depth", "legendFormat": "Queue Depth"}
+        {
+          "expr": "yashigani_inference_payload_log_queue_depth",
+          "legendFormat": "Queue Depth"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}, "unit": "short"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20
+          },
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "Anomaly Events Timeline",
-      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 6},
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 6
+      },
       "targets": [
-        {"expr": "increase(yashigani_repeated_small_calls_total[1m])", "legendFormat": "{{tenant_id}}"}
+        {
+          "expr": "increase(yashigani_repeated_small_calls_total[1m])",
+          "legendFormat": "{{tenant_id}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50}, "unit": "short"}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 50
+          },
+          "unit": "short"
+        }
+      }
     }
   ]
 }

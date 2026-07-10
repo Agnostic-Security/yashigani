@@ -29,7 +29,30 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
+import types as _types
+
 from yashigani.pki.client import internal_httpx_client
+from yashigani.gateway._client_enforce import evaluate_client_policies
+from yashigani.gateway._dispatch_client import agent_dispatch_client
+
+
+def _agent_cp_deny(audit_writer, caller_agent_id, direction, ce_result):
+    """Audit a client-policy denial on the agent path (#16). Best-effort."""
+    if audit_writer is None:
+        return
+    deny = list(ce_result.get("deny", []) or [])
+    failclosed = {"client_enforce_unavailable", "client_enforce_undefined", "client_enforce_not_configured"}
+    try:
+        from yashigani.audit.schema import ClientPolicyDeniedEvent, ClientPolicyCheckFailedEvent
+        if set(deny) & failclosed:
+            audit_writer.write(ClientPolicyCheckFailedEvent(
+                reason=next(iter(set(deny) & failclosed)), outcome="fail_closed", direction=direction))
+        else:
+            audit_writer.write(ClientPolicyDeniedEvent(
+                identity_id=caller_agent_id, scope_kind="agent", scope_id=caller_agent_id,
+                direction=direction, deny_codes=deny))
+    except Exception:  # pragma: no cover — audit must never break the request
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +62,42 @@ _HOP_BY_HOP = frozenset({
 })
 
 _OPA_AGENT_ALLOWED_PATH = "/v1/data/yashigani/agent_call_allowed"
+
+# #47 / G-NEW-5 / R3 — signed orchestration-principal claim header.  The gateway
+# SIGNS this on forward (ES384, bound to the caller SPIFFE) and VERIFIES it on
+# re-entry (SPIFFE-bound + jti replay-deduped), replacing the old TRUSTED header
+# ``X-Yashigani-Caller-Agent-Id`` as the trust source for the OPA principal.
+_PRINCIPAL_HEADER = "X-Yashigani-Orchestration-Principal"
+
+# LAURA-OPA-001 (2.25.2): path-traversal confused-deputy guard.
+# httpx collapses dot-segments ("/do/../admin" -> "/admin") on the wire per
+# RFC-3986, while the OPA gate matched the UN-collapsed path with literal
+# startswith — so an agent scoped to "/do/**" could reach "/admin". We reject
+# any remainder_path that contains a traversal sequence (raw or percent-encoded,
+# single- or double-encoded) BEFORE building the OPA input AND before forwarding,
+# so OPA evaluates a path byte-identical to what httpx forwards (no parser
+# differential). Fail-closed: ambiguous/encoded paths are rejected, not silently
+# normalised. Mirrors the agents.rego _agent_path_safe guard.
+_TRAVERSAL_TOKENS = (
+    "../", "..\\",
+    "%2e", "%2f", "%5c",            # encoded dot / forward-slash / back-slash
+    "%252e", "%252f", "%255c",      # double-encoded
+)
+
+
+def _is_path_traversal(remainder_path: str) -> bool:
+    """True if remainder_path contains any dot-segment or encoded traversal token.
+
+    Case-insensitive on the encoded forms. Also rejects a bare/ trailing ".."
+    segment that the substring check would otherwise miss.
+    """
+    lowered = remainder_path.lower()
+    if any(tok in lowered for tok in _TRAVERSAL_TOKENS):
+        return True
+    # bare ".." or a trailing "/.." segment
+    if remainder_path == ".." or remainder_path.endswith("/.."):
+        return True
+    return False
 # v2.24.1 — GAP-3 / SEC-5: response-leg OPA check
 _OPA_AGENT_RESPONSE_PATH = "/v1/data/yashigani/agent_response_decision"
 
@@ -78,6 +137,103 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
 
     caller_agent_id = getattr(request.state, "agent_id", "unknown")
 
+    # ── #47 / G-NEW-5 / R3 — verify the orchestration principal (signed claim) ──
+    # The authenticated caller (caller_agent_id, proven by PSK in AgentAuth) is
+    # the PRESENTING workload on this hop.  Its SPIFFE identity binds any inbound
+    # signed principal claim:
+    #   * No claim header  → FIRST hop: the immediate caller IS the principal,
+    #     and the gateway will MINT a fresh signed claim on forward.
+    #   * Valid claim       → a RELAY hop: the verified principal_agent_id (bound
+    #     to THIS caller's SPIFFE, not replayed) becomes the principal — a
+    #     verified fact, not a trusted header.
+    #   * Present-but-invalid (bad sig / wrong SPIFFE / expired / replayed) →
+    #     FAIL-CLOSED 403 + audit (no silent trust).
+    principal_agent_id = caller_agent_id
+    principal_verified = False
+    _principal_verifier = state.get("principal_verifier")
+    _principal_tenant = state.get("principal_tenant_id", "default")
+    _inbound_principal = request.headers.get(_PRINCIPAL_HEADER.lower(), "").strip()
+    if _inbound_principal and _principal_verifier is not None:
+        from yashigani.gateway.principal_token import (
+            PrincipalClaimError,
+            caller_spiffe_uri,
+        )
+        presenting_spiffe = caller_spiffe_uri(_principal_tenant, caller_agent_id)
+        try:
+            _claim = _principal_verifier.verify(
+                _inbound_principal, presenting_spiffe=presenting_spiffe
+            )
+            principal_agent_id = _claim.get("principal_agent_id", caller_agent_id)
+            principal_verified = True
+        except PrincipalClaimError as exc:
+            logger.warning(
+                "route_agent_call: signed principal REJECTED (caller=%s target=%s): %s",
+                caller_agent_id, target_agent_id, exc,
+            )
+            _write_denied_rbac_audit(
+                audit_writer=audit_writer,
+                caller_agent_id=caller_agent_id,
+                target_agent_id=target_agent_id,
+                path=path,
+                opa_reason="principal_claim_unverifiable",
+            )
+            try:
+                from yashigani.metrics.registry import agent_calls_total
+                agent_calls_total.labels(
+                    caller_agent_id=caller_agent_id,
+                    target_agent_id=target_agent_id,
+                    outcome="denied_rbac",
+                ).inc()
+            except Exception:
+                logger.debug(
+                    "agent_router: metric increment failed (principal_claim_unverifiable)",
+                    exc_info=True,
+                )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "AGENT_CALL_DENIED",
+                    "reason": "principal_claim_unverifiable",
+                    "target_agent_id": target_agent_id,
+                },
+            )
+
+    # LAURA-OPA-001: reject path traversal BEFORE OPA evaluation and forwarding.
+    # The path OPA sees must be byte-identical to what httpx forwards; rejecting
+    # traversal up front eliminates the parser differential (fail-closed).
+    if _is_path_traversal(remainder_path):
+        logger.warning(
+            "route_agent_call: path traversal rejected (caller=%s target=%s remainder=%r)",
+            caller_agent_id, target_agent_id, remainder_path,
+        )
+        _write_denied_rbac_audit(
+            audit_writer=audit_writer,
+            caller_agent_id=caller_agent_id,
+            target_agent_id=target_agent_id,
+            path=path,
+            opa_reason="path_traversal_attempt",
+        )
+        try:
+            from yashigani.metrics.registry import agent_calls_total
+            agent_calls_total.labels(
+                caller_agent_id=caller_agent_id,
+                target_agent_id=target_agent_id,
+                outcome="denied_rbac",
+            ).inc()
+        except Exception:
+            logger.debug(
+                "agent_router: metric increment failed for agent_calls_total "
+                "(path_traversal)", exc_info=True,
+            )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "AGENT_CALL_DENIED",
+                "reason": "path_traversal_attempt",
+                "target_agent_id": target_agent_id,
+            },
+        )
+
     # Registry must be available
     if registry is None:
         logger.error("route_agent_call: agent_registry not in state")
@@ -103,17 +259,27 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
             },
         )
 
-    # Look up caller agent to get their RBAC groups
-    caller_agent = registry.get(caller_agent_id) or {}
-    caller_groups = caller_agent.get("groups", [])
+    # Look up the PRINCIPAL agent to get their RBAC groups.  The principal is the
+    # VERIFIED orchestration principal (#47/G-NEW-5) — equal to the immediate
+    # caller on the first hop, or the signed-and-verified upstream principal on a
+    # relay hop.  Groups are resolved from the registry by the principal id, so
+    # authority derives from the registry at adjudication time (not from the
+    # claim's self-asserted groups).
+    principal_agent = registry.get(principal_agent_id) or {}
+    caller_groups = principal_agent.get("groups", [])
 
     # ── OPA enforcement (fail-closed) ─────────────────────────────────────────
     opa_url = config.opa_url if config is not None else "https://policy:8181"
     opa_input = {
         "principal": {
             "type": "agent",
-            "agent_id": caller_agent_id,
+            # The VERIFIED orchestration principal feeds OPA as a verified fact.
+            "agent_id": principal_agent_id,
             "groups": caller_groups,
+            # Provenance: True when bound to a signed, SPIFFE-bound, non-replayed
+            # claim; False on the first hop (the gateway is the asserting
+            # authority and mints the signed claim on forward).
+            "verified": principal_verified,
         },
         "target_agent": {
             "agent_id": target_agent_id,
@@ -154,21 +320,84 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
             },
         )
 
+    # ── Client-policy enforcement — INGRESS (#16, agent scope) ──
+    # After the agent_call_allowed gate; deny-only, fail-closed; no-op if unbound.
+    _ce_in = await evaluate_client_policies(
+        _types.SimpleNamespace(opa_url=opa_url), "agent", caller_agent_id, "ingress",
+        {"identity": {"agent": caller_agent_id, "groups": caller_groups},
+         "request": {"path": path, "method": request.method},
+         "target_agent": {"agent_id": target_agent_id}},
+    )
+    if not _ce_in.get("allow", False):
+        _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY DENIED agent ingress: caller=%s target=%s deny=%s",
+                       caller_agent_id, target_agent_id, _ce_reason)
+        _agent_cp_deny(audit_writer, caller_agent_id, "ingress", _ce_in)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "CLIENT_POLICY_DENIED", "reason": _ce_reason,
+                     "target_agent_id": target_agent_id},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
+        )
+
     upstream_url = target_agent["upstream_url"]
 
     # Forward request to upstream
     start = time.monotonic()
     try:
         body = await request.body()
-        # Build forwarded headers — strip hop-by-hop and host; inject trace headers
+        # Build forwarded headers — strip hop-by-hop and host; inject trace headers.
+        # CRITICAL (#47/G-NEW-5): strip any inbound principal header so a caller
+        # cannot smuggle a forged claim through to the upstream — the gateway is
+        # the SOLE asserting authority and re-mints the claim below.
         headers = {
             k: v for k, v in request.headers.items()
             if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
+            and k.lower() != _PRINCIPAL_HEADER.lower()
         }
         headers["X-Yashigani-Caller-Agent-Id"] = caller_agent_id
         headers["X-Yashigani-Request-Id"] = getattr(request.state, "request_id", "")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # ── #47 / G-NEW-5 / R3 — SIGN the orchestration principal on forward ──
+        # The gateway (asserting authority) signs the VERIFIED principal bound to
+        # the TARGET workload's SPIFFE identity — the workload that will PRESENT
+        # the claim if it makes an onward call.  The downstream hop verifies the
+        # signature and binds it to its own SPIFFE, so it cannot forge or replay a
+        # principal it was not issued.  Fail-closed: if signing is unavailable we
+        # do NOT forward a bare trusted principal — we reject (no silent
+        # downgrade to the confused-deputy header).
+        _principal_signer = state.get("principal_signer")
+        if _principal_signer is not None:
+            from yashigani.gateway.principal_token import (
+                PrincipalClaimError,
+                caller_spiffe_uri,
+            )
+            try:
+                target_spiffe = caller_spiffe_uri(_principal_tenant, target_agent_id)
+                headers[_PRINCIPAL_HEADER] = _principal_signer.sign(
+                    principal_agent_id=principal_agent_id,
+                    caller_spiffe=target_spiffe,
+                    caller_groups=caller_groups,
+                )
+            except PrincipalClaimError as exc:
+                logger.error(
+                    "route_agent_call: principal signing failed (caller=%s target=%s): %s "
+                    "— fail-closed (not forwarding a bare trusted principal)",
+                    caller_agent_id, target_agent_id, exc,
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "AGENT_PRINCIPAL_SIGN_FAILED",
+                        "target_agent_id": target_agent_id,
+                    },
+                )
+
+        # v4.1 §2.5 dispatch repoint: registered upstreams are the agents'
+        # Caddy INGRESS fronts (require_and_verify) — present the gateway
+        # mesh leaf via agent_dispatch_client(); a bare client is refused at
+        # the TLS handshake and every dispatch fails closed.
+        async with agent_dispatch_client(timeout=30.0) as client:
             upstream_resp = await client.request(
                 method=request.method,
                 url=upstream_url.rstrip("/") + remainder_path,
@@ -180,6 +409,26 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
             "route_agent_call: upstream unreachable for %s → %s%s: %s",
             caller_agent_id, target_agent_id, remainder_path, exc,
         )
+        # FIND-3.1-INT-AGENT-AUDIT: emit audit on upstream failure so OWASP A09
+        # logging is satisfied.  Best-effort — audit must never break the 502.
+        if audit_writer is not None:
+            try:
+                import httpx as _httpx
+                from yashigani.audit.schema import AgentUpstreamUnreachableEvent
+                _error_type = (
+                    "timeout" if isinstance(exc, _httpx.TimeoutException)
+                    else "connect_error" if isinstance(exc, _httpx.ConnectError)
+                    else "unknown"
+                )
+                audit_writer.write(AgentUpstreamUnreachableEvent(
+                    caller_agent_id=caller_agent_id,
+                    target_agent_id=target_agent_id,
+                    remainder_path=remainder_path,
+                    request_id=getattr(request.state, "request_id", ""),
+                    error_type=_error_type,
+                ))
+            except Exception:  # pragma: no cover — audit must never break the request
+                pass
         return JSONResponse(
             status_code=502,
             content={
@@ -241,7 +490,10 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
 
     # OPA response-leg check — fail-closed
     if opa_url:
-        caller_sensitivity_ceiling = caller_agent.get("sensitivity_ceiling", "RESTRICTED")
+        # Use the VERIFIED principal's ceiling (the authoritative subject of the
+        # call chain; #47/G-NEW-5).  Equal to the immediate caller on the first
+        # hop, or the verified upstream principal on a relay hop.
+        caller_sensitivity_ceiling = principal_agent.get("sensitivity_ceiling", "RESTRICTED")
         resp_opa_input = {
             "caller": {
                 "agent_id": caller_agent_id,
@@ -291,6 +543,27 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
                     "X-Yashigani-OPA-Response-Reason": resp_opa_reason,
                 },
             )
+
+    # ── Client-policy enforcement — EGRESS (#16, agent scope) ──
+    # After the core response-leg OPA gate; deny-only, fail-closed; no-op if unbound.
+    _ce_eg = await evaluate_client_policies(
+        _types.SimpleNamespace(opa_url=opa_url), "agent", caller_agent_id, "egress",
+        {"identity": {"agent": caller_agent_id, "groups": caller_groups},
+         "request": {"path": path, "method": request.method},
+         "target_agent": {"agent_id": target_agent_id},
+         "response_sensitivity": response_sensitivity_value},
+    )
+    if not _ce_eg.get("allow", False):
+        _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
+        logger.warning("CLIENT-POLICY BLOCKED agent egress: caller=%s target=%s deny=%s",
+                       caller_agent_id, target_agent_id, _ce_eg_reason)
+        _agent_cp_deny(audit_writer, caller_agent_id, "egress", _ce_eg)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "CLIENT_POLICY_DENIED", "reason": _ce_eg_reason,
+                     "target_agent_id": target_agent_id},
+            headers={"X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
+        )
 
     # Audit event
     if audit_writer is not None:

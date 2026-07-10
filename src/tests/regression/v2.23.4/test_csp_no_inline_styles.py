@@ -130,15 +130,34 @@ def test_python_middleware_csp_no_unsafe_inline_style() -> None:
 
 @pytest.mark.parametrize("caddyfile", CADDYFILES, ids=[c.name for c in CADDYFILES])
 def test_caddyfile_csp_no_unsafe_inline_style(caddyfile: Path) -> None:
-    """Each Caddyfile CSP header must not include 'unsafe-inline' in style-src."""
+    """The STRICT admin CSP in each Caddyfile must not include 'unsafe-inline'
+    in style-src.
+
+    Scope (YSG-RISK-071, accepted 2026-06-06; refined 2.25.3): the lenient
+    matchers intentionally relax style-src/script-src for everything that is NOT
+    the Yashigani-native admin plane — i.e. the proxied grafana/wazuh/prometheus
+    SPAs (`@lenient_subapp`) and the Open WebUI end-user chat surface served at
+    the root catch-all (`@lenient_ui`). None of those can mount under strict CSP
+    (nonce-less inline bootstrap/hydration scripts + eval()/inline styles). They
+    are admin-gated / forward-auth-gated, mTLS-meshed, first-party/self-hosted.
+    Yashigani's own admin HTML stays under `@strict_ui` (`style-src 'self'`).
+    This guard protects the STRICT admin CSP, so the documented lenient lines
+    (`@lenient_ui`, `@lenient_subapp`, and the legacy `@subapp_ui` name) are
+    excluded from the check. Forward hardening: nonce-based CSP for the subapps
+    (not 2.25.3-blocking).
+    """
     content = _read(caddyfile)
+    # Lenient matcher names that carry the documented, scoped CSP relaxation.
+    # The guard only asserts the STRICT (@strict_ui / global) line is clean.
+    _lenient_matchers = ("@subapp_ui", "@lenient_ui", "@lenient_subapp")
     csp_lines = [
         ln.strip()
         for ln in content.splitlines()
         if "Content-Security-Policy" in ln and "style-src" in ln
+        and not any(m in ln for m in _lenient_matchers)  # YSG-RISK-071 scoped exceptions
     ]
     assert csp_lines, (
-        f"{caddyfile.name}: Could not find a CSP line containing 'style-src'. "
+        f"{caddyfile.name}: Could not find a strict CSP line containing 'style-src'. "
         "Check that the Caddyfile still sets Content-Security-Policy."
     )
     for line in csp_lines:

@@ -13,7 +13,14 @@
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS builder
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS builder
+
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars for RUN commands in this stage.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /build
 
@@ -32,7 +39,12 @@ RUN python -m build --wheel --outdir /dist
 # the committed training corpus. Model is baked into the runtime image.
 # scikit-learn ships pre-built wheels for Python 3.12/3.13/3.14 — no C compiler.
 # Quality bar: macro F1 >= 0.90 (measured 0.9545 on 220-example corpus).
-FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS trainer
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS trainer
+
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /train
 
@@ -40,12 +52,12 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
     pip install --no-cache-dir "scikit-learn>=1.4" "joblib>=1.3"
 
 # Copy training corpus and training script
-COPY data/fasttext/ ./data/fasttext/
+COPY data/classifier/ ./data/classifier/
 COPY scripts/train_sensitivity_classifier.py ./scripts/train_sensitivity_classifier.py
 
 RUN mkdir -p data && \
     python scripts/train_sensitivity_classifier.py \
-        --data    data/fasttext/training_data.txt \
+        --data    data/classifier/training_data.txt \
         --output  data/sensitivity_classifier.joblib \
         --seed    42 \
         --C       1.0 \
@@ -55,7 +67,12 @@ RUN mkdir -p data && \
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS runtime
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
+
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 # Non-root user
 RUN groupadd --gid 1001 yashigani \
@@ -98,7 +115,7 @@ COPY --from=trainer /train/data/sensitivity_classifier.joblib /app/models/sensit
 # Audit log directory (mounted as volume at runtime)
 RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
     chown -R yashigani:yashigani /data /var/log/yashigani /app/models 2>/dev/null || true && \
-    chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/
+    chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/ 2>/dev/null || true
 
 USER yashigani
 
@@ -150,4 +167,14 @@ COPY --chown=root:root docker/gateway-start.sh /usr/local/bin/gateway-start.sh
 USER root
 RUN chmod 0755 /usr/local/bin/gateway-start.sh
 USER yashigani
+
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+
 CMD ["/bin/sh", "/usr/local/bin/gateway-start.sh"]

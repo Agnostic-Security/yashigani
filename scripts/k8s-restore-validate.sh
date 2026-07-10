@@ -287,10 +287,10 @@ else
     # Never pass password via env — rely on local/peer trust inside the pod.
     local out
     if out=$(kctl exec "${POSTGRES_POD}" -- \
-        sh -c "psql -U yashigani_app -d yashigani -At -c \"${sql}\"" 2>&1); then
+        sh -c "psql -U yashigani_admin -d yashigani -At -c \"${sql}\"" 2>&1); then
       printf '%s' "$out"
     elif out=$(kctl exec "${POSTGRES_POD}" -c postgres -- \
-        sh -c "psql -U yashigani_app -d yashigani -At -c \"${sql}\"" 2>&1); then
+        sh -c "psql -U yashigani_admin -d yashigani -At -c \"${sql}\"" 2>&1); then
       printf '%s' "$out"
     else
       # Peer auth fallback: try as postgres superuser

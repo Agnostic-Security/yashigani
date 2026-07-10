@@ -1,12 +1,13 @@
-/* last-updated: 2026-05-13T00:00:00+01:00 — v2.23.4 CSP-INLINE-STYLE-SPA */
+/* last-updated: 2026-06-13T00:00:00+01:00 — 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f1f5f9; }
 nav { background: #0f172a; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
-nav h1 { font-size: 1.1rem; font-weight: 700; }
+/* Agnostic Security brand: orange #EC6B2D (wordmark + active nav), blue #1F5F8E (buttons). */
+nav h1 { font-size: 1.1rem; font-weight: 700; color: #EC6B2D; }
 .nav-links { display: flex; gap: 4px; }
 .nav-links button { background: none; border: none; color: #94a3b8; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
-.nav-links button:hover { background: #1e293b; color: #fff; }
-.nav-links button.active { background: #334155; color: #fff; }
+.nav-links button:hover { background: #1e293b; color: #EC6B2D; }
+.nav-links button.active { background: #334155; color: #EC6B2D; }
 .nav-right { display: flex; align-items: center; gap: 12px; font-size: 0.8rem; color: #64748b; }
 .nav-right button { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 0.8rem; }
 .nav-right button:hover { color: #fff; }
@@ -69,6 +70,7 @@ tr:hover { background: #f8fafc; }
 .fi-url { padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 100%; }
 .fi-hibp { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 340px; max-width: 100%; }
 /* width variants */
+.w-80 { width: 80px; }
 .w-120 { width: 120px; }
 .w-140 { width: 140px; }
 .w-150 { width: 150px; }
@@ -83,9 +85,9 @@ tr:hover { background: #f8fafc; }
 /* base action button */
 .btn { border: none; border-radius: 4px; cursor: pointer; }
 /* xs add button (+ Register / + Add) */
-.btn-xs-add { padding: 4px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-/* sm save/create (green) */
-.btn-sm-save { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.btn-xs-add { padding: 4px 12px; background: #1F5F8E; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* sm save/create — Agnostic Security blue */
+.btn-sm-save { padding: 6px 16px; background: #1F5F8E; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* sm primary (blue) */
 .btn-sm-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* sm secondary (slate) */
@@ -100,8 +102,6 @@ tr:hover { background: #f8fafc; }
 .btn-xs-primary { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
 /* crypto export button */
 .btn-export { margin-top: 12px; padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-/* dismiss (outline-blue) */
-.btn-dismiss-outline { margin-top: 10px; padding: 4px 12px; background: transparent; border: 1px solid #93c5fd; border-radius: 4px; cursor: pointer; font-size: 0.8rem; color: #3b82f6; }
 /* dismiss secondary */
 .btn-dismiss { margin-top: 8px; padding: 6px 16px; background: #64748b; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
 /* pki close button */
@@ -120,12 +120,6 @@ tr:hover { background: #f8fafc; }
 .btn-stepup-cancel { flex: 1; padding: 10px; background: #f1f5f9; color: #334155; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
 /* allowlist add (green) */
 .btn-allowlist-add { padding: 6px 16px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
-
-/* ── Onboarding checklist ───────────────────────────────────── */
-.onboarding { display: none; margin-bottom: 20px; padding: 16px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; }
-.onboarding-title { margin: 0 0 12px; font-size: 1rem; color: #1e40af; }
-.onboarding-items { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; }
-.onboarding-lbl { color: #64748b; }
 
 /* ── Credentials / token panels ────────────────────────────── */
 /* hidden until shown once */
@@ -152,6 +146,9 @@ tr:hover { background: #f8fafc; }
 .card-clickable { cursor: pointer; }
 .card-value-lg { font-size: 1.2rem; font-weight: 700; color: #1e293b; }
 .card-desc { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+/* tile-disabled: optional-service card whose profile is not deployed.
+   Renders greyed-out and non-interactive. JS (loadMonitoring) toggles this. */
+.tile-disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.4); pointer-events: none; }
 
 /* ── Text helpers ───────────────────────────────────────────── */
 .txt-sm { font-size: 0.85rem; }
@@ -160,12 +157,32 @@ tr:hover { background: #f8fafc; }
 .txt-muted { font-size: 0.8rem; color: #64748b; }
 .txt-muted-sm { font-size: 0.75rem; color: #64748b; }
 .txt-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; }
+/* UX-001 (2026-06-14): group multi-select dropdowns */
+.select-multi { overflow-y: auto; }
+.txt-hint { font-size: 0.72rem; color: #94a3b8; font-weight: normal; }
 .txt-note-sm { font-size: 0.75rem; color: #94a3b8; margin-bottom: 8px; }
 .txt-body { font-size: 0.85rem; color: #334155; margin-bottom: 12px; }
 .txt-body-mb8 { font-size: 0.85rem; color: #334155; margin-bottom: 8px; }
 .txt-info { font-size: 0.8rem; color: #64748b; }
 .txt-version { font-size: 0.85rem; color: #64748b; }
 .txt-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+
+/* ── Policies page (moved off inline styles — strict CSP, v2.25.3) ── */
+.is-hidden { display: none; }
+.mt-sm { margin-top: 8px; }
+.mt-xs { margin-top: 6px; }
+.pol-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pol-lbl { font-size: 0.82rem; color: #475569; }
+.pol-result { font-size: 0.8rem; }
+.pol-badge { font-size: 0.7rem; margin-left: 8px; }
+.pol-close { float: right; font-size: 0.75rem; }
+.pol-input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; width: 160px; }
+.pol-prompt { width: 100%; min-height: 64px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.85rem; }
+.pol-src { width: 100%; min-height: 380px; box-sizing: border-box; background: #0f172a; color: #e2e8f0; padding: 14px; border: 1px solid #1e293b; border-radius: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; line-height: 1.45; white-space: pre; }
+.pol-saveas { display: none; gap: 6px; align-items: center; }
+.pol-saveas.is-open { display: inline-flex; }
+/* JS-injected policy-category badge */
+.badge-template { background: #fef3c7; color: #92400e; }
 .txt-mt8 { margin-top: 8px; }
 .txt-mt16 { margin-top: 16px; }
 /* panel body prose: PKI CA mode */
@@ -177,6 +194,33 @@ tr:hover { background: #f8fafc; }
 .pki-rotate-result { font-size: 0.85rem; min-height: 1.2em; margin-bottom: 8px; display: none; }
 .pki-chain-detail { display: none; }
 .pki-chain-table { font-size: 0.82rem; width: 100%; border-collapse: collapse; }
+/* PKI JS-generated HTML classes — ZAP 10015/10049 CSP inline-style fix.
+   pki.js dynamically builds HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.pki-err-text { color: #ef4444; }
+.pki-muted-text { color: #64748b; }
+.pki-camode-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; padding: 12px 14px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; }
+.pki-camode-label { font-size: 0.75rem; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
+.pki-camode-value { font-size: 1rem; color: #1e3a8a; }
+.pki-camode-issuer { font-size: 0.78rem; color: #64748b; margin-left: auto; }
+.pki-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.pki-thead-row { background: #f1f5f9; text-align: left; }
+.pki-th { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
+.pki-row { border-bottom: 1px solid #f1f5f9; }
+.pki-td-mono { padding: 8px 12px; font-family: monospace; }
+.pki-td { padding: 8px 12px; }
+.pki-td-exp { padding: 8px 12px; font-size: 0.8rem; color: #475569; }
+.pki-btn-gap { margin-right: 4px; }
+.pki-section-title { margin: 0 0 6px; font-size: 0.95rem; }
+.pki-section-sub { font-weight: 400; color: #64748b; font-size: 0.8rem; }
+.pki-section-title-mt { margin: 16px 0 6px; font-size: 0.95rem; }
+.pki-code { font-size: 0.8rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }
+.pki-code-fp { font-size: 0.75rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; word-break: break-all; }
+.pki-detail-label { padding: 6px 10px; color: #64748b; white-space: nowrap; font-weight: 500; border-bottom: 1px solid #f1f5f9; width: 140px; }
+.pki-detail-value { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; }
+.pki-chain-panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin-top: 12px; }
+.pki-chain-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.pki-chain-close { font-size: 0.75rem; }
 
 /* ── Backup page ────────────────────────────────────────────── */
 .backup-actions { margin-top: 12px; }
@@ -208,6 +252,11 @@ tr:hover { background: #f8fafc; }
 .hibp-key-result { font-size: 0.8rem; min-height: 1.2em; margin-bottom: 4px; }
 .hibp-probe-result { font-size: 0.8rem; min-height: 1.2em; color: #334155; }
 .hibp-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+/* HIBP JS-generated HTML classes — CSP inline-style fix (FIND-3.1-001).
+   hibp.js builds status HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.hibp-status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.hibp-source-lbl { font-size: 0.85rem; color: #334155; }
 
 /* ── Classify textarea ──────────────────────────────────────── */
 .classify-textarea { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; resize: vertical; }
@@ -246,3 +295,349 @@ tr:hover { background: #f8fafc; }
 .rs-toast-visible { opacity: 1; }
 .rs-toast-ok { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
 .rs-toast-err { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+
+/* ── Layout utilities (CSP-INLINE-STYLE-SPA, #16/#25 panels) ─── */
+.flex-1 { flex: 1; }
+.w-full { width: 100%; }
+/* center-aligned button/control row (pull-model, cloud-override actions) */
+.form-row--mt-center { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+/* wrapping control row with bottom margin (client-policy bindings) */
+.form-row--wrap-mb { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 12px; }
+
+/* Document Enforcement panel — v2.26 */
+.badge-amber { background: #fffbeb; color: #b45309; }
+.doc-hidden { display: none; }
+.doc-row-hidden { background: #fff7ed; }
+.doc-verdict-summary { margin-bottom: 10px; font-size: 0.9rem; line-height: 1.6; }
+.doc-block-reason { color: #b91c1c; font-size: 0.8rem; }
+.doc-user-alert { margin: 8px 0; }
+.doc-alert-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #7f1d1d; }
+.doc-alert-pol { color: #9ca3af; font-size: 0.75rem; font-family: monospace; }
+/* 2.26 set-scoped-salt + field-role + integrity surfaces */
+.doc-routing-note { margin: 6px 0; font-size: 0.82rem; }
+.doc-integrity-row { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.doc-set-note { background: #fffbeb; border-color: #fcd34d; color: #78350f; margin-bottom: 10px; }
+.doc-fieldrole-local { background: #ecfdf5; }
+.badge-salt-file { background: #dbeafe; color: #1e40af; }
+.badge-salt-set { background: #fef3c7; color: #92400e; }
+
+/* MCP capability-envelope re-approval panel — 3.0 (YSG-RISK-060) */
+.env-hidden { display: none; }
+.env-h3 { font-size: 0.95rem; color: #1e293b; margin: 18px 0 4px; }
+.env-actions { margin-top: 18px; display: flex; gap: 10px; }
+.env-headline-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 12px 14px; font-size: 0.9rem; line-height: 1.6; color: #7f1d1d; margin-bottom: 12px; }
+/* ── Strict-CSP page-load helpers (v2.25.4 — zero inline styles) ──────
+   The admin plane serves `style-src 'self'` with no `style-src-attr`, so both
+   inline `style=` attributes and `element.style` CSSOM writes are blocked.
+   These classes replace every remaining inline style in dashboard.js + the
+   template so the dashboard renders with zero CSP violations on page load. */
+
+/* Show modifiers — toggled in place of `.style.display`. Each base class
+   already declares `display:none`; the `is-open` modifier reveals it. */
+.form-panel.is-open { display: block; }
+.once-panel.is-open { display: block; }
+.stepup-overlay.is-open { display: flex; }
+.backup-verify-result.is-open { display: block; }
+.pki-rotate-result.is-open { display: block; }
+
+/* Table-row action buttons (replace inline padding/background/etc.) */
+.btn-tbl { padding: 2px 8px; border: none; border-radius: 3px; cursor: pointer; font-size: 0.75rem; color: #fff; }
+.btn-tbl--blue { background: #2563eb; }
+.btn-tbl--red { background: #dc2626; }
+.btn-tbl--green { background: #16a34a; }
+.btn-tbl--amber { background: #f59e0b; }
+.btn-tbl--ml { margin-left: 4px; }
+/* Pagination / load-more button (4px radius, 0.8rem) */
+.btn-page { padding: 4px 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+/* Unblock button (4px radius) */
+.btn-unblock { padding: 2px 8px; background: #ef4444; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+/* Allowlist remove "x" (bare text button inside chip) */
+.chip-x { background: none; border: none; color: #ef4444; cursor: pointer; font-size: 0.7rem; }
+
+/* Table cells */
+.td-mono { font-family: monospace; }
+.td-mono-xs { font-family: monospace; font-size: 0.8rem; }
+.td-mono-xxs { font-family: monospace; font-size: 0.75rem; }
+.td-xs { font-size: 0.8rem; }
+.td-xxs { font-size: 0.75rem; }
+.td-muted { font-size: 0.8rem; color: #64748b; }
+.td-muted-sm { font-size: 0.75rem; color: #475569; }
+.td-ellipsis { font-size: 0.75rem; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+
+/* JS-injected badge colour overrides (parity with `.badge-template`) */
+.badge-slate { background: #f1f5f9; color: #64748b; }
+.badge-amber { background: #fef3c7; color: #92400e; }
+.badge-violet { background: #ede9fe; color: #6d28d9; }
+
+/* Section sub-headings injected by loadPolicies */
+.h3-section { margin: 14px 0 6px; font-size: 0.95rem; }
+
+/* Inline status text spans (cloud-override, services notes, errors) */
+.txt-err { color: #ef4444; }
+.txt-err-dk { font-size: 0.8rem; color: #b91c1c; }
+.txt-ok-dk { font-size: 0.8rem; color: #334155; }
+.svc-note { font-size: 0.75rem; color: #64748b; }
+.svc-note-faint { font-size: 0.75rem; color: #94a3b8; }
+
+/* License / crypto / backup prose paragraphs */
+.prose-sm { font-size: 0.85rem; color: #334155; }
+.prose-sm .faint { color: #64748b; }
+.crypto-line { margin-top: 8px; font-size: 0.85rem; }
+.crypto-line--bad { color: #ef4444; }
+.crypto-line--ok { color: #22c55e; }
+.crypto-line--pq { font-size: 0.85rem; color: #2563eb; }
+.crypto-line--compliance { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+.crypto-mismatch { font-size: 0.75rem; font-family: monospace; }
+.backup-empty { font-size: 0.85rem; color: #64748b; }
+.mismatch-list { margin-top: 6px; padding-left: 16px; }
+
+/* Allowlist chip (settings IP access) */
+.ip-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; margin: 2px; font-size: 0.8rem; }
+
+/* Session-expiry banner (replaces `.style.cssText`) */
+.session-banner { position: fixed; top: 0; left: 0; right: 0; background: #f59e0b; color: #000; padding: 8px 16px; text-align: center; font-size: 0.85rem; z-index: 9999; }
+.session-banner-btn { margin-left: 12px; padding: 4px 12px; background: #fff; border: 1px solid #d97706; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+
+/* Policy table cells */
+.td-pkg { font-size: 0.8rem; color: #475569; }
+
+/* ── 2.25.5-ui-wiring: R8/R9/R10/R12/R13/R16/R23/R24/R26/N1 ──────────────
+   All new CSS classes added here (append-only). NO inline style= anywhere.  */
+
+/* N1 — second-admin required banner */
+.n1-banner { background: #fff7ed; border: 1px solid #fdba74; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: none; }
+.n1-banner.is-open { display: flex; align-items: center; gap: 12px; }
+.n1-banner-text { flex: 1; font-size: 0.85rem; color: #92400e; }
+.n1-banner-btn { padding: 6px 14px; background: #ea580c; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; white-space: nowrap; }
+
+/* LAURA-V400-R2-001 — Data-protection warning banners */
+.dp-protection-banner { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; }
+.dp-weaken-pending-banner { background: #eff6ff; border-color: #93c5fd; }
+.dp-protection-banner-icon { font-size: 1.2rem; }
+.dp-protection-banner-text { flex: 1; font-size: 0.85rem; color: #7f1d1d; }
+.dp-weaken-pending-banner .dp-protection-banner-text { color: #1e3a5f; }
+.txt-warn { color: #b91c1c; font-size: 0.85rem; margin-top: 8px; }
+
+/* R26 — version badge in nav */
+.version-badge-none { font-size: 0.8rem; color: #64748b; }
+.version-badge-patch { font-size: 0.8rem; color: #1d4ed8; font-weight: 600; }
+.version-badge-minor { font-size: 0.8rem; color: #7c3aed; font-weight: 600; }
+.version-badge-major { font-size: 0.8rem; color: #d97706; font-weight: 600; }
+.version-badge-security { font-size: 0.8rem; color: #dc2626; font-weight: 700; animation: version-pulse 1.5s ease-in-out infinite; }
+@keyframes version-pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+.version-badge-link { color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }
+
+/* R9 — danger-zone panel */
+.danger-zone { border: 1px solid #fca5a5; border-radius: 6px; padding: 12px; background: #fef2f2; margin-top: 8px; }
+.danger-zone-title { font-size: 0.85rem; font-weight: 600; color: #b91c1c; margin-bottom: 6px; }
+.danger-zone-desc { font-size: 0.8rem; color: #7f1d1d; margin-bottom: 10px; }
+.danger-confirm-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.danger-reason-input { padding: 6px 8px; border: 1px solid #fca5a5; border-radius: 4px; font-size: 0.85rem; flex: 1; min-width: 200px; }
+.btn-sm-danger-confirm { padding: 6px 16px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+
+/* R10 — lifecycle status badges */
+.lc-badge-draft { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f1f5f9; color: #475569; }
+.lc-badge-staging { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #fef3c7; color: #92400e; }
+.lc-badge-production { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #dcfce7; color: #166534; }
+.lc-badge-archived { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 500; background: #f8fafc; color: #94a3b8; }
+
+/* R12 — policy dry-run panel */
+.dryrun-panel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 16px; margin-top: 12px; }
+.dryrun-result-allow { font-size: 0.85rem; color: #166534; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-deny { font-size: 0.85rem; color: #dc2626; font-weight: 600; margin-bottom: 4px; }
+.dryrun-result-undef { font-size: 0.85rem; color: #92400e; font-weight: 600; margin-bottom: 4px; }
+.dryrun-codes { font-size: 0.8rem; color: #475569; font-family: monospace; }
+.dryrun-ai { font-size: 0.82rem; color: #334155; margin-top: 8px; font-style: italic; }
+.sim-textarea { width: 100%; min-height: 80px; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 0.82rem; font-family: ui-monospace, monospace; resize: vertical; }
+
+/* R16 — AI-generate pattern panel */
+.genpattern-result { margin-top: 10px; font-size: 0.85rem; }
+.genpattern-preview { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 10px 12px; margin-top: 8px; font-size: 0.82rem; }
+.genpattern-regex { font-family: monospace; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; user-select: all; }
+.genpattern-ai { font-size: 0.8rem; color: #475569; margin-top: 6px; font-style: italic; }
+.btn-genpattern-accept { padding: 6px 14px; background: #16a34a; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82rem; margin-top: 6px; }
+
+/* R13 — RBAC method/path dropdowns with descriptions */
+.rbac-method-help { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+.rbac-path-group { font-size: 0.72rem; color: #94a3b8; }
+.rbac-path-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; max-width: 320px; }
+
+/* R23 — entitlement rows (locked features) */
+.entitlement-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+.entitlement-row:last-child { border-bottom: none; }
+.entitlement-label { font-size: 0.85rem; font-weight: 500; flex: 1; }
+.entitlement-desc { font-size: 0.75rem; color: #64748b; margin-top: 2px; }
+.entitlement-locked { font-size: 0.8rem; color: #64748b; text-align: right; }
+.entitlement-locked-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+.entitlement-upgrade-link { font-size: 0.75rem; color: #2563eb; text-decoration: none; margin-top: 2px; display: block; }
+.entitlement-available-badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; background: #dcfce7; color: #166534; }
+
+/* R24 — PKI / Cryptography merged section note */
+.pki-crypto-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; background: #f8fafc; padding: 8px 12px; border-radius: 4px; }
+
+/* ── Sensitivity taxonomy level badge colours (R14/R15 v2.25.5) ─────────── */
+/* CSP-safe: pure CSS classes, no inline style= attributes.                  */
+/* Palette: red (highest) → orange → yellow → green → blue (lowest).        */
+.sens-level-5 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fef2f2; color: #dc2626; }  /* red */
+.sens-level-4 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fff7ed; color: #ea580c; }  /* orange */
+.sens-level-3 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #fefce8; color: #a16207; }  /* yellow */
+.sens-level-2 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #dcfce7; color: #166534; }  /* green */
+.sens-level-1 { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 500; background: #dbeafe; color: #1d4ed8; }  /* blue */
+
+/* ── R25 Dashboard redesign — widget layout ──────────────────────────────── */
+/* Strict CSP: classes only, no inline style= attributes.                     */
+
+/* Dashboard rows — fluid two-column grid on wide screens, stacked on mobile */
+.dash-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 768px) { .dash-row { grid-template-columns: 1fr; } }
+
+/* Widget modifiers */
+.dash-widget { }
+.dash-widget--wide { grid-column: span 1; }
+.dash-widget--full { grid-column: 1 / -1; }
+
+/* Widget header with right-aligned meta/badge */
+.dash-widget-header { display: flex; justify-content: space-between; align-items: center; }
+.dash-header-meta { font-size: 0.75rem; color: #64748b; font-weight: 400; }
+
+/* ── Semaphore circles — R25 health/alert indicators ─────────────────────── */
+/* Palette: 🔴>🟠>🟡>🟢>🔵 as CSS classes                                    */
+.semaphore {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    vertical-align: middle;
+    flex-shrink: 0;
+}
+/* Status colours */
+.semaphore--ok       { background: #22c55e; box-shadow: 0 0 0 2px #dcfce7; }
+.semaphore--degraded { background: #f59e0b; box-shadow: 0 0 0 2px #fef3c7; }
+.semaphore--critical { background: #ef4444; box-shadow: 0 0 0 2px #fee2e2; }
+.semaphore--loading  { background: #cbd5e1; }
+/* Palette labels for alert priority */
+.semaphore--p1 { background: #ef4444; box-shadow: 0 0 0 2px #fee2e2; }
+.semaphore--p2 { background: #f97316; box-shadow: 0 0 0 2px #ffedd5; }
+.semaphore--p3 { background: #eab308; box-shadow: 0 0 0 2px #fef9c3; }
+.semaphore--p4 { background: #22c55e; box-shadow: 0 0 0 2px #dcfce7; }
+.semaphore--p5 { background: #3b82f6; box-shadow: 0 0 0 2px #dbeafe; }
+
+/* ── Service health table ─────────────────────────────────────────────────── */
+.svc-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.svc-table td { padding: 6px 8px; border-bottom: 1px solid #f1f5f9; }
+.svc-table tr:last-child td { border-bottom: none; }
+.svc-name { font-weight: 500; color: #1e293b; }
+.svc-detail { font-size: 0.75rem; color: #64748b; }
+.svc-crit-tag { font-size: 0.7rem; font-weight: 600; padding: 1px 5px; border-radius: 3px; background: #fef2f2; color: #b91c1c; }
+.svc-noncrit-tag { font-size: 0.7rem; color: #94a3b8; }
+.svc-semaphore-cell { width: 22px; text-align: center; }
+
+/* ── Alert priority list ─────────────────────────────────────────────────── */
+.alert-priority-list { list-style: none; padding: 0; margin: 0; }
+.alert-priority-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f1f5f9; font-size: 0.85rem; }
+.alert-priority-item:last-child { border-bottom: none; }
+.alert-priority-label { flex: 1; font-weight: 600; }
+.alert-priority-count { font-size: 0.85rem; font-weight: 700; color: #1e293b; min-width: 24px; text-align: right; }
+.alert-priority-count--zero { color: #94a3b8; font-weight: 400; }
+
+/* ── Budget widget ───────────────────────────────────────────────────────── */
+.budget-gauge-wrap { margin-bottom: 12px; }
+.budget-gauge-label { font-size: 0.75rem; color: #64748b; margin-bottom: 3px; display: flex; justify-content: space-between; }
+.budget-gauge-bar { background: #e2e8f0; border-radius: 4px; height: 10px; width: 100%; overflow: hidden; position: relative; }
+.budget-gauge-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+.budget-gauge-fill--ok     { background: #22c55e; }
+.budget-gauge-fill--warn   { background: #f59e0b; }
+.budget-gauge-fill--danger { background: #ef4444; }
+/* 85% threshold marker — pure CSS, no inline style */
+.budget-gauge-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: #dc2626; opacity: 0.7; }
+.budget-gauge-marker--85 { left: 85%; }
+
+/* Budget split row: cloud vs local */
+.budget-split { display: flex; gap: 16px; margin-top: 10px; }
+.budget-split-item { flex: 1; text-align: center; }
+.budget-split-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+.budget-split-value { font-size: 1.1rem; font-weight: 700; color: #1e293b; }
+
+/* Budget summary counts */
+.budget-counts { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.budget-count-item { background: #f8fafc; border-radius: 6px; padding: 6px 12px; text-align: center; min-width: 64px; }
+.budget-count-label { font-size: 0.7rem; color: #64748b; }
+.budget-count-value { font-size: 1rem; font-weight: 700; color: #1e293b; }
+
+/* ── Security widget ─────────────────────────────────────────────────────── */
+.sec-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #f1f5f9; font-size: 0.83rem; }
+.sec-row:last-child { border-bottom: none; }
+.sec-label { color: #475569; }
+.sec-value { font-weight: 700; color: #1e293b; }
+
+/* Sensitivity mini-bars (traffic mix) */
+.sensbar-wrap { margin-top: 10px; }
+.sensbar-label { font-size: 0.72rem; color: #64748b; margin-bottom: 4px; }
+.sensbar-track { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #e2e8f0; }
+.sensbar-seg-5 { background: #ef4444; }
+.sensbar-seg-4 { background: #f97316; }
+.sensbar-seg-3 { background: #eab308; }
+.sensbar-seg-2 { background: #22c55e; }
+.sensbar-seg-1 { background: #3b82f6; }
+.sensbar-legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.sensbar-key { font-size: 0.7rem; color: #475569; display: flex; align-items: center; gap: 3px; }
+.sensbar-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.sensbar-dot-5 { background: #ef4444; }
+.sensbar-dot-4 { background: #f97316; }
+.sensbar-dot-3 { background: #eab308; }
+.sensbar-dot-2 { background: #22c55e; }
+.sensbar-dot-1 { background: #3b82f6; }
+
+/* ── Traffic widget ──────────────────────────────────────────────────────── */
+.traffic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.traffic-stat { text-align: center; }
+.traffic-stat-value { font-size: 1.4rem; font-weight: 700; color: #1e293b; }
+.traffic-stat-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* Recent audit mini-table */
+.audit-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+.audit-mini-table th { text-align: left; padding: 4px 8px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+.audit-mini-table td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; color: #334155; }
+.audit-mini-table tr:last-child td { border-bottom: none; }
+
+/* ── Capability Policy page (3.0) — browser Permissions-Policy ────────────── */
+/* CSP-safe: classes only, no inline style= attributes.                        */
+.cap-pol-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.cap-pol-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.cap-pol-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-pol-table tr:last-child td { border-bottom: none; }
+.cap-th-name { width: 160px; }
+.cap-th-value { width: 220px; }
+.cap-name-cell { font-weight: 500; }
+.cap-origins-area { font-size: 0.85rem; }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 4px; min-height: 4px; margin-bottom: 4px; }
+.cap-origin-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; font-size: 0.78rem; font-family: monospace; }
+.cap-origin-add { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.cap-origin-err { display: block; font-size: 0.78rem; color: #dc2626; margin-top: 3px; }
+.cap-origins-display { font-family: monospace; font-size: 0.8rem; line-height: 1.6; }
+.cap-pol-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.cap-scope-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 4px; }
+.cap-scope-picker { display: flex; flex-direction: column; gap: 4px; }
+.cap-eff-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; margin-top: 8px; }
+.cap-eff-table th { text-align: left; padding: 6px 10px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.75rem; }
+.cap-eff-table td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-eff-table tr:last-child td { border-bottom: none; }
+.w-250 { width: 250px; }
+
+/* ── 3.1 Phase 8 — Resource Permissions admin page ─────────────────────── */
+.perm-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.perm-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.perm-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+.perm-table tr:last-child td { border-bottom: none; }
+.perm-decl-just { font-size: 0.8rem; color: #475569; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-code { font-family: monospace; font-size: 0.82rem; background: #f1f5f9; border-radius: 3px; padding: 1px 4px; }
+.perm-allow-label { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; padding: 6px 0; }
+.perm-required { font-size: 0.72rem; color: #dc2626; font-weight: normal; }
+.perm-grants-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.perm-grant-form-title { font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; color: #1e293b; }
+/* Effective resolution path display */
+.perm-eff-result-box { margin-top: 12px; font-size: 0.85rem; min-height: 20px; }
+.perm-eff-path { margin-top: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden; font-size: 0.83rem; }
+.perm-eff-path-row { display: flex; align-items: center; gap: 16px; padding: 7px 14px; border-bottom: 1px solid #f1f5f9; }
+.perm-eff-path-row:last-child { border-bottom: none; }
+.perm-eff-path-row--result { background: #eff6ff; font-weight: 600; }
+.perm-eff-path-lbl { font-size: 0.78rem; color: #64748b; min-width: 120px; }

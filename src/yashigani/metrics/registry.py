@@ -34,15 +34,51 @@ except ImportError:
     REGISTRY = None  # type: ignore[assignment]
 
 
+def _existing_collector(name):
+    """Return an already-registered collector for *name*, or None.
+
+    TEST-1 (Lu) — a module that defines metrics at import time raises
+    ``Duplicated timeseries in CollectorRegistry`` on a SECOND import, which is
+    common in the full unit suite (pytest re-imports modules across files /
+    importlib.reload in fixtures).  The default ``REGISTRY`` exposes a private
+    ``_names_to_collectors`` map; we look the metric up there and hand back the
+    existing collector so re-registration is idempotent instead of fatal.
+    """
+    if not _AVAILABLE or REGISTRY is None:
+        return None
+    try:
+        # prometheus_client maps BOTH the base name and the suffixed series
+        # (e.g. _total / _created / _bucket) to the same collector object.
+        return REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def _register(factory, name, *args, **kwargs):
+    """Construct a metric, returning the EXISTING collector on duplicate
+    registration (idempotent).  Fail-closed only on genuinely unexpected
+    errors — a ValueError whose message is the duplicate-timeseries error is
+    resolved by returning the live collector; any other ValueError re-raises."""
+    try:
+        return factory(name, *args, **kwargs)
+    except ValueError as exc:
+        if "Duplicated timeseries" not in str(exc) and "Duplicate" not in str(exc):
+            raise
+        existing = _existing_collector(name)
+        if existing is not None:
+            return existing
+        raise
+
+
 def _C(name, doc, labelnames=()):
-    return Counter(name, doc, labelnames) if _AVAILABLE else Counter(name, doc, labelnames)
+    return _register(Counter, name, doc, labelnames)
 
 def _G(name, doc, labelnames=()):
-    return Gauge(name, doc, labelnames) if _AVAILABLE else Gauge(name, doc, labelnames)
+    return _register(Gauge, name, doc, labelnames)
 
 def _H(name, doc, labelnames=(), buckets=None):
     kwargs = {"buckets": buckets} if buckets else {}
-    return Histogram(name, doc, labelnames, **kwargs) if _AVAILABLE else Histogram(name, doc, labelnames)
+    return _register(Histogram, name, doc, labelnames, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +121,14 @@ inspection_classifications_total = _C(
     ["label", "severity"],
 )
 
+# #16 (OPA Phase 2): client-policy aggregate query failures (fail-closed denies).
+# Alert on sustained rate — like the OPA *_CHECK_FAILED audit events.
+client_enforce_failures_total = _C(
+    "yashigani_client_enforce_failures_total",
+    "Client-policy aggregate query failures by direction and outcome (fail-closed).",
+    ["direction", "outcome"],
+)
+
 inspection_duration_seconds = _H(
     "yashigani_inspection_duration_seconds",
     "Inspection pipeline latency (classify + sanitise).",
@@ -107,6 +151,22 @@ inspection_model = _G(
     "yashigani_inspection_model_info",
     "Currently active Ollama classifier model (label only).",
     ["model"],
+)
+
+# v2.26 / YSG-RISK-057 — semantic-intent sidecar (content-filter v2) verdicts.
+# Emitted at the sidecar decision point (inspection.semantic_intent.evaluate).
+# verdict: escalated | clean | error
+#   escalated — the sidecar flagged injection intent the v1 heuristic missed
+#               (the YSG-RISK-057 encoded-injection residual).
+#   clean     — the sidecar ran and agreed with the heuristic (no escalation).
+#   error     — fail-closed: backend unreachable/unparseable/indeterminate.
+# view: the decoded view that drove the verdict (raw | base64 | hex | url |
+#       rot13 | suspicious_blob | indeterminate_fail_closed | none).  Engine-
+#       agnostic — never a model or library name.
+inspection_semantic_intent_total = _C(
+    "yashigani_inspection_semantic_intent_total",
+    "Semantic-intent sidecar verdicts (content-filter v2) by verdict and decoded view.",
+    ["verdict", "view"],
 )
 
 # ---------------------------------------------------------------------------
@@ -393,6 +453,13 @@ cicd_image_sbom_present = _G(
     ["image"],
 )
 
+cicd_trivy_findings_total = _C(
+    "yashigani_trivy_findings_total",
+    "Cumulative Trivy vulnerability findings by image, severity, and CVE ID. "
+    "Pushed by the CI Trivy scan job via Pushgateway.",
+    ["image", "severity", "vuln_id"],
+)
+
 
 # ---------------------------------------------------------------------------
 # v0.5.0 — PostgreSQL / audit queue / SIEM metrics
@@ -407,6 +474,13 @@ repeated_small_calls_total = _C(
 inference_payload_log_queue_depth = _G(
     "yashigani_inference_payload_log_queue_depth",
     "Current depth of the async inference payload write queue.",
+)
+
+inference_payload_bytes = _H(
+    "yashigani_inference_payload_bytes",
+    "Distribution of inference request payload sizes in bytes. "
+    "Tracks prompt + context window sizes; feeds the Anomaly dashboard.",
+    buckets=[512, 2048, 8192, 32768, 131072, 524288, 2097152],
 )
 
 cache_hits_total = _C(
@@ -439,26 +513,30 @@ jwks_cache_hits_total = _C(
     ["layer"],  # memory | redis
 )
 
-# v2.23.3: renamed from fasttext_classifications_total / fasttext_latency_ms.
-# Legacy metric names kept for Grafana dashboard backward-compatibility; a
-# `backend` label distinguishes sklearn (current) from fasttext (removed).
-# Existing dashboards that query `yashigani_fasttext_classifications_total`
-# continue to work — they now receive data with `backend="sklearn"`.
-fasttext_classifications_total = _C(
-    "yashigani_fasttext_classifications_total",
+# v2.25.3: renamed from yashigani_fasttext_* to yashigani_classifier_* (engine-agnostic).
+# Deprecated fasttext_* Python names kept as aliases for one release cycle (v2.26.0 removal).
+# Consumers of the old yashigani_fasttext_classifications_total Prometheus metric name must
+# update their dashboards — the metric name has changed (series continuity break is
+# acceptable for this internal pre-GA rename).
+classifier_classifications_total = _C(
+    "yashigani_classifier_classifications_total",
     "First-pass sensitivity classifier outcomes (backend label distinguishes implementation).",
     ["result", "backend"],  # result: clean | unsafe | uncertain; backend: sklearn
 )
-# Canonical alias — preferred name for new dashboards.
-sensitivity_classifier_classifications_total = fasttext_classifications_total
+# v2.23.3 canonical alias — deprecated in v2.25.3, removed in v2.26.0.
+sensitivity_classifier_classifications_total = classifier_classifications_total
+# Legacy name — DEPRECATED in v2.25.3, removed in v2.26.0.
+fasttext_classifications_total = classifier_classifications_total
 
-fasttext_latency_ms = _H(
-    "yashigani_fasttext_latency_ms",
+classifier_latency_ms = _H(
+    "yashigani_classifier_latency_ms",
     "First-pass sensitivity classifier inference latency in milliseconds.",
     buckets=[0.5, 1, 2, 5, 10, 20, 50],
 )
-# Canonical alias — preferred name for new dashboards.
-sensitivity_classifier_latency_ms = fasttext_latency_ms
+# v2.23.3 canonical alias — deprecated in v2.25.3, removed in v2.26.0.
+sensitivity_classifier_latency_ms = classifier_latency_ms
+# Legacy name — DEPRECATED in v2.25.3, removed in v2.26.0.
+fasttext_latency_ms = classifier_latency_ms
 
 trace_spans_total = _C(
     "yashigani_trace_spans_total",
@@ -536,93 +614,158 @@ audit_partition_missing = _G(
 # ---------------------------------------------------------------------------
 
 # OPA routing safety net
-yashigani_opa_safety_blocks_total = Counter(
+yashigani_opa_safety_blocks_total = _C(
     "yashigani_opa_safety_blocks_total",
     "OPA routing safety net blocks — sensitive data heading to cloud",
 )
 
 # Sensitivity classification
-yashigani_sensitivity_detections_total = Counter(
+yashigani_sensitivity_detections_total = _C(
     "yashigani_sensitivity_detections_total",
     "Sensitivity detections by classification level",
     ["level"],
 )
 
-yashigani_sensitivity_conflicts_total = Counter(
+yashigani_sensitivity_conflicts_total = _C(
     "yashigani_sensitivity_conflicts_total",
     "Sensitivity classification conflicts between scanner layers",
 )
 
-yashigani_sensitivity_ceiling_breaches_total = Counter(
+yashigani_sensitivity_ceiling_breaches_total = _C(
     "yashigani_sensitivity_ceiling_breaches_total",
     "Identity accessed data above their sensitivity ceiling",
 )
 
 # Routing decisions
-yashigani_routing_decisions_total = Counter(
+yashigani_routing_decisions_total = _C(
     "yashigani_routing_decisions_total",
     "Optimization Engine routing decisions by rule and route",
     ["rule", "route"],
 )
 
-yashigani_oe_decision_duration_seconds = Histogram(
+# P1 safety-net info gauge — updated whenever an OPA routing safety block fires
+# (rule=P1: sensitive data heading to cloud).  Grafana "P1 Routing Events" table
+# panel (instant query, format=table) reads this metric.
+# Labels: identity_id, provider, sensitivity_level.
+yashigani_routing_p1_events_info = _G(
+    "yashigani_routing_p1_events_info",
+    "Info gauge: OPA routing safety-net P1 events. "
+    "Set to 1 per {identity_id, provider, sensitivity_level} when P1 triggers. "
+    "Powers the Optimization Engine dashboard P1 Routing Events table.",
+    ["identity_id", "provider", "sensitivity_level"],
+)
+
+yashigani_oe_decision_duration_seconds = _H(
     "yashigani_oe_decision_duration_seconds",
     "Optimization Engine decision latency",
     buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
 )
 
 # Budget
-yashigani_budget_tokens_total = Counter(
+yashigani_budget_tokens_total = _C(
     "yashigani_budget_tokens_total",
-    "Cloud tokens consumed by provider and identity kind",
-    ["provider", "kind", "route"],
+    "Cloud tokens consumed by route, provider, and identity. "
+    "route ∈ cloud|local; identity_id is the yashigani identity slug.",
+    ["provider", "kind", "route", "identity_id"],
 )
 
-yashigani_budget_exhausted_total = Counter(
+yashigani_budget_cost_usd_total = _C(
+    "yashigani_budget_cost_usd_total",
+    "Cumulative estimated cost in USD (cloud tokens × per-1k-token price). "
+    "Labelled by provider and identity_id so cost can be attributed.",
+    ["provider", "identity_id"],
+)
+
+yashigani_budget_exhausted_total = _C(
     "yashigani_budget_exhausted_total",
     "Budget exhaustion events — identity auto-switched to local",
 )
 
-yashigani_budget_utilisation_pct = Gauge(
+yashigani_budget_utilisation_pct = _G(
     "yashigani_budget_utilisation_pct",
-    "Budget utilisation percentage by identity",
-    ["identity_id"],
+    "Budget utilisation percentage. identity_id OR group_id label present "
+    "(use group_id='' for identity rows, identity_id='' for group rows).",
+    ["identity_id", "group_id"],
+)
+
+# Complexity scoring
+yashigani_complexity_scores_total = _C(
+    "yashigani_complexity_scores_total",
+    "Complexity scorer outcomes by level (LOW|MEDIUM|HIGH). "
+    "Powers the R25 cloud-vs-local widget.",
+    ["level"],
 )
 
 # Pool Manager
-yashigani_pool_containers_active = Gauge(
+yashigani_pool_containers_active = _G(
     "yashigani_pool_containers_active",
-    "Currently active managed containers",
+    "Currently active managed containers (total across all services)",
 )
 
-yashigani_pool_containers_created_total = Counter(
+yashigani_pool_containers_active_by_service = _G(
+    "yashigani_pool_containers_active_by_service",
+    "Currently active managed containers grouped by service slug. "
+    "Powers the Pool Manager dashboard per-service panel.",
+    ["service"],
+)
+
+yashigani_pool_ollama_instances = _G(
+    "yashigani_pool_ollama_instances",
+    "Number of Ollama container instances currently managed by the Pool Manager. "
+    "Horizontal-scale indicator.",
+)
+
+yashigani_pool_container_info = _G(
+    "yashigani_pool_container_info",
+    "Per-container presence gauge (value=1). Labels carry container metadata. "
+    "Use absent() or == 0 to detect departed containers.",
+    ["container_id", "service", "agent_id", "status"],
+)
+
+yashigani_pool_containers_created_total = _C(
     "yashigani_pool_containers_created_total",
     "Containers created by Pool Manager",
 )
 
-yashigani_pool_containers_replaced_total = Counter(
+yashigani_pool_containers_replaced_total = _C(
     "yashigani_pool_containers_replaced_total",
     "Containers replaced due to health failures",
 )
 
-yashigani_pool_containers_idle_teardown_total = Counter(
+yashigani_pool_containers_idle_teardown_total = _C(
     "yashigani_pool_containers_idle_teardown_total",
     "Containers torn down due to idle timeout",
 )
 
-yashigani_pool_scale_failures_total = Counter(
+yashigani_pool_scale_failures_total = _C(
     "yashigani_pool_scale_failures_total",
     "Failed scaling attempts — resources exhausted",
 )
 
-yashigani_pool_postmortems_total = Counter(
+yashigani_pool_postmortems_total = _C(
     "yashigani_pool_postmortems_total",
     "Postmortem forensic reports collected",
 )
 
-yashigani_pool_limit_exceeded_total = Counter(
+yashigani_pool_limit_exceeded_total = _C(
     "yashigani_pool_limit_exceeded_total",
     "Container creation blocked by license tier limit",
+)
+
+
+# ---------------------------------------------------------------------------
+# FIPS attestation metric — Nico N-002 (v2.25.0 P2 B9)
+# ---------------------------------------------------------------------------
+# yashigani_fips_mode_active is a static gauge (0 or 1) reflecting whether
+# FIPS_MODE=1 is active in this container.  Set once at startup from the env.
+# Operators queried by auditors ("was FIPS mode active in production?") can
+# cite this metric from the Prometheus time-series as a runtime artefact.
+# ---------------------------------------------------------------------------
+
+fips_mode_active = _G(
+    "yashigani_fips_mode_active",
+    "1 if FIPS_MODE=1 is active in this container, 0 otherwise. "
+    "Set once at startup from the FIPS_MODE environment variable.",
 )
 
 

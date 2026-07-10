@@ -1,0 +1,312 @@
+{{/*
+  Yashigani v4.1 unified-sidecar Phase 2a — per-system egress-forwarder pods
+  (design §2.2(c/d), §2.3, §2.6 — I1-02 gate; synthesis must-fix #2).
+
+  One entry per wrapped system under .Values.egressForwarders (map keys are
+  unique camelCase per (system, tenant) — additive across -f overlays, same
+  rationale as mcpSvid). Codegen emits values-<system>-egress.yaml overlays
+  from the system descriptor (spec.egress.needs) — the descriptor is the
+  single source; this template is a mechanical expansion.
+
+  TOPOLOGY DECISION (Captain, §2.6 authoritative): the forwarder is a
+  SEPARATE pod, NOT an in-pod sidecar. An in-pod sidecar shares the pod
+  network namespace, so forwarder→system:<shimPort> would be loopback
+  traffic that NetworkPolicy CANNOT filter — silently voiding the §2.6
+  intra-zone deny. A separate pod makes the forwarder-scoped NetworkPolicies
+  real.
+
+  INTRA-ZONE-DENY (K8s form): standard NetworkPolicy has no deny verb — the
+  deny is achieved by ABSENCE of an egress allow. The forwarder egress
+  policy below allows ONLY yashigani-caddy:18790 + kube-dns; there is NO
+  allow to the wrapped system pod on any port. Do NOT add one — that is the
+  I1-02 regression the §2.6 invariant exists to prevent.
+
+  No Kyverno PolicyException covers these pods: the forwarder needs no
+  CAP_NET_ADMIN (§2.6 — the K8s deny is NP-shaped, not iptables-shaped).
+
+  Per-entry keys:
+    enabled           — render gate (codegen overlays set true)
+    systemName        — wrapped system's app.kubernetes.io/name label value
+    tenantId          — tenant slug (SVID mount path component)
+    shimPort          — wrapped system's serve/shim port (deny-tuple doc)
+    forwarderPort     — forwarder listener (fixed 9400, Captain C2)
+    prefixes          — declared egress prefixes (local allowlist)
+    svidSecretName    — per-instance SVID Secret (client.crt/client.key/ca.crt)
+    existingSecret    — TRANSITIONAL alternative: {name, certKey, keyKey, caKey}
+                        items: projection from the monolithic PKI Secret
+                        (YSG-RISK-053 scoped-projection pattern); retires at
+                        the system's per-instance identity migration
+    image             — optional {repository, tag, pullPolicy} override
+                        (default: the chart's caddy image)
+    resources         — optional resources override
+*/}}
+{{- $root := . -}}
+{{- range $fwdID, $fwd := .Values.egressForwarders }}
+{{- if $fwd.enabled }}
+{{- $system := required "egressForwarders entry requires systemName" $fwd.systemName -}}
+{{- $tenant := required "egressForwarders entry requires tenantId" $fwd.tenantId -}}
+{{- $fwdName := printf "yashigani-egress-%s" $system -}}
+{{- $port := int ($fwd.forwarderPort | default 9400) -}}
+{{- $svidDir := printf "/run/secrets/svid/%s/%s" $tenant $system -}}
+{{- $img := $fwd.image | default $root.Values.caddy.image -}}
+---
+# Forwarder Caddy config — semantic parity with the codegen compose artifact
+# docker/caddy/egress/<system>-forwarder.caddy. Documented K8s deltas ONLY:
+#   1. upstream https://caddy:18790 → https://yashigani-caddy:18790
+#   2. tls_server_name caddy → yashigani-caddy (both SANs are on the caddy
+#      mesh leaf — service_identities.yaml dns_sans)
+# Anything else differing from the compose artifact is drift.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fwdName }}-config
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: egress-{{ $system }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: egress-forwarder
+    yashigani.io/egress-forwarder: {{ $system | quote }}
+data:
+  egress-forwarder.caddy: |
+    # v4.1 unified-sidecar Phase 2a — egress-forwarder config for system: {{ $system }} (tenant: {{ $tenant }})
+    # NO CADDY_INTERNAL_HMAC in this config (synthesis must-fix #2).
+    {
+        admin off
+        auto_https off
+        log {
+            output stderr
+            format json
+        }
+    }
+
+    :{{ $port }} {
+        request_body {
+            max_size 10MB
+        }
+
+        # Liveness only — full-path serviceability is the Phase-2b live gate.
+        handle /healthz {
+            respond "ok" 200
+        }
+{{ range $prefix := $fwd.prefixes }}
+        handle /{{ $prefix }}/* {
+            request_header -X-SPIFFE-ID
+            request_header -X-Caddy-Verified-Secret
+            request_header -X-Yashigani-Verified-Spiffe
+            reverse_proxy https://yashigani-caddy:18790 {
+                transport http {
+                    tls
+                    tls_trust_pool file {{ $svidDir }}/ca.crt
+                    tls_client_auth {{ $svidDir }}/client.crt {{ $svidDir }}/client.key
+                    tls_server_name yashigani-caddy
+                    max_conns_per_host 64
+                }
+            }
+        }
+{{ end }}
+        # Local prefix allowlist (synthesis #2): default-deny everything else.
+        handle {
+            respond "Forbidden" 403
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fwdName }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: egress-{{ $system }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: egress-forwarder
+    app.kubernetes.io/managed-by: Helm
+    yashigani.io/egress-forwarder: {{ $system | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: egress-{{ $system }}
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: egress-{{ $system }}
+        app.kubernetes.io/instance: {{ $root.Release.Name }}
+        app.kubernetes.io/component: egress-forwarder
+        yashigani.io/egress-forwarder: {{ $system | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: egress-forwarder
+          image: "{{ $img.repository }}:{{ $img.tag }}"
+          imagePullPolicy: {{ $img.pullPolicy | default "IfNotPresent" }}
+          command: ["caddy", "run", "--config", "/etc/caddy/egress-forwarder.caddy", "--adapter", "caddyfile"]
+          env:
+            # Caddy writable state on emptyDir (readOnlyRootFilesystem).
+            - name: XDG_CONFIG_HOME
+              value: /tmp/caddy/config
+            - name: XDG_DATA_HOME
+              value: /tmp/caddy/data
+          ports:
+            - name: forwarder
+              containerPort: {{ $port }}
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ $port }}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ $port }}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            {{- if $fwd.resources }}
+            {{- toYaml $fwd.resources | nindent 12 }}
+            {{- else }}
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/caddy
+              readOnly: true
+            # SVID material — FORWARDER-POD-ONLY mount (synthesis #2): the
+            # wrapped system pod never mounts this Secret.
+            - name: svid
+              mountPath: {{ $svidDir }}
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fwdName }}-config
+        - name: svid
+          secret:
+            {{- if $fwd.existingSecret }}
+            # TRANSITIONAL (retires at per-instance migration §3.1 step 1):
+            # items: projection scopes the monolithic PKI Secret to the three
+            # needed files (YSG-RISK-053 scoped-projection pattern).
+            secretName: {{ $fwd.existingSecret.name }}
+            defaultMode: 0440
+            items:
+              - key: {{ $fwd.existingSecret.certKey }}
+                path: client.crt
+              - key: {{ $fwd.existingSecret.keyKey }}
+                path: client.key
+              - key: {{ $fwd.existingSecret.caKey }}
+                path: ca.crt
+            {{- else }}
+            secretName: {{ required "egressForwarders entry requires svidSecretName or existingSecret" $fwd.svidSecretName }}
+            defaultMode: 0440
+            {{- end }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fwdName }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: egress-{{ $system }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: egress-forwarder
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: egress-{{ $system }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+  ports:
+    - name: forwarder
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+---
+# Forwarder-pod NetworkPolicy — the K8s half of the §2.6 split-zone contract.
+#
+# INGRESS: ONLY the wrapped system pod may dial the forwarder (:{{ $port }}) —
+#   the K8s equivalent of ringfence_{{ $system }}_eg 2-member membership.
+# EGRESS:  ONLY yashigani-caddy:18790 + kube-dns.
+#
+# INTRA-ZONE-DENY (I1-02): egress-{{ $system }} -> {{ $system }}:{{ $fwd.shimPort }} is DENIED
+# by the ABSENCE of any egress allow to the system pod below (standard K8s
+# NetworkPolicy is default-deny once an Egress policy selects the pod; there
+# is no deny verb). Do NOT add an allow to the {{ $system }} pod — that
+# re-opens the L3 path around the wrap that I1-02 closed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fwdName }}-forwarder
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: egress-{{ $system }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: egress-forwarder
+    yashigani.io/egress-forwarder: {{ $system | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: egress-{{ $system }}
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ringfence_{{ $system }}_eg parity: the wrapped system is the SOLE peer.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $system }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+  egress:
+    # The ONLY initiable destination: the :18790 egress gateway.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-caddy
+      ports:
+        - protocol: TCP
+          port: 18790
+    # kube-dns for service-name resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # INTRA-ZONE-DENY marker (denied tuple, for audit + contract test 3c):
+    # NO allow to pod {{ $system }} on port {{ $fwd.shimPort }} — deny-by-absence.
+{{- end }}
+{{- end }}

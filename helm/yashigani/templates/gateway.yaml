@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-02T02:32:22+01:00 */ -}}
+{{- /* Last updated: 2026-05-27T00:00:00+00:00 */ -}}
 {{- if .Values.gateway.enabled }}
 ---
 apiVersion: apps/v1
@@ -32,8 +32,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "yashigani.serviceAccountName" . }}
-      # /run/secrets mount collision — see redis.yaml note.
-      automountServiceAccountToken: false
+      # B14 (v2.25.0 P2 TOM-K8S-002): automountServiceAccountToken is conditional.
+      # When poolManager.k8sBackend.enabled=true the gateway ServiceAccount token
+      # must be mounted so pool/backend.py can call load_incluster_config() and
+      # reach the K8s API server (CoreV1Api.create_namespaced_pod). When the k8s
+      # backend is disabled the token is never consumed and mounting it is an
+      # unnecessary attack surface — Checkov CKV_K8S_43 / ASVS V14.3.2.
+      automountServiceAccountToken: {{ if .Values.poolManager.k8sBackend.enabled }}true{{ else }}false{{ end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001
@@ -78,16 +83,17 @@ spec:
               value: "docker"
             - name: YASHIGANI_SERVICE_NAME
               value: "gateway"
+            {{- $gwEnv := .Values.gateway.env | default dict }}
             - name: YASHIGANI_UPSTREAM_URL
-              value: {{ .Values.gateway.env.upstreamUrl | quote }}
+              value: {{ $gwEnv.upstreamUrl | quote }}
             - name: YASHIGANI_OPA_URL
-              value: {{ .Values.gateway.env.opaUrl | quote }}
+              value: {{ $gwEnv.opaUrl | quote }}
             - name: OLLAMA_BASE_URL
-              value: {{ .Values.gateway.env.ollamaUrl | quote }}
+              value: {{ $gwEnv.ollamaUrl | quote }}
             - name: REDIS_HOST
-              value: {{ .Values.gateway.env.redisHost | quote }}
+              value: {{ $gwEnv.redisHost | quote }}
             - name: REDIS_PORT
-              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}{{ .Values.gateway.env.redisPort | quote }}{{ end }}
+              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}{{ $gwEnv.redisPort | quote }}{{ end }}
             # Budget Redis — separate instance, code default "budget-redis"
             # wouldn't resolve in-cluster. K8s service is yashigani-budget-redis.
             - name: BUDGET_REDIS_HOST
@@ -101,15 +107,66 @@ spec:
               value: "/etc/yashigani/service_identities.yaml"
             - name: YASHIGANI_INTERNAL_CA_DIR
               value: "/run/secrets"
+            # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust domain
+            # for the app-layer validators. Default yashigani.internal (single
+            # instance). Compose parity: x-common-env YASHIGANI_SPIFFE_TRUST_DOMAIN.
+            - name: YASHIGANI_SPIFFE_TRUST_DOMAIN
+              value: {{ .Values.global.spiffeTrustDomain | default "yashigani.internal" | quote }}
             {{- end }}
             - name: YASHIGANI_AGENT_ROUTING_ENABLED
-              value: {{ .Values.gateway.env.agentRoutingEnabled | quote }}
+              value: {{ $gwEnv.agentRoutingEnabled | quote }}
             - name: YASHIGANI_AGENT_PATH_PREFIX
-              value: {{ .Values.gateway.env.agentPathPrefix | quote }}
+              value: {{ $gwEnv.agentPathPrefix | quote }}
             - name: YASHIGANI_AGENT_TOKEN_MIN_LENGTH
-              value: {{ .Values.gateway.env.agentTokenMinLength | quote }}
+              value: {{ $gwEnv.agentTokenMinLength | quote }}
             - name: YASHIGANI_DEPLOYMENT_STREAM
-              value: {{ .Values.gateway.env.deploymentStream | quote }}
+              value: {{ $gwEnv.deploymentStream | quote }}
+            # --- Orchestration caps (build-sheet §9 — MF3 helm parity). Mirrors
+            # docker-compose.yml x-gateway env exactly so Docker and K8s gateways
+            # are config-equivalent. MAX_DEPTH=9 is the §0.1 9-level hop invariant.
+            - name: YASHIGANI_ORCH_MAX_DEPTH
+              value: {{ $gwEnv.orchMaxDepth | quote }}
+            - name: YASHIGANI_ORCH_MAX_ITERS
+              value: {{ $gwEnv.orchMaxIters | quote }}
+            - name: YASHIGANI_ORCH_DEADLINE_S
+              value: {{ $gwEnv.orchDeadlineS | quote }}
+            - name: YASHIGANI_ORCH_MAX_FANOUT
+              value: {{ $gwEnv.orchMaxFanout | quote }}
+            # LAURA-ORCH-001(b): strict low budget for injection-originated
+            # (tool-result justified) hops; over-budget result-steered hops are
+            # refused (fail-closed).
+            - name: YASHIGANI_ORCH_INJECTION_BUDGET
+              value: {{ $gwEnv.orchInjectionBudget | quote }}
+            # ORCH-PHASE2 (Design A, letta-as-brain): per-letta-turn HTTP timeout
+            # (seconds). A letta agentic turn does multi-step reasoning + its own
+            # gateway LLM call (~2 min on the 3B brain); must sit above per-turn
+            # latency and below DEADLINE_S so the whole-loop deadline governs.
+            - name: YASHIGANI_ORCH_LETTA_TURN_TIMEOUT_S
+              value: {{ $gwEnv.orchLettaTurnTimeoutS | quote }}
+            # SELFCALL_BASE — internal mesh self-call target (http-mesh port 8081,
+            # same-pod loopback, internal bearer, NetworkPolicy-isolated).
+            - name: YASHIGANI_ORCH_SELFCALL_BASE
+              value: {{ $gwEnv.orchSelfcallBase | quote }}
+            {{- /*
+              Fix-6 (Captain): YASHIGANI_MCP_SERVERS — JSON array of onboarded MCP
+              servers.  Read by build_registry_from_env() at gateway startup.
+              Set gateway.mcpServers in values.yaml (default: empty list = no MCP).
+              Example values.yaml entry:
+                gateway:
+                  mcpServers:
+                    - agent_name: filesystem-mcp
+                      upstream_url: http://filesystem-mcp:8000
+                      tenant_id: acme
+                      is_filesystem_agent: true
+            */}}
+            - name: YASHIGANI_MCP_SERVERS
+              value: {{ .Values.gateway.mcpServers | default list | toJson | quote }}
+            # Iris F-2: MCP broker OPA AsyncClient reads this CA path
+            # (src/yashigani/mcp/_opa.py:_make_opa_http_client).  Without it on
+            # K8s, OPA HTTPS verify falls through to system trust store and
+            # every tools/call fails closed.  Companion to docker-compose.yml.
+            - name: YASHIGANI_CA_CERT
+              value: "/run/secrets/ca_root.crt"
             {{- if .Values.mtls.enabled }}
             # M-01 fix: mTLS OTLP endpoint (grpcs://). Gateway presents its
             # leaf cert. Python OTEL exporter goes through Python ssl —
@@ -124,10 +181,26 @@ spec:
               value: "/run/secrets/gateway_client.key"
             {{- else }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .Values.gateway.env.otelEndpoint | quote }}
+              value: {{ $gwEnv.otelEndpoint | quote }}
             {{- end }}
             - name: SKLEARN_MODEL_PATH
-              value: {{ .Values.gateway.env.sklearnModelPath | quote }}
+              value: {{ $gwEnv.sklearnModelPath | quote }}
+            # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
+            # Default ON: every MCP tool import is screened by the Ollama-backed
+            # semantic-intent classifier before operator approval (tool-poisoning /
+            # day-one-poison close). Uses same OLLAMA_BASE_URL backend as PII classifier.
+            # Set to "false" in values.yaml or via --set to disable.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.gateway.semanticIntentSidecar | default "true" | quote }}
+            # FLAG-3 fix: per-instance /egress/eval LLM rate cap (EgressLimitEnforcer).
+            # Compose parity: docker-compose.yml gateway env YASHIGANI_EGRESS_LIMIT_*.
+            # mode: "cap" (default) deny+fail-closed; "monitor" meter-only, never deny.
+            - name: YASHIGANI_EGRESS_LIMIT_MODE
+              value: {{ .Values.gateway.egressLimitMode | default "cap" | quote }}
+            - name: YASHIGANI_EGRESS_LIMIT_CALLS
+              value: {{ .Values.gateway.egressLimitCalls | default "200" | quote }}
+            - name: YASHIGANI_EGRESS_LIMIT_WINDOW_SECONDS
+              value: {{ .Values.gateway.egressLimitWindowSeconds | default "60" | quote }}
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             - name: POSTGRES_PASSWORD
@@ -152,9 +225,22 @@ spec:
               # puts both replicas on the same backend (internal K8s integration finding).
               # ca_bundle.crt: same libpq chain-verify fix as YASHIGANI_DB_DSN.
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
+            # v2.25.2 (Lu wire-sink-gate P1): DDL / Alembic migrations run as the
+            # admin superuser yashigani_admin (NOT the demoted runtime role
+            # yashigani_app). run_migrations() prefers the admin DSNs; the runtime
+            # asyncpg pool keeps YASHIGANI_DB_DSN (yashigani_app). Same cert +
+            # password — boundary is role privilege. DDL goes direct to postgres.
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_bundle.crt&sslcert=/run/secrets/gateway_client.crt&sslkey=/run/secrets/gateway_client.key"
             {{- else }}
             - name: YASHIGANI_DB_DSN
               value: "postgresql://yashigani_app:$(POSTGRES_PASSWORD)@yashigani-pgbouncer:5432/yashigani"
+            - name: YASHIGANI_DB_DSN_ADMIN
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
+            - name: YASHIGANI_DB_DSN_ADMIN_DIRECT
+              value: "postgresql://yashigani_admin:$(POSTGRES_PASSWORD)@yashigani-postgres:5432/yashigani"
             {{- end }}
             - name: REDIS_PASSWORD
               valueFrom:
@@ -187,6 +273,17 @@ spec:
             # set fips.mode=true without swapping to a FIPS-configured image.
             - name: FIPS_MODE
               value: "1"
+            {{- end }}
+            {{- if .Values.auditLog.enabled }}
+            # B7 fix (v2.25.0 P2): audit env vars injected for PVC-backed audit log.
+            # SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 / CMMC AU.L2-3.3.4/8/9 /
+            # EU AI Act Art.12. Council finding B7: Lu P0-#3.
+            - name: YASHIGANI_AUDIT_LOG_PATH
+              value: {{ .Values.auditLog.logPath | quote }}
+            - name: YASHIGANI_AUDIT_MAX_FILE_SIZE_MB
+              value: {{ .Values.auditLog.maxFileSizeMB | quote }}
+            - name: YASHIGANI_AUDIT_RETENTION_DAYS
+              value: {{ .Values.auditLog.retentionDays | quote }}
             {{- end }}
           envFrom:
             - secretRef:
@@ -266,19 +363,59 @@ spec:
               subPath: license_key
               readOnly: true
             {{- end }}
+            {{- if .Values.agentBundles.filesystemMcp.enabled }}
+            {{- if .Values.gateway.mcpSigningKey.existingSecretName }}
+            # K8s SB-2 fix: mount MCP identity signing key from a standalone Secret.
+            # Logically separate from mTLS PKI — distinct key-management lifecycle
+            # (JWT signing key rotation is independent of TLS cert rotation).
+            # subPath mount lands at /run/secrets/mcp_identity_signing_key —
+            # the default path expected by _jwt.py (YASHIGANI_MCP_SIGNING_KEY_PATH).
+            # Does NOT interfere with the PKI Secret already at /run/secrets/.
+            - name: mcp-signing-key
+              mountPath: /run/secrets/mcp_identity_signing_key
+              subPath: {{ .Values.gateway.mcpSigningKey.secretKey | quote }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 100Mi
+        # B7 fix (v2.25.0 P2): replace emptyDir with PVC when auditLog.enabled.
+        # emptyDir is wiped on pod restart — operator-visible audit log file sink
+        # is lost. PVC persists across restarts for SOC 2 / ISO 27001 / NIST AU-9.
+        # Council finding B7: Lu P0-#3.
         - name: varlog
+          {{- if .Values.auditLog.enabled }}
+          persistentVolumeClaim:
+            claimName: yashigani-gateway-audit-log
+          {{- else }}
           emptyDir:
             sizeLimit: 50Mi
+          {{- end }}
         - name: secrets
           {{- if .Values.mtls.enabled }}
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             # 0440 + fsGroup: pod (1001) can read, others blocked.
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # gateway gets its own leaf + own bootstrap token + the two trust
+            # anchors it uses (ca_root for Python ssl / OTLP / redis / OPA,
+            # ca_bundle for libpq DSN chain verify). caddy_internal_hmac comes
+            # via the CADDY_INTERNAL_HMAC env secretKeyRef, never the file.
+            # No other service's leaf key or bootstrap token is projected.
+            items:
+              - key: gateway_client.crt
+                path: gateway_client.crt
+              - key: gateway_client.key
+                path: gateway_client.key
+              - key: gateway_bootstrap_token
+                path: gateway_bootstrap_token
+              - key: ca_root.crt
+                path: ca_root.crt
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
           {{- else }}
           emptyDir:
             sizeLimit: 10Mi
@@ -294,6 +431,17 @@ spec:
         - name: license
           secret:
             secretName: yashigani-license
+            defaultMode: 0440
+        {{- end }}
+        {{- if and .Values.agentBundles.filesystemMcp.enabled .Values.gateway.mcpSigningKey.existingSecretName }}
+        # K8s SB-2 fix: standalone MCP identity signing key volume.
+        # Only rendered when filesystemMcp is enabled AND existingSecretName is set.
+        # The operator must pre-create this Secret before running helm install/upgrade:
+        #   kubectl create secret generic yashigani-mcp-signing-key -n <ns> \
+        #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
+        - name: mcp-signing-key
+          secret:
+            secretName: {{ .Values.gateway.mcpSigningKey.existingSecretName }}
             defaultMode: 0440
         {{- end }}
 ---

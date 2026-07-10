@@ -17,6 +17,7 @@ admin-API rotation endpoints. Runtime services only LOAD certs.
 
 from yashigani.pki.identity import (
     CertPolicy,
+    EndpointAcl,
     ServiceIdentity,
     current_service,
     load_manifest,
@@ -28,6 +29,7 @@ from yashigani.pki.ssl_context import server_ssl_context, client_ssl_context
 
 __all__ = [
     "CertPolicy",
+    "EndpointAcl",
     "ServiceIdentity",
     "ManifestError",
     "TamperError",

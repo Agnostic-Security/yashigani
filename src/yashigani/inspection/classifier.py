@@ -117,19 +117,21 @@ class PromptInjectionClassifier:
 
     def available_models(self) -> list[str]:
         """Return list of locally available Ollama model tags."""
-        import urllib.request, json
-        try:
-            req = urllib.request.Request(f"{self._base_url}/api/tags")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-            return [m["name"] for m in data.get("models", [])]
-        except Exception:
+        # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport — presents the
+        # per-service leaf to the Caddy :11435 Ollama front on https URLs.
+        from yashigani.inspection._ollama_transport import ollama_get_json
+        data = ollama_get_json(self._base_url, "/api/tags", timeout=5.0)
+        if not data:
             return []
+        return [m["name"] for m in data.get("models", [])]
 
     # -- Internal ------------------------------------------------------------
 
     def _call_model(self, content: str) -> str:
-        import urllib.request, json as _json
+        # v4.1 Phase 1c (LAURA-I1-01 seam): Ollama is fronted by Caddy :11435
+        # (mesh mTLS, require_and_verify).  ollama_post_json presents this
+        # service's leaf on https URLs; http URLs keep the legacy plain path.
+        from yashigani.inspection._ollama_transport import ollama_post_json
 
         # Content is inserted as a quoted literal — never as instruction text
         user_message = (
@@ -137,7 +139,7 @@ class PromptInjectionClassifier:
             + json.dumps(content)   # JSON-encode to escape special chars
             + "\nUSER_CONTENT_END"
         )
-        payload = _json.dumps({
+        payload = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -146,17 +148,10 @@ class PromptInjectionClassifier:
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.0},
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            url=f"{self._base_url}/api/chat",
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
+        }
+        data = ollama_post_json(
+            self._base_url, "/api/chat", payload, timeout=float(self._timeout),
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            data = _json.loads(resp.read())
-
         return data.get("message", {}).get("content", "")
 
     def _parse_response(self, raw: str) -> ClassifierResult:

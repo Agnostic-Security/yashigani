@@ -131,6 +131,21 @@ spec:
               set -euo pipefail
               cp /manifest-ro/service_identities.yaml /manifest-rw/service_identities.yaml
 
+              # MI-6 (multi-instance / YSG-RISK-061): stamp the per-instance SPIFFE
+              # trust domain onto the writable manifest BEFORE the issuer reads it,
+              # so per-instance URI SANs are baked into every leaf cert. K8s parity
+              # with install.sh _apply_trust_domain_to_runtime_manifest. Default
+              # "yashigani.internal" => a no-op rewrite (byte-identical), preserving
+              # single-instance backward-compat. Fail-closed: a failed rewrite must
+              # not let the issuer mint certs with the wrong trust domain.
+              TRUST_DOMAIN='{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}'
+              if [ "$TRUST_DOMAIN" != "yashigani.internal" ]; then
+                sed -E "s#(spiffe://)yashigani\.internal(/)#\1${TRUST_DOMAIN}\2#g" \
+                  /manifest-rw/service_identities.yaml > /manifest-rw/service_identities.yaml.td \
+                  && mv -f /manifest-rw/service_identities.yaml.td /manifest-rw/service_identities.yaml
+                echo "[issuer] MI-6: SPIFFE trust domain set to ${TRUST_DOMAIN}"
+              fi
+
               if [ -f /secrets/.upgrade_mode ]; then
                 echo "[issuer] Upgrade mode: rotating leaves under existing CA root."
                 python -m yashigani.pki.issuer \
@@ -204,9 +219,13 @@ spec:
                 exit 1
               fi
               # Retro #3aj — split materials into two Secrets:
-              #   * leaves Secret (.Values.mtls.secretName, mounted by every
-              #     workload pod): all *_client.{crt,key} + ca_root.crt +
-              #     ca_intermediate.crt. NO ca_*.key.
+              #   * leaves Secret (.Values.mtls.secretName): all
+              #     *_client.{crt,key} + ca_root.crt + ca_intermediate.crt.
+              #     NO ca_*.key. YSG-RISK-053: workload pods mount this Secret
+              #     with per-pod `items:` projections (each pod sees ONLY its
+              #     own leaf/token + trust anchors — never another service's
+              #     key, never caddy_internal_hmac). The Secret object itself
+              #     stays monolithic; the projection is the boundary.
               #   * CA-keys Secret (.Values.mtls.caKeysSecretName, mounted
               #     only by the bootstrap Job + rotation CronJob): the two
               #     CA private keys ca_root.key and ca_intermediate.key.

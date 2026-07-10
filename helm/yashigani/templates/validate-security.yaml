@@ -88,7 +88,112 @@
   Or use the bundled OPA deployment (the default chart configuration).
 */ -}}
 {{- if or (eq .Values.global.environment "production") (eq .Values.global.environment "staging") -}}
-  {{- if not .Values.gateway.env.opaUrl -}}
+  {{- if not ((.Values.gateway).env).opaUrl -}}
     {{- fail "OPA-URL-001 SECURITY VIOLATION: gateway.env.opaUrl is empty in production/staging. When YASHIGANI_OPA_URL is unset, the gateway OPA policy check returns allow:True for every request — all policy enforcement is bypassed. Set gateway.env.opaUrl to the OPA decision endpoint, e.g. --set gateway.env.opaUrl=\"https://yashigani-policy:8181\" or use the bundled OPA deployment (default chart configuration). Do not override to an empty value in production or staging environments." -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /*
+  B11 (DRIFT-001 / Lu A.8.15/A.8.16): warn when wazuh.enabled=true in K8s.
+  The compose stack ships a 3-container Wazuh SIEM. The Helm chart has NO
+  Wazuh templates — wazuh.enabled=true has no operational effect in K8s.
+  An operator who sets this to true has a dangerously false compliance belief:
+  they think SIEM is running when it is not. Fail at template time to prevent
+  that scenario. K8s SIEM requires an external Wazuh deployment.
+*/ -}}
+{{- if (.Values.wazuh).enabled -}}
+  {{- fail "B11 CONFIGURATION ERROR: wazuh.enabled=true has no effect in Kubernetes — this chart ships no Wazuh templates. The Wazuh SIEM stack is only available on the Docker/Podman Compose path. Setting wazuh.enabled=true creates a false compliance posture (ISO 27001 A.8.15/A.8.16): auditors see 'Wazuh active' but no SIEM is running. For K8s SIEM, deploy an external Wazuh cluster and forward container logs to it. Remove wazuh.enabled=true from your values override." -}}
+{{- end -}}
+
+{{- /*
+  B13 (Laura F-002): warn when admissionPolicies.enabled=false in production.
+  Kyverno policies default to off (Kyverno must be pre-installed). In production,
+  a cluster without Kyverno admission control can spawn privileged pods that
+  violate YSG-RISK-008. This guard surfaces a warning so operators are aware of
+  the posture delta — it is a warn (not fail) because Kyverno installation is a
+  cluster-admin prerequisite step, not a chart error.
+  PSA baseline labels on the namespace are rendered unconditionally as a
+  defence-in-depth layer regardless of admissionPolicies.enabled (see namespace.yaml).
+*/ -}}
+{{- if and (eq .Values.global.environment "production") (not .Values.admissionPolicies.enabled) -}}
+  {{- $_ := (printf "B13 SECURITY NOTICE: admissionPolicies.enabled=false in production. Kyverno admission policies (YSG-RISK-008) are not enforcing — privileged pods can be spawned. To enable: install Kyverno cluster-wide, then set admissionPolicies.enabled=true. PSA baseline enforcement labels are applied to the namespace as a defence-in-depth layer regardless of this setting. Document the gap in your risk register with a remediation deadline." | nindent 0) -}}
+{{- end -}}
+
+{{- /*
+  A6 (image version drift): when requireImageDigests=true, enforce that
+  all Yashigani-owned images carry a @sha256: digest pin.
+  Default: false (operators must opt in after running their own image build).
+  This is a template-time assertion only — the chart cannot verify
+  third-party images (OPA, Redis, Grafana etc.) without manifest inspect.
+*/ -}}
+{{- /*
+  Laura SB-2 / MCP-GUARD-001: reject configurations where gateway.mcpServers is
+  non-empty but agentBundles.filesystemMcp.enabled is false.
+
+  Without filesystemMcp enabled:
+    • The Deployment + Service for filesystem-mcp are NOT rendered (no pod
+      exists to receive traffic).
+    • The NetworkPolicy egress rule allowing gateway→TCP/8000 is NOT rendered.
+    • The ingress NetworkPolicy allowing TCP/8000 into Shape-C pods is NOT rendered.
+
+  Yet a JWT would still be issued for an upstream registered in the broker
+  registry (built from YASHIGANI_MCP_SERVERS at gateway startup) — the gateway
+  would forward the call to a non-existent endpoint, proving Laura's path:
+  registry entry present, reachable endpoint absent.
+
+  The correct configuration is: set BOTH, or NEITHER.
+  If you are onboarding a custom MCP server that is NOT the bundled filesystemMcp,
+  you must still set agentBundles.filesystemMcp.enabled=true (or add a dedicated
+  bundle value key for your server). Any future MCP bundle additions MUST add the
+  same gate here, paired with their own enabled flag.
+
+  Finding: Laura SB-2 (2026-05-29).
+*/ -}}
+{{- if and .Values.gateway.mcpServers (not .Values.agentBundles.filesystemMcp.enabled) -}}
+  {{- fail "MCP-GUARD-001 CONFIGURATION ERROR: gateway.mcpServers is non-empty but agentBundles.filesystemMcp.enabled is false. The MCP broker registry would reference upstream(s) with no corresponding Deployment, Service, or NetworkPolicy rendered. A JWT would be issued for an unreachable call target. Set agentBundles.filesystemMcp.enabled=true alongside gateway.mcpServers, or set gateway.mcpServers=[] to disable MCP routing. Finding: Laura SB-2." -}}
+{{- end -}}
+
+{{- /*
+  LANGFLOW-001 (Laura constraint 3): reject langflow-enabled configurations
+  where LANGFLOW_AUTO_LOGIN is overridden to anything other than "true".
+
+  LANGFLOW_AUTO_LOGIN=true is a HARD dependency for the Yashigani reconciler
+  to access the Langflow API programmatically (token exchange, flow registration,
+  health probing). If overridden to "false" or "0" at deploy time, the reconciler
+  loses API access silently — agent flows appear registered but are unreachable.
+
+  The default in values.yaml is "true". This guard catches --set overrides like:
+    --set agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=false
+    --set agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=0
+
+  If you need LANGFLOW_AUTO_LOGIN disabled (non-default auth mode), disable the
+  langflow bundle (agentBundles.langflow.enabled=false) and integrate langflow
+  independently outside of Yashigani's managed flow.
+
+  Finding: Laura reds-review constraint 3, v4.1 design doc (2026-07-09).
+*/ -}}
+{{- if .Values.agentBundles.langflow.enabled -}}
+  {{- $langflowEnv := dict -}}
+  {{- if ((.Values.agentBundles).langflow).env -}}
+    {{- $langflowEnv = .Values.agentBundles.langflow.env -}}
+  {{- end -}}
+  {{- /* toString normalises boolean false → "false", string "false" → "false", int 0 → "0". */ -}}
+  {{- $autoLoginStr := (get $langflowEnv "LANGFLOW_AUTO_LOGIN") | toString -}}
+  {{- if or (eq $autoLoginStr "false") (eq $autoLoginStr "0") -}}
+    {{- fail (printf "LANGFLOW-001 SECURITY VIOLATION: agentBundles.langflow.enabled=true but LANGFLOW_AUTO_LOGIN is set to %q. Yashigani's reconciler requires LANGFLOW_AUTO_LOGIN=true for programmatic API access. Overriding this to false/0 breaks flow registration and health probing silently. Either restore agentBundles.langflow.env.LANGFLOW_AUTO_LOGIN=\"true\" (the default) or disable the bundle with agentBundles.langflow.enabled=false. Finding: Laura constraint 3, v4.1 reds-review." $autoLoginStr) -}}
+  {{- end -}}
+{{- end -}}
+
+{{- if (.Values.imagePolicy).requireImageDigests -}}
+  {{- if not (contains "@sha256:" .Values.gateway.image.tag) -}}
+    {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but gateway.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-gateway:<tag>` and set gateway.image.tag=\"<tag>@sha256:<digest>\"." -}}
+  {{- end -}}
+  {{- if not (contains "@sha256:" .Values.backoffice.image.tag) -}}
+    {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but backoffice.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' yashigani-backoffice:<tag>` and set backoffice.image.tag=\"<tag>@sha256:<digest>\"." -}}
+  {{- end -}}
+  {{- if .Values.caddy.enabled -}}
+    {{- if not (contains "@sha256:" .Values.caddy.image.tag) -}}
+      {{- fail "A6 SECURITY VIOLATION: imagePolicy.requireImageDigests=true but caddy.image.tag does not contain a digest pin (@sha256:...). Pin the digest with `docker inspect --format='{{.RepoDigests}}' caddy:<tag>` and set caddy.image.tag=\"<tag>@sha256:<digest>\"." -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}

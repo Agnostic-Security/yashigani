@@ -67,7 +67,7 @@ async def _run(dry_run: bool = False) -> None:
 
     try:
         # Set tenant context for RLS.
-        await conn.execute(f"SET app.tenant_id = '{_PLATFORM_TENANT_ID}'")
+        await conn.execute(f"SET app.tenant_id = '{_PLATFORM_TENANT_ID}'")  # nosem: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- PostgreSQL SET command (not DML); _PLATFORM_TENANT_ID is a module-level constant UUID ("00000000-0000-0000-0000-000000000000"), not user-supplied input
 
         # Fetch all user-tier records.
         rows: list[Any] = await conn.fetch(

@@ -1,5 +1,5 @@
 {{- /*
-Yashigani v2.23.4 — age-encrypted backup CronJob (MP.L2-3.8.9 / CMMC L2)
+Yashigani v2.25.0 — age-encrypted backup CronJob (MP.L2-3.8.9 / CMMC L2)
 
 Runs scripts/backup.sh daily (default: 02:00 UTC) and pipes the archive
 through age encryption before writing to the output PersistentVolume.
@@ -12,10 +12,17 @@ Encryption model:
 The identity Secret (.Values.backup.identitySecret) is NOT mounted by this
 job — it is only used by the restore path (restore.sh --encrypted).
 
+B5 fix (v2.25.0 P2): agent bundle state directories.
+  - backup.agentBundlePaths entries mount agent PVCs into the CronJob pod.
+  - YASHIGANI_BACKUP_EXTRA_DIRS is passed to backup.sh with the colon-joined
+    mount paths so each agent bundle's state is included in the tarball.
+  - Default: empty list — no agent bundle state included.
+
 Finding: MP.L2-3.8.9 — backup encryption at rest
 CWE: CWE-312 (cleartext storage of sensitive information)
+B5: agent bundle state excluded from backup — silent data loss on restore
 
-Last updated: 2026-05-09T00:00:00+01:00
+Last updated: 2026-05-27T00:00:00+01:00
 */ -}}
 {{- if .Values.backup.enabled }}
 {{- if not .Values.backup.recipientKeyConfigMap }}
@@ -105,6 +112,23 @@ spec:
                 # backup.sh reads this file at startup (Gate 2 — key shape validation).
                 - name: YASHIGANI_BACKUP_RECIPIENT
                   value: "/etc/yashigani/backup-recipient.age.pub"
+                {{- /* B5 (v2.25.0 P2): pass colon-separated agent bundle mount paths to backup.sh.
+                  backup.sh reads YASHIGANI_BACKUP_EXTRA_DIRS and adds each directory as a
+                  separate --directory entry in the tar command, so agent bundle state is included
+                  in the encrypted tarball alongside the core /var/lib/yashigani tree.
+                  Empty when backup.agentBundlePaths is [] (default — no agent state included). */ -}}
+                {{- if .Values.backup.agentBundlePaths }}
+                {{- $mountPaths := list }}
+                {{- range .Values.backup.agentBundlePaths }}
+                {{- if .pvcName }}
+                {{- $mountPaths = append $mountPaths .mountPath }}
+                {{- end }}
+                {{- end }}
+                {{- if $mountPaths }}
+                - name: YASHIGANI_BACKUP_EXTRA_DIRS
+                  value: {{ join ":" $mountPaths | quote }}
+                {{- end }}
+                {{- end }}
               resources:
                 {{- toYaml .Values.backup.resources | nindent 16 }}
               securityContext:
@@ -121,6 +145,16 @@ spec:
                 - name: backup-recipient-key
                   mountPath: /etc/yashigani
                   readOnly: true
+                {{- /* B5: mount each agent bundle PVC at its configured mountPath.
+                  Only rendered when backup.agentBundlePaths is non-empty.
+                  Each entry requires pvcName (existing PVC) and mountPath (where to mount). */ -}}
+                {{- range $i, $p := .Values.backup.agentBundlePaths }}
+                {{- if $p.pvcName }}
+                - name: {{ printf "agent-bundle-%d" $i }}
+                  mountPath: {{ $p.mountPath | quote }}
+                  readOnly: true
+                {{- end }}
+                {{- end }}
           volumes:
             - name: backup-script
               configMap:
@@ -143,4 +177,13 @@ spec:
               {{- else }}
               emptyDir: {}
               {{- end }}
+            {{- /* B5: one PVC volume per agent bundle path entry. */ -}}
+            {{- range $i, $p := .Values.backup.agentBundlePaths }}
+            {{- if $p.pvcName }}
+            - name: {{ printf "agent-bundle-%d" $i }}
+              persistentVolumeClaim:
+                claimName: {{ $p.pvcName | quote }}
+                readOnly: true
+            {{- end }}
+            {{- end }}
 {{- end }}

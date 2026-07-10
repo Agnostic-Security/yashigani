@@ -16,13 +16,17 @@ Routes:
   PUT    /admin/agents/{agent_id}               — update agent fields
   DELETE /admin/agents/{agent_id}               — deactivate (soft delete)
   POST   /admin/agents/{agent_id}/token/rotate  — rotate PSK, return new token once
+  POST   /admin/agents/{agent_id}/cert/rotate   — svid-sidecar self-rotation: re-mint
+                                                  the caller's OWN per-instance leaf
+                                                  (mTLS SPIFFE-gated, NO admin session —
+                                                  v4.1 Phase 1, Nico Q1 must-fix #7)
 
   GET    /admin/identities                      — list HUMAN identities from IdentityRegistry
                                                   (v2.23.4 F4 fix — surfaces local-auth users who
                                                   have logged in at least once and been auto-registered
                                                   via da6de8b; also lists SSO-registered identities)
 
-Last updated: 2026-05-17T00:00:00+01:00
+Last updated: 2026-07-06T00:00:00+00:00 (v4.1 Phase 1 — cert/rotate, Nico Q1)
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
+
+from yashigani.backoffice._ssrf import assert_safe_outbound_url
 
 # ---------------------------------------------------------------------------
 # AVA-2026-04-29-001 — Stored XSS: reject HTML tags in free-text agent fields
@@ -109,102 +115,22 @@ router = APIRouter()
 def _assert_safe_upstream_url(url: str) -> str:
     """Assert that ``url`` is safe to store as an agent's upstream_url.
 
-    Pentest #95 (TM-V231-004): the prior validator was just `Field(min_length=1,
-    max_length=512)`. An authenticated admin could register an agent with
-    ``file:///etc/passwd``, ``gopher://redis:6380/``, ``http://169.254.169.254/``
-    (cloud metadata SSRF), or any internal-service URL. OPA's identity-active
-    gate at invocation time was the only compensating control, and that gate
-    is bypassable by an admin who can also activate the caller identity
-    (TA-3 insider). Admin-trust-boundary SSRF is admin-trust-boundary SSRF.
+    Delegates to the shared SSRF guard (backoffice/_ssrf.py — FIND-3.0-001).
+    Pentest #95 (TM-V231-004): previously hand-rolled inline; extracted into a
+    shared helper so that every admin-configurable outbound URL (agents,
+    SIEM endpoint, …) uses one tested guard.
 
-    Allowed:
-      - Scheme: http or https ONLY. Anything else (file, gopher, ftp, dict,
-        ldap, jar, ws, ...) is rejected outright.
-      - Host: must NOT be a loopback / link-local / multicast / cloud-metadata
-        IP. The link-local 169.254.169.254 is the AWS/GCP/Azure metadata
-        endpoint and is the primary SSRF target.
-      - Optional internal-service allowlist via ``YASHIGANI_AGENT_UPSTREAM_HOSTNAMES``
-        (comma-separated, case-insensitive). Hosts in the allowlist are
-        permitted to be RFC 1918 / loopback / Docker-bridge — needed so
-        operators can run agents like ``yashigani-letta`` or ``openclaw`` on
-        the internal mesh. Empty default — operator MUST explicitly allow
-        internal hosts to permit them.
+    Allowed: http/https, public-routable hosts, or hosts in YASHIGANI_AGENT_UPSTREAM_HOSTNAMES.
+    Rejected: non-http(s) scheme, loopback, link-local/IMDS, RFC-1918, multicast, reserved.
 
     Returns the URL unchanged on PASS. Raises ValueError on any violation
     (Pydantic v2 turns this into HTTP 422 with the structured error body).
     """
-    import ipaddress
-    import socket
-
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
-
-    if scheme not in ("http", "https"):
-        raise ValueError(
-            f"upstream_url scheme {scheme!r} not allowed — only http and https are accepted (CWE-918 / TM-V231-004)"
-        )
-
-    if not host:
-        raise ValueError(
-            f"upstream_url has no hostname (parsed from {url!r}) — agent upstreams "
-            "must be addressable HTTP(S) endpoints"
-        )
-
-    raw_allowlist = os.getenv("YASHIGANI_AGENT_UPSTREAM_HOSTNAMES", "")
-    internal_allowed = {h.strip().lower() for h in raw_allowlist.split(",") if h.strip()}
-    if host in internal_allowed:
-        return url  # Operator explicitly allowed this internal host.
-
-    # For everything else: refuse SSRF-prone IPs. Resolve hostname to IP if
-    # given a name; if resolution fails, refuse (we don't store URLs that
-    # can't be resolved at registration time).
-    try:
-        addrinfo = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        addrs = {info[4][0] for info in addrinfo}
-    except (socket.gaierror, socket.herror):
-        # Hostname doesn't resolve — could be intentional (e.g., DNS not yet
-        # populated for a service that's about to come up). Fall through to
-        # the literal-IP check below; if `host` is itself a literal IP we
-        # check it directly.
-        addrs = {host}
-
-    for addr_str in addrs:
-        try:
-            ip = ipaddress.ip_address(addr_str)
-        except ValueError:
-            continue  # not an IP literal, skip
-        if ip.is_loopback:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to loopback {addr_str} — "
-                "loopback addresses are SSRF targets; add the hostname to "
-                "YASHIGANI_AGENT_UPSTREAM_HOSTNAMES if intentional "
-                "(CWE-918 / TM-V231-004)"
-            )
-        if ip.is_link_local:
-            # 169.254.169.254 is the cloud-metadata endpoint — primary SSRF target.
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to link-local {addr_str} — "
-                "link-local addresses (incl. cloud metadata 169.254.169.254) "
-                "are SSRF targets and never valid for agent upstreams "
-                "(CWE-918 / TM-V231-004)"
-            )
-        if ip.is_multicast:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to multicast {addr_str} — "
-                "multicast addresses are not valid HTTP(S) endpoints"
-            )
-        if ip.is_private:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to RFC 1918 private "
-                f"{addr_str} — private addresses are SSRF-prone; add the "
-                "hostname to YASHIGANI_AGENT_UPSTREAM_HOSTNAMES if "
-                "intentional (CWE-918 / TM-V231-004)"
-            )
-        if ip.is_reserved:
-            raise ValueError(f"upstream_url host {host!r} resolves to reserved {addr_str} (CWE-918 / TM-V231-004)")
-
-    return url
+    return assert_safe_outbound_url(
+        url,
+        allowlist_env="YASHIGANI_AGENT_UPSTREAM_HOSTNAMES",
+        label="upstream_url",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +262,21 @@ class AgentResponse(BaseModel):
     # v0.9.0 — token rotation metadata (F-09)
     token_last_rotated: str = Field(default="")
     token_rotation_schedule: str = Field(default="")
+    # 4.0 admin-UI surfacing (additive, backward-compatible). The registry already
+    # decodes these (see registry._decode_agent); previously _to_response dropped
+    # them so the admin SPA could not distinguish service agents from NHIs /
+    # governed Langflow callees, nor show SVID/cert status. Defaults keep the
+    # shape stable for pre-4.0 ("agent") entries which have no NHI block.
+    #   kind         — "agent" | "nhi" | "persona" (callees register as kind="agent"
+    #                  with the "user_agent_callee" group, see user_agents.commit_agent_template)
+    #   svid_issued  — None for non-NHI; bool for NHI (admin-approval gate, RISK-097)
+    #   spiffe_id    — minted SPIFFE id once an NHI SVID is approved
+    #   owner_identity_id / template_id — NHI/callee lineage (which user/template)
+    kind: str = Field(default="agent")
+    svid_issued: Optional[bool] = Field(default=None)
+    spiffe_id: str = Field(default="")
+    owner_identity_id: str = Field(default="")
+    template_id: str = Field(default="")
 
 
 class AgentRegisterResponse(AgentResponse):
@@ -351,6 +292,21 @@ class AgentRotateResponse(BaseModel):
     agent_id: str
     token: str = Field(description="New plaintext PSK token. Store immediately — never shown again.")
     quick_start: dict = Field(default_factory=dict)
+
+
+class AgentCertRotateResponse(BaseModel):
+    """Response for POST /admin/agents/{agent_id}/cert/rotate (v4.1 Phase 1, Nico Q1).
+
+    Field names ``cert_pem`` / ``key_pem`` are the rotate.sh contract
+    (docker/svid-sidecar/rotate.sh — grep-based extraction, do not rename).
+    ``cert_pem`` is the leaf + intermediate bundle, byte-identical in shape to
+    the install-time /init/client.crt.
+    """
+    agent_id: str
+    spiffe_id: str
+    cert_pem: str = Field(description="New leaf cert PEM bundle (leaf + intermediate).")
+    key_pem: str = Field(description="New private key PEM. Delivered once over mTLS.")
+    cert_not_after: str = Field(default="", description="ISO-8601 expiry of the new leaf.")
 
 
 class AgentQuickStartResponse(BaseModel):
@@ -377,6 +333,11 @@ class IdentityResponse(BaseModel):
     status: str
     created_at: str
     last_seen_at: str = Field(default="")
+
+
+# Pydantic v2: rebuild so Optional hints (with __future__ annotations) resolve.
+AgentResponse.model_rebuild()
+AgentRegisterResponse.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +383,13 @@ def _to_response(agent: dict) -> AgentResponse:
         allowed_cidrs=agent.get("allowed_cidrs", []),
         token_last_rotated=agent.get("token_last_rotated", ""),
         token_rotation_schedule=agent.get("token_rotation_schedule", ""),
+        # 4.0 admin-UI fields (additive). NHI-only fields default sensibly for
+        # plain "agent" entries that have no NHI block in the registry decode.
+        kind=agent.get("kind", "agent"),
+        svid_issued=agent.get("svid_issued"),
+        spiffe_id=agent.get("spiffe_id", ""),
+        owner_identity_id=agent.get("owner_identity_id", ""),
+        template_id=agent.get("template_id", ""),
     )
 
 
@@ -845,6 +813,35 @@ async def deactivate_agent(
     reason = (body.reason if body else "") or ""
     registry.deactivate(agent_id)
 
+    # v4.1 Phase 1a GAP-4 — NHI deactivate revokes the runtime-manifest
+    # identity entry so the OPA baseline push / sidecar binding check fails
+    # the instance immediately (not at cert expiry). Best-effort: a missing
+    # manifest/entry is logged by the issuer, never blocks deactivation.
+    if existing.get("kind") == "nhi":
+        try:
+            from pathlib import Path as _Path
+            from yashigani.pki.issuer import IssuerPaths, revoke_agent_identity
+
+            _pki_paths = IssuerPaths(
+                secrets_dir=_Path(os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")),
+                manifest_path=_Path(os.getenv(
+                    "YASHIGANI_SERVICE_MANIFEST_PATH",
+                    "/etc/yashigani/service_identities.yaml",
+                )),
+            )
+            revoke_agent_identity(
+                _pki_paths,
+                tenant_id=existing.get("owner_identity_id", "tenant"),
+                agent_name=existing.get("name", agent_id),
+                instance_id=agent_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "NHI deactivate: runtime-manifest revocation failed for %s "
+                "(deactivation itself succeeded — registry indexes cleared): %s",
+                agent_id, exc,
+            )
+
     # Audit
     if audit is not None:
         try:
@@ -901,6 +898,344 @@ async def rotate_agent_token(
         agent_id=agent_id,
         token=plaintext_token,
         quick_start=_build_quick_start(agent_id, plaintext_token),
+    )
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1 — POST /admin/agents/{agent_id}/cert/rotate
+# (Nico Q1 — unified-sidecar review must-fix #7, BLOCKER)
+#
+# The svid-sidecar (docker/svid-sidecar/rotate.sh:180) POSTs here over mTLS
+# when < RENEWAL_THRESHOLD_FRAC of the leaf lifetime remains.  The endpoint
+# was ACL'd (service_identities.yaml:398-404) and documented
+# (Dockerfile.svid-sidecar) since 4.0 Phase 0 but never implemented —
+# continuously-running bundled agents hard-failed at leaf expiry (≤90d).
+#
+# Design (per the review synthesis):
+#   * Key off the PRESENTED cert's FULL per-instance SPIFFE — NOT the
+#     {agent_id} path param / sidecar AGENT_ID env, which is the bare server
+#     name (codegen.py) and ambiguous across tenants/instances.  The path
+#     param is only cross-checked by the ACL gate
+#     (verify_spiffe_matches_agent_id).
+#   * Re-mint with the SAME instance_id (nhi_id) + the registry-CURRENT
+#     scope_hash / image_digest from the durable approval record.
+#   * DENY (409) if the tool surface CHANGED since approval — a changed
+#     surface must go through re-approval; silently re-binding it at rotation
+#     would bypass change-prevention (GAP-2).
+#   * No admin session: possession of the CURRENT (unexpired, unrevoked)
+#     agent leaf is the rotation credential, enforced by the mTLS listener +
+#     the SPIFFE ACL gate.  Only the agent's own identity passes the gate for
+#     its own {agent_id}; exact-id callers (caddy/backoffice) never parse as
+#     agent SPIFFEs and are refused below.
+# ---------------------------------------------------------------------------
+
+_CERT_ROTATE_ACL_PATH = "/admin/agents/*/cert/rotate"
+
+
+def _rotate_pki_paths():
+    """IssuerPaths from the live env (same wiring as approve/deactivate)."""
+    from pathlib import Path as _Path
+    from yashigani.pki.issuer import IssuerPaths
+
+    return IssuerPaths(
+        secrets_dir=_Path(os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")),
+        manifest_path=_Path(os.getenv(
+            "YASHIGANI_SERVICE_MANIFEST_PATH",
+            "/etc/yashigani/service_identities.yaml",
+        )),
+    )
+
+
+def _runtime_manifest_agent_entry(pki_paths: Any, entry_name: str) -> Optional[dict]:
+    """Return the runtime-manifest entry for *entry_name*, or None when absent.
+
+    The runtime manifest (mint_agent_leaf appends; revoke_agent_identity flips
+    ``revoked``) is the durable record of EVERY minted agent identity —
+    including install.sh CLI mints that have no registry/envelope row.
+    Fail-closed: an unreadable manifest raises 503 (we cannot prove the
+    identity is still live, so we refuse to re-mint).
+    """
+    import yaml as _yaml
+
+    runtime_path = pki_paths.runtime_manifest
+    if not runtime_path.exists():
+        return None
+    try:
+        doc = _yaml.safe_load(runtime_path.read_text()) or {}
+    except Exception as exc:
+        logger.error("cert-rotate: runtime manifest unreadable at %s: %s", runtime_path, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "runtime_manifest_unreadable",
+                "message": "Agent identity manifest unreadable — rotation refused (fail-closed).",
+            },
+        )
+    for entry in doc.get("agent_identities") or []:
+        if isinstance(entry, dict) and entry.get("name") == entry_name:
+            return entry
+    return None
+
+
+def _deny_surface_changed(spiffe_id: str, approved: str, current: str) -> HTTPException:
+    logger.warning(
+        "cert-rotate: DENIED — tool surface changed since approval for %s "
+        "(approved=%s current=%s). Re-approval required.",
+        spiffe_id, approved[:24], current[:24],
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "surface_changed_reapproval_required",
+            "message": (
+                "The agent's tool surface changed since it was approved. "
+                "Rotation would re-bind an unapproved surface (change-prevention "
+                "bypass). Re-approve the agent (admin approval flow) to mint a "
+                "new identity; the current cert stays valid until its expiry."
+            ),
+        },
+    )
+
+
+@router.post(
+    "/admin/agents/{agent_id}/cert/rotate",
+    response_model=AgentCertRotateResponse,
+)
+async def rotate_agent_cert(
+    agent_id: str,
+    caller_spiffe: str = Depends(require_spiffe_id(_CERT_ROTATE_ACL_PATH)),
+):
+    """Re-mint the CALLING agent's own leaf cert (svid-sidecar rotation).
+
+    Identity is the presented client cert's SPIFFE URI (Caddy/middleware
+    validated) — the ``agent_id`` path param is only the ACL-gate cross-check.
+    """
+    from yashigani.identity.trust_domain import parse_agent_spiffe_uri
+    from yashigani.pki.binding import tool_surface_hash
+    from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
+
+    parsed = parse_agent_spiffe_uri(caller_spiffe)
+    if parsed is None:
+        # caddy/backoffice pass the ACL's exact-id list but carry no agent
+        # identity — there is nothing they could rotate "as themselves".
+        # Admin-initiated re-issuance is the approve flow, not this endpoint.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "cert_rotate_requires_agent_identity",
+                "message": (
+                    "Only an agent's own svid-sidecar identity may rotate its "
+                    "cert. Use the admin approval flow to (re-)issue agent "
+                    "identities."
+                ),
+            },
+        )
+    tenant_id, agent_name, instance_id = parsed
+
+    pki_paths = _rotate_pki_paths()
+    entry_name = IssuerPaths.agent_entry_name(tenant_id, agent_name, instance_id)
+
+    # 1. Durable identity record — runtime manifest (covers CLI-minted bundled
+    #    agents too).  Fail-closed on absent or revoked entries.
+    entry = _runtime_manifest_agent_entry(pki_paths, entry_name)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "identity_not_provisioned",
+                "message": "No minted identity record exists for this SPIFFE ID.",
+            },
+        )
+    if entry.get("revoked"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "identity_revoked",
+                "message": "This agent identity is revoked — rotation refused.",
+            },
+        )
+    entry_spiffe = entry.get("spiffe_id", "")
+    if entry_spiffe and entry_spiffe != caller_spiffe:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "spiffe_identity_mismatch",
+                "message": "Presented SPIFFE ID does not match the minted identity record.",
+            },
+        )
+
+    # 2. Approval record + change-prevention (GAP-2).  Instanced identities
+    #    (3-segment SPIFFE) MUST have a durable approval record; the
+    #    registry-CURRENT scope_hash / image_digest are re-bound at mint.
+    scope_hash = ""
+    image_digest = ""
+    if instance_id:
+        reg = backoffice_state.agent_registry
+        nhi = reg.get(instance_id) if reg is not None else None
+        if nhi is not None:
+            # 2a. Registry NHI (approve_nhi_svid / user_agents instantiate path).
+            if nhi.get("kind") != "nhi" or not nhi.get("svid_issued"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_not_approved",
+                        "message": "Agent has no approved SVID — rotation refused.",
+                    },
+                )
+            if nhi.get("status") != "active":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_not_active",
+                        "message": "Agent is not active — rotation refused.",
+                    },
+                )
+            if nhi.get("spiffe_id", "") != caller_spiffe:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "spiffe_identity_mismatch",
+                        "message": "Presented SPIFFE ID does not match the registry record.",
+                    },
+                )
+            approved_scope = nhi.get("scope_hash") or ""
+            current_scope = tool_surface_hash(nhi.get("allowed_tools") or [])
+            if approved_scope and current_scope != approved_scope:
+                raise _deny_surface_changed(caller_spiffe, approved_scope, current_scope)
+            scope_hash = approved_scope or current_scope
+            image_digest = nhi.get("image_digest") or ""
+        else:
+            # 2b. MCP-onboarded instance (mcp_onboard approve transaction) —
+            #     the ACTIVE capability envelope is the durable approval record.
+            from yashigani.backoffice.routes.mcp_servers import (
+                _durable_registry_store,
+                _envelope_service,
+            )
+
+            svc = _envelope_service()  # raises 503 when the DB pool is down
+            rec = await svc.get_active_envelope(f"{tenant_id}:{agent_name}")
+            if rec is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_record_not_found",
+                        "message": (
+                            "No durable approval record exists for this "
+                            "per-instance identity — rotation refused (fail-closed)."
+                        ),
+                    },
+                )
+            if (
+                not rec.svid_issued
+                or rec.svid_instance_id != instance_id
+                or rec.svid_spiffe_id != caller_spiffe
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "identity_superseded_reapproval_required",
+                        "message": (
+                            "Presented identity does not match the active approval "
+                            "record (server re-onboarded or SVID superseded). "
+                            "Re-approve to mint a fresh identity."
+                        ),
+                    },
+                )
+            # Change-prevention: current_surface_hash advances on triage
+            # re-pins; surface_set_hash is the approved set.  Drift ⇒ deny.
+            if (
+                rec.current_surface_hash
+                and rec.surface_set_hash
+                and rec.current_surface_hash != rec.surface_set_hash
+            ):
+                raise _deny_surface_changed(
+                    caller_spiffe, rec.surface_set_hash, rec.current_surface_hash
+                )
+            # Registry-CURRENT surface — same computation as the approve mint
+            # (mcp_onboard.py: tool_surface_hash(sorted(env.tools.keys()))).
+            scope_hash = tool_surface_hash(sorted(rec.envelope.tools.keys()))
+            store = _durable_registry_store()
+            descriptor = store.get(tenant_id, agent_name) if store is not None else None
+            if descriptor is not None:
+                image_digest = descriptor.get("image_digest", "") or ""
+                baseline = store.get_baseline(tenant_id, agent_name)
+                baseline_hash = (baseline or {}).get("surface_hash", "")
+                if baseline_hash and baseline_hash != scope_hash:
+                    raise _deny_surface_changed(caller_spiffe, baseline_hash, scope_hash)
+            else:
+                logger.warning(
+                    "cert-rotate: durable broker registry unavailable for %s — "
+                    "re-minting with image_digest='' (binding covers the tool "
+                    "surface only; see pki/binding.py).",
+                    caller_spiffe,
+                )
+    # Legacy 2-segment identities (install.sh CLI mints — bundled agents):
+    # no registry/envelope record exists by design; the runtime-manifest check
+    # above is the authorisation record.  scope_hash/image_digest stay "" —
+    # byte-identical re-mint of the legacy identity (no binding extension),
+    # matching the original CLI issuance.
+
+    # 3. Re-mint — same instance_id, registry-current binding inputs.
+    try:
+        new_spiffe = mint_agent_leaf(
+            pki_paths,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            instance_id=instance_id,
+            scope_hash=scope_hash,
+            image_digest=image_digest,
+            approved_by=f"svid-rotation:{caller_spiffe}",
+            audit_writer=backoffice_state.audit_writer,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("cert-rotate: mint_agent_leaf FAILED for %s: %s", caller_spiffe, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "pki_mint_failed",
+                "message": "Leaf re-issuance failed — existing cert remains valid until expiry.",
+            },
+        )
+
+    if new_spiffe != caller_spiffe:
+        # Invariant: same (tenant, name, instance) must reproduce the same
+        # SPIFFE URI.  A mismatch means trust-domain drift — never hand out
+        # a cert for a different identity than the caller presented.
+        logger.error(
+            "cert-rotate: minted SPIFFE %r != presented %r — trust-domain drift? "
+            "Response withheld (fail-closed).", new_spiffe, caller_spiffe,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "identity_mismatch_after_mint"},
+        )
+
+    cert_pem = pki_paths.agent_cert(tenant_id, agent_name, instance_id).read_text()
+    key_pem = pki_paths.agent_key(tenant_id, agent_name, instance_id).read_text()
+
+    cert_not_after = ""
+    try:
+        from cryptography import x509 as _x509
+
+        cert_not_after = _x509.load_pem_x509_certificates(
+            cert_pem.encode()
+        )[0].not_valid_after_utc.isoformat()
+    except Exception as exc:  # pragma: no cover — informational field only
+        logger.warning("cert-rotate: could not parse new cert not_after: %s", exc)
+
+    logger.info(
+        "cert-rotate: re-minted leaf for %s (agent_id path=%r, not_after=%s)",
+        caller_spiffe, agent_id, cert_not_after,
+    )
+
+    return AgentCertRotateResponse(
+        agent_id=agent_id,
+        spiffe_id=new_spiffe,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        cert_not_after=cert_not_after,
     )
 
 
@@ -979,3 +1314,189 @@ async def list_identities(
         )
         for ident in identities
     ]
+
+
+# ---------------------------------------------------------------------------
+# NHI SVID approval (4.0 Phase 3 — RISK-097 / admin-approval-gated SVID)
+#
+# POST /admin/nhi/{nhi_id}/approve
+#
+# Requires StepUpAdminSession (ASVS V6.8.4 — step-up TOTP for high-value ops).
+#
+# Flow (BUG-A v4.1 Phase 0 — mint BEFORE approve, fail-closed):
+#   1. Validate nhi_id refers to a registered NHI (kind="nhi").
+#   2. Call mint_agent_leaf() to issue the PKI leaf cert (internal-CA mode).
+#      Fail-closed: mint failure → NhiSvidIssuanceFailedEvent audit + 502;
+#      svid_issued is NOT set and the NHI stays NHI_PENDING_APPROVAL.
+#   3. Call registry.approve_svid(nhi_id) — sets svid_issued=1, adds to active index.
+#   4. Emit NhiSvidApprovedEvent to the tamper-evident audit hash-chain.
+#   5. Return {nhi_id, spiffe_id, approved: True}.
+#
+# Fail-closed: unknown nhi_id or non-NHI kind → 404; PKI mint failure → 502.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/admin/nhi/{nhi_id}/approve", status_code=200)
+async def approve_nhi_svid(
+    nhi_id: str,
+    session: StepUpAdminSession,
+):
+    """Admin-approve an NHI SVID (step-up required, RISK-097).
+
+    Issues a PKI leaf cert for the NHI's SPIFFE identity FIRST, then
+    transitions svid_issued=False → True in the agent registry so the NHI
+    can be resolved by the gateway (``_resolve_nhi_identity`` checks this flag).
+    Fail-closed: if the mint fails, svid_issued is NOT set, a
+    ``NhiSvidIssuanceFailedEvent`` is written to the audit chain, and the
+    request fails with 502 (BUG-A, v4.1 Phase 0).
+
+    Without approval, the NHI cannot run — the gateway returns 403
+    ``NHI_PENDING_APPROVAL`` on every invocation (fail-closed).
+
+    Emits ``NhiSvidApprovedEvent`` to the tamper-evident audit chain.
+    Step-up TOTP is required (ASVS V6.8.4).
+    """
+    registry = _get_registry()
+
+    # Validate: must be a registered NHI
+    nhi = registry.get(nhi_id)
+    if nhi is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "nhi_not_found", "message": f"No NHI found with id {nhi_id!r}."},
+        )
+    if nhi.get("kind") != "nhi":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "not_an_nhi",
+                "message": f"{nhi_id!r} is registered as kind={nhi.get('kind')!r}, not 'nhi'.",
+            },
+        )
+
+    # 2. PKI: mint agent leaf cert FIRST (fail-closed — BUG-A, v4.1 Phase 0).
+    #    svid_issued is only ever set AFTER a real leaf cert exists on disk.
+    #    (registry.approve_svid docstring: "Called ... after the PKI leaf cert
+    #    is issued" — the previous best-effort order violated that contract and
+    #    left registries claiming issued SVIDs with no cert on disk.)
+    spiffe_id: str = nhi.get("spiffe_id", "")
+    try:
+        from pathlib import Path
+        from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
+
+        _secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+        _manifest_path = os.getenv(
+            "YASHIGANI_SERVICE_MANIFEST_PATH",
+            "/etc/yashigani/service_identities.yaml",
+        )
+        pki_paths = IssuerPaths(
+            secrets_dir=Path(_secrets_dir),
+            manifest_path=Path(_manifest_path),
+        )
+        tenant_id = nhi.get("owner_identity_id", "tenant")
+        agent_name = nhi.get("name", nhi_id)
+        # v4.1 Phase 1a GAP-2 — change-prevention baseline. scope_hash is
+        # stored at register_nhi time (instantiate path); for entries
+        # registered before that field existed, recompute from the SAME
+        # canonical encoding over the registry's allowed_tools.
+        from yashigani.pki.binding import tool_surface_hash
+        scope_hash = nhi.get("scope_hash") or tool_surface_hash(
+            nhi.get("allowed_tools") or []
+        )
+        # OCI image digest pinned at approve time. Populated by PoolManager
+        # once the pool pins digests; "" (unpinned) is recorded honestly —
+        # the binding then covers the tool surface only (see pki/binding.py).
+        image_digest = nhi.get("image_digest") or ""
+        spiffe_id = mint_agent_leaf(
+            pki_paths,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            # GAP-1 — per-instance identity: nhi_id becomes the instance
+            # segment in BOTH the SPIFFE URI and the cert/key file names.
+            instance_id=nhi_id,
+            scope_hash=scope_hash,
+            image_digest=image_digest,
+            approved_by=session.account_id,
+            audit_writer=backoffice_state.audit_writer,
+        )
+        # Persist the minted SPIFFE ID back to the registry entry
+        registry.update(nhi_id, spiffe_id=spiffe_id)
+        logger.info(
+            "NHI approve: mint_agent_leaf succeeded nhi_id=%s spiffe_id=%s",
+            nhi_id, spiffe_id,
+        )
+    except Exception as exc:
+        # Fail-closed: the approval is ABORTED — svid_issued stays 0, the NHI
+        # remains NHI_PENDING_APPROVAL at the gateway. A registry that claims
+        # issued with no cert on disk is unacceptable (BUG-A, v4.1 Phase 0).
+        logger.error(
+            "NHI approve: mint_agent_leaf FAILED for nhi_id=%s — approval aborted, "
+            "svid_issued NOT set (fail-closed). Fix the PKI issuer and re-approve. "
+            "Error: %s",
+            nhi_id, exc,
+        )
+        aw_fail = backoffice_state.audit_writer
+        if aw_fail is not None:
+            try:
+                from yashigani.audit.schema import NhiSvidIssuanceFailedEvent
+                aw_fail.write(NhiSvidIssuanceFailedEvent(
+                    approver_account=session.account_id,
+                    nhi_id=nhi_id,
+                    spiffe_id=spiffe_id,
+                    error_type=type(exc).__name__,
+                ))
+            except Exception as audit_exc:
+                logger.error(
+                    "NhiSvidIssuanceFailedEvent audit write failed (nhi_id=%s): %s",
+                    nhi_id, audit_exc,
+                )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "svid_issuance_failed",
+                "message": (
+                    "PKI leaf cert issuance failed — approval aborted (fail-closed). "
+                    "svid_issued was NOT set; the NHI remains pending. "
+                    "Check backoffice logs and re-approve once the PKI issuer is healthy."
+                ),
+            },
+        )
+
+    # 3. Approve: set svid_issued=1 + add to active index (mint succeeded above)
+    try:
+        registry.approve_svid(nhi_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "nhi_not_found", "message": str(exc)},
+        )
+
+    # 4. Audit: emit NhiSvidApprovedEvent to the tamper-evident hash-chain
+    aw = backoffice_state.audit_writer
+    if aw is not None:
+        try:
+            from yashigani.audit.schema import NhiSvidApprovedEvent
+            aw.write(NhiSvidApprovedEvent(
+                approver_account=session.account_id,
+                nhi_id=nhi_id,
+                spiffe_id=spiffe_id,
+                step_up_verified=True,
+            ))
+        except Exception as exc:
+            logger.warning("NhiSvidApprovedEvent audit write failed (nhi_id=%s): %s", nhi_id, exc)
+
+    logger.info(
+        "NHI SVID approved nhi_id=%s approver=%s spiffe_id=%r",
+        nhi_id, session.account_id, spiffe_id,
+    )
+
+    return {
+        "nhi_id": nhi_id,
+        "approved": True,
+        "spiffe_id": spiffe_id,
+        "message": (
+            "NHI SVID approved. The NHI is now resolvable by the gateway. "
+            "Restart or reload the gateway token-role-map to pick up the new NHI token "
+            "(GET /internal/nhi/refresh on the gateway internal port, or restart gateway)."
+        ),
+    }

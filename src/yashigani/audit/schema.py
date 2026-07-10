@@ -96,6 +96,13 @@ class EventType(str, Enum):
     AGENT_UPDATED = "AGENT_UPDATED"
     AGENT_DEACTIVATED = "AGENT_DEACTIVATED"
     AGENT_TOKEN_ROTATED = "AGENT_TOKEN_ROTATED"
+    # Agent SVID lifecycle — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+    # Emitted by pki/issuer.mint_agent_leaf() and the sidecar rotation callback.
+    # These are governance actions and MUST be on the tamper-evident hash chain.
+    AGENT_SVID_ISSUED = "AGENT_SVID_ISSUED"
+    AGENT_SVID_ROTATED = "AGENT_SVID_ROTATED"
+    AGENT_SVID_REVOKED = "AGENT_SVID_REVOKED"
+    AGENT_SVID_ROTATION_FAILED = "AGENT_SVID_ROTATION_FAILED"
     # Agent auth / routing
     AGENT_AUTH_FAILED = "AGENT_AUTH_FAILED"
     AGENT_CALL_ALLOWED = "AGENT_CALL_ALLOWED"
@@ -117,8 +124,38 @@ class EventType(str, Enum):
     OPA_ASSISTANT_SUGGESTION_GENERATED = "OPA_ASSISTANT_SUGGESTION_GENERATED"
     OPA_ASSISTANT_SUGGESTION_APPLIED = "OPA_ASSISTANT_SUGGESTION_APPLIED"
     OPA_ASSISTANT_SUGGESTION_REJECTED = "OPA_ASSISTANT_SUGGESTION_REJECTED"
+    # SEC-OPA-001 Mode B — Rego module authoring
+    OPA_ASSISTANT_REGO_GENERATED = "OPA_ASSISTANT_REGO_GENERATED"
+    OPA_ASSISTANT_REGO_APPLIED = "OPA_ASSISTANT_REGO_APPLIED"
+    OPA_ASSISTANT_REGO_REJECTED = "OPA_ASSISTANT_REGO_REJECTED"
     # v0.9.0 — Response-path inspection
     RESPONSE_INJECTION_DETECTED = "RESPONSE_INJECTION_DETECTED"
+    # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
+    ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
+    ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
+    ORCHESTRATION_BLOCKED_STEP = "ORCHESTRATION_BLOCKED_STEP"
+    ORCHESTRATION_DEPTH_CEILING = "ORCHESTRATION_DEPTH_CEILING"
+    # v2.25.4 — LAURA-ORCH-001: a tool hop emitted in direct response to prior
+    # tool-RESULT content (an injection-originated hop).  Flagged + budget-capped
+    # even though OPA-every-hop still adjudicates it.
+    ORCHESTRATION_INJECTION_HOP = "ORCHESTRATION_INJECTION_HOP"
+    # v2.25.4 — LAURA-ORCH-001(c): the model placed content derived from a prior
+    # RESTRICTED-sensitivity tool result into the ARGS of an outbound tool call
+    # (data-exfil-via-tool-args).  The hop is denied on egress before dispatch.
+    ORCHESTRATION_EXFIL_BLOCKED = "ORCHESTRATION_EXFIL_BLOCKED"
+    # v2.25.5 — G-ORCH-OPA-3: a brain-REASONING (A→L) leg whose response-leg OPA
+    # decision would have BLOCKED was RELAXED (evaluate-and-log) so the
+    # orchestrator's own cognition can complete.  The verdict is still computed +
+    # recorded here; only the 403/substitute ACTION was relaxed.  A would-have-
+    # blocked reasoning turn is greppable via this event (relaxation_applied=true).
+    ORCHESTRATION_BRAIN_REASONING_RELAXED = "ORCHESTRATION_BRAIN_REASONING_RELAXED"
+    # v4.0 — external_api connection enforcement (Item A — deferred from 3.1).
+    # Emitted when an orchestrator api__ tool hop is DENIED by the runtime
+    # external_api grant check (org grant absent/revoked → blocked before HTTP call).
+    EXTERNAL_API_BLOCKED = "EXTERNAL_API_BLOCKED"
+    # v4.0 — mcp_id lifecycle events (Item B — mcp_id minting + backfill reconcile)
+    MCP_ID_MINTED = "MCP_ID_MINTED"
+    MCP_ID_GRANT_RECONCILED = "MCP_ID_GRANT_RECONCILED"
     # v0.9.0 — Break-glass (S-04)
     BREAK_GLASS_ACTIVATED = "BREAK_GLASS_ACTIVATED"
     BREAK_GLASS_EXPIRED = "BREAK_GLASS_EXPIRED"
@@ -169,6 +206,14 @@ class EventType(str, Enum):
     # request or response body.  Raw PII values are NEVER logged — only
     # pii_type labels and a count.
     PII_DETECTED = "PII_DETECTED"
+    # v2.25.2 — F-RT1 (red-team verified 2026-05-30): encoded-payload audit.
+    # ENCODED_PAYLOAD_DETECTED: emitted when the decode-before-classify stage
+    # encounters a long, encoded-looking, high-entropy blob that could NOT be
+    # decoded to plaintext (or was oversize).  This closes the F-RT1 silent
+    # pass — an encoded blob in a sensitive context now always leaves an audit
+    # record even when no PII pattern matched.  Raw payload is NEVER logged —
+    # only masked token shapes + counts.  ASVS V7.3.4 + V13.2.6.
+    ENCODED_PAYLOAD_DETECTED = "ENCODED_PAYLOAD_DETECTED"
     # v2.23.4 — Streaming stream-termination event (Iris FINDING-004)
     # STREAM_TERMINATED: emitted when a streaming response is terminated
     # early by the StreamingInspector due to sensitive content detection.
@@ -224,6 +269,16 @@ class EventType(str, Enum):
     # response leg errors or is unreachable; gateway returns HTTP 503.
     # Alert on sustained rate — mirrors OPA_RESPONSE_CHECK_FAILED for /v1/*.
     PROXY_OPA_RESPONSE_CHECK_FAILED = "PROXY_OPA_RESPONSE_CHECK_FAILED"
+    # #16 (OPA Phase 2) — client-policy enforcement.
+    # CLIENT_POLICY_DENIED: a bound clients.<name> policy denied on ingress/egress.
+    # CLIENT_POLICY_CHECK_FAILED: the aggregate query errored/was undefined and the
+    # gateway denied fail-closed (alert on sustained rate — like OPA_*_CHECK_FAILED).
+    CLIENT_POLICY_DENIED = "CLIENT_POLICY_DENIED"
+    CLIENT_POLICY_CHECK_FAILED = "CLIENT_POLICY_CHECK_FAILED"
+    # #25 cloud-LLM risk-accepted override (dual-admin break-glass): proposed /
+    # activated (2nd-admin approval) / revoked. Justification + which cloud LLM
+    # + both admin identities are recorded for the risk-acceptance audit trail.
+    CLOUD_OVERRIDE = "CLOUD_OVERRIDE"
     # v2.24.1 — Iris #96: Admin/User Separation-of-Duties (SoD-001..005)
     # NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4 / OWASP ASVS V4.1.2
     # ADMIN_CREATE_REJECTED_USER_EXISTS: admin creation blocked because a user-tier
@@ -246,6 +301,208 @@ class EventType(str, Enum):
     # (SoD-005). Same username/email exists in both admin_accounts and
     # identity_registry. Operator must remediate manually.
     IDENTITY_STORE_CONFLICT = "IDENTITY_STORE_CONFLICT"
+    # ---------------------------------------------------------------------------
+    # v2.25.0 — P1 Universal Ring-fence Onboarding (W0a — Lu-Gap-06 / G3)
+    # All 10 event types registered ahead of the emitting features so the
+    # Merkle chain schema is consistent before any feature dispatch lands.
+    #
+    # Compliance hook (Lu — do NOT assign control IDs here; map in G6 workflow):
+    #   AU-2 / AU-12 / CC7.1 — these events must appear in every ring-fence
+    #   audit trail.  Per-agent control mapping is deferred to Lu's G6 gate.
+    # ---------------------------------------------------------------------------
+    # Manifest lifecycle
+    MANIFEST_ONBOARD = "MANIFEST_ONBOARD"
+    MANIFEST_OFFBOARD = "MANIFEST_OFFBOARD"
+    MANIFEST_VALIDATE_FAILED = "MANIFEST_VALIDATE_FAILED"
+    # PKI / mTLS — dynamic cert operations (v1 = onboard-time; on-demand = v2)
+    DYNAMIC_CERT_ISSUED = "DYNAMIC_CERT_ISSUED"
+    DYNAMIC_CERT_REVOKED = "DYNAMIC_CERT_REVOKED"
+    # MCP data-plane events
+    MCP_CALL = "MCP_CALL"
+    MCP_TOOL_DESCRIPTION_FETCHED = "MCP_TOOL_DESCRIPTION_FETCHED"
+    # v2.26 / YSG-RISK-057 — semantic-intent sidecar escalation (content-filter
+    # v2 caught an encoded injection the v1 heuristic missed).
+    SEMANTIC_INTENT_ESCALATED = "SEMANTIC_INTENT_ESCALATED"
+    # KMS secret distribution to a ring-fenced agent
+    KMS_SECRET_DISTRIBUTED_TO_AGENT = "KMS_SECRET_DISTRIBUTED_TO_AGENT"
+    # OPA decision on an MCP tool call (distinct from OPA_RESPONSE_CHECK_FAILED)
+    OPA_DECISION_ON_MCP = "OPA_DECISION_ON_MCP"
+    # Egress allowlist entry exercised (covert-channel audit — TM-URF-023 / G3)
+    EGRESS_ALLOW_USED = "EGRESS_ALLOW_USED"
+    # 3.0 / YSG-RISK-060 — imported-MCP capability-envelope tool-surface pin.
+    # Benign sub-envelope refresh auto-allowed + byte-hash re-pinned (no operator).
+    MCP_ENVELOPE_BENIGN_UPDATE = "MCP_ENVELOPE_BENIGN_UPDATE"
+    # Capability-expanding OR sidecar-uncertain refresh blocked (latched until
+    # step-up re-approval).  The invocation gate also emits this on a stale /
+    # unpinned tool surface at call time.
+    MCP_ENVELOPE_BLOCKED = "MCP_ENVELOPE_BLOCKED"
+    # Shared privileged-mutation gate fired (envelope re-approval / #4 / #5).
+    PRIVILEGED_MUTATION = "PRIVILEGED_MUTATION"
+    # AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config changes.
+    # These are compliance/legal-relevant decision points: a sensitivity pattern
+    # controls what data the gateway flags and blocks.  Changes MUST be in the
+    # SHA-384 hash chain + signed checkpoint ledger so tampering is detectable.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    SENSITIVITY_PATTERN_CREATED = "SENSITIVITY_PATTERN_CREATED"
+    SENSITIVITY_PATTERN_DELETED = "SENSITIVITY_PATTERN_DELETED"
+    SENSITIVITY_PATTERN_AI_GENERATED = "SENSITIVITY_PATTERN_AI_GENERATED"
+    TAXONOMY_LEVEL_CHANGED = "TAXONOMY_LEVEL_CHANGED"
+    ADMIN_CLOUD_KEY_SET = "ADMIN_CLOUD_KEY_SET"
+    # FIND-3.1-INT-AGENT-AUDIT: agent upstream unreachable (502 / connection error).
+    # Emitted when the agent router's upstream HTTP call fails with a network error
+    # or connect-level exception.  Closes the OWASP A09 logging blind-spot on the
+    # agent proxy path.  The error_type field distinguishes connect vs. timeout vs.
+    # other transport failures.  Raw exception messages are never stored — only
+    # a truncated, sanitised error_type label.
+    # OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    AGENT_UPSTREAM_UNREACHABLE = "AGENT_UPSTREAM_UNREACHABLE"
+    # 3.0 — Admin-configurable browser Permissions-Policy (capability-policy feature).
+    # CAPABILITY_POLICY_CHANGED: emitted on every create/update/delete of a
+    # capability-policy setting (global / per-group / per-user).  Security-control
+    # changes MUST appear in the tamper-evident SHA-384 hash chain + signed Merkle
+    # checkpoint ledger.  scope identifies which tier changed ("global" / "group" /
+    # "user"); scope_id carries the group_id or email (empty for global).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    CAPABILITY_POLICY_CHANGED = "CAPABILITY_POLICY_CHANGED"
+    # 3.1 — Unified permission store (Phase 2 core model).
+    # PERMISSION_GRANT_CHANGED generalises CAPABILITY_POLICY_CHANGED to cover all
+    # resource_types (mcp_server, external_api, cloud_model, agent,
+    # browser_capability).  One event type covers any grant create/update/delete
+    # on any scope (org/group/user/agent).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    PERMISSION_GRANT_CHANGED = "PERMISSION_GRANT_CHANGED"
+    # ---------------------------------------------------------------------------
+    # 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+    # All events route to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / CMMC AU.L2-3.3.1 / SOC 2 CC7.1.
+    # ---------------------------------------------------------------------------
+    # NHI instantiation lifecycle
+    NHI_INSTANTIATION_REQUESTED = "NHI_INSTANTIATION_REQUESTED"
+    NHI_SCOPE_INTERSECTED = "NHI_SCOPE_INTERSECTED"
+    NHI_INSTANTIATION_DENIED = "NHI_INSTANTIATION_DENIED"
+    NHI_SVID_APPROVED = "NHI_SVID_APPROVED"
+    # BUG-A (v4.1 Phase 0) — approval endpoint fail-closed path: PKI leaf mint
+    # failed, svid_issued was NOT set, admin got a 502. Governance-relevant
+    # (an approval attempt that did NOT result in an issued identity).
+    NHI_SVID_ISSUANCE_FAILED = "NHI_SVID_ISSUANCE_FAILED"
+    # NHI invocation (per-hop OPA decisions)
+    NHI_INVOCATION_ALLOWED = "NHI_INVOCATION_ALLOWED"
+    NHI_INVOCATION_DENIED = "NHI_INVOCATION_DENIED"
+    # v4.1 Phase 1c — MCP Caddy-front ingress gate (/auth/verify-mcp).
+    # A mesh caller was DENIED at the per-MCP wrap's forward_auth leg.
+    # Allows are high-volume data-plane traffic → app log only, never chained.
+    MCP_INGRESS_DENIED = "MCP_INGRESS_DENIED"
+    # v4.1 Phase 2b — webhook ingress gate (/auth/verify-webhook forward_auth).
+    # Slack freshness / replay / Telegram token check failed or provider unknown.
+    WEBHOOK_INGRESS_DENIED = "WEBHOOK_INGRESS_DENIED"
+    # v4.1 Phase 1c — MCP approve transaction (mint leaf → codegen → reload →
+    # durable envelope) aborted + rolled back; nothing was onboarded.
+    MCP_ONBOARD_TRANSACTION_FAILED = "MCP_ONBOARD_TRANSACTION_FAILED"
+    # v4.1 unified-sidecar Phase 1 (Lu M1) — a (caller SPIFFE, egress prefixes)
+    # grant was written inside the step-up-gated approve transaction.
+    MCP_EGRESS_GRANT_WRITTEN = "MCP_EGRESS_GRANT_WRITTEN"
+    # P1/P2 header isolation — SECURITY event (HIGH severity)
+    # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
+    # The header is silently stripped; this event is the regression canary.
+    # Laura's regression can detect impersonation attempts without a live exploit.
+    AGENT_HEADER_STRIPPED = "AGENT_HEADER_STRIPPED"
+    # Delegated context (R2 / R12): server-side on-behalf-of record
+    DELEGATED_CTX_MINTED = "DELEGATED_CTX_MINTED"
+    DELEGATED_CTX_EXPIRED = "DELEGATED_CTX_EXPIRED"
+    # Builder graph lifecycle (Phase 4 — builder persistence)
+    AGENT_TEMPLATE_SAVED = "AGENT_TEMPLATE_SAVED"
+    AGENT_TEMPLATE_LOADED = "AGENT_TEMPLATE_LOADED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+    # AI generates; human decides.  The AGENT_FLOW_COMMITTED event is the
+    # audit anchor for the human's explicit decision.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    AGENT_FLOW_GENERATION_REQUESTED = "AGENT_FLOW_GENERATION_REQUESTED"
+    AGENT_FLOW_GENERATED = "AGENT_FLOW_GENERATED"
+    AGENT_FLOW_COMMITTED = "AGENT_FLOW_COMMITTED"
+    # ---------------------------------------------------------------------------
+    # 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+    # AI parses NL → governed workflow spec; human decides (WorkflowCommitted anchor).
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14 HITL.
+    # ---------------------------------------------------------------------------
+    WORKFLOW_GENERATION_REQUESTED = "WORKFLOW_GENERATION_REQUESTED"
+    WORKFLOW_GENERATED = "WORKFLOW_GENERATED"
+    WORKFLOW_COMMITTED = "WORKFLOW_COMMITTED"
+    # 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+    # Every event routes to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    # ---------------------------------------------------------------------------
+    # A committed user workflow was triggered by the scheduler.
+    WORKFLOW_RUN_STARTED = "WORKFLOW_RUN_STARTED"
+    # One step completed cleanly (OPA allow + inspection CLEAN).
+    WORKFLOW_STEP_COMPLETED = "WORKFLOW_STEP_COMPLETED"
+    # One step was denied by OPA or response inspection (run halts fail-closed).
+    WORKFLOW_STEP_DENIED = "WORKFLOW_STEP_DENIED"
+    # All steps completed without a deny — run finished.
+    WORKFLOW_RUN_COMPLETED = "WORKFLOW_RUN_COMPLETED"
+    # Run aborted: a step was denied, raised an exception, or the actor was missing.
+    WORKFLOW_RUN_FAILED = "WORKFLOW_RUN_FAILED"
+    # Admin disabled a user's workflow from the admin oversight plane.
+    WORKFLOW_ADMIN_DISABLED = "WORKFLOW_ADMIN_DISABLED"
+    # ---------------------------------------------------------------------------
+    # 4.0 — LAURA-V400-002 / AUDIT-GAP-001: OPA client-policy lifecycle events.
+    # All state-changing policy operations MUST appear in the tamper-evident
+    # SHA-384 hash chain so that policy promotion/binding cannot be silently
+    # altered.  Admin identity + policy name + transition are captured on every
+    # event.
+    # NIST AU-2 / AU-12 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2 / ASVS V7.2.1.
+    # ---------------------------------------------------------------------------
+    POLICY_SAVED = "POLICY_SAVED"
+    POLICY_DUPLICATED = "POLICY_DUPLICATED"
+    POLICY_REGO_EDITED = "POLICY_REGO_EDITED"
+    POLICY_CORE_EDITED = "POLICY_CORE_EDITED"
+    POLICY_PROMOTED = "POLICY_PROMOTED"
+    POLICY_ARCHIVED = "POLICY_ARCHIVED"
+    POLICY_ACTIVATED = "POLICY_ACTIVATED"
+    POLICY_BOUND = "POLICY_BOUND"
+    POLICY_UNBOUND = "POLICY_UNBOUND"
+    # LAURA-V400-R2-001 — dual-admin data-protection maker-checker (4.0)
+    # Three events cover the full lifecycle of a pending weaken request:
+    # REQUESTED  — admin A (maker) submits a weaken request (step-up required).
+    # APPROVED   — admin B (checker) approves (step-up + distinct-admin required).
+    # REJECTED   — admin B (checker) rejects (step-up + distinct-admin required).
+    # The actual config change (applied state) is recorded as a ConfigChangedEvent
+    # in the existing chain, cross-referenced via request_id.
+    DATA_PROTECTION_WEAKEN_REQUESTED = "DATA_PROTECTION_WEAKEN_REQUESTED"
+    DATA_PROTECTION_WEAKEN_APPROVED = "DATA_PROTECTION_WEAKEN_APPROVED"
+    DATA_PROTECTION_WEAKEN_REJECTED = "DATA_PROTECTION_WEAKEN_REJECTED"
+    # LAURA-4.0-S1-001 (MEDIUM): startup reconcile rewrites stale email/slug
+    # scope_ids in policy bindings to the canonical idnt_ PK so they enforce.
+    BINDING_SCOPE_ID_RECONCILE = "BINDING_SCOPE_ID_RECONCILE"
+    # YSG-RISK-108 / T-3: an unauthenticated caller on the mesh port (:8081)
+    # presented X-Forwarded-User (or X-Yashigani-Identity-Id) without proving
+    # internal mesh identity via the per-install bearer or Caddy-verified secret.
+    # The header is stripped and the request is logged as an attempted header-spoof.
+    # ASVS V1.4.5 / OWASP A07:2021 / CWE-290 (Authentication Bypass by Spoofing).
+    MESH_IDENTITY_HEADER_REJECTED = "MESH_IDENTITY_HEADER_REJECTED"
+    # YSG-RISK-108 / T-4: an unauthenticated caller on the mesh port (:8081)
+    # presented X-Yashigani-Orchestration-Depth to attempt promotion to the
+    # privileged "gateway:orchestrator" identity without proving internal mesh
+    # identity.  The promotion is suppressed and the header is logged.
+    # ASVS V4.1.1 / CWE-269 (Improper Privilege Management) / CWE-290.
+    MESH_ORCH_DEPTH_FORGED = "MESH_ORCH_DEPTH_FORGED"
+    # ---------------------------------------------------------------------------
+    # v4.1 Phase B — Agent Policy Templates (design §4.3 / B1 / B3 / B5)
+    # All events route to the tamper-evident SHA-384 hash chain.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    # identity_basis: "ringfence-position" on all events — honest attribution.
+    # ---------------------------------------------------------------------------
+    # Admin applied a policy template to a bundled or onboarded agent.
+    # Records template_id, version, granted prefixes, SPIFFE, acknowledgements.
+    AGENT_POLICY_TEMPLATE_APPLIED = "AGENT_POLICY_TEMPLATE_APPLIED"
+    # Admin revoked a policy template / egress grant from an agent.
+    # The grant-absence in the re-pushed OPA data IS the kill switch (Nico Q3).
+    AGENT_POLICY_TEMPLATE_REVOKED = "AGENT_POLICY_TEMPLATE_REVOKED"
+    # Langflow reconciler discovered a flow created in langflow's own UI.
+    # An INERT pending registry record was written (no leaf, no grant, no envelope).
+    # Surfaces in nhi-approvals.js as "discovered — pending admin approval".
+    LANGFLOW_FLOW_DISCOVERED = "LANGFLOW_FLOW_DISCOVERED"
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +999,80 @@ class RBACPolicyPushEvent(AuditEvent):
 
 
 # ---------------------------------------------------------------------------
+# Capability Policy events (3.0 — browser Permissions-Policy)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CapabilityPolicyChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a capability-policy setting.
+
+    Security invariants:
+    - The policy value IS recorded (it is a non-secret security configuration,
+      not a credential); this matches the RBAC config audit pattern.
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - scope: "org" | "group" | "user"
+    - scope_id: org_id (for org scope), group_id (for group scope), or email
+      (for user scope).
+    - change_type: "set" | "deleted"
+    - capabilities_changed: list of capability names that were affected.
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.CAPABILITY_POLICY_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    scope: str = ""         # "org" | "group" | "user"
+    scope_id: str = ""      # org_id, group_id, or email (depending on scope)
+    change_type: str = ""   # "set" | "deleted"
+    capabilities_changed: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Unified permission grant events (3.1 — Phase 2 core model)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PermissionGrantChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a permission grant in the unified
+    PermissionStore (Phase 2, yashigani.permissions).
+
+    Generalises CapabilityPolicyChangedEvent to cover all resource_types:
+        mcp_server, external_api, cloud_model, agent, browser_capability.
+
+    Security invariants:
+    - The grant value IS recorded (non-secret security configuration — matches
+      the RBAC config audit pattern).
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - resource_type: one of the ResourceType enum values.
+    - resource_id:   server_id / api_id / model_name / agent_id / capability_name.
+    - scope:         "org" | "group" | "user" | "agent".
+    - scope_id:      org_id, group_id, email, or agent_id.
+    - change_type:   "set" | "deleted".
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.PERMISSION_GRANT_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    resource_type: str = ""    # ResourceType value
+    resource_id: str = ""      # per-resource identifier
+    scope: str = ""            # "org" | "group" | "user" | "agent"
+    scope_id: str = ""         # org_id, group_id, email, or agent_id
+    change_type: str = ""      # "set" | "deleted"
+    # For boolean grants: {"allow": True/False, "opa_policy_ref": ...}
+    # For browser_capability: {"value": "off|self|allow_list", "allow_list": [...]}
+    grant_value: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Agent registry events
 # ---------------------------------------------------------------------------
 
@@ -869,6 +1200,123 @@ class AgentResponseBlockedByOpaEvent(AuditEvent):
     deny_reason: str = ""                 # response_sensitivity_exceeds_caller_ceiling | pii_detected_in_response | missing_agent_identity | opa_unreachable
     request_id: str = ""
     pii_detected: bool = False
+
+
+@dataclass
+class AgentUpstreamUnreachableEvent(AuditEvent):
+    """
+    Emitted when the agent router fails to reach the upstream agent URL
+    (network error, connection refused, timeout, or similar transport failure).
+
+    FIND-3.1-INT-AGENT-AUDIT: closes the OWASP A09 logging blind-spot on the
+    agent proxy path — a 502 from an unreachable upstream was previously silent
+    in the audit chain.
+
+    Security invariants:
+    - Raw exception messages are NEVER stored — error_type is a sanitised label
+      (connect_error | timeout | unknown) derived from the exception class.
+    - target_upstream_url is NOT stored — it may contain internal network
+      addresses; only target_agent_id is recorded.
+    - masking_applied is always True.
+
+    OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    """
+
+    event_type: str = EventType.AGENT_UPSTREAM_UNREACHABLE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_agent_id: str = ""
+    target_agent_id: str = ""
+    remainder_path: str = ""
+    request_id: str = ""
+    error_type: str = ""     # connect_error | timeout | unknown
+
+
+# ---------------------------------------------------------------------------
+# Agent SVID lifecycle events — 4.0 Phase 3 (RISK-104 / AUDIT-GAP-001 class)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentSvidIssuedEvent(AuditEvent):
+    """Emitted by pki/issuer.mint_agent_leaf() when an agent SVID is issued.
+
+    Closes AUDIT-GAP-001 class for PKI operations. These events are governance
+    actions and MUST be on the tamper-evident SHA-384 hash chain (not plain logs).
+
+    approved_by: identity_id of the admin who approved the agent template.
+    approval_audit_jti: jti from the admin-approval audit event — links this
+                        cert to the approval in the hash chain (non-repudiation).
+    cert_not_after:     ISO 8601 UTC expiry of the issued leaf cert.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ISSUED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # no PII in cert metadata
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    cert_not_after: str = ""        # ISO 8601 UTC
+    approved_by: str = ""           # admin identity_id
+    approval_audit_jti: str = ""    # links to approval event in hash chain
+    # v4.1 Phase 1a (GAP-1/GAP-2) — per-instance identity + change-prevention
+    # baseline, recorded on the tamper-evident chain at issuance time.
+    instance_id: str = ""           # registry nhi_id (per-instance segment)
+    scope_hash: str = ""            # sha384:<hex> tool-surface hash (binding.py)
+    image_digest: str = ""          # OCI image digest pinned at approve ("" = unpinned)
+    binding_sha384: str = ""        # sha384:<hex> = binding_digest(image_digest, scope_hash)
+
+
+@dataclass
+class AgentSvidRotatedEvent(AuditEvent):
+    """Emitted by the SVID sidecar cert-rotation callback on the backoffice.
+
+    Written when the sidecar successfully rotates a leaf cert before expiry.
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    new_cert_not_after: str = ""    # ISO 8601 UTC
+
+
+@dataclass
+class AgentSvidRevokedEvent(AuditEvent):
+    """Emitted when an admin revokes an agent SVID.
+
+    Sets svid_state=revoked in the agent DB record. The existing cert is not
+    actively invalidated (no CRL/OCSP — YSG-RISK-058 residual); the agent
+    container is torn down immediately by PoolManager.
+    """
+
+    event_type: str = EventType.AGENT_SVID_REVOKED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = False
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    revoked_by: str = ""            # admin identity_id
+    revoke_reason: str = ""
+
+
+@dataclass
+class AgentSvidRotationFailedEvent(AuditEvent):
+    """Emitted when the SVID sidecar fails to rotate a cert (fail-closed path).
+
+    The sidecar exits on rotation failure, killing the agent container.
+    PoolManager health monitor detects the dead container and calls replace().
+    """
+
+    event_type: str = EventType.AGENT_SVID_ROTATION_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    agent_name: str = ""
+    tenant_id: str = ""
+    spiffe_id: str = ""
+    error_type: str = ""            # api_error | timeout | parse_error
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1449,50 @@ class OPAAssistantSuggestionRejectedEvent(AuditEvent):
 
 
 # ---------------------------------------------------------------------------
+# SEC-OPA-001 / Mode B — Rego module authoring audit events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OPAAssistantRegoGeneratedEvent(AuditEvent):
+    """Written when the OPA assistant generates a Rego module draft (before admin review)."""
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_GENERATED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""          # intended clients.<policy_name> slug
+    description_length: int = 0    # length of NL description (not the text itself)
+    rego_valid: bool = False        # True if the generated Rego compiled against OPA
+    validation_error: Optional[str] = None
+
+
+@dataclass
+class OPAAssistantRegoAppliedEvent(AuditEvent):
+    """
+    Written when admin approves and applies an AI-drafted Rego policy module.
+    Requires step-up TOTP (StepUpAdminSession). This is the accountable human
+    act per EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_APPLIED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""          # clients/<policy_name> applied to OPA
+    rego_length: int = 0           # length of the Rego module applied
+
+
+@dataclass
+class OPAAssistantRegoRejectedEvent(AuditEvent):
+    """Written when admin explicitly rejects an AI-drafted Rego module."""
+
+    event_type: str = EventType.OPA_ASSISTANT_REGO_REJECTED
+    account_tier: str = AccountTier.ADMIN
+    admin_account: str = ""
+    policy_name: str = ""
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
 # v0.9.0 — Response-path inspection events
 # ---------------------------------------------------------------------------
 
@@ -1023,7 +1515,271 @@ class ResponseInjectionDetectedEvent(AuditEvent):
     action_taken: str = ""  # 502_returned | flagged_only
     content_type: str = ""  # Content-Type of the upstream response
     response_content_hash: str = ""  # SHA-256 of the raw response body
-    fasttext_only_mode: bool = False  # True when LLM fallback was skipped
+    classifier_only_mode: bool = False  # True when LLM fallback was skipped
+
+
+# ---------------------------------------------------------------------------
+# v2.25.4 — Agent/tool orchestration events (build sheet §7.6)
+#
+# Per the OPA-every-hop invariant (§0.1), each orchestration hop logs BOTH its
+# ingress OPA decision AND its egress OPA decision AND its inspection verdict,
+# plus the hop-depth, all correlated by a root_request_id.  This makes per-hop
+# OPA coverage *provable* from the audit sink (assertion 0 / 5).  Raw tool args
+# and tool results are NEVER stored — only a SHA-256 args-hash and the verdict.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrchestrationStepEvent(AuditEvent):
+    """One executed tool hop.  Carries the full adjudication triple."""
+
+    event_type: str = EventType.ORCHESTRATION_STEP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""        # correlates the whole orchestration tree
+    request_id: str = ""             # per-hop self-call request id
+    identity_id: str = ""            # the REAL caller (principal), not "internal"
+    # NTH1 (LAURA): the PostgresSink mirrors session_id/agent_id as queryable
+    # columns; set session_id=identity_id + agent_id="orchestrator" so the
+    # principal is queryable in the DB mirror, not only in the file sink.
+    session_id: str = ""             # = identity_id (queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""              # agent__<slug> | model__<id> | mcp__<server>__<tool>
+    tool_kind: str = ""              # agent | model | mcp
+    args_hash: str = ""              # SHA-256 of the JSON args (raw never stored)
+    depth: int = 0                   # hop-depth on the self-call chain (§0.1.2)
+    iteration: int = 0               # ReAct iteration index
+    ingress_opa_decision: str = ""   # allow | deny | <reason>
+    egress_opa_decision: str = ""    # allow | deny | not_applicable | <reason>
+    inspection_verdict: str = ""     # CLEAN | FLAGGED | BLOCKED | skipped
+    inspection_confidence: float = 1.0
+    blocked: bool = False
+    http_status: int = 0
+
+
+@dataclass
+class OrchestrationCapEvent(AuditEvent):
+    """The iteration / fan-out / wall-clock amplification cap was hit (§3.5)."""
+
+    event_type: str = EventType.ORCHESTRATION_CAP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    cap_kind: str = ""               # max_iters | max_fanout | deadline
+    cap_value: int = 0
+    iterations_run: int = 0
+
+
+@dataclass
+class OrchestrationBlockedStepEvent(AuditEvent):
+    """A tool result was BLOCKED on egress (OPA-egress and/or inspection).
+
+    The block-notice substitution (§3.4) means the raw upstream payload never
+    re-enters the orchestrator's context.  This is the 'cloud 9' headline event.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_BLOCKED_STEP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    block_source: str = ""           # opa_egress | response_inspection | both
+    egress_opa_decision: str = ""
+    inspection_verdict: str = ""
+    inspection_confidence: float = 0.0
+    response_content_hash: str = ""  # SHA-256 of the withheld payload (never raw)
+
+
+@dataclass
+class OrchestrationDepthCeilingEvent(AuditEvent):
+    """A hop that would create a 10th nested link was hard-stopped (§0.1.2)."""
+
+    event_type: str = EventType.ORCHESTRATION_DEPTH_CEILING
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    attempted_depth: int = 0
+    max_depth: int = 9
+
+
+@dataclass
+class OrchestrationInjectionHopEvent(AuditEvent):
+    """A tool hop emitted in direct response to prior tool-RESULT content.
+
+    LAURA-ORCH-001: prompt injection is not lexically solvable, so the classifier
+    cannot be the load-bearing control.  The architectural guarantee is that every
+    such hop is (1) OPA-adjudicated ingress+egress like any other hop, (2) FLAGGED
+    here so an injection-driven hop is at minimum visible in the audit trail, and
+    (3) counted against a strict low budget (capped=True when the budget is hit, so
+    a result-steering loop cannot amplify).  Raw tool args/results are never stored.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_INJECTION_HOP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    iteration: int = 0
+    injection_budget_used: int = 0   # how many provenance-derived hops so far
+    injection_budget_max: int = 0    # the strict low cap
+    capped: bool = False             # True → this hop was refused by the budget cap
+
+
+@dataclass
+class OrchestrationExfilBlockedEvent(AuditEvent):
+    """Data-exfil-via-tool-args was blocked on egress (LAURA-ORCH-001(c)).
+
+    The model placed content derived from a prior RESTRICTED/CONFIDENTIAL tool
+    result into the ARGS of an outbound tool call (esp. a PUBLIC-bound or MCP
+    egress hop).  The per-hop egress sensitivity check denied the smuggle before
+    dispatch.  Only the SHA-256 args-hash + the detected ceiling are stored.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_EXFIL_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (NTH1 — queryable principal)
+    agent_id: str = "orchestrator"
+    tool_name: str = ""
+    tool_kind: str = ""
+    depth: int = 0
+    args_hash: str = ""
+    args_sensitivity: str = ""       # detected sensitivity of the outbound args
+    deny_reason: str = ""            # sensitivity_exceeds_egress_ceiling
+
+
+@dataclass
+class OrchestrationBrainReasoningRelaxedEvent(AuditEvent):
+    """G-ORCH-OPA-3 — a brain-REASONING-leg response-OPA block was RELAXED.
+
+    The brain→LLM (A→L) leg is the orchestrator's OWN cognition: consumed only by
+    the gateway loop to pick the next GATED hop, never delivered to a human and
+    never used as a tool result.  When that leg's response-OPA decision WOULD have
+    blocked (e.g. the brain reasons *about* "test the boundaries / threat model /
+    cloud 9" and trips the classifier 0.95–1.0), we still COMPUTE the verdict + OPA
+    decision and record them here with ``relaxation_applied=True`` — only the
+    403/substitute ACTION is relaxed.  A would-have-blocked reasoning turn is
+    therefore ALWAYS greppable in the audit trail.  Raw content is never stored —
+    only the SHA-256 content hash.  The leak guard (a relaxed completion may only
+    resolve to a re-gated call_tool, never a final answer to the user) keeps this
+    relaxation non-exfiltrating; this event makes it observable.
+    """
+
+    event_type: str = EventType.ORCHESTRATION_BRAIN_REASONING_RELAXED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""             # = identity_id (queryable principal)
+    agent_id: str = "letta-brain"
+    verdict: str = ""                # CLEAN | FLAGGED | BLOCKED (response inspection)
+    confidence: float = 0.0          # inspection confidence at relaxation time
+    content_hash: str = ""           # SHA-256 of the relaxed completion (raw never stored)
+    opa_reason: str = ""             # the response-OPA deny reason that was relaxed
+    sensitivity: str = ""            # prompt sensitivity at relaxation time
+    relaxation_applied: bool = True  # always True for this event (greppable flag)
+
+
+# ---------------------------------------------------------------------------
+# v4.0 — external_api enforcement (Item A) + mcp_id lifecycle (Item B)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExternalApiBlockedEvent(AuditEvent):
+    """Emitted when an orchestrator api__ tool hop is DENIED by the external_api
+    runtime grant check.
+
+    The org-level external_api grant for the target host was absent or revoked,
+    so the outbound HTTP call was never made.  Only the SHA-256 hash of the
+    attempted URL path is stored; the raw path (which may contain query params
+    with sensitive values) is never stored.
+
+    Security invariants:
+    - Raw URL path/query is never stored — only SHA-256 hash.
+    - host is the grant key (stable DNS name, not the display connection name).
+    - deny_reason distinguishes org_grant_absent (no grant seeded/approved)
+      from org_grant_denied (grant explicitly deny=True).
+
+    v4.0 / external_api connection enforcement.
+    """
+
+    event_type: str = EventType.EXTERNAL_API_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    root_request_id: str = ""
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""         # = identity_id (queryable principal)
+    agent_id: str = "orchestrator"
+    connection_name: str = ""    # display name of the api__ connection (not the grant key)
+    host: str = ""               # grant key (stable DNS name)
+    method: str = ""             # HTTP method attempted
+    path_hash: str = ""          # SHA-256 of path (raw path never stored)
+    depth: int = 0
+    deny_reason: str = ""        # org_grant_absent | org_grant_denied
+
+
+@dataclass
+class McpIdMintedEvent(AuditEvent):
+    """Emitted when a new stable mcp_id is minted for an MCP server on startup.
+
+    On first startup after 4.0 upgrade, or when a new server_name is seen,
+    a UUID is minted and stored persistently.  This event records the minting
+    so the audit trail tracks every server identity lifecycle event.
+
+    v4.0 / mcp_id stability (Item B).
+    """
+
+    event_type: str = EventType.MCP_ID_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""         # human-readable display name (mutable)
+    mcp_id: str = ""             # stable UUID (immutable after mint)
+    is_backfill: bool = False    # True when minted during reconcile (existing server)
+
+
+@dataclass
+class McpIdGrantReconciledEvent(AuditEvent):
+    """Emitted when startup reconcile copies a name-keyed MCP grant to mcp_id key.
+
+    Backfill: on first startup after 4.0 upgrade, grants stored at
+    perm:grant:mcp_server:org:{org_id}:{agent_name} are copied to
+    perm:grant:mcp_server:org:{org_id}:{mcp_id} so the broker's
+    _check_connection_permit() can switch to mcp_id keys.
+
+    v4.0 / mcp_id stability (Item B).
+    """
+
+    event_type: str = EventType.MCP_ID_GRANT_RECONCILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_name: str = ""         # the old name key that was backfilled
+    mcp_id: str = ""             # the new stable key
+    org_id: str = ""
+    grants_copied: int = 0       # number of grant scopes copied
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +2321,59 @@ class OpaResponseCheckFailedEvent(AuditEvent):
     action: str = "denied_fail_closed"
 
 
+@dataclass
+class ClientPolicyDeniedEvent(AuditEvent):
+    """#16: a bound client policy (data.clients.<name>) denied the request on
+    ingress or egress. No request/response body or user content is stored —
+    only the scope, direction, and the policy-emitted deny codes."""
+
+    event_type: str = EventType.CLIENT_POLICY_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    identity_id: str = ""
+    scope_kind: str = ""      # human|service|api_client|mcp_server|agent
+    scope_id: str = ""
+    direction: str = ""       # ingress|egress
+    deny_codes: list = field(default_factory=list)
+    evaluated: list = field(default_factory=list)
+    action: str = "denied"
+
+
+@dataclass
+class CloudOverrideEvent(AuditEvent):
+    """#25: dual-admin cloud-LLM risk-accepted override lifecycle. override_event is
+    CLOUD_OVERRIDE_PROPOSED | CLOUD_OVERRIDE_ACTIVATED | CLOUD_OVERRIDE_REVOKED.
+    Records the justification, the specific cloud LLM, and BOTH admin identities."""
+
+    event_type: str = EventType.CLOUD_OVERRIDE
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    override_event: str = ""
+    provider: str = ""
+    model: str = ""
+    justification: str = ""
+    initiated_by: str = ""
+    approver: str = ""
+    expires_at: str = ""
+
+
+@dataclass
+class ClientPolicyCheckFailedEvent(AuditEvent):
+    """#16: the client-policy aggregate query errored/was undefined and the
+    gateway denied fail-closed. Alert on sustained rate (OPA outage). Mirrors
+    OpaResponseCheckFailedEvent invariants (no body; exc_str truncated)."""
+
+    event_type: str = EventType.CLIENT_POLICY_CHECK_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""          # "client_enforce_unavailable" | "client_enforce_undefined" | "not_configured"
+    outcome: str = ""         # "exception" | "undefined" | "not_configured"
+    exc_class: str = ""
+    exc_str: str = ""         # str(exc)[:256]
+    direction: str = ""
+    action: str = "denied_fail_closed"
+
+
 # ---------------------------------------------------------------------------
 # v2.23.4 — PII detection event (Iris FINDING-004)
 # ---------------------------------------------------------------------------
@@ -1593,10 +2402,53 @@ class PIIDetectedEvent(AuditEvent):
     action_taken: str = ""         # "logged" | "redacted" | "blocked"
     destination: str = ""          # "local" | "cloud" | "upstream"
     finding_count: int = 0
+    # v2.25.2 — F-RT1: which normalised views matched (e.g. ["raw", "base64"]).
+    # Records that PII was caught only after decoding an encoded segment.
+    matched_views: list = None     # type: ignore[assignment]
 
     def __post_init__(self):
         if self.pii_types is None:
             self.pii_types = []
+        if self.matched_views is None:
+            self.matched_views = []
+
+
+# ---------------------------------------------------------------------------
+# v2.25.2 — F-RT1 encoded-payload audit event (red-team verified 2026-05-30)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EncodedPayloadDetectedEvent(AuditEvent):
+    """Written when the decode-before-classify stage finds an encoded blob.
+
+    Closes the F-RT1 silent pass: a long, encoded-looking, high-entropy blob
+    that could NOT be decoded to plaintext (or was oversize) now always leaves
+    an audit record, even when no PII pattern matched.
+
+    Security invariants (immutable floors):
+      - Raw payload is NEVER stored — only masked token shapes (first4…last4 +
+        length) and a count.
+      - masking_applied is always True.
+      - direction is "request" or "response".
+
+    ASVS V7.3.4 (sensitive-data audit) + V13.2.6 (LLM input handling).
+    """
+
+    event_type: str = EventType.ENCODED_PAYLOAD_DETECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    direction: str = ""            # "request" | "response"
+    destination: str = ""          # "local" | "cloud" | "upstream"
+    high_entropy: bool = False
+    oversize: bool = False
+    token_count: int = 0
+    masked_tokens: list = None     # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.masked_tokens is None:
+            self.masked_tokens = []
 
 
 # ---------------------------------------------------------------------------
@@ -1620,7 +2472,7 @@ class StreamTerminatedEvent(AuditEvent):
     event_type: str = EventType.STREAM_TERMINATED
     account_tier: str = AccountTier.SYSTEM
     masking_applied: bool = True
-    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "fasttext:RESTRICTED"
+    trigger: str = ""          # e.g. "regex:CONFIDENTIAL" | "classifier:RESTRICTED"
     request_id: str = ""
     session_id: str = ""
     agent_id: str = ""
@@ -2039,3 +2891,1523 @@ class IdentityStoreConflictEvent(AuditEvent):
     identity_id: str = ""               # identity_registry identity_id
     conflict_field: str = ""            # "username" | "email"
     conflict_value_hash: str = ""       # HMAC-SHA256 of the conflicting value
+
+
+# ---------------------------------------------------------------------------
+# v2.25.0 — P1 Universal Ring-fence Onboarding event dataclasses (W0a)
+# Lu-Gap-06 / G3 — register ahead of emitting features.
+#
+# Compliance hook: control-ID mapping is intentionally ABSENT from these
+# dataclasses.  Lu maps controls in the G6 per-agent gate (workflow doc).
+# Inserting control IDs here would couple the dataclass to Lu's mapping
+# cadence; the event_type string in EventType is the stable identifier.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ManifestOnboardEvent(AuditEvent):
+    """
+    Emitted when ``yashigani onboard <manifest.yaml>`` completes successfully.
+
+    Records the agent name, tenant, manifest SHA-256, operator identity, and
+    the five ring-fence artifacts generated.  The raw manifest YAML is never
+    stored — only the SHA-256.
+
+    Security invariants:
+      - masking_applied is always True (operator identity masked in lower sinks).
+      - manifest_sha256 is the hex SHA-256 of the canonical YAML blob.
+      - artifacts_generated is a list of artifact-type labels, not paths.
+
+    v2.25.0 / Lu-Gap-06 / W0a.
+    """
+
+    event_type: str = EventType.MANIFEST_ONBOARD
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    tenant_id: str = ""              # from manifest metadata.tenant_id
+    agent_name: str = ""             # from manifest metadata.name
+    manifest_sha256: str = ""        # hex SHA-256 of the YAML blob
+    operator_identity: str = ""      # sub from operator token, or "unknown"
+    token_jti: str = ""              # operator token jti, or ""
+    artifacts_generated: list = None  # type: ignore[assignment]
+    runtime: str = ""                # YSG_RUNTIME value at onboard time
+
+    def __post_init__(self) -> None:
+        if self.artifacts_generated is None:
+            self.artifacts_generated = []
+
+
+@dataclass
+class ManifestOffboardEvent(AuditEvent):
+    """
+    Emitted when ``yashigani offboard <name>`` completes.
+
+    Records whether each artifact was removed cleanly and whether a cert
+    rotation was triggered.
+
+    v2.25.0 / Lu-Gap-06 / W0a / S5 offboard lifecycle.
+    """
+
+    event_type: str = EventType.MANIFEST_OFFBOARD
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    operator_identity: str = ""
+    artifacts_removed: list = None  # type: ignore[assignment]
+    cert_rotation_triggered: bool = False
+
+    def __post_init__(self) -> None:
+        if self.artifacts_removed is None:
+            self.artifacts_removed = []
+
+
+@dataclass
+class ManifestValidateFailedEvent(AuditEvent):
+    """
+    Emitted when ``yashigani validate`` (or the parser inside ``onboard``)
+    rejects a manifest.
+
+    Carries the rule that fired and a sanitised excerpt of the field that
+    failed (raw field values are never stored — only the field name and
+    rule label).  masking_applied is always True.
+
+    v2.25.0 / Lu-Gap-06 / W0a / M1-M9.
+    """
+
+    event_type: str = EventType.MANIFEST_VALIDATE_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    rule: str = ""              # e.g. "M1_size_cap" | "M2_tenant_id_regex" | "M7_unsigned"
+    field_name: str = ""        # the manifest field path that failed, e.g. "spec.image.digest"
+    detail: str = ""            # human-readable reason (no raw field values)
+    manifest_sha256: str = ""   # best-effort; empty when size cap fires before hash
+
+
+@dataclass
+class DynamicCertIssuedEvent(AuditEvent):
+    """
+    Emitted when a leaf mTLS cert is issued for a ring-fenced agent at
+    onboard time (v1) or on-demand (v2, PKI Issuer API).
+
+    Security invariants:
+      - Private key material is NEVER stored.
+      - serial_hex is the certificate serial number in hex (for revocation lookup).
+      - spiffe_id is the full SPIFFE URI assigned to the agent.
+      - expires_at is ISO-8601 UTC.
+
+    v2.25.0 / Lu-Gap-06 / W0a / Nico NICO-002/003.
+    """
+
+    event_type: str = EventType.DYNAMIC_CERT_ISSUED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    spiffe_id: str = ""          # spiffe://yashigani.internal/agents/{tenant}/{name}
+    serial_hex: str = ""         # cert serial number in hex
+    issued_at: str = ""          # ISO-8601 UTC
+    expires_at: str = ""         # ISO-8601 UTC
+    issuance_mode: str = ""      # "onboard_time" | "on_demand"
+
+
+@dataclass
+class DynamicCertRevokedEvent(AuditEvent):
+    """
+    Emitted when a ring-fenced agent's mTLS leaf cert is revoked (on offboard
+    or explicit rotation).
+
+    v2.25.0 / Lu-Gap-06 / W0a / Nico NICO-003.
+    """
+
+    event_type: str = EventType.DYNAMIC_CERT_REVOKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    spiffe_id: str = ""
+    serial_hex: str = ""
+    revocation_reason: str = ""  # "offboard" | "rotation" | "compromise"
+
+
+@dataclass
+class McpCallEvent(AuditEvent):
+    """
+    Emitted on every MCP tool call brokered by the Yashigani gateway.
+
+    Security invariants:
+      - Tool input/output are NEVER stored — only tool_name and
+        args_redacted (a boolean flag) plus OPA decision.
+      - identity_id is the resolved agent SPIFFE identity slug.
+      - request_id correlates with GatewayRequestEvent.
+
+    v2.25.0 / Lu-Gap-06 / W0a / P3 MCP broker.
+    """
+
+    event_type: str = EventType.MCP_CALL
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    identity_id: str = ""        # resolved SPIFFE identity slug
+    request_id: str = ""
+    tool_name: str = ""
+    server_id: str = ""          # upstream MCP server identifier
+    opa_decision: str = ""       # "allow" | "deny" | "redact"
+    args_redacted: bool = False
+    elapsed_ms: Optional[int] = None
+
+
+@dataclass
+class McpToolDescriptionFetchedEvent(AuditEvent):
+    """
+    Emitted when the MCP broker fetches tool descriptions from an upstream
+    MCP server (tools/list or prompts/list response).
+
+    Used to audit the tool-catalogue integrity path (M4 + P3).  The tool
+    description text is NEVER stored — only the tool_name and whether the
+    sanitisation filter modified it.
+
+    v2.25.0 / Lu-Gap-06 / W0a / M4 prompt-injection filter.
+    """
+
+    event_type: str = EventType.MCP_TOOL_DESCRIPTION_FETCHED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    server_id: str = ""
+    tool_count: int = 0          # number of tool descriptors fetched
+    filtered_count: int = 0      # number of descriptors modified by sanitiser
+    rejected_count: int = 0      # number of descriptors rejected (over cap / pattern)
+    fetch_type: str = ""         # "tools_list" | "prompts_list"
+
+
+@dataclass
+class SemanticIntentEscalatedEvent(AuditEvent):
+    """
+    Emitted when the semantic-intent sidecar (content-filter v2 / YSG-RISK-057)
+    ESCALATES a tool-description / prompt that the v1 surface-pattern heuristic
+    passed — i.e. the sidecar caught what the heuristic missed (an encoded /
+    obfuscated injection: base64/hex/url/rot13 in an MCP tool description).
+
+    Self-describing per the user-alert / OPA-decision contract (2026-06-06):
+    every enforcement action carries a stable ``rule_id`` (the "id"), a layman
+    ``user_message`` (education + deterrence), and an HTTP ``code``.  This lets
+    the unified ``yashigani_alert`` envelope surface a consistent explanation at
+    this enforcement point without a gateway lookup table.
+
+    Security invariants:
+      - The raw attacker content is NEVER stored.  ``flagged_segment`` is the
+        already-masked encoded token (pii.decode._mask_token: first4…last4 +
+        length), ``flagged_view`` is a codec name (raw|base64|hex|url|rot13|
+        suspicious_blob), and ``intent_score`` is the aggregate 0–1 score.
+      - masking_applied is always True.
+
+    v2.26.0 / YSG-RISK-057 / CWE-184 / content-filter v2.
+    """
+
+    event_type: str = EventType.SEMANTIC_INTENT_ESCALATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True  # immutable floor — always True
+    tenant_id: str = ""
+    server_id: str = ""
+    # What was being filtered when the sidecar escalated.
+    fetch_type: str = ""          # "tools_list" | "prompts_get"
+    item_name: str = ""           # tool_name or prompt_name (NOT the content)
+    # Sidecar verdict detail — all audit-safe / masked.
+    flagged_view: str = ""        # decoded view that drove the verdict (codec name)
+    flagged_segment: str = ""     # MASKED encoded token (first4…last4 + length)
+    intent_score: float = 0.0     # aggregate injection-intent score (0.0–1.0)
+    # Self-describing contract (id + layman message + code).
+    rule_id: str = "yashigani.inspection.semantic-intent"
+    user_message: str = (
+        "This tool description contained a hidden, encoded instruction that "
+        "tries to manipulate the AI. It was blocked before reaching the agent."
+    )
+    code: int = 403
+
+
+@dataclass
+class McpEnvelopeBenignUpdateEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool-surface refresh is
+    triaged BENIGN (structurally within the approved capability envelope AND
+    the escalate-only sidecar found no injection intent) and auto-allowed.
+
+    The envelope's typed dimensions are UNCHANGED; only the byte-surface-hash
+    change-detector is re-pinned (Iris §2.2).  No operator involvement.
+
+    Self-describing per the user-alert / OPA-decision contract: rule_id +
+    layman user_message + code.  The raw surface text is NEVER stored.
+
+    Security invariants:
+      - The decision was made by the deterministic STRUCTURAL diff (authority),
+        not the LLM (Laura must-have #2).
+      - provenance_id binds the envelope to the P8 transport identity.
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BENIGN_UPDATE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""              # H(server_id ‖ pin-material)
+    envelope_version: int = 0            # the unchanged active envelope version
+    new_surface_hash: str = ""           # the re-pinned byte-hash (audit-safe)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool was updated. The change did not add any new "
+        "capability, so it was accepted automatically and recorded for audit."
+    )
+    code: int = 200
+
+
+@dataclass
+class McpEnvelopeBlockedEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool surface is BLOCKED:
+      - a refresh that EXPANDS capability vs the approved envelope (block +
+        step-up re-approve), OR
+      - a refresh the escalate-only sidecar flagged / fail-closed (UNCERTAIN),
+        OR
+      - the invocation hard gate in broker.enforce() denying a call whose tool
+        surface is unpinned / blocked / stale (the load-bearing security
+        boundary — Laura R3-3).
+
+    The block LATCHES on the provenance until a step-up re-approval; a surface
+    reversion does NOT auto-clear it (Laura §3 bypass B / Δ1).
+
+    Self-describing contract.  The raw surface text is NEVER stored — only the
+    expansion dimension labels + masked detail.
+
+    Security invariants:
+      - The block decision was structural (authority) or fail-closed; the LLM
+        can never DOWNGRADE this to an allow (Laura must-have #2).
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""
+    # "refresh_expanding" | "refresh_uncertain" | "invocation_unpinned" |
+    # "invocation_stale" | "invocation_blocked"
+    block_reason: str = ""
+    # Sorted list of expansion dimension labels (NOT the raw text), e.g.
+    # ["effect_class", "arg_shape", "tool_set"].
+    expansion_dimensions: list = field(default_factory=list)
+    finding_count: int = 0
+    tool_name: str = ""                  # the tool at invocation time (if any)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool tried to expand what it can do beyond what was "
+        "approved, so it was blocked. An operator must review and re-approve "
+        "the change before this tool can be used again."
+    )
+    code: int = 403
+
+
+@dataclass
+class PrivilegedMutationEvent(AuditEvent):
+    """
+    Shared privileged-mutation audit shape (Iris §5.2 / Laura R3-9).
+
+    Emitted by ``auth.stepup.assert_privileged_mutation`` after BOTH the
+    operator-RBAC and fresh-step-up gates pass, for EVERY privileged-mutation
+    surface across tensions #3 (MCP envelope re-approval), #4, and #5.  One
+    uniform tamper-evident shape so all privileged actions are auditable
+    consistently (rides YSG-RISK-059 immutability).
+
+    Security invariants:
+      - Emitted only AFTER fresh TOTP + operator RBAC are proven.
+      - ``before``/``after`` carry state snapshots (e.g. the envelope
+        field-level diff) — callers must pass audit-safe (non-secret) values.
+    """
+
+    event_type: str = EventType.PRIVILEGED_MUTATION
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""                     # e.g. "mcp.envelope.reapprove"
+    principal: str = ""                  # operator identity (sub / account_id)
+    target: str = ""                     # object mutated (e.g. provenance_id)
+    justification: str = ""              # operator free-text (recorded, untrusted)
+    before: Optional[dict] = None
+    after: Optional[dict] = None
+    rule_id: str = "yashigani.auth.privileged-mutation"
+    user_message: str = (
+        "A privileged operator action was performed after fresh identity "
+        "re-verification and recorded for audit."
+    )
+    code: int = 200
+
+
+@dataclass
+class KmsSecretDistributedToAgentEvent(AuditEvent):
+    """
+    Emitted when the KMS layer distributes a secret to a ring-fenced agent
+    (file-based bind-mount at onboard time, or runtime refresh).
+
+    Security invariants:
+      - Secret value is NEVER stored.
+      - kms_key_name is the logical key name (e.g. ``/tenant/acme/agent-goose/openai``),
+        never the raw secret value.
+      - masking_applied is always True.
+
+    v2.25.0 / Lu-Gap-06 / W0a / spec.secrets KMS flow.
+    """
+
+    event_type: str = EventType.KMS_SECRET_DISTRIBUTED_TO_AGENT
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    kms_key_name: str = ""       # logical KMS key path (never the value)
+    kms_provider: str = ""       # "vault" | "aws" | "azure" | "gcp" | "keeper"
+    distribution_mode: str = ""  # "onboard_time" | "runtime_refresh"
+
+
+@dataclass
+class OpaDecisionOnMcpEvent(AuditEvent):
+    """
+    Emitted for every OPA policy decision on an MCP tool call.
+
+    Distinct from OPA_RESPONSE_CHECK_FAILED (which covers OPA errors/timeouts).
+    This event covers deliberate policy decisions — allow, deny, or redact —
+    including tool sensitivity class, budget gate, and multi-hop chain depth.
+
+    Security invariants:
+      - Tool input/output are never stored.
+      - deny_reason is a label, not a raw policy string.
+      - chain_depth is the JWT chain depth (multi-hop guard, Lu-Gap-02).
+
+    v2.25.0 / Lu-Gap-06 / W0a / P3 mcp.rego.
+    """
+
+    event_type: str = EventType.OPA_DECISION_ON_MCP
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    tool_name: str = ""
+    server_id: str = ""
+    request_id: str = ""
+    decision: str = ""           # "allow" | "deny" | "redact"
+    deny_reason: str = ""        # label if denied: "sensitivity_ceiling" | "budget" | "chain_depth_exceeded" | "not_in_allowlist"
+    # FIX-F(1) / Iris FIND-002: tool_sensitivity removed.
+    # mcp.rego's mcp_decision compound document does NOT return a tool_sensitivity
+    # field — the policy does not classify individual tool sensitivity labels.
+    # An always-empty string is misleading in audit records and suggests a
+    # capability the policy layer doesn't implement.  Removed rather than left
+    # as a permanently-empty stub.  If the policy gains tool sensitivity
+    # classification in a future sprint, re-add with a matching rego key.
+    # FIX-E (Lu FIX-3): persist the full SPIFFE identity chain (ordered list) so
+    # an auditor sees WHICH identities were in the chain, not just how many.
+    # G5 multi-hop: previously only chain_depth (int) was recorded.
+    # identity_chain is the upstream_chain at the time of OPA evaluation — i.e.
+    # the chain the caller presented, before this gateway hop appended its own
+    # SPIFFE URI.  For first-hop (mcp-a/mcp-b) this is an empty list.
+    identity_chain: list = field(default_factory=list)
+    chain_depth: int = 0         # JWT identity chain depth (multi-hop) — kept for backward compat
+    elapsed_ms: Optional[int] = None
+    # v4.1 unified-sidecar Phase 1 (Lu M1): FULL caller SPIFFE URI of the
+    # denied/allowed caller.  Grant decisions (deny_reason
+    # "egress:caller_not_granted_prefix") key on the EXACT per-instance
+    # SPIFFE — agent_name is name-collapsed and cannot attribute an egress
+    # grant denial to a specific instance.  Empty for pre-4.1 emitters.
+    caller_spiffe: str = ""
+
+
+@dataclass
+class EgressAllowUsedEvent(AuditEvent):
+    """
+    Emitted every time a ring-fenced agent's traffic traverses a declared
+    ``egress_allow`` entry (Agent → Caddy → OPA → external destination).
+
+    Used as the covert-channel audit control (TM-URF-023 / G3).  For
+    CONFIDENTIAL/RESTRICTED ceiling agents, ``egress_allow`` entries require
+    operator justification; this event is the evidence trail for that
+    justification.
+
+    Security invariants:
+      - The request URL path is truncated to 128 chars and the query string
+        is dropped (no raw user-supplied values in the audit log).
+      - The response body is never stored.
+      - client_identity is the resolved SPIFFE identity slug.
+
+    v2.25.0 / Lu-Gap-06 / W0a / C-adjacent / egress_allow_used audit type.
+    """
+
+    event_type: str = EventType.EGRESS_ALLOW_USED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    agent_name: str = ""
+    client_identity: str = ""    # resolved SPIFFE identity slug
+    egress_entry: str = ""       # the egress_allow entry label (e.g. "openai.com")
+    method: str = ""             # HTTP method
+    path_truncated: str = ""     # request path, max 128 chars, query stripped
+    upstream_status: Optional[int] = None
+    elapsed_ms: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config audit events.
+#
+# Sensitivity patterns control what data the gateway flags and blocks.
+# Changes are compliance/legal-relevant and MUST be in the tamper-evident
+# hash chain (SHA-384 prev_hash links + daily ECDSA-signed Merkle-root
+# checkpoint).  An admin or an injected AI-generated pattern installed
+# without an audit record is not acceptable.
+#
+# Security invariants (all four classes):
+#   - The raw regex pattern is never stored in full in the audit record;
+#     only its SHA-256 is stored (pattern_hash) alongside its length and
+#     description.  This prevents the audit log from becoming a secondary
+#     source of potentially malicious patterns.
+#   - masking_applied is always True (admin email is a PII field).
+#   - admin_account = session.account_id from the StepUpAdminSession.
+#
+# NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SensitivityPatternCreatedEvent(AuditEvent):
+    """Emitted when an admin creates a new sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (create requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_CREATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # auto-assigned numeric id
+    classification: str = ""      # numeric level "1"–"5"
+    pattern_type: str = ""        # regex | keyword | classifier | fasttext | ollama
+    pattern_hash: str = ""        # SHA-256 of raw pattern (pattern itself not stored)
+    description: str = ""         # user-supplied description (max 256 chars)
+    step_up_verified: bool = True  # always True — create requires step-up
+
+
+@dataclass
+class SensitivityPatternDeletedEvent(AuditEvent):
+    """Emitted when an admin deletes a sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (delete requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_DELETED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # the deleted pattern's id
+    step_up_verified: bool = True  # always True — delete requires step-up
+
+
+@dataclass
+class SensitivityPatternAIGeneratedEvent(AuditEvent):
+    """Emitted when the AI generate-pattern endpoint is called.
+
+    Note: this records the GENERATION call (the draft produced by the LLM).
+    The admin still reviews and must call POST /patterns to actually create it
+    (which emits SensitivityPatternCreatedEvent).  Both records together provide
+    a complete chain: generated-by-AI → reviewed-by-admin → created.
+
+    Security invariant: raw AI-generated regex is hashed (SHA-256), not stored.
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_AI_GENERATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    description_length: int = 0   # length of user description (not the text itself)
+    model: str = ""               # Ollama model that generated the pattern
+    generated_regex_hash: str = ""  # SHA-256 of generated regex (raw not stored)
+    suggested_level: int = 0      # AI-suggested sensitivity level 1–5
+    parse_ok: bool = False        # True if the LLM response parsed cleanly
+
+
+@dataclass
+class TaxonomyLevelChangedEvent(AuditEvent):
+    """Emitted when an admin upserts or deletes a taxonomy level.
+
+    The taxonomy defines human-readable labels for sensitivity levels 1–5.
+    Changes affect how the UI and reports describe classifications.
+    step_up_verified is always True (write taxonomy ops require StepUpAdminSession).
+    """
+
+    event_type: str = EventType.TAXONOMY_LEVEL_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    level: int = 0                 # taxonomy level number (1–10)
+    change_type: str = ""          # "upsert" | "delete"
+    label: str = ""                # new label (empty on delete)
+    colour_class: str = ""         # new colour_class (empty on delete)
+    step_up_verified: bool = True  # always True — write ops require step-up
+
+
+@dataclass
+class AdminCloudKeySetEvent(AuditEvent):
+    """Emitted when an admin stores or updates a cloud provider API key via KMS.
+
+    Key VALUE is never logged. Only the provider name and KMS key name are
+    recorded. Step-up TOTP is required to reach the endpoint (ASVS V6.8.4).
+    """
+
+    event_type: str = EventType.ADMIN_CLOUD_KEY_SET
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    provider: str = ""     # e.g. "openai" | "anthropic"
+    kms_key: str = ""      # KMS key name (e.g. "openai_api_key") — never the value
+
+
+# ---------------------------------------------------------------------------
+# 4.0 Phase 3 — NHI identity lifecycle + P1/P2 split (RISK-097/108)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NhiInstantiationRequestedEvent(AuditEvent):
+    """User requests instantiation of an NHI from a user-agent template (RISK-097).
+
+    Emitted before scope intersection so the request is recorded even if
+    it is subsequently denied by NhiInstantiationDeniedEvent.
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""   # the requesting user's identity_id
+    ua_id: str = ""               # user-agent source id (uag_*)
+    template_name: str = ""       # agent name slug
+
+
+@dataclass
+class NhiScopeIntersectedEvent(AuditEvent):
+    """Scope intersection computed for an NHI instantiation (R3 / RISK-097).
+
+    Records the resulting effective_scope so the audit chain proves what
+    the NHI was granted, independently of any later mutation.
+    effective_scope_hash is SHA-384 of the JSON-serialised effective_scope.
+    """
+
+    event_type: str = EventType.NHI_SCOPE_INTERSECTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    nhi_id: str = ""
+    owner_identity_id: str = ""
+    effective_scope_hash: str = ""   # sha384:<hex>
+    declared_scope_tool_count: int = 0
+    effective_scope_tool_count: int = 0
+
+
+@dataclass
+class NhiInstantiationDeniedEvent(AuditEvent):
+    """NHI instantiation denied — empty intersection or admin deny (RISK-097).
+
+    reason: "empty_intersection" | "admin_deny" | "svid_pending".
+    """
+
+    event_type: str = EventType.NHI_INSTANTIATION_DENIED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    reason: str = ""   # empty_intersection | admin_deny | svid_pending
+
+
+@dataclass
+class NhiSvidApprovedEvent(AuditEvent):
+    """Admin approved SVID issuance for an NHI (step-up required, RISK-097).
+
+    step_up_verified is always True — NHI approval requires StepUpAdminSession.
+    """
+
+    event_type: str = EventType.NHI_SVID_APPROVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    nhi_id: str = ""
+    spiffe_id: str = ""
+    step_up_verified: bool = True
+
+
+@dataclass
+class NhiSvidIssuanceFailedEvent(AuditEvent):
+    """PKI leaf mint FAILED during NHI SVID approval (fail-closed path, BUG-A v4.1).
+
+    Emitted by the approval endpoint when mint_agent_leaf() raises. The registry
+    flag ``svid_issued`` is NOT set (approval is aborted with a 502) — a registry
+    entry must never claim an issued SVID with no cert on disk.
+
+    error_type: exception class name from the mint failure (no message payload —
+                paths/errors may leak filesystem layout; the full error goes to
+                app logs only).
+    """
+
+    event_type: str = EventType.NHI_SVID_ISSUANCE_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    nhi_id: str = ""
+    spiffe_id: str = ""
+    error_type: str = ""
+
+
+@dataclass
+class McpIngressDeniedEvent(AuditEvent):
+    """A mesh caller was DENIED at a per-MCP Caddy-front ingress gate.
+
+    v4.1 Phase 1c — emitted by /auth/verify-mcp (the forward_auth leg of the
+    per-MCP wrap, codegen `_gen_caddy_snippet_mcp`).  The subject SPIFFE is
+    the mTLS-VERIFIED peer identity Caddy injected (X-SPIFFE-ID
+    strip-before-set from the verified peer cert URI SAN) — never a
+    client-supplied header (SpiffePeerCertMiddleware Option C guarantees).
+
+    reason: machine-readable deny reason (no_spiffe_id / foreign_identity /
+            legacy_identity / cross_tenant / nhi_not_found / nhi_not_approved /
+            spiffe_mismatch / server_not_onboarded / invalid_target /
+            registry_unavailable / envelope_store_unavailable).
+    """
+
+    event_type: str = EventType.MCP_INGRESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # SPIFFE URIs + slugs only — no PII
+    subject_spiffe_id: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    reason: str = ""
+
+
+@dataclass
+class WebhookIngressDeniedEvent(AuditEvent):
+    """An inbound webhook was DENIED at the /auth/verify-webhook forward_auth gate.
+
+    v4.1 Phase 2b — emitted by the backoffice verify_webhook_ingress route on
+    every deny.  Covers: Layer-B HMAC absent (caught before this event), bad
+    method, unknown provider, Slack timestamp-freshness fail, Slack replay, Telegram
+    token mismatch, and rate-limit exceeded.
+
+    provider: "slack" | "telegram" | "" (unknown/missing)
+    reason: machine-readable deny string
+    client_ip: X-Real-IP from Caddy (never a client-spoofable header)
+    """
+
+    event_type: str = EventType.WEBHOOK_INGRESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False  # no PII in provider / reason
+    provider: str = ""
+    reason: str = ""
+    client_ip: str = ""
+
+
+@dataclass
+class McpOnboardTransactionFailedEvent(AuditEvent):
+    """The MCP approve transaction ABORTED and was rolled back (fail-closed).
+
+    v4.1 Phase 1c — emitted by the import/approve ceremony when any step of
+    mint-leaf → codegen → artifact-write → caddy-reload → durable-envelope
+    fails.  Nothing was onboarded: minted cert/key files and written
+    artifacts are removed; `svid_issued` is never persisted without a real
+    cert on disk (the BUG-A fail-open pattern must not reappear).
+
+    failed_step: which transaction step raised (mint_leaf / codegen /
+                 artifact_write / caddy_reload / envelope_mint).
+    error_type:  exception class name only (paths/messages stay in app logs).
+    """
+
+    event_type: str = EventType.MCP_ONBOARD_TRANSACTION_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    failed_step: str = ""
+    error_type: str = ""
+
+
+@dataclass
+class McpEgressGrantWrittenEvent(AuditEvent):
+    """A (caller SPIFFE, egress prefixes) grant was written at approve time.
+
+    v4.1 unified-sidecar Phase 1 (Lu M1 — synthesis must-fix #1): the
+    positive-grant, closed-world OPA egress model
+    (``data.yashigani.mcp.egress_grants``) is populated ONLY inside the
+    step-up-gated approve transaction (StepUpAdminSession on POST /import).
+    This event is the audit evidence for every grant write.
+
+    Closed world means an EMPTY ``prefixes`` list is itself meaningful (the
+    instance is explicitly granted NO egress) and is still audited.
+    Revocation is grant ABSENCE in the pushed OPA data document (the kill
+    switch — Nico Q3); the rollback path deletes the grant record.
+
+    spiffe_id:  EXACT per-instance SPIFFE URI the grant is keyed on
+                (byte-match at decision time — never name-collapsed).
+    prefixes:   the granted egress prefix slugs (positive set).
+    """
+
+    event_type: str = EventType.MCP_EGRESS_GRANT_WRITTEN
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    prefixes: list = field(default_factory=list)
+
+
+@dataclass
+class NhiInvocationAllowedEvent(AuditEvent):
+    """OPA allowed an NHI-originated hop (RISK-097 invariant pass)."""
+
+    event_type: str = EventType.NHI_INVOCATION_ALLOWED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""   # the invoking user, from delegated ctx
+    path: str = ""
+
+
+@dataclass
+class NhiInvocationDeniedEvent(AuditEvent):
+    """OPA denied an NHI-originated hop — scope containment working (RISK-097)."""
+
+    event_type: str = EventType.NHI_INVOCATION_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    on_behalf_of_identity_id: str = ""
+    path: str = ""
+    deny_reason: str = ""   # scope_ceiling | tool_not_allowed | budget_exceeded
+
+
+@dataclass
+class AgentHeaderStrippedEvent(AuditEvent):
+    """A P1 (agent-only) caller attempted to set a P2 (user-assertion) header.
+
+    Severity: HIGH.  This is a regression canary for FIND-3.1-AGENT-BEARER-
+    IMPERSONATION (RISK-108).  The header was silently stripped; the identity
+    resolved as the agent's own NHI identity (not the claimed user).
+
+    Laura's regression probe checks for this event in the audit chain — any
+    appearance means an agent made an impersonation attempt.
+    """
+
+    event_type: str = EventType.AGENT_HEADER_STRIPPED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_token_role: str = ""        # p1_agent | p1_nhi
+    stripped_header: str = ""          # x-openwebui-user-email | x-yashigani-orchestration-principal
+    agent_identity_id: str = ""        # the resolved agent/NHI id
+    severity: str = "HIGH"             # immutable floor
+
+
+@dataclass
+class DelegatedCtxMintedEvent(AuditEvent):
+    """Gateway minted a server-side delegated context record (R2 / RISK-097).
+
+    Records the binding without exposing the signed nonce value.
+    binding_hash is SHA-384 of (nhi_id + ":" + user_identity_id + ":" + jti).
+    """
+
+    event_type: str = EventType.DELEGATED_CTX_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    nhi_id: str = ""
+    user_identity_id: str = ""
+    session_id_hash: str = ""    # SHA-384 of the raw session_id — never raw
+    binding_hash: str = ""       # SHA-384(nhi_id:user_identity_id:jti)
+    ttl_seconds: int = 0
+
+
+@dataclass
+class AgentTemplateGraphSavedEvent(AuditEvent):
+    """Builder graph persisted server-side (Phase 4 / RISK-113).
+
+    raw graph is never stored; only node_count, edge_count, and a SHA-384
+    of the normalised graph JSON are recorded.
+    effective_scope_stripped=True confirms R11 enforcement ran.
+    """
+
+    event_type: str = EventType.AGENT_TEMPLATE_SAVED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    ua_id: str = ""
+    node_count: int = 0
+    edge_count: int = 0
+    graph_hash: str = ""              # sha384:<hex> of normalised CTF graph JSON
+    effective_scope_stripped: bool = True  # always True (R11)
+
+
+# ---------------------------------------------------------------------------
+# 4.0 no-code backend — NL-driven agent generation (EU AI Act Art.14)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentFlowGenerationRequestedEvent(AuditEvent):
+    """Emitted when a user requests NL-driven Langflow flow generation.
+
+    Records the intent before the governed LLM call so the request is
+    on the audit chain even if generation fails.
+
+    Security invariants:
+    - description is NOT stored (may contain sensitive NL; only length recorded).
+    - masking_applied=True always.
+    - owner_identity_id identifies the accountable human principal.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    description_length: int = 0       # length in chars of the NL description
+    # First 10 effective skills (path strings) — bounded to avoid large records.
+    # No user content (the description) is stored here.
+    effective_skills: "list[str]" = field(default_factory=list)
+
+
+@dataclass
+class AgentFlowGeneratedEvent(AuditEvent):
+    """Emitted after a Langflow flow is successfully generated and created.
+
+    Records the draft flow's identity and scope-clamp outcome.
+    The generated spec is NOT stored (hash only — raw flows may be large
+    and can contain user-description fragments).
+
+    Security invariants:
+    - masking_applied=True always.
+    - spec_hash is SHA-384 of the clamped flow JSON (after model-name clamp).
+    - clamp_warnings records how many model-name substitutions were applied
+      (string list bounded to 20 entries for log hygiene).
+    """
+
+    event_type: str = EventType.AGENT_FLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""
+    draft_id: str = ""                 # ua:draft:{draft_id} Redis key prefix
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""                # sha384:<hex> of the clamped flow JSON
+    clamp_warnings: "list[str]" = field(default_factory=list)   # ≤20 entries
+
+
+@dataclass
+class AgentFlowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their template pool.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the flow; this event records the human's explicit
+    decision to add it to their agent-template pool.  The accountable act
+    is the human's POST /user/agents/templates call, not the LLM generation.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit HTTP POST.
+    - masking_applied=True always.
+    - spec_hash from the draft is reproduced here for chain-of-custody audit.
+    """
+
+    event_type: str = EventType.AGENT_FLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""        # accountable human principal
+    ua_id: str = ""                    # resulting ua:meta:{ua_id} key
+    draft_id: str = ""                 # consumed draft (now deleted from Redis)
+    flow_id: str = ""                  # Langflow flow UUID
+    spec_hash: str = ""               # sha384:<hex> of the committed flow JSON
+    callee_registered: bool = False    # True if agent_registry entry was created
+    human_decided: bool = True         # always True — immutable field (EU AI Act)
+
+
+# ===========================================================================
+# 4.0 no-code WORKFLOW composer (EU AI Act Art.14)
+# ===========================================================================
+
+
+@dataclass
+class WorkflowGenerationRequestedEvent(AuditEvent):
+    """Emitted before the governed LLM call for workflow spec generation.
+
+    Records the incoming NL description length and the calling principal so
+    the audit chain has a pre-LLM anchor for chain-of-custody.
+
+    EU AI Act Art.14: AI generates; human decides.
+    NIST AU-2 / AU-12 / SOC 2 CC7.1.
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATION_REQUESTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    description_length: int = 0         # len(body.description) — not the description itself
+    available_handle_count: int = 0     # number of @-handles visible to this user
+
+
+@dataclass
+class WorkflowGeneratedEvent(AuditEvent):
+    """Emitted after the LLM produces a workflow spec that passes validation.
+
+    Records the draft_id + spec_hash for chain-of-custody.  The spec itself
+    is not stored in the audit chain (may contain sensitive handle names).
+
+    Draft is BOLA-scoped (draft.account_id == owner_identity_id).
+    """
+
+    event_type: str = EventType.WORKFLOW_GENERATED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # calling user's account_id
+    draft_id: str = ""                  # wf:draft:{draft_id} key
+    spec_hash: str = ""                 # sha384:<hex> of the spec JSON
+    step_count: int = 0                 # number of steps in the generated spec
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    clamped_handle_count: int = 0       # number of @-handles removed during validation
+
+
+@dataclass
+class WorkflowCommittedEvent(AuditEvent):
+    """Emitted when a user explicitly commits a generated draft to their workflow store.
+
+    THIS IS THE HUMAN-DECIDES AUDIT ANCHOR (EU AI Act Art.14).
+    The AI generated the spec; this event records the human's explicit decision
+    to persist it as a named, scheduled workflow.
+
+    Security invariants:
+    - human_decided is always True — the event cannot be emitted without a
+      live user session (require_user_session) and an explicit POST /user/workflows.
+    - masking_applied is always True.
+    - spec_hash reproduced from the draft for chain-of-custody.
+    """
+
+    event_type: str = EventType.WORKFLOW_COMMITTED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    owner_identity_id: str = ""         # accountable human principal
+    workflow_id: str = ""               # wf:meta:{workflow_id} key
+    draft_id: str = ""                  # consumed draft_id (now deleted)
+    workflow_name: str = ""             # human-supplied name (masked)
+    spec_hash: str = ""                 # sha384:<hex> of the committed spec JSON
+    step_count: int = 0                 # number of steps
+    schedule_kind: str = "none"         # "interval" | "cron" | "none"
+    human_decided: bool = True          # always True — immutable (EU AI Act)
+# ---------------------------------------------------------------------------
+# 4.0 — Workflow scheduler + governed execution (feat/4.0-wf-exec)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkflowRunStartedEvent(AuditEvent):
+    """Emitted when the scheduler triggers a committed workflow run.
+
+    Records the workflow identity, owner, step count, schedule kind, and
+    trigger source.  Anchors the run on the tamper-evident hash chain.
+
+    NIST AU-2 / AU-12 / SOC 2 CC7.1 / EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.WORKFLOW_RUN_STARTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""           # stable workflow identifier
+    run_id: str = ""                # per-run UUID
+    identity_id: str = ""          # workflow owner's identity_id
+    session_id: str = ""           # = identity_id (queryable principal)
+    step_count: int = 0            # total steps in this workflow
+    schedule_kind: str = ""        # "interval" | "cron"
+    trigger_kind: str = "scheduler"  # "scheduler" | "manual"
+
+
+@dataclass
+class WorkflowStepCompletedEvent(AuditEvent):
+    """Emitted when one workflow step completes cleanly.
+
+    Records the adjudication triple so the audit chain proves every hop was
+    OPA-gated and inspection-cleared (OPA-every-hop invariant).
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""           # workflow owner
+    session_id: str = ""            # = identity_id
+    step_index: int = 0
+    actor: str = ""                 # @-handle (e.g. "@Mimi")
+    ingress_opa: str = ""           # "allow" | "deny:<reason>"
+    egress_opa: str = ""
+    inspection_verdict: str = ""    # CLEAN | FLAGGED | skipped
+
+
+@dataclass
+class WorkflowStepDeniedEvent(AuditEvent):
+    """Emitted when a workflow step is denied by OPA or response inspection.
+
+    The run halts immediately (fail-closed).  Raw step output is NEVER stored.
+    This is the workflow-layer analogue of OrchestrationBlockedStepEvent.
+    """
+
+    event_type: str = EventType.WORKFLOW_STEP_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    step_index: int = 0
+    actor: str = ""
+    block_source: str = ""          # "opa_ingress" | "opa_egress" | "response_inspection" | ...
+    ingress_opa: str = ""
+    egress_opa: str = ""
+    inspection_verdict: str = ""
+
+
+@dataclass
+class WorkflowRunCompletedEvent(AuditEvent):
+    """Emitted when all workflow steps complete without a deny."""
+
+    event_type: str = EventType.WORKFLOW_RUN_COMPLETED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    steps_completed: int = 0
+    steps_denied: int = 0
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowRunFailedEvent(AuditEvent):
+    """Emitted when a workflow run is aborted (denied step, exception, missing actor)."""
+
+    event_type: str = EventType.WORKFLOW_RUN_FAILED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    workflow_id: str = ""
+    run_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    reason: str = ""                # e.g. "step_0_denied" | "step_1_error"
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class WorkflowAdminDisabledEvent(AuditEvent):
+    """Emitted when an admin disables a user's workflow from the admin oversight plane.
+
+    Security invariants:
+    - Emitted only via PATCH /admin/workflows/{wf_id} under StepUpAdminSession.
+    - admin_account_id is the authenticated admin's account_id (not the owner).
+    - workflow_name is truncated to 64 chars.
+    - masking_applied is always True.
+    """
+
+    event_type: str = EventType.WORKFLOW_ADMIN_DISABLED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account_id: str = ""      # the admin who performed the action
+    workflow_id: str = ""           # affected workflow
+    owner_identity_id: str = ""     # identity_id of the workflow owner
+    workflow_name: str = ""         # display name (truncated to 64 chars)
+
+
+# ---------------------------------------------------------------------------
+# 4.0 — LAURA-V400-002 / AUDIT-GAP-001: OPA client-policy lifecycle events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PolicySavedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/save (create or update a client policy).
+
+    Captures admin identity, policy name, lifecycle transition to draft, and
+    whether high-severity sanity warnings were overridden.
+    """
+
+    event_type: str = EventType.POLICY_SAVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""     # session.account_id
+    policy_name: str = ""       # clients/<name>
+    warnings_count: int = 0     # total sanity warnings
+    high_warnings_confirmed: bool = False  # confirm_warnings flag
+
+
+@dataclass
+class PolicyDuplicatedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/templates/duplicate (save-as template)."""
+
+    event_type: str = EventType.POLICY_DUPLICATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    source_template: str = ""   # template_id duplicated from
+    policy_name: str = ""       # new clients/<name>
+
+
+@dataclass
+class PolicyRegoEditedEvent(AuditEvent):
+    """Emitted on PUT /admin/policies/custom/<name>/rego (edit client policy Rego)."""
+
+    event_type: str = EventType.POLICY_REGO_EDITED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    warnings_count: int = 0
+    high_warnings_confirmed: bool = False
+
+
+@dataclass
+class PolicyCoreEditedEvent(AuditEvent):
+    """Emitted on PUT /admin/policies/core/<policy_id> (edit load-bearing core policy).
+
+    Core policy edits are dangerous and require confirm_danger=true + step-up.
+    The reason field carries the operator-supplied justification.
+    """
+
+    event_type: str = EventType.POLICY_CORE_EDITED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_id: str = ""         # full OPA id (e.g. 'yashigani/main')
+    reason: str = ""            # operator-supplied justification (max 500 chars)
+
+
+@dataclass
+class PolicyPromotedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/lifecycle/<name>/promote."""
+
+    event_type: str = EventType.POLICY_PROMOTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    previous_status: str = ""   # e.g. "draft"
+    new_status: str = ""        # e.g. "staging" or "production"
+
+
+@dataclass
+class PolicyArchivedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/lifecycle/<name>/archive."""
+
+    event_type: str = EventType.POLICY_ARCHIVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    previous_status: str = ""
+
+
+@dataclass
+class PolicyActivatedEvent(AuditEvent):
+    """Emitted on POST /admin/policies/activate (confirm policy is loaded in OPA)."""
+
+    event_type: str = EventType.POLICY_ACTIVATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+
+
+@dataclass
+class PolicyBoundEvent(AuditEvent):
+    """Emitted on POST /admin/policies/bind (bind a policy to a subject scope)."""
+
+    event_type: str = EventType.POLICY_BOUND
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    policy_name: str = ""
+    scope_kind: str = ""
+    scope_id: str = ""
+    direction: str = ""
+    binding_id: str = ""
+
+
+@dataclass
+class PolicyUnboundEvent(AuditEvent):
+    """Emitted on DELETE /admin/policies/bind/<binding_id>."""
+
+    event_type: str = EventType.POLICY_UNBOUND
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    binding_id: str = ""
+
+
+@dataclass
+class BindingScopeIdReconcileEvent(AuditEvent):
+    """Emitted by the startup reconciler that normalises stale policy-binding
+    scope_ids (email / slug) to canonical idnt_ PKs (LAURA-4.0-S1-001 MEDIUM).
+
+    Fields:
+      checked       — total human-scoped bindings examined.
+      rewritten     — bindings whose scope_id was rewritten to an idnt_ PK.
+      already_pk    — bindings already carrying an idnt_ PK (skipped).
+      unresolvable  — bindings whose scope_id could not be resolved to any
+                      registered identity (left in place, logged as WARNING).
+      opa_re_pushed — True if OPA was re-pushed after rewrites.
+    """
+
+    event_type: str = EventType.BINDING_SCOPE_ID_RECONCILE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    checked: int = 0
+    rewritten: int = 0
+    already_pk: int = 0
+    unresolvable: int = 0
+    opa_re_pushed: bool = False
+
+
+# ---------------------------------------------------------------------------
+# LAURA-V400-R2-001 — Dual-admin data-protection maker-checker events (4.0)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DataProtectionWeakenRequestedEvent(AuditEvent):
+    """Emitted when admin A (maker) submits a data-protection weaken request.
+
+    The change is NOT applied yet — it sits in the DpWeakenPendingStore until
+    a DIFFERENT admin (admin B, checker) approves or rejects it.
+
+    Compliance anchor: disabling data-protection controls is compliance-critical
+    (GDPR Art. 32, NIST SP 800-53 SI-12, SOC 2 CC6.1).  Every weaken request
+    MUST be on the tamper-evident hash chain regardless of whether it is
+    ultimately approved.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_REQUESTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # maker (requester) account_id
+    request_id: str = ""         # pending store UUID
+    control: str = ""            # pii_config | pii_cloud_bypass | doc_enforcement
+    from_state: Optional[dict] = None   # current enforcing state
+    to_state: Optional[dict] = None     # desired weakened state
+    rule_id: str = "yashigani.data-protection.weaken.requested"
+    user_message: str = (
+        "A data-protection weaken request was submitted and is pending "
+        "approval by a second admin."
+    )
+    code: int = 202
+
+
+@dataclass
+class DataProtectionWeakenApprovedEvent(AuditEvent):
+    """Emitted when admin B (checker) approves a pending weaken request.
+
+    The change IS applied immediately after this event is written.  The
+    resulting config change is also recorded as a ConfigChangedEvent so the
+    change appears in both the approval chain and the config-change chain.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_APPROVED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # checker (approver) account_id
+    requester_id: str = ""       # maker account_id (for cross-reference)
+    request_id: str = ""
+    control: str = ""
+    from_state: Optional[dict] = None
+    to_state: Optional[dict] = None    # the state now applied
+    rule_id: str = "yashigani.data-protection.weaken.approved"
+    user_message: str = (
+        "A data-protection weaken request was approved by a second admin "
+        "and the configuration change has been applied."
+    )
+    code: int = 200
+
+
+@dataclass
+class DataProtectionWeakenRejectedEvent(AuditEvent):
+    """Emitted when admin B (checker) rejects a pending weaken request.
+
+    No config change is applied.  The control remains in its enforcing state.
+    """
+
+    event_type: str = EventType.DATA_PROTECTION_WEAKEN_REJECTED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""      # checker (rejector) account_id
+    requester_id: str = ""       # maker account_id (for cross-reference)
+    request_id: str = ""
+    control: str = ""
+    from_state: Optional[dict] = None
+    to_state: Optional[dict] = None    # the state that was NOT applied
+    rule_id: str = "yashigani.data-protection.weaken.rejected"
+    user_message: str = (
+        "A data-protection weaken request was rejected. "
+        "The protection control remains in its enforcing state."
+    )
+    code: int = 200
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-108 — Mesh port identity-header trust gate rejection events (4.0)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MeshIdentityHeaderRejectedEvent(AuditEvent):
+    """An unauthenticated caller on the mesh port (:8081) presented an
+    identity-forwarding header (X-Forwarded-User or X-Yashigani-Identity-Id)
+    without proving internal mesh identity via the per-install bearer or
+    the Caddy-verified shared secret.
+
+    Severity: HIGH.  The header is stripped and the caller is treated as
+    anonymous (user_id = "unknown").  Any appearance in the audit chain is a
+    regression canary for T-3 of YSG-RISK-108 (header-spoof on mesh port).
+
+    The claimed_value field is truncated to 64 chars (never raw user data).
+
+    ASVS V1.4.5 / OWASP A07:2021 / CWE-290 (Authentication Bypass by Spoofing).
+    """
+
+    event_type: str = EventType.MESH_IDENTITY_HEADER_REJECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    path: str = ""                  # request path (/mcp/...)
+    method: str = ""                # HTTP method
+    # Header name that was rejected (lowercase: x-forwarded-user etc.)
+    rejected_header: str = ""
+    # First 64 chars of the claimed value (never store raw user data in full)
+    claimed_value_truncated: str = ""
+    severity: str = "HIGH"          # immutable floor
+
+
+@dataclass
+class MeshOrchDepthForgedEvent(AuditEvent):
+    """An unauthenticated caller on the mesh port (:8081) presented
+    X-Yashigani-Orchestration-Depth to attempt promotion to the privileged
+    "gateway:orchestrator" identity without proving internal mesh identity.
+
+    Severity: HIGH.  The promotion is suppressed; the caller retains their
+    real (unauthenticated) identity.  Any appearance in the audit chain is a
+    regression canary for T-4 of YSG-RISK-108 (orchestration-depth forge).
+
+    ASVS V4.1.1 / CWE-269 (Improper Privilege Management) / CWE-290.
+    """
+
+    event_type: str = EventType.MESH_ORCH_DEPTH_FORGED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    path: str = ""                  # request path
+    method: str = ""                # HTTP method
+    # Value of the forged depth header (truncated to 16 chars)
+    depth_value_truncated: str = ""
+    severity: str = "HIGH"          # immutable floor
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase B — Agent Policy Template events
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentPolicyTemplateAppliedEvent(AuditEvent):
+    """An admin applied a policy template to an agent (step-up-gated).
+
+    v4.1 Phase B (design §4.3 / B1 / B5).  The grant write (MCP_EGRESS_GRANT_WRITTEN)
+    is the enforcement record; this event adds provenance: which template, which
+    version, which prefixes, which SPIFFE, any overrides/acknowledgements.
+
+    identity_basis: "ringfence-position" — honest attribution per Lu MF-6.
+    The grant document is the sole OPA enforcement input; templates are UX/provenance.
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.AGENT_POLICY_TEMPLATE_APPLIED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    tenant_id: str = ""
+    system_id: str = ""
+    template_id: str = ""
+    template_version: int = 1
+    spiffe_id: str = ""
+    granted_prefixes: list = field(default_factory=list)
+    overrides_digest: str = ""       # SHA-256 of JSON-serialised overrides (or "")
+    acknowledgements: list = field(default_factory=list)  # [{residual_id, justification}]
+    # Honest attribution — never implies mTLS/attestation (Lu MF-6)
+    identity_basis: str = "ringfence-position"
+
+
+@dataclass
+class AgentPolicyTemplateRevokedEvent(AuditEvent):
+    """An admin revoked a policy template / egress grant from an agent (step-up-gated).
+
+    v4.1 Phase B (design §4.3 / B1).  Grant absence in the re-pushed OPA data
+    IS the kill switch (Nico Q3); this event is the audit evidence.
+
+    identity_basis: "ringfence-position" — honest attribution per Lu MF-6.
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.AGENT_POLICY_TEMPLATE_REVOKED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    tenant_id: str = ""
+    system_id: str = ""
+    spiffe_id: str = ""
+    revoked_prefixes: list = field(default_factory=list)
+    # Honest attribution
+    identity_basis: str = "ringfence-position"
+
+
+@dataclass
+class LangflowFlowDiscoveredEvent(AuditEvent):
+    """Langflow reconciler discovered a flow created in langflow's own UI.
+
+    v4.1 Phase B (design §6 / B3).  An INERT pending registry record was written
+    (no leaf, no grant, no envelope — gateway 403s unapproved NHIs fail-closed).
+    The flow surfaces in nhi-approvals.js as 'discovered — pending admin approval'.
+
+    graph_hash is drift-detection metadata only (Nico Q-N3): canonical JSON of
+    the flow graph stripped of UI positions/viewport/timestamps, SHA-256.
+    NOT attestation; NOT a leaf binding input.
+
+    egress_attribution (Lu disclosure, v4.1 F-G/F-H): egress attribution for
+    flows running under this langflow instance is INSTANCE-LEVEL (langflow
+    SPIFFE), NOT per-flow.  All flows share the union egress grant.  Per-flow
+    egress isolation requires per-instance containers (Track 3+).  This
+    disclosure is surfaced in the admin UI residuals panel for every discovered
+    NHI record (agent-policies.js _renderResiduals).
+
+    Compliance: NIST AU-2 / AU-12 / SOC 2 CC7.1.
+    """
+
+    event_type: str = EventType.LANGFLOW_FLOW_DISCOVERED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    flow_id: str = ""
+    # Flow name as returned by langflow — stored raw, encoded at render
+    flow_name_truncated: str = ""    # truncated to 128 chars
+    graph_hash: str = ""             # SHA-256 of canonical graph JSON (drift-detection only)
+    parser_version: int = 1          # canonical-JSON parser version (for hash stability)
+    langflow_instance: str = ""      # which langflow instance (trust_domain/system label)
+    # Lu disclosure (v4.1): egress attribution is instance-level, not per-flow
+    egress_attribution: str = (
+        "INSTANCE-LEVEL (langflow SPIFFE), NOT per-flow. "
+        "All flows under this instance share the union egress grant. "
+        "Per-flow isolation requires per-instance containers (Track 3+)."
+    )

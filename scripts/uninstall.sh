@@ -149,7 +149,9 @@ fi
 #   2. `podman info --format '{{.Host.Security.Rootless}}'` returns "true"
 #   Both must be true to take the unshare path.
 # ---------------------------------------------------------------------------
-SECRETS_DIR="${PROJECT_ROOT}/docker/secrets"
+# YSG-RISK-053: docker/secrets-caddy/ carries the Caddy-scoped secrets
+# (caddy_client.{key,crt} + caddy_internal_hmac) — wipe it the same way.
+for SECRETS_DIR in "${PROJECT_ROOT}/docker/secrets" "${PROJECT_ROOT}/docker/secrets-caddy"; do
 if [ -d "$SECRETS_DIR" ]; then
   _info "Removing secrets directory: ${SECRETS_DIR}"
 
@@ -177,6 +179,7 @@ if [ -d "$SECRETS_DIR" ]; then
 else
   _info "Secrets directory not found: ${SECRETS_DIR}"
 fi
+done
 
 # ---------------------------------------------------------------------------
 # Step 5: Remove .env (prompt unless --force)

@@ -520,6 +520,12 @@ class TestRuntimeSettingsKeys:
     def test_meta_class_defaults_are_positive_numbers(self):
         from yashigani.runtime_settings.keys import KNOWN_SETTINGS
         for meta in KNOWN_SETTINGS:
+            # bool/string settings are not numeric: a bool class_default of
+            # False is legitimate (e.g. gateway.models.service_account_full_list,
+            # default OFF for least-disclosure). The positivity invariant only
+            # applies to numeric (int/float) tunables.
+            if meta.allowed_type not in ("int", "float"):
+                continue
             assert meta.class_default > 0, f"{meta.key} class_default must be positive"
 
     def test_allowed_types_are_valid(self):

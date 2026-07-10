@@ -110,6 +110,16 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + chain-bundle trust anchor only (jaeger.yml OTLP receiver);
+            # no other leaf keys / bootstrap tokens / caddy_internal_hmac.
+            items:
+              - key: jaeger_client.crt
+                path: jaeger_client.crt
+              - key: jaeger_client.key
+                path: jaeger_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
         {{- end }}
         - name: tmp
           emptyDir:

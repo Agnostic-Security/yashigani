@@ -91,10 +91,18 @@ class TestStaticStructure:
         )
 
     def test_hardened_path_present(self):
-        """Hardened PATH must be set at the top of the script."""
+        """Hardened PATH must be set at the top of the script (absolute dirs only).
+        v2.24.4 prepended the Mac runtime dirs (/opt/homebrew/bin, /opt/homebrew/sbin,
+        /opt/podman/bin) so `podman` is discoverable on macOS Podman Desktop during
+        uninstall — otherwise uninstall silently no-ops with 'podman: command not
+        found'. The system-hardened suffix must remain, and PATH must be absolute."""
+        import re
         script = _read_script()
-        assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in script, (
-            "Hardened PATH declaration missing from uninstall.sh"
+        assert "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in script, (
+            "Hardened system PATH suffix missing from uninstall.sh"
+        )
+        assert re.search(r"^PATH=/", script, re.M), (
+            "uninstall.sh PATH must be absolute (declared as PATH=/...)"
         )
 
     def test_runtime_subtypes_all_handled(self):

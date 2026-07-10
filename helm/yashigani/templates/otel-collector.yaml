@@ -107,6 +107,19 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + trust anchors only (ca_bundle for receivers/exporters,
+            # ca_intermediate for the loki exporter); no other leaf keys /
+            # bootstrap tokens / caddy_internal_hmac.
+            items:
+              - key: otel-collector_client.crt
+                path: otel-collector_client.crt
+              - key: otel-collector_client.key
+                path: otel-collector_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
         {{- end }}
         - name: tmp
           emptyDir:

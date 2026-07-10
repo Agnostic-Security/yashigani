@@ -1,0 +1,86 @@
+# Yashigani v4.1 unified-sidecar — langflow egress-forwarder descriptor
+#
+# TRANSITIONAL, OVERLAP PHASE (design §3.2; three-agent wrap directive
+# 2026-07-07): wires langflow onto the unified egress-forwarder TEMPLATE.
+# langflow's ONLY outbound is LLM traffic (OpenAI-SDK env config,
+# OPENAI_API_BASE — compose docker-compose.yml langflow stanza). Under the
+# template that traffic becomes egress class `llm` (design §2.4):
+#   langflow → egress-langflow:9400/llm/v1/* (plain HTTP, 2-member
+#   ringfence_langflow_eg) → caddy:18790/llm/* (forwarder presents the
+#   langflow leaf) → gateway /egress/eval/llm/* (body inspection + OPA)
+#   → caddy:18790/deliver/llm/* → gateway:8081/v1/* (today's inference
+#   surface; §2.4 open item (i) — :8080 openai_router cutover is Tom's).
+#
+# deliver_to `gateway-inference` is the reserved INTERNAL delivery class
+# (codegen _EGRESS_INTERNAL_DELIVER_CLASSES) — no account pins required
+# (L-US-3 applies to internet-facing needs only).
+#
+# The per-agent langflow_yashigani_token (OPENAI_API_KEY shim) STAYS —
+# pin-AND-grant overlap: the bearer still authenticates langflow at the
+# gateway app layer; the forwarder adds the mTLS instance identity +
+# body inspection + OPA grant gate on top. Token retirement is the
+# per-instance /agents/ migration step (design §3.2.1), Laura-gated.
+#
+# RETIRES when langflow migrates to a per-instance /agents/ identity.
+#
+# Regenerating the committed artifacts (drift-gated by
+# tests/contracts/test_v41_egress_forwarder_template.py +
+# tests/contracts/test_v41_agent_ingress_template.py):
+#   PYTHONPATH=src python3 -c "
+#     import yaml, pathlib
+#     from yashigani.manifest import (render_egress_forwarder_artifacts,
+#                                     render_agent_ingress_artifacts)
+#     parsed = yaml.safe_load(open('bundles/langflow-egress.yaml'))
+#     arts = render_egress_forwarder_artifacts(parsed, 'docker')
+#     arts.update(render_agent_ingress_artifacts(parsed, 'docker'))
+#     for rel, content in arts.items():
+#         pathlib.Path(rel).write_text(content)"
+#
+apiVersion: yashigani.io/v1alpha1
+kind: AgentIntegration
+
+metadata:
+  name: langflow
+  tenant_id: default
+  category: other
+  description: >-
+    Transitional egress-forwarder wiring for the bundled langflow agent
+    (pin-AND-grant overlap phase). Not a full onboard manifest.
+  vendor: "Langflow (DataStax)"
+  licence: MIT
+  upstream: "https://github.com/langflow-ai/langflow"
+
+spec:
+  image:
+    repository: docker.io/langflowai/langflow
+    tag: "1.9.2"
+    digest: "sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+
+  ingress:
+    surface: http-api
+    # langflow's UI/API port — the intra-zone-deny tuple is
+    # egress-langflow -> langflow:7860 (REFUSED).
+    shim_port: 7860
+    # §2.5 INGRESS FRONT mesh-listener port — PINNED to the deterministic
+    # allocator value (sha256("default/langflow") in [9500,9900)) so the
+    # install.sh registered upstream URL and the compose/helm dispatch env
+    # (https://caddy:9705/agents/default/langflow) are stable + reviewable.
+    # Drift-gated by tests/contracts/test_v41_agent_ingress_template.py.
+    mesh_port: 9705
+
+  egress:
+    needs:
+      # LLM class (design §2.4): internal delivery to the gateway inference
+      # surface. No pins — reserved internal class, not internet-facing.
+      - prefix: llm
+        deliver_to: gateway-inference
+
+    # TRANSITIONAL identity: langflow's hand-minted service leaf
+    # (spiffe://<td>/langflow, service_identities.yaml `langflow` entry).
+    # Bound read-only at the standard SVID paths so the forwarder config is
+    # mode-agnostic. Mirrors the openclaw descriptor exactly.
+    svid_files:
+      cert: ./secrets/langflow_client.crt
+      key: ./secrets/langflow_client.key
+      ca: ./secrets/ca_root.crt
+      owner_uid: 1000

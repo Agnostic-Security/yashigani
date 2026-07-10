@@ -48,6 +48,32 @@ _SIEM_DEFAULT_BATCH_SIZE = 50              # events per delivery batch
 _SIEM_BATCH_MIN = 1
 _SIEM_BATCH_MAX = 100
 
+# All-zeros tenant UUID used when an event carries no tenant_id (or a
+# non-UUID tenant such as the synthetic "internal" service identity).
+_NULL_TENANT_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
+def _coerce_uuid(v: Any) -> Optional[uuid.UUID]:
+    """Best-effort coerce a value to a uuid.UUID, else None.
+
+    FINDING F-AUDIT (owui-rbac-buildsheet §A2): the audit ``request_id`` column
+    is ``uuid`` (nullable), but Open WebUI chat completions set
+    request_id="chatcmpl-..." which is NOT a UUID.  The previous
+    ``uuid.UUID(str(req_id))`` raised ValueError, which bubbled up through
+    _flush_batch and dropped the ENTIRE audit INSERT for that event ("badly
+    formed hexadecimal UUID string").  Coercing a non-UUID correlation id to
+    None stores the row with request_id=NULL — the event (tenant/type/session/
+    agent/seq/hash-chain) is still captured rather than lost.
+
+    Returns None for None / non-UUID input; never raises.
+    """
+    if v is None:
+        return None
+    try:
+        return uuid.UUID(str(v))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
 
 class AuditSink(ABC):
     name: str
@@ -88,17 +114,36 @@ class PostgresSink(AuditSink):
     name = "postgres"
     MAX_QUEUE_DEPTH = 1000
 
-    def __init__(self, pool_getter, chain_service=None) -> None:
+    def __init__(self, pool_getter, chain_service=None, *, require_chain: bool = False) -> None:
         """
         Args:
             pool_getter: zero-argument callable returning an asyncpg pool.
-            chain_service: optional AuditChainService instance.  When supplied,
-                every INSERT populates prev_hash and event_hash.  When None, the
-                columns are left NULL (permitted by the nullable migration 0011
-                columns; chain integrity gaps are counted at checkpoint time).
+            chain_service: AuditChainService instance.  When supplied, every
+                INSERT populates prev_hash and event_hash.
+            require_chain: v2.25.2 (Lu wire-sink-gate P2, irrevocable chain).
+                When True (the production wired path — see
+                build_postgres_audit_sink), the sink is constructed
+                immutable-by-construction:
+                  * chain_service MUST be non-None (else __init__ raises);
+                  * a hash-computation failure REJECTS the event (it is NOT
+                    written with NULL chain links).
+                The DB additionally enforces a CHECK (prev_hash IS NOT NULL AND
+                event_hash IS NOT NULL) NOT VALID constraint (migration 0015),
+                so even a bypassed app guard cannot land an unchained row.
+                require_chain=False is the legacy/test path (no chain).
+
+        Raises:
+            ValueError: if require_chain=True but chain_service is None.
         """
+        if require_chain and chain_service is None:
+            raise ValueError(
+                "PostgresSink(require_chain=True) requires a non-None chain_service — "
+                "an unchained audit sink would defeat the tamper-evident guarantee "
+                "(Lu wire-sink-gate P2 / irrevocable chain)."
+            )
         self._pool_getter = pool_getter
         self._chain_service = chain_service
+        self._require_chain = require_chain
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.MAX_QUEUE_DEPTH)
         self._last_write: Optional[datetime] = None
         self._task: Optional[asyncio.Task] = None
@@ -138,10 +183,17 @@ class PostgresSink(AuditSink):
         async with pool.acquire() as conn:
             async with conn.transaction():
                 for event in batch:
-                    tenant_id = event.get("tenant_id") or "00000000-0000-0000-0000-000000000000"
+                    # _coerce_uuid handles None / "" / non-UUID slugs (e.g. "default")
+                    # → None; fallback to _NULL_TENANT_UUID.  set_config MUST receive
+                    # a valid UUID string — the RLS policy on audit_events and other
+                    # tables evaluates current_setting('app.tenant_id')::uuid, so a
+                    # non-UUID value (slug like "default") raises
+                    # "invalid input syntax for type uuid" inside the RLS check even
+                    # though the INSERT value itself is correctly coerced below.
+                    tenant_uuid = _coerce_uuid(event.get("tenant_id")) or _NULL_TENANT_UUID
                     await conn.execute(
                         "SELECT set_config('app.tenant_id', $1, true)",
-                        str(tenant_id),
+                        str(tenant_uuid),
                     )
                     req_id = event.get("request_id")
 
@@ -158,19 +210,54 @@ class PostgresSink(AuditSink):
                         try:
                             prev_hash, event_hash = self._chain_service.compute_hashes_for_event(event)
                         except Exception as exc:
+                            # v2.25.2 (irrevocable chain): on the require_chain
+                            # (production) path, a hash-computation failure must
+                            # REJECT the event, not write it unchained.  Skip the
+                            # INSERT; the canonical file sink still has the event,
+                            # so the trail is not lost — only the DB mirror drops
+                            # this one row, which the checkpoint job surfaces as a
+                            # gap.  On the legacy path we preserve the old
+                            # behaviour (NULL hashes).
+                            if self._require_chain:
+                                try:
+                                    from yashigani.metrics.registry import audit_queue_overflow_total
+                                    audit_queue_overflow_total.inc()
+                                except Exception:
+                                    pass
+                                logger.error(
+                                    "PostgresSink: chain hash computation failed — "
+                                    "REJECTING event (require_chain on): %s",
+                                    exc,
+                                )
+                                continue
                             logger.error(
                                 "PostgresSink: chain hash computation failed — INSERT will have NULL hashes: %s",
                                 exc,
                             )
+                    elif self._require_chain:
+                        # Defensive: should be unreachable (__init__ rejects
+                        # chain_service=None when require_chain).  Never write an
+                        # unchained row on the production path.
+                        logger.error(
+                            "PostgresSink: require_chain on but chain_service is None — "
+                            "REJECTING event"
+                        )
+                        continue
 
                     # RETURNING seq (wave 3): capture the authoritative sequence
                     # value for logging / verification. The seq column is the
                     # canonical ordering key; its value is DB-assigned (BIGSERIAL).
                     row = await conn.fetchrow(
                         INSERT_AUDIT_EVENT,
-                        uuid.UUID(str(tenant_id)),
+                        # tenant_uuid already coerced above (non-UUID slugs like
+                        # "default" → _NULL_TENANT_UUID); reuse directly so the
+                        # set_config value and the INSERT value are identical.
+                        tenant_uuid,
                         event.get("event_type", "UNKNOWN"),
-                        uuid.UUID(str(req_id)) if req_id else None,
+                        # FINDING F-AUDIT: chat completions carry a non-UUID
+                        # correlation id (e.g. "chatcmpl-..."). Coerce to NULL
+                        # rather than raise + drop the whole audit row.
+                        _coerce_uuid(req_id),
                         event.get("session_id"),
                         event.get("agent_id"),
                         event.get("action", "UNKNOWN"),
@@ -190,9 +277,22 @@ class PostgresSink(AuditSink):
                         )
         self._last_write = datetime.now(timezone.utc)
 
-    async def write(self, event: dict) -> None:
+    def enqueue_nowait(self, event: dict) -> bool:
+        """Synchronous, non-blocking enqueue (loop-agnostic).
+
+        v2.25.2: called from AuditLogWriter.write() (a sync method invoked from
+        both sync and async request paths) so the DB sink does not depend on a
+        running event loop at the call site.  asyncio.Queue.put_nowait() is
+        thread-safe enough for our single-process fan-out: it only mutates the
+        deque + wakes a waiter via call_soon_threadsafe internally when a loop
+        is bound.  Returns True if enqueued, False if dropped (queue full).
+
+        NEVER raises — queue-full is counted + logged and swallowed so the
+        caller's request and the canonical file write are unaffected.
+        """
         try:
             self._queue.put_nowait(event)
+            return True
         except asyncio.QueueFull:
             try:
                 from yashigani.metrics.registry import audit_queue_overflow_total
@@ -200,6 +300,15 @@ class PostgresSink(AuditSink):
             except Exception:
                 pass
             logger.warning("PostgresSink queue full — audit event dropped")
+            return False
+        except Exception as exc:  # noqa: BLE001 — fan-out must never break caller
+            logger.warning("PostgresSink enqueue error (dropped): %s", exc)
+            return False
+
+    async def write(self, event: dict) -> None:
+        # Delegates to the sync enqueue path so there is a single, audited
+        # drop-and-log code path for both async and sync callers.
+        self.enqueue_nowait(event)
 
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
@@ -465,6 +574,110 @@ class SiemWorker:
                 event.get("audit_event_id", "<unknown>"),
                 exc,
             )
+
+
+# ---------------------------------------------------------------------------
+# v2.25.2 — DB audit-sink wiring helpers
+# ---------------------------------------------------------------------------
+#
+# These helpers are the single construction point for the PostgresSink + the
+# AuditChainService that backs the audit_events hash chain, so both the gateway
+# and backoffice lifespans wire the DB sink identically.  The file sink remains
+# the canonical durability anchor; the DB sink is a fire-and-forget mirror.
+
+
+def _audit_checkpoint_signing() -> tuple[Optional[Any], str]:
+    """Resolve the optional checkpoint signing key path + SPIFFE id from env.
+
+    Returns (signing_key_path | None, signing_spiffe_id).  When the key path is
+    unset or the file is missing, returns (None, spiffe_id) — the chain service
+    + checkpoint scheduler then write UNSIGNED checkpoints (still tamper-evident
+    via the merkle root; signature is an additional non-repudiation layer).
+    """
+    import os
+    from pathlib import Path
+
+    from yashigani.identity.trust_domain import audit_signer_spiffe_id
+
+    # MI-6 (YSG-RISK-061): the explicit env var (compose sets it per instance)
+    # takes precedence; the fallback default is derived from THIS instance's
+    # trust domain so a non-legacy instance signs in its own audit namespace.
+    key_path_str = os.environ.get("YASHIGANI_AUDIT_SIGNING_KEY_PATH", "").strip()
+    spiffe_id = os.environ.get(
+        "YASHIGANI_AUDIT_SIGNING_SPIFFE_ID",
+        audit_signer_spiffe_id(),
+    ).strip()
+    if key_path_str:
+        kp = Path(key_path_str)
+        if kp.exists():
+            return kp, spiffe_id
+        logger.warning(
+            "YASHIGANI_AUDIT_SIGNING_KEY_PATH=%s does not exist — "
+            "daily audit checkpoints will be written UNSIGNED",
+            key_path_str,
+        )
+    return None, spiffe_id
+
+
+def build_postgres_audit_sink(pool_getter):
+    """Construct + start a PostgresSink with a row-level hash-chain service.
+
+    Args:
+        pool_getter: zero-arg callable returning the asyncpg pool
+            (yashigani.db.get_pool).  Reused from the existing DB pool — no
+            second pool is created.
+
+    Returns:
+        (PostgresSink, AuditChainService) — the sink is ALREADY started
+        (drain loop scheduled on the running loop); the chain service is the
+        same instance to pass to the daily checkpoint scheduler so the
+        in-process chain pointer is shared.
+
+    The caller MUST be inside a running event loop (call from the FastAPI
+    lifespan) so PostgresSink.start() can schedule its drain task.
+    """
+    from yashigani.audit.chain import AuditChainService
+
+    key_path, spiffe_id = _audit_checkpoint_signing()
+    # Row-level hashing (compute_hashes_for_event) needs no signing key; the
+    # key only matters for the daily checkpoint signature.  We hand the same
+    # service to both so the chain pointer + signing config are shared.
+    chain_service = AuditChainService(
+        signing_key_path=key_path,
+        signing_spiffe_id=spiffe_id,
+    )
+    # v2.25.2 (Lu wire-sink-gate P2 / irrevocable chain): the wired production
+    # path is immutable-by-construction — require_chain=True so the sink can
+    # never silently write an unchained (NULL-hash) row.
+    sink = PostgresSink(
+        pool_getter=pool_getter,
+        chain_service=chain_service,
+        require_chain=True,
+    )
+    sink.start()
+    logger.info(
+        "PostgresSink started (chain hashing ON [required], checkpoint signing=%s)",
+        "ON" if key_path is not None else "OFF",
+    )
+    return sink, chain_service
+
+
+def stop_postgres_audit_sink(sink) -> None:
+    """Gracefully drain + stop a PostgresSink (call from lifespan shutdown).
+
+    Cancels the drain task; the drain loop flushes the in-flight batch on
+    CancelledError (see PostgresSink._drain_loop), so events already enqueued
+    are persisted before the loop stops.  Never raises.
+    """
+    if sink is None:
+        return
+    try:
+        task = getattr(sink, "_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            logger.info("PostgresSink drain task cancelled — final batch will flush")
+    except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+        logger.warning("PostgresSink stop error (ignored): %s", exc)
 
 
 class MultiSinkAuditWriter:

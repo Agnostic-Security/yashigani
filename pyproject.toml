@@ -1,11 +1,11 @@
-# Last updated: 2026-05-17T10:00:00+01:00 (chore: G16 dep-bump sweep — floor bumps for PyJWT, uvicorn, lupa, fakeredis, argon2-cffi, pydantic, authlib; cryptography <47 hold-back preserved)
+# Last updated: 2026-05-28T00:00:00+00:00 (feat: v2.25.0 P1 W0a+W1 — ring-fence onboarding audit types + manifest parser/linter)
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "yashigani"
-version = "2.23.4"
+version = "4.0.0"
 description = "Security enforcement gateway for MCP servers and agentic AI systems"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -40,6 +40,10 @@ dependencies = [
     "email-validator>=2.1",   # required by pydantic v2 EmailStr; not bundled in pydantic itself
     # v2.23.1 — internal mTLS PKI manifest loader (yashigani.pki.identity)
     "PyYAML>=6",
+    # v2.25.0 P1 W1 — manifest JSON-Schema validator (M8 / Laura TM-URF-026)
+    # External $ref resolution disabled at validator level (P10).
+    # Pin <5.0 — Draft 2020-12 API stabilised in 4.17.3; 5.x may break.
+    "jsonschema>=4.17.3,<5.0",
     # v0.2.0 — TLS bootstrap + observability
     "bcrypt>=4.1",
     "prometheus-client>=0.20",
@@ -98,6 +102,11 @@ dev     = [
 where = ["src"]
 
 [tool.setuptools.package-data]
+# v2.25.0 P1 W1 — bundled manifest schema + signing key placeholder
+"yashigani.manifest" = [
+    "schemas/*.json",
+    "keys/*.pub",
+]
 "yashigani.backoffice" = [
     "templates/*.html",
     "static/css/*.css",

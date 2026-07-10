@@ -5,7 +5,14 @@
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS builder
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS builder
+
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+# ARG declarations expose the build-args as env vars for RUN commands in this stage.
+# Empty (default) = direct internet, behaviour unchanged on normal builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /build
 
@@ -20,7 +27,12 @@ RUN python -m build --wheel --outdir /dist
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e AS runtime
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
+
+# ARGs must be re-declared in each stage (they do not cross stage boundaries).
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
@@ -38,7 +50,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libpq5 \
         libxmlsec1-openssl \
+        postgresql-client-17 \
         age=1.2.1-1+b5 \
+        # LAURA-300-002: docker-cli REMOVED. The extractor now runs via
+        # HttpExtractorBackend (YASHIGANI_EXTRACTOR_RUNTIME=http) — the legacy
+        # CliContainerBackend that shelled out to docker-cli is no longer wired,
+        # no docker socket/proxy is reachable from this image, and no Python code
+        # invokes the binary. It was therefore dead weight carrying a CRITICAL
+        # BuildKit CVE (CVE-2026-33747). If the CLI extractor path is ever
+        # revived, reinstall docker-cli here AND restore the socket-proxy mount.
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -59,6 +79,63 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
 COPY src/yashigani/backoffice/templates/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/templates/
 COPY src/yashigani/backoffice/static/ /usr/local/lib/python3.14/site-packages/yashigani/backoffice/static/
 
+# v4.1 Phase B (F-01): policy templates for /admin/agent-policies routes.
+# _TEMPLATES_DIR in agent_policies.py:
+#   Path(__file__).parent * 5 / "bundles" / "policy-templates"
+# In the installed package __file__ is:
+#   /usr/local/lib/python3.14/site-packages/yashigani/backoffice/routes/agent_policies.py
+# Five .parent() calls ascend to /usr/local/lib/python3.14/, so the resolved
+# target is /usr/local/lib/python3.14/bundles/policy-templates/.
+# Without this COPY the directory is absent, _template_cache caches {}, and
+# GET /admin/agent-policies/templates returns [] while POST .../apply returns 404.
+COPY bundles/policy-templates/ /usr/local/lib/python3.14/bundles/policy-templates/
+
+# 4.0-phase1: Build-time vendor integrity gate (RISK-101 / SC-NEW-002)
+# Verifies every file listed in scripts/vendor-integrity.lock against its
+# stored SHA-384 hash. Fails the build if any hash mismatches or if a vendored
+# file listed in the lock is absent. Closes the supply-chain attack path where
+# an attacker replaces a file on disk without updating the lock.
+#
+# Format: sha384-<base64>  <relative-path-from-package-root>
+# Lines starting with '#' or empty are skipped.
+# The lock uses base64-encoded SHA-384 (HTML SRI format); we use openssl to
+# compute the same encoding for comparison (sha384sum -c uses hex format, not
+# base64 — so we recompute via openssl dgst).
+COPY scripts/vendor-integrity.lock /tmp/vendor-integrity.lock
+RUN set -euo pipefail && \
+    STATIC_ROOT="/usr/local/lib/python3.14/site-packages/yashigani/backoffice" && \
+    fail=0 && \
+    while IFS= read -r line || [ -n "$line" ]; do \
+        # Skip comment and blank lines \
+        case "$line" in \
+            '#'*|'') continue ;; \
+        esac; \
+        hash_b64="${line%%  *}"; \
+        filepath="${line#*  }"; \
+        hash_b64="${hash_b64#sha384-}"; \
+        full_path="$STATIC_ROOT/$filepath"; \
+        if [ ! -f "$full_path" ]; then \
+            echo "INTEGRITY FAIL: $filepath not found in image" >&2; \
+            fail=1; \
+            continue; \
+        fi; \
+        actual=$(openssl dgst -sha384 -binary "$full_path" | openssl base64 -A); \
+        if [ "$actual" != "$hash_b64" ]; then \
+            echo "INTEGRITY FAIL: $filepath" >&2; \
+            echo "  expected: $hash_b64" >&2; \
+            echo "  actual:   $actual" >&2; \
+            fail=1; \
+        else \
+            echo "OK: $filepath"; \
+        fi; \
+    done < /tmp/vendor-integrity.lock && \
+    rm /tmp/vendor-integrity.lock && \
+    if [ "$fail" -ne 0 ]; then \
+        echo "Vendor integrity check FAILED — aborting build." >&2; \
+        exit 1; \
+    fi && \
+    echo "Vendor integrity gate PASSED."
+
 # Alembic config — script_location rewritten for installed package path
 COPY alembic.ini /app/alembic.ini
 RUN sed -i 's|script_location = src/yashigani/db/migrations|script_location = /usr/local/lib/python3.14/site-packages/yashigani/db/migrations|' /app/alembic.ini
@@ -70,7 +147,7 @@ COPY scripts/bootstrap_postgres.py /app/scripts/bootstrap_postgres.py
 
 RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
     chown -R yashigani:yashigani /data /var/log/yashigani /app 2>/dev/null || true && \
-    chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/
+    chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/ 2>/dev/null || true
 
 # umask 0077 wrapper — sets file-creation mask before uvicorn starts so
 # every runtime-written file (audit logs, alembic state, Python open())
@@ -83,6 +160,15 @@ RUN chmod 0755 /usr/local/bin/backoffice-start.sh
 USER yashigani
 
 EXPOSE 8443
+
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 # mTLS healthcheck — Pattern A for Python ssl: trust anchor is the PUBLIC
 # ca_root.crt. Python 3.14/OpenSSL 3.0 strict-chain validation rejects

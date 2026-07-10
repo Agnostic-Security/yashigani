@@ -1,6 +1,12 @@
 schema_version: '1.0'
-last_updated: '2026-05-24'
+last_updated: '2026-06-26'
 maintainer: lu@agnosticsec.com
+# Severity convention (2026-06-27): `severity` is the RESIDUAL risk to THIS deployment,
+# not the raw NVD/CVE rating. A real CVE in a component never loaded or invoked on any
+# reachable path — e.g. perl-base, libsqlite3, ncurses, perl IO::Compress in the
+# python-slim/Debian-13 base image: present but uncalled (YSG-RISK-093, 096-101) — is
+# rated `informational`; the raw NVD severity stays in the entry description. These
+# clear automatically on base-image rebuild once upstream Debian ships the fix.
 risks:
 - id: YSG-RISK-001
   description: SQL f-string interpolation in scripts/partition_maintenance.py (CWE-89, HIGH). Asyncpg/PostgreSQL
@@ -112,7 +118,11 @@ risks:
   closure_evidence:
   - commit: 33f7318
     rationale: Bind moved to 127.0.0.1:18789; bridge access unaffected
-  last_threat_model_review: 2026-05-02
+  - commit: v4.1-phase1c
+    rationale: Host publish removed entirely (LAURA-I1-03 close) — openclaw now rides
+      internal-only bridges; inbound is the signature-verified Caddy /webhooks/* route
+      over openclaw_ringfence; outbound is the Caddy :18790 fixed-upstream egress gateway.
+  last_threat_model_review: 2026-07-06
   source_grep: CHANGELOG.md:718
 - id: YSG-RISK-007
   description: SSRF exposure at multiple call sites (CWE-918, HIGH worst-case). Server-side request forgery to internal
@@ -1661,6 +1671,83 @@ risks:
       other service. Evidence: testing_runs/captain_bug_c7_001_scram_fix_20260525/.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
+- id: YSG-RISK-078
+  description: >-
+    TOTP algorithm change: SHA-256 → SHA-1 (RFC 6238 default). Yashigani previously
+    used HMAC-SHA-256 for TOTP (digest=hashlib.sha256, per maintainer directive
+    2026-05-01 / P0-10 "SHA-256 minimum policy"). 19 of 20 testers' authenticator
+    apps (Google Authenticator, Microsoft Authenticator, and others) either do not
+    support SHA-256 TOTP or silently ignore the algorithm= URI parameter and default
+    to SHA-1, producing codes that never match. This was a critical usability blocker
+    for fresh installs and operator on-boarding. Decision (Tiago Rosado, 2026-06-14):
+    revert to HMAC-SHA1 (RFC 6238 standard default). HMAC-SHA1 is cryptographically
+    secure for 6-digit OTP generation: SHA-1 collision attacks (SHAttered, 2017) are
+    Merkle-Damgård prefix-collision attacks on digital signatures, not HMAC; RFC 2104
+    HMAC-SHA1 has no known exploitable weaknesses in the OTP context; NIST SP 800-63B
+    and FIPS 140-2 both permit HMAC-SHA1 for TOTP. Compensating controls: per-account
+    secrets (ASVS V2.8), replay prevention (Postgres-backed used_totp_codes, ASVS
+    V2.8.3), ±1 window with TOTP backoff, account lockout after 5 failures.
+    RE-ENROLLMENT IMPACT: any TOTP secrets enrolled under SHA-256 (deployed stacks
+    running v2.23.1–v2.25.5 with P0-10 applied) will cease verifying after upgrade
+    because the server now generates SHA-1 codes but the enrolled secret produced
+    SHA-256 codes. Fresh installs are unaffected. In-place upgrades require full
+    TOTP re-enrollment for all admin accounts (force_totp_provision=true). A
+    dual-verify transition path (try SHA-1, fall back to SHA-256 for one window)
+    has not been implemented; escalate to Nico if required for a specific deployment.
+  severity: low
+  controls_impacted:
+  - ASVS V2.8 (TOTP algorithm)
+  compensating_controls:
+  - Per-account TOTP secrets (ASVS V2.8.1)
+  - Postgres-backed replay cache (ASVS V2.8.3, AVA-A006 fix)
+  - TOTP backoff + account lockout (5 failures)
+  - HMAC-SHA1 unaffected by SHA-1 collision attacks (RFC 2104)
+  - NIST SP 800-63B and FIPS 140-2 permit HMAC-SHA1 for OTP
+  status: accepted
+  accepted_by: Tiago Rosado
+  accepted_at: '2026-06-14'
+  review_by: '2027-06-14'
+  closure_evidence: []
+  last_threat_model_review: '2026-06-14'
+  nico_review_required: true
+  notes: >-
+    Nico (crypto) should sanity-check this posture at next crypto review.
+    If a dual-verify SHA-256→SHA-1 transition window is needed for in-place
+    upgrade deployments, raise with Nico before implementing.
+- id: YSG-RISK-079
+  description: >-
+    PII detection/redaction wrongly license-gated (ENT-001). LicenseFeature.PII_LOG /
+    PII_REDACT gated PII to "Professional Plus" (introduced v2.2, commit 78de59f,
+    2026-04-05, when PII detection first shipped as a paid feature). This contradicted
+    (1) README §8 Feature Matrix — the stated source of truth, "mirrors agnosticsec.com/
+    pricing" — which gates only OIDC/SAML/SCIM, NOT PII; (2) the README narrative ("PII
+    filtering runs on both request and response paths, on all traffic, by default");
+    (3) the open-source / free=Enterprise model. The entitlements UI faithfully rendered
+    the (stale) code, showing PII as "requires Professional Plus". Decision (Tiago Rosado,
+    2026-06-14): ungate — PII detection + all three modes (LOG / REDACT / BLOCK) are
+    available on ALL tiers including Community/free, aligning code to README §8. Fix
+    (commit 5a7cac4): _ALWAYS_AVAILABLE_FEATURES guard in enforcer.py (require_feature
+    short-circuits pii_log/pii_redact unconditionally) + removed from the /admin/license/
+    entitlements catalogue and per-tier feature sets; OIDC/SAML/SCIM gating untouched;
+    enum values retained for license-payload back-compat (never enforced — existing Pro+
+    tokens deserialise fine, no re-issue needed).
+  severity: low
+  controls_impacted:
+  - N/A (commercial/usability alignment — was OVER-gating a core feature; no security impact)
+  compensating_controls:
+  - PII detection/redaction is a core always-on capability (three-layer sensitivity pipeline)
+  - Ungating widens availability; it does not weaken any control
+  status: accepted
+  accepted_by: Tiago Rosado
+  accepted_at: '2026-06-14'
+  review_by: '2027-06-14'
+  closure_evidence:
+  - commit: 5a7cac4
+    rationale: PII ungated on all tiers; entitlements catalogue + tier feature sets updated; tests added.
+  last_threat_model_review: '2026-06-14'
+  notes: >-
+    Nora to confirm the pricing page / feature-comparison messaging (remove "PII Detection"
+    from the Pro+ paid-feature row to match agnosticsec.com/pricing ↔ README §8 ↔ code).
 - id: YSG-RISK-077
   description: 'BUG-C7-001: pgbouncer 1.25.1 (edoburu image) has a SCRAM-SHA-256 client-side computation bug on
     ARM64 Linux. When acting as SASL client (auth_user authenticating to postgres), it computes incorrect SCRAM
@@ -1689,3 +1776,833 @@ risks:
       /login 200 OK. No FATAL errors. Evidence: testing_runs/captain_bug_c7_001_scram_fix_20260525/.'
   fix_in_version: v2.24.3
   last_threat_model_review: '2026-05-25'
+- id: YSG-RISK-080
+  description: >-
+    LAURA-30-001 (2026-06-16): Critical host-escape via docker socket proxy (commit 6fc10fc).
+    The tecnativa/docker-socket-proxy replacement for the raw docker.sock mount allowed
+    POST /containers/create + POST /containers/{id}/start via CONTAINERS=1 + POST=1 ACL.
+    The proxy enforces path/method only — it CANNOT inspect the request body. A compromised
+    backoffice could POST /containers/create with HostConfig.Binds=["/:/hostroot:ro"] (passes
+    the ACL), start the container, and read /etc/passwd or every mTLS private key under
+    /run/secrets from the bind-mounted host root. This gives full host takeover from a single
+    compromised network-facing admin container. Original severity mis-registered as LOW (accepted)
+    in commit 6fc10fc — Laura proved CRITICAL exploitability live on 2026-06-16.
+    Fix (Design A, 2026-06-16): replaced socket-proxy with a pre-spawned hardened extractor
+    service (extractor-svc). Backoffice calls it via plain HTTP (extractor_svc internal bridge).
+    Backoffice has NO docker socket, NO container API access. A compromised backoffice can only
+    POST document bytes to http://extractor-svc:8090/run. The extractor-svc is itself hardened:
+    egress=none (internal bridge), read-only rootfs, cap_drop ALL, non-root (UID 65532),
+    no-new-privileges, seccomp, AppArmor, mem/pids limits, no host volume mounts, no secrets.
+    The host-escape primitive is completely eliminated.
+  severity: critical
+  controls_impacted:
+  - Host isolation — arbitrary host bind-mount from compromised backoffice via socket-proxy body-blind ACL
+  - Secret confidentiality — /run/secrets readable by any extractor container the attacker created
+  - Container isolation — attacker could spawn privileged containers on the host
+  compensating_controls:
+  - Prior to fix: backoffice was the only service on extractor_proxy bridge (limiting pivot scope)
+  - Prior to fix: Caddy + OPA gated all inbound requests to backoffice (reducing compromise probability)
+  - After fix (Design A): NO docker socket in backoffice; HttpExtractorBackend calls extractor-svc over HTTP
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Design A implemented: socket-proxy service removed; extractor-svc service added (yashigani/extractor
+      image running server.py as long-running HTTP server). backoffice env updated:
+      YASHIGANI_EXTRACTOR_WORKER_URL=http://extractor-svc:8090, YASHIGANI_EXTRACTOR_RUNTIME=http,
+      DOCKER_HOST removed. HttpExtractorBackend added to pool/backend.py. extractor_proxy network
+      replaced with extractor_svc (internal=true). Laura exploit re-attempted after fix: backoffice
+      has no docker socket and no DOCKER_HOST — POST /containers/create is impossible (no path to
+      Docker API from within the backoffice container). Doc round-trip verified: REDACT and
+      PSEUDONYMIZE both succeeded via the new HTTP extractor backend. All containers healthy.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-16'
+
+- id: YSG-RISK-081
+  description: >-
+    YSG-080-2255 (converged from the 2.25.5 finalization; renumbered to avoid the
+    3.x YSG-RISK-080 docker-socket collision). Duplicate Content-Security-Policy:
+    the backoffice app emitted its own CSP and Caddy added one at the edge, so
+    responses carried two CSP headers — browsers honour the most restrictive,
+    making the policy ambiguous/hard to reason about. Fix: strip the upstream app
+    CSP at the Caddy edge (header_down -Content-Security-Policy on every backoffice
+    reverse_proxy block across all 3 Caddyfiles); single authoritative CSP at the edge.
+  severity: low
+  controls_impacted:
+  - Defence-in-depth header hygiene (CSP determinism)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      header_down -Content-Security-Policy present in all backoffice blocks of
+      Caddyfile.selfsigned/.acme/.ca (27 blocks total); caddy validate passes.
+      Live-verified on the v3.0.0 clean install (security headers present, single CSP).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-082
+  description: >-
+    YSG-081-2255 (converged). The gateway OPA authorization check was passed the
+    raw request path rather than the normalised path, so a non-canonical path
+    (e.g. missing leading slash) could reach _opa_check with an unexpected value —
+    observed making the JWKS endpoint fail-closed 403. Fix: pass norm_path (the
+    already-normalised path used everywhere else in proxy.py) to _opa_check.
+  severity: medium
+  controls_impacted:
+  - Consistent OPA path adjudication at the gateway
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      proxy.py _opa_check now receives norm_path. Live-verified: Laura DAST exercised
+      authz/OPA paths on v3.0.0 with all controls holding (no fail-closed regression).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-083
+  description: >-
+    YSG-082-2255 (converged). Re-provisioning TOTP on an ALREADY-enrolled account
+    did not require a fresh step-up, so a hijacked authenticated session could
+    silently rotate the victim's TOTP secret and lock them out. Fix: all three TOTP
+    provision endpoints (start/confirm/atomic) require assert_fresh_stepup when the
+    account already has a TOTP secret and is not in force_totp_provision state
+    (first-time enrolment remains exempt by design).
+  severity: low
+  controls_impacted:
+  - Step-up on sensitive account-security mutation (ASVS V6.8.4)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Step-up guard present on provision_totp_start/confirm/provision. Live-verified:
+      Laura DAST confirmed step-up enforced for privileged mutations on v3.0.0.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-084
+  description: >-
+    YSG-083-2255 (converged). SSRF surface on the JWKS fetch in jwt_inspector.
+    On the 2.25.5 line a BASIC guard shipped (https-only + reject non-public IPs)
+    with gold-plating deferred to 3.1. On the 3.x line the GOLD-PLATED guard
+    (commit 307c99d: SSRF-guarded HttpClient, allowlist/DNS-pin posture) is already
+    present and was NOT downgraded during convergence.
+  severity: low
+  controls_impacted:
+  - SSRF prevention on outbound JWKS retrieval (CWE-918)
+  compensating_controls:
+  - Internal mTLS mesh + egress default-deny (NetworkPolicy) constrain outbound reach
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      3.x jwt_inspector retains the gold-plated SSRF-guarded JWKS client (8 guard
+      references); the basic 2.25.5 guard was intentionally NOT ported (superseded).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-085
+  description: >-
+    YSG-084-2255 (converged). Install convergence race: on a heavy fresh install
+    (all agent/SIEM profiles) a slow postgres first-initdb could exceed its
+    healthcheck start_period, so compose aborted dependent app-tier containers to
+    "Created" and the gateway never started, failing the convergence gate. Fix:
+    postgres start_period 180s->300s + install.sh convergence-gate self-heal (one
+    idempotent re-converge + re-poll before failing closed).
+  severity: low
+  controls_impacted:
+  - Deterministic clean-install convergence (operability)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      start_period 300s + self-heal block present in install.sh. Live-verified:
+      v3.0.0 clean-from-scratch installs came up green unattended (multiple cycles).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-086
+  description: >-
+    LAURA-3X-001 (v3.0.0 pre-release pentest, MEDIUM). The login brute-force
+    throttle keyed on request.client.host, which behind Caddy (sole ingress) is
+    always the Caddy container IP — collapsing every client into one throttle
+    bucket. An unauthenticated source could trip the per-IP/global throttle and
+    lock out ALL admin logins for the 900s window (DoS; no alternative path for
+    admins without WebAuthn). Fix: _real_client_ip() reads X-Real-IP (Caddy
+    overwrites it with the real TCP peer {remote_host}, unspoofable; X-Forwarded-For
+    is NOT used as Caddy appends to client-supplied XFF). Applied to the login
+    throttle, the throttle-status view, and 2 audit-IP sites.
+  severity: medium
+  controls_impacted:
+  - Anti-automation / brute-force throttle correctness (ASVS V2.2.5)
+  - Admin availability (lockout DoS)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      LIVE-verified on v3.0.0: after failed logins the throttle key was
+      auth:fail:ip:172.24.0.1 (the real client peer set by Caddy via X-Real-IP),
+      NOT a Caddy container IP and NOT a client-supplied spoofed X-Real-IP (8.8.8.8
+      was overwritten by Caddy). Valid admin login confirmed working (no regression).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-087
+  description: >-
+    LAURA-3X-002 (v3.0.0 pre-release pentest, LOW). authenticate() returned
+    immediately for a non-existent/disabled username without running argon2, leaking
+    a ~130ms vs ~15ms timing delta that enables username enumeration. Fix: run one
+    real verify_password against a lazily-computed constant dummy argon2 hash on that
+    path (best-effort try/except so timing-equalization can never break auth).
+  severity: low
+  controls_impacted:
+  - Username enumeration resistance (ASVS V2.2.1)
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      LIVE-verified on v3.0.0: non-existent-user and real-user-wrong-pw both return
+      401 invalid_credentials and both run argon2 (steady-state times converge),
+      closing the fast-path leak. NOTE: live-verify first caught a self-inflicted
+      regression (dummy password contained 'yashigani' -> PasswordContextError ->
+      400), which was fixed (context-valid placeholder) before closure.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-088
+  description: >-
+    LAURA-3X-003 (v3.0.0 pre-release pentest, LOW). The pinned caddy:2.11.2-alpine
+    base image ships Go stdlib 1.26.3 with CVE-2026-27145 (x509.VerifyHostname
+    matching bypass) and CVE-2026-42504 (MIME header DoS via many invalid encoded
+    params). Upstream image CVEs; low exploitability in this deployment.
+  severity: low
+  compensating_controls:
+  - CVE-2026-27145 mitigated by internal mTLS with a pinned CA (all internal hops
+    verify against Yashigani's own CA chain, not public hostname verification).
+  - CVE-2026-42504 mitigated by Caddy request limits + all admin paths gated on
+    session auth; a basic crafted-header test showed no crash.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Accepted as low for v3.0.0 (mitigated + low exploitability); bumping the
+      sole-ingress base image at the release gate carries its own regression risk.
+      Tracked for a caddy base-image bump to Go >= 1.26.4 in v3.0.1.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-089
+  description: >-
+    FIND-OWUI-001 (v3.0.0 QA, LOW, demo-seed reliability). Ava observed that on a
+    fresh deploy OpenWebUI users could land in the "pending" role despite
+    WEBUI_DEFAULT_USER_ROLE=user, requiring a manual SQLite role promotion before the
+    demo scenarios (noah/sara/paul) work. Product code is unaffected — this is a
+    demo-seed/OWUI-config reliability item.
+  severity: low
+  compensating_controls:
+  - WEBUI_DEFAULT_USER_ROLE=user is set + honoured (the canonical OWUI knob for
+    active-by-default users); the owui-users access gate is enforced and verified.
+  - An admin can promote any pending OWUI user (Admin Panel -> Users) — documented fallback.
+  status: open
+  closure_evidence:
+  - rationale: >-
+      Could not be definitively reproduced via curl this cycle (OWUI's trusted-header
+      user-row creation only fires through the real browser SvelteKit flow). Config
+      mitigation in place. Tracked for v3.0.1: confirm OWUI v0.9.2 trusted-header role
+      assignment on a clean browser deploy and, if needed, codify an activation step.
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-090
+  description: >-
+    FIND-DEMO-CREDS (v3.0.0 QA, LOW, demo-seed reliability). populate-demo.py saved
+    the demo-user creds file BEFORE forced-first-login rotated each user's temp
+    password, so the documented creds were stale and users could not log in with
+    them. Product code is unaffected.
+  severity: low
+  status: closed
+  closure_evidence:
+  - rationale: >-
+      Fixed: step7b_save_user_creds now runs AFTER step7c_onboard_users and saves
+      the rotated new_pw (fallback temp_pw). Verified-by-construction: the new_pw
+      formula was proven to log in live on v3.0.0 (mia -> HTTP 200, no forced flows).
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-091
+  description: >-
+    Dependabot HIGH GHSA-537c-gmf6-5ccf (cryptography): "Vulnerable OpenSSL
+    included in cryptography wheels" — the manylinux pip wheel statically bundles
+    an OpenSSL with known CVEs; vulnerable < 48.0.1. The release pins
+    cryptography>=42,<47 (pyproject.toml).
+  severity: high
+  controls_impacted:
+  - Transitive crypto dependency hygiene (bundled OpenSSL in the pip wheel)
+  compensating_controls:
+  - Laura v3.0.0 pentest verified the DEPLOYED image links the SYSTEM OpenSSL
+    3.5.6 (confirmed via ldd + cryptography backend.openssl_version_text()), NOT
+    the wheel's bundled OpenSSL — so the bundled-OpenSSL CVEs are not on the
+    exploitable path in the shipped containers.
+  - All internal transport is mTLS terminated by Caddy/OpenSSL (system), not the
+    cryptography wheel.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Not exploitable in the deployed image (system OpenSSL). The clean fix
+      (bump to >= 48.0.1) is BLOCKED by a real platform bug: cryptography 47.0.0
+      SIGILLs at ec.generate_private_key() on macOS Podman applehv aarch64, and
+      48.x still SIGILLs on applehv (Captain audit 2026-05-11); 46.x is the
+      verified-working pin. Accepted for v3.0.0; tracked for a bump to a
+      48.x-line that is stable on applehv (Tom P-10 cffi/hazmat investigation).
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-092
+  description: >-
+    CodeQL py/clear-text-logging-sensitive-data (#1869): the F-RT1 path logs the
+    flagged high-entropy tokens (the undecodable blobs that floored sensitivity to
+    RESTRICTED) in clear text. Decision: KEEP them clear text — the logs are the
+    operational + forensic record and are forwarded to the customer SIEM (which
+    needs the values as-is to investigate what was flagged).
+  severity: low
+  controls_impacted:
+  - Log-content confidentiality (a flagged blob may itself be sensitive)
+  compensating_controls:
+  - Log STORAGE is encrypted at rest.
+  - Logs flow only to the access-controlled, tamper-evident audit channel / the
+    operator's own SIEM — not a public surface.
+  - The blob is undecodable/unclassifiable by definition (floored to RESTRICTED);
+    the log records WHAT triggered the decision, required for forensics.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Operational necessity (security forensics + SIEM). Clear text is required by
+      design; mitigated by encrypted log storage + access-controlled SIEM delivery.
+      CodeQL #1869 dismissed as won't-fix with this rationale.
+  fix_in_version: v3.0.0
+  last_threat_model_review: '2026-06-25'
+- id: YSG-RISK-093
+  description: >-
+    Trivy CRITICAL CVE-2026-42496 + HIGH CVE-2026-42497 (perl Archive::Tar):
+    Path traversal via crafted symlinks / arbitrary file modification via crafted
+    hardlinks during archive extraction. Present in perl-base/perl/perl-modules-5.40
+    in backoffice and gateway images as an OS dependency of postgresql-client-17.
+    Trivy status: fix_deferred (no upstream Debian fix at time of v3.0.0 release).
+  severity: informational
+  controls_impacted:
+  - Base image OS dependency hygiene (perl transitive dep via postgresql-client)
+  compensating_controls:
+  - Yashigani does not use perl Archive::Tar at any point. Backup/restore uses
+    Python tarfile. No attacker-controlled data is passed to perl tar extraction.
+    No exploitation path exists in the deployed product.
+  - perl binary present but not on any data-flow path from user or agent input.
+  - Containers run with no-new-privileges + seccomp + AppArmor profiles.
+  - Monitoring upstream Debian for a fix; re-assess at next base image bump.
+  status: accepted
+  closure_evidence:
+  - rationale: >-
+      Not exploitable in deployed Yashigani: no code path passes attacker data
+      to perl Archive::Tar. Fix deferred pending upstream Debian perl patch.
+      Identified during v3.0.0 final gate trivy scan (2026-06-26).
+      Re-assess at next base image bump or when Debian fixes become available.
+  fix_in_version: deferred-pending-upstream
+  last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-094
+  description: >-
+    Caddy 3.0.0 image contains CRITICAL/HIGH CVEs in inactive code paths discovered
+    during v3.0.0 final gate trivy/Laura scan (2026-06-26):
+    CVE-2026-30836 (smallstep/certificates@v0.30.0-rc3, CRITICAL): unauthenticated SCEP cert
+    issuance bypass — SCEP not configured in Caddyfile; not reachable.
+    CVE-2026-33186 (grpc@v1.79.1, CRITICAL): gRPC authz bypass — no gRPC port configured.
+    CVE-2026-45447 (libcrypto3/libssl3@3.5.6-r0, HIGH): fix available in 3.5.7-r0.
+    CVE-2026-27135 (nghttp2-libs@1.68.0-r0, HIGH): fix in 1.68.1.
+    CVE-2026-45135/52844/52845 (caddy/v2@v2.11.2, HIGH): fix in v2.11.3/v2.11.4.
+    CVE-2026-34986 (go-jose, HIGH), x/crypto HIGH, x/net HIGH, stdlib HIGH subset.
+    DAST disproven for CRITICAL CVEs: SCEP port not exposed; no gRPC in request path.
+    (WSTG-CONF-05, CWE-1395)
+  severity: medium
+  controls_impacted:
+  - CWE-1395
+  - WSTG-CONF-05
+  - OWASP Cloud-Native Top 10 (insecure default configs)
+  compensating_controls:
+  - SCEP not configured in Caddyfile.selfsigned or Caddyfile.prod — CRITICAL CVE-2026-30836 not reachable.
+  - No gRPC port configured — CRITICAL CVE-2026-33186 not reachable via protocol.
+  - Caddy is the sole external TLS terminator (Caddy alone faces internet); downstream
+    services communicate over mTLS with the internal PKI.
+  - Containers run with no-new-privileges + seccomp + AppArmor.
+  status: accepted
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-26'
+  review_by: '2026-07-15'
+  closure_evidence:
+  - rationale: >-
+      CRITICAL CVEs DAST-disproven: SCEP not exposed (no SCEP stanza in Caddyfile);
+      gRPC not configured (HTTP/2 REST only). HIGH CVEs have fixes available but
+      require base-image rebuild. Bump Caddy to >=2.11.4 in v3.0.1.
+      Discovered: Laura v3.0.0 final gate (2026-06-26). Filed as LAURA-300-001 (pentest).
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-095
+  description: >-
+    Audit masking scope writes (PUT /admin/audit/masking/scope, POST/DELETE
+    /admin/audit/masking/scope/<component>) do not require step-up authentication.
+    An attacker with a hijacked admin session (stolen cookie, no TOTP) can alter
+    audit masking scope — e.g. set mask_all_by_default=false to expose previously-masked
+    display data (IP prefixes, account identifiers) in the audit log UI.
+    DAST-proven: PUT /admin/audit/masking/scope succeeds with a fresh session (no step-up).
+    (WSTG-ATHZ-02, ASVS V6.8, CWE-306)
+  severity: low
+  controls_impacted:
+  - ASVS V6.8 (step-up for sensitive operations)
+  - WSTG-ATHZ-02
+  - CWE-306
+  compensating_controls:
+  - Admin session requires TOTP at login — session hijack requires cookie theft of an active session.
+  - Audit data is tamper-evident (SHA-384 hash chain with daily ECDSA-signed Merkle
+    checkpoint); masking affects display only, not the underlying record integrity.
+  - SIEM config (PUT /admin/audit/siem/config) already requires step-up — higher-value target is protected.
+  - Admin sessions allow reading raw audit export without step-up by design.
+  status: accepted
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-26'
+  review_by: '2026-07-15'
+  closure_evidence:
+  - rationale: >-
+      Display-only impact; hash chain intact; no customer data corruption path.
+      Fix: add assert_fresh_stepup() to PUT /admin/audit/masking/scope and scope
+      POST/DELETE endpoints in v3.0.1. Discovered: Laura v3.0.0 final gate (2026-06-26).
+      Filed as LAURA-300-002 (pentest).
+  fix_in_version: v3.0.1
+  last_threat_model_review: '2026-06-26'
+- id: YSG-RISK-096
+  description: >-
+    Trivy CVE-2026-8376 (perl-base heap buffer overflow, NVD: CRITICAL):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    The perl-base binary is not on any HTTP request-handling path. Identified during
+    Laura's v3.0.1 docker gate sweep (LAURA-301-001). grep confirms no perl invocation
+    on any gateway/backoffice request path.
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl-base transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl-base not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl-base not on
+      any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-097
+  description: >-
+    Trivy CVE-2025-69720 (ncurses buffer overflow, NVD: HIGH):
+    OS library in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    ncurses is not invoked by any HTTP handler. Identified during Laura's v3.0.1
+    docker gate sweep (LAURA-301-001).
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (ncurses transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — ncurses not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — ncurses not on
+      any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-098
+  description: >-
+    Trivy CVE-2026-11822 (libsqlite3-0 memory corruption, NVD: HIGH):
+    OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    grep confirms no `import sqlite` in gateway/backoffice src — sqlite3 is not used
+    by the application. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+      any HTTP request-handling path (no `import sqlite` in gateway/backoffice src). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-099
+  description: >-
+    Trivy CVE-2026-11824 (libsqlite3-0 memory corruption variant, NVD: HIGH):
+    OS dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    Companion to CVE-2026-11822 (YSG-RISK-098). grep confirms no `import sqlite` in
+    gateway/backoffice src. Identified during Laura's v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (libsqlite3-0 transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+    any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — libsqlite3-0 not on
+      any HTTP request-handling path (no `import sqlite` in gateway/backoffice src). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-100
+  description: >-
+    Trivy CVE-2026-48962 (perl IO::Compress, NVD: HIGH):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    perl IO::Compress is not invoked on any request path. Identified during Laura's
+    v3.0.1 docker gate sweep (LAURA-301-001).
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl IO::Compress transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl IO::Compress not
+    on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl IO::Compress not
+      on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+      as YSG-RISK-093. Identified during Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+  last_threat_model_review: '2026-06-27'
+- id: YSG-RISK-101
+  description: >-
+    Trivy CVE-2026-9538 (perl Archive::Tar memory exhaustion, NVD: HIGH):
+    OS transitive dependency in the Debian 13.5 base image of yashigani/gateway:3.0.1.
+    Same perl Archive::Tar component class as YSG-RISK-093; Yashigani backup/restore uses
+    Python tarfile, not perl Archive::Tar. Identified during Laura's v3.0.1 docker gate
+    sweep (LAURA-301-001).
+  severity: informational
+  controls_impacted:
+  - CWE-1395
+  - Base image OS dependency hygiene (perl Archive::Tar transitive dep, Debian 13.5)
+  compensating_controls:
+  - Container hardening (read_only rootfs, cap_drop ALL, seccomp, no-new-privileges). DAST-proven not exploitable via gateway surface.
+  status: accepted
+  rationale: >-
+    OS transitive dep (Debian 13.5 base image). No app data path — perl Archive::Tar not
+    on any HTTP request-handling path. Not DAST-exploitable in deployed stack. Same class
+    as YSG-RISK-093.
+  version_accepted: '3.0.1'
+  fix_eta: best-effort with next Debian base upgrade
+  owner: Captain
+  closure_evidence:
+  - rationale: >-
+      OS transitive dep (Debian 13.5 base image). No app data path — perl Archive::Tar not
+      on any HTTP request-handling path (backup/restore uses Python tarfile). Not
+      DAST-exploitable in deployed stack. Same class as YSG-RISK-093. Identified during
+      Laura v3.0.1 docker gate sweep (LAURA-301-001).
+  fix_in_version: best-effort with next Debian base upgrade
+# 4.0 risks — ids 099/101/102 renumbered to 103/104/105 to avoid collision with 3.1 (096-101)
+
+- id: YSG-RISK-103
+  description: >-
+    Trusted Types not enforced on any path (greenfield gap). Admin vanilla-JS
+    templates use innerHTML calls in dashboard.js, login.js, runtime-settings.js etc.
+    without a TT policy gate. New 4.0 user UI paths (/chat/*, /user/*, /flow/*)
+    will serve Lit-based components that could be vulnerable to mXSS without TT.
+    (CWE-79, ASVS V5.5.3)
+  severity: medium
+  controls_impacted:
+  - ASVS V5.5.3 (DOM XSS / TT)
+  - CWE-79 (XSS)
+  compensating_controls:
+  - Admin paths already have strict-CSP (script-src 'self', no unsafe-inline).
+  - 4.0 user paths get full TT enforcement in Phase 1 (@strict_tt matcher).
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      Phase 1: @strict_tt matcher on /chat/* /user/* /flow/* enables
+      require-trusted-types-for 'script' + trusted-types yashigani-render.
+      yashigani-render policy in static/vendor/shared-layer/safe-render.js is
+      the sole registrant; no default policy (fail-closed). Admin paths (vanilla JS)
+      deferred to Phase 6 per spec §2.5 sequencing invariant. Partial closure —
+      RISK-103 fully closed at Phase 6 when @strict_legacy paths gain TT.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-104
+  description: >-
+    No build-time integrity gate for vendored assets. Zero integrity= attributes
+    in any template, no vendor-integrity.lock, no hash check in Dockerfile.backoffice.
+    The existing swagger-ui-bundle.js (unversioned, eval present, missing .map) is
+    the proof of failure mode. Supply-chain attack: attacker replaces a vendored file
+    on disk without updating a lock — ships undetected. (CWE-494, OWASP CI/CD-SEC-3)
+  severity: high
+  controls_impacted:
+  - CWE-494 (Download of Code Without Integrity Check)
+  - OWASP CI/CD-SEC-3 (Dependency chain abuse)
+  compensating_controls:
+  - 4.0 Phase 1 introduces vendor-integrity.lock + Dockerfile.backoffice build-time
+    SHA-384 verification + eval-audit script.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      scripts/vendor-integrity.lock tracks SHA-384 (base64, HTML SRI format) for
+      all vendored files. Dockerfile.backoffice RUN layer verifies every entry via
+      openssl dgst -sha384 after COPY of static/ — build fails on mismatch.
+      scripts/audit-vendor-eval.sh must PASS before any file enters the lock.
+      Lit 3.3.3, DOMPurify 3.4.11, marked 18.0.5 all audited PASS and locked.
+      swagger-ui remediation (RISK-115) deferred but scoped separately.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-105
+  description: >-
+    Default-to-lenient CSP trap. @strict_ui is an explicit allowlist; @lenient_ui
+    is its catch-all complement. Every new route not added to @strict_ui silently
+    ships under unsafe-eval + unsafe-inline. Structural recurrence of YSG-RISK-081
+    now targeting first-party 4.0 surfaces (/chat/*, /user/*, /flow/*).
+    (SC-NEW-001, CWE-693)
+  severity: high
+  controls_impacted:
+  - CWE-693 (Protection Mechanism Failure)
+  - ASVS V14.4.3 (CSP)
+  compensating_controls:
+  - 4.0 Phase 1 inverts the matcher pattern to strict-as-default.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-06-27'
+  closed_at: '2026-06-27'
+  closure_evidence:
+  - rationale: >-
+      @lenient_ui catch-all matcher REMOVED from all three Caddyfiles and the Helm
+      configmap. New matcher set: @lenient_subapp (explicit exceptions) + @redoc_ui +
+      @strict_legacy (admin plane) + @strict_tt (4.0 user paths with TT). Any new
+      HTML-serving path must be explicitly placed in one of the four matchers — no
+      silent fallback to lenient. Enforced by scripts/check-caddyfile-csp-parity.sh.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-06-27'
+
+- id: YSG-RISK-106
+  description: >-
+    LAURA-4.0-S1-001: Fail-OPEN OPA bypass in scheduled workflow execution.
+    workflow_scheduler._make_scheduled_identity called non-existent
+    identity_registry.get_by_id() (AttributeError silently caught), fell back to a
+    synthetic identity whose slug was the raw account_id UUID. get_by_slug(UUID) returns
+    None, causing fallback to {"identity_id":"internal","kind":"service"} in the router.
+    OPA scope key becomes service:internal — human:idnt_* bindings never match.
+    All per-user client policies were silently bypassed on every workflow step, while the
+    same policies fired correctly on interactive chat/API calls. CVSS 8.2 (HIGH).
+    (LAURA-4.0-S1-001, CWE-284, CWE-273)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-273 (Improper Check for Dropped Privileges)
+  - ASVS V1.4.1 (Access Control Policy)
+  - ASVS V4.1.1 (General Access Control)
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-02'
+  closed_at: '2026-07-02'
+  closure_evidence:
+  - rationale: >-
+      Four-layer fix shipped in single commit referencing LAURA-4.0-S1-001:
+      (1) identity/registry.py: added get_by_account_id() with Redis index
+      identity:account:{account_id} and link_account_id() to populate the index on login.
+      (2) gateway/workflow_scheduler.py: _make_scheduled_identity rewritten fail-closed.
+      Primary lookup: get_by_account_id(owner_identity_id); fallback: get(owner_identity_id)
+      for SSO users where account_id == identity_id. Any failure returns _IDENTITY_UNRESOLVABLE
+      sentinel. _execute_workflow_run blocks immediately on sentinel (run.status=blocked)
+      and emits WorkflowRunFailedEvent. The silent except+synthetic-identity path is removed.
+      (3) backoffice/routes/auth.py: link_account_id() called after every successful login
+      in _register_human_identity_on_login() — backfills existing users on first login
+      post-upgrade. Idempotent.
+      (4) backoffice/routes/policies.py: bind_policy() normalizes human scope_id from
+      email/slug to idnt_ PK at bind time; rejects unresolvable inputs with HTTP 400.
+      Tests: 9/9 contract tests pass; 3 new tests (F1/F2/G) fail precisely on bypass regression.
+      populate-demo.py: step7c_onboard_users uses SHA-256/6-digit TOTP for user logins;
+      step10_bind_policies allows 409 (idempotent re-run after scope normalisation).
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-02'
+
+- id: YSG-RISK-107
+  description: >-
+    Email-in-header residual on 4.0 native chat path (FIND-4.0-CHAT-001 / LAURA-4.0-S1-001).
+    The 4.0 backoffice chat proxy (user_ui.py /user/chat/completions) forwarded
+    X-OpenWebUI-User-Email: session.account_id to the gateway, but session.account_id
+    is a UUID (not an email). The gateway's _resolve_owui_forwarded_user then attempted
+    email_to_slug(UUID), producing an invalid slug that never matched any identity.
+    Per-user OPA/RBAC bindings were therefore silently bypassed on the 4.0 native chat
+    path: all requests resolved to the owui-users baseline instead of the caller's
+    identity. Same bypass class as YSG-RISK-106 (LAURA-4.0-S1-001). (CWE-284, CWE-287)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-287 (Improper Authentication)
+  - ASVS V1.4.1 (Access Control Policy)
+  - ASVS V4.1.1 (General Access Control)
+  compensating_controls:
+  - OPA org-ceiling deny-by-default applies at the policy layer even on baseline identity.
+  - Caddy session gate ensures only authenticated users reach the proxy endpoint.
+  - Internal-bearer path means no public spoofing of the forwarded header is possible.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  closed_at: '2026-07-03'
+  closure_evidence:
+  - rationale: >-
+      user_ui.py /user/chat/completions now resolves caller identity_id via
+      identity_registry.get_by_account_id(session.account_id) (Redis key
+      identity:account:{account_id} → idnt_ PK) and forwards it as
+      X-Yashigani-Identity-Id: <idnt_...>. Fail-closed: if the registry is
+      unavailable → 503; if no account→identity mapping exists → 403; if the
+      record has no valid idnt_ PK → 503. X-OpenWebUI-User-Email is no longer
+      forwarded on the 4.0 chat path.
+      Gateway openai_router.py _resolve_yashigani_identity_id_header() reads
+      X-Yashigani-Identity-Id on the trusted path (p2_forwarder / _INTERNAL_BEARER)
+      and does a direct registry.get(identity_id) lookup (no slug derivation).
+      Fail-closed: header present + not found → 403; header present + registry
+      unavailable → 503; malformed (non-idnt_ prefix) → 403. Header absent →
+      None (falls through to OWUI email / API-key path for backward compat).
+      P1 agent branch now strips X-Yashigani-Identity-Id and emits
+      AGENT_HEADER_STRIPPED (same treatment as X-OpenWebUI-User-Email).
+      Caddy edge-strip of X-Yashigani-Identity-Id deferred to Su's Caddyfile
+      task (header is only trusted on the internal-bearer path — defense in depth).
+      12 regression tests in tests/regression/v4.0/test_identity_id_header_forwarding.py.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'
+
+- id: YSG-RISK-108
+  description: >-
+    Mesh-port (:8081) identity-header authn bypass (LAURA-4.0 T-3 / T-4).
+    The gateway MCP mesh port accepted unauthenticated POST requests and
+    (T-3) promoted X-Forwarded-User to the OPA user_id without verifying the
+    internal bearer; (T-4) promoted X-Yashigani-Orchestration-Depth to the
+    reserved "gateway:orchestrator" caller_agent_id without verifying the
+    internal bearer. An attacker with network access to port 8081 could forge
+    a higher-privilege identity context on inbound MCP calls.
+    (LAURA-4.0 findings T-3/T-4, CWE-284, CWE-287)
+  severity: high
+  controls_impacted:
+  - CWE-284 (Improper Access Control)
+  - CWE-287 (Improper Authentication)
+  - ASVS V4.1.1 (General Access Control — mesh-port identity binding)
+  compensating_controls:
+  - Mesh port :8081 is inside the mTLS mesh (not exposed at the Caddy edge).
+  - OPA deny-by-default applies even on forged identities at the policy layer.
+  status: closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  review_by: '2026-09-30'
+  closure_evidence:
+  - rationale: >-
+      Negative cases (T-3/T-4) hardened in mcp_router_runtime.py:
+      unauthenticated caller without YASHIGANI_INTERNAL_BEARER or Caddy secret
+      is NOT promoted to gateway:orchestrator (T-4) and X-Forwarded-User is
+      NOT trusted (T-3). Regression tests in
+      tests/regression/v4.0/test_ysg_risk_108_mesh_port_authn_bypass.py
+      (10/10 PASS).
+      Positive cases (internal bearer + depth header → promotion) verified in
+      test_v31_mcp_caller_identity::test_orch_depth_header_sets_gateway_orchestrator_caller
+      and test_v31_mcp_phase34_enforcement::test_e3_gateway_orchestrator_skips_identity_lookup
+      (both updated to carry bearer, now PASS). All MCP tests 42/42 PASS.
+  residuals: []
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'
+
+- id: YSG-RISK-109
+  description: >-
+    MCP identity JWT signing key is install-wide, not per-tenant.
+    src/yashigani/mcp/_jwt.py McpJwtIssuer loads ONE install-wide P-384 key
+    (from /run/secrets/mcp_identity_signing_key). The tenant_id argument only
+    labels the kid claim (f"mcp-{tenant_id}-{mtime}") — it does NOT select a
+    different key. In a multi-tenant deployment all tenants share the same
+    physical signing key: a token minted for tenant A can in principle be
+    verified using tenant B's key material (same key), and any entity that
+    obtains the single root key can forge tokens for every tenant.
+    Additionally, registry.py build_registry_from_env() explicitly uses one
+    shared McpJwtIssuer for all brokers ("one key per installation, not per
+    server" — Iris F-1 comment). The operator-token and step-up JWTs in
+    backoffice/routes/auth.py and auth/stepup.py also use the install-wide
+    caddy_internal_hmac (HS256) with no per-tenant scoping.
+    (ASVS V2.1, CWE-320, CWE-321)
+  severity: medium
+  controls_impacted:
+  - ASVS V2.1 (Cryptographic key management)
+  - CWE-320 (Key Management Errors)
+  - CWE-321 (Hard-coded Cryptographic Key)
+  compensating_controls:
+  - ES384 MCP JWTs carry an explicit "tenant" claim; OPA policies verify
+    tenant-scoping at every hop.
+  - The install-wide key file is mounted 0600 inside the gateway container;
+    container hardening (cap_drop ALL, read_only rootfs, seccomp) limits
+    exposure.
+  - jti nonce dedup (RedisNonceStore) prevents replay even if key is leaked.
+  status: partially_closed
+  accepted_by: tiago@agnosticsec.com
+  accepted_at: '2026-07-03'
+  review_by: '2026-12-31'
+  closure_evidence:
+  - rationale: >-
+      PARTIAL CLOSURE (JWT per-tenant key isolation):
+      auth/_jwt.py introduces derive_tenant_ec_key() using HKDF-SHA384:
+        IKM  = 48-byte big-endian root key private scalar
+        salt = b"yashigani-tenant-jwt-v1"
+        info = b"tenant:" + tenant_id
+        out  = 64 bytes → reduced mod secp384r1 order n
+      McpJwtIssuer._load_or_generate_key() now derives a per-tenant P-384 key
+      from the install-wide root before returning it. Two McpJwtIssuer instances
+      with the same root but different tenant_ids produce cryptographically
+      independent keys; McpJwtVerifier.from_issuer() captures the derived
+      public key, so cross-tenant verification fails at the signature check.
+      Tests: tests/unit/test_ysg_risk_078_per_tenant_jwt_isolation.py — F1/F2
+      prove cross-tenant forgery is rejected; B2/C2 prove determinism.
+      Committed: feat(security): per-tenant MCP JWT key isolation (YSG-RISK-109).
+  residuals:
+  - >-
+      ROOT KEY COMPROMISE: derivation is deterministic; if the install-wide
+      root key is exfiltrated, all tenant keys can be re-derived. Mitigated
+      by KMS-backed root key with HSM binding in production (Nico §2).
+  - >-
+      REGISTRY ONE-ISSUER DESIGN: registry.py currently builds ONE shared
+      McpJwtIssuer (Iris F-1) labeled with first_tenant. After this change
+      that issuer uses the first_tenant's derived key, but all brokers still
+      sign JWTs with that single derived key. Full per-tenant isolation
+      requires registry.py to instantiate separate issuers per tenant_id.
+      Deferred: requires editing registry.py (currently disjoint-locked).
+  - >-
+      INTERNAL BEARER (YASHIGANI_INTERNAL_BEARER): install-wide shared token
+      used by agent bundles (letta, langflow, open-webui) as OPENAI_API_KEY
+      shim. Per-tenant scoping requires per-tenant shim tokens and changes to
+      Caddyfile routing. Deferred to a future hardening sprint.
+  - >-
+      CADDY_INTERNAL_HMAC (step-up JWTs, operator tokens): auth/stepup.py and
+      backoffice/routes/auth.py sign HS256 JWTs with the install-wide
+      caddy_internal_hmac. Per-tenant scoping deferred — step-up is admin-plane
+      and already protected by AdminSession + mTLS + SPIFFE. Deferred.
+  fix_in_version: v4.0
+  last_threat_model_review: '2026-07-03'

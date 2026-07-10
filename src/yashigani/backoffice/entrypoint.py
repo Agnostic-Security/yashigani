@@ -21,7 +21,7 @@ import time
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.auth.bootstrap import (
     load_or_generate,
     print_credentials,
@@ -90,6 +90,7 @@ def _bootstrap():
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # ── Session store (Redis db/1) ──────────────────────────────────────────
@@ -190,6 +191,12 @@ def _bootstrap():
     # typical kube-dns propagation window without blocking readiness probes.
     rbac_store = None
     agent_registry = None
+    binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
+    document_policy_store = None
+    document_set_store = None
+    envelope_pending_store = None    # 3.0 — capability-envelope re-approval queue
+    _dp_weaken_store = None          # 4.0 — dual-admin data-protection maker-checker
+    _cap_policy_store = None         # 3.0 — browser Permissions-Policy
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -203,10 +210,101 @@ def _bootstrap():
                 len(rbac_store.list_groups()),
             )
             # Agent registry shares the same Redis db/3 instance (different key namespace)
-            agent_registry = AgentRegistry(redis_client=redis_rbac_client)
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): wire the durable
+            # Postgres mirror so register/update/deactivate dual-write to
+            # agent_registry. Redis db/3 has no persistence (appendonly no /
+            # save ""), so a redis recreate wipes the registry; the durable store
+            # + startup reconciler (lifespan) restore it. Constructed only when a
+            # usable (non-templated) DSN is present; otherwise the registry stays
+            # Redis-only as before. The store uses its own sync psycopg2 conn at
+            # write time, so it does not depend on the asyncpg pool being open yet.
+            _durable_agent_store = None
+            try:
+                from yashigani.agents.durable_store import AgentDurableStore, _direct_dsn
+                if _direct_dsn() and "${POSTGRES_PASSWORD}" not in _direct_dsn():
+                    _durable_agent_store = AgentDurableStore()
+                    logger.info("Agent durable store (Postgres mirror) wired")
+                else:
+                    logger.warning(
+                        "Agent durable store NOT wired — no usable Postgres DSN; "
+                        "agent registrations will NOT survive a redis recreate"
+                    )
+            except Exception as _ds_exc:
+                logger.warning("Agent durable store init skipped (%s)", _ds_exc)
+            agent_registry = AgentRegistry(
+                redis_client=redis_rbac_client,
+                durable_store=_durable_agent_store,
+            )
             logger.info(
                 "Agent registry initialised: %d agent(s) in index",
                 agent_registry.count("all"),
+            )
+            # #16 — client-policy BindingStore shares the same Redis db/3 instance
+            # (key prefix ysgbind:*, disjoint from rbac:* and the agent registry).
+            from yashigani.policy_bindings.store import BindingStore as _BindingStore
+            binding_store = _BindingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Binding store initialised: %d client-policy binding(s) loaded",
+                len(binding_store.list()),
+            )
+            # Document-enforcement policy store (2.26) shares Redis db/3
+            # (key namespace "document:"); same persistence + startup-OPA-re-push
+            # pattern as the RBAC store. Seed the demo matrix on first boot only.
+            from yashigani.documents.policy_store import DocumentPolicyStore
+            document_policy_store = DocumentPolicyStore(redis_client=redis_rbac_client)
+            document_policy_store.seed_defaults()
+            logger.info(
+                "Document policy store initialised: %d policy(ies) loaded from Redis",
+                len(document_policy_store.list_policies()),
+            )
+            # Document-SET store (2.26 set-scoped-salt) shares Redis db/3
+            # (key namespace "document:set:"); holds the opaque per-set salt for
+            # operator-defined cross-file correlation sets.  No seeding — sets are
+            # operator-created (default stays per-file isolation).
+            from yashigani.documents.set_store import DocumentSetStore
+            document_set_store = DocumentSetStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Document set store initialised: %d set(s) loaded from Redis",
+                len(document_set_store.list_sets()),
+            )
+            # Capability-envelope PENDING re-approval store (3.0 / YSG-RISK-060)
+            # shares Redis db/3 (key namespace "mcp_envelope_pending:"). Holds the
+            # candidate (refreshed) tool surface for every BLOCKED imported-MCP
+            # refresh so the re-approval admin SPA can show the diff vs the
+            # ORIGINAL baseline and mint it on step-up approve. No seeding —
+            # entries are created by the broker when it latches a block.
+            from yashigani.mcp.envelope_pending_store import EnvelopePendingStore
+            envelope_pending_store = EnvelopePendingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Capability-envelope pending store initialised: %d pending re-approval(s)",
+                len(envelope_pending_store.list_for_tenant(
+                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+                )),
+            )
+            # 4.0 — Data-protection weaken pending store (LAURA-V400-R2-001).
+            # Shares Redis db/3 (key namespace "dp_weaken:").  Holds pending
+            # maker-checker weaken requests for pii_config, pii_cloud_bypass,
+            # and doc_enforcement until a second admin approves or rejects.
+            # No seeding — entries are created on-demand via the admin API.
+            from yashigani.protection.weaken_pending_store import DpWeakenPendingStore as _DpWeakenStore
+            _dp_weaken_store = _DpWeakenStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Data-protection weaken store initialised (dual-admin maker-checker, 4.0): "
+                "%d pending request(s)",
+                _dp_weaken_store.count_for_tenant(
+                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+                ),
+            )
+            # 3.0 — browser Permissions-Policy store (Redis db/3, prefix cap_policy:*)
+            from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+            _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+            _cap_policy_store = _CapPolStore(
+                redis_client=redis_rbac_client,
+                default_org_id=_cap_pol_org_id,
+            )
+            logger.info(
+                "Capability policy store initialised (browser Permissions-Policy, 3.0, org=%s)",
+                _cap_pol_org_id,
             )
             break  # success
         except Exception as exc:
@@ -301,6 +399,122 @@ def _bootstrap():
             exc,
         )
 
+    # ── Model allocation store (Redis db/3, key prefix model:alloc:*) ──────
+    # Track B1: durable model-RBAC allocations (org/group/user -> alias). Shares
+    # Redis db/3 with the RBAC + agent registry stores (disjoint namespace).
+    # Fail-closed: if Redis is down the store stays None and the allocation
+    # admin API returns 503 rather than silently dropping a grant.
+    model_allocation_store = None
+    try:
+        import redis as _redis
+        from yashigani.models.allocation_store import ModelAllocationStore
+        redis_alloc_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        # Wire the Postgres durable mirror so allocations survive a redis
+        # recreate/restart (Redis db/3 has no persistence). Constructed only when
+        # a usable (non-templated) DSN is present; otherwise Redis-only.
+        _durable_alloc_store = None
+        try:
+            from yashigani.models.allocation_durable_store import (
+                AllocationDurableStore, _direct_dsn as _alloc_dsn,
+            )
+            if _alloc_dsn() and "${POSTGRES_PASSWORD}" not in _alloc_dsn():
+                _durable_alloc_store = AllocationDurableStore()
+                logger.info("Allocation durable store (Postgres mirror) wired")
+            else:
+                logger.warning(
+                    "Allocation durable store NOT wired — no usable Postgres DSN; "
+                    "allocations will NOT survive a redis recreate"
+                )
+        except Exception as _ads_exc:
+            logger.warning("Allocation durable store init skipped (%s)", _ads_exc)
+        model_allocation_store = ModelAllocationStore(
+            redis_client=redis_alloc_client,
+            durable_store=_durable_alloc_store,
+        )
+        logger.info(
+            "Model allocation store initialised: %d allocation(s) loaded from Redis",
+            len(model_allocation_store.list_all()),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Model allocation store init failed (%s) — model allocations disabled",
+            exc,
+        )
+
+    # ── Budget configuration store (Redis db/3, prefix budget:config:*) ──────
+    # B3 fix (2.25.5): the budget admin routes (/admin/budget/*) were never
+    # wired to a store — budget.configure() was never called, so adding a cap
+    # returned 201 but persisted nothing and the lists always rendered empty.
+    # The Postgres BudgetStore can't be used directly because its tables carry
+    # RLS + FKs to tenants/rbac_groups/identities that the free-text admin UI
+    # values don't satisfy. A Redis db/3 config store (same durable admin store
+    # as allocations/bindings) persists + reads back correctly with no route or
+    # UI changes. configure() wires it into the budget router below.
+    budget_config_store = None
+    try:
+        import redis as _redis
+        from yashigani.billing.budget_config_store import BudgetConfigStore
+        from yashigani.backoffice.routes import budget as _budget_routes
+        redis_budget_client = _redis.from_url(
+            _backoffice_redis_url(3),
+            decode_responses=False,
+        )
+        budget_config_store = BudgetConfigStore(redis_client=redis_budget_client)
+        _budget_routes.configure(budget_store=budget_config_store)
+        logger.info("Budget config store initialised (Redis db/3) and wired to /admin/budget/*")
+    except Exception as exc:
+        logger.warning(
+            "Budget config store init failed (%s) — budget caps will not persist",
+            exc,
+        )
+
+    # ── Budget enforcer (budget-redis, db/0) — wires /admin/budget/usage/{id} ──
+    # FIND-3.0-005 fix: /admin/budget/usage/{identity_id} returns 503 because
+    # the backoffice never connected to budget-redis or instantiated a
+    # BudgetEnforcer.  The gateway wires one at startup (gateway/entrypoint.py
+    # line ~325).  The backoffice mirrors that wiring here so usage data written
+    # by the gateway can be read back via the admin UI.
+    #
+    # budget-redis sits on the `data` bridge (compose line 1056: "budget-redis
+    # is a data-plane dep of gateway/backoffice only") — accessible from the
+    # backoffice container.  We reuse build_redis_url() with an explicit host
+    # override (BUDGET_REDIS_HOST, default "budget-redis") and the backoffice
+    # client cert (same TLS CA, accepted by budget-redis --tls-auth-clients yes).
+    try:
+        import redis as _redis_br
+        from yashigani.billing.budget_enforcer import BudgetEnforcer as _BudgetEnforcer
+        from yashigani.backoffice.routes import budget as _budget_routes_be
+        _budget_redis_host = os.getenv("BUDGET_REDIS_HOST", "budget-redis")
+        _budget_redis_port = os.getenv("BUDGET_REDIS_PORT", "6380")
+        _budget_redis_url = build_redis_url(
+            0,
+            host=_budget_redis_host,
+            port=_budget_redis_port,
+            password=_redis_password,
+            use_tls=redis_use_tls,
+            secrets_dir=_secrets_dir,
+            client_cert_name="backoffice_client",
+        )
+        _budget_redis_client = _redis_br.from_url(_budget_redis_url, decode_responses=False)
+        _budget_redis_client.ping()
+        _budget_enforcer = _BudgetEnforcer(redis_client=_budget_redis_client)
+        _budget_routes_be.configure(
+            budget_enforcer=_budget_enforcer,
+            budget_store=budget_config_store,
+        )
+        logger.info(
+            "Budget enforcer wired to /admin/budget/usage/* (budget-redis at %s:%s)",
+            _budget_redis_host, _budget_redis_port,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Budget enforcer init failed (%s) — /admin/budget/usage/* will return 503",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
@@ -371,7 +585,13 @@ def _bootstrap():
     backoffice_state.resource_monitor = resource_monitor
     backoffice_state.rate_limiter = rate_limiter
     backoffice_state.rbac_store = rbac_store
+    backoffice_state.binding_store = binding_store    # #16
     backoffice_state.agent_registry = agent_registry
+    backoffice_state.document_policy_store = document_policy_store
+    backoffice_state.document_set_store = document_set_store
+    backoffice_state.envelope_pending_store = envelope_pending_store
+    backoffice_state.dp_weaken_store = _dp_weaken_store  # 4.0 — dual-admin data-protection maker-checker
+    backoffice_state.capability_policy_store = _cap_policy_store  # 3.0 — Permissions-Policy
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")
@@ -384,6 +604,7 @@ def _bootstrap():
     backoffice_state.response_cache = response_cache
     backoffice_state.license_state = license_state
     backoffice_state.model_alias_store = model_alias_store
+    backoffice_state.model_allocation_store = model_allocation_store
 
     # v0.9.0 — WebAuthn + EventBus (optional, graceful degradation if unavailable)
     try:
@@ -466,13 +687,25 @@ def _bootstrap():
         logger.warning("Identity broker init failed (%s) — SSO routes will return 503", exc)
 
     # v2.1 — Identity registry (Redis db/3, shared with RBAC)
+    # B1 follow-on (2.25.5): wire IdentityDurableStore so create/update/delete
+    # dual-write to Postgres and the startup reconciler can re-hydrate Redis
+    # after a volume-deletion.
     try:
         from yashigani.identity.registry import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         import redis as _redis
         redis_identity_url = _backoffice_redis_url(3)
         redis_identity_client = _redis.from_url(redis_identity_url, decode_responses=False)
-        backoffice_state.identity_registry = IdentityRegistry(redis_client=redis_identity_client)
-        logger.info("Identity registry initialised")
+        _id_durable_bo = None
+        try:
+            _id_durable_bo = IdentityDurableStore()
+        except Exception as _de_bo:
+            logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de_bo)
+        backoffice_state.identity_registry = IdentityRegistry(
+            redis_client=redis_identity_client,
+            durable_store=_id_durable_bo,
+        )
+        logger.info("Identity registry initialised (durable_store=%s)", "wired" if _id_durable_bo else "off")
     except Exception as exc:
         logger.warning("Identity registry init failed (%s) — SSO identity resolution disabled", exc)
 
@@ -521,6 +754,13 @@ def _bootstrap():
         if _ping_ok:
             backoffice_state.break_glass_manager = init_break_glass(redis_bg, audit_writer)
             logger.info("Break glass manager initialized")
+            # #25: dual-admin cloud-LLM override shares the same db/0 Redis client.
+            try:
+                from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+                backoffice_state.cloud_override_manager = CloudLlmOverrideManager(redis_bg, audit_writer)
+                logger.info("Cloud-LLM override manager initialized")
+            except Exception as _co_exc:
+                logger.warning("Cloud-override manager init failed (%s)", _co_exc)
         else:
             logger.warning("Break glass unavailable — Redis unreachable after %d attempts", _BG_MAX_ATTEMPTS)
     except Exception as exc:
@@ -540,6 +780,8 @@ _collector = MetricsCollector(
     rbac_store=backoffice_state.rbac_store,
     agent_registry=backoffice_state.agent_registry,
     backend_registry=backoffice_state.backend_registry,
+    # session_store: powers yashigani_auth_active_sessions (Security Overview panel).
+    session_store=backoffice_state.session_store,
     poll_interval_seconds=15,
 )
 _collector.start()

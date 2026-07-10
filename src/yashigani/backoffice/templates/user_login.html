@@ -25,7 +25,7 @@
             </div>
             <div class="field">
                 <label for="totp_code">TOTP Code</label>
-                <input type="text" id="totp_code" name="totp_code" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" class="totp-input" placeholder="000000">
+                <input type="text" id="totp_code" name="totp_code" required pattern="[0-9]{6,8}" maxlength="8" inputmode="numeric" autocomplete="one-time-code" class="totp-input" placeholder="000000">
             </div>
             <button type="submit" id="login-btn">Sign In</button>
         </form>
@@ -45,7 +45,7 @@
         </form>
 
         <div class="admin-link"><a href="/admin/login">System administration</a></div>
-        <p class="footer">Yashigani v2.1 &mdash; Agnostic Security</p>
+        <p class="footer">Yashigani v{{ yashigani_version }} &mdash; Agnostic Security</p>
     </div>
 
     <script src="/static/js/user_login.js"></script>

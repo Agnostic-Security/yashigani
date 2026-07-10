@@ -1,0 +1,2377 @@
+# Yashigani MCP OPA Policy Tests — P1 W3 Phase 2b-i
+#
+# Tests the mcp.rego policy package.
+# Run with: opa test policy/
+#
+# Coverage sections:
+#   1. Basic allow paths — MCP-A, MCP-B, MCP-C
+#   2. Fail-closed defaults — missing SPIFFE, invalid posture, bad action
+#   3. Subject exclusivity (oneOf) — multiple subjects deny, no subject deny
+#   4. Chain-depth guard — MCP-C length enforcement + operator override
+#   5. P9 per-tool authz — exposed_tools allowlist present and absent
+#   6. Deny reasons — one fires per scenario
+#   7. redact_args — secret-key patterns in tool args
+#   8. audit_capture — trigger conditions
+#   9. rate_limit_key — format and null cases
+#  10. mcp_decision compound document shape
+#  11. v4.1 Phase 2b — per-instance FOUR-GATE authz + change-prevention
+#      (LU-MCP-A1..A4: verified identity, target.mcp_id, per-caller grant,
+#      capability-envelope baseline; flipped default-deny exposed_tools)
+#
+package yashigani_mcp_test
+
+import rego.v1
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+
+_base_input := {
+    "posture": "mcp-a",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+_mcp_a_tool_input := {
+    "posture": "mcp-a",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+_mcp_b_tool_input := {
+    "posture": "mcp-b",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+_mcp_c_input_ok := {
+    "posture": "mcp-c",
+    "action": "mcp.tools.call",
+    "identity": {
+        "spiffe": _spiffe_relay,
+        "verified": true,
+        "chain": [
+            "spiffe://cluster.local/ns/default/sa/origin",
+            _spiffe_relay,
+        ],
+    },
+    "target": _target_ok,
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 2b fixtures — per-instance authz + change-prevention
+# ---------------------------------------------------------------------------
+
+_spiffe_langflow := "spiffe://cluster.local/ns/default/sa/langflow"
+
+_spiffe_relay := "spiffe://cluster.local/ns/default/sa/relay"
+
+_mcp_id_1 := "6a7b1c9e-0001-4000-8000-000000000001"
+
+# A SECOND instance with the SAME name-SPIFFE callers but a distinct mcp_id —
+# per-instance isolation is the whole point (LU-MCP-A2).
+_mcp_id_2 := "6a7b1c9e-0002-4000-8000-000000000002"
+
+_hash_ok := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+_hash_drifted := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+_grants_ok := {
+    _mcp_id_1: {
+        _spiffe_langflow: {"tools": ["web_search"], "actions": ["mcp.tools.call"]},
+        _spiffe_relay: {"tools": ["web_search"], "actions": ["mcp.tools.call"]},
+    },
+    _mcp_id_2: {
+        _spiffe_relay: {"tools": ["other_tool"], "actions": ["mcp.tools.call"]},
+    },
+}
+
+_baselines_ok := {
+    _mcp_id_1: {"surface_hash": _hash_ok, "tools": ["web_search"]},
+    _mcp_id_2: {"surface_hash": _hash_ok, "tools": ["other_tool"]},
+}
+
+_target_ok := {
+    "mcp_id": _mcp_id_1,
+    "cert_fingerprint": "sha256:leaf-fp-1",
+    "surface_hash": _hash_ok,
+}
+
+# Fully-satisfying mcp-b invocation input (verified identity + target).
+_mcp_b_call_ok := {
+    "posture": "mcp-b",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": _spiffe_langflow, "verified": true},
+    "target": _target_ok,
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+# ---------------------------------------------------------------------------
+# 1. Basic allow paths
+# ---------------------------------------------------------------------------
+
+test_allow_mcp_a_tool_call if {
+    data.yashigani.mcp.allow with input as _mcp_a_tool_input
+}
+
+test_allow_mcp_a_prompt_list if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.prompts.list",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "prompt": {"name": "summarize"},
+    }
+}
+
+test_allow_mcp_a_resource_read if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.resources.read",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "resource": {"uri": "file:///data/report.md"},
+    }
+}
+
+# v4.1 Phase 2b: invocation allow requires the FOUR-GATE (verified identity,
+# per-instance target, per-caller grant, unchanged capability envelope).
+test_allow_mcp_b_tool_call if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_allow_mcp_c_with_valid_chain if {
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_allow_mcp_a_ping if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.ping",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "ping", "args_redacted": {}},
+    }
+}
+
+test_allow_mcp_a_initialize if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.initialize",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "init", "args_redacted": {}},
+    }
+}
+
+# v4.1 Phase 2b: remote non-invocation actions require verified identity and —
+# when carrying a tool subject — an explicit exposed_tools listing (flipped gate).
+test_allow_mcp_b_sampling if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "sample", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"sample"}
+}
+
+# ---------------------------------------------------------------------------
+# 2. Fail-closed defaults — missing SPIFFE, invalid posture, bad action
+# ---------------------------------------------------------------------------
+
+test_deny_missing_spiffe if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_reason_missing_spiffe if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d == "missing_spiffe_identity"
+}
+
+test_deny_identity_missing_entirely if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_invalid_posture if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-z",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_reason_invalid_posture if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-z",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d == "invalid_posture"
+}
+
+test_deny_unrecognised_action if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.unknown.action",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_reason_unrecognised_action if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-a",
+        "action": "mcp.unknown.action",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d == "unrecognised_action"
+}
+
+test_deny_empty_action if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Subject exclusivity (oneOf)
+# ---------------------------------------------------------------------------
+
+test_deny_multiple_subjects_tool_and_prompt if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "prompt": {"name": "summarize"},
+    }
+}
+
+test_deny_reason_multiple_subjects if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "prompt": {"name": "summarize"},
+    }
+    d == "multiple_subjects_in_request"
+}
+
+test_deny_multiple_subjects_tool_and_resource if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "resource": {"uri": "file:///data"},
+    }
+}
+
+test_deny_multiple_subjects_all_three if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "prompt": {"name": "summarize"},
+        "resource": {"uri": "file:///data"},
+    }
+}
+
+test_deny_no_subject if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+    }
+}
+
+test_deny_reason_missing_subject if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+    }
+    d == "missing_subject"
+}
+
+# ---------------------------------------------------------------------------
+# 4. Chain-depth guard — MCP-C length enforcement + operator override
+# ---------------------------------------------------------------------------
+
+test_deny_chain_depth_exceeded_default_max if {
+    # 10 entries > pinned max of 9 (YSG-RISK-056): must DENY
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/hop1",
+                "spiffe://cluster.local/ns/default/sa/hop2",
+                "spiffe://cluster.local/ns/default/sa/hop3",
+                "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_reason_chain_depth_exceeded if {
+    # 10 entries > pinned max of 9 (YSG-RISK-056): deny_reason set
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/hop1",
+                "spiffe://cluster.local/ns/default/sa/hop2",
+                "spiffe://cluster.local/ns/default/sa/hop3",
+                "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d == "chain_depth_exceeded"
+}
+
+test_allow_chain_depth_at_max if {
+    # Exactly 9 entries == pinned max (YSG-RISK-056): boundary must ALLOW
+    # (v4.1 Phase 2b: with the four-gate satisfied)
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "target": _target_ok,
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "verified": true,
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/hop1",
+                "spiffe://cluster.local/ns/default/sa/hop2",
+                "spiffe://cluster.local/ns/default/sa/hop3",
+                "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    } with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_allow_chain_depth_2_within_default_max if {
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_deny_chain_depth_operator_override_is_inert if {
+    # YSG-RISK-056 (CWE-15): the operator-overridable chain_max_depth was REMOVED;
+    # mcp_chain_max_depth is now a pinned policy CONSTANT (9). A malicious/lax
+    # operator data bundle that tries to raise the ceiling to 99 must be IGNORED:
+    # an 11-entry chain (> pinned 9) must still DENY despite the override mock.
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/hop1",
+                "spiffe://cluster.local/ns/default/sa/hop2",
+                "spiffe://cluster.local/ns/default/sa/hop3",
+                "spiffe://cluster.local/ns/default/sa/hop4",
+                "spiffe://cluster.local/ns/default/sa/hop5",
+                "spiffe://cluster.local/ns/default/sa/hop6",
+                "spiffe://cluster.local/ns/default/sa/hop7",
+                "spiffe://cluster.local/ns/default/sa/hop8",
+                "spiffe://cluster.local/ns/default/sa/hop9",
+                "spiffe://cluster.local/ns/default/sa/hop10",
+                "spiffe://cluster.local/ns/default/sa/hop11",
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    } with data.yashigani.mcp.policy.chain_max_depth as 99
+}
+
+test_deny_mcp_c_no_chain if {
+    # MCP-C posture but no chain provided → deny mcp_c_requires_chain
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/relay"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_deny_reason_mcp_c_requires_chain if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/relay"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d == "mcp_c_requires_chain"
+}
+
+test_deny_mcp_c_empty_chain if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/relay", "chain": []},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# MCP-A with chain present: chain is extra data — chain_depth_ok passes (depth=0 when absent)
+# When chain IS provided on mcp-a it's ignored for the depth check (depth is count of chain array)
+# but the allow path for mcp-a doesn't check chain presence — it only checks depth_ok.
+# A short chain present on mcp-a should still allow.
+test_allow_mcp_a_with_extra_chain_short if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/test",
+            "chain": ["spiffe://cluster.local/ns/default/sa/test"],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. P9 per-tool authz — exposed_tools allowlist
+# ---------------------------------------------------------------------------
+
+# 5a. FLIPPED (v4.1 Phase 2b / LU-MCP-A4): no allowlist data loaded is NO LONGER
+# an open gate. A legacy invocation input (unverified, no target, no grant) is
+# DENIED on a default install.
+test_p9_deny_legacy_tools_call_when_allowlist_absent if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
+}
+
+# 5b. FLIPPED: empty allowlist → still deny (closed world).
+test_p9_deny_legacy_tools_call_when_allowlist_empty if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
+        with data.yashigani.mcp.exposed_tools as set()
+}
+
+# 5c. FLIPPED: allowlist membership ALONE no longer authorizes an invocation —
+# without verified identity + target + grant + baseline it is denied.
+test_p9_deny_tools_call_allowlist_alone_insufficient if {
+    not data.yashigani.mcp.allow with input as _mcp_b_tool_input
+        with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# 5c-ii. Narrowing gate: four-gate satisfied + tool in populated allowlist → allow.
+test_p9_allow_tool_in_allowlist_with_four_gate if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# 5c-iii. Narrowing gate: four-gate satisfied but populated allowlist EXCLUDES
+# the tool → deny with the allowlist reason.
+test_p9_deny_granted_tool_excluded_by_narrowing_allowlist if {
+    not data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"code_review"}
+}
+
+test_p9_deny_reason_granted_tool_excluded_by_narrowing_allowlist if {
+    d := data.yashigani.mcp.deny_reason with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+        with data.yashigani.mcp.exposed_tools as {"code_review"}
+    d == "tool_not_in_exposed_allowlist"
+}
+
+# 5d. Tool NOT in allowlist → deny
+test_p9_deny_tool_not_in_allowlist if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/langflow"},
+        "tool": {"name": "dangerous_exec", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# 5e. Deny reason for a NON-invocation action carrying a tool subject not in
+# the (flipped, default-deny) allowlist.
+test_p9_deny_reason_tool_not_in_allowlist if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "dangerous_exec", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+    d == "tool_not_in_exposed_allowlist"
+}
+
+# 5e-ii. FLIPPED: non-invocation tool subject with ABSENT allowlist → deny.
+test_p9_deny_nontool_action_tool_subject_allowlist_absent if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "sample", "args_redacted": {}},
+    }
+}
+
+test_p9_deny_reason_nontool_action_tool_subject_allowlist_absent if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.sampling.createMessage",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "tool": {"name": "sample", "args_redacted": {}},
+    }
+    d == "tool_not_in_exposed_allowlist"
+}
+
+# 5f. MCP-A is NOT subject to tool allowlist (allowlist only enforced on mcp-b and mcp-c)
+# Per brief: "MCP-B per-tool authz … enforced at gateway inbound for exposed tools"
+# Policy implementation: mcp-a allow path does NOT call _tool_authz_ok, so allowlist ignored.
+test_p9_mcp_a_not_gated_by_allowlist if {
+    data.yashigani.mcp.allow with input as _mcp_a_tool_input
+        with data.yashigani.mcp.exposed_tools as {"other_tool"}
+}
+
+# 5g. Tool allowlist applied on mcp-c too
+test_p9_deny_tool_not_in_allowlist_mcp_c if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/relay",
+            "chain": ["spiffe://cluster.local/ns/default/sa/origin", "spiffe://cluster.local/ns/default/sa/relay"],
+        },
+        "tool": {"name": "dangerous_exec", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"web_search"}
+}
+
+# 5h. Non-tool subjects (prompts/resources) are not gated by the tool allowlist
+# (v4.1 Phase 2b: remote postures now require verified identity).
+test_p9_prompt_action_not_blocked_by_tool_allowlist if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.prompts.list",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "prompt": {"name": "summarize"},
+    } with data.yashigani.mcp.exposed_tools as {"web_search"}
+}
+
+# ---------------------------------------------------------------------------
+# 6. Deny reasons — spot checks for each reason string
+# ---------------------------------------------------------------------------
+
+test_deny_reason_is_ok_on_allow if {
+    d := data.yashigani.mcp.deny_reason with input as _mcp_a_tool_input
+    d == "ok"
+}
+
+# (See sections 2–5 for all other deny_reason tests)
+
+# ---------------------------------------------------------------------------
+# 7. redact_args — secret-key pattern detection
+# ---------------------------------------------------------------------------
+
+test_redact_args_empty_when_no_secrets if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"query": "hello world", "limit": 10}},
+    }
+    count(r) == 0
+}
+
+test_redact_args_api_key_detected if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"query": "test", "api_key": "<REDACTED>"}},
+    }
+    "api_key" in r
+}
+
+test_redact_args_token_detected if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"query": "test", "token": "<REDACTED>"}},
+    }
+    "token" in r
+}
+
+test_redact_args_password_detected if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"query": "test", "password": "<REDACTED>"}},
+    }
+    "password" in r
+}
+
+test_redact_args_multiple_secrets_detected if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"query": "test", "api_key": "<REDACTED>", "token": "<REDACTED>", "limit": 5}},
+    }
+    "api_key" in r
+    "token" in r
+    not "query" in r
+    not "limit" in r
+}
+
+test_redact_args_empty_on_deny if {
+    # redact_args returns empty when allow is false
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {"api_key": "<REDACTED>"}},
+    }
+    count(r) == 0
+}
+
+test_redact_args_empty_for_non_tool_subject if {
+    # No tool: redact_args is empty set
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.prompts.list",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "prompt": {"name": "summarize"},
+    }
+    count(r) == 0
+}
+
+# ---------------------------------------------------------------------------
+# 8. audit_capture
+# ---------------------------------------------------------------------------
+
+test_audit_capture_false_on_clean_allow if {
+    data.yashigani.mcp.audit_capture == false with input as _mcp_a_tool_input
+}
+
+test_audit_capture_true_on_deny if {
+    data.yashigani.mcp.audit_capture == true with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_audit_capture_true_for_confidential_resource if {
+    data.yashigani.mcp.audit_capture == true with input as {
+        "posture": "mcp-a",
+        "action": "mcp.resources.read",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "resource": {"uri": "file:///data/secret.doc", "sensitivity": "CONFIDENTIAL"},
+    }
+}
+
+test_audit_capture_true_for_restricted_resource if {
+    data.yashigani.mcp.audit_capture == true with input as {
+        "posture": "mcp-a",
+        "action": "mcp.resources.read",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "resource": {"uri": "file:///data/top_secret.doc", "sensitivity": "RESTRICTED"},
+    }
+}
+
+test_audit_capture_false_for_public_resource if {
+    data.yashigani.mcp.audit_capture == false with input as {
+        "posture": "mcp-a",
+        "action": "mcp.resources.read",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "resource": {"uri": "file:///data/readme.md", "sensitivity": "PUBLIC"},
+    }
+}
+
+test_audit_capture_true_for_multihop_chain if {
+    # Allowed multi-hop call (four-gate satisfied) still forces audit capture.
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    data.yashigani.mcp.audit_capture == true with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_audit_capture_true_for_redactable_args if {
+    data.yashigani.mcp.audit_capture == true with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {"api_key": "<REDACTED>"}},
+    }
+}
+
+test_audit_capture_true_for_confidential_prompt if {
+    data.yashigani.mcp.audit_capture == true with input as {
+        "posture": "mcp-a",
+        "action": "mcp.prompts.list",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "prompt": {"name": "classified_summary", "sensitivity": "CONFIDENTIAL"},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9. rate_limit_key
+# ---------------------------------------------------------------------------
+
+test_rate_limit_key_includes_tool_name if {
+    k := data.yashigani.mcp.rate_limit_key with input as _mcp_a_tool_input
+    contains(k, "mcp.tools.call")
+    contains(k, "web_search")
+}
+
+test_rate_limit_key_null_on_deny if {
+    k := data.yashigani.mcp.rate_limit_key with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    k == null
+}
+
+test_rate_limit_key_excludes_tool_name_for_prompt if {
+    k := data.yashigani.mcp.rate_limit_key with input as {
+        "posture": "mcp-a",
+        "action": "mcp.prompts.list",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "prompt": {"name": "summarize"},
+    }
+    contains(k, "mcp.prompts.list")
+    not contains(k, "web_search")
+}
+
+# ---------------------------------------------------------------------------
+# 10. mcp_decision compound document shape
+# ---------------------------------------------------------------------------
+
+test_decision_allow_has_correct_shape if {
+    d := data.yashigani.mcp.mcp_decision with input as _mcp_a_tool_input
+    d.allow == true
+    d.deny_reason == "ok"
+    d.audit_capture == false
+    d.rate_limit_key != null
+    is_set(d.redact_args)
+}
+
+test_decision_deny_has_correct_shape if {
+    d := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d.allow == false
+    d.deny_reason != ""
+    d.deny_reason != "ok"
+    d.audit_capture == true
+    d.rate_limit_key == null
+    is_set(d.redact_args)
+    count(d.redact_args) == 0
+}
+
+test_decision_redact_args_is_set_in_compound_doc if {
+    d := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "api_caller", "args_redacted": {"endpoint": "https://example.com", "api_key": "<REDACTED>"}},
+    }
+    d.allow == true
+    d.audit_capture == true
+    "api_key" in d.redact_args
+}
+
+# ---------------------------------------------------------------------------
+# 11. Security regression tests — Laura PoC probes + gate fixes
+#     Reference: LAURA-MCP-001..004, LU-MCP-01..02, FINDING-MCP-001
+# ---------------------------------------------------------------------------
+
+# --- FIX-1: LAURA-MCP-001 / LU-MCP-01 — malformed-chain depth bypass ---
+
+# probe1a: chain is an object (1 key) — count(object) == 1 but NOT an array of strings
+# Previously allowed mcp-c by counting object keys. Must deny.
+test_fix1_probe1a_object_chain_denies_mcp_c if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/attacker",
+            "chain": {"x": "y"},
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+test_fix1_probe1a_object_chain_chain_depth_is_zero if {
+    # When chain is an object, _chain_depth must resolve to 0 (fail-closed)
+    d := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/attacker",
+            "chain": {"x": "y"},
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+    d.allow == false
+    # depth=0 → mcp_c_requires_chain
+    d.deny_reason == "mcp_c_requires_chain"
+}
+
+# probe1c: chain is an array of objects — each element is NOT a string
+# Previously counted 2 elements and allowed. Must deny.
+test_fix1_probe1c_array_of_objects_chain_denies_mcp_c if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/attacker",
+            "chain": [{"spiffe": "spiffe://a"}, {"spiffe": "spiffe://b"}],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# probe1d: chain is an array of integers — not strings
+# Previously counted 3 elements (≤ pinned max 9) and allowed. Must deny
+# (non-string chain elements are malformed → fail-closed, not a depth pass).
+test_fix1_probe1d_array_of_ints_chain_denies_mcp_c if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "identity": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/attacker",
+            "chain": [1, 2, 3],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# Positive: valid array of SPIFFE strings at depth 2 still allows on mcp-c
+# (v4.1 Phase 2b: with the four-gate satisfied)
+test_fix1_valid_string_array_chain_allows_mcp_c if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-c",
+        "action": "mcp.tools.call",
+        "target": _target_ok,
+        "identity": {
+            "spiffe": _spiffe_relay,
+            "verified": true,
+            "chain": [
+                "spiffe://cluster.local/ns/default/sa/origin",
+                _spiffe_relay,
+            ],
+        },
+        "tool": {"name": "web_search", "args_redacted": {}},
+    } with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# --- FIX-2: LAURA-MCP-002 / LU-MCP-02 — secret-redaction gaps ---
+
+# probe2: pat key must now appear in redact_args
+test_fix2_pat_key_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "s3_upload", "args_redacted": {"pat": "<REDACTED>", "query": "safe"}},
+    }
+    "pat" in r
+    not "query" in r
+}
+
+test_fix2_aws_secret_access_key_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "aws_tool", "args_redacted": {"aws_secret_access_key": "<REDACTED>", "bucket": "my-bucket"}},
+    }
+    "aws_secret_access_key" in r
+    not "bucket" in r
+}
+
+test_fix2_aws_session_token_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "aws_tool", "args_redacted": {"aws_session_token": "<REDACTED>", "region": "us-east-1"}},
+    }
+    "aws_session_token" in r
+    not "region" in r
+}
+
+test_fix2_client_secret_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "oauth_tool", "args_redacted": {"client_secret": "<REDACTED>", "client_id": "abc"}},
+    }
+    "client_secret" in r
+    not "client_id" in r
+}
+
+test_fix2_refresh_token_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "oauth_tool", "args_redacted": {"refresh_token": "<REDACTED>", "grant_type": "refresh_token"}},
+    }
+    "refresh_token" in r
+    # grant_type is not a secret key
+    not "grant_type" in r
+}
+
+test_fix2_session_token_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "session_tool", "args_redacted": {"session_token": "<REDACTED>", "user_id": "123"}},
+    }
+    "session_token" in r
+    not "user_id" in r
+}
+
+test_fix2_x_api_key_is_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "http_tool", "args_redacted": {"x-api-key": "<REDACTED>", "url": "https://api.example.com"}},
+    }
+    "x-api-key" in r
+    not "url" in r
+}
+
+# probe2j: sort_key and cache_key must NOT be redacted (exact-match, not substring)
+test_fix2_sort_key_and_cache_key_not_redacted if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "db_tool", "args_redacted": {"sort_key": "id", "cache_key": "user:123", "query": "safe"}},
+    }
+    not "sort_key" in r
+    not "cache_key" in r
+    not "query" in r
+}
+
+# probe2n: mix — sort_key and cache_key NOT redacted; key IS redacted
+test_fix2_mixed_probe2n_key_redacted_sort_cache_not if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "tool", "args_redacted": {"sort_key": "id", "monkey": "value", "key": "<REDACTED>", "cache_key": "user:123"}},
+    }
+    "key" in r
+    not "sort_key" in r
+    not "cache_key" in r
+    not "monkey" in r
+}
+
+# --- FIX-4: LAURA-MCP-004 — non-string spiffe type bypass ---
+
+# probe5b: spiffe=1 (integer) — must deny (is_string fails)
+test_fix4_non_string_spiffe_integer_denies if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": 1},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# probe5c: spiffe=true (boolean) — must deny
+test_fix4_non_string_spiffe_boolean_denies if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": true},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# probe5d: spiffe={"uri":"spiffe://evil"} (object) — must deny
+test_fix4_non_string_spiffe_object_denies if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": {"uri": "spiffe://evil"}},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# probe5h: spiffe={} (empty object) — must deny
+test_fix4_non_string_spiffe_empty_object_denies if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": {}},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+}
+
+# --- FIX-4: LAURA-MCP-004 — non-object args_redacted guard ---
+
+# probe3e: args_redacted is an array — must not crash; audit still fires correctly
+test_fix4_non_object_args_redacted_array_no_crash if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "tool", "args_redacted": ["api_key", "secret"]},
+    }
+    # Falls through to else := set() — returns empty set without crashing
+    count(r) == 0
+}
+
+# probe3f: args_redacted is a boolean — must not crash
+test_fix4_non_object_args_redacted_bool_no_crash if {
+    r := data.yashigani.mcp.redact_args with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "tool", "args_redacted": true},
+    }
+    count(r) == 0
+}
+
+# --- FIX-5: LAURA-MCP-003 — mcp-a allowlist bypass (SKIPPED, doc-only) ---
+# This test is intentionally SKIPPED. It documents the transport requirement
+# that the mcp-a allow path MUST be restricted to locally-verified channels
+# by the transport/JWT chunk. The policy intentionally skips _tool_authz_ok
+# for mcp-a (same-trust-boundary design). This is NOT a policy bug — it is a
+# binding constraint on the transport layer that must be enforced before this
+# policy is invoked. See LAURA-MCP-003 tracked gate (Maxine/transport chunk).
+
+# SKIPPED: test_TRANSPORT_REQUIREMENT_mcp_a_must_be_local_only
+# This test cannot be expressed as a pure policy assertion because the
+# invariant ("posture=mcp-a requests can only arrive on a local channel")
+# is a TRANSPORT-LAYER property, not an OPA-input property. A network
+# attacker who can forge input.posture="mcp-a" bypasses _tool_authz_ok.
+# The transport layer must prevent that from happening.
+# Tracked: LAURA-MCP-003. Transport chunk gate owned by Maxine (P2/N-next).
+
+# Sanity check: mcp-a with dangerous_exec and a populated exposed_tools
+# allowlist DOES allow (intentional — mcp-a bypasses tool authz).
+# This is correct behaviour given the transport trust requirement above.
+test_fix5_mcp_a_bypasses_tool_allowlist_by_design if {
+    data.yashigani.mcp.allow with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/attacker"},
+        "tool": {"name": "dangerous_exec", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# Contrast: mcp-b with the same tool NOT in allowlist → deny (tool authz enforced)
+test_fix5_mcp_b_enforces_tool_allowlist if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/attacker"},
+        "tool": {"name": "dangerous_exec", "args_redacted": {}},
+    } with data.yashigani.mcp.exposed_tools as {"web_search", "code_review"}
+}
+
+# ---------------------------------------------------------------------------
+# 12. P3 Filesystem MCP server tool gating (Laura threat model §5)
+#     References: LAURA-FS-001 through LAURA-FS-010 regression attack tests
+# ---------------------------------------------------------------------------
+
+# --- 12.1 Read-only tool set: PERMIT ---
+
+test_fs_read_file_allowed_readonly_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "documents/report.md"}},
+    }
+}
+
+test_fs_read_multiple_files_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["a.txt", "b.txt"]}},
+    }
+}
+
+test_fs_list_directory_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_directory", "args": {}},
+    }
+}
+
+test_fs_get_file_info_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "get_file_info", "args": {"path": "report.md"}},
+    }
+}
+
+# --- 12.2 Path traversal denial (LAURA-FS-001 — §5.1) ---
+
+# LAURA-FS-001: read_file with ../ traversal → deny
+test_fs_deny_path_traversal_dotdot if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "../../../etc/shadow"}},
+    }
+}
+
+test_fs_deny_reason_path_traversal if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "../../../etc/shadow"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# Absolute path rejection
+test_fs_deny_absolute_path if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "/etc/passwd"}},
+    }
+}
+
+test_fs_deny_reason_absolute_path if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "read_file", "args": {"path": "/etc/passwd"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# --- 12.3 Write tool denial in readonly posture (LAURA-FS-003) ---
+
+# LAURA-FS-003: write_file denied by default
+test_fs_deny_write_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    }
+}
+
+test_fs_deny_reason_write_file_readonly if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    }
+    r == "fs_tool_denied_readonly_posture"
+}
+
+# LAURA-FS-010: move_file denied
+test_fs_deny_move_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    }
+}
+
+test_fs_deny_reason_move_file_readonly if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    }
+    r == "fs_tool_denied_readonly_posture"
+}
+
+# edit_file and create_directory also denied in readonly posture
+test_fs_deny_edit_file_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "edit_file", "args": {"path": "a.txt"}},
+    }
+}
+
+test_fs_deny_create_directory_readonly_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "create_directory", "args": {"path": "newdir"}},
+    }
+}
+
+# --- 12.4 Write posture: readwrite enables write tools ---
+
+test_fs_allow_write_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "output.txt", "content": "hello"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+test_fs_allow_edit_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "edit_file", "args": {"path": "a.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+test_fs_allow_move_file_readwrite_posture if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "move_file", "args": {"source": "a.txt", "destination": "b.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# Write tools in readwrite posture still reject path traversal
+test_fs_deny_write_file_with_traversal_even_in_readwrite if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "write_file", "args": {"path": "../../../etc/cron.d/evil"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# --- 12.5 list_allowed_directories: ALWAYS denied (LAURA-FS-004) ---
+
+test_fs_deny_list_allowed_directories_always if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    }
+}
+
+test_fs_deny_reason_list_allowed_directories if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    }
+    r == "fs_list_allowed_directories_denied"
+}
+
+# list_allowed_directories denied even in readwrite posture
+test_fs_deny_list_allowed_directories_in_readwrite_posture if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "list_allowed_directories", "args": {}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# --- 12.6 directory_tree depth cap (LAURA-FS-006 — §5.2) ---
+
+# LAURA-FS-006: maxDepth=100 → deny
+test_fs_deny_directory_tree_depth_exceeded if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 100}},
+    }
+}
+
+test_fs_deny_reason_directory_tree_depth if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 100}},
+    }
+    r == "fs_directory_tree_depth_exceeded"
+}
+
+# maxDepth=5 → allow (at limit)
+test_fs_allow_directory_tree_depth_at_limit if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs", "maxDepth": 5}},
+    }
+}
+
+# maxDepth absent → allow (broker enforces default cap)
+test_fs_allow_directory_tree_no_depth if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "directory_tree", "args": {"path": "docs"}},
+    }
+}
+
+# --- 12.7 search_files pattern length cap (LAURA-FS-005 — §5.3 ReDoS) ---
+
+# LAURA-FS-005: 500-char pattern → deny
+test_fs_deny_search_files_pattern_too_long if {
+    _long_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aa",
+    ])
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _long_pattern}},
+    }
+}
+
+test_fs_deny_reason_search_pattern_too_long if {
+    _long_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aa",
+    ])
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _long_pattern}},
+    }
+    r == "fs_search_pattern_too_long"
+}
+
+# 256-char pattern → allow (at limit)
+test_fs_allow_search_files_pattern_at_limit if {
+    _limit_pattern := concat("", [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ])
+    count(_limit_pattern) == 256
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {"pattern": _limit_pattern}},
+    }
+}
+
+# Pattern absent → allow
+test_fs_allow_search_files_no_pattern if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "agent": {"name": "filesystem"},
+        "tool": {"name": "search_files", "args": {}},
+    }
+}
+
+# --- 12.8 Default posture is readonly (write posture absent = readonly) ---
+
+test_fs_default_write_posture_is_readonly if {
+    data.yashigani.mcp._fs_write_posture == "readonly"
+}
+
+# ---------------------------------------------------------------------------
+# 13. FIX-P3-001 — URL-encoded path traversal regression tests
+#     (LAURA-P3-001 PoC → must flip FAIL → PASS after broker normalisation)
+#
+# NOTE: OPA receives already-decoded paths from the broker (_normalize_tool_args).
+# These tests verify the OPA belt-and-suspenders layer catches:
+#   a) Paths that are still encoded AFTER normalisation (anomaly / bypass attempt)
+#   b) Paths that have been decoded to literal "../" (OPA literal check)
+#
+# The PoC test class TestFinding001 calls `opa eval` directly with the encoded
+# string — it tests the full OPA rule (broker normalisation is bypassed in that
+# test path). After FIX-P3-001, the OPA rule ALSO rejects residual %2e/%2f.
+# ---------------------------------------------------------------------------
+
+# 13.1 Residual %2e in path (should never appear post-broker; OPA rejects as anomaly)
+test_fix_p3001_residual_percent2e_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2fetc%2fshadow"}},
+    }
+}
+
+test_fix_p3001_residual_percent2e_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2fetc%2fshadow"}},
+    }
+    r == "fs_path_traversal_encoded_attempt"
+}
+
+# 13.2 Double-encoded path — %252e%252f
+# NOTE: purely double-encoded (%252e) does NOT produce %2e as a literal substring,
+# so OPA's contains(..., "%2e") check does not fire on the raw %252e string.
+# The broker's _normalize_path_arg() decodes it in two iterations before OPA sees it.
+# By the time OPA evaluates this input, the broker has decoded %252e%252e%252f to ../
+# (or blocked the call at the broker layer).
+# The broker decode regression is covered in test_v250_p3_filesystem_mcp.py::TestNormalizePathArg.
+# Here we test what OPA actually receives from the broker: the fully-decoded form.
+test_fix_p3001_double_encoded_broker_decoded_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+}
+
+# 13.3 Upper-case encoded form (%2E, %2F) — OPA uses lower() so both fire
+test_fix_p3001_uppercase_encoded_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "..%2Fetc%2Fshadow"}},
+    }
+}
+
+# 13.4 Decoded traversal: broker delivers "../etc/shadow" → OPA literal check fires
+test_fix_p3001_decoded_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+}
+
+test_fix_p3001_decoded_traversal_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_file", "args": {"path": "../etc/shadow"}},
+    }
+    r == "fs_path_traversal_attempt"
+}
+
+# 13.5 Clean path remains allowed (no regression on happy path)
+test_fix_p3001_clean_path_still_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_file", "args": {"path": "docs/readme.md"}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 14. FIX-P3-002 — read_multiple_files paths-array regression tests
+#     (LAURA-P3-002 PoC → must flip FAIL → PASS)
+# ---------------------------------------------------------------------------
+
+# 14.1 Traversal in paths array → denied
+test_fix_p3002_traversal_in_paths_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["../../../etc/shadow", "safe.txt"]}},
+    }
+}
+
+test_fix_p3002_traversal_in_paths_array_deny_reason if {
+    r := data.yashigani.mcp.filesystem_deny_reason with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["../../../etc/shadow", "safe.txt"]}},
+    }
+    r == "fs_paths_array_traversal_attempt"
+}
+
+# 14.2 Absolute path in array → denied
+test_fix_p3002_absolute_path_in_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["/etc/passwd", "safe.txt"]}},
+    }
+}
+
+# 14.3 Encoded traversal in array → denied (belt-and-suspenders)
+test_fix_p3002_encoded_traversal_in_array_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["..%2fetc%2fshadow"]}},
+    }
+}
+
+# 14.4 Clean paths array → allowed
+test_fix_p3002_clean_paths_array_allowed if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "read_multiple_files", "args": {"paths": ["docs/readme.md", "src/index.ts"]}},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 15. FIX-P3-002 — move_file source/destination path validation
+# ---------------------------------------------------------------------------
+
+# 15.1 move_file traversal in source → denied even in readwrite
+test_fix_p3002_move_source_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "../../../etc/shadow", "destination": "out.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# 15.2 move_file traversal in destination → denied
+test_fix_p3002_move_dest_traversal_denied if {
+    not data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "safe.txt", "destination": "../../../etc/cron.d/evil"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# 15.3 move_file clean args in readwrite → allowed
+test_fix_p3002_move_clean_args_allowed_readwrite if {
+    data.yashigani.mcp.filesystem_tool_allowed with input as {
+        "tool": {"name": "move_file", "args": {"source": "old.txt", "destination": "new.txt"}},
+    } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# ---------------------------------------------------------------------------
+# 16. Capability-envelope decision contract (3.0 / YSG-RISK-060)
+#
+# The structural diff + invocation gate are enforced in the broker (code is the
+# authority — an LLM never grants).  OPA carries only the SELF-DESCRIBING
+# decision contract (I6): policy_id + code + layman user_message keyed by the
+# broker's envelope deny_reason.  These tests assert the contract is stable,
+# closed-world (unknown reason => fail-closed wording), and code is constant.
+# ---------------------------------------------------------------------------
+
+# 16.1 policy_id is the stable envelope identifier.
+test_capability_envelope_policy_id if {
+    data.yashigani.mcp.capability_envelope_policy_id == "mcp.capability_envelope"
+}
+
+# 16.2 not-active reason maps to the re-approval contract with code.
+test_capability_envelope_not_active_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_not_active")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    out.user_message != ""
+}
+
+# 16.3 tool-not-approved reason has its own message.
+test_capability_envelope_tool_not_approved_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_tool_not_approved")
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "approved capability set")
+}
+
+# 16.4 stale-surface reason has its own message.
+test_capability_envelope_stale_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_surface_stale")
+    contains(out.user_message, "changed since it was last approved")
+}
+
+# 16.5 refresh_* expansion reasons share the expansion message.
+test_capability_envelope_refresh_expanding_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_expanding")
+    contains(out.user_message, "expand what it can do")
+}
+
+test_capability_envelope_refresh_uncertain_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_uncertain")
+    contains(out.user_message, "expand what it can do")
+}
+
+# 16.6 CLOSED-WORLD: an unknown/unmapped reason still yields a fail-closed
+# contract (never undefined) — a new reason we have not typed defaults to the
+# conservative review wording.
+test_capability_envelope_unknown_reason_fail_closed if {
+    out := data.yashigani.mcp.capability_envelope_contract("some_brand_new_reason")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "requires operator review")
+}
+
+# ---------------------------------------------------------------------------
+# 17. G-ORCH-OPA-1 — mcp_response_decision (egress OPA gate)
+#
+# Tests for the MCP egress decision: result sensitivity ceiling check + PII gate.
+# Mirrors section structure of tests for agent_response_decision (agents_test.rego).
+# ---------------------------------------------------------------------------
+
+# Test helpers — egress base inputs
+_egress_allow_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "RESTRICTED",
+        "groups": ["mcp_users"],
+    },
+    "result": {
+        "sensitivity": "PUBLIC",
+        "pii_detected": false,
+    },
+    "tool": {"name": "web_search"},
+}
+
+_egress_restricted_result_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "INTERNAL",
+        "groups": [],
+    },
+    "result": {
+        "sensitivity": "RESTRICTED",
+        "pii_detected": false,
+    },
+    "tool": {"name": "db_query"},
+}
+
+_egress_pii_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "RESTRICTED",
+        "groups": [],
+    },
+    "result": {
+        "sensitivity": "PUBLIC",
+        "pii_detected": true,
+    },
+    "tool": {"name": "customer_lookup"},
+}
+
+# --- 17.1 Allow path — result at or below ceiling ---
+
+# PUBLIC result, RESTRICTED ceiling → allow
+test_egress_allow_public_result_restricted_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as _egress_allow_input
+}
+
+# CONFIDENTIAL result, RESTRICTED ceiling → allow
+test_egress_allow_confidential_result_restricted_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "CONFIDENTIAL", "pii_detected": false},
+    }
+}
+
+# RESTRICTED result, RESTRICTED ceiling → allow (boundary: at ceiling)
+test_egress_allow_result_exactly_at_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "RESTRICTED", "pii_detected": false},
+    }
+}
+
+# PUBLIC result, PUBLIC ceiling → allow
+test_egress_allow_public_result_public_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "PUBLIC",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# --- 17.2 Deny: result above caller ceiling ---
+
+# RESTRICTED result, INTERNAL ceiling → deny
+test_egress_deny_result_above_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _egress_restricted_result_input
+}
+
+test_egress_deny_reason_sensitivity_exceeds_ceiling if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_restricted_result_input
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+    d.policy_id == "mcp.response_decision"
+    d.code == "MCP_RESULT_SENSITIVITY_EXCEEDED"
+    d.user_message != ""
+}
+
+# CONFIDENTIAL result, PUBLIC ceiling → deny
+test_egress_deny_confidential_above_public_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "PUBLIC",
+            "groups": [],
+        },
+        "result": {"sensitivity": "CONFIDENTIAL", "pii_detected": false},
+    }
+}
+
+# --- 17.3 Deny: PII detected ---
+
+test_egress_deny_pii_detected if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _egress_pii_input
+}
+
+test_egress_deny_reason_pii_detected if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_pii_input
+    d.allow == false
+    d.deny_reason == "pii_detected_in_result"
+    d.code == "MCP_RESULT_PII_BLOCKED"
+    d.user_message != ""
+}
+
+# PII + below ceiling → pii reason (ceiling-check passes, pii blocks)
+test_egress_pii_blocks_even_below_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "INTERNAL", "pii_detected": true},
+    }
+}
+
+# Ceiling violation takes priority over PII
+# (result_sensitivity_exceeds_caller_ceiling fires when both breach ceiling AND pii)
+test_egress_ceiling_violation_takes_priority_over_pii if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "INTERNAL",
+            "groups": [],
+        },
+        "result": {"sensitivity": "RESTRICTED", "pii_detected": true},
+    }
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+}
+
+# --- 17.4 Fail-closed defaults ---
+
+# Fail-closed: missing caller spiffe → deny
+test_egress_deny_missing_spiffe if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+test_egress_deny_reason_missing_identity if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+    d.allow == false
+    d.deny_reason == "missing_caller_identity"
+    d.code == "MCP_RESULT_IDENTITY_MISSING"
+}
+
+# Fail-closed: caller spiffe is not a string (integer) → deny
+test_egress_deny_non_string_spiffe if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": 1,
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# Fail-closed: invalid/unknown caller ceiling → deny
+test_egress_deny_invalid_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "COSMIC_TOP_SECRET",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+test_egress_deny_reason_invalid_ceiling if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "COSMIC_TOP_SECRET",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+    d.allow == false
+    d.deny_reason == "invalid_or_missing_caller_ceiling"
+    d.code == "MCP_RESULT_CEILING_INVALID"
+}
+
+# Fail-closed: null ceiling → deny (null is not in ceiling map)
+test_egress_deny_null_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": null,
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# Fail-closed: unknown result sensitivity → rank 5 (above RESTRICTED) → deny any ceiling
+test_egress_deny_unknown_result_sensitivity_fails_closed if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "TOP_SECRET", "pii_detected": false},
+    }
+}
+
+# Default mcp_response_allowed is false (fail-closed with empty input)
+test_egress_default_deny_empty_input if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {}
+}
+
+# --- 17.5 Compound document shape ---
+
+# Allow case: correct shape
+test_egress_decision_allow_shape if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_allow_input
+    d.allow == true
+    d.deny_reason == "ok"
+    d.policy_id == "mcp.response_decision"
+    d.code == "MCP_RESULT_OK"
+    d.user_message != ""
+}
+
+# Deny case: correct shape
+test_egress_decision_deny_shape if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_restricted_result_input
+    d.allow == false
+    d.deny_reason != ""
+    d.deny_reason != "ok"
+    d.policy_id == "mcp.response_decision"
+    d.code != ""
+    d.user_message != ""
+}
+
+# --- 17.6 Numeric sensitivity levels (R14/R15 shim) ---
+
+# Numeric level 1 (INTERNAL equivalent), ceiling 3 (RESTRICTED) → allow
+test_egress_allow_numeric_sensitivity_levels if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": 3,
+            "groups": [],
+        },
+        "result": {"sensitivity": 1, "pii_detected": false},
+    }
+}
+
+# Numeric result 4, ceiling 3 → deny (result above ceiling)
+test_egress_deny_numeric_result_above_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": 3,
+            "groups": [],
+        },
+        "result": {"sensitivity": 4, "pii_detected": false},
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 11. v4.1 Phase 2b — per-instance FOUR-GATE authz + change-prevention
+#     (LU-MCP-A1..A4; contract lu.md §3)
+# ---------------------------------------------------------------------------
+
+# 11a. Happy path — all four gates satisfied (mcp-b and mcp-c).
+test_v41_allow_four_gate_mcp_b if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_allow_four_gate_mcp_c if {
+    data.yashigani.mcp.allow with input as _mcp_c_input_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11b. GATE 1 — identity must be CERT-VERIFIED, not merely asserted (LU-MCP-A1).
+test_v41_deny_unverified_identity if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_verified_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_b_call_ok, ["/identity/verified"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# A string "true" (or any non-boolean truthy value) must NOT satisfy the gate.
+test_v41_deny_verified_string_true if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": "true"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_spiffe_not_verified if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "spiffe_not_verified"
+}
+
+# 11c. GATE 2 — per-instance identification (LU-MCP-A2).
+test_v41_deny_target_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(_mcp_b_call_ok, ["/target"])
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_target_absent_instance_unidentified if {
+    d := data.yashigani.mcp.deny_reason with input as json.remove(_mcp_b_call_ok, ["/target"])
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "instance_unidentified"
+}
+
+test_v41_deny_empty_mcp_id if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": ""}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_nonstring_mcp_id if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": 42}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11d. GATE 3 — per-instance, per-caller grant (closed world; LU-MCP-A2/A5).
+test_v41_deny_no_grant_data_at_all if {
+    # Default install: no grants, no baselines loaded → deny.
+    not data.yashigani.mcp.allow with input as _mcp_b_call_ok
+}
+
+test_v41_deny_reason_no_baseline_is_envelope_not_active if {
+    # Baseline missing entirely → the envelope was never activated.
+    d := data.yashigani.mcp.deny_reason with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as {}
+    d == "capability_envelope_not_active"
+}
+
+test_v41_deny_no_grant_for_caller if {
+    # Baseline exists but the CALLER holds no grant for this instance.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok,
+        [{"op": "replace", "path": "/identity/spiffe", "value": "spiffe://cluster.local/ns/default/sa/intruder"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_no_per_instance_grant if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok,
+        [{"op": "replace", "path": "/identity/spiffe", "value": "spiffe://cluster.local/ns/default/sa/intruder"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "no_per_instance_grant"
+}
+
+test_v41_deny_tool_outside_grant if {
+    # Caller granted web_search only; asks for exec → deny.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/tool/name", "value": "exec"}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11e. Cross-instance isolation — two same-named MCPs, distinct mcp_id,
+# distinct grants: a grant on instance 1 does NOT authorize instance 2
+# (lu.md §3d verification ask).
+test_v41_deny_cross_instance_grant if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": _mcp_id_2}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_cross_instance_grant if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/mcp_id", "value": _mcp_id_2}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "no_per_instance_grant"
+}
+
+# 11f. GATE 4 — change-prevention: capability-envelope drift (LU-MCP-A3).
+test_v41_deny_surface_hash_drift if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": _hash_drifted}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_capability_envelope_drift if {
+    d := data.yashigani.mcp.deny_reason with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": _hash_drifted}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "capability_envelope_drift"
+}
+
+test_v41_deny_empty_surface_hash if {
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/target/surface_hash", "value": ""}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_surface_hash_absent if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_b_call_ok, ["/target/surface_hash"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_tool_granted_but_outside_baseline if {
+    # Grant claims a tool the approved baseline does not contain (grant/baseline
+    # desync) → envelope gate denies. Baseline is authoritative for the surface.
+    not data.yashigani.mcp.allow with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/tool/name", "value": "sneaky_tool"}],
+    )
+        with data.yashigani.mcp.grants as {_mcp_id_1: {_spiffe_langflow: {"tools": ["sneaky_tool"], "actions": ["mcp.tools.call"]}}}
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11g. tools.call with a non-tool subject cannot slip through the four-gate.
+test_v41_deny_tools_call_with_prompt_subject if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "target": _target_ok,
+        "prompt": {"name": "summarize"},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+test_v41_deny_reason_tools_call_with_prompt_subject if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": true},
+        "target": _target_ok,
+        "prompt": {"name": "summarize"},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d == "tool_subject_required"
+}
+
+# 11h. mcp-c four-gate additionally requires the chain (unchanged invariant).
+test_v41_deny_mcp_c_four_gate_without_chain if {
+    not data.yashigani.mcp.allow with input as json.remove(
+        _mcp_c_input_ok, ["/identity/chain"],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# 11i. Decision document carries the per-instance deny reason (auditable).
+test_v41_decision_document_carries_four_gate_reason if {
+    d := data.yashigani.mcp.mcp_decision with input as json.patch(
+        _mcp_b_call_ok, [{"op": "replace", "path": "/identity/verified", "value": false}],
+    )
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+    d.allow == false
+    d.deny_reason == "spiffe_not_verified"
+    d.audit_capture == true
+}
+
+# ---------------------------------------------------------------------------
+# 18. v4.1 unified-sidecar Phase 1 — (caller, prefix) egress GRANT model
+#     (Lu M1/M2, Laura L-US-1 — synthesis must-fix #1)
+#
+# Positive-grant, closed-world: input.egress.prefix is authorised ONLY by an
+# exact-SPIFFE-keyed, tenant-consistent grant in
+# data.yashigani.mcp.egress_grants.  Absent/empty data → deny everything.
+# Detection flags (PII / sensitivity) remain INDEPENDENT conjuncts (Lu M3 /
+# Laura L-US-5) — a grant never neutralises them.
+# ---------------------------------------------------------------------------
+
+# Exact per-instance SPIFFE of the granted caller (tenant "default").
+_g18_spiffe := "spiffe://yashigani.internal/agents/default/notifier/nhi_aaa111bbb222"
+
+# A sibling instance of the SAME agent (different nhi) — must NOT inherit.
+_g18_spiffe_other_instance := "spiffe://yashigani.internal/agents/default/notifier/nhi_ccc333ddd444"
+
+_g18_grants := {
+    _g18_spiffe: {
+        "tenant": "default",
+        "prefixes": ["slack", "telegram"],
+    },
+}
+
+# Clean egress request (PUBLIC body, PUBLIC ceiling, no PII) for prefix p.
+_g18_input(spiffe, p) := {
+    "caller": {
+        "spiffe": spiffe,
+        "sensitivity_ceiling": "PUBLIC",
+        "groups": [],
+    },
+    "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    "tool": {"name": sprintf("egress:%s", [p])},
+    "egress": {"prefix": p},
+}
+
+# --- 18.1 Positive grant — allow path ---
+
+test_v41_egress_grant_allow_granted_prefix if {
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+test_v41_egress_grant_allow_second_granted_prefix if {
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "telegram")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# --- 18.2 Closed world — ungranted prefix / wrong instance / absent data ---
+
+# Ungranted prefix → deny with caller_not_granted_prefix.
+test_v41_egress_grant_deny_ungranted_prefix if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _g18_input(_g18_spiffe, "webhook-exfil")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+    d.code == "MCP_EGRESS_PREFIX_NOT_GRANTED"
+    d.user_message != ""
+}
+
+# Wrong-instance SPIFFE (same tenant, same agent name, different nhi) → deny.
+# Byte-exact keying: a grant NEVER collapses across instances.
+test_v41_egress_grant_deny_wrong_instance_spiffe if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _g18_input(_g18_spiffe_other_instance, "slack")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+}
+
+# Absent grant data entirely → deny-all (kill switch).
+test_v41_egress_grant_deny_absent_grant_data if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {}
+}
+
+# Empty prefixes list (grant record exists, nothing granted) → deny.
+test_v41_egress_grant_deny_empty_prefixes if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            _g18_spiffe: {"tenant": "default", "prefixes": []},
+        }
+}
+
+# --- 18.3 Tenant scope ---
+
+# Grant record written for a DIFFERENT tenant than the URI-embedded one → deny.
+test_v41_egress_grant_deny_tenant_mismatch if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            _g18_spiffe: {"tenant": "other-tenant", "prefixes": ["slack"]},
+        }
+}
+
+# Legacy 2-segment agent URI (no instance segment) → tenant undefined → deny
+# even with a byte-matching grant key (mirror of verify-mcp legacy_identity).
+test_v41_egress_grant_deny_legacy_two_segment_agent_uri if {
+    legacy := "spiffe://yashigani.internal/agents/default/notifier"
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(legacy, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            legacy: {"tenant": "default", "prefixes": ["slack"]},
+        }
+}
+
+# --- 18.4 Transitional legacy_system identities (pre-migration seed) ---
+
+# System-form SPIFFE + explicit legacy_system grant → allow (pin-AND-grant
+# overlap for openclaw until it migrates to a per-instance identity).
+test_v41_egress_grant_allow_legacy_system_seed if {
+    sys := "spiffe://yashigani.internal/openclaw"
+    data.yashigani.mcp.mcp_response_allowed with input as _g18_input(sys, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            sys: {"tenant": "default", "prefixes": ["slack", "slack-hooks", "telegram"], "legacy_system": true},
+        }
+}
+
+# System-form SPIFFE WITHOUT the explicit legacy_system flag → deny.
+test_v41_egress_grant_deny_system_uri_without_legacy_flag if {
+    sys := "spiffe://yashigani.internal/openclaw"
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(sys, "slack")
+        with data.yashigani.mcp.egress_grants as {
+            sys: {"tenant": "default", "prefixes": ["slack"]},
+        }
+}
+
+# --- 18.5 Crafted / malformed egress inputs — all fail closed ---
+
+# egress present but prefix missing → deny.
+test_v41_egress_grant_deny_missing_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.remove(
+        _g18_input(_g18_spiffe, "slack"), ["/egress/prefix"],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress present but prefix empty string → deny.
+test_v41_egress_grant_deny_empty_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _g18_input(_g18_spiffe, "")
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress key present with null value → still treated as an egress request → deny.
+test_v41_egress_grant_deny_null_egress_value if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress", "value": null}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# egress key present with false value (crafted falsy escape attempt) → deny.
+test_v41_egress_grant_deny_false_egress_value if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress", "value": false}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# Non-string prefix (number) → deny.
+test_v41_egress_grant_deny_non_string_prefix if {
+    not data.yashigani.mcp.mcp_response_allowed with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/egress/prefix", "value": 1}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+}
+
+# --- 18.6 Detection independence (Lu M3 / Laura L-US-5) ---
+
+# Granted prefix + PII detected → deny with the PII reason (grant does NOT
+# neutralise the detection gate).
+test_v41_egress_grant_does_not_neutralise_pii_gate if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/result/pii_detected", "value": true}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "pii_detected_in_result"
+    d.code == "MCP_RESULT_PII_BLOCKED"
+}
+
+# Granted prefix + RESTRICTED body over PUBLIC ceiling → deny with the
+# ceiling reason (grant does NOT raise the ceiling).
+test_v41_egress_grant_does_not_neutralise_ceiling_gate if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/result/sensitivity", "value": "RESTRICTED"}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+}
+
+# Grant-denied takes reporting priority over content reasons: ungranted
+# prefix AND PII AND ceiling breach → the auditor sees the authorisation gap.
+test_v41_egress_grant_reason_priority_over_content_reasons if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "webhook-exfil"),
+        [
+            {"op": "replace", "path": "/result/pii_detected", "value": true},
+            {"op": "replace", "path": "/result/sensitivity", "value": "RESTRICTED"},
+        ],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "caller_not_granted_prefix"
+}
+
+# --- 18.7 Broker tool-result path regression (no egress key) ---
+
+# Inputs WITHOUT the egress key are the broker G-ORCH-OPA-1 path — the grant
+# model does not apply and pre-existing behaviour is unchanged (section 17
+# covers it in depth; this is the explicit seam regression).
+test_v41_egress_grant_no_egress_key_broker_path_unchanged if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+        "tool": {"name": "web_search"},
+    }
+        with data.yashigani.mcp.egress_grants as {}
+}
+
+# Missing identity still reports missing_caller_identity (priority 1) even on
+# the egress path.
+test_v41_egress_grant_missing_identity_priority if {
+    d := data.yashigani.mcp.mcp_response_decision with input as json.patch(
+        _g18_input(_g18_spiffe, "slack"),
+        [{"op": "replace", "path": "/caller/spiffe", "value": ""}],
+    )
+        with data.yashigani.mcp.egress_grants as _g18_grants
+    d.allow == false
+    d.deny_reason == "missing_caller_identity"
+}

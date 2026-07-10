@@ -150,6 +150,9 @@ spec:
             # Grafana datasource calls now use https://yashigani-prometheus:9090.
             - "--web.config.file=/etc/prometheus/web-config.yml"
             {{- end }}
+            {{- /* B9: fix 302→/graph redirect misrouting under /admin/prometheus/ sub-path. */}}
+            - "--web.external-url=https://{{ .Values.global.tlsDomain }}/admin/prometheus/"
+            - "--web.route-prefix=/"
           ports:
             - name: http
               containerPort: 9090
@@ -209,6 +212,19 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # own leaf + trust anchors only (ca_bundle for scrape targets,
+            # ca_intermediate for web client_ca_file); no other leaf keys /
+            # bootstrap tokens / caddy_internal_hmac.
+            items:
+              - key: prometheus_client.crt
+                path: prometheus_client.crt
+              - key: prometheus_client.key
+                path: prometheus_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
         {{- end }}
         # B-K8S-4: prometheus-web-config volume removed; web-config.yml is now
         # a key in yashigani-prometheus-config, served via the `config` volume.

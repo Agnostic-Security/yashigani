@@ -43,12 +43,12 @@ from typing import Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.openapi.docs import get_swagger_ui_html
+from yashigani.api_docs import swagger_ui_html as _swagger_ui_html, redoc_html as _redoc_html
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from yashigani.auth.spiffe import require_spiffe_id
 from yashigani.pki.client import internal_httpx_client
-from yashigani.audit.schema import PIIDetectedEvent
+from yashigani.audit.schema import EncodedPayloadDetectedEvent, PIIDetectedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,12 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade",
 })
 
+# FIND-3.1-004: single-segment /mcp/* path suffixes that are gateway-owned
+# endpoints (not MCP agent names).  These must never be dispatched via
+# dispatch_mcp_call(); the dedicated routes registered before the catch-all
+# handle them.  Evaluated once at module load (frozenset constant).
+_MCP_INFO_RESERVED: frozenset[str] = frozenset({"health"})
+
 
 def _content_hash(content: str) -> str:
     """SHA-256 hex digest of a string — used for privacy-safe hashing."""
@@ -126,13 +132,21 @@ def create_gateway_app(
     jwt_inspector=None,
     endpoint_rate_limiter=None,
     response_cache=None,
-    fasttext_backend=None,
+    classifier_backend=None,
     inference_logger=None,
     anomaly_detector=None,
     response_inspection_pipeline=None,  # v0.9.0 — ResponseInspectionPipeline | None
     extra_routers=None,  # v2.0 — additional routers to mount BEFORE catch-all
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,   # v2.2 — PiiDetector | None
+    mcp_broker_registry=None,  # v2.25.0 P3 — McpBrokerRegistry | None
+    mcp_jwks_store=None,       # v2.25.0 P3 — JwksStore | None
+    document_pipeline=None,  # v2.26 — DocumentInspectionPipeline | None (mode-B egress)
+    principal_signer=None,    # #47/G-NEW-5 — OrchestrationPrincipalSigner | None
+    principal_verifier=None,  # #47/G-NEW-5 — OrchestrationPrincipalVerifier | None
+    principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
+    capability_policy_store=None,  # 3.0 — CapabilityPolicyStore | None
+    workflow_scheduler=None,  # 4.0 — WorkflowScheduler | None (wf-exec)
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -152,11 +166,22 @@ def create_gateway_app(
         "jwt_inspector": jwt_inspector,
         "endpoint_rate_limiter": endpoint_rate_limiter,
         "response_cache": response_cache,
-        "fasttext_backend": fasttext_backend,
+        "classifier_backend": classifier_backend,
         "inference_logger": inference_logger,
         "anomaly_detector": anomaly_detector,
         "ddos_protector": ddos_protector,  # v2.2
         "pii_detector": pii_detector,      # v2.2
+        "mcp_broker_registry": mcp_broker_registry,  # v2.25.0 P3
+        "mcp_jwks_store": mcp_jwks_store,             # v2.25.0 P3
+        "document_pipeline": document_pipeline,  # v2.26 — mode-B egress round-trip
+        # #47/G-NEW-5 — signed orchestration-principal claim machinery.  The
+        # gateway SIGNS the principal on forward and VERIFIES it (SPIFFE-bound,
+        # replay-deduped) on re-entry so OPA adjudicates a verified fact.
+        "principal_signer": principal_signer,
+        "principal_verifier": principal_verifier,
+        "principal_tenant_id": principal_tenant_id,
+        "capability_policy_store": capability_policy_store,  # 3.0 — Permissions-Policy
+        "workflow_scheduler": workflow_scheduler,  # 4.0 wf-exec
         "http_client": None,
     }
 
@@ -177,6 +202,7 @@ def create_gateway_app(
             follow_redirects=False,
         )
         # Create Postgres async pool on the running event loop
+        _db_audit_sink = None
         if os.environ.get("_YASHIGANI_DB_READY") == "1":
             try:
                 from yashigani.db import create_pool
@@ -184,8 +210,94 @@ def create_gateway_app(
                 logger.info("Postgres async pool created (lifespan)")
             except Exception as exc:
                 logger.warning("Postgres pool creation failed in lifespan: %s", exc)
+            else:
+                # v2.25.2 — wire the PostgresSink as a fire-and-forget mirror on
+                # the gateway's AuditLogWriter.  Reuses the asyncpg pool just
+                # created (get_pool, zero-arg) — no second pool.  The file sink
+                # remains canonical; this never blocks or fails a request.
+                # Guarded by AuditConfig.db_sink_enabled (env YASHIGANI_AUDIT_DB_SINK).
+                try:
+                    from yashigani.audit.config import AuditConfig
+                    if AuditConfig.from_env().db_sink_enabled:
+                        from yashigani.db import get_pool
+                        from yashigani.audit.sinks import build_postgres_audit_sink
+                        _db_audit_sink, _ = build_postgres_audit_sink(get_pool)
+                        _aw = _state.get("audit_writer")
+                        if _aw is not None and hasattr(_aw, "attach_db_sink"):
+                            _aw.attach_db_sink(_db_audit_sink)
+                            logger.info("Gateway: DB audit sink attached to audit writer")
+                        else:
+                            logger.warning(
+                                "Gateway: audit_writer missing attach_db_sink — "
+                                "DB audit sink NOT attached (file sink unaffected)"
+                            )
+                    else:
+                        logger.info(
+                            "Gateway: DB audit sink disabled (YASHIGANI_AUDIT_DB_SINK=false)"
+                        )
+                except Exception as exc:
+                    # Non-fatal: the file sink is the canonical anchor.  A DB-sink
+                    # wiring failure must never prevent the gateway from serving.
+                    logger.warning(
+                        "Gateway: DB audit sink wiring failed (%s) — "
+                        "continuing with file sink only", exc
+                    )
+
+            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): reconcile the agent
+            # registry from the durable Postgres mirror into Redis db/3 on every
+            # boot. Redis db/3 has no persistence (appendonly no / save ""), so a
+            # `docker compose up -d redis` recreate wipes every @agent — the
+            # gateway then returns agent_not_found for all of them. The gateway is
+            # the request-time consumer and may restart independently of
+            # backoffice, so it ALSO self-heals here (idempotent; mirrors the OPA
+            # store→OPA re-push). Runs DIRECTLY against the asyncpg pool + Redis —
+            # no admin API, no admin password, no service account.
+            try:
+                _agent_reg = _state.get("agent_registry")
+                if _agent_reg is not None:
+                    from yashigani.agents.durable_store import AgentDurableStore
+                    from yashigani.agents.reconciler import reconcile_agents_from_durable
+                    await reconcile_agents_from_durable(_agent_reg, AgentDurableStore())
+                else:
+                    logger.warning(
+                        "Gateway: agent_registry not wired — agent reconcile skipped "
+                        "(agents will not auto-restore after a redis recreate)"
+                    )
+            except Exception as exc:
+                # Fail-loud but non-blocking: the gateway must still serve other
+                # traffic even if reconcile cannot run.
+                logger.error(
+                    "Gateway: agent reconcile from durable store FAILED (%s) — @agent "
+                    "routes may return agent_not_found until the registry is restored",
+                    exc,
+                )
+        # 4.0 — start workflow scheduler (after agent registry is reconciled)
+        _wf_sched = _state.get("workflow_scheduler")
+        if _wf_sched is not None:
+            try:
+                _wf_sched.start()
+                logger.info("WorkflowScheduler: started in gateway lifespan")
+            except Exception as _wf_exc:
+                logger.error("WorkflowScheduler start failed: %s", _wf_exc)
+
         yield
+
+        # 4.0 — stop workflow scheduler (before HTTP client close)
+        if _wf_sched is not None:
+            try:
+                await _wf_sched.stop()
+            except Exception as _wf_stop_exc:
+                logger.warning("WorkflowScheduler stop error: %s", _wf_stop_exc)
+
         # Shutdown: close the HTTP client and DB pool
+        # v2.25.2 — drain + stop the DB audit sink first so in-flight audit
+        # events flush before the pool closes.
+        if _db_audit_sink is not None:
+            try:
+                from yashigani.audit.sinks import stop_postgres_audit_sink
+                stop_postgres_audit_sink(_db_audit_sink)
+            except Exception:
+                pass
         client = _state["http_client"]
         if client:
             await client.aclose()
@@ -213,6 +325,31 @@ def create_gateway_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        # ZAP 10015/10049: Dynamic responses (API endpoints, auth flows) must not
+        # be stored in any cache.  Static assets under /static/ (Swagger UI,
+        # fingerprinted resources) are intentionally excluded — they are safe to
+        # cache.
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        # Permissions-Policy: resolve per user identity (3.0).
+        # The gateway receives the user's email via x-yashigani-user-id (set by
+        # Caddy forward_auth after session validation).  Falls back silently if
+        # the store is not wired (dev/test without Redis).
+        _cap_store = _state.get("capability_policy_store")
+        if _cap_store is not None:
+            try:
+                _user_email = request.headers.get("x-yashigani-user-id", "") or None
+                from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
+                from yashigani.capability_policy.header import render_permissions_policy as _render_pp
+                _resolved = _resolve_cap(
+                    _user_email,
+                    _state.get("rbac_store"),
+                    _cap_store,
+                )
+                response.headers["Permissions-Policy"] = _render_pp(_resolved)
+            except Exception as _pp_exc:
+                logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
 
     # Internal health check — used by Caddy and container health probe
@@ -290,15 +427,100 @@ def create_gateway_app(
     async def gateway_swagger_ui(
         identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
     ) -> HTMLResponse:
-        """Swagger UI — gated behind identity resolution (Bearer / SSO).
+        """Swagger UI — CSP-clean, no inline script (N2 fix).
 
-        Assets self-hosted from /static/swagger-ui/ (no CDN).
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        Init logic lives in swagger-ui-init.js (same-origin), replacing the
+        inline <script>const ui = SwaggerUIBundle({...})</script> that
+        FastAPI's get_swagger_ui_html() emits and that strict CSP blocks.
         """
-        return get_swagger_ui_html(
+        return HTMLResponse(
+            _swagger_ui_html(
+                openapi_url="/openapi.json",
+                title="Yashigani Gateway — API Reference",
+                swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url="/static/swagger-ui/swagger-ui.css",
+                swagger_init_js_url="/static/swagger-ui/swagger-ui-init.js",
+                favicon_url="/static/swagger-ui/favicon.png",
+            )
+        )
+
+    @app.get("/redoc", include_in_schema=False)
+    async def gateway_redoc_ui(
+        identity: dict = Depends(_require_gateway_identity),  # noqa: ARG001
+    ) -> HTMLResponse:
+        """ReDoc UI — CSP-clean, no inline script or style (N2 fix).
+
+        Assets are self-hosted from /static/swagger-ui/ (no CDN).
+        The <redoc spec-url="..."> web-component attribute replaces any inline
+        init call.  The response carries a scoped Content-Security-Policy that
+        adds 'worker-src blob: child-src blob:' because Redoc spawns a Web
+        Worker internally via blob: URL.  All other gateway routes retain the
+        strict CSP unchanged.
+        """
+        return _redoc_html(
             openapi_url="/openapi.json",
-            title="Yashigani Gateway — API Reference",
-            swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url="/static/swagger-ui/swagger-ui.css",
+            title="Yashigani Gateway — API Reference (ReDoc)",
+            redoc_js_url="/static/swagger-ui/redoc.standalone.js",
+            favicon_url="/static/swagger-ui/favicon.png",
+        )
+
+    # ── FIND-3.1-004/005: JWKS + /mcp/health gateway-owned endpoint guards ────
+    #
+    # These routes ensure that /.well-known/yashigani-mcp-jwks.json and
+    # /mcp/health are ALWAYS handled by the gateway and NEVER forwarded to
+    # the upstream (demo-mcp or any configured MCP server).
+    #
+    # Primary defence: the mcp_info_router in extra_routers (registered above via
+    # include_router) handles both paths when MCP servers are configured.  These
+    # guards are the belt-and-suspenders for the case where no MCP servers are
+    # configured and mcp_info_router is therefore absent from extra_routers.
+    #
+    # Both endpoints are public (no auth required):
+    #   - JWKS: upstream verifiers fetch it without Yashigani credentials.
+    #   - /mcp/health: monitoring probe used by Caddy and operators.
+    #
+    # Both are registered BEFORE the catch-all so they match first, bypassing
+    # the catch-all's rate-limit / OPA / upstream-forwarding pipeline entirely.
+    @app.get("/.well-known/yashigani-mcp-jwks.json", include_in_schema=False)
+    async def _gateway_mcp_jwks_guard(response: Response):
+        """JWKS guard — always gateway-handled, never forwarded to upstream."""
+        store = _state.get("mcp_jwks_store")
+        if store is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "mcp_not_configured",
+                         "detail": "No MCP servers are configured on this gateway."},
+            )
+        from yashigani.mcp._jwks import JWKS_CACHE_CONTROL
+        response.headers["Cache-Control"] = JWKS_CACHE_CONTROL
+        response.headers["Content-Type"] = "application/json"
+        return store.response()
+
+    @app.get("/mcp/health", include_in_schema=False)
+    async def _gateway_mcp_health_guard():
+        """MCP health guard — always gateway-handled, never forwarded to upstream."""
+        reg = _state.get("mcp_broker_registry")
+        if reg is None:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_not_configured"},
+            )
+        try:
+            brokers = reg.all_brokers()  # type: ignore[attr-defined]
+        except Exception:
+            brokers = []
+        if not brokers:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_no_brokers"},
+            )
+        opa_ok = await brokers[0].opa_health()  # type: ignore[attr-defined]
+        if opa_ok:
+            return {"status": "ok", "opa": "healthy"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "detail": "opa_unreachable"},
         )
 
     # Catch-all reverse proxy route
@@ -515,17 +737,22 @@ async def _proxy_request_body(
                 endpoint_ratelimit_violations_total.labels(path=ep_result.endpoint_hash[:8]).inc()
             except Exception:
                 logger.debug("proxy: metric increment failed for endpoint_ratelimit_violations_total", exc_info=True)
+            # BUG-8-FIX (Ava 2026-05-30): EndpointRLResult uses field name
+            # `retry_after` (Optional[int]), not `retry_after_seconds`.
+            # The old reference raised AttributeError → ASGI returned 500
+            # instead of 429 on rate-limit triggers.
+            _ep_retry = ep_result.retry_after or 1
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": "ENDPOINT_RATE_LIMIT_EXCEEDED",
                     "endpoint": norm_path,
                     "request_id": request_id,
-                    "retry_after_seconds": ep_result.retry_after_seconds,
+                    "retry_after_seconds": _ep_retry,
                 },
                 headers={
                     "X-Yashigani-Request-Id": request_id,
-                    "Retry-After": str(ep_result.retry_after_seconds),
+                    "Retry-After": str(_ep_retry),
                 },
             )
 
@@ -561,6 +788,13 @@ async def _proxy_request_body(
     if len(body_bytes) > cfg.max_request_body_bytes:
         _audit_request(audit_writer, request_id, "BLOCKED", "body_too_large", request, path)
         return _error_response(request_id, 413, "REQUEST_BODY_TOO_LARGE")
+
+    # Observe inference payload size (best-effort — never block on metric failure)
+    try:
+        from yashigani.metrics.registry import inference_payload_bytes
+        inference_payload_bytes.observe(len(body_bytes))
+    except Exception:
+        pass
 
     # 2. Extract session / API key identity
     session_id, agent_id, user_id = _extract_identity(request)
@@ -625,13 +859,21 @@ async def _proxy_request_body(
     if pii_detector is not None and forwarded_body:
         _req_body_text = _decode_body_safe(forwarded_body)
         if _req_body_text:
-            _req_pii_text, _req_pii_result = pii_detector.process(_req_body_text)
+            # F-RT1 (red-team verified 2026-05-30): decode-before-classify on the
+            # generic-proxy leg too — same encoded-bypass class as /v1/chat/completions.
+            _req_pii_text, _req_pii_result = pii_detector.process_decoded(_req_body_text)
+            # F-RT1 silent-pass guard: audit an undecodable high-entropy blob even
+            # when no plaintext PII matched.
+            _emit_encoded_payload_audit(
+                audit_writer, request_id, "request", "upstream", _req_pii_result
+            )
             if _req_pii_result.detected:
                 pii_detected_on_request = True
                 pii_types = [f.pii_type.value for f in _req_pii_result.findings]
                 logger.info(
-                    "PII detected on proxy request path=%s request_id=%s types=%s action=%s",
-                    path, request_id, pii_types, _req_pii_result.action_taken,
+                    "PII detected on proxy request path=%s request_id=%s types=%s views=%s action=%s",
+                    path, request_id, pii_types, sorted(_req_pii_result.matched_views),
+                    _req_pii_result.action_taken,
                 )
                 if audit_writer is not None:
                     try:
@@ -643,6 +885,7 @@ async def _proxy_request_body(
                                 action_taken=_req_pii_result.action_taken,
                                 destination="upstream",
                                 finding_count=len(_req_pii_result.findings),
+                                matched_views=sorted(_req_pii_result.matched_views),
                             )
                         )
                     except Exception as _exc:
@@ -670,11 +913,21 @@ async def _proxy_request_body(
     with (_tracer.start_as_current_span("opa-check") if _tracer else _NullSpan()) as _opa_span:
         _opa_span.set_attribute("opa.path", path)
         _opa_span.set_attribute("yashigani.agent_id", agent_id)
-        opa_allowed = await _opa_check(cfg, request, path, session_id, agent_id, user_id)
+        opa_allowed = await _opa_check(cfg, request, norm_path, session_id, agent_id, user_id)
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
         _audit_request(audit_writer, request_id, "DENIED", "opa_policy", request, path)
-        return _error_response(request_id, 403, "POLICY_DENIED")
+        try:
+            from yashigani.metrics.registry import yashigani_opa_safety_blocks_total
+            yashigani_opa_safety_blocks_total.inc()
+        except Exception:  # noqa: BLE001 — metric must never break the request path
+            pass
+        # #4 OPA decision contract: enrich the deny with the policy's self-description
+        # (policy_id + layman user_message + HTTP code). Best-effort; the gate above
+        # (_opa_check) is the authority and is left untouched.
+        return await _opa_denial_alert(
+            cfg, request, path, session_id, agent_id, user_id, request_id,
+        )
 
     # 4b. Response cache — only on CLEAN forwarded requests (Phase 6)
     tenant_id = request.headers.get("x-yashigani-tenant-id", "platform")
@@ -696,6 +949,146 @@ async def _proxy_request_body(
                 headers=resp_headers,
                 media_type="application/json",
             )
+
+    # 4c. MCP broker routing — intercept /mcp/<agent_name> AFTER rate-limiter,
+    # DDoSProtector, JWT introspection, body-size check, and OPA policy (steps
+    # 0–4 above).  This ensures every MCP call is subject to the same protection
+    # pipeline as any other gateway request.
+    #
+    # Fix-1 (Laura ship-blocker): the mcp_call_router was previously mounted as an
+    # extra_router, which caused /mcp/* to bypass steps 0–4 entirely.  The router
+    # is no longer mounted — instead we dispatch here via dispatch_mcp_call().
+    #
+    # Only /mcp/<agent_name> (POST) is intercepted.  The mcp_info_router
+    # (JWKS at /.well-known/yashigani-mcp-jwks.json + /mcp/health) remains mounted
+    # as an extra_router because those endpoints are intentionally public (upstream
+    # verifiers fetch JWKS without auth; rate-limiting them would break key rotation).
+    mcp_broker_registry = state.get("mcp_broker_registry")
+    if mcp_broker_registry is not None and norm_path.startswith("/mcp/"):
+        _mcp_suffix = norm_path[len("/mcp/"):]   # e.g. "filesystem-mcp"
+        if _mcp_suffix and "/" not in _mcp_suffix and _mcp_suffix not in _MCP_INFO_RESERVED:
+            # Valid single-segment agent_name — dispatch to the MCP handler.
+            # _MCP_INFO_RESERVED excludes "health" (FIND-3.1-004 belt-and-suspenders):
+            # /mcp/health is a gateway-owned endpoint handled by the route registered
+            # before the catch-all and must never be dispatched as an agent name.
+            # Pass response_inspection_pipeline so the G-ORCH-OPA-1 egress gate
+            # can classify the tool result sensitivity before calling enforce_result().
+            #
+            # G-ORCH-OPA-1 / Option A: pass the identity registry so the egress
+            # gate can look up the caller's sensitivity_ceiling from the registry
+            # keyed by X-Forwarded-User.  Reuses the SAME registry the openai_router
+            # uses for all other identity resolution — no new store.
+            from yashigani.gateway.mcp_router_runtime import dispatch_mcp_call
+            from yashigani.gateway import openai_router as _openai_router
+            return await dispatch_mcp_call(
+                agent_name=_mcp_suffix,
+                request=request,
+                registry=mcp_broker_registry,
+                response_inspection_pipeline=state.get("response_inspection_pipeline"),
+                identity_registry=_openai_router._state.identity_registry,
+                # 3.1 Phase 3 — pass agent_registry so caller allowed_tools
+                # can be resolved from the identity registry at call time.
+                agent_registry=state.get("agent_registry"),
+                # YSG-RISK-108 — pass audit_writer so mesh identity-header
+                # rejection events (T-3/T-4) reach the tamper-evident chain.
+                audit_writer=state.get("audit_writer"),
+            )
+        # Multi-segment or empty suffix falls through to generic upstream forwarding
+
+    # 4d. Document enforcement on PROXY EGRESS (v2.26) — POLICY-driven, not
+    # flag-driven.  A document leaving via the proxy is run through the SAME
+    # decision source the backoffice /inspect path uses (evaluate_document_decision
+    # over the REAL OPA + the operator's persisted matrix): OPA decides the action
+    # + mode per route / data-class / sensitivity — LOG (forward unchanged), REDACT
+    # (forward the stripped artefact), PSEUDONYMIZE mode A (forward tokens, user
+    # holds the table), PSEUDONYMIZE mode B (forward tokens AND hold a request-
+    # scoped round-trip for the response-leg restore), or BLOCK (held).  ONE
+    # decision source of truth for UI + proxy.
+    # Hooked into the EXISTING request→upstream→response seam (no parallel path).
+    # Hard-guarded: both flags must be ON and the body must look like a supported
+    # document, else this is a no-op and normal traffic is untouched.  Fail-closed-
+    # but-non-fatal: an unexpected fault forwards the ORIGINAL bytes (egress
+    # disengages); a real OPA BLOCK holds the document.  See documents/proxy_modeb.py.
+    _modeb_round_trip = None  # type: ignore[var-annotated]
+    _document_pipeline = state.get("document_pipeline")
+    if _document_pipeline is not None and forwarded_body:
+        from yashigani.documents.proxy_modeb import (
+            egress_decide,
+            is_modeb_proxy_active,
+            looks_like_document_egress,
+        )
+        _req_content_type = request.headers.get("content-type", "")
+        if is_modeb_proxy_active() and looks_like_document_egress(
+            _req_content_type, forwarded_body
+        ):
+            _egress = await egress_decide(
+                _document_pipeline,
+                opa_url=cfg.opa_url,
+                body=forwarded_body,
+                content_type=_req_content_type,
+                request_id=request_id,
+            )
+            if _egress.blocked:
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_opa_block",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_BLOCKED",
+                        "detail": (
+                            "The document was held by Yashigani document enforcement "
+                            "and not forwarded."
+                        ),
+                        "reason": _egress.block_reason or "document_blocked",
+                        "request_id": request_id,
+                    },
+                    headers={"X-Yashigani-Request-Id": request_id},
+                )
+            if _egress.route_local:
+                # OPA decided ROUTE_LOCAL (PART 2 / Laura D1): the document carries
+                # an OPERATE_ON sensitive field a cloud model would hallucinate over,
+                # so it must be handled by the LOCAL model, not this CLOUD-bound MCP
+                # upstream.  This proxy egress has NO local-model leg attached, so
+                # the only fail-closed-correct action is to HOLD the document (never
+                # forward an operate-on sensitive value to the cloud).  The operator
+                # routes such documents through the local-model path; the header
+                # tells the caller why.  Mirrors the pipeline's no-local-route
+                # fail-closed (OPERATE_ON_BLOCK) — hold, never leak.
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_route_local_no_cloud",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_ROUTED_LOCAL",
+                        "detail": (
+                            "The document contains values an external model would "
+                            "compute on (e.g. amounts, dates of birth, account "
+                            "numbers). Replacing them with placeholders would make "
+                            "the external model invent wrong values, so it was not "
+                            "forwarded to the cloud upstream. Route this document "
+                            "through the local-model path."
+                        ),
+                        "operate_on_classes": _egress.operate_on_classes,
+                        "request_id": request_id,
+                    },
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Document-Route": "local",
+                    },
+                )
+            if _egress.transformed and _egress.forward_bytes is not None:
+                # OPA decided REDACT or PSEUDONYMIZE — send the transformed
+                # (stripped/tokenized) artefact to the upstream, never the original.
+                forwarded_body = _egress.forward_bytes
+                # mode B also holds the round-trip for the response-leg restore;
+                # REDACT / mode A do not (round_trip is None).
+                if _egress.engaged:
+                    _modeb_round_trip = _egress.round_trip
+            # LOG / non-engaged: forward the ORIGINAL bytes unchanged (no transform).
 
     # 5. Forward to upstream MCP server
     client: httpx.AsyncClient = state["http_client"]
@@ -740,32 +1133,73 @@ async def _proxy_request_body(
                     confidence=resp_result.confidence,
                     response_inspection_verdict=resp_result.verdict,
                 )
+                # #4 unified user alert: the threat came FROM THE TOOL/upstream
+                # (e.g. a compromised MCP server injecting an instruction back at
+                # the user/agent). Return the same plain-English envelope used at
+                # every enforcement point — educate + deter.
+                from yashigani.common.user_alert import (
+                    build_alert, ACTION_BLOCKED, DIRECTION_FROM_TOOL,
+                )
+                _resp_alert = build_alert(
+                    ACTION_BLOCKED,
+                    "The tool/assistant tried to send back content that looked like a "
+                    "hidden instruction or an attempt to extract your credentials, so "
+                    "Yashigani blocked the response before it reached you.",
+                    rule="Response inspection (from the tool)",
+                    direction=DIRECTION_FROM_TOOL,
+                    request_id=request_id,
+                )
                 return JSONResponse(
                     status_code=502,
-                    content={
-                        "error": "UPSTREAM_RESPONSE_BLOCKED",
-                        "detail": "The upstream response was blocked by Yashigani response inspection.",
-                        "request_id": request_id,
-                    },
+                    content=_resp_alert,
                     headers={
                         "X-Yashigani-Request-Id": request_id,
                         "X-Yashigani-Response-Verdict": resp_result.verdict,
                     },
                 )
 
+    # 5a-modeB. Document PSEUDONYMIZE mode-B INGRESS restore (v2.26).
+    # Restore the untrusted upstream/cloud response on the trusted host through the
+    # binder (verbatim-echo rejection + position binding + namespace-harvest cap),
+    # AFTER response-injection inspection (5a) has already cleared the tokenized
+    # response.  Fail-closed-but-non-fatal: any fault forwards the STILL-TOKENIZED
+    # response (never cleartext that failed the binder, never a crash).  The
+    # crown-jewel map is destroyed inside ingress_restore on every path.
+    _modeb_tainted = False
+    _upstream_content = upstream_response.content
+    if _modeb_round_trip is not None and _document_pipeline is not None:
+        from yashigani.documents.proxy_modeb import ingress_restore
+        _ingress = ingress_restore(
+            _document_pipeline,
+            _modeb_round_trip,
+            response_bytes=_upstream_content,
+            request_id=request_id,
+        )
+        _upstream_content = _ingress.restored_bytes
+        _modeb_tainted = _ingress.tainted
+        # A tainted round-trip (echo or flagged) MUST NOT be cached — the cached
+        # body would be the tokenized/echo response, bypassing the binder on a
+        # later hit.  A clean restore carries cleartext that likewise must not be
+        # cached against the tokenized request key.  Either way, skip the cache.
+        response_cache = None
+
     # 5b_pii. PII detection on response body
     pii_detected_on_response = False
-    _upstream_content = upstream_response.content
     if pii_detector is not None and _upstream_content:
         _resp_body_text = _decode_body_safe(_upstream_content)
         if _resp_body_text:
-            _resp_pii_text, _resp_pii_result = pii_detector.process(_resp_body_text)
+            # F-RT1: decode-before-classify on the proxy response leg too.
+            _resp_pii_text, _resp_pii_result = pii_detector.process_decoded(_resp_body_text)
+            _emit_encoded_payload_audit(
+                audit_writer, request_id, "response", "upstream", _resp_pii_result
+            )
             if _resp_pii_result.detected:
                 pii_detected_on_response = True
                 pii_resp_types = [f.pii_type.value for f in _resp_pii_result.findings]
                 logger.info(
-                    "PII detected in proxy response path=%s request_id=%s types=%s action=%s",
-                    path, request_id, pii_resp_types, _resp_pii_result.action_taken,
+                    "PII detected in proxy response path=%s request_id=%s types=%s views=%s action=%s",
+                    path, request_id, pii_resp_types, sorted(_resp_pii_result.matched_views),
+                    _resp_pii_result.action_taken,
                 )
                 if audit_writer is not None:
                     try:
@@ -777,6 +1211,7 @@ async def _proxy_request_body(
                                 action_taken=_resp_pii_result.action_taken,
                                 destination="upstream",
                                 finding_count=len(_resp_pii_result.findings),
+                                matched_views=sorted(_resp_pii_result.matched_views),
                             )
                         )
                     except Exception as _exc:
@@ -848,22 +1283,39 @@ async def _proxy_request_body(
         response_cache.set(tenant_id, forwarded_body, upstream_response.content, ttl=cache_ttl)
 
     # 5c. Inference payload logging + anomaly detection (Phases 1+2)
+    # NOTE: this success-path block was previously never exercised (the generic
+    # proxy forward only completes when an upstream actually answers). Both calls
+    # were broken: anomaly_detector has no async `record(payload_bytes=...)` — the
+    # API is the synchronous `detect(session_id=..., payload_size_bytes=...)`; and
+    # inference_logger.log() is synchronous and takes a single InferenceRecord.
+    # Fixed to the real signatures and made defensive so telemetry never breaks
+    # the response.
     inference_logger = state.get("inference_logger")
     if inference_logger is not None and forwarded_body:
         anomaly_detector = state.get("anomaly_detector")
         if anomaly_detector is not None:
-            asyncio.ensure_future(
-                anomaly_detector.record(tenant_id=tenant_id, payload_bytes=len(forwarded_body))
-            )
-        asyncio.ensure_future(
-            inference_logger.log(
+            try:
+                anomaly_detector.detect(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    payload_size_bytes=len(forwarded_body),
+                )
+            except Exception:
+                logger.debug("proxy: anomaly detect failed", exc_info=True)
+        try:
+            from yashigani.inference.payload_logger import InferenceRecord
+            inference_logger.log(InferenceRecord(
                 tenant_id=tenant_id,
                 session_id=session_id,
-                payload=forwarded_body,
-                upstream_status=upstream_response.status_code,
-                elapsed_ms=elapsed_ms,
-            )
-        )
+                agent_id=agent_id,
+                payload_content=_decode_body_safe(forwarded_body) or "",
+                classification_label=response_verdict or "CLEAN",
+                classification_confidence=proxy_inspection_confidence,
+                backend_used="generic_proxy",
+                latency_ms=elapsed_ms,
+            ))
+        except Exception:
+            logger.debug("proxy: inference log failed", exc_info=True)
 
     # 5d. Attach trace ID to response (Phase 9)
     # Use _upstream_content which may have been redacted by PII filtering above.
@@ -879,6 +1331,13 @@ async def _proxy_request_body(
     if response_verdict is not None:
         response.headers["X-Yashigani-Response-Verdict"] = response_verdict
 
+    # 5e-modeB. Surface a tainted mode-B round-trip (echo rejected / flagged) so a
+    # downstream consumer treats the body as not-cleanly-restored (still tokenized).
+    if _modeb_round_trip is not None:
+        response.headers["X-Yashigani-Document-ModeB"] = (
+            "tainted" if _modeb_tainted else "restored"
+        )
+
     # 5e-T10. F-T10-001: Generated-content disclaimer + inspection confidence.
     # X-Yashigani-Generated-Content is always true for proxy responses — the
     # upstream (MCP server, LLM, tool) produces content that downstream consumers
@@ -891,6 +1350,17 @@ async def _proxy_request_body(
     # 5f. PII detection header (v2.2)
     _pii_any = pii_detected_on_request or pii_detected_on_response
     response.headers["X-Yashigani-PII-Detected"] = "true" if _pii_any else "false"
+    # #4 unified user alert (non-blocking REDACT): the result still flows, so the
+    # alert travels via headers rather than replacing the body — same taxonomy as
+    # the blocking alerts so the user learns what was masked and why.
+    if _pii_any:
+        from yashigani.common.user_alert import alert_headers, ACTION_REDACTED
+        for _k, _v in alert_headers(
+            ACTION_REDACTED,
+            rule="PII protection",
+            reason="Personal or sensitive data was detected and masked before continuing.",
+        ).items():
+            response.headers[_k] = _v
 
     return response
 
@@ -948,6 +1418,111 @@ async def _opa_check(
         return False  # fail-closed
 
 
+async def _opa_denial_alert(
+    cfg, request, path: str, session_id: str, agent_id: str, user_id: str, request_id: str
+):
+    """#4: build the unified DENIED user alert for an OPA policy denial, enriched
+    with the policy's self-description (policy_id + layman user_message + HTTP code)
+    from `data.yashigani.decision.denials`. Best-effort — any OPA/parse error falls
+    back to a generic DENIED alert. Never raises (the request is already denied)."""
+    from yashigani.common.user_alert import build_alert, valid_http_code, ACTION_DENIED
+
+    denial = None
+    try:
+        input_doc = {
+            "method": request.method,
+            "path": path,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "session": {"email": user_id},
+            "request": {"method": request.method, "path": path},
+            "headers": {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("authorization", "cookie")
+            },
+        }
+        # Derive the decision doc path from the configured allow path.
+        decision_path = cfg.opa_policy_path.rsplit("/", 1)[0] + "/decision"
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                cfg.opa_url + decision_path,
+                json={"input": input_doc},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            denials = (resp.json().get("result") or {}).get("denials") or []
+            if denials:
+                denial = denials[0]
+    except Exception as exc:  # noqa: BLE001 — enrichment only; deny stands regardless
+        logger.warning(
+            "OPA decision enrichment failed (request_id=%s): %s — generic deny alert", request_id, exc
+        )
+
+    if denial:
+        code = valid_http_code(denial.get("code"), 403)
+        alert = build_alert(
+            ACTION_DENIED,
+            denial.get("user_message", "Your request was blocked by an access policy."),
+            rule=denial.get("rule"),
+            policy_id=denial.get("policy_id"),
+            request_id=request_id,
+        )
+    else:
+        code = 403
+        alert = build_alert(
+            ACTION_DENIED,
+            "Your request was blocked by an access policy.",
+            request_id=request_id,
+        )
+    return JSONResponse(
+        status_code=code, content=alert, headers={"X-Yashigani-Request-Id": request_id}
+    )
+
+
+# ---------------------------------------------------------------------------
+# F-RT1 — encoded-payload audit helper (red-team verified 2026-05-30)
+# ---------------------------------------------------------------------------
+
+
+def _emit_encoded_payload_audit(
+    audit_writer, request_id: str, direction: str, destination: str, pii_result
+) -> None:
+    """Emit an ENCODED_PAYLOAD_DETECTED audit event (F-RT1 silent-pass guard).
+
+    Called when the decode stage flagged a long, encoded-looking, high-entropy
+    blob that could NOT be decoded to plaintext.  Even with no PII match this
+    leaves an audit record — closing the worst part of F-RT1 (the silent pass).
+    Raw payload is never logged — only masked token shapes + a count.
+    """
+    if audit_writer is None:
+        return
+    if not getattr(pii_result, "suspicious_blob", False):
+        return
+    try:
+        masked = list(getattr(pii_result, "suspicious_tokens", None) or [])
+        audit_writer.write(
+            EncodedPayloadDetectedEvent(
+                request_id=request_id,
+                direction=direction,
+                destination=destination,
+                high_entropy=True,
+                oversize=any(t.startswith("oversize(") for t in masked),
+                token_count=len(masked),
+                masked_tokens=masked,
+            )
+        )
+        logger.warning(
+            "F-RT1: encoded high-entropy blob on proxy (request_id=%s direction=%s "
+            "tokens=%s) — audited, no plaintext PII match",
+            request_id, direction, masked,
+        )
+    except Exception as _exc:
+        logger.warning(
+            "Encoded-payload audit write failed (request_id=%s): %s", request_id, _exc
+        )
+
+
 # ---------------------------------------------------------------------------
 # Response-leg OPA helpers (GAP-002)
 # ---------------------------------------------------------------------------
@@ -987,8 +1562,14 @@ def _proxy_response_sensitivity(
         # ResponseInspectionPipeline when a SensitivityClassifier is wired.
         # Attribute is absent on older pipeline versions — getattr is safe.
         sens = getattr(result, "response_sensitivity", None)
-        if sens and isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
-            return sens
+        # R14/R15 (v2.25.5): pipeline now emits legacy string (via _LEVEL_TO_LEGACY_STRING).
+        # Accept both legacy strings and numeric levels as a safety net.
+        if sens is not None:
+            if isinstance(sens, int) and 1 <= sens <= 5:
+                from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+                return _LEVEL_TO_LEGACY_STRING.get(sens, "RESTRICTED")
+            if isinstance(sens, str) and sens in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}:
+                return sens
     except Exception as exc:
         logger.debug(
             "proxy: response sensitivity classification failed (request_id=%s): %s",
@@ -1082,7 +1663,14 @@ async def _opa_proxy_response_check(
             )
             resp.raise_for_status()
             result = resp.json().get("result", {})
-            opa_allow = bool(result.get("allow", True))
+            # Fail-closed (False default): if OPA returns HTTP 200 with body
+            # {"result": {}} (undefined rule — partial bundle load, Helm bundle
+            # where v1_routing.rego failed to load, or proxy_response_decision
+            # undefined for this input shape), the absent "allow" key MUST resolve
+            # to DENY, not ALLOW. Mirrors openai_router._opa_response_check and the
+            # MCP broker _opa.py. Closes LAURA-OPA-004 (same class as
+            # LAURA-V243-001 / YSG-RISK-071).
+            opa_allow = bool(result.get("allow", False))
             opa_reason = result.get("reason", "ok")
 
             if not opa_allow:
@@ -1139,11 +1727,16 @@ async def _forward(
     body: bytes,
     request_id: str,
 ) -> httpx.Response:
-    # Build forwarded headers — strip hop-by-hop, inject trace ID
+    # Build forwarded headers — strip hop-by-hop, inject trace ID.
+    # Also drop the inbound content-length: the body may be re-encoded
+    # (sanitised) and httpx recomputes content-length from ``content=body``.
+    # Forwarding a stale length makes h11 raise "Too little data for declared
+    # Content-Length" against the upstream. Host is dropped so httpx sets it
+    # from the upstream URL.
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP_HEADERS
-        and k.lower() != "host"
+        and k.lower() not in ("host", "content-length")
     }
     headers["X-Yashigani-Request-Id"] = request_id
     headers["X-Forwarded-For"] = _get_client_ip(request)

@@ -322,22 +322,29 @@ class AuditChainService:
                 if self._signing_key_path:
                     sig_hex = _sign_checkpoint(root, self._signing_key_path)
 
-                # Upsert the checkpoint (idempotent — re-running the job for the
-                # same date updates the row rather than failing on the UNIQUE constraint)
+                # Insert the checkpoint — IMMUTABLE ONCE WRITTEN (v2.25.2, Lu
+                # wire-sink-gate P1/P2 / irrevocable chain).  ON CONFLICT DO
+                # NOTHING: the FIRST checkpoint for a (tenant, date) is
+                # authoritative; a re-run is a no-op rather than an overwrite.
+                #
+                # Rationale: the previous ON CONFLICT DO UPDATE let a checkpoint
+                # be silently rewritten, which is a tamper vector (recompute the
+                # merkle root over edited rows, overwrite the checkpoint).  It
+                # also only worked because yashigani_app used to be a SUPERUSER
+                # bypassing the grant — the demoted runtime role has SELECT+INSERT
+                # only (no UPDATE) on audit_chain_checkpoints, matching the
+                # immutable-once-written design intent already documented in
+                # migration 0011.  An auditor compares the on-disk checkpoint to a
+                # freshly recomputed root; a divergence is a finding, not a
+                # silent update.
                 checkpoint_id = str(uuid.uuid4())
-                await conn.execute(
+                status = await conn.execute(
                     """
                     INSERT INTO audit_chain_checkpoints
                         (id, tenant_id, checkpoint_date, event_count, merkle_root,
                          chain_break_count, signing_spiffe_id, signature_hex, computed_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-                    ON CONFLICT (tenant_id, checkpoint_date) DO UPDATE
-                        SET event_count       = EXCLUDED.event_count,
-                            merkle_root       = EXCLUDED.merkle_root,
-                            chain_break_count = EXCLUDED.chain_break_count,
-                            signing_spiffe_id = EXCLUDED.signing_spiffe_id,
-                            signature_hex     = EXCLUDED.signature_hex,
-                            computed_at       = now()
+                    ON CONFLICT (tenant_id, checkpoint_date) DO NOTHING
                     """,
                     uuid.UUID(checkpoint_id),
                     uuid.UUID(tenant_id),
@@ -348,6 +355,13 @@ class AuditChainService:
                     self._signing_spiffe_id,
                     sig_hex,
                 )
+                # "INSERT 0 0" => a checkpoint already existed (no-op re-run).
+                if status.endswith(" 0"):
+                    logger.info(
+                        "audit-chain: checkpoint for %s tenant=%s already exists — "
+                        "immutable, re-run is a no-op",
+                        date_str, tenant_id,
+                    )
 
         logger.info(
             "audit-chain: checkpoint written for %s | tenant=%s | events=%d | "

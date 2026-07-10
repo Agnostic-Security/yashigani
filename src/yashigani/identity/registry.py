@@ -92,6 +92,11 @@ class IdentityRegistry:
     Unified identity registry backed by Redis db/3.
 
     Thread-safe. All mutations are atomic Redis operations.
+
+    Optional Postgres durable store (B1 follow-on, 2.25.5): when wired via
+    the ``durable_store`` constructor argument, every create/update/status-change
+    dual-writes to Postgres so identities survive a Redis volume-deletion.
+    Redis db/3 remains the hot-path lookup; Postgres is the durable backstop.
     """
 
     # LAURA-LIMIT-AGENTS-01 / GROUP-4-1: atomic Lua script for HUMAN identity
@@ -144,10 +149,17 @@ end
 return 1
 """
 
-    def __init__(self, redis_client) -> None:
+    def __init__(self, redis_client, durable_store=None) -> None:
         self._r = redis_client
+        # Optional IdentityDurableStore (B1 follow-on). When wired, register /
+        # update / suspend / reactivate / deactivate dual-write to Postgres.
+        # None = Redis-only (dev/test/Community without a direct DSN).
+        self._durable = durable_store
         count = self._r.scard("identity:index:all") or 0
-        logger.info("IdentityRegistry initialised: %d identity(ies)", count)
+        logger.info(
+            "IdentityRegistry initialised: %d identity(ies) (durable_store=%s)",
+            count, "wired" if durable_store else "off",
+        )
 
     # ── Registration ─────────────────────────────────────────────────────
 
@@ -303,6 +315,53 @@ return 1
             "IdentityRegistry: registered %s (%s, kind=%s, slug=%s)",
             identity_id, name, kind.value, slug,
         )
+
+        # Dual-write to Postgres durable store (best-effort — never block registration).
+        if self._durable is not None:
+            try:
+                # Build a minimal decoded dict for the durable upsert.
+                # api_key_hash is the bcrypt hash (never the plaintext key).
+                durable_record = {
+                    "identity_id":              identity_id,
+                    "kind":                     kind.value,
+                    "name":                     name,
+                    "slug":                     slug,
+                    "description":              description,
+                    "expertise":                expertise or [],
+                    "system_prompt":            system_prompt,
+                    "model_preference":         model_preference,
+                    "sensitivity_ceiling":      sensitivity_ceiling,
+                    "upstream_url":             upstream_url,
+                    "container_image":          container_image,
+                    "container_config":         container_config or {},
+                    "capabilities":             capabilities or [],
+                    "allowed_tools":            allowed_tools or [],
+                    "allowed_models":           allowed_models or [],
+                    "icon_url":                 icon_url,
+                    "groups":                   groups or [],
+                    "allowed_callers":          allowed_callers or [],
+                    "allowed_paths":            allowed_paths or [],
+                    "allowed_cidrs":            allowed_cidrs or [],
+                    "org_id":                   org_id,
+                    "bound_spiffe_uri":         spiffe_uri,
+                    "api_key_hash":             key_hash,
+                    "status":                   "active",
+                    "created_at":               now,
+                    "updated_at":               now,
+                    "last_seen_at":             "",
+                    "token_rotation_schedule":  "",
+                    "api_key_created_at":       now,
+                    "api_key_expires_at":       expires,
+                    "api_key_rotated_at":       now,
+                }
+                self._durable.upsert(durable_record)
+            except Exception as exc:
+                logger.warning(
+                    "IdentityRegistry: durable upsert FAILED for %s (%s) — "
+                    "identity is live in Redis; manual re-sync may be needed if Redis is lost: %s",
+                    identity_id, slug, exc,
+                )
+
         return identity_id, plaintext_key
 
     # ── Reads ────────────────────────────────────────────────────────────
@@ -329,6 +388,40 @@ return 1
             if self.verify_key(identity_id, plaintext_key):
                 return self.get(identity_id)
         return None
+
+    def get_by_account_id(self, account_id: str) -> Optional[dict]:
+        """Look up identity by account_id (UUID from the auth accounts table).
+
+        Returns None if no mapping exists (user has never logged in since the
+        account_id→idnt_ index was introduced, or link_account_id was never called).
+
+        Redis key: identity:account:{account_id} → identity_id (String)
+        """
+        if not account_id:
+            return None
+        identity_id = self._r.get(f"identity:account:{account_id}")
+        if not identity_id:
+            return None
+        if isinstance(identity_id, bytes):
+            identity_id = identity_id.decode("utf-8")
+        return self.get(identity_id)
+
+    def link_account_id(self, account_id: str, identity_id: str) -> None:
+        """Store a mapping from account_id (UUID) to identity_id (idnt_ PK).
+
+        Called by auth.py on successful human login to enable the workflow
+        scheduler to resolve owner_identity_id (stored as account_id UUID) to
+        the real identity (idnt_ PK) that OPA scope keys are keyed on.
+
+        Idempotent — safe to call on every login.
+        """
+        if not account_id or not identity_id:
+            return
+        self._r.set(f"identity:account:{account_id}", identity_id)
+        logger.debug(
+            "IdentityRegistry: linked account_id=%s -> identity_id=%s",
+            account_id, identity_id,
+        )
 
     def list_all(self, kind: IdentityKind | None = None) -> list[dict]:
         """List all identities, optionally filtered by kind."""
@@ -402,12 +495,32 @@ return 1
             mapping["updated_at"] = _now_iso()
             self._r.hset(reg_key, mapping=mapping)
             logger.info("IdentityRegistry: updated %s fields=%s", identity_id, list(fields.keys()))
+            # Dual-write: re-fetch and upsert the full row to Postgres.
+            if self._durable is not None:
+                try:
+                    full = self.get(identity_id)
+                    if full:
+                        # Restore the key hash (not returned by get()).
+                        kh = self._r.get(f"identity:key:{identity_id}")
+                        full["api_key_hash"] = (
+                            kh.decode("utf-8") if isinstance(kh, bytes) else (kh or "")
+                        )
+                        self._durable.upsert(full)
+                except Exception as exc:
+                    logger.warning(
+                        "IdentityRegistry: durable update FAILED for %s: %s", identity_id, exc
+                    )
 
     def suspend(self, identity_id: str) -> None:
         """Suspend an identity (temporary disable)."""
         self._r.hset(f"identity:reg:{identity_id}", "status", "suspended")
         self._r.srem("identity:index:active", identity_id)
         logger.info("IdentityRegistry: suspended %s", identity_id)
+        if self._durable is not None:
+            try:
+                self._durable.update_status(identity_id, "suspended")
+            except Exception as exc:
+                logger.warning("IdentityRegistry: durable suspend FAILED for %s: %s", identity_id, exc)
 
     def reactivate(self, identity_id: str) -> None:
         """Re-enable a suspended identity."""
@@ -417,6 +530,11 @@ return 1
         })
         self._r.sadd("identity:index:active", identity_id)
         logger.info("IdentityRegistry: reactivated %s", identity_id)
+        if self._durable is not None:
+            try:
+                self._durable.update_status(identity_id, "active")
+            except Exception as exc:
+                logger.warning("IdentityRegistry: durable reactivate FAILED for %s: %s", identity_id, exc)
 
     def deactivate(self, identity_id: str) -> None:
         """Permanently deactivate an identity."""
@@ -438,6 +556,11 @@ return 1
             pipe.srem(f"identity:index:org:{org_id}", identity_id)
         pipe.execute()
         logger.info("IdentityRegistry: deactivated %s", identity_id)
+        if self._durable is not None:
+            try:
+                self._durable.delete(identity_id)
+            except Exception as exc:
+                logger.warning("IdentityRegistry: durable delete FAILED for %s: %s", identity_id, exc)
 
     def suspend_owned_by(self, org_id: str) -> int:
         """Suspend all active identities registered under *org_id*.

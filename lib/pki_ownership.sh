@@ -84,11 +84,16 @@
 #   promtail:0        Promtail root (accesses docker.sock + /var/lib/docker)
 #   grafana:472       Grafana (USER 472 upstream Dockerfile)
 #   prometheus:1001   Prometheus nobody (65534) + group_add 1001 → 0640 group-read
-#   langflow:1000     Bucket-C — langflowai/langflow:1.9.2 USER langflow (UID 1000)
-#   letta:0           Bucket-C — letta/letta:0.16.7 root (data at /root/.letta)
-#   open-webui:0      Bucket-C — open-webui:v0.9.2 root (runs bash start.sh as root)
-#   openclaw:1000     Bucket-C — openclaw Node image USER node (UID 1000); reads
-#                     openclaw_gateway_token via env only (not file at runtime)
+#   langflow:1000     v4.1 egress-langflow forwarder (user: "1000:1000") — langflow service
+#                     itself runs at UID 1000 but does NOT mount langflow_client.key; the
+#                     forwarder does. Key UID 1000 serves both paths.
+#   letta:1000        v4.1 egress-letta forwarder (user: "1000:1000").  The letta SERVICE
+#                     itself runs as root (UID 0) but does NOT mount letta_client.key
+#                     (letta only mounts yashigani_internal_bearer).  The forwarder is the
+#                     sole reader of letta_client.key, so UID 1000 is correct here.
+#   openclaw:1000     v4.1 egress-openclaw forwarder (user: "1000:1000").  openclaw service
+#                     also mounts openclaw_client.key directly (runs as UID 1000 / node);
+#                     UID 1000 satisfies both the service and the forwarder.
 #
 # Do NOT add services here that do NOT read a *_client.key from docker/secrets/.
 # Service identities are defined in docker/service_identities.yaml.
@@ -148,6 +153,23 @@ _YSG_PKI_SERVICE_MAP=(
   # Key owned by 1001:1001, mode 0640 → group-readable by prometheus.
   # Pentest EX-231-10 closure.
   "prometheus:1001:0640"
+  # v4.1 egress forwarders (unified-sidecar Phase 2a):
+  # Each bundled agent (openclaw, langflow, letta) has a Caddy-based egress-forwarder
+  # sidecar that runs as UID 1000 (user: "1000:1000" in *-egress-forwarder.override.yml).
+  # The forwarder mounts ./secrets/<system>_client.key as its SVID (presented to
+  # caddy:18790 as the mTLS client cert).  After PKI bootstrap the secrets dir is
+  # chowned to UID 1001 by the issuer container, leaving these keys at 1001:0600 —
+  # unreadable by the UID 1000 forwarder on Linux (macOS virtiofs hides this: F-C).
+  #
+  # Key: UID 1000 matches the forwarder's runtime user, NOT the agent service's native UID
+  # (letta service itself runs as root/UID 0, but letta_client.key is NOT mounted into
+  # the letta service — only into egress-letta).
+  #
+  # pki_key_missing_is_error: returns false for openclaw/langflow/letta (profile-gated,
+  # absence normal on lean installs — already handled in pki_key_missing_is_error below).
+  "openclaw:1000:0600"
+  "langflow:1000:0600"
+  "letta:1000:0600"
 )
 
 # ---------------------------------------------------------------------------
@@ -197,4 +219,82 @@ pki_services_all() {
   for _entry in "${_YSG_PKI_SERVICE_MAP[@]}"; do
     printf '%s\n' "${_entry%%:*}"
   done
+}
+
+# ---------------------------------------------------------------------------
+# pki_key_missing_is_error <service>
+#   Returns 0 (is_error=true) if the named service's private key MUST exist
+#   after PKI bootstrap — i.e. its absence is an operator error, not silence.
+#
+#   Returns 1 (is_error=false) if the service is unknown or its key is
+#   optional (not all services in the map are mandatory on every install;
+#   profile-gated services like langflow/letta/openclaw may be absent on
+#   lean installs).
+#
+#   Mandatory services: those that are part of the core control plane and
+#   must always have a client cert regardless of install profile.
+#   Optional services: profile-gated (open-webui, langflow, letta, openclaw,
+#   letta-pgbouncer) — their absence is normal on lean installs.
+#
+#   S8 (MEDIUM): this function was declared-but-unimplemented in prior versions.
+#   Implemented v2.25.0 P1 W4.
+# ---------------------------------------------------------------------------
+pki_key_missing_is_error() {
+  local _svc="$1"
+  # If the service is not in the map at all, absence is not our error.
+  if ! pki_service_uid "$_svc" >/dev/null 2>&1; then
+    return 1
+  fi
+  # Profile-gated (optional) services — absence is NOT an operator error.
+  case "$_svc" in
+    open-webui|langflow|letta|letta-pgbouncer|openclaw)
+      return 1
+      ;;
+    *)
+      # All other services in the map are mandatory core services.
+      return 0
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# pki_ownership_portability_check
+#   Portability self-test: verify this file uses only bash-3.2-safe constructs.
+#   Returns 0 if all checks pass.
+#   Used by the S6 test gate in tests/install/test_pki_ownership.sh.
+#
+#   bash-3.2 incompatible constructs that must NOT appear in this file:
+#     declare -A       (associative arrays — bash 4.0+)
+#     ${var,,}         (lowercase expansion — bash 4.0+)
+#     ${var^^}         (uppercase expansion — bash 4.0+)
+#     mapfile / readarray  (bash 4.0+)
+#
+#   This function is informational — the static grep check in the test suite
+#   is the authoritative gate.
+# ---------------------------------------------------------------------------
+pki_ownership_portability_check() {
+  local _self
+  _self="${BASH_SOURCE[0]:-${0}}"
+  local _fail=0
+  if grep -q 'declare -A' "$_self" 2>/dev/null; then
+    printf '[pki_ownership] FAIL: declare -A (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '\$\{[a-zA-Z_][a-zA-Z0-9_]*,,' "$_self" 2>/dev/null; then
+    # Single quotes intentional: printing literal text, not shell-expanding it.
+    # shellcheck disable=SC2016
+    printf '[pki_ownership] FAIL: ${var,,} (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '\$\{[a-zA-Z_][a-zA-Z0-9_]*\^\^' "$_self" 2>/dev/null; then
+    # Single quotes intentional: printing literal text, not shell-expanding it.
+    # shellcheck disable=SC2016
+    printf '[pki_ownership] FAIL: ${var^^} (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  if grep -qE '^[[:space:]]*(mapfile|readarray)' "$_self" 2>/dev/null; then
+    printf '[pki_ownership] FAIL: mapfile/readarray (bash 4.0+) found in %s\n' "$_self" >&2
+    _fail=1
+  fi
+  return "$_fail"
 }

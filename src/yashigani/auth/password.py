@@ -24,6 +24,15 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _MIN_PASSWORD_LENGTH = 36
+# SECURITY (YSG-RISK-050): Do NOT reduce _MIN_PASSWORD_LENGTH below 20 without
+# also increasing argon2id parameters (time_cost, memory_cost, parallelism).
+# The backup wrap#1 offline brute-force resistance relies on this floor:
+# alphabet ~74 chars, 36 chars → ~74^36 ≈ 2^220 guesses at argon2id cost.
+# Reducing to 20 drops to ~74^20 ≈ 2^123 — still high, but argon2 param
+# headroom is the backup backstop under FIPS_MODE=1 (PBKDF2-HMAC-SHA384 path).
+# Any change to this constant must be reviewed against the backup key hierarchy
+# in docs/operations/backup.md and the locked spec (signed-encrypted-install-
+# backup-spec-20260528.md).
 _AUTO_PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
 
 # ---------------------------------------------------------------------------

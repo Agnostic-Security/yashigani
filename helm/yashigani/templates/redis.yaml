@@ -70,10 +70,10 @@ spec:
                 --tls-ca-cert-file /run/secrets/ca_bundle.crt \
                 --tls-auth-clients yes \
                 --tls-protocols "TLSv1.2 TLSv1.3" \
-                --save "" \
-                --appendonly no \
+                --appendonly yes \
+                --appendfsync everysec \
                 --maxmemory 256mb \
-                --maxmemory-policy allkeys-lru \
+                --maxmemory-policy volatile-lru \
                 --requirepass "$(REDIS_PASSWORD)"
           ports:
             - name: redis-tls
@@ -85,10 +85,10 @@ spec:
             - "-c"
             - |
               redis-server \
-                --save "" \
-                --appendonly no \
+                --appendonly yes \
+                --appendfsync everysec \
                 --maxmemory 256mb \
-                --maxmemory-policy allkeys-lru \
+                --maxmemory-policy volatile-lru \
                 --requirepass "$(REDIS_PASSWORD)"
           ports:
             - name: redis
@@ -162,6 +162,17 @@ spec:
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping.
+            # The flat Secret also holds every other service's leaf key, all
+            # bootstrap tokens and caddy_internal_hmac (Layer-B forgery secret).
+            # This pod gets ONLY its own leaf + the trust anchor it verifies with.
+            items:
+              - key: redis_client.crt
+                path: redis_client.crt
+              - key: redis_client.key
+                path: redis_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
       {{- end }}
   {{- if .Values.redis.persistence.enabled }}
   volumeClaimTemplates:

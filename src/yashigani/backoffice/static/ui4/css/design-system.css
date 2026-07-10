@@ -1,0 +1,143 @@
+/* Yashigani 4.0 shared layer — design system (spec §8). CLASSES-ONLY.
+ *
+ * Strict CSP (style-src 'self', NO 'unsafe-inline') blocks inline style= and
+ * <style> attributes (Ava FIND-AVA-003 / RISK-102/115). Every visual treatment
+ * in 4.0 code is a CLASS here. No inline styles anywhere in the layer.
+ *
+ * Tokens (CSS custom properties) + component classes. Aligns with the existing
+ * 3.0 vocabulary (badge-red/-green, txt-note) and the brand palette:
+ *   orange #EC6B2D (wordmark/active), blue #1F5F8E (buttons).
+ */
+
+:root {
+  /* colour */
+  --ys-brand-orange: #EC6B2D;
+  --ys-brand-blue: #1F5F8E;
+  --ys-bg: #f1f5f9;
+  --ys-surface: #ffffff;
+  --ys-surface-alt: #f8fafc;
+  --ys-ink: #1e293b;
+  --ys-ink-muted: #64748b;
+  --ys-ink-faint: #94a3b8;
+  --ys-border: #e2e8f0;
+  --ys-border-faint: #f1f5f9;
+  --ys-nav-bg: #0f172a;
+
+  --ys-green-bg: #dcfce7;  --ys-green-fg: #166534;
+  --ys-red-bg: #fef2f2;    --ys-red-fg: #dc2626;
+  --ys-amber-bg: #fefce8;  --ys-amber-fg: #a16207;
+  --ys-blue-bg: #dbeafe;   --ys-blue-fg: #1d4ed8;
+
+  /* spacing */
+  --ys-sp-1: 4px;  --ys-sp-2: 8px;  --ys-sp-3: 12px;
+  --ys-sp-4: 16px; --ys-sp-5: 24px; --ys-sp-6: 32px;
+
+  /* radius / elevation / type */
+  --ys-radius-sm: 4px; --ys-radius: 8px; --ys-radius-pill: 99px;
+  --ys-elev-1: 0 1px 3px rgba(0,0,0,0.1);
+  --ys-elev-2: 0 4px 12px rgba(0,0,0,0.15);
+  --ys-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --ys-mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --ys-fs-sm: 0.8rem; --ys-fs-base: 0.85rem; --ys-fs-lg: 1.1rem;
+}
+
+.ys-root { font-family: var(--ys-font); color: var(--ys-ink); background: var(--ys-bg); }
+
+/* ── buttons ─────────────────────────────────────────────── */
+.ys-btn {
+  display: inline-block; border: none; cursor: pointer;
+  padding: var(--ys-sp-2) var(--ys-sp-4); border-radius: var(--ys-radius-sm);
+  font-size: var(--ys-fs-base); font-weight: 500;
+  background: var(--ys-brand-blue); color: #fff;
+}
+.ys-btn:hover { filter: brightness(1.08); }
+.ys-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ys-btn-secondary { background: var(--ys-surface-alt); color: var(--ys-ink); border: 1px solid var(--ys-border); }
+.ys-btn-danger { background: var(--ys-red-fg); color: #fff; }
+.ys-btn-ghost { background: none; color: var(--ys-ink-muted); }
+
+/* ── badges ──────────────────────────────────────────────── */
+.ys-badge {
+  display: inline-block; padding: 2px var(--ys-sp-2); border-radius: var(--ys-radius-pill);
+  font-size: 0.75rem; font-weight: 500;
+}
+.ys-badge-green  { background: var(--ys-green-bg);  color: var(--ys-green-fg); }
+.ys-badge-red    { background: var(--ys-red-bg);    color: var(--ys-red-fg); }
+.ys-badge-amber  { background: var(--ys-amber-bg);  color: var(--ys-amber-fg); }
+.ys-badge-blue   { background: var(--ys-blue-bg);   color: var(--ys-blue-fg); }
+
+/* ── cards / panels ──────────────────────────────────────── */
+.ys-card { background: var(--ys-surface); border-radius: var(--ys-radius); box-shadow: var(--ys-elev-1); padding: var(--ys-sp-4); }
+.ys-panel { background: var(--ys-surface); border-radius: var(--ys-radius); box-shadow: var(--ys-elev-1); overflow: hidden; margin-bottom: var(--ys-sp-4); }
+.ys-panel-header { padding: var(--ys-sp-3) var(--ys-sp-4); font-weight: 600; font-size: 0.9rem; border-bottom: 1px solid var(--ys-border-faint); }
+.ys-panel-body { padding: var(--ys-sp-4); }
+
+/* ── tables ──────────────────────────────────────────────── */
+.ys-table { width: 100%; border-collapse: collapse; font-size: var(--ys-fs-base); }
+.ys-table th { text-align: left; padding: 10px var(--ys-sp-3); font-weight: 500; color: var(--ys-ink-muted); background: var(--ys-surface-alt); border-bottom: 1px solid var(--ys-border); cursor: pointer; }
+.ys-table td { padding: 10px var(--ys-sp-3); border-bottom: 1px solid var(--ys-border-faint); color: #334155; }
+.ys-table tr:hover { background: var(--ys-surface-alt); }
+.ys-table-empty { text-align: center; color: var(--ys-ink-faint); padding: var(--ys-sp-6); font-size: 0.9rem; }
+.ys-table-pager { display: flex; gap: var(--ys-sp-2); align-items: center; padding: var(--ys-sp-2) var(--ys-sp-3); font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+/* ── forms ───────────────────────────────────────────────── */
+.ys-field { display: flex; flex-direction: column; gap: var(--ys-sp-1); margin-bottom: var(--ys-sp-3); }
+.ys-label { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+.ys-input, .ys-select, .ys-textarea {
+  padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); font-size: var(--ys-fs-base); font-family: inherit;
+}
+.ys-input:focus, .ys-select:focus, .ys-textarea:focus { outline: 2px solid var(--ys-brand-blue); outline-offset: -1px; }
+.ys-field-error { font-size: var(--ys-fs-sm); color: var(--ys-red-fg); }
+
+/* ── modal ───────────────────────────────────────────────── */
+.ys-modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.ys-modal { background: var(--ys-surface); border-radius: var(--ys-radius); box-shadow: var(--ys-elev-2); max-width: 480px; width: 90%; }
+.ys-modal-header { padding: var(--ys-sp-4); font-weight: 600; border-bottom: 1px solid var(--ys-border-faint); }
+.ys-modal-body { padding: var(--ys-sp-4); }
+.ys-modal-footer { padding: var(--ys-sp-3) var(--ys-sp-4); display: flex; justify-content: flex-end; gap: var(--ys-sp-2); border-top: 1px solid var(--ys-border-faint); }
+
+/* ── toast ───────────────────────────────────────────────── */
+.ys-toast-stack { position: fixed; top: var(--ys-sp-4); right: var(--ys-sp-4); display: flex; flex-direction: column; gap: var(--ys-sp-2); z-index: 1100; }
+.ys-toast { padding: var(--ys-sp-3) var(--ys-sp-4); border-radius: var(--ys-radius-sm); box-shadow: var(--ys-elev-2); font-size: var(--ys-fs-base); max-width: 360px; }
+.ys-toast-info { background: var(--ys-blue-bg); color: var(--ys-blue-fg); }
+.ys-toast-error { background: var(--ys-red-bg); color: var(--ys-red-fg); }
+.ys-toast-success { background: var(--ys-green-bg); color: var(--ys-green-fg); }
+
+/* ── markdown (UNTRUSTED-CONTENT container — visually distinct, §5/FIND-AVA-001.3) ── */
+.ys-md {
+  border: 1px solid var(--ys-border); border-left: 3px solid var(--ys-brand-blue);
+  background: var(--ys-surface-alt); border-radius: var(--ys-radius-sm);
+  padding: var(--ys-sp-3) var(--ys-sp-4); font-size: var(--ys-fs-base); line-height: 1.5;
+}
+.ys-md pre { background: #0f172a; color: #e2e8f0; padding: var(--ys-sp-3); border-radius: var(--ys-radius-sm); overflow-x: auto; font-family: var(--ys-mono); }
+.ys-md code { font-family: var(--ys-mono); font-size: 0.85em; }
+/* copy-code affordance on fenced blocks (TRUSTED-CHROME added imperatively) */
+.ys-code-wrap { position: relative; }
+.ys-code-wrap .ys-code-copy {
+  position: absolute; top: var(--ys-sp-1); right: var(--ys-sp-1);
+  padding: 2px var(--ys-sp-2); font-size: 0.72rem;
+  background: rgba(255, 255, 255, 0.12); color: #e2e8f0;
+  border-radius: var(--ys-radius-sm); opacity: 0; transition: opacity 0.12s ease;
+}
+.ys-code-wrap:hover .ys-code-copy, .ys-code-copy:focus { opacity: 1; }
+.ys-md table { border-collapse: collapse; }
+.ys-md th, .ys-md td { border: 1px solid var(--ys-border); padding: var(--ys-sp-1) var(--ys-sp-2); }
+
+/* ── chat stream ─────────────────────────────────────────── */
+.ys-chat-bubble { margin-bottom: var(--ys-sp-3); }
+.ys-chat-streaming { white-space: pre-wrap; font-size: var(--ys-fs-base); color: var(--ys-ink); }
+
+/* ── system chrome / verdict banner (TRUSTED-CHROME, OUTSIDE content, §5.1) ── */
+.ys-system-chrome {
+  border: 2px solid var(--ys-red-fg); background: #fff5f5; border-radius: var(--ys-radius-sm);
+  padding: var(--ys-sp-3) var(--ys-sp-4); margin: var(--ys-sp-3) 0;
+  /* deliberately distinct from .ys-md so an LLM cannot visually forge it */
+}
+.ys-system-chrome-sentinel { font-weight: 700; color: var(--ys-red-fg); letter-spacing: 0.03em; }
+.ys-system-chrome-msg { margin-top: var(--ys-sp-2); color: var(--ys-ink); font-size: var(--ys-fs-base); }
+.ys-system-chrome-code { margin-top: var(--ys-sp-2); font-family: var(--ys-mono); font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+.ys-system-chrome-policy { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+.ys-txt-note { font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+.ys-hidden { display: none; }

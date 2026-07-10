@@ -1,77 +1,204 @@
 {
   "uid": "yashigani-logs",
-  "title": "Yashigani — Log Streams",
-  "tags": ["yashigani", "logs", "loki"],
+  "title": "Yashigani \u2014 Log Streams",
+  "tags": [
+    "yashigani",
+    "logs",
+    "loki"
+  ],
   "timezone": "browser",
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
+    {
+      "id": 7,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Live log streams from gateway, backoffice, and all services via Loki. Also shows error log rate and volume by service \u2014 use to triage incidents without leaving Grafana."
+      }
+    },
     {
       "id": 1,
       "type": "logs",
       "title": "Gateway Logs",
-      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 8},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "{service=\"gateway\"}", "legendFormat": ""}
+        {
+          "expr": "{service=\"gateway\"}",
+          "legendFormat": ""
+        }
       ],
-      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": true, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true}
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      }
     },
     {
       "id": 2,
       "type": "logs",
       "title": "Backoffice Logs",
-      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "{service=\"backoffice\"}", "legendFormat": ""}
+        {
+          "expr": "{service=\"backoffice\"}",
+          "legendFormat": ""
+        }
       ],
-      "options": {"dedupStrategy": "none", "enableLogDetails": true, "sortOrder": "Descending", "wrapLogMessage": true}
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      }
     },
     {
       "id": 3,
       "type": "logs",
       "title": "Error Logs (all services)",
-      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 12,
+        "y": 11,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "{project=\"yashigani\"} |= \"ERROR\"", "legendFormat": ""}
+        {
+          "expr": "{project=\"yashigani\"} |= \"ERROR\"",
+          "legendFormat": ""
+        }
       ],
-      "options": {"dedupStrategy": "none", "enableLogDetails": true, "sortOrder": "Descending", "wrapLogMessage": true}
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      }
     },
     {
       "id": 4,
       "type": "timeseries",
       "title": "Error Log Rate by Service (per minute)",
-      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 6},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "sum by(service) (rate({project=\"yashigani\"} |= \"ERROR\" [1m]))", "legendFormat": "{{service}}"}
+        {
+          "expr": "sum by(service) (rate({project=\"yashigani\"} |= \"ERROR\" [1m]))",
+          "legendFormat": "{{service}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Log Volume by Service (bytes/min)",
-      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 6},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 12,
+        "y": 19,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "sum by(service) (rate({project=\"yashigani\"} [1m]))", "legendFormat": "{{service}}"}
+        {
+          "expr": "sum by(service) (rate({project=\"yashigani\"} [1m]))",
+          "legendFormat": "{{service}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50}}}
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 50
+          }
+        }
+      }
     },
     {
       "id": 6,
       "type": "logs",
       "title": "Audit Events (gateway audit logs)",
-      "gridPos": {"x": 0, "y": 22, "w": 24, "h": 8},
-      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "targets": [
-        {"expr": "{service=\"gateway\"} | json | event_type != \"\"", "legendFormat": ""}
+        {
+          "expr": "{service=\"gateway\"} | json | event_type != \"\"",
+          "legendFormat": ""
+        }
       ],
-      "options": {"dedupStrategy": "none", "enableLogDetails": true, "sortOrder": "Descending", "wrapLogMessage": true}
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      }
     }
   ],
   "templating": {
@@ -80,7 +207,11 @@
         "name": "DS_LOKI",
         "type": "datasource",
         "query": "loki",
-        "hide": 0
+        "hide": 0,
+        "current": {
+          "text": "Loki",
+          "value": "loki"
+        }
       }
     ]
   }

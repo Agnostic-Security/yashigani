@@ -345,25 +345,46 @@ _detect_gpu() {
     fi
   fi
 
-  # --- AMD ROCm ---
+  # --- AMD ROCm (discrete GPU: Radeon RX / Instinct / PRO) ---
+  # rocm-smi present and working → full ROCm driver stack installed.
+  # AMD APUs (Ryzen AI gfx1150/1151) with partial ROCm may also trigger this;
+  # if ROCm inference fails at runtime, set YSG_GPU_TYPE=vulkan in docker/.env
+  # to route through the Vulkan overlay (docker-compose.gpu-vulkan.yml) instead.
   if [ "$gpu_type" = "none" ] && command -v rocm-smi >/dev/null 2>&1; then
     if rocm-smi >/dev/null 2>&1; then
       gpu_type="amd_rocm"
       gpu_name="$(rocm-smi --showproductname 2>/dev/null | grep -i "card series" | head -1 | awk -F: '{gsub(/^[ \t]+/,"",$2); print $2}' || echo "AMD GPU")"
+      gpu_vram_mb="$(rocm-smi --showmeminfo vram 2>/dev/null | grep -i 'total.*vram' | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)"
       gpu_compute="rocm"
     fi
   fi
 
   # --- Fallback: lspci (Linux only) ---
+  # Covers: NVIDIA without driver, AMD discrete without ROCm, Intel Arc/iGPU,
+  # AMD APU without ROCm. Intel and AMD APU are mapped to 'vulkan' since the
+  # Vulkan backend is the reliable inference path for these (source: docs.ollama.com/gpu).
   if [ "$gpu_type" = "none" ] && command -v lspci >/dev/null 2>&1; then
     if lspci 2>/dev/null | grep -qi "nvidia"; then
       gpu_type="nvidia_no_driver"
       gpu_name="$(lspci 2>/dev/null | grep -i nvidia | head -1 | sed 's/.*: //')"
-      gpu_compute="none (install NVIDIA drivers)"
-    elif lspci 2>/dev/null | grep -qiE "amd.*(radeon|instinct)"; then
+      gpu_compute="none (install NVIDIA drivers + nvidia-container-toolkit)"
+    elif lspci 2>/dev/null | grep -qiE "amd.*(radeon rx|instinct|pro w)"; then
+      # AMD discrete (no ROCm driver) — install ROCm for best performance.
       gpu_type="amd_no_driver"
-      gpu_name="$(lspci 2>/dev/null | grep -iE 'amd.*(radeon|instinct)' | head -1 | sed 's/.*: //')"
-      gpu_compute="none (install ROCm)"
+      gpu_name="$(lspci 2>/dev/null | grep -iE 'amd.*(radeon rx|instinct|pro w)' | head -1 | sed 's/.*: //')"
+      gpu_compute="none (install ROCm: rocm.docs.amd.com)"
+    elif lspci 2>/dev/null | grep -qiE "intel.*(arc|xe|a[0-9]+ graphics|hd graphics|uhd graphics|iris)"; then
+      # Intel Arc discrete + iGPU (HD/UHD/Iris/Xe). No native ollama support —
+      # inference via Vulkan backend (docker-compose.gpu-vulkan.yml).
+      gpu_type="vulkan"
+      gpu_name="$(lspci 2>/dev/null | grep -iE 'intel.*(arc|xe|a[0-9]+ graphics|hd graphics|uhd graphics|iris)' | head -1 | sed 's/.*: //')"
+      gpu_compute="vulkan (Intel — requires mesa-vulkan-drivers)"
+    elif lspci 2>/dev/null | grep -qiE "amd.*(radeon|ryzen|rx|vega|780m|760m|graphics)"; then
+      # AMD APU / Ryzen integrated graphics (no rocm-smi, or gfx1150/1151 APU).
+      # Map to Vulkan — ROCm APU support is experimental (source: docs.ollama.com/gpu).
+      gpu_type="vulkan"
+      gpu_name="$(lspci 2>/dev/null | grep -iE 'amd.*(radeon|ryzen|rx|vega|780m|760m|graphics)' | head -1 | sed 's/.*: //')"
+      gpu_compute="vulkan (AMD APU — ROCm experimental; Mesa RADV recommended)"
     fi
   fi
 

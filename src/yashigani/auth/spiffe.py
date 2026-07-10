@@ -2,7 +2,7 @@
 SPIFFE URI ACL gate — application-layer identity check for service-to-service
 callers.
 
-Last updated: 2026-04-30T04:30:00+01:00
+Last updated: 2026-07-06T00:00:00+00:00 (v4.1 Phase 1 — agent-prefix grant, Nico Q1)
 
 Threat model and trust boundary
 -------------------------------
@@ -28,6 +28,16 @@ Contract
   * 403 if the ACL table has no entry for this path (``no_acl_for_path``)
   * 403 if the header value is not in the allowlist (``spiffe_id_not_allowed``)
   * 200-passthrough (returns the caller SPIFFE ID) on success
+
+v4.1 Phase 1 (Nico Q1 — cert/rotate): rules may additionally carry
+``allowed_spiffe_prefix`` + ``verify_spiffe_matches_agent_id`` (see
+pki.identity.EndpointAcl).  A caller that is not in the exact allowlist is
+accepted when its SPIFFE URI starts with the prefix AND — when the verify
+flag is set — its SPIFFE ``agent_name`` or ``instance_id`` segment equals
+the route's ``{agent_id}`` path parameter (403 ``spiffe_id_agent_mismatch``
+otherwise).  This is the grant that lets every agent's svid-sidecar rotate
+its OWN cert without listing per-instance URIs in IaC, while structurally
+preventing one agent from rotating another agent's cert.
 
 The ACL source is the same ``service_identities.yaml`` manifest used by the
 PKI issuer. This keeps the allowlist in one place: the file that also mints
@@ -60,15 +70,22 @@ import logging
 import os
 import time
 from threading import Lock
-from typing import Any, Callable, Coroutine, Optional, Tuple
+from typing import Any, Callable, Coroutine, Optional, Tuple, Union
 
 from fastapi import HTTPException, Request, status
 
+from yashigani.pki.identity import EndpointAcl
+
 logger = logging.getLogger(__name__)
+
+# One ACL rule as held in the cache.  EndpointAcl is what the manifest parser
+# produces; the bare frozenset shape is retained for back-compat (tests and
+# any caller that monkeypatches _load_acls with {path: frozenset(ids)}).
+_AclRule = Union[EndpointAcl, frozenset]
 
 # Cache state: (loaded_at_monotonic, acl_dict)
 # None means "not yet loaded".
-_CACHE: Optional[Tuple[float, dict[str, frozenset[str]]]] = None
+_CACHE: Optional[Tuple[float, dict[str, _AclRule]]] = None
 _CACHE_LOCK = Lock()
 
 _DEFAULT_MANIFEST_PATH = "/etc/yashigani/service_identities.yaml"
@@ -136,7 +153,7 @@ def _get_max_stale() -> float:
         return float(_DEFAULT_MAX_STALE_SECONDS)
 
 
-def _read_manifest() -> dict[str, frozenset[str]]:
+def _read_manifest() -> dict[str, _AclRule]:
     """Read and parse the manifest from disk. Raises on any failure."""
     manifest_path = os.getenv(
         "YASHIGANI_SERVICE_MANIFEST_PATH", _DEFAULT_MANIFEST_PATH
@@ -149,7 +166,7 @@ def _read_manifest() -> dict[str, frozenset[str]]:
     return dict(manifest.endpoint_acls)
 
 
-def _load_acls() -> dict[str, frozenset[str]]:
+def _load_acls() -> dict[str, _AclRule]:
     """Return the current ACL dict, refreshing if the TTL has expired.
 
     First call: loads from disk; on failure returns {} (fail-closed).
@@ -305,13 +322,57 @@ def require_spiffe_id(path: str) -> Callable[[Request], Coroutine[Any, Any, str]
                 detail="no_spiffe_id",
             )
 
-        if caller not in allowed:
+        # Normalise the rule shape: EndpointAcl (manifest parser) or a bare
+        # frozenset of exact ids (legacy/test-injected — no prefix grant).
+        if isinstance(allowed, EndpointAcl):
+            allowed_ids: frozenset = allowed.allowed_spiffe_ids
+            prefix = allowed.allowed_spiffe_prefix
+            verify_agent_id = allowed.verify_spiffe_matches_agent_id
+        else:
+            allowed_ids = allowed
+            prefix = ""
+            verify_agent_id = False
+
+        if caller in allowed_ids:
+            return caller
+
+        # v4.1 Phase 1 (Nico Q1) — agent-prefix grant: a live agent identity
+        # may call its OWN self-service endpoint (cert rotate / svid status).
+        if prefix and caller.startswith(prefix):
+            if not verify_agent_id:
+                return caller
+            # The rule requires the caller's SPIFFE to match the {agent_id}
+            # path parameter — one agent must never rotate another agent's
+            # cert.  Both the agent_name segment (sidecar AGENT_ID env is the
+            # server/agent name — codegen.py) and the per-instance nhi_id
+            # segment (GAP-1) are accepted as the path parameter value.
+            from yashigani.identity.trust_domain import parse_agent_spiffe_uri
+
+            path_agent_id = str(
+                (getattr(request, "path_params", None) or {}).get("agent_id", "")
+            )
+            parsed = parse_agent_spiffe_uri(caller)
+            if parsed is not None and path_agent_id:
+                _tenant_id, agent_name, instance_id = parsed
+                if path_agent_id == agent_name or (
+                    instance_id and path_agent_id == instance_id
+                ):
+                    return caller
+            logger.warning(
+                "spiffe-gate: 403 spiffe_id_agent_mismatch for path=%s — "
+                "caller=%r does not match path agent_id=%r "
+                "(cross-agent rotation attempt or malformed agent SPIFFE)",
+                path, caller, path_agent_id,
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="spiffe_id_not_allowed",
+                detail="spiffe_id_agent_mismatch",
             )
 
-        return caller
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="spiffe_id_not_allowed",
+        )
 
     return _dep
 

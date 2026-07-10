@@ -205,13 +205,12 @@ def _email_hash(email: str, org_id: str = "") -> str:
 def _email_to_slug(email: str) -> str:
     """
     Derive a registry slug from an email address.
+    B5 (2.25.5): delegates to the canonical implementation in identity.slug
+    so all slug-derivation sites produce the same result.
     e.g. alice@example.com -> alice-example-com
     """
-    local, _, domain = email.partition("@")
-    raw = f"{local}-{domain}".lower()
-    slug = _SLUG_RE.sub("-", raw).strip("-")
-    # Trim to 64 chars — IdentityRegistry slug limit.
-    return slug[:64]
+    from yashigani.identity.slug import email_to_slug as _canonical
+    return _canonical(email)
 
 
 def _resolve_or_create_identity(
@@ -997,8 +996,16 @@ async def sso_2fa_verify(request: Request):
             },
         )
 
+    # Phase 13: SSO identities are user-tier; fall back to SHA256/6 if the
+    # identity dict doesn't carry a totp_algorithm field (pre-3.1 identities).
+    # Follow-up: add totp_algorithm to the identity registry schema for identities
+    # that may be admin-tier in future.
+    from yashigani.auth.totp import TOTP_ALGO_SHA256 as _SSO_DEFAULT_ALGO
+    _sso_totp_algo = identity.get("totp_algorithm", _SSO_DEFAULT_ALGO)
+    _sso_totp_digits = 8 if _sso_totp_algo == "SHA512" else 6
+
     used_codes: set = set()  # Recovery codes not applicable here
-    if not verify_totp(totp_secret, totp_code, used_codes):
+    if not verify_totp(totp_secret, totp_code, used_codes, algorithm=_sso_totp_algo, digits=_sso_totp_digits):
         # Don't consume the pending token on TOTP failure — let them retry
         _write_sso_failure_audit(
             pending.get("idp_id", ""),

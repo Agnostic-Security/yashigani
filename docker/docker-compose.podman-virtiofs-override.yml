@@ -52,10 +52,16 @@ services:
   gateway:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      # YSG-RISK-053: scoped single-file mount needs :U on macOS virtiofs too
+      # (same statfs-EPERM rationale as the dir mount). No clobber risk: the
+      # hmac file is shared only by gateway + backoffice, both UID 1001.
+      - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
 
   backoffice:
     volumes:
       - ./secrets:/run/secrets:rw,U
+      # YSG-RISK-053: see gateway note above.
+      - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
 
   policy:
     volumes:
@@ -76,6 +82,15 @@ services:
   caddy:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      # YSG-RISK-053: Caddy-scoped secrets (docker/secrets-caddy/) — single-file
+      # :U mounts; caddy is the ONLY consumer of the mesh leaf key/crt.
+      # caddy_internal_hmac is deliberately NOT :U'd here: caddy (UID 0) would
+      # lchown the shared source file away from subuid+1001 and clobber the
+      # gateway/backoffice mapping (LINUX-SHARED-MOUNT-UID-CLOBBER pattern —
+      # see header). Caddy reads the HMAC via the CADDY_INTERNAL_HMAC env var,
+      # never the file, so the base ro mount is sufficient.
+      - ./secrets-caddy/caddy_client.crt:/run/secrets/caddy_client.crt:ro,U
+      - ./secrets-caddy/caddy_client.key:/run/secrets/caddy_client.key:ro,U
 
   postgres:
     volumes:
@@ -102,10 +117,6 @@ services:
       - ./secrets:/run/secrets:ro,U
 
   vault:
-    volumes:
-      - ./secrets:/run/secrets:ro,U
-
-  open-webui:
     volumes:
       - ./secrets:/run/secrets:ro,U
 

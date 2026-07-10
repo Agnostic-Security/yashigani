@@ -231,11 +231,28 @@ CREATE TABLE siem_config (
 );
 INSERT INTO siem_config (backend) VALUES ('none');
 
--- Application role (least privilege)
+-- Application role (least privilege).
+-- v2.25.2 (Lu wire-sink-gate P1): yashigani_app is the RUNTIME role and MUST be
+-- NOSUPERUSER.  DDL / migrations run as the separate bootstrap admin superuser
+-- (compose POSTGRES_USER=yashigani_admin).  Created explicitly NOSUPERUSER here
+-- so a fresh install never has a superuser runtime identity; migration 0015
+-- additionally demotes any pre-2.25.2 install where yashigani_app was the
+-- bootstrap superuser.  NOBYPASSRLS so FORCE RLS on the audit tables applies.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yashigani_app') THEN
-        CREATE ROLE yashigani_app LOGIN PASSWORD 'PLACEHOLDER_REPLACED_BY_BOOTSTRAP';
+        CREATE ROLE yashigani_app
+            LOGIN
+            NOSUPERUSER
+            NOCREATEDB
+            NOCREATEROLE
+            NOREPLICATION
+            NOBYPASSRLS
+            PASSWORD 'PLACEHOLDER_REPLACED_BY_BOOTSTRAP';
+    ELSE
+        -- Idempotent / upgrade-in-place: ensure the role is least-privilege even
+        -- if it pre-exists (e.g. created as the old bootstrap superuser).
+        ALTER ROLE yashigani_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
     END IF;
 END $$;
 GRANT CONNECT ON DATABASE yashigani TO yashigani_app;

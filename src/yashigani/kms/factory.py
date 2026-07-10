@@ -116,7 +116,21 @@ def create_provider() -> KSMProvider:
         )
 
     cls = _load_class(_PROVIDER_MAP[provider_name])
-    instance: KSMProvider = cls(environment_scope=env_scope)
+
+    # DockerSecretsProvider supports an optional writable cloud-keys directory
+    # (demo/free tier only — Tiago directive).  When YASHIGANI_CLOUD_KEYS_DIR is
+    # set, pass it so the provider can store/read runtime-set cloud API keys.
+    # Production KMS providers (keeper, aws, azure, gcp, vault) ignore this arg.
+    if provider_name == "docker":
+        from pathlib import Path
+        cloud_keys_dir_str = os.environ.get("YASHIGANI_CLOUD_KEYS_DIR", "").strip()
+        cloud_keys_dir = Path(cloud_keys_dir_str) if cloud_keys_dir_str else None
+        instance: KSMProvider = cls(
+            environment_scope=env_scope,
+            cloud_keys_dir=cloud_keys_dir,
+        )
+    else:
+        instance = cls(environment_scope=env_scope)
 
     if instance.provider_name != provider_name:
         raise ProviderError(

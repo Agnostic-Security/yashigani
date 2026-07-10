@@ -1,0 +1,133 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# openclaw INBOUND WEBHOOK ROUTES — v4.1 Phase 1c (LAURA-I1-03 / FP-05)
+# Last updated: 2026-07-06
+#
+# SINGLE SOURCE. Defines the (openclaw-webhooks) named snippet. Imported
+# (top-level) by every Caddyfile variant
+#   docker/Caddyfile.{selfsigned,ca,acme}  via  import /etc/caddy/Caddyfile.openclaw-webhooks
+# and pulled into each variant's public :443 site block with
+#   import openclaw-webhooks
+# The Helm caddy ConfigMap (helm/yashigani/templates/configmaps.yaml) carries
+# the hand-coded K8s render of the same routes (yashigani-* service names),
+# gated on .Values.agentBundles.openclaw.enabled.
+#
+# WHY: with openclaw off the `edge` bridge (LAURA-I1-03 close), Slack/Telegram
+# webhooks can no longer reach openclaw:18789 directly (it was host-loopback
+# published; that publish is removed — internal-only bridges cannot DNAT).
+# Inbound now arrives EXCLUSIVELY through these Caddy routes:
+#   internet → caddy:443 /webhooks/{slack,telegram} → forward_auth verify
+#            → openclaw:18789 over the dedicated openclaw_ringfence bridge.
+#
+# FP-05 hardening (Laura threat model, all mandatory):
+#   * EXACT POST paths only — /webhooks/slack and /webhooks/telegram. The
+#     /webhooks/* fallthrough 404s everything else. openclaw's full API
+#     surface (health/admin/config on :18789) is NEVER published; there is
+#     deliberately no `reverse_proxy /*` to openclaw anywhere.
+#   * Fail-closed signature verification BEFORE openclaw sees the request:
+#     forward_auth → backoffice /auth/verify-webhook (mirrors the
+#     /auth/verify-mcp pattern, c3b1a0e6). forward_auth denies on ANY non-2xx
+#     from the verifier — backoffice down / endpoint missing / Redis down all
+#     read as DENY at the edge.
+#   * Replay dedupe + rate-limit live in the verifier (stock caddy:2.11.2 has
+#     no rate_limit module — same design decision as the Layer-B HMAC
+#     fallback, 2026-04-29: no custom Caddy build).
+#   * Body cap 1MB per route (Slack events + Telegram updates are KB-scale;
+#     openclaw mem_limit 1024m — unbounded POST would be API4:2023 DoS).
+#   * SSRF-back (FP-05/FP-07): URLs carried in webhook payloads (Slack
+#     response_url, Telegram file paths) are fetched by openclaw via the
+#     :18790 egress gateway ONLY — openclaw has no direct internet route at
+#     L3, so the inbound route cannot be used to trigger unfiltered outbound.
+#
+# ── CONTRACT — backoffice GET /auth/verify-webhook (Tom follow-up) ──────────
+# Caddy's forward_auth issues a GET subrequest with the ORIGINAL HEADERS but
+# NO BODY (Caddy strips the body on forward_auth subrequests — this is
+# documented Caddy behaviour and shapes the verification split below).
+#
+#   Request (from Caddy, over internal mTLS + Layer-B HMAC header):
+#     GET /auth/verify-webhook?provider={slack|telegram}
+#     X-Forwarded-Method: <original method>     (set by forward_auth)
+#     X-Forwarded-Uri:    <original URI>        (set by forward_auth)
+#     X-Caddy-Verified-Secret: <layer-B HMAC>   (inject-caddy-verified)
+#     + all original client headers (Slack/Telegram signature headers included)
+#
+#   MUST enforce, fail-closed (any failure → 401; store down → 503; never 2xx
+#   on a downgrade path — release-gate SOP 4):
+#     0. CaddyVerifiedMiddleware Layer-B check (present for every backoffice
+#        route already) — a direct public call to /auth/verify-webhook without
+#        the per-install secret is 401 by construction.
+#     1. X-Forwarded-Method == POST.
+#     2. provider == slack:
+#          a. X-Slack-Request-Timestamp present, integer, |now - ts| <= 300s.
+#          b. X-Slack-Signature present, format v0=<64 hex>.
+#          c. Replay dedupe: Redis SETNX sha256(X-Slack-Signature) TTL 600s;
+#             duplicate → 401. (The signature is a deterministic MAC over
+#             v0:ts:body, so an exact replay is detectable WITHOUT the body.)
+#        provider == telegram:
+#          a. X-Telegram-Bot-Api-Secret-Token present; constant-time compare
+#             (hmac.compare_digest) against the per-install secret at
+#             /run/secrets/openclaw_telegram_webhook_secret (install.sh mint;
+#             operator supplies the same value to Telegram setWebhook).
+#     3. Rate-limit: per-IP (X-Real-IP) and global buckets in Redis;
+#        exceeded → 429 (Caddy copies it to the client — still a deny).
+#     4. Audit every deny on the tamper-evident chain
+#        (WEBHOOK_INGRESS_DENIED event type, mirroring MCP_INGRESS_DENIED).
+#     5. Unknown/missing provider param → 401.
+#
+#   Body-MAC layer split (documented per Laura FP-05 "document which"):
+#   the Slack HMAC is computed over v0:ts:BODY; the verifier subrequest has no
+#   body, so full HMAC verification happens at the body-holding hop — openclaw's
+#   Slack channel integration verifies the signing secret before any
+#   side-effect (standard Slack SDK behaviour; openclaw is configured with the
+#   signing secret). The verifier enforces freshness + exact-replay dedupe +
+#   rate + shape at the edge. Telegram verification (header secret_token) is
+#   COMPLETE at the verifier. Laura Phase-3 test (d) proves the end-to-end
+#   drop; if openclaw's Slack verification cannot be evidenced, the escalation
+#   is a Tom verify-AND-RELAY endpoint (full body), never a weaker gate.
+# ─────────────────────────────────────────────────────────────────────────────
+(openclaw-webhooks) {
+    # ── Slack events / slash-commands / interactivity ───────────────────────
+    handle /webhooks/slack {
+        route {
+            @not_post not method POST
+            respond @not_post "Method Not Allowed" 405
+            request_body {
+                max_size 1MB
+            }
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
+            import inject-caddy-verified
+                uri /auth/verify-webhook?provider=slack
+            }
+            reverse_proxy http://openclaw:18789 {
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+            }
+        }
+    }
+
+    # ── Telegram bot updates ─────────────────────────────────────────────────
+    handle /webhooks/telegram {
+        route {
+            @not_post not method POST
+            respond @not_post "Method Not Allowed" 405
+            request_body {
+                max_size 1MB
+            }
+            forward_auth https://backoffice:8443 {
+            import internal-mtls
+            import inject-caddy-verified
+                uri /auth/verify-webhook?provider=telegram
+            }
+            reverse_proxy http://openclaw:18789 {
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_host}
+            }
+        }
+    }
+
+    # Default-deny for the webhook namespace — nothing else under /webhooks/
+    # exists, and openclaw's wider :18789 surface is never published.
+    handle /webhooks/* {
+        respond "Not Found" 404
+    }
+}

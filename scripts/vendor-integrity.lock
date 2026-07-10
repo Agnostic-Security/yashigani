@@ -1,0 +1,43 @@
+# vendor-integrity.lock — SHA-384 integrity hashes for vendored third-party assets
+#
+# Format: sha384-<base64>  <relative-path-from-repo-root>
+#
+# These hashes match the integrity= attribute values used in HTML templates.
+# The Dockerfile.backoffice build-time gate verifies every entry here against
+# the actual file in the image (see Dockerfile.backoffice build-integrity layer).
+#
+# To update: run the vendor step (see scripts/vendor-audit-log.md), then:
+#   openssl dgst -sha384 -binary <file> | openssl base64 -A
+# and update the hash here AND in the corresponding HTML template integrity= attribute.
+#
+# CRITICAL: any change to a file under static/vendor/ MUST produce a lock-file
+# update in the same commit. The build-time gate will fail the Docker build
+# if hashes do not match.
+
+# Phase-1 integration fix (RECONCILIATION-20260627): ESM builds at UI-imported paths
+# All three files audited: 0 eval() occurrences; CSP-clean under no-unsafe-eval.
+# Old UMD/version-stamped files (purify-3.4.11.min.js, marked-18.0.5.min.js,
+# lit-all-3.3.3.min.js) remain in the tree for provenance but are NOT served by
+# the UI and are excluded from this lock (gate checks only ACTUAL served files).
+sha384-78CXiC89zTlJuiThUqPO9bq+aZYATjt07Gu4vQPHmVsGgA1xcSeLOdUMbnJlrpgT  static/vendor/dompurify/purify.es.mjs
+sha384-vdFRmGkHN1y8o9A9ZKPX+Eg7+/zFN16IhGIN9en7KokS0KIXsAmb7vmH9Hk4mChh  static/vendor/marked/marked.esm.js
+sha384-cBzrHZ8u4IIGOvDAM8EvZTPl/pjhSl5VSC5gtkUvAi10eJbxv8gLfqW6Z7E8EceE  static/vendor/lit/lit-core.min.js
+
+# ── Phase 4: Drawflow 0.0.60 ─────────────────────────────────────────────────
+# drawflow.esm.js — patched ESM shim wrapping the UMD build.
+#   Source: https://registry.npmjs.org/drawflow/-/drawflow-0.0.60.tgz
+#   Eval audit: PASS on source UMD (no eval/Function/setTimeout-str/document.write).
+#   TT patches: 6 innerHTML="" / "x" → textContent; 2 innerHTML=var → __df_tt()
+#   (zero-allowlist DOMPurify + drawflow-label TT policy). See vendor-audit-log.md.
+sha384-8u9QSHa0NpNzUh7hK3NiCiTkf7Uduk/Nhhwh/tw9mG0YnBEOVlEYwpZHsHpyFQxw  static/vendor/drawflow/drawflow.esm.js
+sha384-IFh+Q6zh+LRcTjqVmAKetdGY59dT485vtvWT5DAKQy8iv5+fYWHXisHP7mFKcFqV  static/vendor/drawflow/drawflow.min.css
+
+# ── Deferred (Phase 1 - swagger-ui remediation) ──────────────────────────────
+# swagger-ui-bundle.js KNOWN FAIL on eval audit (webpack eval source-maps).
+# Must be rebuilt with devtool:false. See spec §3.6 and vendor-audit-log.md.
+# Existing file at static/swagger-ui/swagger-ui-bundle.js is NOT in this lock
+# because it predates the integrity gate and has not been remediated yet.
+# DO NOT add to lock until remediated.
+# sha384-<PENDING>  static/vendor/swagger-ui/swagger-ui-bundle-<version>.js
+# sha384-<PENDING>  static/vendor/swagger-ui/swagger-ui.min.css
+# sha384-<PENDING>  static/vendor/redoc/redoc.standalone-<version>.js

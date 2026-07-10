@@ -262,6 +262,30 @@ When `data.yashigani.rbac.groups` is empty (`{}`), the RBAC gate is **open** —
 
 > **Warning:** Leave RBAC disabled only during initial setup. Enable it before going to production by creating at least one group and assigning users.
 
+### Pinned policy constants (NOT data-overridable)
+
+Some policy-tuning values are **deliberately compiled into the policy, not read from the data
+document** — so they cannot be changed at runtime via the OPA data API.
+
+**`mcp_chain_max_depth` — MCP-C multi-hop chain-depth limit.** Pinned to **9** in
+`policy/mcp.rego`. This is the maximum identity-chain depth OPA will accept for a multi-hop
+MCP-C call (origin → relays → gateway); a chain deeper than this is denied (fail-closed) as a
+likely routing loop, confused-deputy, or injection attempt. 9 covers complex multi-agent + MCP
+workflows; each hop is independently JWT/SPIFFE-authenticated, so depth is a sanity backstop,
+not the authentication control.
+
+- **Why it is a constant, not data (YSG-RISK-056 / CWE-15):** it was previously read from
+  `data.yashigani.mcp.policy.chain_max_depth`, which is writable at runtime through the OPA
+  REST data API (the same path the RBAC sync uses). Any holder of a policy-write cert could
+  raise the limit and defeat the guard. Pinning removes that external-control surface.
+- **To change it** (a deliberate, reviewed change — *not* a runtime knob): edit the constant in
+  `policy/mcp.rego` **and** keep the two enforcement defaults in sync — `chain_max_depth` in
+  `src/yashigani/mcp/broker.py` (gateway pre-validation) and `_DEFAULT_CHAIN_MAX_DEPTH` in
+  `src/yashigani/mcp/_jwt.py` (issuer) — then redeploy the policy bundle.
+- **Roadmap:** a governed, audited **admin-UI setting** for this value is tracked in the
+  Yashigani backlog (replacing the hardcoded constant). Consider pairing it with a
+  no-repeat/cycle check so loop defense is identity-based rather than purely depth-based.
+
 ---
 
 ## 5. Decision Flow — How `allow` Is Computed

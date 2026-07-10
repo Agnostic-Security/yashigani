@@ -15,7 +15,7 @@
     "mode": "replace",
     "providers": {
       "yashigani": {
-        "baseUrl": "http://gateway:8081/v1",
+        "baseUrl": "http://egress-openclaw:9400/llm/v1",
         "apiKey": "__YASHIGANI_INTERNAL_BEARER__",
         "api": "openai-completions",
         "models": [
@@ -32,6 +32,12 @@
   "agents": {
     "defaults": {
       "model": "yashigani/qwen2.5:3b"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "apiRoot": "http://egress-openclaw:9400/telegram"
     }
   }
 }

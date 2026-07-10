@@ -1,2 +1,37 @@
-{{/* Namespace is created by helm install --create-namespace.
-     This template is intentionally empty to avoid conflicts. */}}
+{{- /*
+  B13 fix (Laura F-002) — namespace manifest INTENTIONALLY EMPTY here.
+  
+  History:
+    - v2.25.0 P2 wave 2 (commit 6a8406e, Captain): added Namespace manifest
+      with PSA baseline labels, gated on .Release.IsInstall
+    - Live-verify (kind v1.35.0) caught two compounding bugs:
+      - LIVE-B13-001: `--create-namespace` race silently dropped PSA labels
+      - LIVE-B13-002: enforce=baseline rejected caddy (NET_ADMIN required)
+      - and a third on the v1 fix: helm.sh/hook annotation broke release tracking
+      - and a fourth: unconditional Namespace + --create-namespace + --atomic
+        triggered full rollback on Namespace-already-exists conflict
+  
+  Resolution: chart no longer manages the Namespace resource. install.sh's
+  k8s_helm_install() pre-creates the namespace with PSA warn+audit baseline
+  labels BEFORE running `helm install` (without --create-namespace). This
+  separates concerns cleanly:
+    - install.sh owns the namespace lifecycle + PSA labels
+    - helm chart owns workload resources only
+  
+  Operators bypassing install.sh and running `helm install` directly MUST:
+    1. Pre-create the namespace with PSA labels:
+         kubectl create namespace yashigani
+         kubectl label namespace yashigani \
+           pod-security.kubernetes.io/warn=baseline \
+           pod-security.kubernetes.io/warn-version=latest \
+           pod-security.kubernetes.io/audit=baseline \
+           pod-security.kubernetes.io/audit-version=latest
+    2. Run helm install WITHOUT --create-namespace
+  
+  Hard enforcement (enforce=baseline) is NOT applied — caddy needs CAP_NET_ADMIN
+  which baseline forbids, and PSA has no per-pod exception mechanism. Operators
+  wanting hard enforcement should install Kyverno + set admissionPolicies.enabled
+  =true (which can express the caddy exemption).
+  
+  YSG-RISK-008: B13 / Laura F-002.
+*/ -}}

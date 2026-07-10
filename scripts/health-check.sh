@@ -252,7 +252,7 @@ fi
 
 # 3. Postgres
 _check_compose_exec "Postgres" "postgres" \
-  "pg_isready -U yashigani_app" "accepting connections"
+  "pg_isready -U yashigani_admin" "accepting connections"
 
 # 4. Redis — v2.23.1: TLS-only on 6380 with client-cert auth.
 # Uses redis_client.crt mounted into the redis container (same cert the

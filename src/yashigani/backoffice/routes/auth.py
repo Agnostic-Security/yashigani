@@ -1,14 +1,32 @@
 """
 Yashigani Backoffice — Authentication routes.
-POST /auth/login                   — username + password + TOTP
-POST /auth/logout                  — invalidate session
+POST /auth/login                   — username + password + TOTP (returns redirect_to for role routing)
+POST /auth/logout                  — invalidate session (any session tier — single-logout fix)
+GET  /auth/logout-redirect         — browser-navigable single-logout (Phase 2: OWUI signout redirect target)
 GET  /auth/status                  — check session validity
+GET  /auth/verify                  — Caddy forward_auth for data-plane (user sessions only)
+GET  /auth/verify-admin            — Caddy forward_auth for /admin/* (admin sessions only)
+GET  /auth/verify-user             — Caddy forward_auth for /app/webui and user paths (user sessions only; rejects admin)
 POST /auth/password/change         — forced change on first login
 POST /auth/totp/provision          — TOTP + recovery codes provisioning
 POST /auth/stepup                  — V6.8.4 step-up TOTP verification for high-value flows
 GET  /auth/post-login-redirect     — server-side next= validator + redirect (drift audit #6)
 
-Last updated: 2026-05-25T00:00:00+00:00
+Phase 1 changes (2026-06-12, feat/2.25.5-auth-ingress):
+  - login() now returns redirect_to ("/admin/" for admin, "/app/webui" for user) so the
+    login JS can navigate role-appropriately without a separate server roundtrip.
+  - logout() changed from AdminSession → AnySession: user-tier sessions were trapped
+    because the admin-only guard prevented logout (the "no end-user logout" bug).
+  - verify-user endpoint added: accepts user-tier sessions, explicitly rejects admin
+    sessions.  Caddy uses it for the /app/webui forward_auth leg.
+  - Both /auth/verify and /auth/verify-user reject admin sessions (SoD-003 preserved).
+
+Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
+  - logout-redirect endpoint added: GET version of logout for browser navigation.
+    OWUI's WEBUI_AUTH_SIGNOUT_REDIRECT_URL points here so its logout button clears
+    the Yashigani session cookie.  See Phase 2 notes.
+
+Last updated: 2026-06-13T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -180,6 +198,24 @@ def _check_ip_access(client_ip: str) -> None:
             )
 
 
+def _real_client_ip(request: Request) -> str:
+    """Real client IP for per-IP throttle + audit keys (LAURA-3X-001).
+
+    Caddy is the SOLE ingress and overwrites ``X-Real-IP`` with the actual TCP
+    peer (``{remote_host}``) on every proxied request, so it is trustworthy and
+    NOT client-spoofable.  ``X-Forwarded-For`` is deliberately NOT used here: Caddy
+    *appends* the peer to any client-supplied XFF, so ``XFF.split(',')[0]`` is
+    attacker-controlled and unsafe for a throttle key.  ``request.client.host`` is
+    the Caddy container IP behind the proxy and MUST NOT be used for per-IP
+    throttling — it collapses every client to one key, letting any single source
+    lock out all admin logins for the throttle window (LAURA-3X-001, DoS).
+    """
+    xri = request.headers.get("x-real-ip", "").strip()
+    if xri:
+        return xri.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _apply_auth_throttle(client_ip: str, response: Response) -> None:
     """
     Check per-IP and global failure counters.  If either exceeds its threshold,
@@ -292,7 +328,11 @@ def _reset_ip_auth_failures(client_ip: str) -> None:
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 digits (users/SHA-256) or 8 digits (admins/SHA-512).
+    # The server validates the exact count against the account's totp_algorithm
+    # after role resolution — the route cannot know the tier before looking up
+    # the account.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class PasswordChangeRequest(BaseModel):
@@ -301,12 +341,14 @@ class PasswordChangeRequest(BaseModel):
 
 
 class TotpConfirmRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class SelfServiceResetRequest(BaseModel):
     username: str = Field(min_length=3)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/login")
@@ -317,7 +359,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     Returns 401 for any failure (no credential enumeration).
     Includes brute-force throttle per ASVS 6.3.5.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001: real peer, not Caddy IP
 
     # Check order: allowlist → blocklist → throttle → auth
     _check_ip_access(client_ip)
@@ -350,6 +392,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
     if not success:
         _record_auth_failure(client_ip)
         state.audit_writer.write(_make_login_event(body.username, "failure", reason))
+        try:
+            from yashigani.metrics.registry import auth_login_attempts_total
+            auth_login_attempts_total.labels(outcome="failure").inc()
+        except Exception:  # noqa: BLE001 — metric must never break auth
+            pass
         # QA Wave 2 Issue 7 — do NOT disclose server_time to unauthenticated
         # callers. TOTP drift diagnostics only belong in authenticated flows
         # (/auth/password/change, /auth/totp/provision/confirm) where the
@@ -428,6 +475,55 @@ async def login(body: LoginRequest, request: Request, response: Response):
             record.force_password_change = True
             _log.info("Password expired: user=%s age=%d days, max=%d", record.username, int(age_days), max_age_days)
 
+    # LAURA-V400-NEW-002 (ASVS V2.1.7): enforce force_password_change server-side
+    # for user-tier accounts.  A user whose account has force_password_change=True
+    # (set by an admin force-reset or by password expiry above) receives a
+    # RESTRICTED session with account_tier="password_change_required".
+    #
+    # This mirrors the totp_provisioning tier pattern:
+    #   - "password_change_required" sessions are accepted by require_any_session
+    #     (so /auth/password/change and /auth/logout remain reachable).
+    #   - "password_change_required" sessions are REJECTED by require_user_session
+    #     (all /user/* and data-plane endpoints are blocked).
+    #   - Once the user changes their password (/auth/password/change), ALL sessions
+    #     are invalidated (ASVS V2.1.4); the user must log in again to get a full
+    #     session.
+    #
+    # Admin accounts with force_password_change=True are NOT restricted here —
+    # they already go through the totp_provisioning path if applicable, and the
+    # admin plane has separate controls. This fix targets user-plane bypass only.
+    if record.force_password_change and record.account_tier == "user":
+        restricted_session = state.session_store.create(
+            account_id=record.account_id,
+            account_tier="password_change_required",
+            client_ip=client_ip,
+        )
+        state.audit_writer.write(
+            _make_login_event(
+                body.username,
+                "password_change_restricted",
+                None,
+                account_tier=record.account_tier,
+            )
+        )
+        _log.info(
+            "LAURA-V400-NEW-002: password_change_required session issued for %s "
+            "(force_password_change=True). All /user/* endpoints blocked until "
+            "password is changed via /auth/password/change.",
+            body.username,
+        )
+        _set_session_cookie(response, restricted_session.token, "password_change_required")
+        return {
+            "status": "ok",
+            "force_password_change": True,
+            "force_totp_provision": record.force_totp_provision,
+            "redirect_to": "/chat",
+            "message": (
+                "Your password must be changed before you can access this account. "
+                "POST to /auth/password/change to set a new password."
+            ),
+        }
+
     # Gap 3 / v2.23.4 arch-completion: register HUMAN identity before session
     # creation so a seat-limit rejection prevents session issuance (fail-closed).
     # Skips silently when identity_registry is None (community-tier).
@@ -441,31 +537,119 @@ async def login(body: LoginRequest, request: Request, response: Response):
     )
 
     state.audit_writer.write(_make_login_event(body.username, "success", None, account_tier=record.account_tier))
+    try:
+        from yashigani.metrics.registry import auth_login_attempts_total
+        auth_login_attempts_total.labels(outcome="success").inc()
+    except Exception:  # noqa: BLE001 — metric must never break auth
+        pass
+
+    # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
+    # admin → /admin/  (admin console)
+    # user  → /chat    (4.0 user chat SPA; avoids false-positive OPEN_REDIRECT audit
+    #                   and the 3-hop redirect that / → catch-all → /chat produces)
+    # Any other tier (totp_provisioning is handled above) → /chat as safe fallback.
+    if record.account_tier == "admin":
+        redirect_to = "/admin/"
+    elif record.account_tier == "user":
+        redirect_to = "/chat"
+    else:
+        redirect_to = "/chat"
 
     _set_session_cookie(response, session.token, record.account_tier)
     return {
         "status": "ok",
         "force_password_change": record.force_password_change,
         "force_totp_provision": record.force_totp_provision,
+        # role-based redirect destination for the login JS; validated server-side
+        # by /auth/post-login-redirect when following the normal login flow.
+        "redirect_to": redirect_to,
     }
 
 
 @router.post("/logout")
 async def logout(
-    session: AdminSession,
+    session: AnySession,  # Phase 1 fix: was AdminSession — user-tier sessions were trapped (no end-user logout bug)
     response: Response,
     store=Depends(get_session_store),
 ):
+    """
+    Single-logout endpoint.  Clears the session regardless of tier (admin or user).
+
+    Phase 1 / 2.25.5-auth-ingress: changed from AdminSession → AnySession so
+    user-tier accounts can reach this endpoint.  Previously a user-tier session
+    received HTTP 403 from require_admin_session and was permanently trapped
+    (no working end-user logout).
+
+    Security: the session token is invalidated in Redis and BOTH cookies
+    (__Host-yashigani_admin_session and __Host-yashigani_session) are cleared.
+    An expired/invalidated session calling this endpoint returns HTTP 401 from
+    require_any_session before reaching this handler — no unauthenticated
+    session-clearing is possible.
+    """
     store.invalidate(session.token)
     response.delete_cookie(_SESSION_COOKIE, path="/")
     response.delete_cookie(_USER_SESSION_COOKIE, path="/")
     # AU.L2-3.3.1 / OWASP A09: emit audit event for every auth lifecycle action.
-    # All other auth outcomes (login success/failure, totp_provision, stepup,
-    # self_reset) are audited; logout was the only gap (yashigani-retro#95).
     state = backoffice_state
     if state.audit_writer is not None:
         state.audit_writer.write(_make_login_event(session.account_id, "logout", None, account_tier=session.account_tier))
     return {"status": "ok"}
+
+
+@router.get("/logout-redirect")
+async def logout_redirect(
+    request: Request,
+    response: Response,
+    store=Depends(get_session_store),
+):
+    """
+    Browser-navigable single-logout endpoint.
+
+    Phase 2 / 2.25.5-auth-ingress: OWUI (with WEBUI_AUTH=false) calls its own
+    /api/v1/auths/signout endpoint, which — when WEBUI_AUTH_SIGNOUT_REDIRECT_URL is
+    set — returns {"status": true, "redirect_url": "<url>"} to the SvelteKit client.
+    The client then navigates the browser to that URL.  We point it here so clicking
+    the logout button inside /app/webui actually clears the Yashigani session cookie.
+
+    Behaviour:
+      - Valid session (admin or user): invalidate in Redis, clear both cookies,
+        redirect to /login.
+      - No session / expired session: clear cookies defensively, redirect to /login.
+        (Not a security issue: if there is nothing to invalidate, forcing the user
+        back to /login is correct.)
+
+    Security: this is a GET handler that modifies state.  The CSRF risk is accepted
+    because:
+      1. Logging out is not a sensitive state change (worst-case: nuisance logout).
+      2. OWUI does NOT support submitting a POST form redirect via WEBUI_AUTH_SIGNOUT_REDIRECT_URL;
+         it only performs a browser navigation (window.location).
+      3. The action is idempotent — a forged logout just forces a re-login.
+    """
+    # Try to read the session token from either cookie name.
+    token = (
+        request.cookies.get(_USER_SESSION_COOKIE)
+        or request.cookies.get(_SESSION_COOKIE)
+    )
+
+    state = backoffice_state
+    if token:
+        try:
+            store.invalidate(token)
+            if state.audit_writer is not None:
+                # Resolve the account_id from the session if it is still valid.
+                session_data = store.get(token)
+                account_id = session_data.account_id if session_data else "unknown"
+                state.audit_writer.write(
+                    _make_login_event(account_id, "logout", None)
+                )
+        except Exception:
+            # Session already expired / gone — still clear the cookies.
+            pass
+
+    redirect = _RedirectResponse(url="/login", status_code=302)
+    redirect.delete_cookie(_SESSION_COOKIE, path="/")
+    redirect.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    return redirect
 
 
 @router.get("/status")
@@ -509,9 +693,18 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
 
     # Use the auth service's Postgres-backed replay cache so the self-service
     # path can't be abused for TOTP replay.
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
     # pylint: disable=protected-access
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _SELF_RESET_ROLE_DIGITS
+    _self_reset_digits = _SELF_RESET_ROLE_DIGITS.get(record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        if not await state.auth_service._verify_totp_with_replay(conn, record.totp_secret, body.totp_code):
+        if not await state.auth_service._verify_totp_with_replay(
+            conn,
+            record.totp_secret,
+            body.totp_code,
+            algorithm=record.totp_algorithm,
+            digits=_self_reset_digits,
+        ):
             raise generic_error
 
     # TOTP valid — generate new temporary password and persist via the
@@ -588,7 +781,7 @@ async def verify_session(request: Request):
     # NIST AC-5 / OWASP ASVS V4.1.2 / ISO 27001 A.5.16 / v2.24.1 Iris #96.
     if session.account_tier == "admin":
         from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
-        _client_ip = request.client.host if request.client else "unknown"
+        _client_ip = _real_client_ip(request)  # LAURA-3X-001
         from yashigani.auth.session import _mask_ip as _verify_mask_ip
         if state.audit_writer is not None:
             state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
@@ -610,6 +803,22 @@ async def verify_session(request: Request):
             },
         )
 
+    # LAURA-V400-NEW-002: defence-in-depth — block password_change_required sessions
+    # at the Caddy forward_auth layer so they cannot reach any data-plane resource.
+    # The primary enforcement is at require_user_session in middleware.py; this is
+    # the early-rejection layer (Caddy sees 403 → does not forward the request).
+    if session.account_tier == "password_change_required":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "password_change_required",
+                "message": (
+                    "You must change your password before accessing this resource. "
+                    "POST to /auth/password/change to set a new password."
+                ),
+            },
+        )
+
     # Resolve account from account_id
     record = await state.auth_service.get_account_by_id(session.account_id)
 
@@ -625,6 +834,614 @@ async def verify_session(request: Request):
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
     return resp
+
+
+@router.get("/verify-admin")
+async def verify_admin_session(request: Request):
+    """
+    Caddy forward_auth for ADMIN-only operator proxies (Grafana / Wazuh / Prometheus
+    under /admin/*). This is the INVERSE of /auth/verify: it REQUIRES a valid admin
+    session (account_tier == "admin") and rejects user-tier, provisioning-state, and
+    anonymous requests.
+
+    SoD-003 bars admins from the DATA plane (/auth/verify), but the operator
+    monitoring dashboards are an ADMIN function — admins must reach them and normal
+    users must not. Using /auth/verify here (the bug) rejected admins outright.
+    200 + identity headers → Caddy proceeds. 401 → redirect to /admin/login.
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+    token = request.cookies.get(_SESSION_COOKIE)  # admin cookie only
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    session = state.session_store.get(token)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    if session.account_tier != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_session_required",
+                "message": "These operator dashboards require an admin session.",
+            },
+        )
+    record = await state.auth_service.get_account_by_id(session.account_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    from starlette.responses import Response as StarletteResponse
+
+    resp = StarletteResponse(status_code=200)
+    email = record.email or f"{record.username}@yashigani.local"
+    resp.headers["X-Forwarded-User"] = email
+    resp.headers["X-Forwarded-Name"] = record.username
+    resp.headers["X-Forwarded-Email"] = email
+    return resp
+
+
+@router.get("/verify-user")
+async def verify_user_session(request: Request):
+    """
+    Caddy forward_auth endpoint for USER paths (/app/webui and its sub-paths).
+
+    Phase 1 / 2.25.5-auth-ingress.  The split-verify pattern:
+      /auth/verify-admin → admin sessions only  (for /admin/*)
+      /auth/verify       → user sessions only   (existing data-plane / OWUI catch-all)
+      /auth/verify-user  → user sessions only   (this endpoint, for /app/webui)
+
+    Accepts any authenticated SESSION with account_tier == "user".
+    Rejects admin sessions with HTTP 403 (SoD preserved — admins never reach the
+    user/OWUI path, even if they have a valid session).
+    Rejects unauthenticated or expired sessions with HTTP 401.
+
+    On 200: sets X-Forwarded-User/Name/Email headers for OWUI trusted-header auth.
+    On 401: Caddy redirects to /login?next=<path>.
+    On 403: Caddy surfaces an authorization error (not a login redirect).
+
+    NIST AC-5 / ASVS V4.1.2 / design: auth-ingress-architecture-20260612.md
+    """
+    state = backoffice_state
+    assert state.auth_service is not None  # set unconditionally at startup
+    assert state.session_store is not None  # set unconditionally at startup
+
+    # Accept both user cookie and admin cookie names for flexibility; the tier
+    # check below enforces the actual restriction.
+    token = request.cookies.get(_USER_SESSION_COOKIE) or request.cookies.get(_SESSION_COOKIE)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    session = state.session_store.get(token)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # Admin sessions MUST NOT access user paths.
+    # This is the /app/webui-side mirror of SoD-003 (which blocks admin on /auth/verify).
+    if session.account_tier == "admin":
+        _log.warning(
+            "verify-user: rejected admin session account_id=%s — "
+            "admins cannot access user paths (/app/webui)",
+            session.account_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_session_not_allowed_user_path",
+                "message": (
+                    "Admin accounts cannot access user paths. "
+                    "Use your admin console at /admin/."
+                ),
+            },
+        )
+
+    # Reject provisioning-state sessions (must finish TOTP enrolment first).
+    if session.account_tier == "totp_provisioning":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "totp_provisioning_incomplete",
+                "message": "Complete TOTP enrolment before accessing this resource.",
+            },
+        )
+
+    # LAURA-V400-NEW-002: reject password_change_required sessions.
+    # User must change their temporary/expired password via /auth/password/change
+    # before accessing any data-plane resource.
+    if session.account_tier == "password_change_required":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "password_change_required",
+                "message": (
+                    "You must change your password before accessing this resource. "
+                    "POST to /auth/password/change to set a new password."
+                ),
+            },
+        )
+
+    # Only user-tier sessions proceed past this point.
+    if session.account_tier != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "insufficient_tier",
+                "message": "This path requires a user-tier session.",
+            },
+        )
+
+    record = await state.auth_service.get_account_by_id(session.account_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # OWUI access is OPT-IN (Yashigani is API-first). A user-tier session is
+    # provisioned for the API by default (the `users` caller group); reaching
+    # OpenWebUI (served at root) additionally requires membership of the
+    # `owui-users` RBAC group. Membership lives in the RBAC store
+    # (group.members = emails), NOT identity_registry.groups (empty for RBAC
+    # members). Skip-allow when the RBAC store or owui-users group is absent
+    # (community/non-standard deploy) — never lock everyone out. (YSG 2.25.5
+    # a64331e + c751e15; see docs/operator-guide.md §5.6.)
+    _rbac = getattr(state, "rbac_store", None)
+    if _rbac is not None:
+        _email = (record.email or f"{record.username}@yashigani.local").strip().lower()
+        _owui_grp = next(
+            (grp for grp in _rbac.list_groups()
+             if str(getattr(grp, "display_name", "")).lower() == "owui-users"),
+            None,
+        )
+        if _owui_grp is not None:
+            _members = {str(m).strip().lower() for m in (_owui_grp.members or set())}
+            if _email not in _members:
+                _log.info(
+                    "verify-user: user %s not in owui-users RBAC group — denying "
+                    "OpenWebUI access (API-first; user has API access only)",
+                    record.username,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "owui_access_required",
+                        "message": (
+                            "Your account does not have OpenWebUI access. Ask an "
+                            "administrator to add you to the owui-users group."
+                        ),
+                    },
+                    headers={"X-Authz-Reason": "owui_access_required"},
+                )
+
+    from starlette.responses import Response as StarletteResponse
+
+    resp = StarletteResponse(status_code=200)
+    email = record.email or f"{record.username}@yashigani.local"
+    resp.headers["X-Forwarded-User"] = email
+    resp.headers["X-Forwarded-Name"] = record.username
+    resp.headers["X-Forwarded-Email"] = email
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 1c — /auth/verify-mcp: forward_auth gate for the per-MCP wrap
+# ---------------------------------------------------------------------------
+
+# server_id / tenant_id slugs (mirrors mcp_servers._SAFE_SERVER_ID_RE — 1–63
+# chars, alphanumeric start, [-_] allowed). Anything else is denied outright.
+_VERIFY_MCP_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}$")
+
+# v4.1 §2.5 — backoffice transport-subject allow (CLOSED allowlist, Lu-review
+# item): the backoffice mesh leaf (spiffe://<td>/backoffice) is a legitimate
+# dispatcher ONLY toward the bundled langflow front (user_agents draft-flow
+# creation + langflow_client.create_flow via YASHIGANI_LANGFLOW_URL).  Every
+# other (subject=backoffice, server) pair keeps the deny — this is a
+# positive, server-scoped grant, not a blanket transport identity.  The
+# tenant conjunct is enforced in the route (must equal the install tenant).
+# No OPA/rego change: this gate is Python-only (mcp.rego governs egress
+# grants + broker tool results, not the §2.5 ingress transport subjects).
+_VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS: frozenset[str] = frozenset({"langflow"})
+
+
+def _verify_mcp_install_tenant() -> str:
+    """This install's tenant id (mirrors mcp_servers._install_tenant)."""
+    return os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+
+
+def _verify_mcp_envelope_service():
+    """Live CapabilityEnvelopeService over the asyncpg pool (patchable in tests)."""
+    from yashigani.db import get_pool
+    from yashigani.mcp.envelope_service import CapabilityEnvelopeService
+    return CapabilityEnvelopeService(get_pool())
+
+
+def _verify_mcp_audit_deny(
+    reason: str, subject: str, tenant: str, server: str,
+) -> None:
+    """Best-effort MCP_INGRESS_DENIED audit write (never raises)."""
+    aw = backoffice_state.audit_writer
+    if aw is None:
+        return
+    try:
+        from yashigani.audit.schema import McpIngressDeniedEvent
+        aw.write(McpIngressDeniedEvent(
+            subject_spiffe_id=subject,
+            tenant_id=tenant,
+            server_id=server,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001 — audit must never mask the deny
+        _log.error("verify-mcp: MCP_INGRESS_DENIED audit write failed: %s", exc)
+
+
+def _verify_mcp_deny(
+    status_code: int, reason: str, subject: str, tenant: str, server: str,
+) -> HTTPException:
+    """Audit + build the deny response (Caddy treats any non-2xx as DENY)."""
+    _verify_mcp_audit_deny(reason, subject, tenant, server)
+    _log.warning(
+        "verify-mcp: DENY reason=%s subject=%r tenant=%r server=%r",
+        reason, subject, tenant, server,
+    )
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": reason},
+        headers={"X-Authz-Reason": reason},
+    )
+
+
+@router.get("/verify-mcp")
+async def verify_mcp_ingress(request: Request, tenant: str = "", server: str = ""):
+    """
+    Caddy forward_auth gate for the per-MCP Caddy-front wrap (v4.1 Phase 1c,
+    SYNTHESIS.md Issue-1 step 3/6; snippet contract in codegen
+    ``_gen_caddy_snippet_mcp`` / tests/contracts/test_codegen_mcp_caddy_front.py).
+
+    Trust model — the subject identity is NEVER a spoofable client header:
+      * The per-MCP mesh listener terminates mTLS ``require_and_verify``
+        against the internal intermediate CA, then STRIP-BEFORE-SETS
+        ``X-SPIFFE-ID`` from the VERIFIED peer cert URI SAN.
+      * The forward_auth hop to this endpoint presents caddy_client.crt
+        (backoffice mTLS, ``--ssl-cert-reqs 2``) and carries
+        ``X-Caddy-Verified-Secret`` (Layer B HMAC).  ``CaddyVerifiedMiddleware``
+        401s any request without the valid secret, and
+        ``SpiffePeerCertMiddleware`` (Option C) strips ``x-spiffe-id`` unless
+        the secret validated — so an ``x-spiffe-id`` value observed here is
+        Caddy-set-from-verified-peer by construction.
+
+    Authorisation (fail-closed at every step):
+      * Subject == ``spiffe://<td>/gateway`` → ALLOW (the broker's mesh
+        transport identity; per-tool authz stays with the broker's OPA leg —
+        SYNTHESIS Issue-2 role split; per-instance grant objects land in
+        Phase 2 with Lu's rego).
+      * Subject == ``spiffe://<td>/backoffice`` → ALLOW only toward the
+        bundled langflow front in this install's tenant (v4.1 §2.5 closed
+        allowlist — the backoffice dispatches draft-flow creation through
+        langflow's ingress front); every other target denies
+        ``transport_subject_not_allowed``.
+      * Subject matching Nico's per-instance contract
+        ``spiffe://<td>/agents/<tenant>/<name>/<nhi_id>`` → ALLOW only when
+        the instance segment is present, the URI tenant equals the route
+        ``tenant``, the NHI exists in the registry with ``svid_issued`` set,
+        and the registered SPIFFE matches the presented one exactly.
+      * The target ``(tenant, server)`` must have an ACTIVE capability
+        envelope (durable registry) — un-onboarded servers deny.
+      * Registry / envelope store unavailable → 503 (deny, fail-closed).
+
+    Denies are audited (``MCP_INGRESS_DENIED``); allows are data-plane volume
+    and stay in app logs at DEBUG.
+    """
+    # 0. Route params must be sane slugs (they come from the generated snippet,
+    #    but validate anyway — zero-trust on our own config surface).
+    if not _VERIFY_MCP_SLUG_RE.match(tenant) or not _VERIFY_MCP_SLUG_RE.match(server):
+        raise _verify_mcp_deny(
+            status.HTTP_403_FORBIDDEN, "invalid_target", "", tenant, server,
+        )
+
+    # 1. Subject identity — Caddy-set from the VERIFIED peer cert (see above).
+    #    x-spiffe-id-peer-cert (this hop's own TLS peer = Caddy) is not the
+    #    subject; the wrap's verified client rides in x-spiffe-id.
+    subject = request.headers.get("x-spiffe-id", "").strip()
+    if not subject:
+        raise _verify_mcp_deny(
+            status.HTTP_401_UNAUTHORIZED, "no_spiffe_id", "", tenant, server,
+        )
+
+    from yashigani.identity.trust_domain import (
+        parse_agent_spiffe_uri,
+        trust_domain,
+    )
+
+    # 2a. Broker transport identity (gateway mesh leaf) — allowed.
+    if subject == f"spiffe://{trust_domain()}/gateway":
+        _log.debug(
+            "verify-mcp: ALLOW gateway transport tenant=%r server=%r",
+            tenant, server,
+        )
+    # 2a-ii. Backoffice transport identity (v4.1 §2.5) — allowed ONLY toward
+    # the bundled langflow front in this install's tenant (closed allowlist,
+    # _VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS).  Any other target keeps the
+    # deny (fail-closed).  Step 3's envelope requirement still applies.
+    elif subject == f"spiffe://{trust_domain()}/backoffice":
+        if (
+            server not in _VERIFY_MCP_BACKOFFICE_ALLOWED_SERVERS
+            or tenant != _verify_mcp_install_tenant()
+        ):
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "transport_subject_not_allowed",
+                subject, tenant, server,
+            )
+        _log.debug(
+            "verify-mcp: ALLOW backoffice transport tenant=%r server=%r",
+            tenant, server,
+        )
+    else:
+        # 2b. Per-instance agent identity (Nico's contract, GAP-1).
+        parsed_subject = parse_agent_spiffe_uri(subject)
+        if parsed_subject is None:
+            # Foreign trust domain or not under /agents/ — reject-foreign exact.
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "foreign_identity",
+                subject, tenant, server,
+            )
+        subj_tenant, _subj_name, subj_instance = parsed_subject
+        if not subj_instance:
+            # Legacy 2-segment URI — per-instance identity is REQUIRED at the
+            # wrap (two same-named agents must not share an ingress identity).
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "legacy_identity",
+                subject, tenant, server,
+            )
+        if subj_tenant != tenant:
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "cross_tenant",
+                subject, tenant, server,
+            )
+
+        registry = backoffice_state.agent_registry
+        if registry is None:
+            # Fail-closed: cannot corroborate the identity → deny, not allow.
+            raise _verify_mcp_deny(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "registry_unavailable",
+                subject, tenant, server,
+            )
+        nhi = registry.get(subj_instance)
+        if nhi is None or nhi.get("kind") != "nhi":
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "nhi_not_found",
+                subject, tenant, server,
+            )
+        if not nhi.get("svid_issued"):
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "nhi_not_approved",
+                subject, tenant, server,
+            )
+        registered_spiffe = (nhi.get("spiffe_id") or "").strip()
+        if registered_spiffe != subject:
+            # The presented (cert-verified) URI must match the registered
+            # identity byte-for-byte — a valid mesh cert for a DIFFERENT
+            # instance must not authorise this one.
+            raise _verify_mcp_deny(
+                status.HTTP_403_FORBIDDEN, "spiffe_mismatch",
+                subject, tenant, server,
+            )
+
+    # 3. Target must be onboarded: ACTIVE capability envelope for
+    #    (tenant, server) in the durable registry.
+    try:
+        svc = _verify_mcp_envelope_service()
+        rec = await svc.get_active_envelope(f"{tenant}:{server}")
+    except Exception as exc:  # noqa: BLE001 — store down ⇒ deny, never allow
+        _log.error("verify-mcp: envelope store unavailable: %s", exc)
+        raise _verify_mcp_deny(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "envelope_store_unavailable",
+            subject, tenant, server,
+        )
+    if rec is None or rec.tenant_id != tenant:
+        raise _verify_mcp_deny(
+            status.HTTP_403_FORBIDDEN, "server_not_onboarded",
+            subject, tenant, server,
+        )
+
+    _log.debug(
+        "verify-mcp: ALLOW subject=%r tenant=%r server=%r envelope_id=%d",
+        subject, tenant, server, rec.id,
+    )
+    from starlette.responses import Response as StarletteResponse
+    resp = StarletteResponse(status_code=200)
+    # Copied upstream by Caddy's forward_auth copy_headers if configured;
+    # also useful in access logs.
+    resp.headers["X-Yashigani-Mcp-Caller"] = subject
+    resp.headers["X-Yashigani-Mcp-Envelope"] = str(rec.id)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# v4.1 Phase 2b — /auth/verify-webhook: forward_auth gate for openclaw webhook
+# ingress (Caddyfile.openclaw-webhooks / LAURA-I1-03 / FP-05).
+# ---------------------------------------------------------------------------
+
+_SLACK_SIG_RE = re.compile(r"^v0=[0-9a-f]{64}$")
+_WEBHOOK_RATE_IP_LIMIT = 60        # per-IP per 60s
+_WEBHOOK_RATE_GLOBAL_LIMIT = 300   # global per 60s
+_WEBHOOK_RATE_WINDOW = 60          # seconds
+_WEBHOOK_REPLAY_TTL = 600          # Slack sig replay-dedup window (seconds)
+_TELEGRAM_SECRET_PATH = "/run/secrets/openclaw_telegram_webhook_secret"
+
+
+def _webhook_audit_deny(provider: str, reason: str, client_ip: str) -> None:
+    """Best-effort WEBHOOK_INGRESS_DENIED audit write (never raises)."""
+    aw = backoffice_state.audit_writer
+    if aw is None:
+        return
+    try:
+        from yashigani.audit.schema import WebhookIngressDeniedEvent
+        aw.write(WebhookIngressDeniedEvent(
+            provider=provider,
+            reason=reason,
+            client_ip=client_ip,
+        ))
+    except Exception as exc:  # noqa: BLE001 — audit must never mask the deny
+        _log.error("verify-webhook: WEBHOOK_INGRESS_DENIED audit write failed: %s", exc)
+
+
+def _webhook_deny(status_code: int, reason: str, provider: str, client_ip: str):
+    """Audit + build deny response for verify-webhook."""
+    _webhook_audit_deny(provider, reason, client_ip)
+    _log.warning(
+        "verify-webhook: DENY reason=%s provider=%r ip=%s",
+        reason, provider, client_ip,
+    )
+    from fastapi import HTTPException as _HTTPException
+    raise _HTTPException(
+        status_code=status_code,
+        detail={"error": reason},
+        headers={"X-Authz-Reason": reason},
+    )
+
+
+def _webhook_rate_check(client_ip: str, provider: str) -> None:
+    """Per-IP + global rate-limit via Redis (fail-closed: 429 on Redis error)."""
+    try:
+        r = _get_throttle_redis()
+        import time as _time
+        _now = int(_time.time())
+        _window = _now // _WEBHOOK_RATE_WINDOW
+        ip_key = f"webhook:rate:ip:{client_ip}:{_window}"
+        global_key = f"webhook:rate:global:{_window}"
+        pipe = r.pipeline()
+        pipe.incr(ip_key)
+        pipe.expire(ip_key, _WEBHOOK_RATE_WINDOW + 5)
+        pipe.incr(global_key)
+        pipe.expire(global_key, _WEBHOOK_RATE_WINDOW + 5)
+        results = pipe.execute()
+        ip_count = int(results[0])
+        global_count = int(results[2])
+        if ip_count > _WEBHOOK_RATE_IP_LIMIT:
+            _webhook_deny(429, "rate_limit_ip", provider, client_ip)
+        if global_count > _WEBHOOK_RATE_GLOBAL_LIMIT:
+            _webhook_deny(429, "rate_limit_global", provider, client_ip)
+    except Exception as exc:  # noqa: BLE001 — Redis down → fail-closed
+        _log.error("verify-webhook: rate-limit Redis unavailable — denying: %s", exc)
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "rate_limit_store_unavailable"},
+        )
+
+
+def _slack_replay_dedup(sig: str, provider: str, client_ip: str) -> None:
+    """SETNX sha256(X-Slack-Signature) with TTL=600s; duplicate → 401."""
+    from fastapi import HTTPException as _HTTPException
+    import hashlib as _hashlib
+    sig_hash = _hashlib.sha256(sig.encode("utf-8")).hexdigest()
+    try:
+        r = _get_throttle_redis()
+        replay_key = f"webhook:slack:replay:{sig_hash}"
+        inserted = r.setnx(replay_key, "1")
+        if inserted:
+            r.expire(replay_key, _WEBHOOK_REPLAY_TTL)
+        else:
+            _webhook_deny(401, "slack_replay_detected", provider, client_ip)
+    except _HTTPException:
+        raise  # deny decisions must propagate, not be masked as 503
+    except Exception as exc:  # noqa: BLE001 — Redis down → fail-closed
+        _log.error("verify-webhook: replay-dedup Redis unavailable — denying: %s", exc)
+        raise _HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "replay_store_unavailable"},
+        )
+
+
+@router.get("/verify-webhook")
+async def verify_webhook_ingress(request: Request, provider: str = ""):
+    """
+    Caddy forward_auth gate for openclaw inbound webhooks (v4.1 Phase 2b,
+    LAURA-I1-03 / FP-05; contract in Caddyfile.openclaw-webhooks header).
+
+    Fail-closed at every step — any missing or malformed header is 401; any
+    store unavailability is 503.  Caddy treats any non-2xx as DENY.
+
+    Layer-B HMAC (X-Caddy-Verified-Secret):
+      CaddyVerifiedMiddleware already enforces this globally for ALL backoffice
+      routes — a direct public call to this endpoint without the per-install
+      secret is 401 before reaching this handler.
+
+    Step 0: X-Forwarded-Method must be POST (Caddy sets this on the subrequest).
+    Step 1: provider must be "slack" or "telegram".
+    Step 2 (slack): timestamp freshness (±300s) + signature shape + replay dedupe.
+    Step 2 (telegram): constant-time compare of X-Telegram-Bot-Api-Secret-Token
+                       against /run/secrets/openclaw_telegram_webhook_secret.
+    Step 3: per-IP + global rate-limit buckets in Redis.
+    Step 4: audit every deny (WEBHOOK_INGRESS_DENIED).
+
+    Body-MAC split (Caddyfile.openclaw-webhooks §76-85):
+      Caddy's forward_auth strips the body → full Slack HMAC (v0:ts:body) lives
+      with openclaw's Slack SDK channel integration.  This gate enforces:
+        * freshness (timestamp window guards replay without the body), and
+        * exact-replay dedupe (deterministic MAC over v0:ts:body makes the sig
+          a unique per-request token within the freshness window).
+      Telegram token verification is COMPLETE here (no body dependency).
+    """
+    import hmac as _hmac
+    import time as _time
+
+    client_ip = _real_client_ip(request)
+
+    # Step 0 — method check (forward_auth sets X-Forwarded-Method)
+    fwd_method = request.headers.get("x-forwarded-method", "").strip().upper()
+    if fwd_method != "POST":
+        _webhook_deny(401, "method_not_post", provider, client_ip)
+
+    # Step 1 — provider validation
+    if provider not in ("slack", "telegram"):
+        _webhook_deny(401, "unknown_provider", provider or "", client_ip)
+
+    # Step 3 — rate-limit (early, before doing crypto work on attacker input)
+    _webhook_rate_check(client_ip, provider)
+
+    if provider == "slack":
+        # Step 2a — Slack: timestamp freshness
+        ts_raw = request.headers.get("x-slack-request-timestamp", "").strip()
+        if not ts_raw:
+            _webhook_deny(401, "slack_timestamp_missing", provider, client_ip)
+        try:
+            ts = int(ts_raw)
+        except ValueError:
+            _webhook_deny(401, "slack_timestamp_invalid", provider, client_ip)
+        now = int(_time.time())
+        if abs(now - ts) > 300:
+            _webhook_deny(401, "slack_timestamp_stale", provider, client_ip)
+
+        # Step 2b — Slack: signature shape (v0=<64 hex>)
+        sig = request.headers.get("x-slack-signature", "").strip()
+        if not sig:
+            _webhook_deny(401, "slack_signature_missing", provider, client_ip)
+        if not _SLACK_SIG_RE.match(sig):
+            _webhook_deny(401, "slack_signature_malformed", provider, client_ip)
+
+        # Step 2c — Slack: replay dedup (SETNX sha256(sig) TTL 600s)
+        _slack_replay_dedup(sig, provider, client_ip)
+
+    else:  # telegram
+        # Step 2 — Telegram: constant-time token compare
+        presented = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not presented:
+            _webhook_deny(401, "telegram_token_missing", provider, client_ip)
+        try:
+            expected = open(_TELEGRAM_SECRET_PATH).read().strip()  # noqa: WPS515
+        except OSError as exc:
+            _log.error(
+                "verify-webhook: cannot read Telegram webhook secret at %r: %s — "
+                "denying (fail-closed; mount the secret in install.sh)",
+                _TELEGRAM_SECRET_PATH, exc,
+            )
+            from fastapi import HTTPException as _HTTPException
+            raise _HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "telegram_secret_unavailable"},
+            )
+        if not _hmac.compare_digest(presented, expected):
+            _webhook_deny(401, "telegram_token_mismatch", provider, client_ip)
+
+    _log.debug("verify-webhook: ALLOW provider=%r ip=%s", provider, client_ip)
+    from starlette.responses import Response as StarletteResponse
+    return StarletteResponse(status_code=200)
 
 
 @router.post("/password/change")
@@ -801,7 +1618,25 @@ async def provision_totp_start(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: re-provisioning an already-enrolled authenticator
+        # requires a fresh step-up — blocks a hijacked session from silently
+        # rotating TOTP and locking out the legitimate owner.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
+
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
+
+    # Phase 13: include algorithm and digit count in the response so the client
+    # can display role-appropriate instructions.
+    _digit_word = f"{prov.digits}-digit"
+    _algo_note = (
+        "IMPORTANT: Classic Google Authenticator (SHA-1 only) is not compatible "
+        "with this account's TOTP tier. Use agnosticOTP (iOS/Android), Aegis, "
+        "or any authenticator that reads the 'algorithm' field from the "
+        "otpauth:// URI."
+    )
 
     return {
         "status": "pending_confirmation",
@@ -809,11 +1644,14 @@ async def provision_totp_start(
         "provisioning_uri": prov.provisioning_uri,
         "recovery_codes": prov.recovery_codes,  # shown once — client must acknowledge
         "recovery_codes_count": len(prov.recovery_codes),
+        "totp_algorithm": prov.algorithm,
+        "totp_digits": prov.digits,
         "message": (
-            "Scan the QR code with your authenticator app, then POST the "
-            "current 6-digit code to /auth/totp/provision/confirm to "
-            "complete enrolment. Store the recovery codes securely — "
-            "they will not be shown again."
+            f"Scan the QR code with agnosticOTP or a compatible authenticator app, "
+            f"then POST the current {_digit_word} code to "
+            f"/auth/totp/provision/confirm to complete enrolment. "
+            f"Store the recovery codes securely — they will not be shown again. "
+            f"{_algo_note}"
         ),
     }
 
@@ -838,6 +1676,13 @@ async def provision_totp_confirm(
     record = await _get_record_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: confirming a re-provision against an already-enrolled
+        # authenticator requires a fresh step-up.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
 
     ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
@@ -881,6 +1726,13 @@ async def provision_totp(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
+    if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: atomic re-provision of an already-enrolled
+        # authenticator requires a fresh step-up.
+        from yashigani.auth.stepup import assert_fresh_stepup
+
+        assert_fresh_stepup(session)
+
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
     # Verify the user-supplied code against the freshly-stored seed.
@@ -913,7 +1765,8 @@ async def provision_totp(
 
 
 class StepUpRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/stepup")
@@ -997,8 +1850,17 @@ async def stepup_verify(
         )
 
     # Verify against Postgres-backed replay cache (same path as login).
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _ROLE_TOTP_DIGITS
+    _stepup_digits = _ROLE_TOTP_DIGITS.get(admin_record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        ok = await state.auth_service._verify_totp_with_replay(conn, admin_record.totp_secret, body.totp_code)
+        ok = await state.auth_service._verify_totp_with_replay(
+            conn,
+            admin_record.totp_secret,
+            body.totp_code,
+            algorithm=admin_record.totp_algorithm,
+            digits=_stepup_digits,
+        )
 
     if not ok:
         try:
@@ -1053,7 +1915,13 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
             max_age=14400,  # 4 hours absolute
             path="/",  # __Host- prefix requires Path=/
         )
-    # Always set the user-level cookie (used by forward_auth for Open WebUI)
+        # RISK-100 SoD: admins get ONLY the admin-plane cookie. OWUI is removed in
+        # 4.0, so the legacy "always set the user cookie for forward_auth" line is
+        # dead — and issuing a user-plane cookie to an admin let the admin session
+        # pass the /chat presence gate and load the user UI. Admins must not hold a
+        # user-plane session at all.
+        return
+    # User / totp_provisioning tiers get ONLY the user-plane cookie.
     response.set_cookie(
         key=_USER_SESSION_COOKIE,
         value=token,
@@ -1274,6 +2142,101 @@ async def verify_operator_token(
 
 
 # ---------------------------------------------------------------------------
+# MI-4 (YSG-RISK-061): privileged-mutation step-up PROOF token mint
+#
+# The headless counterpart of the in-session step-up gate.  After a fresh TOTP
+# step-up, an operator mints a short-lived proof token bound to a specific
+# destructive lifecycle op (e.g. "add-component"), then hands it to install.sh
+# (--stepup-token).  install.sh verifies it against the SAME shared gate
+# (auth.stepup.verify_stepup_proof) before mutating a running stack.
+#
+# Prereqs: AdminSession + fresh step-up (assert_fresh_stepup) — a hijacked
+# session that has not re-proven TOTP cannot mint a proof.
+# ---------------------------------------------------------------------------
+
+
+class StepUpProofRequest(BaseModel):
+    """Request body for POST /auth/stepup-proof."""
+
+    op: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+        description="Lifecycle op the proof authorises, e.g. 'add-component'.",
+    )
+
+
+@router.post("/stepup-proof")
+async def issue_stepup_proof(
+    body: StepUpProofRequest,
+    session: AdminSession,
+):
+    """
+    Mint a privileged-mutation step-up proof token (MI-4 / YSG-RISK-061).
+
+    Prerequisites:
+      - Active admin session (AdminSession dependency — cookie auth).
+      - Fresh step-up TOTP (assert_fresh_stepup — within YASHIGANI_STEPUP_TTL_SECONDS).
+
+    The proof is an HS256 JWT (signed with caddy_internal_hmac, the same per-install
+    key the gate verifies with) carrying purpose="privileged-mutation" and the
+    bound op label.  TTL = YASHIGANI_STEPUP_PROOF_TTL_SECONDS (default 300 s).
+
+    The token is NEVER written to the audit log — only the jti + op + TTL.
+    """
+    from yashigani.auth.stepup import (
+        assert_fresh_stepup,
+        mint_stepup_proof,
+        STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    assert_fresh_stepup(session)
+
+    state = backoffice_state
+    assert state.auth_service is not None
+    assert state.audit_writer is not None
+
+    admin_record = await state.auth_service.get_account_by_id(session.account_id)
+    if admin_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        token, jti = mint_stepup_proof(subject=admin_record.username, op=body.op)
+    except Exception as exc:  # StepUpProofInvalid(signing_key_unavailable) etc.
+        _log.error("MI-4: step-up proof mint failed for %s: %s", admin_record.username, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "signing_key_unavailable"},
+        )
+
+    from yashigani.audit.schema import PrivilegedMutationEvent
+
+    state.audit_writer.write(
+        PrivilegedMutationEvent(
+            reason=f"stepup_proof.mint.{body.op}",
+            principal=admin_record.username,
+            target=body.op,
+            justification=f"jti={jti} ttl={STEPUP_PROOF_TTL_SECONDS}",
+        )
+    )
+
+    _log.info(
+        "MI-4: step-up proof minted by %s op=%s jti=%s ttl=%ds",
+        admin_record.username, body.op, jti, STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    return {
+        "token": token,
+        "jti": jti,
+        "op": body.op,
+        "expires_in": STEPUP_PROOF_TTL_SECONDS,
+        "token_type": "Bearer",
+        "purpose": "privileged-mutation",
+    }
+
+
+# ---------------------------------------------------------------------------
 # LU-AMEND-04: Internal onboard audit endpoint
 #
 # Called by the yashigani-onboard CLI to emit an ONBOARD_ATTEMPTED event after
@@ -1396,7 +2359,7 @@ async def list_blocked_ips(request: Request, session: AdminSession):
     # Caller's own state — resolved from request headers so the admin
     # sees exactly what server-side records about their IP, even when
     # they are being throttled (non-200 paths still emit this view).
-    caller_ip = request.client.host if request.client else "unknown"
+    caller_ip = _real_client_ip(request)  # LAURA-3X-001: match the throttle key written at login
     caller_level = int(r.get(f"auth:throttle:ip:{caller_ip}") or 0)
     caller_fails = int(r.get(f"auth:fail:ip:{caller_ip}") or 0)
     caller_blocked_data = r.get(f"auth:blocked:{caller_ip}")
@@ -1583,7 +2546,7 @@ async def post_login_redirect(
 
     ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001
     ok, result = _validate_next(next)
 
     if not ok:
@@ -1760,21 +2723,18 @@ def _make_sessions_invalidated_event(
 #     migration.
 # ---------------------------------------------------------------------------
 
-_AUTH_SLUG_RE = re.compile(r"[^a-z0-9\-]")
-
-
 def _auth_email_to_slug(email: str) -> str:
     """
     Derive a stable registry slug from an email address.
-    Mirrors sso.py::_email_to_slug — kept separate to avoid coupling auth.py
-    to the SSO module, which has its own heavy import chain.
 
-    e.g. alice@example.com → alice-example-com
+    B5 (2.25.5): delegates to yashigani.identity.slug.email_to_slug — the single
+    canonical implementation.  All slug-derivation sites (auth.py, sso.py,
+    openai_router.py, users.py, me.py) produce the SAME slug for any given email.
+
+    e.g. dana.lee@example.com → dana-lee-example-com
     """
-    local, _, domain = email.partition("@")
-    raw = f"{local}-{domain}".lower()
-    slug = _AUTH_SLUG_RE.sub("-", raw).strip("-")
-    return slug[:64]
+    from yashigani.identity.slug import email_to_slug as _canonical_slug
+    return _canonical_slug(email)
 
 
 def _register_human_identity_on_login(record, state) -> None:
@@ -1871,6 +2831,17 @@ def _register_human_identity_on_login(record, state) -> None:
             slug,
             identity_id,
         )
+        # LAURA-4.0-S1-001: ensure account_id → idnt_ index is populated even
+        # for users whose identity already existed before this fix was deployed.
+        # link_account_id is idempotent — safe to call on every login.
+        try:
+            registry.link_account_id(record.account_id, identity_id)
+        except Exception as exc:
+            _log.warning(
+                "link_account_id failed for existing identity %s (account_id=%s): %s — "
+                "workflow scheduler may not resolve this user until next login",
+                identity_id, record.account_id, exc,
+            )
         return
 
     # New user — register with HUMAN kind.
@@ -1902,6 +2873,18 @@ def _register_human_identity_on_login(record, state) -> None:
                 "max": exc.max_val,
             },
         ) from exc
+
+    # LAURA-4.0-S1-001: store account_id → identity_id mapping so the workflow
+    # scheduler can resolve owner_identity_id (stored as account_id UUID) to the
+    # real identity PK that OPA scope keys are built from (human:{idnt_...}).
+    try:
+        registry.link_account_id(record.account_id, identity_id)
+    except Exception as exc:
+        _log.warning(
+            "link_account_id failed for new identity %s (account_id=%s): %s — "
+            "workflow scheduler may not resolve this user",
+            identity_id, record.account_id, exc,
+        )
 
     _log.info(
         "HUMAN identity registered on local-auth login: "

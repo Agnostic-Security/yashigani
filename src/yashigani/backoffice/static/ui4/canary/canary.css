@@ -1,0 +1,7 @@
+/* Canary page styling — classes-only (no inline styles, CSP-clean). */
+.ys-canary-main { max-width: 900px; margin: 0 auto; padding: 24px; }
+#results .pass { color: #166534; font-family: var(--ys-mono); font-size: 0.8rem; padding: 2px 0; }
+#results .fail { color: #dc2626; font-family: var(--ys-mono); font-size: 0.8rem; padding: 2px 0; font-weight: 700; }
+#results .summary { font-weight: 700; margin-bottom: 8px; padding: 6px 8px; border-radius: 4px; }
+#results .summary.pass { background: #dcfce7; color: #166534; }
+#results .summary.fail { background: #fef2f2; color: #dc2626; }

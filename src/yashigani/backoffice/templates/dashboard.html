@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-25T00:00:00+00:00 — v2.24.3 runtime-settings Phase 2 nav + page div + edit form + toast -->
+<!-- last-updated: 2026-06-13T00:00:00+01:00 — R25 dashboard redesign (semaphores/alerts/budget/security/traffic) + 2.25.5-ui-wiring (R8/R9/R10/R12/R13/R16/R23/R24/R26/N1) -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17,46 +17,124 @@
                 <button data-action="showPage" data-param="accounts">Accounts</button>
                 <button data-action="showPage" data-param="budgets">Budgets</button>
                 <button data-action="showPage" data-param="models">Models</button>
+                <button data-action="showPage" data-param="policies">Policies</button>
+                <button data-action="showPage" data-param="rbac">Access</button>
                 <button data-action="showPage" data-param="sensitivity">Sensitivity</button>
+                <button data-action="showPage" data-param="documents">Documents</button>
+                <button data-action="showPage" data-param="envelopes">MCP Re-approvals</button>
+                <button data-action="showPage" data-param="data-protection" id="dp-nav-btn">Data Protection</button>
                 <button data-action="showPage" data-param="alerts">Alerts</button>
                 <button data-action="showPage" data-param="audit">Audit Log</button>
                 <button data-action="showPage" data-param="monitoring">Monitoring</button>
                 <button data-action="showPage" data-param="backup">Backup</button>
-                <button data-action="showPage" data-param="pki">PKI</button>
+                <button data-action="showPage" data-param="pki">PKI / Crypto</button>
                 <button data-action="showPage" data-param="settings">Settings</button>
                 <button data-action="showPage" data-param="runtime-settings">Runtime Settings</button>
+                <button data-action="showPage" data-param="capability-policy">Permissions Policy</button>
+                <button data-action="showPage" data-param="permissions">Permissions</button>
             </div>
         </div>
         <div class="nav-right">
-            <span>v2.2</span>
+            <!-- R26: version badge — updated by loadVersionCheck() on DOMContentLoaded -->
+            <span id="version-badge" class="version-badge-none">v{{ yashigani_version }}</span>
             <button data-action="logout">Logout</button>
         </div>
     </nav>
 
     <main>
-        <!-- Dashboard Page -->
+        <!-- N1 — second-admin required banner (shown when action_required=true from GET /admin/accounts/enforcement) -->
+        <div id="n1-admin-banner" class="n1-banner">
+            <span class="n1-banner-text">
+                <strong>Action required:</strong> This deployment has fewer than 2 active administrators.
+                Add a second admin to meet NIST AC-2 / SOC 2 CC6.2 requirements.
+            </span>
+            <button class="n1-banner-btn" data-action="showPage" data-param="accounts">Add second admin</button>
+        </div>
+
+        <!-- LAURA-V400-R2-001 — Data-protection warning banner -->
+        <!-- Shown when any data-protection control is in a weakened state. -->
+        <!-- Populated by loadDpProtectionStatus() on DOMContentLoaded + page load. -->
+        <div id="dp-protection-banner" class="dp-protection-banner" style="display:none">
+            <span class="dp-protection-banner-icon">&#9888;</span>
+            <span class="dp-protection-banner-text" id="dp-protection-banner-text"></span>
+            <button class="n1-banner-btn" data-action="showPage" data-param="pii">PII Settings</button>
+        </div>
+
+        <!-- LAURA-V400-R2-001 — Pending data-protection weaken requests banner -->
+        <!-- Shown to admins when there are weaken requests awaiting a second approval. -->
+        <div id="dp-weaken-pending-banner" class="dp-protection-banner dp-weaken-pending-banner" style="display:none">
+            <span class="dp-protection-banner-icon">&#128274;</span>
+            <span class="dp-protection-banner-text" id="dp-weaken-pending-text"></span>
+            <button class="n1-banner-btn" id="dp-weaken-pending-btn" data-action="showPage" data-param="data-protection">Review</button>
+        </div>
+
+        <!-- Dashboard Page — R25 redesign -->
         <div class="page active" id="page-dashboard">
-            <!-- First-run onboarding checklist -->
-            <div id="onboarding-checklist" class="onboarding">
-                <h3 class="onboarding-title">Getting Started</h3>
-                <div class="onboarding-items">
-                    <label id="ob-password" class="onboarding-lbl"><input type="checkbox" disabled> Change default password</label>
-                    <label id="ob-agent" class="onboarding-lbl"><input type="checkbox" disabled> Register your first agent</label>
-                    <label id="ob-budget" class="onboarding-lbl"><input type="checkbox" disabled> Configure budget allocation</label>
-                    <label id="ob-alerts" class="onboarding-lbl"><input type="checkbox" disabled> Set up alert webhooks</label>
+
+            <!-- Row 1: service semaphores + active alerts semaphore -->
+            <div class="dash-row">
+
+                <!-- Widget 1: Per-service health semaphores + roll-up -->
+                <div class="dash-widget dash-widget--wide panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Service Health</span>
+                        <span id="dash-health-rollup" class="semaphore semaphore--loading" title="Overall health"></span>
+                    </div>
+                    <div class="panel-body" id="dash-services-body">
+                        <span class="loading">Loading…</span>
+                    </div>
                 </div>
-                <button data-action="dismissOnboarding" class="btn-dismiss-outline">Dismiss</button>
+
+                <!-- Widget 2: Active alerts semaphore (P1→P5, priority order) -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Active Alerts</span>
+                        <span class="dash-header-meta" id="dash-alerts-total"></span>
+                    </div>
+                    <div class="panel-body" id="dash-alerts-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
             </div>
 
-            <h2>System Health</h2>
-            <div id="health-cards" class="cards"><div class="card"><span class="loading">Loading...</span></div></div>
+            <!-- Row 2: Budget usage + Security story -->
+            <div class="dash-row">
 
-            <h2>Overview</h2>
-            <div class="cards">
-                <div class="card"><div class="card-label">Admin Accounts</div><div class="card-value" id="stat-accounts">-</div></div>
-                <div class="card"><div class="card-label">Registered Agents</div><div class="card-value" id="stat-agents">-</div></div>
-                <div class="card"><div class="card-label">License Tier</div><div class="card-value" id="stat-license">-</div></div>
+                <!-- Widget 3: Budget usage — used/cap gauge, 85% marker, cloud/local split -->
+                <div class="dash-widget panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Budget Usage</span>
+                        <span class="dash-header-meta" id="dash-budget-threshold-badge"></span>
+                    </div>
+                    <div class="panel-body" id="dash-budget-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
+                <!-- Widget 4: Security story — denials, blocks, sensitivity mix -->
+                <div class="dash-widget panel">
+                    <div class="panel-header">Security</div>
+                    <div class="panel-body" id="dash-security-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+
             </div>
+
+            <!-- Row 3: Traffic, agent/MCP activity, recent audit -->
+            <div class="dash-row">
+                <div class="dash-widget dash-widget--full panel">
+                    <div class="panel-header dash-widget-header">
+                        <span>Traffic &amp; Activity</span>
+                        <button data-action="dashRefresh" class="btn-xs-add">Refresh</button>
+                    </div>
+                    <div class="panel-body" id="dash-traffic-body">
+                        <span class="loading">Loading…</span>
+                    </div>
+                </div>
+            </div>
+
         </div>
 
         <!-- Agents Page -->
@@ -74,12 +152,28 @@
                         <div><label class="lbl">Protocol</label><br><select id="agent-protocol" class="fi"><option value="openai">openai</option><option value="letta">letta</option><option value="langflow">langflow</option></select></div>
                     </div>
                     <div class="form-row--mt">
-                        <div><label class="lbl">Groups (comma-separated)</label><br><input id="agent-groups" type="text" placeholder="default,engineering" class="fi w-200"></div>
-                        <div><label class="lbl">Allowed caller groups</label><br><input id="agent-caller-groups" type="text" placeholder="admins,operators" class="fi w-200"></div>
+                        <div><label class="lbl">Groups <span class="txt-hint">(Ctrl/Cmd+click to multi-select)</span></label><br><select id="agent-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
+                        <div><label class="lbl">Allowed caller groups <span class="txt-hint">(Ctrl/Cmd+click)</span></label><br><select id="agent-caller-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
                         <div><label class="lbl">Allowed CIDRs</label><br><input id="agent-cidrs" type="text" placeholder="10.0.0.0/8" class="fi w-160"></div>
                         <button data-action="registerAgent" class="btn-sm-save">Register</button>
                     </div>
                     <div id="register-agent-result" class="form-result"></div>
+                </div>
+                <!-- R6: inline edit form (populated on Edit click) -->
+                <div id="edit-agent-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Agent ID</label><br><input id="edit-agent-id" type="text" readonly class="fi w-250"></div>
+                        <div><label class="lbl">Name</label><br><input id="edit-agent-name" type="text" placeholder="my-agent" class="fi w-150"></div>
+                        <div><label class="lbl">Upstream URL</label><br><input id="edit-agent-url" type="text" placeholder="http://agent:8000" class="fi w-250"></div>
+                    </div>
+                    <div class="form-row--mt">
+                        <div><label class="lbl">Groups <span class="txt-hint">(Ctrl/Cmd+click to multi-select)</span></label><br><select id="edit-agent-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
+                        <div><label class="lbl">Allowed caller groups <span class="txt-hint">(Ctrl/Cmd+click)</span></label><br><select id="edit-agent-caller-groups" multiple class="fi w-200 select-multi" size="4"><option value="users">users — API access (programmatic)</option><option value="owui-users">owui-users — Open WebUI (human)</option></select></div>
+                        <button data-action="saveEditAgent" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAgent" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Alias is derived from the agent name. Changing groups/caller-groups updates RBAC immediately.</p>
+                    <div id="edit-agent-result" class="form-result"></div>
                 </div>
                 <table>
                     <thead><tr><th>Name</th><th>Agent ID</th><th>Upstream URL</th><th>Status</th><th>Last Seen</th><th>Actions</th></tr></thead>
@@ -114,9 +208,21 @@
                     </div>
                     <div id="create-admin-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-admin-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-admin-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-admin-email" type="email" placeholder="admin@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-admin-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="admin" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="admin" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-admin-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="accounts-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="accounts-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -134,9 +240,21 @@
                     </div>
                     <div id="create-user-result" class="form-result"></div>
                 </div>
+                <!-- R5: inline edit form (populated on Edit click) -->
+                <div id="edit-user-form" class="form-panel">
+                    <div class="form-row--no-wrap">
+                        <div><label class="lbl">Username</label><br><input id="edit-user-username" type="text" readonly class="fi w-180"></div>
+                        <div><label class="lbl">Email</label><br><input id="edit-user-email" type="email" placeholder="user@example.com" class="fi w-280"></div>
+                        <div><label class="lbl">Status</label><br><select id="edit-user-status" class="fi"><option value="active">Active</option><option value="disabled">Disabled</option></select></div>
+                        <button data-action="saveEditAccount" data-account-type="user" class="btn-sm-save">Save</button>
+                        <button data-action="cancelEditAccount" data-account-type="user" class="btn-sm-secondary">Cancel</button>
+                    </div>
+                    <p class="txt-note">Role/tier is fixed for an existing account (admin and user identities are kept strictly separate). To change tier, delete and recreate in the correct list.</p>
+                    <div id="edit-user-result" class="form-result"></div>
+                </div>
                 <table>
-                    <thead><tr><th>Username</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
-                    <tbody id="users-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                    <thead><tr><th>Username</th><th>Email</th><th>Status</th><th>Password</th><th>TOTP</th><th>Actions</th></tr></thead>
+                    <tbody id="users-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
                 </table>
             </div>
 
@@ -242,8 +360,8 @@
                     <div id="orgcap-result" class="form-result"></div>
                 </div>
                 <table>
-                    <thead><tr><th>Provider</th><th>Token Cap</th><th>Period</th></tr></thead>
-                    <tbody id="orgcaps-tbody"><tr><td colspan="3" class="empty">No caps configured</td></tr></tbody>
+                    <thead><tr><th>Org</th><th>Provider</th><th>Token Cap</th><th>Period</th><th>Actions</th></tr></thead>
+                    <tbody id="orgcaps-tbody"><tr><td colspan="5" class="empty">No caps configured</td></tr></tbody>
                 </table>
             </div>
             <div class="panel">
@@ -253,7 +371,7 @@
                 </div>
                 <div id="add-group-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Group ID</label><br><input id="group-id" type="text" placeholder="engineering" class="fi w-150"></div>
+                        <div><label class="lbl">Group</label><br><select id="group-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="group-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="group-tokens" type="number" min="1" value="500000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="group-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -262,8 +380,8 @@
                     <div id="group-result" class="form-result"></div>
                 </div>
                 <table>
-                    <thead><tr><th>Group</th><th>Provider</th><th>Budget</th><th>Period</th></tr></thead>
-                    <tbody id="groupbudgets-tbody"><tr><td colspan="4" class="empty">No group budgets configured</td></tr></tbody>
+                    <thead><tr><th>Group</th><th>Provider</th><th>Budget</th><th>Period</th><th>Actions</th></tr></thead>
+                    <tbody id="groupbudgets-tbody"><tr><td colspan="5" class="empty">No group budgets configured</td></tr></tbody>
                 </table>
             </div>
             <div class="panel">
@@ -273,7 +391,7 @@
                 </div>
                 <div id="add-ind-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Identity ID</label><br><input id="ind-id" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">User</label><br><select id="ind-id" class="fi w-200"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Provider</label><br><select id="ind-provider" class="fi"><option value="*">* (all)</option><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="ollama">ollama</option></select></div>
                         <div><label class="lbl">Token Budget</label><br><input id="ind-tokens" type="number" min="1" value="100000" class="fi w-140"></div>
                         <div><label class="lbl">Period</label><br><select id="ind-period" class="fi"><option value="monthly">monthly</option><option value="weekly">weekly</option><option value="daily">daily</option></select></div>
@@ -282,8 +400,8 @@
                     <div id="ind-result" class="form-result"></div>
                 </div>
                 <table>
-                    <thead><tr><th>Identity</th><th>Provider</th><th>Budget</th><th>Period</th></tr></thead>
-                    <tbody id="indbudgets-tbody"><tr><td colspan="4" class="empty">No individual budgets configured</td></tr></tbody>
+                    <thead><tr><th>Identity</th><th>Provider</th><th>Budget</th><th>Period</th><th>Actions</th></tr></thead>
+                    <tbody id="indbudgets-tbody"><tr><td colspan="5" class="empty">No individual budgets configured</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -297,6 +415,12 @@
                     <thead><tr><th>Model</th><th>Size</th><th>Modified</th></tr></thead>
                     <tbody id="models-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
                 </table>
+                <!-- #25: pull a model into the local Ollama store -->
+                <div class="form-row--mt-center">
+                    <input id="pull-model-name" type="text" placeholder="e.g. gemma3:4b" class="fi w-180">
+                    <button data-action="pullModel" class="btn-sm-save">Pull model</button>
+                    <span id="pull-model-status" class="txt-note"></span>
+                </div>
             </div>
             <div class="panel">
                 <div class="panel-header panel-header-flex">
@@ -305,10 +429,10 @@
                 </div>
                 <div id="add-alias-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Alias</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-120"></div>
-                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
-                        <div><label class="lbl">Model</label><br><input id="alias-model" type="text" placeholder="qwen2.5:3b" class="fi w-200"></div>
-                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi"><option value="true">Yes</option><option value="false">No</option></select></div>
+                        <div><label class="lbl">Alias name</label><br><input id="alias-name" type="text" placeholder="fast" class="fi w-160"></div>
+                        <div><label class="lbl">Provider</label><br><select id="alias-provider" class="fi w-120"><option value="ollama">ollama</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select></div>
+                        <div><label class="lbl">Model (from pulled list)</label><br><select id="alias-model" class="fi w-250"><option value="">Loading models…</option></select></div>
+                        <div><label class="lbl">Force Local</label><br><select id="alias-local" class="fi w-80"><option value="true">Yes</option><option value="false">No</option></select></div>
                         <button data-action="addAlias" class="btn-sm-save">Save</button>
                     </div>
                     <div id="alias-result" class="form-result"></div>
@@ -325,9 +449,9 @@
                 </div>
                 <div id="add-alloc-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Model Alias</label><br><input id="alloc-alias" type="text" placeholder="fast" class="fi w-120"></div>
+                        <div><label class="lbl">Model Alias</label><br><select id="alloc-alias" class="fi w-120"><option value="">Loading…</option></select></div>
                         <div><label class="lbl">Target Type</label><br><select id="alloc-type" class="fi"><option value="user">user</option><option value="group">group</option><option value="org">org</option></select></div>
-                        <div><label class="lbl">Target ID</label><br><input id="alloc-target" type="text" placeholder="user@example.com" class="fi w-200"></div>
+                        <div><label class="lbl">Target ID</label><br><select id="alloc-target" class="fi w-200"><option value="">Select a type…</option></select></div>
                         <button data-action="addAllocation" class="btn-sm-save">Allocate</button>
                     </div>
                     <div id="alloc-result" class="form-result"></div>
@@ -336,6 +460,61 @@
                     <thead><tr><th>Model Alias</th><th>Target Type</th><th>Target ID</th><th>Actions</th></tr></thead>
                     <tbody id="allocs-tbody"><tr><td colspan="4" class="empty">No allocations configured</td></tr></tbody>
                 </table>
+            </div>
+            <!-- Cloud-provider API keys (OpenAI / Anthropic) — stored via KMS -->
+            <div class="panel">
+                <div class="panel-header">Cloud Provider API Keys</div>
+                <div class="panel-body">
+                    <p class="txt-note">Store an OpenAI or Anthropic API key so the gateway can route to cloud models.
+                        Keys are stored via the KMS backend (never plaintext DB). Step-up required to save.
+                        The gateway reads keys from KMS at routing time using the key name convention
+                        <code>openai_api_key</code> / <code>anthropic_api_key</code>.</p>
+                    <table>
+                        <thead><tr><th>Provider</th><th>Status</th></tr></thead>
+                        <tbody id="cloud-key-status"><tr><td colspan="2" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Provider</label><br>
+                            <select id="cloud-key-provider" class="fi w-140">
+                                <option value="openai">OpenAI</option>
+                                <option value="anthropic">Anthropic</option>
+                            </select>
+                        </div>
+                        <div class="flex-1"><label class="lbl">API Key (stored encrypted via KMS)</label><br>
+                            <input id="cloud-key-value" type="password" placeholder="sk-…" class="fi w-full" autocomplete="new-password"></div>
+                    </div>
+                    <div class="form-row--gap12 form-row--mt">
+                        <button data-action="cloudKeySet" class="btn-sm-save">Save key (step-up)</button>
+                    </div>
+                    <div id="cloud-key-result" class="form-result"></div>
+                </div>
+            </div>
+
+            <!-- #25: dual-admin cloud-LLM risk-accepted override (break-glass) -->
+            <div class="panel">
+                <div class="panel-header">Cloud-LLM Override (dual-admin, risk-accepted)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Emergency/contractual override: allow a <b>specific cloud LLM</b> to serve
+                        even CONFIDENTIAL/RESTRICTED traffic the optimization engine would normally keep on-prem —
+                        for a customer who has signed a cloud-provider agreement and accepts the P1–P9 risk. Requires
+                        <b>two admins</b> (a second, different admin must approve within 5 min) and a written
+                        justification. Auto-expires. Does NOT affect auth, RBAC, or threat inspection.</p>
+                    <div id="cloud-override-status" class="form-result">Loading…</div>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Cloud provider</label><br><input id="co-provider" type="text" placeholder="openai" class="fi w-120"></div>
+                        <div><label class="lbl">Cloud model</label><br><input id="co-model" type="text" placeholder="gpt-4o" class="fi w-160"></div>
+                        <div><label class="lbl">TTL (hours, 1–72)</label><br><input id="co-ttl" type="number" min="1" max="72" value="4" class="fi w-80"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="flex-1"><label class="lbl">Justification (ticket #, contract #, CEO email — required)</label><br>
+                            <input id="co-justification" type="text" placeholder="e.g. CONTRACT-ACME-2026 / approved by CEO 2026-06-07" class="fi w-full"></div>
+                    </div>
+                    <div class="form-row--gap12">
+                        <button data-action="cloudOverridePropose" class="btn-sm-save">Propose (admin 1)</button>
+                        <button data-action="cloudOverrideApprove" class="btn-sm-save">Approve (admin 2)</button>
+                        <button data-action="cloudOverrideRevoke" class="btn-sm-danger">Revoke</button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -348,14 +527,70 @@
                     <span class="badge badge-green">Active (always on)</span>
                 </div>
                 <div class="card">
-                    <div class="card-label">Layer 2: FastText</div>
-                    <span class="badge badge-green" id="fasttext-status">Active</span>
+                    <div class="card-label">Layer 2: sklearn</div>
+                    <span class="badge badge-green" id="classifier-status">Active</span>
                 </div>
                 <div class="card">
                     <div class="card-label">Layer 3: Ollama</div>
                     <span class="badge badge-green" id="ollama-status">Active</span>
                 </div>
             </div>
+            <!-- Taxonomy panel — rendered before Detection Patterns (R14/R15 v2.25.5) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Sensitivity Taxonomy</span>
+                    <button data-action="toggleForm" data-form-id="add-taxonomy-form" class="btn-xs-add">+ Add Level</button>
+                </div>
+                <div id="add-taxonomy-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Level (number)</label><br><input id="tax-level" type="number" min="1" max="10" class="fi w-80"></div>
+                        <div><label class="lbl">Label</label><br><input id="tax-label" type="text" placeholder="e.g. Sensitive" class="fi w-150"></div>
+                        <div><label class="lbl">Colour</label><br>
+                            <select id="tax-colour" class="fi">
+                                <option value="sens-level-5">Red (highest)</option>
+                                <option value="sens-level-4">Orange</option>
+                                <option value="sens-level-3">Yellow</option>
+                                <option value="sens-level-2">Green</option>
+                                <option value="sens-level-1">Blue (lowest)</option>
+                            </select>
+                        </div>
+                        <button data-action="saveTaxonomyLevel" class="btn-sm-save">Save</button>
+                    </div>
+                    <div id="taxonomy-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>Level</th><th>Label</th><th>Colour</th><th>Actions</th></tr></thead>
+                    <tbody id="taxonomy-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+                </table>
+            </div>
+            <!-- R16 — AI-generate detection pattern panel -->
+            <div class="panel">
+                <div class="panel-header">AI-generate Detection Pattern</div>
+                <div class="panel-body">
+                    <p class="txt-note">Describe a sensitive data type in plain English. The internal LLM
+                        generates a regex pattern + suggested sensitivity level. Review and accept to add it.</p>
+                    <div class="form-row">
+                        <div class="flex-1">
+                            <label class="lbl">Description</label><br>
+                            <input id="genpattern-desc" type="text" placeholder="e.g. UK government OFFICIAL-SENSITIVE markings"
+                                   class="fi w-full">
+                        </div>
+                        <button data-action="generatePattern" class="btn-sm-save">Generate</button>
+                    </div>
+                    <div id="genpattern-result" class="genpattern-result"></div>
+                    <!-- Preview box — shown after generation, hidden initially -->
+                    <div id="genpattern-preview" class="genpattern-preview is-hidden">
+                        <div class="form-row">
+                            <div><label class="lbl">Generated regex</label><br><code id="genpattern-regex-val" class="genpattern-regex"></code></div>
+                            <div><label class="lbl">Suggested level</label><br><span id="genpattern-level-val"></span></div>
+                            <div><label class="lbl">Description</label><br><span id="genpattern-desc-val"></span></div>
+                        </div>
+                        <button data-action="acceptGeneratedPattern" class="btn-genpattern-accept">Accept — add this pattern</button>
+                        <span id="genpattern-accept-result" class="pol-result"></span>
+                    </div>
+                </div>
+            </div>
+
             <div class="panel">
                 <div class="panel-header panel-header-flex">
                     <span>Detection Patterns</span>
@@ -363,7 +598,17 @@
                 </div>
                 <div id="add-pattern-form" class="form-panel">
                     <div class="form-row">
-                        <div><label class="lbl">Classification</label><br><select id="pat-class" class="fi"><option value="RESTRICTED">RESTRICTED</option><option value="CONFIDENTIAL">CONFIDENTIAL</option><option value="INTERNAL">INTERNAL</option><option value="PUBLIC">PUBLIC</option></select></div>
+                        <div><label class="lbl">Classification</label><br>
+                            <select id="pat-class" class="fi">
+                                <!-- Static fallback options (numeric values, R14/R15 v2.25.5). -->
+                                <!-- JS loadTaxonomy() replaces these with live taxonomy labels. -->
+                                <option value="5">5 — Sensitive</option>
+                                <option value="4">4 — Confidential</option>
+                                <option value="3">3 — Internal</option>
+                                <option value="2">2 — Public</option>
+                                <option value="1">1 — Info</option>
+                            </select>
+                        </div>
                         <div><label class="lbl">Type</label><br><select id="pat-type" class="fi"><option value="regex">regex</option><option value="keyword">keyword</option></select></div>
                         <div><label class="lbl">Pattern</label><br><input id="pat-pattern" type="text" placeholder="\bpattern\b" class="fi w-250"></div>
                         <div><label class="lbl">Description</label><br><input id="pat-desc" type="text" placeholder="What it detects" class="fi w-180"></div>
@@ -386,18 +631,278 @@
             </div>
         </div>
 
+        <!-- Document Enforcement Page — v2.26 (document-content OPA enforcement) -->
+        <div class="page" id="page-documents">
+            <h2>Document Enforcement</h2>
+
+            <!-- 1. Enablement / status -->
+            <div class="cards" id="doc-status-cards">
+                <div class="card"><span class="loading">Loading…</span></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">Supported Formats (full-depth inspection)</div>
+                <div class="panel-body">
+                    <p class="txt-note">These six formats are inspected end-to-end (visible + hidden parts + metadata). Any other format fails closed to BLOCK.</p>
+                    <table>
+                        <thead><tr><th>Format</th><th>Family</th><th>Description</th></tr></thead>
+                        <tbody id="doc-formats-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">Parked Formats (fail-closed BLOCK)</div>
+                <div class="panel-body">
+                    <table>
+                        <thead><tr><th>Format</th><th>Family</th><th>Disposition</th></tr></thead>
+                        <tbody id="doc-parked-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 2. Policy configuration: data-class × format × route → action -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Action Policies (data-class × format × route)</span>
+                    <button data-action="docToggleForm" data-form-id="doc-add-policy-form" class="btn-xs-add">+ Add Policy</button>
+                </div>
+                <div id="doc-add-policy-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Data class</label><br><select id="doc-pol-class" class="fi"><option value="PII">PII</option><option value="QI">QI</option><option value="PHI">PHI</option><option value="PCI">PCI</option><option value="SECRET">SECRET</option><option value="IP_MARKING">IP_MARKING</option></select></div>
+                        <div><label class="lbl">Format</label><br><select id="doc-pol-format" class="fi"><option value="any">any</option><option value="docx">docx</option><option value="xlsx">xlsx</option><option value="pptx">pptx</option><option value="pdf">pdf</option><option value="csv">csv</option><option value="txt">txt</option></select></div>
+                        <div><label class="lbl">Route</label><br><select id="doc-pol-route" class="fi"><option value="any">any</option><option value="ingress-upload">ingress-upload</option><option value="egress-mcp-result">egress-mcp-result</option><option value="json-attachment">json-attachment</option></select></div>
+                        <div><label class="lbl">Action</label><br><select id="doc-pol-action" class="fi"><option value="LOG">LOG</option><option value="REDACT">REDACT</option><option value="PSEUDONYMIZE">PSEUDONYMIZE</option><option value="BLOCK">BLOCK</option></select></div>
+                        <div><label class="lbl">Pseudonymize mode</label><br><select id="doc-pol-mode" class="fi"><option value="A">A — give user table</option><option value="B">B — internal round-trip</option></select></div>
+                        <div><label class="lbl">Small-set / QI escalation</label><br><select id="doc-pol-escalate" class="fi"><option value="true">on</option><option value="false">off</option></select></div>
+                        <div><label class="lbl">Description</label><br><input id="doc-pol-desc" type="text" placeholder="What this policy does" class="fi w-180"></div>
+                        <button data-action="docAddPolicy" class="btn-sm-save">Save</button>
+                    </div>
+                    <div id="doc-policy-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>Data class</th><th>Format</th><th>Route</th><th>Action</th><th>Mode</th><th>Escalate</th><th>Description</th><th>Actions</th></tr></thead>
+                    <tbody id="doc-policies-tbody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+                </table>
+            </div>
+
+            <!-- 3. Inspect a sample document -->
+            <div class="panel">
+                <div class="panel-header">Inspect a Sample Document</div>
+                <div class="panel-body">
+                    <p class="txt-note">Run a sample through the real enforcement pipeline. Paste CSV / text content; pick the action a policy would apply.</p>
+                    <div class="form-row">
+                        <div><label class="lbl">Filename</label><br><input id="doc-insp-name" type="text" value="sample.csv" class="fi w-180"></div>
+                        <div><label class="lbl">Action</label><br><select id="doc-insp-action" class="fi"><option value="LOG">LOG</option><option value="REDACT">REDACT</option><option value="PSEUDONYMIZE">PSEUDONYMIZE</option><option value="BLOCK">BLOCK</option></select></div>
+                        <div><label class="lbl">Pseudonymize mode</label><br><select id="doc-insp-mode" class="fi"><option value="A">A — give user table</option><option value="B">B — internal round-trip</option></select></div>
+                        <div><label class="lbl">Detokenize role</label><br><input id="doc-insp-role" type="text" value="doc-pseudonymize-reverser" class="fi w-180"></div>
+                        <div><label class="lbl">Document set (salt scope)</label><br><select id="doc-insp-set" class="fi"><option value="">Per-file (default, max isolation)</option></select></div>
+                    </div>
+                    <textarea id="doc-insp-content" rows="4" class="classify-textarea" placeholder="name,email&#10;Jane Doe,jane@example.com"></textarea>
+                    <button data-action="docInspect" class="classify-btn">Inspect</button>
+                    <div id="doc-insp-result" class="form-result"></div>
+                </div>
+            </div>
+
+            <!-- 3b. Per-document verdict viewer -->
+            <div class="panel">
+                <div class="panel-header" id="doc-viewer-header">Verdict Viewer</div>
+                <div class="panel-body">
+                    <div id="doc-verdict-summary" class="doc-verdict-summary"></div>
+                    <div id="doc-user-alert" class="doc-user-alert"></div>
+                    <div id="doc-routing-note" class="doc-routing-note"></div>
+                    <table>
+                        <thead><tr><th>Data class</th><th>QI</th><th>Masked value</th><th>Field role</th><th>Location / provenance</th><th>Part</th></tr></thead>
+                        <tbody id="doc-matches-tbody"><tr><td colspan="6" class="empty">Inspect a document to see matches.</td></tr></tbody>
+                    </table>
+                    <div class="doc-integrity-row">
+                        <button data-action="docVerifyIntegrity" class="btn-sm-secondary">Verify integrity / splice</button>
+                        <span class="txt-note">Confirms the tokenised output + mapping belong to this document (rejects cross-file splice).</span>
+                    </div>
+                    <div id="doc-integrity-result" class="form-result"></div>
+                </div>
+            </div>
+
+            <!-- 4. Correspondence-table retrieval (mode A, RBAC'd) -->
+            <div class="panel">
+                <div class="panel-header">Correspondence Table Retrieval (mode A — RBAC gated)</div>
+                <div class="panel-body">
+                    <p class="txt-note">The token→original table is the re-identification key. Only an admin in the document's detokenize role may retrieve it. Unauthorised retrieval is denied (403) and the rows are never shown.</p>
+                    <div class="form-row">
+                        <div><label class="lbl">Document (request id)</label><br><input id="doc-table-rid" type="text" placeholder="doc-1-sample.csv" class="fi w-250"></div>
+                        <button data-action="docRetrieveTable" class="btn-sm-primary">Retrieve table</button>
+                        <button data-action="docDownloadTable" class="btn-sm-secondary">Download CSV</button>
+                    </div>
+                    <div id="doc-table-result" class="form-result"></div>
+                    <table id="doc-table-table" class="doc-hidden">
+                        <thead><tr><th>Token</th><th>Original</th></tr></thead>
+                        <tbody id="doc-table-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 5. Document sets — set-scoped salt (cross-file correlation) -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Document Sets (set-scoped salt)</span>
+                    <button data-action="docToggleForm" data-form-id="doc-add-set-form" class="btn-xs-add">+ New Set</button>
+                </div>
+                <div class="panel-body">
+                    <div id="doc-set-security-note" class="doc-alert-box doc-set-note"></div>
+                    <div id="doc-add-set-form" class="form-panel">
+                        <div class="form-row">
+                            <div><label class="lbl">Set name</label><br><input id="doc-set-name" type="text" placeholder="e.g. Q2 customer exports" class="fi w-250"></div>
+                            <button data-action="docCreateSet" class="btn-sm-save">Create set</button>
+                        </div>
+                        <div id="doc-set-result" class="form-result"></div>
+                    </div>
+                    <table>
+                        <thead><tr><th>ID</th><th>Name</th><th>Members</th><th>Salt</th><th>Created</th><th>Actions</th></tr></thead>
+                        <tbody id="doc-sets-tbody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- MCP Capability-Envelope Re-approvals Page — 3.0 (YSG-RISK-060) -->
+        <div class="page" id="page-envelopes">
+            <h2>MCP Tool-Surface Re-approvals</h2>
+            <p class="txt-note">When an imported MCP's tool surface tries to EXPAND beyond its originally-approved capability envelope (a new tool, a read&rarr;write/network jump, a widened argument schema, an egress-posture change), the broker <strong>blocks it</strong> and parks it here. Review the change <strong>against the ORIGINAL approved envelope</strong> &mdash; not just the last version &mdash; then approve (re-pins a new baseline, requires TOTP step-up) or keep it blocked.</p>
+
+            <!-- 1. Pending queue -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Pending re-approvals</span>
+                    <button data-action="envRefresh" class="btn-xs-add">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div id="env-pending-result"></div>
+                    <table>
+                        <thead><tr><th>MCP server</th><th>Provenance</th><th>Reason</th><th>Tools</th><th>Egress</th><th>Blocked</th><th>Action</th></tr></thead>
+                        <tbody id="env-pending-tbody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 2. Field-level diff — vs ORIGINAL baseline (anti-rug-pull) -->
+            <div class="panel" id="env-diff-panel">
+                <div class="panel-header">Change review</div>
+                <div class="panel-body">
+                    <div id="env-diff-empty" class="empty">Select a pending re-approval above to review the field-level diff.</div>
+                    <div id="env-diff-body" class="env-hidden">
+                        <div id="env-diff-headline"></div>
+
+                        <h3 class="env-h3">What changed vs the ORIGINAL approved envelope</h3>
+                        <p class="txt-note">Cumulative drift since this MCP was first imported. Incremental re-approvals cannot hide a big change behind small steps &mdash; this is always the full picture.</p>
+                        <table>
+                            <thead><tr><th>Dimension</th><th>Tool</th><th>Detail</th></tr></thead>
+                            <tbody id="env-vsorig-tbody"></tbody>
+                        </table>
+
+                        <h3 class="env-h3">Delta vs the immediately-prior approved version</h3>
+                        <table>
+                            <thead><tr><th>Dimension</th><th>Tool</th><th>Detail</th></tr></thead>
+                            <tbody id="env-vsprior-tbody"></tbody>
+                        </table>
+
+                        <div class="env-actions">
+                            <button data-action="envApprove" class="btn-sm-save">Approve &mdash; re-pin new baseline (TOTP)</button>
+                            <button data-action="envReject" class="btn-sm-danger">Keep blocked (TOTP)</button>
+                        </div>
+                        <div id="env-decision-result"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Audit Log Page -->
         <div class="page" id="page-audit">
             <h2>Audit Log</h2>
             <div class="panel">
                 <div class="panel-header">Search</div>
                 <div class="panel-body">
+                    <!-- Row 1: event type (exact match), verdict, source type (populated from /admin/audit/facets) -->
                     <div class="form-row">
-                        <div><label class="lbl">Event type</label><br><select id="audit-event-type" class="fi"><option value="">All</option><option value="login">Login</option><option value="agent_registered">Agent registered</option><option value="credential_exfil">Credential exfil</option><option value="policy_denied">Policy denied</option><option value="config_change">Config change</option></select></div>
+                        <div><label class="lbl">Event type</label><br>
+                            <select id="audit-event-type" class="fi">
+                                <option value="">* (All events)</option>
+                                <optgroup label="Auth — admin">
+                                    <option value="ADMIN_LOGIN">ADMIN_LOGIN</option>
+                                    <option value="ADMIN_SESSION_INVALIDATED">ADMIN_SESSION_INVALIDATED</option>
+                                    <option value="AUTH_LOGIN_ATTEMPT">AUTH_LOGIN_ATTEMPT</option>
+                                    <option value="ACCOUNT_LOCKOUT">ACCOUNT_LOCKOUT</option>
+                                    <option value="PASSWORD_CHANGED">PASSWORD_CHANGED</option>
+                                    <option value="SESSIONS_INVALIDATED">SESSIONS_INVALIDATED</option>
+                                    <option value="FULL_RESET_TOTP_FAILURE">FULL_RESET_TOTP_FAILURE</option>
+                                    <option value="WEBAUTHN_LOGIN_SUCCESS">WEBAUTHN_LOGIN_SUCCESS</option>
+                                    <option value="WEBAUTHN_LOGIN_FAILURE">WEBAUTHN_LOGIN_FAILURE</option>
+                                    <option value="SSO_LOGIN_SUCCESS">SSO_LOGIN_SUCCESS</option>
+                                    <option value="SSO_LOGIN_FAILURE">SSO_LOGIN_FAILURE</option>
+                                </optgroup>
+                                <optgroup label="Auth — user">
+                                    <option value="USER_LOGIN">USER_LOGIN</option>
+                                    <option value="TOTP_PROVISION_COMPLETED">TOTP_PROVISION_COMPLETED</option>
+                                    <option value="TOTP_PROVISION_FAILED">TOTP_PROVISION_FAILED</option>
+                                    <option value="RECOVERY_CODE_USED">RECOVERY_CODE_USED</option>
+                                    <option value="EMERGENCY_UNLOCK_EXECUTED">EMERGENCY_UNLOCK_EXECUTED</option>
+                                    <option value="LOGIN_BLOCKED_SUSPENDED_IDENTITY">LOGIN_BLOCKED_SUSPENDED_IDENTITY</option>
+                                </optgroup>
+                                <optgroup label="Security">
+                                    <option value="CREDENTIAL_LEAK_DETECTED">CREDENTIAL_LEAK_DETECTED</option>
+                                    <option value="PROMPT_INJECTION_DETECTED">PROMPT_INJECTION_DETECTED</option>
+                                    <option value="RESPONSE_INJECTION_DETECTED">RESPONSE_INJECTION_DETECTED</option>
+                                    <option value="PII_DETECTED">PII_DETECTED</option>
+                                    <option value="ENCODED_PAYLOAD_DETECTED">ENCODED_PAYLOAD_DETECTED</option>
+                                    <option value="IP_ALLOWLIST_VIOLATION">IP_ALLOWLIST_VIOLATION</option>
+                                    <option value="RATE_LIMIT_VIOLATION">RATE_LIMIT_VIOLATION</option>
+                                    <option value="USER_RATE_LIMIT_EXCEEDED">USER_RATE_LIMIT_EXCEEDED</option>
+                                    <option value="OPEN_REDIRECT_ATTEMPT_BLOCKED">OPEN_REDIRECT_ATTEMPT_BLOCKED</option>
+                                    <option value="BREAK_GLASS_ACTIVATED">BREAK_GLASS_ACTIVATED</option>
+                                </optgroup>
+                                <optgroup label="Gateway / OPA">
+                                    <option value="GATEWAY_REQUEST">GATEWAY_REQUEST</option>
+                                    <option value="CLIENT_POLICY_DENIED">CLIENT_POLICY_DENIED</option>
+                                    <option value="AGENT_CALL_ALLOWED">AGENT_CALL_ALLOWED</option>
+                                    <option value="AGENT_CALL_DENIED_RBAC">AGENT_CALL_DENIED_RBAC</option>
+                                    <option value="AGENT_CALL_DENIED_INSPECTION">AGENT_CALL_DENIED_INSPECTION</option>
+                                    <option value="AGENT_RESPONSE_BLOCKED_BY_OPA">AGENT_RESPONSE_BLOCKED_BY_OPA</option>
+                                    <option value="CLOUD_OVERRIDE">CLOUD_OVERRIDE</option>
+                                </optgroup>
+                                <optgroup label="Orchestration">
+                                    <option value="ORCHESTRATION_STEP">ORCHESTRATION_STEP</option>
+                                    <option value="ORCHESTRATION_BLOCKED_STEP">ORCHESTRATION_BLOCKED_STEP</option>
+                                    <option value="ORCHESTRATION_INJECTION_HOP">ORCHESTRATION_INJECTION_HOP</option>
+                                    <option value="ORCHESTRATION_EXFIL_BLOCKED">ORCHESTRATION_EXFIL_BLOCKED</option>
+                                </optgroup>
+                                <optgroup label="Config / Admin">
+                                    <option value="CONFIG_CHANGED">CONFIG_CHANGED</option>
+                                    <option value="RUNTIME_SETTING_CHANGED">RUNTIME_SETTING_CHANGED</option>
+                                    <option value="AGENT_REGISTERED">AGENT_REGISTERED</option>
+                                    <option value="AGENT_UPDATED">AGENT_UPDATED</option>
+                                    <option value="AGENT_DEACTIVATED">AGENT_DEACTIVATED</option>
+                                    <option value="RBAC_GROUP_CREATED">RBAC_GROUP_CREATED</option>
+                                    <option value="RBAC_MEMBER_ADDED">RBAC_MEMBER_ADDED</option>
+                                    <option value="RBAC_POLICY_PUSHED">RBAC_POLICY_PUSHED</option>
+                                    <option value="KSM_ROTATION_SUCCESS">KSM_ROTATION_SUCCESS</option>
+                                    <option value="SECRET_ROTATION_REQUESTED">SECRET_ROTATION_REQUESTED</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <div><label class="lbl">Verdict</label><br><select id="audit-verdict" class="fi"><option value="">* (All verdicts)</option></select></div>
+                        <div><label class="lbl">Source type</label><br><select id="audit-source-type" class="fi"><option value="">* (All sources)</option></select></div>
+                    </div>
+                    <!-- Row 2: date range, actor filters, free text -->
+                    <div class="form-row form-row--mt">
                         <div><label class="lbl">From</label><br><input id="audit-from" type="date" class="fi"></div>
                         <div><label class="lbl">To</label><br><input id="audit-to" type="date" class="fi"></div>
+                        <div><label class="lbl">Agent ID</label><br><input id="audit-agent-id" type="text" placeholder="agent-id substring" class="fi w-180"></div>
+                        <div><label class="lbl">User / Admin</label><br><input id="audit-user" type="text" placeholder="username substring" class="fi w-160"></div>
                         <div><label class="lbl">Free text</label><br><input id="audit-text" type="text" placeholder="search..." class="fi w-180"></div>
+                    </div>
+                    <!-- Row 3: actions -->
+                    <div class="form-row form-row--mt form-row--gap12">
                         <button data-action="searchAudit" class="btn-sm-primary">Search</button>
+                        <button data-action="resetAudit" class="btn-sm-secondary">Reset</button>
                         <button data-action="exportAudit" class="btn-sm-secondary">Export CSV</button>
                     </div>
                 </div>
@@ -409,6 +914,232 @@
                     <tbody id="audit-tbody"><tr><td colspan="5" class="empty">Use the search form above to query audit events.</td></tr></tbody>
                 </table>
                 <div id="audit-pagination" class="audit-pagination"></div>
+            </div>
+        </div>
+
+        <!-- Policies Page — R8/R9/R10/R12 wired to live endpoints -->
+        <div class="page" id="page-policies">
+            <h2>Policies (OPA)</h2>
+            <div class="panel">
+                <div class="panel-header">Active policy modules</div>
+                <div class="panel-body">
+                    <p class="txt-note">Rego policy modules currently loaded in the OPA decision service.
+                        "Example" modules are immutable governance templates (duplicate to edit).
+                        "Core" policies are load-bearing gateway rules (danger-zone edit requires TOTP + confirmation).
+                        "Client" policies are editable copies under <code>clients/</code>.</p>
+                    <div id="policies-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+
+            <!-- R10 — Lifecycle status panel (client policies only) -->
+            <div class="panel">
+                <div class="panel-header">Policy Lifecycle (client policies)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Client policies progress: <strong>Draft</strong> → <strong>Staging</strong> → <strong>Production</strong>.
+                        Only production policies can be bound to subjects. Promote requires TOTP step-up.</p>
+                    <div id="lifecycle-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+
+            <!-- R12 — Policy dry-run panel -->
+            <div class="panel">
+                <div class="panel-header">Policy Dry-run / Simulate</div>
+                <div class="panel-body">
+                    <p class="txt-note">Test a policy against a mock input scenario without applying any change.
+                        Returns block/allow verdict + deny codes + AI explanation.</p>
+                    <div class="form-row">
+                        <div class="flex-1">
+                            <label class="lbl">Policy ID (e.g. <code>clients/my_policy</code> or <code>examples/gdpr</code>)</label><br>
+                            <input id="sim-policy-id" type="text" placeholder="clients/my_policy" class="fi w-280">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <div class="flex-1">
+                            <label class="lbl">Input scenario (JSON)</label><br>
+                            <textarea id="sim-input-json" class="sim-textarea" placeholder='{"identity":{"agent":"openclaw","role":"user"},"tool":"email.delete"}'></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row--gap12">
+                        <button data-action="simulatePolicy" class="btn-sm-primary">Run dry-run</button>
+                        <label><input type="checkbox" id="sim-ai-explain" checked> AI explanation</label>
+                    </div>
+                    <div id="sim-result" class="dryrun-panel is-hidden"></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">Client-policy bindings (#16 — enforcement)</div>
+                <div class="panel-body">
+                    <p class="txt-note">Bind a saved client policy (clients/&lt;name&gt;) to a subject scope and a
+                        direction. Bound policies are enforced by the gateway on every matching request
+                        (ingress) and/or response (egress), in addition to the core gates — they can only add
+                        denials, never remove one. Wildcard = leave Subject ID empty (all subjects of that kind).</p>
+                    <div class="form-row--wrap-mb">
+                        <label class="lbl">Policy name<br>
+                            <select id="bind-policy-name" class="fi-sm">
+                                <option value="">Loading policies…</option>
+                            </select></label>
+                        <label class="lbl">Subject kind<br>
+                            <select id="bind-scope-kind" class="fi-sm">
+                                <option value="human">human</option>
+                                <option value="service">service</option>
+                                <option value="api_client">api_client</option>
+                                <option value="mcp_server">mcp_server</option>
+                                <option value="agent">agent</option>
+                            </select></label>
+                        <label class="lbl">Subject ID<br>
+                            <select id="bind-scope-id" class="fi-sm">
+                                <option value="*">All (wildcard)</option>
+                            </select></label>
+                        <label class="lbl">Direction<br>
+                            <select id="bind-direction" class="fi-sm">
+                                <option value="ingress">ingress</option>
+                                <option value="egress">egress</option>
+                                <option value="both">both</option>
+                            </select></label>
+                        <button data-action="bindPolicy" class="btn-sm-primary">Bind</button>
+                    </div>
+                    <div id="bindings-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">Create a policy with AI</div>
+                <div class="panel-body">
+                    <p class="txt-note">Describe the policy in plain English; the internal LLM drafts the Rego. Review &amp; edit
+                        below, then save (which OPA‑validates it). e.g. <em>"allow openclaw to read and reply to all my emails but not delete them"</em>.</p>
+                    <textarea id="policy-gen-prompt" spellcheck="false" placeholder="Describe the policy…" class="pol-prompt"></textarea>
+                    <div class="pol-row">
+                        <label class="pol-lbl">Name <code>clients.</code></label>
+                        <input id="policy-gen-name" type="text" placeholder="email_guard" class="pol-input">
+                        <button class="btn btn-sm btn-sm-save" data-action="policyGenerate">Generate</button>
+                        <span id="policy-gen-result" class="pol-result"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="panel is-hidden" id="policy-view-panel">
+                <div class="panel-header">
+                    <span id="policy-view-title">Policy source</span>
+                    <span id="policy-view-badge" class="pol-badge"></span>
+                    <button class="btn btn-sm pol-close" data-action="policyClose">Close</button>
+                </div>
+                <div class="panel-body">
+                    <textarea id="policy-view-src" readonly spellcheck="false" class="pol-src"></textarea>
+                    <div id="policy-edit-controls" class="pol-row">
+                        <!-- R8: "Create editable copy" (Save-As) — for example/template policies -->
+                        <button class="btn btn-sm" data-action="policyEditCopy">Create editable copy</button>
+                        <!-- R8: "Duplicate" template → POST /admin/policies/templates/duplicate -->
+                        <button class="btn btn-sm btn-sm-save" id="btn-duplicate-template" data-action="duplicateTemplate">Duplicate to client policy</button>
+                        <!-- R9: "Edit core policy" — danger-zone, only shown for core policies -->
+                        <button class="btn btn-sm btn-sm-danger" id="btn-edit-core" data-action="editCorePolicy">Edit core policy (dangerous)</button>
+                        <span id="policy-saveas" class="pol-saveas">
+                            <label class="pol-lbl">Save as <code>clients.</code></label>
+                            <input id="policy-copy-name" type="text" placeholder="my_org_gdpr" pattern="[a-z][a-z0-9_]*"
+                                   class="pol-input">
+                            <button class="btn btn-sm btn-sm-save" data-action="policySaveCopy">Save</button>
+                        </span>
+                        <span id="policy-save-result" class="pol-result"></span>
+                    </div>
+                    <!-- R8: edit-rego controls (shown when editing an existing client policy's Rego directly) -->
+                    <div id="policy-editrego-controls" class="pol-row is-hidden">
+                        <span class="pol-lbl">Editing <code>clients.</code><span id="policy-editrego-name"></span></span>
+                        <button class="btn btn-sm btn-sm-save" data-action="saveCustomRegoEdit">Save Rego (PUT)</button>
+                        <button class="btn btn-sm btn-sm-secondary" data-action="cancelRegoEdit">Cancel</button>
+                        <span id="policy-editrego-result" class="pol-result"></span>
+                    </div>
+                    <!-- R9: danger-zone confirmation (shown when editing a core policy) -->
+                    <div id="core-danger-zone" class="danger-zone is-hidden">
+                        <div class="danger-zone-title">Core policy edit — danger zone</div>
+                        <div class="danger-zone-desc">You are editing a load-bearing core gateway policy.
+                            An error here can disrupt ALL traffic through the gateway.
+                            This edit is audited. A TOTP step-up is required to save.</div>
+                        <div class="danger-confirm-row">
+                            <input id="core-danger-reason" type="text" placeholder="Justification (ticket #, reason — required)"
+                                   class="danger-reason-input">
+                            <button class="btn-sm-danger-confirm" data-action="saveCorePolicyEdit">Save core policy (confirm danger)</button>
+                            <button class="btn btn-sm btn-sm-secondary" data-action="cancelCorePolicyEdit">Cancel</button>
+                        </div>
+                        <div id="core-danger-result" class="pol-result"></div>
+                    </div>
+                    <p class="txt-note mt-sm">Examples are <strong>immutable templates</strong>.
+                        "Duplicate" fast-copies the Rego to a new <code>clients.&lt;name&gt;</code> policy via the API (R8).
+                        Client policies can be edited directly via "Edit Rego" (R8).
+                        Core policies require danger-zone confirmation + TOTP (R9).
+                        To persist across a full redeploy, add it to your policy bundle.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Access (RBAC) Page — R13: path dropdown from /admin/rbac/sources/paths + method descriptions -->
+        <div class="page" id="page-rbac">
+            <h2>Access (RBAC Groups)</h2>
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Groups</span>
+                    <button data-action="toggleForm" data-form-id="create-group-form" class="btn-xs-add">+ Create group</button>
+                </div>
+                <div id="create-group-form" class="form-panel">
+                    <div class="form-row">
+                        <div><label class="lbl">Display name</label><br><input id="rbac-group-name" type="text" placeholder="e.g. Support team" class="fi w-200"></div>
+                    </div>
+                    <p class="txt-note mt-sm">Allowed resources (method + path). Select from the catalogues or type a custom path; blank rows are ignored.</p>
+                    <div id="rbac-resource-rows">
+                        <!-- R13: first row uses dropdowns populated from /admin/rbac/sources/paths + /methods -->
+                        <div class="form-row rbac-resource-row">
+                            <div>
+                                <label class="lbl">Method</label><br>
+                                <select class="fi rbac-res-method" data-action="rbacMethodChanged">
+                                    <option value="*">* (all methods)</option>
+                                    <option value="GET">GET — Read</option>
+                                    <option value="POST">POST — Create / invoke</option>
+                                    <option value="PUT">PUT — Update (replace)</option>
+                                    <option value="DELETE">DELETE — Delete</option>
+                                </select>
+                                <div class="rbac-method-help" id="rbac-method-help-0"></div>
+                            </div>
+                            <div>
+                                <label class="lbl">Path</label><br>
+                                <select class="fi w-250 rbac-res-path-select" data-action="rbacPathSelectChanged">
+                                    <option value="">Loading paths…</option>
+                                </select>
+                                <input type="text" placeholder="or type a custom path glob" class="fi w-250 rbac-res-path is-hidden">
+                                <div class="rbac-method-help rbac-path-desc" id="rbac-path-desc-0"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="rbacAddResourceRow" class="btn-xs-add">+ Add resource</button>
+                        <button data-action="createGroup" class="btn-sm-save">Create group</button>
+                    </div>
+                    <div id="rbac-create-result" class="form-result"></div>
+                </div>
+                <table>
+                    <thead><tr><th>ID</th><th>Display name</th><th>Members</th><th>Allowed resources</th><th>Actions</th></tr></thead>
+                    <tbody id="rbac-groups-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+                </table>
+            </div>
+            <div class="panel is-hidden" id="rbac-members-panel">
+                <div class="panel-header panel-header-flex">
+                    <span id="rbac-members-title">Members</span>
+                    <button data-action="rbacMembersClose" class="btn btn-sm">Close</button>
+                </div>
+                <div class="panel-body">
+                    <div class="form-row--wrap-mb">
+                        <label class="lbl">Member email<br>
+                            <input id="rbac-member-email" type="email" placeholder="user@example.com" class="fi-sm"></label>
+                        <button data-action="addRbacMember" class="btn-sm-primary">Add member</button>
+                    </div>
+                    <div id="rbac-members-container"><span class="loading">Select a group's "Members" action to manage members.</span></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">OPA synchronisation</div>
+                <div class="panel-body">
+                    <p class="txt-note">Group changes are pushed to the OPA decision service automatically on every
+                        mutation. Use this to force a re-push (e.g. after an OPA restart).</p>
+                    <div class="form-row--mt-center">
+                        <button data-action="rbacForcePush" class="btn-sm-save">Re-push to OPA</button>
+                        <span id="rbac-push-result" class="txt-note"></span>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -426,10 +1157,11 @@
                     <div class="card-value card-value-lg">Query Engine</div>
                     <p class="card-desc">Direct access to Prometheus PromQL queries, alert rules, and target status. Click to open.</p>
                 </div>
-                <div class="card card-clickable" data-action="openExternal" data-url="/admin/wazuh/">
+                <!-- Wazuh tile — optional service; loadMonitoring() hides/greys when not deployed -->
+                <div id="monitoring-tile-wazuh" class="card card-clickable tile-disabled" data-url="/admin/wazuh/" aria-disabled="true">
                     <div class="card-label">Wazuh SIEM</div>
                     <div class="card-value card-value-lg">Security Monitoring</div>
-                    <p class="card-desc">Open-source SIEM: threat detection, compliance, vulnerability assessment. Available when installed with --wazuh flag.</p>
+                    <p id="monitoring-tile-wazuh-note" class="card-desc">Not deployed — re-run installer with --wazuh to enable.</p>
                 </div>
             </div>
             <h2>Quick Links</h2>
@@ -438,20 +1170,51 @@
                     <table>
                         <thead><tr><th>Dashboard</th><th>Description</th><th>Link</th></tr></thead>
                         <tbody>
-                            <tr><td>System Health</td><td>CPU, memory, uptime, container status</td><td><a href="/admin/grafana/d/system_health" target="_blank">Open</a></td></tr>
-                            <tr><td>Security Overview</td><td>Prompt injection, credential exfil, OPA denials</td><td><a href="/admin/grafana/d/security_overview" target="_blank">Open</a></td></tr>
-                            <tr><td>Budget Usage</td><td>Token consumption per identity and provider</td><td><a href="/admin/grafana/d/budget_usage" target="_blank">Open</a></td></tr>
-                            <tr><td>Agent Activity</td><td>Request patterns, latency, error rates per agent</td><td><a href="/admin/grafana/d/agent_activity" target="_blank">Open</a></td></tr>
-                            <tr><td>Rate Limit Status</td><td>Rate limit violations and near-limit warnings</td><td><a href="/admin/grafana/d/rate_limit_status" target="_blank">Open</a></td></tr>
-                            <tr><td>Optimization Engine</td><td>Routing decisions, model selection, cost tracking</td><td><a href="/admin/grafana/d/optimization_engine" target="_blank">Open</a></td></tr>
-                            <tr><td>Pool Manager</td><td>Container lifecycle, per-identity isolation</td><td><a href="/admin/grafana/d/pool_manager" target="_blank">Open</a></td></tr>
-                            <tr><td>Logs (Loki)</td><td>Aggregated application and service logs</td><td><a href="/admin/grafana/d/logs" target="_blank">Open</a></td></tr>
-                            <tr><td>Tracing (Jaeger)</td><td>Distributed request traces end-to-end</td><td><a href="/admin/grafana/d/tracing" target="_blank">Open</a></td></tr>
-                            <tr><td>Anomaly Detection</td><td>Behavioral anomaly metrics and alerts</td><td><a href="/admin/grafana/d/anomaly" target="_blank">Open</a></td></tr>
-                            <tr><td>Inspection Backend</td><td>Classification backend health and latency</td><td><a href="/admin/grafana/d/inspection_backend" target="_blank">Open</a></td></tr>
-                            <tr><td>CI/CD</td><td>Pipeline metrics and deployment tracking</td><td><a href="/admin/grafana/d/cicd" target="_blank">Open</a></td></tr>
+                            <tr><td>System Health</td><td>CPU, memory, uptime, container status</td><td><a href="/admin/grafana/d/yashigani-system-health" target="_blank">Open</a></td></tr>
+                            <tr><td>Security Overview</td><td>Prompt injection, credential exfil, OPA denials</td><td><a href="/admin/grafana/d/yashigani-security" target="_blank">Open</a></td></tr>
+                            <tr><td>Budget Usage</td><td>Token consumption per identity and provider</td><td><a href="/admin/grafana/d/yashigani-budget" target="_blank">Open</a></td></tr>
+                            <tr><td>Agent Activity</td><td>Request patterns, latency, error rates per agent</td><td><a href="/admin/grafana/d/yashigani-agent-activity" target="_blank">Open</a></td></tr>
+                            <tr><td>Rate Limit Status</td><td>Rate limit violations and near-limit warnings</td><td><a href="/admin/grafana/d/yashigani-ratelimit" target="_blank">Open</a></td></tr>
+                            <tr><td>Optimization Engine</td><td>Routing decisions, model selection, cost tracking</td><td><a href="/admin/grafana/d/yashigani-oe" target="_blank">Open</a></td></tr>
+                            <tr><td>Pool Manager</td><td>Container lifecycle, per-identity isolation</td><td><a href="/admin/grafana/d/yashigani-pool" target="_blank">Open</a></td></tr>
+                            <tr><td>Logs (Loki)</td><td>Aggregated application and service logs</td><td><a href="/admin/grafana/d/yashigani-logs" target="_blank">Open</a></td></tr>
+                            <tr><td>Tracing (Jaeger)</td><td>Distributed request traces end-to-end</td><td><a href="/admin/grafana/d/yashigani-tracing" target="_blank">Open</a></td></tr>
+                            <tr><td>Anomaly Detection</td><td>Behavioral anomaly metrics and alerts</td><td><a href="/admin/grafana/d/yashigani-anomaly" target="_blank">Open</a></td></tr>
+                            <tr><td>Inspection Backend</td><td>Classification backend health and latency</td><td><a href="/admin/grafana/d/yashigani-inspection-backend" target="_blank">Open</a></td></tr>
+                            <tr><td>CI/CD</td><td>Pipeline metrics and deployment tracking</td><td><a href="/admin/grafana/d/yashigani-cicd" target="_blank">Open</a></td></tr>
                         </tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- External SIEM connect form — wired to /admin/audit/siem/config (PUT) + test (POST) -->
+            <div class="panel">
+                <div class="panel-header">External SIEM / Audit Sink</div>
+                <div class="panel-body">
+                    <p class="txt-note">Forward audit events to an external SIEM (Splunk, Elasticsearch, or an existing Wazuh).
+                        Step-up required to save. A test event is sent to verify connectivity before the change is persisted.</p>
+                    <div id="siem-config-status" class="form-result">Loading…</div>
+                    <div class="form-row form-row--mt">
+                        <div><label class="lbl">Backend</label><br>
+                            <select id="siem-backend" class="fi w-160">
+                                <option value="none">None (disabled)</option>
+                                <option value="splunk">Splunk HEC</option>
+                                <option value="elasticsearch">Elasticsearch</option>
+                                <option value="wazuh">Wazuh (existing)</option>
+                            </select>
+                        </div>
+                        <div><label class="lbl">Endpoint URL</label><br>
+                            <input id="siem-endpoint" type="url" placeholder="https://siem.corp.example:9200" class="fi w-320"></div>
+                    </div>
+                    <div class="form-row">
+                        <div class="flex-1"><label class="lbl">API Key / Token (stored via KMS — never plaintext DB)</label><br>
+                            <input id="siem-token" type="password" placeholder="Leave blank to keep existing" class="fi w-full" autocomplete="new-password"></div>
+                    </div>
+                    <div class="form-row--gap12 form-row--mt">
+                        <button data-action="siemTest" class="btn-sm">Test connection</button>
+                        <button data-action="siemSave" class="btn-sm-save">Save (step-up)</button>
+                    </div>
+                    <div id="siem-config-result" class="form-result"></div>
                 </div>
             </div>
         </div>
@@ -465,16 +1228,20 @@
                     <p class="txt-note">Backups created by the installer and update scripts. Verify integrity by re-hashing against the recorded checksum manifest.</p>
                     <div id="backup-status-container"><span class="loading">Loading...</span></div>
                     <div id="backup-actions" class="backup-actions">
+                        <button id="btn-create-backup" data-action="createBackup" class="btn-sm-save">Create backup</button>
                         <button id="btn-verify-latest" data-action="verifyBackup" class="btn-verify" disabled>Verify latest</button>
                     </div>
+                    <p class="txt-note mt-xs">"Create backup" takes an on-demand database snapshot (accounts, RBAC,
+                        agents, policies, budgets, audit). Full-system restore/recovery is an installer operation.</p>
+                    <div id="backup-create-result" class="backup-verify-result"></div>
                     <div id="backup-verify-result" class="backup-verify-result"></div>
                 </div>
             </div>
         </div>
 
-        <!-- PKI Admin Page — v2.23.3 (#51 + #53) -->
+        <!-- PKI / Cryptography Admin Page — R24: merged Crypto into PKI -->
         <div class="page" id="page-pki">
-            <h2>PKI Certificate Management</h2>
+            <h2>PKI / Cryptography</h2>
 
             <!-- Status Overview -->
             <div class="panel">
@@ -500,7 +1267,7 @@
                         <table class="pki-chain-table">
                             <tbody id="pki-chain-table-body"></tbody>
                         </table>
-                        <button onclick="hidePkiChain()" class="btn-pki-close">
+                        <button data-action="pkiClose" class="btn-pki-close">
                             Close
                         </button>
                     </div>
@@ -521,6 +1288,18 @@
                         <code>YASHIGANI_BYO_SIGNING_ENDPOINT</code> and <code>YASHIGANI_BYO_CA_CERT_PATH</code>.
                         See documentation for full configuration reference.
                     </p>
+                </div>
+            </div>
+
+            <!-- R24 — Cryptography merged here (was Settings > Cryptography) -->
+            <div class="panel">
+                <div class="panel-header">Cryptography (ASVS v5 V11)</div>
+                <div class="panel-body">
+                    <p class="pki-crypto-note">Cryptographic algorithm inventory. Lists all algorithms in use,
+                        deprecated ciphers, and post-quantum readiness. Consolidated here alongside PKI
+                        to provide a single "PKI / Cryptography" view (R24 IA).</p>
+                    <div id="crypto-inventory"><span class="loading">Loading...</span></div>
+                    <button data-action="exportCryptoJson" class="btn-export">Export JSON</button>
                 </div>
             </div>
         </div>
@@ -563,6 +1342,15 @@
                 <div class="panel-header">License</div>
                 <div class="panel-body" id="license-info"><span class="loading">Loading...</span></div>
             </div>
+            <!-- R23 — license entitlements (tier-gated features) -->
+            <div class="panel">
+                <div class="panel-header">Feature Entitlements</div>
+                <div class="panel-body">
+                    <p class="txt-note">Features available on your current license tier. Locked features are shown
+                        as disabled configuration — upgrade to unlock them.</p>
+                    <div id="entitlements-container"><span class="loading">Loading…</span></div>
+                </div>
+            </div>
             <div class="panel">
                 <div class="panel-header">Identity Providers</div>
                 <div class="panel-body">
@@ -577,8 +1365,9 @@
                             <span class="badge badge-yellow" id="saml-status">Not configured</span>
                         </div>
                     </div>
-                    <div class="idp-config-box">
-                        <p><strong>OIDC Configuration</strong></p>
+                    <!-- R23: entitlement-lock overlay is applied by loadEntitlements() in JS -->
+                    <div class="idp-config-box" id="idp-config-box">
+                        <p><strong>OIDC Configuration</strong> <span id="oidc-entitlement-badge"></span></p>
                         <div class="idp-grid">
                             <label class="lbl">Issuer URL</label>
                             <input id="oidc-issuer" type="text" placeholder="https://idp.example.com/realms/yashigani" class="fi-sm">
@@ -589,7 +1378,7 @@
                         </div>
                         <button data-action="saveIdpConfig" data-idp-type="oidc" class="btn-xs-primary txt-mt8">Save OIDC Config</button>
                         <span id="oidc-save-result" class="idp-result"></span>
-                        <p class="idp-section-mt"><strong>SAML v2 Configuration</strong></p>
+                        <p class="idp-section-mt"><strong>SAML v2 Configuration</strong> <span id="saml-entitlement-badge"></span></p>
                         <div class="idp-grid">
                             <label class="lbl">Metadata URL</label>
                             <input id="saml-metadata" type="text" placeholder="https://idp.example.com/saml/metadata" class="fi-sm">
@@ -604,17 +1393,10 @@
             <div class="panel">
                 <div class="panel-header">System Info</div>
                 <div class="panel-body">
-                    <p class="txt-version">Version: 2.1 | Runtime: Podman/Docker | TLS: Self-signed</p>
+                    <p class="txt-version">Version: {{ yashigani_version }} | Runtime: Podman/Docker | TLS: Self-signed</p>
                 </div>
             </div>
-            <div class="panel">
-                <div class="panel-header">Cryptography</div>
-                <div class="panel-body">
-                    <p class="txt-body">Cryptographic algorithm inventory (OWASP ASVS v5 V11). Lists all algorithms in use, deprecated ciphers, and post-quantum readiness.</p>
-                    <div id="crypto-inventory"><span class="loading">Loading...</span></div>
-                    <button data-action="exportCryptoJson" class="btn-export">Export JSON</button>
-                </div>
-            </div>
+            <!-- R24: Cryptography moved to PKI page ("PKI / Cryptography") — see page-pki below. -->
 
             <!-- Authentication > HIBP — v2.23.3 (#59) -->
             <div class="panel">
@@ -661,6 +1443,86 @@
                 </div>
             </div>
         </div>
+        <!-- 3.0 — Browser Permissions-Policy admin page (capability_policy.py) -->
+        <div class="page" id="page-capability-policy">
+            <h2>Browser Permissions Policy</h2>
+
+            <!-- Scope selector -->
+            <div class="panel">
+                <div class="panel-header">Scope</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Configure which browser capabilities (camera, microphone, etc.) are permitted for users
+                        accessing resources via Yashigani. Policies cascade: user override &gt; most-restrictive
+                        group &gt; org policy &gt; immutable baseline (all <code>self</code>).
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Scope type</label>
+                            <select id="cap-scope-type" class="fi-sm">
+                                <option value="org">Organisation (default)</option>
+                                <option value="group">Group</option>
+                                <option value="user">User</option>
+                            </select>
+                        </div>
+                        <div id="cap-group-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Group</label>
+                            <select id="cap-group-id" class="fi-sm">
+                                <option value="">Loading&hellip;</option>
+                            </select>
+                        </div>
+                        <div id="cap-user-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">User email</label>
+                            <input id="cap-user-email" type="email" placeholder="user@example.com" class="fi w-250">
+                        </div>
+                        <button data-action="capPolLoad" class="btn-sm-primary">Load policy</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Policy editor -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Policy &mdash; <span id="cap-pol-scope-label">Organisation (default)</span></span>
+                    <span id="cap-pol-partial-note" class="txt-note is-hidden">Unset capabilities inherit from the parent scope.</span>
+                </div>
+                <div class="panel-body">
+                    <div id="cap-pol-rows"><span class="loading">Loading&hellip;</span></div>
+                    <div class="cap-pol-actions">
+                        <button data-action="capPolSave" class="btn-sm-save">Save</button>
+                        <button id="cap-pol-delete-btn" data-action="capPolDelete" class="btn-sm-danger is-hidden">Delete override</button>
+                        <span id="cap-pol-result"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Effective policy preview -->
+            <div class="panel">
+                <div class="panel-header">Effective Policy (resolved for a user)</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Shows the resolved capability settings that apply to a specific user after all precedence
+                        rules (user override &gt; most-restrictive group &gt; org &gt; baseline).
+                    </p>
+                    <div class="form-row--wrap-mb">
+                        <input id="cap-eff-user" type="email" placeholder="user@example.com" class="fi w-250">
+                        <button data-action="capPolEffective" class="btn-sm-primary">Resolve</button>
+                    </div>
+                    <div id="cap-eff-result"></div>
+                    <table id="cap-eff-table" class="cap-eff-table is-hidden">
+                        <thead>
+                            <tr>
+                                <th>Capability</th>
+                                <th>Effective Setting</th>
+                                <th>Allowed Origins</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cap-eff-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <!-- Runtime Settings Page — v2.24.3 (admin-surfaces-all-runtime-settings Phase 2) -->
         <div class="page" id="page-runtime-settings">
             <h2>Runtime Settings</h2>
@@ -706,6 +1568,242 @@
             <!-- Toast notification -->
             <div id="rs-toast" class="rs-toast"></div>
         </div>
+        <!-- Permissions Page — 3.1 Phase 8: Unified Resource Permission Grant admin UI -->
+        <!-- LAURA-V400-R2-001 — Data Protection admin page -->
+        <div class="page" id="page-data-protection">
+            <h2>Data Protection</h2>
+            <p class="txt-note">
+                Disabling any data-protection control requires <strong>two admin approvals</strong>
+                (maker-checker). An admin submits a weaken request; a <em>different</em> admin must
+                approve it. Re-enabling protection is single-admin step-up only.
+            </p>
+
+            <!-- Current state panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Current Protection State</span>
+                    <button data-action="dpRefresh" class="btn-xs-add">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div id="dp-status-result"></div>
+                </div>
+            </div>
+
+            <!-- Pending weaken requests panel -->
+            <div class="panel">
+                <div class="panel-header">Pending Weaken Requests (Action Required)</div>
+                <div class="panel-body">
+                    <p class="txt-note">These requests are awaiting a second admin approval.
+                    You can approve or reject any request that you did not submit.</p>
+                    <div id="dp-pending-result"></div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Control</th>
+                                <th>Requested by</th>
+                                <th>From state</th>
+                                <th>To state</th>
+                                <th>Requested at</th>
+                                <th>Expires</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dp-pending-tbody">
+                            <tr><td colspan="7" class="empty">Loading&hellip;</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Decision result -->
+            <div id="dp-decision-result"></div>
+        </div>
+
+        <div class="page" id="page-permissions">
+            <h2>Resource Permissions</h2>
+
+            <!-- Scope + Resource Type selector -->
+            <div class="panel">
+                <div class="panel-header">Scope &amp; Resource Type</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Manage explicit allow/deny grants for blast-radius resource types
+                        (MCP servers, external APIs, cloud models, agents).
+                        Org grant is the ceiling; groups and users may only narrow it.
+                        Browser Permissions-Policy is on the <strong>Permissions Policy</strong> page.
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Scope type</label>
+                            <select id="perm-scope-type" class="fi-sm">
+                                <option value="org">Organisation</option>
+                                <option value="group">Group</option>
+                                <option value="user">User</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div id="perm-group-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Group</label>
+                            <select id="perm-group-id" class="fi-sm">
+                                <option value="">Loading&hellip;</option>
+                            </select>
+                        </div>
+                        <div id="perm-user-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">User email</label>
+                            <input id="perm-user-email" type="email" placeholder="user@example.com" class="fi w-250">
+                        </div>
+                        <div id="perm-agent-picker" class="cap-scope-picker is-hidden">
+                            <label class="lbl">Agent ID</label>
+                            <input id="perm-agent-id" type="text" placeholder="agent-id" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource type</label>
+                            <select id="perm-resource-type" class="fi-sm">
+                                <option value="mcp_server">MCP Server</option>
+                                <option value="external_api">External API</option>
+                                <option value="cloud_model">Cloud Model</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <button data-action="permLoad" class="btn-sm-primary">Load grants</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grants panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Grants &mdash; <span id="perm-scope-label">MCP Server &mdash; Organisation</span></span>
+                    <button data-action="permGrantEdit" data-rid="" data-allow="1" data-opa="" class="btn-xs-add">+ Add grant</button>
+                </div>
+                <!-- Add / Edit grant inline form -->
+                <div id="perm-grant-form" class="form-panel">
+                    <p class="lbl perm-grant-form-title" id="perm-grant-form-title">Add grant</p>
+                    <div class="form-row">
+                        <div>
+                            <label class="lbl">Resource ID</label><br>
+                            <input id="perm-grant-rid" type="text" placeholder="server-id / api-host / model-name / agent-id" class="fi w-250">
+                        </div>
+                        <div>
+                            <label class="lbl">Grant</label><br>
+                            <label class="perm-allow-label">
+                                <input id="perm-grant-allow" type="checkbox" checked>
+                                Allow
+                            </label>
+                        </div>
+                    </div>
+                    <div id="perm-grant-opa-row" class="form-row--mt is-hidden">
+                        <div>
+                            <label class="lbl">OPA Policy Ref <span class="perm-required">(required for cloud_model + allow)</span></label><br>
+                            <input id="perm-grant-opa" type="text" placeholder="yashigani/cloud_model/gpt4o" class="fi w-250">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="permSaveGrant" class="btn-sm-save">Save</button>
+                        <button data-action="permGrantEditCancel" class="btn-sm-secondary">Cancel</button>
+                        <span id="perm-grant-result"></span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div id="perm-grants-container"><span class="loading">Loading&hellip;</span></div>
+                    <div class="perm-grants-actions">
+                        <span id="perm-grants-result"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Effective permission preview -->
+            <div class="panel">
+                <div class="panel-header">Effective Permission (resolved)</div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Resolve the effective permission for a subject + resource after org-ceiling rules
+                        (org grant is ceiling; groups and user may narrow it further).
+                        Matches the gateway enforcement path.
+                    </p>
+                    <div class="cap-scope-row">
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource type</label>
+                            <select id="perm-eff-rt" class="fi-sm">
+                                <option value="mcp_server">MCP Server</option>
+                                <option value="external_api">External API</option>
+                                <option value="cloud_model">Cloud Model</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Resource ID</label>
+                            <input id="perm-eff-rid" type="text" placeholder="server-id / host / model" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Org ID</label>
+                            <input id="perm-eff-org" type="text" value="default" class="fi w-80">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">User email <span class="txt-hint">(optional)</span></label>
+                            <input id="perm-eff-user" type="email" placeholder="user@example.com" class="fi w-200">
+                        </div>
+                        <div class="cap-scope-picker">
+                            <label class="lbl">Group IDs <span class="txt-hint">(comma-sep, optional)</span></label>
+                            <input id="perm-eff-groups" type="text" placeholder="group1,group2" class="fi w-200">
+                        </div>
+                        <button data-action="permEffective" class="btn-sm-primary">Resolve</button>
+                    </div>
+                    <div id="perm-eff-result" class="perm-eff-result-box"></div>
+                    <div id="perm-eff-path" class="is-hidden"></div>
+                </div>
+            </div>
+
+            <!-- Declarations panel -->
+            <div class="panel">
+                <div class="panel-header panel-header-flex">
+                    <span>Pending Declarations</span>
+                    <button data-action="loadDeclarations" class="btn-xs-add">Refresh</button>
+                </div>
+                <!-- Approve confirm form (EU AI Act Art.14 human-in-the-loop) -->
+                <div id="perm-decl-approve-form" class="form-panel">
+                    <p class="txt-note">
+                        Approving creates an org-level grant.
+                        This is the <strong>human-accountable act</strong> (EU AI Act Art.14 / ASVS V10.3.5).
+                    </p>
+                    <div class="form-row">
+                        <div>
+                            <label class="lbl">Resource</label><br>
+                            <strong id="perm-decl-approve-label"></strong>
+                        </div>
+                        <div>
+                            <label class="lbl">Grant</label><br>
+                            <label class="perm-allow-label">
+                                <input id="perm-decl-approve-allow" type="checkbox" checked>
+                                Allow
+                            </label>
+                        </div>
+                    </div>
+                    <div id="perm-decl-approve-opa-row" class="form-row--mt is-hidden">
+                        <div>
+                            <label class="lbl">OPA Policy Ref <span class="perm-required">(required for cloud_model + allow)</span></label><br>
+                            <input id="perm-decl-approve-opa" type="text" placeholder="yashigani/cloud_model/gpt4o" class="fi w-250">
+                        </div>
+                    </div>
+                    <div class="form-row--mt">
+                        <button data-action="permApproveDeclaration" class="btn-sm-save">Confirm approval</button>
+                        <button data-action="permApproveCancelClick" class="btn-sm-secondary">Cancel</button>
+                        <span id="perm-decl-approve-result"></span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <p class="txt-note">
+                        Agent manifests and operators declare resources they need access to.
+                        An admin must approve to create the org-level grant (human-in-the-loop).
+                    </p>
+                    <div id="perm-decl-container"><span class="loading">Loading&hellip;</span></div>
+                    <div class="perm-grants-actions">
+                        <span id="perm-decl-result"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- V6.8.4 Step-up TOTP modal — shown when a high-value action requires fresh TOTP -->
@@ -718,15 +1816,15 @@
             </p>
             <label class="stepup-lbl">TOTP Code</label>
             <input id="stepup-code" type="text" inputmode="numeric" autocomplete="one-time-code"
-                   maxlength="6" pattern="[0-9]{6}"
+                   maxlength="8" pattern="[0-9]{6,8}"
                    placeholder="000000"
                    class="stepup-input">
             <p id="stepup-error" class="stepup-error"></p>
             <div class="stepup-buttons">
-                <button id="stepup-submit" onclick="submitStepUp()" class="btn-stepup-submit">
+                <button id="stepup-submit" data-action="stepUpSubmit" class="btn-stepup-submit">
                     Verify
                 </button>
-                <button onclick="cancelStepUp()" class="btn-stepup-cancel">
+                <button data-action="stepUpCancel" class="btn-stepup-cancel">
                     Cancel
                 </button>
             </div>
@@ -734,8 +1832,13 @@
     </div>
 
     <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/dp_weaken.js" defer></script>
     <script src="/static/js/hibp.js" defer></script>
     <script src="/static/js/pki.js" defer></script>
     <script src="/static/js/runtime-settings.js" defer></script>
+    <script src="/static/js/documents.js" defer></script>
+    <script src="/static/js/envelope_reapproval.js" defer></script>
+    <script src="/static/js/capability-policy.js" defer></script>
+    <script src="/static/js/permissions.js" defer></script>
 </body>
 </html>

@@ -28,6 +28,12 @@ from yashigani.backoffice.routes.audit_search import router as audit_search_rout
 from yashigani.backoffice.routes.models import router as models_router
 from yashigani.backoffice.routes.sensitivity import router as sensitivity_router
 from yashigani.backoffice.routes.sso import router as sso_router
+# v2.26 — Document Enforcement admin surface (document-content OPA enforcement)
+from yashigani.backoffice.routes.documents import router as documents_router
+# 3.0 — Capability-envelope RE-APPROVAL admin surface (YSG-RISK-060)
+from yashigani.backoffice.routes.envelope_reapproval import router as envelope_reapproval_router
+# 4.0 — MCP Server Registry admin surface (list + import ceremony)
+from yashigani.backoffice.routes.mcp_servers import router as mcp_servers_router
 # v2.2
 from yashigani.backoffice.routes.pii import router as pii_router
 # v2.3 — ASVS 11.1.3 crypto inventory
@@ -52,6 +58,26 @@ from yashigani.backoffice.routes.me import router as me_router
 from yashigani.backoffice.routes.manifest_history import router as manifest_history_router
 # v2.24.1 — admin-surfaces-all-runtime-settings: runtime settings admin API
 from yashigani.backoffice.routes.runtime_settings import router as runtime_settings_router
+# v2.25.5 — R13: RBAC group source paths + method catalogue
+from yashigani.backoffice.routes.rbac_sources import router as rbac_sources_router
+# v2.25.5 — R26: version check endpoint
+from yashigani.backoffice.routes.version_check import router as version_check_router
+# fix/medlow-findings — cloud provider API key management
+from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
+# 3.0 — admin-configurable browser Permissions-Policy
+from yashigani.backoffice.routes.capability_policy import router as capability_policy_router
+# 3.1 Phase 8 — unified permission grant admin API
+from yashigani.backoffice.routes.permissions import router as permissions_router
+# 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+from yashigani.backoffice.routes.user_ui import router as user_ui_router
+# 4.0 Chat persistence — conversation + message CRUD (BOLA-enforced)
+from yashigani.backoffice.routes.user_conversations import router as user_conversations_router
+# 4.0 Workflow run history (wf-exec — BOLA-enforced, user-tier only)
+from yashigani.backoffice.routes.user_workflows import router as user_workflows_router
+# 4.0 Admin workflow-oversight (cross-user read + disable; AdminSession / StepUpAdminSession)
+from yashigani.backoffice.routes.admin_workflows import router as admin_workflows_router
+# 4.1 Phase B — Agent Policy Templates (policy template apply/revoke + status join)
+from yashigani.backoffice.routes.agent_policies import router as agent_policies_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -69,6 +95,11 @@ __all__ = [
     "models_router",
     "sensitivity_router",
     "sso_router",
+    "documents_router",
+    # 3.0
+    "envelope_reapproval_router",
+    # 4.0 — MCP registry
+    "mcp_servers_router",
     # v2.2
     "pii_router",
     # v2.3
@@ -91,4 +122,26 @@ __all__ = [
     "manifest_history_router",
     # v2.24.1 — admin-surfaces-all-runtime-settings
     "runtime_settings_router",
+    # service management
+    "services_router",
+    # v2.25.5 — R13: RBAC sources
+    "rbac_sources_router",
+    # v2.25.5 — R26: version check
+    "version_check_router",
+    # fix/medlow-findings — cloud provider API key management
+    "cloud_keys_router",
+    # 3.0 — browser Permissions-Policy
+    "capability_policy_router",
+    # 3.1 Phase 8 — unified permission grant admin API
+    "permissions_router",
+    # 4.0 Phase 2 — user-plane routes (OWUI replacement; RISK-100/112)
+    "user_ui_router",
+    # 4.0 Chat persistence — conversation + message CRUD
+    "user_conversations_router",
+    # 4.0 Workflow run history (wf-exec — BOLA-enforced)
+    "user_workflows_router",
+    # 4.0 Admin workflow-oversight (cross-user read + disable)
+    "admin_workflows_router",
+    # 4.1 Phase B — Agent Policy Templates
+    "agent_policies_router",
 ]

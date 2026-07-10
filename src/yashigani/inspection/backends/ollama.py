@@ -4,16 +4,19 @@ Yashigani Inspection — Ollama classifier backend.
 Implements ClassifierBackend using the local Ollama inference server.
 Uses the shared classification prompt from classification_prompt.py.
 No external network calls — Ollama is always local.
-Uses urllib.request only (no new dependencies).
+
+v4.1 Phase 1c (LAURA-I1-01 seam): transport moved to
+yashigani.inspection._ollama_transport — on https URLs (the Caddy :11435
+Ollama mesh front) it presents this service's mesh leaf; http URLs keep the
+legacy plain path (dev/test).
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
-import urllib.error
-import urllib.request
-from typing import Optional
+
+import httpx
 
 from yashigani.inspection.backend_base import (
     ClassifierBackend,
@@ -60,7 +63,11 @@ class OllamaBackend(ClassifierBackend):
         start_ms = int(time.monotonic() * 1000)
         try:
             raw = self._call_model(content)
-        except urllib.error.URLError as exc:
+        except httpx.TimeoutException as exc:
+            raise BackendUnavailableError(
+                f"Ollama timed out after {self._timeout}s: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
             raise BackendUnavailableError(
                 f"Ollama unreachable at {self._base_url}: {exc}"
             ) from exc
@@ -92,23 +99,21 @@ class OllamaBackend(ClassifierBackend):
 
     def health_check(self) -> bool:
         """GET /api/tags — returns True if Ollama responds with HTTP 200."""
-        try:
-            req = urllib.request.Request(f"{self._base_url}/api/tags")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        from yashigani.inspection._ollama_transport import ollama_get_json
+        return ollama_get_json(self._base_url, "/api/tags", timeout=5.0) is not None
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _call_model(self, content: str) -> str:
         """POST to /api/chat and return the model's message content string."""
+        from yashigani.inspection._ollama_transport import ollama_post_json
+
         user_message = (
             "USER_CONTENT_START\n"
             + json.dumps(content)  # JSON-encode to escape special chars
             + "\nUSER_CONTENT_END"
         )
-        payload = json.dumps({
+        payload = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -117,15 +122,8 @@ class OllamaBackend(ClassifierBackend):
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.0},
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            url=f"{self._base_url}/api/chat",
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
+        }
+        data = ollama_post_json(
+            self._base_url, "/api/chat", payload, timeout=float(self._timeout),
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            data = json.loads(resp.read())
-
         return data.get("message", {}).get("content", "")

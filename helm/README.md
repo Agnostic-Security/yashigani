@@ -68,7 +68,7 @@ pre-create these unless you are running the issuer / minter out of band:
 
 | Secret name (default)             | Lifecycle                                                                                          | Override key                              |
 |-----------------------------------|----------------------------------------------------------------------------------------------------|-------------------------------------------|
-| `yashigani-pki-certs`             | Filled by the PKI bootstrap Job. Leaf certs + CA public certs only (no CA keys). Mounted by every workload pod at `/run/secrets`. | `mtls.existingSecretName`                |
+| `yashigani-pki-certs`             | Filled by the PKI bootstrap Job. Leaf certs + CA public certs only (no CA keys). Mounted at `/run/secrets` via per-pod `items:` projections (YSG-RISK-053) — each pod receives only its own leaf/token + trust anchors, never another service's key or `caddy_internal_hmac`. | `mtls.existingSecretName`                |
 | `yashigani-pki-ca-keys`           | Retro #3aj. CA private keys only. Mounted only by the PKI bootstrap Job and rotation CronJob.       | (no override — managed by the chart)      |
 | `yashigani-admin-bootstrap`       | Retro #3ap. Filled by the admin-bootstrap Job: `admin1_username`, `admin_initial_password`, `admin1_totp_secret`, `admin2_username`, `admin2_password`, `admin2_totp_secret`. | `adminBootstrap.existingSecretName` |
 

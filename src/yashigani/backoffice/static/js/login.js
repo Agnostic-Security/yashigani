@@ -1,4 +1,4 @@
-// Last updated: 2026-05-24
+// Last updated: 2026-06-12 (Phase 1: role-based redirect via server-supplied redirect_to)
 document.addEventListener('DOMContentLoaded', function() {
     var savedPassword = '';
 
@@ -89,15 +89,25 @@ document.addEventListener('DOMContentLoaded', function() {
                     document.getElementById('login-form').className = 'hidden';
                     document.getElementById('pw-form').className = '';
                     document.getElementById('page-subtitle').textContent = 'Set a new password to continue';
-                    showMsg('info', 'First login \u2014 you must change your password before accessing the admin panel.');
+                    showMsg('info', 'First login — you must change your password before continuing.');
                 } else {
                     var params = new URLSearchParams(window.location.search);
                     var next = params.get('next');
-                    // Defence-in-depth: JS guard (safeNext) runs first as a
-                    // client-side pre-flight.  The server-side validator at
+                    // Phase 1 (2.25.5-auth-ingress) — role-based redirect.
+                    // data.redirect_to comes from the server: "/admin/" for admin,
+                    // "/app/webui" for user.  If the URL carried a ?next= (set by
+                    // Caddy when a protected path bounced to /login), honour it;
+                    // otherwise use the server-supplied role destination.
+                    // Defence-in-depth: JS safeNext guard runs first; server-side
                     // /auth/post-login-redirect is the trust-boundary enforcement
                     // point (drift audit finding #6 — ASVS V5.1.5 / CWE-601).
-                    var clientValidated = (next && safeNext(next)) || '/admin/';
+                    var serverDefault = (data.redirect_to && safeNext(data.redirect_to)) || '/admin/';
+                    // Honour ?next= ONLY if it stays in the SAME plane as the role's
+                    // home. An admin must never be bounced to a user-plane next (or
+                    // vice-versa) — redirect_to encodes the plane (RISK-100 SoD).
+                    var n = next && safeNext(next);
+                    var sameP = n && ((n.indexOf('/admin') === 0) === (serverDefault.indexOf('/admin') === 0));
+                    var clientValidated = sameP ? n : serverDefault;
                     window.location.href = '/auth/post-login-redirect?next=' + encodeURIComponent(clientValidated);
                 }
             } else {

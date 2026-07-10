@@ -408,7 +408,7 @@ class TestProxyHandlerResponseOPA:
             "jwt_inspector": None,
             "endpoint_rate_limiter": None,
             "response_cache": None,
-            "fasttext_backend": None,
+            "classifier_backend": None,
             "inference_logger": None,
             "anomaly_detector": None,
             "ddos_protector": None,

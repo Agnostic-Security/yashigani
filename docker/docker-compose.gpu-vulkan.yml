@@ -1,0 +1,63 @@
+# GPU overlay — Vulkan backend (Intel Arc/iGPU + AMD APU/Ryzen AI).
+# last-updated: 2026-07-08 (feat(gpu): Vulkan overlay for Intel + AMD APU — UNTESTED ON HARDWARE)
+#
+# Passes /dev/dri/renderD128 (DRM render node) into the ollama container so the
+# Vulkan GPU backend can drive inference. Covers:
+#   - Intel Arc (discrete A-series + B-series)
+#   - Intel HD/UHD/Iris/Xe (integrated graphics)
+#   - AMD Ryzen AI APUs (gfx1150/1151 — ROCm "Preview", not production-stable)
+#
+# WHY VULKAN AND NOT NATIVE ROCm FOR AMD APUs:
+#   AMD Ryzen AI gfx1150/1151 are ROCm "Preview" status. On Linux with Dynamic-
+#   VRAM / UMA-Auto BIOS mode, ROCm detection often fails (ollama falls back to
+#   library=cpu). The Vulkan backend is more reliable for APU shared-memory GPU
+#   access. For AMD DISCRETE GPUs (RX 5000/6000/7000, Instinct), use
+#   docker-compose.gpu-amd.yml (native ROCm) instead.
+#
+# STATUS: IMPLEMENTED, NOT TESTED ON PHYSICAL HARDWARE.
+# Implemented per llama.cpp Vulkan backend docs + ollama GPU matrix (0.23+).
+# No specific OLLAMA_* env var is required — ollama auto-selects the Vulkan
+# llama.cpp library when /dev/dri is present and other GPU backends are absent.
+#
+# REQUIREMENTS (must be provisioned before install):
+#   Intel:
+#     1. Intel GPU drivers: sudo apt install intel-media-va-driver-non-free \
+#                                vainfo mesa-vulkan-drivers
+#     2. Verify: vulkaninfo --summary | grep driverName
+#     3. User in `render` and `video` groups:
+#          sudo usermod -aG render,video $USER
+#   AMD APU (Ryzen AI):
+#     1. Mesa + RADV driver: sudo apt install mesa-vulkan-drivers
+#     2. Optionally ROCm runtime for amdgpu-pro (check docs for your gfx target)
+#     3. User in `render` and `video` groups
+#
+# PERFORMANCE EXPECTATION:
+#   Vulkan backend inference is generally slower than CUDA/ROCm on discrete GPUs.
+#   On Intel iGPU and AMD APU, performance depends on UMA (shared-memory) bandwidth.
+#   Expect 5–15 tok/s on a modern Intel Iris Xe or Ryzen AI APU for qwen2.5:3b.
+#
+# install.sh adds this overlay when YSG_GPU_TYPE=vulkan on Docker runtime.
+#
+# DOCKER + PODMAN PARITY:
+#   Docker: this file (device passthrough via compose devices:)
+#   Podman: same device syntax works natively
+#   Kubernetes: no standard device-plugin for generic Vulkan; manual device mount
+#               required via values.yaml ollama.extraDevices (not yet implemented)
+
+services:
+  ollama:
+    devices:
+      # /dev/dri/renderD128 — DRM render node for GPU 0.
+      # Gives the container access to the GPU's 3D/compute pipeline via Vulkan.
+      # Adjust suffix for multi-GPU: renderD129=GPU1, renderD130=GPU2, etc.
+      - "/dev/dri/renderD128"
+    group_add:
+      # render group required to open /dev/dri/renderD128 without root.
+      - "render"
+      # video group for framebuffer / display access (some driver stacks require it).
+      - "video"
+    environment:
+      # OLLAMA_LLM_LIBRARY: force a specific llama.cpp backend shared library.
+      # Ollama auto-detects; set this only if auto-selection picks the wrong backend.
+      # Example: OLLAMA_LLM_LIBRARY=libggml-vulkan.so
+      OLLAMA_LLM_LIBRARY: ${OLLAMA_LLM_LIBRARY:-}

@@ -1,0 +1,62 @@
+{{- /* B7 fix (v2.25.0 P2): Audit log PersistentVolumeClaims for gateway + backoffice.
+   Council finding B7: Lu P0-#3. SOC 2 CC7.2 / ISO 27001 A.8.15 / NIST AU-9/AU-11 /
+   CMMC AU.L2-3.3.4/8/9 / EU AI Act Art.12.
+
+   Creates one PVC per enabled workload when auditLog.enabled=true.
+   When auditLog.enabled=false (default), no PVCs are created and both workloads
+   continue using the prior emptyDir behaviour (no behaviour change on upgrade
+   unless the operator explicitly sets auditLog.enabled=true).
+*/ -}}
+
+{{- if .Values.auditLog.enabled }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: yashigani-gateway-audit-log
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-gateway
+    app.kubernetes.io/component: audit-log
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    # Retain PVC on helm uninstall — audit logs must survive chart lifecycle
+    # for compliance retention (NIST AU-11: organisation-defined retention period).
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.auditLog.persistence.accessMode }}
+  {{- if .Values.auditLog.persistence.storageClass }}
+  storageClassName: {{ .Values.auditLog.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.auditLog.persistence.size }}
+{{- end }}
+
+{{- if .Values.backoffice.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: yashigani-backoffice-audit-log
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-backoffice
+    app.kubernetes.io/component: audit-log
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    # Retain PVC on helm uninstall — audit logs must survive chart lifecycle.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.auditLog.persistence.accessMode }}
+  {{- if .Values.auditLog.persistence.storageClass }}
+  storageClassName: {{ .Values.auditLog.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.auditLog.persistence.size }}
+{{- end }}
+{{- end }}

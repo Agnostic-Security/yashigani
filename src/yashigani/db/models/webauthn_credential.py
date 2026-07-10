@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+from yashigani.db.pgcrypto import PGP_SYM_ENCRYPT_OPTIONS
+
 
 @dataclass(frozen=True)
 class WebAuthnCredentialRow:
@@ -43,13 +45,15 @@ class WebAuthnCredentialRow:
 # Query helpers — $N parameterization only, no string interpolation
 # ---------------------------------------------------------------------------
 
-INSERT_WEBAUTHN_CREDENTIAL = """
+# v4.1 (#144): public_key is AES-256 encrypted at rest (pgp_sym_encrypt
+# defaults to AES-128 without the options argument).
+INSERT_WEBAUTHN_CREDENTIAL = f"""
 INSERT INTO webauthn_credentials (
     id, user_id, credential_id, public_key,
     sign_count, aaguid, name
 ) VALUES (
     $1, $2, $3,
-    pgp_sym_encrypt($4::text, current_setting('app.aes_key'))::bytea,
+    pgp_sym_encrypt($4::text, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}')::bytea,
     $5, $6, $7
 )
 """

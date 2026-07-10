@@ -107,8 +107,4 @@ jaeger:
     tag: "2.17.0@sha256:6266573208d665ce5c17483bce0a75d0806480d92c84766d288d0aee885ce708"
     digest: "sha256:6266573208d665ce5c17483bce0a75d0806480d92c84766d288d0aee885ce708"
 
-openWebui:
-  image:
-    repository: ghcr.io/open-webui/open-webui
-    tag: "v0.9.1@sha256:03d2b006989f0fe6559391a0c5d4ccac12688d7813d23cb4de86e5cc0ab22978"
-    digest: "sha256:03d2b006989f0fe6559391a0c5d4ccac12688d7813d23cb4de86e5cc0ab22978"
+# openWebui removed in 4.0 — ui4 (first-party Lit SPA) served by backoffice

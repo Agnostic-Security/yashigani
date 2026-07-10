@@ -1,4 +1,4 @@
-{{- /* Last updated: 2026-05-19T00:00:00+01:00 — fix(helm): inject X-SPIFFE-ID on /admin/* Caddy handle — close SIDE-001 — Helm parity for 8a1dbf5 */ -}}
+{{- /* Last updated: 2026-05-27T00:00:00+01:00 — fix(helm): add /api/v1/admin/* route — B4 — helm parity for /api/v1/admin/* backoffice route absent since v2.23.3 */ -}}
 {{/* ConfigMaps for services that need mounted config files */}}
 
 {{- if .Values.policy.enabled }}
@@ -11,386 +11,44 @@ metadata:
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
 data:
+  # B6 fix (v2.25.0 P2): replace inline rego with .Files.Get references.
+  # The prior inline blocks were a 144-line subset of the canonical policy files.
+  # GAP-001: models_list_decision MISSING. GAP-002: catch-all sensitivity_rank
+  # (rank=4 for unknown labels) MISSING. GAP-3/SEC-5: _effective_sensitivity_rank
+  # MAX-rule MISSING. agent_response_allowed MISSING.
+  # compose DENIES these inputs; K8s helm bundle silently ALLOWED them.
+  # Fix: .Files.Get loads canonical policy/*.rego files at helm template time.
+  # files/policy/*.rego are byte-identical copies of the canonical policy/*.rego,
+  # enforced by sha256 in tests/contracts/test_helm_opa_bundle_parity.py — that
+  # test asserts EVERY policy/*.rego is mirrored here AND mounted in policy.yaml,
+  # and fails if a new policy file is added to policy/ but not to this bundle.
+  # Council finding B6: Lu P0-#1.
+  # LAURA-OPA-002 (v2.25.2): mcp.rego was absent from this list and from the
+  # policy.yaml subPath mounts, so K8s OPA never loaded the MCP package — every
+  # data.yashigani.mcp.* query was undefined -> broker fail-closed -> MCP broken
+  # on K8s. Added below. The claimed parity test did not exist; it does now.
   yashigani.rego: |
-    # Yashigani — OPA policy bundle.
-    # All policy decisions are local. No cloud delegation. (ASVS V4.2)
-    #
-    # Inputs provided by the gateway proxy:
-    #   input.method        — HTTP method
-    #   input.path          — request path
-    #   input.session_id    — caller session token (hashed)
-    #   input.agent_id      — X-Yashigani-Agent-Id header value
-    #   input.user_id       — X-Yashigani-User-Id header value
-    #   input.headers       — sanitized request headers (no Authorization/Cookie)
-    #
-    # The gateway's fail-closed behaviour: any OPA error → deny.
-
-    package yashigani
-
-    import future.keywords.if
-    import future.keywords.in
-
-    # ---------------------------------------------------------------------------
-    # Default: deny unless explicitly allowed
-    # ---------------------------------------------------------------------------
-
-    default allow := false
-
-    # ---------------------------------------------------------------------------
-    # Allow authenticated sessions
-    # ---------------------------------------------------------------------------
-
-    allow if {
-        # Session ID must be present (non-empty, non-anonymous)
-        input.session_id != ""
-        input.session_id != "anonymous"
-
-        # Agent ID must be declared
-        input.agent_id != ""
-        input.agent_id != "unknown"
-
-        # Method must be in the allowed set
-        input.method in allowed_methods
-
-        # Path must not match any blocked pattern
-        not path_blocked
-    }
-
-    # ---------------------------------------------------------------------------
-    # Allowed HTTP methods for MCP traffic
-    # ---------------------------------------------------------------------------
-
-    allowed_methods := {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-
-    # ---------------------------------------------------------------------------
-    # Blocked path patterns
-    # ---------------------------------------------------------------------------
-
-    path_blocked if {
-        # Block direct access to internal metadata/admin paths
-        startswith(input.path, "/admin")
-    }
-
-    path_blocked if {
-        startswith(input.path, "/.well-known/internal")
-    }
-
-    path_blocked if {
-        input.path == "/metrics"
-    }
-
-    path_blocked if {
-        input.path == "/healthz"
-    }
-
-    # ---------------------------------------------------------------------------
-    # RBAC enforcement — deny if RBAC data is loaded and user is not permitted
-    # ---------------------------------------------------------------------------
-    # When data.yashigani.rbac.groups is non-empty, every request that passed
-    # the session/method/path checks above must additionally satisfy allow_rbac
-    # (defined in rbac.rego).  If RBAC data is absent or empty the gate is
-    # open — this preserves backwards compatibility during roll-out.
-
-    deny_rbac if {
-        count(data.yashigani.rbac.groups) > 0
-        not allow_rbac
-    }
-
-    # Override the default allow: deny when RBAC says no
-    allow := false if { deny_rbac }
-
-    # ---------------------------------------------------------------------------
-    # Agent-to-agent enforcement
-    # agent_call_allowed is defined in agents.rego (same package yashigani).
-    # ---------------------------------------------------------------------------
-
-    # Deny agent calls that are not explicitly allowed
-    deny_agent_call if {
-        input.principal.type == "agent"
-        not agent_call_allowed
-    }
-
-    allow := false if { deny_agent_call }
+{{ .Files.Get "files/policy/yashigani.rego" | indent 4 }}
   v1_routing.rego: |
-    # Yashigani v1.0 — OPA Routing Safety Net
-    #
-    # Second-pass validation of Optimization Engine routing decisions.
-    # Defence-in-depth: even if the OE has a bug, OPA catches policy violations.
-    #
-    # Input schema:
-    #   input.identity          — identity record (kind, groups, allowed_models, sensitivity_ceiling)
-    #   input.routing_decision  — OE decision (provider, model, route, sensitivity, rule)
-    #   input.request           — request metadata (path, method)
-
-    package yashigani.v1
-
-    import rego.v1
-
-    # ── Identity authorisation ────────────────────────────────────────────────
-
-    # Allow /v1/* requests from authenticated identities
-    default allow_v1 := false
-
-    allow_v1 if {
-        input.identity.status == "active"
-    }
-
-    # ── Model access control ─────────────────────────────────────────────────
-
-    # Identity can use the selected model
-    default model_allowed := true
-
-    model_allowed if {
-        count(input.identity.allowed_models) == 0  # No restriction = all models allowed
-    }
-
-    model_allowed if {
-        input.routing_decision.model in input.identity.allowed_models
-    }
-
-    model_allowed if {
-        "*" in input.identity.allowed_models
-    }
-
-    # ── Routing safety net ────────────────────────────────────────────────────
-
-    # CRITICAL: CONFIDENTIAL/RESTRICTED data must NEVER route to cloud
-    # unless the provider is in the trusted_cloud_providers list
-    default routing_safe := true
-
-    routing_safe := false if {
-        input.routing_decision.sensitivity in {"CONFIDENTIAL", "RESTRICTED"}
-        input.routing_decision.route == "cloud"
-        not trusted_cloud_provider
-    }
-
-    trusted_cloud_provider if {
-        input.routing_decision.provider in input.trusted_cloud_providers
-    }
-
-    # Identity cannot receive data above their sensitivity ceiling
-    default sensitivity_allowed := true
-
-    sensitivity_allowed := false if {
-        sensitivity_rank(input.routing_decision.sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
-    }
-
-    sensitivity_rank(level) := 0 if level == "PUBLIC"
-    sensitivity_rank(level) := 1 if level == "INTERNAL"
-    sensitivity_rank(level) := 2 if level == "CONFIDENTIAL"
-    sensitivity_rank(level) := 3 if level == "RESTRICTED"
-
-    # ── Response-path enforcement ─────────────────────────────────────────────
-    #
-    # Evaluates whether a response can be delivered to the caller.
-    # Input schema (response path):
-    #   input.identity              — caller's identity record
-    #   input.response_sensitivity  — detected sensitivity of the response content
-    #   input.response_verdict      — inspection verdict (clean/suspicious/blocked)
-    #   input.pii_detected          — boolean, PII found in response
-
-    default response_allowed := true
-
-    # Block response if its sensitivity exceeds the caller's ceiling
-    response_allowed := false if {
-        sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
-    }
-
-    # Block response if inspection verdict is BLOCKED and identity is not admin
-    response_allowed := false if {
-        input.response_verdict == "blocked"
-        input.identity.kind != "admin"
-    }
-
-    response_decision := {
-        "allow": response_allowed,
-        "reason": response_reason,
-    }
-
-    response_reason := "ok" if response_allowed
-
-    response_reason := "response_sensitivity_exceeds_ceiling" if {
-        not response_allowed
-        sensitivity_rank(input.response_sensitivity) > sensitivity_rank(input.identity.sensitivity_ceiling)
-    }
-
-    response_reason := "response_blocked_by_inspection" if {
-        not response_allowed
-        input.response_verdict == "blocked"
-    }
-
-    # ── Combined decision ─────────────────────────────────────────────────────
-
-    decision := {
-        "allow": allow_v1,
-        "model_allowed": model_allowed,
-        "routing_safe": routing_safe,
-        "sensitivity_allowed": sensitivity_allowed,
-        "reason": reason,
-    }
-
-    reason := "ok" if {
-        allow_v1
-        model_allowed
-        routing_safe
-        sensitivity_allowed
-    }
-
-    reason := "identity_not_active" if not allow_v1
-
-    reason := "model_not_allowed" if {
-        allow_v1
-        not model_allowed
-    }
-
-    reason := "routing_unsafe_sensitive_to_cloud" if {
-        allow_v1
-        model_allowed
-        not routing_safe
-    }
-
-    reason := "sensitivity_ceiling_exceeded" if {
-        allow_v1
-        model_allowed
-        routing_safe
-        not sensitivity_allowed
-    }
+{{ .Files.Get "files/policy/v1_routing.rego" | indent 4 }}
   rbac.rego: |
-    # Yashigani RBAC — OPA enforcement module.
-    #
-    # Deny-by-default: if data.yashigani.rbac is empty or the user has no
-    # groups, allow_rbac evaluates to false.
-    #
-    # data.yashigani.rbac is populated by rbac/opa_push.py after every mutation
-    # via a PUT to /v1/data/yashigani/rbac.
-    #
-    # Input fields consumed:
-    #   input.session.email    — user email resolved from the gateway session
-    #   input.request.method   — HTTP method
-    #   input.request.path     — request path
-
-    package yashigani
-
-    import future.keywords.if
-    import future.keywords.in
-
-    # ---------------------------------------------------------------------------
-    # allow_rbac — true if the user is in a group that permits the request
-    # ---------------------------------------------------------------------------
-
-    allow_rbac if {
-        # Require RBAC data to be present and non-empty
-        count(data.yashigani.rbac.groups) > 0
-
-        email := input.session.email
-        email != ""
-
-        # Walk user → group → pattern
-        group_id := data.yashigani.rbac.user_groups[email][_]
-        group    := data.yashigani.rbac.groups[group_id]
-        pattern  := group.allowed_resources[_]
-
-        _method_matches(pattern.method, input.request.method)
-        _path_matches(pattern.path_glob, input.request.path)
-    }
-
-    # ---------------------------------------------------------------------------
-    # Method helper — "*" matches anything; otherwise exact match
-    # ---------------------------------------------------------------------------
-
-    _method_matches(pattern, method) if { pattern == "*" }
-    _method_matches(pattern, method) if { pattern == method }
-
-    # ---------------------------------------------------------------------------
-    # Path helper — mirrors store.py _path_matches exactly
-    #
-    #   "**"           — any path
-    #   "/prefix/**"   — /prefix/ and anything underneath
-    #   exact string   — only that path
-    # ---------------------------------------------------------------------------
-
-    _path_matches(glob, path) if { glob == "**" }
-    _path_matches(glob, path) if { glob == path }
-    _path_matches(glob, path) if {
-        endswith(glob, "/**")
-        prefix := trim_suffix(glob, "/**")
-        startswith(path, concat("", [prefix, "/"]))
-    }
+{{ .Files.Get "files/policy/rbac.rego" | indent 4 }}
   agents.rego: |
-    package yashigani
-
-    import future.keywords.if
-    import future.keywords.in
-
-    # ---------------------------------------------------------------------------
-    # agent_call_allowed — true when a calling agent is permitted to reach
-    # the target agent's path.
-    #
-    # Input fields (set by the gateway for /agents/* requests):
-    #   input.principal.type                  "agent"
-    #   input.principal.agent_id              calling agent's ID
-    #   input.principal.groups                list of RBAC group IDs the caller belongs to
-    #   input.target_agent.agent_id           target agent ID
-    #   input.target_agent.allowed_caller_groups  groups allowed to call this agent
-    #   input.target_agent.allowed_paths      path prefixes or exact paths the agent accepts
-    #   input.request.remainder_path          path after /agents/{target_agent_id}
-    # ---------------------------------------------------------------------------
-
-    agent_call_allowed if {
-        input.principal.type == "agent"
-        input.principal.agent_id != ""
-
-        # Caller must be in at least one of the target's allowed_caller_groups
-        group := input.principal.groups[_]
-        group in input.target_agent.allowed_caller_groups
-
-        # The remainder path must match at least one allowed path pattern
-        _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
-    }
-
-    # Path matching helper — exact or prefix
-    _path_allowed(path, allowed_paths) if {
-        p := allowed_paths[_]
-        _agent_path_matches(p, path)
-    }
-
-    _agent_path_matches(pattern, path) if { pattern == "**" }
-    _agent_path_matches(pattern, path) if { pattern == path }
-    _agent_path_matches(pattern, path) if {
-        endswith(pattern, "/**")
-        prefix := trim_suffix(pattern, "/**")
-        startswith(path, concat("", [prefix, "/"]))
-    }
-    _agent_path_matches(pattern, path) if {
-        not endswith(pattern, "/**")
-        not contains(pattern, "*")
-        startswith(path, concat("", [pattern, "/"]))
-    }
-
-    # ---------------------------------------------------------------------------
-    # agent_call_deny_reason — human-readable explanation used in audit events
-    # ---------------------------------------------------------------------------
-
-    agent_call_deny_reason := "caller_group_not_in_allowed_caller_groups" if {
-        input.principal.type == "agent"
-        not _caller_group_allowed
-    }
-
-    agent_call_deny_reason := "path_not_in_allowed_paths" if {
-        input.principal.type == "agent"
-        _caller_group_allowed
-        not _path_allowed(input.request.remainder_path, input.target_agent.allowed_paths)
-    }
-
-    agent_call_deny_reason := "target_agent_not_in_data" if {
-        input.principal.type == "agent"
-        not input.target_agent.agent_id
-    }
-
-    _caller_group_allowed if {
-        group := input.principal.groups[_]
-        group in input.target_agent.allowed_caller_groups
-    }
+{{ .Files.Get "files/policy/agents.rego" | indent 4 }}
+  mcp.rego: |
+{{ .Files.Get "files/policy/mcp.rego" | indent 4 }}
+  document.rego: |
+{{ .Files.Get "files/policy/document.rego" | indent 4 }}
+  clients_aggregate.rego: |
+{{ .Files.Get "files/policy/clients_aggregate.rego" | indent 4 }}
+  # LAURA-30-001 (2026-06-14): OPA management-API authorisation policy.
+  # Loaded by OPA as package system.authz (--authorization=basic). Stored under
+  # a flat ConfigMap key (system-authz.rego) and subPath-mounted at the path
+  # OPA recurses at startup (/policies/system/authz.rego). The system/ subdir
+  # is preserved in the mountPath so OPA loads it as data.system.authz
+  # (package name must match directory path for OPA's bundle loader).
+  system-authz.rego: |
+{{ .Files.Get "files/policy/system/authz.rego" | indent 4 }}
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}
@@ -658,7 +316,14 @@ data:
       # probe via caddy CLI or curl --unix-socket; kubelet pod-IP probes use
       # the :80 /healthz listener below (unchanged). No TCP admin surface
       # exposed to any pod network or host port.
-      admin unix//run/caddy/admin.sock
+      # |0666: K8s emptyDir /run/caddy is caddy-pod-local (no backoffice unix-
+      # socket sharing on K8s — separate pods; see SEAM-1d-04 / Phase-3 K8s
+      # asymmetry). 0666 matches compose parity; contained to caddy pod only.
+      # v4.1 SU-SEAM-1d-04: the MCP approve transaction reaches this socket
+      # from the backoffice pod via the mesh-mTLS :2019 admin relay site block
+      # below (POST /load only, backoffice SPIFFE URI only) — the raw admin
+      # endpoint itself remains unix-socket-only per MUST-4.
+      admin unix//run/caddy/admin.sock|0666
       servers {
         timeouts {
           read_body   10s
@@ -712,6 +377,25 @@ data:
         tls_server_name backoffice
       }
     }
+    # 4.0 monitoring-proxy: mTLS snippets for Grafana and Loki.
+    # K8s service names (yashigani-grafana / yashigani-loki) differ from cert
+    # SANs (grafana / loki — sourced from service_identities.yaml); override SNI.
+    (internal-mtls-grafana) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        tls_server_name grafana
+      }
+    }
+    (internal-mtls-loki) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        tls_server_name loki
+      }
+    }
     {{- end }}
     # ────────────────────────────────────────────────────────────────────────
     # EX-231-10 Layer B — Caddy HMAC shared-secret marker.
@@ -738,6 +422,48 @@ data:
       # docker/Caddyfile.acme (lines 76-84). Bug introduced in Helm-only
       # Caddyfile during #58c — fixed at b85aad1 closure (2026-04-30).
       header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}
+    }
+    # ────────────────────────────────────────────────────────────────────────
+    # Strip orchestration-context headers at the public edge (LAURA/IRIS drift).
+    # X-Yashigani-Orchestration-* carry the agent-orchestration identity context
+    # (depth, principal, root-request-id) the gateway uses for model-RBAC. A real
+    # external user proved they can FORGE X-Yashigani-Orchestration-Depth at the
+    # public edge to bypass model-RBAC. These headers are LEGITIMATE only on the
+    # internal mesh self-call path (gateway:8081), exactly like X-OpenWebUI-User-*.
+    # Imported into EVERY public handle that reaches the gateway (direct or via
+    # the OWUI catch-all). Single-source snippet = no per-handle drift.
+    # CRITICAL: this MUST stay byte-parity with the docker/Caddyfile.* renders —
+    # the un-patched render (esp. this K8s one) is where the bypass persists.
+    # Pairs with Tom's gateway-side identity-gate (the two halves ship together).
+    # ────────────────────────────────────────────────────────────────────────
+    (strip-orchestration-headers) {
+      request_header -X-Yashigani-Orchestration-Depth
+      request_header -X-Yashigani-Orchestration-Principal
+      request_header -X-Yashigani-Orchestration-Root-Request-Id
+      # Defence-in-depth catch for any future X-Yashigani-Orchestration-* header.
+      request_header -X-Yashigani-Orchestration-*
+    }
+    # ────────────────────────────────────────────────────────────────────────
+    # Strip internal-trust headers at the public edge (T-1 belt-and-suspenders).
+    # CRITICAL: MUST stay byte-parity with docker/Caddyfile.{selfsigned,ca,acme}.
+    # Three classes of header MUST NOT arrive from external clients unchallenged:
+    #   X-Yashigani-User-Id / X-Yashigani-Identity-Id — set by the trusted internal
+    #     backoffice forwarder on the mesh path (gateway:8081).
+    #   X-Caddy-Verified-Secret — set ONLY by Caddy (inject-caddy-verified) on every
+    #     reverse_proxy upstream call (YSG-RISK-108 / EX-231-10 Layer B). Stripping
+    #     here prevents an external client from forging the value before Caddy's
+    #     `header_up set` overwrites it on the upstream call.
+    # Applied at the public-site level inside :443 — no per-handle drift.
+    # NOT applied on :8444/:8445 (internal-mesh listeners) where the trusted
+    # forwarder legitimately sets these headers.
+    # X-Yashigani-User-Id     — 3.x identity forward header
+    # X-Yashigani-Identity-Id — 4.0 identity forward header (Tom's rename, 4.0 port)
+    # ────────────────────────────────────────────────────────────────────────
+    (strip-identity-headers) {
+      request_header -X-Yashigani-User-Id
+      request_header -X-Yashigani-Identity-Id
+      # YSG-RISK-108 / EX-231-10 Layer B — strip any client-supplied Caddy secret.
+      request_header -X-Caddy-Verified-Secret
     }
     # Bind on :443 (any Host) so port-forward / NodePort / IP-based tests
     # work regardless of how the cluster operator routes the public domain.
@@ -773,15 +499,55 @@ data:
         curves x25519mlkem768 x25519 secp384r1 secp256r1
       }
       {{- end }}
+      # X-Frame-Options scoped: monitoring embed paths (Grafana/Alertmanager) must
+      # be iframeable from the admin shell (same origin). XFO: DENY on those
+      # responses blocks the embed. CSP frame-ancestors 'self' (@lenient_subapp)
+      # is the primary guard; this matcher ensures XFO is also absent on embed
+      # paths for legacy browsers.
+      @not_embed not path /admin/grafana/* /admin/alertmanager/*
+      header @not_embed X-Frame-Options "DENY"
       header {
         X-Content-Type-Options    "nosniff"
-        X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+        # CSP is set per-path below (NOT here) — a global SET would produce a
+        # second CSP header when the per-path @redoc_ui override also fires.
+        # LAURA-2255-006 / LAURA-30-009: double CSP header on /admin/api-redoc
+        # and /redoc was caused by a global CSP here + @redoc_ui below both
+        # setting the header. Fixed by moving all CSP to named-matcher directives.
         Cross-Origin-Opener-Policy "same-origin"
         -Server
       }
+      # CSP matchers — strict-by-default (4.0 / RISK-102 / SC-NEW-001)
+      # Source of truth: docker/Caddyfile.csp — Helm inlines an equivalent block
+      # because ConfigMaps cannot import external files at runtime.
+      # Parity enforced by scripts/check-caddyfile-csp-parity.sh.
+      # Four matchers: @lenient_subapp @redoc_ui @strict_legacy @strict_tt
+      # @lenient_ui catch-all REMOVED — new paths no longer silently inherit lenient.
+      # /admin/loki/* added: Loki query API (JSON, no UI); excluded from @strict_legacy.
+      @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
+      @redoc_ui path /admin/api-redoc /redoc
+      @strict_legacy {
+        path /admin/* /admin-legacy/ /admin-legacy/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/ /admin4/
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
+        not path /admin/api-redoc /redoc
+      }
+      @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+      # frame-src 'self': explicit (default-src 'self' already implies it);
+      # admin pages iframe /admin/grafana/ and /admin/loki/ — same-origin.
+      header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+      header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
+      # frame-ancestors 'self': admin-gated same-origin embeds (Grafana/Alertmanager
+      # iframed from the admin shell). 'none' blocked the embed — fixed here.
+      header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'self'; object-src 'none'; base-uri 'none'"
+      header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+      # T-1 edge strip: remove any client-supplied identity-forwarding headers
+      # before they reach any handle block (backoffice or gateway). Site-level
+      # placement covers ALL paths — no per-handle drift. Internal mesh listeners
+      # (:8444/:8445) are separate site blocks and are NOT affected.
+      import strip-identity-headers
       handle /healthz {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -797,6 +563,16 @@ data:
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         {{- end }}
+        # Track C (F-B) anti-spoof: strip any client-supplied forwarded-user
+        # identity headers on the public /v1 path so an external caller cannot
+        # impersonate an OWUI user. ONLY OWUI (internal, via gateway:8081) may
+        # set these; the gateway honours them solely under the internal bearer.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -809,6 +585,7 @@ data:
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         {{- end }}
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -817,6 +594,7 @@ data:
         }
       }
       handle /mcp/* {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -827,7 +605,9 @@ data:
       # Iris Seam 15 (PR #145): gateway:8080 serves GET /openapi.json and
       # GET /docs (Swagger UI). Without explicit handles these fell through
       # to the Open WebUI catch-all and were functionally unreachable.
+      # N2 (2.25.5): /redoc added — ReDoc navigable API map, same auth gate.
       handle /openapi.json {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -836,6 +616,7 @@ data:
         }
       }
       handle /docs {
+        import strip-orchestration-headers
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -843,6 +624,94 @@ data:
           import inject-caddy-verified
         }
       }
+      handle /redoc {
+        import strip-orchestration-headers
+        reverse_proxy https://yashigani-gateway:8080 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-gateway
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      # ── Grafana — admin-authenticated access via /admin/grafana/* ───────────
+      # 4.0 monitoring-proxy: same-origin admin-gated proxy, handle (no strip)
+      # + GF_SERVER_SERVE_FROM_SUB_PATH=true + GF_SERVER_ROOT_URL on Grafana side.
+      # Wazuh not in Helm (compose-only — see values.yaml wazuh.enabled=false).
+      {{- if .Values.grafana.enabled }}
+      handle /admin/grafana/* {
+        # Normalise misrouted asset requests (browser resolves relative refs against
+        # dashboard path; strip spurious /d/<uid>/ prefix).
+        @grafana_misroute path_regexp gmis ^/admin/grafana/d/(?:[^/]+/)*?((?:public|api|apis|avatar|d-solo|render)/.+)$
+        rewrite @grafana_misroute /admin/grafana/{http.regexp.gmis.1}
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login?next=/admin/grafana/ 302
+          }
+        }
+        reverse_proxy https://yashigani-grafana:3443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-grafana
+          {{- end }}
+          # Strip Grafana's own X-Frame-Options / CSP so the edge CSP governs
+          # and same-origin iframe embedding from /admin/* works.
+          header_down -X-Frame-Options
+          header_down -Content-Security-Policy
+        }
+      }
+      {{- end }}
+      # ── Loki — admin-authenticated access via /admin/loki/* ─────────────────
+      # Exposes Loki HTTP query API for direct admin use (primary: Grafana datasource).
+      # Loki has no UI; @lenient_subapp CSP covers this path.
+      {{- if .Values.loki.enabled }}
+      handle /admin/loki/* {
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login 302
+          }
+        }
+        reverse_proxy https://yashigani-loki:3100 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-loki
+          {{- end }}
+        }
+      }
+      {{- end }}
+      # ── Alertmanager — admin-authenticated access via /admin/alertmanager/* ──
+      # Alertmanager serves plain HTTP on port 9093 (no mTLS). forward_auth gate
+      # mirrors the grafana/loki pattern (verify-admin). @lenient_subapp CSP
+      # covers this path; X-Frame-Options + CSP stripped from upstream so same-
+      # origin iframe embedding from /admin/ works.
+      {{- if .Values.alertmanager.enabled }}
+      handle_path /admin/alertmanager/* {
+        forward_auth https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify-admin
+          @unauthorized status 401
+          handle_response @unauthorized {
+            redir * /admin/login 302
+          }
+        }
+        reverse_proxy http://alertmanager:9093 {
+          header_down -X-Frame-Options
+          header_down -Content-Security-Policy
+        }
+      }
+      {{- end }}
       handle /admin/* {
         {{- if .Values.mtls.enabled }}
         # SIDE-001 (2026-05-19): inject Caddy's own SPIFFE identity on the
@@ -851,11 +720,32 @@ data:
         # Caddy presents caddy_client.crt to backoffice via internal-mtls.
         # require_spiffe_id trusts x-spiffe-id when x-spiffe-id-peer-cert is
         # absent (uvicorn does not expose the ASGI TLS peer_cert extension).
-        # The hardcoded "spiffe://yashigani.internal/caddy" matches the ACL
+        # MI-6: the per-instance "spiffe://<trust-domain>/caddy" matches the ACL
         # entry in service_identities.yaml endpoint_acls["/admin/agents"].
+        # trust-domain = .Values.global.spiffeTrustDomain (default yashigani.internal).
         # Parity with docker/Caddyfile.{selfsigned,ca,acme} (commit 8a1dbf5).
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
+        {{- end }}
+        reverse_proxy https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+        }
+      }
+      # ── Admin API — /api/v1/admin/* (PKI, HIBP, secrets, WebAuthn) ─────────
+      # B4 (v2.25.0 P2): absent from Helm Caddyfile since v2.23.3 when this
+      # route was added to the compose Caddyfiles (Ava SWEEP-16 / ASVS V9.1 /
+      # API5 BFLA). Without this block, Caddy returns 404 on all /api/v1/admin/*
+      # requests on K8s; the open-webui catch-all cannot route API calls.
+      # Parity with docker/Caddyfile.{selfsigned,ca,acme} line ~319/297/266.
+      # SPIFFE injection: same pattern as /admin/* — Caddy injects its own
+      # identity so require_spiffe_id() on backoffice can verify the caller.
+      handle /api/v1/admin/* {
+        {{- if .Values.mtls.enabled }}
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
         {{- end }}
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}
@@ -896,43 +786,79 @@ data:
           import inject-caddy-verified
         }
       }
-      # ── Open WebUI — catch-all (LAURA-V231-010 fix) ──────────────────────────
-      # Strip any externally-supplied identity headers before auth runs.
-      # Prevents X-Forwarded-User spoofing: an unauthenticated client must
-      # not be able to forge the trusted-email header open-webui consumes.
-      # Mirrors docker/Caddyfile.selfsigned catch-all handle block exactly.
-      handle {
-        request_header -X-Forwarded-User
-        request_header -X-Forwarded-Name
-        request_header -X-Forwarded-Groups
-
-        # Forward auth: validate session cookie against backoffice.
-        # On 200: copies X-Forwarded-User/Name/Email from auth response.
-        # On 401: redirect to login page.
-        forward_auth https://yashigani-backoffice:8443 {
-          {{- if .Values.mtls.enabled }}
-          import internal-mtls-backoffice
-          {{- end }}
-          import inject-caddy-verified
-          uri /auth/verify
-          copy_headers X-Forwarded-User X-Forwarded-Name X-Forwarded-Email
-
-          @unauthorized status 401
-          handle_response @unauthorized {
-            redir * /login?next={http.request.uri} 302
+      {{- if .Values.agentBundles.openclaw.enabled }}
+      # ── openclaw inbound webhooks — /webhooks/{slack,telegram} ─────────────
+      # v4.1 Phase 1c (LAURA-I1-03 / FP-05). K8s render of the single-source
+      # docker/Caddyfile.openclaw-webhooks (yashigani-* service names; see the
+      # compose snippet for the full design rationale AND the
+      # /auth/verify-webhook contract). Exact POST paths only; forward_auth
+      # signature verify fails closed (any non-2xx from the verifier = deny);
+      # replay dedupe + rate-limit live in the verifier; 1MB body cap;
+      # /webhooks/* falls through to 404 — openclaw's wider :18789 surface is
+      # never published.
+      handle /webhooks/slack {
+        route {
+          @not_post not method POST
+          respond @not_post "Method Not Allowed" 405
+          request_body {
+            max_size 1MB
+          }
+          forward_auth https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            uri /auth/verify-webhook?provider=slack
+          }
+          reverse_proxy http://yashigani-openclaw:18789 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
           }
         }
-
-        # inject-caddy-verified: open-webui does not validate the header but
-        # we inject it uniformly across all reverse_proxy blocks. Auth is
-        # enforced by the forward_auth block above. Closes LU-231-10-A.
-        reverse_proxy open-webui:8080 {
-          import inject-caddy-verified
-          header_up X-Forwarded-Proto https
-          header_up X-Real-IP {remote_host}
-          header_up X-Forwarded-User {http.request.header.X-Forwarded-User}
-          header_up X-Forwarded-Name {http.request.header.X-Forwarded-Name}
-          header_up X-Forwarded-Email {http.request.header.X-Forwarded-Email}
+      }
+      handle /webhooks/telegram {
+        route {
+          @not_post not method POST
+          respond @not_post "Method Not Allowed" 405
+          request_body {
+            max_size 1MB
+          }
+          forward_auth https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            uri /auth/verify-webhook?provider=telegram
+          }
+          reverse_proxy http://yashigani-openclaw:18789 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+          }
+        }
+      }
+      handle /webhooks/* {
+        respond "Not Found" 404
+      }
+      {{- end }}
+      # ── 4.0 catch-all — ui4 portal redirect + backoffice proxy ─────────────
+      # OWUI removed in 4.0. / → /chat; unmatched paths → backoffice (ui4).
+      # Backoffice owns its own session auth — no forward_auth needed here.
+      # Mirrors docker/Caddyfile.{selfsigned,ca,acme} catch-all handle block.
+      handle {
+        import strip-orchestration-headers
+        @root_path path /
+        handle @root_path {
+          redir * /chat 302
+        }
+        handle {
+          reverse_proxy https://yashigani-backoffice:8443 {
+            {{- if .Values.mtls.enabled }}
+            import internal-mtls-backoffice
+            {{- end }}
+            import inject-caddy-verified
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+          }
         }
       }
     }
@@ -1015,6 +941,194 @@ data:
       }
     }
     {{- end }}
+    {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # v4.1 SU-SEAM-1d-04 (Su, ebe5f141) — mesh-mTLS caddy admin relay (:2019).
+    # K8s-only reload path for the MCP approve transaction
+    # (mcp_onboard._reload_via_admin_api).  On compose runtimes backoffice
+    # reloads Caddy over the shared /run/caddy/admin.sock unix socket; on K8s
+    # caddy and backoffice are SEPARATE PODS — a unix socket cannot span pods
+    # (emptyDir is pod-local; same-node co-location / RWX PVC is not the arch).
+    #
+    # MUST-4 compatibility: this does NOT re-expose the raw admin TCP endpoint.
+    # The admin API itself stays bound to the caddy-pod-local unix socket
+    # (global options above).  This is an ordinary Caddy HTTPS site block that:
+    #   1. terminates mesh mTLS — client_auth require_and_verify against the
+    #      internal CA bundle.  Identity-less clients are refused at the TLS
+    #      handshake, before any HTTP surface exists.
+    #   2. admits ONLY POST /load AND ONLY the backoffice SPIFFE URI.  The
+    #      verified client-cert URI SAN is stamped into
+    #      X-Yashigani-Verified-Spiffe (bare SET — replaces any client-sent
+    #      value; same discipline as the :8444/:8445 X-SPIFFE-ID stamp) and
+    #      matched with an exact `header` matcher.  Deliberately NOT a CEL
+    #      `expression` on the SAN placeholder: caddy 2.11.x cannot convert
+    #      the *url.URL placeholder value to CEL ("unsupported conversion to
+    #      ref.Val: (*url.URL)") and 500s EVERY request through the matcher —
+    #      proven live 2026-07-06 (SU-SEAM-1d-04 verification; the :18790
+    #      @caller_not_openclaw expression shares this defect — flagged
+    #      separately; fail-closed there since != that errors never admits).
+    #      Every other method/path/identity gets 403.  No /config, /stop,
+    #      /pki or other admin routes are ever proxied.
+    #   3. proxies to the local unix admin socket with Host pinned to
+    #      "localhost" — Caddy's admin host/origin check (DNS-rebinding guard)
+    #      only admits its own listener origins, so the relayed request must
+    #      not carry the external Host (yashigani-caddy:2019).
+    # Defence-in-depth stack: NetworkPolicy (backoffice pods only) → mesh mTLS
+    # (require_and_verify) → SPIFFE URI pin (backoffice leaf only) → method+
+    # path pin (POST /load only).
+    # ─────────────────────────────────────────────────────────────────────────
+    :{{ .Values.caddy.adminRelay.port }} {
+      tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+          mode require_and_verify
+          trust_pool file /run/secrets/ca_bundle.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+      }
+      # Stamp the VERIFIED client-cert URI SAN. Bare SET (no + prefix)
+      # replaces any client-supplied value — a client cannot forge this
+      # header past the stamp (see inject-caddy-verified rationale above).
+      # request_header runs before handle in Caddy's directive order, so the
+      # header matcher below sees the stamped value.
+      request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+      @backoffice_reload {
+        method POST
+        path /load
+        header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/backoffice"
+      }
+      handle @backoffice_reload {
+        reverse_proxy unix//run/caddy/admin.sock {
+          # Caddy admin origin check admits its own listener origins only;
+          # strip the mesh Host before it reaches the admin endpoint.
+          header_up Host localhost
+          # Don't leak the mesh-identity stamp into the admin endpoint.
+          header_up -X-Yashigani-Verified-Spiffe
+        }
+      }
+      handle {
+        respond "Forbidden" 403
+      }
+    }
+    {{- end }}
+    {{- if .Values.ollama.enabled }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # v4.1 Phase 1b-ii (LAURA-I1-01) — Ollama inference-plane mesh front (:11435)
+    # K8s parity for docker/Caddyfile.ollama-front. Per retro #81-b this Helm
+    # ConfigMap Caddyfile is a hand-coded K8s variant (yashigani-ollama service
+    # name, ca_bundle.crt trust anchor) — the compose snippet is the design
+    # single-source; this block is the K8s render of the same front.
+    #
+    # WHY: Ollama's :11434 must be reachable ONLY through a mesh-mTLS Caddy front.
+    # The K8s NetworkPolicy (allow-ollama-ingress) is flipped to admit ONLY the
+    # Caddy pod on :11434 — the gateway/backoffice reach Ollama exclusively via
+    # this listener presenting their mesh leaf. Closes the LAURA-I1-01 L3 bypass.
+    # ─────────────────────────────────────────────────────────────────────────
+    :11435 {
+      tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+          mode require_and_verify
+          trust_pool file /run/secrets/ca_bundle.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+      }
+      handle_path /ollama/* {
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        # Ollama has no TLS (mtls_capable:false) — plain HTTP upstream. The
+        # identity boundary is the mesh mTLS Caddy verifies above.
+        reverse_proxy http://yashigani-ollama:11434 {
+          header_up X-Forwarded-Proto https
+          header_up X-Real-IP {remote_host}
+          # Rewrite Host to localhost — ollama's checkHostMiddleware accepts
+          # "localhost" universally. K8s parity with docker/Caddyfile.ollama-front.
+          header_up Host "localhost"
+          transport http {
+            read_timeout 300s
+            write_timeout 300s
+          }
+        }
+      }
+      handle {
+        respond "Not Found" 404
+      }
+    }
+    {{- end }}
+    {{- if .Values.agentBundles.openclaw.enabled }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # v4.1 Phase 1c (LAURA-I1-03) — openclaw egress gateway (:18790)
+    # SINGLE-SOURCE RENDER (v4.1 unified-sidecar must-fix #9, Captain C5).
+    # The listener is loaded via .Files.Get from the byte-identical mirror
+    #   helm/yashigani/files/Caddyfile.openclaw-egress
+    # of the CANONICAL docker/Caddyfile.openclaw-egress (full Laura threat-model
+    # rationale FP-01..FP-07 lives there).  Mirror maintained by
+    #   scripts/sync-caddyfile-egress-helm.sh
+    # Drift gate: tests/contracts/test_openclaw_egress_single_source.py
+    # (byte parity + no-reinlined-copy + caddy adapt/validate on THIS rendered
+    # ConfigMap).  DO NOT hand-edit routes here — edit the canonical file.
+    #
+    # The ONLY K8s deltas are the four documented `replace` substitutions below
+    # plus this (internal-mtls) snippet shim: compose defines the snippet in
+    # the Caddyfile.{selfsigned,ca,acme} monoliths with the ca_intermediate.crt
+    # anchor; K8s uses the full-chain ca_bundle.crt.  versions 1.1 matches
+    # compose (R4: Caddy v2.11.x drops header_up-set headers on h2 upstream
+    # connections — the X-SPIFFE-ID stamp would be lost).
+    #
+    # HONEST ASYMMETRY vs compose: K8s NetworkPolicy cannot FQDN-pin Caddy's
+    # own outbound (yashigani-caddy-acme-egress already grants public :443);
+    # compose adds a per-IP iptables mirror in caddy-entrypoint.sh. On K8s the
+    # fixed upstreams in the rendered block are the destination control.
+    # Reachability to :18790 is scoped to openclaw pods by allow-caddy-ingress
+    # (networkpolicy.yaml) — the K8s equivalent of the compose
+    # openclaw_ringfence 2-member bridge.
+    # ─────────────────────────────────────────────────────────────────────────
+    (internal-mtls) {
+      transport http {
+        tls
+        tls_trust_pool file /run/secrets/ca_bundle.crt
+        tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
+        versions 1.1
+      }
+    }
+    {{- $egressTd := .Values.global.spiffeTrustDomain | default "yashigani.internal" }}
+    {{- $egressTgBotId := .Values.agentBundles.openclaw.telegramBotId | default "" }}
+    {{- $egress := .Files.Get "files/Caddyfile.openclaw-egress" }}
+    {{- if not $egress }}
+    {{- fail "helm/yashigani/files/Caddyfile.openclaw-egress is missing — run scripts/sync-caddyfile-egress-helm.sh (single-source mirror of docker/Caddyfile.openclaw-egress)" }}
+    {{- end }}
+    {{- /* Delta 1: K8s Service name — compose service `gateway` → `yashigani-gateway`. */}}
+    {{- $egress = $egress | replace "https://gateway:8080" "https://yashigani-gateway:8080" }}
+    {{- /* Delta 2: K8s trust anchor is the full-chain bundle. */}}
+    {{- $egress = $egress | replace "/run/secrets/ca_intermediate.crt" "/run/secrets/ca_bundle.crt" }}
+    {{- /* Delta 3: SPIFFE trust domain — compose composes it via parse-time env; K8s templates it. */}}
+    {{- $egress = $egress | replace "spiffe://yashigani.internal/" (printf "spiffe://%s/" $egressTd) }}
+    {{- /* Delta 4: telegram bot-ID pin default from values (a pod env var still wins if set). */}}
+    {{- if $egressTgBotId }}
+    {{- $egress = $egress | replace "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:}" (printf "{$YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID:%s}" $egressTgBotId) }}
+    {{- end }}
+    {{- $egress | nindent 4 }}
+    {{- end }}
+    # ─────────────────────────────────────────────────────────────────────────
+    # S4 — Agent import sentinel (P1 W3 Phase 2a)
+    # Last updated: 2026-05-29T00:00:00+00:00
+    #
+    # DESIGN: onboarded-agent Caddyfile snippets are generated by the
+    # ringfence-init codegen engine and mounted from the yashigani-caddy-agents
+    # ConfigMap at /etc/caddy/agents/<agent>.caddy in the Caddy pod. Each
+    # snippet is a top-level `:443 { handle_path ... }` site block. Caddy
+    # merges multiple `:443` blocks at parse time — agent routes are appended
+    # after the base routes defined above, so they never shadow base handles.
+    #
+    # IDEMPOTENCY: Caddy `import` with a wildcard glob is idempotent — if the
+    # directory contains no .caddy files (no agents onboarded yet), Caddy logs
+    # a warning and continues normally.
+    #
+    # NEVER regenerate the Caddyfile monolith — agent routes live in snippets.
+    # ─────────────────────────────────────────────────────────────────────────
+    import /etc/caddy/agents/*.caddy
 {{- end }}
 
 {{/*
@@ -1335,11 +1449,25 @@ data:
 {{- end }}
 {{- /*
   Backup script ConfigMap (MP.L2-3.8.9)
-  Embeds scripts/backup.sh so the backup CronJob can invoke it without
-  requiring a custom image build. The gateway image already carries the
-  age binary (installed in Dockerfile.gateway).
+  DRIFT-B5-BACKUP-EMBEDDED-COPY fix (v2.25.0 P2 FIX-3):
+  The prior inline backup.sh had 7 documented divergences from canonical
+  scripts/backup.sh (Iris audit): missing header/usage block, missing color
+  output, missing operator runbook error messages, missing post-encrypt
+  file-existence guard (Iris item 6 — `if [[ ! -f "${TMP_OUTPUT}" ]]`),
+  and unified extra-warn semantics.
+
+  Fix: replace inline with .Files.Get "files/scripts/backup.sh" (same pattern
+  as B6 OPA rego, commit d1d9433). helm/yashigani/files/scripts/backup.sh is a
+  byte-identical copy of scripts/backup.sh; sha256 parity enforced in
+  tests/contracts/test_helm_p2_fix3_backup_files_get.py.
+
+  Single source of truth: scripts/backup.sh. The files/ copy must track it.
+  CronJob entrypoint (backup-cronjob.yaml): `bash /scripts/backup.sh` — no CLI
+  args, env-var-only invocation. The canonical script's env var defaults are
+  identical to what the CronJob env block sets.
+
   See: backup-cronjob.yaml for mount and command usage.
-  Last updated: 2026-05-09T00:00:00+01:00
+  Last updated: 2026-05-28T00:00:00+01:00
 */}}
 {{- if .Values.backup.enabled }}
 ---
@@ -1354,64 +1482,8 @@ metadata:
   annotations:
     yashigani.io/finding: "MP.L2-3.8.9"
     yashigani.io/cwe: "CWE-312"
+    yashigani.io/drift-fix: "DRIFT-B5-BACKUP-EMBEDDED-COPY"
 data:
   backup.sh: |
-    #!/usr/bin/env bash
-    # Yashigani backup.sh — age-encrypted backup (MP.L2-3.8.9 / CMMC L2)
-    # Helm-embedded copy of scripts/backup.sh.
-    # Last updated: 2026-05-09T00:00:00+01:00
-    set -euo pipefail
-    umask 077
-    RECIPIENT_KEY_FILE="${YASHIGANI_BACKUP_RECIPIENT:-/etc/yashigani/backup-recipient.age.pub}"
-    OUTPUT_DIR="${YASHIGANI_BACKUP_OUTPUT_DIR:-/var/lib/yashigani/backups}"
-    SOURCE_DIR="${YASHIGANI_BACKUP_SOURCE_DIR:-/var/lib/yashigani}"
-    log_info()    { printf "    --> %s\n" "$*"; }
-    log_success() { printf "    ok  %s\n" "$*"; }
-    log_error()   { printf "    !!  ERROR: %s\n" "$*" >&2; }
-    if ! command -v age >/dev/null 2>&1; then
-      log_error "age binary not found. Install: apt-get install -y age (or apk add age)"
-      exit 1
-    fi
-    if [[ ! -f "${RECIPIENT_KEY_FILE}" ]]; then
-      log_error "Recipient public key not found: ${RECIPIENT_KEY_FILE}"
-      log_error "Provision ConfigMap '${YASHIGANI_BACKUP_RECIPIENT_CONFIGMAP:-yashigani-backup-recipient}' with key recipient.age.pub"
-      log_error "See docs/operations/backup.md"
-      exit 1
-    fi
-    RECIPIENT_KEY="$(< "${RECIPIENT_KEY_FILE}")"
-    RECIPIENT_KEY="${RECIPIENT_KEY%%$'\n'*}"
-    RECIPIENT_KEY="${RECIPIENT_KEY%"${RECIPIENT_KEY##*[![:space:]]}"}"
-    if [[ -z "${RECIPIENT_KEY}" || "${RECIPIENT_KEY}" != age1* ]]; then
-      log_error "Invalid recipient key in ${RECIPIENT_KEY_FILE} — must start with 'age1'"
-      exit 1
-    fi
-    if [[ ! -d "${SOURCE_DIR}" ]]; then
-      log_error "Source directory not found: ${SOURCE_DIR}"
-      exit 1
-    fi
-    mkdir -p "${OUTPUT_DIR}"
-    chmod 0700 "${OUTPUT_DIR}"
-    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
-    OUTPUT_FILE="${OUTPUT_DIR}/${TIMESTAMP}.tar.gz.age"
-    TMP_OUTPUT="${OUTPUT_DIR}/.tmp-${TIMESTAMP}-$$.tar.gz.age"
-    trap 'rm -f "${TMP_OUTPUT}" 2>/dev/null; exit 1' INT TERM
-    TAR_STATUS=0
-    ENCRYPT_STATUS=0
-    { tar --create --gzip --directory "$(dirname "${SOURCE_DIR}")" "$(basename "${SOURCE_DIR}")" 2>/dev/null; TAR_STATUS=$?; } \
-      | age --encrypt --recipient "${RECIPIENT_KEY}" --output "${TMP_OUTPUT}" 2>/dev/null
-    ENCRYPT_STATUS=$?
-    if [[ "${TAR_STATUS}" -ne 0 ]]; then
-      rm -f "${TMP_OUTPUT}" 2>/dev/null || true; trap - INT TERM
-      log_error "tar failed (exit ${TAR_STATUS})"
-      exit 1
-    fi
-    if [[ "${ENCRYPT_STATUS}" -ne 0 ]]; then
-      rm -f "${TMP_OUTPUT}" 2>/dev/null || true; trap - INT TERM
-      log_error "age encryption failed (exit ${ENCRYPT_STATUS})"
-      exit 1
-    fi
-    mv "${TMP_OUTPUT}" "${OUTPUT_FILE}"
-    trap - INT TERM
-    chmod 0400 "${OUTPUT_FILE}"
-    log_success "Encrypted backup: ${OUTPUT_FILE} ($(du -sh "${OUTPUT_FILE}" | awk '{print $1}'))"
+{{ .Files.Get "files/scripts/backup.sh" | indent 4 }}
 {{- end }}

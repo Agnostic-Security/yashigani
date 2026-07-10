@@ -50,6 +50,17 @@
 #      Encrypt OCSP; only in acme mode). Caddy auto-staples OCSP.
 #   6. ESTABLISHED/RELATED — return traffic for inbound client connections on
 #      :80/:443 (these are response packets, not new connections)
+#   7. openclaw egress-gateway upstreams (v4.1 Phase 1c + FP-06 Phase 2) —
+#      slack.com:443, hooks.slack.com:443, api.telegram.org:443 — ONLY when
+#      YASHIGANI_OPENCLAW_EGRESS=1 (install.sh sets it iff the openclaw
+#      profile is enabled). These mirror the fixed reverse_proxy upstreams in
+#      Caddyfile.openclaw-egress (the PRIMARY control; this iptables layer is
+#      defence in depth). Unlike the ACME hosts, these use iptables hashlimit
+#      (60/min burst 20 per dstip, tunable via YASHIGANI_OPENCLAW_EGRESS_RATE_LIMIT
+#      + YASHIGANI_OPENCLAW_EGRESS_RATE_BURST) — coarse NEW-connection rate
+#      brake, not per-request HTTP. Falls back to plain ACCEPT if the hashlimit
+#      kernel module is unavailable. Known CDN limitation: IPs resolved once at
+#      container start; rotate → restart to refresh.
 #   Operators may extend the ACME list via YASHIGANI_CADDY_EGRESS_ALLOWLIST env.
 #
 # DESIGN NOTES
@@ -191,7 +202,7 @@ apply_egress_rules() {
     log "egress allow: DNS → 127.0.0.11:53 (Docker embedded resolver, IPv4 only)"
 
     # ── Step 5: Allow Docker bridge subnets (IPv4 only) ────────────────────
-    # Caddy proxies to in-mesh services (gateway, backoffice, open-webui,
+    # Caddy proxies to in-mesh services (gateway, backoffice,
     # grafana, prometheus) on Docker bridge networks. We enumerate IPv4
     # subnets from the kernel routing table. IPv6 routes (if any — `ip -6
     # route show`) are deliberately ignored; compose networks are configured
@@ -243,10 +254,27 @@ apply_egress_rules() {
             full_allowlist="${full_allowlist} ${extra_space}"
         fi
     fi
-    # If nothing to allowlist (non-acme + no operator extras), skip the loop —
-    # iptables policy DROP is already in effect (LOG + DROP appended below).
-    if [ -z "$full_allowlist" ]; then
-        log "No upstream destinations to allowlist (TLS mode is non-acme, no operator extras)."
+
+    # ── Step 6b: openclaw egress-gateway upstreams (v4.1 Phase 1c) ─────────
+    # LAURA-I1-03: the :18790 fixed-upstream egress gateway
+    # (Caddyfile.openclaw-egress) reverse_proxies to exactly these three FQDNs.
+    # These hosts are handled separately from the ACME/operator allowlist (Step 6c
+    # below) so they can carry a hashlimit rate-brake (FP-06 Phase 2). Gated on
+    # the flag install.sh writes iff the openclaw profile is enabled; any value
+    # other than the literal "1" keeps these hosts BLOCKED (fail-closed default).
+    OPENCLAW_EGRESS_HOSTS="slack.com:443 hooks.slack.com:443 api.telegram.org:443"
+    _openclaw_egress_active=0
+    if [ "${YASHIGANI_OPENCLAW_EGRESS:-0}" = "1" ]; then
+        _openclaw_egress_active=1
+        log "openclaw egress gateway enabled — will allowlist with hashlimit rate-brake: ${OPENCLAW_EGRESS_HOSTS}"
+    else
+        log "openclaw egress gateway disabled (YASHIGANI_OPENCLAW_EGRESS != 1) — Slack/Telegram hosts NOT allowlisted."
+    fi
+    # If nothing to allowlist (non-acme + no operator extras + openclaw off), skip.
+    if [ -z "$full_allowlist" ] && [ "$_openclaw_egress_active" = "0" ]; then
+        log "No upstream destinations to allowlist (TLS mode is non-acme, no operator extras, openclaw disabled)."
+    elif [ -z "$full_allowlist" ]; then
+        log "No ACME/operator destinations to allowlist (TLS mode is non-acme, no operator extras)."
     fi
 
     # LAURA-V243-005 (MED): defensive iptables ADD wrapper.
@@ -309,6 +337,90 @@ apply_egress_rules() {
     fi
     log "ACME/OCSP/operator egress: $resolved_v4 IPv4 rules added; $skipped_v6 IPv6 destinations BLOCKED by policy."
 
+    # ── Step 6c: openclaw egress hashlimit rate-brake (FP-06 Phase 2) ───────
+    # DESIGN: openclaw egress hosts are NOT in the plain full_allowlist above.
+    # Instead, each resolved IPv4 gets a hashlimit ACCEPT (within rate) and an
+    # explicit NEW DROP (over rate) pair — inserted BEFORE the final LOG+DROP.
+    # Coarse control: connection-rate (NEW TCP SYN), not per-request HTTP.
+    # ESTABLISHED packets for accepted connections are already handled by Step 3.
+    #
+    # CDN limitation: Slack.com, hooks.slack.com, and api.telegram.org resolve
+    # to CDN-rotated IPs. Rules are built once at container start; if IPs rotate,
+    # the old rules cover the stale set and new IPs are BLOCKED until restart.
+    # This matches the existing ACME allowlist behaviour and is documented as a
+    # known class (retro #57-c). A container restart refreshes all rules.
+    #
+    # Fail-soft: if hashlimit is unavailable (kernel module not loaded or
+    # NET_ADMIN absent), the fallback is plain ACCEPT — egress remains functional
+    # without the rate brake. Logged as WARN so the operator knows the brake is off.
+    #
+    # Tunable via env vars (set by install.sh / operator override):
+    #   YASHIGANI_OPENCLAW_EGRESS_RATE_LIMIT  — hashlimit rate  (default: 60/min)
+    #   YASHIGANI_OPENCLAW_EGRESS_RATE_BURST  — hashlimit burst (default: 20)
+    if [ "$_openclaw_egress_active" = "1" ]; then
+        _rl_rate="${YASHIGANI_OPENCLAW_EGRESS_RATE_LIMIT:-60/min}"
+        _rl_burst="${YASHIGANI_OPENCLAW_EGRESS_RATE_BURST:-20}"
+        _rl_applied=0
+        _rl_fallback=0
+        log "openclaw egress hashlimit rate-brake: ${_rl_rate} burst ${_rl_burst} NEW conn per dstip"
+        for host_port in $OPENCLAW_EGRESS_HOSTS; do
+            host="${host_port%:*}"
+            port="${host_port##*:}"
+            all_ips=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+            if [ -z "$all_ips" ]; then
+                warn "hashlimit: could not resolve $host — $host:$port BLOCKED (fail-safe)"
+                continue
+            fi
+            for ip in $all_ips; do
+                case "$ip" in
+                    *:*)
+                        # IPv6 — blocked by ip6tables policy, skip.
+                        ;;
+                    *.*)
+                        # Try hashlimit ACCEPT first. On success, add the per-IP NEW
+                        # DROP rule (connections over the limit fall through to DROP here
+                        # rather than the final DROP, keeping the LOG rule readable).
+                        if iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" \
+                            -m state --state NEW \
+                            -m hashlimit \
+                            --hashlimit-upto "${_rl_rate}" \
+                            --hashlimit-burst "${_rl_burst}" \
+                            --hashlimit-mode dstip \
+                            --hashlimit-name "ysg-oc-egress" \
+                            -j ACCEPT 2>/dev/null; then
+                            # Explicit DROP for NEW connections that exceeded the rate.
+                            # ESTABLISHED packets (return traffic) are accepted by Step 3.
+                            if ! iptables -A OUTPUT -p tcp -d "$ip" --dport "$port" \
+                                -m state --state NEW -j DROP 2>/dev/null; then
+                                warn "hashlimit: NEW-DROP rule failed for $host ($ip):$port — rate exceeded traffic will hit final DROP"
+                            fi
+                            log "egress hashlimit allow: $host ($ip):$port NEW <=${_rl_rate} burst ${_rl_burst}"
+                            _rl_applied=$((_rl_applied + 1))
+                        else
+                            # hashlimit module unavailable — fall back to plain ACCEPT
+                            # so openclaw egress remains operational.
+                            warn "hashlimit unavailable for $host ($ip):$port — falling back to plain ACCEPT (rate-brake OFF)"
+                            _iptables_add_or_warn -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+                            _rl_fallback=$((_rl_fallback + 1))
+                        fi
+                        ;;
+                    *)
+                        warn "hashlimit: unrecognised address family for $host: $ip — skipping"
+                        ;;
+                esac
+            done
+        done
+        if [ "$_rl_applied" -gt 0 ]; then
+            log "openclaw egress hashlimit: $_rl_applied rules applied (${_rl_rate} burst ${_rl_burst} per dstip)."
+        fi
+        if [ "$_rl_fallback" -gt 0 ]; then
+            warn "openclaw egress hashlimit: $_rl_fallback host(s) fell back to plain ACCEPT (rate-brake NOT active for those hosts)."
+        fi
+        if [ "$_rl_applied" -eq 0 ] && [ "$_rl_fallback" -eq 0 ]; then
+            warn "openclaw egress hashlimit: no rules applied — all hosts unresolvable. Slack/Telegram egress is BLOCKED."
+        fi
+    fi
+
     # ── Step 7: LOG then DROP (both tables) ──────────────────────────────
     # IPv4 LOG: any blocked IPv4 egress appears in the host kernel log under
     # CADDY_EGRESS_BLOCKED_V4 prefix.
@@ -351,6 +463,33 @@ if [ -n "${YASHIGANI_CADDY_EGRESS_ALLOWLIST:-}" ]; then
 fi
 
 apply_egress_rules
+
+
+# ── FP-06 Phase 2: Slack operator-config secrets → Caddy parse-time env ───
+# Secret files (0600, created by install.sh from operator-supplied values):
+#   /run/secrets/openclaw_slack_webhook_path  (CHANNEL 1: incoming-webhook path pin)
+#   /run/secrets/openclaw_slack_bot_token     (CHANNEL 2: Web API bot-token pin)
+# These are NOT declared in compose environment: — the secret file is the single
+# source of truth; this avoids the value appearing in `docker inspect` env dumps.
+# caddy-entrypoint.sh reads the files HERE (before exec caddy) and exports them
+# so Caddy inherits the vars at parse time ({$YASHIGANI_OPENCLAW_SLACK_*:} in
+# the Caddyfile substitutes to the actual value).
+# Empty/absent file → var stays unset → Caddy default "" → enforcement expression
+# short-circuits false (inert-until-set; default install unbroken).
+if [ -s /run/secrets/openclaw_slack_webhook_path ]; then
+    YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH="$(cat /run/secrets/openclaw_slack_webhook_path)"
+    export YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+    log "Slack webhook-path pin loaded (YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH set)."
+else
+    log "Slack webhook-path pin: secret file absent or empty — CHANNEL 1 enforcement OFF (inert)."
+fi
+if [ -s /run/secrets/openclaw_slack_bot_token ]; then
+    YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN="$(cat /run/secrets/openclaw_slack_bot_token)"
+    export YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+    log "Slack bot-token pin loaded (YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN set; value redacted from log)."
+else
+    log "Slack bot-token pin: secret file absent or empty — CHANNEL 2 enforcement OFF (inert)."
+fi
 
 log "Starting Caddy..."
 exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

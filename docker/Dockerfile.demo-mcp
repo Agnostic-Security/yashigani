@@ -1,0 +1,32 @@
+# Yashigani — demo-mcp upstream ("cloud-9" headline demo).
+#
+# A deliberately MALICIOUS demo MCP upstream used to showcase Yashigani's MCP
+# egress defense: when a tool receives input text with the digit 9 in the middle,
+# the tool result is a prompt-injection / data-exfil payload. Yashigani's
+# orchestrator runs every MCP tool result through an OPA egress decision +
+# ResponseInspection (G-ORCH-OPA-1), so the injected result is BLOCKED at egress
+# and the user sees a neutral notice instead. Benign input echoes normally.
+#
+# Stdlib only (no third-party deps) → minimal attack surface. Runs non-root
+# (USER 10001), binds non-privileged :8000, compatible with the compose
+# read_only rootfs + cap_drop:[ALL] + no-new-privileges hardening.
+#
+# Built by scripts/build-demo-mcp.sh and by `docker compose` via the build:
+# directive on the demo-mcp service (profile: demo-mcp).
+#
+# Context: repo root. Source: docker/demo-mcp/server.py.
+FROM python:3.12-slim
+
+COPY docker/demo-mcp/server.py /app/server.py
+
+USER 10001
+EXPOSE 8000
+ENV MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000 \
+    PYTHONUNBUFFERED=1
+
+# GET / returns 200 — liveness page used by the compose healthcheck too.
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
+  CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2).status==200 else 1)"
+
+CMD ["python3", "/app/server.py"]

@@ -27,6 +27,9 @@ from typing import Optional
 
 from yashigani.auth.password import hash_password, verify_password, generate_password
 from yashigani.auth.totp import (
+    LEGACY_TOTP_ALGO,
+    ROLE_TOTP_ALGO,
+    ROLE_TOTP_DIGITS,
     generate_provisioning,
     generate_recovery_code_set,
     verify_totp,
@@ -115,6 +118,9 @@ class AccountRecord:
     # Use Optional[float] (epoch seconds) for symmetry with other time fields.
     last_login_at: Optional[float] = None
     inactive_disabled_at: Optional[float] = None
+    # Phase 13: role-tiered TOTP algorithm.  "SHA1" = legacy pre-3.1 enrolment
+    # (forces re-enrolment on next login).  "SHA256" = user tier.  "SHA512" = admin tier.
+    totp_algorithm: str = LEGACY_TOTP_ALGO
 
 
 class LocalAuthService:
@@ -222,11 +228,28 @@ class LocalAuthService:
             record.failed_attempts = 0
             return True, record, "totp_provision_required"
 
+        # Phase 13: legacy SHA-1 enrolment detected → force re-enrolment.
+        # The expected algorithm for this role differs from what was enrolled.
+        # This is transparent to the user: they get a provisioning session and
+        # see the new QR code (SHA-256/6 for users, SHA-512/8 for admins).
+        expected_algo = ROLE_TOTP_ALGO.get(record.account_tier, LEGACY_TOTP_ALGO)
+        if record.totp_secret and record.totp_algorithm != expected_algo:
+            record.force_totp_provision = True
+            record.failed_attempts = 0
+            return True, record, "totp_provision_required"
+
         # Exponential backoff check — ASVS v5 V2 compensating control
         if record.totp_backoff_until > time.time():
             return False, None, generic_fail
 
-        if not verify_totp(record.totp_secret, totp_code, self._used_totp_codes):
+        role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+        if not verify_totp(
+            record.totp_secret,
+            totp_code,
+            self._used_totp_codes,
+            algorithm=record.totp_algorithm,
+            digits=role_digits,
+        ):
             record.totp_failed_attempts += 1
             n = record.totp_failed_attempts
             if n >= _MAX_FAILED_ATTEMPTS:
@@ -272,10 +295,14 @@ class LocalAuthService:
         client.
         """
         record = self._accounts[username]
-        prov = generate_provisioning(account_name=username)
+        # Phase 13: choose algorithm and digit count based on account tier.
+        algo = ROLE_TOTP_ALGO.get(record.account_tier, LEGACY_TOTP_ALGO)
+        digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+        prov = generate_provisioning(account_name=username, algorithm=algo, digits=digits)
         code_set = generate_recovery_code_set(prov.recovery_codes)
 
         record.totp_secret = prov.secret_b32
+        record.totp_algorithm = algo
         record.recovery_codes = code_set
         # Leave force_totp_provision=True — only provision_totp_confirm
         # (with a valid code) may clear it.
@@ -298,7 +325,14 @@ class LocalAuthService:
             return False, "account_not_found"
         if not record.totp_secret:
             return False, "no_pending_enrolment"
-        if not verify_totp(record.totp_secret, totp_code, self._used_totp_codes):
+        role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+        if not verify_totp(
+            record.totp_secret,
+            totp_code,
+            self._used_totp_codes,
+            algorithm=record.totp_algorithm,
+            digits=role_digits,
+        ):
             return False, "invalid_totp_code"
         record.force_totp_provision = False
         return True, "ok"
@@ -344,7 +378,14 @@ class LocalAuthService:
         if not verify_password(current_password, record.password_hash):
             return False, "invalid_credentials"
 
-        if not verify_totp(record.totp_secret, totp_code, self._used_totp_codes):
+        role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+        if not verify_totp(
+            record.totp_secret,
+            totp_code,
+            self._used_totp_codes,
+            algorithm=record.totp_algorithm,
+            digits=role_digits,
+        ):
             return False, "invalid_totp"
 
         # -- Password reuse history check (IA.L2-3.5.8) ---------------------
@@ -382,12 +423,24 @@ class LocalAuthService:
         username: str,
         admin_totp_secret: str,
         admin_totp_code: str,
+        admin_totp_algorithm: str = LEGACY_TOTP_ALGO,
+        admin_totp_digits: int = 8,
     ) -> tuple[bool, str]:
         """
         Admin full-reset a user account (strips all access).
         Requires admin's TOTP re-verification (ASVS V2.8).
+
+        admin_totp_algorithm / admin_totp_digits — must match the algorithm and
+        digit count stored on the acting admin's AccountRecord.  Callers must
+        fetch the admin's record and pass these explicitly.
         """
-        if not verify_totp(admin_totp_secret, admin_totp_code, self._used_totp_codes):
+        if not verify_totp(
+            admin_totp_secret,
+            admin_totp_code,
+            self._used_totp_codes,
+            algorithm=admin_totp_algorithm,
+            digits=admin_totp_digits,
+        ):
             return False, "invalid_admin_totp"
 
         record = self._accounts.get(username)
@@ -396,6 +449,7 @@ class LocalAuthService:
 
         # Strip all access
         record.totp_secret = ""
+        record.totp_algorithm = LEGACY_TOTP_ALGO  # sentinel — requires re-enrolment
         record.recovery_codes = None
         record.force_password_change = True
         record.force_totp_provision = True

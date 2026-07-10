@@ -1,0 +1,77 @@
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index a0a29b4..9377b31 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -2024,17 +2024,17 @@ services:
+       API_USERNAME: wazuh-wui
+       API_PASSWORD: ${WAZUH_API_PASSWORD:-}
+     volumes:
+-      - wazuh_api_configuration:/var/ossec/api/configuration
+-      - wazuh_etc:/var/ossec/etc
+-      - wazuh_logs:/var/ossec/logs
+-      - wazuh_queue:/var/ossec/queue
+-      - wazuh_var_multigroups:/var/ossec/var/multigroups
+-      - wazuh_integrations:/var/ossec/integrations
+-      - wazuh_active_response:/var/ossec/active-response/bin
+-      - wazuh_agentless:/var/ossec/agentless
+-      - wazuh_wodles:/var/ossec/wodles
+-      - filebeat_etc:/etc/filebeat
+-      - filebeat_var:/var/lib/filebeat
++      # E2E-FIX3 (F7): NO named volumes — Docker 29.1.3 has a volume-mount-readiness
++      # race; the wazuh s6 init runs `find` on per-subdir volume mounts before they
++      # are ready (~94% of cycles), failing the cp-restore. Running fully ephemeral
++      # (image writable layer, only the secrets bind) removes the race entirely.
++      # Trade-off: manager data not persisted across recreate (acceptable for SIEM).
++      - ./secrets:/run/secrets:ro
++      - ./wazuh-patch/0-wazuh-init:/etc/cont-init.d/0-wazuh-init
++      # E2E-FIX (F7): filebeat→indexer mTLS certs — env points here but compose never mounted them.
++      - ./secrets/wazuh-manager_client.crt:/etc/wazuh-indexer/certs/wazuh.manager.pem:ro
++      - ./secrets/wazuh-manager_client.key:/etc/wazuh-indexer/certs/wazuh.manager-key.pem:ro
++      - ./secrets/ca_root.crt:/etc/ssl/root-ca.pem:ro
+     healthcheck:
+       test: ["CMD-SHELL", "curl -sf http://localhost:55000 || exit 1"]
+       interval: 30s
+@@ -2048,8 +2048,11 @@ services:
+     security_opt:
+       - no-new-privileges:true
+     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
+-    # No cap_add: wazuh-manager uses standard ports (55000/1514/1515).
++    # E2E-FIX (F7-ROOT): Wazuh's s6 entrypoint is incompatible with cap_drop:[ALL].
++    # It must chown/setuid to the wazuh(999) user and chroot analysisd into
++    # /var/ossec. Grant the minimal caps Wazuh requires.
+     cap_drop: [ALL]
++    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL, SETPCAP, SYS_CHROOT]
+     # EX-231-10: wazuh receives audit events from backoffice/gateway sinks.
+     # Both gateway/backoffice are on `data`, so wazuh-manager joins `data`.
+     # Also joins `obs` for indexer (wazuh-indexer is on obs).
+@@ -2081,8 +2084,10 @@ services:
+     security_opt:
+       - no-new-privileges:true
+     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
+-    # No cap_add: wazuh-indexer binds port 9200 (non-privileged).
++    # E2E-FIX (F7-ROOT): OpenSearch entrypoint drops root→wazuh-indexer(1000);
++    # cap_drop:[ALL] blocks the setuid/chown. Grant minimal caps.
+     cap_drop: [ALL]
++    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
+     # EX-231-10: wazuh-indexer is obs-plane (receives from wazuh-manager).
+     networks:
+       - obs
+@@ -2124,8 +2129,9 @@ services:
+     security_opt:
+       - no-new-privileges:true
+     # V232-CSCAN-01k-RES-01: defence-in-depth — no Helm counterpart (wazuh profile).
+-    # No cap_add: wazuh-dashboard binds port 5601 (non-privileged).
++    # E2E-FIX (F7-ROOT): dashboard entrypoint drops root→wazuh-dashboard(1000).
+     cap_drop: [ALL]
++    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]
+     # EX-231-10: wazuh-dashboard is obs-plane (queries indexer + manager).
+     networks:
+       - obs
+@@ -2238,6 +2244,7 @@ volumes:
+   wazuh_logs:
+     driver: local
+   wazuh_queue:
++  wazuh_multigroups:
+     driver: local
+   wazuh_var_multigroups:
+     driver: local

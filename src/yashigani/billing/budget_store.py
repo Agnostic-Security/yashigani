@@ -13,7 +13,6 @@ DB tables (from migration 0005):
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +111,43 @@ class BudgetStore:
                 "SELECT provider, model_name, input_cost_per_1k, output_cost_per_1k, is_local FROM model_pricing ORDER BY provider, model_name"
             )
             return [dict(r) for r in rows]
+
+    async def delete_org_cap(self, tenant_id: str, org_id: str, provider: str) -> bool:
+        """Delete an org cap.  Returns True if a row was deleted, False if absent."""
+        if not self._pool:
+            return False
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM org_cloud_caps WHERE tenant_id = $1 AND org_id = $2 AND provider = $3",
+                tenant_id, org_id, provider,
+            )
+            return result.endswith("1")
+
+    async def delete_group_budget(
+        self, tenant_id: str, group_id: str, provider: str, period: str = "monthly",
+    ) -> bool:
+        """Delete a group budget.  Returns True if a row was deleted, False if absent."""
+        if not self._pool:
+            return False
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM group_budgets WHERE tenant_id = $1 AND group_id = $2 AND provider = $3 AND period = $4",
+                tenant_id, group_id, provider, period,
+            )
+            return result.endswith("1")
+
+    async def delete_individual_budget(
+        self, tenant_id: str, identity_id: str, provider: str, period: str = "monthly",
+    ) -> bool:
+        """Delete an individual budget.  Returns True if a row was deleted, False if absent."""
+        if not self._pool:
+            return False
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM individual_budgets WHERE tenant_id = $1 AND identity_id = $2 AND provider = $3 AND period = $4",
+                tenant_id, identity_id, provider, period,
+            )
+            return result.endswith("1")
 
     async def get_model_aliases(self, tenant_id: str) -> list[dict]:
         """Get all model aliases for a tenant."""

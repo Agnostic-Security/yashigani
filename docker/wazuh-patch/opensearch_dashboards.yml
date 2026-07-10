@@ -1,0 +1,18 @@
+# E2E-FIX (F7): minimal dashboard config — image ships none & compose never mounted one.
+# 4.0 monitoring-proxy: Caddy proxies /admin/wazuh/* without stripping the prefix
+# (handle, not handle_path), so OpenSearch Dashboards must rewrite its basePath.
+# server.basePath strips the prefix from all incoming requests so OSD renders
+# correctly. server.rewriteBasePath=true also rewrites HTTP redirects from the
+# dashboard so they stay under /admin/wazuh/.
+server.host: "0.0.0.0"
+server.port: 5601
+server.ssl.enabled: false
+server.basePath: "/admin/wazuh"
+server.rewriteBasePath: true
+opensearch.hosts: ["https://wazuh-indexer:9200"]
+opensearch.ssl.verificationMode: none
+opensearch.username: "admin"
+opensearch.password: "admin"
+opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]
+opensearch_security.multitenancy.enabled: false
+opensearch_security.readonly_mode.roles: ["kibana_read_only"]

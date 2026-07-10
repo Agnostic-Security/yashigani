@@ -1,0 +1,79 @@
+# Yashigani v4.1 — Agent Policy Template: langflow default
+#
+# Applies to: langflow bundled agent (visual workflow builder)
+# Version: 1
+#
+# Mode-A prefixes (reverse-proxy / body-inspected):
+#   llm   — LLM inference via gateway-inference deliver class
+#   tools — MCP tool calls via gateway-mcp internal deliver class (NEW)
+#
+# WIDENING NOTE (Nico Q-N1 / B5): adding any prefix beyond {llm} widens egress
+# for every flow in this langflow instance (egress enforcement is at the langflow-
+# instance grant — per-flow isolation requires pool-managed containers, Track 3+).
+# Adding `tools` is the expected baseline. Adding internet-facing prefixes is
+# WEAKEN-class and requires the dp_weaken dual-admin ceremony.
+#
+# Last updated: 2026-07-08T00:00:00+00:00
+apiVersion: yashigani.io/v1alpha1
+kind: AgentPolicyTemplate
+metadata:
+  template_id: tmpl-langflow-default
+  version: 1
+  applies_to: langflow
+  description: >-
+    Default governance policy for the bundled langflow agent. Enables LLM and
+    MCP-tools egress (Mode A — body-inspected). Both deliver internally via the
+    Yashigani gateway mesh; no direct internet reach.
+
+spec:
+  ingress:
+    enabled: true
+
+  egress:
+    - prefix: llm
+      mode: reverse_proxy
+      deliver_to: gateway-inference
+      ceiling: PUBLIC
+      scan_secrets: true
+      filter_description: true
+
+    # NEW internal deliver class — gateway-mcp (design §4.1).
+    # langflow flows calling MCP tools ride the governed forwarder to the
+    # gateway broker. Internal delivery only (INTERNAL ceiling allowed here
+    # because the body never leaves the mesh).
+    - prefix: tools
+      mode: reverse_proxy
+      deliver_to: gateway-mcp
+      ceiling: INTERNAL
+      scan_secrets: true
+      filter_description: true
+
+  disclosure:
+    enforced:
+      - "Destination closed-world — perimeter-owned Caddy config"
+      - "Body DLP + injection screen + OPA ceiling/PII on llm, tools (Mode A)"
+      - "Per-caller positive grant; absence = deny; revocation = grant removal"
+      - "Internal delivery only — no direct internet egress"
+    residuals:
+      - id: UNION-N1
+        applies_to: llm,tools
+        text: >-
+          Revoking this agent's grant kills its LLM/tools ingress. While a
+          sibling flow holds the same prefix via the langflow union grant, the
+          forwarder route remains active — the kill switch removes this
+          caller's grant entry, not the forwarder route itself. Per-flow
+          egress isolation requires pool-managed containers (Track 3+).
+      - id: UNION-WIDEN
+        text: >-
+          Widening langflow egress beyond {llm, tools} affects ALL flows in
+          this langflow instance. An additional prefix is WEAKEN-class and
+          requires the dual-admin dp_weaken ceremony.
+      - id: GRAPH-N3
+        text: >-
+          graph_hash is drift-detection metadata only (registry-level change
+          detection). It is NOT attestation of a flow's behaviour or tool
+          surface.
+      - id: IDENTITY-MF6
+        text: >-
+          Audit identity_basis is ringfence-position: caller identity is the
+          2-member ringfence topology, not per-flow mTLS/attestation.

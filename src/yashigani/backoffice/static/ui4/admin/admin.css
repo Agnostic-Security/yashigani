@@ -1,0 +1,230 @@
+/* Yashigani 4.0 admin shell — layout + module chrome. CLASSES-ONLY.
+ *
+ * Strict CSP (style-src 'self', NO 'unsafe-inline') forbids inline style= and
+ * <style>. Every visual treatment here is a class; the shell + reference module
+ * reference only these + the shared design-system tokens (design-system.css).
+ * No colours/spacing literals beyond the shared --ys-* custom properties.
+ */
+
+/* ── app shell grid: topbar over [nav | content] ─────────────────────────── */
+.ys-admin-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.ys-admin-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── top bar ─────────────────────────────────────────────────────────────── */
+.ys-admin-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--ys-nav-bg);
+  color: #fff;
+  padding: var(--ys-sp-3) var(--ys-sp-5);
+  box-shadow: var(--ys-elev-1);
+}
+.ys-admin-brand { display: flex; align-items: baseline; gap: var(--ys-sp-3); }
+.ys-admin-brand-mark { font-weight: 700; color: var(--ys-brand-orange); letter-spacing: 0.01em; }
+.ys-admin-brand-tag {
+  font-size: var(--ys-fs-sm); font-weight: 600; color: #cbd5e1;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.ys-admin-section-title {
+  margin-left: var(--ys-sp-3); padding-left: var(--ys-sp-3);
+  border-left: 1px solid rgba(255, 255, 255, 0.2);
+  font-size: var(--ys-fs-base); color: #e2e8f0;
+}
+.ys-admin-session { display: flex; align-items: center; gap: var(--ys-sp-3); font-size: var(--ys-fs-sm); }
+.ys-admin-user { color: #cbd5e1; }
+
+/* ── left nav ────────────────────────────────────────────────────────────── */
+.ys-admin-nav {
+  width: 232px;
+  flex-shrink: 0;
+  background: var(--ys-surface);
+  border-right: 1px solid var(--ys-border);
+  padding: var(--ys-sp-3) var(--ys-sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+.ys-admin-nav-empty { padding: var(--ys-sp-3); }
+.ys-admin-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ys-admin-nav-group + .ys-admin-nav-group { margin-top: var(--ys-sp-3); }
+.ys-admin-nav-group-header {
+  margin: 0;
+  padding: var(--ys-sp-2) var(--ys-sp-3) var(--ys-sp-1);
+  font-size: var(--ys-fs-xs, 0.6875rem);
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ys-ink-faint, var(--ys-ink-muted));
+}
+.ys-admin-nav-link {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-2) var(--ys-sp-3);
+  border-radius: var(--ys-radius-sm);
+  color: var(--ys-ink-muted);
+  text-decoration: none;
+  font-size: var(--ys-fs-base); font-weight: 500;
+  cursor: pointer;
+}
+.ys-admin-nav-link:hover { background: var(--ys-surface-alt); color: var(--ys-ink); }
+.ys-admin-nav-active { background: var(--ys-blue-bg); color: var(--ys-brand-blue); }
+.ys-admin-nav-icon { width: 1.2em; text-align: center; }
+.ys-admin-nav-label { flex: 1; }
+
+/* ── content area ────────────────────────────────────────────────────────── */
+.ys-admin-content { flex: 1; min-width: 0; overflow-y: auto; background: var(--ys-bg); }
+.ys-admin-content-pad { padding: var(--ys-sp-5); }
+.ys-admin-2col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: var(--ys-sp-4);
+}
+@media (max-width: 900px) {
+  .ys-admin-2col { grid-template-columns: 1fr; }
+}
+
+/* ── stat cards ──────────────────────────────────────────────────────────── */
+.ys-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--ys-sp-4);
+  margin-bottom: var(--ys-sp-4);
+}
+.ys-stat-card {
+  background: var(--ys-surface);
+  border-radius: var(--ys-radius);
+  box-shadow: var(--ys-elev-1);
+  padding: var(--ys-sp-4);
+}
+.ys-stat-num { font-size: 1.8rem; font-weight: 700; color: var(--ys-ink); }
+.ys-stat-num--sm { font-size: 1.1rem; }
+.ys-stat-num--warn { color: var(--ys-red-fg); }
+.ys-stat-label { margin-top: var(--ys-sp-1); font-size: var(--ys-fs-sm); color: var(--ys-ink-muted); }
+
+/* ── service health cards ────────────────────────────────────────────────── */
+.ys-svc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--ys-sp-3);
+}
+.ys-svc-card {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-3);
+  border: 1px solid var(--ys-border-faint);
+  border-radius: var(--ys-radius-sm);
+  background: var(--ys-surface-alt);
+}
+.ys-svc-meta { flex: 1; min-width: 0; }
+.ys-svc-name { font-weight: 600; font-size: var(--ys-fs-base); }
+
+/* ── semaphores ──────────────────────────────────────────────────────────── */
+.ys-semaphore {
+  display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+  flex-shrink: 0; background: var(--ys-ink-faint);
+}
+.ys-semaphore--ok { background: #22c55e; }
+.ys-semaphore--degraded { background: #f59e0b; }
+.ys-semaphore--critical { background: var(--ys-red-fg); }
+.ys-semaphore--p1 { background: #dc2626; }
+.ys-semaphore--p2 { background: #ea580c; }
+.ys-semaphore--p3 { background: #f59e0b; }
+.ys-semaphore--p4 { background: #3b82f6; }
+.ys-semaphore--p5 { background: var(--ys-ink-faint); }
+
+/* ── alert priority list ─────────────────────────────────────────────────── */
+.ys-alert-list { list-style: none; margin: 0; padding: 0; }
+.ys-alert-item {
+  display: flex; align-items: center; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-2) 0;
+  border-bottom: 1px solid var(--ys-border-faint);
+}
+.ys-alert-item:last-child { border-bottom: none; }
+.ys-alert-label { flex: 1; font-size: var(--ys-fs-base); }
+.ys-alert-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ── monitoring (embedded observability tools) ───────────────────────────── */
+.ys-mon-intro { margin: 0 0 var(--ys-sp-3); }
+.ys-mon-tabs {
+  display: flex; gap: var(--ys-sp-2); flex-wrap: wrap;
+  margin: 0 0 var(--ys-sp-4); border-bottom: 1px solid var(--ys-border);
+}
+.ys-mon-tab {
+  appearance: none; background: none; border: 0;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  padding: var(--ys-sp-2) var(--ys-sp-3);
+  font-size: var(--ys-fs-base); font-weight: 500;
+  color: var(--ys-ink-muted); cursor: pointer;
+}
+.ys-mon-tab:hover { color: var(--ys-ink); }
+.ys-mon-tab--active { color: var(--ys-brand-blue); border-bottom-color: var(--ys-brand-blue); }
+.ys-mon-pane { display: flex; flex-direction: column; gap: var(--ys-sp-3); }
+.ys-mon-pane--hidden { display: none; }
+.ys-mon-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--ys-sp-3); flex-wrap: wrap;
+}
+.ys-mon-newtab { text-decoration: none; white-space: nowrap; }
+.ys-mon-down { margin: 0; }
+.ys-mon-down-body { display: flex; align-items: center; gap: var(--ys-sp-3); }
+.ys-mon-down-msg { flex: 1; font-size: var(--ys-fs-base); }
+.ys-mon-frame {
+  width: 100%; height: calc(100vh - 230px); min-height: 480px;
+  border: 0; border-radius: var(--ys-radius);
+  background: var(--ys-surface); box-shadow: var(--ys-elev-1);
+}
+.ys-alert-count--zero { color: var(--ys-ink-faint); font-weight: 500; }
+
+/* ── CSP-INL-001: extracted inline styles (mcp.js + budget-models.js) ────── */
+/* All inline style= attributes in ui4/admin/modules/ must map to a class here. */
+
+/* Error / danger text colour (replaces style="color:var(--ys-danger)" in mcp.js) */
+.ys-txt-danger { color: var(--ys-red-fg); }
+
+/* Small text modifier — 0.8em of the element's context (replaces font-size:0.8em) */
+.ys-txt-sm { font-size: 0.8em; }
+
+/* Muted colour on an inline span without an existing ys-txt-note parent class */
+.ys-txt-muted { color: var(--ys-ink-muted); }
+
+/* .ys-txt-note with bottom margin (GPU summary separator in budget-models.js) */
+.ys-txt-note--mb { margin-bottom: var(--ys-sp-2); }
+
+/* .ys-txt-note with small top margin (inventory footer note in budget-models.js) */
+.ys-txt-note--mt-sm { margin-top: var(--ys-sp-1); }
+
+/* Badge with inline horizontal gap (tool-key chips in mcp.js tool-surface row) */
+.ys-badge--gap { margin: 1px var(--ys-sp-1); }
+
+/* Sub-row cell holding the tool badge list in the MCP server table */
+.ys-mcp-tools-cell { padding: 0 0 var(--ys-sp-2) var(--ys-sp-4); }
+
+/* Panel header that contains a right-aligned action button (display:flex layout) */
+.ys-panel-header--flex { display: flex; align-items: center; gap: var(--ys-sp-2); }
+
+/* Action button styled smaller and pushed to the far right inside .ys-panel-header--flex */
+.ys-btn-header { margin-left: auto; font-size: 0.85em; }
+
+/* Panel with an explicit top margin for visual separation between stacked panels */
+.ys-panel--mt { margin-top: var(--ys-sp-4); }
+
+/* Dashboard "Action required" alerts (pending NHI / MCP approvals) */
+.ys-panel--action { border-left: 3px solid var(--ys-amber, #c77700); }
+.ys-action-list { list-style: none; margin: 0; padding: 0; }
+.ys-action-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0; }
+.ys-action-count { font-weight: 700; font-size: 1.1rem; min-width: 1.75rem; text-align: center; color: var(--ys-amber, #c77700); }
+.ys-action-label { flex: 1; }
+.ys-action-cta { white-space: nowrap; text-decoration: none; font-weight: 600; }

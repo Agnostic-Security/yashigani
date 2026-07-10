@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# last-updated: 2026-05-29T00:00:00+01:00 (feat(p3): MCP bridge-join + P-384 signing key generation — YSG-P3-MCP-SIGKEY / YSG-P3-MCP-BRIDGE-JOIN)
+# last-updated: 2026-05-28T00:00:00+01:00 (fix(backup): DRIFT-B5-COMPOSE-AGENT-BACKUP — snapshot langflow_data/letta_data/openclaw_data named volumes in _backup_existing_data; warn-only on absent volume; Docker+Podman parity via alpine tar pattern; 0600 tarballs; K8s-gated)
 # last-updated: 2026-05-23T00:00:00+00:00 (fix(install): BYOCA-BUG-001/002/003/004 — _fp init + podman unshare BYO staging + EC key gate + podman unshare YAML update)
 # last-updated: 2026-05-19T00:00:00+01:00 (fix(install): inject X-SPIFFE-ID on POST /admin/agents — close ISSUE-019)
 # last-updated: 2026-05-17T17:00:00+00:00 (feat(install): per-install YASHIGANI_INTERNAL_BEARER token generation — close Captain Bucket-C finding)
@@ -90,9 +92,49 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="2.24.0"
+YASHIGANI_VERSION="4.1.0"
+# GIT_SHA: git short-hash of the current source tree used as a cache-busting
+# build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
+# backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
+# Dockerfile AFTER all dep-install COPY layers so base/dep layers stay cached
+# while any source commit forces the app-code layer to rebuild.
+# This closes the version-drift stale-image bug class (cf. 0d9aed1): when
+# YASHIGANI_VERSION is unchanged but source commits have landed, a cached image
+# tagged :3.0.0 from an earlier build would be reused silently. With GIT_SHA
+# baked into the image label, _local_images_cached() detects the mismatch and
+# forces a rebuild even when the version tag already exists in the local store.
+# Falls back to "dev" (non-git checkout / airgap / tarball installs); in those
+# cases the caller must ensure the image store is clean or set YASHIGANI_FORCE_REBUILD=1.
+YASHIGANI_GIT_SHA="${YASHIGANI_GIT_SHA:-}"
+if [[ -z "$YASHIGANI_GIT_SHA" ]]; then
+  if command -v git >/dev/null 2>&1 && git -C "${_YSG_SCRIPT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    YASHIGANI_GIT_SHA="$(git -C "${_YSG_SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  YASHIGANI_GIT_SHA="${YASHIGANI_GIT_SHA:-dev}"
+fi
+export YASHIGANI_GIT_SHA
+
+# Build-arg passthrough for proxied/airgapped builds (Fix 2 — cold-build robustness).
+# Each yashigani Dockerfile declares ARG HTTP_PROXY / HTTPS_PROXY / NO_PROXY in every
+# stage that runs pip/apt/apk/npm; pip/apt honour these env vars during `docker build`.
+# When the shell env is proxy-free the array stays empty → no-op, unchanged behaviour.
+# Usage: podman build "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" ...
+YSG_PROXY_BUILD_ARGS=()
+[[ -n "${HTTP_PROXY:-}" ]]  && YSG_PROXY_BUILD_ARGS+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}")
+[[ -n "${HTTPS_PROXY:-}" ]] && YSG_PROXY_BUILD_ARGS+=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY}")
+[[ -n "${NO_PROXY:-}" ]]    && YSG_PROXY_BUILD_ARGS+=(--build-arg "NO_PROXY=${NO_PROXY}")
+
 YASHIGANI_REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 YASHIGANI_TARBALL_URL="${YASHIGANI_TARBALL_URL:-https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${YASHIGANI_VERSION}.tar.gz}"
+# MI-1: record whether the operator pinned YSG_INSTALL_DIR explicitly in the
+# environment BEFORE the default is applied. An explicit pin always wins over the
+# per-instance keying in _resolve_instance_install_dir() (operator intent is
+# authoritative). Must be evaluated before the ":-default" assignment below.
+if [[ -n "${YSG_INSTALL_DIR:-}" ]]; then
+  _YSG_INSTALL_DIR_EXPLICIT=1
+else
+  _YSG_INSTALL_DIR_EXPLICIT=0
+fi
 YSG_INSTALL_DIR="${YSG_INSTALL_DIR:-$HOME/.yashigani}"
 
 # -----------------------------------------------------------------------------
@@ -117,7 +159,21 @@ fi
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
-log_step()    { printf "${C_BLUE}[ %s ] %s${C_RESET}\n" "$1" "$2"; }
+# log_step "N/TOTAL" "message" — renders an ASCII progress bar from N/TOTAL.
+# Falls back to the plain "[ N/TOTAL ]" form for non-numeric labels. Bash-3.2
+# safe (printf width + tr; no seq, no unicode, no bc).
+log_step() {
+  local _frac="$1" _msg="$2" _cur _tot _pct _fill _bar _pad
+  _cur="${_frac%%/*}"; _tot="${_frac##*/}"
+  if [ "$_cur" -eq "$_cur" ] 2>/dev/null && [ "$_tot" -eq "$_tot" ] 2>/dev/null && [ "${_tot:-0}" -gt 0 ]; then
+    _pct=$(( _cur * 100 / _tot )); _fill=$(( _pct * 24 / 100 ))
+    _bar="$(printf '%*s' "$_fill" '' | tr ' ' '#')"
+    _pad="$(printf '%*s' "$(( 24 - _fill ))" '' | tr ' ' '.')"
+    printf "${C_BLUE}[%s%s] %3d%% (step %s) %s${C_RESET}\n" "$_bar" "$_pad" "$_pct" "$_frac" "$_msg"
+  else
+    printf "${C_BLUE}[ %s ] %s${C_RESET}\n" "$_frac" "$_msg"
+  fi
+}
 log_info()    { printf "${C_BOLD}    --> %s${C_RESET}\n" "$1"; }
 log_success() { printf "${C_GREEN}    ok  %s${C_RESET}\n" "$1"; }
 log_warn()    { printf "${C_YELLOW}    !!  WARNING: %s${C_RESET}\n" "$1" >&2; }
@@ -133,6 +189,22 @@ MODE="compose"
 MODE_EXPLICIT=0
 DEPLOY_MODE=""                # demo|production|enterprise — set interactively or via --deploy
 DOMAIN=""
+# Multi-instance (3.0, scoping-draft §4a). The compose PROJECT name scopes every
+# container/volume/network. Historically hardcoded/derived as "docker" (the compose
+# file's directory name), so two instances on one host collided. PROJECT now derives
+# from --domain (sanitised), with an optional explicit --project override.
+#   - PROJECT_EXPLICIT=1 when --project was passed (override beats domain derivation).
+#   - PROJECT defaults to "docker" until resolved, preserving backward-compat for
+#     single-instance installs whose state file predates the PROJECT field.
+PROJECT=""
+PROJECT_EXPLICIT=0
+LIST_INSTANCES=false          # --list: enumerate instances on the host then exit
+MULTI_INSTANCE_TIER_ACK=false # --i-understand-tier: acknowledge advisory Pro+/Enterprise gate
+# MI-4 (step-up on destructive lifecycle ops / YSG-RISK-061): step-up proof for the
+# add-component path. Token minted by the admin API after a fresh TOTP step-up
+# (auth/stepup.py); also accepted from YASHIGANI_STEPUP_TOKEN. See _require_stepup_mi4.
+STEPUP_TOKEN="${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}"
+STEPUP_ACK=false              # --i-have-stepped-up: interactive operator ack
 TLS_MODE="acme"
 # FIPS_MODE — operator opt-in to FIPS-mode crypto (CMVP #4985 when a FIPS-
 # configured base image is in use). Default 0 = standard OpenSSL. Set to 1
@@ -143,6 +215,12 @@ TLS_MODE="acme"
 # runtime-agnostically rather than relying on env-var propagation through
 # subshells (which works on Linux Podman but not Mac Podman Desktop).
 FIPS_MODE="${YSG_FIPS_MODE:-0}"
+# CMVP_CERT — operator-supplied CMVP certificate number for the FIPS-validated
+# OpenSSL provider in the chosen base image (e.g. "#4985"). Surfaced by
+# /admin/crypto/inventory as runtime FIPS attestation evidence for auditors
+# (Nico N-002 / v2.25.0 P2 B9). Default empty = attestation reports null.
+# Set via --cmvp-cert flag or YSG_CMVP_CERT env var.
+CMVP_CERT="${YSG_CMVP_CERT:-}"
 ADMIN_EMAIL=""
 UPSTREAM_URL=""
 LICENSE_KEY_PATH=""
@@ -188,6 +266,19 @@ YASHIGANI_INTERMEDIATE_LIFETIME_DAYS="${YASHIGANI_INTERMEDIATE_LIFETIME_DAYS:-18
 YASHIGANI_CERT_LIFETIME_DAYS="${YASHIGANI_CERT_LIFETIME_DAYS:-90}"
 PKI_ACTION=""             # --pki-action=bootstrap|rotate-leaves|rotate-intermediate|rotate-root|status
 
+# S3 (SHIP-BLOCKER): manifest cosign signature gate.
+# YSG_REQUIRE_SIGNED_MANIFEST controls enforcement level for the shell gate.
+# Values: unset/"warn" (dev default) | "fail" (CI + prod hard-fail).
+# The Python signatures.py has its own enforcement; this shell gate guards the
+# install path before the Python layer is invoked.
+# YSG_RUNTIME_4WAY is set by _detect_runtime() (W2 lib/detect_runtime.sh) after
+# resolve_compose_cmd() completes. Used by the onboard codegen path.
+YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}"
+
+# P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
+ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
+OFFBOARD_AGENT=""         # --offboard <agent-name>
+
 # Public-access SAN for demo / system-use deployments (YSG-CERT-SAN-001).
 # Tiago directive 2026-05-18: VM-IP / hostname access is a supported customer
 # path for demo and system-use; CA / Let's Encrypt is the proper-deployment path.
@@ -214,8 +305,34 @@ USAGE
 
 OPTIONS
   --deploy         demo|production|enterprise  Deployment mode (interactive if omitted)
+                                          Picks the deployment SUBSTRATE:
+                                            demo, production -> Docker/Podman Compose
+                                            enterprise       -> Kubernetes via Helm
+                                          So --deploy enterprise REQUIRES a Kubernetes
+                                          cluster (--runtime k8s). Combining
+                                          --deploy enterprise with --runtime docker/podman
+                                          is rejected up-front. For a single-host
+                                          Docker/Podman install use --deploy production
+                                          (or demo) with --runtime docker|podman.
   --mode           compose|k8s|vm         Legacy deployment mode (prefer --deploy)
-  --domain         DOMAIN                 TLS domain, e.g. yashigani.example.com
+  --domain         DOMAIN                 TLS domain, e.g. yashigani.example.com.
+                                          ALSO the instance identity: the compose
+                                          project derives from it (eu-west.acme.com
+                                          -> eu-west-acme-com), so two instances on
+                                          one host no longer collide (multi-instance,
+                                          Professional Plus / Enterprise).
+  --project        NAME                   Override the derived compose project name
+                                          (sanitised to [a-z0-9][a-z0-9_-]*). Use a
+                                          stable short name (e.g. eu-west) that
+                                          --upgrade / --wazuh / uninstall.sh then
+                                          target. Defaults to the sanitised --domain.
+  --list                                  List Yashigani instances on this host
+                                          (project + domain + runtime), then exit.
+                                          Use it to pick which instance to upgrade
+                                          or uninstall on a shared host.
+  --i-understand-tier                     Acknowledge the advisory multi-instance
+                                          tier notice (Pro+/Enterprise). The running
+                                          instance enforces org limits authoritatively.
   --tls-mode       acme|ca|selfsigned     TLS provisioning mode (default: acme)
   --fips-mode      [0|1]                  Enable FIPS-mode crypto routing (default: 0).
                                           Pass --fips-mode 1 OR --fips-mode (no arg → 1)
@@ -227,12 +344,23 @@ OPTIONS
                                           (default python:3.14.0-slim does NOT — operators
                                           requiring CMVP #4985 must swap to a FIPS-configured
                                           base image. See docs/yashigani_install_config.md §30.)
+  --cmvp-cert      CERT                   CMVP certificate number for runtime FIPS
+                                          attestation, e.g. "#4985". Surfaced by
+                                          /admin/crypto/inventory as evidence for auditors.
+                                          OR set YSG_CMVP_CERT in the env. Default empty
+                                          = attestation reports cmvp_cert: null.
   --admin-email    EMAIL                  Admin account email / username
   --upstream-url   URL                    Upstream MCP URL
   --license-key    PATH                   Path to .ysg license file
   --db-aes-key     KEY                    Database AES-256 encryption key (64-char hex)
   --namespace      NAMESPACE              Kubernetes namespace (default: yashigani)
-  --agent-bundles  BUNDLES               Comma-separated opt-in agents: langflow,letta,openclaw (or "all")
+  --agent-bundles  BUNDLES               Agent bundles to include: langflow,letta,openclaw (or "all", or "none"
+                                          to disable the default-on bundles). In non-interactive mode,
+                                          langflow and letta are included by default; pass --no-agents
+                                          (or --agent-bundles none) to exclude them on lean installs.
+  --no-agents                             Exclude ALL agent bundles. Non-interactive shorthand for
+                                          --agent-bundles none. Lean/minimal installs should pass this
+                                          flag explicitly to suppress the langflow+letta defaults.
   --with-openwebui                        Install Open WebUI chat surface (non-interactive explicit opt-in).
                                           In interactive mode a wizard question is presented instead
                                           ("Will Yashigani be used by humans with a web UI? [Y/n]").
@@ -266,6 +394,36 @@ OPTIONS
                                             ./scripts/prepare-airgap-bundle.sh --profile core
   --bundle         PATH                   Path to the .tar.zst bundle produced by
                                           prepare-airgap-bundle.sh. Required with --air-gap.
+  --gpu-index      N                      On multi-GPU hosts: index (0-based) of the NVIDIA
+                                          GPU to use for Ollama inference. Without this flag
+                                          the installer auto-selects the card with the most
+                                          VRAM and prompts interactively when multiple cards
+                                          are present. Equivalent to setting YSG_GPU_INDEX.
+                                          Example: --gpu-index 1 (selects the second card).
+
+  GPU support (source: docs.ollama.com/gpu — Linux + macOS platforms):
+    NVIDIA CUDA      — Linux: compute capability 5.0+ (GTX 750 Ti/K2200 through RTX/GB10);
+                       driver 550+ (570+ for cc5.0–6.2). Auto-detected via nvidia-smi.
+                       Overlay: docker-compose.gpu.yml (Docker) / gpu-podman.yml (Podman).
+    AMD ROCm         — Linux: Radeon RX series, Instinct, PRO (ROCm v7).
+                       Supported gfx: gfx908 gfx90a gfx942 gfx950 gfx1030
+                       gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201.
+                       Auto-detected via rocm-smi.
+                       Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
+    Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
+                       Container ollama bypassed; host ollama must be pre-installed
+                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding,
+                       Docker Desktop VPNKit relays container→host.docker.internal
+                       to Mac loopback — LAN fully isolated):
+                         OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       Auto-detected on Darwin arm64.
+                       Overlay: docker-compose.gpu-mac-metal.yml. [TESTED: Apple M4 ✓]
+    Vulkan           — Linux: Intel Arc (A/B-series) + Intel iGPU (HD/UHD/Iris/Xe)
+    (Intel iGPU /      + AMD Ryzen AI APUs (gfx1150/1151 — ROCm experimental on APU,
+     AMD APU)           Vulkan preferred). Requires mesa-vulkan-drivers + /dev/dri.
+                       Auto-detected via lspci when native GPU drivers absent.
+                       Overlay: docker-compose.gpu-vulkan.yml [untested on hardware here].
+    CPU-only         — Default when no GPU detected. ollama logs library=cpu.
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -273,6 +431,10 @@ OPTIONS
                                           --non-interactive mode if both Docker and
                                           Podman are installed. Default in interactive
                                           mode: prompt with Podman pre-selected.
+                                          MUST agree with --deploy: k8s pairs with
+                                          --deploy enterprise; docker/podman pair with
+                                          --deploy demo|production. A mismatch is rejected
+                                          before any install step runs.
   --http-port  <N>                        Host port to bind for HTTP (default: 80; or 8080
                                           on macOS / rootless Podman). Use a higher port if
                                           80 is not externally reachable in your network
@@ -306,6 +468,14 @@ ENVIRONMENT
   YASHIGANI_HTTP_PORT    Host HTTP port (overridden by --http-port flag if both set)
   YASHIGANI_HTTPS_PORT   Host HTTPS port (overridden by --https-port flag if both set)
   YSG_DEBUG              Set to 1 for verbose output
+  YSG_HEALTHZ_TIMEOUT_S  Convergence gate timeout in seconds (default: 1200).
+                         Cold builds (fresh image compile + all services starting)
+                         can take 10–15 min on a modest host before the gateway
+                         becomes healthy.  Set lower (e.g. 300) in warm-cache CI.
+  HTTP_PROXY             Outbound HTTP proxy forwarded to every image build stage
+  HTTPS_PROXY            Outbound HTTPS proxy forwarded to every image build stage
+  NO_PROXY               Comma-separated hosts that bypass the proxy (forwarded to
+                         every image build stage). All three are NO-OP when unset.
 
 EXAMPLES
   # Interactive compose install
@@ -353,7 +523,49 @@ parse_args() {
         ;;
       --domain)
         DOMAIN="${2:?'--domain requires a value'}"
+        # LAURA-V2253-001: reject anything but an RFC-1123 hostname charset so a
+        # value with newlines can't inject extra lines into docker/.env (which is
+        # later written via these flags and fed to every container). Operator-
+        # supplied, but cheap to harden and closes the class for all DOMAIN writes.
+        if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+          log_error "--domain must be a valid hostname (letters, digits, dot, hyphen), got: ${DOMAIN}"
+          exit 1
+        fi
         shift 2
+        ;;
+      --project)
+        # Multi-instance (3.0): explicit compose-project override. Normally PROJECT
+        # derives from --domain; this flag lets the operator pin a stable short name
+        # (e.g. "eu-west") used by --upgrade/--add-component/uninstall.sh thereafter.
+        # Sanitised + validated by _sanitise_project (called after parse_args).
+        PROJECT="${2:?'--project requires a value'}"
+        PROJECT_EXPLICIT=1
+        shift 2
+        ;;
+      --list)
+        # Multi-instance (3.0): enumerate Yashigani instances on this host
+        # (project + domain) so the operator can pick one for upgrade/uninstall.
+        LIST_INSTANCES=true
+        shift
+        ;;
+      --stepup-token)
+        # MI-4: step-up proof for a destructive lifecycle op (add-component).
+        STEPUP_TOKEN="${2:?'--stepup-token requires a value'}"
+        shift 2
+        ;;
+      --stepup-token=*)
+        STEPUP_TOKEN="${1#*=}"
+        shift
+        ;;
+      --i-have-stepped-up)
+        # MI-4: interactive-operator step-up acknowledgement (host-shell path).
+        STEPUP_ACK=true
+        shift
+        ;;
+      --i-understand-tier)
+        # Advisory multi-instance tier-gate acknowledgement (see _multi_instance_tier_gate).
+        MULTI_INSTANCE_TIER_ACK=true
+        shift
         ;;
       --tls-mode)
         TLS_MODE="${2:?'--tls-mode requires a value: acme|ca|selfsigned'}"
@@ -373,6 +585,10 @@ parse_args() {
             shift 1
             ;;
         esac
+        ;;
+      --cmvp-cert)
+        CMVP_CERT="${2:?'--cmvp-cert requires a value, e.g. \"#4985\"'}"
+        shift 2
         ;;
       --admin-email)
         ADMIN_EMAIL="${2:?'--admin-email requires a value'}"
@@ -481,11 +697,37 @@ parse_args() {
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
       --agent-bundles)
-        AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta'}"
+        AGENT_BUNDLES="${2:?'--agent-bundles requires a value, e.g. langflow,letta or none'}"
+        shift 2
+        ;;
+      --no-agents)
+        AGENT_BUNDLES="none"
+        shift
+        ;;
+      --gpu-index)
+        _raw_gpu_index="${2:?'--gpu-index requires a non-negative integer'}"
+        if ! [[ "$_raw_gpu_index" =~ ^[0-9]+$ ]]; then
+          log_error "--gpu-index must be a non-negative integer (0-based GPU index), got: ${_raw_gpu_index}"
+          exit 1
+        fi
+        YSG_GPU_INDEX="$_raw_gpu_index"
+        export YSG_GPU_INDEX
         shift 2
         ;;
       --pki-action)
         PKI_ACTION="${2:?'--pki-action requires: bootstrap|rotate-leaves|rotate-intermediate|rotate-root|status'}"
+        shift 2
+        ;;
+      --onboard)
+        # P1 W4: onboard a new agent manifest.
+        # Usage: ./install.sh --onboard path/to/agent-manifest.yaml
+        ONBOARD_MANIFEST="${2:?'--onboard requires a path to the agent manifest YAML'}"
+        shift 2
+        ;;
+      --offboard)
+        # P1 W4: offboard a named agent (reverses codegen artifacts).
+        # Usage: ./install.sh --offboard <agent-name>
+        OFFBOARD_AGENT="${2:?'--offboard requires the agent name to remove'}"
         shift 2
         ;;
       --root-ca-lifetime-years)
@@ -608,6 +850,519 @@ trap on_error ERR
 set_step() {
   CURRENT_STEP="$1"
   CURRENT_STEP_NAME="$2"
+}
+
+# =============================================================================
+# Multi-instance support (3.0 — scoping-draft §4a)
+# -----------------------------------------------------------------------------
+# The compose PROJECT name scopes every container/volume/network. It was hardcoded
+# or directory-derived as "docker", so two instances on one host collided. PROJECT
+# now derives from --domain (sanitised to a valid compose project), with an optional
+# --project override, and is persisted in docker/.yashigani-install-state so
+# upgrade/uninstall/add-component target the right instance.
+#
+# Compose project naming is identical on Docker and Podman (lowercase, [a-z0-9_-],
+# leading alnum). We feed it via COMPOSE_PROJECT_NAME in docker/.env (compose reads
+# the project-dir .env on BOTH runtimes) AND export it for the label-filter ps calls.
+# =============================================================================
+
+# _sanitise_project <raw> — emit a valid compose project name on stdout.
+# Compose/Podman rule: must match ^[a-z0-9][a-z0-9_-]*$ (lowercase). We:
+#   lowercase → replace every run of disallowed chars with '-' → strip leading
+#   non-alnum → trim trailing '-' / '_' → cap length → fall back to "yashigani"
+#   if nothing valid remains. Pure string op; no I/O.
+_sanitise_project() {
+  local _raw="${1:-}"
+  local _s
+  # lowercase
+  _s="$(printf '%s' "$_raw" | tr '[:upper:]' '[:lower:]')"
+  # any char not in [a-z0-9_-] → '-'
+  _s="$(printf '%s' "$_s" | sed 's/[^a-z0-9_-]/-/g')"
+  # collapse repeated separators to a single '-'
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]{2,}/-/g')"
+  # strip leading non-alphanumeric (compose requires a leading [a-z0-9])
+  _s="$(printf '%s' "$_s" | sed -E 's/^[^a-z0-9]+//')"
+  # trim trailing separators
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]+$//')"
+  # length cap (compose/k8s-safe); 60 leaves headroom for "<proj>_<volume>" names
+  _s="${_s:0:60}"
+  # trim again in case the cap left a trailing separator
+  _s="$(printf '%s' "$_s" | sed -E 's/[-_]+$//')"
+  if [[ -z "$_s" || ! "$_s" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    _s="yashigani"
+  fi
+  printf '%s' "$_s"
+}
+
+# _resolve_project — set the global PROJECT for a fresh install / explicit override.
+# Precedence: explicit --project (sanitised) > derived from --domain (sanitised) >
+# "docker" (backward-compatible default; what every pre-3.0 single-instance install used).
+# Idempotent: safe to call once after parse_args.
+_resolve_project() {
+  local _candidate=""
+  if [[ "$PROJECT_EXPLICIT" -eq 1 && -n "$PROJECT" ]]; then
+    _candidate="$PROJECT"
+  elif [[ -n "$DOMAIN" ]]; then
+    _candidate="$DOMAIN"
+  fi
+  if [[ -z "$_candidate" ]]; then
+    # No domain and no override (e.g. demo/localhost path) → preserve legacy name.
+    PROJECT="docker"
+  else
+    PROJECT="$(_sanitise_project "$_candidate")"
+  fi
+  export COMPOSE_PROJECT_NAME="$PROJECT"
+  log_info "Compose project: ${PROJECT}$( [[ "$PROJECT" == "docker" ]] && printf ' (legacy default — single instance)' || true )"
+}
+
+# _read_state_project <state_file> — echo the PROJECT recorded in a state file, or
+# "docker" if the field is absent (backward-compat: pre-3.0 state files have no
+# PROJECT line, and those installs all used the "docker" project). Used by the
+# upgrade / add-component paths so they target the EXISTING instance, not a
+# re-derivation (the operator may have used --project the first time).
+_read_state_project() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _p=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _p="$(grep -E '^PROJECT=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_p" ]]; then
+    _p="docker"
+  fi
+  printf '%s' "$_p"
+}
+
+# _read_state_trust_domain <state_file> — echo the SPIFFE_TRUST_DOMAIN recorded in
+# a state file, or "yashigani.internal" if absent (legacy single-instance / pre-3.0
+# state files). Used by the host-side onboard/codegen path so a BYO agent gets the
+# instance's per-instance trust domain on its spiffe_id, not the shared default.
+_read_state_trust_domain() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _td=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _td="$(grep -E '^SPIFFE_TRUST_DOMAIN=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_td" ]]; then
+    _td="yashigani.internal"
+  fi
+  printf '%s' "$_td"
+}
+
+# =============================================================================
+# Multi-instance tenancy isolation (3.0 / YSG-RISK-061) — MI-1 / MI-2 / MI-6
+# -----------------------------------------------------------------------------
+# Root cause the 3.0 work left open: PROJECT namespaced the *runtime* objects
+# (per-project compose, networks, volumes) but the on-disk secrets/state and the
+# crypto identity (PKI/SPIFFE) stayed at single-instance granularity, anchored at
+# a single shared WORK_DIR (default $HOME/.yashigani). Result: a second install
+# clobbered the first instance's secrets+state, and `uninstall --project A` wiped
+# the shared tree out from under B. These helpers move the *disk* and *identity*
+# boundary to per-instance granularity, keyed by PROJECT, while preserving the
+# legacy single-instance layout byte-for-byte (PROJECT=docker => no change).
+# =============================================================================
+
+# _early_project — best-effort PROJECT resolution from argv ALONE, before the
+# wizard runs. Used only to decide the per-instance install dir + trust domain
+# early in main(), when --project / --domain are already on the command line.
+# Mirrors _resolve_project precedence (explicit --project > --domain > legacy
+# "docker") but is side-effect-free: it does NOT export COMPOSE_PROJECT_NAME and
+# does NOT log (the authoritative resolution still happens later via
+# _resolve_project / _read_state_project once DOMAIN is finalised). Echoes the
+# sanitised project on stdout.
+_early_project() {
+  local _candidate=""
+  if [[ "${PROJECT_EXPLICIT:-0}" -eq 1 && -n "${PROJECT:-}" ]]; then
+    _candidate="$PROJECT"
+  elif [[ -n "${DOMAIN:-}" ]]; then
+    _candidate="$DOMAIN"
+  fi
+  if [[ -z "$_candidate" ]]; then
+    printf 'docker'
+  else
+    _sanitise_project "$_candidate"
+  fi
+}
+
+# _resolve_instance_install_dir — MI-1: key the bootstrap install dir (and hence
+# WORK_DIR, and hence docker/secrets + docker/.env + docker/.yashigani-install-state)
+# to the instance PROJECT, so two instances on one host get fully isolated trees.
+#
+# Backward-compat (NON-NEGOTIABLE): legacy single-instance installs keep the exact
+# default path. The keyed path is ONLY used when ALL of:
+#   * PROJECT is non-legacy (not "docker"), AND
+#   * the operator did NOT pin YSG_INSTALL_DIR explicitly (env override always wins),
+#   * AND we are on the bootstrap (curl / non-repo) code path — an in-repo checkout
+#     is a fixed tree we must not silently relocate (handled by the guard below).
+#
+# Idempotent + side-effect-free except for assigning YSG_INSTALL_DIR. Safe to call
+# once, right after parse_args, before detect_working_directory.
+_resolve_instance_install_dir() {
+  # Operator pinned the dir explicitly (env was set before invocation) — honour it
+  # verbatim. _YSG_INSTALL_DIR_EXPLICIT is set in parse_args when the env var was
+  # present at startup. Never override an explicit operator choice.
+  if [[ "${_YSG_INSTALL_DIR_EXPLICIT:-0}" -eq 1 ]]; then
+    return 0
+  fi
+
+  local _proj
+  _proj="$(_early_project)"
+
+  # Legacy / single-instance: leave the default ($HOME/.yashigani) untouched so
+  # every pre-3.0 install and every demo/localhost install is byte-for-byte stable.
+  if [[ "$_proj" == "docker" ]]; then
+    return 0
+  fi
+
+  # Non-legacy instance with no explicit dir: key the install dir by project so a
+  # second instance does not bootstrap on top of the first. base derived from the
+  # default so YSG_INSTALL_DIR overrides (handled above) are never reached here.
+  YSG_INSTALL_DIR="${HOME}/.yashigani-${_proj}"
+  log_info "Multi-instance: per-instance install dir for project '${_proj}': ${YSG_INSTALL_DIR}"
+}
+
+# _instance_identity_token <state_file> — MI-2: read the per-instance identity
+# token recorded in a state file. The token is a host-random nonce written once at
+# install time; it binds a lifecycle operation to the instance it claims to target.
+# A lifecycle op (upgrade / add-component / uninstall) must present a target whose
+# resolved state file carries a token that matches the running instance's labels —
+# a bare --project string is NOT sufficient to act on a sibling. Echoes the token
+# (empty if absent: pre-3.0 / legacy state files have none — handled by callers as
+# the backward-compat single-instance case).
+_instance_identity_token() {
+  local _sf="${1:-${WORK_DIR}/docker/.yashigani-install-state}"
+  local _t=""
+  if [[ -f "$_sf" && -r "$_sf" ]]; then
+    _t="$(grep -E '^INSTANCE_ID=' "$_sf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  printf '%s' "$_t"
+}
+
+# _gen_instance_id — MI-2: mint a fresh per-instance identity token (128-bit hex,
+# CSPRNG). Written into the state file at install time and embedded as a container
+# label so a lifecycle op can prove it is operating on the instance it named rather
+# than a free-form sibling. Pure CSPRNG read; no I/O beyond /dev/urandom.
+_gen_instance_id() {
+  # openssl preferred; /dev/urandom fallback keeps this dependency-light + portable
+  # across Docker/Podman/k8s install hosts (busybox included).
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+  else
+    LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32
+  fi
+}
+
+# _spiffe_trust_domain — MI-6: the per-instance SPIFFE trust domain. Each instance
+# gets its OWN trust domain so a leaf cert minted in instance A (URI SAN
+# spiffe://<A>.yashigani.internal/<svc>) does NOT satisfy instance B's validators,
+# which pin spiffe://<B>.yashigani.internal/. Combined with MI-1's per-instance CA
+# key (distinct signing key per tree), cross-instance identity fails BOTH on the CA
+# trust anchor AND on the trust-domain authority — belt-and-braces (neither alone is
+# sufficient: same-domain+distinct-CA still cross-validates against a verifier that
+# only string-matches the SAN under a shared root; distinct-domain+shared-CA still
+# cross-validates against a verifier that trusts the CA without pinning the domain).
+#
+# Backward-compat: legacy PROJECT=docker keeps the canonical "yashigani.internal"
+# byte-for-byte, so existing certs + app-side validators (which historically
+# hardcoded "yashigani.internal") keep working with NO rotation required.
+#
+# Echoes the trust-domain authority (no scheme/path) on stdout. Arg: project name.
+_spiffe_trust_domain() {
+  local _proj="${1:-docker}"
+  if [[ -z "$_proj" || "$_proj" == "docker" ]]; then
+    printf 'yashigani.internal'
+  else
+    # <project>.yashigani.internal — the instance label is the leftmost DNS label
+    # of the SPIFFE trust-domain authority. _proj is already sanitised to
+    # [a-z0-9][a-z0-9_-]* by _sanitise_project; '_' is not DNS-legal, so map any
+    # underscore to '-' for the authority component only (cert URI SAN must parse
+    # as a URI authority).
+    printf '%s.yashigani.internal' "$(printf '%s' "$_proj" | tr '_' '-')"
+  fi
+}
+
+# _apply_trust_domain_to_runtime_manifest <runtime_manifest> <trust_domain>
+# MI-6: rewrite every `spiffe_id: spiffe://yashigani.internal/<svc>` line in the
+# RUNTIME service-identity manifest to the per-instance trust domain so the PKI
+# issuer bakes per-instance URI SANs into each leaf cert. Operates on the runtime
+# (gitignored) copy ONLY — the canonical git-tracked manifest is never touched, so
+# git status stays clean (two-copies discipline: canonical = schema/legacy domain,
+# runtime = per-install populated copy).
+#
+# Backward-compat: when trust_domain is the legacy "yashigani.internal" this is a
+# no-op rewrite (byte-identical), so legacy installs are unaffected.
+# Idempotent: re-running on an already-rewritten manifest replaces the authority
+# again to the same value (anchored to the canonical authority via the fixed
+# match). Pure text op via sed on the gitignored file; fail-closed (return 1).
+_apply_trust_domain_to_runtime_manifest() {
+  local _mf="${1:?manifest path required}"
+  local _td="${2:?trust domain required}"
+
+  # Legacy / default authority — nothing to do (the canonical manifest already
+  # carries spiffe://yashigani.internal/<svc>).
+  if [[ "$_td" == "yashigani.internal" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$_mf" ]]; then
+    log_error "_apply_trust_domain_to_runtime_manifest: runtime manifest not found at ${_mf}"
+    return 1
+  fi
+
+  # Replace the trust-domain authority in every spiffe_id value. Anchor on the
+  # canonical authority "yashigani.internal" immediately after the scheme so we
+  # rewrite the authority and nothing else (the /<svc> path is preserved). This is
+  # idempotent because we always anchor on the canonical authority and a previously
+  # rewritten file no longer contains it; to stay safe under re-issue we re-seed
+  # the runtime manifest from canonical on every _pki_run_issuer call (above), so
+  # this rewrite always starts from the canonical authority.
+  local _tmp="${_mf}.td.new"
+  if sed -E "s#(spiffe://)yashigani\.internal(/)#\1${_td}\2#g" "$_mf" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$_mf" || { rm -f "$_tmp"; log_error "_apply_trust_domain_to_runtime_manifest: atomic move failed"; return 1; }
+    log_info "MI-6: runtime manifest SPIFFE trust domain set to '${_td}' (${_mf})"
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+  log_error "_apply_trust_domain_to_runtime_manifest: sed rewrite failed on ${_mf}"
+  return 1
+}
+
+# _require_stepup_mi4 <op-label> — MI-4: step-up gate for a destructive lifecycle
+# mutation on the install.sh side (add-component on a running stack). The shared
+# step-up gate is src/yashigani/auth/stepup.py (Tom's surface); the admin API/WebUI
+# path enforces a fresh TOTP step-up and passes the resulting token via
+# --stepup-token / YASHIGANI_STEPUP_TOKEN. Host-shell path requires the token, an
+# interactive --i-have-stepped-up ack, or an inline interactive confirmation; an
+# unattended run with no proof fails closed. When a token is supplied it is now
+# CRYPTOGRAPHICALLY VERIFIED end-to-end against the shared privileged_mutation gate
+# (src/yashigani/auth/stepup.py verify_stepup_proof, via the `--verify-proof` shim)
+# — signature + freshness + purpose + op-binding. A forged/stale/wrong-op token is
+# rejected fail-closed (the gate is the single source of truth; we do NOT duplicate it).
+# _verify_stepup_proof_token <token> <op-label> — cryptographically verify a
+# privileged-mutation step-up proof against the shared gate. The verifier lives
+# in the yashigani package (src/yashigani/auth/stepup.py) and needs the per-install
+# signing key (caddy_internal_hmac); both are present INSIDE the backoffice
+# container, so we exec the shim there. Runtime-agnostic: uses $COMPOSE_CMD which
+# is already resolved to docker/podman compose. Returns 0 iff the shim prints OK
+# and exits 0; fail-closed (non-zero) on any verifier error, missing container,
+# or DENY.
+_verify_stepup_proof_token() {
+  local _tok="$1" _op_label="$2"
+  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
+
+  if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+    resolve_compose_cmd 2>/dev/null || true
+  fi
+  if [[ ${#COMPOSE_CMD[@]} -eq 0 || ! -f "$compose_file" ]]; then
+    log_error "MI-4: cannot verify step-up proof — no compose runtime / compose file."
+    return 1
+  fi
+
+  # Pass the token via env (YASHIGANI_STEPUP_TOKEN) so it never lands in the
+  # container's argv / process table. -T disables TTY alloc (non-interactive exec).
+  if "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T \
+        -e "YASHIGANI_STEPUP_TOKEN=${_tok}" \
+        backoffice \
+        python3 -m yashigani.auth.stepup --verify-proof --op "${_op_label}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+_require_stepup_mi4() {
+  local _op="${1:-privileged mutation}"
+  local _op_label="${2:-${_op}}"   # machine op label bound into the proof (e.g. add-component)
+  local _tok="${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}"
+  if [[ -n "${_tok}" ]]; then
+    # Cryptographically verify the proof against the shared gate. The verifier
+    # runs inside the backoffice container (where the signing key + yashigani
+    # package live); fail-closed if it cannot run or returns non-zero.
+    if _verify_stepup_proof_token "${_tok}" "${_op_label}"; then
+      log_info "MI-4: step-up proof VERIFIED (op=${_op_label}) — ${_op} authorised."
+      return 0
+    fi
+    log_error "MI-4: step-up proof FAILED verification (op=${_op_label}) — refusing ${_op}."
+    exit 1
+  fi
+  if [[ "${STEPUP_ACK:-false}" == "true" && -t 0 ]]; then
+    log_info "MI-4: interactive operator step-up acknowledgement accepted (${_op})."
+    return 0
+  fi
+  if [[ -t 0 && "${NON_INTERACTIVE:-false}" != "true" ]]; then
+    printf 'MI-4 step-up: confirm a fresh TOTP step-up for this destructive action (%s).\n' "$_op"
+    printf 'Type STEPPED-UP to proceed: '
+    local _su_ack=""
+    read -r _su_ack || _su_ack=""
+    if [[ "$_su_ack" == "STEPPED-UP" ]]; then
+      log_info "MI-4: interactive step-up confirmation accepted (${_op})."
+      return 0
+    fi
+    log_error "MI-4: step-up not confirmed — aborting ${_op}."
+    exit 1
+  fi
+  log_error "MI-4 safety stop: ${_op} requires step-up proof."
+  log_error "  Supply --stepup-token=<value> (or YASHIGANI_STEPUP_TOKEN) minted by the"
+  log_error "  admin API after a fresh TOTP step-up, or run interactively with"
+  log_error "  --i-have-stepped-up. Refusing to proceed unattended without step-up."
+  exit 1
+}
+
+# _list_instances — enumerate Yashigani compose instances on this host as
+# "<project>\t<domain>\t<runtime>" rows. Works on Docker (com.docker.compose.project)
+# and Podman (io.podman.compose.project) by listing running containers and reading
+# the project label + our YASHIGANI_TLS_DOMAIN env from the gateway container.
+# Best-effort + read-only; never mutates state. Exit 0 always (empty = no instances).
+_list_instances() {
+  local _runtimes=() _rt
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && _runtimes+=("docker")
+  command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 && _runtimes+=("podman")
+
+  if [[ "${#_runtimes[@]}" -eq 0 ]]; then
+    log_warn "No reachable container runtime (docker/podman) — cannot list instances."
+    return 0
+  fi
+
+  printf '%-30s %-40s %-8s\n' "PROJECT" "DOMAIN" "RUNTIME"
+  printf '%-30s %-40s %-8s\n' "-------" "------" "-------"
+
+  local _found=0
+  for _rt in "${_runtimes[@]}"; do
+    local _label_key
+    if [[ "$_rt" == "podman" ]]; then
+      _label_key="io.podman.compose.project"
+    else
+      _label_key="com.docker.compose.project"
+    fi
+    # All distinct compose projects that have a yashigani gateway container.
+    local _projects
+    _projects="$("$_rt" ps -a \
+        --filter 'name=gateway' \
+        --format '{{.Label "'"$_label_key"'"}}' 2>/dev/null \
+        | grep -v '^$' | sort -u || true)"
+    local _proj
+    while IFS= read -r _proj; do
+      [[ -z "$_proj" ]] && continue
+      # Pull the domain from the caddy container's env (the canonical holder of
+      # YASHIGANI_TLS_DOMAIN). Read-only inspect; the gateway container does NOT
+      # carry the domain. Fall back to "(unknown)" if caddy is absent/stopped.
+      local _caddy_cid _domain
+      _caddy_cid="$("$_rt" ps -a \
+          --filter "label=${_label_key}=${_proj}" \
+          --filter 'name=caddy' \
+          --format '{{.ID}}' 2>/dev/null | head -n1 || true)"
+      _domain="(unknown)"
+      if [[ -n "$_caddy_cid" ]]; then
+        _domain="$("$_rt" inspect "$_caddy_cid" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+            | grep -E '^YASHIGANI_TLS_DOMAIN=' | head -n1 | cut -d= -f2- || true)"
+        [[ -z "$_domain" ]] && _domain="(unknown)"
+      fi
+      printf '%-30s %-40s %-8s\n' "$_proj" "$_domain" "$_rt"
+      _found=$((_found + 1))
+    done <<< "$_projects"
+  done
+
+  if [[ "$_found" -eq 0 ]]; then
+    printf '%s\n' "(no Yashigani instances found on this host)"
+  fi
+  return 0
+}
+
+# _host_has_other_instance <this_project> — return 0 if a DIFFERENT Yashigani
+# compose project already exists on this host (i.e. this install would create a
+# 2nd, side-by-side instance → multi-instance territory). Read-only.
+_host_has_other_instance() {
+  local _this="$1"
+  local _rt _label_key _projects
+  for _rt in docker podman; do
+    command -v "$_rt" >/dev/null 2>&1 || continue
+    "$_rt" info >/dev/null 2>&1 || continue
+    if [[ "$_rt" == "podman" ]]; then
+      _label_key="io.podman.compose.project"
+    else
+      _label_key="com.docker.compose.project"
+    fi
+    _projects="$("$_rt" ps -a --filter 'name=gateway' \
+        --format '{{.Label "'"$_label_key"'"}}' 2>/dev/null \
+        | grep -v '^$' | sort -u || true)"
+    local _p
+    while IFS= read -r _p; do
+      [[ -z "$_p" ]] && continue
+      if [[ "$_p" != "$_this" ]]; then
+        return 0
+      fi
+    done <<< "$_projects"
+  done
+  return 1
+}
+
+# _unverified_license_tier — echo the tier string from the UNVERIFIED license-key
+# payload, or "community" when no license / unparseable. ADVISORY ONLY: this does
+# NOT verify the Ed25519 signature (the verify key is image-baked, not on the host),
+# so the value is forgeable and used purely for the up-front UX gate. The running
+# gateway/backoffice perform the authoritative signed-license + max_orgs enforcement.
+_unverified_license_tier() {
+  local _lic="${WORK_DIR}/docker/secrets/license_key"
+  [[ -n "${LICENSE_KEY_PATH:-}" && -f "$LICENSE_KEY_PATH" ]] && _lic="$LICENSE_KEY_PATH"
+  if [[ ! -f "$_lic" ]]; then
+    printf 'community'; return 0
+  fi
+  local _content _seg1 _json _tier
+  _content="$(tr -d '[:space:]' < "$_lic" 2>/dev/null || true)"
+  if [[ -z "$_content" || "$_content" == \#community* || "${#_content}" -le 20 ]]; then
+    printf 'community'; return 0
+  fi
+  # v4 format: base64url(json).base64url(sig).base64url(countersig) — decode segment 1.
+  _seg1="${_content%%.*}"
+  # base64url → base64, pad to a multiple of 4, decode (best-effort).
+  local _b64 _pad
+  _b64="$(printf '%s' "$_seg1" | tr '_-' '/+')"
+  _pad=$(( ${#_b64} % 4 ))
+  [[ "$_pad" -ne 0 ]] && _b64="${_b64}$(printf '%*s' $((4 - _pad)) '' | tr ' ' '=')"
+  _json="$(printf '%s' "$_b64" | base64 -d 2>/dev/null || true)"
+  # Extract "tier":"..." without a JSON parser (grep is enough for this single field).
+  _tier="$(printf '%s' "$_json" | grep -oE '"tier"[[:space:]]*:[[:space:]]*"[a-z_]+"' \
+            | head -n1 | sed -E 's/.*"([a-z_]+)"$/\1/' || true)"
+  if [[ -z "$_tier" ]]; then
+    printf 'community'; return 0
+  fi
+  printf '%s' "$_tier"
+}
+
+# _multi_instance_tier_gate — advisory Pro+/Enterprise gate for the multi-instance
+# path. Triggered ONLY when this install would create a 2nd instance alongside an
+# existing one on the host. Default behaviour (Tiago decision pending — memo
+# project_v300_design_conflict_tiergate.md): WARN + proceed; server-side max_orgs is
+# the authoritative boundary. To switch to a hard ack-required gate, flip the
+# `_block_without_ack` flag below to true (one-line change).
+_multi_instance_tier_gate() {
+  local _block_without_ack=false   # <-- decision seam: false = warn+proceed (a); true = require --i-understand-tier (b)
+
+  # Only relevant when a SECOND instance is being created on this host.
+  if ! _host_has_other_instance "$PROJECT"; then
+    return 0
+  fi
+
+  local _tier
+  _tier="$(_unverified_license_tier)"
+  case "$_tier" in
+    professional_plus|enterprise|academic_nonprofit)
+      log_info "Multi-instance: license tier '${_tier}' — multi-instance permitted."
+      return 0
+      ;;
+  esac
+
+  log_warn "MULTI-INSTANCE TIER GATE (advisory):"
+  log_warn "  Another Yashigani instance already exists on this host."
+  log_warn "  Running multiple instances side-by-side is a Professional Plus / Enterprise"
+  log_warn "  capability. The detected license tier is: ${_tier}."
+  log_warn "  The RUNNING instance enforces per-tier org limits (max_orgs) authoritatively;"
+  log_warn "  this installer cannot verify the signed license host-side (key is image-baked)."
+
+  if [[ "$_block_without_ack" == "true" && "$MULTI_INSTANCE_TIER_ACK" != "true" ]]; then
+    log_error "  Re-run with --i-understand-tier to proceed, or upgrade to Pro+/Enterprise."
+    exit 1
+  fi
+  log_warn "  Proceeding — server-side licensing will enforce the actual limits."
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -733,9 +1488,15 @@ resolve_compose_cmd() {
     # paths (Pentest #95 TM-V231-005), security_opt parsing, and a few other places
     # where docker-compose makes Docker-specific assumptions about the socket.
     if command -v podman-compose >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman-compose")
+      # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
+      # podman-compose defaults to one pod per project; the NVIDIA CDI hook
+      # (/usr/bin/nvidia-cdi-hook) fails (exit 1) when the GPU container starts
+      # inside that pod, wedging ollama + everything that depends on it. The same
+      # CDI device works in a standalone `podman run` (no pod), so we disable the
+      # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
+      COMPOSE_CMD=("podman-compose" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (native, sequential)"
+      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
       return 0
     fi
     if podman compose version >/dev/null 2>&1; then
@@ -1022,6 +1783,12 @@ print_platform_summary() {
   # or pre-existing env var).
   prompt_runtime_choice
 
+  # --- Multi-GPU selection (NVIDIA only; no-op for single-GPU / non-NVIDIA) ---
+  # Picks the largest-VRAM card as default, shows an interactive choice when
+  # more than one card is present, honours --gpu-index / YSG_GPU_INDEX.
+  # Updates YSG_GPU_NAME / YSG_GPU_VRAM_MB / YSG_GPU_CDI before the summary.
+  _select_nvidia_gpu
+
   printf "\n"
   printf "  %-22s %s\n" "OS:"           "${YSG_OS:-unknown} (${YSG_DISTRO:-unknown})"
   printf "  %-22s %s\n" "Architecture:" "${YSG_ARCH:-unknown}"
@@ -1033,12 +1800,44 @@ print_platform_summary() {
     printf "  %-22s %s\n" "Namespace:"  "$NAMESPACE"
   fi
   if [[ "${YSG_GPU_TYPE:-none}" != "none" ]]; then
-    printf "  %-22s %s\n" "GPU:"        "${YSG_GPU_NAME:-detected}"
+    local _gpu_label="${YSG_GPU_NAME:-detected}"
+    [[ -n "${YSG_GPU_INDEX:-}" ]] && _gpu_label="[${YSG_GPU_INDEX}] ${_gpu_label}"
+    printf "  %-22s %s\n" "GPU:"        "$_gpu_label"
     printf "  %-22s %s\n" "GPU memory:" "$(_format_gpu_vram)"
     printf "  %-22s %s\n" "GPU compute:" "${YSG_GPU_COMPUTE:-unknown}"
+    [[ -n "${YSG_GPU_CDI:-}" ]] && printf "  %-22s %s\n" "GPU device (CDI):" "${YSG_GPU_CDI}"
   else
     printf "  %-22s %s\n" "GPU:"        "none detected"
   fi
+  printf "\n"
+
+  # --- Optional services — DEPLOY-TIME choice (CLAUDE.md / Optional Services panel) ---
+  # Listed so the operator sees exactly what is (and is NOT) being installed, what
+  # each does, and that the choice is deploy-time — missing one means re-running
+  # the installer. Avoids the "I expected service X" surprise post-install.
+  local _wz=" " _ca=" " _lf=" " _le=" " _oc=" "
+  [[ "${INSTALL_WAZUH:-false}" == true ]] && _wz="x"
+  [[ "${INSTALL_INTERNAL_CA:-false}" == true ]] && _ca="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx langflow && _lf="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx letta && _le="x"
+  printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw && _oc="x"
+  # Non-interactive --agent-bundles is parsed into AGENT_BUNDLES but only pushed
+  # into COMPOSE_PROFILES at step 8 (after this summary), so read AGENT_BUNDLES too
+  # — otherwise the summary shows agents unticked even though they WILL install.
+  local _ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  [[ "$_ab" == *",all,"* ]] && { _lf="x"; _le="x"; _oc="x"; }
+  [[ "$_ab" == *",langflow,"* ]] && _lf="x"
+  [[ "$_ab" == *",letta,"* ]] && _le="x"
+  [[ "$_ab" == *",openclaw,"* ]] && _oc="x"
+  printf "  Optional services (deploy-time choice):\n"
+  printf "    [x] %-12s %s\n" "ui4 chat"    "built-in Lit SPA (chat/agents/builder/workflows) — always on in 4.0"
+  printf "    [%s] %-12s %s\n" "$_wz" "Wazuh SIEM"  "security monitoring — SIEM (manager+indexer+dashboard)"
+  printf "    [%s] %-12s %s\n" "$_ca" "BYO CA"      "Bring-your-own intermediate CA (default: built-in mesh CA)"
+  printf "    [%s] %-12s %s\n" "$_lf" "Langflow"    "visual multi-agent workflow builder"
+  printf "    [%s] %-12s %s\n" "$_le" "Letta"       "stateful agent with persistent memory"
+  printf "    [%s] %-12s %s\n" "$_oc" "OpenClaw"    "connected agent (web search + messaging)"
+  printf "    %s\n" "[x] = will be installed. This is a DEPLOY-TIME choice: to add or remove a"
+  printf "    %s\n" "service later you re-run the installer (an update/redeploy preserving data)."
   printf "\n"
   _print_model_recommendations
 }
@@ -1068,6 +1867,328 @@ _print_model_recommendations() {
     printf "    - qwen2.5:3b (inspection only), CPU inference for others\n"
   fi
   printf "\n"
+}
+
+# _pick_ollama_model_for_vram — return the best default OLLAMA_MODEL for the
+# installed GPU's VRAM. Mirrors the tier thresholds in _print_model_recommendations
+# so the pulled model matches the displayed recommendation (BUG-GPU-VRAM-001).
+# Printed to stdout; caller assigns with $().
+_pick_ollama_model_for_vram() {
+  local vram="${YSG_GPU_VRAM_MB:-0}"
+  if [ "$vram" -ge 32768 ]; then
+    printf "qwen3:30b-a3b"
+  elif [ "$vram" -ge 16384 ]; then
+    printf "llama3.1:8b"
+  elif [ "$vram" -ge 8192 ]; then
+    printf "llama3.1:8b"
+  else
+    printf "qwen2.5:3b"
+  fi
+}
+
+# =============================================================================
+# Multi-GPU selection — pick largest VRAM as default; let operator choose
+# =============================================================================
+# Called from print_platform_summary after platform-detect sets YSG_GPU_TYPE.
+# Only runs when nvidia-smi reports >= 2 GPUs.
+# Sets YSG_GPU_INDEX (0-based), YSG_GPU_NAME, YSG_GPU_VRAM_MB, and YSG_GPU_CDI
+# so downstream compose overlays wire the right card into ollama.
+_select_nvidia_gpu() {
+  # Require nvidia-smi and at least two GPUs; single-GPU or non-NVIDIA: no-op.
+  if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then return 0; fi
+
+  # Enumerate: "index,name,vram_mb" per line (noheader, nounits → bare integers for VRAM)
+  local smi_out
+  smi_out="$(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>/dev/null)" || return 0
+
+  local gpu_count
+  gpu_count="$(echo "$smi_out" | grep -c .)" || gpu_count=0
+  if [[ "$gpu_count" -lt 2 ]]; then
+    # Single GPU — set CDI to pin it explicitly (index 0) rather than "all".
+    # Also update YSG_GPU_NAME / YSG_GPU_VRAM_MB so the preflight VRAM check
+    # and model-recommendation logic use the real card's values (BUG-GPU-VRAM-001).
+    local _idx _name _vram
+    IFS=',' read -r _idx _name _vram <<< "$(echo "$smi_out" | head -1)"
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    YSG_GPU_INDEX="${YSG_GPU_INDEX:-${_idx}}"
+    YSG_GPU_NAME="$_name"
+    YSG_GPU_VRAM_MB="${_vram:-0}"
+    YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+    YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
+    return 0
+  fi
+
+  # Multiple GPUs present — find the one with the most VRAM as the default.
+  local best_idx=0 best_name="" best_vram=0
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    if [[ "${_vram:-0}" -gt "$best_vram" ]]; then
+      best_idx="$_idx"; best_name="$_name"; best_vram="${_vram:-0}"
+    fi
+  done <<< "$smi_out"
+
+  # If --gpu-index was passed (YSG_GPU_INDEX already set), validate it.
+  if [[ -n "${YSG_GPU_INDEX:-}" ]]; then
+    local _chosen_name _chosen_vram _found=false
+    while IFS=',' read -r _idx _name _vram; do
+      _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+      if [[ "$_idx" == "$YSG_GPU_INDEX" ]]; then
+        _chosen_name="$_name"; _chosen_vram="${_vram:-0}"; _found=true
+      fi
+    done <<< "$smi_out"
+    if [[ "$_found" != "true" ]]; then
+      log_error "--gpu-index ${YSG_GPU_INDEX} is out of range (detected ${gpu_count} GPUs, indices 0-$((gpu_count-1)))"
+      exit 1
+    fi
+    YSG_GPU_NAME="$_chosen_name"
+    YSG_GPU_VRAM_MB="$_chosen_vram"
+    YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+    YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+    export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
+    log_info "GPU pinned via --gpu-index: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
+    return 0
+  fi
+
+  # Interactive: show detected GPUs and let the operator choose.
+  printf "\n"
+  printf "  ${C_BOLD}Multiple NVIDIA GPUs detected — select the one for Ollama inference:${C_RESET}\n"
+  printf "\n"
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    local _vram_display
+    if [[ "${_vram:-0}" -ge 1024 ]]; then
+      _vram_display="$(awk "BEGIN { printf \"%.1f GB\", ${_vram}/1024 }")"
+    else
+      _vram_display="${_vram} MB"
+    fi
+    local _default_tag=""
+    [[ "$_idx" == "$best_idx" ]] && _default_tag=" ${C_GREEN}← most VRAM (default)${C_RESET}"
+    printf "    %s) %-36s %s%b\n" "$_idx" "$_name" "$_vram_display" "$_default_tag"
+  done <<< "$smi_out"
+  printf "\n"
+
+  local chosen_idx
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # Non-interactive without --gpu-index: auto-select largest VRAM, no prompt.
+    chosen_idx="$best_idx"
+    log_info "Non-interactive: auto-selected GPU ${chosen_idx} (${best_name}, $(_format_gpu_vram_mb "$best_vram")) — largest VRAM"
+  else
+    printf "  Choice [%s]: " "$best_idx"
+    read -r chosen_idx </dev/tty 2>/dev/null || chosen_idx=""
+    chosen_idx="${chosen_idx:-$best_idx}"
+    chosen_idx="${chosen_idx// /}"
+    # Validate
+    local _valid=false
+    while IFS=',' read -r _idx _ _; do
+      _idx="${_idx// /}"
+      [[ "$_idx" == "$chosen_idx" ]] && _valid=true
+    done <<< "$smi_out"
+    if [[ "$_valid" != "true" ]]; then
+      log_warn "Invalid choice '${chosen_idx}' — defaulting to GPU ${best_idx} (largest VRAM)"
+      chosen_idx="$best_idx"
+    fi
+  fi
+
+  # Apply the chosen GPU
+  local _chosen_name="" _chosen_vram=0
+  while IFS=',' read -r _idx _name _vram; do
+    _idx="${_idx// /}"; _name="${_name# }"; _vram="${_vram// /}"
+    if [[ "$_idx" == "$chosen_idx" ]]; then
+      _chosen_name="$_name"; _chosen_vram="${_vram:-0}"
+    fi
+  done <<< "$smi_out"
+
+  YSG_GPU_INDEX="$chosen_idx"
+  YSG_GPU_NAME="$_chosen_name"
+  YSG_GPU_VRAM_MB="$_chosen_vram"
+  YSG_GPU_CDI="nvidia.com/gpu=${YSG_GPU_INDEX}"
+  YSG_GPU_DEV="/dev/nvidia${YSG_GPU_INDEX}"
+  export YSG_GPU_INDEX YSG_GPU_NAME YSG_GPU_VRAM_MB YSG_GPU_CDI YSG_GPU_DEV
+  log_success "GPU selected: [${YSG_GPU_INDEX}] ${YSG_GPU_NAME} ($(_format_gpu_vram))"
+  printf "\n"
+}
+
+# Helper: format an arbitrary VRAM-MB value (not the global YSG_GPU_VRAM_MB)
+_format_gpu_vram_mb() {
+  local vram_mb="${1:-0}"
+  if [ "$vram_mb" -ge 1024 ]; then
+    printf "%.1f GB" "$(awk "BEGIN { printf \"%.1f\", ${vram_mb}/1024 }")"
+  else
+    printf "%d MB" "$vram_mb"
+  fi
+}
+
+# =============================================================================
+# Podman GPU CDI provisioning — no host sudo (ROOTLESS-CDI-001)
+# =============================================================================
+# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0. Podman 4.9.3 (Ubuntu)
+# hardcodes /etc/cdi as its ONLY CDI scan directory — cdi_spec_dirs in
+# containers.conf is NOT effective on this version (empirically verified: even
+# with cdi_spec_dirs pointing only to ~/.config/cdi, podman still reads /etc/cdi
+# and ignores the user dir). No /etc/cdi scan means no CDI device resolution.
+#
+# Two blockers from the prior broken attempt:
+#   A. The minimal 0.5.0 spec had no library mounts → ollama sees library=cpu.
+#      A working CDI spec MUST include the containerEdits that mount libcuda.so,
+#      libnvidia-ml.so etc. — what nvidia-ctk normally discovers and emits.
+#   B. /etc/cdi/nvidia.yaml was written 0600 (root-only) → rootless podman
+#      gets EACCES on the CDI registry refresh → all CDI devices unresolvable.
+#
+# Correct fix (no interactive sudo):
+#   1. Run nvidia-ctk cdi generate to produce the COMPLETE 0.7.0 spec including
+#      all CUDA library mounts and hooks. This is the only reliable source for
+#      the correct host library paths and device nodes.
+#   2. Transform 0.7.0 → 0.6.0 in-process (Python3, no extra deps):
+#        - set cdiVersion: "0.6.0"
+#        - strip per-device additionalGids: blocks (0.7.0 addition)
+#        - strip gid: fields from deviceNodes (0.7.0 addition)
+#        - KEEP all hooks, mounts, library containerEdits intact
+#      Podman 4.9.3 accepts 0.6.0 (confirmed via binary string scan: v0.6.0
+#      present; v0.7.0 absent). The stripped fields are display/GID-namespace
+#      features not needed for headless CUDA compute.
+#   3. Write the 0.6.0 spec to /etc/cdi/nvidia.yaml with chmod 0644 via the
+#      Docker Engine daemon (rootful — no interactive user sudo). Without 0644,
+#      rootless podman cannot read the spec and the CDI registry refresh fails.
+#      /etc/cdi/ is created via Docker if it does not exist.
+#
+# Podman ≥5.0 accepts cdiVersion 0.7.0 natively → skip the transform and
+# write the raw nvidia-ctk output directly to /etc/cdi/nvidia.yaml (still with
+# 0644 via Docker, so rootless podman can read it).
+#
+# If nvidia-ctk is missing: WARN loudly and return (CDI unavailable; the
+# install.sh CDI probe will fail → devpath fallback WARNS that GPU is CPU-only).
+# If Docker daemon unavailable: same — WARN and return; do not silently proceed.
+
+# _transform_cdi_spec_060 <input-070-path> <output-060-path>
+# Read a cdiVersion 0.7.0 spec and write a 0.6.0-compatible version by:
+#   - setting cdiVersion to "0.6.0"
+#   - stripping per-device additionalGids: blocks (indent-aware)
+#   - stripping gid: fields from deviceNodes
+# All other content (hooks, mounts, library paths, env) is preserved intact.
+_transform_cdi_spec_060() {
+  local _in="$1" _out="$2"
+  python3 - "${_in}" "${_out}" <<'PYEOF'
+import sys, re
+
+in_path, out_path = sys.argv[1], sys.argv[2]
+with open(in_path) as f:
+    lines = f.readlines()
+
+out = []
+skip_until_indent = None  # set when inside an additionalGids: block
+
+for line in lines:
+    raw = line.rstrip('\n')
+    stripped = raw.lstrip()
+    indent = len(raw) - len(stripped)
+
+    # End-of-additionalGids-block detection: stop skipping when we reach a
+    # line at the SAME or SHALLOWER indentation as the additionalGids: key.
+    if skip_until_indent is not None:
+        if stripped == '' or indent <= skip_until_indent:
+            skip_until_indent = None   # resume output (fall through)
+        else:
+            continue                   # still inside block — skip
+
+    # Rewrite version line
+    if re.match(r'^cdiVersion:\s*0\.7\.0\s*$', stripped):
+        out.append('cdiVersion: "0.6.0"\n')
+        continue
+
+    # Strip additionalGids: block (keyword + deeper-indented list items)
+    if re.match(r'^additionalGids:\s*$', stripped):
+        skip_until_indent = indent
+        continue
+
+    # Strip gid: fields from deviceNodes (0.7.0 addition)
+    if re.match(r'^gid:\s*\d+\s*$', stripped):
+        continue
+
+    out.append(line)
+
+with open(out_path, 'w') as f:
+    f.writelines(out)
+
+removed = len(lines) - len(out)
+print(f"CDI 0.7.0 → 0.6.0 transform: {len(lines)} lines in, {len(out)} out "
+      f"({removed} lines stripped)")
+PYEOF
+}
+
+# _setup_podman_cdi_gpu
+# Generate a complete podman-compatible CDI spec via nvidia-ctk, transform it
+# to cdiVersion 0.6.0 (podman <5.0 compatible) and deploy it to the USER CDI dir
+# (~/.config/cdi), wiring podman to it via cdi_spec_dirs in the USER containers.conf.
+# NO /etc/cdi, NO Docker daemon, NO sudo — pure user-space (proven on podman 4.9.3:
+# libcuda + nvidia-smi visible in-container via cdi_spec_dirs alone).
+# MUST be called before the CDI probe in compose_up() so the probe passes.
+_setup_podman_cdi_gpu() {
+  if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
+
+  log_info "Podman GPU CDI provisioning — user-space, no host writes (ROOTLESS-CDI-001)"
+
+  # nvidia-ctk required to produce a COMPLETE spec (device nodes + driver-library
+  # mounts). A minimal device-only spec does NOT make CUDA work.
+  if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    log_warn "nvidia-ctk not found — cannot generate CDI spec; ollama will run CPU-only"
+    log_warn "Install nvidia-container-toolkit and re-run the installer to enable GPU"
+    return 0
+  fi
+
+  # User-owned CDI dir — podman (rootless) reads it via cdi_spec_dirs in the USER
+  # containers.conf. NO /etc/cdi, NO docker, NO sudo.
+  local _cdi_dir="${HOME}/.config/cdi"
+  local _cdi_raw="${_cdi_dir}/nvidia-raw.yaml"
+  local _cdi_out="${_cdi_dir}/nvidia.yaml"
+  mkdir -p "${_cdi_dir}"
+
+  local _podman_major
+  _podman_major="$(podman version --format '{{.Client.Version}}' 2>/dev/null | cut -d. -f1)" || _podman_major="4"
+  log_info "  podman ${_podman_major}.x detected"
+
+  # Generate the COMPLETE CDI spec (with library mounts) into the user dir.
+  log_info "  nvidia-ctk cdi generate → ${_cdi_raw}"
+  if ! nvidia-ctk cdi generate --output="${_cdi_raw}" 2>/dev/null || [[ ! -s "${_cdi_raw}" ]]; then
+    log_warn "nvidia-ctk cdi generate failed/empty; ollama will run CPU-only"
+    rm -f "${_cdi_raw}"; return 0
+  fi
+  log_info "  raw spec: $(wc -l < "${_cdi_raw}") lines (cdiVersion 0.7.0)"
+
+  # podman <5.0 cannot parse cdiVersion 0.7.0 → transform to 0.6.0 (strip the
+  # 0.7.0-only additionalGids blocks; KEEP all library mounts/hooks). ≥5.0 native.
+  if [[ "${_podman_major:-4}" -ge 5 ]]; then
+    mv -f "${_cdi_raw}" "${_cdi_out}"
+    log_info "  podman ≥5.0: using native cdiVersion 0.7.0 spec"
+  else
+    if ! _transform_cdi_spec_060 "${_cdi_raw}" "${_cdi_out}"; then
+      log_warn "CDI 0.6.0 transform failed; ollama will run CPU-only"; rm -f "${_cdi_raw}"; return 0
+    fi
+    rm -f "${_cdi_raw}"
+    if ! grep -q 'cdiVersion: "0.6.0"' "${_cdi_out}" 2>/dev/null; then
+      log_warn "transform produced no cdiVersion 0.6.0 marker; ollama will run CPU-only"; return 0
+    fi
+  fi
+  log_info "  CDI spec ready: ${_cdi_out} ($(wc -l < "${_cdi_out}") lines)"
+
+  # Point rootless podman at the user CDI dir via the USER containers.conf.
+  # MUST be under [engine] (podman ignores cdi_spec_dirs in other tables — this
+  # was the prior bug) and the user dir ONLY — including /etc/cdi would let a host
+  # 0.7.0 spec poison the CDI registry on podman <5.0. Idempotent; never touches /etc.
+  local _cc="${HOME}/.config/containers/containers.conf"
+  mkdir -p "$(dirname "${_cc}")"
+  if [[ -f "${_cc}" ]] && grep -qE '^[[:space:]]*cdi_spec_dirs' "${_cc}"; then
+    sed -i -E "s|^[[:space:]]*cdi_spec_dirs.*|cdi_spec_dirs = [\"${_cdi_dir}\"]|" "${_cc}"
+    log_info "  updated cdi_spec_dirs in ${_cc}"
+  elif [[ -f "${_cc}" ]] && grep -qE '^\[engine\]' "${_cc}"; then
+    sed -i -E "0,/^\[engine\]/s||[engine]\ncdi_spec_dirs = [\"${_cdi_dir}\"]|" "${_cc}"
+    log_info "  inserted cdi_spec_dirs under [engine] in ${_cc}"
+  else
+    printf '[engine]\ncdi_spec_dirs = ["%s"]\n' "${_cdi_dir}" >> "${_cc}"
+    log_info "  wrote [engine] cdi_spec_dirs to ${_cc}"
+  fi
+  log_success "Podman GPU CDI ready — user-space spec, no /etc/cdi, no docker, no sudo"
 }
 
 # =============================================================================
@@ -1240,11 +2361,12 @@ _interactive_platform_fallback() {
   fi
   if [[ "${YSG_GPU_TYPE:-none}" == "none" ]]; then
     printf "  No GPU was detected automatically. Do you have a GPU?\n"
-    printf "    1) NVIDIA GPU (CUDA)\n"
-    printf "    2) Apple Silicon (M1 / M2 / M3 / M4)\n"
-    printf "    3) AMD GPU (ROCm)\n"
-    printf "    4) No GPU / CPU only\n"
-    printf "  Choice [1-4]: "
+    printf "    1) NVIDIA GPU (CUDA — compute capability 5.0+, driver 550+)\n"
+    printf "    2) Apple Silicon (M1 / M2 / M3 / M4 — Metal via host ollama)\n"
+    printf "    3) AMD GPU discrete (ROCm v7 — Radeon RX 5000+/6000+/7000+, Instinct)\n"
+    printf "    4) Intel Arc / iGPU, or AMD APU (Vulkan backend — best-effort)\n"
+    printf "    5) No GPU / CPU only\n"
+    printf "  Choice [1-5]: "
     read -r gpu_choice
     case "$gpu_choice" in
       1)
@@ -1269,7 +2391,14 @@ _interactive_platform_fallback() {
         printf "  Enter GPU VRAM in GB: "; read -r vram_gb
         [[ "${vram_gb:-0}" =~ ^[0-9]+$ ]] || vram_gb=0
         YSG_GPU_VRAM_MB=$(( ${vram_gb:-0} * 1024 )) ;;
-      4|*) YSG_GPU_TYPE=none ;;
+      4)
+        # Intel Arc/iGPU + AMD APU: Vulkan backend (docs.ollama.com/gpu — no native Intel
+        # support; AMD APU gfx1150/1151 ROCm is experimental, Vulkan is more reliable).
+        YSG_GPU_TYPE=vulkan; YSG_GPU_COMPUTE=vulkan; YSG_GPU_NAME="Intel/AMD APU (user-reported)"
+        printf "  Enter GPU VRAM in GB (or shared memory in GB for iGPU/APU): "; read -r vram_gb
+        [[ "${vram_gb:-0}" =~ ^[0-9]+$ ]] || vram_gb=0
+        YSG_GPU_VRAM_MB=$(( ${vram_gb:-0} * 1024 )) ;;
+      5|*) YSG_GPU_TYPE=none ;;
     esac
     printf "\n"
   fi
@@ -1360,6 +2489,34 @@ check_installer_preflight() {
         fi
       fi
     fi
+  fi
+
+  # --- Check 1d (#24): Ollama model-store free-space preflight ---------------
+  # The Ollama model store (compose: the dedicated ollama_data volume → /root/.ollama;
+  # K8s: a 100Gi PVC) grows with each model pull. The full local model set can
+  # exceed 80 GB; a "no space left on device" mid-pull leaves models half-written
+  # and inference broken. Warn (non-fatal) when the filesystem backing the
+  # container-volume store has less than YASHIGANI_OLLAMA_MIN_DISK_GB (default 80)
+  # GB free, so the operator can relocate the runtime data-root to a larger disk
+  # (or mount one) before pulling models.
+  local _min_gb="${YASHIGANI_OLLAMA_MIN_DISK_GB:-80}"
+  local _vol_root=""
+  if [[ "${YSG_RUNTIME:-}" == "docker" ]] && command -v docker >/dev/null 2>&1; then
+    _vol_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo "")"
+  elif command -v podman >/dev/null 2>&1; then
+    _vol_root="$(podman info -f '{{.Store.GraphRoot}}' 2>/dev/null || echo "")"
+  fi
+  [[ -z "$_vol_root" || ! -d "$_vol_root" ]] && _vol_root="/var/lib/docker"
+  [[ ! -d "$_vol_root" ]] && _vol_root="/"
+  local _avail_gb
+  _avail_gb="$(df -Pk "$_vol_root" 2>/dev/null | awk 'NR==2{print int($4/1024/1024)}')"  # MACOS-DF-001: BSD df has no -B; -Pk (1024-blocks) is BSD+GNU portable
+  if [[ -n "$_avail_gb" ]] && awk "BEGIN { exit !($_avail_gb < $_min_gb) }"; then
+    printf "\n"
+    printf "${C_YELLOW}[WARN] Only %s GB free on %s (container-volume store).${C_RESET}\n" "$_avail_gb" "$_vol_root"
+    printf "       The dedicated Ollama model store needs >= %s GB for the local model set;\n" "$_min_gb"
+    printf "       a 'no space left on device' mid-pull breaks inference. Relocate the runtime\n"
+    printf "       data-root to a larger disk (or mount one) before continuing.\n"
+    printf "       Override the threshold with YASHIGANI_OLLAMA_MIN_DISK_GB.\n\n"
   fi
 
   # --- Check 1c: rootless Podman linger pre-flight ---------------------------
@@ -1610,6 +2767,8 @@ run_preflight() {
 # compose container is currently running under either Docker or Podman.
 # Used by run_preflight (skip port check) and check_existing_installation
 # (skip contaminated-volume check on additive re-run).
+# NOTE: do NOT use this for the onboard/offboard AUTH gate — use
+# _is_installed_or_running() instead (residuals-based, fail-closed).
 _is_existing_yashigani_running() {
   local _secrets_dir="${WORK_DIR}/docker/secrets"
   # Secrets dir must exist and contain the root CA cert (written by PKI bootstrap;
@@ -1624,11 +2783,14 @@ _is_existing_yashigani_running() {
   # The socket is local so hang risk is low. Use label filter (fastest — no compose
   # parsing) as primary, compose ps as fallback.
   # Label filter: works even without compose CLI installed.
-  if docker ps --filter 'label=com.docker.compose.project=docker' \
+  # Multi-instance (3.0): scope the label filter to THIS install's project, not a
+  # hardcoded "docker" — otherwise a 2nd named instance false-matches the first.
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  if docker ps --filter "label=com.docker.compose.project=${_proj}" \
        --format '{{.Names}}' 2>/dev/null | grep -q .; then
     return 0
   fi
-  if podman ps --filter 'label=io.podman.compose.project=docker' \
+  if podman ps --filter "label=io.podman.compose.project=${_proj}" \
        --format '{{.Names}}' 2>/dev/null | grep -q .; then
     return 0
   fi
@@ -1637,6 +2799,43 @@ _is_existing_yashigani_running() {
     return 0
   fi
   if podman compose -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
+    return 0
+  fi
+  return 1
+}
+
+# _is_installed_or_running — FIX-2: residuals-based install detection for the
+# onboard/offboard AUTH gate.
+#
+# Returns 0 (true) when install RESIDUALS are present — compose file AND at
+# least one file under docker/secrets/ — INDEPENDENT of whether containers are
+# currently running and INDEPENDENT of which specific secret file is present.
+#
+# Design rationale (Laura F1/F2):
+#   _is_existing_yashigani_running() is affirmative-only: if the specific
+#   ca_root.crt check fails (file removed/renamed) OR all containers are
+#   stopped, it returns false and the auth gate is skipped. Both states are
+#   trivially achievable by an attacker with host access.
+#
+#   This function is fail-closed: ANY install residuals (compose file +
+#   secrets dir non-empty) imply a prior install and therefore require auth,
+#   even if containers are down or the PKI files have been tampered with.
+#
+# Used exclusively by the onboard/offboard step-up gate decision.
+# Never used for port-check or volume-contamination logic (those stay with
+# _is_existing_yashigani_running which correctly requires running containers).
+_is_installed_or_running() {
+  local _compose_file="${WORK_DIR}/docker/docker-compose.yml"
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # Compose file must be present (written by install.sh; indicates a completed
+  # or partially-completed install).
+  [[ -f "$_compose_file" ]] || return 1
+
+  # Secrets dir must exist AND contain at least one file (any file — not a
+  # specific named file, so removal/rename of ca_root.crt does not bypass).
+  [[ -d "$_secrets_dir" ]] || return 1
+  if find "$_secrets_dir" -maxdepth 1 -type f 2>/dev/null | grep -q .; then
     return 0
   fi
   return 1
@@ -1720,6 +2919,45 @@ _apply_deploy_defaults() {
     else
       log_info "Offline mode: TLS set to self-signed, image pull skipped"
     fi
+  fi
+
+  # F3/F9: fail FAST on a deploy-mode ↔ runtime mismatch.
+  # The deploy mode determines the deployment substrate:
+  #   demo, production → Docker/Podman Compose   (MODE=compose)
+  #   enterprise       → Kubernetes via Helm     (MODE=k8s)
+  # Previously, `--deploy enterprise --runtime docker` silently resolved to
+  # MODE=k8s and ran 8 steps before aborting at "kubernetes cluster unreachable".
+  # We only enforce this when the operator set --runtime / YSG_RUNTIME EXPLICITLY
+  # (YSG_RUNTIME_EXPLICIT=true) — the natural enterprise→k8s default still works
+  # untouched. We also respect an explicit --mode override (MODE_EXPLICIT): if the
+  # operator deliberately set --mode compose with --deploy enterprise, that is a
+  # conscious override and the runtime check below uses the resolved MODE.
+  if [[ "${YSG_RUNTIME_EXPLICIT:-false}" == "true" ]]; then
+    case "$MODE" in
+      k8s)
+        if [[ "${YSG_RUNTIME:-}" == "docker" || "${YSG_RUNTIME:-}" == "podman" ]]; then
+          log_error "Incompatible options: --deploy ${DEPLOY_MODE} resolves to Kubernetes (MODE=k8s),"
+          log_error "but --runtime ${YSG_RUNTIME} selects a Compose container runtime."
+          log_error ""
+          log_error "  Enterprise deployments run on Kubernetes via Helm. They do NOT use"
+          log_error "  Docker/Podman Compose. Choose ONE of:"
+          log_error "    • Kubernetes  : --deploy enterprise --runtime k8s"
+          log_error "    • Compose     : --deploy production  --runtime ${YSG_RUNTIME}"
+          log_error "                    (or --deploy demo --runtime ${YSG_RUNTIME})"
+          exit 1
+        fi
+        ;;
+      compose)
+        if [[ "${YSG_RUNTIME:-}" == "k8s" ]]; then
+          log_error "Incompatible options: --deploy ${DEPLOY_MODE} resolves to Docker/Podman Compose"
+          log_error "(MODE=compose), but --runtime k8s selects Kubernetes."
+          log_error ""
+          log_error "  demo / production deployments run on Compose. For Kubernetes use:"
+          log_error "    --deploy enterprise --runtime k8s"
+          exit 1
+        fi
+        ;;
+    esac
   fi
 }
 
@@ -1979,16 +3217,6 @@ _write_aes_key_to_env() {
   # --- AES encryption key ---
   _env_set "YASHIGANI_DB_AES_KEY" "${DB_AES_KEY}"
 
-  # --- OWUI secret key ---
-  # Required by docker-compose (OWUI_SECRET_KEY has no fallback default
-  # after Compliance review finding #4). Generate a fresh 256-bit key on first
-  # install; preserve existing value across re-runs so cookies survive.
-  local existing_owui_key
-  existing_owui_key="$(grep '^OWUI_SECRET_KEY=' "$env_file" 2>/dev/null | sed 's/^OWUI_SECRET_KEY=//' || echo "")"
-  if [[ -z "$existing_owui_key" ]]; then
-    _env_set "OWUI_SECRET_KEY" "$(openssl rand -hex 32)"
-  fi
-
   # --- Runtime-specific security profile overrides (Compliance review finding #2) ---
   # Seccomp + AppArmor profiles are enabled by default in docker-compose.yml.
   # Podman machine VM on macOS runs SELinux, not AppArmor — loading the
@@ -2058,16 +3286,111 @@ _write_aes_key_to_env() {
   fi
 
   # --- Upstream MCP URL ---
-  # Demo mode: use a built-in echo server so compose doesn't fail on missing var
-  # Production: set from wizard or --upstream-url flag
+  # Demo mode: point the gateway at the bundled demo-mcp upstream so the headline
+  # "cloud 9" rogue-MCP leg is reproducible from committed code with zero manual
+  # steps. Two things MUST be codified together:
+  #   1. UPSTREAM_MCP_URL=http://demo-mcp:8000 — tool_catalog._resolve_mcp_servers()
+  #      only projects the demo MCP catalog when the upstream URL contains
+  #      "demo-mcp" (otherwise the orchestration MCP catalog is EMPTY and the
+  #      cloud-9 leg silently doesn't exist).
+  #   2. the `demo-mcp` compose profile — without it the service is never started
+  #      even though the gateway points at it.
+  # Both land via COMPOSE_PROFILES (drives --profile flags + YASHIGANI_ENABLED_PROFILES)
+  # and docker/.env. Production: set from wizard or --upstream-url flag.
   local upstream="${UPSTREAM_URL}"
   if [[ -z "$upstream" && "$DEPLOY_MODE" == "demo" ]]; then
-    upstream="http://localhost:8080/echo"
+    upstream="http://demo-mcp:8000"
+    # Enable the demo-mcp compose profile (idempotent — guard against a duplicate).
+    if ! printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "demo-mcp"; then
+      COMPOSE_PROFILES+=("demo-mcp")
+      log_info "Demo mode: enabling demo-mcp compose profile + pointing UPSTREAM_MCP_URL at http://demo-mcp:8000 (cloud-9 demo upstream)"
+    fi
   fi
   _env_set "UPSTREAM_MCP_URL" "${upstream}"
 
+  # --- Cloud-9 MCP-injection demo (demo mode ONLY) ---
+  # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
+  # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
+  # model and enable response inspection so the egress block fires and renders in
+  # OWUI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # enterprise leave it OFF; demo turns it ON to showcase the injection block.
+  if [[ "$DEPLOY_MODE" == "demo" ]]; then
+    _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
+    _env_set "YASHIGANI_ORCH_BRAIN_MODEL"  "${YASHIGANI_ORCH_BRAIN_MODEL:-qwen2.5:3b}"
+    _env_set "YASHIGANI_INSPECT_RESPONSES" "${YASHIGANI_INSPECT_RESPONSES:-true}"
+    log_info "Demo mode: cloud-9 demo wired (cloud9-orchestrate model + response inspection ON)"
+
+    # 4.0 — Register the cloud-9 demo MCP in YASHIGANI_MCP_SERVERS so the broker
+    # registry picks it up at gateway startup and @-handles appear in the user surface.
+    # Only set if not already present (upgrade-safe: preserve operator-configured servers).
+    # SEAM-1d-01: derive tenant_id from YASHIGANI_TENANT_ID (default "default") so the
+    # broker entry stays consistent with the envelope tenant on non-default deployments.
+    local _demo_mcp_entry='[{"agent_name":"cloud9-demo","upstream_url":"http://demo-mcp:8000","tenant_id":"'"${YASHIGANI_TENANT_ID:-default}"'","is_filesystem_agent":false,"is_git_agent":false,"display_name":"Cloud-9 Demo MCP"}]'
+    local _existing_mcp_servers
+    _existing_mcp_servers="$(grep -m1 '^YASHIGANI_MCP_SERVERS=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ -z "$_existing_mcp_servers" || "$_existing_mcp_servers" == "[]" || "$_existing_mcp_servers" == "" ]]; then
+      _env_set "YASHIGANI_MCP_SERVERS" "${_demo_mcp_entry}"
+      log_info "Demo mode: YASHIGANI_MCP_SERVERS set to cloud9-demo (broker registry + @-handles enabled)"
+    else
+      log_info "Demo mode: YASHIGANI_MCP_SERVERS already set — skipping demo-mcp injection (existing: ${_existing_mcp_servers:0:60}...)"
+    fi
+  fi
+
   # --- Domain ---
   _env_set "YASHIGANI_TLS_DOMAIN" "${DOMAIN}"
+
+  # --- Multi-instance identity token (3.0 — MI-2 / YSG-RISK-061) ---
+  # Mint-or-preserve a per-instance CSPRNG identity token NOW (at .env generation,
+  # before compose up) so compose can stamp it as a container label on every
+  # service. A destructive lifecycle op (uninstall) then proves it is operating on
+  # the instance it claims by matching the label on the running containers against
+  # the INSTANCE_ID recorded in THIS tree's state file — a bare --project string
+  # can no longer act on a sibling.
+  # Preservation order (idempotent across re-runs/upgrades): existing .env value >
+  # existing state-file value > fresh CSPRNG mint. Stored in docker/.env as
+  # YASHIGANI_INSTANCE_ID (compose label source) and echoed into the state file by
+  # the Step 12b writer (which reads it back from .env via _instance_identity_token
+  # of the SAME value).
+  local _env_file="${WORK_DIR}/docker/.env"
+  local _existing_iid=""
+  if [[ -f "$_env_file" ]]; then
+    _existing_iid="$(grep -E '^YASHIGANI_INSTANCE_ID=' "$_env_file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  fi
+  if [[ -z "$_existing_iid" ]]; then
+    _existing_iid="$(_instance_identity_token "${WORK_DIR}/docker/.yashigani-install-state")"
+  fi
+  if [[ -z "$_existing_iid" ]]; then
+    _existing_iid="$(_gen_instance_id)"
+  fi
+  YASHIGANI_INSTANCE_ID="$_existing_iid"
+  export YASHIGANI_INSTANCE_ID
+  _env_set "YASHIGANI_INSTANCE_ID" "${YASHIGANI_INSTANCE_ID}"
+
+  # --- Multi-instance compose project (3.0 — scoping-draft §4a) ---
+  # COMPOSE_PROJECT_NAME in docker/.env is the single source of truth for the
+  # project name on BOTH Docker and Podman compose (each reads the project-dir
+  # .env). Without it, compose derives the project from the directory name
+  # ("docker") and two instances on one host collide on container/volume/network
+  # names. PROJECT is resolved in main() (from --project / --domain / state file).
+  # Same .env-over-process-env rationale as FIPS_MODE above.
+  if [[ -n "${PROJECT:-}" && "${PROJECT}" != "docker" ]]; then
+    _env_set "COMPOSE_PROJECT_NAME" "${PROJECT}"
+  fi
+
+  # --- Multi-instance SPIFFE trust domain (3.0 — MI-6 / YSG-RISK-061) ---
+  # Each instance gets its OWN SPIFFE trust-domain authority so a leaf cert minted
+  # in instance A does not satisfy instance B's validators. This is the SINGLE
+  # SOURCE OF TRUTH consumed by:
+  #   * the install-time cert issuer (per-instance URI SANs baked into leaf certs —
+  #     see _apply_trust_domain_to_runtime_manifest, called from enroll path),
+  #   * Caddy edge (X-SPIFFE-ID injection + peer-cert ACL match), and
+  #   * the app-layer validators (Tom's surface: linter/pool/principal_token/audit
+  #     read YASHIGANI_SPIFFE_TRUST_DOMAIN; default "yashigani.internal" preserves
+  #     legacy single-instance behaviour with no rotation).
+  # Legacy PROJECT=docker keeps "yashigani.internal" byte-for-byte (no env churn).
+  YASHIGANI_SPIFFE_TRUST_DOMAIN="$(_spiffe_trust_domain "${PROJECT:-docker}")"
+  export YASHIGANI_SPIFFE_TRUST_DOMAIN
+  _env_set "YASHIGANI_SPIFFE_TRUST_DOMAIN" "${YASHIGANI_SPIFFE_TRUST_DOMAIN}"
 
   # --- TLS mode ---
   _env_set "YASHIGANI_TLS_MODE" "${TLS_MODE}"
@@ -2082,6 +3405,11 @@ _write_aes_key_to_env() {
   # opt-in reaches gateway/backoffice/caddy regardless of runtime.
   _env_set "FIPS_MODE" "${FIPS_MODE:-0}"
   _env_set "YSG_FIPS_MODE" "${FIPS_MODE:-0}"
+  # Nico N-002 (v2.25.0 P2 B9): CMVP certificate number for runtime FIPS
+  # attestation. Compose YAML at docker/docker-compose.yml x-common-env reads
+  # YASHIGANI_CMVP_CERT: ${YSG_CMVP_CERT:-}. Surfaced by /admin/crypto/inventory
+  # as auditor evidence. Empty default = attestation reports cmvp_cert: null.
+  _env_set "YSG_CMVP_CERT" "${CMVP_CERT:-}"
 
   # --- Admin email ---
   if [[ -n "$ADMIN_EMAIL" ]]; then
@@ -2109,28 +3437,128 @@ print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode())
 " 2>/dev/null || echo "")"
   fi
 
-  # Method 3: python3 stdlib bcrypt via hashlib (no external deps)
-  # Caddy requires bcrypt ($2a$/$2b$) — PBKDF2 is incompatible
+  # Method 3 (F1): GENUINE pure-Python bcrypt — zero host prerequisites.
+  # Works on a fresh host with NEITHER `htpasswd` (apache2-utils) NOR the python
+  # `bcrypt` module — only python3 stdlib is required. Implements the Eksblowfish
+  # key schedule + the 64-round "OrpheanBeholderScryDoubt" encryption that defines
+  # the bcrypt $2b$ hash. Blowfish init constants are computed from the fractional
+  # hex digits of pi at runtime (no embedded data table). Validated byte-for-byte
+  # against reference bcrypt 5.0.0 (cost 4/6/10/12, ASCII + symbol + utf-8 + 36-char
+  # passwords) — produces identical output and reference checkpw() verifies it.
+  # NOTE: cost-12 Eksblowfish in pure Python takes ~30s on a typical host; this
+  # path is only reached when both faster methods are unavailable.
+  # The password is passed via the environment (never interpolated into the script
+  # body) so any password charset is injection-safe. The heredoc is single-quoted
+  # ('PYEOF') so the shell performs NO expansion on the Python source.
   if [[ -z "$prom_hash" ]] && command -v python3 >/dev/null 2>&1; then
-    prom_hash="$(YASHIGANI_PROM_PW="$prom_password" python3 -c "
-import os, hashlib, base64, struct
-pw = os.environ['YASHIGANI_PROM_PW'].encode()
-# bcrypt via subprocess htpasswd or fail
-import subprocess, sys
-try:
-    r = subprocess.run(['htpasswd', '-nbBC', '12', '', pw.decode()], capture_output=True, text=True)
-    if r.returncode == 0:
-        print(r.stdout.strip().lstrip(':'))
-        sys.exit(0)
-except FileNotFoundError:
-    pass
-# No bcrypt available — cannot generate compatible hash
-sys.exit(1)
-" 2>/dev/null || echo "")"
+    log_info "Generating Prometheus basic-auth hash via pure-Python bcrypt (no htpasswd/bcrypt module found; may take ~30s)..."
+    prom_hash="$(YASHIGANI_PROM_PW="$prom_password" python3 - <<'PYEOF' 2>/dev/null || echo ""
+import os, sys
+from decimal import Decimal, getcontext
+
+_B64 = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+def _b64encode(data):
+    out = []; i = 0; n = len(data)
+    while i < n:
+        c1 = data[i]; i += 1
+        out.append(_B64[(c1 >> 2) & 0x3F]); c1 = (c1 & 0x03) << 4
+        if i >= n: out.append(_B64[c1 & 0x3F]); break
+        c2 = data[i]; i += 1; c1 |= (c2 >> 4) & 0x0F
+        out.append(_B64[c1 & 0x3F]); c1 = (c2 & 0x0F) << 2
+        if i >= n: out.append(_B64[c1 & 0x3F]); break
+        c3 = data[i]; i += 1; c1 |= (c3 >> 6) & 0x03
+        out.append(_B64[c1 & 0x3F]); out.append(_B64[c3 & 0x3F])
+    return "".join(out)
+
+def _init_words():
+    n = 18 + 4 * 256; need_hex = n * 8 + 16
+    getcontext().prec = int(need_hex * 1.25) + 120
+    C = 426880 * Decimal(10005).sqrt()
+    K = Decimal(6); M = Decimal(1); X = Decimal(1); L = Decimal(13591409); S = L; i = 1
+    limit = Decimal(10) ** (-(int(need_hex * 1.25) + 30))
+    while True:
+        M = M * (K**3 - 16 * K) / (Decimal(i) ** 3)
+        L += 545140134; X *= -262537412640768000
+        term = M * L / X; S += term; K += 12
+        if abs(term) < limit: break
+        i += 1
+    pi = C / S; frac = pi - 3
+    h = format(int(frac * (Decimal(16) ** need_hex)), "x").rjust(need_hex, "0")
+    return [int(h[j * 8:j * 8 + 8], 16) for j in range(n)]
+
+_W = _init_words()
+
+class _BF:
+    def __init__(self):
+        self.P = list(_W[:18])
+        self.S = [list(_W[18 + s * 256:18 + (s + 1) * 256]) for s in range(4)]
+    def _F(self, x):
+        a = (x >> 24) & 0xFF; b = (x >> 16) & 0xFF; c = (x >> 8) & 0xFF; d = x & 0xFF
+        y = (self.S[0][a] + self.S[1][b]) & 0xFFFFFFFF
+        y = (y ^ self.S[2][c]) & 0xFFFFFFFF
+        return (y + self.S[3][d]) & 0xFFFFFFFF
+    def enc(self, xl, xr):
+        for i in range(16):
+            xl ^= self.P[i]; xr ^= self._F(xl); xl, xr = xr, xl
+        xl, xr = xr, xl
+        xr ^= self.P[16]; xl ^= self.P[17]
+        return xl & 0xFFFFFFFF, xr & 0xFFFFFFFF
+    @staticmethod
+    def _s2w(data, off):
+        w = 0
+        for _ in range(4):
+            w = ((w << 8) | data[off % len(data)]) & 0xFFFFFFFF; off += 1
+        return w, off
+    def expand(self, key):
+        off = 0
+        for i in range(18):
+            w, off = self._s2w(key, off); self.P[i] ^= w
+        xl = xr = 0
+        for i in range(0, 18, 2):
+            xl, xr = self.enc(xl, xr); self.P[i] = xl; self.P[i + 1] = xr
+        for s in range(4):
+            for i in range(0, 256, 2):
+                xl, xr = self.enc(xl, xr); self.S[s][i] = xl; self.S[s][i + 1] = xr
+    def expand_salt(self, data, key):
+        off = 0
+        for i in range(18):
+            w, off = self._s2w(key, off); self.P[i] ^= w
+        xl = xr = 0; soff = 0
+        for i in range(0, 18, 2):
+            s1, soff = self._s2w(data, soff); s2, soff = self._s2w(data, soff)
+            xl ^= s1; xr ^= s2; xl, xr = self.enc(xl, xr); self.P[i] = xl; self.P[i + 1] = xr
+        for s in range(4):
+            for i in range(0, 256, 2):
+                s1, soff = self._s2w(data, soff); s2, soff = self._s2w(data, soff)
+                xl ^= s1; xr ^= s2; xl, xr = self.enc(xl, xr); self.S[s][i] = xl; self.S[s][i + 1] = xr
+
+def hashpw(password, cost, salt16):
+    key = password[:72] + b"\x00"
+    bf = _BF(); bf.expand_salt(salt16, key)
+    for _ in range(1 << cost):
+        bf.expand(key); bf.expand(salt16)
+    ct = list(b"OrpheanBeholderScryDoubt")
+    cd = [(ct[i] << 24) | (ct[i + 1] << 16) | (ct[i + 2] << 8) | ct[i + 3] for i in range(0, 24, 4)]
+    for _ in range(64):
+        for i in range(0, 6, 2):
+            cd[i], cd[i + 1] = bf.enc(cd[i], cd[i + 1])
+    out = bytearray()
+    for w in cd:
+        out += bytes([(w >> 24) & 0xFF, (w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF])
+    return "$2b$%02d$%s%s" % (cost, _b64encode(salt16), _b64encode(bytes(out[:23])))
+
+pw = os.environ["YASHIGANI_PROM_PW"].encode()
+sys.stdout.write(hashpw(pw, 12, os.urandom(16)))
+PYEOF
+)"
   fi
 
   if [[ -z "$prom_hash" ]]; then
-    log_error "Failed to generate Prometheus basic-auth hash. Install htpasswd (brew install httpd) or ensure python3 is available."
+    log_error "Failed to generate Prometheus basic-auth hash."
+    log_error "python3 is required for the built-in pure-Python bcrypt fallback."
+    log_error "Install python3, OR install htpasswd (apache2-utils / 'brew install httpd'),"
+    log_error "OR 'pip install bcrypt' — then re-run install.sh."
     exit 1
   fi
   # Escape $ to $$ for Docker Compose — bcrypt hashes contain $ delimiters
@@ -2197,6 +3625,14 @@ SSO_EOF
     dry_print "Generate SAML SP RSA-4096 key + certificate (YSG-RISK-044)"
   fi
 
+  # --- Source SHA for first-party image cache-busting ---
+  # Written here so `compose build` (Docker path) picks it up via .env
+  # interpolation: the compose YAML passes it as build arg GIT_SHA to each
+  # first-party Dockerfile. _local_images_cached() reads it back from the
+  # running image label to detect stale-tag hits when YASHIGANI_VERSION
+  # is unchanged but source commits have landed (version-drift stale-image bug).
+  _env_set "YASHIGANI_GIT_SHA" "${YASHIGANI_GIT_SHA}"
+
   log_info "Environment written to ${env_file}"
 }
 
@@ -2219,8 +3655,22 @@ run_wizard() {
       log_warn "Defaults or empty values will be used; reconfigure via your .env file."
     fi
 
+    # On upgrade, reuse an existing UPSTREAM_MCP_URL from .env rather than exporting an
+    # empty value. Compose declares it required (${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}),
+    # so a blank export breaks `up` even though the value is already configured — this is
+    # what forced operators to re-pass --upstream-url on every upgrade.
+    if [[ -z "$UPSTREAM_URL" && -f "${WORK_DIR}/docker/.env" ]]; then
+      UPSTREAM_URL="$(grep -m1 '^UPSTREAM_MCP_URL=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
+      [[ -n "$UPSTREAM_URL" ]] && log_info "Reusing existing UPSTREAM_MCP_URL from .env (upgrade)"
+    fi
     export YASHIGANI_TLS_DOMAIN="$DOMAIN"
-    export YASHIGANI_ADMIN_USERNAME="$ADMIN_EMAIL"
+    # v4.1 username-fix: do NOT export YASHIGANI_ADMIN_USERNAME here.
+    # The admin username is a generated handle (hawk/orchid/etc.) produced by
+    # generate_secrets() and written to .env; ADMIN_EMAIL is the notification
+    # address, not the login username. Exporting ADMIN_EMAIL here as
+    # YASHIGANI_ADMIN_USERNAME caused compose to prefer the shell env (admin@…)
+    # over .env (hawk) — container got the wrong value → login with "hawk" → 401.
+    # YASHIGANI_ADMIN_EMAIL is already written to .env via _env_set at step 5.
     export UPSTREAM_MCP_URL="$UPSTREAM_URL"
     export YASHIGANI_TLS_MODE="$TLS_MODE"
     return 0
@@ -2263,14 +3713,19 @@ run_inline_wizard() {
   fi
 
   export YASHIGANI_TLS_DOMAIN="$DOMAIN"
-  export YASHIGANI_ADMIN_USERNAME="$ADMIN_EMAIL"
+  # v4.1 username-fix: see run_wizard() non-interactive note above — same fix.
+  # ADMIN_EMAIL is the notification address; admin username is generated by
+  # generate_secrets() and written to .env as YASHIGANI_ADMIN_USERNAME.
   export UPSTREAM_MCP_URL="$UPSTREAM_URL"
   export YASHIGANI_TLS_MODE="$TLS_MODE"
 }
 
 # =============================================================================
 _backup_existing_data() {
-  local backup_dir="${WORK_DIR}/backups/$(date +%Y%m%d_%H%M%S)"
+  # YSG-RISK-050 guardrail: capture ts once; reused for dir name, AADs, recovery id.
+  local backup_ts
+  backup_ts="$(date +%Y%m%d_%H%M%S)"
+  local backup_dir="${WORK_DIR}/backups/${backup_ts}"
   mkdir -p "$backup_dir"
 
   log_info "Backing up existing data to ${backup_dir}..."
@@ -2302,8 +3757,41 @@ _backup_existing_data() {
         rm -rf "$_secrets_dest"
       fi
     else
-      cp -rp "$_secrets_src" "$_secrets_dest"
-      log_info "  secrets/ backed up (ownership/mode preserved)"
+      # Docker/rootful path. Some client certs/keys are owned by container UIDs
+      # (root/999/1000) and unreadable by a non-root install user, so cp -rp returns
+      # non-zero. That must NOT abort the upgrade under set -e: the live volumes still
+      # hold the secrets and the dual-wrap bundle below is the authoritative copy.
+      mkdir -p "$_secrets_dest"
+      if cp -rp "$_secrets_src"/. "$_secrets_dest"/ 2>/dev/null; then
+        log_info "  secrets/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets/ partial copy — some keys owned by container UIDs are unreadable as $(id -un); non-fatal (live volumes + dual-wrap bundle retain them)."
+      fi
+    fi
+  fi
+
+  # YSG-RISK-053: back up the Caddy-scoped secrets dir (caddy_client.{key,crt}
+  # + caddy_internal_hmac) alongside docker/secrets — same ownership-preserving
+  # strategy per runtime. restore.sh restores it into docker/secrets-caddy/.
+  if [[ -d "${WORK_DIR}/docker/secrets-caddy" ]]; then
+    local _caddy_src="${WORK_DIR}/docker/secrets-caddy"
+    local _caddy_dest="${backup_dir}/secrets-caddy"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+      mkdir -p "$_caddy_dest"
+      if podman unshare bash -c "tar -cf - -C '${_caddy_src}' ." \
+           | tar -xpf - -C "$_caddy_dest" 2>/dev/null; then
+        log_info "  secrets-caddy/ backed up via podman unshare tar (YSG-RISK-053)"
+      else
+        log_warn "  secrets-caddy/ backup via podman unshare failed — skipping (non-fatal; install.sh regenerates/relocates on next run)"
+        rm -rf "$_caddy_dest"
+      fi
+    else
+      mkdir -p "$_caddy_dest"
+      if cp -rp "$_caddy_src"/. "$_caddy_dest"/ 2>/dev/null; then
+        log_info "  secrets-caddy/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets-caddy/ partial copy — some files owned by container UIDs are unreadable as $(id -un); non-fatal."
+      fi
     fi
   fi
 
@@ -2326,7 +3814,9 @@ _backup_existing_data() {
   # K8s path: find the running postgres pod and exec pg_dump via kubectl.
   # The postgres pod runs as runAsUser: 70 (postgres on Alpine), so kubectl exec
   # arrives as UID 70 — the postgres superuser for this cluster. No root needed;
-  # pg_dump -U yashigani_app connects via the local Unix socket (trust auth).
+  # pg_dump -U yashigani_admin (v2.25.2: the DDL/admin superuser) connects via
+  # the local Unix socket (trust auth) — a full dump needs the superuser, the
+  # demoted runtime role yashigani_app cannot read every table.
   # Compose/Podman path: exec into the named container. Container name varies by
   # runtime and install order, so detect via docker/podman ps rather than
   # hardcoding 'docker-postgres-1'.
@@ -2337,7 +3827,7 @@ _backup_existing_data() {
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     if [[ -n "$_pg_pod" ]]; then
       if kubectl exec -i -n "${NAMESPACE}" "$_pg_pod" -- \
-           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+           pg_dump -U yashigani_admin yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
         log_info "  postgres_dump.sql backed up (K8s: pod ${_pg_pod})"
       else
         log_info "  Postgres K8s dump skipped (pod not ready or auth failed)"
@@ -2355,7 +3845,7 @@ _backup_existing_data() {
       | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
     if [[ -n "$_pg_container" ]]; then
       if $_runtime_cmd exec "$_pg_container" \
-           pg_dump -U yashigani_app yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
+           pg_dump -U yashigani_admin yashigani > "${backup_dir}/postgres_dump.sql" 2>/dev/null; then
         log_info "  postgres_dump.sql backed up (${RUNTIME:-compose}: container ${_pg_container})"
       else
         log_info "  Postgres dump failed for container ${_pg_container} — dump skipped"
@@ -2366,88 +3856,762 @@ _backup_existing_data() {
     fi
   fi
 
-  # BUG-58B-04a (v2.23.1): do NOT use 'chmod -R 600' on the backup dir.
-  # That clobbers intentionally-0644 public secret files (admin passwords,
-  # bootstrap tokens, service passwords that non-root containers must read).
-  # When restore.sh copies these back, the 0600 mode on files that were 0644
-  # causes service containers (pgbouncer=UID70, redis=UID999, etc.) to get
-  # EACCES on startup. Fix: tighten private keys to 0400, leave everything
-  # else at its source mode (already ≤0644 per install.sh canonical assignment).
-  # CA private keys and service private keys are the only secret material that
-  # must be inaccessible to processes other than their owner; everything else
-  # (passwords, certs, tokens) is intentionally readable by the service UIDs.
-  find "${backup_dir}/secrets" -maxdepth 1 -type f \
-    \( -name '*.key' \) -exec chmod 0400 {} \; 2>/dev/null || true
-  # Lock down the backup dir itself and non-secrets files (e.g. postgres_dump.sql,
-  # .env) to owner-read-only; the secrets sub-dir mode is controlled above.
+  # DRIFT-B5-COMPOSE-AGENT-BACKUP: snapshot named Docker/Podman volumes for each
+  # agent bundle that is present on this host. These volumes carry agent-specific
+  # state (langflow flows + DB, letta memory + config, openclaw policies) and were
+  # silently excluded from every compose backup since v2.23.3.
+  #
+  # Design decisions:
+  #   - Volume names are hardcoded constants — not operator-supplied — so no
+  #     path-injection risk.
+  #   - Uses "docker/podman run --rm -v <vol>:/data:ro alpine tar" instead of
+  #     "docker volume export" because Podman lacks volume export.  The pattern
+  #     works identically on both Docker and Podman (rootful + rootless).
+  #   - Warn-only when a volume is absent: agent bundles are optional; missing
+  #     volumes simply mean the bundle is not enabled.
+  #   - Output path: ${backup_dir}/agent-volumes/<bundle>.tar (0600).
+  #     The MANIFEST sweep below covers these files automatically.
+  #   - Threat model: agent volumes may contain API keys and bearer tokens.
+  #     Tarballs are written 0600 (owner-read-only) before any content reaches
+  #     them; the backup dir itself is locked to 0700 in the chmod block below.
+  #   - Skipped on K8s: agent PVCs are handled by the Helm backup CronJob
+  #     (scripts/backup.sh --extra-dirs, B5 Helm side).  This block runs only
+  #     on compose/Podman installs.
+  if [[ "${MODE:-compose}" != "k8s" && "${YSG_RUNTIME:-}" != "k8s" ]]; then
+    # LIVE-FIX2-001 (VM smoke 2026-05-28): compose-created named volumes carry
+    # the compose project prefix. The compose file lives in docker/, so the
+    # project name is "docker" and volumes are "docker_langflow_data" etc. —
+    # NOT bare "langflow_data". The chown path at the post-install step already
+    # uses _compose_project_prefix (see the agent-bundle chown block); mirror it
+    # here so `volume inspect` actually finds the volume instead of always
+    # reporting "not present — skipping" and silently losing agent state.
+    # Multi-instance (3.0): the prefix is THIS install's compose project, not a
+    # hardcoded "docker" — a 2nd named instance has e.g. "eu-west-acme-com_langflow_data".
+    local _compose_project_prefix="${COMPOSE_PROJECT_NAME:-docker}"
+    # Ordered list: <volume_name>:<bundle_label>
+    local -a _agent_volumes=(
+      "${_compose_project_prefix}_langflow_data:langflow"
+      "${_compose_project_prefix}_letta_data:letta"
+      "${_compose_project_prefix}_openclaw_data:openclaw"
+    )
+    local _agent_vol_dir="${backup_dir}/agent-volumes"
+    local _agent_vol_any=false
+    for _vol_entry in "${_agent_volumes[@]}"; do
+      local _vol_name="${_vol_entry%%:*}"
+      local _vol_label="${_vol_entry##*:}"
+      # Check whether the named volume exists on this host.
+      if $_runtime_cmd volume inspect -- "$_vol_name" >/dev/null 2>&1; then
+        _agent_vol_any=true
+        mkdir -p "$_agent_vol_dir"
+        local _vol_tar="${_agent_vol_dir}/${_vol_label}.tar"
+        # Pre-create at 0600 before writing so content never touches disk at
+        # a looser mode (even briefly). umask alone is insufficient here because
+        # the tar redirect lands via the shell's open(2), not install(1).
+        ( umask 177 && : > "$_vol_tar" )
+        # Pipe volume contents through a read-only bind mount via an Alpine
+        # container. "--" before the volume name prevents injection if the name
+        # ever starts with "-". The volume name is a hardcoded constant but
+        # defensive quoting costs nothing.
+        # Iris SU-FIX2-IRIS-001: pin alpine digest matching install.sh codebase norm.
+        # Prefer cached alpine:3 tag (--pull=never); fall back to digest-pinned pull
+        # if not cached. Same pattern as lines 4277-4281 / 5942/5980 / 6076/6158 / 6248/6269.
+        local _agent_vol_alpine="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+        if $_runtime_cmd run --rm --pull=never \
+             --read-only \
+             -v "${_vol_name}:/data:ro" \
+             --entrypoint "" \
+             "alpine:3" \
+             tar -C /data -cf - -- . \
+           > "$_vol_tar" 2>/dev/null; then
+          chmod 0600 "$_vol_tar"
+          log_info "  agent-volumes/${_vol_label}.tar backed up (volume: ${_vol_name})"
+        elif $_runtime_cmd run --rm \
+               --read-only \
+               -v "${_vol_name}:/data:ro" \
+               --entrypoint "" \
+               "$_agent_vol_alpine" \
+               tar -C /data -cf - -- . \
+             > "$_vol_tar" 2>/dev/null; then
+          chmod 0600 "$_vol_tar"
+          log_info "  agent-volumes/${_vol_label}.tar backed up (volume: ${_vol_name}, digest-pinned)"
+        else
+          log_warn "  agent-volumes/${_vol_label}.tar: tar from volume ${_vol_name} failed — removing partial"
+          rm -f "$_vol_tar"
+        fi
+      else
+        log_info "  agent bundle '${_vol_label}' volume (${_vol_name}) not present — skipping (bundle not enabled)"
+      fi
+    done
+    if [[ "$_agent_vol_any" == "true" && -d "$_agent_vol_dir" ]]; then
+      chmod 0700 "$_agent_vol_dir"
+    fi
+  fi
+
+  # BUG-58B-04a (v2.23.1) — sentinel preserved for test_install_compose_agent_backup.py
+  # delimiter. The chmod block that was here is superseded by the v2 dual-wrap
+  # construction below (YSG-RISK-050/051): all secret content is encrypted into
+  # bundle.enc; no plaintext files remain in the backup dir after encryption.
+
+  # ── YSG-RISK-050/051: Dual-wrap signed+encrypted backup (v2, LOCKED) ─────────
+  # Supersedes RETRO-R4-3 plaintext + SHA-256 manifest. All sensitive content
+  # (secrets/, .env, postgres_dump.sql, agent-volumes/*.tar) is encrypted with
+  # AES-256-GCM under a random DEK. The DEK is wrapped under two independent KEKs:
+  #   Wrap#1 — admin-password path (argon2id, FIPS_MODE=0 ONLY — ABSENT under FIPS_MODE=1)
+  #   Wrap#2 — recovery path (license .ysg bytes OR YASHIGANI_DB_AES_KEY for community)
+  # HMAC-SHA384 (key-separated via HKDF) covers the cleartext backup-meta.json.
+  # All crypto runs in Python inside the gateway/backoffice container
+  # (cryptography + argon2-cffi, both confirmed present). SHA-384 everywhere;
+  # no SHA-256 in any new primitive. CNSA-2.0 symmetric suite (Nico-verified).
+  #
+  # Key hierarchy (locked spec 2026-05-28):
+  #   DEK     = os.urandom(32)
+  #   MAC_KEY = HKDF-SHA384(DEK, info=b"yashigani-backup-meta-mac-v1", len=48)
+  #   IKM1 = V = raw 32-byte argon2 verifier extracted from stored PHC (NO argon2 call at backup)
+  #     V = base64decode_padded(PHC.split("$")[-1])   # unpadded argon2 PHC base64
+  #   KEK1    = HKDF-SHA384(V, kek1_hkdf_salt, len=32)
+  #   KEK2    = HKDF-SHA384(.ysg bytes | DB_AES_KEY, kek2_hkdf_salt, len=32)
+  #   WDEK1/2 = AES-256-GCM(KEK, IV, aad=version+ts+wrap_id, pt=DEK)
+  #   bundle.enc = AES-256-GCM(DEK, IV_B, aad=meta_bytes_with_empty_hmac, pt=tar.gz)
+  #   hmac_hex = HMAC-SHA384(MAC_KEY, aad_bytes)
+  #   FIPS_MODE=1: wrap#1 is ABSENT (wrap1.present=false). PBKDF2 cannot reproduce an
+  #     argon2 verifier; there is no sound non-interactive password-recovery wrap under FIPS.
+  #     Only wrap#2 is written under FIPS. (Nico ruling 2026-05-28.)
+  #
+  # Guardrails (spec §Implementation guardrails):
+  #   - ts captured once and reused everywhere.
+  #   - DEK/KEK/MAC_KEY in memory only; never on disk.
+  #   - bundle.enc written via tmp→atomic rename; deleted on error.
+  #   - backup-meta.json written only AFTER bundle.enc succeeds; if meta fails
+  #     bundle.enc is deleted.
+  #   - Old plaintext files (secrets/, .env, postgres_dump.sql) + MANIFEST.*
+  #     removed from backup dir after bundle.enc is finalised.
+  #   - No silent failure; no plaintext fallback; fail-closed.
+  #   - Docker + Podman parity; compose/vm path only (K8s is unchanged).
+
+  # Lock down backup_dir itself to 0700 before writing the encrypted bundle.
   chmod 0700 "$backup_dir"
-  if [[ -f "${backup_dir}/.env" ]]; then
-    chmod 0600 "${backup_dir}/.env"
-  fi
-  if [[ -f "${backup_dir}/postgres_dump.sql" ]]; then
-    chmod 0600 "${backup_dir}/postgres_dump.sql"
-  fi
-  # Defensive assertion: no world/group-readable private keys in backup (S1).
-  if find "${backup_dir}/secrets" -type f -name '*.key' \( -perm -004 -o -perm -040 \) 2>/dev/null | grep -q .; then
-    log_error "CWE-732: group/world-readable key file(s) in backup ${backup_dir}/secrets"
+
+  # Locate a running gateway or backoffice container for the Python crypto step.
+  local _crypto_container=""
+  local _runtime_cmd_local=""
+  [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _runtime_cmd_local="podman" || _runtime_cmd_local="docker"
+  _crypto_container=$($_runtime_cmd_local ps --format '{{.Names}}' 2>/dev/null \
+    | grep -E 'backoffice|gateway' | head -1 || true)
+
+  if [[ -z "$_crypto_container" ]]; then
+    log_error "YSG-RISK-050: No running gateway/backoffice container found — cannot run dual-wrap backup crypto."
+    log_error "  The backup requires the cryptography + argon2-cffi Python libraries (present in gateway/backoffice)."
+    log_error "  Ensure at least one of these containers is running before upgrading."
+    # Remove the staging dir so no plaintext leaks to disk.
+    rm -rf "$backup_dir"
     exit 1
   fi
 
-  # RETRO-R4-3: sign the backup manifest so restore.sh can cryptographically verify
-  # integrity before touching any live secrets. Signing key is the CA intermediate
-  # private key (already present at install time; 0400 owner-only). The signature
-  # covers a SHA-256 manifest of every file under the backup dir. restore.sh
-  # validate_backup() verifies the signature with the CA intermediate public cert
-  # (extracted from ca_intermediate.crt) — reject-if-invalid, warn-if-absent.
-  #
-  # Threat model: an attacker who can modify backup files on disk but cannot read
-  # the CA intermediate key (0400, requires host root or the issuer container) cannot
-  # forge a valid signature. Without the signature check, a tampered backup silently
-  # overwrites live secrets and breaks mTLS for all services.
-  #
-  # Implementation:
-  #   1. Build a sorted SHA-256 manifest of all files in the backup dir.
-  #   2. Sign the manifest with openssl dgst -sign (ECDSA/RSA depending on key type).
-  #   3. Write manifest + .sig into the backup dir (0400).
-  #   The intermediate key is used rather than the root to avoid root key exposure;
-  #   both are equally trusted for this purpose since we control both.
-  local _ca_key="${WORK_DIR}/docker/secrets/ca_intermediate.key"
-  local _manifest_file="${backup_dir}/MANIFEST.sha256"
-  local _sig_file="${backup_dir}/MANIFEST.sha256.sig"
-  if [[ -f "$_ca_key" ]]; then
-    # Build sorted deterministic manifest: "sha256hash  relative/path" per line.
-    # find with -print0 + sort -z to handle spaces in names; awk strips leading ./
-    # _fips_sha256_manifest_stream routes through OpenSSL FIPS Provider when FIPS_MODE=1
-    # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2).
-    if (
-      cd "$backup_dir" && \
-      find . -type f ! -name 'MANIFEST.sha256' ! -name 'MANIFEST.sha256.sig' -print0 | \
-        sort -z | \
-        _fips_sha256_manifest_stream > MANIFEST.sha256
-    ); then
-      chmod 0400 "$_manifest_file"
-      # Sign: openssl dgst -sign reads the raw key (PEM), outputs binary DER sig.
-      if openssl dgst -sha256 -sign "$_ca_key" -out "$_sig_file" "$_manifest_file" 2>/dev/null; then
-        chmod 0400 "$_sig_file"
-        log_success "Backup manifest signed (RETRO-R4-3): ${_manifest_file##*/} + ${_sig_file##*/}"
-      else
-        log_warn "Backup manifest signing failed (openssl dgst -sign error) — backup is unsigned"
-        rm -f "$_sig_file"
-      fi
-    else
-      log_warn "Backup manifest generation failed — backup is unsigned"
+  log_info "Running dual-wrap backup crypto in container: ${_crypto_container}"
+
+  # Read the admin password hash from Postgres for wrap#1.
+  # Query: admin_accounts.password_hash WHERE account_tier='admin' AND disabled=false ORDER BY created_at LIMIT 1
+  # If Postgres is unreachable → wrap1.present=false, warn, continue (wrap#2 covers recovery).
+  local _admin_phc=""
+  local _wrap1_present="true"
+  local _pg_container_for_hash
+  _pg_container_for_hash=$($_runtime_cmd_local ps --format '{{.Names}}' 2>/dev/null \
+    | grep -E 'postgres' | grep -v pgbouncer | head -1 || true)
+  if [[ -n "$_pg_container_for_hash" ]]; then
+    _admin_phc=$($_runtime_cmd_local exec "$_pg_container_for_hash" \
+      psql -U yashigani_admin yashigani -t -A \
+      -c "SELECT password_hash FROM admin_accounts WHERE account_tier='admin' AND disabled=false ORDER BY created_at LIMIT 1;" \
+      2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -z "$_admin_phc" ]]; then
+      log_warn "YSG-RISK-050: Could not read admin password_hash from Postgres (empty result) — wrap#1 will be skipped."
+      _wrap1_present="false"
     fi
   else
-    log_warn "CA intermediate key not found at ${_ca_key} — backup is unsigned (expected on first-run before PKI bootstrap)"
+    log_warn "YSG-RISK-050: No running Postgres container found — wrap#1 (admin-password) will be skipped."
+    _wrap1_present="false"
   fi
 
-  log_success "Backup saved to ${backup_dir}"
+  # Read the recovery IKM: licensed tier = .ysg file bytes; community = YASHIGANI_DB_AES_KEY.
+  local _license_file="${WORK_DIR}/docker/secrets/license_key"
+  local _ysg_tier="community"
+  local _license_key_id="null"
+  local _ikm2_source="db_aes_key"  # internal marker: "license" or "db_aes_key"
+
+  if [[ -f "$_license_file" ]]; then
+    local _lic_content
+    # BUG-B+-004 / BUG-FIX (3.1.0): license_key is subuid-owned on Podman rootless (e.g.
+    # UID 166536). Direct `< file` redirect emits a bash "Permission denied" error to
+    # stderr that `2>/dev/null` inside the subshell cannot suppress (bash prints the error
+    # before entering the subshell). Use `_safe_read_secret` (podman unshare cat) so the
+    # read happens inside the correct user namespace and the error is fully silent.
+    # Community tier: if the file is unreadable (no license), _lic_content stays empty
+    # and the code falls through to the db_aes_key path. Non-fatal.
+    _lic_content=$(_safe_read_secret "$_license_file" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -n "$_lic_content" && "$_lic_content" != "#community"* && "${#_lic_content}" -gt 20 ]]; then
+      _ysg_tier="licensed"
+      _ikm2_source="license"
+      # Extract license_key_id: first 16 chars of the file content as a stable ID.
+      _license_key_id="$(printf '%.16s' "$_lic_content")"
+    fi
+  fi
+
+  # Read YASHIGANI_DB_AES_KEY from .env (community recovery path).
+  local _db_aes_key=""
+  if [[ -f "${WORK_DIR}/docker/.env" ]]; then
+    _db_aes_key=$(grep '^YASHIGANI_DB_AES_KEY=' "${WORK_DIR}/docker/.env" 2>/dev/null \
+      | sed 's/^YASHIGANI_DB_AES_KEY=//' | tr -d '\n' || true)
+  fi
+
+  if [[ "$_ikm2_source" == "db_aes_key" && -z "$_db_aes_key" ]]; then
+    log_error "YSG-RISK-050: YASHIGANI_DB_AES_KEY not found in docker/.env — cannot derive wrap#2 (recovery) key."
+    log_error "  Community tier backup requires YASHIGANI_DB_AES_KEY for the recovery wrap."
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Build the Python crypto script. This runs inside the container via docker/podman exec.
+  # Secrets (_YSG_ADMIN_PHC, _YSG_IKM2_HEX) passed via stdin JSON to avoid docker inspect
+  # exposure (FINDING-4). Non-secret config via -e env: _YSG_WRAP1_PRESENT, _YSG_TIER, etc.
+  #
+  # The container sees backup_dir as a bind-mount path: the host backup_dir is
+  # accessible inside the container because install.sh runs on the host and
+  # exec's into the container to perform the crypto. We pass the host path and
+  # the container will access it via the bind-mount at ${WORK_DIR} (compose mounts
+  # the repo root read-write into gateway/backoffice for secrets access).
+  # Specifically: docker/secrets is mounted at /run/secrets inside containers.
+  # The backup dir is under ${WORK_DIR}/backups/ which is NOT a container mount,
+  # so we pass the backup dir contents via stdin as a tar stream into the container.
+  #
+  # Implementation pattern: tar the staging dir to stdin → pipe into container →
+  # container decrypts/encrypts → writes bundle.enc + backup-meta.json to stdout →
+  # host extracts. This avoids any host-path dependency inside the container.
+
+  # We run the Python crypto inline: pass the staging content as a base64-encoded
+  # tar.gz blob via environment variable (for small backups this is fine; for large
+  # backups we stream). Since backups can be arbitrarily large (agent volumes),
+  # we use a streaming approach: write to a temp file in the container's writable
+  # scratch space (tmpfs), then stream results back.
+  #
+  # Simpler approach: exec python3 directly, pass backup_dir path, read result files.
+  # This works because the container filesystem has access to the host secrets via
+  # the /run/secrets bind-mount, but backup_dir is NOT accessible from inside.
+  # Solution: pass the entire staging data as a compressed stdin stream, get the
+  # encrypted bundle + meta back as two base64-delimited outputs.
+  #
+  # Final approach (chosen for clarity + auditability): write the Python script to
+  # a tmpfile (mode 0700, no secrets), exec it inside the container with secrets via
+  # env. The container needs access to backup_dir. Since the compose bind-mount for
+  # data/certs/secrets doesn't include backups/, we use docker cp to push the
+  # staging dir in and pull the results out, then clean up in the container.
+  # This is clean and avoids any path-injection risk.
+
+  # The Python inline script (heredoc, written to a 0700 tmpfile).
+  # All secrets arrive as env vars. No secrets in the script itself.
+  local _py_script_path="${backup_dir}/.ysg_backup_crypto_$$.py"
+  # Pre-create at 0700 (no content readable) before writing.
+  ( umask 077 && : > "$_py_script_path" )
+  cat > "$_py_script_path" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+YSG-RISK-050/051: Dual-wrap signed+encrypted backup construction.
+LOCKED spec 2026-05-28. Zero crypto decisions here — implement verbatim.
+Runs inside gateway/backoffice container (cryptography + argon2-cffi present).
+All secrets arrive via stdin JSON. No secrets in argv, env, or on disk
+other than the final output files.
+
+IKM1 = V = raw 32-byte argon2 verifier, extracted from stored PHC by base64-decoding
+the hash segment (no argon2 call at backup — NO plaintext password needed).
+RESTORE recomputes V = argon2id_raw(typed_plaintext, argon2_salt_from_meta, params).
+They match iff the password is unchanged. (Nico ruling 2026-05-28.)
+
+FIPS_MODE=1: wrap#1 is ABSENT (wrap1.present=false). PBKDF2 cannot reproduce an
+argon2 verifier (different function, different output). Only wrap#2 under FIPS.
+"""
+import base64
+import hashlib
+import hmac as _hmac
+import json
+import os
+import sys
+import tarfile
+from pathlib import Path
+
+# ── Imports (cryptography + argon2-cffi) ─────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hashes import SHA384
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.backends import default_backend
+except ImportError as e:
+    sys.stderr.write(f"FATAL: cryptography library not available: {e}\n")
+    sys.exit(1)
+
+try:
+    from argon2 import extract_parameters
+except ImportError as e:
+    sys.stderr.write(f"FATAL: argon2-cffi not available: {e}\n")
+    sys.exit(1)
+
+# ── Inputs via stdin JSON (secrets) + environment (non-secret config) ─────────
+# Secrets (_YSG_ADMIN_PHC, _YSG_IKM2_HEX) arrive via stdin JSON to avoid
+# exposure in 'docker inspect' (FINDING-4). Non-secret config via env vars.
+try:
+    _stdin_data = json.loads(sys.stdin.read())
+except Exception as e:
+    sys.stderr.write(f"FATAL: Failed to parse stdin JSON: {e}\n")
+    sys.exit(1)
+
+STAGING_DIR   = os.environ["_YSG_BACKUP_STAGING_DIR"]   # path accessible from container
+OUTPUT_DIR    = os.environ["_YSG_BACKUP_OUTPUT_DIR"]     # where bundle.enc + meta go
+ADMIN_PHC     = _stdin_data.get("admin_phc", "")         # argon2 PHC or empty (from stdin)
+WRAP1_PRESENT = os.environ.get("_YSG_WRAP1_PRESENT", "false").lower() == "true"
+IKM2_HEX      = _stdin_data["ikm2_hex"]                  # hex-encoded recovery IKM (from stdin)
+TIER          = os.environ.get("_YSG_TIER", "community")
+LIC_ID        = os.environ.get("_YSG_LIC_ID", "null")
+FIPS_MODE     = os.environ.get("_YSG_FIPS_MODE", "0") == "1"
+YSG_VERSION   = os.environ.get("_YSG_VERSION", "unknown")
+TS            = os.environ["_YSG_TS"]                    # YYYYMMDD_HHMMSS (captured once)
+
+staging = Path(STAGING_DIR)
+output  = Path(OUTPUT_DIR)
+output.mkdir(parents=True, exist_ok=True)
+
+bundle_enc_tmp  = output / f"bundle.enc.tmp.{os.getpid()}"
+bundle_enc_path = output / "bundle.enc"
+meta_path       = output / "backup-meta.json"
+
+def _zero(b: bytearray) -> None:
+    """Best-effort zero a bytearray (Python GC gives no hard guarantee)."""
+    for i in range(len(b)):
+        b[i] = 0
+
+def _hkdf_sha384(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    return HKDF(
+        algorithm=SHA384(),
+        length=length,
+        salt=salt if salt else None,
+        info=info,
+        backend=default_backend(),
+    ).derive(ikm)
+
+# ── Step 1: DEK + MAC_KEY ─────────────────────────────────────────────────────
+dek     = bytearray(os.urandom(32))
+mac_key = bytearray(_hkdf_sha384(
+    bytes(dek), b"", b"yashigani-backup-meta-mac-v1", 48
+))
+
+# ── Step 2: Wrap#1 (admin-password, FIPS_MODE=0 only) ────────────────────────
+# FIPS_MODE=1 → wrap#1 is ABSENT. PBKDF2 cannot reproduce an argon2 verifier
+# (different primitive, different output). No sound password-recovery wrap under FIPS.
+# Nico ruling 2026-05-28. Only wrap#2 under FIPS_MODE=1.
+#
+# When FIPS_MODE=0: IKM1 = V = the raw 32-byte argon2 verifier extracted from the
+# stored PHC. We base64-decode the last "$"-segment of the PHC (argon2 PHC base64
+# is unpadded — add "=" padding before decoding). NO argon2 call at backup.
+# RESTORE recomputes V = argon2id_raw(typed_plaintext, argon2_salt_from_meta, params).
+# They match iff the password is unchanged. (Single argon2 pass total, at restore only.)
+wrap1 = {"present": False}
+if WRAP1_PRESENT and ADMIN_PHC and not FIPS_MODE:
+    kek1_hkdf_salt = os.urandom(32)
+    try:
+        params = extract_parameters(ADMIN_PHC)
+        # PHC format: $argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<hash_b64>
+        # Segments after split("$"): ['', 'argon2id', 'v=19', 'm=...,t=...,p=...', '<salt_b64>', '<hash_b64>']
+        phc_segs = ADMIN_PHC.split("$")
+        if len(phc_segs) < 6:
+            raise ValueError(f"Unexpected PHC format: only {len(phc_segs)} segments")
+        salt_seg = phc_segs[4]
+        salt_b = base64.b64decode(salt_seg + "=" * (-len(salt_seg) % 4))
+        # Extract V by base64-decoding the hash segment (last "$" field).
+        # argon2 PHC uses unpadded base64 — add "=" padding before decoding.
+        seg = phc_segs[5]
+        ikm1 = bytearray(base64.b64decode(seg + "=" * (-len(seg) % 4)))
+        if len(ikm1) != 32:
+            raise ValueError(f"Unexpected argon2 verifier length: {len(ikm1)} (expected 32)")
+        kdf_algo = "argon2id+hkdf-sha384"
+        wrap1_extra = {
+            "argon2_salt_hex": salt_b.hex(),
+            "argon2_time_cost": params.time_cost,
+            "argon2_memory_cost": params.memory_cost,
+            "argon2_parallelism": params.parallelism,
+            "argon2_hash_len": 32,
+            "argon2_version": params.version,
+        }
+        kek1 = bytearray(_hkdf_sha384(
+            bytes(ikm1), kek1_hkdf_salt, b"yashigani-kek1-v1", 32
+        ))
+        _zero(ikm1)
+        aad1 = b"yashigani-backup-v1" + TS.encode() + b"\x01"
+        iv1  = os.urandom(12)
+        ct_and_tag1 = AESGCM(bytes(kek1)).encrypt(iv1, bytes(dek), aad1)
+        _zero(kek1)
+        # GCM returns ciphertext+tag concatenated; tag is last 16 bytes.
+        wdek1_ct  = ct_and_tag1[:-16]
+        wdek1_tag = ct_and_tag1[-16:]
+        wrap1 = {
+            "kdf_algo": kdf_algo,
+            **wrap1_extra,
+            "kek1_hkdf_salt_hex": kek1_hkdf_salt.hex(),
+            "iv_hex": iv1.hex(),
+            "wdek_ct_hex": wdek1_ct.hex(),
+            "wdek_tag_hex": wdek1_tag.hex(),
+            "present": True,
+        }
+    except Exception as e:
+        sys.stderr.write(f"WARNING: wrap#1 V-extraction failed: {e} — wrap#1 skipped\n")
+        wrap1 = {"present": False}
+elif FIPS_MODE:
+    # FIPS_MODE=1: wrap#1 absent by design (Nico ruling 2026-05-28).
+    sys.stderr.write("INFO: FIPS_MODE=1 — wrap#1 absent (no sound argon2-free password wrap). wrap#2 only.\n")
+    wrap1 = {"present": False}
+
+# ── Step 3: Wrap#2 (recovery) ─────────────────────────────────────────────────
+ikm2 = bytearray(bytes.fromhex(IKM2_HEX))
+kek2_hkdf_salt = os.urandom(32)
+kek2 = bytearray(_hkdf_sha384(bytes(ikm2), kek2_hkdf_salt, b"yashigani-kek2-v1", 32))
+_zero(ikm2)
+aad2 = b"yashigani-backup-v1" + TS.encode() + b"\x02"
+iv2  = os.urandom(12)
+ct_and_tag2 = AESGCM(bytes(kek2)).encrypt(iv2, bytes(dek), aad2)
+_zero(kek2)
+wdek2_ct  = ct_and_tag2[:-16]
+wdek2_tag = ct_and_tag2[-16:]
+wrap2 = {
+    "kdf_algo": "hkdf-sha384",
+    "kek2_hkdf_salt_hex": kek2_hkdf_salt.hex(),
+    "iv_hex": iv2.hex(),
+    "wdek_ct_hex": wdek2_ct.hex(),
+    "wdek_tag_hex": wdek2_tag.hex(),
+    "present": True,
+}
+
+# ── Step 4: tar.gz the staging dir ────────────────────────────────────────────
+import io, datetime
+pt_buf = io.BytesIO()
+with tarfile.open(fileobj=pt_buf, mode="w:gz") as tar:
+    tar.add(str(staging), arcname="backup_staging")
+pt_bytes = pt_buf.getvalue()
+
+# ── Step 5: Build candidate meta (hmac_hex = "" placeholder) ──────────────────
+# AAD_B = canonical meta bytes with hmac_hex = "" (spec: hmac covers this)
+iv_b = os.urandom(12)
+
+import time as _time
+created_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+meta_obj = {
+    "version": "yashigani-backup-v1",
+    "ts": TS,
+    "tier": TIER,
+    "license_key_id": LIC_ID if LIC_ID != "null" else None,
+    "fips_mode": FIPS_MODE,
+    "bundle_aead": {
+        "algorithm": "AES-256-GCM",
+        "iv_hex": iv_b.hex(),
+        "tag_included_in_bundle_enc": True,
+    },
+    "wrap1": wrap1,
+    "wrap2": wrap2,
+    "hmac": {
+        "algorithm": "HMAC-SHA384",
+        "mac_key_derivation": "HKDF-SHA384(IKM=DEK,salt=empty,info=yashigani-backup-meta-mac-v1)",
+        "hmac_hex": "",
+    },
+    "created_at": created_at,
+    "yashigani_version": YSG_VERSION,
+}
+
+# Canonical AAD = meta bytes with hmac_hex = "" (sorted keys, compact separators)
+aad_b = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode()
+
+# ── Step 6: Encrypt bundle ────────────────────────────────────────────────────
+ct_bundle = AESGCM(bytes(dek)).encrypt(iv_b, pt_bytes, aad_b)
+# ct_bundle = ciphertext + 16-byte GCM tag (spec: tag_included_in_bundle_enc=true)
+
+# ── Step 7: HMAC-SHA384 over AAD_B ───────────────────────────────────────────
+hmac_hex = _hmac.new(bytes(mac_key), aad_b, digestmod=hashlib.sha384).hexdigest()
+_zero(mac_key)
+_zero(dek)
+
+# ── Step 8: Finalise meta with real hmac_hex ─────────────────────────────────
+meta_obj["hmac"]["hmac_hex"] = hmac_hex
+
+# ── Step 9: Write bundle.enc (atomic tmp→rename) ─────────────────────────────
+try:
+    with open(str(bundle_enc_tmp), "wb") as f:
+        f.write(ct_bundle)
+    os.chmod(str(bundle_enc_tmp), 0o600)
+    os.rename(str(bundle_enc_tmp), str(bundle_enc_path))
+except Exception as e:
+    try:
+        bundle_enc_tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    sys.stderr.write(f"FATAL: Failed to write bundle.enc: {e}\n")
+    sys.exit(1)
+
+# ── Step 10: Write backup-meta.json (0444 — cleartext, never encrypted) ───────
+try:
+    meta_json = json.dumps(meta_obj, indent=2, sort_keys=True)
+    with open(str(meta_path), "w") as f:
+        f.write(meta_json)
+    os.chmod(str(meta_path), 0o444)
+except Exception as e:
+    try:
+        bundle_enc_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        meta_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    sys.stderr.write(f"FATAL: Failed to write backup-meta.json: {e}\n")
+    sys.exit(1)
+
+sys.stdout.write(f"OK: bundle.enc ({len(ct_bundle)} bytes) + backup-meta.json written\n")
+sys.stdout.write(f"OK: wrap1.present={wrap1.get('present', False)} wrap2.present={wrap2.get('present', False)}\n")
+sys.exit(0)
+PYEOF
+  chmod 0700 "$_py_script_path"
+
+  # ── Execute Python crypto in the container ────────────────────────────────
+  # The container needs access to:
+  #   - backup_dir (staging data: secrets/, .env, postgres_dump.sql, agent-volumes/)
+  #   - backup_dir (output: bundle.enc, backup-meta.json)
+  # The container does NOT have the host backup_dir mounted. We use docker cp
+  # to push the script and staging dir in, exec Python, then cp results back.
+  #
+  # Approach: use a single exec with the Python script piped via stdin.
+  # The staging path is made available to the container by copying the backup dir
+  # into a container tmpdir using docker cp, then exec, then cp results back.
+
+  local _container_work="/tmp/.ysg_backup_$$"
+  local _container_staging="${_container_work}/staging"
+  local _container_output="${_container_work}/output"
+
+  # Push staging dir into container
+  if ! $_runtime_cmd_local exec "$_crypto_container" mkdir -p \
+        "$_container_staging" "$_container_output" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to create container working dirs in ${_crypto_container}"
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Stream staging IN via tar-over-exec, then grant access. NOT `docker cp`: it refuses
+  # any container with ReadonlyRootfs=true even when the target is a writable tmpfs
+  # (Docker 29) — gateway/backoffice run read_only with tmpfs /tmp, so docker cp fails
+  # closed there ("Failed to copy staging data"). `exec` writes through the running process
+  # into the tmpfs; the container app user then owns all extracted items.
+  #
+  # BUG-FIX (3.1.0): Two Podman-rootless bugs fixed here:
+  # (1) GNU tar two-phase directory-mode: `tar -xf - -C staging` applies the mode of the
+  #     archive's `.` entry to the staging directory itself, transiently setting it to 000
+  #     (the archive records the backup_dir's actual mode, but tar's two-phase algorithm
+  #     sets directories to 000 initially and restores at stream end; with a piped stream
+  #     in a Podman exec the final restore sometimes fails). Fix: --no-same-owner
+  #     --no-same-permissions so tar uses the container process's umask (022) for all
+  #     items, never touching ownership or permissions from archive headers.
+  # (2) `chmod -R` uses fchmodat(dirfd, path, mode, 0) to recurse, which returns EPERM
+  #     inside a Podman rootless user-namespace + tmpfs context even when the container
+  #     user owns the target. `find -exec chmod {} \;` uses chmod(path) per item (one
+  #     exec per file/dir), applies chmod on the directory BEFORE descending into it, and
+  #     succeeds. Note: this is `\;` not `+` — batch mode (`+`) still uses fchmodat.
+  if ! tar -cf - -C "$backup_dir" . | $_runtime_cmd_local exec -i "$_crypto_container" \
+       tar -xf - --no-same-owner --no-same-permissions -C "$_container_staging" 2>/dev/null \
+     || ! $_runtime_cmd_local exec "$_crypto_container" \
+       sh -c "find '${_container_work}' -exec chmod u+rwX {} \;" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to stream staging data into container ${_crypto_container}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Write the Python script IN via exec stdin (same read_only-rootfs reason as above).
+  if ! $_runtime_cmd_local exec -i "$_crypto_container" sh -c "cat > '${_container_work}/backup_crypto.py'" < "$_py_script_path" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to write crypto script into container ${_crypto_container}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Derive IKM2: encode as hex for safe env var transmission.
+  local _ikm2_hex=""
+  if [[ "$_ikm2_source" == "license" ]]; then
+    # .ysg bytes as hex (xxd or od for BusyBox portability).
+    _ikm2_hex=$(xxd -p -c 9999 "$_license_file" 2>/dev/null | tr -d '\n' \
+      || od -A n -t x1 "$_license_file" 2>/dev/null | tr -d ' \n' || true)
+  else
+    # DB AES key: already a hex/base64 string. Encode its UTF-8 bytes as hex.
+    _ikm2_hex=$(printf '%s' "$_db_aes_key" | xxd -p -c 9999 2>/dev/null | tr -d '\n' \
+      || printf '%s' "$_db_aes_key" | od -A n -t x1 2>/dev/null | tr -d ' \n' || true)
+  fi
+
+  if [[ -z "$_ikm2_hex" ]]; then
+    log_error "YSG-RISK-050: Failed to hex-encode recovery IKM (xxd/od missing?)"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Run Python inside container. Non-secret config is passed via -e env vars.
+  # Secrets (admin_phc, ikm2_hex) are passed to the container via stdin as a JSON
+  # blob to avoid exposure in 'docker inspect' (FINDING-5: env vars to docker exec
+  # are visible in docker inspect to any user with Docker socket access; stdin is not).
+  # NEW-ISSUE-1 (Laura re-gate, CWE-214): the host-side JSON build must NOT place
+  # the secrets in argv either (visible in ps / /proc/<pid>/cmdline to same-uid).
+  # Feed both secrets to the host python3 via stdin, NUL-separated (neither a PHC
+  # string nor a hex IKM contains a NUL byte). Not in argv, not in env.
+  local _secrets_json
+  _secrets_json=$(printf '%s\0%s' "${_admin_phc}" "${_ikm2_hex}" | python3 -c \
+    "import json,sys; d=sys.stdin.buffer.read().split(b'\0'); print(json.dumps({'admin_phc': d[0].decode(), 'ikm2_hex': (d[1].decode() if len(d) > 1 else '')}))" \
+    2>/dev/null)
+  if [[ -z "$_secrets_json" ]]; then
+    log_error "YSG-RISK-050: Failed to build secrets JSON for container stdin"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  local _py_output
+  if ! _py_output=$(printf '%s' "$_secrets_json" | $_runtime_cmd_local exec -i \
+        -e "_YSG_BACKUP_STAGING_DIR=${_container_staging}" \
+        -e "_YSG_BACKUP_OUTPUT_DIR=${_container_output}" \
+        -e "_YSG_WRAP1_PRESENT=${_wrap1_present}" \
+        -e "_YSG_TIER=${_ysg_tier}" \
+        -e "_YSG_LIC_ID=${_license_key_id}" \
+        -e "_YSG_FIPS_MODE=${FIPS_MODE:-0}" \
+        -e "_YSG_VERSION=${YASHIGANI_VERSION:-unknown}" \
+        -e "_YSG_TS=${backup_ts}" \
+        "$_crypto_container" \
+        python3 "${_container_work}/backup_crypto.py" 2>&1); then
+    log_error "YSG-RISK-050: Dual-wrap crypto script failed in container ${_crypto_container}"
+    log_error "  Output: ${_py_output}"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -f "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  log_info "  Crypto output: ${_py_output}"
+
+  # Pull the results back from the container.
+  local _tmp_results_dir
+  _tmp_results_dir=$(mktemp -d "${backup_dir}/.ysg_results_XXXXXX")
+  # Stream results OUT via tar-over-exec — `docker cp` refuses read_only-rootfs containers
+  # in BOTH directions (Docker 29), so cp-out fails too even though the crypto wrote
+  # bundle.enc successfully inside the container. exec reads the tmpfs; untar on the host.
+  if ! $_runtime_cmd_local exec "$_crypto_container" tar -cf - -C "$_container_output" . | tar -xf - -C "$_tmp_results_dir" 2>/dev/null; then
+    log_error "YSG-RISK-050: Failed to stream encrypted bundle from container"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -rf "$_tmp_results_dir" "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Verify bundle.enc and backup-meta.json are present.
+  if [[ ! -f "${_tmp_results_dir}/bundle.enc" || ! -f "${_tmp_results_dir}/backup-meta.json" ]]; then
+    log_error "YSG-RISK-050: bundle.enc or backup-meta.json missing from container output"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -rf "$_tmp_results_dir" "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Integrity: tar-streaming (unlike per-file docker cp) is not atomic — a truncated but
+  # parseable archive could otherwise pass the existence check and be installed as the
+  # canonical backup. Verify the streamed bundle.enc matches the in-container original by
+  # sha256 (computed via the container's python3, which the crypto step already requires).
+  local _in_sha _host_sha
+  _in_sha="$($_runtime_cmd_local exec "$_crypto_container" python3 -c "import hashlib;print(hashlib.sha256(open('${_container_output}/bundle.enc','rb').read()).hexdigest())" 2>/dev/null || true)"
+  _host_sha="$(sha256sum "${_tmp_results_dir}/bundle.enc" 2>/dev/null | cut -d' ' -f1)"
+  if [[ -z "$_in_sha" || "$_in_sha" != "$_host_sha" ]]; then
+    log_error "YSG-RISK-050: bundle.enc integrity check failed (in-container sha256 != host) — possible truncated stream; refusing to install an incomplete backup"
+    $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+    rm -rf "$_tmp_results_dir" "$_py_script_path"
+    rm -rf "$backup_dir"
+    exit 1
+  fi
+
+  # Move results into backup_dir.
+  install -m 0600 "${_tmp_results_dir}/bundle.enc" "${backup_dir}/bundle.enc"
+  install -m 0444 "${_tmp_results_dir}/backup-meta.json" "${backup_dir}/backup-meta.json"
+  rm -rf "$_tmp_results_dir"
+
+  # Clean up container working dir.
+  $_runtime_cmd_local exec "$_crypto_container" rm -rf "$_container_work" 2>/dev/null || true
+
+  # Remove the Python script from host (no secrets in it but cleanup is good hygiene).
+  rm -f "$_py_script_path"
+
+  # ── Remove plaintext staging data from backup_dir ─────────────────────────
+  # All sensitive content is now in bundle.enc. Remove plaintext files and any
+  # old MANIFEST.sha256 / MANIFEST.sha256.sig (v1 leftovers — spec guardrail 4).
+  rm -rf "${backup_dir}/secrets" 2>/dev/null || true
+  rm -f  "${backup_dir}/.env" 2>/dev/null || true
+  rm -f  "${backup_dir}/postgres_dump.sql" 2>/dev/null || true
+  rm -f  "${backup_dir}/MANIFEST.sha256" 2>/dev/null || true
+  rm -f  "${backup_dir}/MANIFEST.sha256.sig" 2>/dev/null || true
+  # agent-volumes/ tarballs are already inside bundle.enc; remove the plaintext dir.
+  rm -rf "${backup_dir}/agent-volumes" 2>/dev/null || true
+
+  # Final permission check: backup_dir should contain ONLY bundle.enc + backup-meta.json.
+  # bundle.enc = 0600 (owner-read-only); backup-meta.json = 0444 (cleartext, public).
+  if [[ ! -f "${backup_dir}/bundle.enc" ]]; then
+    log_error "YSG-RISK-050: bundle.enc not found in ${backup_dir} after cleanup"
+    exit 1
+  fi
+  if [[ ! -f "${backup_dir}/backup-meta.json" ]]; then
+    log_error "YSG-RISK-050: backup-meta.json not found in ${backup_dir} after cleanup"
+    exit 1
+  fi
+
+  # S1 assertion: no plaintext secret files should remain (all went into bundle.enc).
+  if find "${backup_dir}" -type f \( -name '*.key' -o -name '*.env' -o -name 'postgres_dump.sql' \) \
+        2>/dev/null | grep -q .; then
+    log_error "CWE-311 (YSG-RISK-050): plaintext secret file(s) remain in ${backup_dir} after encryption"
+    exit 1
+  fi
+
+  log_success "Backup encrypted (YSG-RISK-050): bundle.enc + backup-meta.json saved to ${backup_dir}"
+  log_info    "  wrap1.present=${_wrap1_present} | wrap2.present=true | tier=${_ysg_tier}"
+  log_info    "  Recovery: wrap#1=admin-password | wrap#2=${_ikm2_source}"
+  if [[ "$_ysg_tier" == "community" ]]; then
+    log_warn  "  Community tier: wrap#2 uses YASHIGANI_DB_AES_KEY. Safeguard/offsite your .env — lose it → backup unrecoverable (YSG-RISK-052)."
+  fi
 }
 
 # Idempotency check — detect and handle an existing running installation
 # =============================================================================
 check_existing_installation() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # MI-1 (in-repo collision guard): a fresh install whose resolved PROJECT differs
+  # from the PROJECT already recorded in THIS tree's state file would clobber the
+  # existing instance's secrets + state in place. _resolve_instance_install_dir()
+  # relocates bootstrap (curl) installs to a per-project tree, but an in-repo
+  # checkout (WORK_DIR = the repo, fixed) cannot be relocated. Fail closed and tell
+  # the operator to use a separate install dir, rather than silently overwriting a
+  # sibling instance's crypto material. Only fires on a genuine mismatch for a fresh
+  # install — upgrade/add-component targets the SAME project by design.
+  local _state_file="${WORK_DIR}/docker/.yashigani-install-state"
+  if [[ "${UPGRADE:-false}" != "true" && -f "$_state_file" ]]; then
+    local _existing_proj _wanted_proj
+    _existing_proj="$(_read_state_project "$_state_file")"
+    _wanted_proj="${COMPOSE_PROJECT_NAME:-${PROJECT:-docker}}"
+    if [[ -n "$_existing_proj" && "$_existing_proj" != "$_wanted_proj" ]]; then
+      log_error "Multi-instance safety stop (MI-1): this install tree already hosts instance '${_existing_proj}'."
+      log_error "  Installing project '${_wanted_proj}' here would overwrite '${_existing_proj}' secrets + state in place."
+      log_error "  Install the new instance into its OWN directory, e.g.:"
+      log_error "    YSG_INSTALL_DIR=\"\$HOME/.yashigani-${_wanted_proj}\" ./install.sh --project ${_wanted_proj} ..."
+      log_error "  Or target the existing instance with --upgrade --project ${_existing_proj}."
+      exit 1
+    fi
+  fi
 
   if [[ ! -d "$secrets_dir" ]]; then
     return 0
@@ -2471,8 +4635,14 @@ check_existing_installation() {
       # macOS does not ship `timeout` (GNU coreutils). Use label filter via
       # docker/podman ps (fastest, no compose parsing, socket is local) and fall
       # back to compose ps without timeout.
+      # Multi-instance (3.0): scope to THIS install's project (not hardcoded
+      # "docker") and use the runtime's own compose-project label key (podman and
+      # docker differ), so a 2nd named instance is detected correctly.
       local _runtime_bin="${COMPOSE_CMD[0]%%[[:space:]]*}"
-      if "$_runtime_bin" ps --filter 'label=com.docker.compose.project=docker' \
+      local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+      local _label_key="com.docker.compose.project"
+      [[ "$_runtime_bin" == podman* ]] && _label_key="io.podman.compose.project"
+      if "$_runtime_bin" ps --filter "label=${_label_key}=${_proj}" \
            --format '{{.Names}}' 2>/dev/null | grep -q .; then
         running=true
       elif "${COMPOSE_CMD[@]}" -f "$compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
@@ -2499,6 +4669,10 @@ check_existing_installation() {
     # The live project volumes belong to the running install (same PKI CA) — not contamination.
     if [[ "$INSTALL_OPENWEBUI" == "true" || -n "$AGENT_BUNDLES" ]]; then
       log_info "Additive re-run detected (--with-openwebui / --agent-bundles on running stack)"
+      # MI-4: add-component on a RUNNING stack mutates a live instance — gate it
+      # with the shared step-up (auth/stepup.py via the API path; token/ack on the
+      # host-shell path). Fail-closed if unattended without a step-up proof.
+      _require_stepup_mi4 "add-component on running instance" "add-component"
       log_info "Existing PKI CA and volumes preserved — skipping contamination check (BUG-B+-002)"
       REUSE_VOLUMES=true
     fi
@@ -2619,7 +4793,10 @@ _check_contaminated_volumes() {
   # (Docker + Podman both installed), auto-detect can pick the wrong store.
   # RUNTIME is set in the call site from COMPOSE_CMD[0] / YSG_RUNTIME.
   local _runtime="${RUNTIME:-${YSG_RUNTIME:-docker}}"
-  local _project_prefix="docker"
+  # Project-aware: the contaminated-volume check must scope to THIS install's compose
+  # project, not a hardcoded "docker" — otherwise a parallel/renamed-project install
+  # false-positives on an unrelated project's volumes (e.g. a live stack alongside).
+  local _project_prefix="${COMPOSE_PROJECT_NAME:-docker}"
   local _found_volumes=()
 
   for _vol in "${_INSTALL_CANONICAL_VOLUMES[@]}"; do
@@ -3007,6 +5184,7 @@ select_agent_bundles() {
   printf "\n"
   printf "${C_YELLOW}╔═══════════════════════════════════════════════════════════╗${C_RESET}\n"
   printf "${C_YELLOW}║  THIRD-PARTY AGENT BUNDLES — COURTESY INTEGRATIONS        ║${C_RESET}\n"
+  printf "${C_YELLOW}║  Integrations: OpenWebUI, Wazuh, Langflow, Letta, OpenClaw║${C_RESET}\n"
   printf "${C_YELLOW}╠═══════════════════════════════════════════════════════════╣${C_RESET}\n"
   printf "${C_YELLOW}║  The following agents are provided AS IS by               ║${C_RESET}\n"
   printf "${C_YELLOW}║  Agnostic Security as a convenience.                      ║${C_RESET}\n"
@@ -3021,16 +5199,24 @@ select_agent_bundles() {
   printf "${C_YELLOW}╚═══════════════════════════════════════════════════════════╝${C_RESET}\n"
   printf "\n"
 
-  # Non-interactive: honour --agent-bundles flag (comma-separated list or empty)
+  # Non-interactive: honour --agent-bundles / --no-agents flag.
+  # DEFAULT (no flag): include langflow + letta — they are first-class Yashigani UX.
+  # CONSTRAINT (Laura): a non-interactive installer must NOT silently include containers.
+  # This block always emits an explicit log line naming what will be started and how to
+  # opt out, satisfying the mandatory-visibility requirement.
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
     if [[ -n "$AGENT_BUNDLES" ]]; then
       IFS=',' read -ra _bundles <<< "$AGENT_BUNDLES"
       for _b in "${_bundles[@]}"; do
         _b="${_b// /}"   # trim spaces
         case "$_b" in
+          none)
+            # Explicit opt-out via --no-agents or --agent-bundles none.
+            log_info "Agent bundles: EXCLUDED (--no-agents / --agent-bundles none). Langflow and Letta will not be installed."
+            ;;
           all)
             COMPOSE_PROFILES+=("langflow" "letta" "openclaw")
-            log_info "Agent bundle enabled (--agent-bundles): langflow, letta, openclaw"
+            log_info "Agent bundles: langflow, letta, openclaw (--agent-bundles all)"
             ;;
           langflow|letta|openclaw)
             COMPOSE_PROFILES+=("$_b")
@@ -3042,23 +5228,29 @@ select_agent_bundles() {
         esac
       done
     else
-      log_info "No agent bundles selected (--non-interactive, --agent-bundles not set)"
+      # DEFAULT: no --agent-bundles flag → include langflow + letta.
+      # Lean / minimal installs that do not want these containers MUST pass --no-agents
+      # (or --agent-bundles none) to exclude them.  This log line is mandatory so that
+      # non-interactive pipelines always have explicit evidence of which containers start.
+      COMPOSE_PROFILES+=("langflow" "letta")
+      log_info "Agent bundles: langflow, letta INCLUDED BY DEFAULT (first-class Yashigani UX)."
+      log_info "  To exclude on lean / minimal installs: re-run with --no-agents or --agent-bundles none."
     fi
     return 0
   fi
 
   printf "${C_BOLD}Available agent bundles:${C_RESET}\n\n"
-  printf "    1) Langflow    — Visual multi-agent workflow builder (MIT)\n"
-  printf "    2) Letta       — Stateful agent with persistent memory (Apache 2.0)\n"
+  printf "    1) Langflow    — Visual multi-agent workflow builder (MIT)  ${C_GREEN}[default]${C_RESET}\n"
+  printf "    2) Letta       — Stateful agent with persistent memory (Apache 2.0)  ${C_GREEN}[default]${C_RESET}\n"
   printf "    3) OpenClaw    — Node.js 24 personal AI, 30+ channels (${C_YELLOW}~800 MB${C_RESET}, MIT)\n"
   printf "    4) All of the above\n"
   printf "    0) None — skip agent bundles\n"
   printf "\n"
-  printf "${C_BOLD}  Enter your choices (comma-separated, e.g. 1,2 or 4 for all) [0]: ${C_RESET}"
+  printf "${C_BOLD}  Enter your choices (comma-separated, e.g. 1,2 or 4 for all) [1,2]: ${C_RESET}"
 
   local choices
-  read -r choices </dev/tty 2>/dev/null || choices="0"
-  choices="${choices:-0}"
+  read -r choices </dev/tty 2>/dev/null || choices="1,2"
+  choices="${choices:-1,2}"
 
   # Normalize: remove spaces
   choices="$(echo "$choices" | tr -d ' ')"
@@ -3109,6 +5301,155 @@ select_agent_bundles() {
     COMPOSE_PROFILES=("${unique_profiles[@]}")
     log_success "Agent bundles selected: ${COMPOSE_PROFILES[*]}"
   fi
+}
+
+# =============================================================================
+# 3.0 doc-OPA: build the per-job sandboxed extractor image (release artifact).
+#
+# yashigani/extractor:${YASHIGANI_VERSION} is the image the document-enforcement
+# feature spawns per job (src/yashigani/documents/sandbox.py
+# SandboxedExtractorRunner). It is a BUILD-ONLY service in the
+# docker-compose.extractor.yml overlay (never `up`), so it must be built + tagged
+# explicitly here to be present when the feature flag is flipped on. Idempotent:
+# skips the build if the versioned image is already present (airgap / re-run).
+# Failure is FATAL on the Docker path only when document enforcement is enabled;
+# otherwise it is a warning (the feature is OFF by default, so a missing image
+# does not break a default install — it is only needed if the operator opts in).
+# =============================================================================
+_build_extractor_image() {
+  resolve_compose_cmd
+  local _base="${WORK_DIR}/docker/docker-compose.yml"
+  local _overlay="${WORK_DIR}/docker/docker-compose.extractor.yml"
+  local _tag="yashigani/extractor:${YASHIGANI_VERSION}"
+
+  if [[ ! -f "$_overlay" ]]; then
+    log_warn "extractor overlay not found ($_overlay) — skipping extractor build"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "${COMPOSE_CMD[*]} -f $_base -f $_overlay build extractor"
+    return 0
+  fi
+
+  # Skip if already built (versioned tag), to support airgap / re-runs.
+  # Also verify the revision label matches the current source SHA so a stale
+  # cached extractor image does not shadow the current source (same fix class
+  # as _local_images_cached — version-drift stale-image bug).
+  if docker image inspect "$_tag" >/dev/null 2>&1 && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    local _cached_sha
+    _cached_sha="$(docker image inspect "$_tag" \
+      --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+    if [[ "$YASHIGANI_GIT_SHA" == "dev" || "$_cached_sha" == "$YASHIGANI_GIT_SHA" ]]; then
+      log_info "Extractor image already present ($_tag, SHA ${_cached_sha:-dev}) — skipping build"
+      return 0
+    fi
+    log_info "Extractor image SHA (${_cached_sha:-none}) != source SHA ${YASHIGANI_GIT_SHA} — rebuilding"
+  fi
+
+  log_info "Building per-job extractor image ($_tag) as a release artifact..."
+  # build-only profile is required to materialise the `extractor` service.
+  if "${COMPOSE_CMD[@]}" -f "$_base" -f "$_overlay" --profile build-only build extractor; then
+    log_success "Extractor image built ($_tag)"
+  else
+    if [[ "${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}" == "true" ]]; then
+      log_error "Extractor image build FAILED and document enforcement is ENABLED — cannot continue"
+      exit 1
+    fi
+    log_warn "Extractor image build failed; document enforcement is OFF by default so continuing"
+    log_warn "Enable the feature only after a successful extractor build (Dockerfile.extractor)"
+  fi
+}
+
+# v4.1 unified-sidecar (Phase-3 deploy fix): build the ringfence-init and
+# svid-sidecar images as RELEASE ARTIFACTS, next to the gateway/backoffice
+# source build. Referenced tags:
+#   ghcr.io/agnosticsec/ringfence-init:0.1.0  — intra-zone-deny enforcer;
+#     referenced by the codegen forwarder overrides (e.g. the committed
+#     docker/openclaw-egress-forwarder.override.yml) and by every generated
+#     agent override's ringfence-init-<agent> stanza.
+#   ghcr.io/agnosticsec/svid-sidecar:0.1.0    — per-instance SVID writer
+#     (docker/Dockerfile.svid-sidecar). Also alias-tagged with
+#     ${YASHIGANI_VERSION} because the codegen per-MCP sidecar stanza
+#     references ${YASHIGANI_SVID_SIDECAR_IMAGE:-...}:${YASHIGANI_VERSION}
+#     (src/yashigani/manifest/codegen.py — _gen sidecar stanza).
+# NEITHER tag is published on ghcr.io — a clean install with the forwarder /
+# ringfence features active fails at image-pull/up time unless the images
+# exist in the local store. Dockerfiles are in-tree:
+#   docker/ringfence-init/Dockerfile  (self-contained context docker/ringfence-init/)
+#   docker/Dockerfile.svid-sidecar    (context docker/)
+# Idempotent: skips when the exact tag already exists (airgap / re-runs /
+# pre-seeded stores); YASHIGANI_FORCE_REBUILD=1 forces a rebuild. Runs under
+# both runtimes (docker + podman) — plain `build`, no compose service needed
+# (these images are referenced by overlays/generated files, not the base file).
+_build_ringfence_images() {
+  local _rf_img="${YASHIGANI_RINGFENCE_INIT_IMAGE:-ghcr.io/agnosticsec/ringfence-init}:${YASHIGANI_RINGFENCE_INIT_VERSION:-0.1.0}"
+  local _svid_img="${YASHIGANI_SVID_SIDECAR_IMAGE:-ghcr.io/agnosticsec/svid-sidecar}:${YASHIGANI_SVID_SIDECAR_VERSION:-0.1.0}"
+  local _svid_alias="${YASHIGANI_SVID_SIDECAR_IMAGE:-ghcr.io/agnosticsec/svid-sidecar}:${YASHIGANI_VERSION}"
+  local _ctr_cmd="docker"
+  [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _ctr_cmd="podman"
+
+  # Active only when the unified-sidecar forwarder/ringfence features are in
+  # play for THIS install: the openclaw bundle (whose enablement layers the
+  # committed egress-forwarder override at compose up). Probe BOTH
+  # COMPOSE_PROFILES and AGENT_BUNDLES — same defensive pattern as the
+  # overlay gate in compose_up (non-interactive --agent-bundles is only
+  # pushed into COMPOSE_PROFILES at step 8).
+  local _rf_active="false"
+  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
+    _rf_active="true"
+  else
+    local _rf_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+    if [[ "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
+      _rf_active="true"
+    fi
+  fi
+  if [[ "$_rf_active" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "$_ctr_cmd build -t $_rf_img ${WORK_DIR}/docker/ringfence-init/"
+    dry_print "$_ctr_cmd build -f ${WORK_DIR}/docker/Dockerfile.svid-sidecar -t $_svid_img ${WORK_DIR}/docker"
+    dry_print "$_ctr_cmd tag $_svid_img $_svid_alias"
+    return 0
+  fi
+
+  # ringfence-init — required by the forwarder overlay's intra-zone-deny
+  # stanza. Fail-closed: the overlay WILL be applied at compose up (same
+  # gate), so a missing image is a guaranteed deploy failure later.
+  if "$_ctr_cmd" image inspect "$_rf_img" >/dev/null 2>&1 \
+      && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    log_info "ringfence-init image already present ($_rf_img) — skipping build"
+  else
+    log_info "Building ringfence-init image ($_rf_img)..."
+    "$_ctr_cmd" build \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+        -t "$_rf_img" "${WORK_DIR}/docker/ringfence-init/" || {
+      log_error "ringfence-init image build FAILED — the egress-forwarder overlay"
+      log_error "references $_rf_img and compose up cannot pull it (unpublished). ABORTING."
+      exit 1
+    }
+    log_success "ringfence-init image built ($_rf_img)"
+  fi
+
+  # svid-sidecar — per-instance SVID writer for onboarded systems.
+  if "$_ctr_cmd" image inspect "$_svid_img" >/dev/null 2>&1 \
+      && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+    log_info "svid-sidecar image already present ($_svid_img) — skipping build"
+  else
+    log_info "Building svid-sidecar image ($_svid_img)..."
+    "$_ctr_cmd" build -f "${WORK_DIR}/docker/Dockerfile.svid-sidecar" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+        -t "$_svid_img" "${WORK_DIR}/docker" || {
+      log_error "svid-sidecar image build FAILED — onboarded-agent SVID stanzas"
+      log_error "reference this unpublished image. ABORTING."
+      exit 1
+    }
+    log_success "svid-sidecar image built ($_svid_img)"
+  fi
+  # Alias tag for the codegen per-MCP stanza reference (:${YASHIGANI_VERSION}).
+  "$_ctr_cmd" tag "$_svid_img" "$_svid_alias" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -3249,22 +5590,56 @@ except Exception:
   # store. This supports airgap installs and CI harnesses where images are
   # pre-seeded, and avoids unnecessary registry round-trips for the base image.
   # Check by versioned tag (not :latest) to avoid using stale images.
+  # _local_images_cached returns 0 (true) only when BOTH version-tagged images
+  # exist in the local store AND their org.opencontainers.image.revision label
+  # matches the current YASHIGANI_GIT_SHA.  A tag-only match is not sufficient:
+  # a cached yashigani/backoffice:3.0.0 built from an earlier commit satisfies
+  # the tag check while shipping stale code.  The revision label is stamped by
+  # --build-arg GIT_SHA=<sha> consumed late in each Dockerfile so the app-code
+  # layer re-executes on every source commit while base/dep layers remain cached.
+  # Skips the label check and always rebuilds when YASHIGANI_FORCE_REBUILD=1
+  # (operator escape hatch for airgap / pre-seeded stores that use GIT_SHA=dev).
   _local_images_cached() {
-    local _gw _bo
+    local _gw _bo _sha_label_gw _sha_label_bo
+    if [[ "${YASHIGANI_FORCE_REBUILD:-0}" == "1" ]]; then
+      return 1  # force rebuild requested
+    fi
     if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
       _gw="localhost/yashigani/gateway:${YASHIGANI_VERSION}"
       _bo="localhost/yashigani/backoffice:${YASHIGANI_VERSION}"
-      podman image inspect "$_gw" >/dev/null 2>&1 && \
-        podman image inspect "$_bo" >/dev/null 2>&1
+      # Existence check first (fast path — avoids inspect parse on miss)
+      podman image inspect "$_gw" >/dev/null 2>&1 || \
+        podman image inspect "yashigani/gateway:${YASHIGANI_VERSION}" >/dev/null 2>&1 || return 1
+      podman image inspect "$_bo" >/dev/null 2>&1 || \
+        podman image inspect "yashigani/backoffice:${YASHIGANI_VERSION}" >/dev/null 2>&1 || return 1
+      # Revision label check — detect stale-tag cache hits
+      _sha_label_gw="$(podman image inspect "$_gw" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+      _sha_label_bo="$(podman image inspect "$_bo" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
     else
       _gw="yashigani/gateway:${YASHIGANI_VERSION}"
       _bo="yashigani/backoffice:${YASHIGANI_VERSION}"
-      docker image inspect "$_gw" >/dev/null 2>&1 && \
-        docker image inspect "$_bo" >/dev/null 2>&1
+      docker image inspect "$_gw" >/dev/null 2>&1 || return 1
+      docker image inspect "$_bo" >/dev/null 2>&1 || return 1
+      _sha_label_gw="$(docker image inspect "$_gw" \
+        --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
+      _sha_label_bo="$(docker image inspect "$_bo" \
+        --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)"
     fi
+    # If GIT_SHA is "dev" (non-git install), trust the tag and skip label check.
+    if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+      return 0
+    fi
+    # Labels must match; mismatch means the cached image is from an older commit.
+    if [[ "$_sha_label_gw" != "$YASHIGANI_GIT_SHA" || "$_sha_label_bo" != "$YASHIGANI_GIT_SHA" ]]; then
+      log_info "Cached image SHA (gw=${_sha_label_gw:-none} bo=${_sha_label_bo:-none}) != source SHA ${YASHIGANI_GIT_SHA} — will rebuild"
+      return 1
+    fi
+    return 0
   }
   if _local_images_cached; then
-    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}) — skipping build"
+    log_info "Gateway and backoffice images already present (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping build"
     log_success "Local images ready (cached)"
     # Signal compose_up() to use --pull never so digest-pinned compose image refs
     # don't trigger registry round-trips for pre-seeded images. Only safe when
@@ -3272,13 +5647,31 @@ except Exception:
     # bundle); fresh installs build+pull with digest verification as usual.
     YASHIGANI_COMPOSE_PULL_POLICY="never"
   else
-    log_info "Building gateway and backoffice images from source..."
+    log_info "Building gateway and backoffice images from source (SHA ${YASHIGANI_GIT_SHA})..."
     "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
       log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
       exit 1
     }
     log_success "Local images built"
   fi
+
+  # --- 3.0 doc-OPA: build the per-job extractor image as a RELEASE ARTIFACT ---
+  # The document-enforcement feature spawns ephemeral yashigani/extractor:<ver>
+  # containers on demand (SandboxedExtractorRunner). The image is build-only
+  # (never `up`), so the standard `build gateway backoffice` does not produce
+  # it. Build + tag it here as part of the release image set so the image
+  # EXISTS when the operator flips YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true
+  # — without this an enabled feature fails at first spawn (image not found).
+  # Built on the Docker path here; Podman builds it in the Podman build block.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    _build_extractor_image
+  fi
+
+  # v4.1 unified-sidecar: build ringfence-init + svid-sidecar (unpublished
+  # ghcr.io tags — must exist locally before the forwarder overlay is applied
+  # at compose up). No-op unless the forwarder/ringfence features are active.
+  # Runs on BOTH runtimes (the helper picks docker vs podman itself).
+  _build_ringfence_images
 
   # letta-pgbouncer uses edoburu/pgbouncer:v1.25.1-p0 (same multi-arch image as the
   # existing pgbouncer service — arm64 + amd64, pinned sha256). No local build required.
@@ -3820,35 +6213,55 @@ _fix_config_perms() {
   #          unconditionally on every install/reinstall. Non-secret, non-executable.
   #          (A3 / Iris §2 / iris-letta-openapi-write-design-review.md 2026-05-21
   #           / laura-letta-openapi-0666-threat-model.md 2026-05-21)
+  # LIVE-BACKUP-PERMS-001 (VM smoke 2026-05-28, CWE-732): backups/ MUST be
+  # pruned. _backup_existing_data() copies docker/secrets, docker/.env, the
+  # postgres dump, and (B5/FIX-2) agent-volume tarballs into backups/<ts>/ and
+  # locks them to 0600/0700. Without this prune the o+rX sweep below re-exposes
+  # every one of those backup copies to world-read — the live docker/secrets is
+  # pruned but its BACKUP COPY was not, so the S1 assertion passed while backup
+  # copies of admin_initial_password, redis_password, agent tokens, the .env,
+  # and the DB dump were all 0604/0644. Prune the whole backups/ tree.
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
+    -not \( -path "${work_dir}/docker/secrets-caddy" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
+    -not \( -path "${work_dir}/backups" -prune \) \
+    -not \( -path "${work_dir}/docker/openclaw/openclaw.runtime.json" -prune \) \
     -exec chmod o+rX {} + 2>/dev/null \
     || log_warn "chmod o+rX sweep had partial failures (non-fatal — secrets/ not touched)"
 
-  log_info "  Config sweep applied (work_dir minus secrets/.git/.ysg_work/docker/.env)"
+  log_info "  Config sweep applied (work_dir minus secrets/.git/.ysg_work/docker/.env/backups)"
 
   # Invariant: secrets dir must NOT have been touched — assert no world-readable
   # non-certificate files under docker/secrets/ (CWE-732 / v2.23.1 S1).
   # Note: *.crt files are intentionally 0644 (public material — CA and client certs
   # must be readable by all container UIDs for mTLS peer verification). Only private
   # keys and password/token files are checked here.
-  local _secrets_dir="${work_dir}/docker/secrets"
-  if [[ -d "$_secrets_dir" ]]; then
-    # A1 (Iris BLOCKING / iris-install-umask-design-review.md):
-    # Check only WORLD-readable (-perm -004), NOT group-readable (-perm -040).
-    # caddy_internal_hmac is intentionally 0640 (group-readable for caddy<->backoffice
-    # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
-    # Group-readable is a legitimate design choice for specific files in docker/secrets/;
-    # world-readable (o+r) on ANY secret file there is always wrong.
-    if find "${_secrets_dir}" -type f ! -name "*.crt" -perm -004 2>/dev/null | grep -q .; then
-      log_error "CWE-732: world-readable non-cert file(s) found under ${_secrets_dir} after _fix_config_perms" >&2
-      log_error "This is a security regression — check for chmod errors above." >&2
-      exit 1
+  # YSG-RISK-053: sweep BOTH secret dirs — the flat docker/secrets/ and the
+  # Caddy-scoped docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  local _sweep_dir
+  for _sweep_dir in "${work_dir}/docker/secrets" "${work_dir}/docker/secrets-caddy"; do
+    if [[ -d "$_sweep_dir" ]]; then
+      # A1 (Iris BLOCKING / iris-install-umask-design-review.md):
+      # Check only WORLD-readable (-perm -004), NOT group-readable (-perm -040).
+      # caddy_internal_hmac is intentionally 0640 (group-readable for caddy<->backoffice
+      # HMAC handoff); checking -perm -040 caused a false-positive abort on every install.
+      # Group-readable is a legitimate design choice for specific files in docker/secrets/;
+      # world-readable (o+r) on ANY secret file there is always wrong.
+      # Self-heal THEN assert: tighten any world-readable non-cert secret (e.g. a password
+      # file left 0644 by an earlier step or a prior install) by removing world access, then
+      # fail only if any remain. Tightening rather than aborting keeps upgrades moving without
+      # weakening posture — group bits (e.g. caddy_internal_hmac 0640) are preserved (o-rwx only).
+      find "${_sweep_dir}" -type f ! -name "*.crt" -perm -004 -exec chmod o-rwx {} + 2>/dev/null || true
+      if find "${_sweep_dir}" -type f ! -name "*.crt" -perm -004 2>/dev/null | grep -q .; then
+        log_error "CWE-732: world-readable non-cert file(s) STILL present under ${_sweep_dir} after self-heal" >&2
+        log_error "Could not tighten (ownership/filesystem issue) — investigate." >&2
+        exit 1
+      fi
     fi
-  fi
+  done
 
   log_success "Bind-mounted config permissions verified"
 }
@@ -3856,6 +6269,739 @@ _fix_config_perms() {
 # =============================================================================
 # STEP 10 (compose/vm): docker compose up -d
 # =============================================================================
+# ---------------------------------------------------------------------------
+# v2.25.1: provision Wazuh full internal-CA mTLS material (deploy-local, git-ignored).
+# Generates — idempotently, with NO manual steps — everything docker-compose.wazuh.yml
+# mounts so the indexer HTTP listener runs on the internal CA (SAN wazuh-indexer),
+# filebeat does `full` verification, and admin/kibanaserver authenticate with the REAL
+# generated passwords (the image's demo admin/admin is removed). Output lands under
+# docker/wazuh-mtls/ (git-ignored — contains the admin key + real-password configs).
+# Transport stays on the image demo certs (single node) — only the HTTP layer is re-PKI'd.
+# ---------------------------------------------------------------------------
+_provision_wazuh_mtls() {
+  local secrets="${WORK_DIR}/docker/secrets"
+  local wp="${WORK_DIR}/docker/wazuh-mtls"
+  local idx_img="docker.io/wazuh/wazuh-indexer:4.14.5"
+  local rt="${RUNTIME:-${YSG_RUNTIME:-docker}}"
+
+  # Idempotency: a dedicated marker written LAST (not an intermediate artifact) so a
+  # mid-function abort never leaves a half-provisioned dir that a re-run would skip.
+  if [[ -f "${wp}/.provisioned" ]]; then
+    log_info "Wazuh mTLS material already provisioned — skipping"
+    return 0
+  fi
+  require_cmd openssl
+  umask 077   # private keys are born owner-only; relaxed selectively in step 7
+  log_info "Provisioning Wazuh full-mTLS material (internal-CA admin cert + real-password internal_users)..."
+  # Clear any prior wazuh-mtls dir. A previous successful run chowns it to the container UID
+  # (step 7), so a non-root install user may be unable to remove/recurse it — fall back to a
+  # root container so re-runs (re-install / upgrade) are idempotent rather than aborting with
+  # a misleading downstream error (e.g. a failed cp surfacing as "lacks SAN").
+  if [[ -e "${wp}" ]]; then
+    rm -rf "${wp}" 2>/dev/null \
+      || "$rt" run --rm -u 0 -v "${WORK_DIR}/docker":/d "$idx_img" rm -rf /d/wazuh-mtls 2>/dev/null \
+      || true
+  fi
+  mkdir -p "${wp}/certs" "${wp}/opensearch-security"
+
+  # -------------------------------------------------------------------------
+  # Rootless-Podman wazuh-mtls fix (gate #ROOTLESS-WAZUH-1):
+  #
+  # On rootless Podman the PKI issuer (which ran at step 9b) chowns secrets/
+  # to the subuid-mapped host UID (e.g. 165536 for container root). The host
+  # user (e.g. UID 1001) cannot open any secrets/ files → EPERM on:
+  #   - cat ca_intermediate.crt ca_root.crt  (step 1 CA bundle)
+  #   - openssl x509 -CAkey ca_intermediate.key  (step 2 admin cert signing)
+  #   - cp wazuh-indexer_client.{crt,key}  (step 3 indexer cert copy)
+  #   - password reads for steps 5, 6
+  #
+  # Fix strategy: steps 1-3 are grouped into a single `podman unshare bash -c`
+  # block that runs as namespace-root (host 165536) and can read secrets/.
+  # All output lands in ${wp}/certs/ which is host-owned, so no final chown
+  # is needed on the output files (wp/ is owned by the install user).
+  # Steps 5-6 (password reads) use _safe_read_secret, which tries direct
+  # cat first, then `podman unshare cat` on failure.
+  #
+  # Docker / rootful Podman / macOS: direct path unchanged (no unshare).
+  # Fallback: if podman unshare is unavailable (remote client), log_warn and
+  # fall through to the direct path.
+  # -------------------------------------------------------------------------
+  local _is_rootless_podman=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]] \
+      && [[ "$(id -u)" != "0" ]]; then
+    _is_rootless_podman=true
+  fi
+
+  # Docker Linux non-root detection (gate #DOCKER-NONROOT-WAZUH-1).
+  # Mirrors the same gate in _provision_audit_signing_key.
+  local _is_docker_nonroot=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]]; then
+    _is_docker_nonroot=true
+  fi
+
+  if [[ "$_is_rootless_podman" == "true" ]]; then
+    # Rootless Podman path — steps 1-3 read from secrets/ inside podman unshare.
+    # ${wp} and ${secrets} are expanded host-side before the string reaches unshare;
+    # all writes go to ${wp}/certs/ which is host-owned so no chown of output is needed.
+    # Process substitution <(printf ...) is unreliable across bash -c heredoc delivery,
+    # so the x509 extfile is written to a temp path inside wp/certs/, then removed —
+    # keeping all scratch inside the working area (never /tmp).
+    local _wazuh_unshare_script
+    _wazuh_unshare_script="$(cat <<WAZUH_UNSHARE_EOF
+set -euo pipefail
+# Step 1: CA bundle
+cat '${secrets}/ca_intermediate.crt' '${secrets}/ca_root.crt' > '${wp}/certs/http-ca-bundle.pem'
+# Step 2: wazuh-admin leaf signed by internal intermediate
+openssl ecparam -genkey -name prime256v1 -out '${wp}/certs/.admin-sec1.pem' 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt -in '${wp}/certs/.admin-sec1.pem' -out '${wp}/certs/wazuh-admin-key.pem' 2>/dev/null
+rm -f '${wp}/certs/.admin-sec1.pem'
+openssl req -new -key '${wp}/certs/wazuh-admin-key.pem' -out '${wp}/certs/.admin.csr' \
+  -subj '/O=Agnostic Security/CN=wazuh-admin' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > '${wp}/certs/.admin-ext.cnf'
+openssl x509 -req -in '${wp}/certs/.admin.csr' -CA '${secrets}/ca_intermediate.crt' \
+  -CAkey '${secrets}/ca_intermediate.key' -CAcreateserial -days 825 \
+  -out '${wp}/certs/wazuh-admin.pem' \
+  -extfile '${wp}/certs/.admin-ext.cnf' 2>/dev/null
+rm -f '${wp}/certs/.admin.csr' '${wp}/certs/.admin-ext.cnf' '${secrets}/ca_intermediate.srl'
+# Step 3: copy indexer HTTP cert/key from secrets to wp
+cp '${secrets}/wazuh-indexer_client.crt' '${wp}/certs/http-indexer.pem'
+cp '${secrets}/wazuh-indexer_client.key' '${wp}/certs/http-indexer-key.pem'
+# Verify outputs are non-empty INSIDE the namespace
+[ -s '${wp}/certs/http-ca-bundle.pem' ]
+[ -s '${wp}/certs/wazuh-admin-key.pem' ]
+[ -s '${wp}/certs/wazuh-admin.pem' ]
+[ -s '${wp}/certs/http-indexer.pem' ]
+[ -s '${wp}/certs/http-indexer-key.pem' ]
+WAZUH_UNSHARE_EOF
+)"
+    if podman unshare bash -c "$_wazuh_unshare_script" 2>/dev/null; then
+      log_info "Wazuh steps 1-3 (CA bundle + admin cert + indexer cert) completed via podman unshare (rootless)"
+    else
+      log_warn "podman unshare unavailable or failed for wazuh steps 1-3 — falling back to direct path"
+      _is_rootless_podman=false  # trigger direct block below
+    fi
+  fi
+
+  if [[ "$_is_rootless_podman" == "false" ]]; then
+    if [[ "$_is_docker_nonroot" == "true" ]]; then
+      # -----------------------------------------------------------------------
+      # Docker Linux non-root sub-path (gate #DOCKER-NONROOT-WAZUH-1):
+      #
+      # On Linux+Docker non-root, secrets/ is owned by UID 1001 (set by the
+      # PKI issuer container). Steps 1-3 need to READ ca_intermediate.{crt,key}
+      # and wazuh-indexer_client.{crt,key} but cannot open them (EPERM).
+      #
+      # Fix: read each secret via _safe_read_secret (which uses a throwaway
+      # --user 1001:1001 container on Docker non-root — gate
+      # #DOCKER-NONROOT-SECRET-1) into umask-077 temp files owned by the
+      # installer (UID 1000). openssl operates on the temp files, never touching
+      # secrets/ directly. A subshell EXIT trap cleans up all temp files
+      # (including key material) on success or failure.
+      #
+      # The .srl serial file openssl creates is directed to the tmpdir via
+      # -CAserial, so it never lands inside secrets/ (which is UID 1001 owned).
+      #
+      # Scope: Linux + Docker + invoking UID != 0 AND YSG_OS != macos.
+      # macOS virtiofs / rootful / root paths use the direct block below.
+      # -----------------------------------------------------------------------
+      local _wm_tmpdir
+      _wm_tmpdir="$(mktemp -d "${WORK_DIR}/docker/.wazuh-stage-XXXXXX")"
+      (
+        umask 077
+        trap "rm -rf '${_wm_tmpdir}'" EXIT
+
+        # Read all required secrets via _safe_read_secret (Docker non-root fallback
+        # inside the helper dispatches a throwaway --user 1001:1001 container).
+        _safe_read_secret "${secrets}/ca_intermediate.crt" >"${_wm_tmpdir}/ca_int.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_intermediate.crt (gate #DOCKER-NONROOT-WAZUH-1)"; exit 1; }
+        _safe_read_secret "${secrets}/ca_root.crt" >"${_wm_tmpdir}/ca_root.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_root.crt"; exit 1; }
+        _safe_read_secret "${secrets}/ca_intermediate.key" >"${_wm_tmpdir}/ca_int.key" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_intermediate.key"; exit 1; }
+        _safe_read_secret "${secrets}/wazuh-indexer_client.crt" >"${_wm_tmpdir}/idx_client.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read wazuh-indexer_client.crt"; exit 1; }
+        _safe_read_secret "${secrets}/wazuh-indexer_client.key" >"${_wm_tmpdir}/idx_client.key" \
+          || { log_error "Wazuh Docker non-root: cannot read wazuh-indexer_client.key"; exit 1; }
+        # Fail-closed: all inputs must be non-empty
+        for _wm_f in "${_wm_tmpdir}/ca_int.crt" "${_wm_tmpdir}/ca_root.crt" \
+                     "${_wm_tmpdir}/ca_int.key" "${_wm_tmpdir}/idx_client.crt" \
+                     "${_wm_tmpdir}/idx_client.key"; do
+          [[ -s "$_wm_f" ]] \
+            || { log_error "Wazuh Docker non-root: staged secret empty after read: ${_wm_f}"; exit 1; }
+        done
+
+        # Step 1: CA bundle (intermediate + root) — HTTP-layer trust anchor
+        # _safe_read_secret captures via $() which strips trailing newlines, so each
+        # temp file lacks the final \n. Use an explicit printf '\n' separator so the
+        # two PEM blocks join as '-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----'
+        # rather than '-----END CERTIFICATE----------BEGIN CERTIFICATE-----', which
+        # Java X509Factory rejects with exit 255 (wazuh-security-init failure).
+        # (fix: #DOCKER-NONROOT-WAZUH-BUNDLE-1)
+        { cat "${_wm_tmpdir}/ca_int.crt"; printf '\n'; cat "${_wm_tmpdir}/ca_root.crt"; } \
+          > "${wp}/certs/http-ca-bundle.pem"
+
+        # Step 2: wazuh-admin leaf signed by internal intermediate (mirrors unshare path)
+        openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+        openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+        rm -f "${wp}/certs/.admin-sec1.pem"
+        openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+          -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+        printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+          > "${_wm_tmpdir}/.admin-ext.cnf"
+        # -CAserial directs the serial file into _wm_tmpdir (never into secrets/).
+        openssl x509 -req -in "${wp}/certs/.admin.csr" \
+          -CA "${_wm_tmpdir}/ca_int.crt" -CAkey "${_wm_tmpdir}/ca_int.key" \
+          -CAcreateserial -CAserial "${_wm_tmpdir}/ca_int.srl" \
+          -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+          -extfile "${_wm_tmpdir}/.admin-ext.cnf" 2>/dev/null
+        rm -f "${wp}/certs/.admin.csr"
+
+        # Step 3: indexer HTTP cert/key from staged temp files
+        cp "${_wm_tmpdir}/idx_client.crt" "${wp}/certs/http-indexer.pem"
+        cp "${_wm_tmpdir}/idx_client.key" "${wp}/certs/http-indexer-key.pem"
+
+        # Verify outputs non-empty (mirrors unshare path verification)
+        [ -s "${wp}/certs/http-ca-bundle.pem" ]
+        [ -s "${wp}/certs/wazuh-admin-key.pem" ]
+        [ -s "${wp}/certs/wazuh-admin.pem" ]
+        [ -s "${wp}/certs/http-indexer.pem" ]
+        [ -s "${wp}/certs/http-indexer-key.pem" ]
+
+        # Best-effort secure-wipe of key material before EXIT trap rm -rf.
+        for _wm_kf in "${_wm_tmpdir}/ca_int.key" "${_wm_tmpdir}/idx_client.key"; do
+          [[ -f "$_wm_kf" ]] \
+            && dd if=/dev/zero of="$_wm_kf" bs="$(wc -c < "$_wm_kf")" count=1 2>/dev/null || true
+        done
+      ) || { log_error "Wazuh mTLS steps 1-3 failed (Docker non-root — gate #DOCKER-NONROOT-WAZUH-1)"; rm -rf "$_wm_tmpdir"; return 1; }
+      rm -rf "$_wm_tmpdir"  # belt-and-suspenders; subshell EXIT trap already cleaned up
+      log_info "Wazuh steps 1-3 (CA bundle + admin cert + indexer cert) completed via _safe_read_secret temp files (Docker non-root — gate #DOCKER-NONROOT-WAZUH-1)"
+    else
+      # Docker / rootful Podman / macOS / root / fallback from unshare-unavailable path.
+
+      # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
+      cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+
+      # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
+      openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+      rm -f "${wp}/certs/.admin-sec1.pem"
+      openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+        -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+      openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
+        -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+        -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+      rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+
+      # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
+      cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
+      cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+    fi
+  fi
+
+  # fail-closed: filebeat `full` verification needs SAN=wazuh-indexer on the HTTP cert
+  # wp/certs/ is host-owned so this host-side check is valid on both paths.
+  if ! openssl x509 -in "${wp}/certs/http-indexer.pem" -noout -text 2>/dev/null | grep -q 'DNS:wazuh-indexer'; then  # MACOS-WAZUHSAN-001: LibreSSL x509 has no -ext flag; the -text SAN read is portable (BSD/LibreSSL + GNU/OpenSSL)
+    log_error "wazuh-indexer_client.crt lacks SAN 'wazuh-indexer' — full mTLS would fail closed; aborting"; return 1
+  fi
+
+  # 4. base opensearch config from the image, then re-PKI ONLY the HTTP listener + admin_dn
+  #    (transport keys are left at the image's demo paths — single node, untouched).
+  local cid; cid="$("$rt" create "$idx_img")" || { log_error "could not create temp indexer container"; return 1; }
+  if ! "$rt" cp "${cid}:/usr/share/wazuh-indexer/config/opensearch.yml" "${wp}/opensearch.yml" \
+     || ! "$rt" cp "${cid}:/usr/share/wazuh-indexer/config/opensearch-security/." "${wp}/opensearch-security/"; then
+    "$rt" rm "$cid" >/dev/null 2>&1; log_error "could not extract base indexer config from image"; return 1
+  fi
+  "$rt" rm "$cid" >/dev/null 2>&1
+  # MACOS-SED-001: BSD sed requires an explicit backup extension with -i (e.g. -i '')
+  # while GNU sed accepts bare -i. Use -i.bak + rm to be portable across both.
+  # Wazuh is Linux-only in practice but the installer runs on macOS for Colima/Docker.
+  sed -i.bak \
+    -e 's#ssl.http.pemcert_filepath: .*#ssl.http.pemcert_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer.pem#' \
+    -e 's#ssl.http.pemkey_filepath: .*#ssl.http.pemkey_filepath: /usr/share/wazuh-indexer/config/certs/http-indexer-key.pem#' \
+    -e 's#ssl.http.pemtrustedcas_filepath: .*#ssl.http.pemtrustedcas_filepath: /usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem#' \
+    "${wp}/opensearch.yml" \
+    && rm -f "${wp}/opensearch.yml.bak"
+  if ! python3 - "${wp}/opensearch.yml" <<'PYEOF'
+import sys,re,yaml
+p=sys.argv[1]; t=open(p).read()
+# admin_dn -> the internal-CA admin cert CN (securityadmin authenticates as this)
+t=re.sub(r'plugins\.security\.authcz\.admin_dn:\n((?:[ \t]*- ".*"\n)+)',
+         'plugins.security.authcz.admin_dn:\n- "CN=wazuh-admin,O=Agnostic Security"\n', t)
+# TLS 1.3 floor on the HTTP listener — match the internal-mesh 1.3-min (#156). The Wazuh
+# stock config pins enabled_protocols to TLSv1.2 with 1.2-only ciphers; rewrite to 1.3.
+# wazuh-indexer 4.14.5 (JDK 21) serves 1.3; filebeat (Go) + dashboard (Node) negotiate it
+# with NO client change and 1.2 is refused (validated on the clean-slate stack). Transport
+# (single node, internal) is intentionally left at the image default.
+t,np=re.subn(r'(plugins\.security\.ssl\.http\.enabled_protocols:\n)(?:[ \t]*-[ \t]*"[^"]*"\n)+',
+             r'\g<1>  - "TLSv1.3"\n', t)
+t,nc=re.subn(r'(plugins\.security\.ssl\.http\.enabled_ciphers:\n)(?:[ \t]*-[ \t]*"[^"]*"\n)+',
+             r'\g<1>  - "TLS_AES_256_GCM_SHA384"\n  - "TLS_AES_128_GCM_SHA256"\n  - "TLS_CHACHA20_POLY1305_SHA256"\n', t)
+if np != 1:
+    sys.stderr.write("opensearch.yml: http.enabled_protocols block not found (!=1) — cannot enforce TLS 1.3 floor\n"); sys.exit(1)
+yaml.safe_load(t)   # fail-closed: rewrite must remain valid YAML or the indexer crash-loops
+open(p,'w').write(t)
+PYEOF
+  then log_error "opensearch.yml rewrite (admin_dn + TLS 1.3 floor) failed — aborting"; return 1; fi
+  # fail-closed: admin_dn must have landed (else securityadmin can't authenticate) AND the
+  # HTTP listener must now be TLS 1.3 (the mesh 1.3-min must extend to the SIEM link)
+  grep -q 'CN=wazuh-admin,O=Agnostic Security' "${wp}/opensearch.yml" \
+    || { log_error "admin_dn substitution failed in opensearch.yml — aborting"; return 1; }
+  grep -A1 'plugins.security.ssl.http.enabled_protocols:' "${wp}/opensearch.yml" | grep -q '"TLSv1.3"' \
+    || { log_error "TLS 1.3 floor not applied to indexer HTTP listener — aborting"; return 1; }
+
+  # 5. internal_users.yml: admin + kibanaserver = bcrypt(real generated passwords).
+  #    Password is passed via the container ENV (never interpolated into a shell string),
+  #    so any password charset is injection-safe.
+  #    #ROOTLESS-WAZUH-1: use _safe_read_secret so the cat succeeds on both Docker
+  #    (direct) and rootless Podman (podman unshare cat fallback inside _safe_read_secret).
+  local ah kh
+  local _wazuh_idxpw _wazuh_dashpw
+  _wazuh_idxpw="$(_safe_read_secret "${secrets}/wazuh_indexer_password" "" "" 2>/dev/null)" \
+    || { log_error "Could not read wazuh_indexer_password — aborting"; return 1; }
+  _wazuh_dashpw="$(_safe_read_secret "${secrets}/wazuh_dashboard_password" "" "" 2>/dev/null)" \
+    || { log_error "Could not read wazuh_dashboard_password — aborting"; return 1; }
+  if [[ -z "$_wazuh_idxpw" || -z "$_wazuh_dashpw" ]]; then
+    log_error "wazuh_indexer_password or wazuh_dashboard_password is empty — aborting"; return 1
+  fi
+  ah="$("$rt" run --rm -e RAWPW="${_wazuh_idxpw}" "$idx_img" \
+        bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
+  kh="$("$rt" run --rm -e RAWPW="${_wazuh_dashpw}" "$idx_img" \
+        bash -lc 'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$RAWPW"' 2>/dev/null | tail -1)"
+  if [[ ! "$ah" =~ ^\$2[aby]\$ ]] || [[ ! "$kh" =~ ^\$2[aby]\$ ]]; then
+    log_error "bcrypt hash generation failed (admin/kibanaserver not valid \$2 hashes) — aborting"; return 1
+  fi
+  python3 - "${wp}/opensearch-security/internal_users.yml" "$ah" "$kh" <<'PYEOF'
+import sys,yaml
+p,ah,kh=sys.argv[1:4]
+d=yaml.safe_load(open(p))
+if 'admin' in d: d['admin']['hash']=ah
+if 'kibanaserver' in d: d['kibanaserver']['hash']=kh
+yaml.safe_dump(d,open(p,'w'),default_flow_style=False,sort_keys=False)
+PYEOF
+
+  # 5b. (#21) least-privilege cert-identity for audit forwarding. The agnostic
+  #     audit pipeline (gateway + backoffice) forwards events to this indexer over
+  #     mesh mTLS, presenting each service's OWN internal-CA leaf (CN=gateway /
+  #     CN=backoffice). Map those CNs to a WRITE-ONLY role on yashigani-audit*
+  #     — never the wazuh admin. Three edits, applied by securityadmin (security-init):
+  #       - config.yml: enable the clientcert_auth_domain (cert CN → username).
+  #       - roles.yml: add yashigani_audit_writer (bulk + write/create on yashigani-audit* only).
+  #       - roles_mapping.yml: map backoffice + gateway → yashigani_audit_writer.
+  #     clientauth_mode is OPTIONAL (default), challenge:false — basic-auth clients
+  #     (dashboard/filebeat/securityadmin) are unaffected.
+  python3 - "${wp}/opensearch-security" <<'PYEOF'
+import sys,yaml,os
+sec=sys.argv[1]
+cfgp=os.path.join(sec,"config.yml")
+cfg=yaml.safe_load(open(cfgp))
+authc=cfg["config"]["dynamic"]["authc"]
+dom=authc.get("clientcert_auth_domain")
+if dom is None:
+    dom={"description":"Authenticate via SSL client certificates","transport_enabled":False,
+         "order":1,"http_authenticator":{"type":"clientcert",
+         "config":{"username_attribute":"cn"},"challenge":False},
+         "authentication_backend":{"type":"noop"}}
+    authc["clientcert_auth_domain"]=dom
+dom["http_enabled"]=True
+yaml.safe_dump(cfg,open(cfgp,"w"),default_flow_style=False,sort_keys=False)
+
+rp=os.path.join(sec,"roles.yml")
+roles=yaml.safe_load(open(rp))
+roles["yashigani_audit_writer"]={"reserved":False,
+  "cluster_permissions":["cluster_composite_ops"],
+  "index_permissions":[{"index_patterns":["yashigani-audit*"],
+    "allowed_actions":["indices:admin/create","indices:admin/mapping/put",
+      "indices:admin/mapping/auto_put","indices:data/write/index","indices:data/write/bulk*"]}]}
+yaml.safe_dump(roles,open(rp,"w"),default_flow_style=False,sort_keys=False)
+
+rmp=os.path.join(sec,"roles_mapping.yml")
+rm=yaml.safe_load(open(rmp))
+rm["yashigani_audit_writer"]={"reserved":False,"users":["backoffice","gateway"]}
+yaml.safe_dump(rm,open(rmp,"w"),default_flow_style=False,sort_keys=False)
+print("[wazuh-mtls] clientcert auth + yashigani_audit_writer (write-only) mapped to backoffice,gateway")
+PYEOF
+
+  # 6. dashboard config: real indexer password + internal-CA bundle + full verification
+  #    #ROOTLESS-WAZUH-1: _wazuh_idxpw already read via _safe_read_secret above.
+  {
+    printf 'server.host: "0.0.0.0"\nserver.port: 5601\nserver.ssl.enabled: false\n'
+    printf 'opensearch.hosts: ["https://wazuh-indexer:9200"]\n'
+    printf 'opensearch.ssl.verificationMode: full\n'
+    printf 'opensearch.ssl.certificateAuthorities: ["/usr/share/wazuh-indexer/config/certs/http-ca-bundle.pem"]\n'
+    printf 'opensearch.username: "admin"\n'
+    printf 'opensearch.password: "%s"\n' "${_wazuh_idxpw}"
+    printf 'opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]\n'
+    printf 'opensearch_security.multitenancy.enabled: false\n'
+    # Served behind Caddy at /admin/wazuh/* — basePath makes the dashboard
+    # generate links/redirects under that prefix instead of escaping to /app/login
+    # (which falls through to the data-plane verifier). rewriteBasePath=true means
+    # OSD expects the prefix on inbound requests, so Caddy uses `handle` (no strip).
+    printf 'server.basePath: "/admin/wazuh"\nserver.rewriteBasePath: true\n'
+  } > "${wp}/opensearch_dashboards.yml"
+
+  # 7. ownership: indexer/dashboard/sidecar run as uid 1000; CA bundle world-readable (manager uid 999)
+  "$rt" run --rm -u 0 -v "${wp}":/w "$idx_img" sh -c '
+    chown -R 1000:1000 /w
+    chmod 644 /w/certs/http-ca-bundle.pem /w/certs/http-indexer.pem /w/certs/wazuh-admin.pem /w/opensearch.yml /w/opensearch-security/*.yml
+    chmod 640 /w/certs/http-indexer-key.pem /w/certs/wazuh-admin-key.pem
+    chmod 600 /w/opensearch_dashboards.yml' || { log_error "wazuh-mtls ownership/permission step failed"; return 1; }
+  : > "${wp}/.provisioned"   # marker written LAST — gates idempotent re-runs
+  log_success "Wazuh full-mTLS material provisioned (docker/wazuh-mtls/, git-ignored)"
+}
+
+# =============================================================================
+# _provision_audit_signing_key — internal-CA leaf for audit-chain checkpoints
+# =============================================================================
+# Lu wire-sink-gate P2 (v2.25.2 — irrevocable signed chain):
+#   The daily audit-chain checkpoint (AuditChainService.run_daily_checkpoint)
+#   signs the merkle root with an ECDSA leaf private key.  This function mints a
+#   dedicated audit-signing leaf (EC P-256, PKCS#8) signed by the internal
+#   intermediate CA — mirroring the wazuh-admin pattern in _provision_wazuh_mtls.
+#
+# CRITICAL PLACEMENT (Tiago directive 2026-06-04):
+#   The signing key is written to docker/secrets/audit-signing/audit_signing.key
+#   and mounted RO into BACKOFFICE ONLY (compose: ./secrets/audit-signing →
+#   /run/audit-signing).  It is NOT mounted into the gateway/runtime path, so a
+#   held yashigani_app DB credential cannot read it and cannot forge a signed
+#   checkpoint.  The public cert (audit_signing.crt) is world-readable so an
+#   auditor / verification tool can validate signatures against the internal CA.
+#
+# Idempotent: skips when the key already exists (rotation is a separate concern;
+# the key is long-lived like the wazuh-admin cert — 825 days).  Fail-closed:
+# returns non-zero if the intermediate CA material is missing.
+_provision_audit_signing_key() {
+  local secrets="${WORK_DIR}/docker/secrets"
+  local asd="${secrets}/audit-signing"
+  local keyf="${asd}/audit_signing.key"
+  local crtf="${asd}/audit_signing.crt"
+
+  if [[ -f "$keyf" && -f "$crtf" ]]; then
+    log_info "Audit-chain signing key already provisioned — skipping"
+    return 0
+  fi
+  if [[ ! -f "${secrets}/ca_intermediate.crt" || ! -f "${secrets}/ca_intermediate.key" ]]; then
+    log_error "Audit signing-key provisioning: intermediate CA material missing — aborting (fail-closed)"
+    return 1
+  fi
+  require_cmd openssl
+
+  # -------------------------------------------------------------------------
+  # Rootless-Podman audit-signing fix (gate #ROOTLESS-AUDIT-1):
+  #
+  # On rootless Podman the PKI issuer step (which ran earlier under podman
+  # unshare) chowns secrets/ to the subuid-mapped host UID (e.g. 165536 for
+  # container root).  The host user (e.g. UID 1001) cannot create a subdir or
+  # write files inside that tree → EPERM → empty key → fail-closed abort.
+  #
+  # Fix: when running rootless Podman, execute the entire mkdir + openssl
+  # block inside `podman unshare bash -c '...'` so it runs as namespace-root
+  # (host 165536) which CAN write into the subuid-owned secrets tree.  The
+  # final chown 1001:1001 inside the unshare maps to the correct subuid host
+  # UID (166537 on a 165536-base system) — identical to how the bind-mount
+  # block and the PKI issuer block do it.
+  #
+  # Process substitution (<(printf ...)) is not reliable inside a bash -c
+  # heredoc delivered over a single-quoted string, so the x509 extfile is
+  # written to a temp path inside audit-signing/ then removed, keeping all
+  # scratch inside the function's own working area (never /tmp — repo policy).
+  #
+  # Fallback: if podman unshare is unavailable (remote client), log_warn and
+  # fall through to the existing direct-path block.
+  # -------------------------------------------------------------------------
+  local _is_rootless_podman=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]] \
+      && [[ "$(id -u)" != "0" ]]; then
+    _is_rootless_podman=true
+  fi
+
+  # -------------------------------------------------------------------------
+  # Docker Linux non-root audit-signing fix (gate #DOCKER-NONROOT-AUDIT-1):
+  #
+  # On Linux+Docker non-root the PKI bootstrap (which ran inside yashigani/gateway
+  # as UID 1001) chowns secrets/ to UID 1001 via an ephemeral alpine container.
+  # The host installer (e.g. UID 1000) cannot mkdir or write inside that tree →
+  # EPERM → empty key → fail-closed abort.
+  #
+  # Fix: when running Linux+Docker+non-root, execute the mkdir+openssl block
+  # inside a throwaway Docker container as --user 1001:1001, reusing
+  # yashigani/gateway (already present — the PKI issuer used it at step 9b).
+  # Files are created with UID 1001:1001 ownership from the start, matching what
+  # the backoffice container expects when it bind-mounts /run/audit-signing.
+  # openssl CLI is available in yashigani/gateway: python:3.14.5-slim ships
+  # ca-certificates which depends on the openssl Debian package.
+  #
+  # Scope: Linux+Docker+non-root only.
+  #   macOS+Docker: virtiofs UID remapping means the direct path works there
+  #     (installer UID maps to UID 0 inside Colima VM; PKI-chown ephemeral
+  #     container made secrets/ UID 1001 from inside the container, not the
+  #     host stat). Direct path unchanged for macOS.
+  #   Root (id==0): direct path unchanged.
+  #   Podman rootless: handled by the podman unshare block above.
+  #   Podman rootless fallback (unshare unavailable): _is_rootless_podman set
+  #     to false but _is_docker_nonroot remains false → direct path (unchanged).
+  # -------------------------------------------------------------------------
+  local _is_docker_nonroot=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]]; then
+    _is_docker_nonroot=true
+  fi
+
+  if [[ "$_is_rootless_podman" == "true" ]]; then
+    # Rootless Podman path: run the full openssl block inside podman unshare.
+    # Variables (asd/keyf/crtf/secrets) are expanded host-side before the
+    # string is passed to podman unshare bash -c.
+    local _unshare_script
+    _unshare_script="$(cat <<UNSHARE_EOF
+set -euo pipefail
+umask 077
+mkdir -p '${asd}'
+openssl ecparam -genkey -name prime256v1 -out '${asd}/.audit-sec1.pem' 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt -in '${asd}/.audit-sec1.pem' -out '${keyf}' 2>/dev/null
+rm -f '${asd}/.audit-sec1.pem'
+openssl req -new -key '${keyf}' -out '${asd}/.audit.csr' \
+  -subj '/O=Agnostic Security/CN=audit-checkpoint-signer' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > '${asd}/.audit-ext.cnf'
+openssl x509 -req -in '${asd}/.audit.csr' -CA '${secrets}/ca_intermediate.crt' \
+  -CAkey '${secrets}/ca_intermediate.key' -CAcreateserial -days 825 -out '${crtf}' \
+  -extfile '${asd}/.audit-ext.cnf' 2>/dev/null
+rm -f '${asd}/.audit.csr' '${asd}/.audit-ext.cnf' '${secrets}/ca_intermediate.srl'
+chmod 0640 '${keyf}'
+chmod 0644 '${crtf}'
+chmod 0750 '${asd}'
+chown 1001:1001 '${keyf}' '${crtf}' '${asd}'
+# Verify non-empty INSIDE the namespace: after chown to the subuid UID + 0750
+# dir, the host user (other) cannot traverse audit-signing/ to stat these, so
+# the host-side -s check would false-fail on a healthy key. Verify here
+# where access works (#ROOTLESS-AUDIT-1); set -e -> non-zero exit -> fallback.
+[ -s '${keyf}' ] && [ -s '${crtf}' ]
+UNSHARE_EOF
+)"
+    if podman unshare bash -c "$_unshare_script" 2>/dev/null; then
+      log_info "Audit signing key generated + verified via podman unshare (rootless)"
+      log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+      return 0
+    else
+      log_warn "podman unshare unavailable or failed — falling back to direct path (rootless Podman without unshare support)"
+      _is_rootless_podman=false   # trigger the direct block below
+    fi
+  fi
+
+  if [[ "$_is_rootless_podman" == "false" ]]; then
+    # --- Docker Linux non-root sub-path (gate #DOCKER-NONROOT-AUDIT-1) -------
+    # secrets/ is owned UID 1001 (set by the PKI bootstrap). The host installer
+    # (non-root) cannot mkdir inside it. Provision entirely inside a throwaway
+    # container running as --user 1001:1001 so files are born with the correct
+    # owner and the backoffice container can read the key at /run/audit-signing.
+    if [[ "$_is_docker_nonroot" == "true" ]]; then
+      # yashigani/gateway is guaranteed present (PKI issuer used it at step 9b).
+      # Try YASHIGANI_VERSION first, fall back to :latest (same as _pki_run_issuer).
+      local _audit_dkr_image=""
+      local _audit_dkr_tag
+      for _audit_dkr_tag in "${YASHIGANI_VERSION:-}" "latest"; do
+        [[ -z "$_audit_dkr_tag" ]] && continue
+        if docker image inspect "yashigani/gateway:${_audit_dkr_tag}" >/dev/null 2>&1; then
+          _audit_dkr_image="yashigani/gateway:${_audit_dkr_tag}"
+          break
+        fi
+      done
+      if [[ -z "$_audit_dkr_image" ]]; then
+        log_error "Audit signing-key (Docker non-root): yashigani/gateway not found in local image store"
+        log_error "  Fix: compose build must complete before this step, or re-run installer as root"
+        return 1
+      fi
+      # Script runs as UID 1001 inside the container; secrets/ is bind-mounted
+      # at /s (same /s convention as _pki_run_issuer and _safe_write_secret).
+      # Temp extfile lives inside /s/audit-signing/ (never /tmp — repo policy).
+      # set -eu: POSIX sh compatible (dash); no pipefail needed (no pipelines).
+      # Heredoc uses single-quoted delimiter so no host-side variable expansion.
+      local _dkr_audit_script
+      _dkr_audit_script=$(cat <<'DKRAUDIT'
+set -eu
+umask 077
+mkdir -p /s/audit-signing
+openssl ecparam -genkey -name prime256v1 \
+  -out /s/audit-signing/.audit-sec1.pem 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt \
+  -in /s/audit-signing/.audit-sec1.pem \
+  -out /s/audit-signing/audit_signing.key 2>/dev/null
+rm -f /s/audit-signing/.audit-sec1.pem
+openssl req -new -key /s/audit-signing/audit_signing.key \
+  -out /s/audit-signing/.audit.csr \
+  -subj '/O=Agnostic Security/CN=audit-checkpoint-signer' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > /s/audit-signing/.audit-ext.cnf
+openssl x509 -req \
+  -in /s/audit-signing/.audit.csr \
+  -CA /s/ca_intermediate.crt \
+  -CAkey /s/ca_intermediate.key \
+  -CAcreateserial -days 825 \
+  -out /s/audit-signing/audit_signing.crt \
+  -extfile /s/audit-signing/.audit-ext.cnf 2>/dev/null
+rm -f /s/audit-signing/.audit.csr /s/audit-signing/.audit-ext.cnf /s/ca_intermediate.srl
+chmod 0640 /s/audit-signing/audit_signing.key
+chmod 0644 /s/audit-signing/audit_signing.crt
+chmod 0750 /s/audit-signing
+[ -s /s/audit-signing/audit_signing.key ] && [ -s /s/audit-signing/audit_signing.crt ]
+DKRAUDIT
+)
+      # --network none: no I/O needed; cuts accidental exfil (same as PKI issuer).
+      # --security-opt no-new-privileges: belt-and-suspenders for the gateway image.
+      # :rw,Z: SELinux relabelling (no-op on non-SELinux hosts).
+      if docker run --rm \
+             --user 1001:1001 \
+             --network none \
+             --security-opt no-new-privileges \
+             --volume "${secrets}:/s:rw,Z" \
+             "$_audit_dkr_image" \
+             sh -c "$_dkr_audit_script"; then
+        log_info "Audit signing key generated + verified via Docker container as UID 1001 (Linux non-root — gate #DOCKER-NONROOT-AUDIT-1)"
+        log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+        return 0
+      else
+        log_error "Audit signing-key provisioning: Docker container (UID 1001) exited non-zero — openssl or mkdir failed"
+        log_error "  Check: docker/secrets/ca_intermediate.crt and ca_intermediate.key must exist"
+        return 1
+      fi
+    fi
+    # -------------------------------------------------------------------------
+
+    # Docker / rootful Podman / macOS / root / fallback from unshare-unavailable.
+    ( umask 077   # private key born owner-only
+      mkdir -p "$asd"
+      # EC P-256 key, converted to PKCS#8 (load_pem_private_key in chain.py expects PKCS#8).
+      openssl ecparam -genkey -name prime256v1 -out "${asd}/.audit-sec1.pem" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "${asd}/.audit-sec1.pem" -out "$keyf" 2>/dev/null
+      rm -f "${asd}/.audit-sec1.pem"
+      # CSR + leaf signed by the internal intermediate. CN encodes the SPIFFE-ish
+      # signing identity so an auditor can tie a signature to the issuing context.
+      openssl req -new -key "$keyf" -out "${asd}/.audit.csr" \
+        -subj "/O=Agnostic Security/CN=audit-checkpoint-signer" 2>/dev/null
+      openssl x509 -req -in "${asd}/.audit.csr" -CA "${secrets}/ca_intermediate.crt" \
+        -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "$crtf" \
+        -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+      rm -f "${asd}/.audit.csr" "${secrets}/ca_intermediate.srl"
+    )
+    if [[ ! -s "$keyf" || ! -s "$crtf" ]]; then
+      log_error "Audit signing-key provisioning: openssl produced empty key/cert — aborting"
+      return 1
+    fi
+    # Perms: key 0640 owned by the backoffice container UID (1001); cert 0644 (auditor-readable).
+    # cap_drop:[ALL] on backoffice strips DAC_OVERRIDE, so the key must be owner- or
+    # group-readable by the backoffice runtime UID. Backoffice runs as UID 1001 (see
+    # docker-compose backoffice user/_pki_chown_client_keys map). Chown best-effort
+    # (host may lack the UID on macOS virtiofs — the bind mount remaps on read).
+    chmod 0640 "$keyf" 2>/dev/null || true
+    chmod 0644 "$crtf" 2>/dev/null || true
+    chmod 0750 "$asd" 2>/dev/null || true
+    chown 1001:1001 "$keyf" 2>/dev/null || true
+    chown 1001:1001 "$asd"  2>/dev/null || true
+  fi
+
+  log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+}
+
+# =============================================================================
+# _ensure_agent_databases — idempotent agent-DB provisioning (INSTALL-AGENTDB-001)
+# =============================================================================
+# Postgres docker-entrypoint-initdb.d scripts (incl. 11-agent-dbs.sh, which
+# creates the `letta` database + pgvector) run ONLY on a FRESH/EMPTY PGDATA.
+# An upgrade — or any install onto a pre-existing postgres_data volume that was
+# initialized before the agent-DB init script existed (or before a given agent
+# bundle was enabled) — never runs that script, so the agent DB is missing and
+# the agent (e.g. letta) crash-loops on "database \"letta\" does not exist".
+#
+# This step closes that gap: on EVERY compose_up (fresh AND upgrade), after
+# postgres is accepting connections, re-execute the SAME init script that the
+# entrypoint would have run — by exec'ing the copy already bind-mounted into the
+# running postgres container at /docker-entrypoint-initdb.d/11-agent-dbs.sh.
+#
+# Single source of truth: the set of agent DBs + owners + extensions lives ONLY
+# in docker/postgres/init-agent-dbs.sh. We do NOT duplicate the DB list here.
+# The script is already idempotent — `CREATE DATABASE ... WHERE NOT EXISTS ...
+# \gexec` (CREATE DATABASE has no IF NOT EXISTS) + `CREATE EXTENSION IF NOT
+# EXISTS vector` — so re-running it on a populated volume is a no-op when the DB
+# already exists and provisions it when absent. Safe to run repeatedly.
+#
+# Runtime-agnostic: uses "${COMPOSE_CMD[@]}" ... exec -T postgres, the same
+# invocation pattern as _upgrade_postgres_ssl, which works under Docker and
+# Podman (rootful + rootless). No host-side psql, no ad-hoc one-liner, no
+# hard-coded container name.
+#
+# Fail behaviour: agent bundles are OPT-IN and OPTIONAL; a provisioning failure
+# must not block the core stack. We log the psql output and warn (non-fatal) so
+# the gateway/backoffice still come up — the agent will simply remain unreachable
+# until the DB is provisioned, which is strictly better than failing the whole
+# install. The convergence gate for core services runs separately.
+# -----------------------------------------------------------------------------
+_ensure_agent_databases() {
+  # Only meaningful when at least one agent bundle that needs a postgres DB is
+  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/openwebui/wazuh
+  # carry no dedicated agent DB). We gate on COMPOSE_PROFILES containing `letta`
+  # rather than hard-coding the DB name — if a future bundle adds a DB to the init
+  # script, add its profile here and the init script remains the single source for
+  # the actual DB/owner/extension definitions.
+  local _need_agent_db="false"
+  local _p
+  for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+    case "$_p" in
+      letta) _need_agent_db="true" ;;
+    esac
+  done
+  if [[ "$_need_agent_db" != "true" ]]; then
+    return 0
+  fi
+
+  local _compose_file="${1:-${WORK_DIR}/docker/docker-compose.yml}"
+  local _initdb_script="/docker-entrypoint-initdb.d/11-agent-dbs.sh"
+
+  log_info "Ensuring agent databases exist (idempotent; INSTALL-AGENTDB-001)..."
+
+  # Wait for postgres to accept connections over the local socket (trust auth,
+  # the path the init script itself uses). Transport errors only — retry with
+  # capped backoff; a non-transport psql error is surfaced, not retried-to-pass.
+  local _ready="false" _i
+  for _i in $(seq 1 30); do
+    if "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         pg_isready -U yashigani_admin -d yashigani >/dev/null 2>&1; then
+      _ready="true"; break
+    fi
+    sleep 2
+  done
+  if [[ "$_ready" != "true" ]]; then
+    log_warn "  postgres did not become ready in 60s — skipping agent-DB provisioning (agents may be unreachable until next run)"
+    return 0
+  fi
+
+  # Confirm the init script is mounted in the running container. If the volume
+  # mount is missing (older compose file), fall back to a warn — we do NOT inline
+  # a duplicate DB list (single-source-of-truth rule).
+  if ! "${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+         test -r "$_initdb_script" 2>/dev/null; then
+    log_warn "  ${_initdb_script} not mounted in postgres container — cannot provision agent DBs"
+    log_warn "  (ensure docker/postgres/init-agent-dbs.sh is mounted; see docker-compose.yml)"
+    return 0
+  fi
+
+  # Re-run the EXACT init script the entrypoint runs on a fresh volume. It reads
+  # POSTGRES_USER / POSTGRES_DB from the container env (already set) and is
+  # idempotent. Capture output so failures are visible, never silent.
+  local _out _rc=0
+  _out="$("${COMPOSE_CMD[@]}" -f "$_compose_file" exec -T postgres \
+            bash "$_initdb_script" 2>&1)" || _rc=$?
+  if [[ "$_rc" -eq 0 ]]; then
+    log_success "Agent databases ensured (init-agent-dbs.sh ran clean)"
+  else
+    log_warn "Agent-DB provisioning returned non-zero (rc=${_rc}) — agents may be unreachable:"
+    printf '%s\n' "$_out" | sed 's/^/    /' >&2
+  fi
+  return 0
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -3866,6 +7012,187 @@ compose_up() {
 
   # Auto-apply Podman rootless override when running on Podman
   local compose_files=("-f" "$compose_file")
+
+  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
+  # is active, provision the deploy-local mTLS material (git-ignored) and layer the overlay
+  # that adds caps/cont-init/securityadmin/healthchecks + the internal-CA HTTP listener.
+  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
+  local _wazuh_overlay="${WORK_DIR}/docker/docker-compose.wazuh.yml"
+  if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "$_wazuh_overlay" ]]; then
+    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
+    compose_files+=("-f" "$_wazuh_overlay")
+    log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
+  fi
+
+  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): per-bundle
+  # egress-forwarder overlays. When a bundled agent (openclaw, langflow,
+  # letta) is enabled, layer the codegen-emitted override that stands up the
+  # egress-<agent> forwarder + the SPLIT ringfences
+  # (ringfence_<agent>_in = {<agent>, caddy}; ringfence_<agent>_eg =
+  # {<agent>, egress-<agent>} — design §2.6, 2-member invariant). Each
+  # agent's egress config dials its forwarder
+  # (http://egress-<agent>:9400/<prefix>) via that agent's REAL config
+  # mechanism (openclaw.json models.providers baseUrl + channels.telegram
+  # apiRoot; langflow/letta OPENAI_API_BASE), and the forwarder presents the
+  # agent's leaf to caddy:18790 → /egress/eval. The static caller/destination
+  # pins at :18790 remain in force (pin-AND-grant OVERLAP — synthesis
+  # must-fix #1; pin deletion is a later, Laura-gated step).
+  # Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the non-interactive
+  # --agent-bundles value is only pushed into COMPOSE_PROFILES at step 8
+  # (same defensive pattern as the YASHIGANI_OPENCLAW_EGRESS flag writer).
+  local _fwd_agent _fwd_overlay _fwd_enabled _fwd_ab
+  for _fwd_agent in openclaw langflow letta; do
+    _fwd_overlay="${WORK_DIR}/docker/${_fwd_agent}-egress-forwarder.override.yml"
+    _fwd_enabled="false"
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "$_fwd_agent"; then
+      _fwd_enabled="true"
+    else
+      _fwd_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+      if [[ "$_fwd_ab" == *",${_fwd_agent},"* || "$_fwd_ab" == *",all,"* ]]; then
+        _fwd_enabled="true"
+      fi
+    fi
+    if [[ "$_fwd_enabled" == "true" ]]; then
+      if [[ -f "$_fwd_overlay" ]]; then
+        compose_files+=("-f" "$_fwd_overlay")
+        log_info "Applying ${_fwd_agent} egress-forwarder overlay (unified-sidecar v4.1: egress-${_fwd_agent} + split ringfences)"
+      else
+        # Fail-closed: the agent's egress config points at the forwarder, so
+        # an enabled bundle WITHOUT this overlay has no egress path at all.
+        log_error "${_fwd_agent} bundle enabled but overlay not found: ${_fwd_overlay}"
+        log_error "${_fwd_agent} egress dials egress-${_fwd_agent}:9400 — without the overlay ${_fwd_agent} has NO egress path (fail-closed)"
+        return 1
+      fi
+    fi
+  done
+
+  # ── GPU overlay selection ─────────────────────────────────────────────────────
+  # Supported types (source: docs.ollama.com/gpu):
+  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker) or CDI+devpath (Podman)
+  #   apple_metal— Metal via host-native ollama (Mac only; container ollama bypassed)
+  #   amd_rocm   — ROCm v7 discrete (Radeon RX 5000+/6000+/7000+, Instinct); /dev/kfd+dri
+  #   vulkan     — Vulkan backend (Intel Arc/iGPU, AMD APU gfx1150/1151); /dev/dri only
+  #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
+  # ollama service has its GPU reservation commented out and the nvidia runtime is not
+  # the daemon default, so without this ollama runs CPU-only. Pin a card with YSG_GPU_UUID
+  # (defaults to all). Podman uses CDI devices separately; K8s uses the device plugin.
+  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
+    compose_files+=("-f" "$_gpu_overlay")
+    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+  fi
+  # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
+  # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
+  # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
+  # transformed 0.7.0 → 0.6.0 for podman 4.9.3, then written to /etc/cdi/nvidia.yaml
+  # with 0644 perms via Docker daemon (no interactive sudo). See _setup_podman_cdi_gpu.
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    _setup_podman_cdi_gpu
+  fi
+  local _gpu_overlay_podman="${WORK_DIR}/docker/docker-compose.gpu-podman.yml"
+  local _gpu_overlay_podman_devpath="${WORK_DIR}/docker/docker-compose.gpu-podman-devpath.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    local _cdi_probe_ok=false
+    if podman run --rm --device "nvidia.com/gpu=0" \
+         --entrypoint "" \
+         alpine:latest echo "cdi-probe" >/dev/null 2>&1; then
+      _cdi_probe_ok=true
+    fi
+    if [[ "$_cdi_probe_ok" == "true" ]] && [[ -f "$_gpu_overlay_podman" ]]; then
+      compose_files+=("-f" "$_gpu_overlay_podman")
+      log_info "CDI probe OK — applying Podman CDI GPU overlay (docker-compose.gpu-podman.yml) — ollama on ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+    elif [[ -f "$_gpu_overlay_podman_devpath" ]]; then
+      # CDI unavailable (probe failed or _setup_podman_cdi_gpu returned early).
+      # devpath overlay passes device nodes only — NO library mounts.
+      # ollama WILL run CPU-only on this path: library=cpu, not library=cuda.
+      log_warn "WARN: CDI probe failed — falling back to device-path passthrough (#ROOTLESS-CDI-001)"
+      log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
+      log_warn "WARN: GPU acceleration NOT active. Fix: ensure nvidia-ctk + Docker daemon are available."
+      log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
+      compose_files+=("-f" "$_gpu_overlay_podman_devpath")
+    else
+      log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+    fi
+  fi
+
+  # GPU overlay — Apple Metal / macOS host-native ollama.
+  # Container ollama cannot access Apple Metal (Docker Desktop = Linux VM, no Metal).
+  # Route caddy's ollama-front upstream to the host-native ollama (library=metal) via
+  # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
+  # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
+  # service_started). ollama-init is also a no-op (models managed on host).
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via VPNKit (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  #   VPNKit relays container→host.docker.internal to Mac loopback; LAN fully isolated.
+  local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_mac_metal" ]]; then
+    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
+    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
+    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      log_error "Apple Metal: host ollama not reachable on 127.0.0.1:11434"
+      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
+      log_error "  Then pre-pull models:"
+      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
+      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
+      return 1
+    fi
+    compose_files+=("-f" "$_gpu_overlay_mac_metal")
+    log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
+    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:host-gateway]"
+    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
+    log_info "  ollama-init disabled (models managed on host)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
+  fi
+
+  # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).
+  # Device passthrough: /dev/kfd (ROCm compute) + /dev/dri/renderD128 (render node).
+  # UNTESTED ON HARDWARE — implemented per docs.ollama.com/gpu + ROCm container guide.
+  local _gpu_overlay_amd="${WORK_DIR}/docker/docker-compose.gpu-amd.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "amd_rocm" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_amd" ]]; then
+    # Preflight: verify /dev/kfd exists (ROCm runtime installed)
+    if [[ ! -e "/dev/kfd" ]]; then
+      log_warn "AMD ROCm: /dev/kfd not found — ROCm runtime may not be installed."
+      log_warn "  Install: https://rocm.docs.amd.com/en/latest/deploy/linux/"
+      log_warn "  ollama will run CPU-only without ROCm."
+    fi
+    compose_files+=("-f" "$_gpu_overlay_amd")
+    log_info "Applying AMD ROCm GPU overlay (docker-compose.gpu-amd.yml)"
+    log_info "  ollama on /dev/kfd + /dev/dri/renderD128 [UNTESTED ON HARDWARE]"
+  fi
+
+  # GPU overlay — Vulkan backend (Intel Arc/iGPU, AMD APU).
+  # Device passthrough: /dev/dri/renderD128 (DRM render node, no /dev/kfd needed).
+  # ollama auto-selects Vulkan llama.cpp library when other backends are absent.
+  # UNTESTED ON HARDWARE — per docs.ollama.com/gpu (Intel=Vulkan only; AMD APU=Vulkan preferred).
+  local _gpu_overlay_vulkan="${WORK_DIR}/docker/docker-compose.gpu-vulkan.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "vulkan" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_vulkan" ]]; then
+    if [[ ! -e "/dev/dri/renderD128" ]]; then
+      log_warn "Vulkan GPU: /dev/dri/renderD128 not found — GPU drivers may not be installed."
+      log_warn "  Intel: sudo apt install mesa-vulkan-drivers intel-media-va-driver-non-free"
+      log_warn "  AMD APU: sudo apt install mesa-vulkan-drivers (Mesa RADV)"
+      log_warn "  ollama will run CPU-only without DRM render access."
+    fi
+    compose_files+=("-f" "$_gpu_overlay_vulkan")
+    log_info "Applying Vulkan GPU overlay (docker-compose.gpu-vulkan.yml)"
+    log_info "  ollama on /dev/dri/renderD128 (Intel Arc/iGPU / AMD APU) [UNTESTED ON HARDWARE]"
+  fi
+
   if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
     log_info "Podman detected — configuring rootless deployment"
 
@@ -3982,6 +7309,43 @@ compose_up() {
       fi
     fi
 
+    # Public base URL (scheme://domain[:port]) — single source for the external
+    # URLs that reverse-proxied sub-apps must self-reference (Grafana root_url,
+    # Wazuh basePath, …). Port suffix omitted when standard 443. Without the
+    # published port these apps 301-redirect to :443 ("site can't be reached"
+    # on a non-standard port). update-or-append into .env.
+    local _pub_port_suffix=""
+    if [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]]; then
+      _pub_port_suffix=":${YASHIGANI_HTTPS_PORT}"
+    fi
+    local _pub_url="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_port_suffix}"
+    if grep -q "^YASHIGANI_PUBLIC_URL=" "$env_file" 2>/dev/null; then
+      local _tmp_env2; _tmp_env2="$(mktemp)"
+      sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url}|" "$env_file" > "$_tmp_env2"
+      mv "$_tmp_env2" "$env_file"
+    else
+      echo "YASHIGANI_PUBLIC_URL=${_pub_url}" >> "$env_file"
+    fi
+    export YASHIGANI_PUBLIC_URL="$_pub_url"
+
+    # Declared set of enabled optional-service profiles, for the backoffice
+    # Optional Services panel (observational; the hardened container can't probe
+    # Docker). Assemble from agent bundles + the per-flag opt-ins.
+    local _enabled_profiles=()
+    [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _enabled_profiles+=("${COMPOSE_PROFILES[@]}")
+    [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _enabled_profiles+=("wazuh")
+    [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _enabled_profiles+=("internal-ca")
+    # de-dupe, comma-join
+    local _ep_csv; _ep_csv="$(printf '%s\n' "${_enabled_profiles[@]+"${_enabled_profiles[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+    if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$env_file" 2>/dev/null; then
+      local _tmp_env3; _tmp_env3="$(mktemp)"
+      sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv}|" "$env_file" > "$_tmp_env3"
+      mv "$_tmp_env3" "$env_file"
+    else
+      echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv}" >> "$env_file"
+    fi
+    export YASHIGANI_ENABLED_PROFILES="$_ep_csv"
+
     # 3. Create Docker-compatible directories for promtail (best-effort).
     # On CI runners (GitHub Actions / Podman) /var/lib/docker does not exist and
     # is owned by root, so a plain mkdir fails with EPERM. The installer body
@@ -4040,15 +7404,43 @@ compose_up() {
     fi
 
     # 5. Build images with podman build (compose build uses Docker buildx)
-    #    Skip rebuild on upgrade if images already exist
+    #    Skip rebuild only when both version-tagged images exist AND their
+    #    revision label matches the current source SHA. A stale :latest or a
+    #    version-tagged image from an older commit must be rebuilt (version-drift
+    #    stale-image bug — cf. 0d9aed1 + YASHIGANI_GIT_SHA cache-busting fix).
     local _gw_exists=false _bo_exists=false
-    podman image exists yashigani/gateway:latest 2>/dev/null && _gw_exists=true
-    podman image exists yashigani/backoffice:latest 2>/dev/null && _bo_exists=true
+    local _gw_sha_ok=false _bo_sha_ok=false
+    if podman image exists "yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null || \
+       podman image exists "localhost/yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null; then
+      _gw_exists=true
+      if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+        _gw_sha_ok=true
+      else
+        local _gw_lbl
+        _gw_lbl="$(podman image inspect "yashigani/gateway:${YASHIGANI_VERSION}" 2>/dev/null \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+        [[ "$_gw_lbl" == "$YASHIGANI_GIT_SHA" ]] && _gw_sha_ok=true
+      fi
+    fi
+    if podman image exists "yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null || \
+       podman image exists "localhost/yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null; then
+      _bo_exists=true
+      if [[ "$YASHIGANI_GIT_SHA" == "dev" ]]; then
+        _bo_sha_ok=true
+      else
+        local _bo_lbl
+        _bo_lbl="$(podman image inspect "yashigani/backoffice:${YASHIGANI_VERSION}" 2>/dev/null \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+        [[ "$_bo_lbl" == "$YASHIGANI_GIT_SHA" ]] && _bo_sha_ok=true
+      fi
+    fi
 
-    if [[ "$UPGRADE" == "true" && "$_gw_exists" == "true" && "$_bo_exists" == "true" ]]; then
-      log_info "Images already built — skipping rebuild (upgrade path)"
+    if [[ "$_gw_exists" == "true" && "$_bo_exists" == "true" && \
+          "$_gw_sha_ok" == "true" && "$_bo_sha_ok" == "true" && \
+          "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+      log_info "Images already current (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping rebuild (Podman)"
     else
-      log_info "Building images with Podman..."
+      log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
       # retro #32: do NOT pipe through `tail -1`. The script's outer exec
       # redirect at the top of main() already tees stdout+stderr to
       # install.log. Piping through `tail -1` here truncates build output
@@ -4056,11 +7448,87 @@ compose_up() {
       # errors ("no space left on device"), Dockerfile syntax errors, and
       # cache-eviction warnings are silently dropped from the log.
       # Verbose terminal output is the explicit tradeoff for visibility.
-      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" -t yashigani/gateway:latest "${WORK_DIR}"
-      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" -t yashigani/backoffice:latest "${WORK_DIR}"
+      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
+        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+        -t "yashigani/gateway:${YASHIGANI_VERSION}" \
+        -t yashigani/gateway:latest "${WORK_DIR}"
+      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
+        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+        -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
+        -t yashigani/backoffice:latest "${WORK_DIR}"
       log_success "Images built with Podman"
     fi
+
+    # 3.0 doc-OPA: build the per-job extractor image (release artifact) under
+    # Podman too. Build-only (never `up`), so it must be built + tagged
+    # explicitly with the VERSIONED tag the runner names
+    # (yashigani/extractor:${YASHIGANI_VERSION}). Idempotent on re-run.
+    local _podman_ext_tag="yashigani/extractor:${YASHIGANI_VERSION}"
+    local _podman_ext_cached_sha=""
+    if podman image exists "$_podman_ext_tag" 2>/dev/null && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
+      _podman_ext_cached_sha="$(podman image inspect "$_podman_ext_tag" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Labels',{}).get('org.opencontainers.image.revision',''))" 2>/dev/null || true)"
+    fi
+    if podman image exists "$_podman_ext_tag" 2>/dev/null \
+        && [[ "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]] \
+        && { [[ "$YASHIGANI_GIT_SHA" == "dev" ]] || [[ "$_podman_ext_cached_sha" == "$YASHIGANI_GIT_SHA" ]]; }; then
+      log_info "Extractor image already present ($_podman_ext_tag, SHA ${_podman_ext_cached_sha:-dev}) — skipping"
+    elif [[ -f "${WORK_DIR}/docker/Dockerfile.extractor" ]]; then
+      log_info "Building per-job extractor image with Podman (release artifact)..."
+      if podman build -f "${WORK_DIR}/docker/Dockerfile.extractor" \
+           --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+           "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+           -t "yashigani/extractor:${YASHIGANI_VERSION}" \
+           -t "yashigani/extractor:latest" "${WORK_DIR}"; then
+        log_success "Extractor image built with Podman (yashigani/extractor:${YASHIGANI_VERSION})"
+      elif [[ "${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}" == "true" ]]; then
+        log_error "Extractor build FAILED and document enforcement is ENABLED — cannot continue"
+        exit 1
+      else
+        log_warn "Extractor build failed; document enforcement is OFF by default — continuing"
+      fi
+    else
+      log_warn "Dockerfile.extractor not found — skipping extractor build (Podman)"
+    fi
   fi
+
+  # --- Runtime-agnostic .env writes (MUST run for docker AND podman) ----------
+  # BUGFIX (2026-06-08): YASHIGANI_PUBLIC_URL and YASHIGANI_ENABLED_PROFILES were
+  # only written inside the `if podman` branch above, so on Docker they were never
+  # set. Result: the backoffice Optional-Services panel read an empty
+  # YASHIGANI_ENABLED_PROFILES and showed EVERY deployed optional service + agent
+  # (openwebui, wazuh, langflow, letta, openclaw) as "Not deployed"; external
+  # sub-apps (Grafana/Wazuh) had no public-URL to self-reference. Recomputed here
+  # (the in-branch `local`s never execute on docker) and written unconditionally.
+  local _env_file_rt="${WORK_DIR}/docker/.env"
+  local _pub_suffix_rt=""
+  [[ -n "${YASHIGANI_HTTPS_PORT:-}" && "${YASHIGANI_HTTPS_PORT}" != "443" ]] && _pub_suffix_rt=":${YASHIGANI_HTTPS_PORT}"
+  local _pub_url_rt="https://${YASHIGANI_TLS_DOMAIN:-${DOMAIN:-localhost}}${_pub_suffix_rt}"
+  if grep -q "^YASHIGANI_PUBLIC_URL=" "$_env_file_rt" 2>/dev/null; then
+    local _t1_rt; _t1_rt="$(mktemp)"
+    sed "s|^YASHIGANI_PUBLIC_URL=.*|YASHIGANI_PUBLIC_URL=${_pub_url_rt}|" "$_env_file_rt" > "$_t1_rt"
+    mv "$_t1_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_PUBLIC_URL=${_pub_url_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_PUBLIC_URL="$_pub_url_rt"
+
+  local _ep_rt=()
+  [[ ${#COMPOSE_PROFILES[@]} -gt 0 ]] && _ep_rt+=("${COMPOSE_PROFILES[@]}")
+  [[ "${INSTALL_WAZUH:-false}" == "true" ]] && _ep_rt+=("wazuh")
+  [[ "${INSTALL_INTERNAL_CA:-false}" == "true" ]] && _ep_rt+=("internal-ca")
+  local _ep_csv_rt; _ep_csv_rt="$(printf '%s\n' "${_ep_rt[@]+"${_ep_rt[@]}"}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
+  if grep -q "^YASHIGANI_ENABLED_PROFILES=" "$_env_file_rt" 2>/dev/null; then
+    local _t2_rt; _t2_rt="$(mktemp)"
+    sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}|" "$_env_file_rt" > "$_t2_rt"
+    mv "$_t2_rt" "$_env_file_rt"
+  else
+    echo "YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}" >> "$_env_file_rt"
+  fi
+  export YASHIGANI_ENABLED_PROFILES="$_ep_csv_rt"
+  log_info "Enabled optional-service profiles: ${_ep_csv_rt:-<none>}"
 
   # Ensure all required directories and secret files exist (handles upgrades,
   # re-runs, and failed previous installs). Docker Desktop for Mac (VirtioFS)
@@ -4365,9 +7833,21 @@ compose_up() {
         }
         # CA bundle: root + intermediate (same as _upgrade_postgres_ssl step 1)
         local _tmp_bundle
-        # V232-NEG04: use secrets dir for temp bundle — never /tmp
-        _tmp_bundle=$(mktemp "${_host_secrets}/.ysg_bundle_XXXXXX.crt" 2>/dev/null || echo "${_host_secrets}/.ysg_bundle.crt")
-        cat "${_host_secrets}/ca_root.crt" "${_host_secrets}/ca_intermediate.crt" > "$_tmp_bundle"
+        # V232-NEG04: use tls/ dir for temp bundle (never /tmp); secrets/ is subuid-owned on
+        # rootless Podman so mktemp there would EPERM (#ROOTLESS-WAZUH-1 follow-up).
+        # tls/ is created by _prepare_secrets_dir_for_pki and is host-owned.
+        _tmp_bundle=$(mktemp "${WORK_DIR}/docker/tls/.ysg_bundle_XXXXXX.crt" 2>/dev/null \
+                      || echo "${WORK_DIR}/docker/tls/.ysg_bundle.crt")
+        # Read CA certs via podman unshare (subuid-owned on rootless); write bundle to host-owned tls/.
+        if ! podman unshare bash -c \
+               "cat '${_host_secrets}/ca_root.crt' '${_host_secrets}/ca_intermediate.crt' > '${_tmp_bundle}'" \
+               2>/dev/null; then
+          # Fallback: direct cat (Docker / rootful / macOS paths should not reach here, but be safe)
+          cat "${_host_secrets}/ca_root.crt" "${_host_secrets}/ca_intermediate.crt" > "$_tmp_bundle" 2>/dev/null || {
+            log_error "CA bundle creation failed (direct + unshare) — SSL injection aborted"
+            rm -f "$_tmp_bundle"; return 1
+          }
+        fi
         podman cp "$_tmp_bundle" "${_pg_container_name}:${_pgdata}/root.crt" 2>/dev/null || {
           log_error "podman cp ca bundle failed — SSL injection aborted"; rm -f "$_tmp_bundle"; return 1
         }
@@ -4425,7 +7905,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         for _ssl_i in $(seq 1 30); do
           local _ssl_check
           _ssl_check=$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
-              psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+              psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
           if [[ "$_ssl_check" == "on" ]]; then
             log_success "  postgres SSL enabled (cp path, confirmed on retry ${_ssl_i})"
             _ssl_ok=1; break
@@ -4437,11 +7917,14 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
           return 1
         fi
         # SCRAM re-hash (same as _upgrade_postgres_ssl step 6)
+        # #ROOTLESS-WAZUH-1: postgres_password is subuid-owned on rootless Podman; use
+        # _safe_read_secret (tries direct cat, then podman unshare cat, then .env lookup).
         local _pg_pass
-        _pg_pass=$(cat "${WORK_DIR}/docker/secrets/postgres_password" 2>/dev/null || echo "")
+        _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
+                    "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
         if [[ -n "$_pg_pass" ]]; then
           "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
-              psql -U yashigani_app -d yashigani -h 127.0.0.1 \
+              psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
               -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>/dev/null || true
           log_info "  SCRAM re-hash applied (cp path)"
         fi
@@ -4477,6 +7960,13 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       _digest_stripped_compose="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
       sed 's|@sha256:[a-f0-9]\{64\}||g' "${compose_file}" > "$_digest_stripped_compose"
       _compose_files_up=("-f" "$_digest_stripped_compose")
+      # Preserve override files (wazuh/podman/gpu overlays) after the base compose — the
+      # digest-strip applies only to the base; dropping overlays means profile services
+      # defined ONLY in an overlay (e.g. wazuh-security-init) never start.
+      local _cf_i
+      for ((_cf_i=2; _cf_i<${#compose_files[@]}; _cf_i++)); do
+        _compose_files_up+=("${compose_files[$_cf_i]}")
+      done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose")"
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
@@ -4497,6 +7987,13 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       _digest_stripped_compose2="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
       sed 's|@sha256:[a-f0-9]\{64\}||g' "${compose_file}" > "$_digest_stripped_compose2"
       _compose_files_up2=("-f" "$_digest_stripped_compose2")
+      # Preserve override files (wazuh/podman/gpu overlays) — see note above; without this
+      # the wazuh-security-init sidecar (overlay-only) never starts → indexer never gets
+      # securityadmin'd → whole SIEM chain stalls on a fresh pre-seeded install.
+      local _cf2_i
+      for ((_cf2_i=2; _cf2_i<${#compose_files[@]}; _cf2_i++)); do
+        _compose_files_up2+=("${compose_files[$_cf2_i]}")
+      done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
@@ -4594,6 +8091,19 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # Timeout: 60 seconds (polling every 2s).
   # ---------------------------------------------------------------------------
   _verify_gateway_healthz
+
+  # ---------------------------------------------------------------------------
+  # INSTALL-AGENTDB-001: idempotently ensure opt-in agent databases exist.
+  #
+  # The postgres initdb agent-DB script (creates `letta` + pgvector) runs ONLY
+  # on a fresh PGDATA. On an upgrade — or an install onto a postgres_data volume
+  # that predates the agent-DB init script / the bundle being enabled — the DB is
+  # never created and the agent crash-loops. This re-runs the SAME (idempotent)
+  # init script inside the running postgres container so the DB is provisioned on
+  # every install/upgrade. Non-fatal: agent bundles are optional, so a failure
+  # here must not block the core stack.
+  # ---------------------------------------------------------------------------
+  _ensure_agent_databases "$compose_file"
 }
 
 # =============================================================================
@@ -4604,14 +8114,19 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 #   2. Backoffice /login → must return HTTP 200 via Caddy (proves Caddy→backoffice
 #      routing; /login is unauth-200 per health-check.sh retro #3n comment)
 #
-# If either check times out (60s), dumps gateway + postgres logs and exits 1.
-# Exit 0 from compose_up is therefore conditional on both checks passing.
+# If either check times out (see YSG_HEALTHZ_TIMEOUT_S), dumps gateway + postgres
+# logs and exits 1.  Exit 0 from compose_up is therefore conditional on both checks passing.
 #
 # Timeout and poll interval are tunable via env vars for CI:
-#   YSG_HEALTHZ_TIMEOUT_S   (default: 60)
+#   YSG_HEALTHZ_TIMEOUT_S   (default: 1200)
 #   YSG_HEALTHZ_POLL_S      (default: 2)
 _verify_gateway_healthz() {
-  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-60}"
+  local _timeout_s="${YSG_HEALTHZ_TIMEOUT_S:-1200}"  # 60→180→300→1200: cold builds (fresh image
+  # compile + all services starting together on a modest host) can take well over 300s for the
+  # gateway to converge. 1200s (20 min) is safe for the worst-case cold-build on a single-core
+  # VM (observed on clean --wazuh installs with Wazuh indexer + manager bringing up simultaneously).
+  # Warm-cache re-installs converge in <30s; the gate polls every 2s and exits as soon as healthy.
+  # Override with YSG_HEALTHZ_TIMEOUT_S (e.g. set 300 in a warm-cache CI harness).
   local _poll_s="${YSG_HEALTHZ_POLL_S:-2}"
   local _https_port="${YASHIGANI_HTTPS_PORT:-443}"
   local _domain="${DOMAIN:-localhost}"
@@ -4623,11 +8138,26 @@ _verify_gateway_healthz() {
 
   log_info "Convergence gate: polling gateway /healthz (timeout ${_timeout_s}s) — BUG-INSTALL-ON-CONTAMINATED-VOLUMES"
 
+  # FIX-3 (defence-in-depth): use --cacert instead of --insecure/-k.
+  # No credentials on these polls, but consistent TLS verification prevents
+  # a rogue cert on the loopback from going unnoticed (Laura F2 hardening).
+  # ca_root.crt is present here: PKI bootstrap (step 9b) ran before compose_up.
+  # Loopback liveness poll of the Caddy EDGE (127.0.0.1 via --resolve) → use --insecure.
+  # RECURRING-REGRESSION GUARD (v2.23.x retros — "Caddyfile/cert/probe drift"): the EDGE cert is
+  # whatever Caddy issued for this TLS mode — selfsigned = Caddy's own on-the-fly local CA,
+  # acme = Let's Encrypt, ca = the BYO CA — and is NEVER signed by the internal mesh ca_root.crt.
+  # So `--cacert ca_root` ALWAYS fails verification here (HTTP 000, ssl_verify_result=20) and the
+  # gate hangs until timeout — observed breaking every selfsigned/acme install. This is a
+  # localhost convergence/liveness check (not a security boundary; verifying a loopback edge cert
+  # buys nothing), so use --insecure. DO NOT "harden" this back to --cacert (that is the regression).
+  local _curl_tls_opt="--insecure"
+
   local _deadline=$(( $(date +%s) + _timeout_s ))
   local _gateway_ok=0
 
   while [[ "$(date +%s)" -lt "$_deadline" ]]; do
-    if curl -sk --max-time 5 \
+    # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
+    if curl --silent $_curl_tls_opt --max-time 5 \
          --resolve "${_domain}:${_https_port}:127.0.0.1" \
          "https://${_domain}:${_https_port}/healthz" \
          -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
@@ -4636,6 +8166,34 @@ _verify_gateway_healthz() {
     fi
     sleep "$_poll_s"
   done
+
+  # YSG-RISK-084 self-heal: under a heavy fresh install (all agent/SIEM profiles),
+  # a slow postgres first-initdb can exceed its healthcheck start_period, so compose
+  # aborts dependent app-tier containers to "Created" and the gateway never starts.
+  # Postgres is healthy by now — re-converge ONCE (idempotent `up -d` with the same
+  # profiles) and re-poll before failing closed.
+  if [[ "$_gateway_ok" -eq 0 ]]; then
+    local _sh_profile_args=()
+    local _p
+    for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+      _sh_profile_args+=("--profile" "$_p")
+    done
+    log_warn "Convergence gate: gateway not healthy yet — one self-heal re-converge (YSG-RISK-084)"
+    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
+    local _deadline_sh=$(( $(date +%s) + _timeout_s ))
+    while [[ "$(date +%s)" -lt "$_deadline_sh" ]]; do
+      # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
+      if curl --silent $_curl_tls_opt --max-time 5 \
+           --resolve "${_domain}:${_https_port}:127.0.0.1" \
+           "https://${_domain}:${_https_port}/healthz" \
+           -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
+        _gateway_ok=1
+        log_success "Convergence gate: gateway healthy after self-heal re-converge"
+        break
+      fi
+      sleep "$_poll_s"
+    done
+  fi
 
   if [[ "$_gateway_ok" -eq 0 ]]; then
     log_error "Convergence gate FAILED: gateway /healthz did not return 200 within ${_timeout_s}s"
@@ -4660,7 +8218,8 @@ _verify_gateway_healthz() {
   local _backoffice_ok=0
 
   while [[ "$(date +%s)" -lt "$_deadline2" ]]; do
-    if curl -sk --max-time 5 \
+    # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
+    if curl --silent $_curl_tls_opt --max-time 5 \
          --resolve "${_domain}:${_https_port}:127.0.0.1" \
          "https://${_domain}:${_https_port}/login" \
          -o /dev/null -w "%{http_code}" 2>/dev/null | grep -q "^200$"; then
@@ -5125,7 +8684,7 @@ _upgrade_postgres_ssl() {
   log_info "Checking postgres SSL state (upgrade path)..."
   local _ssl_state
   _ssl_state=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-      psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+      psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
 
   if [[ "$_ssl_state" == "on" ]]; then
     log_info "Postgres SSL already enabled — skipping SSL upgrade injection"
@@ -5211,7 +8770,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   for _i in $(seq 1 $_retries); do
     local _ssl_check
     _ssl_check=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-        psql -U yashigani_app -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
+        psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc "SHOW ssl;" 2>/dev/null | tr -d ' \n' || echo "unknown")
     if [[ "$_ssl_check" == "on" ]]; then
       log_success "postgres SSL enabled (confirmed on retry ${_i})"
       break
@@ -5227,14 +8786,17 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # Retro N1-HARNESS-003 (2026-05-02): upgrading from v2.22.x leaves the SCRAM
   # hash with parameters that may not match the server's current
   # scram_iterations. A password reset forces postgres to recompute the hash.
+  # #ROOTLESS-WAZUH-1: postgres_password is subuid-owned on rootless Podman; use
+  # _safe_read_secret (direct cat → podman unshare cat → .env lookup) rather than
+  # a bare `cat` that would EPERM on the rootless path.
   local _pg_pass
-  _pg_pass=$(cat "${WORK_DIR}/docker/secrets/postgres_password" 2>/dev/null || \
-             grep -oP '(?<=POSTGRES_PASSWORD=)[^ ]+' "${WORK_DIR}/docker/.env" 2>/dev/null | head -1 || echo "")
+  _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
+              "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
   if [[ -z "$_pg_pass" ]]; then
     log_warn "postgres SSL upgrade: could not read postgres_password — skipping SCRAM re-hash"
   else
     "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
-        psql -U yashigani_app -d yashigani -h 127.0.0.1 \
+        psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
         -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>&1 || {
       log_warn "postgres SSL upgrade: SCRAM re-hash failed — pgbouncer auth may fail"
     }
@@ -5333,14 +8895,43 @@ register_agent_bundles() {
   local first=true
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
     [[ -z "$_profile" ]] && continue
+    # Phase 5 §C: per-profile caps (groups/paths/kind/ceiling).  Defaults are
+    # empty so letta/openclaw inherit the pre-4.0 open-group behaviour unchanged.
+    local _lf_groups='[]' _lf_caller_groups='[]' _lf_paths='[]'
+    local _lf_kind="" _lf_ceiling=""
+    # v4.1 unified-sidecar §2.5 INGRESS-FRONTING: registered upstream URLs
+    # point at each agent's Caddy mesh front, NOT the raw agent hostname —
+    # the §2.6 split-ringfence migration removed gateway L3 reach to the
+    # agents (ingress ringfence is strictly 2-member {agent, caddy}).
+    #   https://caddy:<mesh_port>/agents/<tenant>/<agent>  →  forward_auth
+    #   /auth/verify-mcp → reverse_proxy agent:<port> over ringfence_<s>_in.
+    # Mesh ports are PINNED in bundles/<agent>-egress.yaml
+    # (spec.ingress.mesh_port) and drift-gated by
+    # tests/contracts/test_v41_agent_ingress_template.py — change them THERE.
+    # NOTE (Tom, §2.5 dispatch repoint): gateway agent_router + backoffice
+    # langflow_client must present the mesh client leaf on https upstreams;
+    # until that lands, dispatch through the front fails CLOSED at the TLS
+    # handshake (no regression — the direct path had no L3 route at all).
     case "$_profile" in
-      langflow)  local _name="langflow"  _url="http://langflow:7860"   _proto="langflow" ;;
-      letta)     local _name="letta"     _url="http://letta:8283"     _proto="letta" ;;
-      openclaw)  local _name="openclaw"  _url="http://openclaw:18789" _proto="openai" ;;
+      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="openai"
+                 # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
+                 # agent__langflow is a P1-only callee: only the gateway can be its upstream
+                 # (OPENAI_API_BASE=http://egress-langflow:9400/llm/v1 — enforced in compose/helm).
+                 # allowed_caller_groups: any logged-in user or admin may invoke it.
+                 # allowed_paths: constrained to the OpenAI-compat chat endpoint only.
+                 # sensitivity_ceiling: INTERNAL (hard-cap also enforced in policy/agents.rego).
+                 _lf_kind="agent"
+                 _lf_ceiling="INTERNAL"
+                 _lf_groups='["langflow_callee"]'
+                 _lf_caller_groups='["admin","user"]'
+                 _lf_paths='["/v1/chat/completions"]'
+                 ;;
+      letta)     local _name="letta"     _url="https://caddy:9775/agents/default/letta"     _proto="letta" ;;
+      openclaw)  local _name="openclaw"  _url="https://caddy:9671/agents/default/openclaw"  _proto="openai" ;;
       *) continue ;;
     esac
     $first || agents_json+=','
-    agents_json+="{\"profile\":\"${_profile}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\"}"
+    agents_json+="{\"profile\":\"${_profile}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\",\"groups\":${_lf_groups},\"allowed_caller_groups\":${_lf_caller_groups},\"allowed_paths\":${_lf_paths},\"kind\":\"${_lf_kind}\",\"sensitivity_ceiling\":\"${_lf_ceiling}\"}"
     first=false
   done
   agents_json+=']'
@@ -5354,193 +8945,144 @@ register_agent_bundles() {
   local reg_exit=0
   reg_output="$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T -e AGENTS_JSON="${agents_json}" backoffice \
     python3 -c '
-import json, os, ssl, sys, time, urllib.request
-
-secrets = "/run/secrets"
-def read_secret(name):
-    try:
-        return open(os.path.join(secrets, name)).read().strip()
-    except:
-        return ""
-
-# v2.23.1: backoffice serves mTLS on :8443. Present the client cert on every
-# call (same chain used by the Dockerfile HEALTHCHECK).
-# Pattern A for Python ssl: trust anchor is the PUBLIC ca_root.crt. Python
-# 3.12/OpenSSL 3.0/Ubuntu 24.04 strict chain validation rejects intermediate-
-# only anchors (gate #58a evidence, 2026-04-28). Private ca_root.key never
-# enters a workload container.
-_ctx = ssl.create_default_context(cafile=os.path.join(secrets, "ca_root.crt"))
-_ctx.load_cert_chain(
-    os.path.join(secrets, "backoffice_client.crt"),
-    os.path.join(secrets, "backoffice_client.key"),
-)
-
-user = read_secret("admin1_username")
-pw = read_secret("admin1_password")
-totp_secret = read_secret("admin1_totp_secret")
-caddy_hmac = read_secret("caddy_internal_hmac")
-if not all([user, pw, totp_secret, caddy_hmac]):
-    print("ERROR:missing_secrets", file=sys.stderr)
-    sys.exit(1)
-
-# Compute TOTP using pyotp with SHA-256 (same as backoffice)
-import pyotp, hashlib
-totp_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
-
-# Login — Layer B: X-Caddy-Verified-Secret required on every direct backoffice call
-login_data = json.dumps({"username": user, "password": pw, "totp_code": totp_code}).encode()
-req = urllib.request.Request("https://localhost:8443/auth/login", data=login_data,
-                             headers={"Content-Type": "application/json",
-                                      "X-Caddy-Verified-Secret": caddy_hmac})
-try:
-    resp = urllib.request.urlopen(req, context=_ctx)
-except Exception as e:
-    print(f"ERROR:login_failed:{e}", file=sys.stderr)
-    sys.exit(1)
-
-session = ""
-cookie = resp.headers.get("Set-Cookie", "")
-for part in cookie.split(";"):
-    part = part.strip()
-    if part.startswith("__Host-yashigani_admin_session="):
-        session = part.split("=", 1)[1]
-        break
-
-if not session:
-    print("ERROR:no_session_cookie", file=sys.stderr)
-    sys.exit(1)
-
-# Step-up — POST /admin/agents requires StepUpAdminSession (assert_fresh_stepup).
-# A single stepup covers all agent registrations within the 300 s TTL.
+# SEC-001 (2026-06-14): register agent bundles via the NO-ADMIN-API durable
+# path — mirrors agents/reconciler.py. Writes directly to Postgres
+# (AgentDurableStore) + Redis db/3 (AgentRegistry). No admin login, no TOTP,
+# no step-up, no install_svc service account. Eliminates LAURA-2255-001 (human
+# admin bootstrap regression) and the install_svc standing-admin backdoor.
 #
-# ISSUE-020 (2026-05-19): login and stepup both call pyotp.TOTP(...).now().  If
-# both calls land in the same 30 s TOTP window the Postgres-backed replay
-# cache already holds that window code (inserted by login) and rejects
-# the stepup with invalid_totp_code → session last_totp_verified_at never set
-# → POST /admin/agents returns 401 step_up_required on every attempt.
-#
-# Fix: sleep until the start of the NEXT 30 s TOTP window before computing the
-# stepup code.  Worst-case latency: 30 s; best-case: ~1 s (called at window
-# boundary).  Acceptable in an already-long install path.
-_remaining = 30 - (int(time.time()) % 30)
-# Add 1 s margin so the new window is firmly established before we compute.
-time.sleep(_remaining + 1)
-stepup_code = pyotp.TOTP(totp_secret, digest=hashlib.sha256).now()
-stepup_data = json.dumps({"totp_code": stepup_code}).encode()
-req = urllib.request.Request("https://localhost:8443/auth/stepup", data=stepup_data,
-                             headers={"Content-Type": "application/json",
-                                      "X-Caddy-Verified-Secret": caddy_hmac,
-                                      "Cookie": f"__Host-yashigani_admin_session={session}"})
-# Hard-fail on stepup failure.  A successful stepup is required before any
-# POST /admin/agents call.  The server updates last_totp_verified_at in the
-# existing session (no new cookie is issued) so the same session cookie is
-# valid for the subsequent POSTs.
-try:
-    stepup_resp = urllib.request.urlopen(req, context=_ctx)
-    stepup_body = json.loads(stepup_resp.read())
-    if not stepup_body.get("stepup_verified"):
-        print(f"ERROR:stepup_not_verified:{stepup_body}", file=sys.stderr)
-        sys.exit(1)
-except urllib.error.HTTPError as e:
-    detail = e.read().decode()[:200]
-    print(f"ERROR:stepup_failed:{e.code}:{detail}", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"ERROR:stepup_failed:{e}", file=sys.stderr)
-    sys.exit(1)
+# Security: this Python runs INSIDE the backoffice container (compose exec),
+# which is mesh-isolated (data-network only). We use the same env vars
+# (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) that the in-process app uses.
+# The HTTP stack is not touched — no admin session, no TOTP, no HMAC secret.
+import json, os, sys, secrets as _sec_mod
+sys.path.insert(0, "/app/src")
 
-# YSG-AGENT-REG-001: query the live registry before registering.
-# GET /admin/agents returns all agents currently in Redis. This is the
-# authoritative source — token files on disk can diverge from the registry
-# when secrets_dir is preserved across a re-install that wiped volumes.
-# Agents already in the registry are skipped (idempotent); agents absent
-# from the registry are registered even if a stale token file exists.
-registered_names = set()
-try:
-    req = urllib.request.Request("https://localhost:8443/admin/agents",
-                                 headers={"X-Caddy-Verified-Secret": caddy_hmac,
-                                          "Cookie": f"__Host-yashigani_admin_session={session}"})
-    resp = urllib.request.urlopen(req, context=_ctx)
-    existing = json.loads(resp.read())
-    registered_names = {a.get("name", "") for a in existing}
-except Exception as e:
-    # Non-fatal: if list fails, attempt registration for all agents.
-    # Worst case: duplicate registration attempt → 409 Conflict (handled below).
-    print(f"WARNING:list_agents_failed:{e}", file=sys.stderr)
-
-# Register agents
-agents = json.loads(os.environ.get("AGENTS_JSON", "[]"))
+agents_spec = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
-for agent in agents:
-    profile = agent["profile"]
-    aname = agent["name"]
-    # Skip if agent is already registered in the live registry (idempotent).
-    # This check uses registry state, not token-file existence, so it correctly
-    # handles: fresh install (registry empty → register), upgrade (registry has
-    # agent → skip), re-install with wiped volumes (registry empty, stale token
-    # file → register and overwrite stale token).
-    if aname in registered_names:
-        results.append("SKIP:" + aname + ":" + profile)
-        continue
-    reg_data = json.dumps({"name": aname, "upstream_url": agent["url"], "protocol": agent.get("protocol", "openai")}).encode()
-    # ISSUE-019 (2026-05-19): POST /admin/agents requires a SPIFFE ID
-    # (require_spiffe_id gate, YSG-RISK-012b / ASVS V10.3.5).  install.sh runs
-    # inside the backoffice container and calls localhost:8443 directly (not via
-    # Caddy), so Caddy cannot inject X-SPIFFE-ID from the TLS peer cert.
-    # SpiffePeerCertMiddleware cannot extract the peer cert via the ASGI TLS
-    # extension because uvicorn does not expose it (confirmed 0.39.0 / 0.46.0).
-    # We inject the backoffice identity explicitly.  Trust anchor: this code
-    # runs inside the backoffice container, which is the only entity that holds
-    # backoffice_client.crt.  CaddyVerifiedMiddleware Layer B (X-Caddy-Verified-
-    # Secret HMAC) prevents an external attacker from reaching this route.
-    req = urllib.request.Request("https://localhost:8443/admin/agents", data=reg_data,
-                                 headers={"Content-Type": "application/json",
-                                          "X-Caddy-Verified-Secret": caddy_hmac,
-                                          "X-SPIFFE-ID": "spiffe://yashigani.internal/backoffice",
-                                          "Cookie": f"__Host-yashigani_admin_session={session}"})
+
+for agent_spec in agents_spec:
+    profile        = agent_spec["profile"]
+    aname          = agent_spec["name"]
+    aurl           = agent_spec["url"]
+    aproto         = agent_spec.get("protocol", "openai")
+    # Phase 5 §C: per-profile caps from the bash case statement above.
+    agroups        = agent_spec.get("groups") or []
+    acaller_groups = agent_spec.get("allowed_caller_groups") or []
+    apaths         = agent_spec.get("allowed_paths") or []
+    akind          = agent_spec.get("kind") or "agent"
+    aceiling       = agent_spec.get("sensitivity_ceiling") or None
+
     try:
-        resp = urllib.request.urlopen(req, context=_ctx)
-        body = json.loads(resp.read())
-        token = body.get("token", "")
-        if token:
-            token_path = os.path.join(secrets, profile + "_token")
+        from yashigani.agents.registry import AgentRegistry
+        from yashigani.agents.durable_store import AgentDurableStore
+        from yashigani.gateway._redis_url import build_redis_url
+        import redis as _redis
+
+        _redis_url = build_redis_url(
+            3,
+            use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+            secrets_dir="/run/secrets",
+            client_cert_name="backoffice_client",
+        )
+        _rc = _redis.from_url(_redis_url, decode_responses=True)
+        registry = AgentRegistry(_rc)
+        durable  = AgentDurableStore()
+
+        # Skip if agent is already registered by name (idempotent; preserves token)
+        existing_names = {a.get("name", "") for a in registry.list_all()}
+        if aname in existing_names:
+            results.append("SKIP:" + aname + ":" + profile)
+            continue
+
+        # Generate PSK token + bcrypt hash (mirrors POST /admin/agents)
+        import bcrypt as _bcrypt
+        raw_token = "ysg-" + _sec_mod.token_hex(32)
+        token_hash = _bcrypt.hashpw(raw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
+        agent_id = "agnt_" + _sec_mod.token_hex(8)
+
+        agent_data = {
+            "agent_id": agent_id,
+            "name": aname,
+            "upstream_url": aurl,
+            "protocol": aproto,
+            "status": "active",
+            "groups": agroups,
+            "allowed_caller_groups": acaller_groups,
+            "allowed_paths": apaths,
+            "allowed_cidrs": [],
+            # Phase 5 §C: callee-class fields (registry.py additive extension).
+            "kind": akind,
+            "sensitivity_ceiling": aceiling,
+        }
+
+        # 1. Durable write (Postgres) — survives redis recreate
+        durable.upsert(agent_data, token_hash=token_hash)
+        # 2. Fast write (Redis db/3) — request-time source of truth
+        registry.restore_from_durable(agent_data, token_hash)
+        # 3. Token file for gateway
+        token_path = os.path.join("/run/secrets", profile + "_token")
+        try:
+            with open(token_path, "w") as _tf:
+                _tf.write(raw_token)
             try:
-                with open(token_path, "w") as f:
-                    f.write(token)
-                try:
-                    # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read at
-                    # runtime when installer wrote the file as a different UID.
-                    os.chmod(token_path, 0o640)
-                except OSError as _chmod_err:
-                    # best-effort; host-side chmod applied below.
-                    # Log so the issue is visible in install.log (e.g. owner mismatch
-                    # on Podman rootless where file owner is UID 101000 inside the
-                    # container but a different UID on the host).
-                    print(f"WARNING:chmod_640_failed:{token_path}:{_chmod_err}", file=sys.stderr)
-            except PermissionError:
-                pass  # token printed below for host-side capture
-            results.append("OK:" + aname + ":" + profile + ":" + token)
-        else:
-            results.append("FAIL:" + aname + ":no_token")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()[:100]
-        results.append("FAIL:" + aname + ":" + str(e.code) + ":" + detail)
+                # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read
+                os.chmod(token_path, 0o640)
+            except OSError as _ce:
+                print(f"WARNING:chmod_640_failed:{token_path}:{_ce}", file=sys.stderr)
+        except PermissionError:
+            pass  # printed below for host-side capture
+        results.append("OK:" + aname + ":" + profile + ":" + raw_token)
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
+
+# POST-REGISTRATION: mint capability envelopes for bundled agents (SEC-ENVELOPE-001).
+#
+# bootstrap_bundled_agent_envelopes in app.py lifespan fires BEFORE this script
+# runs: backoffice starts at step 10 (compose_up), lifespan completes, THEN
+# step 11b calls register_agent_bundles.  On a cold install the agent registry
+# (Redis db/3) is empty at lifespan time, so both bootstrap passes in the
+# lifespan find 0 bundled agents and mint 0 envelopes.
+#
+# Fix: mint here, immediately after each agent is written to Redis+Postgres,
+# so mcp_tool_surface_pins has rows before the first request reaches
+# /auth/verify-mcp step 3.  Idempotent: get_active_envelope() skips already-
+# active rows (covers re-run / upgrade paths where envelopes already exist).
+#
+# decode_responses=False for the registry client: AgentRegistry._decode_agent
+# does byte-key lookups on the hgetall return dict, which only works when Redis
+# returns bytes (the default); decode_responses=True would flip all keys to str
+# and cause every field lookup to silently return the empty-bytes default.
+import asyncio as _asyncio
+
+async def _mint_bundled_envelopes():
+    import asyncpg as _asyncpg
+    import redis as _r2
+    from yashigani.gateway._redis_url import build_redis_url as _bru
+    from yashigani.agents.registry import AgentRegistry as _AR
+    from yashigani.mcp.envelope_service import CapabilityEnvelopeService as _CES
+    from yashigani.backoffice.bundled_envelopes import bootstrap_bundled_agent_envelopes as _bbe
+    _dsn = os.environ.get("YASHIGANI_DB_DSN_DIRECT") or os.environ.get("YASHIGANI_DB_DSN", "")
+    if not _dsn or "${POSTGRES_PASSWORD}" in _dsn:
+        return []
+    _ru = _bru(3, use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+               secrets_dir="/run/secrets", client_cert_name="backoffice_client")
+    _rc2 = _r2.from_url(_ru, decode_responses=False)
+    _pool = await _asyncpg.create_pool(_dsn, min_size=1, max_size=1)
+    try:
+        return await _bbe(_CES(_pool), _AR(_rc2))
+    finally:
+        await _pool.close()
+
+try:
+    for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
+        results.append("ENVELOPE_MINTED:" + _pid)
+except Exception as _me:
+    results.append("ENVELOPE_WARN:" + str(_me))
 
 for r in results:
     print(r)
 ' 2>&1)" || reg_exit=$?
-
-  # Hard-fail on stepup errors (Python sys.exit(1); output contains ERROR:stepup_*).
-  # Per ISSUE-020: stepup failure means NO agent can be registered; continuing is
-  # misleading and violates [[feedback_test_harness_no_fake_green]] applied to
-  # install scripts — an advertised flag that silently fails is a fake-green class.
-  if [[ $reg_exit -ne 0 ]] && echo "$reg_output" | grep -qE '^ERROR:stepup'; then
-    log_error "Agent registration aborted: stepup failed"
-    echo "$reg_output" | grep '^ERROR:stepup' >&2
-    return 1
-  fi
 
   # Parse results
   local any_registered=false
@@ -5593,6 +9135,14 @@ for r in results:
       ERROR:*)
         log_warn "Agent registration: ${line#ERROR:}"
         ;;
+      ENVELOPE_MINTED:*)
+        # SEC-ENVELOPE-001: capability envelope minted for this bundled agent front.
+        log_success "  envelope minted: ${line#ENVELOPE_MINTED:}"
+        ;;
+      ENVELOPE_WARN:*)
+        # Non-fatal: fail-closed (verify-mcp denies until next boot retries).
+        log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
+        ;;
     esac
   done <<< "$reg_output"
 
@@ -5605,15 +9155,7 @@ for r in results:
     done
     log_success "Agent bundle registration complete"
 
-    # Pre-populate agents in Open WebUI's database
-    log_info "Syncing agents to Open WebUI..."
-    local init_script="${WORK_DIR}/scripts/init-openwebui-agents.py"
-    if [[ -f "$init_script" ]]; then
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" cp "$init_script" open-webui:/tmp/init-agents.py 2>/dev/null || \
-        podman cp "$init_script" docker_open-webui_1:/tmp/init-agents.py 2>/dev/null || true
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T open-webui python3 /tmp/init-agents.py 2>&1 || \
-        podman exec docker_open-webui_1 python3 /tmp/init-agents.py 2>&1 || true
-    fi
+    # 4.0: OWUI removed — agent sync via /admin/agents UI or API.
   else
     log_warn "No agents were registered — register manually via /admin/agents"
   fi
@@ -5640,6 +9182,77 @@ run_health_check() {
 
   bash "$health_script"
   log_success "Health checks passed"
+
+  # OLLAMA-INIT-EXIT-001: check ollama-init exit status and warn loudly if it
+  # failed. ollama-init is a one-shot container (no restart-unless-stopped) so
+  # a failed pull is silent once compose_up returns — the step-12 health check
+  # only verifies the ollama service port, not that models were actually pulled.
+  # This check surfaces init failures so the operator is not left wondering why
+  # agents return 404 "model not found". Non-fatal: the core stack is healthy;
+  # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
+  _check_ollama_init_exit "${WORK_DIR}/docker"
+}
+
+# _check_ollama_init_exit — inspect the stopped ollama-init container exit code.
+# Called at the end of run_health_check() after the main health script passes.
+# Non-fatal: emits a clear WARNING and remediation hint; does NOT exit 1 because
+# compose warn-and-continue logic (digest=skip) means exit 0 is now the normal
+# path; a lingering exit-1 container means something else (network, disk) failed.
+_check_ollama_init_exit() {
+  local _compose_dir="${1:-${WORK_DIR}/docker}"
+  local _compose_file="${_compose_dir}/docker-compose.yml"
+
+  # Only applies to compose deployments; helm has its own Job status.
+  if [[ "${DEPLOY_MODE:-compose}" != "compose" && "${DEPLOY_MODE:-compose}" != "vm" ]]; then
+    return 0
+  fi
+
+  # ollama-init only runs when at least one AI profile is active.
+  local _has_ai_profile=false
+  for _p in "${COMPOSE_PROFILES[@]:-}"; do
+    case "$_p" in
+      langflow|letta|openclaw) _has_ai_profile=true; break ;;
+    esac
+  done
+  if [[ "$_has_ai_profile" != "true" ]]; then
+    return 0
+  fi
+
+  # Look for an exited ollama-init container. Container name format varies by
+  # runtime: docker = <project>-ollama-init-1, podman = <project>_ollama-init_1
+  local _exit_code=""
+  local _ctr_name=""
+  while IFS= read -r _line; do
+    if [[ "$_line" == *"ollama-init"* ]]; then
+      _ctr_name="$_line"
+      break
+    fi
+  done < <("${COMPOSE_CMD[@]:-docker compose}" -f "$_compose_file" ps -a --format '{{.Name}}' 2>/dev/null || true)
+
+  if [[ -z "$_ctr_name" ]]; then
+    log_warn "ollama-init container not found — model pull status unknown (check: docker compose ps -a)"
+    return 0
+  fi
+
+  _exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$_ctr_name" 2>/dev/null || \
+                podman inspect --format '{{.State.ExitCode}}' "$_ctr_name" 2>/dev/null || true)"
+
+  if [[ -z "$_exit_code" ]]; then
+    log_warn "ollama-init: could not read exit code from container '$_ctr_name'"
+    return 0
+  fi
+
+  if [[ "$_exit_code" != "0" ]]; then
+    log_warn "################################################################"
+    log_warn "INSTALL WARNING: ollama-init exited with code ${_exit_code}"
+    log_warn "  The model pull container failed — agents (@letta/@langflow/@openclaw)"
+    log_warn "  may return 404 'model not found' until models are available in Ollama."
+    log_warn "  Check logs:  docker compose -f ${_compose_file} logs ollama-init"
+    log_warn "  Re-run pull: docker compose -f ${_compose_file} --profile <profile> run --rm ollama-init"
+    log_warn "################################################################"
+  else
+    log_success "ollama-init exited cleanly (models pulled successfully)"
+  fi
 }
 
 # =============================================================================
@@ -5746,14 +9359,22 @@ _gen_totp_secret() {
 }
 
 _gen_totp_uri() {
-  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&algorithm=SHA256&digits=6&period=30
-  # algorithm=SHA256 is mandatory — pyotp uses digest=hashlib.sha256.
-  # Without this parameter, authenticator apps default to SHA-1 → codes never match.
-  # P0-10 / SHA-256 minimum policy (maintainer directive 2026-05-01).
+  # Phase 13 (Yashigani 3.1): Admin-tier TOTP upgraded to HMAC-SHA-512, 8 digits.
+  # otpauth://totp/Yashigani:username?secret=SECRET&issuer=Yashigani&algorithm=SHA512&digits=8&period=30
+  #
+  # All Yashigani admin accounts use SHA-512/8-digit TOTP from v3.1.
+  # User-tier accounts use SHA-256/6-digit; those are provisioned via the web UI.
+  #
+  # REQUIRED AUTHENTICATOR APP: agnosticOTP (iOS/Android) or Aegis — reads the
+  # algorithm= and digits= URI parameters. Classic Google Authenticator (SHA-1 only)
+  # is NOT compatible with SHA-512/8-digit TOTP and MUST NOT be used.
+  #
+  # YSG-RISK-078 context: the original SHA-256 reversion was driven by SHA-1-only
+  # apps failing silently. Phase 13 mandates agnosticOTP specifically to avoid this.
   local username="$1"
   local secret="$2"
   local issuer="${DOMAIN:-Yashigani}"
-  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&algorithm=SHA256&digits=6&period=30"
+  echo "otpauth://totp/Yashigani:${username}?secret=${secret}&issuer=${issuer}&algorithm=SHA512&digits=8&period=30"
 }
 
 # Generate two distinct admin usernames from curated word lists
@@ -6311,12 +9932,62 @@ _do_chmod_0640() {
   return 0
 }
 
+# _secret_is_valid — F-001 self-heal predicate
+#
+# Returns 0 (true) if a CSPRNG secret file is present, non-empty, AND does not
+# contain a placeholder comment line ("# ...").  Returns 1 in all other cases:
+# file absent, zero-length, or contains only a placeholder/comment.
+#
+# Usage: _secret_is_valid <file>
+#
+# Rationale: install.sh writes placeholder strings (e.g. "# placeholder —
+# auto-generated at first bootstrap") into new secret slots before the PKI
+# bootstrap chowns secrets_dir.  A stale/partial install can leave those
+# placeholders on disk.  The old guard `[[ -s "$f" ]]` only checks non-zero
+# size, so a placeholder file is treated as a valid secret and preserved — then
+# envsubst substitution in the OpenClaw config receives the literal comment
+# string instead of a token (F-001 abort).  This predicate closes that gap.
+#
+# F-001 / fix/medlow-findings (Su, 2026-06-14)
+_secret_is_valid() {
+  local _sv_file="$1"
+  # Must exist and be non-empty
+  [[ -s "$_sv_file" ]] || return 1
+  # Must not start with a comment/placeholder marker.
+  # BUG-B+-004 (3.1.0): On Podman rootless, secrets are subuid-owned and unreadable by
+  # the host installer user. `head -c 1` fails → the function would return 1 (invalid)
+  # on every upgrade, triggering a re-generate + write path that ALSO fails (same EPERM).
+  # Fix: if head fails and YSG_PODMAN_RUNTIME=true, retry inside the user namespace via
+  # `podman unshare`. If the unshare read also fails, treat the file as valid (it exists
+  # and is non-empty per -s, so it's a real secret — the service started with it).
+  local _sv_first
+  if ! _sv_first="$(head -c 1 "$_sv_file" 2>/dev/null)"; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && command -v podman >/dev/null 2>&1; then
+      _sv_first="$(podman unshare sh -c "head -c 1 '${_sv_file}'" 2>/dev/null)" || {
+        # Podman unshare also failed: file exists+nonempty but totally unreadable.
+        # Treat as valid — the running service proves the value is real.
+        return 0
+      }
+    else
+      return 1
+    fi
+  fi
+  [[ "$_sv_first" == "#" ]] && return 1
+  return 0
+}
+
 # _safe_read_secret — BUG-B+-004: Podman-rootless-aware secret file reader
 #
 # On Podman rootless, secrets are owned by subuid-remapped UIDs that the host
 # installer user (UID 1000) cannot read directly. This helper tries:
 #   1. Direct read (works on Docker / Podman rootful / first-install)
 #   2. `podman unshare cat` (works on Podman rootless re-run)
+#   2b. Docker Linux non-root — throwaway --user 1001:1001 container cat
+#       (gate #DOCKER-NONROOT-SECRET-1: secrets/ is UID 1001 owned post-PKI;
+#        host installer UID 1000 cannot open the files directly. A container
+#        running as UID 1001 CAN read its own files. Image: yashigani/gateway
+#        is guaranteed present after the PKI issuer step. Falls through to
+#        Attempt 3 if the image is absent or the container run fails.)
 #   3. Read from .env (last-resort — value is already there from first install)
 #
 # Usage: _safe_read_secret <file> <ENV_KEY> <env_file>
@@ -6338,6 +10009,43 @@ _safe_read_secret() {
     if _sr_val="$(podman unshare cat "$_sr_file" 2>/dev/null)" && [[ -n "$_sr_val" ]]; then
       printf '%s' "$_sr_val"
       return 0
+    fi
+  fi
+
+  # Attempt 2b: Docker Linux non-root — read via throwaway --user 1001:1001 container.
+  # Condition: not Podman AND invoking UID != 0 (root bypasses DAC directly) AND
+  # not macOS (virtiofs UID remapping makes Attempt 1 succeed there).
+  # yashigani/gateway is the PKI issuer image and is guaranteed present post-PKI-bootstrap.
+  # The secrets directory (dirname of the file) is bind-mounted at /s:ro so the
+  # container can read UID 1001 owned files without any host-side permission change.
+  # gate: #DOCKER-NONROOT-SECRET-1
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]] \
+      && command -v docker >/dev/null 2>&1; then
+    local _sr_secrets_dir _sr_basename _sr_dkr_image _sr_dkr_tag
+    _sr_secrets_dir="$(dirname "${_sr_file}")"
+    _sr_basename="$(basename "${_sr_file}")"
+    _sr_dkr_image=""
+    for _sr_dkr_tag in "${YASHIGANI_VERSION:-}" "latest"; do
+      [[ -z "$_sr_dkr_tag" ]] && continue
+      if docker image inspect "yashigani/gateway:${_sr_dkr_tag}" >/dev/null 2>&1; then
+        _sr_dkr_image="yashigani/gateway:${_sr_dkr_tag}"
+        break
+      fi
+    done
+    if [[ -n "$_sr_dkr_image" ]]; then
+      if _sr_val="$(docker run --rm \
+                      --user 1001:1001 \
+                      --network none \
+                      --security-opt no-new-privileges \
+                      --volume "${_sr_secrets_dir}:/s:ro" \
+                      "$_sr_dkr_image" \
+                      cat "/s/${_sr_basename}" 2>/dev/null)" \
+          && [[ -n "$_sr_val" ]]; then
+        printf '%s' "$_sr_val"
+        return 0
+      fi
     fi
   fi
 
@@ -6443,11 +10151,15 @@ generate_secrets() {
   # Skip if secrets already exist (upgrade path)
   if [[ -f "${secrets_dir}/postgres_password" && -f "${secrets_dir}/redis_password" ]]; then
     log_info "Secrets already exist — preserving (upgrade path)"
-    GEN_POSTGRES_PASSWORD="$(cat "${secrets_dir}/postgres_password" 2>/dev/null || echo "[preserved]")"
-    GEN_REDIS_PASSWORD="$(cat "${secrets_dir}/redis_password" 2>/dev/null || echo "[preserved]")"
-    GEN_GRAFANA_PASSWORD="$(cat "${secrets_dir}/grafana_admin_password" 2>/dev/null || echo "[preserved]")"
-    GEN_ADMIN1_USERNAME="$(cat "${secrets_dir}/admin1_username" 2>/dev/null || echo "[preserved]")"
-    GEN_ADMIN2_USERNAME="$(cat "${secrets_dir}/admin2_username" 2>/dev/null || echo "[preserved]")"
+    # Docker non-root: direct cat fails (secrets/ owned by UID 1001). Route through
+    # _safe_read_secret so the Docker non-root fallback (gate #DOCKER-NONROOT-SECRET-1)
+    # is used. POSTGRES_PASSWORD + REDIS_PASSWORD have .env fallback keys; the
+    # others fall through to the display-only "[preserved]" placeholder on failure.
+    GEN_POSTGRES_PASSWORD="$(_safe_read_secret "${secrets_dir}/postgres_password" "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_REDIS_PASSWORD="$(_safe_read_secret "${secrets_dir}/redis_password" "REDIS_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_GRAFANA_PASSWORD="$(_safe_read_secret "${secrets_dir}/grafana_admin_password" "" "" 2>/dev/null || echo "[preserved]")"
+    GEN_ADMIN1_USERNAME="$(_safe_read_secret "${secrets_dir}/admin1_username" "YASHIGANI_ADMIN_USERNAME" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_ADMIN2_USERNAME="$(_safe_read_secret "${secrets_dir}/admin2_username" "" "" 2>/dev/null || echo "[preserved]")"
     GEN_ADMIN1_PASSWORD="[preserved — check secrets dir]"
     GEN_ADMIN2_PASSWORD="[preserved — check secrets dir]"
     GEN_ADMIN1_TOTP_SECRET="[preserved]"
@@ -6484,11 +10196,63 @@ generate_secrets() {
         echo "POSTGRES_PASSWORD_URLENC=${_pgurlenc}" >> "$env_file"
       fi
     fi
+    # v4.1 F-03: URL-encoded Redis password for YASHIGANI_REDIS_URL DSN (upgrade path).
+    # Mirrors the POSTGRES_PASSWORD_URLENC block above; both must be kept in sync.
+    if [[ "$GEN_REDIS_PASSWORD" != "[preserved]" && -n "$GEN_REDIS_PASSWORD" ]]; then
+      local _redisurlenc
+      _redisurlenc="$(_urlencode_userinfo "$GEN_REDIS_PASSWORD")"
+      if grep -q "^REDIS_PASSWORD_URLENC=" "$env_file" 2>/dev/null; then
+        local tmp_env; tmp_env="$(mktemp)"
+        sed "s|^REDIS_PASSWORD_URLENC=.*|REDIS_PASSWORD_URLENC=${_redisurlenc}|" "$env_file" > "$tmp_env"
+        mv "$tmp_env" "$env_file"
+      else
+        echo "REDIS_PASSWORD_URLENC=${_redisurlenc}" >> "$env_file"
+      fi
+    fi
+    # v4.1 username-fix (upgrade path): sync YASHIGANI_ADMIN_USERNAME in .env to the
+    # stored admin1_username so compose uses the generated handle (e.g. "hawk"), not the
+    # compose fallback "admin@yashigani.local". The fresh-install path writes this at
+    # generate_secrets() line ~9963; the upgrade path previously skipped it, leaving
+    # .env stale if the shell had exported YASHIGANI_ADMIN_USERNAME=<email> earlier.
+    if [[ -n "$GEN_ADMIN1_USERNAME" && "$GEN_ADMIN1_USERNAME" != "[preserved]" ]]; then
+      if grep -q "^YASHIGANI_ADMIN_USERNAME=" "$env_file" 2>/dev/null; then
+        local tmp_env; tmp_env="$(mktemp)"
+        sed "s|^YASHIGANI_ADMIN_USERNAME=.*|YASHIGANI_ADMIN_USERNAME=${GEN_ADMIN1_USERNAME}|" "$env_file" > "$tmp_env"
+        mv "$tmp_env" "$env_file"
+      else
+        echo "YASHIGANI_ADMIN_USERNAME=${GEN_ADMIN1_USERNAME}" >> "$env_file"
+      fi
+    fi
     # Ensure OpenClaw gateway token exists
     if ! grep -q "^OPENCLAW_GATEWAY_TOKEN=" "$env_file" 2>/dev/null; then
       local openclaw_token
       openclaw_token="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(32))')"
       echo "OPENCLAW_GATEWAY_TOKEN=${openclaw_token}" >> "$env_file"
+    fi
+
+    # v4.1 Phase 1c (LAURA-I1-03): openclaw egress-gateway flag.
+    # When the openclaw profile is enabled, caddy-entrypoint.sh must allowlist
+    # the three fixed egress upstreams (slack.com / hooks.slack.com /
+    # api.telegram.org — see docker/Caddyfile.openclaw-egress) in its iptables
+    # OUTPUT layer. Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the
+    # non-interactive --agent-bundles value is only pushed into
+    # COMPOSE_PROFILES at step 8, which can be after this function runs (same
+    # dual-probe as the optional-services summary panel). Default stays "0"
+    # (fail-closed: Slack/Telegram hosts NOT allowlisted).
+    # Idempotent: sed-replace on re-run so a profile change is reflected.
+    local _openclaw_egress="0"
+    local _oc_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
+      _openclaw_egress="1"
+    elif [[ "$_oc_ab" == *",openclaw,"* || "$_oc_ab" == *",all,"* ]]; then
+      _openclaw_egress="1"
+    fi
+    if grep -q "^YASHIGANI_OPENCLAW_EGRESS=" "$env_file" 2>/dev/null; then
+      local tmp_env_oc; tmp_env_oc="$(mktemp)"
+      sed "s|^YASHIGANI_OPENCLAW_EGRESS=.*|YASHIGANI_OPENCLAW_EGRESS=${_openclaw_egress}|" "$env_file" > "$tmp_env_oc"
+      mv "$tmp_env_oc" "$env_file"
+    else
+      echo "YASHIGANI_OPENCLAW_EGRESS=${_openclaw_egress}" >> "$env_file"
     fi
 
     # Generate credentials for NEW services added since last install
@@ -6514,10 +10278,13 @@ generate_secrets() {
       log_success "New service credentials generated (upgrade path)"
     fi
 
-    # Read Wazuh credentials (may have been generated above or in a previous install)
-    GEN_WAZUH_INDEXER_PASSWORD="$(cat "${secrets_dir}/wazuh_indexer_password" 2>/dev/null || echo "")"
-    GEN_WAZUH_API_PASSWORD="$(cat "${secrets_dir}/wazuh_api_password" 2>/dev/null || echo "")"
-    GEN_WAZUH_DASHBOARD_PASSWORD="$(cat "${secrets_dir}/wazuh_dashboard_password" 2>/dev/null || echo "")"
+    # Read Wazuh credentials (may have been generated above or in a previous install).
+    # Docker non-root: route through _safe_read_secret for the same reason as the
+    # postgres/redis reads above (gate #DOCKER-NONROOT-SECRET-1).
+    local _wazuh_env_file="${WORK_DIR}/docker/.env"
+    GEN_WAZUH_INDEXER_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_indexer_password" "WAZUH_INDEXER_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
+    GEN_WAZUH_API_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_api_password" "WAZUH_API_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
+    GEN_WAZUH_DASHBOARD_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_dashboard_password" "WAZUH_DASHBOARD_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
 
     # BUG-1 (v2.23.1): caddy_internal_hmac was silently skipped on the upgrade
     # path because this early-return block never reached the generation code below.
@@ -6525,8 +10292,16 @@ generate_secrets() {
     # .env but omits caddy_internal_hmac, so the gateway cannot start.
     # Fix: check + generate each new secret independently, regardless of whether
     # core secrets (postgres/redis) already exist.
-    local hmac_file="${secrets_dir}/caddy_internal_hmac"
-    if [[ ! -s "$hmac_file" ]] || [[ "${REINSTALL:-false}" == "true" ]]; then
+    #
+    # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
+    # never the flat docker/secrets/ shared by ~18 services. Relocation is
+    # unconditional + idempotent: it migrates a legacy-layout file (rename —
+    # value PRESERVED, .env stays consistent) and guarantees the inert
+    # mountpoint stubs exist at the flat paths for the compose overlay.
+    _relocate_caddy_scoped_secrets || return 1
+    local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
+    # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
+    if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
       local _hmac_secret
       if command -v openssl >/dev/null 2>&1; then
         _hmac_secret="$(openssl rand -hex 32)"
@@ -6558,9 +10333,12 @@ generate_secrets() {
     fi
 
     # Bucket-C finding (Captain gitleaks baseline 2026-05-17): per-install
-    # YASHIGANI_INTERNAL_BEARER — generate if absent on upgrade path.
+    # YASHIGANI_INTERNAL_BEARER — generate if absent OR placeholder on upgrade path.
+    # F-001 self-heal: _secret_is_valid rejects placeholder files so a stale
+    # partial install that left a "# placeholder" string is treated as missing and
+    # regenerated instead of being synced verbatim into .env (fix/medlow-findings).
     local _bearer_file_up="${secrets_dir}/yashigani_internal_bearer"
-    if [[ ! -s "$_bearer_file_up" ]]; then
+    if ! _secret_is_valid "$_bearer_file_up"; then
       local _bearer_up
       _bearer_up="$(_gen_password)"
       printf "%s" "$_bearer_up" > "$_bearer_file_up"
@@ -6573,6 +10351,10 @@ generate_secrets() {
     # BUG-B+-004: use _safe_read_secret — direct cat fails on Podman rootless (subuid owner).
     local _bearer_val_up
     if _bearer_val_up="$(_safe_read_secret "$_bearer_file_up" "YASHIGANI_INTERNAL_BEARER" "$env_file")"; then
+      if [[ -z "$_bearer_val_up" ]] || [[ "$_bearer_val_up" == \#* ]]; then
+        log_error "F-001: yashigani_internal_bearer was just generated but read back empty or as placeholder — inconsistent state in ${secrets_dir}. Check permissions on docker/secrets/."
+        return 1
+      fi
       if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
         local tmp_env; tmp_env="$(mktemp)"
         sed "s|^YASHIGANI_INTERNAL_BEARER=.*|YASHIGANI_INTERNAL_BEARER=${_bearer_val_up}|" "$env_file" > "$tmp_env"
@@ -6624,6 +10406,39 @@ generate_secrets() {
     else
       log_info "pgbouncer_authenticator_password already present — preserving (upgrade path)"
     fi
+
+    # BEGIN YSG-P3-MCP-SIGKEY-UPGRADE
+    # MCP signing key — generate if absent on upgrade path (same idempotency as caddy_internal_hmac above).
+    # This covers upgrades from pre-v2.25.0 where the key did not yet exist.
+    local _mcp_key_file_up="${secrets_dir}/mcp_identity_signing_key"
+    local _env_file_up="${WORK_DIR}/docker/.env"
+
+    if [[ ! -s "$_mcp_key_file_up" ]]; then
+      log_info "Generating MCP P-384 signing key (upgrade path) → ${_mcp_key_file_up}"
+      (
+        umask 077
+        if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
+             | openssl ec -out "${_mcp_key_file_up}" 2>/dev/null; then
+          printf 'ERROR: Failed to generate MCP P-384 signing key (upgrade path)\n' >&2
+          rm -f "${_mcp_key_file_up}" 2>/dev/null || true
+          exit 1
+        fi
+        chmod 0600 "${_mcp_key_file_up}"
+      ) || {
+        log_error "MCP P-384 signing key generation failed (upgrade path) — aborting"
+        return 1
+      }
+      log_info "MCP P-384 signing key generated (mode 0600, upgrade path)"
+    else
+      log_info "mcp_identity_signing_key already present — preserving (upgrade path)"
+    fi
+
+    # No .env sync needed — the gateway reads the key from
+    # /run/secrets/mcp_identity_signing_key (file-tier in _jwt.py), which is
+    # exposed via the existing docker-compose bind-mount `./secrets:/run/secrets:ro`.
+    # Storing the raw private key in .env is wider exposure (docker inspect,
+    # backup tools, process env) and is intentionally avoided.
+    # END YSG-P3-MCP-SIGKEY-UPGRADE
 
     return 0
   fi
@@ -6723,6 +10538,19 @@ generate_secrets() {
   else
     echo "REDIS_PASSWORD=${GEN_REDIS_PASSWORD}" >> "$env_file"
   fi
+  # v4.1 F-03: URL-encoded variant for YASHIGANI_REDIS_URL DSN in docker-compose.yml.
+  # _registry_store() in agent_policies.py passes YASHIGANI_REDIS_URL directly to
+  # redis.Redis.from_url(); passwords with URL sub-delimiters (e.g. ',') must be
+  # percent-encoded so the URL parser passes them through correctly.
+  local GEN_REDIS_PASSWORD_URLENC
+  GEN_REDIS_PASSWORD_URLENC="$(_urlencode_userinfo "$GEN_REDIS_PASSWORD")"
+  if grep -q "^REDIS_PASSWORD_URLENC=" "$env_file" 2>/dev/null; then
+    local tmp_env; tmp_env="$(mktemp)"
+    sed "s|^REDIS_PASSWORD_URLENC=.*|REDIS_PASSWORD_URLENC=${GEN_REDIS_PASSWORD_URLENC}|" "$env_file" > "$tmp_env"
+    mv "$tmp_env" "$env_file"
+  else
+    echo "REDIS_PASSWORD_URLENC=${GEN_REDIS_PASSWORD_URLENC}" >> "$env_file"
+  fi
 
   # --- OpenClaw gateway token ---
   local openclaw_token
@@ -6735,6 +10563,45 @@ generate_secrets() {
     mv "$tmp_env" "$env_file"
   else
     echo "OPENCLAW_GATEWAY_TOKEN=${openclaw_token}" >> "$env_file"
+  fi
+
+  # --- OpenClaw Slack operator-config secrets (FP-06 Phase 2) ---
+  # CHANNEL 1: incoming-webhook path pin (/services/T.../B.../<secret>)
+  # CHANNEL 2: Web API bot-token pin (xoxb-... scoped to one workspace)
+  #
+  # Both are INERT by default (empty secret file → feature off). The operator
+  # supplies values at install time via env vars; on re-run (upgrade) existing
+  # non-empty files are preserved unless the operator supplies a new value.
+  # Single-source: stored ONLY in the secret file — NOT in openclaw.json or
+  # docker/.env — so a compromised openclaw cannot rewrite its own destination.
+  # caddy-entrypoint.sh exports YASHIGANI_OPENCLAW_SLACK_{WEBHOOK_PATH,BOT_TOKEN}
+  # from these files before exec caddy (Caddy parse-time substitution).
+  local _oc_slack_webhook_path="${YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH:-}"
+  local _oc_slack_bot_token="${YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN:-}"
+  local _oc_wh_file="${secrets_dir}/openclaw_slack_webhook_path"
+  local _oc_bt_file="${secrets_dir}/openclaw_slack_bot_token"
+  # Write if: file does not exist (fresh install), OR operator supplies a new value.
+  if [[ ! -f "$_oc_wh_file" ]] || [[ -n "$_oc_slack_webhook_path" ]]; then
+    printf "%s" "$_oc_slack_webhook_path" > "$_oc_wh_file"
+    chmod 600 "$_oc_wh_file"
+    if [[ -n "$_oc_slack_webhook_path" ]]; then
+      log_info "openclaw Slack webhook-path pin provisioned (CHANNEL 1 enforcement ON)."
+    else
+      log_info "openclaw Slack webhook-path pin: empty secret file created (CHANNEL 1 inert — supply YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH to enable)."
+    fi
+  else
+    log_info "openclaw Slack webhook-path pin: existing secret file preserved (re-run; supply YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH to update)."
+  fi
+  if [[ ! -f "$_oc_bt_file" ]] || [[ -n "$_oc_slack_bot_token" ]]; then
+    printf "%s" "$_oc_slack_bot_token" > "$_oc_bt_file"
+    chmod 600 "$_oc_bt_file"
+    if [[ -n "$_oc_slack_bot_token" ]]; then
+      log_info "openclaw Slack bot-token pin provisioned (CHANNEL 2 enforcement ON)."
+    else
+      log_info "openclaw Slack bot-token pin: empty secret file created (CHANNEL 2 inert — supply YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to enable)."
+    fi
+  else
+    log_info "openclaw Slack bot-token pin: existing secret file preserved (re-run; supply YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN to update)."
   fi
 
   # --- Grafana ---
@@ -6776,8 +10643,16 @@ generate_secrets() {
   # never world-readable.
   # On --upgrade this block regenerates the secret. All three containers must
   # be restarted to pick it up (install.sh --upgrade restarts them).
-  local hmac_file="${secrets_dir}/caddy_internal_hmac"
-  if [[ ! -s "$hmac_file" ]] || [[ "${REINSTALL:-false}" == "true" ]]; then
+  #
+  # YSG-RISK-053: the HMAC lives in the Caddy-scoped dir (docker/secrets-caddy/),
+  # never the flat docker/secrets/ shared by ~18 services. Relocation is
+  # unconditional + idempotent: it migrates a legacy-layout file (rename —
+  # value PRESERVED) and guarantees the inert mountpoint stubs exist at the
+  # flat paths for the compose overlay.
+  _relocate_caddy_scoped_secrets || return 1
+  local hmac_file="${WORK_DIR}/docker/secrets-caddy/caddy_internal_hmac"
+  # F-001 self-heal: _secret_is_valid rejects placeholder files; REINSTALL rotates.
+  if ! _secret_is_valid "$hmac_file" || [[ "${REINSTALL:-false}" == "true" ]]; then
     local _hmac_secret
     if command -v openssl >/dev/null 2>&1; then
       _hmac_secret="$(openssl rand -hex 32)"
@@ -6816,19 +10691,31 @@ generate_secrets() {
   # guarantees — per feedback_password_charset.md.
   # Mode 0600: only the install user can read it; Captain wires it into
   # docker-compose.yml as a Docker/Podman secret (Captain's scope).
-  # Idempotent: file already exists with non-empty content → preserve.
+  # Idempotent: valid secret already on disk → preserve.
+  #
+  # F-001 self-heal (fix/medlow-findings): use _secret_is_valid (not -s) so a
+  # stale placeholder file ("# placeholder — auto-generated at first bootstrap")
+  # left by a partial install is treated as absent and regenerated.  A plain -s
+  # check passes for any non-zero file, so placeholders were silently propagated
+  # into .env and then into the OpenClaw envsubst step, causing the abort
+  # "yashigani_internal_bearer could not be read".
   local _bearer_file="${secrets_dir}/yashigani_internal_bearer"
-  if [[ ! -s "$_bearer_file" ]]; then
-    local _bearer_token
+  local _bearer_token
+  if ! _secret_is_valid "$_bearer_file"; then
     _bearer_token="$(_gen_password)"
     printf "%s" "$_bearer_token" > "$_bearer_file"
     chmod 0600 "$_bearer_file"
     log_info "Generated yashigani_internal_bearer → ${_bearer_file} (mode 0600)"
   else
     log_info "yashigani_internal_bearer already present — preserving (use --remove-volumes to rotate)"
-    local _bearer_token
     # BUG-B+-004 (sweep): safe read — may be subuid-owned on Podman rootless re-install.
     _bearer_token="$(_safe_read_secret "$_bearer_file" "YASHIGANI_INTERNAL_BEARER" "$env_file" || true)"
+  fi
+  # Fail-closed: if the token is still empty or a comment after generation,
+  # there is a genuine inconsistency (e.g. write failure on an EACCES secrets_dir).
+  if [[ -z "$_bearer_token" ]] || [[ "$_bearer_token" == \#* ]]; then
+    log_error "F-001: yashigani_internal_bearer could not be generated or read back — check permissions on ${secrets_dir}. If docker/secrets/ is owned by a subuid-remapped UID, wipe it and re-run."
+    return 1
   fi
   # Sync YASHIGANI_INTERNAL_BEARER into .env for Compose interpolation.
   if grep -q "^YASHIGANI_INTERNAL_BEARER=" "$env_file" 2>/dev/null; then
@@ -6838,6 +10725,32 @@ generate_secrets() {
   else
     echo "YASHIGANI_INTERNAL_BEARER=${_bearer_token}" >> "$env_file"
   fi
+
+  # --- langflow_yashigani_token (Phase 5 §C — per-agent P1 outbound token) ----
+  # Separate from the shared yashigani_internal_bearer: langflow uses this token
+  # as its OPENAI_API_KEY when calling gateway:8081/v1 (entrypoint shim).
+  # 4.0 Phase 3 LIVE: gateway _load_token_role_map() reads this file from
+  # /run/secrets at startup and maps it → (p1_agent, agent__langflow) (RISK-108).
+  # Idempotent: upgrade path preserves existing token (prevents LLM session breaks).
+  local _lf_token_file="${secrets_dir}/langflow_yashigani_token"
+  if ! _secret_is_valid "$_lf_token_file"; then
+    local _lf_token
+    _lf_token="$(_gen_password)"
+    printf "%s" "$_lf_token" > "$_lf_token_file"
+    chmod 0600 "$_lf_token_file"
+    log_info "Generated langflow_yashigani_token → ${_lf_token_file} (mode 0600)"
+  else
+    log_info "langflow_yashigani_token already present — preserving (upgrade path)"
+  fi
+  # BUG-4.0-LANGFLOW-TOKEN-PERMS: langflow runs uid=1000 gid=0; the Docker
+  # named-secret mode: 0440 in compose is ignored by Podman (Podman inherits
+  # host file permissions for file secrets).  Fix: chown 0:0 + chmod 0440 so
+  # the file is root-group readable — langflow's gid=0 grants read access.
+  # Letta uses yashigani_internal_bearer (already handled); openclaw uses an
+  # env var — only langflow_yashigani_token has this uid mismatch.
+  _do_chown "0:0" "$_lf_token_file" "langflow_yashigani_token" "0440" "${secrets_dir}" || \
+    log_warn "BUG-4.0-LANGFLOW-TOKEN-PERMS: chown 0:0 failed for langflow_yashigani_token — langflow may fail to read its token (EACCES)"
+  log_info "langflow_yashigani_token → chown 0:0 chmod 0440 (gid=0 readable for langflow uid=1000 gid=0)"
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
   # YSG-RISK-049 is now CLOSED by the auth_query design (v2.24.0).
@@ -6882,12 +10795,124 @@ generate_secrets() {
   # consistently with the installer version (`:${YASHIGANI_VERSION}`) and the
   # version is visible to Compose for any `${YASHIGANI_VERSION}` interpolation.
   if grep -q "^YASHIGANI_VERSION=" "$env_file" 2>/dev/null; then
-    local tmp_env; tmp_env="$(mktemp)"
+    local tmp_env; tmp_env="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
     sed "s|^YASHIGANI_VERSION=.*|YASHIGANI_VERSION=${YASHIGANI_VERSION}|" "$env_file" > "$tmp_env"
     mv "$tmp_env" "$env_file"
   else
     echo "YASHIGANI_VERSION=${YASHIGANI_VERSION}" >> "$env_file"
   fi
+
+  # BUG-4.0-GPU-CDI-NO-ENV: YSG_GPU_CDI is exported at install time but was
+  # never written to docker/.env, so `docker compose up` outside install.sh
+  # (e.g. upgrade scripts, health checks, manual re-up) lost the GPU overlay.
+  # Write it unconditionally; empty string when no GPU detected (no-op for overlays).
+  if grep -q "^YSG_GPU_CDI=" "$env_file" 2>/dev/null; then
+    local tmp_cdi; tmp_cdi="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+    sed "s|^YSG_GPU_CDI=.*|YSG_GPU_CDI=${YSG_GPU_CDI:-}|" "$env_file" > "$tmp_cdi"
+    mv "$tmp_cdi" "$env_file"
+  else
+    echo "YSG_GPU_CDI=${YSG_GPU_CDI:-}" >> "$env_file"
+  fi
+
+  # Cache-busting SHA — keep in sync with the value written by _write_aes_key_to_env.
+  # This block runs on the upgrade path (step 7 re-runs secrets generation but skips
+  # _write_aes_key_to_env on non-fresh installs), so we always refresh the SHA here
+  # to reflect the current source commit.
+  if grep -q "^YASHIGANI_GIT_SHA=" "$env_file" 2>/dev/null; then
+    local tmp_sha; tmp_sha="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+    sed "s|^YASHIGANI_GIT_SHA=.*|YASHIGANI_GIT_SHA=${YASHIGANI_GIT_SHA}|" "$env_file" > "$tmp_sha"
+    mv "$tmp_sha" "$env_file"
+  else
+    echo "YASHIGANI_GIT_SHA=${YASHIGANI_GIT_SHA}" >> "$env_file"
+  fi
+
+  # BEGIN YSG-P3-MCP-SIGKEY
+  # --- MCP identity signing key (P-384 / ES384) — Nico ship-blocker ---
+  # The MCP JWT issuer (src/yashigani/mcp/_jwt.py) performs a 3-tier key lookup:
+  #   1. YASHIGANI_MCP_SIGNING_KEY_PEM env var (base64-encoded PEM, testing only)
+  #   2. PEM file at $YASHIGANI_MCP_SIGNING_KEY_PATH
+  #      (default /run/secrets/mcp_identity_signing_key — bind-mounted into the
+  #      gateway container by the existing compose pattern ./secrets:/run/secrets:ro)
+  #   3. Ephemeral key — REFUSED in production/staging (RuntimeError)
+  #
+  # Install.sh owns path #2: generate a P-384 EC private key and write it to
+  # ${secrets_dir}/mcp_identity_signing_key (0600); the existing compose
+  # bind-mount exposes it at /run/secrets/mcp_identity_signing_key inside the
+  # gateway container, where _jwt.py reads it. No .env env-var sync —
+  # storing the raw private key in .env is wider exposure (docker inspect,
+  # backup tools, process env) and is intentionally avoided.
+  #
+  # Idempotent: if the key file already exists, preserve it.
+  # Rotation: use scripts/rotate-secret.sh (separate documented operation).
+  # Backup: the file lands in ${secrets_dir}/ which is captured by
+  #   _backup_existing_data → bundle.enc (YSG-RISK-050/051 dual-wrap).
+  # Uninstall: wipe of docker/secrets/* in uninstall.sh --remove-volumes covers this.
+  local _mcp_key_file="${secrets_dir}/mcp_identity_signing_key"
+
+  if [[ ! -s "$_mcp_key_file" ]]; then
+    log_info "Generating MCP P-384 signing key → ${_mcp_key_file}"
+    umask 077
+    # Generate a P-384 (secp384r1) EC private key in unencrypted PEM format.
+    # openssl ecparam + openssl ec produces a PKCS#8-compatible PEM that the
+    # Python cryptography library reads via load_pem_private_key().
+    # Use a subshell to scope umask 077 tightly to the key file write.
+    (
+      umask 077
+      if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
+           | openssl ec -out "${_mcp_key_file}" 2>/dev/null; then
+        printf 'ERROR: Failed to generate MCP P-384 signing key\n' >&2
+        rm -f "${_mcp_key_file}" 2>/dev/null || true
+        exit 1
+      fi
+      chmod 0600 "${_mcp_key_file}"
+    ) || {
+      log_error "MCP P-384 signing key generation failed — aborting"
+      return 1
+    }
+    log_info "MCP P-384 signing key generated (mode 0600)"
+  else
+    log_info "mcp_identity_signing_key already present — preserving (use scripts/rotate-secret.sh to rotate)"
+  fi
+
+  # S1 invariant check: the key file must be 0600 — never world or group readable.
+  if [[ -f "$_mcp_key_file" ]]; then
+    local _mcp_key_mode
+    _mcp_key_mode="$(stat -c '%a' "${_mcp_key_file}" 2>/dev/null \
+                     || stat -f '%p' "${_mcp_key_file}" 2>/dev/null | tail -c 4 || echo "???")";
+    if [[ "${_mcp_key_mode}" != "600" ]]; then
+      log_warn "mcp_identity_signing_key mode is ${_mcp_key_mode} — enforcing 0600 (CWE-732 guard)"
+      chmod 0600 "${_mcp_key_file}" || true
+    fi
+  fi
+
+  # FIX-MCP-SIGKEY-PERM: chown the signing key to UID 1001 (gateway container user).
+  #
+  # The key is generated as 0600 owned by the installer user (UID 1000 = max).
+  # The gateway container runs as UID 1001 (maxine on the VM host = uid=1001).
+  # Docker rootful bind-mounts expose host UID/GID directly — 0600 uid=1000 is
+  # unreadable by the gateway (uid=1001), causing PermissionError at startup.
+  #
+  # Fix: use _do_chown (V240-002 helper) to set ownership to 1001:1001.  When
+  # the installer runs as a non-root user (typical Docker install), bare chown
+  # fails silently (EPERM); _do_chown falls through to the docker_run path
+  # (alpine container with bind-mount) which succeeds because Docker is rootful.
+  # The 0600 mode is preserved — only the owner changes.  This mirrors the
+  # convention for other private key files in docker/secrets/ (e.g.
+  # gateway_client.key is 0600 1001:1001).
+  #
+  # P3 broker E2E gate — J8/J9/J10 gateway PermissionError fix (2026-05-30).
+  # ASVS V2.6.3: key generation and storage must follow least-privilege.
+  if [[ -f "$_mcp_key_file" ]]; then
+    _do_chown "1001:1001" "${_mcp_key_file}" "mcp_identity_signing_key" "" "${secrets_dir}" \
+      || log_warn "mcp_identity_signing_key: _do_chown 1001:1001 failed — gateway may fail to start"
+  fi
+
+  # No .env sync needed — the gateway reads the key from
+  # /run/secrets/mcp_identity_signing_key (file-tier in _jwt.py), which is
+  # exposed via the existing docker-compose bind-mount `./secrets:/run/secrets:ro`.
+  # Storing the raw private key in .env is wider exposure (docker inspect,
+  # backup tools, process env) and is intentionally avoided.
+  # END YSG-P3-MCP-SIGKEY
 
   log_success "All passwords and 2FA secrets generated (${secrets_dir}/)"
 }
@@ -7054,6 +11079,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_TOTP_SECRET}"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
   if [[ -n "$GEN_ADMIN1_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN1_TOTP_URI}"
@@ -7063,6 +11089,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_TOTP_SECRET}"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
   if [[ -n "$GEN_ADMIN2_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN2_TOTP_URI}"
@@ -7135,7 +11162,7 @@ print_completion_summary() {
   # --- Next steps ---
   printf "  ${C_BOLD}Next steps:${C_RESET}\n"
   printf "    1. Save ALL credentials above in a password manager\n"
-  printf "    2. Scan the TOTP QR URIs into a SHA-256-compatible authenticator app (Authy, 1Password, Aegis).\n       Note: Google Authenticator may not work on iOS or older Android — Yashigani uses HMAC-SHA-256\n       per the SHA-256 minimum policy. Apps that ignore the algorithm parameter default to SHA-1\n       and will silently produce wrong codes.\n"
+  printf "    2. Scan the TOTP QR URIs into any authenticator app (Google Authenticator, Authy, Aegis,\n       1Password, Microsoft Authenticator, etc.) — Yashigani uses standard HMAC-SHA-1 TOTP\n       (RFC 6238 default), compatible with all authenticator apps.\n"
   printf "    3. Log in to the backoffice as '%s' and change the default password\n" "${GEN_ADMIN1_USERNAME}"
   printf "    4. Store '%s' credentials in a safe/vault (break-glass backup)\n" "${GEN_ADMIN2_USERNAME}"
   printf "    5. Register your first AI agent\n"
@@ -7195,6 +11222,17 @@ print_completion_summary() {
 # STEP 7 (k8s): helm dependency update
 k8s_helm_dep_update() {
   set_step "7" "helm dependency update"
+
+  # F2: helm is a Kubernetes-only dependency. A Docker/Podman compose operator
+  # must never be forced to install helm. This step (and every other k8s_* step)
+  # only runs inside the `MODE == k8s` branch of main(); this guard is
+  # defence-in-depth so that if the flow is ever reached with a compose runtime
+  # (e.g. a future refactor), helm is skipped instead of aborting the install.
+  if [[ "${MODE:-compose}" != "k8s" || "${YSG_RUNTIME:-}" == "docker" || "${YSG_RUNTIME:-}" == "podman" ]]; then
+    log_info "Skipping Helm chart dependencies (compose runtime — helm not required)"
+    return 0
+  fi
+
   log_step "7/${TOTAL_STEPS}" "Updating Helm chart dependencies..."
 
   require_cmd "helm"
@@ -7213,6 +11251,136 @@ k8s_helm_dep_update() {
 
   helm dependency update "$chart_dir"
   log_success "Helm dependencies updated"
+}
+
+# _write_helm_values — render operator-supplied flags into ${WORK_DIR}/.env.helm
+# (B2 — GAP 2: this file was never written by any code path; k8s_helm_install
+# silently fell through to chart defaults meaning DOMAIN, UPSTREAM_URL, AES key,
+# and TLS_MODE never reached Helm regardless of what the operator passed).
+#
+# Produces a YAML values override file read by k8s_helm_install as `-f .env.helm`.
+# Helm merge order: chart defaults < -f .env.helm < --set flags.
+# The FIPS_MODE --set injection in k8s_helm_install is intentionally retained
+# (--set wins over -f, and the operator-visible log message stays).
+#
+# DB_AES_KEY handling (Iris coord #1 — v2.25.0 P2 wave 2):
+# backoffice.dbAesKey is now a first-class values.yaml key. When DB_AES_KEY is
+# non-empty it is written into .env.helm as backoffice.dbAesKey so secrets.yaml
+# uses it directly (Priority: existing Secret > backoffice.dbAesKey > randAlphaNum).
+# The prior kubectl create secret --dry-run workaround is removed — it was a
+# pre-seeding hack to work around the missing schema key. No longer needed.
+#
+# Permissions: 0600 — the file may contain the licensing key (paid credential).
+_write_helm_values() {
+  local helm_values="${WORK_DIR}/.env.helm"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "_write_helm_values → ${helm_values}"
+    return 0
+  fi
+
+  # Create with 0600 IMMEDIATELY (may contain license key — paid credential).
+  # umask 022 would produce 0644 which is world-readable; explicit chmod prevents
+  # that race between touch and chmod.
+  touch "$helm_values"
+  chmod 0600 "$helm_values"
+
+  # Write YAML values override.
+  # Each key is only written when the operator supplied a non-empty value —
+  # empty writes would silently override chart defaults with empty strings,
+  # which is worse than omitting the key entirely.
+  {
+    printf '# Yashigani helm values override — generated by install.sh\n'
+    printf '# B2-fix: operator-supplied flags are now written here so k8s_helm_install\n'
+    printf '# does not silently deploy with chart defaults for domain/upstream/tls-mode.\n'
+    printf '# DO NOT edit manually — re-run install.sh to regenerate.\n'
+    printf '\n'
+    printf 'global:\n'
+
+    if [[ -n "${DOMAIN:-}" ]]; then
+      # YAML single-quote the domain to prevent glob/special-char interpretation.
+      printf "  tlsDomain: '%s'\n" "${DOMAIN}"
+    fi
+
+    if [[ -n "${TLS_MODE:-}" ]]; then
+      printf "  tlsMode: '%s'\n" "${TLS_MODE}"
+    fi
+
+    if [[ -n "${ADMIN_EMAIL:-}" ]]; then
+      # acmeEmail used by ACME/Let's Encrypt — also the primary admin contact.
+      printf "  acmeEmail: '%s'\n" "${ADMIN_EMAIL}"
+    fi
+
+    printf '\n'
+    printf 'gateway:\n'
+    printf '  env:\n'
+
+    if [[ -n "${UPSTREAM_URL:-}" ]]; then
+      printf "    upstreamUrl: '%s'\n" "${UPSTREAM_URL}"
+    fi
+
+    printf '\n'
+    printf 'backoffice:\n'
+
+    if [[ -n "${DB_AES_KEY:-}" ]]; then
+      # Iris coord #1 (v2.25.0 P2): write dbAesKey directly into helm values.
+      # secrets.yaml uses .Values.backoffice.dbAesKey when non-empty, so
+      # Helm generates the Secret with the operator key on first install.
+      # On upgrade, Helm's lookup() finds the existing Secret and preserves it
+      # regardless of this value. The kubectl pre-seeding workaround is retired.
+      printf "  dbAesKey: '%s'\n" "${DB_AES_KEY}"
+    fi
+
+    printf '\n'
+    printf 'fips:\n'
+    # Write fips.mode into the file so the value is visible in the values
+    # override. The --set fips.mode=true injection in k8s_helm_install is
+    # kept (--set wins over -f); this makes the intent explicit in the file.
+    if [[ "${FIPS_MODE:-0}" == "1" ]]; then
+      printf '  mode: true\n'
+    else
+      printf '  mode: false\n'
+    fi
+    # Nico N-002 (v2.25.0 P2 B9): persist cmvpCert too. Operator-supplied;
+    # may be empty (omit field if so to preserve chart default).
+    # YAML-single-quoted to safely carry "#" (would be a YAML comment unquoted).
+    # Replace any single quotes in the value with the YAML-escaped form ''.
+    if [[ -n "${CMVP_CERT:-}" ]]; then
+      printf "  cmvpCert: '%s'\n" "${CMVP_CERT//\'/\'\'}"
+    fi
+
+    # License key: read from file if operator passed --license-key.
+    # Written last — it may be multi-line (YAML literal block scalar).
+    if [[ -n "${LICENSE_KEY_PATH:-}" ]]; then
+      if [[ -f "$LICENSE_KEY_PATH" ]]; then
+        local _license_content
+        _license_content="$(cat "$LICENSE_KEY_PATH" 2>/dev/null || true)"
+        if [[ -n "$_license_content" ]]; then
+          printf '\n'
+          printf 'licensing:\n'
+          # YAML literal block scalar (|) preserves newlines. Indent 4 spaces.
+          printf '  licenseKey: |\n'
+          printf '%s\n' "$_license_content" | sed 's/^/    /'
+          log_info "License key written to helm values (from ${LICENSE_KEY_PATH})"
+        else
+          log_warn "License key file is empty: ${LICENSE_KEY_PATH} — community tier will be used"
+        fi
+      else
+        log_error "License key file not found: ${LICENSE_KEY_PATH}"
+        exit 1
+      fi
+    fi
+
+  } >> "$helm_values"
+
+  # Iris coord #1 (v2.25.0 P2): kubectl pre-seeding workaround REMOVED.
+  # DB_AES_KEY is now written to .env.helm as backoffice.dbAesKey above.
+  # Helm's secrets.yaml lookup() preserves the existing Secret on upgrade;
+  # on first install it reads backoffice.dbAesKey from the values file.
+  # No pre-seeding kubectl call required.
+
+  log_success "Helm values written: ${helm_values}"
+  log_info "  tlsDomain=${DOMAIN:-<unset>}  tlsMode=${TLS_MODE:-<unset>}  upstreamUrl=${UPSTREAM_URL:-<unset>}"
 }
 
 # STEP 8 (k8s): helm upgrade --install
@@ -7282,10 +11450,32 @@ k8s_helm_install() {
     log_info "No existing Helm release — using fresh-install timeout: ${_helm_timeout}"
   fi
 
+  # LIVE-B13-001/002/003/004 (end-of-P2 live-verify on kind v1.35.0):
+  # The chart used to manage the Namespace resource directly. That collided
+  # with --create-namespace in multiple ways: PSA labels silently dropped on
+  # first install, hook annotations broke release tracking, and unconditional
+  # Namespace + --atomic triggered full rollback on Namespace-already-exists.
+  # Fix: install.sh owns the namespace lifecycle. Pre-create the namespace
+  # with PSA warn+audit baseline labels here, then run helm install WITHOUT
+  # --create-namespace. PSA enforce is intentionally NOT applied (caddy needs
+  # CAP_NET_ADMIN which baseline forbids; PSA has no per-pod exception).
+  # Hard enforcement is delegated to Kyverno (admissionPolicies.enabled=true).
+  if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+    log_info "Pre-creating namespace ${NAMESPACE} with PSA warn+audit baseline labels..."
+    kubectl create namespace "$NAMESPACE"
+  fi
+  # Apply / refresh PSA labels (idempotent via --overwrite). Safe on existing ns.
+  kubectl label namespace "$NAMESPACE" --overwrite \
+    pod-security.kubernetes.io/warn=baseline \
+    pod-security.kubernetes.io/warn-version=latest \
+    pod-security.kubernetes.io/audit=baseline \
+    pod-security.kubernetes.io/audit-version=latest \
+    >/dev/null
+  log_success "PSA warn+audit baseline labels applied to namespace ${NAMESPACE}"
+
   local helm_args=(
     upgrade --install yashigani "$chart_dir"
     --namespace "$NAMESPACE"
-    --create-namespace
     --wait
     --wait-for-jobs
     --timeout "${_helm_timeout}"
@@ -7294,10 +11484,16 @@ k8s_helm_install() {
     --qps 500
   )
 
+  # B2-fix: gate on values file existence. _write_helm_values must run before
+  # this step (called from main() k8s path). If the file is absent it means the
+  # install sequence is broken — fail closed rather than deploy misconfigured.
   if [[ -f "$helm_values" ]]; then
     helm_args+=(-f "$helm_values")
   else
-    log_warn "Helm values file not found ($helm_values) — using chart defaults"
+    log_error "Helm values file not found: $helm_values"
+    log_error "_write_helm_values must run before k8s_helm_install (sequence bug)"
+    log_error "Re-run install.sh from the beginning to regenerate $helm_values"
+    exit 1
   fi
 
   # Iris drift gate finding Q1 (v2.24.4 close): translate --fips-mode to
@@ -7311,6 +11507,43 @@ k8s_helm_install() {
     helm_args+=(--set fips.mode=true)
     log_info "FIPS_MODE=1 — passing --set fips.mode=true to helm"
   fi
+  # Nico N-002 (v2.25.0 P2 B9): translate --cmvp-cert to fips.cmvpCert helm value.
+  # Without this, --mode k8s --cmvp-cert "#4985" silently drops the cert number
+  # (k8s path doesn't read docker/.env). Mirrors the FIPS_MODE Q1 pattern above.
+  if [[ -n "${CMVP_CERT:-}" ]]; then
+    helm_args+=(--set "fips.cmvpCert=${CMVP_CERT}")
+    log_info "CMVP_CERT=${CMVP_CERT} — passing --set fips.cmvpCert to helm"
+  fi
+
+  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): bundled agents on
+  # K8s. `--agent-bundles <agent>` (or `all`) enables the bundle Deployment
+  # AND layers the codegen-emitted egress-forwarder overlay
+  # (values-<agent>-egress.yaml → templates/egress-forwarders.yaml renders
+  # the yashigani-egress-<agent> Deployment/Service/NetworkPolicies). Each
+  # agent's env (values.yaml agentBundles.<agent>.env OPENAI_API_BASE for
+  # langflow/letta; openclaw config-file — K8s ConfigMap gap flagged in
+  # values.yaml) dials the forwarder Service
+  # (http://yashigani-egress-<agent>:9400/llm/v1) — the K8s half of the
+  # split-zone contract. Static caller/destination pins at :18790 remain in
+  # force (pin-AND-grant OVERLAP; pin deletion is a later, Laura-gated step).
+  # Merge order note: these -f land AFTER -f .env.helm — distinct key
+  # (egressForwarders, additive per-system map keys), no collision; --set
+  # still wins over both.
+  local _hb_agent _hb_ab _hb_overlay
+  _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  for _hb_agent in openclaw langflow letta; do
+    if [[ "$_hb_ab" == *",${_hb_agent},"* || "$_hb_ab" == *",all,"* ]]; then
+      _hb_overlay="${chart_dir}/values-${_hb_agent}-egress.yaml"
+      if [[ ! -f "$_hb_overlay" ]]; then
+        # Fail-closed: the agent's env dials the forwarder Service — enabling
+        # the bundle without the forwarder overlay ships a dead egress path.
+        log_error "${_hb_agent} bundle requested (--agent-bundles) but overlay not found: ${_hb_overlay}"
+        exit 1
+      fi
+      helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay")
+      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay (unified-sidecar v4.1)"
+    fi
+  done
 
   helm "${helm_args[@]}"
   log_success "Helm release deployed"
@@ -7510,6 +11743,147 @@ _pki_runtime_cmd() {
   echo "podman"
 }
 
+# ---------------------------------------------------------------------------
+# YSG-RISK-053 — per-service secret scoping (Caddy-scoped secrets).
+#
+# The flat ./secrets:/run/secrets bind-mount is shared by ~18 compose services.
+# Any compromised co-resident (redis, prometheus, ...) could read the Caddy
+# mesh leaf key + the forward_auth HMAC and forge X-Caddy-Verified-Secret /
+# X-SPIFFE-ID (forward_auth bypass). Fix: caddy_client.{key,crt} and
+# caddy_internal_hmac live in docker/secrets-caddy/ and are re-mounted as
+# single-file binds ONLY on caddy (all three) and gateway/backoffice (hmac) —
+# at the SAME in-container paths, so no Caddyfile/Python change is needed.
+#
+# The PKI issuer (yashigani.pki.issuer) still mints caddy_client.* into
+# docker/secrets/ (its only mounted output dir); _relocate_caddy_scoped_secrets
+# sweeps them into docker/secrets-caddy/ after every mutating issuer action.
+#
+# MOUNTPOINT STUBS (runtime-verified 2026-07-06, Docker 29.4.1): a single-file
+# bind-mount whose target sits under a READ-ONLY dir mount FAILS at container
+# create when no file exists underneath —
+#   "create mountpoint for /run/secrets/<f> mount: make mountpoint:
+#    read-only file system"
+# — the runtime must materialise the mountpoint inside the ro tree. Fix: after
+# relocating each real secret, an INERT stub (marker line, zero secret
+# material, mode 0600) is left at the flat path. The scoped single-file bind
+# covers the stub inside caddy/gateway/backoffice; every other flat-mount
+# service sees only the stub. The issuer's _write_secret() unlinks+rewrites
+# the stub on the next mint/rotation; the post-issuer sweep then re-relocates
+# and re-stubs.
+# ---------------------------------------------------------------------------
+_YSG_CADDY_SCOPED_SECRETS=(caddy_client.key caddy_client.crt caddy_internal_hmac)
+_YSG_SCOPED_STUB_MARKER="# YSG-RISK-053 mountpoint stub"
+
+# _ysg_is_scoped_stub <file> — true when <file> is an inert mountpoint stub.
+# podman unshare fallback covers subuid-owned files on rootless Podman.
+_ysg_is_scoped_stub() {
+  local _f="$1" _first=""
+  _first="$(head -n 1 -- "$_f" 2>/dev/null || true)"
+  if [[ -z "$_first" && "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+     && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+    _first="$(podman unshare head -n 1 -- "$_f" 2>/dev/null || true)"
+  fi
+  [[ "$_first" == "${_YSG_SCOPED_STUB_MARKER}"* ]]
+}
+
+# _ysg_write_scoped_stub <file> — write the inert mountpoint stub (0600, zero
+# secret material). Fail-closed: without a stub the scoped single-file bind
+# cannot overlay the ro flat mount and the container refuses to create.
+_ysg_write_scoped_stub() {
+  local _f="$1"
+  local _stub_line="${_YSG_SCOPED_STUB_MARKER} — real secret lives in docker/secrets-caddy/; single-file bind-mounts cover this inert mountpoint (no secret material here)"
+  if printf '%s\n' "$_stub_line" > "$_f" 2>/dev/null; then
+    chmod 0600 "$_f" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+     && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]] \
+     && podman unshare sh -c "printf '%s\n' \"${_stub_line}\" > '${_f}' && chmod 0600 '${_f}'" 2>/dev/null; then
+    return 0
+  fi
+  local _rt; _rt="$(_pki_runtime_cmd)"
+  local _dirp _basef; _dirp="$(dirname "$_f")"; _basef="$(basename "$_f")"
+  if "$_rt" run --rm --network=none --volume "${_dirp}:/s:rw" \
+       "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
+       sh -c "printf '%s\n' \"${_stub_line}\" > '/s/${_basef}' && chmod 0600 '/s/${_basef}'" 2>/dev/null; then
+    return 0
+  fi
+  log_error "YSG-RISK-053: cannot write mountpoint stub at ${_f} — the scoped single-file bind-mount would fail at container create (read-only mountpoint). Aborting."
+  return 1
+}
+
+_ensure_caddy_secrets_dir() {
+  local _dir="${WORK_DIR}/docker/secrets-caddy"
+  if [[ ! -d "$_dir" ]]; then
+    mkdir -p "$_dir" || { log_error "YSG-RISK-053: cannot create ${_dir}"; return 1; }
+  fi
+  # 0700 — owner-only. Bind-mount source resolution is performed by the
+  # container runtime (root dockerd, or rootless podman running as the owner),
+  # so no other host UID needs traversal. In-container access control is the
+  # per-file mode/owner (key 0600 UID 0, hmac 0640 UID 1001), same as before.
+  # Best-effort: on re-runs the dir may be owned by a prior installer user.
+  chmod 0700 "$_dir" 2>/dev/null || true
+  return 0
+}
+
+# _relocate_caddy_scoped_secrets — move the three Caddy-scoped files out of the
+# flat docker/secrets/ dir and leave an inert mountpoint stub in each one's
+# place. Idempotent (stub detected → no-op; absent → stub only). Preserves
+# mode+ownership of the real files (rename, not copy). FAIL-CLOSED both ways:
+# a real file that cannot be moved stays exposed to every flat-mount service;
+# a missing stub breaks the scoped overlay at container create. Either aborts.
+_relocate_caddy_scoped_secrets() {
+  local _src="${WORK_DIR}/docker/secrets"
+  local _dst="${WORK_DIR}/docker/secrets-caddy"
+  _ensure_caddy_secrets_dir || return 1
+  local _f _moved=0
+  for _f in "${_YSG_CADDY_SCOPED_SECRETS[@]}"; do
+    if [[ ! -e "${_src}/${_f}" ]]; then
+      # Never minted at the flat path (e.g. fresh install before the issuer
+      # runs) — the mountpoint stub must still exist for the compose overlay.
+      _ysg_write_scoped_stub "${_src}/${_f}" || return 1
+      continue
+    fi
+    if _ysg_is_scoped_stub "${_src}/${_f}"; then
+      # Already relocated on a previous run — never move the stub over the
+      # real scoped secret.
+      continue
+    fi
+    local _relocated=false
+    # (1) plain rename — needs write+search on both parent dirs only; file
+    #     ownership (container/subuid UIDs) is irrelevant for rename(2).
+    if mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
+      _relocated=true
+    # (2) rootless Podman: docker/secrets/ itself may be owned by a subuid-range
+    #     UID (set by _prepare_secrets_dir_for_pki) — rename inside the userns.
+    elif [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] \
+       && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]] \
+       && podman unshare mv -f "${_src}/${_f}" "${_dst}/${_f}" 2>/dev/null; then
+      _relocated=true
+    else
+      # (3) last resort: ephemeral container with both dirs mounted (same
+      #     pinned alpine digest as _pki_chown_client_keys — supply-chain pin).
+      local _rt; _rt="$(_pki_runtime_cmd)"
+      "$_rt" run --rm --network=none \
+        --volume "${_src}:/a:rw" --volume "${_dst}:/b:rw" \
+        "alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11" \
+        mv -f "/a/${_f}" "/b/${_f}" 2>/dev/null || true
+      [[ ! -e "${_src}/${_f}" ]] && _relocated=true
+    fi
+    if [[ "$_relocated" != "true" ]]; then
+      log_error "YSG-RISK-053: could not relocate ${_f} out of ${_src} — it would remain readable by every service on the flat /run/secrets mount. Aborting fail-closed."
+      log_error "  Manual fix: mv '${_src}/${_f}' '${_dst}/${_f}' (as root or via podman unshare), then re-run."
+      return 1
+    fi
+    _ysg_write_scoped_stub "${_src}/${_f}" || return 1
+    _moved=$((_moved + 1))
+  done
+  if [[ "$_moved" -gt 0 ]]; then
+    log_info "YSG-RISK-053: relocated ${_moved} Caddy-scoped secret(s) → docker/secrets-caddy/ (inert stubs left at flat paths)"
+  fi
+  return 0
+}
+
 _pki_validate_lifetimes() {
   # Clamp to manifest bounds: root 5-20 yr, intermediate 90-365 d, leaf 30-90 d.
   if ! [[ "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" =~ ^[0-9]+$ ]] \
@@ -7680,12 +12054,22 @@ _pki_run_issuer_docker() {
 # target UID (subuid-mapped 1001 = e.g. 428680) is outside the host
 # user's UID (1005), so the kernel rejects lchown with EPERM even though
 # the user owns the file and is namespace-root inside the container.
-# The secrets dir is pre-chowned to the remapped UID by
-# _prepare_secrets_dir_for_pki(), so it does not need :U; but keeping :U
-# on secrets_dir is harmless and helps rootful Podman. The manifest is
-# pre-chowned via podman unshare (rootless) or plain chown (rootful) so the
-# container can write back bootstrap_token_sha256 fields. ":U" is NOT
-# applied to the manifest mount on any path.
+#
+# NEW-BUG-B FIX (Ava 2026-05-30): ":U" MUST NOT be applied to secrets_dir either.
+# When secrets_dir already contains files owned by subuid-remapped UIDs (e.g.
+# UID 101000 from a previous PKI bootstrap), Podman's ":U" flag calls lchown
+# on the bind-mount source for each file.  The caller at UID 1000 cannot
+# lchown files owned by UID 101000 — EPERM — even inside podman unshare.
+# The outer UID mapping constraint means user-namespace-root cannot lchown
+# files whose host UID is outside the caller's subuid range mapped into that
+# namespace.  Removing ":U" from secrets_dir is safe: the PKI issuer runs as
+# UID 1001 inside the container, and secrets files are pre-chowned to the
+# remapped equivalent of UID 1001 by _prepare_secrets_dir_for_pki().
+# ":z" (lowercase SELinux label only) is retained — it does NOT call lchown.
+#
+# The manifest is pre-chowned via podman unshare (rootless) or plain chown
+# (rootful) so the container can write back bootstrap_token_sha256 fields.
+# ":U" is NOT applied to any mount on any path in this function.
 # ---------------------------------------------------------------------------
 _pki_run_issuer_podman_linux() {
   local subcmd="$1"; local image="$2"; local manifest_in="$3"; local secrets_in="$4"
@@ -7703,14 +12087,16 @@ _pki_run_issuer_podman_linux() {
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    dry_print "podman run --rm --network=none -v ${secrets_in}:/secrets:rw,Z,U -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
+    dry_print "podman run --rm --network=none -v ${secrets_in}:/secrets:rw,z -v ${manifest_in}:/manifest.yaml:rw,Z $image python -m yashigani.pki.issuer --secrets-dir /secrets --manifest /manifest.yaml $subcmd $*"
     return 0
   fi
 
   # --network=none: issuer does no network I/O, and cutting the network
   # prevents any accidental telemetry exfil.
+  # NEW-BUG-B: ":U" removed from secrets_dir mount — see gate #ROOTLESS-9 comment.
+  # ":z" (SELinux label, no lchown) replaces ":Z,U" for rootless safety.
   podman run --rm --network=none \
-    -v "${secrets_in}:/secrets:rw,Z,U" \
+    -v "${secrets_in}:/secrets:rw,z" \
     -v "${manifest_in}:/manifest.yaml:rw,Z" \
     "$image" \
     python -m yashigani.pki.issuer \
@@ -7938,9 +12324,171 @@ _pki_run_issuer() {
   # Create the runtime directory and seed the runtime manifest from the canonical.
   # mkdir -p is idempotent — safe to re-run on upgrade.
   mkdir -p "${WORK_DIR}/docker/var/runtime"
-  cp -f "$_canonical_manifest" "$manifest_in" \
-    || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
-  log_info "_pki_run_issuer: seeded runtime manifest at ${manifest_in} (hash-back will populate bootstrap_token_sha256 values)"
+
+  # NEW-BUG-C FIX (Ava 2026-05-30): do NOT unconditionally overwrite the runtime
+  # manifest with the canonical.  The runtime manifest carries runtime-only fields
+  # (bootstrap_token_sha256) written by the PKI issuer and by the onboard handler.
+  # Overwriting with the canonical erases those fields — which breaks BUG-5's
+  # token-population fix: the token is populated at onboard time, then immediately
+  # erased when _pki_run_issuer is called to issue the leaf cert.
+  #
+  # New policy:
+  #   a. If the runtime manifest does NOT exist → copy canonical (bootstrap case).
+  #   b. If the runtime manifest DOES exist → merge: copy canonical structure but
+  #      preserve bootstrap_token_sha256 values from the runtime copy.
+  #
+  # Merge is implemented via Python (already a dependency at this point): parse
+  # both YAML files, take canonical as the base, overlay bootstrap_token_sha256
+  # values from runtime for any service that already has a non-empty hash.
+  # On failure (Python absent / YAML error), fall back to canonical-wins and warn.
+  if [[ ! -f "$manifest_in" ]]; then
+    # Fresh install: runtime manifest absent — seed from canonical.
+    cp -f "$_canonical_manifest" "$manifest_in" \
+      || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+    log_info "_pki_run_issuer: seeded runtime manifest at ${manifest_in} (fresh — hash-back will populate bootstrap_token_sha256 values)"
+  else
+    # Runtime manifest exists — merge, preserving bootstrap_token_sha256 fields.
+    local _merge_ok=false
+    # NEW-BUG-C FIX (cascade audit 2026-05-30):
+    #   (a) Removed 2>/dev/null — stderr captured and echoed via log_info so
+    #       errors surface in the install log instead of being silently swallowed.
+    #   (b) Fixed name-extraction regex: service_identities.yaml uses YAML list
+    #       syntax "  - name: caddy" (list-item), not "  name: caddy" (map key).
+    #       The old regex r'^\s{0,4}name:...' never matched "  - name:" lines
+    #       → runtime_tokens always empty → merge silently produced canonical
+    #       output, erasing all bootstrap_token_sha256 values on every PKI call.
+    #       Fixed regex accepts both "  - name: svc" and "  name: svc" forms.
+    # Strategy: write the Python body to a mktemp file, run once, capture stderr.
+    local _merge_py; _merge_py="$(mktemp)"
+    cat > "$_merge_py" <<'PYMERGE'
+import sys, re
+
+canonical_path, runtime_path = sys.argv[1], sys.argv[2]
+
+# Read both files as raw text to preserve formatting/comments.
+with open(canonical_path, encoding='utf-8') as f:
+    canonical_text = f.read()
+with open(runtime_path, encoding='utf-8') as f:
+    runtime_text = f.read()
+
+# Extract bootstrap_token_sha256 values from the runtime file.
+# Pattern: lines like "    bootstrap_token_sha256: \"<hex>\"" with non-empty value.
+# We preserve them by service name: map service_name -> sha256_value.
+#
+# BUGFIX (2026-05-30): service_identities.yaml uses YAML list syntax:
+#   services:
+#     - name: caddy
+# The old regex r'^\s{0,4}name:' never matched "  - name:" list-item lines.
+# Updated regex accepts both "  - name: svc" and "  name: svc" forms.
+runtime_tokens = {}
+current_service = None
+for line in runtime_text.splitlines():
+    # Match "  - name: svc" (list item) or "    name: svc" (map key)
+    name_m = re.match(r'^\s+(?:-\s+)?name:\s*["\']?([\w][\w\-]*)["\']?', line)
+    if name_m:
+        current_service = name_m.group(1)
+    tok_m = re.match(r'^\s+bootstrap_token_sha256:\s*"([0-9a-fA-F]{64})"', line)
+    if tok_m and current_service:
+        runtime_tokens[current_service] = tok_m.group(1)
+
+if not runtime_tokens:
+    print('pki-merge: no bootstrap_token_sha256 values found in runtime manifest (fresh install or empty runtime)', file=sys.stderr)
+
+# Now rewrite canonical: for each service that has a runtime token, replace
+# the empty bootstrap_token_sha256 placeholder with the runtime value.
+current_service = None
+out_lines = []
+substituted = []
+for line in canonical_text.splitlines():
+    name_m = re.match(r'^\s+(?:-\s+)?name:\s*["\']?([\w][\w\-]*)["\']?', line)
+    if name_m:
+        current_service = name_m.group(1)
+    if current_service and current_service in runtime_tokens:
+        # Replace empty or existing placeholder.
+        bts_m = re.match(r'^(\s+bootstrap_token_sha256:)\s*(""|"[0-9a-fA-F]{0,64}")', line)
+        if bts_m:
+            prefix = bts_m.group(1)
+            line = '%s "%s"' % (prefix, runtime_tokens[current_service])
+            substituted.append(current_service)
+    out_lines.append(line)
+
+merged_text = '\n'.join(out_lines)
+if not merged_text.endswith('\n'):
+    merged_text += '\n'
+
+with open(runtime_path, 'w', encoding='utf-8') as f:
+    f.write(merged_text)
+
+print('pki-merge: preserved %d/%d bootstrap_token_sha256 values: %s' % (
+    len(substituted), len(runtime_tokens),
+    ', '.join(substituted) if substituted else '(none)'),
+    file=sys.stderr)
+PYMERGE
+    _merge_ok=false
+    local _merge_log2; _merge_log2="$(mktemp)"
+    # NEW-BUG-H FIX (Ava iter-4 2026-05-30): on Podman rootless, service_identities.yaml
+    # in docker/var/runtime/ is owned by the subuid-mapped UID for container UID 1001
+    # (e.g. UID 101000 when max=1000 and subuid starts at 100000).  Running plain
+    # python3 as UID 1000 raises PermissionError on both read and write paths.
+    # Fix: detect rootless Podman via any of: YSG_PODMAN_RUNTIME=true, YSG_RUNTIME=podman,
+    # or simply "podman available + /etc/subuid present + running as non-root on Linux".
+    # Wrap the merge in `podman unshare` so it runs as UID 0 inside the user namespace
+    # (which maps to the PKI-issuer-owned subuid range outside).
+    # Note: this check is runtime-agnostic and does NOT depend on YSG_PODMAN_RUNTIME
+    # having been set by resolve_compose_cmd, so it works on --pki-action invocations too.
+    local _use_unshare=false
+    if [[ "$(uname -s)" == "Linux" ]] && \
+       [[ "$(id -u)" != "0" ]] && \
+       command -v podman >/dev/null 2>&1 && \
+       [[ -f /etc/subuid ]]; then
+      _use_unshare=true
+    fi
+    if [[ "$_use_unshare" == "true" ]]; then
+      podman unshare python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" \
+        2>"$_merge_log2" && _merge_ok=true
+    else
+      python3 "$_merge_py" "$_canonical_manifest" "$manifest_in" 2>"$_merge_log2" && _merge_ok=true
+    fi
+    if [[ -s "$_merge_log2" ]]; then
+      while IFS= read -r _ml; do log_info "_pki_run_issuer merge: ${_ml}"; done < "$_merge_log2"
+    fi
+    rm -f "$_merge_py" "$_merge_log2"
+    if [[ "$_merge_ok" == "true" ]]; then
+      log_info "_pki_run_issuer: merged canonical → runtime manifest (bootstrap_token_sha256 values preserved)"
+    else
+      log_warn "_pki_run_issuer: manifest merge failed — falling back to canonical (bootstrap_token_sha256 values will be re-issued)"
+      # NEW-BUG-H: same podman unshare wrapper for the fallback copy.
+      if [[ "$_use_unshare" == "true" ]]; then
+        podman unshare cp -f "$_canonical_manifest" "$manifest_in" \
+          || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+      else
+        cp -f "$_canonical_manifest" "$manifest_in" \
+          || { log_error "_pki_run_issuer: failed to copy canonical manifest to runtime path ${manifest_in}"; return 1; }
+      fi
+    fi
+  fi
+
+  # MI-6: stamp the per-instance SPIFFE trust domain onto the runtime manifest
+  # BEFORE the issuer reads it, so per-instance URI SANs are baked into every leaf
+  # cert. Trust domain resolves from the state file (authoritative once written)
+  # then from PROJECT; legacy "yashigani.internal" => no-op. Runs after the manifest
+  # is seeded/merged and before the issuer dispatch. Under rootless Podman the
+  # runtime manifest may be owned by the subuid-mapped issuer UID, so reuse the
+  # same `podman unshare` gate the merge used.
+  local _td_for_manifest
+  _td_for_manifest="$(grep -E '^SPIFFE_TRUST_DOMAIN=' "${WORK_DIR}/docker/.yashigani-install-state" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+  if [[ -z "$_td_for_manifest" ]]; then
+    _td_for_manifest="$(_spiffe_trust_domain "${COMPOSE_PROJECT_NAME:-${PROJECT:-docker}}")"
+  fi
+  if [[ "$_td_for_manifest" != "yashigani.internal" ]]; then
+    if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "0" ]] && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+      podman unshare bash -c "$(declare -f _apply_trust_domain_to_runtime_manifest log_info log_error); _apply_trust_domain_to_runtime_manifest \"\$1\" \"\$2\"" _ "$manifest_in" "$_td_for_manifest" \
+        || { log_error "_pki_run_issuer: MI-6 trust-domain rewrite failed (podman unshare) — refusing to issue certs with wrong trust domain"; return 1; }
+    else
+      _apply_trust_domain_to_runtime_manifest "$manifest_in" "$_td_for_manifest" \
+        || { log_error "_pki_run_issuer: MI-6 trust-domain rewrite failed — refusing to issue certs with wrong trust domain"; return 1; }
+    fi
+  fi
 
   case "$runtime" in
     docker)
@@ -7961,6 +12509,68 @@ _pki_run_issuer() {
       return 1
       ;;
   esac
+  local _issuer_rc=$?
+
+  # ISSUE-009 / finding C (idempotent self-heal, all runtimes): the runtime
+  # manifest's bootstrap_token_sha256 fields MUST be populated from the
+  # authoritative source — docker/secrets/<svc>_bootstrap_token, which persists
+  # across --upgrade. The issuer writes these back, but a write-back miss (merge
+  # fallback, cp race, rootless perms) previously shipped empty tokens, breaking
+  # the internal mesh mTLS client at runtime (ISSUE-009). Re-derive host-side on
+  # every run and fail closed if none land. Mirrors _update_manifest_hashes()
+  # in src/yashigani/pki/issuer.py and the macOS host-side guard above.
+  if [[ -d "$secrets_in" ]] && compgen -G "${secrets_in}/*_bootstrap_token" >/dev/null 2>&1; then
+    local _use_unshare2=false
+    if [[ "$(uname -s)" == "Linux" ]] && [[ "$(id -u)" != "0" ]] \
+       && command -v podman >/dev/null 2>&1 && [[ -f /etc/subuid ]]; then
+      _use_unshare2=true
+    fi
+    local _hashpy; _hashpy="$(mktemp)"
+    cat > "$_hashpy" <<'PYHASH'
+import sys, hashlib, pathlib
+mf=pathlib.Path(sys.argv[1]); sec=pathlib.Path(sys.argv[2])
+out=[]; cur=None; n=0
+for line in mf.read_text().splitlines(keepends=True):
+    s=line.strip()
+    if s.startswith("- name:"): cur=s.split(":",1)[1].strip().strip("'\"")
+    if s.startswith("bootstrap_token_sha256:") and cur:
+        tok=sec/f"{cur}_bootstrap_token"
+        if tok.exists():
+            h=hashlib.sha256(tok.read_bytes().strip()).hexdigest()
+            pre=line[:len(line)-len(line.lstrip())]
+            line=f'{pre}bootstrap_token_sha256: "{h}"\n'; n+=1
+    out.append(line)
+tmp=mf.with_suffix(".yaml.tok_new"); tmp.write_text("".join(out)); tmp.replace(mf)
+print(f"pki-token-ensure: populated {n} bootstrap_token_sha256 field(s) from secrets", file=sys.stderr)
+PYHASH
+    if [[ "$_use_unshare2" == "true" ]]; then
+      podman unshare python3 "$_hashpy" "$manifest_in" "$secrets_in" 2>&1 | while IFS= read -r _l; do log_info "_pki_run_issuer: ${_l}"; done
+    else
+      python3 "$_hashpy" "$manifest_in" "$secrets_in" 2>&1 | while IFS= read -r _l; do log_info "_pki_run_issuer: ${_l}"; done
+    fi
+    rm -f "$_hashpy"
+    # fail-closed verification — the explicit ISSUE-009 action-item gate
+    local _pop
+    if [[ "$_use_unshare2" == "true" ]]; then
+      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+    else
+      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${_pop:-0}" -lt 1 ]]; then
+      log_error "_pki_run_issuer: runtime manifest has 0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009) — aborting fail-closed"
+      return 1
+    fi
+    log_success "_pki_run_issuer: runtime manifest bootstrap tokens populated (${_pop} service(s))"
+  fi
+
+  # YSG-RISK-053: after any mutating issuer action (bootstrap / rotate-*), sweep
+  # freshly minted Caddy-scoped material out of the flat secrets dir before any
+  # container can mount it. Idempotent no-op when nothing was (re)minted for
+  # caddy (e.g. rotate-leaves --only <agent>). `status` never writes — skip.
+  if [[ "$_issuer_rc" -eq 0 && "$subcmd" != "status" ]]; then
+    _relocate_caddy_scoped_secrets || return 1
+  fi
+  return "$_issuer_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -8145,16 +12755,26 @@ _pki_chown_client_keys() {
   # pki_service_uid + pki_key_mode replace the inline array and the prometheus
   # special-case. Adding a new service updates lib/pki_ownership.sh only.
   # GATE5-BUG-01 / maintainer directive 2026-05-10.
-  local _svc _uid _mode _keyfile
+  local _svc _uid _mode _keyfile _keybase
+  local _caddy_scoped_dir="${WORK_DIR}/docker/secrets-caddy"
   while IFS= read -r _svc; do
     _uid="$(pki_service_uid "$_svc")"
     _mode="$(pki_key_mode "$_svc")"
     _keyfile="${_secrets_dir}/${_svc}_client.key"
+    _keybase="$_secrets_dir"
+    # YSG-RISK-053: the caddy leaf key lives in the Caddy-scoped dir (relocated
+    # by _relocate_caddy_scoped_secrets after every mint/rotation). Pass the
+    # scoped dir as _do_chown's mount base (5th arg) so the container-dispatch
+    # modes bind the correct root.
+    if [[ "$_svc" == "caddy" ]]; then
+      _keyfile="${_caddy_scoped_dir}/${_svc}_client.key"
+      _keybase="$_caddy_scoped_dir"
+    fi
     if [[ -f "$_keyfile" ]]; then
       # #3d-fix: mode from shared map (0600 default, 0640 for prometheus).
       # chmod runs inside the container alongside chown so a non-root installer
       # (e.g. uid 1003) doesn't get EPERM trying to chmod a file it no longer owns.
-      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "${_mode}" || return 1
+      _do_chown "${_uid}" "$_keyfile" "${_svc}_client.key" "${_mode}" "$_keybase" || return 1
     fi
   done < <(pki_services_all)
 
@@ -8167,6 +12787,11 @@ _pki_chown_client_keys() {
   find "${_secrets_dir}" -maxdepth 1 -type f \
     \( -name '*_client.crt' -o -name 'ca_*.crt' \) \
     -exec chmod 0644 {} \; 2>/dev/null || true
+  # YSG-RISK-053: caddy leaf cert lives in the Caddy-scoped dir — same 0644
+  # public-material posture (best-effort, mirrors the find above).
+  if [[ -f "${_caddy_scoped_dir}/caddy_client.crt" ]]; then
+    chmod 0644 "${_caddy_scoped_dir}/caddy_client.crt" 2>/dev/null || true
+  fi
 
   # gate #ROOTLESS-11: password files, bootstrap tokens, and HMAC secret are
   # written by generate_secrets() as the installer user (e.g. UID 1005 on Podman
@@ -8201,9 +12826,18 @@ _pki_chown_client_keys() {
     admin2_password
     admin2_username
     admin2_totp_secret
+    # Install-path service account — read by backoffice (UID 1001) at bootstrap
+    # seed AND by register_agent_bundles() inside the backoffice container.
+    svc_admin_username
+    svc_admin_password
+    svc_admin_totp_secret
     grafana_admin_password
     caddy_internal_hmac
     openclaw_gateway_token
+    # FP-06 Phase 2 operator-config secrets: caddy (uid 1001) reads them via
+    # caddy-entrypoint.sh before exec caddy. Empty = inert-until-set.
+    openclaw_slack_webhook_path
+    openclaw_slack_bot_token
     # wazuh passwords are read by the wazuh containers (run as root inside docker),
     # not by the UID 1001 services. Chowning them to 1001 is harmless: root (UID 0)
     # inside the wazuh containers can still read them; the mode stays 0600.
@@ -8213,8 +12847,16 @@ _pki_chown_client_keys() {
   )
   for _sf in "${_uid1001_secrets[@]}"; do
     local _sfpath="${_secrets_dir}/${_sf}"
+    local _sfbase="$_secrets_dir"
+    # YSG-RISK-053: caddy_internal_hmac lives in the Caddy-scoped dir; keep it
+    # in this array (ownership contract unchanged: 1001, mode 0640 set at
+    # generation) but chown it at its scoped path with the matching mount base.
+    if [[ "$_sf" == "caddy_internal_hmac" ]]; then
+      _sfpath="${_caddy_scoped_dir}/${_sf}"
+      _sfbase="$_caddy_scoped_dir"
+    fi
     if [[ -f "$_sfpath" ]]; then
-      _do_chown "1001" "$_sfpath" "$_sf" || return 1
+      _do_chown "1001" "$_sfpath" "$_sf" "" "$_sfbase" || return 1
     fi
   done
 
@@ -8343,6 +12985,113 @@ _pki_chown_client_keys() {
       _do_chmod_0640 "$_atpath" "$_atf" || return 1
     fi
   done
+
+  # C-003 FIX: chown dynamically-onboarded agent client keys.
+  #
+  # Background: pki_services_all() returns only the STATIC service map from
+  # lib/pki_ownership.sh.  Agents onboarded via `install.sh --onboard` are
+  # appended to docker/service_identities.yaml (B-002 fix) so that rotate-leaves
+  # issues them a client cert/key.  But the static map has no entry for them —
+  # the issued key lands owned by the PKI issuer UID (1001 post-:U remap on
+  # Docker, subuid-range on Podman rootless) and is unreadable by the agent
+  # container (UID 65534, set in compose override by codegen — codegen.py:560).
+  # Without this block every post-onboard rotate-leaves leaves the agent key
+  # unreadable → agent crash-loops on mTLS handshake.
+  #
+  # Implementation: read sentinel-guarded agent names from
+  # docker/service_identities.yaml (the same file the issuer reads).  Extract
+  # `# BEGIN YSG-ONBOARD-<name>` markers; chown each `<name>_client.key` to
+  # UID 65534 (nobody — the hardcoded compose `user:` for all BYO agents).
+  # Mode 0600 (owner-read-only; nobody is the sole consumer).
+  #
+  # This is safe to call on a fresh install with no onboarded agents: the
+  # grep produces no output and the loop body never executes.
+  #
+  # UID contract: codegen.py line 560 → `user: "65534:65534"` for ALL
+  # Shape-A BYO agents.  A future manifest field (spec.container_uid) may
+  # allow override — when that lands, update this block to read from the
+  # service_identities entry rather than hardcoding 65534.
+  local _sid_runtime="${WORK_DIR}/docker/service_identities.yaml"
+  if [[ ! -f "$_sid_runtime" ]]; then
+    # Runtime manifest not yet seeded (fresh install pre-PKI); fall back to
+    # the IaC source file.
+    _sid_runtime="${WORK_DIR}/docker/service_identities.yaml"
+  fi
+  if [[ -f "$_sid_runtime" ]]; then
+    local _onboarded_agent
+    while IFS= read -r _onboarded_agent; do
+      # Strip leading/trailing whitespace and extract name from sentinel comment.
+      _onboarded_agent="${_onboarded_agent#"# BEGIN YSG-ONBOARD-"}"
+      _onboarded_agent="${_onboarded_agent%%[[:space:]]*}"
+      [[ -z "$_onboarded_agent" ]] && continue
+      local _agent_key="${_secrets_dir}/${_onboarded_agent}_client.key"
+      if [[ -f "$_agent_key" ]]; then
+        log_info "C-003: chown'ing onboarded agent key ${_onboarded_agent}_client.key → UID 65534 (nobody)"
+        _do_chown "65534" "$_agent_key" "${_onboarded_agent}_client.key" "0600" || return 1
+      fi
+    done < <(grep -E '^[[:space:]]*# BEGIN YSG-ONBOARD-' "$_sid_runtime" 2>/dev/null || true)
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# _ysg_ensure_gid_2002 — S7 (HIGH): ensure GID 2002 (ysg-secrets) exists on the
+# host and that file-based (source: kms) agent secrets are owned by GID 2002.
+#
+# Agents declaring spec.secrets[].source=kms receive group_add:["2002"] in
+# compose (and supplementalGroups:[2002] in Helm) from the codegen. This
+# function ensures the host-side GID exists so the bind-mount ownership is
+# correct at container startup.
+#
+# Linux-only: macOS does not use the GID 2002 pattern (virtiofs remaps).
+# K8s: Helm fsGroup handles this — skip on k8s.
+#
+# S1 (security): never chmod 0644 on secrets files. GID 2002 means 0640 only.
+# ---------------------------------------------------------------------------
+_ysg_ensure_gid_2002() {
+  local _secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # K8s path: Helm fsGroup handles supplementalGroups — skip.
+  if [[ "${YSG_RUNTIME:-docker}" == "k8s" || "${MODE:-compose}" == "k8s" ]]; then
+    log_info "_ysg_ensure_gid_2002: K8s runtime — GID 2002 handled by Helm fsGroup, skipping host-side provisioning"
+    return 0
+  fi
+
+  # macOS: virtiofs UID/GID remapping makes host-side GID provisioning irrelevant.
+  local _os_type
+  _os_type="$(uname -s 2>/dev/null || printf 'Linux')"
+  if [[ "$_os_type" == "Darwin" ]]; then
+    log_info "_ysg_ensure_gid_2002: macOS — virtiofs remaps UIDs/GIDs, skipping host GID check"
+    return 0
+  fi
+
+  # Check if GID 2002 exists (Linux).
+  if ! getent group 2002 >/dev/null 2>&1; then
+    log_warn "S7: GID 2002 (ysg-secrets) not found on this host."
+    log_warn "  KMS-source agent secrets require GID 2002 for group_add:[\"2002\"] bind-mount access."
+    log_warn "  Create it: sudo groupadd -g 2002 ysg-secrets"
+    # Non-fatal: the agent will fail to read its secrets, but offboard is safe.
+    return 0
+  fi
+
+  log_info "_ysg_ensure_gid_2002: GID 2002 exists on host"
+
+  # Apply GID 2002 group ownership to any *_secret files under docker/secrets/
+  # that were written for kms-source agents (identified by their naming pattern).
+  # The codegen names these with the pattern: <agent>_kms_secret (placeholder).
+  # At install/onboard time these files may not yet exist — this is a best-effort
+  # post-codegen pass.
+  if [[ -d "$_secrets_dir" ]]; then
+    local _count=0
+    while IFS= read -r _f; do
+      if _do_chgrp "2002" "$_f" "${_f##*/}" 2>/dev/null; then
+        _do_chmod_0640 "$_f" "${_f##*/}" 2>/dev/null || true
+        _count=$((_count + 1))
+      fi
+    done < <(find "$_secrets_dir" -maxdepth 1 -type f -name '*_kms_secret' 2>/dev/null || true)
+    if [[ "$_count" -gt 0 ]]; then
+      log_info "  Applied GID 2002 + mode 0640 to ${_count} kms-source secret file(s)"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -8412,6 +13161,9 @@ _pki_detect_uri_san_drift() {
   while IFS='|' read -r svc expected; do
     [[ -z "$svc" || -z "$expected" ]] && continue
     crt="${secrets_dir}/${svc}_client.crt"
+    # YSG-RISK-053: the caddy leaf lives in the Caddy-scoped dir, not the flat
+    # secrets dir (relocated by _relocate_caddy_scoped_secrets).
+    [[ "$svc" == "caddy" ]] && crt="${WORK_DIR}/docker/secrets-caddy/${svc}_client.crt"
     if [[ ! -f "$crt" ]]; then
       log_warn "  ${svc}: leaf cert missing (${crt}) — treating as drift"
       drift=1
@@ -8448,14 +13200,27 @@ _prepare_secrets_dir_for_pki() {
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     if [[ "$(id -u)" == "0" ]]; then
       # Rootful Podman running as root — plain chown works
-      chown 1001:1001 "$secrets_dir" 2>/dev/null || true
-      log_info "secrets_dir chown 1001:1001 applied (rootful)"
+      chown -R 1001:1001 "$secrets_dir" 2>/dev/null || true
+      log_info "secrets_dir chown -R 1001:1001 applied (rootful)"
     else
-      # Rootless Podman — use podman unshare to map through the user namespace
-      if podman unshare chown 1001:1001 "$secrets_dir" 2>/dev/null; then
-        log_info "secrets_dir chown 1001:1001 applied via podman unshare (rootless)"
+      # Rootless Podman — use podman unshare to map through the user namespace.
+      #
+      # NEW-BUG-B FIX (cascade audit 2026-05-30): the previous call only chowned
+      # the DIRECTORY (secrets_dir), not the FILES inside it.  The installer runs
+      # as host UID 1000 and writes secret files at UID 1000.  The PKI issuer
+      # runs as container UID 1001 (mapped to subuid-range host UID, e.g. 101001).
+      # Mode-0400 files owned by host UID 1000 are unreadable by UID 101001 →
+      # the issuer gets EPERM when reading existing secrets (e.g. on re-issue
+      # or rotate-leaves paths).
+      # Fix: chown the directory AND all files inside it to 1001:1001 via
+      # podman unshare (which maps 1001 through the user-namespace correctly).
+      # Use find + xargs to avoid shell glob limits on large secrets dirs.
+      if podman unshare bash -c "chown 1001:1001 '$secrets_dir' && find '$secrets_dir' -maxdepth 1 -mindepth 1 -exec chown 1001:1001 {} +" 2>/dev/null; then
+        log_info "secrets_dir + files chown 1001:1001 applied via podman unshare (rootless)"
       else
-        log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer and all service containers use :U remapping (podman-override.yml); ownership is consistent across the stack"
+        # Fallback: try plain chown on the directory only (rootless without unshare — e.g. old kernel)
+        podman unshare chown 1001:1001 "$secrets_dir" 2>/dev/null \
+          || log_warn "Could not chown ${secrets_dir} via podman unshare — PKI issuer and all service containers use :U remapping (podman-override.yml); ownership is consistent across the stack"
       fi
     fi
   fi
@@ -8512,11 +13277,12 @@ _chown_agent_volumes() {
 
   log_info "Chown'ing agent named volumes to container UIDs (runtime: ${_effective_runtime})"
 
-  # Docker Compose prefixes named volumes with the project name derived from the
-  # directory containing the compose file. Our compose file lives under docker/,
-  # so the project name is "docker" → volumes are docker_langflow_data, etc.
-  # This matches the _project_prefix convention in _check_contaminated_volumes.
-  local _compose_project_prefix="docker"
+  # Docker Compose prefixes named volumes with the project name. Pre-3.0 this was
+  # always "docker" (the compose-file directory name) → docker_langflow_data, etc.
+  # Multi-instance (3.0): the project is now THIS install's COMPOSE_PROJECT_NAME, so a
+  # 2nd named instance gets e.g. eu-west-acme-com_langflow_data. Falls back to "docker"
+  # for single-instance / legacy installs. Matches _check_contaminated_volumes.
+  local _compose_project_prefix="${COMPOSE_PROJECT_NAME:-docker}"
 
   # langflow_data → uid=1000 (langflowai/langflow USER langflow = UID 1000)
   # ASVS V14.1.1: least privilege — volume must not be root-owned when process
@@ -8602,6 +13368,11 @@ bootstrap_internal_pki() {
   local ca_root="${WORK_DIR}/docker/secrets/ca_root.crt"
   if [[ -f "$ca_root" ]]; then
     log_info "Root CA already present — checking renewal status"
+    # YSG-RISK-053: legacy-layout upgrades (pre-v4.1) still hold the Caddy leaf
+    # + HMAC in docker/secrets/. Relocate BEFORE the drift check so the caddy
+    # leaf is found at its scoped path and no spurious "leaf missing → forced
+    # rotation" fires on every upgrade.
+    _relocate_caddy_scoped_secrets || return 1
     local needs_rotation=false
     # Platform Review Finding: no /tmp — keep scratch inside WORK_DIR.
     # Podman rootless: status_file written by container (UID 363144) cannot
@@ -8646,9 +13417,16 @@ bootstrap_internal_pki() {
       # NOT sweep-chmod existing keys. Ownership is applied only when new key
       # material has actually been written. GATE5-BUG-01.
       _pki_chown_client_keys || return 1
+      # Lu wire-sink-gate P2 (v2.25.2): ensure the audit signing key exists after
+      # rotation (idempotent — does not rotate the long-lived signing leaf).
+      _provision_audit_signing_key || return 1
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
+      # Lu wire-sink-gate P2 (v2.25.2): provision the audit signing key on the
+      # upgrade path too (idempotent — skips if already present). Installs that
+      # predate this feature have a CA but no signing leaf; mint it now.
+      _provision_audit_signing_key || return 1
       # No new keys generated. Existing keys are already correctly owned from the
       # previous install/rotate step. Do NOT re-apply chown (upgrade no-touch rule).
       # maintainer directive 2026-05-10 / GATE5-BUG-01.
@@ -8688,6 +13466,10 @@ bootstrap_internal_pki() {
   _pki_persist_env
 
   _pki_chown_client_keys || return 1  # re-own service keys to container UIDs; fail-closed
+
+  # Lu wire-sink-gate P2 (v2.25.2): mint the audit-chain checkpoint signing leaf
+  # (internal-CA, backoffice-only) so daily checkpoints are SIGNED → non-repudiable.
+  _provision_audit_signing_key || return 1
 
   log_success "Internal CA + per-service leaf certs generated"
   log_info "  CA root:      docker/secrets/ca_root.crt"
@@ -9040,7 +13822,16 @@ _activate_byo_ca_rerun() {
   local _compose_file="${WORK_DIR}/docker/docker-compose.yml"
   local _stack_running=false
   if [[ -f "$_compose_file" && ${#COMPOSE_CMD[@]} -gt 0 ]]; then
-    if timeout 10 "${COMPOSE_CMD[@]}" -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
+    # MACOS-TIMEOUT-001: `timeout` (GNU coreutils) is absent on macOS; use
+    # gtimeout (via Homebrew coreutils) when available, otherwise omit the
+    # guard. The compose ps call is local-socket so hangs are unlikely.
+    local _timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+      _timeout_cmd="timeout 10"
+    elif command -v gtimeout >/dev/null 2>&1; then
+      _timeout_cmd="gtimeout 10"
+    fi
+    if ${_timeout_cmd} "${COMPOSE_CMD[@]}" -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
       _stack_running=true
       log_info "  Stack is running — will restart services after BYO CA activation"
     fi
@@ -9069,6 +13860,1387 @@ _activate_byo_ca_rerun() {
   exit 0
 }
 
+# =============================================================================
+# P1 W6 — Step-up gate for onboard/offboard on a RUNNING system
+#
+# Called ONLY when _is_existing_yashigani_running() returns 0 (true).
+# Prompts for admin username + password + TOTP, authenticates against the
+# running backoffice through Caddy (no local crypto — auth delegates entirely
+# to the running system, per "Caddy is the auth perimeter").
+#
+# Two HTTP round-trips, each with a DISTINCT TOTP code:
+#   1. POST /auth/login  {username, password, totp_code}  → session cookie
+#   2. POST /auth/stepup {totp_code}                      → stepup verified
+#
+# FIX-1: login and stepup use DIFFERENT TOTP codes (_totp vs _stepup_totp).
+# The backoffice used_totp_codes replay cache rejects an already-consumed code
+# on the second call (→ 401). The operator must wait for the NEXT authenticator
+# window (new 30-second code) before entering the step-up TOTP.
+#   - login:  proves identity (username + password + TOTP per ASVS V2.2).
+#   - stepup: satisfies the high-value-flow step-up (ASVS V6.8.4, ≤5 min TTL).
+#
+# NOTE: live login→stepup flow requires two distinct codes from the operator.
+# bats tests can only assert distinct field serialisation (no live auth server).
+# Real login→stepup interaction is smoke-verified before tag on the live VM.
+#
+# CWE-214 hardening:
+#   - Password and TOTP are read with `read -s` from /dev/tty — never via
+#     argv (visible in `ps -ef`) or env vars (visible in /proc/environ).
+#   - POST bodies are written to 0600 tmpfiles and fed via curl's --data @file
+#     so the credentials never appear on the curl command line.
+#   - Tmpfiles and in-memory credentials are cleared in a trap EXIT handler.
+#   - All tmpfiles go under ${WORK_DIR} (NEVER /tmp — filesystem guardrail).
+#
+# Abort discipline:
+#   - Any non-2xx HTTP response → return 1 (caller must NOT proceed).
+#   - curl transport errors (exit 7 conn-refused, 28 timeout, 35 TLS) → return 1.
+#   - Backoffice unreachable → return 1.
+#   - No retry-into-pass on auth failures (SOP 4).
+#
+# Arguments: $1 = operation label ("onboard" | "offboard") for user messages.
+# Returns: 0 on success; 1 on any failure.
+# =============================================================================
+_ysg_onboard_stepup_gate() {
+  local _op_label="${1:-onboard}"
+
+  # ── Resolve Caddy HTTPS endpoint ─────────────────────────────────────────
+  # 1. Honour YASHIGANI_HTTPS_PORT if already in env (parse_args sets it).
+  # 2. Otherwise read from docker/.env (source of truth written at install time).
+  # 3. Fall back to 443.
+  local _port="${YASHIGANI_HTTPS_PORT:-}"
+  if [[ -z "$_port" && -f "${WORK_DIR}/docker/.env" ]]; then
+    _port="$(grep '^YASHIGANI_HTTPS_PORT=' "${WORK_DIR}/docker/.env" \
+               2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+  fi
+  _port="${_port:-443}"
+
+  # ── Resolve CA cert for TLS verification ─────────────────────────────────
+  # Use the local PKI root — never skip TLS verification.
+  local _ca_cert="${WORK_DIR}/docker/secrets/ca_root.crt"
+  if [[ ! -f "$_ca_cert" ]]; then
+    log_error "Step-up gate: CA cert not found at ${_ca_cert}"
+    log_error "  Cannot authenticate against the running system without it."
+    return 1
+  fi
+
+  local _base_url="https://localhost:${_port}"
+
+  log_step "-" "Step-up authentication required"
+  log_info "  This system is already running. Modifying a live ring-fence requires"
+  log_info "  admin password + TOTP verification against the running backoffice."
+  log_info "  Endpoint: ${_base_url}"
+  printf "\n"
+
+  # ── Prompt for credentials (never via argv/env — CWE-214) ────────────────
+  local _username _password _totp _stepup_totp
+
+  printf "  Admin username: " >/dev/tty
+  read -r _username </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read username from tty"; return 1; }
+
+  printf "  Admin password: " >/dev/tty
+  read -rs _password </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read password from tty"; return 1; }
+  printf "\n" >/dev/tty
+
+  printf "  TOTP code for login (6 digits): " >/dev/tty
+  read -rs _totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read TOTP from tty"; return 1; }
+  printf "\n" >/dev/tty
+
+  # FIX-1: prompt for a second, distinct TOTP for the step-up call.
+  # The backoffice replay cache (used_totp_codes) rejects an already-consumed
+  # code on the second round-trip — the operator must enter the NEXT code from
+  # their authenticator (a fresh 30-second window).
+  log_info "  Wait for the NEXT code in your authenticator (new 30-second window),"
+  log_info "  then enter it below for the step-up verification."
+  printf "  TOTP code for step-up (6 digits, NEXT window): " >/dev/tty
+  read -rs _stepup_totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read step-up TOTP from tty"; _username=""; _password=""; _totp=""; _stepup_totp=""; return 1; }
+  printf "\n" >/dev/tty
+
+  # Validate inputs before making any network call
+  if [[ -z "$_username" || -z "$_password" || -z "$_totp" || -z "$_stepup_totp" ]]; then
+    log_error "Step-up gate: username, password, login TOTP, and step-up TOTP are all required."
+    _username=""; _password=""; _totp=""; _stepup_totp=""
+    return 1
+  fi
+  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$'; then
+    log_error "Step-up gate: login TOTP must be exactly 6 digits."
+    _username=""; _password=""; _totp=""; _stepup_totp=""
+    return 1
+  fi
+  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$'; then
+    log_error "Step-up gate: step-up TOTP must be exactly 6 digits."
+    _username=""; _password=""; _totp=""; _stepup_totp=""
+    return 1
+  fi
+
+  # ── Tmpfile setup (0700 dir, 0600 files, under WORK_DIR — never /tmp) ──────
+  local _gate_tmpdir
+  _gate_tmpdir="$(mktemp -d "${WORK_DIR}/docker/.ysg-gate-XXXXXX")"
+  chmod 0700 "$_gate_tmpdir"
+
+  local _login_body="${_gate_tmpdir}/login.json"
+  local _cookie_jar="${_gate_tmpdir}/cookies.txt"
+  local _stepup_body="${_gate_tmpdir}/stepup.json"
+  local _curl_err="${_gate_tmpdir}/curl_err.txt"
+  local _response_file="${_gate_tmpdir}/response.txt"
+
+  # Cleanup function — zeroizes credentials and removes tmpdir on any return path.
+  # Registered as RETURN trap so it fires when the function exits for any reason.
+  _gate_cleanup() {
+    # Shred or overwrite before unlink to limit secret residency on disk.
+    if [[ -f "${_login_body:-}" ]]; then
+      dd if=/dev/zero of="$_login_body" bs=1 count="$(wc -c < "$_login_body" 2>/dev/null || echo 128)" 2>/dev/null || true
+    fi
+    if [[ -f "${_stepup_body:-}" ]]; then
+      dd if=/dev/zero of="$_stepup_body" bs=1 count="$(wc -c < "$_stepup_body" 2>/dev/null || echo 64)" 2>/dev/null || true
+    fi
+    rm -rf "${_gate_tmpdir:-}"
+  }
+  # shellcheck disable=SC2064
+  trap "_gate_cleanup; trap - RETURN" RETURN
+
+  # ── Serialize credentials to 0600 JSON tmpfiles (no shell quoting escape risk)
+  # python3 json.dumps handles all Unicode and special characters correctly.
+  # Credentials never appear on the command line (CWE-214).
+  local _prev_umask
+  _prev_umask="$(umask)"
+  umask 077
+  # FIX-1: pass _stepup_totp as a distinct 6th argument so login.json and
+  # stepup.json carry different codes — the replay cache rejects a reused code.
+  python3 - "$_login_body" "$_stepup_body" \
+      "$_username" "$_password" "$_totp" "$_stepup_totp" <<'PYJSON' || {
+import sys, json, os
+login_path, stepup_path, user, pw, totp, stepup_totp = \
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+# Write with mode 0600 via os.open
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+fd = os.open(login_path, flags, 0o600)
+os.write(fd, json.dumps({"username": user, "password": pw, "totp_code": totp}).encode())
+os.close(fd)
+fd = os.open(stepup_path, flags, 0o600)
+os.write(fd, json.dumps({"totp_code": stepup_totp}).encode())
+os.close(fd)
+PYJSON
+    log_error "Step-up gate: failed to write credential tmpfiles."
+    umask "$_prev_umask"
+    _username=""; _password=""; _totp=""; _stepup_totp=""
+    return 1
+  }
+  umask "$_prev_umask"
+
+  # Zeroize shell-local copies immediately after Python consumed them
+  _password=""; _totp=""; _stepup_totp=""
+
+  # ── Round-trip 1: POST /auth/login ────────────────────────────────────────
+  log_info "  Authenticating against ${_base_url}/auth/login ..."
+  local _login_http_code _login_curl_rc=0
+  _login_http_code="$(
+    curl --silent \
+         --cacert "$_ca_cert" \
+         --max-time 15 \
+         --connect-timeout 10 \
+         -X POST \
+         -H "Content-Type: application/json" \
+         --data "@${_login_body}" \
+         --cookie-jar "$_cookie_jar" \
+         -o "$_response_file" \
+         -w '%{http_code}' \
+         "${_base_url}/auth/login" 2>"${_curl_err}"
+  )" || _login_curl_rc=$?
+
+  # Shred login body immediately after use
+  if [[ -f "$_login_body" ]]; then
+    dd if=/dev/zero of="$_login_body" bs=1 count="$(wc -c < "$_login_body" 2>/dev/null || echo 128)" 2>/dev/null || true
+    rm -f "$_login_body"
+  fi
+
+  # Abort on transport error (curl exit 7=conn-refused, 28=timeout, 35=TLS)
+  if [[ "$_login_curl_rc" -ne 0 ]]; then
+    log_error "Step-up gate: /auth/login transport error (curl exit ${_login_curl_rc})."
+    if [[ -s "$_curl_err" ]]; then
+      log_error "  curl: $(head -1 "${_curl_err}" | tr -d '\n')"
+    fi
+    log_error "  Is the Yashigani stack running? Check: docker compose ps"
+    _username=""
+    return 1
+  fi
+
+  # Non-2xx → abort, make no changes (SOP 4: first non-2xx is FAIL)
+  if [[ "$_login_http_code" != "2"* ]]; then
+    log_error "Step-up gate: /auth/login returned HTTP ${_login_http_code}."
+    if [[ "$_login_http_code" == "401" ]]; then
+      log_error "  Invalid credentials or TOTP. Re-run ${_op_label} with correct credentials."
+    elif [[ "$_login_http_code" == "429" ]]; then
+      log_error "  Too many failed attempts. Check Retry-After header and wait before retrying."
+    fi
+    log_error "  NO CHANGES MADE."
+    _username=""
+    return 1
+  fi
+
+  log_info "  Login successful (HTTP ${_login_http_code})."
+
+  # ── Round-trip 2: POST /auth/stepup ───────────────────────────────────────
+  # The login TOTP proves identity; the stepup TOTP satisfies the high-value-flow
+  # prerequisite (ASVS V6.8.4). Both are required per Tiago directive 2026-05-29.
+  log_info "  Performing step-up verification at ${_base_url}/auth/stepup ..."
+  local _stepup_http_code _stepup_curl_rc=0
+  _stepup_http_code="$(
+    curl --silent \
+         --cacert "$_ca_cert" \
+         --max-time 15 \
+         --connect-timeout 10 \
+         -X POST \
+         -H "Content-Type: application/json" \
+         --data "@${_stepup_body}" \
+         --cookie "$_cookie_jar" \
+         -o "$_response_file" \
+         -w '%{http_code}' \
+         "${_base_url}/auth/stepup" 2>"${_curl_err}"
+  )" || _stepup_curl_rc=$?
+
+  # Shred stepup body immediately after use
+  if [[ -f "$_stepup_body" ]]; then
+    dd if=/dev/zero of="$_stepup_body" bs=1 count="$(wc -c < "$_stepup_body" 2>/dev/null || echo 64)" 2>/dev/null || true
+    rm -f "$_stepup_body"
+  fi
+
+  if [[ "$_stepup_curl_rc" -ne 0 ]]; then
+    log_error "Step-up gate: /auth/stepup transport error (curl exit ${_stepup_curl_rc})."
+    if [[ -s "$_curl_err" ]]; then
+      log_error "  curl: $(head -1 "${_curl_err}" | tr -d '\n')"
+    fi
+    _username=""
+    return 1
+  fi
+
+  if [[ "$_stepup_http_code" != "2"* ]]; then
+    log_error "Step-up gate: /auth/stepup returned HTTP ${_stepup_http_code}."
+    if [[ "$_stepup_http_code" == "401" ]]; then
+      log_error "  TOTP code rejected at step-up. Ensure your authenticator clock is synchronised."
+    elif [[ "$_stepup_http_code" == "429" ]]; then
+      log_error "  Step-up locked. Log out and log in again to reset the step-up counter."
+    fi
+    log_error "  NO CHANGES MADE."
+    _username=""
+    return 1
+  fi
+
+  log_success "Step-up gate passed — admin identity verified."
+
+  # ── Shell-side audit record ───────────────────────────────────────────────
+  # MANIFEST_ONBOARD / MANIFEST_OFFBOARD events are emitted by Python codegen
+  # and offboard.sh respectively (G2 stages 5c/6a). This log line is the
+  # belt-and-suspenders shell record that the step-up gate was satisfied.
+  log_info "  Audit: ${_op_label} step-up gate passed for user '${_username}' at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Export operator identity so the Python codegen heredoc and offboard.sh
+  # can carry it into the Merkle audit event (G2 stage-5c/6a requirement).
+  # Exported before _username is cleared — this is the only path that sets it.
+  export YSG_OPERATOR_IDENTITY="${_username}"
+
+  _username=""
+  return 0
+}
+
+# =============================================================================
+# P1 W4 — S3: cosign manifest signature shell gate
+#
+# Invokes `cosign verify-blob` against the bundled public key.
+# Enforcement level mirrors signatures.py (Python side):
+#   YSG_REQUIRE_SIGNED_MANIFEST=unset/"warn" → WARN in dev
+#   YSG_REQUIRE_SIGNED_MANIFEST=fail/1/true  → FAIL in CI+prod
+#   YASHIGANI_ENV=production|staging         → implicit FAIL
+#
+# The shell gate runs BEFORE the Python parser/validator so a corrupt or
+# unsigned manifest cannot reach the codegen pipeline.
+#
+# Bundled cosign public key location:
+#   src/yashigani/manifest/keys/manifest-signing.pub
+#
+# Hard FAIL on any non-zero cosign exit (S3 / Su-003 / M7).
+# =============================================================================
+_ysg_cosign_gate() {
+  local _manifest_file="$1"
+  local _sig_file="${_manifest_file}.cosign.sig"
+
+  # C-001 (Nico MED): FIPS guard — cosign uses Go crypto, NOT covered by
+  # CMVP #4985.  Under FIPS_MODE=1 the Python signatures.py path enforces
+  # its own gate using RSA-PSS-3072/SHA-384 (FIPS-validated).  We defer to
+  # that path and skip cosign entirely.
+  if [[ "${FIPS_MODE:-0}" == "1" ]]; then
+    log_info "S3: FIPS mode — cosign bypassed; manifest verification defers to signatures.py (RSA-PSS-3072/SHA-384)"
+    return 0
+  fi
+
+  # Resolve enforcement level
+  local _level="warn"
+  local _env_val="${YSG_REQUIRE_SIGNED_MANIFEST:-}"
+  case "${_env_val}" in
+    fail|1|true|yes) _level="fail" ;;
+    skip|off|false|0) _level="skip" ;;
+  esac
+  # Implicit production gate
+  local _ysg_env="${YASHIGANI_ENV:-}"
+  if [[ "$_ysg_env" == "production" || "$_ysg_env" == "staging" || "$_ysg_env" == "prod" ]]; then
+    _level="fail"
+  fi
+
+  if [[ "$_level" == "skip" ]]; then
+    log_info "S3: manifest signature check skipped (YSG_REQUIRE_SIGNED_MANIFEST=skip)"
+    return 0
+  fi
+
+  # Locate the bundled cosign public key
+  local _key_candidates=(
+    "${_YSG_SCRIPT_DIR}/src/yashigani/manifest/keys/manifest-signing.pub"
+    "${_YSG_SCRIPT_DIR}/keys/manifest-signing.pub"
+  )
+  local _bundled_key=""
+  local _k
+  for _k in "${_key_candidates[@]}"; do
+    if [[ -f "$_k" ]]; then
+      _bundled_key="$_k"
+      break
+    fi
+  done
+
+  if [[ -z "$_bundled_key" ]]; then
+    local _msg="S3: bundled cosign public key not found. Expected at src/yashigani/manifest/keys/manifest-signing.pub"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg"
+      return 1
+    fi
+    log_warn "$_msg (S3: non-fatal in dev mode)"
+    return 0
+  fi
+
+  # Check for detached signature file
+  if [[ ! -f "$_sig_file" ]]; then
+    local _msg2="S3: cosign detached signature not found at ${_sig_file}"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg2"
+      log_error "  Sign the manifest with: cosign sign-blob --key <signing-key> ${_manifest_file} > ${_sig_file}"
+      return 1
+    fi
+    log_warn "$_msg2 (S3: non-fatal in dev — set YSG_REQUIRE_SIGNED_MANIFEST=fail for CI/prod)"
+    return 0
+  fi
+
+  # Check cosign is on PATH
+  if ! command -v cosign >/dev/null 2>&1; then
+    local _msg3="S3: cosign binary not found in PATH"
+    if [[ "$_level" == "fail" ]]; then
+      log_error "$_msg3"
+      log_error "  Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
+      return 1
+    fi
+    log_warn "$_msg3 (S3: non-fatal in dev)"
+    return 0
+  fi
+
+  # Execute cosign verify-blob — hard FAIL on any non-zero exit (S3).
+  local _cosign_out
+  local _cosign_rc=0
+  _cosign_out="$(cosign verify-blob \
+      --key "$_bundled_key" \
+      --signature "$_sig_file" \
+      "$_manifest_file" 2>&1)" || _cosign_rc=$?
+
+  if [[ "$_cosign_rc" -ne 0 ]]; then
+    log_error "S3 (SHIP-BLOCKER): cosign verify-blob FAILED (exit ${_cosign_rc})."
+    log_error "  Manifest:   ${_manifest_file}"
+    log_error "  Signature:  ${_sig_file}"
+    log_error "  Public key: ${_bundled_key}"
+    log_error "  cosign output: ${_cosign_out}"
+    log_error "  Manifests must be signed before onboarding in CI/prod."
+    log_error "  Set YSG_REQUIRE_SIGNED_MANIFEST=skip to bypass in dev (never in prod)."
+    # Hard FAIL regardless of enforcement level — any non-zero cosign exit is fatal.
+    return 1
+  fi
+
+  log_info "S3: cosign verify-blob passed for ${_manifest_file}"
+  return 0
+}
+
+# =============================================================================
+# P1 W4 — S2: onboard handler
+#
+# Wires _detect_runtime (W2) into the codegen path, invokes Python codegen,
+# and applies the generated artifacts (service_identities.yaml append,
+# pki_ownership.sh tuple append, compose override write, Helm values write).
+#
+# The issuer reads service_identities.yaml automatically — no function-body
+# edit of install.sh is needed. All additions use BEGIN/END sentinels.
+# =============================================================================
+handle_onboard_subcommand() {
+  local _manifest="${ONBOARD_MANIFEST}"
+
+  if [[ -z "$_manifest" ]]; then
+    log_error "--onboard requires a path to an agent manifest YAML"
+    exit 1
+  fi
+  if [[ ! -f "$_manifest" ]]; then
+    log_error "--onboard: manifest file not found: ${_manifest}"
+    exit 1
+  fi
+
+  log_step "-" "Onboarding agent from manifest: ${_manifest}"
+
+  # Resolve WORK_DIR early — needed by both the step-up gate (to locate
+  # docker/.env + docker/secrets/ca_root.crt) and the subsequent codegen.
+  if [[ -z "${WORK_DIR:-}" || ! -d "${WORK_DIR}" ]]; then
+    detect_working_directory
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+      cd "$WORK_DIR"
+    fi
+  fi
+
+  # P1 W6 — Step-up gate: if install residuals are present (compose file +
+  # any secrets), the operator MUST authenticate (password + TOTP) against
+  # the live system BEFORE any changes are made.
+  # FIX-2: use _is_installed_or_running (residuals-based, fail-closed) NOT
+  # _is_existing_yashigani_running (affirmative-only — bypassed by cert
+  # removal or stopped containers; Laura F1/F2).
+  # Fresh installs (no residuals) skip this gate — onboarding is part of
+  # the trusted install flow.
+  # Tiago directive 2026-05-29: "if it is adding agents to an already
+  # existing system you need to provide password and totp, always."
+  if _is_installed_or_running; then
+    _ysg_onboard_stepup_gate "onboard" || exit 1
+  fi
+
+  # S3: cosign signature gate BEFORE codegen (after step-up gate)
+  _ysg_cosign_gate "$_manifest" || exit 1
+
+  # Wire _detect_runtime (W2/L10) — resolve the 4-way runtime BEFORE codegen.
+  # Wrong-runtime codegen silently produces no ring-fence (L10).
+  if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
+    # shellcheck source=lib/detect_runtime.sh
+    # shellcheck disable=SC1091
+    source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
+    _detect_runtime 2>/dev/null || true
+    log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown} — ${YSG_RUNTIME_4WAY_NOTE:-}"
+  else
+    log_warn "lib/detect_runtime.sh not found — YSG_RUNTIME_4WAY will be inferred from YSG_RUNTIME"
+    # Map legacy YSG_RUNTIME to 4-way for codegen
+    case "${YSG_RUNTIME:-}" in
+      docker) YSG_RUNTIME_4WAY="docker" ;;
+      podman) YSG_RUNTIME_4WAY="podman-rootless" ;;
+      k8s)    YSG_RUNTIME_4WAY="k8s" ;;
+      *)      YSG_RUNTIME_4WAY="docker" ;;
+    esac
+    export YSG_RUNTIME_4WAY
+  fi
+
+  if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "unknown" ]]; then
+    log_error "Runtime detection failed. Set YSG_RUNTIME_4WAY=docker|podman-rootful|podman-rootless|k8s"
+    exit 1
+  fi
+
+  # Invoke Python codegen pipeline:
+  #   parse → validate → verify_signature (Python side) → codegen → apply artifacts
+  log_info "Running Python codegen for manifest: ${_manifest}"
+  local _codegen_rc=0
+
+  # MI-6: per-instance SPIFFE trust domain for the onboarded agent's spiffe_id.
+  # Read from the target instance's state file (authoritative); legacy default
+  # yashigani.internal preserved.
+  local _onboard_trust_domain
+  _onboard_trust_domain="$(_read_state_trust_domain "${WORK_DIR}/docker/.yashigani-install-state")"
+  python3 - "$_manifest" "$WORK_DIR" "${YSG_RUNTIME_4WAY}" \
+      "${YSG_REQUIRE_SIGNED_MANIFEST:-warn}" "${_onboard_trust_domain}" <<'PYEOF' || _codegen_rc=$?
+import sys, os
+
+manifest_path = sys.argv[1]
+output_root   = sys.argv[2]
+runtime       = sys.argv[3]
+sig_level     = sys.argv[4]
+# MI-6: per-instance SPIFFE trust-domain authority (legacy => yashigani.internal).
+trust_domain  = sys.argv[5] if len(sys.argv) > 5 else "yashigani.internal"
+
+# Extend sys.path to find the yashigani package in the repo src/ tree.
+src_dir = os.path.join(output_root, 'src')
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+try:
+    from yashigani.manifest import (
+        parse_manifest, validate_manifest, verify_manifest_signature,
+        CodegenEngine, reset_codegen_registry, is_shape_c,
+    )
+    # FIX-SHAPE-C-DISPATCH (Ava 2026-05-30): import Shape-C engine so
+    # manifests with mcp-b posture / mcp_server category get the correct
+    # codegen path (isolated-container + bridge artifacts) instead of the
+    # Shape-A LLM-agent path.
+    try:
+        from yashigani.manifest import CodegenEngineShapeC
+        _SHAPE_C_ENGINE_AVAILABLE = True
+    except ImportError:
+        _SHAPE_C_ENGINE_AVAILABLE = False
+except ImportError as e:
+    print('[onboard] ERROR: yashigani.manifest package not found: %s' % e, file=sys.stderr)
+    print('[onboard] Ensure the package is installed or run from the repo root.', file=sys.stderr)
+    sys.exit(1)
+
+from pathlib import Path
+
+manifest_bytes = Path(manifest_path).read_bytes()
+
+# Parse
+try:
+    parsed = parse_manifest(manifest_bytes)
+except Exception as e:
+    print('[onboard] FAIL: manifest parse error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# Validate
+try:
+    validate_manifest(parsed)
+except Exception as e:
+    print('[onboard] FAIL: manifest validation error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# S3 (Python side): signature verification
+os.environ.setdefault('YSG_REQUIRE_SIGNED_MANIFEST', sig_level)
+try:
+    verify_manifest_signature(manifest_bytes, parsed)
+except Exception as e:
+    print('[onboard] FAIL: signature verification: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# Codegen — write artifacts to output_root
+# FIX-SHAPE-C-DISPATCH: dispatch to correct engine based on manifest shape.
+# Shape-C manifests (mcp_server category / mcp-b posture) generate an
+# isolated-container compose override with the first-party bridge; they must
+# NOT use CodegenEngine which generates Shape-A LLM-agent artifacts.
+reset_codegen_registry()
+try:
+    _manifest_is_shape_c = is_shape_c(parsed) if callable(is_shape_c) else False
+    if _manifest_is_shape_c and _SHAPE_C_ENGINE_AVAILABLE:
+        print('[onboard] Shape-C manifest detected — using CodegenEngineShapeC')
+        engine = CodegenEngineShapeC(parsed, runtime)
+    else:
+        if _manifest_is_shape_c and not _SHAPE_C_ENGINE_AVAILABLE:
+            print('[onboard] WARN: Shape-C manifest but CodegenEngineShapeC not importable — falling back to CodegenEngine', file=sys.stderr)
+        engine = CodegenEngine(parsed, runtime)
+    artifacts = engine.render(output_root=Path(output_root), dry_run=False)
+    print('[onboard] Codegen complete. Artifacts written:')
+    for rel_path in sorted(artifacts.keys()):
+        print('  + %s' % rel_path)
+except Exception as e:
+    print('[onboard] FAIL: codegen error: %s' % e, file=sys.stderr)
+    sys.exit(1)
+
+# S2: append service_identities.yaml entry (sentinel-guarded)
+# The issuer reads service_identities.yaml automatically — this appends
+# the onboarded agent's SPIFFE identity for PKI issuance on next rotate-leaves.
+import re
+
+meta = parsed.get('metadata') or {}
+spec = parsed.get('spec') or {}
+agent_name = meta.get('name', '')
+tenant_id  = meta.get('tenant_id', '')
+sid_file   = os.path.join(output_root, 'docker', 'service_identities.yaml')
+
+if not os.path.isfile(sid_file):
+    print('[onboard] WARN: service_identities.yaml not found — skipping PKI identity append', file=sys.stderr)
+else:
+    content = open(sid_file, encoding='utf-8').read()
+    begin_marker = '# BEGIN YSG-ONBOARD-' + agent_name
+    if begin_marker in content:
+        print('[onboard] service_identities.yaml: entry for %r already present — idempotent' % agent_name)
+    else:
+        # B-002 FIX: insert sentinel-guarded entry INSIDE the top-level
+        # `services:` mapping, not at EOF (which puts it after `canary_policy:`
+        # and outside the mapping → structurally invalid YAML).
+        #
+        # Strategy: locate the insertion boundary — the first line at column 0
+        # that is NOT inside the services: mapping (i.e. a top-level key or
+        # comment-section separator that follows the last services entry).
+        # We look for:
+        #   (a) the pattern `\n\n# ────…` (the decorative separator line
+        #       before endpoint_acls: or other top-level sections), OR
+        #   (b) `\n^[a-z_]+:` (any top-level key at column 0 after a blank line)
+        # whichever comes first AFTER the `services:` line.
+        #
+        # This is safe for any valid service_identities.yaml: if onboarded
+        # agents have already been inserted (prior runs), `begin_marker` check
+        # above would have caught the duplicate; this path only runs when the
+        # entry is absent.
+        spiffe_id = 'spiffe://%s/agents/%s/%s' % (trust_domain, tenant_id, agent_name)
+        entry_block = (
+            '  # BEGIN YSG-ONBOARD-{name}\n'
+            '  # Onboarded agent — managed by yashigani onboard/offboard\n'
+            '  - name: {name}\n'
+            '    dns_sans: [{name}, {name}.internal]\n'
+            '    spiffe_id: {spiffe_id}\n'
+            '    purpose: "BYO agent — ring-fenced (P1 onboarding)"\n'
+            '    mtls_capable: false\n'
+            '    bootstrap_token_sha256: ""\n'
+            '    revoked: false\n'
+            '  # END YSG-ONBOARD-{name}\n'
+        ).format(name=agent_name, spiffe_id=spiffe_id)
+
+        # Find the services: key position first, then search only past it.
+        services_match = re.search(r'^services:\s*$', content, re.MULTILINE)
+        if services_match is None:
+            print('[onboard] FAIL: service_identities.yaml has no top-level `services:` key — cannot insert entry', file=sys.stderr)
+            sys.exit(1)
+        search_start = services_match.end()
+
+        # Look for the first separator comment block (decorative ─── lines
+        # used as section dividers in service_identities.yaml) OR any
+        # top-level YAML key (word chars + colon at column 0, preceded by
+        # a blank line). Whichever comes first after `services:` is the
+        # boundary — we insert the new block immediately before it.
+        boundary_re = re.compile(
+            r'\n(?=# [─]{5}|[a-z_][a-zA-Z0-9_]*:)',
+            re.MULTILINE,
+        )
+        boundary_match = boundary_re.search(content, search_start)
+        if boundary_match is None:
+            # Fallback: no boundary found — append before EOF (last resort).
+            insert_pos = len(content)
+            new_content = content.rstrip('\n') + '\n' + entry_block
+        else:
+            insert_pos = boundary_match.start() + 1  # after the \n
+            new_content = content[:insert_pos] + entry_block + '\n' + content[insert_pos:]
+
+        import tempfile
+        dir_ = os.path.dirname(sid_file)
+        fd, tmp = tempfile.mkstemp(dir=dir_, prefix='.ysg-onboard-tmp-', suffix='.yaml')
+        try:
+            os.write(fd, new_content.encode('utf-8'))
+            os.close(fd); fd = -1
+            os.chmod(tmp, os.stat(sid_file).st_mode & 0o777)
+            os.rename(tmp, sid_file)
+        except Exception:
+            if fd != -1: os.close(fd)
+            os.unlink(tmp)
+            raise
+        print('[onboard] service_identities.yaml: appended entry for %r' % agent_name)
+
+# S7: apply GID 2002 ownership for kms-secret agents
+#   The codegen already emits group_add/supplementalGroups in compose/helm.
+#   Here we log the requirement; actual chown is deferred to _pki_chown_client_keys
+#   post-PKI-bootstrap (the key doesn't exist yet at onboard time).
+secrets_list = spec.get('secrets') or []
+has_kms = any(s.get('source') == 'kms' for s in secrets_list if isinstance(s, dict))
+if has_kms:
+    print('[onboard] S7: kms secrets detected — GID 2002 group_add will apply at PKI bootstrap.')
+    print('[onboard] S7: ensure GID 2002 exists on host: groupadd -g 2002 ysg-secrets')
+
+print('[onboard] Onboard complete for agent: %s (tenant: %s)' % (agent_name, tenant_id))
+
+# G2 stage-5c: emit MANIFEST_ONBOARD Merkle audit event (Lu-Gap-06 / G2.2)
+# Reads operator identity from YSG_OPERATOR_IDENTITY env var (set by the
+# step-up gate before _username is cleared). Falls back to "unknown" when
+# running on a fresh install where the gate was not invoked.
+try:
+    import hashlib, json as _json, os as _os
+    from yashigani.audit.writer import AuditLogWriter
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.schema import ManifestOnboardEvent
+
+    # Canonical manifest SHA-256: full SHA-256 of the raw YAML bytes
+    _manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+    # Operator identity threaded from the step-up gate via env var
+    _operator = _os.environ.get('YSG_OPERATOR_IDENTITY', 'unknown') or 'unknown'
+
+    # Artifact labels (relative paths without WORK_DIR)
+    _artifact_labels = sorted(artifacts.keys())
+
+    # AuditConfig: default log path; override via YASHIGANI_AUDIT_LOG_PATH.
+    # On a running system the volume path is /var/log/yashigani/audit.log.
+    _audit_log_path = _os.environ.get(
+        'YASHIGANI_AUDIT_LOG_PATH',
+        _os.path.join(output_root, 'docker', 'var', 'audit.log'),
+    )
+    _audit_config = AuditConfig(
+        log_path=_audit_log_path,
+        max_file_size_mb=int(_os.environ.get('YASHIGANI_AUDIT_MAX_FILE_SIZE_MB', '100')),
+        retention_days=int(_os.environ.get('YASHIGANI_AUDIT_RETENTION_DAYS', '90')),
+    )
+    _writer = AuditLogWriter(config=_audit_config)
+    _writer.write(ManifestOnboardEvent(
+        tenant_id=tenant_id,
+        agent_name=agent_name,
+        manifest_sha256=_manifest_sha256,
+        operator_identity=_operator,
+        artifacts_generated=_artifact_labels,
+        runtime=runtime,
+    ))
+    _writer.close()
+    print('[onboard] MANIFEST_ONBOARD audit event written (operator=%s sha256=%.16s...)' % (
+        _operator, _manifest_sha256))
+except Exception as _audit_exc:
+    # FIX-03 (YCS-...-W6-03): onboard audit-write must NOT be silent.
+    # A change-management control (AU-2 / CM-3 / CC8.1) applied with NO
+    # Merkle event is a control failure. The operator and auditor MUST see it.
+    # Artifacts are already durable — we do NOT un-apply them.
+    import datetime as _dt, json as _json2, os as _os2
+    # Fallbacks: these locals may be unset if the exception fired before
+    # they were assigned (e.g., import error at the top of the try block).
+    _operator = locals().get('_operator', _os2.environ.get('YSG_OPERATOR_IDENTITY', 'unknown') or 'unknown')
+    _audit_log_path = locals().get('_audit_log_path', _os2.path.join(output_root, 'docker', 'var', 'audit.log'))
+    # (1) LOUD operator-facing error to stderr.
+    print('', file=sys.stderr)
+    print('=' * 72, file=sys.stderr)
+    print('[onboard] ERROR: MANIFEST_ONBOARD audit event write FAILED', file=sys.stderr)
+    print('[onboard] ERROR: The ring-fence artifacts were applied but the', file=sys.stderr)
+    print('[onboard] ERROR: Merkle audit record could NOT be written.', file=sys.stderr)
+    print('[onboard] ERROR: This is a change-management control failure.', file=sys.stderr)
+    print('[onboard] ERROR: Agent=%s  Operator=%s' % (agent_name, _operator), file=sys.stderr)
+    print('[onboard] ERROR: Cause: %s' % _audit_exc, file=sys.stderr)
+    print('[onboard] ERROR: Action required: investigate audit volume, then', file=sys.stderr)
+    print('[onboard] ERROR:   manually add a MANIFEST_ONBOARD record or', file=sys.stderr)
+    print('[onboard] ERROR:   re-run onboard once the audit volume is healthy.', file=sys.stderr)
+    print('=' * 72, file=sys.stderr)
+    # (2) Fallback breadcrumb — write a minimal JSON record next to the audit log
+    # so the failure is recorded somewhere even if the main audit volume is broken.
+    _breadcrumb = {
+        'event_type': 'MANIFEST_ONBOARD_AUDIT_WRITE_FAILED',
+        'timestamp': _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        'agent_name': agent_name,
+        'operator_identity': _operator,
+        'cause': str(_audit_exc),
+    }
+    try:
+        _bc_dir = _os2.path.dirname(_audit_log_path)
+        _bc_path = _os2.path.join(
+            _bc_dir,
+            'audit-write-failed-%s.json' % agent_name.replace('/', '_'),
+        )
+        _os2.makedirs(_bc_dir, exist_ok=True)
+        with open(_bc_path, 'w', encoding='utf-8') as _bc_f:
+            _bc_f.write(_json2.dumps(_breadcrumb) + '\n')
+        print('[onboard] ERROR: breadcrumb written to %s' % _bc_path, file=sys.stderr)
+    except Exception as _bc_exc:
+        print('[onboard] ERROR: breadcrumb write also failed: %s' % _bc_exc, file=sys.stderr)
+    # (3) Advisory non-zero exit so the shell caller signals the failure.
+    sys.exit(1)
+PYEOF
+
+  if [[ "$_codegen_rc" -ne 0 ]]; then
+    # FIX-03: codegen exit non-zero covers both real codegen errors AND
+    # the audit-write failure path above. Artifacts are applied in both cases;
+    # the operator must investigate the audit volume.
+    log_error "Onboard completed but audit event write FAILED (exit ${_codegen_rc})"
+    log_error "  Merkle audit record is missing — this is a control failure."
+    log_error "  Check stderr above and the breadcrumb file in the audit log directory."
+    log_error "  Investigate and restore the audit record before considering this onboard complete."
+    exit 1
+  fi
+
+  # BEGIN YSG-P3-MCP-BRIDGE-JOIN
+  # Shape-C (MCP server) post-onboard bridge wiring.
+  #
+  # After codegen lands the compose-override.yml for a Shape-C agent, the GATEWAY
+  # container must join the new ringfence_<agent> bridge so it can reach the bridge
+  # on TCP/8000.  The codegen emits an operator-instruction comment; this block
+  # mechanises that step.
+  #
+  # Detection: fast-grep the manifest YAML for category:mcp_server.  We do NOT
+  # re-invoke Python here — grep on the already-validated manifest is sufficient
+  # and avoids a second Python startup in a potentially slow CI environment.
+  #
+  # Input validation: agent_name is extracted from the ALREADY-VALIDATED manifest
+  # (the Python codegen above rejected it on any invalid character set).  We still
+  # guard against shell injection by validating the extracted value against a strict
+  # pattern before using it in a shell word.
+  #
+  # K8s: NetworkPolicy handles gateway↔MCP-server routing; no docker network connect
+  # needed.  This block is skipped on K8s runtime.
+  #
+  # Rootless Podman: podman network connect works but the L1 egress gap (internal:true
+  # may not block DNS on rootless) is pre-existing and documented in codegen
+  # (_ROOTLESS_L1_GAP_WARNING).  The connect itself still succeeds.
+
+  local _manifest_is_shape_c=false
+  if grep -qE '^[[:space:]]*category:[[:space:]]*mcp_server' "${_manifest}" 2>/dev/null; then
+    _manifest_is_shape_c=true
+  fi
+
+  if [[ "$_manifest_is_shape_c" == "true" ]] && \
+     [[ "${YSG_RUNTIME_4WAY:-docker}" != "k8s" ]]; then
+
+    # Extract agent_name from the manifest (already Python-validated — but we
+    # validate again for shell safety: only [a-zA-Z0-9_-] permitted).
+    local _agent_name_raw
+    _agent_name_raw="$(grep -E '^[[:space:]]*name:[[:space:]]*' "${_manifest}" 2>/dev/null \
+                        | head -1 | sed 's/.*name:[[:space:]]*//' | tr -d '[:space:]"'"'"'' || true)"
+
+    # Extract tenant_id similarly
+    local _tenant_id_raw
+    _tenant_id_raw="$(grep -E '^[[:space:]]*tenant_id:[[:space:]]*' "${_manifest}" 2>/dev/null \
+                       | head -1 | sed 's/.*tenant_id:[[:space:]]*//' | tr -d '[:space:]"'"'"'' || true)"
+
+    # SECURITY: validate agent_name against strict allowlist before use in any
+    # shell expansion or docker/podman command argument.
+    # Pattern: alphanumeric + hyphen + underscore, 1-64 chars.
+    # Reject anything else — this prevents injection via a crafted manifest name.
+    if [[ -z "$_agent_name_raw" ]] || ! [[ "$_agent_name_raw" =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; then
+      log_error "Shape-C bridge-join: could not extract a safe agent name from manifest"
+      log_error "  Extracted value: '${_agent_name_raw}'"
+      log_error "  Expected: alphanumeric + hyphen + underscore, 1-64 chars"
+      log_error "  Bridge-join SKIPPED — run operator action manually:"
+      log_error "    docker network connect ringfence_<agent> <gateway-container>"
+      log_error "    docker compose -f docker/docker-compose.yml up --no-deps -d gateway"
+    else
+      # Safe to use in shell words from here.
+      local _ringfence_net="ringfence_${_agent_name_raw}"
+      local _compose_file="${WORK_DIR}/docker/docker-compose.yml"
+
+      # Determine the gateway container name.
+      # Compose names containers as <project>-<service>-<index>; the project
+      # defaults to the directory name of the compose file.
+      #
+      # We CANNOT use `compose ps -q gateway` here because docker-compose.yml
+      # declares YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+      # — the :? makes it required, so compose errors out when UPSTREAM_MCP_URL
+      # is empty (e.g. non-interactive install without --upstream-url).
+      # Instead we resolve the container name via `docker/podman ps --filter`
+      # which needs no compose-file interpolation.  YSG-P3-MCP-BRIDGE-JOIN-FIX.
+      #
+      # NEW-BUG-A Part 1 FIX (cascade audit 2026-05-30): on standalone --onboard
+      # invocations COMPOSE_CMD is still the empty global.  _runtime_bin_ps would
+      # then default to "docker" even on Podman-only stacks, causing all five
+      # detection tiers to run "docker ps" and find nothing.
+      # Fix: resolve COMPOSE_CMD here, before the detection block.
+      if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+        resolve_compose_cmd 2>/dev/null || true
+      fi
+      local _gw_container=""
+      local _runtime_bin_ps="${COMPOSE_CMD[0]:-docker}"
+      # strip -compose suffix: "docker-compose" → "docker", "podman-compose" → "podman"
+      _runtime_bin_ps="${_runtime_bin_ps%%-compose}"
+
+      # Derive the compose project name from the compose-file directory name
+      # (same logic Docker Compose v2 uses by default).
+      local _compose_project
+      _compose_project="$(basename "$(dirname "$_compose_file")")"
+
+      # NEW-BUG-A FIX — Part 1: gateway container detection.
+      #
+      # Docker Compose v2 sets com.docker.compose.* labels on containers.
+      # podman-compose sets io.podman.compose.* labels.
+      # Also: podman-compose names containers with underscores
+      # (<project>_<service>_<N>) whereas docker compose v2 uses hyphens
+      # (<project>-<service>-<N>).  We must try both label schemas and both
+      # naming separators.
+      #
+      # We CANNOT use `compose ps -q gateway` here because docker-compose.yml
+      # declares YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+      # — the :? makes it required, so compose errors out when UPSTREAM_MCP_URL
+      # is empty.  Use ps --filter which needs no file interpolation.
+      #
+      # Detection order:
+      #   1. Docker-Compose-v2 label: com.docker.compose.project + service=gateway
+      #   2. podman-compose label:    io.podman.compose.project + service=gateway
+      #   3. Name pattern hyphen:     <project>-gateway-<N>
+      #   4. Name pattern underscore: <project>_gateway_<N>  (podman-compose)
+      #   5. Last resort:             any container whose name contains "gateway"
+
+      # Primary: Docker Compose v2 labels (docker / rootful podman-compose)
+      _gw_container="$(
+        "$_runtime_bin_ps" ps \
+          --filter "label=com.docker.compose.project=${_compose_project}" \
+          --filter "label=com.docker.compose.service=gateway" \
+          --format "{{.Names}}" 2>/dev/null \
+        | head -1 || true
+      )"
+
+      # Fallback 1: podman-compose labels (io.podman.compose.*)
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "label=io.podman.compose.project=${_compose_project}" \
+            --filter "label=com.docker.compose.service=gateway" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Fallback 2: deterministic compose-v2 name pattern <project>-gateway-<N>
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=^${_compose_project}-gateway-" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Fallback 3: podman-compose name pattern <project>_gateway_<N> (underscore)
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=^${_compose_project}_gateway_" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # Last resort: any running container whose name contains "gateway"
+      if [[ -z "$_gw_container" ]]; then
+        _gw_container="$(
+          "$_runtime_bin_ps" ps \
+            --filter "name=gateway" \
+            --format "{{.Names}}" 2>/dev/null \
+          | head -1 || true
+        )"
+      fi
+
+      # NEW-BUG-A FIX — Part 2: persistent network wiring via docker-compose.yml.
+      #
+      # `docker/podman network connect` is NOT persisted across `compose down/up`
+      # cycles: the gateway container is recreated and the connection is lost.
+      # Fix: write the ringfence_<agent> network into the gateway service's
+      # `networks:` section of docker-compose.yml AND into the top-level
+      # `networks:` definition block.  This way the `compose up --no-deps -d gateway`
+      # later in this block creates the gateway container already connected.
+      # On subsequent `compose down/up` the network persists via the compose file.
+      #
+      # This replaces the one-shot `network connect` call as the PRIMARY wiring
+      # mechanism.  The `network connect` is retained as a LIVE-stack supplement:
+      # it wires the CURRENTLY-RUNNING gateway while we wait for the recreate.
+      log_step "-" "NEW-BUG-A: writing ${_ringfence_net} into docker-compose.yml (persistent network wiring)"
+      local _compose_patch_ok=false
+      python3 - "$_compose_file" "$_ringfence_net" <<'PYCOMPOSE' 2>/dev/null && _compose_patch_ok=true
+import sys, re
+
+compose_path = sys.argv[1]
+ringfence_net = sys.argv[2]
+
+with open(compose_path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+# ── Pass 1: find the gateway service networks: block and add the ringfence net.
+# Strategy: locate "  gateway:" (2-space indent, top-level service) then find
+# its "    networks:" block.  Insert the new entry only if not already present.
+in_gateway = False
+in_gateway_networks = False
+gateway_networks_indent = None
+gateway_networks_end = None  # line index AFTER the last network entry
+already_in_gateway_nets = False
+inserted_gateway = False
+
+i = 0
+result_lines = []
+while i < len(lines):
+    line = lines[i]
+    stripped = line.rstrip('\n')
+
+    # Detect gateway service start (exactly 2-space indent at root level)
+    if re.match(r'^  gateway:\s*$', stripped):
+        in_gateway = True
+        in_gateway_networks = False
+        gateway_networks_indent = None
+        result_lines.append(line)
+        i += 1
+        continue
+
+    # Leaving gateway service (another 2-space-indent key or end of file)
+    if in_gateway and re.match(r'^  \w', stripped) and not re.match(r'^  gateway:', stripped):
+        in_gateway = False
+        in_gateway_networks = False
+
+    if in_gateway:
+        # Detect `    networks:` block (4-space indent)
+        nm = re.match(r'^( {4,})networks:\s*$', stripped)
+        if nm and not in_gateway_networks:
+            in_gateway_networks = True
+            gateway_networks_indent = nm.group(1)
+            result_lines.append(line)
+            i += 1
+            # Walk the network entries
+            entry_indent = gateway_networks_indent + '  '
+            while i < len(lines):
+                entry_line = lines[i]
+                entry_stripped = entry_line.rstrip('\n')
+                # Still inside networks block?
+                if re.match(r'^' + re.escape(entry_indent) + r'- ', entry_stripped):
+                    if ringfence_net in entry_stripped:
+                        already_in_gateway_nets = True
+                    result_lines.append(entry_line)
+                    i += 1
+                else:
+                    # End of networks block for gateway.
+                    # Insert before this line if not already present.
+                    if not already_in_gateway_nets:
+                        result_lines.append('%s- %s\n' % (entry_indent, ringfence_net))
+                        inserted_gateway = True
+                    break
+            continue
+
+    result_lines.append(line)
+    i += 1
+
+# ── Pass 2: find the top-level `networks:` block and add the ringfence net def.
+# Top-level networks: starts at column 0 with no indent.
+# Format to add:
+#   <ringfence_net>:
+#     driver: bridge
+#     enable_ipv6: false
+#     internal: true
+
+in_top_networks = False
+top_networks_entry_re = re.compile(r'^  \w')
+already_in_top_networks = False
+inserted_top = False
+
+final_lines = []
+i = 0
+while i < len(result_lines):
+    line = result_lines[i]
+    stripped = line.rstrip('\n')
+
+    if re.match(r'^networks:\s*$', stripped):
+        in_top_networks = True
+        final_lines.append(line)
+        i += 1
+        # Walk top-level network entries until EOF or next top-level key
+        while i < len(result_lines):
+            nl = result_lines[i]
+            ns = nl.rstrip('\n')
+            # Another top-level key (no indent, not a comment, not empty)
+            if re.match(r'^\w', ns) and not re.match(r'^networks:', ns):
+                break
+            if re.match(r'^  ' + re.escape(ringfence_net) + r':', ns):
+                already_in_top_networks = True
+            final_lines.append(nl)
+            i += 1
+        if not already_in_top_networks:
+            final_lines.append('  # NEW-BUG-A: ringfence bridge for %s MCP agent\n' % ringfence_net)
+            final_lines.append('  %s:\n' % ringfence_net)
+            final_lines.append('    driver: bridge\n')
+            final_lines.append('    enable_ipv6: false\n')
+            final_lines.append('    internal: true\n')
+            inserted_top = True
+        continue
+
+    final_lines.append(line)
+    i += 1
+
+if not (inserted_gateway or already_in_gateway_nets):
+    print('ERROR: could not find gateway service networks: block', file=sys.stderr)
+    sys.exit(1)
+if not (inserted_top or already_in_top_networks):
+    print('ERROR: could not find top-level networks: block', file=sys.stderr)
+    sys.exit(1)
+
+with open(compose_path, 'w', encoding='utf-8') as f:
+    f.writelines(final_lines)
+
+print('compose-patch: gateway networks+=%s, top-level networks+=%s' % (
+    'added' if inserted_gateway else 'already-present',
+    'added' if inserted_top else 'already-present',
+))
+PYCOMPOSE
+
+      if [[ "$_compose_patch_ok" == "true" ]]; then
+        log_success "NEW-BUG-A: ${_ringfence_net} added to docker-compose.yml (gateway + top-level networks)"
+      else
+        log_warn "NEW-BUG-A: could not patch docker-compose.yml — falling back to network connect only."
+        log_warn "  The ringfence network will NOT persist across compose down/up cycles."
+        log_warn "  Manual fix: add '- ${_ringfence_net}' under gateway.networks in docker/docker-compose.yml"
+        log_warn "  and add '${_ringfence_net}: {driver: bridge, enable_ipv6: false, internal: true}'"
+        log_warn "  to the top-level networks: block."
+      fi
+
+      if [[ -z "$_gw_container" ]]; then
+        log_warn "Shape-C bridge-join: gateway container not found via docker ps."
+        log_warn "  Tried: Docker Compose v2 labels (com.docker.compose.*), podman-compose labels"
+        log_warn "         (io.podman.compose.*), name patterns '${_compose_project}-gateway-*'"
+        log_warn "         and '${_compose_project}_gateway_*', and substring 'gateway'."
+        log_warn "  Ensure the stack is running before --onboard for Shape-C agents."
+        log_warn "  After starting the stack, rerun:"
+        log_warn "    bash install.sh --onboard <manifest> --runtime ${YSG_RUNTIME_4WAY:-docker}"
+      else
+        log_step "-" "YSG-P3-MCP-BRIDGE-JOIN: live-stack network connect to ${_ringfence_net}"
+
+        # Use the runtime binary we already derived above (_runtime_bin_ps).
+        # For network connect we always use the base container runtime (docker/podman).
+        local _runtime_bin="$_runtime_bin_ps"
+
+        # Check if gateway is already connected to the ringfence bridge (idempotent).
+        local _already_connected=false
+        if "$_runtime_bin" network inspect "${_ringfence_net}" \
+             --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null \
+           | grep -qF "$_gw_container"; then
+          _already_connected=true
+        fi
+
+        if [[ "$_already_connected" == "true" ]]; then
+          log_info "Gateway already connected to ${_ringfence_net} — idempotent, no action."
+        else
+          log_info "Connecting live gateway container (${_gw_container}) to ${_ringfence_net}..."
+          # This live-connect is ephemeral (survives until next gateway recreate).
+          # Persistence is via the compose-file patch above.
+          if "$_runtime_bin" network connect "${_ringfence_net}" "${_gw_container}" 2>/dev/null; then
+            log_success "Gateway live-connected to ${_ringfence_net}"
+          else
+            local _nc_rc=$?
+            log_warn "docker/podman network connect failed (exit ${_nc_rc}) — not fatal."
+            log_warn "  Container: ${_gw_container}  Network: ${_ringfence_net}"
+            log_warn "  The compose-file patch ensures connectivity after the gateway recreate below."
+          fi
+        fi
+
+        # ── YASHIGANI_MCP_SERVERS env update + gateway recreate ──────────────
+        # The gateway reads YASHIGANI_MCP_SERVERS (JSON array) at startup.
+        # We append the new agent's descriptor, then recreate the gateway
+        # container with the updated env (compose up --no-deps gateway).
+        #
+        # Tenant ID: validated against the same allowlist as agent_name.
+        local _tenant_id_safe=""
+        if [[ -n "$_tenant_id_raw" ]] && [[ "$_tenant_id_raw" =~ ^[a-zA-Z0-9_-]{1,128}$ ]]; then
+          _tenant_id_safe="$_tenant_id_raw"
+        else
+          _tenant_id_safe="unknown"
+          log_warn "Shape-C: tenant_id '${_tenant_id_raw}' contains unsafe chars — using 'unknown'"
+        fi
+
+        local _env_file="${WORK_DIR}/docker/.env"
+        local _bridge_port=8000   # _SC_BRIDGE_PORT from codegen.py:1319
+
+        # Build the new descriptor JSON.
+        # _agent_name_raw and _tenant_id_safe are already validated against
+        # [a-zA-Z0-9_-] — safe for inline expansion here.
+        # python3 json.dumps handles any residual escaping needs.
+        # Detect agent type from manifest subprocess command.
+        # git-mcp uses /usr/local/bin/git-mcp-launcher; filesystem-mcp uses the
+        # mcp-server-filesystem binary.  grep the already-validated manifest to set
+        # the correct is_* flag in the YASHIGANI_MCP_SERVERS descriptor.
+        # FIX-GIT-AGENT-FLAG (Ava 2026-05-30): previously always emitted
+        # is_filesystem_agent=True for all Shape-C agents; git agents must emit
+        # is_git_agent=True so broker.py routes to git_tool_allowed OPA gate.
+        local _is_git_agent_flag=false
+        if grep -qE 'git-mcp-launcher' "${_manifest}" 2>/dev/null; then
+          _is_git_agent_flag=true
+        fi
+
+        local _new_descriptor
+        _new_descriptor="$(python3 -c "
+import json
+agent = '${_agent_name_raw}'
+tenant = '${_tenant_id_safe}'
+port = ${_bridge_port}
+is_git = '${_is_git_agent_flag}' == 'true'
+desc = {
+    'agent_name': agent,
+    # FIX-UPSTREAM-URL-DOUBLE-MCP (2026-05-30): McpHttpTransport.forward() always
+    # appends path="/mcp" to upstream_url.  Do NOT include /mcp in upstream_url —
+    # the base URL only (http://filesystem:8000).  Adding /mcp here causes
+    # double-path: http://filesystem:8000/mcp/mcp → HTTP 404.
+    'upstream_url': 'http://%s:%d' % (agent, port),
+    'tenant_id': tenant,
+    'is_git_agent': is_git,
+    'is_filesystem_agent': not is_git,
+}
+print(json.dumps(desc))
+" 2>/dev/null || echo "")"
+
+        if [[ -z "$_new_descriptor" ]]; then
+          log_warn "Shape-C: failed to build MCP server descriptor JSON — YASHIGANI_MCP_SERVERS not updated"
+          log_warn "  Add manually to docker/.env:"
+          log_warn "    YASHIGANI_MCP_SERVERS=[{\"agent_name\":\"${_agent_name_raw}\",..."
+        else
+          # Read current YASHIGANI_MCP_SERVERS value from .env (may be absent or empty).
+          local _current_servers=""
+          if grep -q "^YASHIGANI_MCP_SERVERS=" "$_env_file" 2>/dev/null; then
+            _current_servers="$(grep "^YASHIGANI_MCP_SERVERS=" "$_env_file" | head -1 | cut -d= -f2-)"
+          fi
+
+          # Append descriptor to the JSON array (or create a new array).
+          local _new_servers
+          _new_servers="$(python3 -c "
+import json, sys
+current_raw = '''${_current_servers}'''.strip()
+new_desc = json.loads('''${_new_descriptor}''')
+try:
+    arr = json.loads(current_raw) if current_raw and current_raw != '[]' else []
+except json.JSONDecodeError:
+    arr = []
+# Idempotent: remove existing entry for the same agent_name before appending.
+arr = [e for e in arr if isinstance(e, dict) and e.get('agent_name') != new_desc['agent_name']]
+arr.append(new_desc)
+print(json.dumps(arr))
+" 2>/dev/null || echo "[]")"
+
+          if [[ "$_new_servers" == "[]" ]] || [[ -z "$_new_servers" ]]; then
+            log_warn "Shape-C: YASHIGANI_MCP_SERVERS update produced empty array — check manually"
+          else
+            # Write to .env (atomic replace)
+            if grep -q "^YASHIGANI_MCP_SERVERS=" "$_env_file" 2>/dev/null; then
+              local _tmp_env_mcp; _tmp_env_mcp="$(mktemp "${WORK_DIR}/docker/.env-mcp-XXXXXX")"
+              # Use python3 for the replacement — avoids sed special-char issues in JSON values.
+              python3 - "$_env_file" "$_tmp_env_mcp" "$_new_servers" <<'PYREPLACE' || {
+import sys, re
+src, dst, new_val = sys.argv[1], sys.argv[2], sys.argv[3]
+content = open(src, encoding='utf-8').read()
+new_content = re.sub(r'^YASHIGANI_MCP_SERVERS=.*', 'YASHIGANI_MCP_SERVERS=' + new_val, content, flags=re.MULTILINE)
+with open(dst, 'w', encoding='utf-8') as f:
+    f.write(new_content)
+PYREPLACE
+                log_warn "Shape-C: could not update YASHIGANI_MCP_SERVERS in .env — update manually"
+                rm -f "${_tmp_env_mcp}" 2>/dev/null || true
+              }
+              if [[ -f "$_tmp_env_mcp" ]]; then
+                mv "$_tmp_env_mcp" "$_env_file"
+              fi
+            else
+              printf 'YASHIGANI_MCP_SERVERS=%s\n' "$_new_servers" >> "$_env_file"
+            fi
+            log_success "YASHIGANI_MCP_SERVERS updated in docker/.env"
+            log_info "  Added: ${_new_descriptor}"
+          fi
+
+          # Recreate the gateway container with the updated env.
+          # Uses `compose up --no-deps gateway` (Captain spec — restarts only gateway,
+          # not the entire stack).  Fail-loud: if this fails, the operator gets
+          # explicit recovery instructions.
+          #
+          # FIX-COMPOSE-CMD: when invoked via `install.sh --onboard`, COMPOSE_CMD is
+          # not set by the main install flow.  Resolve it on-demand here so the
+          # gateway recreate can proceed in both install-time and standalone --onboard
+          # invocations.
+          # P3 broker E2E gate — J8/J9 gateway-not-reloaded fix (2026-05-30).
+          if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
+            resolve_compose_cmd 2>/dev/null || true
+          fi
+          log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
+          if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
+            local _gw_up_rc=0
+            "${COMPOSE_CMD[@]}" -f "$_compose_file" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
+            if [[ "$_gw_up_rc" -ne 0 ]]; then
+              log_error "Gateway recreate failed (exit ${_gw_up_rc})."
+              log_error "  The YASHIGANI_MCP_SERVERS env change requires a gateway restart to take effect."
+              log_error "  Recovery:"
+              log_error "    ${COMPOSE_CMD[*]} -f ${_compose_file} up --no-deps -d gateway"
+              log_error "  If the gateway fails to start, check: docker compose logs gateway"
+            else
+              log_success "Gateway recreated with updated MCP server list."
+            fi
+          else
+            log_warn "Shape-C: COMPOSE_CMD not resolved — cannot recreate gateway automatically."
+            log_warn "  Run manually: docker compose -f docker/docker-compose.yml up --no-deps -d gateway"
+          fi
+        fi
+      fi
+    fi
+  fi
+  # END YSG-P3-MCP-BRIDGE-JOIN
+
+  # Production/staging guard: after onboarding a Shape-C MCP agent, verify the
+  # MCP signing key file exists.  The gateway will refuse to start if it doesn't
+  # (Tom's McpJwtIssuer RuntimeError guard in _jwt.py).
+  if [[ "${YASHIGANI_ENV:-}" == "production" || "${YASHIGANI_ENV:-}" == "staging" ]]; then
+    local _mcp_key_check="${WORK_DIR}/docker/secrets/mcp_identity_signing_key"
+    if [[ ! -f "$_mcp_key_check" ]]; then
+      log_error "PRODUCTION GUARD: mcp_identity_signing_key not found at ${_mcp_key_check}"
+      log_error "  The gateway will REFUSE to start in ${YASHIGANI_ENV} without a persistent MCP signing key."
+      log_error "  Run: ./install.sh (or --pki-action=bootstrap) to generate the key."
+      exit 1
+    fi
+    log_info "Production guard: mcp_identity_signing_key present at ${_mcp_key_check} — OK"
+  fi
+
+  # BUG-5 FIX (Ava 2026-05-30): run rotate-leaves --only for the newly onboarded
+  # agent immediately so its bootstrap_token_sha256 is populated before the agent
+  # container first starts.  Without this, the agent container calls current_service()
+  # at startup, finds bootstrap_token_sha256: "" in the runtime manifest, and raises
+  # TamperError — refusing to start.
+  #
+  # Precondition: PKI has been bootstrapped (intermediate cert exists).  If the
+  # operator onboards before running bootstrap, skip this with a clear warning —
+  # they will need to run --pki-action=rotate-leaves manually after bootstrap.
+  #
+  # Extract agent name from the manifest (already validated by Python codegen above).
+  # Use the same grep pattern as the Shape-C bridge-join block.
+  local _new_agent_name=""
+  _new_agent_name="$(grep -E '^[[:space:]]*name:[[:space:]]*' "${_manifest}" 2>/dev/null \
+    | head -1 | sed 's/.*name:[[:space:]]*//' | tr -d '[:space:]"'"'"'' || true)"
+
+  if [[ -n "${_new_agent_name}" ]] && [[ "${_new_agent_name}" =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; then
+    local _intermediate_cert="${WORK_DIR}/docker/secrets/ca_intermediate.crt"
+    if [[ -f "$_intermediate_cert" ]]; then
+      log_step "-" "BUG-5: issuing bootstrap token + leaf cert for '${_new_agent_name}' (rotate-leaves --only)"
+      local _rl_rc=0
+      _pki_run_issuer rotate-leaves --only "${_new_agent_name}" || _rl_rc=$?
+      if [[ "$_rl_rc" -ne 0 ]]; then
+        log_warn "BUG-5: rotate-leaves --only '${_new_agent_name}' failed (exit ${_rl_rc})."
+        log_warn "  The agent container will refuse to start until bootstrap_token_sha256 is populated."
+        log_warn "  Run manually: ./install.sh --pki-action=rotate-leaves"
+      else
+        log_success "BUG-5: bootstrap_token_sha256 populated for '${_new_agent_name}' — agent container can start."
+        # Re-chown: rotate-leaves generates key material owned by the issuer UID (1001).
+        # Without chown, the agent container (potentially a different UID) cannot read its key.
+        _pki_chown_client_keys \
+          || log_warn "BUG-5: _pki_chown_client_keys failed after --only rotate — agent key may be unreadable"
+      fi
+    else
+      log_warn "BUG-5: PKI not yet bootstrapped (${_intermediate_cert} missing)."
+      log_warn "  Run bootstrap first, then: ./install.sh --pki-action=rotate-leaves"
+    fi
+  else
+    log_warn "BUG-5: could not extract valid agent name from manifest — skipping bootstrap-token issuance."
+    log_warn "  Run manually: ./install.sh --pki-action=rotate-leaves"
+  fi
+
+  log_success "Agent onboarded. Bootstrap token issued (or: run --pki-action=rotate-leaves if PKI not yet bootstrapped)."
+  log_info "  (Rotate-leaves issues/updates the agent's client cert from service_identities.yaml)"
+}
+
+# =============================================================================
+# P1 W4 — S5: offboard handler (delegates to scripts/offboard.sh)
+# =============================================================================
+handle_offboard_subcommand() {
+  local _agent="${OFFBOARD_AGENT}"
+
+  if [[ -z "$_agent" ]]; then
+    log_error "--offboard requires an agent name"
+    exit 1
+  fi
+
+  log_step "-" "Offboarding agent: ${_agent}"
+
+  # Resolve WORK_DIR first so _is_existing_yashigani_running can find docker/secrets
+  if [[ -z "${WORK_DIR:-}" || ! -d "${WORK_DIR}" ]]; then
+    detect_working_directory
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+      cd "$WORK_DIR"
+    fi
+  fi
+
+  # P1 W6 — Step-up gate: same requirement as onboard — removing an agent
+  # from a ring-fence with install residuals modifies the live security
+  # posture and therefore requires admin password + TOTP verification.
+  # FIX-2: use _is_installed_or_running (residuals-based, fail-closed);
+  # see onboard comment above (Laura F1/F2).
+  if _is_installed_or_running; then
+    _ysg_onboard_stepup_gate "offboard" || exit 1
+  fi
+
+  local _offboard_sh="${_YSG_SCRIPT_DIR}/scripts/offboard.sh"
+  if [[ ! -f "$_offboard_sh" ]]; then
+    log_error "scripts/offboard.sh not found at ${_offboard_sh}"
+    exit 1
+  fi
+
+  WORK_DIR="$WORK_DIR" \
+  YSG_RUNTIME="${YSG_RUNTIME:-}" \
+  YSG_OPERATOR_IDENTITY="${YSG_OPERATOR_IDENTITY:-}" \
+    bash "$_offboard_sh" "$_agent"
+  local _rc=$?
+
+  if [[ "$_rc" -ne 0 ]]; then
+    log_error "Offboard failed (exit ${_rc})"
+    exit 1
+  fi
+}
+
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
   case "$PKI_ACTION" in
@@ -9087,6 +15259,15 @@ handle_pki_subcommand() {
       _pki_run_issuer rotate-leaves \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS" \
         "${_rl_san_args[@]}"
+      # Re-chown private keys to container UIDs after rotation (C-003 fix).
+      # _pki_run_issuer regenerates keys with fresh material and writes them
+      # mode 0400 owned by the installer UID. Without the chown step the
+      # container service processes (e.g. pgbouncer UID 70, backoffice UID 1000)
+      # can no longer read their own private keys → crash-loop on next restart.
+      # The inline pki_action path did not call _pki_chown_client_keys; the
+      # offboard-triggered path (install.sh --pki-action rotate-leaves) therefore
+      # left keys unreadable by their owning containers.
+      _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-leaves — keys may be unreadable by containers"; return 1; }
       log_success "Leaf certs rotated — restart services to pick up new certs"
       log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
       ;;
@@ -9127,6 +15308,25 @@ handle_pki_subcommand() {
 main() {
   parse_args "$@"
 
+  # Multi-instance (3.0 / MI-1): key the bootstrap install dir to the instance
+  # PROJECT BEFORE detect_working_directory runs, so a second --project/--domain
+  # install on the same host bootstraps into its OWN tree
+  # ($HOME/.yashigani-<project>) — isolated secrets, .env, state file and CA —
+  # instead of clobbering the first instance's shared $HOME/.yashigani. Legacy /
+  # single-instance (no --project, no --domain) is untouched. An explicit
+  # YSG_INSTALL_DIR env override always wins. Side-effect-free except assigning
+  # YSG_INSTALL_DIR; safe before --list / PKI / onboard short-circuits below.
+  _resolve_instance_install_dir
+
+  # Multi-instance (3.0): --list enumerates instances on the host, then exits.
+  # No working-directory / wizard needed — it only reads the runtime's container
+  # labels. Placed before all other short-circuits so it works on any host state.
+  if [[ "$LIST_INSTANCES" == "true" ]]; then
+    detect_working_directory 2>/dev/null || true
+    _list_instances
+    exit 0
+  fi
+
   # Short-circuit path for PKI maintenance commands: no full install, no wizard.
   if [[ -n "$PKI_ACTION" ]]; then
     detect_working_directory
@@ -9135,8 +15335,51 @@ main() {
     exit 0
   fi
 
+  # P1 W4: Short-circuit path for onboard/offboard: no full install, no wizard.
+  if [[ -n "${ONBOARD_MANIFEST:-}" ]]; then
+    handle_onboard_subcommand
+    exit 0
+  fi
+  if [[ -n "${OFFBOARD_AGENT:-}" ]]; then
+    handle_offboard_subcommand
+    exit 0
+  fi
+
   # ---- Step 0: Banner ----
   print_banner
+
+  # Concurrency guard (YSG retro 2026-06-25): a host-wide ADVISORY LOCK prevents
+  # two installers colliding on the shared compose project + ports 80/443 (the
+  # root cause of the v3.0.0 cycle's zombie-installer collision). flock is tied to
+  # the open fd, so a crashed/killed run releases the lock automatically — no
+  # stale-lock cruft, and (unlike a pgrep heuristic) no false-positives on the
+  # launcher's own command line. FAIL-OPEN: if flock is unavailable or the lock
+  # path is unwritable we proceed (never block a legitimate install). Override
+  # with YASHIGANI_ALLOW_CONCURRENT_INSTALL=1 for genuine multi-instance hosts.
+  #
+  # BUG-FIX (3.1.0): Use bash {varname} fd auto-assignment (bash 4.1+, standard on
+  # Ubuntu 20.04+) so the lock fd has FD_CLOEXEC set automatically. Without CLOEXEC,
+  # every child process spawned by podman-compose (conmon, slirp4netns, aardvark-dns,
+  # etc.) inherits the open fd and keeps the flock alive indefinitely — blocking ALL
+  # subsequent installs until the containers are killed. With CLOEXEC the lock is held
+  # only by the installer process itself, which is the correct invariant.
+  if [[ "${YASHIGANI_ALLOW_CONCURRENT_INSTALL:-0}" != "1" && "$DRY_RUN" != "true" ]] \
+     && command -v flock >/dev/null 2>&1; then
+    local _lockdir="/run/lock"; [[ -w "$_lockdir" ]] || _lockdir="${YSG_INSTALL_DIR:-$HOME}"
+    local _lockfile="${_lockdir}/yashigani-install.lock"
+    local _lock_fd
+    # {_lock_fd} auto-assigns a high fd WITH FD_CLOEXEC — children never inherit it.
+    # Held for the lifetime of this process; released on exit (or exec).
+    if exec {_lock_fd}>"$_lockfile" 2>/dev/null; then
+      if ! flock -n "$_lock_fd"; then
+        log_error "Another Yashigani install/uninstall already holds the lock:"
+        log_error "  ${_lockfile}"
+        log_error "Wait for it to finish (or kill the stale PID), then retry. For genuine"
+        log_error "parallel/multi-instance installs set YASHIGANI_ALLOW_CONCURRENT_INSTALL=1."
+        exit 1
+      fi
+    fi
+  fi
 
   # ---- Step 1: Working directory ----
   detect_working_directory
@@ -9197,8 +15440,14 @@ main() {
     # Step 6: Wizard / config
     run_wizard
 
-    # Write AES key to Helm values or K8s secret
+    # Write AES key to compose .env (no-op for k8s helm path; AES key is
+    # pre-seeded into K8s Secret by _write_helm_values below).
     _write_aes_key_to_env
+
+    # Write helm values override file from operator-supplied flags.
+    # B2-fix: _write_helm_values must run BEFORE k8s_helm_dep_update so that the
+    # AES key pre-seed happens before helm installs the backoffice Secret.
+    _write_helm_values
 
     # Step 7: Helm dependency update
     k8s_helm_dep_update
@@ -9211,6 +15460,57 @@ main() {
 
     # Step 10: Access instructions
     k8s_print_access
+
+    # Step 11: Write install state file (B1 — GAP 1: k8s path never wrote this
+    # file, causing uninstall.sh to fall through to auto-detect which tried
+    # podman/docker and never reached the k8s teardown path. Operator ran
+    # uninstall.sh, got clean exit 0, Helm release + PKI Secrets all survived.)
+    #
+    # Mode 0644: intentional — uninstall.sh may run as a different OS user
+    # (cross-UID clean-slate scenario). Contents are not sensitive (Laura TM-1
+    # verdict: runtime name + namespace are not credentials).
+    # git-ignored via docker/.yashigani-install-state entry in .gitignore.
+    if [[ "$DRY_RUN" != "true" ]]; then
+      mkdir -p "${WORK_DIR}/docker"
+      # MI-2/MI-6 parity with the compose path: mint-or-preserve the instance
+      # identity token and record the per-instance trust domain. On k8s the
+      # instance label is the namespace (already the tenancy boundary), so the
+      # trust domain derives from NAMESPACE; legacy "yashigani" namespace keeps
+      # the canonical yashigani.internal authority byte-for-byte.
+      local _k8s_state_path="${WORK_DIR}/docker/.yashigani-install-state"
+      local _k8s_instance_id _k8s_trust_domain _k8s_proj
+      _k8s_proj="${NAMESPACE:-yashigani}"
+      _k8s_instance_id="$(_instance_identity_token "$_k8s_state_path")"
+      if [[ -z "$_k8s_instance_id" ]]; then
+        _k8s_instance_id="$(_gen_instance_id)"
+      fi
+      # On k8s the legacy default namespace is "yashigani"; map it to the legacy
+      # trust domain. Any other namespace gets <namespace>.yashigani.internal.
+      if [[ "$_k8s_proj" == "yashigani" ]]; then
+        _k8s_trust_domain="yashigani.internal"
+      else
+        _k8s_trust_domain="$(_spiffe_trust_domain "$(_sanitise_project "$_k8s_proj")")"
+      fi
+      {
+        printf 'RUNTIME=%s\n'            "k8s"
+        printf 'NAMESPACE=%s\n'          "${NAMESPACE}"
+        printf 'HELM_RELEASE=%s\n'       "yashigani"
+        # Multi-instance (3.0): on k8s, instance separation is by namespace/release
+        # (already parameterised); PROJECT/DOMAIN are recorded for state-file parity
+        # with the compose path and for `--list`. PROJECT defaults to NAMESPACE here.
+        printf 'PROJECT=%s\n'            "${NAMESPACE:-yashigani}"
+        printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
+        printf 'INSTANCE_ID=%s\n'        "${_k8s_instance_id}"
+        printf 'SPIFFE_TRUST_DOMAIN=%s\n' "${_k8s_trust_domain}"
+        printf 'INSTALL_UID=%s\n'        "$(id -u)"
+        printf 'INSTALL_USER=%s\n'       "$(id -un)"
+        printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
+      } > "$_k8s_state_path"
+      chmod 0644 "$_k8s_state_path"
+      log_info "Install state written: ${_k8s_state_path}"
+      log_info "  RUNTIME=k8s  NAMESPACE=${NAMESPACE}  HELM_RELEASE=yashigani  TRUST_DOMAIN=${_k8s_trust_domain}"
+    fi
 
   else
     # ------------------------------------------------------------------
@@ -9231,6 +15531,40 @@ main() {
       log_step "6/${TOTAL_STEPS}" "Skipping wizard (demo mode — using defaults)"
     else
       run_wizard
+    fi
+
+    # Multi-instance (3.0): resolve the compose PROJECT name NOW — after the wizard
+    # has finalised DOMAIN, before any project-scoped operation (existing-install
+    # detection, contaminated-volume check, compose up).
+    #
+    # Precedence:
+    #   1. --upgrade / add-component against an EXISTING install → read PROJECT from
+    #      that install's state file (don't re-derive; the operator may have used a
+    #      custom --project the first time, or --domain may differ on the upgrade run).
+    #   2. Explicit --project override (fresh install) → sanitised override.
+    #   3. Derived from --domain (fresh install) → sanitised domain.
+    #   4. No domain (demo/localhost) → legacy "docker" (single-instance default).
+    #
+    # The resolved name is exported as COMPOSE_PROJECT_NAME (read by both Docker and
+    # Podman compose) and written into docker/.env in generate_env_file().
+    if [[ "$UPGRADE" == "true" ]]; then
+      # Upgrade / add-component targets an EXISTING instance. Precedence:
+      #   1. explicit --project (operator names the instance directly — required to
+      #      disambiguate on a multi-instance host) → sanitise it.
+      #   2. PROJECT recorded in the state file → use as-is (already a valid name).
+      #   3. "docker" legacy default (single-instance, pre-3.0 state file).
+      if [[ "$PROJECT_EXPLICIT" -eq 1 && -n "$PROJECT" ]]; then
+        PROJECT="$(_sanitise_project "$PROJECT")"
+        log_info "Upgrade/add-component targeting instance — project: ${PROJECT} (from --project)"
+      else
+        PROJECT="$(_read_state_project "${WORK_DIR}/docker/.yashigani-install-state")"
+        log_info "Upgrade/add-component targeting existing instance — project: ${PROJECT} (from state file)"
+      fi
+      export COMPOSE_PROJECT_NAME="$PROJECT"
+    else
+      _resolve_project
+      # Advisory Pro+/Enterprise gate (only fires for a 2nd side-by-side instance).
+      _multi_instance_tier_gate
     fi
 
     # Idempotency: check for running installation before making changes
@@ -9272,6 +15606,22 @@ main() {
     fi
     _check_contaminated_volumes
 
+    # W2/L10 — wire _detect_runtime after resolve_compose_cmd succeeds.
+    # YSG_RUNTIME_4WAY is used by the onboard codegen path to emit the correct
+    # ring-fence artifacts. Wrong-runtime codegen silently produces no ring-fence (L10).
+    # Called here (after runtime is resolved, before any codegen step) so the
+    # 4-way value is available for the rest of the install flow.
+    if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
+      # shellcheck source=lib/detect_runtime.sh
+      # shellcheck disable=SC1091
+      source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
+      _detect_runtime 2>/dev/null || true
+      log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown}"
+      if [[ "${YSG_RUNTIME_4WAY:-}" == "podman-rootless" ]]; then
+        log_warn "L1 network-plane containment NOT active (rootless Podman). L2+L3 active."
+      fi
+    fi
+
     # Write AES key to .env
     _write_aes_key_to_env
 
@@ -9302,6 +15652,60 @@ main() {
 
     # Step 8: Optional agent bundle selection
     select_agent_bundles
+
+    # Step 8a: LANGFLOW_AUTO_LOGIN preflight (Laura constraint 3 — MANDATORY).
+    # LANGFLOW_AUTO_LOGIN=true is a REQUIRED, NON-OVERRIDABLE operational setting when
+    # langflow is installed. The reconciler (langflow_reconciler.py) calls
+    # GET /api/v1/auto_login to obtain a session token and then creates an API key for
+    # system→langflow communication. If AUTO_LOGIN is disabled, this call returns 401 and
+    # ALL system→langflow API access (flow discovery, reconciliation, admin visibility)
+    # is permanently lost for the lifetime of that backoffice process.
+    #
+    # docker-compose.yml hardcodes LANGFLOW_AUTO_LOGIN: "true" in the langflow service
+    # definition (not a variable, cannot be overridden by shell env). However, an operator
+    # could apply a compose override file that changes it. This check catches the most
+    # likely misconfiguration paths: shell environment export and docker/.env entry.
+    #
+    # See: /Users/max/Documents/Claude/AgnosticSecurity/Products/Yashigani/
+    #       langflow-letta-default-availability-design-20260709.md §2.2 FLAG-5
+    _check_langflow_auto_login() {
+      local _lf_in_profiles=false
+      for _p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+        [[ "$_p" == "langflow" ]] && _lf_in_profiles=true
+      done
+      [[ "$_lf_in_profiles" == "false" ]] && return 0
+
+      local _fail=false
+      # Check 1: shell environment (does not affect compose literal, but indicates confusion)
+      if [[ "${LANGFLOW_AUTO_LOGIN:-}" == "false" || "${LANGFLOW_AUTO_LOGIN:-}" == "0" ]]; then
+        log_error "PREFLIGHT FAIL: LANGFLOW_AUTO_LOGIN is set to '${LANGFLOW_AUTO_LOGIN}' in the shell environment."
+        log_error "  LANGFLOW_AUTO_LOGIN=true is REQUIRED for Yashigani's system→langflow API access."
+        log_error "  The reconciler and gateway client both rely on the /api/v1/auto_login endpoint."
+        log_error "  Disabling AUTO_LOGIN breaks flow discovery, reconciliation, and admin visibility."
+        log_error "  Unset LANGFLOW_AUTO_LOGIN from your shell environment before re-running install.sh."
+        _fail=true
+      fi
+      # Check 2: docker/.env override (would affect compose if the var were parameterized;
+      # flag proactively to catch operators who may later parameterize the compose env)
+      local _env_file="${WORK_DIR}/docker/.env"
+      if [[ -f "$_env_file" ]]; then
+        local _env_val
+        _env_val="$(grep -E '^LANGFLOW_AUTO_LOGIN=' "$_env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')" || true
+        if [[ "$_env_val" == "false" || "$_env_val" == "0" ]]; then
+          log_error "PREFLIGHT FAIL: LANGFLOW_AUTO_LOGIN=${_env_val} found in docker/.env."
+          log_error "  LANGFLOW_AUTO_LOGIN=true is REQUIRED for Yashigani's system→langflow API access."
+          log_error "  Remove or correct the LANGFLOW_AUTO_LOGIN entry in docker/.env before re-running."
+          _fail=true
+        fi
+      fi
+      if [[ "$_fail" == "true" ]]; then
+        log_error "Installer aborted: LANGFLOW_AUTO_LOGIN constraint violated."
+        log_error "  This setting is documented as REQUIRED and NON-OVERRIDABLE in the operator guide."
+        return 1
+      fi
+      log_info "LANGFLOW_AUTO_LOGIN constraint satisfied (required=true, no contradicting override detected)"
+    }
+    _check_langflow_auto_login || exit 1
 
     # Step 8b-0: BYO Internal CA wizard — Q1 + Q1a (Tiago directive 2026-05-23).
     # Q1 (BYO internal CA) and Q2 (edge TLS mode) are INDEPENDENT decisions.
@@ -9398,50 +15802,22 @@ main() {
       fi
     fi
 
-    # Step 8b: Open WebUI — interactive wizard or honour --with-openwebui flag.
-    # Non-interactive: INSTALL_OPENWEBUI is false (default) or true (--with-openwebui).
-    #   No prompt. Honour the flag as-is.
-    # Interactive: ask [Y/n] (default Y). Wizard sets INSTALL_OPENWEBUI=true when Y.
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-      if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI enabled (--with-openwebui flag)"
-      else
-        log_info "Open WebUI skipped (default non-interactive; pass --with-openwebui to enable)"
-      fi
-    else
-      printf "\n${C_BOLD}Will Yashigani be used by humans with a web UI?${C_RESET}\n"
-      printf "  Y (default) — Installs Open WebUI as chat surface for human users.\n"
-      printf "                Recommended if any human will log in and chat with MCP-backed LLMs.\n"
-      printf "  N           — API/agent-only deployment. Smaller footprint, no chat UI exposed.\n"
-      printf "                You can add Open WebUI later by re-running install.sh with --with-openwebui.\n"
-      printf "\n"
-      if prompt_yn "Install Open WebUI (human chat UI)?" "y"; then
-        INSTALL_OPENWEBUI=true
-        COMPOSE_PROFILES+=("openwebui")
-        log_success "Open WebUI selected"
-      else
-        log_info "Open WebUI skipped — API/agent-only deployment"
-      fi
+    # Step 8b: 4.0 — ui4 is built-in (no OWUI). --with-openwebui is accepted
+    # but silently ignored for backward-compat with existing operator scripts.
+    if [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]]; then
+      log_info "--with-openwebui is a no-op in 4.0 (ui4 chat surface is built in — Open WebUI removed)"
     fi
 
-    # Step 8b-ii: Write OLLAMA_MODEL to .env when Open WebUI is enabled.
-    # ollama-init (compose) and the ollama-init Job (helm) both read OLLAMA_MODEL
-    # to decide which model to pull. install.sh sets it here so operators get
-    # a working default (qwen2.5:3b, 1.9 GB) without manual .env editing.
-    # Value is written only when INSTALL_OPENWEBUI=true; on API-only installs the
-    # ollama-init service is gated by profiles: [openwebui] and never starts,
-    # so the var is irrelevant there.
-    if [[ "$INSTALL_OPENWEBUI" == "true" ]]; then
-      local _env_file="${WORK_DIR}/docker/.env"
-      local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-qwen2.5:3b}"
-      # Preserve any operator-supplied OLLAMA_MODEL — only write if absent.
-      if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
-        echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
-        log_info "Ollama default model set: ${_ollama_model} (1.9 GB — will pull on first start)"
-      else
-        log_info "Ollama model already set in .env — preserving operator value"
-      fi
+    # Step 8b-ii: Write OLLAMA_MODEL to .env for the gateway + ui4 chat inference.
+    # ollama-init reads OLLAMA_MODEL and pulls the model when any agent bundle is active.
+    # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM.
+    local _env_file="${WORK_DIR}/docker/.env"
+    local _ollama_model="${OLLAMA_MODEL_OVERRIDE:-$(_pick_ollama_model_for_vram)}"
+    if ! grep -q "^OLLAMA_MODEL=" "$_env_file" 2>/dev/null; then
+      echo "OLLAMA_MODEL=${_ollama_model}" >> "$_env_file"
+      log_info "Ollama default model set: ${_ollama_model} (VRAM-tier choice for $(_format_gpu_vram) — will pull on first start with agent bundles)"
+    else
+      log_info "Ollama model already set in .env — preserving operator value"
     fi
 
     # Step 8c: Wazuh SIEM (opt-in)
@@ -9461,6 +15837,31 @@ main() {
           log_success "Wazuh SIEM selected"
           ;;
       esac
+    fi
+
+    # Step 8c-siem (#21): when Wazuh is selected, point the agnostic audit SIEM
+    # pipeline at the bundled indexer via deployment config (.env), loaded at
+    # startup by AuditLogWriter.siem_targets_from_env(). Identity = each service's
+    # OWN internal-mesh leaf cert (mesh_mtls → pki.client_ssl_context()): no
+    # password, NEVER the wazuh admin credential. wazuh-indexer is added to the
+    # SSRF allowlist (its name resolves to a private docker IP). If Wazuh is NOT
+    # selected, both stay unset → forward to none.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "wazuh"; then
+      local _siem_env_file="${WORK_DIR}/docker/.env"
+      local _siem_targets_json='[{"name":"wazuh-bundled","target_type":"elastic_opensearch","url":"https://wazuh-indexer:9200/_bulk","mesh_mtls":true}]'
+      _siem_set_env() {  # set-or-replace KEY=VALUE in docker/.env (value may contain |)
+        local _k="$1" _v="$2"
+        if grep -q "^${_k}=" "$_siem_env_file" 2>/dev/null; then
+          local _t; _t="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+          awk -v k="$_k" -v v="$_v" 'BEGIN{FS=OFS="="} $1==k{print k"="v;next} {print}' "$_siem_env_file" > "$_t"
+          mv "$_t" "$_siem_env_file"
+        else
+          printf '%s=%s\n' "$_k" "$_v" >> "$_siem_env_file"
+        fi
+      }
+      _siem_set_env "YASHIGANI_SIEM_TARGETS" "$_siem_targets_json"
+      _siem_set_env "YASHIGANI_SIEM_HOSTNAMES" "wazuh-indexer"
+      log_success "Audit SIEM forwarding pointed at bundled Wazuh indexer (mesh-mTLS leaf identity)"
     fi
 
     # Step 8d: Write agent-bundle token placeholders NOW — while the installer
@@ -9517,6 +15918,107 @@ main() {
       chmod 0666 "$_letta_openapi" \
         || log_warn "Could not chmod 0666 letta-runtime/openapi_letta.json — letta openapi bind-mount may fail"
       log_info "letta-runtime/openapi_letta.json placeholder: mode 0666 (DAC_OVERRIDE-free write)"
+    fi
+
+    # Step 8f: Substitute __YASHIGANI_INTERNAL_BEARER__ into openclaw.runtime.json.
+    # docker/docker-compose.yml (openclaw service) bind-mounts
+    #   ./openclaw/openclaw.runtime.json:/etc/openclaw/openclaw.json:ro
+    # Docker auto-creates the missing bind-source as a DIRECTORY when the file does
+    # not yet exist on the host, causing openclaw to read a directory and crash with
+    # EISDIR. This step reads docker/openclaw/openclaw.json (git-tracked template),
+    # substitutes __YASHIGANI_INTERNAL_BEARER__ with the real token from
+    # docker/secrets/yashigani_internal_bearer, and writes the result as a file
+    # at docker/openclaw/openclaw.runtime.json (mode 0640, git-ignored).
+    # Runs only when the openclaw profile is active.
+    # Idempotent: re-runs overwrite the file with fresh token value; a stale
+    # directory from a prior broken run is removed first.
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -q "^openclaw$"; then
+      local _oc_template="${WORK_DIR}/docker/openclaw/openclaw.json"
+      local _oc_runtime="${WORK_DIR}/docker/openclaw/openclaw.runtime.json"
+      local _oc_secrets_dir="${WORK_DIR}/docker/secrets"
+      local _oc_bearer_file="${_oc_secrets_dir}/yashigani_internal_bearer"
+      local _oc_env_file="${WORK_DIR}/docker/.env"
+
+      # Safety: remove a stale directory left by Docker's dir-autocreate (broken prior run).
+      # The directory may be root-owned (Docker creates it as root), so plain rm -rf may fail.
+      # Fall back to an ephemeral alpine container that can remove it (same pattern as
+      # _chown_agent_volumes and the PKI issuer container).
+      if [[ -d "$_oc_runtime" ]] && [[ ! -L "$_oc_runtime" ]]; then
+        log_warn "Removing stale openclaw.runtime.json DIRECTORY (left by Docker dir-autocreate on prior broken install)"
+        if ! rm -rf "$_oc_runtime" 2>/dev/null; then
+          log_info "Plain rm failed (likely root-owned) — using alpine container to remove stale directory"
+          local _oc_alpine="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+          local _oc_openclaw_dir
+          _oc_openclaw_dir="$(dirname "$_oc_runtime")"
+          local _oc_dir_basename
+          _oc_dir_basename="$(basename "$_oc_runtime")"
+          ${YSG_RUNTIME:-docker} run --rm \
+            -v "${_oc_openclaw_dir}:/mnt/openclaw" \
+            "$_oc_alpine" \
+            rm -rf "/mnt/openclaw/${_oc_dir_basename}" \
+            2>/dev/null \
+            || { log_error "Cannot remove stale openclaw.runtime.json directory via container — please run: sudo rm -rf ${_oc_runtime}"; exit 1; }
+        fi
+        if [[ -e "$_oc_runtime" ]]; then
+          log_error "Stale openclaw.runtime.json directory still exists after removal attempt — please run: sudo rm -rf ${_oc_runtime}"
+          exit 1
+        fi
+        log_info "Stale openclaw.runtime.json directory removed"
+      fi
+
+      if [[ ! -f "$_oc_template" ]]; then
+        log_error "openclaw: template ${_oc_template} not found — cannot generate openclaw.runtime.json"
+        exit 1
+      fi
+
+      # Read bearer token (Podman-rootless-aware; falls back to .env).
+      local _oc_bearer
+      _oc_bearer="$(_safe_read_secret "$_oc_bearer_file" "YASHIGANI_INTERNAL_BEARER" "$_oc_env_file" || true)"
+      if [[ -z "$_oc_bearer" ]] || [[ "$_oc_bearer" == \#* ]]; then
+        log_error "openclaw: yashigani_internal_bearer could not be read from ${_oc_bearer_file} — cannot generate openclaw.runtime.json"
+        exit 1
+      fi
+
+      # Substitute placeholder and write runtime file.
+      # Use a temp file + atomic rename to avoid a partial write being bind-mounted.
+      local _oc_tmpfile
+      _oc_tmpfile="$(mktemp "${WORK_DIR}/docker/openclaw/.openclaw_runtime_XXXXXX")"
+      sed "s|__YASHIGANI_INTERNAL_BEARER__|${_oc_bearer}|g" "$_oc_template" > "$_oc_tmpfile" \
+        || { rm -f "$_oc_tmpfile"; log_error "openclaw: sed substitution into openclaw.runtime.json failed"; exit 1; }
+      chmod 0640 "$_oc_tmpfile" \
+        || log_warn "openclaw: could not chmod 0640 openclaw.runtime.json temp file"
+      mv -f "$_oc_tmpfile" "$_oc_runtime" \
+        || { rm -f "$_oc_tmpfile"; log_error "openclaw: atomic rename of openclaw.runtime.json failed"; exit 1; }
+
+      # Fail-closed: assert the result is a regular file, not a directory.
+      if [[ ! -f "$_oc_runtime" ]] || [[ -d "$_oc_runtime" ]]; then
+        log_error "openclaw: openclaw.runtime.json is not a regular file after write — aborting to prevent EISDIR crash"
+        exit 1
+      fi
+
+      # Fix EACCES: chown openclaw.runtime.json to the openclaw container's runtime
+      # UID/GID (node uid=1000, gid=1000 — confirmed from image USER directive).
+      # Mode 0640: owner rw, group r, no world-read — preserves CWE-732 intent (the
+      # file holds yashigani_internal_bearer; world-read was already excluded by the
+      # o+rX exclusion in commit 1f25bec). The install user (e.g. uid 1001) writes the
+      # file, but the openclaw process runs as uid 1000 and is not the owner — so it
+      # cannot read at 0640 unless it IS the owner. We chown 1000:1000 so the openclaw
+      # process is the file owner and mode 0640 grants it read.
+      #
+      # Docker: _do_chown uses an ephemeral alpine container (docker_run mode) with the
+      # openclaw directory mounted at /s — daemon-provided root can chown any UID.
+      # Podman rootless: _do_chown uses podman unshare (local) or podman run (remote)
+      # to remap container UID 1000 into the host subuid namespace; virtiofs/fuse-
+      # overlayfs ensures the remapped ownership is seen correctly by the container.
+      # K8s: _do_chown is a no-op (k8s path) — Helm uses podSecurityContext.fsGroup.
+      #
+      # _mount_base arg (arg 5): the parent directory of _oc_runtime so the /s mount
+      # and the relative path strip work correctly (S5 convention from _do_chown).
+      local _oc_dir
+      _oc_dir="$(dirname "$_oc_runtime")"
+      _do_chown "1000" "$_oc_runtime" "openclaw.runtime.json" "0640" "$_oc_dir" \
+        || { log_error "openclaw: chown 1000:1000 on openclaw.runtime.json failed — openclaw will EACCES on startup"; exit 1; }
+      log_info "openclaw.runtime.json written (bearer substituted, mode 0640, owner 1000:1000 — container-readable, not world-readable)"
     fi
 
     # Step 9: docker compose pull — OR air-gap bundle load
@@ -9637,20 +16139,13 @@ main() {
     # Step 11b: Register agent bundles (after backoffice is healthy)
     register_agent_bundles
 
-    # Step 11c: Auto-configure SIEM sink when Wazuh is installed
-    if [[ "$INSTALL_WAZUH" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; then
-      log_info "Configuring audit SIEM sink for Wazuh..."
-      # v2.23.1: reach backoffice via Caddy (host port → :443 in container).
-      # Caddy uses a self-signed cert in demo; -k tolerates it. Admin auth is
-      # the session cookie minted during admin bootstrap.
-      local _bo_url="https://localhost:${YASHIGANI_HTTPS_PORT:-443}"
-      local _siem_config='{"backend":"wazuh","wazuh_url":"https://wazuh-manager:55000","wazuh_username":"wazuh-wui","wazuh_password":"'"${GEN_WAZUH_API_PASSWORD:-}"'","enabled":true}'
-      if curl -skf -X PUT "${_bo_url}/admin/alerts/sinks" -H "Content-Type: application/json" -d "$_siem_config" -b "$(cat "${WORK_DIR}/docker/secrets/admin1_session_cookie" 2>/dev/null || echo '')" >/dev/null 2>&1; then
-        log_success "Wazuh SIEM sink auto-configured"
-      else
-        log_warn "Wazuh SIEM sink auto-configuration failed — configure manually via admin UI"
-      fi
-    fi
+    # Step 11c (#21): audit SIEM forwarding is configured PRE-deploy at Step
+    # 8c-siem by writing YASHIGANI_SIEM_TARGETS + YASHIGANI_SIEM_HOSTNAMES into
+    # docker/.env, which AuditLogWriter loads at startup. The previous post-deploy
+    # auto-config here PUT to a non-existent endpoint (/admin/alerts/sinks) with a
+    # mismatched schema and a session cookie that couldn't satisfy the step-up
+    # gate — it silently failed every install, so nothing was ever forwarded.
+    # Removed; nothing to do post-deploy.
 
     # Step 12: Health check
     run_health_check
@@ -9661,15 +16156,52 @@ main() {
     # Mode 0644: intentional — uninstall.sh may run as a different OS user (cross-UID
     # clean-slate scenario). Contents are not sensitive (see Laura TM-1 verdict).
     # git-ignored via docker/.yashigani-install-state entry in .gitignore.
+    # MI-2: mint-or-preserve the per-instance identity token. It binds lifecycle
+    # ops to THIS instance (see _instance_identity_token). Preserve an existing
+    # token across upgrade/add-component re-runs so the binding is stable; mint a
+    # fresh CSPRNG token only on first install. MI-6: record the per-instance
+    # SPIFFE trust domain so uninstall/upgrade and audits read the same authority.
+    local _state_path="${WORK_DIR}/docker/.yashigani-install-state"
+    local _instance_id _trust_domain _env_path
+    # MI-2: the authoritative INSTANCE_ID was minted/preserved in generate_env_file()
+    # and written to docker/.env (it is ALSO the compose container-label source).
+    # Read it back from .env so the state file and the running-container label carry
+    # the SAME token. Fall back to the existing state-file value, then a fresh mint
+    # (defensive — .env should always have it on the compose path).
+    _env_path="${WORK_DIR}/docker/.env"
+    _instance_id=""
+    if [[ -f "$_env_path" ]]; then
+      _instance_id="$(grep -E '^YASHIGANI_INSTANCE_ID=' "$_env_path" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+    fi
+    [[ -z "$_instance_id" ]] && _instance_id="$(_instance_identity_token "$_state_path")"
+    [[ -z "$_instance_id" ]] && _instance_id="$(_gen_instance_id)"
+    _trust_domain="$(_spiffe_trust_domain "${PROJECT:-docker}")"
     {
       printf 'RUNTIME=%s\n'            "${RUNTIME:-${YSG_RUNTIME:-docker}}"
+      # Multi-instance (3.0): record the compose project + domain so upgrade /
+      # add-component / uninstall.sh target THIS instance without re-deriving.
+      # PROJECT falls back to "docker" (legacy single-instance default).
+      printf 'PROJECT=%s\n'            "${PROJECT:-docker}"
+      printf 'DOMAIN=%s\n'             "${DOMAIN:-}"
+      # MI-2: authenticated lifecycle target. INSTANCE_ID is a host-random nonce;
+      # a lifecycle op must match it (state file <-> running container label) to
+      # act on this instance — a bare --project string is not enough.
+      printf 'INSTANCE_ID=%s\n'        "${_instance_id}"
+      # MI-6: per-instance SPIFFE trust-domain authority (legacy => yashigani.internal).
+      printf 'SPIFFE_TRUST_DOMAIN=%s\n' "${_trust_domain}"
       printf 'INSTALL_UID=%s\n'        "$(id -u)"
       printf 'INSTALL_USER=%s\n'       "$(id -un)"
       printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
-    } > "${WORK_DIR}/docker/.yashigani-install-state"
-    chmod 0644 "${WORK_DIR}/docker/.yashigani-install-state"
-    log_info "Install state written: ${WORK_DIR}/docker/.yashigani-install-state"
+      # BUG-4.0-GPU-CDI-NO-ENV: persist GPU CDI device + overlay list so
+      # upgrade/health scripts reconstruct the same compose overlay set without
+      # re-running GPU detection (nvidia-smi may not be in PATH for health checks).
+      # YSG_GPU_CDI='' when no GPU was detected (overlays not applied).
+      printf 'YSG_GPU_CDI=%s\n'        "${YSG_GPU_CDI:-}"
+    } > "$_state_path"
+    chmod 0644 "$_state_path"
+    log_info "Install state written: ${_state_path}"
+    log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}  TRUST_DOMAIN=${_trust_domain}"
 
     # Step 13: Completion summary
     print_completion_summary
@@ -9678,7 +16210,22 @@ main() {
   # SF-012: drain the tee coprocess so the final log lines ([12/13] and [13/13])
   # are flushed to install.log before the process exits.  Wait on the specific
   # PID only — bare `wait` would deadlock (see L2782 comment on coprocess + wait).
+  #
+  # do_wait-HANG FIX (YSG retro 2026-06-25): `wait "$_tee_pid"` with stdout still
+  # open blocks FOREVER — the tee coprocess only exits when it receives EOF on the
+  # pipe, which never happens while our fd 1/2 (the pipe's write end) stay open.
+  # That left install.sh hung in do_wait after printing the completion banner,
+  # accumulating zombie installers that collided on the compose project. Fix:
+  # reassign fd 1/2 to /dev/null first (closes the pipe's write end -> tee gets
+  # EOF -> flushes -> exits), then reap with a bounded backstop so this can NEVER
+  # hang again even if tee misbehaves.
   if [[ -n "${_tee_pid:-}" ]]; then
+    exec >/dev/null 2>&1
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$_tee_pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill "$_tee_pid" 2>/dev/null || true
     wait "$_tee_pid" 2>/dev/null || true
   fi
 }

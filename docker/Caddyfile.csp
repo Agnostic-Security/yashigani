@@ -1,0 +1,76 @@
+# docker/Caddyfile.csp — single source of truth for CSP matchers (4.0)
+#
+# Imported by Caddyfile.selfsigned, Caddyfile.ca, Caddyfile.acme.
+# The Helm chart (helm/yashigani/templates/configmaps.yaml) inlines an
+# equivalent block because Helm ConfigMaps cannot import external files at
+# runtime; the parity-check script (scripts/check-caddyfile-csp-parity.sh)
+# enforces byte-level equivalence between this file and the Helm configmap.
+#
+# DESIGN: strict-by-default
+# Any HTML-serving path MUST be explicitly placed in one of the four matchers
+# below. There is NO catch-all lenient fallback — @lenient_ui has been removed
+# (RISK-102 fix / SC-NEW-001). API paths, healthz, security.txt, etc. receive
+# no CSP header (correct: browsers do not enforce CSP on non-document responses).
+#
+# Matcher inventory (extend ALL four Caddyfiles + Helm configmap in the SAME
+# commit when adding a path — ENUMERATE-BEFORE-EDIT SOP):
+#
+#  @lenient_subapp  — observability sub-apps (Grafana/Wazuh/Prometheus).
+#                     Third-party SPAs that cannot be made strict-CSP-compliant.
+#                     DO NOT add new paths here without a recorded justification.
+#
+#  @redoc_ui        — ReDoc API docs. Needs worker-src blob: + unsafe-inline
+#                     style-src (Shadow DOM inline CSS). Scoped narrowly.
+#
+#  @strict_legacy   — Legacy admin plane (/admin-legacy/) + all /admin/* API
+#                     sub-paths + /auth/*, /static/*, etc. NO Trusted Types —
+#                     dashboard.js / runtime-settings.js / login.js use innerHTML.
+#                     Excludes /admin/ (shell, now Lit -> @strict_tt), /admin4/
+#                     (TT alias -> @strict_tt), and /admin/alertmanager/* (subapp).
+#
+#  @strict_tt       — 4.0 first-party paths (Lit-based, no innerHTML).
+#                     Now includes /admin/ (Phase 6 flip: Lit admin is primary)
+#                     and /admin4/ (redirect alias). Full strict policy + Trusted
+#                     Types (yashigani-render, dompurify, lit-html, drawflow-label).
+#                     Add every new 4.0 user-facing route prefix here before
+#                     deployment.
+
+(csp-policies) {
+    # Lenient exception 1: observability sub-apps (third-party SPAs)
+    # /admin/loki/* — Loki query API (JSON, no UI); added so it is excluded from
+    # the @strict_legacy matcher and does not receive an HTML-page CSP.
+    # /admin/alertmanager/* — Alertmanager UI (plain HTTP upstream; same lenient
+    # treatment as Grafana/Prometheus — third-party SPA cannot be made strict-CSP).
+    @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
+
+    # Lenient exception 2: ReDoc API docs
+    @redoc_ui path /admin/api-redoc /redoc
+
+    # Strict legacy: /admin-legacy/ (old vanilla-JS admin, fallback) + all
+    # /admin/* sub-paths (API endpoints, login page, etc.). NO Trusted Types.
+    # Excludes: /admin/ and /admin4/ (shell pages -> @strict_tt); the
+    # observability sub-apps (grafana/wazuh/prometheus/loki/alertmanager ->
+    # @lenient_subapp); /admin/api-redoc + /redoc -> @redoc_ui.
+    @strict_legacy {
+        path /admin/* /admin-legacy/ /admin-legacy/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /openapi.json
+        not path /admin/ /admin4/
+        not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
+        not path /admin/api-redoc /redoc
+    }
+
+    # Strict + Trusted Types: 4.0 first-party paths.
+    # Four named TT policies: yashigani-render, dompurify, lit-html, drawflow-label.
+    @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+
+    # frame-src 'self': explicit (default-src 'self' already implies it, but
+    # stated for clarity -- admin pages iframe /admin/grafana/, /admin/wazuh/,
+    # /admin/loki/ all of which are same-origin).
+    header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+    header @strict_tt     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label; report-uri /api/v1/csp-report; report-to default"
+    # frame-ancestors 'self': admin-gated same-origin embeds. The admin shell at
+    # /admin/ (same origin) must be able to iframe these. 'none' blocked the
+    # Grafana/Alertmanager iframe -- fixed here. 'self' is safe: the forward_auth
+    # gate ensures only authenticated admins can load this content.
+    header @lenient_subapp Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'self'; object-src 'none'; base-uri 'none'"
+    header @redoc_ui      Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+}

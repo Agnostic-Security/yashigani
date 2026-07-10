@@ -381,15 +381,34 @@ def test_chain_break_detection(pool, superuser_pool, chain_service):
 
 @_NEEDS_DB
 def test_checkpoint_row_created(pool, chain_service):
-    """run_daily_checkpoint creates/updates a checkpoint row with correct fields."""
+    """run_daily_checkpoint creates a checkpoint row with correct fields.
+
+    v2.25.2: checkpoints are IMMUTABLE once written (ON CONFLICT DO NOTHING).
+    A prior test in the same run may have written today's checkpoint, so we
+    delete it first (admin/superuser only — yashigani_app has no DELETE) to
+    test a fresh write against the events this test inserts.
+    """
     EVENT_TYPE = "TEST_CHAIN_CHECKPOINT"
     _run(_cleanup_test_events(EVENT_TYPE))
+
+    today = datetime.now(tz=timezone.utc).date()
+
+    # Immutability: clear any existing checkpoint for today via the superuser so
+    # this test exercises a fresh INSERT (DO NOTHING would otherwise keep an
+    # earlier test's row, and the DB root would not match this test's events).
+    if _SUPERUSER_POOL is not None:
+        async def _clear_ckpt():
+            async with _SUPERUSER_POOL.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM audit_chain_checkpoints WHERE tenant_id = $1 AND checkpoint_date = $2",
+                    uuid.UUID(_TENANT_ID), today,
+                )
+        _run(_clear_ckpt())
 
     from yashigani.audit.chain import AuditChainService
     local_svc = AuditChainService()
     _run(_insert_events_direct(local_svc, 10, EVENT_TYPE))
 
-    today = datetime.now(tz=timezone.utc).date()
     result = _run(chain_service.run_daily_checkpoint(
         target_date=today,
         pool=_POOL,

@@ -80,6 +80,15 @@ spec:
               containerPort: {{ .Values.caddy.internalMetricsListenerBackoffice.port }}
               protocol: TCP
             {{- end }}
+            {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+            # v4.1 SU-SEAM-1d-04: mesh-mTLS admin relay (see configmaps.yaml
+            # :2019 site block). NOT the raw admin API (MUST-4 — that stays on
+            # the pod-local unix socket): mTLS require_and_verify + backoffice
+            # SPIFFE pin + POST /load only. NetworkPolicy admits backoffice only.
+            - name: admin-relay
+              containerPort: {{ .Values.caddy.adminRelay.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: YASHIGANI_TLS_DOMAIN
               value: {{ .Values.global.tlsDomain | quote }}
@@ -106,6 +115,28 @@ spec:
             # set fips.mode=true without swapping to a FIPS-configured image.
             - name: FIPS_MODE
               value: "1"
+            {{- end }}
+            {{- if .Values.agentBundles.openclaw.enabled }}
+            # FP-06 Phase 2: Slack operator-config secrets → Caddy parse-time env.
+            # CHANNEL 1 (incoming-webhook path pin) and CHANNEL 2 (bot-token pin).
+            # Sourced from K8s Secret yashigani-openclaw-slack-secrets (secrets.yaml).
+            # optional: true → if Secret/key absent, env var not set → Caddy default
+            # "" → enforcement expression short-circuits false (inert-until-set).
+            # Byte-parity with compose: compose reads from /run/secrets/ files via
+            # caddy-entrypoint.sh; K8s injects the same vars directly from the Secret.
+            # Caddyfile uses {$YASHIGANI_OPENCLAW_SLACK_*:} in both runtimes.
+            - name: YASHIGANI_OPENCLAW_SLACK_WEBHOOK_PATH
+              valueFrom:
+                secretKeyRef:
+                  name: yashigani-openclaw-slack-secrets
+                  key: webhook_path
+                  optional: true
+            - name: YASHIGANI_OPENCLAW_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: yashigani-openclaw-slack-secrets
+                  key: bot_token
+                  optional: true
             {{- end }}
           # Retro #3al — probe the public :80 listener instead of the admin
           # endpoint at :2019. Caddy's admin API is bound to localhost only;
@@ -139,6 +170,14 @@ spec:
               mountPath: /etc/caddy/Caddyfile
               subPath: Caddyfile
               readOnly: true
+            # S4 (P1 W3 Phase 2a): agent Caddyfile snippet directory.
+            # Populated by the yashigani-caddy-agents ConfigMap (empty at base
+            # install). The Caddyfile ends with `import /etc/caddy/agents/*.caddy`
+            # which picks up per-agent route snippets as agents are onboarded.
+            # Read-only: snippets are written by ringfence-init codegen, not Caddy.
+            - name: caddy-agents
+              mountPath: /etc/caddy/agents
+              readOnly: true
             # MUST-4 / v2.24.1: admin unix socket lives here.
             # readOnlyRootFilesystem requires an explicit writable mount for
             # the socket directory — Caddy creates admin.sock at startup.
@@ -154,6 +193,20 @@ spec:
               mountPath: /run/secrets
               readOnly: true
             {{- end }}
+            {{- /* SEAM-1d-04: per-MCP SVID Secret volumes.
+                 Each Shape-C agent emits a mcpSvid.<key> entry in its values
+                 file (codegen _gen_values_yaml_shape_c).  Helm merges map
+                 keys addtively across -f values files, so multiple agents each
+                 get their own Secret projected into the Caddy Pod at their
+                 own mountPath.  GID model: fsGroup=1000 (pod security context
+                 above) + defaultMode=0440 → Caddy (UID/GID 1000) can read the
+                 key. No supplementalGroups[2003] needed in K8s (unlike compose
+                 group_add — K8s uses fsGroup instead). */ -}}
+            {{- range $key, $svid := .Values.mcpSvid }}
+            - name: mcp-svid-{{ $key }}
+              mountPath: {{ $svid.mountPath }}
+              readOnly: true
+            {{- end }}
       {{- if .Values.mtls.enabled }}
       # /run/secrets PKI mount collides with SA-token at
       # /var/run/secrets/kubernetes.io/serviceaccount (since /var/run→/run).
@@ -167,15 +220,53 @@ spec:
           emptyDir: {}
         # MUST-4 / v2.24.1: writable dir for the admin unix socket.
         # emptyDir is ephemeral and pod-local — socket is never shared.
+        # Iris-F2 / LAURA-002 (LOW): memory-backed + bounded to match compose
+        # tmpfs /run/caddy:size=1m,mode=0700. medium:Memory gives tmpfs
+        # semantics (no host-disk writes); sizeLimit:1Mi caps runaway growth.
         - name: caddy-admin-sock
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: caddyfile
           configMap:
             name: yashigani-caddy-config
+        # S4 (P1 W3 Phase 2a): agent snippet directory.
+        # Base ConfigMap is empty (no agents onboarded). Caddy logs a non-fatal
+        # warning for the empty glob and continues normally. Populated by
+        # ringfence-init onboarding flow as agents are added.
+        - name: caddy-agents
+          configMap:
+            name: yashigani-caddy-agents
+            defaultMode: 0444
         {{- if .Values.mtls.enabled }}
         - name: pki-certs
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
+            defaultMode: 0440
+            # YSG-RISK-053 (K8s parity with compose fix f7d792d5): items: scoping —
+            # caddy gets its own mesh leaf + the two trust anchors the Caddyfile
+            # references (ca_bundle for upstream verify, ca_intermediate for
+            # client_auth). caddy_internal_hmac is consumed via the
+            # CADDY_INTERNAL_HMAC env secretKeyRef (parse-time {$VAR} in the
+            # Caddyfile), never the file. No other service's leaf key and no
+            # bootstrap tokens are projected.
+            items:
+              - key: caddy_client.crt
+                path: caddy_client.crt
+              - key: caddy_client.key
+                path: caddy_client.key
+              - key: ca_bundle.crt
+                path: ca_bundle.crt
+              - key: ca_intermediate.crt
+                path: ca_intermediate.crt
+        {{- end }}
+        {{- /* SEAM-1d-04: per-MCP SVID Secret volumes (parity with compose group_add model).
+             Created by the approve transaction (mcp_onboard.py Phase 1c).
+             defaultMode: 0440 + fsGroup: 1000 → Caddy reads key without world-readable (0444). */ -}}
+        {{- range $key, $svid := .Values.mcpSvid }}
+        - name: mcp-svid-{{ $key }}
+          secret:
+            secretName: {{ $svid.secretName }}
             defaultMode: 0440
         {{- end }}
 ---
@@ -202,4 +293,38 @@ spec:
       port: {{ .Values.caddy.service.port }}
       targetPort: 443
       protocol: TCP
+{{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+---
+# v4.1 SU-SEAM-1d-04: dedicated ClusterIP Service for the mesh-mTLS admin
+# relay. DELIBERATELY separate from the yashigani-caddy Service above — that
+# one is type LoadBalancer (public edge); putting :2019 on it would publish
+# the admin relay on the external LB IP. This Service is ClusterIP-only, so
+# the relay is reachable exclusively on the pod network. Defence-in-depth:
+# ClusterIP-only → NetworkPolicy (backoffice pods only) → mTLS
+# require_and_verify → backoffice SPIFFE URI pin → POST /load only.
+# The raw admin API remains unix-socket-only inside the caddy pod (MUST-4).
+# backoffice dials https://yashigani-caddy-admin:2019/load
+# (mcp_onboard._reload_via_admin_api); the caddy leaf carries the
+# yashigani-caddy-admin DNS SAN (service_identities.yaml) so hostname
+# verification passes against the internal CA.
+apiVersion: v1
+kind: Service
+metadata:
+  name: yashigani-caddy-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: yashigani-caddy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: admin-relay
+      port: {{ .Values.caddy.adminRelay.port }}
+      targetPort: {{ .Values.caddy.adminRelay.port }}
+      protocol: TCP
+{{- end }}
 {{- end }}

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    Yashigani 4.0 agent-management surface (Phase 4, surface 1).
+    Form-based agent builder on the Phase-1 shared layer (/static/ui4/core/).
+    Same CSP/Trusted-Types posture as chat.html — NO unsafe-inline/eval, the
+    safe-render named TT policy runs under enforcement, classes-only CSS.
+  -->
+  <!--
+    trusted-types adds `drawflow-label`: the no-code generation panel
+    (agent-generate.js) renders the generated flow READ-ONLY through
+    ui4/core/drawflow-safe.js, whose seam registers the `drawflow-label`
+    DOMPurify/Trusted-Types policy (RISK-096). The summary text is rendered via
+    Lit textContent only — never an HTML sink.
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; require-trusted-types-for 'script'; trusted-types yashigani-render dompurify lit-html drawflow-label">
+  <title>Yashigani — Agents</title>
+  <link rel="stylesheet" href="/static/ui4/css/design-system.css">
+  <link rel="stylesheet" href="/static/vendor/drawflow/drawflow.min.css">
+  <link rel="stylesheet" href="/static/ui4/user/user.css">
+</head>
+<body class="ys-root">
+  <ys-agent-manager-app></ys-agent-manager-app>
+  <script type="module" src="/static/ui4/user/agent-manager.js"></script>
+</body>
+</html>

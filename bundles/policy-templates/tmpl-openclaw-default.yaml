@@ -1,0 +1,97 @@
+# Yashigani v4.1 — Agent Policy Template: openclaw default
+#
+# Applies to: openclaw bundled agent
+# Version: 1
+#
+# Mode-A prefixes (reverse-proxy / body-inspected, enforced now):
+#   llm      — LLM inference via gateway-inference deliver class (Mode A)
+#   telegram — Telegram Bot API, bot-ID pin required (Mode A)
+#
+# Mode-B prefix (CONNECT tunnel — Track 2 ONLY, disabled in Track 1):
+#   slack    — Slack Web API via HTTP CONNECT; host-gated ONLY (no DLP, no body
+#              inspection — see disclosure.residuals[FP-06])
+#              requires_acknowledgement: true + dual-admin ceremony (§5.3)
+#
+# PERIMETER-OWNED FIELD: connect_hosts is immutable perimeter data.
+# Admin may NOT supply free-form connect hosts. A shipped entry can be
+# toggled on/off only when Mode B is enabled (Track 2+).
+#
+# Last updated: 2026-07-08T00:00:00+00:00
+apiVersion: yashigani.io/v1alpha1
+kind: AgentPolicyTemplate
+metadata:
+  template_id: tmpl-openclaw-default
+  version: 1
+  applies_to: openclaw
+  description: >-
+    Default governance policy for the bundled openclaw agent. Enables LLM and
+    Telegram egress (Mode A — body-inspected). Slack egress (Mode B — CONNECT
+    tunnel) is Track 2 only and requires dual-admin acknowledgement; it is
+    disabled in this track.
+
+spec:
+  ingress:
+    enabled: true
+
+  egress:
+    - prefix: llm
+      mode: reverse_proxy
+      deliver_to: gateway-inference
+      ceiling: PUBLIC
+      scan_secrets: true
+      filter_description: true
+
+    - prefix: telegram
+      mode: reverse_proxy
+      deliver_to: api.telegram.org
+      ceiling: PUBLIC
+      scan_secrets: true
+      filter_description: true
+      pins:
+        telegram_bot_id_env: YASHIGANI_OPENCLAW_TELEGRAM_BOT_ID
+
+    # Mode B — Track 2 ONLY. Disabled here. Do not enable without Laura re-review
+    # of FP-01 NO-GO + dual-admin acknowledgement ceremony (design §5.3).
+    - prefix: slack
+      mode: connect
+      track_2_only: true
+      enabled: false
+      requires_acknowledgement: true
+      # PERIMETER-OWNED: these are the ONLY permitted connect targets for openclaw-Slack.
+      # Admin-supplied free-form hosts are REJECTED (422). Toggle on/off only.
+      connect_hosts:
+        - "slack.com:443"
+        - "hooks.slack.com:443"
+
+  disclosure:
+    enforced:
+      - "Destination closed-world — perimeter-owned Caddy config"
+      - "Body DLP + injection screen + OPA ceiling/PII on llm, telegram (Mode A)"
+      - "Per-caller positive grant; absence = deny; revocation = grant removal"
+      - "Telegram bot-ID path pin (FP-06 Phase 2)"
+    residuals:
+      - id: FP-06
+        applies_to: slack
+        track: 2
+        text: >-
+          Slack egress is host-gated ONLY (opaque CONNECT tunnel): no body
+          inspection, no injection screen, no workspace/bot-token pinning.
+          Cannot prevent exfiltration to an attacker-owned slack.com workspace.
+          openclaw hardcodes slack.com; Yashigani does not and will not MITM
+          openclaw's TLS to slack.com. Host-only governance or leave Slack off.
+      - id: UNION-N1
+        applies_to: llm
+        text: >-
+          Revoking this agent's grant kills its LLM ingress. While a sibling
+          agent holds the same prefix in the union grant, the forwarder route
+          remains active — the kill switch removes this caller's grant entry,
+          not the forwarder route itself.
+      - id: GRAPH-N3
+        text: >-
+          graph_hash is drift-detection metadata only (registry-level change
+          detection). It is NOT attestation of the agent's behaviour, tool
+          surface, or internal state.
+      - id: IDENTITY-MF6
+        text: >-
+          Audit identity_basis is ringfence-position: caller identity is the
+          2-member ringfence topology, not mTLS/attestation on this hop.

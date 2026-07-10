@@ -1,29 +1,30 @@
 """
-Regression test: install.sh _gen_totp_uri must include algorithm=SHA256.
+Phase 13 regression: install.sh _gen_totp_uri must emit SHA-512 / 8-digit TOTP
+for admin accounts.
 
-P0-10 / SHA-256 minimum policy (maintainer directive 2026-05-01):
-pyotp uses digest=hashlib.sha256. Without algorithm=SHA256 in the otpauth URI,
-authenticator apps (Google Authenticator, Authy, 1Password, etc.) default to
-SHA-1 and generate codes that never match. This test FAILS against pre-fix
-install.sh (no algorithm parameter) and PASSES after the fix.
+Context (Phase 13, Yashigani 3.1):
+  - All Yashigani admin bootstrap accounts use HMAC-SHA-512, 8 digits.
+  - User-tier accounts use SHA-256/6 (provisioned via web UI, not install.sh).
+  - Classic Google Authenticator (SHA-1 only) is incompatible.
+  - Required authenticator: agnosticOTP (iOS/Android) or Aegis.
 
-Last updated: 2026-05-01T13:00:00+01:00
+History:
+  - YSG-RISK-078 (2026-06-14) reverted from SHA-256 to SHA-1 due to
+    authenticator-app compatibility. Phase 13 supersedes that reversion by
+    mandating agnosticOTP (SHA-256/512 capable) as the required app.
 
 Coverage:
-- install.sh _gen_totp_uri emits algorithm=SHA256
-- install.sh _gen_totp_uri emits digits=6
+- install.sh _gen_totp_uri emits algorithm=SHA512
+- install.sh _gen_totp_uri emits digits=8
 - install.sh _gen_totp_uri emits period=30
-- install.sh _gen_totp_uri does NOT emit algorithm=SHA1
-- pyotp provisioning_uri with digest=hashlib.sha256 also emits algorithm=SHA256
-  (parity check: both URIs agree on algorithm)
-- oathtool / pyotp code parity (SHA256 codes match)
+- otpauth:// scheme and secret param present
+- Both bootstrapped admin URIs use SHA-512/8
+- Cross-algorithm check: SHA-1 code does NOT verify against SHA-512 TOTP
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -40,27 +41,14 @@ def _source_and_run(bash_snippet: str) -> str:
     """
     Source _gen_totp_uri from install.sh (without executing the installer)
     and run the provided bash snippet, returning stdout.
-
-    We source only the lines up to and including the function definition
-    to avoid running any installer logic.
     """
     if not INSTALL_SH.exists():
         pytest.skip(f"install.sh not found at {INSTALL_SH}")
 
-    # Extract lines up to and including the closing brace of _gen_totp_uri.
-    # Strategy: source the whole file with --norc in a subshell that only
-    # runs our snippet — install.sh is guarded by function definitions and
-    # a main() call pattern, so sourcing it is safe for function extraction.
-    # We use YASHIGANI_DRY_RUN=1 and a fake BASH_SOURCE check to prevent
-    # any top-level code from executing.
     script = (
         "set -euo pipefail\n"
-        # Stub out everything that would execute on source
         "YASHIGANI_DRY_RUN=1\n"
         "_main() { :; }\n"
-        # Source the function definitions from install.sh
-        # We parse only the _gen_totp_uri function to avoid running any
-        # installer logic. Safe: we grep the function body directly.
         + _extract_function("_gen_totp_uri")
         + "\n"
         + bash_snippet
@@ -80,10 +68,7 @@ def _source_and_run(bash_snippet: str) -> str:
 
 
 def _extract_function(func_name: str) -> str:
-    """
-    Extract a single bash function definition from install.sh by name.
-    Returns the full function body as a string.
-    """
+    """Extract a single bash function definition from install.sh by name."""
     lines = INSTALL_SH.read_text().splitlines()
     in_func = False
     depth = 0
@@ -91,7 +76,6 @@ def _extract_function(func_name: str) -> str:
 
     for line in lines:
         if not in_func:
-            # Match: func_name() { or func_name () {
             if re.match(rf"^{re.escape(func_name)}\s*\(\)", line):
                 in_func = True
                 depth = 0
@@ -110,38 +94,57 @@ def _extract_function(func_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tests: shell URI emission
+# Tests: Phase 13 shell URI emission (SHA-512 / 8 digits)
 # ---------------------------------------------------------------------------
 
 class TestInstallShTotpUri:
-    """Verify _gen_totp_uri produces a URI that authenticator apps will parse correctly."""
+    """Verify _gen_totp_uri produces a SHA-512/8-digit URI for admin accounts (Phase 13)."""
 
     def _get_uri(self, username: str = "testadmin", secret: str = "JBSWY3DPEHPK3PXP") -> str:
         return _source_and_run(f'_gen_totp_uri "{username}" "{secret}"')
 
-    def test_contains_algorithm_sha256(self):
+    def test_algorithm_is_sha512(self):
         """
-        REGRESSION TEST (P0-10): URI must contain algorithm=SHA256.
-        Without this, authenticator apps default to SHA-1 → codes never match pyotp.
-        This test FAILS against pre-fix install.sh.
+        Phase 13: admin bootstrap TOTP must use HMAC-SHA-512.
+        Classic Google Authenticator (SHA-1 only) is NOT compatible.
+        Required app: agnosticOTP or Aegis.
         """
         uri = self._get_uri()
-        assert "algorithm=SHA256" in uri, (
-            f"P0-10: otpauth URI missing algorithm=SHA256 → authenticator apps will use SHA-1.\n"
+        assert "algorithm=SHA512" in uri, (
+            f"Phase 13: install.sh admin TOTP URI must use algorithm=SHA512.\n"
             f"URI was: {uri}"
         )
 
-    def test_does_not_contain_algorithm_sha1(self):
-        """URI must not contain algorithm=SHA1 (neither explicit nor as a default remnant)."""
+    def test_does_not_contain_sha1(self):
+        """
+        URI must NOT revert to SHA-1 (YSG-RISK-078 reversion is superseded by Phase 13).
+        """
         uri = self._get_uri()
+        # algorithm=SHA1 or no algorithm param (which implies SHA-1) are both wrong
         assert "algorithm=SHA1" not in uri, (
-            f"P0-10: URI contains algorithm=SHA1 — this is forbidden (feedback_sha256_minimum_pqr).\n"
+            f"Phase 13: admin TOTP must not use SHA-1 (superseded by SHA-512 mandate).\n"
+            f"URI was: {uri}"
+        )
+        # Also must not omit the algorithm param (omit = SHA-1 default)
+        assert "algorithm=" in uri, (
+            f"Phase 13: URI must explicitly specify algorithm=SHA512 (omitting means SHA-1 default).\n"
             f"URI was: {uri}"
         )
 
-    def test_contains_digits_6(self):
+    def test_contains_digits_8(self):
+        """Admin TOTP uses 8-digit codes (Phase 13)."""
         uri = self._get_uri()
-        assert "digits=6" in uri, f"URI missing digits=6: {uri}"
+        assert "digits=8" in uri, (
+            f"Phase 13: admin TOTP URI must specify digits=8.\nURI was: {uri}"
+        )
+
+    def test_does_not_contain_digits_6(self):
+        """URI must not emit digits=6 for admin bootstrap accounts (that's user-tier)."""
+        uri = self._get_uri()
+        assert "digits=6" not in uri, (
+            f"Phase 13: admin TOTP URI must NOT specify digits=6 (that is user-tier).\n"
+            f"URI was: {uri}"
+        )
 
     def test_contains_period_30(self):
         uri = self._get_uri()
@@ -163,74 +166,102 @@ class TestInstallShTotpUri:
         assert "admin1" in uri1
         assert "admin2" in uri2
 
-    def test_both_admin_uris_contain_algorithm_sha256(self):
-        """Explicit check that BOTH admin URIs include the algorithm parameter."""
+    def test_both_admin_uris_use_sha512(self):
+        """Both bootstrapped admin URIs must use SHA-512 (Phase 13)."""
         uri1 = self._get_uri(username="admin1", secret="JBSWY3DPEHPK3PXP")
         uri2 = self._get_uri(username="admin2", secret="MFRA2YLNMFRA2YLN")
-        assert "algorithm=SHA256" in uri1, f"admin1 URI missing algorithm=SHA256: {uri1}"
-        assert "algorithm=SHA256" in uri2, f"admin2 URI missing algorithm=SHA256: {uri2}"
+        assert "algorithm=SHA512" in uri1, f"admin1 URI must use SHA512: {uri1}"
+        assert "algorithm=SHA512" in uri2, f"admin2 URI must use SHA512: {uri2}"
+        assert "digits=8" in uri1, f"admin1 URI must have digits=8: {uri1}"
+        assert "digits=8" in uri2, f"admin2 URI must have digits=8: {uri2}"
 
 
 # ---------------------------------------------------------------------------
-# Tests: pyotp parity — shell URI must agree with pyotp's own URI
+# Tests: raw TOTP compute cross-algorithm isolation
 # ---------------------------------------------------------------------------
 
-class TestShellUriMatchesPyotp:
+class TestPhase13AlgorithmIsolation:
     """
-    Verify that the algorithm parameter in the shell-emitted URI matches what
-    pyotp.TOTP(digest=hashlib.sha256).provisioning_uri() emits.
-    Both must declare algorithm=SHA256 so authenticator apps and pyotp agree.
+    Prove that SHA-1 and SHA-512 TOTP codes are distinct for the same secret,
+    so a SHA-1 app (classic Google Authenticator) will always produce a wrong
+    code against a SHA-512-configured account.
     """
 
-    def test_algorithm_matches_pyotp_uri(self):
-        try:
-            import pyotp
-        except ImportError:
-            pytest.skip("pyotp not installed")
-
-        secret = "JBSWY3DPEHPK3PXP"
-        pyotp_uri = pyotp.TOTP(
-            secret, issuer="Yashigani", digest=hashlib.sha256
-        ).provisioning_uri(name="testadmin", issuer_name="Yashigani")
-
-        shell_uri = _source_and_run(f'_gen_totp_uri "testadmin" "{secret}"')
-
-        # Both must contain algorithm=SHA256
-        assert "algorithm=SHA256" in pyotp_uri, (
-            f"pyotp URI unexpectedly missing algorithm=SHA256: {pyotp_uri}"
-        )
-        assert "algorithm=SHA256" in shell_uri, (
-            f"shell URI missing algorithm=SHA256: {shell_uri}"
-        )
-
-    def test_codes_match_between_pyotp_and_oathtool(self):
+    def _raw_totp(self, secret_b32: str, algorithm: str, digits: int) -> str:
         """
-        End-to-end parity: a code generated by pyotp with SHA-256 must also
-        be accepted by pyotp verify (trivially true) and must NOT match a
-        SHA-1 TOTP for the same secret (confirms SHA-256 ≠ SHA-1 codes).
+        Compute a TOTP code using our own _totp_at implementation.
+        This is the same function used by the server — proves parity.
         """
         try:
-            import pyotp
+            from yashigani.auth.totp import _totp_at
         except ImportError:
-            pytest.skip("pyotp not installed")
+            pytest.skip("yashigani.auth.totp not importable")
+        import time
+        return _totp_at(secret_b32, int(time.time()), algorithm, digits)
 
-        secret = pyotp.random_base32()
+    def test_sha1_code_does_not_equal_sha512_code(self):
+        """
+        For the same secret and same window, SHA-1/6 and SHA-512/8 codes MUST
+        differ (different HMAC functions + different digit counts).
+        If they accidentally collide this test is skipped (astronomically unlikely).
+        """
+        try:
+            from yashigani.auth.totp import generate_totp_secret
+        except ImportError:
+            pytest.skip("yashigani.auth.totp not importable")
 
-        totp_sha256 = pyotp.TOTP(secret, digest=hashlib.sha256)
-        totp_sha1 = pyotp.TOTP(secret)  # default: SHA-1
+        secret = generate_totp_secret()
+        code_sha1_6 = self._raw_totp(secret, "SHA1", 6)
+        code_sha512_8 = self._raw_totp(secret, "SHA512", 8)
 
-        code_sha256 = totp_sha256.now()
-        code_sha1 = totp_sha1.now()
+        if code_sha1_6 == code_sha512_8[:6]:
+            # Prefix collision: skip rather than fail
+            pytest.skip("SHA1/6 code collided with first 6 digits of SHA512/8 — retry")
 
-        # SHA-256 code must verify against SHA-256 TOTP
-        assert totp_sha256.verify(code_sha256), "SHA-256 code must verify with SHA-256 TOTP"
-
-        # SHA-1 code must NOT verify against SHA-256 TOTP (in virtually all cases;
-        # a collision at this instant is astronomically unlikely but theoretically
-        # possible — skip gracefully if codes happen to match)
-        if code_sha256 == code_sha1:
-            pytest.skip("SHA-256 and SHA-1 codes collided for this secret/window — retry")
-        assert not totp_sha256.verify(code_sha1), (
-            "SHA-1 code must NOT verify against SHA-256 TOTP — "
-            "authenticators using SHA-1 would silently produce wrong codes"
+        assert code_sha1_6 != code_sha512_8, (
+            "SHA-1/6 and SHA-512/8 codes must differ — algorithm isolation requires distinct outputs"
         )
+
+    def test_sha512_8_code_verifies_with_raw_impl(self):
+        """
+        End-to-end: a code produced by _totp_at(SHA512, 8) verifies via
+        verify_totp(algorithm=SHA512, digits=8).
+        """
+        try:
+            from yashigani.auth.totp import generate_totp_secret, verify_totp, _totp_at
+        except ImportError:
+            pytest.skip("yashigani.auth.totp not importable")
+        import time
+
+        secret = generate_totp_secret()
+        code = _totp_at(secret, int(time.time()), "SHA512", 8)
+        assert verify_totp(
+            secret_b32=secret,
+            code=code,
+            used_codes_cache=set(),
+            algorithm="SHA512",
+            digits=8,
+        ), "SHA-512/8 code must verify against SHA-512/8 TOTP"
+
+    def test_sha1_6_code_does_not_verify_sha512_8(self):
+        """
+        A SHA-1/6-digit code MUST NOT verify against SHA-512/8 configuration.
+        This confirms classic Google Authenticator is incompatible with admin accounts.
+        """
+        try:
+            from yashigani.auth.totp import generate_totp_secret, verify_totp, _totp_at
+        except ImportError:
+            pytest.skip("yashigani.auth.totp not importable")
+        import time
+
+        secret = generate_totp_secret()
+        # Produce a SHA-1/6-digit code (what Google Authenticator would generate)
+        sha1_code = _totp_at(secret, int(time.time()), "SHA1", 6)
+        # Attempt to verify it as SHA-512/8 — must fail
+        assert not verify_totp(
+            secret_b32=secret,
+            code=sha1_code,
+            used_codes_cache=set(),
+            algorithm="SHA512",
+            digits=8,
+        ), "SHA-1/6 code MUST NOT verify against SHA-512/8 TOTP — algorithm isolation failure"

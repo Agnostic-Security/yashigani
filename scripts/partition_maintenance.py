@@ -97,6 +97,7 @@ def _build_ssl_context(dsn: str) -> tuple[str, ssl.SSLContext | None]:
         return clean_dsn, None
 
     ctx = ssl.create_default_context(cafile=sslrootcert)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3  # TLS 1.3 only (2.25.1; Postgres 16 supports it)
     if sslcert and sslkey:
         ctx.load_cert_chain(certfile=sslcert, keyfile=sslkey)
     if sslmode in ("require", "verify-ca"):

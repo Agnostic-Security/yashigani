@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+from yashigani.db.pgcrypto import PGP_SYM_ENCRYPT_OPTIONS
+
 
 @dataclass(frozen=True)
 class TenantRow:
@@ -64,7 +66,11 @@ class AuditEventRow:
 # Query helpers — all use $N parameterization, no string interpolation
 # ---------------------------------------------------------------------------
 
-INSERT_INFERENCE_EVENT = """
+# v4.1 (#144): payload/response content is AES-256 encrypted at rest
+# (pgp_sym_encrypt defaults to AES-128 without the options argument).
+# NOTE: this module is shadowed by the models/ package — the authoritative
+# copy lives in models/__init__.py; kept in sync.
+INSERT_INFERENCE_EVENT = f"""
 INSERT INTO inference_events (
     tenant_id, session_id, agent_id, payload_hash, payload_length,
     response_length, payload_content, response_content,
@@ -72,12 +78,16 @@ INSERT INTO inference_events (
     backend_used, latency_ms
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
-    pgp_sym_encrypt($7, current_setting('app.aes_key')),
-    pgp_sym_encrypt($8, current_setting('app.aes_key')),
+    pgp_sym_encrypt($7, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}'),
+    pgp_sym_encrypt($8, current_setting('app.aes_key'), '{PGP_SYM_ENCRYPT_OPTIONS}'),
     $9, $10, $11, $12
 )
 """
 
+# NOTE: this module is SHADOWED at runtime by the models/ package
+# (yashigani/db/models/__init__.py).  The authoritative INSERT_AUDIT_EVENT used
+# by audit/sinks.py lives there.  Kept in sync to avoid confusion; RETURNING seq
+# is required because PostgresSink._flush_batch fetchrow()s row["seq"].
 INSERT_AUDIT_EVENT = """
 INSERT INTO audit_events (
     tenant_id, event_type, request_id, session_id, agent_id,
@@ -85,6 +95,7 @@ INSERT INTO audit_events (
     confidence_score, client_ip_hash,
     prev_hash, event_hash
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING seq
 """
 
 SELECT_AGENT_BY_TOKEN_HASH = """

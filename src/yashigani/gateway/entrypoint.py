@@ -14,7 +14,7 @@ from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.scope import MaskingScopeConfig
-from yashigani.audit.writer import AuditLogWriter
+from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
 from yashigani.chs.handle import CredentialHandleService
 from yashigani.chs.resource_monitor import ResourceMonitor
 from yashigani.inspection.classifier import PromptInjectionClassifier
@@ -29,6 +29,7 @@ from yashigani.metrics.middleware import PrometheusMiddleware
 from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
 from yashigani.gateway.agent_auth import AgentAuthMiddleware
 from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router
+from yashigani.gateway.egress_proxy import router as egress_proxy_router, configure as configure_egress_proxy
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
 from yashigani.gateway.ddos import DDoSProtector, ENV_PER_IP_LIMIT, ENV_WINDOW_SECONDS, ENV_EXEMPT_PATHS, _EXEMPT_PATHS, _ddos_default_per_ip_limit
@@ -54,6 +55,7 @@ def _build_app(mesh_mode: bool = False):
     audit_writer = AuditLogWriter(
         config=audit_config,
         masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
     )
 
     # Resource monitor (cgroup v2 for dynamic TTL)
@@ -85,11 +87,11 @@ def _build_app(mesh_mode: bool = False):
         logger.info("Response inspection pipeline enabled")
 
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
-    fasttext_backend = None  # legacy name retained; wired into SensitivityClassifier below
+    classifier_backend = None
     try:
         from yashigani.inspection.backends.sklearn_backend import SklearnBackend
-        fasttext_backend = SklearnBackend()
-        logger.info("sklearn sensitivity backend loaded: %s", fasttext_backend.model_path)
+        classifier_backend = SklearnBackend()
+        logger.info("sklearn sensitivity backend loaded: %s", classifier_backend.model_path)
     except Exception as exc:
         logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
@@ -190,6 +192,8 @@ def _build_app(mesh_mode: bool = False):
     rbac_store = None
     agent_registry = None
     redis_client_rbac = None
+    capability_policy_store = None  # 3.0 — browser Permissions-Policy
+    permission_store = None          # 3.1 Phase 4 — MCP connection allow-list
     try:
         import redis as _redis
         redis_client_rbac = _redis.from_url(_gw_redis_url(3), decode_responses=False)
@@ -200,6 +204,25 @@ def _build_app(mesh_mode: bool = False):
         logger.info(
             "Gateway agent registry ready: %d agent(s)",
             agent_registry.count("all"),
+        )
+        # 3.0 — Capability policy store shares Redis db/3 (key prefix cap_policy:*)
+        from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+        _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+        capability_policy_store = _CapPolStore(
+            redis_client=redis_client_rbac,
+            default_org_id=_cap_pol_org_id,
+        )
+        logger.info(
+            "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
+            _cap_pol_org_id,
+        )
+        # 3.1 Phase 4 — Unified Permission Store shares Redis db/3 (key prefix
+        # perm:grant:*).  Used by the MCP broker connection allow-list check.
+        from yashigani.permissions import PermissionStore as _PermStore
+        permission_store = _PermStore(redis_client=redis_client_rbac)
+        logger.info(
+            "Gateway permission store ready (Phase 4 MCP allow-list, org=%s)",
+            _cap_pol_org_id,
         )
     except Exception as exc:
         logger.warning(
@@ -283,8 +306,17 @@ def _build_app(mesh_mode: bool = False):
     identity_registry = None
     try:
         from yashigani.identity import IdentityRegistry
+        from yashigani.identity.durable_store import IdentityDurableStore
         if redis_client_rbac:
-            identity_registry = IdentityRegistry(redis_client=redis_client_rbac)
+            _id_durable = None
+            try:
+                _id_durable = IdentityDurableStore()
+            except Exception as _de:
+                logger.warning("IdentityDurableStore unavailable (%s) — Redis-only mode", _de)
+            identity_registry = IdentityRegistry(
+                redis_client=redis_client_rbac,
+                durable_store=_id_durable,
+            )
     except Exception as exc:
         logger.warning("Identity registry unavailable (%s)", exc)
 
@@ -293,9 +325,9 @@ def _build_app(mesh_mode: bool = False):
     try:
         from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
         sensitivity_classifier = SensitivityClassifier(
-            enable_sklearn=fasttext_backend is not None,
+            enable_sklearn=classifier_backend is not None,
             enable_ollama=True,
-            sklearn_backend=fasttext_backend,
+            sklearn_backend=classifier_backend,
             ollama_url=ollama_url,
             ollama_model=model,
         )
@@ -336,6 +368,33 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("Token counter unavailable (%s)", exc)
 
+    # ── #25: dual-admin cloud-LLM override — engine reads the ACTIVE grant live ──
+    # (Redis db/0, same namespace home as break-glass). 5s in-process cache bounds
+    # Redis load to <=1 read / 5s instead of per-request. None when unavailable.
+    cloud_override_getter = None
+    try:
+        import redis as _redis_co_mod
+        from yashigani.optimization.cloud_override import CloudLlmOverrideManager
+        _redis_co = _redis_co_mod.from_url(_gw_redis_url(0), decode_responses=False)
+        _redis_co.ping()
+        _co_mgr = CloudLlmOverrideManager(_redis_co, audit_writer)
+        _co_cache = {"t": 0.0, "v": None}
+
+        def cloud_override_getter():  # noqa: F811 — assigned only on success
+            import time as _t
+            now = _t.monotonic()
+            if now - _co_cache["t"] > 5.0:
+                try:
+                    _co_cache["v"] = _co_mgr.get_active()
+                except Exception:
+                    _co_cache["v"] = None
+                _co_cache["t"] = now
+            return _co_cache["v"]
+        logger.info("Cloud-LLM override getter wired (engine honours dual-admin grants)")
+    except Exception as exc:
+        logger.warning("Cloud-override getter unavailable (%s) — engine override disabled", exc)
+        cloud_override_getter = None
+
     # ── v1.0: Optimization Engine ─────────────────────────────────────────
     optimization_engine = None
     try:
@@ -344,6 +403,7 @@ def _build_app(mesh_mode: bool = False):
             default_model=model,
             default_cloud_provider=os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic"),
             default_cloud_model=os.getenv("YASHIGANI_DEFAULT_CLOUD_MODEL", "claude-sonnet-4-6"),
+            cloud_override_getter=cloud_override_getter,
         )
     except Exception as exc:
         logger.warning("Optimization Engine unavailable (%s)", exc)
@@ -375,6 +435,36 @@ def _build_app(mesh_mode: bool = False):
         )
     except Exception as exc:
         logger.warning("PII detector unavailable (%s) — PII filtering disabled", exc)
+
+    # ── v2.26: Document PSEUDONYMIZE mode-B egress pipeline (gap #1).
+    # Built ONLY when the operator opts into mode-B-via-proxy (both the
+    # document-enforcement flag AND the dedicated mode-B-proxy flag).  Default
+    # OFF (dark): when not opted in, document_pipeline stays None and the proxy
+    # hot path is completely untouched.  A construction failure here disables the
+    # OPTIONAL feature (document_pipeline=None) — it does NOT crash startup, since
+    # mode-B-proxy is opt-in and its absence simply means documents are not
+    # tokenized on egress (the proxy's existing PII/OPA controls still apply).
+    document_pipeline = None
+    try:
+        from yashigani.documents.proxy_modeb import is_modeb_proxy_active
+        if is_modeb_proxy_active():
+            from yashigani.documents.config import DocumentEnforcementConfig
+            from yashigani.documents.pipeline import DocumentInspectionPipeline
+            _doc_cfg = DocumentEnforcementConfig.from_env()
+            document_pipeline = DocumentInspectionPipeline(
+                registry=_doc_cfg.build_registry(),
+            )
+            logger.info(
+                "Document mode-B egress pipeline ready (max_bytes=%d, max_segments=%d)",
+                _doc_cfg.max_document_bytes, _doc_cfg.max_segments,
+            )
+        else:
+            logger.info("Document mode-B egress pipeline disabled (flag off — dark)")
+    except Exception as exc:
+        logger.warning(
+            "Document mode-B egress pipeline unavailable (%s) — mode-B egress disabled",
+            exc,
+        )
 
     # ── v2.4.1: Pool Manager — create early so it can be wired into the
     # OpenAI router before create_gateway_app().  Health monitor is started
@@ -615,6 +705,115 @@ def _build_app(mesh_mode: bool = False):
             "RuntimeSettings gateway wiring failed (%s) — using startup values only", exc
         )
 
+    # ── Track B1 (model-RBAC): allocation store (db/3) + alias store (db/1) ──
+    # The gateway reads BOTH on the request path to compute the caller's
+    # effective-allowed-models (own allowed_models ∪ allocated aliases, expanded
+    # to concrete models). Both share the existing per-DB Redis clients' URLs.
+    # Fail-closed: if a store cannot be built it stays None and the resolver
+    # treats the caller as restricted to its own allowed_models (no allocation
+    # widening) — never fail-open.
+    model_allocation_store = None
+    model_alias_store = None
+    try:
+        import redis as _redis
+        from yashigani.models.allocation_store import ModelAllocationStore
+        _redis_alloc = _redis.from_url(_gw_redis_url(3), decode_responses=False)
+        _redis_alloc.ping()
+        # Wire the Postgres durable mirror (when a usable DSN exists) and reconcile
+        # Postgres → Redis db/3 on boot. Redis db/3 has no persistence, so a redis
+        # recreate/restart wipes allocations; the gateway re-hydrates them
+        # independently of the backoffice (same pattern as the agent reconcile).
+        _gw_alloc_durable = None
+        try:
+            from yashigani.models.allocation_durable_store import (
+                AllocationDurableStore, _direct_dsn as _alloc_dsn,
+            )
+            if _alloc_dsn() and "${POSTGRES_PASSWORD}" not in _alloc_dsn():
+                _gw_alloc_durable = AllocationDurableStore()
+        except Exception as _gads_exc:
+            logger.warning("Gateway allocation durable store skipped (%s)", _gads_exc)
+        model_allocation_store = ModelAllocationStore(
+            redis_client=_redis_alloc, durable_store=_gw_alloc_durable,
+        )
+        if _gw_alloc_durable is not None:
+            try:
+                from yashigani.models.allocation_durable_store import (
+                    reconcile_allocations_from_durable,
+                )
+                reconcile_allocations_from_durable(model_allocation_store, _gw_alloc_durable)
+            except Exception as _grec_exc:
+                logger.error(
+                    "Gateway ALLOC-RECONCILE failed (%s) — allocations may be absent "
+                    "until the next admin mutation", _grec_exc,
+                )
+        logger.info(
+            "Gateway model allocation store ready: %d allocation(s)",
+            len(model_allocation_store.list_all()),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Gateway model allocation store unavailable (%s) — allocations not enforced "
+            "(callers restricted to their own allowed_models)", exc,
+        )
+    try:
+        import redis as _redis
+        from yashigani.models.alias_store import ModelAliasStore
+        _redis_alias = _redis.from_url(_gw_redis_url(1), decode_responses=False)
+        _redis_alias.ping()
+        model_alias_store = ModelAliasStore(redis_client=_redis_alias)
+        _all_aliases = model_alias_store.list_all()
+        logger.info(
+            "Gateway model alias store ready: %d alias(es)",
+            len(_all_aliases),
+        )
+        # Track B1: feed the alias map into the OptimizationEngine so it resolves
+        # an alias (e.g. 'smart') to its concrete provider/model (anthropic/
+        # claude-sonnet-4-6) instead of treating the alias name as a local Ollama
+        # model. Without this the OE downgrades every aliased request to local
+        # default, so an allocated CLOUD alias would never actually serve its
+        # cloud model. Format: {alias: (provider, model, force_local)}.
+        if optimization_engine is not None and _all_aliases:
+            try:
+                optimization_engine.update_aliases({
+                    name: (cfg.provider, cfg.model, cfg.force_local)
+                    for name, cfg in _all_aliases.items()
+                })
+                logger.info(
+                    "OptimizationEngine alias map loaded from store: %d alias(es)",
+                    len(_all_aliases),
+                )
+            except Exception as _oe_alias_exc:
+                logger.warning(
+                    "Failed to load OE alias map from store (%s) — aliases resolve "
+                    "to local default", _oe_alias_exc,
+                )
+    except Exception as exc:
+        logger.warning(
+            "Gateway model alias store unavailable (%s) — allocated aliases will "
+            "only be matched by name, not expanded to concrete models", exc,
+        )
+
+    # ── 4.0 — Workflow Scheduler (Redis DB 6, separate namespace) ────────────
+    # Builds and pre-loads the scheduler; actual start() is called from the
+    # gateway lifespan (proxy.py) AFTER the agent registry is reconciled.
+    workflow_scheduler = None
+    try:
+        import redis as _redis
+        from yashigani.gateway.workflow_scheduler import build_workflow_scheduler
+        redis_client_wf = _redis.from_url(_gw_redis_url(6), decode_responses=False)
+        redis_client_wf.ping()
+        workflow_scheduler = build_workflow_scheduler(
+            redis_client_wf,
+            audit_writer=audit_writer,
+            identity_registry=identity_registry,
+            agent_registry=agent_registry,
+        )
+        logger.info("WorkflowScheduler: built and pre-loaded from Redis DB 6")
+    except Exception as exc:
+        logger.warning(
+            "WorkflowScheduler unavailable (%s) — scheduled workflows disabled", exc
+        )
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -635,7 +834,307 @@ def _build_app(mesh_mode: bool = False):
         content_relay_detector=content_relay_detector,
         pool_manager=pool_manager,
         ddos_protector=ddos_protector,
+        model_allocation_store=model_allocation_store,
+        model_alias_store=model_alias_store,
+        kms_provider=kms_provider,
+        permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
     )
+
+    # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────
+    # Mounts /egress/eval/{prefix}/{path:path}: every sidecar-wrapped system's
+    # outbound body traverses this endpoint for secret_detector + M4 injection
+    # inspection + OPA mcp_response_decision before Caddy forwards to destination.
+    #
+    # FLAG-3 fix: wire per-instance egress rate/budget cap via EgressLimitEnforcer.
+    # Uses Redis DB-2 (same DB as EndpointRateLimiter, distinct egress:rlk: prefix).
+    # On Redis failure: enforcer is set to None → limiter gracefully disabled for
+    # this boot (gateway does not abort — consistent with endpoint ratelimit pattern).
+    _egress_limit_enforcer = None
+    try:
+        import redis as _redis
+        from yashigani.gateway.egress_limit import EgressLimitEnforcer
+        _redis_client_egress_rl = _redis.from_url(_gw_redis_url(2), decode_responses=False)
+        _redis_client_egress_rl.ping()
+        _egress_limit_enforcer = EgressLimitEnforcer(redis_client=_redis_client_egress_rl)
+        logger.info(
+            "Egress limit enforcer ready (mode=%s calls=%d window=%ds)",
+            _egress_limit_enforcer.mode,
+            _egress_limit_enforcer.calls_per_window,
+            _egress_limit_enforcer.window_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Egress limit enforcer unavailable (%s) — /egress/eval rate cap disabled",
+            exc,
+        )
+
+    configure_egress_proxy(
+        opa_url=opa_url,
+        audit_writer=audit_writer,
+        egress_limit_enforcer=_egress_limit_enforcer,
+    )
+
+    # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────
+    # Build a McpBrokerRegistry + JwksStore from YASHIGANI_MCP_SERVERS env var.
+    # Guard: if env var is unset/empty, both return values are empty/None and
+    # the gateway behaves exactly as before (backward-compatible).
+    try:
+        from yashigani.mcp.registry import build_registry_from_env
+        from yashigani.mcp.router import create_mcp_router
+        # Note: create_mcp_call_router is no longer imported here.
+        # The call router is no longer mounted as an extra_router (Fix-1).
+        # proxy.py dispatches /mcp/<agent> via dispatch_mcp_call() in the catch-all.
+
+        # 3.1 Phase 4 — org ID for permission store seeding.
+        # Reuse the same YASHIGANI_ORG_ID that the capability policy store uses.
+        _perm_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+
+        # v4.0 Item B — mint stable mcp_id per MCP server using db/3 Redis.
+        # Uses the same redis_client_rbac (db 3) as PermissionStore — the
+        # id_store keys live under a separate mcp: prefix.  When Redis is
+        # unavailable (permission_store=None), fall back gracefully.
+        _mcp_id_store = None
+        if redis_client_rbac is not None:
+            try:
+                from yashigani.mcp._id_store import McpIdStore
+                _mcp_id_store = McpIdStore(redis_client_rbac)
+                logger.info("mcp-id-store: McpIdStore initialised (Redis db/3)")
+            except Exception as _id_store_exc:
+                logger.warning(
+                    "mcp-id-store: McpIdStore init failed — mcp_id minting "
+                    "unavailable, grants keyed by agent_name (fallback): %s",
+                    _id_store_exc,
+                )
+
+        # v4.1 Phase 2a (Iris SEAM-1d-07) — durable broker registry: the
+        # backoffice approve transaction writes onboarded-MCP descriptors to
+        # Redis db/3; the registry lazily loads them on a lookup miss so an
+        # onboarded MCP routes WITHOUT a gateway reboot.
+        _mcp_durable_store = None
+        if redis_client_rbac is not None:
+            try:
+                from yashigani.mcp._durable_registry import DurableMcpRegistryStore
+                _mcp_durable_store = DurableMcpRegistryStore(redis_client_rbac)
+                logger.info(
+                    "mcp-durable-registry: store initialised (Redis db/3) — "
+                    "onboarded MCPs route without a reboot (SEAM-1d-07)"
+                )
+            except Exception as _dur_exc:
+                logger.warning(
+                    "mcp-durable-registry: init failed — onboarded MCPs will "
+                    "require a gateway recreate to route: %s",
+                    _dur_exc,
+                )
+
+        _mcp_registry, _mcp_jwks_store = build_registry_from_env(
+            opa_url=opa_url,
+            audit_writer=audit_writer,
+            # 3.1 Phase 4 — wire permission store + org_id for connection allow-list.
+            # When permission_store is None (Redis unavailable), the check no-ops.
+            permission_store=permission_store,
+            org_id=_perm_org_id,
+            # v4.0 Item B — pass the id store so each server gets a stable mcp_id.
+            mcp_id_store=_mcp_id_store,
+            # v4.1 Phase 2a — lazy durable-registry fallback (SEAM-1d-07).
+            durable_store=_mcp_durable_store,
+        )
+        _extra_routers: list = [openai_router, egress_proxy_router]
+
+        if len(_mcp_registry) > 0 and _mcp_jwks_store is not None:
+            # Pick any broker for the /mcp/health OPA probe (they all share opa_url)
+            _representative_broker = _mcp_registry.all_brokers()[0]
+            _mcp_info_router = create_mcp_router(_mcp_jwks_store, _representative_broker)
+            # Fix-1 (Laura ship-blocker): do NOT mount _mcp_call_router as an
+            # extra_router — that path bypasses rate-limiter + DDoSProtector.
+            # Instead, proxy.py intercepts /mcp/<agent_name> in the catch-all
+            # dispatch path (after rate-limit + DDoS + JWT + OPA) and calls
+            # dispatch_mcp_call() directly.  The _mcp_info_router (JWKS + health)
+            # IS mounted as extra_router — those endpoints are intentionally public.
+            _extra_routers = [openai_router, egress_proxy_router, _mcp_info_router]
+            logger.info(
+                "MCP broker wiring: %d server(s) registered, JWKS info routes mounted "
+                "(call routes wired through catch-all — Fix-1)",
+                len(_mcp_registry),
+            )
+
+            # 3.1 Phase 4 / 4.0 Item A — seed org-level grants (B1 / auto-seed).
+            # Seeds both MCP server grants AND external API host grants.
+            # Idempotent; runs at every startup so grants stay in sync with
+            # YASHIGANI_MCP_SERVERS + YASHIGANI_EXTERNAL_APIS.
+            # NOTE (4.0 Item A): external_api grants are now ENFORCED at
+            # runtime by orchestrator._execute_api_call().  Absent seed =
+            # deny-by-default for all api__ tool calls.
+            if permission_store is not None:
+                try:
+                    from yashigani.permissions import seed_mcp_grants
+                    import json as _json
+                    _mcp_raw = os.environ.get("YASHIGANI_MCP_SERVERS", "").strip()
+                    _server_ids: list = []
+                    if _mcp_raw:
+                        try:
+                            _server_ids = [
+                                str(e.get("agent_name", ""))
+                                for e in _json.loads(_mcp_raw)
+                                if isinstance(e, dict) and e.get("agent_name")
+                            ]
+                        except Exception:
+                            pass
+                    # 4.0 Item A — parse YASHIGANI_EXTERNAL_APIS to collect
+                    # approved external API hosts for org-level grant seeding.
+                    _ext_api_raw = os.environ.get("YASHIGANI_EXTERNAL_APIS", "").strip()
+                    _ext_api_hosts: list = []
+                    if _ext_api_raw:
+                        try:
+                            _ext_api_entries = _json.loads(_ext_api_raw)
+                            _ext_api_hosts = [
+                                str(e.get("host", "")).strip()
+                                for e in _ext_api_entries
+                                if isinstance(e, dict) and e.get("host", "").strip()
+                            ]
+                        except Exception as _parse_exc:
+                            logger.warning(
+                                "YASHIGANI_EXTERNAL_APIS invalid JSON — "
+                                "external_api grants not seeded: %s",
+                                _parse_exc,
+                            )
+                    seed_mcp_grants(
+                        perm_store=permission_store,
+                        server_ids=_server_ids,
+                        org_id=_perm_org_id,
+                        external_api_hosts=_ext_api_hosts or None,
+                    )
+                    logger.info(
+                        "Permission seeder: seeded %d MCP server grant(s) + "
+                        "%d external_api grant(s) for org=%s",
+                        len(_server_ids), len(_ext_api_hosts), _perm_org_id,
+                    )
+
+                    # v4.0 Item B — reconcile name-keyed grants to mcp_id-keyed grants.
+                    # On first startup after upgrade, existing grants may be stored at
+                    # agent_name keys; copy them to mcp_id keys so the new broker path
+                    # (which uses mcp_id as grant key) passes correctly.
+                    if _mcp_id_store is not None:
+                        _reconcile_total = 0
+                        try:
+                            for _sn in _server_ids:
+                                if not _sn:
+                                    continue
+                                _mid = _mcp_id_store.get_mcp_id_for_name(_sn)
+                                if _mid:
+                                    _reconcile_total += _mcp_id_store.reconcile_grants(
+                                        permission_store, _perm_org_id, _sn, _mid,
+                                    )
+                            logger.info(
+                                "mcp-id-store: reconciled %d name→id grant(s) for org=%s",
+                                _reconcile_total, _perm_org_id,
+                            )
+                        except Exception as _rec_exc:
+                            logger.warning(
+                                "mcp-id-store: grant reconcile failed (non-fatal): %s",
+                                _rec_exc,
+                            )
+
+                except Exception as _seed_exc:
+                    # Seeding failure is non-fatal at startup but deny-by-default
+                    # will apply to ALL MCP servers + external API hosts until
+                    # the next restart seeds them.
+                    logger.warning(
+                        "Permission seeder FAILED (%s) — deny-by-default "
+                        "applies to all MCP servers + external API hosts until next restart",
+                        _seed_exc,
+                    )
+
+            # v4.1 Phase 2b (Seam-3 — OPA grants/baselines re-push on start):
+            # Push data.yashigani.mcp.{grants, baselines} to OPA so that OPA
+            # restarts (which wipe in-memory data) do NOT permanently deny all
+            # MCP invocations.  Non-fatal: OPA may not yet be reachable at
+            # gateway startup (they start concurrently); invocations will deny
+            # fail-closed until a subsequent push succeeds.  A Phase-3 broker
+            # health task will re-push on OPA reconnect.
+            if _mcp_durable_store is not None and _mcp_id_store is not None:
+                try:
+                    from yashigani.mcp._opa_push import push_mcp_opa_data
+                    _mcp_opa_doc = _mcp_durable_store.build_mcp_opa_data(
+                        _mcp_id_store, _perm_org_id,
+                    )
+                    push_mcp_opa_data(opa_url, _mcp_opa_doc)
+                    logger.info(
+                        "MCP OPA startup push: %d grant(s) + %d baseline(s) "
+                        "pushed to OPA (Seam-3)",
+                        len(_mcp_opa_doc.get("grants", {})),
+                        len(_mcp_opa_doc.get("baselines", {})),
+                    )
+                except Exception as _opa_push_exc:
+                    logger.warning(
+                        "MCP OPA startup push FAILED (non-fatal) — invocations "
+                        "will deny until OPA is reachable and data re-pushed "
+                        "(Seam-3): %s", _opa_push_exc,
+                    )
+        else:
+            _mcp_registry = None
+            _mcp_jwks_store = None
+            logger.info("MCP broker wiring: no servers configured (YASHIGANI_MCP_SERVERS unset)")
+
+    except Exception as exc:
+        # Fail-closed: MCP wiring failure must not silently degrade.
+        # Log the error and raise so the gateway exits non-zero at startup.
+        logger.exception("MCP broker wiring failed at startup: %s", exc)
+        raise RuntimeError(
+            f"MCP broker wiring failed — gateway cannot start safely: {exc}"
+        ) from exc
+
+    # ── v4.1 unified-sidecar Phase 1 (Lu M1) — egress_grants startup push ───
+    # Push data.yashigani.mcp.egress_grants (durable-store grants + the
+    # transitional bundled-system seed) UNCONDITIONALLY — the Seam-3 full push
+    # above only runs when YASHIGANI_MCP_SERVERS is configured AND the durable
+    # store is wired, but the (caller, prefix) grant model applies to EVERY
+    # /egress/eval request (closed world: no data in OPA = deny ALL egress,
+    # including pre-migration openclaw traffic that the static Caddy pins
+    # admit at the transport layer).  Sub-path PUT — never touches
+    # grants/baselines.  Deliberately non-fatal (matches the Seam-3 posture:
+    # OPA starts concurrently; egress denies fail-closed until a push lands).
+    try:
+        from yashigani.mcp._egress_grants import build_egress_grants_doc
+        from yashigani.mcp._opa_push import push_egress_grants
+        _egress_grants_doc = build_egress_grants_doc(_mcp_durable_store)
+        push_egress_grants(opa_url, _egress_grants_doc)
+        logger.info(
+            "egress-grants startup push: %d (caller, prefix) grant(s) pushed "
+            "to OPA (v4.1 Phase 1 / Lu M1)",
+            len(_egress_grants_doc),
+        )
+    except Exception as _egress_push_exc:  # noqa: BLE001 — deny-until-pushed is fail-closed
+        logger.warning(
+            "egress-grants startup push FAILED (non-fatal) — ALL /egress/eval "
+            "requests deny with caller_not_granted_prefix until OPA is "
+            "reachable and the data re-pushed (fail-closed, v4.1 Phase 1): %s",
+            _egress_push_exc,
+        )
+
+    # ── Signed orchestration-principal machinery (#47 / G-NEW-5 / R3) ─────────
+    # The gateway SIGNS the orchestration principal (ES384, the SAME signing key
+    # the MCP broker uses) bound to the caller's SPIFFE identity, and VERIFIES it
+    # (SPIFFE-bound + jti replay-deduped) on re-entry — so the agent-to-agent OPA
+    # adjudication receives the principal as a VERIFIED fact, not a trusted
+    # header.  Fail-closed: a key/FIPS misconfiguration (or a missing persistent
+    # key in production/staging) raises here at startup, not at request time.
+    _principal_tenant_id = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+    try:
+        from yashigani.gateway.principal_token import build_principal_machinery
+        _principal_signer, _principal_verifier = build_principal_machinery(
+            tenant_id=_principal_tenant_id,
+        )
+        logger.info(
+            "orchestration-principal: signer+verifier wired (tenant=%s) — "
+            "agent principal is now a verified signed claim (#47/G-NEW-5)",
+            _principal_tenant_id,
+        )
+    except Exception as exc:
+        logger.exception("orchestration-principal machinery wiring failed: %s", exc)
+        raise RuntimeError(
+            f"orchestration-principal machinery wiring failed — gateway cannot "
+            f"start safely (fail-closed, #47/G-NEW-5): {exc}"
+        ) from exc
 
     gateway_app = create_gateway_app(
         config=cfg,
@@ -648,13 +1147,21 @@ def _build_app(mesh_mode: bool = False):
         jwt_inspector=jwt_inspector,
         endpoint_rate_limiter=endpoint_rate_limiter,
         response_cache=response_cache,
-        fasttext_backend=fasttext_backend,
+        classifier_backend=classifier_backend,
         inference_logger=inference_logger,
         anomaly_detector=anomaly_detector,
         response_inspection_pipeline=response_pipeline,
-        extra_routers=[openai_router],
+        extra_routers=_extra_routers,
         pii_detector=pii_detector,
         ddos_protector=ddos_protector,
+        mcp_broker_registry=_mcp_registry,
+        mcp_jwks_store=_mcp_jwks_store,
+        document_pipeline=document_pipeline,
+        principal_signer=_principal_signer,
+        principal_verifier=_principal_verifier,
+        principal_tenant_id=_principal_tenant_id,
+        capability_policy_store=capability_policy_store,  # 3.0
+        workflow_scheduler=workflow_scheduler,
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 
@@ -707,6 +1214,8 @@ def _build_app(mesh_mode: bool = False):
         inspection_pipeline=pipeline,
         rbac_store=rbac_store,
         agent_registry=agent_registry,
+        pool_manager=pool_manager,
+        budget_enforcer=budget_enforcer,
         poll_interval_seconds=15,
     )
     collector.start()

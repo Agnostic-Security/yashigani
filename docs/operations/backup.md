@@ -228,15 +228,120 @@ bash scripts/preflight.sh
 
 ---
 
+## Security properties
+
+> This section covers the install-time backup produced by `install.sh` `_backup_existing_data()`
+> (v2.25.0+, closes YSG-RISK-050/051). The operator backup produced by `scripts/backup.sh` uses
+> age asymmetric encryption (see sections above).
+
+The install-time backup uses a dual-wrap AES-256-GCM envelope (CNSA-2.0 symmetric suite,
+Nico-verified). The bundle is encrypted with a random DEK wrapped under two independent KEKs —
+EITHER wrap can recover the DEK.
+
+### Wrap#1 — admin-password path (everyday restore)
+
+- The admin password **is not stored** in the backup. At backup time, the raw 32-byte argon2
+  verifier (V) is extracted from the stored PHC in the database; V is used as IKM for
+  HKDF-SHA384 → KEK1. No argon2 call is made at backup time; no plaintext password is needed.
+- At restore time, `argon2id_raw(typed_plaintext, argon2_salt_from_meta, params_from_meta)` is
+  computed. If the password is unchanged this equals V → same KEK1 → successful unwrap.
+- argon2 parameters (salt, time_cost, memory_cost, parallelism, version) are stored in
+  `backup-meta.json` in cleartext. This is sound: the salt is non-secret (already in the DB PHC).
+
+### Wrap#2 — recovery path (license/local-key)
+
+- **Licensed tier:** IKM2 = raw bytes of the `.ysg` license file. To recover, restore the
+  **same `.ysg` file that was current when the backup was taken** and pass it to
+  `restore.sh --recovery-license <file>`. The backup's `backup-meta.json` records the
+  `license_key_id` so you can identify which `.ysg` version a given backup was encrypted under.
+- **Community tier:** IKM2 = `YASHIGANI_DB_AES_KEY` from `docker/.env`. This key is LOCAL —
+  **there is NO portal recovery**. If you lose both the backup and your `.env`, the backup is
+  unrecoverable. **Safeguard and offsite your `.env` before taking backups.**
+
+### License rotation and backup compatibility (READ BEFORE ROTATING A LICENSE)
+
+Wrap#2 (licensed tier) is derived from the exact bytes of the `.ysg` file. **When you renew or
+rotate your license, the new `.ysg` produces a different key — backups encrypted under the OLD
+license can no longer be decrypted with the NEW one** via the recovery path. Wrap#1 (admin
+password) is unaffected by license rotation, but it is itself broken by an admin-password change
+and is absent under `FIPS_MODE=1`, so do not rely on it as the sole recovery path.
+
+> **INTERIM LIMITATION (v2.25.0):** portal-side retention of prior `.ysg` versions is **not yet
+> available**. Until it ships you MUST, before renewing/rotating a license, EITHER:
+> 1. **Archive the old `.ysg`** offsite/secure (label it with its `license_id` / date), so you can
+>    later restore prior backups via `restore.sh --recovery-license <old.ysg>`; OR
+> 2. **Re-encrypt** the backups you need to keep by restoring them under the old license and
+>    taking a fresh backup under the new one.
+>
+> Do not rotate a license while you still depend on backups taken under the old one without doing
+> one of the above first — those backups would otherwise become unrecoverable via wrap#2.
+
+### FIPS_MODE=1
+
+Under `FIPS_MODE=1`, wrap#1 (admin-password path) is **ABSENT** — there is NO password-recovery
+path. Only wrap#2 (license/local-key) is written. This is inherent: argon2id is not FIPS-approved,
+and PBKDF2 cannot reproduce an argon2 verifier (different function, different output). Restore under
+FIPS requires `--recovery-license` or `--recovery-key`.
+
+### DB-holder property (inherent, documented)
+
+Because KEK1 = HKDF(V) and V is the stored verifier, **an attacker holding the live database
+obtains V directly and can derive KEK1 without knowing the plaintext password.** This is inherent
+to non-interactive backup with password recovery — there is no sound alternative (Nico-confirmed).
+
+This is acceptable for the intended threat model: backups exist for disaster recovery (database
+gone → password is the credential). An attacker with both the live database and the backup file
+already owns the running system.
+
+**wrap#1 separates the backup from an attacker who holds the backup file but not the live DB.**
+**An attacker holding BOTH the live DB (which contains the stored verifier V) and the backup file
+can derive KEK1 without knowing the plaintext password. wrap#2 (license/local-key) is the
+protection against an attacker holding both assets; it requires a separate credential not stored
+in the DB.**
+
+### Integrity and tamper protection
+
+- `backup-meta.json` is covered by HMAC-SHA384 (MAC_KEY derived via HKDF-SHA384 from the DEK).
+  The HMAC is verified before any decryption attempt; tampered metadata causes fail-closed.
+- `bundle.enc` is AES-256-GCM; the GCM tag authenticates both ciphertext and `backup-meta.json`
+  (passed as AAD). Tampering with either causes fail-closed (InvalidTag).
+- AAD includes version string + timestamp + wrap-id byte — prevents cross-backup and cross-wrap
+  substitution attacks.
+
+### Key hierarchy summary
+
+```
+DEK = os.urandom(32)
+MAC_KEY = HKDF-SHA384(DEK, info="yashigani-backup-meta-mac-v1", len=48)
+-- Wrap#1 (FIPS_MODE=0 only) --
+  V = base64decode(PHC_hash_segment)  # NO argon2 call at backup
+  KEK1 = HKDF-SHA384(V, kek1_hkdf_salt, info="yashigani-kek1-v1", len=32)
+  WDEK1 = AES-256-GCM(KEK1, IV1, aad="yashigani-backup-v1"+ts+\x01, pt=DEK)
+-- Wrap#2 (always) --
+  IKM2 = .ysg bytes (licensed) | YASHIGANI_DB_AES_KEY (community)
+  KEK2 = HKDF-SHA384(IKM2, kek2_hkdf_salt, info="yashigani-kek2-v1", len=32)
+  WDEK2 = AES-256-GCM(KEK2, IV2, aad="yashigani-backup-v1"+ts+\x02, pt=DEK)
+-- Bundle --
+  CT = AES-256-GCM(DEK, IV_B, aad=meta_bytes_with_hmac_hex="", pt=gzip_tar)
+  hmac_hex = HMAC-SHA384(MAC_KEY, aad_bytes)
+```
+
+All salts are per-backup random (stored in `backup-meta.json`). No fixed derived-key files.
+
+---
+
 ## Compliance notes
 
 | Control | Standard | Status |
 |---------|----------|--------|
 | MP.L2-3.8.9 | CMMC L2 | CLOSED — backups encrypted with AES-256-GCM via age |
 | CWE-312 | CWE | CLOSED — no cleartext sensitive data at rest in backup archives |
+| YSG-RISK-050 | Internal | CLOSED — install-time backup: AES-256-GCM dual-wrap (v2.25.0+) |
+| YSG-RISK-051 | Internal | CLOSED — install-time backup: HMAC-SHA384 manifest integrity (v2.25.0+) |
+| YSG-RISK-052 | Internal | DOCUMENTED — community tier: local-key-only, no portal recovery; see above |
 
-Evidence artefact: `scripts/backup.sh` + this document.
+Evidence artefact: `scripts/backup.sh` + `install.sh` `_backup_existing_data()` + this document.
 
 ---
 
-*Last updated: 2026-05-09T00:00:00+01:00 — v2.23.3*
+*Last updated: 2026-05-28T00:00:00+01:00 — v2.25.0 (Security properties section added — YSG-RISK-050/051/052; Nico ruling 2026-05-28)*

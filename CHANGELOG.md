@@ -34,6 +34,75 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [3.0.0] — 2026-06-25 — GA (combined 3.0 + 3.1 + 2.25.5 convergence)
+
+First public 3.x GA. Folds the 2.25.5 finalization line into the 3.x line (which
+already contained all of 3.0 and the 3.1 batch-1 work) for a single release.
+Mustui-only build + curated public release per the repo-route policy.
+
+### Headline
+- **Document-content data protection (doc-OPA):** policy-driven pass / redact (delete) /
+  pseudonymise (reversible) / block on document content, with the four self-describing
+  verdict actions; hardened HTTP extractor service (no docker socket in backoffice).
+- **Agent orchestration with every-hop OPA:** every inter-entity hop (agent↔agent/LLM/
+  human/API/MCP) adjudicated at ingress AND egress; gateway sole-mediator, no in-process
+  shortcut; SPIFFE/SVID identity projected to OPA.
+- **MCP hardening:** identity-JWT broker, import-binding, egress OPA, tool-poisoning /
+  shadowing / confused-deputy mitigations.
+- **cloud-9 MCP-injection demo:** `cloud9-orchestrate` virtual model + ResponseInspection
+  egress block — a rogue MCP's credential-exfil payload is blocked before reaching the caller.
+- **OpenWebUI served at ROOT** (OWUI v0.9.2 ignores `WEBUI_BASE_URL`; the `/app/webui`
+  subpath never rendered) behind the verify-user + owui-users access gate; default user role
+  active; RAG embeddings via `nomic-embed-text`.
+
+### Converged from the 2.25.5 finalization
+- CSP single-at-edge (YSG-RISK-081), OPA `norm_path` adjudication (YSG-RISK-082), TOTP
+  re-provision step-up (YSG-RISK-083), gold-plated JWKS SSRF guard retained (YSG-RISK-084),
+  install convergence-gate self-heal + postgres `start_period` 300s (YSG-RISK-085).
+- OWUI-at-root revert, `WEBUI_DEFAULT_USER_ROLE=user`, owui-users access gate, demo-mcp
+  built-from-source + cloud-9 wiring, 8 committed demo OPA policies + the demo seed script.
+
+### Security (pre-release gate — Laura full SAST+DAST+tooling pentest: RELEASE-CLEAR)
+- **YSG-RISK-086 (MED):** login throttle no longer collapses all clients to the Caddy IP —
+  keys on the real peer via `X-Real-IP` (unspoofable); fixes an admin-lockout DoS. Live-verified.
+- **YSG-RISK-087 (LOW):** constant-time dummy-hash on the unknown-user path closes username
+  timing enumeration. Live-verified.
+- **YSG-RISK-088 (LOW, accepted→v3.0.1):** Caddy upstream Go-stdlib CVEs — mitigated (mTLS +
+  request limits); base-image bump tracked for v3.0.1.
+- FIND-3.0-001 SIEM SSRF (previously release-blocking) confirmed fixed live.
+
+### Quality gate
+- Ava exhaustive functional QA: **83/83** assertions (admin + user UI one-by-one, API↔WebUI
+  parity, 4 demo scenarios, 11 security/adversarial). Clean-from-scratch install verified green.
+- Demo-seed reliability fixes: FIND-DEMO-CREDS (YSG-RISK-090, save rotated user pw),
+  cloud-9 benign-vs-injection contrast (ana ceiling). FIND-OWUI-001 (YSG-RISK-089) open→v3.0.1.
+
+### Post-tag hardening (release-polish pass)
+- **OPA/UX message polish.** User-facing block messages humanised: "sensitivity
+  clearance" → "data classification clearance"; the seed-deny shows a human message
+  (raw code kept in `code`/header); the brain no longer says "try again later" on a
+  policy block. The per-hop orchestration transcript no longer leaks raw OPA internals
+  to end users — it emits an **opaque, stable, non-sequential coded tuple**
+  (`<tooluid>:<depth>:<status>:<leg>:<action>:<reason>`) decoded by
+  `docs/decision-code-legend.yml` / `scripts/decode-steps.py` (full reason stays in the
+  audit sink). Live-verified: cloud-9 injection → human block + coded transcript;
+  benign → passes.
+- **Installer robustness.** Fixed the `install.sh` `do_wait` hang after the completion
+  banner (tee coprocess never got EOF → zombie installers) and added a **flock**-based
+  concurrency guard (one installer per host; fail-open).
+- **GitHub security review (now a standing pre-release gate item).** Dependabot +
+  code-scanning triaged: 1 real fix path reviewed, the rest dismissed-with-comments
+  (false-positive / used-in-tests / not-exploitable) + registered. YSG-RISK-091
+  (cryptography bundled-OpenSSL) and YSG-RISK-088 (Caddy Go-stdlib CVEs) confirmed
+  **not exploitable + externally-blocked** (no patched upstream release yet) → v3.0.1.
+  YSG-RISK-092: flagged-token clear-text logging kept by design (forensics + SIEM),
+  compensating control = encrypted log/audit storage at rest (operator-guide §8).
+- **Docs/process.** SECURITY.md → v3.0.x supported versions + SSH signing; release SOP
+  gains the GitHub-security-review item + a "real-rendered-UI (no JSON/404)" anti-false-pass
+  rule; new convergence SOP (commit-by-commit, not marker-grep).
+
+---
+
 ## [Unreleased] — v2.24.3
 
 ### Fixed
