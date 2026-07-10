@@ -6434,7 +6434,14 @@ WAZUH_UNSHARE_EOF
         done
 
         # Step 1: CA bundle (intermediate + root) — HTTP-layer trust anchor
-        cat "${_wm_tmpdir}/ca_int.crt" "${_wm_tmpdir}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+        # _safe_read_secret captures via $() which strips trailing newlines, so each
+        # temp file lacks the final \n. Use an explicit printf '\n' separator so the
+        # two PEM blocks join as '-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----'
+        # rather than '-----END CERTIFICATE----------BEGIN CERTIFICATE-----', which
+        # Java X509Factory rejects with exit 255 (wazuh-security-init failure).
+        # (fix: #DOCKER-NONROOT-WAZUH-BUNDLE-1)
+        { cat "${_wm_tmpdir}/ca_int.crt"; printf '\n'; cat "${_wm_tmpdir}/ca_root.crt"; } \
+          > "${wp}/certs/http-ca-bundle.pem"
 
         # Step 2: wazuh-admin leaf signed by internal intermediate (mirrors unshare path)
         openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
