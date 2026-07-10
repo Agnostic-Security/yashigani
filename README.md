@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-06-25T00:00:00+01:00 -->
+<!-- last-updated: 2026-07-10T00:00:00+01:00 -->
 # Yashigani
 ---
 
@@ -16,12 +16,14 @@
 *Yashigani — Proactive compliance enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.25.5 (2026-06-25) — an auth/ingress rebuild (a single authenticated portal with role-based routing to `/admin` for admins and the chat surface at the root `/` for end users, end-user logout, deny-by-default preserved), a full admin-UX refinement layer, and a security hardening pass. The admin-UX layer brings working CRUD across the back office, a policy lifecycle (draft→staging→production) with an AI policy dry-run, plain-English detection-pattern authoring, a numeric sensitivity taxonomy with per-tenant labels, second-admin enforcement, self-hosted auth-gated OpenAPI/ReDoc docs, a Postgres-backed durable identity store, and a dashboard redesign. The hardening pass adds an SSRF guard on JWKS URL resolution (https-only + non-public-IP block), OPA decision-path normalisation (fixes the public MCP JWKS endpoint, previously failing closed), a fresh step-up requirement to re-provision an existing TOTP authenticator (first-time enrolment unaffected), and a single canonical Content-Security-Policy header. Open WebUI is now served at the root `/` for reliable rendering (v0.9.2), RAG file-upload embeddings are fixed (`nomic-embed-text` pulled on install), new user accounts are active by default, and a self-healing convergence gate plus a longer Postgres first-boot window let clean installs converge unattended. Built on v2.25.4 — gateway-mediated agent/tool orchestration (every inter-entity hop policy-adjudicated at ingress and egress) and model-allocation RBAC enforced on the inference path, with a visible model-pin deny, an identity-header trust gate, GPU-bound inference, and model warmup/keep-alive to remove cold-start latency. See `CHANGELOG.md` for the full release history.
+**Latest Tagged Release:** v3.1.1 (2026-06-29) — the first public 3.x GA line. **3.0 GA** delivers document-content data protection (policy-driven pass / redact / pseudonymise / block on document content, with self-describing verdict actions and a hardened HTTP extractor service), agent orchestration with every inter-entity hop OPA-adjudicated at ingress *and* egress (the gateway is the sole mediator; no agent holds direct network reach to an upstream), and MCP hardening (identity-JWT broker, import-binding, egress policy, and tool-poisoning / shadowing / confused-deputy mitigations), on top of the authenticated single-portal ingress with Open WebUI served at the root `/`. **3.1** adds the unified authorization model: an org-ceiling, deny-by-default permission model (subject × resource-type × value), per-agent connection allow-lists for MCP and external APIs bound to caller identity, enforced tool allow-lists, an SSRF guard on MCP forwarding, cloud-LLM deny-by-default coupled to mandatory OPA data-protection (fail-closed), role-tiered TOTP, an admin permission API + WebUI, and audit-chained grant changes. **v3.1.1** is a least-privilege topology hardening: the inference runtime no longer sits on the edge network, removing runtime internet egress (model pulls are handled at install time only). See `CHANGELOG.md` for the full release history.
+
+> **🦀 Yashigani 4.0 is now in Beta (early-access).** The next major release moves the whole experience in-house — a first-class native UI we build and own, a uniform security sidecar around every agent, out-of-the-box visual and stateful agent building, multi-platform GPU (NVIDIA / AMD / Apple Silicon / Intel, Linux & macOS), usage metering and caps, and stronger data-at-rest crypto — with every action still policy-governed on every call. Early-access beta is open to design partners; get in touch or watch this repo. **Watch this crab! 🦀**
 
 ---
-### 🦀 Coming next — Yashigani 3.0 *(early-access beta)*
+### 🦀 Now shipped — Yashigani 3.x *(GA)*
 
-The next major release is now in **early-access beta**. What's coming:
+The 3.x GA line delivers what the 2.x line pointed toward:
 
 - **File redaction & pseudonymisation, in-flight** — proportionate enforcement beyond log/block: sensitive data in prompts, responses and documents is **redacted or pseudonymised** as it crosses the gateway (`Log · Redact · Pseudonymise · Block`).
 
@@ -31,9 +33,9 @@ The next major release is now in **early-access beta**. What's coming:
   
 - **Security-mediated agent orchestration** — agents can fan out to other agents, LLMs and MCP tools, and **every hop is OPA-adjudicated at ingress *and* egress, up to 9 nested levels**; no agent ever holds direct network reach to an upstream.
 - **Tool-result inspection** — a poisoned MCP tool result or a compromised API response is inspected and **blocked before it re-enters an agent's context**.
-- **Multi-instance / HA** and **MCP capability-envelope pinning**.
+- **Unified authorization + MCP hardening** — org-ceiling deny-by-default permissions, per-agent connection allow-lists (MCP + external API) bound to caller identity, and MCP identity-JWT brokering with tool-poisoning / shadowing / confused-deputy mitigations.
 
-Early-access beta is open to design partners — get in touch or watch this repo. **Watch this crab! 🦀**
+The next major release — **Yashigani 4.0** — is now in early-access beta (see the note above). Early-access beta is open to design partners — get in touch or watch this repo. **Watch this crab! 🦀**
 
 > **Upgrade notice (v2.25.0+):** Backup format changed to dual-wrap AES-256-GCM with argon2id KEK; legacy age-encrypted archives are not forward-compatible — migrate before upgrading. TLS 1.2 is disabled on the internal mesh (TLS 1.3 minimum from v2.25.1); internal clients must support TLS 1.3.
 
@@ -42,7 +44,7 @@ Early-access beta is open to design partners — get in touch or watch this repo
 ---
 **Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-06-25
+**Document Date:** 2026-07-10
 ---
 **Classification:** ***Public — Product Overview***
 ---
@@ -204,7 +206,7 @@ These run alongside the supply-chain controls in §5 (SHA-pinned GitHub Actions,
 
 ## 7. Current Release Highlights
 
-The current release is **v2.25.5**. The v2.23 line established the core security foundation (mTLS, OPA, PKI, audit chain, BOPLA, air-gap); the v2.24 series hardened the K8s/Helm path, shipped FIPS 140-3 alignment, signed+encrypted backups, and addressed pgbouncer auth cycles; the v2.25 series enforces TLS 1.3 on the internal mesh, ships the Wazuh SIEM full-stack integration, closes the audit DB and OPA hardening backlog, delivers gateway-mediated agent/tool orchestration with model-allocation RBAC, and lands the auth/ingress rebuild, the full admin-UX refinement layer, and a security hardening pass. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+The current release is **v3.1.1** (the first public 3.x GA line). The v2.23 line established the core security foundation (mTLS, OPA, PKI, audit chain, BOPLA, air-gap); the v2.24 series hardened the K8s/Helm path, shipped FIPS 140-3 alignment, signed+encrypted backups, and addressed pgbouncer auth cycles; the v2.25 series enforced TLS 1.3 on the internal mesh, shipped the Wazuh SIEM full-stack integration, closed the audit DB and OPA hardening backlog, delivered gateway-mediated agent/tool orchestration with model-allocation RBAC, and landed the auth/ingress rebuild, admin-UX refinement layer, and a security hardening pass. The **3.x GA line** folds that finalization together and adds document-content data protection (pass / redact / pseudonymise / block), every-hop agent orchestration with OPA at ingress and egress, MCP hardening, and the unified org-ceiling deny-by-default authorization model. **Yashigani 4.0 is now in early-access beta.** For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
 
 ### v2.25.5 — Auth/Ingress Rebuild, Admin-UX Refinement Layer, and Security Hardening Pass
 

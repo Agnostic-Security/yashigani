@@ -1,8 +1,8 @@
 # AI Assets Inventory
 
 **Product:** Yashigani MCP Security Gateway
-**Version:** 2.25.5
-**Last updated:** 2026-06-25T00:00:00+01:00
+**Version:** 3.1.1
+**Last updated:** 2026-07-10T00:00:00+01:00
 **ACS control:** ASSET.1 — AI model inventory file required at repo root
 **Asset owners:** Gateway engineering, container engineering, and product ownership (Agnostic Security Ltd)
 
