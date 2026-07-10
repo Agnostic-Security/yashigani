@@ -34,6 +34,16 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.extractor
+      # Proxy build-args — mirror the base compose pattern (${VAR:-} is a no-op on
+      # direct-internet builds). When -f base -f overlay are merged by compose,
+      # the overlay build: block REPLACES the base block — proxy args must be
+      # repeated here or pip install inside the container cannot reach PyPI behind
+      # a corporate proxy. Dockerfile.extractor declares ARG HTTP/HTTPS/NO_PROXY.
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     # Build-only: this service is NEVER started by `up`. The gateway spawns
     # per-job instances from the image. The unsatisfiable profile keeps it out
     # of the default `up` set while still being built by `build extractor`.

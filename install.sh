@@ -6614,6 +6614,39 @@ _provision_audit_signing_key() {
     _is_rootless_podman=true
   fi
 
+  # -------------------------------------------------------------------------
+  # Docker Linux non-root audit-signing fix (gate #DOCKER-NONROOT-AUDIT-1):
+  #
+  # On Linux+Docker non-root the PKI bootstrap (which ran inside yashigani/gateway
+  # as UID 1001) chowns secrets/ to UID 1001 via an ephemeral alpine container.
+  # The host installer (e.g. UID 1000) cannot mkdir or write inside that tree →
+  # EPERM → empty key → fail-closed abort.
+  #
+  # Fix: when running Linux+Docker+non-root, execute the mkdir+openssl block
+  # inside a throwaway Docker container as --user 1001:1001, reusing
+  # yashigani/gateway (already present — the PKI issuer used it at step 9b).
+  # Files are created with UID 1001:1001 ownership from the start, matching what
+  # the backoffice container expects when it bind-mounts /run/audit-signing.
+  # openssl CLI is available in yashigani/gateway: python:3.14.5-slim ships
+  # ca-certificates which depends on the openssl Debian package.
+  #
+  # Scope: Linux+Docker+non-root only.
+  #   macOS+Docker: virtiofs UID remapping means the direct path works there
+  #     (installer UID maps to UID 0 inside Colima VM; PKI-chown ephemeral
+  #     container made secrets/ UID 1001 from inside the container, not the
+  #     host stat). Direct path unchanged for macOS.
+  #   Root (id==0): direct path unchanged.
+  #   Podman rootless: handled by the podman unshare block above.
+  #   Podman rootless fallback (unshare unavailable): _is_rootless_podman set
+  #     to false but _is_docker_nonroot remains false → direct path (unchanged).
+  # -------------------------------------------------------------------------
+  local _is_docker_nonroot=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]]; then
+    _is_docker_nonroot=true
+  fi
+
   if [[ "$_is_rootless_podman" == "true" ]]; then
     # Rootless Podman path: run the full openssl block inside podman unshare.
     # Variables (asd/keyf/crtf/secrets) are expanded host-side before the
@@ -6656,7 +6689,85 @@ UNSHARE_EOF
   fi
 
   if [[ "$_is_rootless_podman" == "false" ]]; then
-    # Docker / rootful Podman / macOS / fallback from unshare-unavailable path.
+    # --- Docker Linux non-root sub-path (gate #DOCKER-NONROOT-AUDIT-1) -------
+    # secrets/ is owned UID 1001 (set by the PKI bootstrap). The host installer
+    # (non-root) cannot mkdir inside it. Provision entirely inside a throwaway
+    # container running as --user 1001:1001 so files are born with the correct
+    # owner and the backoffice container can read the key at /run/audit-signing.
+    if [[ "$_is_docker_nonroot" == "true" ]]; then
+      # yashigani/gateway is guaranteed present (PKI issuer used it at step 9b).
+      # Try YASHIGANI_VERSION first, fall back to :latest (same as _pki_run_issuer).
+      local _audit_dkr_image=""
+      local _audit_dkr_tag
+      for _audit_dkr_tag in "${YASHIGANI_VERSION:-}" "latest"; do
+        [[ -z "$_audit_dkr_tag" ]] && continue
+        if docker image inspect "yashigani/gateway:${_audit_dkr_tag}" >/dev/null 2>&1; then
+          _audit_dkr_image="yashigani/gateway:${_audit_dkr_tag}"
+          break
+        fi
+      done
+      if [[ -z "$_audit_dkr_image" ]]; then
+        log_error "Audit signing-key (Docker non-root): yashigani/gateway not found in local image store"
+        log_error "  Fix: compose build must complete before this step, or re-run installer as root"
+        return 1
+      fi
+      # Script runs as UID 1001 inside the container; secrets/ is bind-mounted
+      # at /s (same /s convention as _pki_run_issuer and _safe_write_secret).
+      # Temp extfile lives inside /s/audit-signing/ (never /tmp — repo policy).
+      # set -eu: POSIX sh compatible (dash); no pipefail needed (no pipelines).
+      # Heredoc uses single-quoted delimiter so no host-side variable expansion.
+      local _dkr_audit_script
+      _dkr_audit_script=$(cat <<'DKRAUDIT'
+set -eu
+umask 077
+mkdir -p /s/audit-signing
+openssl ecparam -genkey -name prime256v1 \
+  -out /s/audit-signing/.audit-sec1.pem 2>/dev/null
+openssl pkcs8 -topk8 -nocrypt \
+  -in /s/audit-signing/.audit-sec1.pem \
+  -out /s/audit-signing/audit_signing.key 2>/dev/null
+rm -f /s/audit-signing/.audit-sec1.pem
+openssl req -new -key /s/audit-signing/audit_signing.key \
+  -out /s/audit-signing/.audit.csr \
+  -subj '/O=Agnostic Security/CN=audit-checkpoint-signer' 2>/dev/null
+printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+  > /s/audit-signing/.audit-ext.cnf
+openssl x509 -req \
+  -in /s/audit-signing/.audit.csr \
+  -CA /s/ca_intermediate.crt \
+  -CAkey /s/ca_intermediate.key \
+  -CAcreateserial -days 825 \
+  -out /s/audit-signing/audit_signing.crt \
+  -extfile /s/audit-signing/.audit-ext.cnf 2>/dev/null
+rm -f /s/audit-signing/.audit.csr /s/audit-signing/.audit-ext.cnf /s/ca_intermediate.srl
+chmod 0640 /s/audit-signing/audit_signing.key
+chmod 0644 /s/audit-signing/audit_signing.crt
+chmod 0750 /s/audit-signing
+[ -s /s/audit-signing/audit_signing.key ] && [ -s /s/audit-signing/audit_signing.crt ]
+DKRAUDIT
+)
+      # --network none: no I/O needed; cuts accidental exfil (same as PKI issuer).
+      # --security-opt no-new-privileges: belt-and-suspenders for the gateway image.
+      # :rw,Z: SELinux relabelling (no-op on non-SELinux hosts).
+      if docker run --rm \
+             --user 1001:1001 \
+             --network none \
+             --security-opt no-new-privileges \
+             --volume "${secrets}:/s:rw,Z" \
+             "$_audit_dkr_image" \
+             sh -c "$_dkr_audit_script"; then
+        log_info "Audit signing key generated + verified via Docker container as UID 1001 (Linux non-root — gate #DOCKER-NONROOT-AUDIT-1)"
+        log_success "Audit-chain signing key provisioned (docker/secrets/audit-signing/, backoffice-only, git-ignored)"
+        return 0
+      else
+        log_error "Audit signing-key provisioning: Docker container (UID 1001) exited non-zero — openssl or mkdir failed"
+        log_error "  Check: docker/secrets/ca_intermediate.crt and ca_intermediate.key must exist"
+        return 1
+      fi
+    fi
+    # -------------------------------------------------------------------------
+
+    # Docker / rootful Podman / macOS / root / fallback from unshare-unavailable.
     ( umask 077   # private key born owner-only
       mkdir -p "$asd"
       # EC P-256 key, converted to PKCS#8 (load_pem_private_key in chain.py expects PKCS#8).
