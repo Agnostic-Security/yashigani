@@ -8,6 +8,48 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [v3.1.1] — 2026-06-29
+
+Theme: **Least-privilege topology hardening**.
+
+### Security
+
+- **sec(topology): inference runtime removed from the edge network** — the long-running inference runtime no longer sits on the edge network, so it has no runtime internet egress; model pulls are handled at install time only. A least-privilege topology fix that preserves the no-bypass posture with no added capability.
+
+---
+
+## [v3.1.0] — 2026-06-28
+
+Theme: **Unified authorization model**.
+
+### Added
+
+- **feat(authz): org-ceiling deny-by-default permission model** — a unified permission model keyed on `subject × resource_type × value`, enforced under an organisation ceiling and deny-by-default throughout.
+- **feat(authz): per-agent connection allow-lists** — each agent carries an allow-list of the MCP servers and external APIs it may reach, bound to caller identity; `allowed_tools` is now enforced on the call path.
+- **feat(gateway): SSRF guard on MCP forwarding** — outbound MCP forwards are validated against the SSRF allow/block policy.
+- **feat(routing): cloud-LLM deny-by-default coupled to OPA data-protection** — cloud-LLM egress is deny-by-default and coupled to a mandatory OPA data-protection decision that fails closed.
+- **feat(auth): role-tiered TOTP** — TOTP strength is tiered by role (users and admins on distinct HMAC/digit profiles).
+- **feat(admin): permission API + WebUI** — administrators manage per-identity permissions through a dedicated API and back-office panel; grant changes are written to the tamper-evident audit chain.
+
+---
+
+## [3.0.0] — 2026-06-16 — GA
+
+First public 3.x GA. Folds the 2.25.5 finalization line into the 3.x line and adds the 3.0 feature set.
+
+### Added
+
+- **feat(dlp): document-content data protection (doc-OPA)** — policy-driven pass / redact (delete) / pseudonymise (reversible) / block on document content, with self-describing verdict actions, served by a hardened HTTP extractor service (no container socket in the back office).
+- **feat(orchestration): every-hop agent orchestration** — every inter-entity hop (agent↔agent / LLM / human / API / MCP) is OPA-adjudicated at ingress **and** egress; the gateway is the sole mediator with no in-process shortcut, and SPIFFE/SVID identity is projected to OPA.
+- **feat(mcp): MCP hardening** — identity-JWT broker, import-binding, egress policy, and tool-poisoning / shadowing / confused-deputy mitigations.
+- **feat(ingress): authenticated single portal** — Open WebUI is served at the root `/` behind the verify-user access gate, with the default user role active and RAG embeddings via `nomic-embed-text`.
+
+### Changed
+
+- Converges the 2.25.5 finalization (single-source CSP at the edge, OPA path normalisation, TOTP re-provision step-up, JWKS SSRF guard, install convergence-gate self-heal and a longer Postgres first-boot window) into the 3.x line.
+
+---
+
 ## [v2.25.5] — 2026-06-25
 
 Theme: **Auth/ingress rebuild + the full admin-UX refinement layer + security hardening pass** — a single authenticated portal with role-based routing, a top-to-bottom pass over the back-office admin experience, and a security hardening batch covering SSRF, OPA path normalisation, TOTP re-provision protection, and install robustness.

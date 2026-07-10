@@ -6,13 +6,13 @@ A single release line is actively maintained on the `main` branch. Open WebUI is
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| 2.23.1  | ✅ Current | Core-plane mTLS default-on, two-tier PKI (step-ca), seccomp + AppArmor default-on, full pre-release security and QA hardening |
-| 2.23.0  | ✅ Patch window | Single branch, API-first admin, strict CSP, compose profiles, opt-in internal CA |
-| 2.22.x  | ✅ Patch window | OPA on /v1, Wazuh SIEM, Grafana/Prometheus admin access, agent personas |
-| 2.20.x  | ❌ | Superseded by 2.22.x |
-| 2.1.x   | ❌ | Superseded by 2.20.x |
-| 2.0.x   | ❌ | Superseded by 2.1.x |
-| < 2.0   | ❌ | End of life |
+| 3.1.x   | ✅ Current | Unified org-ceiling deny-by-default authorization, per-agent connection allow-lists (MCP + external API), MCP hardening; least-privilege topology hardening in 3.1.1 |
+| 3.0.x   | ✅ Patch window | First public 3.x GA — document-content data protection (pass / redact / pseudonymise / block), every-hop OPA agent orchestration, MCP identity-JWT broker |
+| 2.25.x  | ✅ Patch window | TLS 1.3 internal mesh, Wazuh SIEM full stack, auth/ingress rebuild, admin-UX refinement layer, security hardening pass |
+| 2.24.x  | ❌ | Superseded by 2.25.x |
+| < 2.24  | ❌ | End of life |
+
+> **Yashigani 4.0** is in early-access beta. Beta builds are not covered by the supported-version guarantee above; report security issues found in the beta through the same coordinated-disclosure process.
 
 ## Reporting a Vulnerability
 
@@ -68,7 +68,7 @@ Agnostic Security does not operate a paid bug bounty programme. Researchers who 
 
 ## Release signing
 
-Version tags and release artifacts are GPG-signed by the Agnostic Security release key.
+Version tags and release artifacts are SSH-signed by the Agnostic Security release key (the signing scheme moved from GPG to SSH in 2026-05; the allowed-signers file is published in-repo and the verification recipe is in the README, section 5 "Verifying a Release").
 
 **Required repository secrets** (configure in Settings → Secrets → Actions):
 
