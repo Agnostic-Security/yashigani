@@ -6332,6 +6332,15 @@ _provision_wazuh_mtls() {
     _is_rootless_podman=true
   fi
 
+  # Docker Linux non-root detection (gate #DOCKER-NONROOT-WAZUH-1).
+  # Mirrors the same gate in _provision_audit_signing_key.
+  local _is_docker_nonroot=false
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]]; then
+    _is_docker_nonroot=true
+  fi
+
   if [[ "$_is_rootless_podman" == "true" ]]; then
     # Rootless Podman path — steps 1-3 read from secrets/ inside podman unshare.
     # ${wp} and ${secrets} are expanded host-side before the string reaches unshare;
@@ -6377,25 +6386,112 @@ WAZUH_UNSHARE_EOF
   fi
 
   if [[ "$_is_rootless_podman" == "false" ]]; then
-    # Docker / rootful Podman / macOS / fallback from unshare-unavailable path.
+    if [[ "$_is_docker_nonroot" == "true" ]]; then
+      # -----------------------------------------------------------------------
+      # Docker Linux non-root sub-path (gate #DOCKER-NONROOT-WAZUH-1):
+      #
+      # On Linux+Docker non-root, secrets/ is owned by UID 1001 (set by the
+      # PKI issuer container). Steps 1-3 need to READ ca_intermediate.{crt,key}
+      # and wazuh-indexer_client.{crt,key} but cannot open them (EPERM).
+      #
+      # Fix: read each secret via _safe_read_secret (which uses a throwaway
+      # --user 1001:1001 container on Docker non-root — gate
+      # #DOCKER-NONROOT-SECRET-1) into umask-077 temp files owned by the
+      # installer (UID 1000). openssl operates on the temp files, never touching
+      # secrets/ directly. A subshell EXIT trap cleans up all temp files
+      # (including key material) on success or failure.
+      #
+      # The .srl serial file openssl creates is directed to the tmpdir via
+      # -CAserial, so it never lands inside secrets/ (which is UID 1001 owned).
+      #
+      # Scope: Linux + Docker + invoking UID != 0 AND YSG_OS != macos.
+      # macOS virtiofs / rootful / root paths use the direct block below.
+      # -----------------------------------------------------------------------
+      local _wm_tmpdir
+      _wm_tmpdir="$(mktemp -d "${WORK_DIR}/docker/.wazuh-stage-XXXXXX")"
+      (
+        umask 077
+        trap "rm -rf '${_wm_tmpdir}'" EXIT
 
-    # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
-    cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+        # Read all required secrets via _safe_read_secret (Docker non-root fallback
+        # inside the helper dispatches a throwaway --user 1001:1001 container).
+        _safe_read_secret "${secrets}/ca_intermediate.crt" >"${_wm_tmpdir}/ca_int.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_intermediate.crt (gate #DOCKER-NONROOT-WAZUH-1)"; exit 1; }
+        _safe_read_secret "${secrets}/ca_root.crt" >"${_wm_tmpdir}/ca_root.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_root.crt"; exit 1; }
+        _safe_read_secret "${secrets}/ca_intermediate.key" >"${_wm_tmpdir}/ca_int.key" \
+          || { log_error "Wazuh Docker non-root: cannot read ca_intermediate.key"; exit 1; }
+        _safe_read_secret "${secrets}/wazuh-indexer_client.crt" >"${_wm_tmpdir}/idx_client.crt" \
+          || { log_error "Wazuh Docker non-root: cannot read wazuh-indexer_client.crt"; exit 1; }
+        _safe_read_secret "${secrets}/wazuh-indexer_client.key" >"${_wm_tmpdir}/idx_client.key" \
+          || { log_error "Wazuh Docker non-root: cannot read wazuh-indexer_client.key"; exit 1; }
+        # Fail-closed: all inputs must be non-empty
+        for _wm_f in "${_wm_tmpdir}/ca_int.crt" "${_wm_tmpdir}/ca_root.crt" \
+                     "${_wm_tmpdir}/ca_int.key" "${_wm_tmpdir}/idx_client.crt" \
+                     "${_wm_tmpdir}/idx_client.key"; do
+          [[ -s "$_wm_f" ]] \
+            || { log_error "Wazuh Docker non-root: staged secret empty after read: ${_wm_f}"; exit 1; }
+        done
 
-    # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
-    openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
-    openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
-    rm -f "${wp}/certs/.admin-sec1.pem"
-    openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
-      -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
-    openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
-      -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
-      -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
-    rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+        # Step 1: CA bundle (intermediate + root) — HTTP-layer trust anchor
+        cat "${_wm_tmpdir}/ca_int.crt" "${_wm_tmpdir}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
 
-    # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
-    cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
-    cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+        # Step 2: wazuh-admin leaf signed by internal intermediate (mirrors unshare path)
+        openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+        openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+        rm -f "${wp}/certs/.admin-sec1.pem"
+        openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+          -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+        printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' \
+          > "${_wm_tmpdir}/.admin-ext.cnf"
+        # -CAserial directs the serial file into _wm_tmpdir (never into secrets/).
+        openssl x509 -req -in "${wp}/certs/.admin.csr" \
+          -CA "${_wm_tmpdir}/ca_int.crt" -CAkey "${_wm_tmpdir}/ca_int.key" \
+          -CAcreateserial -CAserial "${_wm_tmpdir}/ca_int.srl" \
+          -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+          -extfile "${_wm_tmpdir}/.admin-ext.cnf" 2>/dev/null
+        rm -f "${wp}/certs/.admin.csr"
+
+        # Step 3: indexer HTTP cert/key from staged temp files
+        cp "${_wm_tmpdir}/idx_client.crt" "${wp}/certs/http-indexer.pem"
+        cp "${_wm_tmpdir}/idx_client.key" "${wp}/certs/http-indexer-key.pem"
+
+        # Verify outputs non-empty (mirrors unshare path verification)
+        [ -s "${wp}/certs/http-ca-bundle.pem" ]
+        [ -s "${wp}/certs/wazuh-admin-key.pem" ]
+        [ -s "${wp}/certs/wazuh-admin.pem" ]
+        [ -s "${wp}/certs/http-indexer.pem" ]
+        [ -s "${wp}/certs/http-indexer-key.pem" ]
+
+        # Best-effort secure-wipe of key material before EXIT trap rm -rf.
+        for _wm_kf in "${_wm_tmpdir}/ca_int.key" "${_wm_tmpdir}/idx_client.key"; do
+          [[ -f "$_wm_kf" ]] \
+            && dd if=/dev/zero of="$_wm_kf" bs="$(wc -c < "$_wm_kf")" count=1 2>/dev/null || true
+        done
+      ) || { log_error "Wazuh mTLS steps 1-3 failed (Docker non-root — gate #DOCKER-NONROOT-WAZUH-1)"; rm -rf "$_wm_tmpdir"; return 1; }
+      rm -rf "$_wm_tmpdir"  # belt-and-suspenders; subshell EXIT trap already cleaned up
+      log_info "Wazuh steps 1-3 (CA bundle + admin cert + indexer cert) completed via _safe_read_secret temp files (Docker non-root — gate #DOCKER-NONROOT-WAZUH-1)"
+    else
+      # Docker / rootful Podman / macOS / root / fallback from unshare-unavailable path.
+
+      # 1. CA bundle (intermediate + root) — HTTP-layer trust anchor
+      cat "${secrets}/ca_intermediate.crt" "${secrets}/ca_root.crt" > "${wp}/certs/http-ca-bundle.pem"
+
+      # 2. internal-CA admin cert (EC P-256, PKCS#8 key) signed by the internal intermediate
+      openssl ecparam -genkey -name prime256v1 -out "${wp}/certs/.admin-sec1.pem" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "${wp}/certs/.admin-sec1.pem" -out "${wp}/certs/wazuh-admin-key.pem" 2>/dev/null
+      rm -f "${wp}/certs/.admin-sec1.pem"
+      openssl req -new -key "${wp}/certs/wazuh-admin-key.pem" -out "${wp}/certs/.admin.csr" \
+        -subj "/O=Agnostic Security/CN=wazuh-admin" 2>/dev/null
+      openssl x509 -req -in "${wp}/certs/.admin.csr" -CA "${secrets}/ca_intermediate.crt" \
+        -CAkey "${secrets}/ca_intermediate.key" -CAcreateserial -days 825 -out "${wp}/certs/wazuh-admin.pem" \
+        -extfile <(printf 'keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE') 2>/dev/null
+      rm -f "${wp}/certs/.admin.csr" "${secrets}/ca_intermediate.srl"
+
+      # 3. indexer HTTP server cert = the bootstrap-issued internal-CA cert (SAN wazuh-indexer)
+      cp "${secrets}/wazuh-indexer_client.crt" "${wp}/certs/http-indexer.pem"
+      cp "${secrets}/wazuh-indexer_client.key" "${wp}/certs/http-indexer-key.pem"
+    fi
   fi
 
   # fail-closed: filebeat `full` verification needs SAN=wazuh-indexer on the HTTP cert
@@ -9827,6 +9923,12 @@ _secret_is_valid() {
 # installer user (UID 1000) cannot read directly. This helper tries:
 #   1. Direct read (works on Docker / Podman rootful / first-install)
 #   2. `podman unshare cat` (works on Podman rootless re-run)
+#   2b. Docker Linux non-root — throwaway --user 1001:1001 container cat
+#       (gate #DOCKER-NONROOT-SECRET-1: secrets/ is UID 1001 owned post-PKI;
+#        host installer UID 1000 cannot open the files directly. A container
+#        running as UID 1001 CAN read its own files. Image: yashigani/gateway
+#        is guaranteed present after the PKI issuer step. Falls through to
+#        Attempt 3 if the image is absent or the container run fails.)
 #   3. Read from .env (last-resort — value is already there from first install)
 #
 # Usage: _safe_read_secret <file> <ENV_KEY> <env_file>
@@ -9848,6 +9950,43 @@ _safe_read_secret() {
     if _sr_val="$(podman unshare cat "$_sr_file" 2>/dev/null)" && [[ -n "$_sr_val" ]]; then
       printf '%s' "$_sr_val"
       return 0
+    fi
+  fi
+
+  # Attempt 2b: Docker Linux non-root — read via throwaway --user 1001:1001 container.
+  # Condition: not Podman AND invoking UID != 0 (root bypasses DAC directly) AND
+  # not macOS (virtiofs UID remapping makes Attempt 1 succeed there).
+  # yashigani/gateway is the PKI issuer image and is guaranteed present post-PKI-bootstrap.
+  # The secrets directory (dirname of the file) is bind-mounted at /s:ro so the
+  # container can read UID 1001 owned files without any host-side permission change.
+  # gate: #DOCKER-NONROOT-SECRET-1
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_RUNTIME:-}" != "podman" ]] \
+      && [[ "$(id -u)" != "0" ]] \
+      && [[ "${YSG_OS:-linux}" != "macos" ]] \
+      && command -v docker >/dev/null 2>&1; then
+    local _sr_secrets_dir _sr_basename _sr_dkr_image _sr_dkr_tag
+    _sr_secrets_dir="$(dirname "${_sr_file}")"
+    _sr_basename="$(basename "${_sr_file}")"
+    _sr_dkr_image=""
+    for _sr_dkr_tag in "${YASHIGANI_VERSION:-}" "latest"; do
+      [[ -z "$_sr_dkr_tag" ]] && continue
+      if docker image inspect "yashigani/gateway:${_sr_dkr_tag}" >/dev/null 2>&1; then
+        _sr_dkr_image="yashigani/gateway:${_sr_dkr_tag}"
+        break
+      fi
+    done
+    if [[ -n "$_sr_dkr_image" ]]; then
+      if _sr_val="$(docker run --rm \
+                      --user 1001:1001 \
+                      --network none \
+                      --security-opt no-new-privileges \
+                      --volume "${_sr_secrets_dir}:/s:ro" \
+                      "$_sr_dkr_image" \
+                      cat "/s/${_sr_basename}" 2>/dev/null)" \
+          && [[ -n "$_sr_val" ]]; then
+        printf '%s' "$_sr_val"
+        return 0
+      fi
     fi
   fi
 
@@ -9953,11 +10092,15 @@ generate_secrets() {
   # Skip if secrets already exist (upgrade path)
   if [[ -f "${secrets_dir}/postgres_password" && -f "${secrets_dir}/redis_password" ]]; then
     log_info "Secrets already exist — preserving (upgrade path)"
-    GEN_POSTGRES_PASSWORD="$(cat "${secrets_dir}/postgres_password" 2>/dev/null || echo "[preserved]")"
-    GEN_REDIS_PASSWORD="$(cat "${secrets_dir}/redis_password" 2>/dev/null || echo "[preserved]")"
-    GEN_GRAFANA_PASSWORD="$(cat "${secrets_dir}/grafana_admin_password" 2>/dev/null || echo "[preserved]")"
-    GEN_ADMIN1_USERNAME="$(cat "${secrets_dir}/admin1_username" 2>/dev/null || echo "[preserved]")"
-    GEN_ADMIN2_USERNAME="$(cat "${secrets_dir}/admin2_username" 2>/dev/null || echo "[preserved]")"
+    # Docker non-root: direct cat fails (secrets/ owned by UID 1001). Route through
+    # _safe_read_secret so the Docker non-root fallback (gate #DOCKER-NONROOT-SECRET-1)
+    # is used. POSTGRES_PASSWORD + REDIS_PASSWORD have .env fallback keys; the
+    # others fall through to the display-only "[preserved]" placeholder on failure.
+    GEN_POSTGRES_PASSWORD="$(_safe_read_secret "${secrets_dir}/postgres_password" "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_REDIS_PASSWORD="$(_safe_read_secret "${secrets_dir}/redis_password" "REDIS_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_GRAFANA_PASSWORD="$(_safe_read_secret "${secrets_dir}/grafana_admin_password" "" "" 2>/dev/null || echo "[preserved]")"
+    GEN_ADMIN1_USERNAME="$(_safe_read_secret "${secrets_dir}/admin1_username" "YASHIGANI_ADMIN_USERNAME" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "[preserved]")"
+    GEN_ADMIN2_USERNAME="$(_safe_read_secret "${secrets_dir}/admin2_username" "" "" 2>/dev/null || echo "[preserved]")"
     GEN_ADMIN1_PASSWORD="[preserved — check secrets dir]"
     GEN_ADMIN2_PASSWORD="[preserved — check secrets dir]"
     GEN_ADMIN1_TOTP_SECRET="[preserved]"
@@ -10076,10 +10219,13 @@ generate_secrets() {
       log_success "New service credentials generated (upgrade path)"
     fi
 
-    # Read Wazuh credentials (may have been generated above or in a previous install)
-    GEN_WAZUH_INDEXER_PASSWORD="$(cat "${secrets_dir}/wazuh_indexer_password" 2>/dev/null || echo "")"
-    GEN_WAZUH_API_PASSWORD="$(cat "${secrets_dir}/wazuh_api_password" 2>/dev/null || echo "")"
-    GEN_WAZUH_DASHBOARD_PASSWORD="$(cat "${secrets_dir}/wazuh_dashboard_password" 2>/dev/null || echo "")"
+    # Read Wazuh credentials (may have been generated above or in a previous install).
+    # Docker non-root: route through _safe_read_secret for the same reason as the
+    # postgres/redis reads above (gate #DOCKER-NONROOT-SECRET-1).
+    local _wazuh_env_file="${WORK_DIR}/docker/.env"
+    GEN_WAZUH_INDEXER_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_indexer_password" "WAZUH_INDEXER_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
+    GEN_WAZUH_API_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_api_password" "WAZUH_API_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
+    GEN_WAZUH_DASHBOARD_PASSWORD="$(_safe_read_secret "${secrets_dir}/wazuh_dashboard_password" "WAZUH_DASHBOARD_PASSWORD" "$_wazuh_env_file" 2>/dev/null || echo "")"
 
     # BUG-1 (v2.23.1): caddy_internal_hmac was silently skipped on the upgrade
     # path because this early-return block never reached the generation code below.
