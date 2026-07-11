@@ -181,7 +181,11 @@ ENV PYTHONUNBUFFERED=1 \
     # LIC-003 / LAURA-LICENSE-06: disable Python user-site to prevent
     # sitecustomize.py monkey-patch attacks via ~/.local/lib/pythonX.Y/site-packages/.
     PYTHONNOUSERSITE=1 \
-    YASHIGANI_SERVICE_NAME=backoffice
+    YASHIGANI_SERVICE_NAME=backoffice \
+    # GHSA-537c-gmf6-5ccf / applehv SVE2/HWCAP: clear SVE bit in OpenSSL armcap;
+    # 0x8fd keeps NEON/AES/SHA hardware accel on Linux, fixes SIGILL on macOS Podman applehv.
+    # Matrix-confirmed 2026-07-11 (cryptography 49.0.0) — baked globally, no runtime override.
+    OPENSSL_armcap=0x8fd
 
 # Internal mTLS (v2.23.1) — mutual TLS terminated by uvicorn.
 # Pattern A for Python ssl: ca_root.crt is the trust anchor; private root key

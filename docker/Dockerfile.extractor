@@ -108,7 +108,11 @@ ENV PYTHONUNBUFFERED=1 \
     YASHIGANI_EXTRACTOR_IN_SANDBOX=1 \
     YASHIGANI_WORKER_PATH=/app/worker.py \
     YASHIGANI_EXTRACTOR_HOST=0.0.0.0 \
-    YASHIGANI_EXTRACTOR_PORT=8090
+    YASHIGANI_EXTRACTOR_PORT=8090 \
+    # GHSA-537c-gmf6-5ccf / applehv SVE2/HWCAP: clear SVE bit in OpenSSL armcap;
+    # 0x8fd keeps NEON/AES/SHA hardware accel on Linux, fixes SIGILL on macOS Podman applehv.
+    # pypdf[crypto] installs the cryptography wheel; ec.generate_private_key() is the SIGILL site.
+    OPENSSL_armcap=0x8fd
 
 # Cache-busting build arg consumed AFTER all COPY/pip steps so only the
 # final image layer re-executes when the source SHA changes; base + dep

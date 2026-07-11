@@ -145,9 +145,9 @@ ENV PYTHONUNBUFFERED=1 \
     # unprotected `cntb` probe in OpenSSL 4.0.0+ (cryptography ≥47). Affects
     # virtualised aarch64 hosts that advertise SVE2 in AT_HWCAP2 but do not
     # enable SVE at EL0. 0x8fd preserves NEON/AES/SHA acceleration on Linux.
-    # macOS Podman applehv overrides this to 0 (full SW fallback) via
-    # docker/docker-compose.podman-virtiofs-override.yml — applehv mis-exposes
-    # additional HWCAP bits beyond SVE that SIGILL at 48.0.1; see GHSA-537c-gmf6-5ccf fix.
+    # GHSA-537c-gmf6-5ccf / applehv SVE2/HWCAP: matrix-confirmed 2026-07-11
+    # (cryptography 49.0.0, macOS Podman applehv aarch64) — 0x8fd → PASS on both
+    # Linux and macOS Podman; baked globally into all Python service images, no override.
     OPENSSL_armcap=0x8fd
 
 # Dual-port startup wrapper (v2.23.4):
