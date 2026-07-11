@@ -4,7 +4,7 @@
 #   -f docker/docker-compose.podman-override.yml \
 #   -f docker/docker-compose.podman-virtiofs-override.yml \
 #   up -d
-# Last updated: 2026-05-13T00:00:00+00:00 (fix(podman): scope :U-override-load to macOS only — LINUX-SHARED-MOUNT-UID-CLOBBER)
+# Last updated: 2026-07-11T00:00:00+00:00 (fix(deps): GHSA-537c-gmf6-5ccf — OPENSSL_armcap=0 on macOS Podman for cryptography >=48.0.1)
 #
 # WHY THIS FILE EXISTS (LINUX-SHARED-MOUNT-UID-CLOBBER regression — PR #138):
 #
@@ -50,6 +50,14 @@
 
 services:
   gateway:
+    environment:
+      # GHSA-537c-gmf6-5ccf: cryptography >=48.0.1 bundles OpenSSL 4.0.1 but
+      # still SIGILLs at ec.generate_private_key() under macOS Podman applehv
+      # aarch64: applehv mis-exposes ARMv8 HWCAP bits beyond SVE.
+      # OPENSSL_armcap=0 forces full SW crypto path, eliminating the SIGILL.
+      # Overrides Dockerfile.gateway's 0x8fd (SVE-clear only) on this path.
+      # Linux is NOT affected — this file is never loaded on Linux (see header).
+      OPENSSL_armcap: "0"
     volumes:
       - ./secrets:/run/secrets:ro,U
       # YSG-RISK-053: scoped single-file mount needs :U on macOS virtiofs too
@@ -58,6 +66,10 @@ services:
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
 
   backoffice:
+    environment:
+      # GHSA-537c-gmf6-5ccf: same OPENSSL_armcap=0 fix as gateway above.
+      # Backoffice Dockerfile has no existing armcap bake; this sets it fresh.
+      OPENSSL_armcap: "0"
     volumes:
       - ./secrets:/run/secrets:rw,U
       # YSG-RISK-053: see gateway note above.
