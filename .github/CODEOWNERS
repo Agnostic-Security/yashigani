@@ -1,13 +1,3 @@
-# Yashigani CODEOWNERS
-# Python source → backend team
-/src/                       @yashigani/backend
-# Helm charts → platform team
-/helm/                      @yashigani/platform
-# Docker → platform team
-/docker/                    @yashigani/platform
-# GitHub Actions → platform team
-/.github/workflows/         @yashigani/platform
-# Policy (OPA) → security team
-/policy/                    @yashigani/security
-# Docs → any maintainer
-*.md                        @yashigani/maintainers
+# Default owner for all paths — review + approval required before merge to main.
+# External contributions to this repository are gated on this owner's review.
+* tr@agnosticsec.com
