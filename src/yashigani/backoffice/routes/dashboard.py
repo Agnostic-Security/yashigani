@@ -381,7 +381,11 @@ async def services_health(session: AdminSession):
                 opa_ok = resp.status == 200
             _add("opa", "ok" if opa_ok else "degraded", f"opa_url={opa_url}")
         except Exception as exc:
-            _add("opa", "degraded", str(exc)[:120])
+            # Do not leak raw exception text to the client — use the same
+            # safe envelope every other health handler here uses (full detail
+            # goes to server logs; client sees a fixed public message).
+            payload, _ = safe_error_envelope(exc, public_message="opa health check failed", status=500)
+            _add("opa", "degraded", payload["error"])
     else:
         _add("opa", "not_configured")
 

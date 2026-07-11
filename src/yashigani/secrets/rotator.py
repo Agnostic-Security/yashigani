@@ -26,7 +26,14 @@ Password charset (per feedback_password_charset.md):
 JWT signing key: 64-byte (512-bit) secrets.token_bytes → hex string (128 hex chars).
 HMAC key: 32-byte → hex string (64 hex chars), matching install.sh keygen.py output.
 
-Last updated: 2026-05-07T00:00:00+01:00
+Storage security (CodeQL py/clear-text-storage-sensitive-data):
+  Secrets are written to YASHIGANI_SECRETS_DIR (default /run/secrets), which MUST be
+  a tmpfs/ramfs or a Docker/Podman secret mount — memory-backed, never persistent disk.
+  On a persistent-disk override the rotated secrets would be UNENCRYPTED AT REST.
+  __init__ emits a WARNING (best-effort, Linux /proc/mounts) if the configured dir is
+  not ephemeral-backed; it does not fail-closed, so dev / macOS installs still work.
+
+Last updated: 2026-07-11T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -44,6 +51,39 @@ from typing import Optional
 from urllib.parse import quote
 
 _log = logging.getLogger("yashigani.secrets.rotator")
+
+
+def _secrets_dir_is_ephemeral(path: Path) -> Optional[bool]:
+    """Best-effort: is `path` backed by tmpfs/ramfs (memory) rather than disk?
+
+    Returns True (ephemeral/memory-backed), False (persistent disk), or None when
+    undeterminable — non-Linux, no /proc/mounts, or path unresolvable. Never raises.
+    """
+    try:
+        mounts_file = Path("/proc/mounts")
+        if not mounts_file.exists():
+            return None  # non-Linux (e.g. macOS dev) — cannot determine
+        target = path
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        target_str = str(target.resolve())
+        best_mount = ""
+        best_fstype: Optional[str] = None
+        for line in mounts_file.read_text().splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mount_point, fstype = parts[1], parts[2]
+            # Most specific (longest) matching mount point wins.
+            if (target_str == mount_point
+                    or target_str.startswith(mount_point.rstrip("/") + "/")) \
+                    and len(mount_point) >= len(best_mount):
+                best_mount, best_fstype = mount_point, fstype
+        if best_fstype is None:
+            return None
+        return best_fstype in ("tmpfs", "ramfs")
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Password charset (feedback_password_charset.md)
@@ -139,6 +179,17 @@ class SecretRotator:
             or os.getenv("YASHIGANI_SECRETS_DIR")
             or "/run/secrets"
         )
+        # Storage-security guard (CodeQL clear-text-storage): secrets are written
+        # in plaintext here by design, so the dir MUST be memory-backed (tmpfs/ramfs
+        # or a container secret mount). Warn — do not fail — if it resolves to
+        # persistent disk, so dev / macOS installs still function.
+        if _secrets_dir_is_ephemeral(self._secrets_dir) is False:
+            _log.warning(
+                "SECURITY: secrets dir %s is not tmpfs/ramfs-backed — rotated "
+                "secrets will be UNENCRYPTED AT REST. Point YASHIGANI_SECRETS_DIR "
+                "at a tmpfs mount or a Docker/Podman secret mount.",
+                self._secrets_dir,
+            )
         # Direct Postgres DSN (bypasses pgbouncer) for ALTER USER.
         self._db_dsn_direct: Optional[str] = db_dsn_direct or os.getenv("YASHIGANI_DB_DSN_DIRECT")
         # Redis client for CONFIG SET requirepass.
