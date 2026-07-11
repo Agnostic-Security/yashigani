@@ -131,7 +131,8 @@ _STRIP_HEADERS = frozenset({
     "x-forwarded-proto",
     "x-real-ip",
     "x-posture",
-    "x-forwarded-user",  # stripped from downstream MCP call; preserved for identity resolution
+    "x-forwarded-user",        # stripped from downstream MCP call; no longer used for authz (4.1)
+    "x-yashigani-identity-id", # stripped from downstream MCP call; identity resolved at boundary
 })
 
 # Methods that require tools/call enforcement gate
@@ -262,14 +263,17 @@ async def _handle_mcp_call_inner(
     )
     _caller_is_trusted = _caller_is_internal or _caller_is_caddy
 
-    # T-3: X-Forwarded-User trust gate
-    _fwd_user_raw = request.headers.get("x-forwarded-user", "").strip()
-    if _fwd_user_raw and not _caller_is_trusted:
+    # T-3: X-Yashigani-Identity-Id trust gate (4.1 SEC-GAP-1 — replaces X-Forwarded-User)
+    # Open WebUI is removed in 4.x; the native identity rail is X-Yashigani-Identity-Id.
+    # Caddy STRIPS client-supplied X-Yashigani-Identity-Id at the public edge, so
+    # any value in the header on an untrusted path is a spoof attempt.
+    _iid_raw = request.headers.get("x-yashigani-identity-id", "").strip()
+    if _iid_raw and not _caller_is_trusted:
         logger.warning(
             "mcp-runtime: YSG-RISK-108/T-3: unauthenticated caller on mesh port "
-            "presented X-Forwarded-User=%r without internal bearer or Caddy secret — "
+            "presented X-Yashigani-Identity-Id=%r without internal bearer or Caddy secret — "
             "stripped; caller treated as anonymous. path=%r",
-            _fwd_user_raw[:64],
+            _iid_raw[:64],
             str(request.url.path)[:128],
         )
         if audit_writer is not None:
@@ -278,14 +282,14 @@ async def _handle_mcp_call_inner(
                 audit_writer.write(MeshIdentityHeaderRejectedEvent(
                     path=str(request.url.path)[:256],
                     method=request.method,
-                    rejected_header="x-forwarded-user",
-                    claimed_value_truncated=_fwd_user_raw[:64],
+                    rejected_header="x-yashigani-identity-id",
+                    claimed_value_truncated=_iid_raw[:64],
                 ))
             except Exception as _ae:
                 logger.error(
                     "mcp-runtime: failed to write MESH_IDENTITY_HEADER_REJECTED event: %s", _ae
                 )
-        _fwd_user_raw = ""  # strip — caller is anonymous
+        _iid_raw = ""  # strip — caller is anonymous
 
     # T-4: Orchestration-depth promotion gate
     # Priority 1: AgentAuthMiddleware sets agent_id on request.state for /agents/ paths.
@@ -410,29 +414,35 @@ async def _handle_mcp_call_inner(
     is_notification = msg_id is None
 
     # ── Identity settled above (top-of-function gate, YSG-RISK-108) ──────────
-    # _fwd_user_raw and _caller_agent_id were computed and trust-gated before
-    # the registry lookup; use them here to build call IDs and pass to OPA.
-    user_id = _fwd_user_raw or "unknown"
+    # 4.1 SEC-GAP-1: identity_id comes from request.state.ysg_principal (set by
+    # the proxy.py boundary resolver or openai_router) as the authoritative source.
+    # Falls back to the trust-gated X-Yashigani-Identity-Id header (_iid_raw).
+    # Never falls back to email or slug (Open WebUI removed in 4.x).
+    _rp_mcp = getattr(request.state, "ysg_principal", None)
+    user_id = (
+        _rp_mcp.identity_id
+        if _rp_mcp is not None
+        else (_iid_raw or "unknown")
+    )
     call_id = str(uuid.uuid4())
     request_id = str(uuid.uuid4())
 
-    # G-ORCH-OPA-1 / Option A: look up the caller's sensitivity_ceiling from
-    # the identity registry (keyed by the X-Forwarded-User slug).  This is the
-    # SAME registry the openai_router uses for identity resolution — no new store.
-    # Result is set on McpCallContext.caller_sensitivity_ceiling before the egress
-    # enforce_result() call.
+    # G-ORCH-OPA-1: look up the caller's sensitivity_ceiling from the identity
+    # registry (keyed by identity_id = idnt_{12hex}).
+    # 4.1 SEC-GAP-1: use identity_registry.get(identity_id) directly since user_id
+    # is now the canonical idnt_ key — no get_by_slug slug resolution needed.
     #
     # Fail-closed: if the registry is absent, or user_id is "unknown", or the
-    # slug is not found, caller_sensitivity_ceiling stays None → OPA denies
+    # identity is not found, caller_sensitivity_ceiling stays None → OPA denies
     # with invalid_or_missing_caller_ceiling.  This is intentional: an
     # unauthenticated or registry-unavailable path must not allow result delivery.
     caller_sensitivity_ceiling: Optional[str] = None
     if identity_registry is not None and user_id != "unknown":
         try:
-            identity_rec = identity_registry.get_by_slug(user_id)  # type: ignore[attr-defined]
+            identity_rec = identity_registry.get(user_id)  # type: ignore[attr-defined]
             if identity_rec is not None:
                 # identity_rec is either an IdentityRecord dataclass or a dict
-                # (Redis-backed registry returns a dict from get_by_slug).
+                # (Redis-backed registry returns a dict from get()).
                 if hasattr(identity_rec, "sensitivity_ceiling"):
                     caller_sensitivity_ceiling = identity_rec.sensitivity_ceiling
                 elif isinstance(identity_rec, dict):

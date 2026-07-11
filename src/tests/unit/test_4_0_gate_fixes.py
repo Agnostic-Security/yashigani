@@ -319,7 +319,20 @@ class TestChatProxyContract:
         assert "UserSession" in block
         assert "StreamingResponse" in block
         assert "YASHIGANI_INTERNAL_BEARER" in block
-        assert "X-OpenWebUI-User-Email" in block
+        # 4.1 SEC-GAP-1: chat proxy forwards X-Yashigani-Identity-Id (idnt_ PK),
+        # not the legacy X-OpenWebUI-User-Email header (OWUI removed in 4.x).
+        # The header may be referenced via a module constant _YASHIGANI_IDENTITY_ID_HEADER.
+        identity_header_used = (
+            "X-Yashigani-Identity-Id" in block
+            or "_YASHIGANI_IDENTITY_ID_HEADER" in block
+        )
+        assert identity_header_used, (
+            "user_chat_proxy must forward X-Yashigani-Identity-Id (or _YASHIGANI_IDENTITY_ID_HEADER constant)"
+        )
+        # Explicitly ensure the old OWUI email header is NOT forwarded.
+        assert "X-OpenWebUI-User-Email" not in block, (
+            "user_chat_proxy must not forward X-OpenWebUI-User-Email in 4.x (OWUI removed)"
+        )
 
     def test_proxy_fail_closed_on_missing_bearer(self):
         """Proxy must 503 when YASHIGANI_INTERNAL_BEARER is absent."""
@@ -354,16 +367,23 @@ class TestChatProxyContract:
         )
 
     def test_proxy_forwards_user_identity(self):
-        """Proxy must inject X-OpenWebUI-User-Email from session.account_id."""
+        """Proxy must inject X-Yashigani-Identity-Id (4.1+) resolved from session.account_id."""
         import pathlib
         src = pathlib.Path(
             os.path.dirname(__file__),
             "..", "..", "yashigani", "backoffice", "routes", "user_ui.py"
         ).resolve().read_text()
-        # account_id must be used as the forwarded email
+        # account_id is used to resolve the identity_id (idnt_ PK)
         assert "session.account_id" in src
-        # The header name must be correct
-        assert '"X-OpenWebUI-User-Email"' in src
+        # 4.1 SEC-GAP-1: header must be X-Yashigani-Identity-Id (or its module constant)
+        assert (
+            '"X-Yashigani-Identity-Id"' in src
+            or "_YASHIGANI_IDENTITY_ID_HEADER" in src
+        ), "user_ui.py must forward X-Yashigani-Identity-Id (not X-OpenWebUI-User-Email)"
+        # Old OWUI email header must be gone
+        assert '"X-OpenWebUI-User-Email"' not in src, (
+            "user_ui.py must not reference X-OpenWebUI-User-Email in 4.x"
+        )
 
     def test_sse_content_type(self):
         """Proxy must return text/event-stream media type."""

@@ -147,6 +147,8 @@ def create_gateway_app(
     principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
     capability_policy_store=None,  # 3.0 — CapabilityPolicyStore | None
     workflow_scheduler=None,  # 4.0 — WorkflowScheduler | None (wf-exec)
+    identity_registry=None,   # 4.1 SEC-GAP-1 — IdentityRegistry | None (boundary resolver)
+    permission_store=None,    # 4.1 SEC-GAP-1 — PermissionStore | None (perm migration)
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -182,6 +184,8 @@ def create_gateway_app(
         "principal_tenant_id": principal_tenant_id,
         "capability_policy_store": capability_policy_store,  # 3.0 — Permissions-Policy
         "workflow_scheduler": workflow_scheduler,  # 4.0 wf-exec
+        "identity_registry": identity_registry,   # 4.1 SEC-GAP-1 boundary resolver
+        "permission_store": permission_store,      # 4.1 SEC-GAP-1 perm migration
         "http_client": None,
     }
 
@@ -333,17 +337,21 @@ def create_gateway_app(
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         # Permissions-Policy: resolve per user identity (3.0).
-        # The gateway receives the user's email via x-yashigani-user-id (set by
-        # Caddy forward_auth after session validation).  Falls back silently if
-        # the store is not wired (dev/test without Redis).
+        # 4.1 SEC-GAP-1: read identity_id from request.state.ysg_principal
+        # (set by the boundary resolver in openai_router, mcp_router_runtime,
+        # or the catch-all boundary resolver below).  Falls back to reading
+        # X-Yashigani-Identity-Id directly for paths that bypass those routers.
+        # Falls back silently if the store is not wired (dev/test without Redis).
         _cap_store = _state.get("capability_policy_store")
         if _cap_store is not None:
             try:
-                _user_email = request.headers.get("x-yashigani-user-id", "") or None
+                _rp_cap = getattr(request.state, "ysg_principal", None)
+                _user_id = (_rp_cap.identity_id if _rp_cap is not None
+                            else request.headers.get("x-yashigani-identity-id", "") or None)
                 from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
                 from yashigani.capability_policy.header import render_permissions_policy as _render_pp
                 _resolved = _resolve_cap(
-                    _user_email,
+                    _user_id,
                     _state.get("rbac_store"),
                     _cap_store,
                 )
@@ -632,20 +640,79 @@ async def _proxy_request_body(
                 },
             )
 
+    # 0b-pre. Gateway boundary resolution — resolves identity_id once before any
+    # auth-sensitive processing (rate limiting, OPA, audit).
+    # For requests handled by openai_router or mcp_router_runtime (mounted as
+    # extra_routers), request.state.ysg_principal is already set by those handlers.
+    # For the catch-all proxy (anything not matched by extra_routers), we resolve
+    # from the trusted Caddy-injected X-Yashigani-Identity-Id header here.
+    # Caddy STRIPS client-supplied X-Yashigani-Identity-Id at the edge
+    # (Caddyfile.selfsigned line ~211) — so any value in the header is trusted-internal.
+    # Fail-closed: if the header is absent or identity not in registry, ysg_principal
+    # stays None; downstream consumers treat None as anonymous (DENY).
+    if not hasattr(request.state, "ysg_principal") or request.state.ysg_principal is None:
+        _id_reg = state.get("identity_registry")
+        _iid_raw = request.headers.get("x-yashigani-identity-id", "").strip()
+        if _iid_raw and _id_reg is not None:
+            try:
+                if not _iid_raw.startswith("idnt_"):
+                    logger.warning(
+                        "proxy: boundary resolution: malformed X-Yashigani-Identity-Id=%r "
+                        "(expected idnt_ prefix) — denying fail-closed request_id=%s",
+                        _iid_raw[:64], request_id,
+                    )
+                    return _error_response(request_id, 403, "IDENTITY_ID_MALFORMED")
+                _pr_rec = _id_reg.get(_iid_raw)
+                if _pr_rec is not None:
+                    from yashigani.gateway.types import ResolvedPrincipal as _RP
+                    import os as _os
+                    _pr_kind = (
+                        _pr_rec.get("kind", "unknown")
+                        if isinstance(_pr_rec, dict)
+                        else str(getattr(_pr_rec, "kind", "unknown"))
+                    )
+                    _pr_groups = (
+                        list(_pr_rec.get("groups") or [])
+                        if isinstance(_pr_rec, dict)
+                        else list(getattr(_pr_rec, "groups", []) or [])
+                    )
+                    request.state.ysg_principal = _RP(
+                        identity_id=_iid_raw,
+                        principal_scope="user" if _pr_kind in ("human", "user") else None,
+                        group_ids=_pr_groups,
+                        org_id=_os.getenv("YASHIGANI_ORG_ID", "default"),
+                        kind=_pr_kind,
+                    )
+                else:
+                    # identity_id from trusted Caddy header but not in registry
+                    # (deprovisioned principal). Fail-closed.
+                    logger.info(
+                        "proxy: boundary resolution: identity_id %r not in registry "
+                        "(deprovisioned principal) — denying fail-closed request_id=%s",
+                        _iid_raw, request_id,
+                    )
+                    return _error_response(request_id, 401, "IDENTITY_NOT_FOUND")
+            except Exception as _pr_exc:
+                logger.debug("proxy: boundary resolution failed for %r: %s", _iid_raw, _pr_exc)
+
     # 0b. Rate limiting — before any expensive processing
     rate_limiter = state["rate_limiter"]
     if rate_limiter is not None:
         client_ip = _get_client_ip(request)
         agent_id_rl = request.headers.get("x-yashigani-agent-id", "unknown")
         session_id_rl = request.cookies.get("__Host-yashigani_session", "")
-        user_email_rl = request.headers.get("x-yashigani-user-id", "")
+        # 4.1 SEC-GAP-1 (Laura T-2): rate-limit bucket keyed by identity_id.
+        # Read from request.state.ysg_principal (set by boundary resolver above).
+        # Falls back to empty string (no per-user bucket) if unresolved.
+        _rp_rl = getattr(request.state, "ysg_principal", None)
+        user_id_rl: str = _rp_rl.identity_id if _rp_rl is not None else ""
 
         # Apply per-role rate limit override: use the most permissive (highest) RPS
         # across all groups the user belongs to that have an override configured.
         rbac_store_rl = state.get("rbac_store")
-        if rbac_store_rl is not None and user_email_rl:
+        if rbac_store_rl is not None and user_id_rl:
             try:
-                user_groups = rbac_store_rl.get_user_groups(user_email_rl)
+                user_groups = rbac_store_rl.get_user_groups(user_id_rl)
                 best_rps = None
                 best_burst = None
                 for grp in user_groups:
@@ -663,7 +730,7 @@ async def _proxy_request_body(
             except Exception as exc:
                 logger.debug("RBAC rate limit override lookup failed: %s", exc)
 
-        rl_result = rate_limiter.check(client_ip, agent_id_rl, session_id_rl, user_email_rl)
+        rl_result = rate_limiter.check(client_ip, agent_id_rl, session_id_rl, user_id_rl)
         if not rl_result.allowed:
             retry_sec = max(1, rl_result.retry_after_ms // 1000)
             try:
@@ -672,12 +739,12 @@ async def _proxy_request_body(
             except Exception:
                 logger.debug("proxy: metric increment failed for ratelimit_violations_total", exc_info=True)
             # Per-user breach: increment dedicated metric + emit admin-alert audit event.
-            if rl_result.dimension == "user" and user_email_rl:
+            if rl_result.dimension == "user" and user_id_rl:
                 _admin_alert_user_rate_limit(
                     audit_writer=state["audit_writer"],
                     request_id=request_id,
                     result=rl_result,
-                    user_id=user_email_rl,
+                    user_id=user_id_rl,
                     agent_id=agent_id_rl,
                     session_id=session_id_rl,
                     rate_limiter=rate_limiter,
@@ -1784,7 +1851,11 @@ def _extract_identity(request: Request) -> tuple[str, str, str]:
         session_id = hashlib.sha256(auth.encode()).hexdigest()[:16] if auth else "anonymous"
 
     agent_id = request.headers.get("x-yashigani-agent-id", "unknown")
-    user_id = request.headers.get("x-yashigani-user-id", "unknown")
+    # 4.1 SEC-GAP-1: read identity_id from ysg_principal (set by boundary resolver)
+    # or fall back to X-Yashigani-Identity-Id header (trusted on internal path).
+    _rp = getattr(request.state, "ysg_principal", None)
+    user_id = (_rp.identity_id if _rp is not None
+               else request.headers.get("x-yashigani-identity-id", "unknown") or "unknown")
     return session_id, agent_id, user_id
 
 

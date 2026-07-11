@@ -337,8 +337,12 @@ def _self_call_headers(identity, depth: int, root_rid: str) -> dict:
     slug = _principal_slug(identity)
     if slug and slug != "internal":
         headers[_HDR_PRINCIPAL] = slug
-        # The MCP path resolves user_id from X-Forwarded-User; propagate it so the
-        # broker/OPA names the real user, not "unknown" (build sheet §6).
+        # 4.1 SEC-GAP-1: propagate identity_id on X-Yashigani-Identity-Id so the
+        # proxy.py boundary resolver and mcp_router_runtime T-3 gate name the real
+        # user, not "unknown".  Also set X-Forwarded-User (slug) for 3.x backward compat.
+        _iid = (identity or {}).get("identity_id", "")
+        if _iid and _iid not in ("internal", "unknown"):
+            headers["x-yashigani-identity-id"] = _iid
         headers["X-Forwarded-User"] = slug
     return headers
 
@@ -681,10 +685,9 @@ async def _execute_api_call(
     _org_id = DEFAULT_ORG_ID
 
     # Extract caller context for group/user narrowing.
+    # 4.1 SEC-GAP-1: use identity_id (idnt_{12hex}) not email for user principal.
     _identity_dict = identity or {}
-    _user_email: Optional[str] = (
-        _identity_dict.get("email") or _identity_dict.get("identity_id") or None
-    )
+    _user_id: Optional[str] = _identity_dict.get("identity_id") or None
     _group_ids: list[str] = [
         str(g) for g in (_identity_dict.get("groups") or []) if g
     ]
@@ -721,7 +724,8 @@ async def _execute_api_call(
             api_host,
             org_id=_org_id,
             group_ids=_group_ids,
-            user_email=_user_email,
+            principal_scope="user" if _user_id else None,
+            principal_id=_user_id,
             store=perm_store,
         )
         if not _grant_allowed:

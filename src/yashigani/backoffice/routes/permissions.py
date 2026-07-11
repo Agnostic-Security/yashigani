@@ -473,7 +473,15 @@ async def get_effective(
     resource_type: str = Query(..., description="Resource type to resolve"),
     resource_id: str = Query(..., description="Resource identifier"),
     org_id: str = Query(default="default", description="Organisation ID (ceiling)"),
-    user_email: Optional[str] = Query(default=None, description="User email to resolve for"),
+    identity_id: Optional[str] = Query(
+        default=None,
+        description="Principal identity_id (idnt_{12hex}) to resolve for (4.1+). "
+                    "Alias: user_email accepted for backward compat.",
+    ),
+    user_email: Optional[str] = Query(
+        default=None,
+        description="[Deprecated 4.1] Pass identity_id instead. Accepted as alias.",
+    ),
     group_ids: Optional[str] = Query(
         default=None,
         description="Comma-separated group IDs for the user",
@@ -487,6 +495,10 @@ async def get_effective(
 
     Returns the effective_allow value and the full resolution breakdown
     (org grant, group grants, user grant).
+
+    4.1 SEC-GAP-1: grants are keyed by identity_id (idnt_{12hex}), not email.
+    Pass identity_id for accurate results. user_email accepted as alias for
+    backward compat with existing admin tooling.
     """
     rt = _parse_resource_type(resource_type)
     store = _get_perm_store()
@@ -500,9 +512,18 @@ async def get_effective(
             },
         )
 
+    # 4.1 SEC-GAP-1: prefer identity_id; fall back to user_email alias.
+    # Guard: when route is called directly in tests (not via HTTP), FastAPI's
+    # Query() FieldInfo objects appear as parameter defaults rather than None.
+    # Normalise them so user_email is not shadowed by a truthy FieldInfo.
+    _iid: Optional[str] = identity_id if isinstance(identity_id, str) else None
+    _ue: Optional[str] = user_email if isinstance(user_email, str) else None
+    _principal_id: Optional[str] = (_iid or _ue) or None
+
     parsed_groups: list[str] = []
-    if group_ids:
-        parsed_groups = [g.strip() for g in group_ids.split(",") if g.strip()]
+    _gids: Optional[str] = group_ids if isinstance(group_ids, str) else None
+    if _gids:
+        parsed_groups = [g.strip() for g in _gids.split(",") if g.strip()]
 
     # Gather raw grant values for the resolution breakdown
     org_grant = store.get_boolean_grant(rt, "org", org_id, resource_id)
@@ -512,8 +533,8 @@ async def get_effective(
         if gg is not None:
             group_grants.append({"group_id": gid, **gg.to_dict()})
     user_grant = None
-    if user_email:
-        ug = store.get_boolean_grant(rt, "user", user_email, resource_id)
+    if _principal_id:
+        ug = store.get_boolean_grant(rt, "user", _principal_id, resource_id)
         if ug is not None:
             user_grant = ug.to_dict()
 
@@ -523,7 +544,8 @@ async def get_effective(
         resource_id,
         org_id=org_id,
         group_ids=parsed_groups,
-        user_email=user_email,
+        principal_scope="user" if _principal_id else None,
+        principal_id=_principal_id,
         store=store,
     )
 
@@ -531,7 +553,7 @@ async def get_effective(
         "resource_type": resource_type,
         "resource_id": resource_id,
         "org_id": org_id,
-        "user_email": user_email,
+        "identity_id": _principal_id,
         "group_ids": parsed_groups,
         "effective_allow": effective,
         "resolution_path": {

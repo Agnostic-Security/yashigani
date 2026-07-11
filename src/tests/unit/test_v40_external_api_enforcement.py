@@ -444,7 +444,8 @@ class TestExternalApiSeeder:
             "api.seeded.com",
             org_id="test-org",
             group_ids=[],
-            user_email=None,
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is True
@@ -459,7 +460,8 @@ class TestExternalApiSeeder:
             "api.unseeded.com",
             org_id="test-org",
             group_ids=[],
-            user_email=None,
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is False

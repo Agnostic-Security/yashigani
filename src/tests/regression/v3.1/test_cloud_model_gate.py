@@ -323,7 +323,8 @@ class TestCloudModelGate:
             ResourceType.CLOUD_MODEL, "gpt-4o",
             org_id=DEFAULT_ORG_ID,
             group_ids=["everyone"],
-            user_email="test@example.com",
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is False
@@ -339,7 +340,8 @@ class TestCloudModelGate:
             ResourceType.CLOUD_MODEL, "gpt-4o",
             org_id=DEFAULT_ORG_ID,
             group_ids=[],
-            user_email="test@example.com",
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is True
@@ -499,7 +501,8 @@ class TestCloudModelGate:
             ResourceType.CLOUD_MODEL, "qwen2.5:3b",
             org_id=DEFAULT_ORG_ID,
             group_ids=[],
-            user_email="test@example.com",
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is False, "Strict mode: local model with no grant must be DENIED"
@@ -518,7 +521,8 @@ class TestCloudModelGate:
             ResourceType.CLOUD_MODEL, "qwen2.5:3b",
             org_id=DEFAULT_ORG_ID,
             group_ids=[],
-            user_email="test@example.com",
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert result is True

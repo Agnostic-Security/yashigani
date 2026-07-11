@@ -1007,7 +1007,7 @@ class McpBroker:
           - Resolve server key: ctx.mcp_id (v4.0 stable UUID) or ctx.server_id
               or ctx.agent_name (backward compat fallback).
           - Call resolve_boolean_grant(MCP_SERVER, server_key, org_id,
-              group_ids=[], user_email=None) — org-level check only.
+              group_ids=[], principal_scope=None, principal_id=None) — org-level check only.
           - Returns "mcp_server_not_permitted" when no org grant or org denies.
 
         Fail-closed: any exception from the resolver is already caught inside
@@ -1033,7 +1033,8 @@ class McpBroker:
             server_key,
             org_id=org_id,
             group_ids=[],
-            user_email=None,  # org-level only; no group/user narrowing
+            principal_scope=None,  # org-level only; no group/user narrowing
+            principal_id=None,
             store=self._config.permission_store,  # type: ignore[arg-type]
         )
         return None if allowed else "mcp_server_not_permitted"

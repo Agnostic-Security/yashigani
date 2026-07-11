@@ -382,6 +382,24 @@ return 1
             identity_id = identity_id.decode("utf-8")
         return self.get(identity_id)
 
+    def get_by_email(self, email: str) -> Optional[dict]:
+        """Look up identity by email address.
+
+        Derives the slug from the email using email_to_slug, then delegates to
+        get_by_slug.  Returns None for malformed or unregistered emails.
+
+        4.1 SEC-GAP-1: used by uid_migrations.py to resolve legacy email-keyed
+        RBAC members and permission grants to their identity_id (idnt_) PK.
+        """
+        if not email or "@" not in email:
+            return None
+        try:
+            from yashigani.identity.slug import email_to_slug
+            slug = email_to_slug(email)
+        except (ValueError, Exception):
+            return None
+        return self.get_by_slug(slug)
+
     def get_by_api_key(self, plaintext_key: str) -> Optional[dict]:
         """Look up identity by API key. Checks current key + grace key."""
         for identity_id in self._iter_active_ids():

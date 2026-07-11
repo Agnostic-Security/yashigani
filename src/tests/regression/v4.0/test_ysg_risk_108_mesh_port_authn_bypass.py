@@ -106,9 +106,15 @@ def test_mesh_caller_is_internal_non_bearer_scheme(monkeypatch) -> None:
 
 def test_t3_anonymous_forwarded_user_is_stripped(monkeypatch) -> None:
     """
-    T-3 REGRESSION: anonymous POST :8081/mcp/test-server + X-Forwarded-User: victim
-    → MESH_IDENTITY_HEADER_REJECTED audit event MUST be emitted; registry misses (404)
-    proves we got past the identity gate with user_id stripped.
+    T-3 REGRESSION (4.1 update): anonymous POST :8081/mcp/test-server +
+    X-Yashigani-Identity-Id: victim → MESH_IDENTITY_HEADER_REJECTED audit event
+    MUST be emitted; registry misses (404) proves we got past the identity gate
+    with user_id stripped.
+
+    4.1 SEC-GAP-1: the T-3 gate now guards X-Yashigani-Identity-Id (the 4.x
+    canonical identity header) rather than X-Forwarded-User (which was the 4.0
+    OWUI forward).  X-Forwarded-User is now stripped by _STRIP_HEADERS but does
+    not trigger a MeshIdentityHeaderRejectedEvent (it's not an identity gate anymore).
     """
     monkeypatch.setattr("yashigani.gateway.openai_router._INTERNAL_BEARER", _FAKE_BEARER)
     # No Caddy secret on mesh port
@@ -118,9 +124,9 @@ def test_t3_anonymous_forwarded_user_is_stripped(monkeypatch) -> None:
 
     audit_writer = _RecordingAuditWriter()
 
-    # Anonymous request — no auth, only forged X-Forwarded-User
+    # Anonymous request — no auth, only forged X-Yashigani-Identity-Id (4.1 identity header)
     request = _make_request(
-        headers={"X-Forwarded-User": "victim-user"},
+        headers={"X-Yashigani-Identity-Id": "idnt_victimuser123"},
         path="/mcp/test-server",
     )
 
@@ -148,8 +154,8 @@ def test_t3_anonymous_forwarded_user_is_stripped(monkeypatch) -> None:
 
     rejected = [e for e in audit_writer.events
                 if type(e).__name__ == "MeshIdentityHeaderRejectedEvent"]
-    assert rejected[0].rejected_header == "x-forwarded-user"
-    assert "victim" in rejected[0].claimed_value_truncated
+    assert rejected[0].rejected_header == "x-yashigani-identity-id"
+    assert "idnt_victim" in rejected[0].claimed_value_truncated
 
 
 def test_t3_anonymous_no_forwarded_user_no_audit_event(monkeypatch) -> None:
@@ -355,9 +361,10 @@ def test_t3_and_t4_combined_anonymous_caller(monkeypatch) -> None:
 
     audit_writer = _RecordingAuditWriter()
 
+    # 4.1 SEC-GAP-1: forged identity header is X-Yashigani-Identity-Id (not X-Forwarded-User)
     request = _make_request(
         headers={
-            "X-Forwarded-User": "victim-user",
+            "X-Yashigani-Identity-Id": "idnt_victimuser123",
             "X-Yashigani-Orchestration-Depth": "1",
         },
         path="/mcp/test-server",

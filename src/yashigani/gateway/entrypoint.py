@@ -216,10 +216,13 @@ def _build_app(mesh_mode: bool = False):
             "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
             _cap_pol_org_id,
         )
-        # 3.1 Phase 4 — Unified Permission Store shares Redis db/3 (key prefix
-        # perm:grant:*).  Used by the MCP broker connection allow-list check.
-        from yashigani.permissions import PermissionStore as _PermStore
-        permission_store = _PermStore(redis_client=redis_client_rbac)
+        # 3.1 Phase 4 / 4.1 SEC-GAP-1 — Permission Store is the inner perm_store
+        # of capability_policy_store (same Redis backing, same default_org_id,
+        # same Python object as used by the backoffice routes).
+        # Sourced from capability_policy_store.perm_store so there is exactly ONE
+        # PermissionStore instance — prevents the getattr(rbac_store, "_perm_store")
+        # dead-migration pattern from the discarded 3fb42f51 restore attempt.
+        permission_store = capability_policy_store.perm_store
         logger.info(
             "Gateway permission store ready (Phase 4 MCP allow-list, org=%s)",
             _cap_pol_org_id,
@@ -1111,6 +1114,35 @@ def _build_app(mesh_mode: bool = False):
             _egress_push_exc,
         )
 
+    # ── 4.1 SEC-GAP-1 — UID unification startup migrations ───────────────────
+    # Re-keys RBAC group members and perm grants from email/slug → identity_id.
+    # Idempotent: safe to run every startup (already-migrated keys are skipped).
+    # Fail-closed for unmapped entries: they are REMOVED rather than silently
+    # left as inert grants (a DENY grant on an old email key would become ALLOW
+    # because the reader now queries by identity_id).
+    # Runs AFTER identity_registry is connected and BEFORE the first request.
+    if rbac_store is not None and identity_registry is not None:
+        try:
+            from yashigani.gateway.uid_migrations import migrate_rbac_to_identity_id
+            migrate_rbac_to_identity_id(rbac_store, identity_registry)
+        except Exception as _rbac_mig_exc:
+            logger.error(
+                "SEC-GAP-1: RBAC UID migration raised an unexpected error — "
+                "RBAC data may be partially migrated: %s",
+                _rbac_mig_exc,
+            )
+
+    if permission_store is not None and identity_registry is not None:
+        try:
+            from yashigani.gateway.uid_migrations import migrate_perm_grants_to_identity_id
+            migrate_perm_grants_to_identity_id(permission_store, identity_registry)
+        except Exception as _perm_mig_exc:
+            logger.error(
+                "SEC-GAP-1: perm grant UID migration raised an unexpected error — "
+                "permission grants may be partially migrated: %s",
+                _perm_mig_exc,
+            )
+
     # ── Signed orchestration-principal machinery (#47 / G-NEW-5 / R3) ─────────
     # The gateway SIGNS the orchestration principal (ES384, the SAME signing key
     # the MCP broker uses) bound to the caller's SPIFFE identity, and VERIFIES it
@@ -1162,6 +1194,8 @@ def _build_app(mesh_mode: bool = False):
         principal_tenant_id=_principal_tenant_id,
         capability_policy_store=capability_policy_store,  # 3.0
         workflow_scheduler=workflow_scheduler,
+        identity_registry=identity_registry,   # 4.1 SEC-GAP-1 boundary resolver
+        permission_store=permission_store,      # 4.1 SEC-GAP-1 perm migration
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 

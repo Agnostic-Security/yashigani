@@ -26,8 +26,9 @@ all api__ tool calls to that host are blocked.  Revoking a seeded grant
 all subsequent orchestrated calls to that host.
 
 "gateway:orchestrator" is implicitly covered by the org-level grant because
-``resolve_boolean_grant`` is called with ``user_email=None`` for the connection
-allow-list check (org-level only; no group/user narrowing for the orchestrator).
+``resolve_boolean_grant`` is called with ``principal_scope=None, principal_id=None``
+for the connection allow-list check (org-level only; no group/user narrowing
+for the orchestrator).  4.1 SEC-GAP-1: user_email removed from authz path.
 
 Idempotency
 -----------

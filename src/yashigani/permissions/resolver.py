@@ -20,10 +20,23 @@ ORG IS THE CEILING — most-restrictive-wins
         where "most-restrictive" = min by restrictiveness rank
         Fallback: immutable baseline (self×5) when org has no setting for this capability.
 
-Unauthenticated principals (email=None/"")
-    Group and user tiers are skipped.  The org-level setting (or baseline) applies.
+Principal tiers
+    Tier order:
+      1. Org ceiling  — must allow (deny-by-default, INV-1)
+      2. Group tier   — any group deny → denied (fires for ALL principals
+                        that carry group_ids, independent of principal_scope)
+      3. Principal tier — principal-scope-specific deny → denied
+           principal_scope="user"  → reads perm:grant:{type}:user:{principal_id}:{resource_id}
+                                     principal_id = user_id (slug from identity registry, NOT email)
+           principal_scope="agent" → reads perm:grant:{type}:agent:{principal_id}:{resource_id}
+                                     principal_id = agent_id from registry
+           principal_scope=None    → principal tier skipped (org+group ceiling only)
 
-Last updated: 2026-06-28T00:00:00+00:00
+    user_id (slug) is the scope_id for human "user"-scope grants.
+    Email is NOT an authz key — it is used only for password reset.
+    Agents and service principals use "agent" scope with agent_id.
+
+Last updated: 2026-07-02T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -61,7 +74,8 @@ def resolve_boolean_grant(
     *,
     org_id: str,
     group_ids: list[str],
-    user_email: Optional[str],
+    principal_scope: Optional[str],
+    principal_id: Optional[str],
     store: PermissionStore,
 ) -> bool:
     """
@@ -69,19 +83,23 @@ def resolve_boolean_grant(
 
     Returns True only when:
       1. The org-level grant for (resource_type, resource_id) is allow=True.
-      2. No group grant for any of the user's groups is allow=False.
-      3. The user grant (if any) is not allow=False.
+      2. No group grant for any of the principal's groups is allow=False.
+      3. The principal-scope grant (if any) is not allow=False.
 
     Any exception falls closed to False (DENIED).
 
     Parameters
     ----------
-    resource_type:  Must be a BLAST_RADIUS_TYPE.
-    resource_id:    Server ID / API ID / model name / agent ID.
-    org_id:         The principal's org (org ceiling).
-    group_ids:      List of group IDs the principal belongs to.
-    user_email:     Principal email.  None / "" → group and user tiers skipped.
-    store:          PermissionStore instance.
+    resource_type:    Must be a BLAST_RADIUS_TYPE.
+    resource_id:      Server ID / API ID / model name / agent ID.
+    org_id:           The principal's org (org ceiling).
+    group_ids:        List of group IDs the principal belongs to.
+    principal_scope:  "user" | "agent" | None.  Controls which store tier is
+                      queried for per-principal narrowing.  None → principal
+                      tier is skipped; org+group ceiling only.
+    principal_id:     Scope-specific identifier: user_id (slug, never email) for
+                      "user" scope; agent_id for "agent" scope; None to skip tier.
+    store:            PermissionStore instance.
     """
     if resource_type not in BLAST_RADIUS_TYPES:
         raise ValueError(
@@ -95,11 +113,9 @@ def resolve_boolean_grant(
         if org_grant is None or not org_grant.allow:
             return False  # No org grant or org explicitly denies → ceiling blocks
 
-        if not user_email:
-            # Unauthenticated — org allows and there's no group/user context
-            return True
-
-        # INV-3  Groups can only narrow
+        # INV-2  Group tier — runs for ALL principals that carry group_ids,
+        # including agents and service-kind identities (principal_scope=None).
+        # Groups can only narrow, never widen.
         for group_id in group_ids:
             group_grant: Optional[BooleanGrantValue] = store.get_boolean_grant(
                 resource_type, "group", group_id, resource_id
@@ -107,20 +123,24 @@ def resolve_boolean_grant(
             if group_grant is not None and not group_grant.allow:
                 return False  # Group explicitly denies → narrowing kicks in
 
-        # INV-3  User can only narrow
-        user_grant: Optional[BooleanGrantValue] = store.get_boolean_grant(
-            resource_type, "user", user_email, resource_id
-        )
-        if user_grant is not None and not user_grant.allow:
-            return False  # User explicitly denies → narrowing kicks in
+        # INV-3  Principal tier — dispatches by scope, skipped when scope/id absent.
+        # "user"  → reads perm:grant:{type}:user:{principal_id}:{resource_id}
+        # "agent" → reads perm:grant:{type}:agent:{principal_id}:{resource_id}
+        # None    → skipped (org+group ceiling only, e.g. orchestrator/unauthed)
+        if principal_scope in ("user", "agent") and principal_id:
+            principal_grant: Optional[BooleanGrantValue] = store.get_boolean_grant(
+                resource_type, principal_scope, principal_id, resource_id
+            )
+            if principal_grant is not None and not principal_grant.allow:
+                return False  # Principal explicitly denies → narrowing kicks in
 
-        return True  # Org allows; no group/user denial
+        return True  # Org allows; no group/principal denial
 
     except Exception as exc:
         logger.error(
-            "perm: resolve_boolean_grant(%s, %s) for org=%s user=%s — "
+            "perm: resolve_boolean_grant(%s, %s) for org=%s scope=%s/%s — "
             "fail-closed to DENIED: %s",
-            resource_type.value, resource_id, org_id, user_email, exc,
+            resource_type.value, resource_id, org_id, principal_scope, principal_id, exc,
         )
         return False  # Fail closed
 
@@ -133,7 +153,8 @@ def resolve_browser_capability_set(
     *,
     org_id: str,
     group_ids: list[str],
-    user_email: Optional[str],
+    principal_scope: Optional[str],
+    principal_id: Optional[str],
     store: PermissionStore,
 ) -> CapabilityPolicySet:
     """
@@ -152,22 +173,29 @@ def resolve_browser_capability_set(
     Falls back to the immutable baseline (self×5) if an exception occurs.
     Always returns a complete CapabilityPolicySet (all 5 capabilities).
 
+    Browser capabilities are human-only by product design.  Agents never call
+    this function.  The signature uses principal_scope/principal_id for
+    contract consistency; pass principal_scope=None for non-user principals
+    and the user tier is skipped (org+group ceiling only).
+
     Parameters
     ----------
-    org_id:      The principal's org (org ceiling).
-    group_ids:   Group IDs the principal belongs to.
-    user_email:  Principal email.  None / "" → group and user tiers skipped.
-    store:       PermissionStore instance.
+    org_id:           The principal's org (org ceiling).
+    group_ids:        Group IDs the principal belongs to.
+    principal_scope:  "user" to apply user-tier narrowing, None to skip it.
+                      Agents should pass None (browser caps are human-only).
+    principal_id:     Email for "user" scope; None skips the user tier.
+    store:            PermissionStore instance.
     """
     try:
         org_policy: CapabilityPolicySet = store.get_browser_cap_org_policy(org_id)
         # org_policy always has all 5 capabilities (get_browser_cap_org_policy merges
         # with the baseline, so even if no org key exists, we get self×5).
 
-        if not user_email:
-            # Unauthenticated — org policy (or baseline) is the effective policy.
-            return org_policy
-
+        # Group tier runs for ALL principals carrying group_ids, regardless of
+        # principal_scope — mirrors resolve_boolean_grant so a caller that
+        # supplies groups without a user scope cannot silently drop the group
+        # tier.  (Groups can only narrow.)
         result: CapabilityPolicySet = {}
         for cap in CAPABILITY_NAMES:
             candidates: list[CapabilitySetting] = [org_policy[cap]]
@@ -178,10 +206,11 @@ def resolve_browser_capability_set(
                 if cap in group_partial:
                     candidates.append(group_partial[cap])
 
-            # User tier
-            user_partial = store.get_browser_cap_partial("user", user_email)
-            if cap in user_partial:
-                candidates.append(user_partial[cap])
+            # User tier — only for user-scoped principals (browser caps are human-only)
+            if principal_scope == "user" and principal_id:
+                user_partial = store.get_browser_cap_partial("user", principal_id)
+                if cap in user_partial:
+                    candidates.append(user_partial[cap])
 
             # Most-restrictive wins (min by restrictiveness rank).
             # This enforces org-ceiling: a user "allow_list" will never beat
@@ -192,9 +221,9 @@ def resolve_browser_capability_set(
 
     except Exception as exc:
         logger.error(
-            "perm: resolve_browser_capability_set(org=%s, user=%s) failed "
+            "perm: resolve_browser_capability_set(org=%s, scope=%s/%s) failed "
             "— falling back to baseline: %s",
-            org_id, user_email, exc,
+            org_id, principal_scope, principal_id, exc,
         )
         try:
             return store.get_browser_cap_org_policy(org_id)

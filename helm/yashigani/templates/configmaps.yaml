@@ -649,6 +649,7 @@ data:
           {{- end }}
           import inject-caddy-verified
           uri /auth/verify-admin
+          copy_headers X-Yashigani-Identity-Id  # 4.1 SEC-GAP-1 — identity rail
           @unauthorized status 401
           handle_response @unauthorized {
             redir * /admin/login?next=/admin/grafana/ 302
@@ -676,6 +677,7 @@ data:
           {{- end }}
           import inject-caddy-verified
           uri /auth/verify-admin
+          copy_headers X-Yashigani-Identity-Id  # 4.1 SEC-GAP-1 — identity rail
           @unauthorized status 401
           handle_response @unauthorized {
             redir * /admin/login 302
@@ -701,6 +703,7 @@ data:
           {{- end }}
           import inject-caddy-verified
           uri /auth/verify-admin
+          copy_headers X-Yashigani-Identity-Id  # 4.1 SEC-GAP-1 — identity rail
           @unauthorized status 401
           handle_response @unauthorized {
             redir * /admin/login 302

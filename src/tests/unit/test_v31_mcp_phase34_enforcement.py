@@ -447,7 +447,8 @@ class TestSeedMcpGrants:
             "my-mcp",
             org_id="default",
             group_ids=[],
-            user_email=None,
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert allowed is True, (
@@ -468,7 +469,8 @@ class TestSeedMcpGrants:
             "unregistered-server",
             org_id="default",
             group_ids=[],
-            user_email=None,
+            principal_scope=None,
+            principal_id=None,
             store=store,
         )
         assert allowed is False, (

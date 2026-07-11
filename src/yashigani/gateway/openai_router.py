@@ -2301,17 +2301,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         # User-level grants for narrowing — only for human/user principals.
         # Service/agent/gateway identities use org+group tiers only.
         _perm_kind = identity.get("kind", "") if identity else ""
-        _perm_user_email: Optional[str] = (
-            (identity.get("_owui_email") or identity.get("email") or identity.get("identity_id"))
+        # 4.1 SEC-GAP-1: key on identity_id (idnt_{12hex}) not email.
+        _perm_user_id: Optional[str] = (
+            identity.get("identity_id")
             if _perm_kind in ("human", "user") else None
-        )
+        ) if identity else None
 
         _perm_allowed = _resolve_grant(
             _RT.CLOUD_MODEL,
             selected_model,
             org_id=_perm_org_id,
             group_ids=_perm_groups,
-            user_email=_perm_user_email,
+            principal_scope="user" if _perm_user_id else None,
+            principal_id=_perm_user_id,
             store=_state.permission_store,
         )
         if not _perm_allowed:
@@ -4500,12 +4502,32 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     if not _state.identity_registry:
         return None
 
+    # ── 4.1 SEC-GAP-1 — boundary-resolver pre-populated ysg_principal ──────────
+    # proxy.py boundary resolver runs as middleware and sets
+    # request.state.ysg_principal when X-Yashigani-Identity-Id is present and
+    # trusted-internal (Caddy strips external copies at the edge).  Use it first;
+    # this covers the browser-session SSO path without touching email/slug.
+    # Fail-closed: the boundary resolver already rejected malformed/unknown ids
+    # with 403/401, so ysg_principal is only set when identity is confirmed valid.
+    _rp_oir = getattr(getattr(request, "state", None), "ysg_principal", None)
+    if _rp_oir is not None:
+        try:
+            _oir_identity = _state.identity_registry.get(_rp_oir.identity_id)
+        except Exception as _oir_exc:
+            logger.warning(
+                "_resolve_identity: registry get for pre-resolved principal %r raised %s",
+                _rp_oir.identity_id, _oir_exc,
+            )
+            _oir_identity = None
+        if _oir_identity is not None:
+            return _oir_identity
+        # principal was pre-resolved but registry blip prevented dict fetch —
+        # fall through to legacy paths rather than fail-open with partial data
+
     # ── SSO headers (from Caddy) ── LAURA-OBS-B: trust-gate X-Forwarded-User ──
-    # X-Forwarded-User is the SSO identity Caddy's forward_auth re-injects AFTER
-    # the backoffice has verified the session (the copy_headers X-Forwarded-User
-    # in the forward_auth blocks).  Caddy ALSO strips any inbound X-Forwarded-User
-    # at the public edge AND injects X-Caddy-Verified-Secret (the per-install
-    # caddy_internal_hmac) on every reverse_proxy hop to the gateway.
+    # X-Forwarded-User is the 3.x SSO identity Caddy's forward_auth re-injects.
+    # In 4.x the canonical header is X-Yashigani-Identity-Id (above); this path
+    # is preserved for backward-compat with 3.x Caddyfile deployments only.
     #
     # ASYMMETRY CLOSED: X-OpenWebUI-User-* is honoured ONLY inside the proven
     # internal-bearer branch above, but X-Forwarded-User was previously honoured

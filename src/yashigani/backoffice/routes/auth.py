@@ -828,11 +828,21 @@ async def verify_session(request: Request):
     from starlette.responses import Response as StarletteResponse
 
     resp = StarletteResponse(status_code=200)
-    # X-Forwarded-User must be an email for Open WebUI's trusted header auth
     email = record.email or f"{record.username}@yashigani.local"
     resp.headers["X-Forwarded-User"] = email
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
+    # 4.1 SEC-GAP-1: inject X-Yashigani-Identity-Id for the gateway boundary resolver.
+    # Caddy propagates this via copy_headers in the forward_auth block.
+    _idreg = getattr(state, "identity_registry", None)
+    if _idreg is not None:
+        try:
+            _iid = _idreg.get_by_account_id(session.account_id)
+            if _iid:
+                resp.headers["X-Yashigani-Identity-Id"] = _iid
+        except Exception as _idreg_exc:
+            _log.debug("verify: identity_registry lookup failed for %s: %s",
+                       session.account_id, _idreg_exc)
     return resp
 
 
@@ -876,6 +886,16 @@ async def verify_admin_session(request: Request):
     resp.headers["X-Forwarded-User"] = email
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
+    # 4.1 SEC-GAP-1: inject identity_id for forward_auth copy_headers propagation.
+    _idreg_a = getattr(state, "identity_registry", None)
+    if _idreg_a is not None:
+        try:
+            _iid_a = _idreg_a.get_by_account_id(session.account_id)
+            if _iid_a:
+                resp.headers["X-Yashigani-Identity-Id"] = _iid_a
+        except Exception as _idreg_a_exc:
+            _log.debug("verify-admin: identity_registry lookup failed for %s: %s",
+                       session.account_id, _idreg_a_exc)
     return resp
 
 
@@ -1015,6 +1035,16 @@ async def verify_user_session(request: Request):
     resp.headers["X-Forwarded-User"] = email
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
+    # 4.1 SEC-GAP-1: inject identity_id for forward_auth copy_headers propagation.
+    _idreg_u = getattr(state, "identity_registry", None)
+    if _idreg_u is not None:
+        try:
+            _iid_u = _idreg_u.get_by_account_id(session.account_id)
+            if _iid_u:
+                resp.headers["X-Yashigani-Identity-Id"] = _iid_u
+        except Exception as _idreg_u_exc:
+            _log.debug("verify-user: identity_registry lookup failed for %s: %s",
+                       session.account_id, _idreg_u_exc)
     return resp
 
 

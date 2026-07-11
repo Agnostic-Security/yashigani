@@ -302,10 +302,15 @@ class TestStoreRoundTrips:
 class TestBooleanResolver:
 
     def _resolve(self, resource_type, resource_id, *, org_id, group_ids, user_email, store):
+        # 4.1 SEC-GAP-1: resolver now uses principal_scope/principal_id.
+        # Pass the user_email value as principal_id (used as the grant store key;
+        # tests seed grants at the same key so resolver logic is preserved).
         from yashigani.permissions.resolver import resolve_boolean_grant
         return resolve_boolean_grant(
             resource_type, resource_id,
-            org_id=org_id, group_ids=group_ids, user_email=user_email,
+            org_id=org_id, group_ids=group_ids,
+            principal_scope="user" if user_email else None,
+            principal_id=user_email if user_email else None,
             store=store,
         )
 
@@ -531,12 +536,14 @@ class TestBooleanResolver:
 class TestBrowserCapabilityResolver:
 
     def _resolve_set(self, *, org_id, group_ids, user_email, store):
+        # 4.1 SEC-GAP-1: resolver now uses principal_scope/principal_id.
         from yashigani.permissions.resolver import resolve_browser_capability_set
         perm_store = getattr(store, "perm_store", store)
         return resolve_browser_capability_set(
             org_id=org_id,
             group_ids=group_ids,
-            user_email=user_email,
+            principal_scope="user" if user_email else None,
+            principal_id=user_email if user_email else None,
             store=perm_store,
         )
 
