@@ -1,7 +1,7 @@
 # Last updated: 2026-05-02T00:00:00+01:00 (RETRO-R4-2: expose connect_with_retry_sync)
-from yashigani.db.postgres import create_pool, close_pool, tenant_transaction, get_pool, connect_with_retry_sync
+from yashigani.db.postgres import create_pool, close_pool, tenant_transaction, get_pool, connect_with_retry_sync, PGP_SYM_OPTS
 
-__all__ = ["create_pool", "close_pool", "tenant_transaction", "get_pool", "run_migrations", "connect_with_retry_sync"]
+__all__ = ["create_pool", "close_pool", "tenant_transaction", "get_pool", "run_migrations", "connect_with_retry_sync", "PGP_SYM_OPTS"]
 
 
 # Stable 64-bit advisory-lock key for Yashigani schema/bootstrap operations.
@@ -162,7 +162,7 @@ def _sync_app_role_password(conn, logger) -> None:
     # use psycopg2 sql.Literal for correct, injection-safe quoting of the literal.
     try:
         with conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosem: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- DDL utility statement; role name is a static literal, password is quoted via psycopg2 sql.Literal (not user input, read from a secrets file)
                 sql.SQL("ALTER ROLE yashigani_app WITH PASSWORD {}").format(sql.Literal(app_pw))
             )
         logger.info(

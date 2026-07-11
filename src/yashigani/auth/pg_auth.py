@@ -43,6 +43,9 @@ from yashigani.auth.password import (
     verify_password,
 )
 from yashigani.auth.totp import (
+    LEGACY_TOTP_ALGO,
+    ROLE_TOTP_ALGO,
+    ROLE_TOTP_DIGITS,
     RecoveryCodeSet,
     TotpProvisioning,
     generate_provisioning,
@@ -59,6 +62,30 @@ _PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
 # accept ±1 window, so 60 s is sufficient to defeat replay across all
 # accepted windows.
 _TOTP_REPLAY_TTL_SECONDS = 60
+
+# LAURA-3X-002: a constant argon2 hash used to equalize authentication timing on
+# the non-existent/disabled-user path (ASVS V2.2.1). Computed lazily once so the
+# argon2 cost is not paid at import time, then reused for every dummy verify.
+_DUMMY_PASSWORD_HASH: Optional[str] = None
+
+
+def _dummy_password_hash() -> str:
+    """Return (computing once) a valid argon2 hash for timing-equalization.
+
+    Verifying a real password against this hash takes ~the same wall-clock as a
+    genuine wrong-password verify, so a non-existent username cannot be told apart
+    from a real one by response timing.
+    """
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        # NB: must be >=36 chars and must NOT contain product/company/common
+        # terms (validate_password_context rejects e.g. "yashigani"); check_breach
+        # is disabled — this is never a real account password.
+        _DUMMY_PASSWORD_HASH = hash_password(
+            "constant-timing-equalizer-placeholder-row-0000",
+            check_breach=False,
+        )
+    return _DUMMY_PASSWORD_HASH
 
 
 class PostgresLocalAuthService:
@@ -166,6 +193,17 @@ class PostgresLocalAuthService:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             record = await self._fetch_by_username(conn, username)
             if record is None or record.disabled:
+                # LAURA-3X-002 (ASVS V2.2.1): equalize timing. A non-existent or
+                # disabled username must take ~the same wall-clock as a wrong
+                # password for a real account, otherwise the ~130ms argon2 delta
+                # leaks valid usernames (timing enumeration). Run one real argon2
+                # verify against a constant dummy hash and discard the result.
+                # Best-effort: timing-equalization must NEVER break the auth path,
+                # so any error here is swallowed and we still fail closed.
+                try:
+                    verify_password(password, _dummy_password_hash())
+                except Exception:  # noqa: BLE001 — hardening only, never fail auth
+                    pass
                 return False, None, generic_fail
 
             if _is_locked(record):
@@ -190,10 +228,26 @@ class PostgresLocalAuthService:
                 await self._update(conn, record)
                 return True, record, "totp_provision_required"
 
+            # Phase 13: legacy SHA-1 enrolment — force re-enrolment transparently.
+            # The expected algorithm for this role differs from what was enrolled.
+            expected_algo = ROLE_TOTP_ALGO.get(record.account_tier, LEGACY_TOTP_ALGO)
+            if record.totp_secret and record.totp_algorithm != expected_algo:
+                record.force_totp_provision = True
+                record.failed_attempts = 0
+                await self._update(conn, record)
+                return True, record, "totp_provision_required"
+
             if record.totp_backoff_until > time.time():
                 return False, None, generic_fail
 
-            totp_ok = await self._verify_totp_with_replay(conn, record.totp_secret, totp_code)
+            role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+            totp_ok = await self._verify_totp_with_replay(
+                conn,
+                record.totp_secret,
+                totp_code,
+                algorithm=record.totp_algorithm,
+                digits=role_digits,
+            )
 
             if not totp_ok:
                 record.totp_failed_attempts += 1
@@ -237,9 +291,13 @@ class PostgresLocalAuthService:
             if record is None:
                 raise KeyError(username)
 
-            prov = generate_provisioning(account_name=username)
+            # Phase 13: choose algorithm and digit count based on account tier.
+            algo = ROLE_TOTP_ALGO.get(record.account_tier, LEGACY_TOTP_ALGO)
+            digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+            prov = generate_provisioning(account_name=username, algorithm=algo, digits=digits)
             code_set = generate_recovery_code_set(prov.recovery_codes)
             record.totp_secret = prov.secret_b32
+            record.totp_algorithm = algo
             record.recovery_codes = code_set
             record.force_totp_provision = True
             await self._update(conn, record)
@@ -252,7 +310,14 @@ class PostgresLocalAuthService:
                 return False, "account_not_found"
             if not record.totp_secret:
                 return False, "no_pending_enrolment"
-            if not await self._verify_totp_with_replay(conn, record.totp_secret, totp_code):
+            role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+            if not await self._verify_totp_with_replay(
+                conn,
+                record.totp_secret,
+                totp_code,
+                algorithm=record.totp_algorithm,
+                digits=role_digits,
+            ):
                 return False, "invalid_totp_code"
             record.force_totp_provision = False
             await self._update(conn, record)
@@ -291,7 +356,14 @@ class PostgresLocalAuthService:
                 return False, "invalid_credentials"
             if not verify_password(current_password, record.password_hash):
                 return False, "invalid_credentials"
-            if not await self._verify_totp_with_replay(conn, record.totp_secret, totp_code):
+            role_digits = ROLE_TOTP_DIGITS.get(record.account_tier, 6)
+            if not await self._verify_totp_with_replay(
+                conn,
+                record.totp_secret,
+                totp_code,
+                algorithm=record.totp_algorithm,
+                digits=role_digits,
+            ):
                 return False, "invalid_totp"
 
             # -- Reuse history check (IA.L2-3.5.8) --------------------------
@@ -407,9 +479,25 @@ class PostgresLocalAuthService:
         username: str,
         admin_totp_secret: str,
         admin_totp_code: str,
+        admin_totp_algorithm: str = LEGACY_TOTP_ALGO,
+        admin_totp_digits: int = 8,
     ) -> tuple[bool, str]:
+        """
+        Full-reset a user account. Requires admin TOTP re-verification.
+
+        admin_totp_algorithm / admin_totp_digits — must match the algorithm and
+        digit count on the acting admin's AccountRecord (from ``totp_algorithm``
+        and ``ROLE_TOTP_DIGITS[account_tier]``). Callers must pass these
+        explicitly; the defaults are conservative fail-safe values only.
+        """
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            if not await self._verify_totp_with_replay(conn, admin_totp_secret, admin_totp_code):
+            if not await self._verify_totp_with_replay(
+                conn,
+                admin_totp_secret,
+                admin_totp_code,
+                algorithm=admin_totp_algorithm,
+                digits=admin_totp_digits,
+            ):
                 return False, "invalid_admin_totp"
 
             record = await self._fetch_by_username(conn, username)
@@ -417,6 +505,7 @@ class PostgresLocalAuthService:
                 return False, "user_not_found"
 
             record.totp_secret = ""
+            record.totp_algorithm = LEGACY_TOTP_ALGO  # sentinel — requires re-enrolment
             record.recovery_codes = None
             record.force_password_change = True
             record.force_totp_provision = True
@@ -606,7 +695,8 @@ class PostgresLocalAuthService:
             res = await conn.execute(
                 "UPDATE admin_accounts SET "
                 "totp_secret = '', recovery_codes = NULL, "
-                "force_totp_provision = true "
+                "force_totp_provision = true, "
+                "totp_algorithm = 'SHA1' "  # sentinel — next provision_totp_start sets role algo
                 "WHERE username = $1",
                 username,
             )
@@ -615,7 +705,12 @@ class PostgresLocalAuthService:
             except (ValueError, IndexError):
                 return False
 
-    async def set_totp_secret_direct(self, username: str, totp_secret: str) -> bool:
+    async def set_totp_secret_direct(
+        self,
+        username: str,
+        totp_secret: str,
+        algorithm: str = LEGACY_TOTP_ALGO,
+    ) -> bool:
         """
         INSTALLER-PRIVILEGED bootstrap-only path.
 
@@ -626,15 +721,24 @@ class PostgresLocalAuthService:
         to have delivered the secret to the admin via a separate channel
         (printed to stdout during install).
 
+        algorithm — the HMAC algorithm that was used to generate the URI
+        delivered to the admin ("SHA512" for admin-tier bootstrap paths in
+        3.1+). Callers MUST pass the correct algorithm so the stored
+        totp_algorithm column matches what the authenticator app was
+        configured with.
+
         This is the ONLY place in the codebase that should call this
         method — user-facing flows MUST go through
         provision_totp_start + provision_totp_confirm.
         """
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             res = await conn.execute(
-                "UPDATE admin_accounts SET totp_secret = $1, force_totp_provision = false WHERE username = $2",
+                "UPDATE admin_accounts SET "
+                "totp_secret = $1, force_totp_provision = false, totp_algorithm = $3 "
+                "WHERE username = $2",
                 totp_secret,
                 username,
+                algorithm.upper(),
             )
             try:
                 return int(res.split()[-1]) > 0
@@ -661,7 +765,7 @@ class PostgresLocalAuthService:
                 """
                 INSERT INTO admin_accounts (
                     account_id, tenant_id, username, password_hash,
-                    totp_secret, recovery_codes, account_tier, email,
+                    totp_secret, totp_algorithm, recovery_codes, account_tier, email,
                     force_password_change, force_totp_provision, disabled,
                     failed_attempts, locked_until,
                     totp_failed_attempts, totp_backoff_until,
@@ -669,12 +773,12 @@ class PostgresLocalAuthService:
                     last_login_at, inactive_disabled_at
                 ) VALUES (
                     $1, $2::uuid, $3, $4,
-                    $5, $6::jsonb, $7, $8,
-                    $9, $10, $11,
-                    $12, $13,
-                    $14, $15,
-                    $16, $17,
-                    $18, $19
+                    $5, $6, $7::jsonb, $8, $9,
+                    $10, $11, $12,
+                    $13, $14,
+                    $15, $16,
+                    $17, $18,
+                    $19, $20
                 )
                 """,
                 uuid.UUID(record.account_id),
@@ -682,6 +786,7 @@ class PostgresLocalAuthService:
                 record.username,
                 record.password_hash,
                 record.totp_secret,
+                record.totp_algorithm,
                 _serialise_recovery(record.recovery_codes),
                 record.account_tier,
                 record.email,
@@ -716,23 +821,25 @@ class PostgresLocalAuthService:
             UPDATE admin_accounts SET
                 password_hash = $2,
                 totp_secret = $3,
-                recovery_codes = $4::jsonb,
-                email = $5,
-                force_password_change = $6,
-                force_totp_provision = $7,
-                disabled = $8,
-                failed_attempts = $9,
-                locked_until = $10,
-                totp_failed_attempts = $11,
-                totp_backoff_until = $12,
-                password_changed_at = $13,
-                last_login_at = $14,
-                inactive_disabled_at = $15
+                totp_algorithm = $4,
+                recovery_codes = $5::jsonb,
+                email = $6,
+                force_password_change = $7,
+                force_totp_provision = $8,
+                disabled = $9,
+                failed_attempts = $10,
+                locked_until = $11,
+                totp_failed_attempts = $12,
+                totp_backoff_until = $13,
+                password_changed_at = $14,
+                last_login_at = $15,
+                inactive_disabled_at = $16
             WHERE username = $1
             """,
             record.username,
             record.password_hash,
             record.totp_secret,
+            record.totp_algorithm,
             _serialise_recovery(record.recovery_codes),
             record.email,
             record.force_password_change,
@@ -759,14 +866,20 @@ class PostgresLocalAuthService:
         conn: asyncpg.Connection,
         secret_b32: str,
         totp_code: str,
+        algorithm: str = LEGACY_TOTP_ALGO,
+        digits: int = 6,
     ) -> bool:
         """
         Wrap verify_totp() with a Postgres-backed replay cache.
 
+        algorithm / digits — must match the algorithm and digit count stored on
+        the AccountRecord.  Callers must pass these explicitly; the defaults are
+        conservative legacy values for the migration window.
+
         Loads the set of code_hashes that are still within the replay
         window, invokes verify_totp() with that local set, and if the set
         grew (i.e. the code was valid and just-consumed) INSERTs the new
-        hash with a short TTL. verify_totp() itself is not modified.
+        hash with a short TTL.
         """
         if not secret_b32:
             return False
@@ -796,7 +909,7 @@ class PostgresLocalAuthService:
 
         proxy = _HashingSet()
         before = len(cache)
-        ok = verify_totp(secret_b32, totp_code, proxy)
+        ok = verify_totp(secret_b32, totp_code, proxy, algorithm=algorithm, digits=digits)
         if ok and len(cache) > before:
             # Insert only the newly consumed hash(es) — expiration is
             # short (60s) which covers the full valid-window set of three
@@ -871,6 +984,9 @@ def _row_to_record(row) -> AccountRecord:
         inactive_disabled_at=_ts_to_epoch(row["inactive_disabled_at"])
         if "inactive_disabled_at" in row.keys()
         else None,
+        # Phase 13: totp_algorithm column (migration 0023); fall back to SHA1 for
+        # pre-migration rows that don't yet have the column.
+        totp_algorithm=row["totp_algorithm"] if "totp_algorithm" in row.keys() else LEGACY_TOTP_ALGO,
     )
 
 

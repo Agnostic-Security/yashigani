@@ -374,3 +374,311 @@ class TestKSMRotationScheduler:
         )
         with pytest.raises(ValueError, match="frequently"):
             scheduler.set_schedule("*/30 * * * *")  # every 30 min
+
+
+# ---------------------------------------------------------------------------
+# DockerSecretsProvider — cloud-key write support (demo/free tier)
+# ---------------------------------------------------------------------------
+
+class TestDockerSecretsProviderCloudKeys:
+    """Tests for the writable cloud-keys extension (Tiago directive).
+
+    Verifies:
+    1. set_secret writes atomically (0600) for cloud keys.
+    2. get_secret returns the runtime-set value (cloud_keys_dir first).
+    3. get_secret falls back to read-only /run/secrets when cloud_keys_dir
+       has no entry (pre-seeded key scenario).
+    4. set_secret refuses non-cloud keys (install-managed secrets stay RO).
+    5. set_secret raises when cloud_keys_dir is None.
+    6. set_secret raises when cloud_keys_dir does not exist.
+    7. Path-traversal is still rejected on both get and set.
+    8. health_check requires rw on cloud_keys_dir when configured.
+    9. Factory wires cloud_keys_dir from YASHIGANI_CLOUD_KEYS_DIR env var.
+    10. Gateway _get_cloud_api_key() flow: set → persists → get returns it.
+    """
+
+    def _make_provider(
+        self,
+        secrets_dir: Path,
+        cloud_keys_dir: Path | None = None,
+    ) -> DockerSecretsProvider:
+        return DockerSecretsProvider(
+            environment_scope="dev",
+            secrets_dir=secrets_dir,
+            cloud_keys_dir=cloud_keys_dir,
+        )
+
+    # --- set_secret (cloud key namespace) -----------------------------------
+
+    def test_set_secret_cloud_key_writes_atomically(self, tmp_path):
+        """set_secret for openai_api_key writes the file with mode 0600."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        provider.set_secret("openai_api_key", "sk-test-value-123")
+
+        written = rw_dir / "openai_api_key"
+        assert written.exists(), "key file not created"
+        assert written.read_text(encoding="utf-8") == "sk-test-value-123"
+        # CWE-732: mode must be 0600 (owner rw only)
+        file_mode = written.stat().st_mode & 0o777
+        assert file_mode == 0o600, f"expected 0600, got {oct(file_mode)}"
+
+    def test_set_secret_anthropic_key_writes(self, tmp_path):
+        """set_secret for anthropic_api_key also works."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        provider.set_secret("anthropic_api_key", "ant-key-456")
+
+        written = rw_dir / "anthropic_api_key"
+        assert written.exists()
+        assert written.read_text(encoding="utf-8") == "ant-key-456"
+
+    def test_set_secret_overwrites_existing_value(self, tmp_path):
+        """set_secret can update an already-stored key."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        provider.set_secret("openai_api_key", "first-value")
+        provider.set_secret("openai_api_key", "second-value")
+
+        written = rw_dir / "openai_api_key"
+        assert written.read_text(encoding="utf-8") == "second-value"
+        assert (written.stat().st_mode & 0o777) == 0o600
+
+    # --- get_secret resolution order ----------------------------------------
+
+    def test_get_secret_prefers_cloud_keys_dir(self, tmp_path):
+        """get_secret returns cloud_keys_dir value, not the /run/secrets one."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+        # Both directories have the key — cloud_keys_dir wins.
+        (ro_dir / "openai_api_key").write_text("ro-value", encoding="utf-8")
+        (rw_dir / "openai_api_key").write_text("rw-value", encoding="utf-8")
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        assert provider.get_secret("openai_api_key") == "rw-value"
+
+    def test_get_secret_falls_back_to_ro_secrets(self, tmp_path):
+        """get_secret uses /run/secrets when cloud_keys_dir has no entry (pre-seeded)."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+        # Only the read-only mount has the key (pre-seeded by install.sh).
+        (ro_dir / "openai_api_key").write_text("preseed-value\n", encoding="utf-8")
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        assert provider.get_secret("openai_api_key") == "preseed-value"
+
+    def test_get_secret_no_cloud_keys_dir_reads_ro(self, tmp_path):
+        """When cloud_keys_dir is None, get_secret reads from secrets_dir only."""
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        (ro_dir / "openai_api_key").write_text("env-value", encoding="utf-8")
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=None)
+        assert provider.get_secret("openai_api_key") == "env-value"
+
+    def test_set_then_get_round_trip(self, tmp_path):
+        """Full round-trip: set via demo provider → get returns the stored value."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        provider.set_secret("openai_api_key", "sk-roundtrip-key")
+        result = provider.get_secret("openai_api_key")
+        assert result == "sk-roundtrip-key"
+
+    # --- install-managed secrets remain read-only ---------------------------
+
+    def test_set_secret_refuses_non_cloud_key(self, tmp_path):
+        """set_secret on postgres_password or any non-cloud key raises ProviderError."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+            provider.set_secret("postgres_password", "newpw")
+
+    def test_set_secret_refuses_internal_bearer(self, tmp_path):
+        """internal_bearer is install-managed and must not be writable."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+            provider.set_secret("yashigani_internal_bearer", "fake-bearer")
+
+    def test_set_secret_refuses_ca_root(self, tmp_path):
+        """ca_root.crt is PKI material and must not be writable."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+            provider.set_secret("ca_root.crt", "fake-cert")
+
+    # --- error conditions ---------------------------------------------------
+
+    def test_set_secret_raises_when_no_cloud_keys_dir(self, tmp_path):
+        """set_secret for a cloud key raises when cloud_keys_dir is None."""
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=None)
+        with pytest.raises(ProviderError, match="cloud-keys directory is not configured"):
+            provider.set_secret("openai_api_key", "sk-key")
+
+    def test_set_secret_raises_when_dir_missing(self, tmp_path):
+        """set_secret raises ProviderError when cloud_keys_dir does not exist."""
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        missing_rw = tmp_path / "nonexistent-cloud-keys"
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=missing_rw)
+        with pytest.raises(ProviderError, match="does not exist"):
+            provider.set_secret("openai_api_key", "sk-key")
+
+    # --- path-traversal safety ----------------------------------------------
+
+    def test_set_secret_path_traversal_rejected(self, tmp_path):
+        """Path-traversal via key name is rejected before any filesystem access."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        with pytest.raises(ProviderError):
+            provider.set_secret("../etc/passwd", "evil")
+
+    def test_get_secret_path_traversal_rejected_with_cloud_dir(self, tmp_path):
+        """Path-traversal via get_secret is still rejected when cloud_keys_dir is set."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        with pytest.raises(ProviderError):
+            provider.get_secret("../../etc/shadow")
+
+    # --- health_check -------------------------------------------------------
+
+    def test_health_check_passes_when_rw_dir_writable(self, tmp_path):
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        assert provider.health_check() is True
+
+    def test_health_check_fails_when_rw_dir_missing(self, tmp_path):
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        missing_rw = tmp_path / "nonexistent"
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=missing_rw)
+        assert provider.health_check() is False
+
+    # --- factory wiring -----------------------------------------------------
+
+    def test_factory_passes_cloud_keys_dir_to_docker_provider(self, tmp_path, monkeypatch):
+        """Factory reads YASHIGANI_CLOUD_KEYS_DIR and passes it to DockerSecretsProvider."""
+        rw_dir = tmp_path / "cloud-keys"
+        rw_dir.mkdir()
+
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "docker")
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        monkeypatch.setenv("YASHIGANI_CLOUD_KEYS_DIR", str(rw_dir))
+
+        provider = create_provider()
+        assert isinstance(provider, DockerSecretsProvider)
+        assert provider._cloud_keys_dir == rw_dir
+
+    def test_factory_no_cloud_keys_dir_env_gives_none(self, monkeypatch):
+        """When YASHIGANI_CLOUD_KEYS_DIR is unset, cloud_keys_dir is None."""
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.setenv("YASHIGANI_KMS_PROVIDER", "docker")
+        monkeypatch.delenv("YASHIGANI_KSM_PROVIDER", raising=False)
+        monkeypatch.delenv("YASHIGANI_CLOUD_KEYS_DIR", raising=False)
+
+        provider = create_provider()
+        assert isinstance(provider, DockerSecretsProvider)
+        assert provider._cloud_keys_dir is None
+
+    # --- list_secrets includes cloud_keys_dir entries -----------------------
+
+    def test_list_secrets_includes_runtime_cloud_keys(self, tmp_path):
+        """list_secrets enumerates keys from both dirs; cloud-dir entries get version='docker-runtime'."""
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+        (ro_dir / "postgres_password").write_text("pgpw", encoding="utf-8")
+        (rw_dir / "openai_api_key").write_text("sk-list-test", encoding="utf-8")
+
+        provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
+        meta = {m.key: m for m in provider.list_secrets()}
+        assert "postgres_password" in meta
+        assert meta["postgres_password"].version == "docker-static"
+        assert "openai_api_key" in meta
+        assert meta["openai_api_key"].version == "docker-runtime"
+
+    # --- gateway _get_cloud_api_key() integration path ----------------------
+
+    def test_gateway_resolves_cloud_key_after_set(self, tmp_path, monkeypatch):
+        """
+        Simulates the gateway _get_cloud_api_key() flow:
+        1. Admin stores the key via DockerSecretsProvider.set_secret.
+        2. Gateway calls kms_provider.get_secret("openai_api_key").
+        3. The returned value matches what was stored.
+
+        The gateway caches for 60 s, but this test exercises the KMS path
+        directly (cache already expired or first call) to confirm the demo
+        provider path is wired correctly.
+        """
+        ro_dir = tmp_path / "ro"
+        rw_dir = tmp_path / "rw"
+        ro_dir.mkdir()
+        rw_dir.mkdir()
+
+        # Simulates backoffice DockerSecretsProvider (write side).
+        backoffice_provider = DockerSecretsProvider(
+            environment_scope="dev",
+            secrets_dir=ro_dir,
+            cloud_keys_dir=rw_dir,
+        )
+        backoffice_provider.set_secret("openai_api_key", "sk-gateway-test-key")
+
+        # Simulates gateway DockerSecretsProvider (read side, same host dir).
+        gateway_provider = DockerSecretsProvider(
+            environment_scope="dev",
+            secrets_dir=ro_dir,
+            cloud_keys_dir=rw_dir,
+        )
+        resolved = gateway_provider.get_secret("openai_api_key")
+        assert resolved == "sk-gateway-test-key"

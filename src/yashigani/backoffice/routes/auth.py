@@ -198,6 +198,24 @@ def _check_ip_access(client_ip: str) -> None:
             )
 
 
+def _real_client_ip(request: Request) -> str:
+    """Real client IP for per-IP throttle + audit keys (LAURA-3X-001).
+
+    Caddy is the SOLE ingress and overwrites ``X-Real-IP`` with the actual TCP
+    peer (``{remote_host}``) on every proxied request, so it is trustworthy and
+    NOT client-spoofable.  ``X-Forwarded-For`` is deliberately NOT used here: Caddy
+    *appends* the peer to any client-supplied XFF, so ``XFF.split(',')[0]`` is
+    attacker-controlled and unsafe for a throttle key.  ``request.client.host`` is
+    the Caddy container IP behind the proxy and MUST NOT be used for per-IP
+    throttling — it collapses every client to one key, letting any single source
+    lock out all admin logins for the throttle window (LAURA-3X-001, DoS).
+    """
+    xri = request.headers.get("x-real-ip", "").strip()
+    if xri:
+        return xri.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _apply_auth_throttle(client_ip: str, response: Response) -> None:
     """
     Check per-IP and global failure counters.  If either exceeds its threshold,
@@ -310,7 +328,11 @@ def _reset_ip_auth_failures(client_ip: str) -> None:
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 digits (users/SHA-256) or 8 digits (admins/SHA-512).
+    # The server validates the exact count against the account's totp_algorithm
+    # after role resolution — the route cannot know the tier before looking up
+    # the account.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class PasswordChangeRequest(BaseModel):
@@ -319,12 +341,14 @@ class PasswordChangeRequest(BaseModel):
 
 
 class TotpConfirmRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 class SelfServiceResetRequest(BaseModel):
     username: str = Field(min_length=3)
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/login")
@@ -335,7 +359,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     Returns 401 for any failure (no credential enumeration).
     Includes brute-force throttle per ASVS 6.3.5.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001: real peer, not Caddy IP
 
     # Check order: allowlist → blocklist → throttle → auth
     _check_ip_access(client_ip)
@@ -472,7 +496,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
     # Phase 1 / 2.25.5-auth-ingress: single portal, role-based redirect.
     # admin → /admin/  (admin console)
-    # user  → /app/webui  (placeholder until Phase 2 re-paths OWUI)
+    # user  → /  (OWUI served at root; root catch-all proxies open-webui)
     # Any other tier (totp_provisioning is handled above) → / as safe fallback.
     if record.account_tier == "admin":
         redirect_to = "/admin/"
@@ -619,9 +643,18 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
 
     # Use the auth service's Postgres-backed replay cache so the self-service
     # path can't be abused for TOTP replay.
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
     # pylint: disable=protected-access
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _SELF_RESET_ROLE_DIGITS
+    _self_reset_digits = _SELF_RESET_ROLE_DIGITS.get(record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        if not await state.auth_service._verify_totp_with_replay(conn, record.totp_secret, body.totp_code):
+        if not await state.auth_service._verify_totp_with_replay(
+            conn,
+            record.totp_secret,
+            body.totp_code,
+            algorithm=record.totp_algorithm,
+            digits=_self_reset_digits,
+        ):
             raise generic_error
 
     # TOTP valid — generate new temporary password and persist via the
@@ -698,7 +731,7 @@ async def verify_session(request: Request):
     # NIST AC-5 / OWASP ASVS V4.1.2 / ISO 27001 A.5.16 / v2.24.1 Iris #96.
     if session.account_tier == "admin":
         from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
-        _client_ip = request.client.host if request.client else "unknown"
+        _client_ip = _real_client_ip(request)  # LAURA-3X-001
         from yashigani.auth.session import _mask_ip as _verify_mask_ip
         if state.audit_writer is not None:
             state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
@@ -857,6 +890,69 @@ async def verify_user_session(request: Request):
     record = await state.auth_service.get_account_by_id(session.account_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # OWUI access is OPT-IN (Yashigani is API-first). A user-tier session is
+    # provisioned for the API by default (the `users` caller group); reaching
+    # OpenWebUI (served at root) additionally requires membership of the
+    # `owui-users` RBAC group.
+    #
+    # FIND-3.1-001 (3.1 UID unification): group.members now stores identity IDs
+    # (idnt_xxx from the identity registry), NOT emails. Resolve the current
+    # user's identity_id via the registry and compare that. Fall back to email
+    # comparison only when identity_registry is absent (community-tier deploys
+    # that pre-date 3.1, where members may still be email-keyed).
+    #
+    # Skip-allow when the RBAC store or owui-users group is absent
+    # (community/non-standard deploy) — never lock everyone out. (YSG 2.25.5
+    # a64331e + c751e15; FIND-3.1-001 fix; see docs/operator-guide.md §5.6.)
+    _rbac = getattr(state, "rbac_store", None)
+    if _rbac is not None:
+        _owui_grp = next(
+            (grp for grp in _rbac.list_groups()
+             if str(getattr(grp, "display_name", "")).lower() == "owui-users"),
+            None,
+        )
+        if _owui_grp is not None:
+            _members = {str(m).strip() for m in (_owui_grp.members or set())}
+            _email = (record.email or f"{record.username}@yashigani.local").strip().lower()
+            _id_reg = getattr(state, "identity_registry", None)
+            _identity_id = None
+            if _id_reg is not None:
+                try:
+                    _id_rec = _id_reg.get_by_email(_email)
+                    if _id_rec is not None:
+                        _identity_id = (
+                            _id_rec.get("identity_id")
+                            if isinstance(_id_rec, dict)
+                            else getattr(_id_rec, "identity_id", None)
+                        )
+                except Exception:
+                    _identity_id = None
+
+            # Primary check: identity_id membership (3.1+ stores with idnt_xxx keys).
+            # Fallback: email comparison for community-tier / pre-3.1 deployments
+            # where identity_registry is absent and members may be email-keyed.
+            _in_group = (
+                (_identity_id is not None and _identity_id in _members)
+                or (_id_reg is None and _email in {m.lower() for m in _members})
+            )
+            if not _in_group:
+                _log.info(
+                    "verify-user: user %s (identity_id=%s) not in owui-users RBAC group "
+                    "— denying OpenWebUI access (API-first; user has API access only)",
+                    record.username, _identity_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "owui_access_required",
+                        "message": (
+                            "Your account does not have OpenWebUI access. Ask an "
+                            "administrator to add you to the owui-users group."
+                        ),
+                    },
+                    headers={"X-Authz-Reason": "owui_access_required"},
+                )
 
     from starlette.responses import Response as StarletteResponse
 
@@ -1042,17 +1138,25 @@ async def provision_totp_start(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
-    # YSG-RISK-082: re-provisioning an EXISTING authenticator is a credential
-    # change — require a fresh step-up (prove possession of the current TOTP
-    # before issuing a new seed). First-time enrolment (force_totp_provision /
-    # no seed) is the bootstrap path and cannot require step-up; a lost
-    # authenticator is recovered via the second admin (dual-admin recovery),
-    # not self-reprovision.
     if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: re-provisioning an already-enrolled authenticator
+        # requires a fresh step-up — blocks a hijacked session from silently
+        # rotating TOTP and locking out the legitimate owner.
         from yashigani.auth.stepup import assert_fresh_stepup
+
         assert_fresh_stepup(session)
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
+
+    # Phase 13: include algorithm and digit count in the response so the client
+    # can display role-appropriate instructions.
+    _digit_word = f"{prov.digits}-digit"
+    _algo_note = (
+        "IMPORTANT: Classic Google Authenticator (SHA-1 only) is not compatible "
+        "with this account's TOTP tier. Use agnosticOTP (iOS/Android), Aegis, "
+        "or any authenticator that reads the 'algorithm' field from the "
+        "otpauth:// URI."
+    )
 
     return {
         "status": "pending_confirmation",
@@ -1060,11 +1164,14 @@ async def provision_totp_start(
         "provisioning_uri": prov.provisioning_uri,
         "recovery_codes": prov.recovery_codes,  # shown once — client must acknowledge
         "recovery_codes_count": len(prov.recovery_codes),
+        "totp_algorithm": prov.algorithm,
+        "totp_digits": prov.digits,
         "message": (
-            "Scan the QR code with your authenticator app, then POST the "
-            "current 6-digit code to /auth/totp/provision/confirm to "
-            "complete enrolment. Store the recovery codes securely — "
-            "they will not be shown again."
+            f"Scan the QR code with agnosticOTP or a compatible authenticator app, "
+            f"then POST the current {_digit_word} code to "
+            f"/auth/totp/provision/confirm to complete enrolment. "
+            f"Store the recovery codes securely — they will not be shown again. "
+            f"{_algo_note}"
         ),
     }
 
@@ -1090,12 +1197,11 @@ async def provision_totp_confirm(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
-    # YSG-RISK-082: confirming a re-provision commits a NEW authenticator over an
-    # existing one — require fresh step-up. First-time enrolment is exempt (no
-    # TOTP yet); lost-authenticator recovery is via the second admin,
-    # not self-reprovision.
     if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: confirming a re-provision against an already-enrolled
+        # authenticator requires a fresh step-up.
         from yashigani.auth.stepup import assert_fresh_stepup
+
         assert_fresh_stepup(session)
 
     ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
@@ -1140,12 +1246,11 @@ async def provision_totp(
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
 
-    # YSG-RISK-082: atomic re-provision of an EXISTING authenticator is a
-    # credential change — require fresh step-up. First-time enrolment is exempt
-    # (no TOTP yet); lost-authenticator recovery is via the second admin,
-    # not self-reprovision.
     if record.totp_secret and not record.force_totp_provision:
+        # YSG-RISK-082: atomic re-provision of an already-enrolled
+        # authenticator requires a fresh step-up.
         from yashigani.auth.stepup import assert_fresh_stepup
+
         assert_fresh_stepup(session)
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
@@ -1180,7 +1285,8 @@ async def provision_totp(
 
 
 class StepUpRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    # Phase 13: accept 6 (user) or 8 (admin) digit codes.
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")
 
 
 @router.post("/stepup")
@@ -1264,8 +1370,17 @@ async def stepup_verify(
         )
 
     # Verify against Postgres-backed replay cache (same path as login).
+    # Phase 13: pass the account's enrolled algorithm and role digit count.
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _ROLE_TOTP_DIGITS
+    _stepup_digits = _ROLE_TOTP_DIGITS.get(admin_record.account_tier, 6)
     async with _pg_tenant_transaction() as conn:
-        ok = await state.auth_service._verify_totp_with_replay(conn, admin_record.totp_secret, body.totp_code)
+        ok = await state.auth_service._verify_totp_with_replay(
+            conn,
+            admin_record.totp_secret,
+            body.totp_code,
+            algorithm=admin_record.totp_algorithm,
+            digits=_stepup_digits,
+        )
 
     if not ok:
         try:
@@ -1541,6 +1656,101 @@ async def verify_operator_token(
 
 
 # ---------------------------------------------------------------------------
+# MI-4 (YSG-RISK-061): privileged-mutation step-up PROOF token mint
+#
+# The headless counterpart of the in-session step-up gate.  After a fresh TOTP
+# step-up, an operator mints a short-lived proof token bound to a specific
+# destructive lifecycle op (e.g. "add-component"), then hands it to install.sh
+# (--stepup-token).  install.sh verifies it against the SAME shared gate
+# (auth.stepup.verify_stepup_proof) before mutating a running stack.
+#
+# Prereqs: AdminSession + fresh step-up (assert_fresh_stepup) — a hijacked
+# session that has not re-proven TOTP cannot mint a proof.
+# ---------------------------------------------------------------------------
+
+
+class StepUpProofRequest(BaseModel):
+    """Request body for POST /auth/stepup-proof."""
+
+    op: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+        description="Lifecycle op the proof authorises, e.g. 'add-component'.",
+    )
+
+
+@router.post("/stepup-proof")
+async def issue_stepup_proof(
+    body: StepUpProofRequest,
+    session: AdminSession,
+):
+    """
+    Mint a privileged-mutation step-up proof token (MI-4 / YSG-RISK-061).
+
+    Prerequisites:
+      - Active admin session (AdminSession dependency — cookie auth).
+      - Fresh step-up TOTP (assert_fresh_stepup — within YASHIGANI_STEPUP_TTL_SECONDS).
+
+    The proof is an HS256 JWT (signed with caddy_internal_hmac, the same per-install
+    key the gate verifies with) carrying purpose="privileged-mutation" and the
+    bound op label.  TTL = YASHIGANI_STEPUP_PROOF_TTL_SECONDS (default 300 s).
+
+    The token is NEVER written to the audit log — only the jti + op + TTL.
+    """
+    from yashigani.auth.stepup import (
+        assert_fresh_stepup,
+        mint_stepup_proof,
+        STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    assert_fresh_stepup(session)
+
+    state = backoffice_state
+    assert state.auth_service is not None
+    assert state.audit_writer is not None
+
+    admin_record = await state.auth_service.get_account_by_id(session.account_id)
+    if admin_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        token, jti = mint_stepup_proof(subject=admin_record.username, op=body.op)
+    except Exception as exc:  # StepUpProofInvalid(signing_key_unavailable) etc.
+        _log.error("MI-4: step-up proof mint failed for %s: %s", admin_record.username, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "signing_key_unavailable"},
+        )
+
+    from yashigani.audit.schema import PrivilegedMutationEvent
+
+    state.audit_writer.write(
+        PrivilegedMutationEvent(
+            reason=f"stepup_proof.mint.{body.op}",
+            principal=admin_record.username,
+            target=body.op,
+            justification=f"jti={jti} ttl={STEPUP_PROOF_TTL_SECONDS}",
+        )
+    )
+
+    _log.info(
+        "MI-4: step-up proof minted by %s op=%s jti=%s ttl=%ds",
+        admin_record.username, body.op, jti, STEPUP_PROOF_TTL_SECONDS,
+    )
+
+    return {
+        "token": token,
+        "jti": jti,
+        "op": body.op,
+        "expires_in": STEPUP_PROOF_TTL_SECONDS,
+        "token_type": "Bearer",
+        "purpose": "privileged-mutation",
+    }
+
+
+# ---------------------------------------------------------------------------
 # LU-AMEND-04: Internal onboard audit endpoint
 #
 # Called by the yashigani-onboard CLI to emit an ONBOARD_ATTEMPTED event after
@@ -1663,7 +1873,7 @@ async def list_blocked_ips(request: Request, session: AdminSession):
     # Caller's own state — resolved from request headers so the admin
     # sees exactly what server-side records about their IP, even when
     # they are being throttled (non-200 paths still emit this view).
-    caller_ip = request.client.host if request.client else "unknown"
+    caller_ip = _real_client_ip(request)  # LAURA-3X-001: match the throttle key written at login
     caller_level = int(r.get(f"auth:throttle:ip:{caller_ip}") or 0)
     caller_fails = int(r.get(f"auth:fail:ip:{caller_ip}") or 0)
     caller_blocked_data = r.get(f"auth:blocked:{caller_ip}")
@@ -1850,7 +2060,7 @@ async def post_login_redirect(
 
     ASVS V5.1.5 / CWE-601 / OWASP A01:2021.
     """
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _real_client_ip(request)  # LAURA-3X-001
     ok, result = _validate_next(next)
 
     if not ok:
@@ -2139,12 +2349,17 @@ def _register_human_identity_on_login(record, state) -> None:
 
     # New user — register with HUMAN kind.
     # description carries the account_id for cross-system linkage (Gap 3 / v2.23.4).
+    # LAURA-DK-001: pass org_id=record.account_id so identity:index:org:{account_id}
+    # is populated at registration time and suspend_owned_by() can find it on
+    # account disable.  Without this, the org index is never written and disable
+    # is inert for human users.
     try:
         identity_id, _plaintext_key = registry.register(
             kind=IdentityKind.HUMAN,
             name=record.username,
             slug=slug,
             description=f"local-auth user; account_id={record.account_id}",
+            org_id=record.account_id,
         )
     except LicenseLimitExceeded as exc:
         _log.warning(

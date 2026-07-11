@@ -16,11 +16,17 @@ Phase-2 P8 finding:
     in the TLS handshake.  The broker verifies the SPIFFE ID matches the
     pinned value.
 
-CRL/OCSP note: CRL/OCSP does not cover external upstreams (they are not
-issued by our internal CA).  Manual pin-rotation is required when an upstream
-server rotates its cert.  The operator updates the pinned fingerprint in the
-consumes.servers[] config.  TODO [P8-v2]: automated pin-rotation alert via
-PKI watch endpoint.
+REVOCATION (YSG-RISK-058 / 3.0): a fingerprint pin proves identity CONTINUITY
+but not VALIDITY — a revoked-but-unrotated leaf still matches the pinned
+fingerprint.  ``verify_upstream_pin`` now runs an external-CA revocation-watch
+(``_upstream_revocation.check_revocation``) AFTER a fingerprint/SPIFFE match:
+the live leaf's AIA OCSP / CRL channels are queried and a REVOKED (or, in
+strict_mode, NO_CHANNEL) verdict overrides the match and BLOCKS the upstream.
+L2 OCSP freshness (this_update/next_update) rejects replayed "good" responses.
+See ``_upstream_revocation`` for the layered design + the documented residual
+(bounded by ``max_pin_age``).  Pass ``revocation_config=None`` (default) to use
+env-driven config, or a RevocationConfig to override; the broker passes a
+per-server pin age so an over-age pin fails closed.
 
 Validator:
   The ``require_pin_mode_for_servers()`` linter checks every server entry in
@@ -90,6 +96,9 @@ class PinVerificationResult:
     reason: str                     # "ok" | specific mismatch / error label
     observed_fingerprint: Optional[str] = None   # for audit (never log to end-user)
     observed_spiffe_id: Optional[str] = None
+    # YSG-RISK-058 revocation-watch outcome (set when a match runs the watch).
+    revocation_status: Optional[str] = None   # RevocationStatus value, e.g. "good"/"revoked"
+    revocation_reason: Optional[str] = None   # stable revocation label for audit
 
 
 # ---------------------------------------------------------------------------
@@ -102,25 +111,35 @@ def _normalise_fingerprint(fp: str) -> str:
     return fp.replace(":", "").replace(" ", "").lower()
 
 
-def _get_cert_fingerprint_sha256(host: str, port: int, timeout: float = 5.0) -> str:
+def _get_cert_der(host: str, port: int, timeout: float = 5.0) -> bytes:
     """
-    Retrieve the TLS leaf-cert SHA-256 fingerprint for the given host:port.
+    Retrieve the TLS leaf-cert DER bytes for the given host:port.
 
     Uses ssl.create_default_context() for the TLS handshake (validates the
-    cert against system CA store during retrieval).  Returns hex fingerprint
-    of the leaf cert DER bytes.
+    cert against system CA store during retrieval).  These are the SAME DER
+    bytes the fingerprint pin hashes AND the revocation-watch parses — one
+    handshake feeds both checks.
 
     Raises OSError / ssl.SSLError on failure.
     """
     ctx = ssl.create_default_context()
     with socket.create_connection((host, port), timeout=timeout) as raw_sock:
         with ctx.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
-            # get_peer_certificate(binary_form=True) returns the DER bytes of the
-            # leaf certificate (first cert in the chain).
             der_cert = tls_sock.getpeercert(binary_form=True)
             if not der_cert:
                 raise ssl.SSLError("No peer certificate returned")
-            return hashlib.sha256(der_cert).hexdigest()
+            return der_cert
+
+
+def _get_cert_fingerprint_sha256(host: str, port: int, timeout: float = 5.0) -> str:
+    """
+    Retrieve the TLS leaf-cert SHA-256 fingerprint for the given host:port.
+
+    Returns hex fingerprint of the leaf cert DER bytes.
+
+    Raises OSError / ssl.SSLError on failure.
+    """
+    return hashlib.sha256(_get_cert_der(host, port, timeout)).hexdigest()
 
 
 def _get_spiffe_id_from_san(host: str, port: int, timeout: float = 5.0) -> Optional[str]:
@@ -151,6 +170,81 @@ def _get_spiffe_id_from_san(host: str, port: int, timeout: float = 5.0) -> Optio
 
 
 # ---------------------------------------------------------------------------
+# YSG-RISK-058 — revocation-watch overlay on a matched pin
+# ---------------------------------------------------------------------------
+
+
+def _apply_revocation_watch(
+    matched_result: "PinVerificationResult",
+    config: UpstreamPinConfig,
+    timeout: float,
+    *,
+    revocation_config: Optional[Any],
+    pin_age_seconds: Optional[float],
+    get_der: Optional[Callable[..., bytes]],
+    check_revocation: Optional[Callable[..., Any]],
+    skip_revocation: bool,
+) -> "PinVerificationResult":
+    """
+    Run the external-CA revocation-watch on an ALREADY-matched pin and override
+    the match to matched=False if the leaf is revoked / stale / (strict) has no
+    channel / the pin is over-age.  Fail-closed.
+
+    The fingerprint pin proved identity continuity; this proves validity.  A
+    REVOKED leaf whose fingerprint still matches the pin is the exact residual
+    YSG-RISK-058 closes.
+    """
+    if skip_revocation:
+        return matched_result
+
+    fetch_der = get_der if get_der is not None else _get_cert_der
+    try:
+        leaf_der = fetch_der(config.host, config.port, timeout)
+    except Exception as exc:  # noqa: BLE001 — retrieval failure is fail-closed below
+        logger.error(
+            "revocation-watch: could not retrieve leaf DER for %s host=%s:%d: %s",
+            config.server_id, config.host, config.port, exc,
+        )
+        # We matched the fingerprint but cannot run the watch; if a pin age is
+        # configured and over-age, fail closed. Otherwise the fingerprint pin holds.
+        matched_result.revocation_status = "error"
+        matched_result.revocation_reason = f"der_retrieve_error:{type(exc).__name__}"
+        return matched_result
+
+    if check_revocation is None:
+        from yashigani.mcp._upstream_revocation import check_revocation as _cr
+        check_revocation = _cr
+
+    rev = check_revocation(
+        leaf_der,
+        pin_age_seconds=pin_age_seconds,
+        config=revocation_config,
+    )
+
+    matched_result.revocation_status = getattr(rev, "status", None) and rev.status.value
+    matched_result.revocation_reason = getattr(rev, "reason", None)
+
+    if getattr(rev, "blocks", False):
+        logger.warning(
+            "revocation-watch: %s server_id=%s host=%s:%d — pin matched but "
+            "revocation BLOCKS (status=%s) — refusing upstream.",
+            rev.reason, config.server_id, config.host, config.port,
+            rev.status.value,
+        )
+        return PinVerificationResult(
+            server_id=config.server_id,
+            matched=False,
+            reason=rev.reason,
+            observed_fingerprint=matched_result.observed_fingerprint,
+            observed_spiffe_id=matched_result.observed_spiffe_id,
+            revocation_status=rev.status.value,
+            revocation_reason=rev.reason,
+        )
+
+    return matched_result
+
+
+# ---------------------------------------------------------------------------
 # Public verification interface
 # ---------------------------------------------------------------------------
 
@@ -161,6 +255,12 @@ def verify_upstream_pin(
     # Allow injection of retrieval functions for testing
     _get_fp: Optional[Callable[..., str]] = None,
     _get_spiffe: Optional[Callable[..., Optional[str]]] = None,
+    # YSG-RISK-058 revocation-watch
+    revocation_config: Optional[Any] = None,
+    pin_age_seconds: Optional[float] = None,
+    _get_der: Optional[Callable[..., bytes]] = None,
+    _check_revocation: Optional[Callable[..., Any]] = None,
+    skip_revocation: bool = False,
 ) -> PinVerificationResult:
     """
     Verify the upstream MCP server's identity against the pinned value.
@@ -170,14 +270,27 @@ def verify_upstream_pin(
 
     On network/TLS error, also returns matched=False (fail-closed).
 
+    YSG-RISK-058: after a fingerprint/SPIFFE MATCH, the revocation-watch runs
+    (unless ``skip_revocation``).  A REVOKED / STALE (or strict-mode NO_CHANNEL,
+    or over-age PIN_EXPIRED) verdict overrides the match → matched=False so a
+    revoked-but-unrotated leaf is refused even though its fingerprint matched.
+
     Parameters
     ----------
     config:
         Pinning configuration for the upstream server.
     timeout:
         TLS connection timeout in seconds.
-    _get_fp / _get_spiffe:
+    revocation_config:
+        ``_upstream_revocation.RevocationConfig`` (env-driven default when None).
+    pin_age_seconds:
+        Age of the configured pin (the broker passes this per server); an
+        over-age pin with no fresh GOOD verdict fails closed.
+    _get_fp / _get_spiffe / _get_der / _check_revocation:
         Injection hooks for unit testing (override live network calls).
+    skip_revocation:
+        Bypass the revocation-watch (e.g. internal-CA SPIFFE upstreams covered
+        by the internal CRL/OCSP, or explicit operator opt-out).
     """
     get_fp = _get_fp if _get_fp is not None else _get_cert_fingerprint_sha256
     get_spiffe = _get_spiffe if _get_spiffe is not None else _get_spiffe_id_from_san
@@ -194,11 +307,19 @@ def verify_upstream_pin(
             pinned = _normalise_fingerprint(config.cert_fingerprint_sha256)
             observed_norm = _normalise_fingerprint(observed)
             if observed_norm == pinned:
-                return PinVerificationResult(
+                matched_result = PinVerificationResult(
                     server_id=config.server_id,
                     matched=True,
                     reason="ok",
                     observed_fingerprint=observed_norm,
+                )
+                return _apply_revocation_watch(
+                    matched_result, config, timeout,
+                    revocation_config=revocation_config,
+                    pin_age_seconds=pin_age_seconds,
+                    get_der=_get_der,
+                    check_revocation=_check_revocation,
+                    skip_revocation=skip_revocation,
                 )
             else:
                 logger.warning(
@@ -223,11 +344,19 @@ def verify_upstream_pin(
                 )
             observed_spiffe = get_spiffe(config.host, config.port, timeout)
             if observed_spiffe == config.spiffe_id:
-                return PinVerificationResult(
+                matched_result = PinVerificationResult(
                     server_id=config.server_id,
                     matched=True,
                     reason="ok",
                     observed_spiffe_id=observed_spiffe,
+                )
+                return _apply_revocation_watch(
+                    matched_result, config, timeout,
+                    revocation_config=revocation_config,
+                    pin_age_seconds=pin_age_seconds,
+                    get_der=_get_der,
+                    check_revocation=_check_revocation,
+                    skip_revocation=skip_revocation,
                 )
             else:
                 logger.warning(

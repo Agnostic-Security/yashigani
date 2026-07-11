@@ -21,6 +21,13 @@ Configuration (environment variables):
     YASHIGANI_OUTBOUND_ALLOW_HTTP      "1" to permit plain-HTTP to
                                        allowlisted hosts (default: off).
     YASHIGANI_OUTBOUND_DEFAULT_TIMEOUT Seconds (default 30).
+
+MCP upstream guard mode (bypass_private_for_allowlisted=True):
+    Used by McpHttpTransport to allow private/RFC1918 MCP upstreams
+    (Docker bridge IPs) while still hard-blocking IMDS, link-local, and
+    loopback.  In this mode the allowlist is MANDATORY and any host not
+    in it is denied (fail-closed).  IMDS/link-local/loopback cannot be
+    overridden even if an operator mistakenly allowlists them.
 """
 
 from __future__ import annotations
@@ -107,12 +114,50 @@ def _is_private_or_metadata(host: str) -> bool:
     return False
 
 
+def _is_hard_block(host: str) -> bool:
+    """Return True for hosts that are UNCONDITIONALLY blocked even when
+    ``bypass_private_for_allowlisted=True`` is set.
+
+    These are the cloud metadata endpoints (IMDS), loopback addresses, and
+    link-local ranges that must never be reachable regardless of operator
+    configuration:
+
+    * ``_HARD_BLOCK_HOSTS``: named IMDS endpoints (169.254.169.254,
+      metadata.google.internal, fd00:ec2::254, 100.100.100.200).
+    * ``_HARD_BLOCK_NETS``: loopback (127.0.0.0/8, ::1/128) and link-local
+      (169.254.0.0/16, fe80::/10).
+
+    Generic RFC-1918 private ranges (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16) are NOT in scope here — those may be bypassed for
+    explicitly-allowlisted MCP upstream hosts on private Docker bridges.
+    """
+    if host.lower() in _HARD_BLOCK_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # hostname (not a literal IP) — not a hard block
+    for net in _HARD_BLOCK_NETS:  # loopback + link-local
+        if ip in net:
+            return True
+    return False
+
+
 class HttpClient:
     """Wraps :mod:`httpx` with allowlist enforcement.
 
     Instances are cheap; reuse across a single scope for connection
     pooling. Every method (:meth:`get`, :meth:`post`, etc.) calls
     :meth:`_check_policy` before issuing the request.
+
+    ``bypass_private_for_allowlisted`` (MCP upstream mode):
+        When True the policy check order is changed so that allowlisted
+        hosts bypass the RFC-1918 private-IP rejection, enabling internal
+        Docker-bridge MCP upstreams to be reached.  IMDS/link-local/loopback
+        (``_is_hard_block``) are still blocked unconditionally.  Requires a
+        non-empty allowlist; without one every host is denied (fail-closed).
+        This flag is set only by ``McpHttpTransport`` — never for general
+        outbound HTTP.
     """
 
     def __init__(
@@ -122,6 +167,7 @@ class HttpClient:
         blocklist: Optional[list[str]] = None,
         allow_http: Optional[bool] = None,
         timeout_s: Optional[float] = None,
+        bypass_private_for_allowlisted: bool = False,
     ):
         self.allowlist = allowlist if allowlist is not None else _env_list("YASHIGANI_OUTBOUND_ALLOWLIST")
         self.blocklist = blocklist if blocklist is not None else _env_list("YASHIGANI_OUTBOUND_BLOCKLIST")
@@ -131,13 +177,28 @@ class HttpClient:
         if timeout_s is None:
             timeout_s = float(os.getenv("YASHIGANI_OUTBOUND_DEFAULT_TIMEOUT", "30"))
         self.timeout_s = timeout_s
+        self.bypass_private_for_allowlisted = bypass_private_for_allowlisted
 
     # ------------------------------------------------------------------
     # Policy check
     # ------------------------------------------------------------------
 
     def _check_policy(self, url: str) -> None:
-        """Raise :class:`BlockedByPolicy` if ``url`` is not allowed."""
+        """Raise :class:`BlockedByPolicy` if ``url`` is not allowed.
+
+        Standard mode (``bypass_private_for_allowlisted=False``):
+          scheme → private-IP → blocklist → allowlist (if set)
+
+        MCP upstream mode (``bypass_private_for_allowlisted=True``):
+          scheme → IMDS/link-local/loopback hard-block (unconditional)
+                 → allowlist gate (allowlisted RFC-1918 hosts PASS here)
+                 → anything not in allowlist DENIED
+
+        The split prevents a blanket private-IP rejection from blocking
+        legitimate internal MCP servers on Docker bridge networks while
+        ensuring cloud metadata endpoints (IMDS, link-local) are never
+        reachable regardless of the allowlist contents.
+        """
         parsed = urlparse(url)
         scheme = (parsed.scheme or "").lower()
         host = (parsed.hostname or "").lower()
@@ -158,6 +219,34 @@ class HttpClient:
                 "explicitly-trusted internal hosts)."
             )
 
+        # ── MCP upstream guard mode ──────────────────────────────────────────
+        # When bypass_private_for_allowlisted=True (set only by McpHttpTransport):
+        #  1. Unconditionally hard-block IMDS/link-local/loopback.
+        #  2. Allowlist is MANDATORY and is the sole gate — host must match.
+        #     This allows RFC-1918 Docker bridge hosts that are explicitly
+        #     registered as MCP upstreams, while blocking everything else.
+        if self.bypass_private_for_allowlisted:
+            if _is_hard_block(host):
+                raise BlockedByPolicy(
+                    f"Host {host!r} is an IMDS / link-local / loopback address "
+                    "(unconditionally hard-blocked; cannot be overridden by "
+                    "the MCP upstream allowlist)."
+                )
+            if not self.allowlist:
+                raise BlockedByPolicy(
+                    "bypass_private_for_allowlisted=True requires a non-empty "
+                    "trusted upstream allowlist — no host is reachable in this "
+                    "mode without an explicit allowlist entry."
+                )
+            for entry in self.allowlist:
+                if _host_matches_entry(host, entry):
+                    return  # registered MCP upstream — allow even if RFC-1918
+            raise BlockedByPolicy(
+                f"Host {host!r} is not in the trusted MCP upstream allowlist "
+                f"(SSRF guard blocked unregistered host)."
+            )
+
+        # ── Standard mode ────────────────────────────────────────────────────
         if _is_private_or_metadata(host):
             raise BlockedByPolicy(
                 f"Host {host!r} is a private / loopback / metadata address "
@@ -210,3 +299,12 @@ class HttpClient:
         kwargs.setdefault("follow_redirects", False)  # explicit opt-in only
         async with httpx.AsyncClient() as client:
             return await client.request(method, url, **kwargs)
+
+    async def aclose(self) -> None:
+        """No-op — ``HttpClient`` creates a new connection per request.
+
+        Provided so that callers that own the lifetime of an injected
+        client (e.g. ``McpHttpTransport.__aexit__``) can call ``aclose()``
+        uniformly on both ``httpx.AsyncClient`` and ``HttpClient`` instances
+        without a type check.
+        """

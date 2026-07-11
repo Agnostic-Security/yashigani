@@ -162,7 +162,7 @@ spec:
       initContainers:
         - name: wait-for-ollama
           # busybox ships wget; the ollama image does not. Pinned by digest per image-pinning SOP.
-          image: "busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+          image: "busybox:1.37.0@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsNonRoot: true
@@ -215,17 +215,34 @@ spec:
                 echo "Skipping model pull. Free space on the PVC and re-deploy."
                 exit 0
               fi
+              # SF-QWEN-001 (ordering fix): pull qwen2.5:3b FIRST, unconditionally,
+              # before any digest check on the VRAM-tier primary model. A stale
+              # digest on the primary must not block the agent base model pull.
+              if [ "${OLLAMA_MODEL}" != "qwen2.5:3b" ]; then
+                echo "Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
+                OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull "qwen2.5:3b"
+                echo "Base model pull complete: qwen2.5:3b"
+              fi
               echo "Disk OK. Pulling ${OLLAMA_MODEL}..."
               OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull "${OLLAMA_MODEL}"
+              # DIGEST POLICY: default is "skip" (see values.yaml ollama.initJob.modelDigest).
+              # A mismatch is a loud WARNING, never exit 1. See compose counterpart comment.
               EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
               ACTUAL_DIGEST=$(OLLAMA_HOST=http://yashigani-ollama:11434 ollama list | grep "${OLLAMA_MODEL}" | awk '{print $2}')
               if [ -n "$EXPECTED_DIGEST" ] && [ "$EXPECTED_DIGEST" != "skip" ]; then
                 if echo "$ACTUAL_DIGEST" | grep -q "$EXPECTED_DIGEST"; then
                   echo "Digest verified: $ACTUAL_DIGEST"
                 else
-                  echo "WARNING: Digest mismatch! Expected=$EXPECTED_DIGEST Actual=$ACTUAL_DIGEST"
-                  echo "Set ollama.initJob.modelDigest=skip to bypass (after upstream model update)."
-                  exit 1
+                  echo "###############################################################"
+                  echo "WARNING: Model digest mismatch (SOL-SC-03)"
+                  echo "  Model:    ${OLLAMA_MODEL}"
+                  echo "  Expected: $EXPECTED_DIGEST"
+                  echo "  Actual:   $ACTUAL_DIGEST"
+                  echo "This model was updated upstream. Review the change and update"
+                  echo "ollama.initJob.modelDigest in values.yaml to the new digest,"
+                  echo "or set it to 'skip' to silence this warning."
+                  echo "Continuing with the pulled model (Job not aborted)."
+                  echo "###############################################################"
                 fi
               fi
               echo "Model pull complete: ${OLLAMA_MODEL}"

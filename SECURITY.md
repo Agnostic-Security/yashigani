@@ -6,13 +6,12 @@ A single release line is actively maintained on the `main` branch. Open WebUI is
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| 3.1.x   | ✅ Current | Unified org-ceiling deny-by-default authorization, per-agent connection allow-lists (MCP + external API), MCP hardening; least-privilege topology hardening in 3.1.1 |
-| 3.0.x   | ✅ Patch window | First public 3.x GA — document-content data protection (pass / redact / pseudonymise / block), every-hop OPA agent orchestration, MCP identity-JWT broker |
-| 2.25.x  | ✅ Patch window | TLS 1.3 internal mesh, Wazuh SIEM full stack, auth/ingress rebuild, admin-UX refinement layer, security hardening pass |
+| 3.1.x   | ✅ Current | Unified identity-ID authorization, role-tiered TOTP (admin SHA-512/8, user SHA-256/6), PII enforcement blocks at ingress, RBAC group-mutation step-up, capability-envelope MCP import ceremony, connection allow-list; full pre-release SAST + DAST + tooling security gate |
+| 3.0.x   | ✅ Patch window | Document-content data protection (doc-OPA: pass/redact/pseudonymize/block), every-hop OPA agent orchestration, MCP hardening, OpenWebUI at root behind the owui-users gate |
+| 2.25.x  | ❌ | Superseded by 3.0.x |
 | 2.24.x  | ❌ | Superseded by 2.25.x |
-| < 2.24  | ❌ | End of life |
-
-> **Yashigani 4.0** is in early-access beta. Beta builds are not covered by the supported-version guarantee above; report security issues found in the beta through the same coordinated-disclosure process.
+| 2.23.x  | ❌ | Superseded by 2.24.x |
+| < 2.23  | ❌ | End of life |
 
 ## Reporting a Vulnerability
 
@@ -37,7 +36,7 @@ The following are **in scope**:
 
 - Authentication and session management (OIDC, SAML, TOTP, WebAuthn, fail2ban throttle, __Host- cookies)
 - OPA policy enforcement on /v1 traffic (request path and response path)
-- Content inspection pipeline (FastText, LLM backends, PII detection, CHS)
+- Content inspection pipeline (scikit-learn ML classifier, LLM backends, PII detection, CHS)
 - Sensitivity classification and routing (Optimization Engine, P1-P9 matrix)
 - Budget enforcement (three-tier hierarchy, budget-redis)
 - IP allowlist/blocklist enforcement (IPv4/IPv6/CIDR)
@@ -68,38 +67,25 @@ Agnostic Security does not operate a paid bug bounty programme. Researchers who 
 
 ## Release signing
 
-Version tags and release artifacts are SSH-signed by the Agnostic Security release key (the signing scheme moved from GPG to SSH in 2026-05; the allowed-signers file is published in-repo and the verification recipe is in the README, section 5 "Verifying a Release").
-
-**Required repository secrets** (configure in Settings → Secrets → Actions):
-
-| Secret | Description |
-|--------|-------------|
-| `GPG_PRIVATE_KEY` | ASCII-armored RSA 4096 signing subkey, exported via `gpg --armor --export-secret-subkeys <subkey-id>!` |
-| `GPG_PASSPHRASE` | Passphrase protecting the signing subkey |
-
-**Graceful degradation:** if `GPG_PRIVATE_KEY` is not set, the release pipeline emits a `::warning::` annotation and the tag ships unsigned. No build step fails. Populate the secrets and re-run the release workflow to produce a signed tag.
+Version tags are **SSH-signed** (`git config gpg.format ssh`) with the Agnostic
+Security release key (Ed25519). Each `vX.Y.Z` tag is an annotated, signed tag;
+verification shows `Good "git" signature with ED25519 key SHA256:…`.
 
 **Verifying a signed tag:**
 
 ```sh
-gpg --import docs/release-signing-key.asc
 git fetch --tags --force origin
 git tag -v vX.Y.Z
+# Expect: Good "git" signature with ED25519 key SHA256:<release-key-fingerprint>
 ```
 
-**Public key fingerprint:** TBD — populate `docs/release-signing-key.asc` and update this file after key generation.
+The release signer's public key is published in the repository's SSH
+allowed-signers file (`.github/allowed_signers` / `docs/release-signing.md`); add
+it to your local allowed-signers to validate the signer identity.
 
-**Key generation (one-time setup):**
+**Release-signing key fingerprint:** see `docs/release-signing.md` (the active
+Ed25519 release key). Tags signed by any other key must be treated as untrusted.
 
-```sh
-# Generate a dedicated release signing subkey (RSA 4096)
-gpg --full-generate-key
-
-# Export the private signing subkey (subkey-id! notation selects subkey only)
-gpg --armor --export-secret-subkeys <subkey-id>!
-
-# Export the public key for repository consumers
-gpg --armor --export releases@agnosticsec.com > docs/release-signing-key.asc
-```
-
-**Scope note:** for FedRAMP High/strict paths, a hardware-backed key (FIPS 140-2 token) is required. This pipeline supports software keys for standard releases; hardware key integration is a separate workstream.
+**Scope note:** for FedRAMP High / strict paths, a hardware-backed key
+(FIPS 140-2 token) is required; the standard release line uses the software
+Ed25519 SSH key. Hardware-key integration is a separate workstream.

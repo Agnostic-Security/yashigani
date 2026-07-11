@@ -3,7 +3,8 @@
 Status: **HTTPS restore + securityadmin automation VALIDATED green on the 2.25.1 config
 (AMD64 / Docker 29.1.3, 2026-05-30).** One follow-up is installer-scope: verified mTLS
 (server-cert verification) is blocked until the indexer is put on the internal CA — see
-"Verified mTLS — installer work-item" below.
+"Verified mTLS — installer work-item" below. Full validation report:
+`testing_runs/yashigani/wazuh-2251-validation/VALIDATION.md`.
 
 Validated PASS: dependency chain (no deadlock), `wazuh-security-init` securityadmin
 (exit 0, security index created), indexer cluster **green** over HTTPS, all healthchecks

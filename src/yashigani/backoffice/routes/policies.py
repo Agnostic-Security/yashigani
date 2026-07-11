@@ -119,17 +119,56 @@ _lifecycle_store = _PolicyLifecycle()
 # ---------------------------------------------------------------------------
 
 async def _resolve_default_model(ollama_url: str) -> tuple[str, list[str]]:
-    """Resolve the install-default model: prefer YASHIGANI_OPA_ASSISTANT_MODEL /
-    OLLAMA_MODEL env vars; fall back to first available model from /api/tags.
-    Returns (model_name, available_names)."""
-    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL")
+    """Resolve the install-default model for structured-output assistant flows.
+
+    Resolution order (FIND-003 fix/medlow-findings):
+      1. YASHIGANI_OPA_ASSISTANT_MODEL — explicit operator override (highest priority).
+      2. qwen2.5:3b — always-present installer-pulled model; suitable for structured JSON.
+         We do NOT fall through to OLLAMA_MODEL because it may be a VRAM-tier model
+         (llama3.1:8b etc.) that returns empty JSON for generate-pattern / policy-draft.
+
+    Still fetches /api/tags for availability checking and warning on missing pref model.
+    Returns (model_name, available_names).
+
+    fix/medlow-findings P1.4: raises HTTPException 503 with a SPECIFIC error message
+    when Ollama is unreachable AND no YASHIGANI_OPA_ASSISTANT_MODEL override is set.
+    """
+    # FIND-003: YASHIGANI_OPA_ASSISTANT_MODEL only — never fall through to OLLAMA_MODEL.
+    # qwen2.5:3b is the always-present structured-output model; OLLAMA_MODEL is the
+    # VRAM-tier inference model which may not handle format:json tasks correctly.
+    pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
+    _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
+    ollama_reachable = False
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
             tags_resp = await c.get(ollama_url + "/api/tags")
+            tags_resp.raise_for_status()
             avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
-    except Exception:
+            ollama_reachable = True
+    except Exception as _exc:
+        _log.warning("_resolve_default_model: Ollama unreachable at %s: %s", ollama_url, _exc)
         avail = []
-    model = pref if (pref and pref in avail) else (avail[0] if avail else (pref or "qwen2.5:3b"))
+    if not avail and not pref:
+        # Nothing at all: raise a specific 503 so the caller returns an actionable error.
+        detail_msg = (
+            f"No LLM models available. Ollama at {ollama_url} "
+            + ("returned 0 models — pull a model (e.g. `ollama pull qwen2.5:3b`)"
+               if ollama_reachable else "is unreachable — ensure the Ollama service is running")
+            + ". Set YASHIGANI_OPA_ASSISTANT_MODEL to override the model choice."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "no_model_available", "message": detail_msg},
+        )
+    # Default: qwen2.5:3b (structured-output capable, always pulled by installer).
+    # Operator override via YASHIGANI_OPA_ASSISTANT_MODEL takes priority.
+    model = pref if pref else _STRUCTURED_OUTPUT_DEFAULT
+    if pref and avail and pref not in avail:
+        _log.warning(
+            "_resolve_default_model: preferred model %r not in pulled models %s — "
+            "will attempt anyway (Ollama will return 404 if not pulled)",
+            pref, avail,
+        )
     return model, avail
 
 
@@ -177,6 +216,11 @@ async def list_policies(session: AdminSession):  # noqa: ARG001 — auth gate
         policies.append(
             {
                 "id": pid,
+                # AVA-2255-04 / AVA-30-005: policy_id mirrors id for schema
+                # alignment with other resource schemas (agents, patterns, etc.).
+                # id is kept for backwards compatibility; consumers should use
+                # policy_id going forward.
+                "policy_id": pid,
                 "name": name,
                 "package": pkg,
                 "category": cat,
@@ -839,6 +883,11 @@ class GeneratePolicyRequest(BaseModel):
 # from a terse instruction, so we give them the contract, the input vocabulary,
 # AND a concrete working exemplar to copy. {name} is substituted via .replace
 # (NOT str.format) because the embedded Rego contains literal { } braces.
+#
+# CRITICAL REGO V1 RULES (fix/medlow-findings P1.3 — bare [] invalid in rego.v1):
+# Models sometimes emit `input.data_tags[] == "pii"` which is invalid Rego v1
+# (bare iteration outside a comprehension). The system prompt explicitly forbids
+# this pattern and shows the CORRECT alternatives so the model copies them.
 _REGO_GEN_SYSTEM = """You are an OPA Rego policy author for the Yashigani AI security gateway.
 Write ONE Rego policy module for the operator's requirement, copying the structure
 of the EXAMPLE below exactly.
@@ -853,9 +902,18 @@ Inputs the gateway supplies (use what's relevant):
   input.identity.{agent,role,clearance,groups}
   input.request.{purpose,lawful_basis}
   input.routing_decision.{route,provider,model}
-  input.tool, input.method, input.path, input.data_tags[]
+  input.tool, input.method, input.path, input.data_tags
 
-EXAMPLE — copy this structure:
+CRITICAL REGO V1 SYNTAX RULES (violations cause compile errors — NEVER break these):
+  1. To check if a VALUE exists in an ARRAY: use  `"value" in input.data_tags`
+     NEVER write: `input.data_tags[] == "value"`  (bare [] is invalid in rego.v1)
+  2. To iterate over array elements: use  `some t in input.data_tags; t == "value"`
+     NEVER write: `input.data_tags[_] == "value"` (wildcard is Rego v0 style)
+  3. Use `deny contains "code" if { ... }` (rego.v1 incremental rules).
+     NEVER use `deny[msg] { ... }` (Rego v0 set comprehension style).
+  4. Always `import rego.v1` — this is mandatory for the gateway's OPA version.
+
+EXAMPLE — copy this structure EXACTLY:
 ----
 package clients.example_agent_email
 import rego.v1
@@ -869,6 +927,11 @@ deny contains "email_delete_forbidden" if {
 	input.tool in {"email.delete", "email.trash"}
 }
 
+# Block if request contains a PII data tag (correct v1 array membership check).
+deny contains "pii_tag_forbidden" if {
+	"pii" in input.data_tags
+}
+
 obligations contains "audit_email_access" if startswith(input.tool, "email.")
 ----
 
@@ -876,6 +939,7 @@ Now write the policy:
 - start with: package clients.{name}
 - import rego.v1
 - use `deny contains "code" if { ... }` rules; allow = count(deny) == 0
+- For arrays: use `"value" in array` NOT `array[] == "value"`
 - Output ONLY valid Rego. No prose. No markdown fences."""
 
 
@@ -942,26 +1006,42 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
     repaired = False
     repair_error = None
     warnings: list = []
+    compile_ok: bool = True  # P1.3: track whether final rego compiles
     try:
         rep = await compile_repair_once(rego, name, _regenerate)
         rego = rep["rego"]
         repaired = rep["repaired"]
         repair_error = rep["repair_error"]
+        compile_ok = not bool(repair_error)
         if not repair_error:
             sc = await static_sanity_check(rego, name)
             warnings = sc.get("warnings", [])
     except Exception as exc:  # noqa: BLE001 — generation already succeeded; repair/sanity advisory
         _log.info("policy generate: repair/sanity skipped (%s)", exc)
 
+    # P1.3 (fix/medlow-findings): surface a distinct status so the UI can warn
+    # the admin that the draft failed OPA compilation even after one repair attempt.
+    # The draft is still returned (so the admin can see what the LLM produced and
+    # hand-edit it), but status="compile_error" signals it MUST be fixed before save.
+    status_str = "ok" if compile_ok else "compile_error"
+    note = (
+        "AI-generated draft — review and edit before saving. Saving runs an OPA compile + sanity check."
+        if compile_ok else
+        f"WARNING: draft failed OPA compilation after one repair attempt ({repair_error}). "
+        "Review the Rego carefully — common issue: `array[] ==` is invalid in rego.v1, "
+        "use `\"value\" in array` instead. Edit and save will re-validate."
+    )
+
     return {
-        "status": "ok",
+        "status": status_str,
         "name": name,
         "rego": rego,
         "model": model,
         "repaired": repaired,
         "repair_error": repair_error,
+        "compile_ok": compile_ok,
         "warnings": warnings,
-        "note": "AI-generated draft — review and edit before saving. Saving runs an OPA compile + sanity check.",
+        "note": note,
     }
 
 

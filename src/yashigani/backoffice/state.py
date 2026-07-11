@@ -59,6 +59,10 @@ class BackofficeState:
     model_alias_store: Optional[Any] = None               # ModelAliasStore (v2.3)
     model_allocation_store: Optional[Any] = None          # ModelAllocationStore (Track B1)
     auth_settings_store: Optional[Any] = None             # AuthSettingsStore (v2.23.3)
+    document_policy_store: Optional[Any] = None           # DocumentPolicyStore (2.26)
+    document_set_store: Optional[Any] = None               # DocumentSetStore (2.26 set-scoped-salt)
+    envelope_pending_store: Optional[Any] = None          # EnvelopePendingStore (3.0 capability-envelope re-approval queue)
+    capability_policy_store: Optional[Any] = None         # CapabilityPolicyStore (3.0 browser Permissions-Policy)
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None
@@ -68,6 +72,13 @@ class BackofficeState:
     # disabled (YASHIGANI_AUDIT_DB_SINK=false) or no DB is configured.
     db_audit_sink: Optional[Any] = None              # PostgresSink instance
     audit_checkpoint_scheduler: Optional[Any] = None  # AuditCheckpointScheduler
+    # DP-Y-003 §3.4 — semantic-intent classifier sidecar for MCP import screening.
+    # Wired by the gateway entrypoint from the same OllamaBackend the broker uses
+    # (SemanticIntentSidecar wrapping OllamaBackend at OLLAMA_BASE_URL/OLLAMA_MODEL).
+    # None when Ollama is unavailable at startup or the feature flag is OFF.
+    # ``_screen_tools`` in envelope_import.py reads this; when None it records
+    # ``classifier_status="unavailable"`` honestly instead of claiming the classifier ran.
+    semantic_intent_sidecar: Optional[Any] = None    # SemanticIntentSidecar | None
     # SIEM sink runtime config (updated via /admin/audit/siem/config)
     siem_backend: str = "none"
     siem_endpoint: Optional[str] = None

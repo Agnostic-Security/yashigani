@@ -122,6 +122,64 @@ def _get_store():
     return store
 
 
+def _resolve_identity_id_from_email(email: str, raise_on_not_found: bool = True) -> Optional[str]:
+    """
+    Resolve email → identity_id (idnt_{12hex}) via the identity registry.
+
+    3.1 UID unification: RBAC store is keyed by identity_id after migration.
+    SCIM callers that receive email addresses from the IdP must resolve them
+    before touching the store.
+
+    raise_on_not_found=False: returns None instead of raising 404.  Used for
+    idempotency checks where "not in registry" == "not yet provisioned".
+
+    Raises HTTPException(503) if the identity registry is unavailable.
+    Raises HTTPException(404) if the email has no identity_id (and raise_on_not_found=True).
+    """
+    id_reg = getattr(backoffice_state, "identity_registry", None)
+    if id_reg is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "identity_registry_not_configured"},
+        )
+    try:
+        rec = id_reg.get_by_email(email)
+    except Exception as exc:
+        logger.warning("scim: identity registry lookup failed for email=%r: %s", email, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "identity_registry_unavailable"},
+        )
+    if rec is None:
+        if not raise_on_not_found:
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "identity_not_found",
+                "message": (
+                    f"No identity found for email={email!r}. "
+                    "The user must log in at least once to obtain an identity_id "
+                    "before SCIM membership can be assigned."
+                ),
+            },
+        )
+    identity_id = (
+        rec.get("identity_id") if isinstance(rec, dict) else getattr(rec, "identity_id", None)
+    )
+    if not identity_id:
+        if not raise_on_not_found:
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error": "identity_missing_id",
+                "message": f"Identity record for email={email!r} has no identity_id field.",
+            },
+        )
+    return identity_id
+
+
 def _user_resource(email: str, groups: list[RBACGroup]) -> dict:
     return {
         "schemas": [_URN_USER],
@@ -253,7 +311,12 @@ async def scim_provision_user(
     store = _get_store()
     email = body.userName
 
-    existing_groups = store.get_user_groups(email)
+    # 3.1 UID unification: resolve email → identity_id before querying the store.
+    # raise_on_not_found=False: if the user has no identity_id yet (not yet logged
+    # in), treat as "not yet provisioned" (empty groups).  The provision below will
+    # still fail at add_member time if identity_id cannot be resolved.
+    _scim_iid = _resolve_identity_id_from_email(email, raise_on_not_found=False)
+    existing_groups = store.get_user_groups(_scim_iid) if _scim_iid else []
 
     # SoD-002b: reject SCIM provision if an admin account already exists with
     # this email. Admins and users must be strictly separate identity stores.
@@ -338,10 +401,17 @@ async def scim_deprovision_user(
     store = _get_store()
     email = user_id
 
-    groups = store.get_user_groups(email)
+    # 3.1 UID unification: resolve email → identity_id before querying the store.
+    # If the user has no identity_id (never logged in), they have no RBAC groups
+    # to remove — treat as idempotent success.
+    _scim_iid = _resolve_identity_id_from_email(email, raise_on_not_found=False)
+    if _scim_iid is None:
+        return  # nothing to deprovision
+
+    groups = store.get_user_groups(_scim_iid)
     for group in groups:
         try:
-            store.remove_member(group.id, email)
+            store.remove_member(group.id, _scim_iid)
         except KeyError:
             pass
 
@@ -386,13 +456,24 @@ async def scim_create_group(
         return JSONResponse(status_code=402, content=license_feature_gated_response(exc))
     store = _get_store()
 
-    # Extract member emails from SCIM members list
+    # 3.1 UID unification: SCIM members carry email addresses from the IdP.
+    # Resolve each email → identity_id (idnt_{12hex}) before storing in the group.
+    # Members that cannot be resolved are skipped with a warning (fail-partial:
+    # the group is still created; unresolvable members should be re-added once
+    # the user logs in and obtains an identity_id).
     initial_members: set[str] = set()
     if body.members:
         for m in body.members:
-            # value is expected to be an email address in this implementation
             if "@" in m.value:
-                initial_members.add(m.value)
+                _iid = _resolve_identity_id_from_email(m.value, raise_on_not_found=False)
+                if _iid:
+                    initial_members.add(_iid)
+                else:
+                    logger.warning(
+                        "scim create_group: cannot resolve email=%r to identity_id "
+                        "— member skipped; add them after first login.",
+                        m.value,
+                    )
 
     group = RBACGroup(
         id=str(uuid.uuid4()),
@@ -458,8 +539,16 @@ async def scim_patch_group(
             for item in values:
                 email = item.get("value", "") if isinstance(item, dict) else str(item)
                 if "@" in email:
+                    # 3.1 UID unification: resolve email → identity_id before calling store.
+                    _iid = _resolve_identity_id_from_email(email, raise_on_not_found=False)
+                    if not _iid:
+                        logger.warning(
+                            "scim patch_group add: cannot resolve email=%r to identity_id — skipped",
+                            email,
+                        )
+                        continue
                     try:
-                        store.add_member(group_id, email)
+                        store.add_member(group_id, _iid)
                         added.append(email)
                     except KeyError:
                         pass
@@ -468,31 +557,50 @@ async def scim_patch_group(
             for item in values:
                 email = item.get("value", "") if isinstance(item, dict) else str(item)
                 if "@" in email:
+                    # 3.1 UID unification: resolve email → identity_id before calling store.
+                    _iid = _resolve_identity_id_from_email(email, raise_on_not_found=False)
+                    if not _iid:
+                        logger.warning(
+                            "scim patch_group remove: cannot resolve email=%r to identity_id — skipped",
+                            email,
+                        )
+                        continue
                     try:
-                        store.remove_member(group_id, email)
+                        store.remove_member(group_id, _iid)
                         removed.append(email)
                     except KeyError:
                         pass
 
         elif op_name == "replace":
-            # Replace replaces the full members list
+            # Replace replaces the full members list.
+            # 3.1 UID unification: resolve all incoming emails → identity_ids.
+            # group.members is now a set of identity_ids after the 3.1 migration.
             new_emails: set[str] = set()
+            new_identity_ids: set[str] = set()
             for item in values:
                 email = item.get("value", "") if isinstance(item, dict) else str(item)
                 if "@" in email:
                     new_emails.add(email)
-            # Remove members no longer in the list
-            for email in list(group.members - new_emails):
+                    _iid = _resolve_identity_id_from_email(email, raise_on_not_found=False)
+                    if _iid:
+                        new_identity_ids.add(_iid)
+                    else:
+                        logger.warning(
+                            "scim patch_group replace: cannot resolve email=%r to identity_id — skipped",
+                            email,
+                        )
+            # Remove identity_ids no longer in the requested set
+            for _iid in list(group.members - new_identity_ids):
                 try:
-                    store.remove_member(group_id, email)
-                    removed.append(email)
+                    store.remove_member(group_id, _iid)
+                    removed.append(_iid)
                 except KeyError:
                     pass
-            # Add new members
-            for email in new_emails - group.members:
+            # Add new identity_ids
+            for _iid in new_identity_ids - group.members:
                 try:
-                    store.add_member(group_id, email)
-                    added.append(email)
+                    store.add_member(group_id, _iid)
+                    added.append(_iid)
                 except KeyError:
                     pass
 

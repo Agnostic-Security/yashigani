@@ -107,7 +107,7 @@ curl -X POST https://<gateway-host>/admin/accounts/{username}/disable \
 
 Re-enable a disabled admin account.
 
-Note: enforce admin seat limit before re-enabling.
+Iris MISSING-04 / GROUP-2-6: enforce admin seat limit before re-enabling.
 
 **Auth required:** Cookie: __Host-yashigani_admin_session=<token>
 
@@ -496,7 +496,7 @@ curl -X GET https://<gateway-host>/admin/audit/export \
 
 Stream the audit log as NDJSON or CSV. Never buffers the full file in memory.
 
-Note (ASVS V7.1.3):
+AVA-2026-04-29-002 fix (ASVS V7.1.3):
 - AuditLogExporter.export() is the canonical method; export_ndjson() / export_csv()
   never existed and caused AttributeError mid-stream (HTTP 200 then 502 cascade).
 - ndjson maps to AuditLogExporter format 'json' (newline-delimited JSON).
@@ -2849,7 +2849,7 @@ curl -X POST https://<gateway-host>/admin/users/{username}/disable \
 
 Re-enable a disabled user account.
 
-Note: enforce end-user seat limit before re-enabling.
+Iris MISSING-04 / GROUP-2-6: enforce end-user seat limit before re-enabling.
 A disabled user is not counted in the canonical end-user count, so re-enabling
 one could push the deployment over the licensed seat limit.
 
@@ -2899,7 +2899,9 @@ Retains: username, UUID, audit history.
 
 Reactivate a suspended HUMAN identity for a user-tier account.
 
-Auto-reactivate on login is not supported — this endpoint is the sole reactivation path (admin-action-only, audit-logged).
+Q3 / v2.23.4 arch-completion: auto-reactivate on login was reverted (Tiago
+directive 2026-05-15 — "admin-action-only, audit-logged"). This endpoint is
+the sole reactivation path.
 
 Requirements:
   - Caller: admin tier + fresh StepUp (StepUpAdminSession, TOTP within 5 min).
@@ -3221,7 +3223,10 @@ On failure: WEBAUTHN_LOGIN_FAILURE audit event + 401.
 
 Audit events: WEBAUTHN_LOGIN_SUCCESS | WEBAUTHN_LOGIN_FAILURE.
 
-Applies the same per-IP blocklist + progressive-delay throttle as login/start and the password login route. Records auth failure on bad assertion (sign_count rollback, wrong key, bad challenge) so that automated probing accumulates throttle delay across attempts.
+W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
+throttle as login/start and the password login route.  Records auth failure
+on bad assertion (sign_count rollback, wrong key, bad challenge) so that
+automated probing accumulates throttle delay across attempts.
 
 **Auth required:** Cookie: __Host-yashigani_admin_session=<token>
 
@@ -3256,7 +3261,9 @@ PUBLIC endpoint — does not require a session cookie.
 Looks up the admin's account_id by username, then generates a challenge.
 Returns allow_credentials list and challenge for navigator.credentials.get().
 
-Applies the same per-IP blocklist + progressive-delay throttle as the password login route. An unauthenticated DB-query endpoint without a rate gate is an invitation to enumerate admin usernames at scale.
+W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
+throttle as the password login route.  An unauthenticated DB-query endpoint
+without a rate gate is an invitation to enumerate admin usernames at scale.
 
 **Auth required:** Cookie: __Host-yashigani_admin_session=<token>
 

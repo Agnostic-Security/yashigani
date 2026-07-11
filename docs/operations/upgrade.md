@@ -149,7 +149,7 @@ cat docker/secrets/admin2_totp_secret
 > **DEFECT-N1-001 — LOW, accepted per security baseline**
 
 Yashigani uses **SHA-256** as the TOTP digest algorithm, per the
-the SHA-256 minimum security baseline (NIST SP 800-63B alignment).
+`feedback_sha256_minimum_pqr.md` security baseline (NIST SP 800-63B alignment).
 
 **Standard RFC 6238 TOTP authenticators that only support SHA-1 will not work**
 with Yashigani v2.23.3. This includes older builds of Google Authenticator on

@@ -110,6 +110,60 @@ class TestCryptoInventoryRequiresSession:
         )
 
 
+class TestCryptoInventoryTotpHonestClaims:
+    """
+    LAURA-3X-003: crypto_inventory.py must not assert HMAC-SHA-1 as the
+    deployed TOTP algorithm.  Phase 13 (v3.1) switched to role-tiered TOTP:
+      - User tier:  HMAC-SHA-256 / 6-digit
+      - Admin tier: HMAC-SHA-512 / 8-digit
+    SHA-1 is NOT deployed for new enrolments; it is only a legacy-detection
+    sentinel.  Listing SHA-1 as the live TOTP digest misleads auditors.
+    """
+
+    def test_hmac_sha1_not_falsely_listed_as_deployed_totp(self):
+        """
+        The crypto inventory must NOT contain an entry whose name is 'HMAC-SHA-1'
+        with TOTP usage — that would falsely imply SHA-1 is the deployed algorithm.
+        """
+        source = _CRYPTO_PY.read_text(encoding="utf-8")
+        # The old entry was: {"name": "HMAC-SHA-1", "usage": "TOTP digest (RFC 6238 default)", ...}
+        # We accept "HMAC-SHA-1" in comments / notes that clarify it is NOT deployed,
+        # but it must not appear as an inventory entry name alongside TOTP usage.
+        assert '"HMAC-SHA-1", "usage": "TOTP' not in source, (
+            "LAURA-3X-003 REGRESSION: crypto_inventory.py still lists 'HMAC-SHA-1' "
+            "as the deployed TOTP algorithm. Phase 13 (v3.1) uses SHA-256 (users) "
+            "and SHA-512 (admins). Remove the SHA-1 entry."
+        )
+
+    def test_hmac_sha256_totp_user_tier_listed(self):
+        """HMAC-SHA-256 (user-tier TOTP) must appear in the crypto inventory."""
+        source = _CRYPTO_PY.read_text(encoding="utf-8")
+        assert "HMAC-SHA-256" in source and "user tier" in source, (
+            "LAURA-3X-003: crypto_inventory.py must list HMAC-SHA-256 as the "
+            "user-tier TOTP algorithm (Phase 13 / v3.1)."
+        )
+
+    def test_hmac_sha512_totp_admin_tier_listed(self):
+        """HMAC-SHA-512 (admin-tier TOTP) must appear in the crypto inventory."""
+        source = _CRYPTO_PY.read_text(encoding="utf-8")
+        assert "HMAC-SHA-512" in source and "admin tier" in source, (
+            "LAURA-3X-003: crypto_inventory.py must list HMAC-SHA-512 as the "
+            "admin-tier TOTP algorithm (Phase 13 / v3.1)."
+        )
+
+    def test_sha1_not_deployed_note_present(self):
+        """
+        The inventory must contain an explicit note that HMAC-SHA-1 is NOT deployed,
+        so auditors reading the file do not infer SHA-1 is in use.
+        """
+        source = _CRYPTO_PY.read_text(encoding="utf-8")
+        assert "SHA-1 NOT deployed" in source or "HMAC-SHA-1 NOT deployed" in source, (
+            "LAURA-3X-003: crypto_inventory.py must contain an explicit note that "
+            "HMAC-SHA-1 is NOT deployed (e.g. in a usage string or comment). "
+            "Auditors must not infer SHA-1 is active."
+        )
+
+
 def _make_crypto_inventory_app():
     """
     Build a minimal FastAPI app with a /crypto/inventory-shaped route protected

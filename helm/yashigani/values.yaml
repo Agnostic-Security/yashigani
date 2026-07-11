@@ -20,6 +20,13 @@ global:
   acmeEmail: "admin@example.com"
   environment: "production"
   useExternalSecrets: false
+  # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust-domain
+  # authority. On K8s the tenancy boundary is the namespace/release, so a
+  # second instance is a separate namespace + a distinct trust domain (e.g.
+  # "apac.yashigani.internal"). Set this per release so a sibling instance's
+  # SPIFFE identity does not validate. Leave at the default for a single
+  # instance — preserves "yashigani.internal" byte-for-byte (no rotation).
+  spiffeTrustDomain: "yashigani.internal"
 
   keda:
     enabled: true
@@ -234,7 +241,7 @@ adminBootstrap:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.24.0"
+    tag: "3.0.0"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -277,7 +284,7 @@ gateway:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "2.24.0"
+    tag: "3.0.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -413,7 +420,7 @@ backoffice:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "2.24.0"
+    tag: "3.0.0"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -613,7 +620,7 @@ policy:
   enabled: true
   image:
     repository: openpolicyagent/opa
-    tag: "1.16.1@sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02"
+    tag: "1.18.2@sha256:cba27d3c6af2feba1e4d6e6b5e24df5b53db332420d4148a90acccd12efae6ed"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -673,7 +680,7 @@ ollama:
   enabled: true
   image:
     repository: ollama/ollama
-    tag: "0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
+    tag: "0.31.1@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -717,14 +724,17 @@ ollama:
   # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
   #   chat surface shows it as an available backend.
   # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
-  #   Set to "skip" after an upstream model update that changes the digest.
+  #   Default is "skip" — Ollama republishes models on upstream updates, which
+  #   changes the manifest SHA and hard-fails every clean install if a stale
+  #   digest is pinned. Prod operators who need strict enforcement set an explicit
+  #   prefix here; mismatches are always logged as loud WARNINGs.
   # minDiskGiB: minimum free gigabytes required on the ollama volume before pull.
   #   If free space < minDiskGiB the Job logs a warning and exits 0 (warn-only).
   initJob:
     # defaultModel: qwen2.5:3b — 1.9 GB, Qwen 2.5 3B-parameter instruct model.
     # Good balance of size and capability for a single-node deployment.
     defaultModel: "qwen2.5:3b"
-    modelDigest: "357c53fb659c"
+    modelDigest: "skip"
     minDiskGiB: 3
     resources:
       requests:
@@ -741,7 +751,7 @@ prometheus:
   enabled: true
   image:
     repository: prom/prometheus
-    tag: "v3.11.3@sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3"
+    tag: "v3.13.0@sha256:c6b27ea434f8389bfe233fbc7be381cf50587c286e871bc842008f5a1b1908a7"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -768,7 +778,7 @@ grafana:
   enabled: true
   image:
     repository: grafana/grafana
-    tag: "13.0.1@sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a"
+    tag: "13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -799,7 +809,7 @@ alertmanager:
   enabled: true
   image:
     repository: prom/alertmanager
-    tag: "v0.32.1@sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286"
+    tag: "v0.33.0@sha256:af26fbe4dd1886ac0efd7bd55cd9027da262e105b137a376522b7c14c3626e4a"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -825,7 +835,7 @@ loki:
   enabled: true
   image:
     repository: grafana/loki
-    tag: "3.7.1@sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4"
+    tag: "3.7.3@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -852,7 +862,7 @@ jaeger:
   enabled: true
   image:
     repository: jaegertracing/jaeger
-    tag: "2.17.0@sha256:6266573208d665ce5c17483bce0a75d0806480d92c84766d288d0aee885ce708"
+    tag: "2.19.0@sha256:ede4864215be4cd85bd8c3129a2fea6c5713c5653c7282c429dba123014bc68b"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -874,7 +884,7 @@ otelCollector:
   enabled: true
   image:
     repository: otel/opentelemetry-collector-contrib
-    tag: "0.151.0@sha256:d57bfe8eee2378f31cb1193239fbcac521d54a5a071fca2bfc106916a32b892d"
+    tag: "0.155.0@sha256:4935caa35e9a4cb387e35732e8fb22b2b5759af8d12e7043357f03837f6e8df5"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -909,7 +919,7 @@ caddy:
   enabled: true
   image:
     repository: caddy
-    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+    tag: "2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1000,6 +1010,8 @@ agentBundles:
       # Pinned to 2026.5.6 to match docker-compose.yml. INDEX digest verified
       # 2026-05-07 via crane digest — multi-arch (linux/amd64 + linux/arm64).
       repository: ghcr.io/openclaw/openclaw
+      # HELD at 2026.5.6 — 2026.6.10 is a BREAKING bump (refuses to start, "missing
+      # gateway.mode", exit 78). Upstream config contract changed. (#144 re-gate)
       tag: "2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
       pullPolicy: IfNotPresent
     replicaCount: 1
@@ -1038,7 +1050,7 @@ agentBundles:
       # Pinned to 1.9.2 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
       repository: docker.io/langflowai/langflow
-      tag: "1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14"
+      tag: "1.10.1@sha256:bb52d9bc6f413e1a73235497c75cab334d05b7c3db0818515f54771b17376be5"
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
@@ -1137,7 +1149,7 @@ agentBundles:
       # Pinned to 0.16.7 to match docker-compose.yml.
       # INDEX digest verified 2026-05-13 — multi-arch (linux/amd64 + linux/arm64).
       repository: docker.io/letta/letta
-      tag: "0.16.7@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
+      tag: "0.16.8@sha256:aa66c3eeee13d2dfc40c650d709b550237ee31bfc91942a52fa488a13fa8c102"
       pullPolicy: IfNotPresent
     replicaCount: 1
     env:
@@ -1264,11 +1276,11 @@ agentBundles:
     # over full mTLS presenting letta-pgbouncer_client.crt (UID 70:0400, no C4 violation).
     # session mode required for alembic DDL advisory locks.
     #
-    # Multi-arch: edoburu/pgbouncer:v1.25.1-p0 publishes arm64+amd64. No buildx required.
+    # Multi-arch: edoburu/pgbouncer:v1.25.2-p0 publishes arm64+amd64. No buildx required.
     # Same image as existing yashigani-pgbouncer Deployment. No new registry dependency.
     extraContainers:
       - name: letta-pgbouncer
-        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        image: "docker.io/edoburu/pgbouncer:v1.25.2-p0@sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340"
         imagePullPolicy: IfNotPresent
         securityContext:
           # pgbouncer runs as UID 70 (edoburu image USER pgbouncer). runAsNonRoot:true
@@ -1501,7 +1513,7 @@ postgres:
   enabled: true
   image:
     repository: postgres
-    tag: "16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50"
+    tag: "16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1528,7 +1540,7 @@ pgbouncer:
   enabled: true
   image:
     repository: edoburu/pgbouncer
-    tag: "v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+    tag: "v1.25.2-p0@sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1758,3 +1770,30 @@ licensing:
   # Leave empty to run in COMMUNITY tier.
   # Example: licenseKey: "$(cat /path/to/my.ysg)"
   licenseKey: ""
+
+# ---------------------------------------------------------------------------
+# Document-OPA enforcement (2.26 feature) — sandboxed extractor (B1, Captain).
+# Ships DARK: enabled=false means no extractor RBAC/NetworkPolicy is rendered
+# and the gateway never invokes the document path. Set enabled=true to opt in.
+# ---------------------------------------------------------------------------
+documentEnforcement:
+  enabled: false
+  # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
+  # Pin a digest in production (Verification Protocol §7).
+  image:
+    repository: yashigani/extractor
+    tag: ""            # defaults to .Chart.AppVersion when empty
+  # Per-job resource caps for the ephemeral extractor pods (fail-closed defaults).
+  timeoutSeconds: 20   # activeDeadlineSeconds — wall-clock kill
+  memLimit: "512Mi"    # cgroup memory limit — host never OOM'd
+  cpuLimit: "1"        # cpu quota
+
+# ---------------------------------------------------------------------------
+# Semantic-intent import classifier sidecar (DP-Y-003 §3.4).
+# Default ON for both gateway and backoffice (DP-Y-003 coherence).
+# Override per-service by setting gateway.semanticIntentSidecar or
+# backoffice.semanticIntentSidecar to false.
+# gateway.semanticIntentSidecar and backoffice.semanticIntentSidecar
+# are defaulted to true in the templates when not set.
+# ---------------------------------------------------------------------------
+# (no top-level key needed — gateway/backoffice templates default true)

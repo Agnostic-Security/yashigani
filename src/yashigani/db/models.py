@@ -2,6 +2,9 @@
 Table column definitions and typed row helpers.
 Not an ORM. asyncpg returns asyncpg.Record objects; these dataclasses
 provide typed wrappers for frequently accessed rows.
+
+NOTE: at runtime this module is SHADOWED by the db/models/ package
+(yashigani/db/models/__init__.py). Keep in sync to avoid confusion.
 """
 from __future__ import annotations
 
@@ -9,6 +12,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+
+from yashigani.db.postgres import PGP_SYM_OPTS  # Issue #144: AES-256 cipher pin
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,7 @@ class AuditEventRow:
 # Query helpers — all use $N parameterization, no string interpolation
 # ---------------------------------------------------------------------------
 
-INSERT_INFERENCE_EVENT = """
+INSERT_INFERENCE_EVENT = f"""
 INSERT INTO inference_events (
     tenant_id, session_id, agent_id, payload_hash, payload_length,
     response_length, payload_content, response_content,
@@ -72,8 +77,8 @@ INSERT INTO inference_events (
     backend_used, latency_ms
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
-    pgp_sym_encrypt($7, current_setting('app.aes_key')),
-    pgp_sym_encrypt($8, current_setting('app.aes_key')),
+    pgp_sym_encrypt($7, current_setting('app.aes_key'), '{PGP_SYM_OPTS}'),
+    pgp_sym_encrypt($8, current_setting('app.aes_key'), '{PGP_SYM_OPTS}'),
     $9, $10, $11, $12
 )
 """

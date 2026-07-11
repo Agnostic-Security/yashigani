@@ -120,6 +120,56 @@ class McpCallContext:
     resource_sensitivity: Optional[str] = None
     prompt_sensitivity: Optional[str] = None
 
+    # G-ORCH-OPA-1 — egress: caller's declared sensitivity ceiling.
+    # Set from the caller's identity/session before calling enforce_result().
+    # Defaults to None; OPA's mcp_response_decision fails-closed when absent
+    # (undefined _ceiling_rank → deny).  Transport layers MUST populate this
+    # from the authenticated caller identity before the egress check.
+    caller_sensitivity_ceiling: Optional[str] = None
+
+    # 3.1 Phase 1 — calling agent's identity for MCP authorization decisions.
+    # Populated by the transport layer; flows into the OPA input so policies
+    # can make caller-aware decisions (e.g. per-caller rate limits, allow-lists).
+    # Values:
+    #   - agent_id string: from AgentAuthMiddleware (request.state.agent_id)
+    #     for authenticated agent-originated MCP calls.
+    #   - "gateway:orchestrator": reserved service identity for the gateway's
+    #     own orchestrator when it issues MCP calls via the gateway-mediated
+    #     self-call path (detected via X-Yashigani-Orchestration-Depth header).
+    #   - None (default): caller not identified / unauthenticated path.
+    # Phase 1 is ADDITIVE — unbound policies are no-ops on this field.
+    caller_agent_id: Optional[str] = None
+
+    # 3.1 Phase 3 — per-caller tool allowlist.
+    # Populated by the MCP router runtime from the identity registry (field
+    # IdentityRecord.allowed_tools for the caller identified by caller_agent_id).
+    # Enforcement in McpBroker.enforce():
+    #   - None / empty list → no per-caller tool restriction (all tools allowed
+    #     for this caller, subject to OPA and other gates).
+    #   - Non-empty list → only tools in the list are permitted for this caller;
+    #     any other tool_name results in deny_reason="tool_not_permitted".
+    # "gateway:orchestrator" is exempt from this check (unrestricted access to
+    # all tools on any registered MCP server).
+    caller_allowed_tools: Optional[list[str]] = None
+
+    # 3.1 Phase 4 (group/user narrowing) — caller's group membership for the
+    # connection allow-list check in _check_connection_permit.
+    # Populated by mcp_router_runtime from the identity registry when the
+    # caller's identity is resolved via get_by_slug(user_id).
+    # Empty list → org-only check (same as current behaviour when identity absent).
+    caller_group_ids: list[str] = field(default_factory=list)
+
+    # 3.1 Phase 4 (group/user narrowing) — caller's email (human principals only).
+    # PRESENTATION FIELD ONLY — never passed as the authz key to the resolver.
+    # The authz key for the "user" principal tier is ctx.user_id (the identity_id
+    # idnt_{12hex} from the identity registry, set by mcp_router_runtime after 3.1
+    # UID unification — NOT a slug and NOT PII).
+    # Populated when the caller kind is "human"/"user" AND an X-OpenWebUI-User-Email
+    # header is present.  Serves as the "is this a human?" discriminator in
+    # _check_connection_permit.  None for agents, orchestrator, unauthenticated, and
+    # any path where the identity registry is absent or the kind is not "human"/"user".
+    caller_user_email: Optional[str] = None
+
 
 @dataclass
 class OpaDecision:
@@ -152,3 +202,26 @@ class BrokerDecision:
     chain_depth: int = 0
     elapsed_ms: Optional[int] = None
     error: Optional[str] = None         # internal error string (never client-visible)
+
+
+@dataclass
+class EgressDecision:
+    """
+    G-ORCH-OPA-1 — MCP egress decision after OPA mcp_response_decision check.
+
+    Returned by McpBroker.enforce_result().  When allow=False the transport
+    layer MUST NOT return the tool result to the caller — the result is
+    withheld and the deny shape (deny_reason, code, user_message) is returned
+    as the error body to the calling agent.
+
+    Fields mirror OpaResponseDecisionResult so callers need only inspect this
+    dataclass; they do not need to import from _opa directly.
+    """
+
+    allow: bool
+    deny_reason: str    # "ok" when allowed; label when denied
+    policy_id: str      # "mcp.response_decision" (stable self-describing ID)
+    code: str           # MCP_RESULT_OK | MCP_RESULT_* (machine-readable)
+    user_message: str   # layman explanation (safe to surface to calling agent)
+    elapsed_ms: int
+    error: Optional[str] = None   # internal OPA error string (never client-visible)

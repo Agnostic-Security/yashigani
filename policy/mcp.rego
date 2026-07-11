@@ -452,13 +452,303 @@ mcp_decision := {
     "redact_args": ra,
     "audit_capture": audit_capture,
     "rate_limit_key": rate_limit_key,
+    # FIX-004: surface caller in the OPA decision output for audit visibility.
+    #
+    # input.caller.agent_id is the POLICY-AUTHOR EXTENSION POINT for per-agent
+    # enforcement in custom policies.  Example: "deny if input.caller.agent_id
+    # not in allowed_callers[input.tool.name]" to restrict which agents may call
+    # which tools.
+    #
+    # NOTE: substantive per-agent enforcement is ALREADY done by the permission
+    # model in the broker BEFORE this OPA query fires:
+    #   • broker._check_connection_permit  — MCP_SERVER org-level allow-list
+    #   • broker._check_tool_permit        — per-caller allowed_tools
+    # This default policy does NOT re-implement those checks here (they are not
+    # OPA-visible by design — see admin-plane-not-OPA-gated memory entry).
+    # The caller field is surfaced for AUDIT RECORD COMPLETENESS so the OPA
+    # decision log carries the caller identity alongside the tool decision.
+    "caller": _mcp_caller_info,
 }
+
+# Safe caller extraction — guard against missing/non-string input.caller.agent_id.
+_mcp_caller_info := {"agent_id": input.caller.agent_id} if {
+    is_string(input.caller.agent_id)
+} else := {"agent_id": ""}
 
 # Use a safe getter to avoid undefined when allow is true (deny_reason is undefined)
 deny_reason_value := deny_reason if { not allow }
 deny_reason_value := "ok" if { allow }
 
 ra := redact_args
+
+# ---------------------------------------------------------------------------
+# G-ORCH-OPA-1 — MCP egress decision: mcp_response_decision
+#
+# Evaluated AFTER the upstream tool result is obtained (by the broker's
+# enforce_result() method), AFTER the content-filter + inspection step.
+# Closes the gap documented in the orchestration buildsheet as G-ORCH-OPA-1:
+# previously there was content-filter + inspection on the result, but NO OPA
+# DECISION evaluating the result against the caller's sensitivity ceiling.
+#
+# Mirrors agent_response_decision (policy/agents.rego) for the MCP surface.
+# The v1_routing.rego response_decision (gateway LLM egress) is the third
+# sibling that follows the same shape.
+#
+# Input schema (caller + result):
+#   input.caller.spiffe                 SPIFFE URI of the calling entity
+#   input.caller.sensitivity_ceiling    caller's clearance level (string or int)
+#   input.caller.groups                 list of RBAC group IDs (informational)
+#   input.result.sensitivity            sensitivity label of the tool result
+#   input.result.pii_detected           bool — PII found in the result body
+#   input.tool.name                     (optional) tool that produced the result
+#   input.agent.name                    (optional) agent being called
+#
+# Query path: /v1/data/yashigani/mcp/mcp_response_decision
+#
+# Fail-closed: default allow := false.  Any missing / malformed input → deny.
+# Self-describing: carries policy_id + code + user_message (I6 / user-alert contract).
+# ---------------------------------------------------------------------------
+
+# Sensitivity rank helper (duplicated from agents.rego — packages are scoped).
+# Maps content/ceiling level to an integer rank for comparison.
+# Unknown string → rank 5 (above RESTRICTED — fail-closed for content operand).
+_result_sensitivity_rank(level) := level if {
+    is_number(level)
+    level >= 1
+}
+_result_sensitivity_rank(level) := 0 if level == "PUBLIC"
+_result_sensitivity_rank(level) := 1 if level == "INTERNAL"
+_result_sensitivity_rank(level) := 2 if level == "CONFIDENTIAL"
+_result_sensitivity_rank(level) := 3 if level == "RESTRICTED"
+_result_sensitivity_rank(level) := 5 if {
+    not is_number(level)
+    not level in {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
+}
+
+# _result_ceiling_rank — rank for the CEILING operand.
+# Unknown ceiling string → UNDEFINED → rule does not fire → fail-closed deny.
+# This is intentionally asymmetric with _result_sensitivity_rank:
+# an unknown CONTENT label is most-sensitive (rank 5 = deny all);
+# an unknown CEILING label is undefined (deny rather than treating as highest
+# clearance — that would be permissive on a garbage input).
+_result_ceiling_rank(level) := level if {
+    is_number(level)
+    level >= 1
+}
+_result_ceiling_rank(level) := 0 if level == "PUBLIC"
+_result_ceiling_rank(level) := 1 if level == "INTERNAL"
+_result_ceiling_rank(level) := 2 if level == "CONFIDENTIAL"
+_result_ceiling_rank(level) := 3 if level == "RESTRICTED"
+
+# Fail-closed default.
+default mcp_response_allowed := false
+
+mcp_response_allowed if {
+    # Caller SPIFFE must be a non-empty string.
+    is_string(input.caller.spiffe)
+    input.caller.spiffe != ""
+
+    # Caller ceiling must be a recognised level (unknown → _ceiling_rank undefined → deny).
+    result_rank := _result_sensitivity_rank(input.result.sensitivity)
+    ceiling_rank := _result_ceiling_rank(input.caller.sensitivity_ceiling)
+    result_rank <= ceiling_rank
+
+    # No PII gate trigger.
+    not input.result.pii_detected == true
+}
+
+# Deny reasons — exactly one fires per deny case.
+#
+# Priority order (high → low):
+#   1. missing_caller_identity (identity check first)
+#   2. invalid_or_missing_caller_ceiling (ceiling must be parseable)
+#   3. result_sensitivity_exceeds_caller_ceiling (ceiling breach, with or without PII)
+#   4. pii_detected_in_result (PII only when ceiling is satisfied)
+#
+# Ceiling takes priority over PII: when result exceeds ceiling AND PII is present,
+# the auditor sees the sensitivity-governance reason (ceiling) — that is the
+# primary data-governance signal.  PII only fires when the result is within the
+# ceiling (the caller has clearance but PII blocks delivery).
+_mcp_response_deny_reason := "ok" if { mcp_response_allowed }
+
+_mcp_response_deny_reason := "result_sensitivity_exceeds_caller_ceiling" if {
+    not mcp_response_allowed
+    is_string(input.caller.spiffe)
+    input.caller.spiffe != ""
+    # _ceiling_rank MUST be defined (meaning the ceiling string is valid).
+    _result_ceiling_rank(input.caller.sensitivity_ceiling)
+    result_rank := _result_sensitivity_rank(input.result.sensitivity)
+    ceiling_rank := _result_ceiling_rank(input.caller.sensitivity_ceiling)
+    # Ceiling breach: report regardless of whether PII is also present.
+    result_rank > ceiling_rank
+}
+
+_mcp_response_deny_reason := "pii_detected_in_result" if {
+    not mcp_response_allowed
+    input.result.pii_detected == true
+    is_string(input.caller.spiffe)
+    input.caller.spiffe != ""
+    # Only fire when ceiling is valid AND result is within ceiling.
+    # If ceiling is also exceeded, the ceiling rule above takes priority.
+    _result_ceiling_rank(input.caller.sensitivity_ceiling)
+    result_rank := _result_sensitivity_rank(input.result.sensitivity)
+    ceiling_rank := _result_ceiling_rank(input.caller.sensitivity_ceiling)
+    result_rank <= ceiling_rank
+}
+
+_mcp_response_deny_reason := "invalid_or_missing_caller_ceiling" if {
+    not mcp_response_allowed
+    is_string(input.caller.spiffe)
+    input.caller.spiffe != ""
+    # _ceiling_rank is UNDEFINED for the provided ceiling — that is why we denied.
+    # This rule fires regardless of PII status; an unrecognised ceiling is
+    # structurally prior to all content-level checks.
+    not _result_ceiling_rank(input.caller.sensitivity_ceiling)
+}
+
+_mcp_response_deny_reason := "missing_caller_identity" if {
+    not mcp_response_allowed
+    not is_string(input.caller.spiffe)
+}
+
+_mcp_response_deny_reason := "missing_caller_identity" if {
+    not mcp_response_allowed
+    is_string(input.caller.spiffe)
+    input.caller.spiffe == ""
+}
+
+# Self-describing user messages (I6 / unified user-alert contract).
+_mcp_response_user_message := msg if {
+    mcp_response_allowed
+    msg := "Tool result approved for delivery."
+}
+
+_mcp_response_user_message := msg if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+    msg := "The tool result contains information above your authorisation level and cannot be returned to you."
+}
+
+_mcp_response_user_message := msg if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "pii_detected_in_result"
+    msg := "The tool result was blocked because personal information (PII) was detected in the response."
+}
+
+_mcp_response_user_message := msg if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "invalid_or_missing_caller_ceiling"
+    msg := "The tool result could not be returned because your authorisation level is not recognised."
+}
+
+_mcp_response_user_message := msg if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "missing_caller_identity"
+    msg := "The tool result was blocked because the caller identity could not be verified."
+}
+
+# Default user message (catches any deny reason not covered above).
+default _mcp_response_user_message := "The tool result was blocked by the security policy."
+
+_mcp_response_code := "MCP_RESULT_OK" if { mcp_response_allowed }
+_mcp_response_code := "MCP_RESULT_SENSITIVITY_EXCEEDED" if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+}
+_mcp_response_code := "MCP_RESULT_PII_BLOCKED" if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "pii_detected_in_result"
+}
+_mcp_response_code := "MCP_RESULT_CEILING_INVALID" if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "invalid_or_missing_caller_ceiling"
+}
+_mcp_response_code := "MCP_RESULT_IDENTITY_MISSING" if {
+    not mcp_response_allowed
+    _mcp_response_deny_reason == "missing_caller_identity"
+}
+default _mcp_response_code := "MCP_RESULT_DENIED"
+
+# mcp_response_decision — compound egress decision document.
+# Query path: /v1/data/yashigani/mcp/mcp_response_decision
+mcp_response_decision := {
+    "allow":        mcp_response_allowed,
+    "deny_reason":  _mcp_response_deny_reason,
+    "policy_id":    "mcp.response_decision",
+    "code":         _mcp_response_code,
+    "user_message": _mcp_response_user_message,
+}
+
+# ---------------------------------------------------------------------------
+# 3.0 / YSG-RISK-060 — capability-envelope decision contract (self-describing)
+#
+# The capability-envelope INVOCATION HARD GATE and the refresh-time triage are
+# enforced in the broker (deterministic structural diff is the authority — an
+# LLM is never trusted to grant; see _envelope.py / _envelope_triage.py).  OPA
+# does NOT re-derive the structural diff (that authority is code, by design).
+#
+# What lives here is the SELF-DESCRIBING DECISION CONTRACT (I6 / the unified
+# user-alert envelope, 2026-06-06): stable policy_id + layman user_message +
+# code keyed by the broker's envelope deny_reason, so the gateway can render a
+# consistent layman explanation at the enforcement point WITHOUT a lookup
+# table.  The broker passes its deny_reason; this maps it to the contract.
+#
+# Whether the re-approval ADMIN action is rendered as a real OPA admin-plane
+# decision or as broker-internal-fail-closed + AdminSession+StepUp is contingent
+# on Tiago design-call #1 (GAP-003/004 admin-plane OPA).  The fresh-TOTP step-up
+# is UNCONDITIONAL either way (auth.stepup.assert_privileged_mutation).
+# ---------------------------------------------------------------------------
+
+# Stable policy identifier for the capability-envelope enforcement point.
+capability_envelope_policy_id := "mcp.capability_envelope"
+
+# capability_envelope_contract(reason) -> {policy_id, code, user_message}
+# `reason` is the broker's envelope deny_reason (e.g.
+# "capability_envelope_not_active", "capability_envelope_tool_not_approved",
+# "capability_envelope_surface_stale", "refresh_expanding", "refresh_uncertain").
+capability_envelope_contract(reason) := out if {
+    out := {
+        "policy_id": capability_envelope_policy_id,
+        "code": "TOOL_SURFACE_REAPPROVAL_REQUIRED",
+        "user_message": _capability_envelope_user_message(reason),
+    }
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_not_active"
+    msg := "This imported tool has not been approved (or its approval was suspended pending review), so it cannot be used until an operator re-approves it."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_tool_not_approved"
+    msg := "The tool you tried to use is not part of the approved capability set for this imported service, so it was blocked."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    reason == "capability_envelope_surface_stale"
+    msg := "This imported tool changed since it was last approved. It is blocked until an operator reviews the change."
+}
+
+_capability_envelope_user_message(reason) := msg if {
+    startswith(reason, "refresh_")
+    msg := "An imported tool tried to expand what it can do beyond what was approved, so it was blocked. An operator must review and re-approve the change before this tool can be used again."
+}
+
+# Fallback for any unmapped envelope reason — fail-closed wording (closed-world).
+_capability_envelope_user_message(reason) := msg if {
+    not _known_envelope_reason(reason)
+    msg := "This imported tool was blocked by the capability-envelope control and requires operator review."
+}
+
+_known_envelope_reason(reason) if {
+    reason in {
+        "capability_envelope_not_active",
+        "capability_envelope_tool_not_approved",
+        "capability_envelope_surface_stale",
+    }
+}
+
+_known_envelope_reason(reason) if { startswith(reason, "refresh_") }
 
 # ---------------------------------------------------------------------------
 # P3 — Filesystem MCP server tool gating (Laura threat model §5)

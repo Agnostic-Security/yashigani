@@ -49,12 +49,13 @@ function showPage(name, triggerEl) {
     if (name === 'agents') loadAgents();
     if (name === 'accounts') { loadAccounts(); loadEnforcementBanner(); }
     if (name === 'budgets') loadBudgets();
-    if (name === 'models') { loadModels(); loadCloudOverride(); }
+    if (name === 'models') { loadModels(); loadCloudOverride(); loadCloudKeys(); }
     if (name === 'sensitivity') loadSensitivity();
     if (name === 'policies') { loadPolicies(); loadLifecycle(); }
     if (name === 'audit') loadAuditFacets();  // R19/R20 — populate verdict + source-type filters
     if (name === 'settings') { loadSettings(); loadEntitlements(); }
     if (name === 'backup') loadBackup();
+    if (name === 'monitoring') { loadMonitoring(); loadSiemConfig(); }
     // PKI / Crypto page — R24: also load crypto inventory when PKI tab is activated.
     // loadPkiStatus is defined in pki.js (loaded defer).
     if (name === 'pki') {
@@ -64,7 +65,15 @@ function showPage(name, triggerEl) {
     // Runtime settings panel — loadRuntimeSettings is defined in runtime-settings.js (loaded defer).
     if (name === 'runtime-settings' && typeof window.loadRuntimeSettings === 'function') window.loadRuntimeSettings();
     if (name === 'policies') loadBindings();  // #16 — load bindings alongside policies
+    // Document Enforcement panel — loadDocuments is defined in documents.js (loaded defer).
+    if (name === 'documents' && typeof window.loadDocuments === 'function') window.loadDocuments();
+    // MCP capability-envelope re-approvals — loadEnvelopes is in envelope_reapproval.js (defer).
+    if (name === 'envelopes' && typeof window.loadEnvelopes === 'function') window.loadEnvelopes();
     if (name === 'rbac') { loadGroups(); loadRbacSources(); }  // R13: populate path/method catalogues
+    // 3.0 — Permissions-Policy admin page — loadCapabilityPolicy is in capability-policy.js (defer).
+    if (name === 'capability-policy' && typeof window.loadCapabilityPolicy === 'function') window.loadCapabilityPolicy();
+    // 3.1 Phase 8 — Resource Permissions admin page — loadPermissions is in permissions.js (defer).
+    if (name === 'permissions' && typeof window.loadPermissions === 'function') window.loadPermissions();
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,8 +1046,66 @@ function dashRefresh() {
     loadDashboard();
 }
 
+// ── UX-001 (2026-06-14): group multi-select population ───────────────────────
+// Well-known groups with human-readable labels.
+var _GROUP_LABELS = {
+    'users':      'users — API access (programmatic)',
+    'owui-users': 'owui-users — Open WebUI (human)',
+};
+
+// IDs of the four group multi-selects.
+var _GROUP_SELECT_IDS = ['agent-groups', 'agent-caller-groups', 'edit-agent-groups', 'edit-agent-caller-groups'];
+
+// Fetch RBAC groups and populate all four multi-selects.
+// Preserves current selections so calling again after a group is created/deleted
+// keeps the existing state.
+async function populateGroupSelects() {
+    var data = await api('/admin/rbac/groups');
+    var groups = (data && data.groups) ? data.groups : [];
+    // Always include the two baseline groups even if they aren't in the RBAC store yet.
+    var knownIds = new Set(groups.map(function(g) { return g.id; }));
+    if (!knownIds.has('users'))      { groups.unshift({ id: 'users',      display_name: 'users' }); }
+    if (!knownIds.has('owui-users')) { groups.unshift({ id: 'owui-users', display_name: 'owui-users' }); }
+
+    _GROUP_SELECT_IDS.forEach(function(selId) {
+        var sel = document.getElementById(selId);
+        if (!sel) return;
+        // Save current selections so they survive the rebuild.
+        var selected = new Set(Array.from(sel.options).filter(function(o) { return o.selected; }).map(function(o) { return o.value; }));
+        sel.innerHTML = '';
+        groups.forEach(function(g) {
+            var label = _GROUP_LABELS[g.id] || (g.id + (g.display_name && g.display_name !== g.id ? ' — ' + g.display_name : ''));
+            var opt = document.createElement('option');
+            opt.value = g.id;
+            opt.textContent = label;
+            opt.selected = selected.has(g.id);
+            sel.appendChild(opt);
+        });
+    });
+}
+
+// Read selected values from a multi-select by element id.
+function _getSelectedGroups(selId) {
+    var sel = document.getElementById(selId);
+    if (!sel) return [];
+    return Array.from(sel.options).filter(function(o) { return o.selected; }).map(function(o) { return o.value; });
+}
+
+// Pre-select the given comma-separated group string in a multi-select.
+function _setSelectedGroups(selId, csvOrArray) {
+    var sel = document.getElementById(selId);
+    if (!sel) return;
+    var active = new Set(typeof csvOrArray === 'string'
+        ? csvOrArray.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
+        : (csvOrArray || []));
+    Array.from(sel.options).forEach(function(o) {
+        o.selected = active.has(o.value);
+    });
+}
+
 // Agents
 async function loadAgents() {
+    populateGroupSelects();   // UX-001: ensure dropdowns are populated when Agents tab loads
     var agents = await api('/admin/agents');
     var tbody = document.getElementById('agents-tbody');
     if (agents && agents.length > 0) {
@@ -1073,8 +1140,8 @@ async function registerAgent() {
     var name = document.getElementById('agent-name').value.trim();
     var url = document.getElementById('agent-url').value.trim();
     var protocol = document.getElementById('agent-protocol').value;
-    var groups = document.getElementById('agent-groups').value.trim().split(',').filter(Boolean);
-    var callerGroups = document.getElementById('agent-caller-groups').value.trim().split(',').filter(Boolean);
+    var groups = _getSelectedGroups('agent-groups');           // UX-001: multi-select
+    var callerGroups = _getSelectedGroups('agent-caller-groups'); // UX-001: multi-select
     var cidrs = document.getElementById('agent-cidrs').value.trim().split(',').filter(Boolean);
     var result = document.getElementById('register-agent-result');
     if (!name || !url) { result.textContent = 'Name and URL are required.'; return; }
@@ -1114,6 +1181,19 @@ async function rotateAgentToken(agentId, name) {
         document.getElementById('agent-token-name').textContent = name;
         document.getElementById('agent-token-value').textContent = data.token;
         document.getElementById('agent-token-panel').classList.add('is-open');
+    } else if (resp && resp.status === 401) {
+        // AVA-30-003: token rotation requires a SPIFFE mTLS client certificate
+        // (X-Yashigani-Spiffe-Id header injected by Caddy on mTLS connections).
+        // Browser-session callers don't present a client cert, so this endpoint
+        // always returns 401 from the browser.  Show a clear, actionable message
+        // rather than a generic "Token rotation failed: 401".
+        alert(
+            'Token rotation requires a SPIFFE mTLS client certificate.\n\n' +
+            'This action cannot be performed from a browser session. ' +
+            'Use the Yashigani API directly with your service SPIFFE certificate:\n\n' +
+            '  curl --cert <leaf.crt> --key <leaf.key> --cacert <ca.crt> \\\n' +
+            '       -X POST https://<host>/admin/agents/' + agentId + '/token/rotate'
+        );
     } else if (resp) {
         alert('Token rotation failed: ' + resp.status);
     }
@@ -1133,8 +1213,8 @@ function editAgent(agentId, name, url, groups, callerGroups) {
     document.getElementById('edit-agent-id').value = agentId;
     document.getElementById('edit-agent-name').value = name || '';
     document.getElementById('edit-agent-url').value = url || '';
-    document.getElementById('edit-agent-groups').value = groups || '';
-    document.getElementById('edit-agent-caller-groups').value = callerGroups || '';
+    _setSelectedGroups('edit-agent-groups', groups || '');         // UX-001: multi-select
+    _setSelectedGroups('edit-agent-caller-groups', callerGroups || ''); // UX-001: multi-select
     document.getElementById('edit-agent-result').textContent = '';
     document.getElementById('edit-agent-form').classList.add('is-open');
 }
@@ -1147,8 +1227,8 @@ async function saveEditAgent() {
     var agentId = document.getElementById('edit-agent-id').value;
     var name = document.getElementById('edit-agent-name').value.trim();
     var url = document.getElementById('edit-agent-url').value.trim();
-    var groups = document.getElementById('edit-agent-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
-    var callerGroups = document.getElementById('edit-agent-caller-groups').value.trim().split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var groups = _getSelectedGroups('edit-agent-groups');              // UX-001: multi-select
+    var callerGroups = _getSelectedGroups('edit-agent-caller-groups'); // UX-001: multi-select
     var result = document.getElementById('edit-agent-result');
     // Only send changed/non-empty fields — AgentUpdateRequest fields are all optional.
     var body = {};
@@ -1273,18 +1353,22 @@ async function createAdmin() {
 
 async function createUser() {
     var username = document.getElementById('new-user-name').value.trim();
+    var email = document.getElementById('new-user-email').value.trim();
     var result = document.getElementById('create-user-result');
-    if (!username) { result.textContent = 'Username is required.'; return; }
+    if (!email) { result.textContent = 'Email is required (it is the user’s canonical identity).'; return; }
     result.innerHTML = '<span class="loading">Creating...</span>';
+    var payload = { email: email };
+    if (username) { payload.username = username; }
     var resp = await fetch('/admin/users', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username })
+        body: JSON.stringify(payload)
     });
     if (resp.ok) {
         var data = await resp.json();
         result.innerHTML = '<span class="badge badge-green">Created</span>';
         document.getElementById('new-user-name').value = '';
+        document.getElementById('new-user-email').value = '';
         showCredentials(username, data.temporary_password, data.totp_secret, data.totp_uri);
         loadAccounts();
     } else {
@@ -1392,12 +1476,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < caps.org_caps.length; i++) {
             var c = caps.org_caps[i];
-            html += '<tr><td>' + escapeHtml(c.provider || '*') + '</td><td>' + (c.token_cap || 0).toLocaleString() + '</td><td>' + escapeHtml(c.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteOrgCap" data-org-id="' + escapeHtml(c.org_id || 'default') + '" data-provider="' + escapeHtml(c.provider || '*') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(c.org_id || 'default') + '</td><td>' + escapeHtml(c.provider || '*') + '</td><td>' + (c.token_cap || 0).toLocaleString() + '</td><td>' + escapeHtml(c.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         tbody.innerHTML = html;
         document.getElementById('stat-org-caps').textContent = caps.org_caps.length;
     } else {
-        tbody.innerHTML = '<tr><td colspan="3" class="empty">No caps configured</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No caps configured</td></tr>';
         document.getElementById('stat-org-caps').textContent = '0';
     }
 
@@ -1407,12 +1492,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < groups.group_budgets.length; i++) {
             var g = groups.group_budgets[i];
-            html += '<tr><td>' + escapeHtml(g.group_id) + '</td><td>' + escapeHtml(g.provider || '*') + '</td><td>' + (g.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(g.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteGroupBudget" data-group-id="' + escapeHtml(g.group_id) + '" data-provider="' + escapeHtml(g.provider || '*') + '" data-period="' + escapeHtml(g.period || 'monthly') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(g.group_id) + '</td><td>' + escapeHtml(g.provider || '*') + '</td><td>' + (g.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(g.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         gtbody.innerHTML = html;
         document.getElementById('stat-group-budgets').textContent = groups.group_budgets.length;
     } else {
-        gtbody.innerHTML = '<tr><td colspan="4" class="empty">No group budgets configured</td></tr>';
+        gtbody.innerHTML = '<tr><td colspan="5" class="empty">No group budgets configured</td></tr>';
         document.getElementById('stat-group-budgets').textContent = '0';
     }
 
@@ -1422,12 +1508,13 @@ async function loadBudgets() {
         var html = '';
         for (var i = 0; i < indiv.individual_budgets.length; i++) {
             var ind = indiv.individual_budgets[i];
-            html += '<tr><td>' + escapeHtml(ind.identity_id) + '</td><td>' + escapeHtml(ind.provider || '*') + '</td><td>' + (ind.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(ind.period || 'monthly') + '</td></tr>';
+            var delBtn = '<button class="btn btn-sm btn-sm-danger" data-action="deleteIndBudget" data-identity-id="' + escapeHtml(ind.identity_id) + '" data-provider="' + escapeHtml(ind.provider || '*') + '" data-period="' + escapeHtml(ind.period || 'monthly') + '">Delete</button>';
+            html += '<tr><td>' + escapeHtml(ind.identity_id) + '</td><td>' + escapeHtml(ind.provider || '*') + '</td><td>' + (ind.token_budget || 0).toLocaleString() + '</td><td>' + escapeHtml(ind.period || 'monthly') + '</td><td>' + delBtn + '</td></tr>';
         }
         itbody.innerHTML = html;
         document.getElementById('stat-individual-budgets').textContent = indiv.individual_budgets.length;
     } else {
-        itbody.innerHTML = '<tr><td colspan="4" class="empty">No individual budgets configured</td></tr>';
+        itbody.innerHTML = '<tr><td colspan="5" class="empty">No individual budgets configured</td></tr>';
         document.getElementById('stat-individual-budgets').textContent = '0';
     }
 }
@@ -1483,6 +1570,33 @@ async function addIndBudget() {
     });
     if (resp.ok) { result.innerHTML = '<span class="badge badge-green">Saved</span>'; loadBudgets(); }
     else { var err = await resp.json().catch(function(){return {};}); result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(err.detail || resp.status); }
+}
+
+async function deleteOrgCap(orgId, provider) {
+    var params = new URLSearchParams({ org_id: orgId, provider: provider });
+    var resp = await fetch('/admin/budget/org-caps?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
+}
+
+async function deleteGroupBudget(groupId, provider, period) {
+    var params = new URLSearchParams({ group_id: groupId, provider: provider, period: period || 'monthly' });
+    var resp = await fetch('/admin/budget/groups?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
+}
+
+async function deleteIndBudget(identityId, provider, period) {
+    var params = new URLSearchParams({ identity_id: identityId, provider: provider, period: period || 'monthly' });
+    var resp = await fetch('/admin/budget/individuals?' + params.toString(), {
+        method: 'DELETE', credentials: 'same-origin'
+    });
+    if (resp.ok || resp.status === 204) { loadBudgets(); }
+    else { var err = await resp.json().catch(function(){return {};}); alert('Delete failed: ' + (err.detail || resp.status)); }
 }
 
 // Models
@@ -2434,7 +2548,7 @@ async function loadAlertConfig() {
             var c = data.config || {};
             document.getElementById('alert-slack-url').value = c.slack_webhook_url || '';
             document.getElementById('alert-teams-url').value = c.teams_webhook_url || '';
-            document.getElementById('alert-pagerduty-key').value = c.pagerduty_integration_key || '';
+            document.getElementById('alert-pagerduty-key').value = c.pagerduty_routing_key || '';
             document.getElementById('alert-trigger-exfil').checked = c.alert_on_credential_exfil !== false;
             document.getElementById('alert-trigger-anomaly').checked = c.alert_on_anomaly_threshold !== false;
             document.getElementById('alert-trigger-budget').checked = c.alert_on_budget_exhaustion === true;
@@ -2453,7 +2567,7 @@ async function saveAlertConfig() {
             body: JSON.stringify({
                 slack_webhook_url: document.getElementById('alert-slack-url').value || null,
                 teams_webhook_url: document.getElementById('alert-teams-url').value || null,
-                pagerduty_integration_key: document.getElementById('alert-pagerduty-key').value || null,
+                pagerduty_routing_key: document.getElementById('alert-pagerduty-key').value || null,
                 alert_on_credential_exfil: document.getElementById('alert-trigger-exfil').checked,
                 alert_on_anomaly_threshold: document.getElementById('alert-trigger-anomaly').checked,
                 alert_on_budget_exhaustion: document.getElementById('alert-trigger-budget').checked,
@@ -2512,12 +2626,16 @@ async function searchAudit(cursor) {
     var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
+    var agentId = document.getElementById('audit-agent-id').value.trim();
+    var user = document.getElementById('audit-user').value.trim();
     var text = document.getElementById('audit-text').value.trim();
     if (et) params.set('event_type', et);
     if (verdict) params.set('verdict', verdict);
     if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
+    if (agentId) params.set('agent_id', agentId);
+    if (user) params.set('user', user);
     // free_text is a substring match, not a glob — treat a lone '*' as "match all".
     if (text && text !== '*') params.set('free_text', text);
     if (cursor) params.set('cursor', cursor);
@@ -2559,13 +2677,45 @@ async function exportAudit() {
     var sourceType = document.getElementById('audit-source-type').value;
     var from = document.getElementById('audit-from').value;
     var to = document.getElementById('audit-to').value;
+    var agentId = document.getElementById('audit-agent-id').value.trim();
+    var user = document.getElementById('audit-user').value.trim();
     if (et) params.set('event_type', et);
     if (verdict) params.set('verdict', verdict);
     if (sourceType) params.set('source_type', sourceType);
     if (from) params.set('date_from', from);
     if (to) params.set('date_to', to);
+    if (agentId) params.set('agent_id', agentId);
+    if (user) params.set('user', user);
     params.set('output_format', 'csv');
     window.open('/admin/audit/export?' + params.toString(), '_blank');
+}
+
+function resetAudit() {
+    // Clear all filter inputs back to their default (empty / "All") state.
+    var sel = document.getElementById('audit-event-type');
+    if (sel) sel.value = '';
+    sel = document.getElementById('audit-verdict');
+    if (sel) sel.value = '';
+    sel = document.getElementById('audit-source-type');
+    if (sel) sel.value = '';
+    var inp = document.getElementById('audit-from');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-to');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-agent-id');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-user');
+    if (inp) inp.value = '';
+    inp = document.getElementById('audit-text');
+    if (inp) inp.value = '';
+    // Clear the results table and pagination.
+    var tbody = document.getElementById('audit-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Use the search form above to query audit events.</td></tr>';
+    var pag = document.getElementById('audit-pagination');
+    if (pag) pag.innerHTML = '';
+    var hdr = document.getElementById('audit-count');
+    if (hdr) hdr.textContent = 'Events';
+    auditCursor = '';
 }
 
 // IP Access Control
@@ -2804,6 +2954,15 @@ document.addEventListener('click', function(e) {
         case 'addIndBudget':
             addIndBudget();
             break;
+        case 'deleteOrgCap':
+            deleteOrgCap(actionEl.getAttribute('data-org-id'), actionEl.getAttribute('data-provider'));
+            break;
+        case 'deleteGroupBudget':
+            deleteGroupBudget(actionEl.getAttribute('data-group-id'), actionEl.getAttribute('data-provider'), actionEl.getAttribute('data-period'));
+            break;
+        case 'deleteIndBudget':
+            deleteIndBudget(actionEl.getAttribute('data-identity-id'), actionEl.getAttribute('data-provider'), actionEl.getAttribute('data-period'));
+            break;
 
         // Model actions
         case 'addAlias':
@@ -2858,6 +3017,9 @@ document.addEventListener('click', function(e) {
         case 'exportAudit':
             exportAudit();
             break;
+        case 'resetAudit':
+            resetAudit();
+            break;
 
         // Monitoring — external links
         case 'openExternal':
@@ -2890,6 +3052,17 @@ document.addEventListener('click', function(e) {
             break;
         case 'disableService':
             toggleService(e.target.dataset.service, 'disable');
+            break;
+        // SIEM / audit sink
+        case 'siemSave':
+            siemSave();
+            break;
+        case 'siemTest':
+            siemTest();
+            break;
+        // Cloud-provider API key
+        case 'cloudKeySet':
+            cloudKeySet();
             break;
         // Backup
         case 'createBackup':
@@ -3043,6 +3216,77 @@ document.addEventListener('click', function(e) {
         case 'acceptGeneratedPattern':
             acceptGeneratedPattern();
             break;
+
+        // 3.0 — Capability Policy (browser Permissions-Policy) actions
+        // All functions defined in capability-policy.js (loaded defer).
+        case 'capPolLoad':
+            if (typeof capPolLoad === 'function') capPolLoad();
+            break;
+        case 'capPolSave':
+            if (typeof capPolSave === 'function') capPolSave();
+            break;
+        case 'capPolDelete':
+            if (typeof capPolDelete === 'function') capPolDelete();
+            break;
+        case 'capPolEffective':
+            if (typeof capPolEffective === 'function') capPolEffective();
+            break;
+        case 'capPolAddOrigin':
+            if (typeof capPolAddOrigin === 'function') capPolAddOrigin(actionEl.getAttribute('data-cap'));
+            break;
+        case 'capPolRemoveOrigin':
+            if (typeof capPolRemoveOrigin === 'function') capPolRemoveOrigin(
+                actionEl.getAttribute('data-cap'),
+                actionEl.getAttribute('data-origin')
+            );
+            break;
+
+        // 3.1 Phase 8 — Resource Permissions admin page (defined in permissions.js, loaded defer).
+        case 'permLoad':
+            if (typeof permLoad === 'function') permLoad();
+            break;
+        case 'permGrantEdit':
+            if (typeof permGrantEdit === 'function') permGrantEdit(
+                actionEl.getAttribute('data-rid'),
+                actionEl.getAttribute('data-allow'),
+                actionEl.getAttribute('data-opa')
+            );
+            break;
+        case 'permGrantEditCancel':
+            if (typeof permGrantEditCancel === 'function') permGrantEditCancel();
+            break;
+        case 'permSaveGrant':
+            if (typeof permSaveGrant === 'function') permSaveGrant();
+            break;
+        case 'permDeleteGrant':
+            if (typeof permDeleteGrant === 'function') permDeleteGrant(
+                actionEl.getAttribute('data-rid')
+            );
+            break;
+        case 'permEffective':
+            if (typeof permEffective === 'function') permEffective();
+            break;
+        case 'loadDeclarations':
+            if (typeof window.loadDeclarations === 'function') window.loadDeclarations();
+            break;
+        case 'permApproveClick':
+            if (typeof permApproveClick === 'function') permApproveClick(
+                actionEl.getAttribute('data-rt'),
+                actionEl.getAttribute('data-rid')
+            );
+            break;
+        case 'permApproveDeclaration':
+            if (typeof permApproveDeclaration === 'function') permApproveDeclaration();
+            break;
+        case 'permApproveCancelClick':
+            if (typeof permApproveCancelClick === 'function') permApproveCancelClick();
+            break;
+        case 'permRejectDeclaration':
+            if (typeof permRejectDeclaration === 'function') permRejectDeclaration(
+                actionEl.getAttribute('data-rt'),
+                actionEl.getAttribute('data-rid')
+            );
+            break;
     }
 });
 
@@ -3088,6 +3332,127 @@ async function toggleService(serviceId, action) {
 }
 
 loadServices();
+
+// ── Monitoring page — hide/grey optional service tiles when not deployed ────
+// Fetches /admin/services and adds .tile-disabled to each optional-service
+// card whose profile is not in the deployed set. Grafana and Prometheus are
+// always present (bundled); only Wazuh is optional. If the services API is
+// unavailable, tiles remain as-is (no silent removal).
+async function loadMonitoring() {
+    var data = await api('/admin/services');
+    if (!data || !data.services) return;
+    var deployed = {};
+    data.services.forEach(function(s) { deployed[s.id] = (s.status === 'running'); });
+
+    // Gate: Wazuh monitoring tile
+    var wazuhTile = document.getElementById('monitoring-tile-wazuh');
+    if (wazuhTile) {
+        if (deployed['wazuh']) {
+            wazuhTile.classList.remove('tile-disabled');
+            wazuhTile.removeAttribute('aria-disabled');
+            wazuhTile.setAttribute('data-action', 'openExternal');
+        } else {
+            wazuhTile.classList.add('tile-disabled');
+            wazuhTile.setAttribute('aria-disabled', 'true');
+            wazuhTile.removeAttribute('data-action');  // prevent click-through
+            var wazuhNote = document.getElementById('monitoring-tile-wazuh-note');
+            if (wazuhNote) wazuhNote.textContent = 'Not deployed — re-run installer with --wazuh to enable.';
+        }
+    }
+}
+
+// ── SIEM config (Monitoring page) ───────────────────────────────────────────
+async function loadSiemConfig() {
+    var status = document.getElementById('siem-config-status');
+    if (!status) return;
+    var data = await api('/admin/audit/siem/config');
+    if (!data) { status.textContent = 'Could not load SIEM config.'; return; }
+    var be = data.backend || 'none';
+    var ep = data.endpoint || '';
+    status.innerHTML = 'Current backend: <strong>' + escapeHtml(be) + '</strong>'
+        + (ep ? ' — <span class="txt-muted">' + escapeHtml(ep) + '</span>' : '');
+    var sel = document.getElementById('siem-backend');
+    if (sel) sel.value = be;
+    var epEl = document.getElementById('siem-endpoint');
+    if (epEl) epEl.value = ep;
+}
+
+async function siemTest() {
+    var result = document.getElementById('siem-config-result');
+    if (result) result.innerHTML = '<span class="loading">Sending test event…</span>';
+    var r = await apiMutate('/admin/audit/siem/config/test', { method: 'POST' });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Failed</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Test event sent</span>';
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
+
+async function siemSave() {
+    var result = document.getElementById('siem-config-result');
+    var backend = (document.getElementById('siem-backend') || {}).value || 'none';
+    var endpoint = (document.getElementById('siem-endpoint') || {}).value || '';
+    var token = (document.getElementById('siem-token') || {}).value || '';
+    if (result) result.innerHTML = '<span class="loading">Saving…</span>';
+    // Step-up: apiMutate triggers TOTP challenge automatically.
+    var body = { backend: backend, endpoint: endpoint || null };
+    if (token) body.token_secret_key = token;
+    var r = await apiMutate('/admin/audit/siem/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Cancelled</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('siem-token').value = '';
+        loadSiemConfig();
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
+
+// ── Cloud provider API key (Models page) ────────────────────────────────────
+async function loadCloudKeys() {
+    var status = document.getElementById('cloud-key-status');
+    if (!status) return;
+    var data = await api('/admin/cloud-keys');
+    if (!data) { status.textContent = 'Could not load cloud key status.'; return; }
+    var html = '';
+    (data.providers || []).forEach(function(p) {
+        var badge = p.configured
+            ? '<span class="badge badge-green">Configured</span>'
+            : '<span class="badge badge-slate">Not set</span>';
+        html += '<tr><td>' + escapeHtml(p.provider) + '</td><td>' + badge + '</td></tr>';
+    });
+    status.innerHTML = html || '<span class="txt-muted">No keys configured.</span>';
+}
+
+async function cloudKeySet() {
+    var result = document.getElementById('cloud-key-result');
+    var provider = (document.getElementById('cloud-key-provider') || {}).value || '';
+    var key = (document.getElementById('cloud-key-value') || {}).value || '';
+    if (!provider) { if (result) result.innerHTML = '<span class="badge badge-red">Select a provider</span>'; return; }
+    if (!key) { if (result) result.innerHTML = '<span class="badge badge-red">API key is required</span>'; return; }
+    if (result) result.innerHTML = '<span class="loading">Saving (step-up required)…</span>';
+    var r = await apiMutate('/admin/cloud-keys', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: provider, api_key: key })
+    });
+    if (!r) { if (result) result.innerHTML = '<span class="badge badge-red">Cancelled</span>'; return; }
+    var data = await r.json().catch(function() { return {}; });
+    if (r.ok) {
+        if (result) result.innerHTML = '<span class="badge badge-green">Saved</span>';
+        document.getElementById('cloud-key-value').value = '';
+        loadCloudKeys();
+    } else {
+        if (result) result.innerHTML = '<span class="badge badge-red">Error</span> ' + escapeHtml(data.detail || r.status);
+    }
+}
 
 // Backup status + verify
 async function loadBackup() {

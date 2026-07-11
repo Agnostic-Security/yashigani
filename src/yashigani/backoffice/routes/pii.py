@@ -1,9 +1,9 @@
 """
 Yashigani Backoffice — PII configuration and test routes (v2.2).
 
-License gating:
-  pii_log    — required for LOG mode (detection only).
-  pii_redact — required for REDACT and BLOCK modes.
+ENT-001 (2026-06-14): PII detection (LOG / REDACT / BLOCK) is available on ALL tiers
+including Community/free.  There is no license gate on PII.  The _require_pii_feature()
+helper is retained as a no-op stub so call-sites need no change, but it no longer raises.
 
 Routes:
   GET  /admin/pii/config          — current PII config (mode, enabled types)
@@ -17,7 +17,6 @@ Cloud bypass (OFF by default):
   When enabled, PII filtering is skipped for cloud-routed requests only.
   Local (Ollama) traffic is ALWAYS filtered regardless of this setting.
   This is an explicit admin opt-in to allow PII to reach cloud LLMs.
-  Enabling this requires pii_redact license tier.
 """
 from __future__ import annotations
 
@@ -29,7 +28,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from yashigani.backoffice.middleware import AdminSession
 from yashigani.backoffice.state import backoffice_state
-from yashigani.licensing.enforcer import LicenseFeatureGated, require_feature
+# ENT-001: LicenseFeatureGated / require_feature no longer used in this module
+#          (PII is always available); imports removed to keep ruff clean.
 from yashigani.pii.detector import PiiDetector, PiiMode, PiiType
 
 logger = logging.getLogger(__name__)
@@ -114,25 +114,17 @@ class PiiCloudBypassRequest(BaseModel):
 # License helpers
 # ---------------------------------------------------------------------------
 
-def _require_pii_feature(mode: str) -> None:
-    """Raise HTTP 402 if the active license does not cover the requested mode."""
-    try:
-        if mode in ("redact", "block"):
-            require_feature("pii_redact")
-        else:
-            require_feature("pii_log")
-    except LicenseFeatureGated as exc:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "error": "LICENSE_FEATURE_GATED",
-                "feature": exc.feature,
-                "message": (
-                    "PII detection requires Professional Plus or higher. "
-                    "Upgrade at https://agnosticsec.com/pricing"
-                ),
-            },
-        ) from exc
+def _require_pii_feature(mode: str) -> None:  # noqa: ARG001
+    """No-op stub (ENT-001, 2026-06-14).
+
+    PII detection is available on ALL tiers including Community.  This function
+    previously raised HTTP 402 for tiers below Professional Plus; that gate is
+    removed.  The stub is retained so call-sites in this module need no change.
+    """
+    # require_feature("pii_log"/"pii_redact") now short-circuits in enforcer.py
+    # via _ALWAYS_AVAILABLE_FEATURES and will never raise LicenseFeatureGated —
+    # but calling it here is equally correct.  We keep the body empty to make the
+    # intent explicit: this is intentionally a no-op.
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +245,13 @@ async def update_pii_cloud_bypass(
 ):
     """Toggle the PII cloud bypass setting.
 
-    Requires pii_redact license tier (same as REDACT/BLOCK modes) because
-    enabling bypass has equivalent data exposure implications.
+    ENT-001: no license gate — PII bypass is available on all tiers.
 
     Local (Ollama) traffic is NEVER affected — it is always filtered.
     This setting only controls whether PII filtering runs for requests
     that the optimization engine routes to cloud providers.
     """
-    # Enabling cloud bypass has the same data-exposure risk as BLOCK mode —
-    # require pii_redact so community-tier users cannot accidentally expose PII.
-    _require_pii_feature("redact" if body.enabled else "log")
+    _require_pii_feature("redact" if body.enabled else "log")  # no-op (ENT-001)
 
     previous = _get_cloud_bypass()
     _set_cloud_bypass(body.enabled)

@@ -28,7 +28,7 @@
             </div>
             <div class="field">
                 <label for="totp_code">TOTP Code</label>
-                <input type="text" id="totp_code" name="totp_code" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" class="totp-input" placeholder="000000">
+                <input type="text" id="totp_code" name="totp_code" required pattern="[0-9]{8}" maxlength="8" inputmode="numeric" autocomplete="one-time-code" class="totp-input" placeholder="00000000">
             </div>
             <button type="submit" id="login-btn">Sign In</button>
         </form>
@@ -48,9 +48,10 @@
         </form>
 
         <!-- WebAuthn / FIDO2 hardware key option
-             Hidden until JS confirms browser support (via webauthn_login.js).
+             Default hidden; webauthn_login.js reveals it only when the browser
+             confirms PublicKeyCredential support (see classList.remove('hidden')).
              Username field is shared with the TOTP form above. -->
-        <div id="webauthn-section">
+        <div id="webauthn-section" class="hidden">
             <div class="divider"><span>or</span></div>
             <button type="button" id="webauthn-login-btn" class="btn-secondary">
                 Sign in with Security Key

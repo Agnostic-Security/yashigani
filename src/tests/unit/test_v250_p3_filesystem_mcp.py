@@ -361,8 +361,35 @@ def _make_fs_call_context(tool_name: str = "read_file", args: Optional[dict] = N
     )
 
 
+async def _allow_client_policies(*_args, **_kwargs):
+    """No-op client-policy result (allow) — these broker tests bind no client
+    policies, so prod semantics are pass-through (deny-only / additive)."""
+    return {"allow": True, "deny": [], "obligations": []}
+
+
 class TestBrokerFilesystemGate:
     """FIX-P3-ENFORCE: broker second OPA gate for is_filesystem_agent=True."""
+
+    @pytest.fixture(autouse=True)
+    def _service_identity_env(self, monkeypatch):
+        """Close the client-enforce fixture gap (Su ``ccae785``, #16).
+
+        ``broker.enforce`` runs the INGRESS client-policy gate (broker.py step
+        2d) which opens an mTLS OPA round-trip via
+        ``pki.client.internal_httpx_client`` → ``pki.identity.current_service()``,
+        requiring ``YASHIGANI_SERVICE_NAME`` + a service-manifest/cert tree that
+        production compose/helm provision but these in-process unit fixtures
+        cannot.  Absent them the gate fails CLOSED (``client_enforce_unavailable``)
+        on the allow-path tests.  ENV/INFRA fixture gap, NOT a regression — these
+        tests bind no client policies (prod = pass-through).  Same fix as
+        test_v250_p1_mcp_broker.py / test_g_new_5_agent_principal_signing.py.
+        """
+        monkeypatch.setenv("YASHIGANI_SERVICE_NAME", "gateway")
+        monkeypatch.setattr(
+            "yashigani.gateway._client_enforce.evaluate_client_policies",
+            _allow_client_policies,
+            raising=False,
+        )
 
     async def test_non_fs_broker_does_not_query_second_gate(self) -> None:
         """

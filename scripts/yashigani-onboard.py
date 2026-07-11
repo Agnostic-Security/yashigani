@@ -71,6 +71,17 @@ _AUDIT_ONBOARD_PATH = "/auth/onboard-event"  # audit write endpoint (mounted on 
 # CLI callers outside the container must supply it via YSG_CADDY_HMAC env var.
 _HMAC_ENV = "YSG_CADDY_HMAC"
 
+# MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust-domain authority.
+# The backoffice identity asserted by this onboard CLI must use the TARGET
+# instance's trust domain, or the per-instance SPIFFE validator rejects it. Read
+# from YASHIGANI_SPIFFE_TRUST_DOMAIN (operator sources it from the instance's
+# docker/.env). Legacy single-instance default preserves yashigani.internal.
+_TRUST_DOMAIN_ENV = "YASHIGANI_SPIFFE_TRUST_DOMAIN"
+
+
+def _trust_domain() -> str:
+    return os.environ.get(_TRUST_DOMAIN_ENV, "").strip() or "yashigani.internal"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -265,7 +276,8 @@ def _register_agent(
     headers = {
         "X-Caddy-Verified-Secret": hmac,
         # ISSUE-019: inject SPIFFE ID for the backoffice identity gate.
-        "X-SPIFFE-ID": "spiffe://yashigani.internal/backoffice",
+        # MI-6: per-instance trust domain (legacy default yashigani.internal).
+        "X-SPIFFE-ID": f"spiffe://{_trust_domain()}/backoffice",
         "Cookie": f"__Host-yashigani_admin_session={session_cookie}",
     }
     try:

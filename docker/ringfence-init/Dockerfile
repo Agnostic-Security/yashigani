@@ -28,7 +28,7 @@
 #   L3 (OPA policy) only. This is documented, not silently swallowed.
 #
 # SECURITY CONTEXT
-#   - Base: alpine:3.21.3 (digest-pinned below; re-pin when Alpine cuts 3.22)
+#   - Base: alpine:3.22.0 (digest-pinned below; re-pin when Alpine cuts 3.23)
 #   - Packages: iptables, ip6tables (via iptables metapackage), bind-tools
 #     (getent via nss_dns), iproute2-minimal (ip addr for diagnostics only)
 #   - Non-root target: the script needs NET_ADMIN to manipulate iptables in the
@@ -58,12 +58,12 @@
 # LIVE-TEST PLAN (DEFERRED — needs runtime)
 #   See docker/ringfence-init/README.md §"Deferred live-test plan".
 
-# Alpine 3.21.3 — digest-pinned. Update with:
-#   docker manifest inspect docker.io/library/alpine:3.21.3 \
+# Alpine 3.22.0 — digest-pinned. Update with:
+#   docker manifest inspect docker.io/library/alpine:3.22.0 \
 #     | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
 # Re-pin for each architecture at buildx time via --platform flag.
 # TODO(captain,post-runtime): pin digest after first manifest inspect.
-FROM docker.io/library/alpine:3.21.3
+FROM docker.io/library/alpine:3.22.0
 
 # Install iptables (nf_tables shim on Alpine 3.21 — semantically equivalent
 # to legacy iptables for OUTPUT chain manipulation), ip6tables (same package),
@@ -75,7 +75,7 @@ RUN apk add --no-cache \
     bind-tools \
     iproute2-minimal \
     # TODO(captain,post-runtime): pin bind-tools + iproute2-minimal versions.
-    # Run `apk info bind-tools iproute2-minimal` inside a live alpine:3.21.3
+    # Run `apk info bind-tools iproute2-minimal` inside a live alpine:3.22.0
     # container to get exact versions, then replace the lines above with:
     #   bind-tools=<version>
     #   iproute2-minimal=<version>

@@ -48,7 +48,7 @@ def push_rbac_data(
         {
             "rbac": {
                 "groups": { "<id>": { ... }, ... },
-                "user_groups": { "<email>": ["<id>", ...], ... }
+                "user_groups": { "<identity_id>": ["<id>", ...], ... }
             },
             "agents": {
                 "<agent_id>": {

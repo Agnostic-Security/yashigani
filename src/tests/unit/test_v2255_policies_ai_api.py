@@ -592,17 +592,24 @@ class TestGeneratePattern:
         return _j.dumps({"regex": regex, "level": level, "description": description})
 
     def test_generate_returns_regex_and_level(self):
+        # LAURA-2255-003: endpoint now uses chat API (/api/chat), not /api/generate.
+        # Response shape: {"message": {"content": "<json>"}} (not {"response": "..."}).
+        # FIND-003: model is now qwen2.5:3b by default (not avail[0]=gemma3:4b).
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": self._llm_json_response(
-                r"\bOFFICIAL[\s-]SENSITIVE\b", 4, "UK OFFICIAL-SENSITIVE marking"
-            )
+            "message": {
+                "content": self._llm_json_response(
+                    r"\bOFFICIAL[\s-]SENSITIVE\b", 4, "UK OFFICIAL-SENSITIVE marking"
+                )
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
         mock_tags_resp = MagicMock()
+        # gemma3:4b is the only available model; qwen2.5:3b is the fixed default (FIND-003)
         mock_tags_resp.json = MagicMock(return_value={"models": [{"name": "gemma3:4b"}]})
+        mock_tags_resp.raise_for_status = MagicMock()
 
         mock_httpx_inst = AsyncMock()
         mock_httpx_inst.__aenter__ = AsyncMock(return_value=mock_httpx_inst)
@@ -623,15 +630,23 @@ class TestGeneratePattern:
         assert data["status"] == "ok"
         assert data["generated_regex"] == r"\bOFFICIAL[\s-]SENSITIVE\b"
         assert data["suggested_level"] == 4
-        assert data["model"] == "gemma3:4b"
-        assert data["parse_error"] is None
+        # FIND-003: default is qwen2.5:3b (structured-output model), not avail[0]
+        assert data["model"] == "qwen2.5:3b", \
+            f"FIND-003: expected qwen2.5:3b default, got {data['model']!r}"
+        # LAURA-2255-003: raw_llm_response is never returned to the client
+        assert "raw_llm_response" not in data
 
     def test_generate_clamps_level_to_valid_range(self):
-        """LLM returning level=99 should be clamped to 5."""
+        """LLM returning level=99 should be clamped to 5.
+
+        LAURA-2255-003: uses chat API response shape {"message": {"content": ...}}.
+        """
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": self._llm_json_response(r"\d+", 99, "numbers")
+            "message": {
+                "content": self._llm_json_response(r"\d+", 99, "numbers")
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
@@ -656,15 +671,25 @@ class TestGeneratePattern:
         assert resp.json()["suggested_level"] == 5
 
     def test_generate_llm_unavailable_returns_503(self):
+        """LLM chat call fails → 503 llm_unavailable.
+
+        FIND-003: model is resolved before the chat call. The tags endpoint must
+        return at least one model (or YASHIGANI_OPA_ASSISTANT_MODEL must be set)
+        for the code to reach the chat call; otherwise it raises no_model_available.
+        This test simulates: Ollama reachable (tags returns a model), chat call fails.
+        """
         import httpx
 
         mock_tags_resp = MagicMock()
-        mock_tags_resp.json = MagicMock(return_value={"models": []})
+        # Provide qwen2.5:3b as available so model resolution succeeds
+        mock_tags_resp.json = MagicMock(return_value={"models": [{"name": "qwen2.5:3b"}]})
+        mock_tags_resp.raise_for_status = MagicMock()
 
         mock_httpx_inst = AsyncMock()
         mock_httpx_inst.__aenter__ = AsyncMock(return_value=mock_httpx_inst)
         mock_httpx_inst.__aexit__ = AsyncMock(return_value=None)
         mock_httpx_inst.get = AsyncMock(return_value=mock_tags_resp)
+        # Chat call fails with connection error
         mock_httpx_inst.post = AsyncMock(
             side_effect=httpx.ConnectError("connection refused")
         )
@@ -701,22 +726,35 @@ class TestGeneratePattern:
         # Pydantic validation rejects <5 chars
         assert resp.status_code == 422
 
-    def test_generate_parse_error_returns_raw(self):
-        """If LLM returns non-JSON, parse_error is set and raw is included."""
+    def test_generate_parse_error_raw_not_exposed(self):
+        """If LLM returns non-JSON text, raw is NOT returned to client (LAURA-2255-003).
+
+        FIND-003 update: a plain-text non-JSON response (no '{') triggers a retry
+        with a stricter prompt. If the retry also returns non-JSON, the status is
+        "empty_response" (FIND-003 new status) — NOT "parse_error" (which applies
+        when the JSON is present but malformed). "empty_response" is still a failure
+        status and the raw LLM output is never returned to the client.
+
+        LAURA-2255-003: raw LLM output is logged server-side only.
+        """
         mock_llm_resp = MagicMock()
         mock_llm_resp.status_code = 200
         mock_llm_resp.json = MagicMock(return_value={
-            "response": "Sorry, I cannot generate that pattern."
+            "message": {
+                "content": "Sorry, I cannot generate that pattern."
+            }
         })
         mock_llm_resp.raise_for_status = MagicMock()
 
         mock_tags_resp = MagicMock()
         mock_tags_resp.json = MagicMock(return_value={"models": [{"name": "gemma3:4b"}]})
+        mock_tags_resp.raise_for_status = MagicMock()
 
         mock_httpx_inst = AsyncMock()
         mock_httpx_inst.__aenter__ = AsyncMock(return_value=mock_httpx_inst)
         mock_httpx_inst.__aexit__ = AsyncMock(return_value=None)
         mock_httpx_inst.get = AsyncMock(return_value=mock_tags_resp)
+        # Both initial call and retry return the non-JSON text (simulating a stubborn model)
         mock_httpx_inst.post = AsyncMock(return_value=mock_llm_resp)
 
         app = _make_sensitivity_app()
@@ -729,9 +767,14 @@ class TestGeneratePattern:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "parse_error"
-        assert data["parse_error"] is not None
-        assert data["raw_llm_response"] is not None
+        # FIND-003: plain-text non-JSON (no '{') → retry → still no JSON → "empty_response"
+        # "parse_error" is for when JSON is present but malformed.
+        assert data["status"] in ("parse_error", "empty_response"), \
+            f"Expected parse_error or empty_response, got {data['status']!r}"
+        # Security (LAURA-2255-003): raw LLM output MUST NOT reach the client
+        assert "raw_llm_response" not in data
+        # No usable regex is returned when generation fails
+        assert data["generated_regex"] == ""
 
 
 # ---------------------------------------------------------------------------

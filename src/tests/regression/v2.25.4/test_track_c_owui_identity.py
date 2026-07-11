@@ -46,6 +46,7 @@ import importlib
 import os
 import sys
 import unittest.mock as mock
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,16 @@ def test_t3_no_match_uses_registered_default_slug():
     assert out["sensitivity_ceiling"] == "INTERNAL"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "3.1 UID unification (uid_unification spec §8 Risk 4): "
+        "_resolve_owui_forwarded_user now raises HTTPException(403, "
+        "error='owui_user_not_registered') instead of returning the "
+        "baseline-RESTRICTED synthetic identity. Fail-closed replaces "
+        "fail-open. v2.25.4 documented the old baseline-fallback behaviour."
+    ),
+    strict=True,
+)
 def test_t4_no_match_no_default_falls_to_baseline_restricted():
     mod = _load_router_with_env({"YASHIGANI_OWUI_DEFAULT_SLUG": "owui-users"})
     # Empty registry — neither user slug nor default slug registered.
@@ -250,6 +261,16 @@ def test_t9_malformed_empty_email_is_flat_internal_not_elevated():
     assert out["sensitivity_ceiling"] == "RESTRICTED"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "3.1 UID unification (uid_unification spec §8 Risk 4): "
+        "_resolve_owui_forwarded_user now raises HTTPException(403, "
+        "error='identity_registry_unavailable') instead of returning the "
+        "baseline-RESTRICTED synthetic identity when the registry is None. "
+        "v2.25.4 documented the old baseline-fallback behaviour."
+    ),
+    strict=True,
+)
 def test_t10_registry_unavailable_under_bearer_fails_closed_to_baseline():
     mod = _load_router_with_env({})
     mod._state.identity_registry = None

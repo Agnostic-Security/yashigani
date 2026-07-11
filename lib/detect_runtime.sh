@@ -187,7 +187,10 @@ _detect_runtime() {
     # but extend it to 4-way (k8s and podman rootless/rootful split).
     # YSG_RUNTIME=podman → distinguish rootful vs rootless here.
     # YSG_RUNTIME=k8s    → map to k8s.
-    # YSG_RUNTIME=docker → map to docker.
+    # YSG_RUNTIME=docker → map to docker directly (FIND-INSTALL-3.1-004: skip Podman
+    #                       reachability check so a box with both runtimes installed
+    #                       reports docker-rootful, not podman-rootless, when the
+    #                       operator passed --runtime docker).
     _legacy_hint="${YSG_RUNTIME:-}"
 
     # ── Case 1: K8s in-cluster ─────────────────────────────────────────────
@@ -206,6 +209,23 @@ _detect_runtime() {
         export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
         _dr_log "Detected: k8s (from YSG_RUNTIME hint)"
         return 0
+    fi
+
+    # ── Case docker from hint (FIND-INSTALL-3.1-004) ──────────────────────
+    # When the operator passed --runtime docker (YSG_RUNTIME=docker), honour
+    # that decision and skip the Podman reachability check. On a box where both
+    # Docker Engine and rootless Podman are installed, Podman is reachable, so
+    # the auto-detection falls into the podman-rootless branch and mislabels
+    # the runtime — causing a false L1-gap warning and wrong ring-fence codegen.
+    if [ "${_legacy_hint}" = "docker" ]; then
+        if _dr_docker_reachable; then
+            YSG_RUNTIME_4WAY="docker"
+            YSG_RUNTIME_4WAY_NOTE="Docker Engine (YSG_RUNTIME=docker explicit). Full L1 containment available (iptables + ip6tables). NET_ADMIN required on ringfence-init container."
+            export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+            _dr_log "Detected: docker (from YSG_RUNTIME=docker hint)"
+            return 0
+        fi
+        _dr_warn "YSG_RUNTIME=docker but Docker daemon unreachable — falling through to auto-detection."
     fi
 
     # ── Cases 2-4: Podman ────────────────────────────────────────────────

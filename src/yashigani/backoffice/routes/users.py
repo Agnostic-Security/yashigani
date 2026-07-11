@@ -19,11 +19,15 @@ from typing import Optional
 import re as _re
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
-from yashigani.auth.totp import generate_provisioning
+from yashigani.auth.totp import (
+    generate_provisioning,
+    TOTP_ALGO_SHA256,
+    TOTP_DIGITS_USER,
+)
 from yashigani.backoffice.schemas.bopla import UserAccountPublic, UserCreateResponse
 
 router = APIRouter()
@@ -83,7 +87,7 @@ def _derive_username_from_email(email: str) -> str:
 
 
 class FullResetRequest(BaseModel):
-    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    totp_code: str = Field(min_length=6, max_length=8, pattern=r"^\d{6,8}$")  # 6 (user SHA256) or 8 (admin SHA512) — Phase 13
 
 
 class ReactivateRequest(BaseModel):
@@ -280,8 +284,16 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
 
     # Generate TOTP secret for provisioning — installer-privileged path
     # because the admin is performing an out-of-band TOTP delivery.
-    totp = generate_provisioning(account_name=effective_username, issuer="Yashigani")
-    await state.auth_service.set_totp_secret_direct(effective_username, totp.secret_b32)
+    # Phase 13: user tier → SHA-256/6-digit TOTP.
+    totp = generate_provisioning(
+        account_name=effective_username,
+        issuer="Yashigani",
+        algorithm=TOTP_ALGO_SHA256,
+        digits=TOTP_DIGITS_USER,
+    )
+    await state.auth_service.set_totp_secret_direct(
+        effective_username, totp.secret_b32, algorithm=TOTP_ALGO_SHA256
+    )
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned, user just needs the URI
 
@@ -299,12 +311,22 @@ async def create_user(body: CreateUserRequest, session: AdminSession):
     ).model_dump()
 
 
+# CONF-001 (2026-06-14): valid sensitivity ceiling values — the TEXT enum enforced
+# by the DB CHECK constraint on the identities table AND the identity registry.
+_VALID_SENSITIVITY_CEILINGS: frozenset[str] = frozenset(
+    {"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"}
+)
+
+
 class UpdateUserRequest(BaseModel):
     """R5 (2.25.5): editable user-account fields.
 
-    email    — the canonical identity for a user-tier account. Optional; omit to
-               leave unchanged.
-    disabled — set active/disabled status. Optional; omit to leave unchanged.
+    email               — the canonical identity for a user-tier account.
+    disabled            — active/disabled status.
+    sensitivity_ceiling — CONF-001: maximum sensitivity classification this user
+                          may see/send. One of: PUBLIC, INTERNAL, CONFIDENTIAL,
+                          RESTRICTED. Written to the HUMAN identity entry in the
+                          identity registry. Omit to leave unchanged.
 
     NOTE (SoD-002): tier/role is NOT editable here — user and admin identities
     are strictly separate by design. Promoting a user to admin must go through
@@ -312,14 +334,41 @@ class UpdateUserRequest(BaseModel):
     """
     email: Optional[EmailStr] = None
     disabled: Optional[bool] = None
+    sensitivity_ceiling: Optional[str] = Field(
+        default=None,
+        description=(
+            "Maximum sensitivity classification for this user. "
+            "One of: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED."
+        ),
+    )
+
+    @field_validator("sensitivity_ceiling")
+    @classmethod
+    def _validate_sensitivity_ceiling(cls, v: Optional[str]) -> Optional[str]:
+        """CONF-001: validate sensitivity_ceiling against the taxonomy enum."""
+        if v is None:
+            return v
+        normalised = v.strip().upper()
+        if normalised not in _VALID_SENSITIVITY_CEILINGS:
+            raise ValueError(
+                f"sensitivity_ceiling must be one of "
+                f"{sorted(_VALID_SENSITIVITY_CEILINGS)!r}; got {v!r}"
+            )
+        return normalised
 
 
 @router.put("/{username}")
 async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdminSession):
-    """R5 (2.25.5): edit a user account's email and/or active status.
+    """R5 (2.25.5) + CONF-001 (2026-06-14): edit a user account's email, active status,
+    and/or sensitivity_ceiling.
 
     Step-up (TOTP) gated, modelled on delete_user / disable_user. Tier/role is
     NOT editable here (SoD-002 — see UpdateUserRequest docstring).
+
+    CONF-001: sensitivity_ceiling is written to the HUMAN identity entry in the
+    identity registry. If the user has no registered identity yet (has never
+    logged in) the field is silently skipped — a 409 is not raised because the
+    user account itself exists and the other fields may still be updated.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -363,12 +412,55 @@ async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdm
                 )
             await state.auth_service.disable(username)
             state.session_store.invalidate_all_for_account(record.account_id)
-            _suspend_identity_registry_for_account(record.account_id)
+            _suspend_identity_registry_for_account(
+                record.account_id,
+                username=username,
+                email=getattr(record, "email", None),
+            )
             state.audit_writer.write(_config_event(session.account_id, "user_account_disabled", username, "disabled", account_tier=session.account_tier))
         else:
             await state.auth_service.enable(username)
             state.audit_writer.write(_config_event(session.account_id, "user_account_enabled", username, "enabled", account_tier=session.account_tier))
         changed.append("disabled")
+
+    # CONF-001 (2026-06-14): write sensitivity_ceiling to the user's HUMAN identity
+    # in the identity registry.  Validation is done by the Pydantic model_validator
+    # (_validate_sensitivity_ceiling) — only normalised, enum-legal values reach here.
+    if body.sensitivity_ceiling is not None:
+        registry = getattr(state, "identity_registry", None)
+        if registry is not None:
+            from yashigani.backoffice.routes.auth import _auth_email_to_slug
+            email_for_slug = getattr(record, "email", None) or f"{record.username}@yashigani.local"
+            slug = _auth_email_to_slug(email_for_slug)
+            identity = registry.get_by_slug(slug)
+            if identity is not None:
+                old_ceiling = identity.get("sensitivity_ceiling", "PUBLIC")
+                if old_ceiling != body.sensitivity_ceiling:
+                    registry.update(identity["identity_id"], sensitivity_ceiling=body.sensitivity_ceiling)
+                    state.audit_writer.write(
+                        _config_event(
+                            session.account_id,
+                            "user_sensitivity_ceiling_changed",
+                            old_ceiling,
+                            body.sensitivity_ceiling,
+                            account_tier=session.account_tier,
+                        )
+                    )
+                    changed.append("sensitivity_ceiling")
+            else:
+                # User has not yet logged in — no HUMAN identity exists in the registry yet.
+                # Log the attempt; do not error so the other fields are still updated.
+                _log.info(
+                    "CONF-001: sensitivity_ceiling update skipped for %r — no HUMAN identity "
+                    "in registry yet (user has not logged in)",
+                    username,
+                )
+        else:
+            _log.warning(
+                "CONF-001: identity_registry not available — sensitivity_ceiling update "
+                "skipped for user %r",
+                username,
+            )
 
     return {"status": "ok", "changed": changed}
 
@@ -423,10 +515,15 @@ async def full_reset_user(
 
     # full_reset_user handles admin-TOTP verification + target reset atomically
     # inside a single tenant_transaction, using the Postgres-backed replay cache.
+    # Phase 13: pass admin's algorithm and digit count so verify_totp uses the right HMAC.
+    from yashigani.auth.totp import ROLE_TOTP_DIGITS as _FRU_ROLE_DIGITS
+    _fru_admin_digits = _FRU_ROLE_DIGITS.get(admin_record.account_tier, 8)
     success, reason = await state.auth_service.full_reset_user(
         username,
         admin_totp_secret=admin_record.totp_secret,
         admin_totp_code=body.totp_code,
+        admin_totp_algorithm=admin_record.totp_algorithm,
+        admin_totp_digits=_fru_admin_digits,
     )
     if not success:
         if reason == "invalid_admin_totp":
@@ -466,8 +563,12 @@ async def disable_user(username: str, session: StepUpAdminSession):
         return {"status": "ok", "message": "already_disabled"}
     await state.auth_service.disable(username)
     state.session_store.invalidate_all_for_account(record.account_id)
-    # LF-DISABLE-PARTIAL: suspend all identity-registry entries for this account.
-    _suspend_identity_registry_for_account(record.account_id)
+    # LF-DISABLE-PARTIAL / LAURA-DK-001: suspend all identity-registry entries for this account.
+    _suspend_identity_registry_for_account(
+        record.account_id,
+        username=username,
+        email=getattr(record, "email", None),
+    )
     state.audit_writer.write(_config_event(session.account_id, "user_account_disabled", username, "disabled", account_tier=session.account_tier))
     return {"status": "ok"}
 
@@ -694,43 +795,80 @@ async def admin_issue_user_api_key(username: str, session: StepUpAdminSession):
     }
 
 
-def _suspend_identity_registry_for_account(account_id: str) -> None:
+def _suspend_identity_registry_for_account(
+    account_id: str,
+    *,
+    username: str = "",
+    email: str | None = None,
+) -> None:
     """Suspend all identity-registry entries owned by account_id.
 
     LF-DISABLE-PARTIAL (2026-04-27): disable_user must suspend API keys /
     agent tokens registered under the same account, not only browser sessions.
     This prevents a disabled user's API key from remaining usable.
 
-    SEC-240-7: now delegates to suspend_owned_by() — O(1) org_id index lookup
+    SEC-240-7: delegates to suspend_owned_by() — O(1) org_id index lookup
     instead of a full registry scan + Python filter.
+
+    LAURA-DK-001 (2026-07-04): slug-based fallback for HUMAN identities
+    registered before fix (a) landed (org_id="" at registration time means
+    suspend_owned_by returns 0).  When suspend_owned_by finds nothing AND we
+    have username/email to derive a slug, we look up the identity directly and
+    suspend it.  This covers ALL existing deployments without any Redis
+    backfill.  The scope is tight: the slug is derived from THIS account's
+    email/username, so account A disable cannot touch account B.
 
     Fail-soft: if identity_registry is unavailable (e.g. community tier with
     no IdentityRegistry wired), log a warning and continue — the session
     invalidation has already executed.
     """
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
     state = backoffice_state
     registry = state.identity_registry
     if registry is None:
-        import logging as _log
-
-        _log.getLogger(__name__).warning(
+        _logger.warning(
             "LF-DISABLE-PARTIAL: identity_registry not available — API keys for account %s NOT suspended",
             account_id,
         )
         return
     try:
+        # Primary path: org_id index (O(1)) — populated at registration for
+        # identities registered after LAURA-DK-001 fix (a).
         suspended = registry.suspend_owned_by(account_id)
-        import logging as _log
 
-        _log.getLogger(__name__).info(
+        # LAURA-DK-001 slug fallback: for HUMAN identities registered with
+        # org_id="" (pre-fix), look up by slug and suspend directly.
+        if suspended == 0 and (username or email):
+            from yashigani.backoffice.routes.auth import _auth_email_to_slug
+            slug_email = email or f"{username}@yashigani.local"
+            try:
+                slug = _auth_email_to_slug(slug_email)
+                identity = registry.get_by_slug(slug)
+                if identity is not None and identity.get("status") == "active":
+                    registry.suspend(identity["identity_id"])
+                    suspended = 1
+                    _logger.info(
+                        "LAURA-DK-001: suspended HUMAN identity %s for account %s "
+                        "via slug fallback (org_id index was empty)",
+                        identity["identity_id"],
+                        account_id,
+                    )
+            except Exception as slug_exc:
+                _logger.error(
+                    "LAURA-DK-001: slug fallback suspend FAILED for account %s: %s",
+                    account_id,
+                    slug_exc,
+                )
+
+        _logger.info(
             "LF-DISABLE-PARTIAL: suspended %d identity-registry entries for account %s",
             suspended,
             account_id,
         )
     except Exception as exc:
-        import logging as _log
-
-        _log.getLogger(__name__).error(
+        _logger.error(
             "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
             account_id,
             exc,

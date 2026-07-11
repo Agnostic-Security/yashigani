@@ -70,7 +70,7 @@ The names "Yashigani", "Agnostic Security", and the Yashigani logo are trademark
 
 ## 6. Reporting attribution gaps
 
-If you spot a component used by Yashigani that is not attributed in this document, or a license identifier or restriction that has changed upstream since the `Last-Updated` header above, please open an issue at https://github.com/agnosticsec-com/yashigani/issues with the label `license-attribution`.
+If you spot a component used by Yashigani that is not attributed in this document, or a license identifier or restriction that has changed upstream since the `Last-Updated` header above, please open an issue at https://github.com/Agnostic-Security/yashigani/issues with the label `license-attribution`.
 
 ---
 

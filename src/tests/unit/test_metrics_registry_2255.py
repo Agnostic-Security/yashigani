@@ -332,7 +332,7 @@ class TestB2WiringNewMetrics:
         from yashigani.metrics.registry import audit_events_total
 
         with tempfile.NamedTemporaryFile(
-            suffix=".log", dir="/home/max/Documents/Claude/testing_runs/yashigani", delete=False
+            suffix=".log", delete=False
         ) as f:
             log_path = f.name
 

@@ -389,6 +389,31 @@ return 1
                 return self.get(identity_id)
         return None
 
+    def get_by_email(self, email: str) -> Optional[dict]:
+        """Look up identity by email address.
+
+        Derives the canonical registry slug from the email using
+        ``email_to_slug()`` (the single source of truth for slug
+        derivation introduced in B5/2.25.5), then delegates to
+        ``get_by_slug()``.
+
+        Returns None if the email cannot be parsed or no matching
+        identity is found.  Never raises — callers in the startup
+        migration and admin routes rely on a clean None-return for
+        unregistered-but-valid emails.
+
+        3.1 UID unification: used by migrate_rbac_to_identity_id,
+        migrate_perm_grants_to_identity_id, backoffice/routes/rbac.py,
+        and backoffice/routes/scim.py to resolve email-keyed entries
+        written before the refactor.
+        """
+        from yashigani.identity.slug import email_to_slug
+        try:
+            slug = email_to_slug(email)
+        except ValueError:
+            return None
+        return self.get_by_slug(slug)
+
     def list_all(self, kind: IdentityKind | None = None) -> list[dict]:
         """List all identities, optionally filtered by kind."""
         if kind:

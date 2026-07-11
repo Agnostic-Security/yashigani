@@ -231,10 +231,11 @@ bash scripts/preflight.sh
 ## Security properties
 
 > This section covers the install-time backup produced by `install.sh` `_backup_existing_data()`
-> (v2.25.0+). The operator backup produced by `scripts/backup.sh` uses
+> (v2.25.0+, closes YSG-RISK-050/051). The operator backup produced by `scripts/backup.sh` uses
 > age asymmetric encryption (see sections above).
 
-The install-time backup uses a dual-wrap AES-256-GCM envelope (CNSA-2.0 symmetric suite). The bundle is encrypted with a random DEK wrapped under two independent KEKs —
+The install-time backup uses a dual-wrap AES-256-GCM envelope (CNSA-2.0 symmetric suite,
+Nico-verified). The bundle is encrypted with a random DEK wrapped under two independent KEKs —
 EITHER wrap can recover the DEK.
 
 ### Wrap#1 — admin-password path (everyday restore)
@@ -286,7 +287,7 @@ FIPS requires `--recovery-license` or `--recovery-key`.
 
 Because KEK1 = HKDF(V) and V is the stored verifier, **an attacker holding the live database
 obtains V directly and can derive KEK1 without knowing the plaintext password.** This is inherent
-to non-interactive backup with password recovery — there is no sound alternative.
+to non-interactive backup with password recovery — there is no sound alternative (Nico-confirmed).
 
 This is acceptable for the intended threat model: backups exist for disaster recovery (database
 gone → password is the credential). An attacker with both the live database and the backup file
@@ -335,12 +336,12 @@ All salts are per-backup random (stored in `backup-meta.json`). No fixed derived
 |---------|----------|--------|
 | MP.L2-3.8.9 | CMMC L2 | CLOSED — backups encrypted with AES-256-GCM via age |
 | CWE-312 | CWE | CLOSED — no cleartext sensitive data at rest in backup archives |
-| Install-time backup (v2.25.0+) | Implementation | CLOSED — AES-256-GCM dual-wrap |
-| Manifest integrity (v2.25.0+) | Implementation | CLOSED — HMAC-SHA384 |
-| Community tier: local-key-only | Design | DOCUMENTED — no portal recovery; see above |
+| YSG-RISK-050 | Internal | CLOSED — install-time backup: AES-256-GCM dual-wrap (v2.25.0+) |
+| YSG-RISK-051 | Internal | CLOSED — install-time backup: HMAC-SHA384 manifest integrity (v2.25.0+) |
+| YSG-RISK-052 | Internal | DOCUMENTED — community tier: local-key-only, no portal recovery; see above |
 
 Evidence artefact: `scripts/backup.sh` + `install.sh` `_backup_existing_data()` + this document.
 
 ---
 
-*Last updated: 2026-05-28T00:00:00+01:00 — v2.25.0 (Security properties section added)*
+*Last updated: 2026-05-28T00:00:00+01:00 — v2.25.0 (Security properties section added — YSG-RISK-050/051/052; Nico ruling 2026-05-28)*

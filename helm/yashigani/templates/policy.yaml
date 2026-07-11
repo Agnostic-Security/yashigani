@@ -98,6 +98,16 @@ spec:
             - "--tls-cert-file=/run/secrets/policy_client.crt"
             - "--tls-private-key-file=/run/secrets/policy_client.key"
             - "--tls-ca-cert-file=/run/secrets/ca_root.crt"
+            # LAURA-30-001 (2026-06-14): require client cert + enforce authz policy.
+            # L1 --authentication=tls: OPA rejects no-cert connections at handshake.
+            # L2 --authorization=basic: evaluates data.system.authz.allow per
+            #    request. system/authz.rego (in the policy ConfigMap) restricts:
+            #      backoffice SPIFFE → write+read policies+data (sole OPA writer)
+            #      gateway SPIFFE    → POST /v1/data/yashigani/* eval-only
+            #      unauthenticated   → /health only (kubelet probe on :8282)
+            #      all others        → DENY
+            - "--authentication=tls"
+            - "--authorization=basic"
             {{- end }}
             - "/policies"
           ports:
@@ -155,6 +165,35 @@ spec:
             - name: policies
               mountPath: /policies/mcp.rego
               subPath: mcp.rego
+              readOnly: true
+            # 3.0 convergence (Iris): document.rego must be subPath-mounted too,
+            # same class as LAURA-OPA-002 above. doc-OPA added document.rego to the
+            # ConfigMap (configmaps.yaml) + the compose whole-dir mount, but not to
+            # this K8s Deployment — without it OPA loads /policies/ without the
+            # document package and every data.yashigani.document.* decision is
+            # undefined on K8s (document egress-OPA would fail to find its rules).
+            - name: policies
+              mountPath: /policies/document.rego
+              subPath: document.rego
+              readOnly: true
+            # 3.0 (Iris-flagged, Captain): clients_aggregate.rego must be
+            # subPath-mounted too, same drift class as mcp.rego/document.rego
+            # above. It is canonical + in the ConfigMap but was absent here, so
+            # OPA loaded /policies/ without the clients-aggregate package and
+            # every data.yashigani.clients_aggregate.* decision was undefined on
+            # K8s (defined on the compose whole-dir mount — multi-runtime drift).
+            - name: policies
+              mountPath: /policies/clients_aggregate.rego
+              subPath: clients_aggregate.rego
+              readOnly: true
+            # LAURA-30-001 (2026-06-14): system.authz policy required by
+            # --authorization=basic. Mounted at /policies/system/authz.rego so
+            # OPA loads it as package system.authz (directory path = package path).
+            # ConfigMap key: system-authz.rego (hyphens allowed in CM keys, not
+            # in Rego package names — the subPath target preserves the directory).
+            - name: policies
+              mountPath: /policies/system/authz.rego
+              subPath: system-authz.rego
               readOnly: true
             {{- if .Values.mtls.enabled }}
             - name: pki-certs

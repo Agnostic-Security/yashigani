@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-17T18:30:00+01:00 -->
+<!-- last-updated: 2026-05-17T18:30:00+01:00 (v2.23.4: SEC-240-5 / ACS-RISK-015 close — HSTS preload operator-side guidance) -->
 
 # HSTS Preload — Operator Guidance
 
@@ -67,5 +67,6 @@ If you want to disable HSTS entirely (uncommon — usually only during pre-produ
 
 ## Risk register cross-reference
 
-Closed in v2.23.4.
+- **YSG-RISK-015** (LOW) — `Internal/Risk-Register/yashigani-risks.md` — Caddyfile.ca HSTS preload directive.
+- **SEC-240-5** — `Internal/v2.24.0/backlog-security.md` — was originally scoped as v2.24.0 P1; closed in v2.23.4 per the "everything ships in v2.23.4" rule (Tiago directive 2026-05-15).
 - **ASVS reference:** V3.7.4 (HSTS preload eligibility).

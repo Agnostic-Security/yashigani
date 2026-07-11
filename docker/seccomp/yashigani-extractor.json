@@ -1,0 +1,99 @@
+{
+  "_comment": "Yashigani SANDBOXED-EXTRACTOR seccomp profile (plan §6 B1, Captain; Su security-reviewed + hardened 2026-06-09). defaultAction SCMP_ACT_ERRNO => every syscall NOT listed is blocked (fail-closed). This jail runs UNTRUSTED document parsers with egress=none, ro-rootfs, all-caps-dropped, non-root. The worker only needs to: read stdin, decompress a zip (CPU+mem), parse XML via lxml/libxml2 (and openpyxl/pypdf), write one JSON object to stdout, and exit. It performs NO network I/O (network is also disabled at the runtime layer — this profile is defence-in-depth, NOT the sole egress control). This is INTENTIONALLY tighter than the gateway profile (yashigani-gateway.json): NO socket/bind/connect/listen/accept (the worker never networks), NO ptrace/process_vm_* (no introspection), NO mount/pivot_root/chroot/unshare/setns (no namespace fiddling), NO bpf/perf_event_open, and clone is FLAG-FILTERED to reject every CLONE_NEW* bit (clone3 forced to ENOSYS so glibc falls back to the filtered clone).",
+  "_su_review_decisions_2026-06-09": "Su review CLOSED, all four Captain asks answered with runtime evidence on Docker 29.1.3 + Podman 3.4.4 (containment harness 6/6 both). (1) ALLOWLIST MINIMAL: verified — 122->121 syscalls after dropping execveat (real docx/xlsx/pdf parse jobs pass with execve kept + execveat removed; see harness). (2) ZERO NETWORK: confirmed — socket/connect/bind/listen/accept/sendto/recvfrom/sendmsg/recvmsg and all socket-family syscalls are ABSENT (programmatically asserted); egress harness CASE 5 green both runtimes. (3) CLONE FLAG-FILTER: ADDED — clone is now allowed ONLY when arg0 (flags) carries no CLONE_NEW* bit (SCMP_CMP_MASKED_EQ against the CLONE_NEW* mask 0x7e020000), the docker-default strategy; an adversary calling clone(CLONE_NEWUSER) gets EPERM (proven: rc=-1 errno=1), while CPython thread creation still works (proven: threads start, all parse jobs exit 0). clone3 cannot be flag-filtered (its args live in a struct, not a register) so it is forced to ENOSYS (errnoRet 38) — glibc then falls back to the filtered clone. This is belt-and-suspenders ON TOP OF the existing absence of unshare/setns + no-new-privileges + cap_drop ALL. (4) execve/execveat: execve is REQUIRED (removing it breaks the OCI 'exec /usr/local/bin/python' entrypoint — proven: 'operation not permitted'); execveat is REMOVED (all parser paths pass without it). DEFAULT ACTION: kept SCMP_ACT_ERRNO (not KILL) — matches docker-default + the gateway profile, lets glibc probe-and-fallback (clone3->clone, statx->fstat), and a denied syscall surfaces as a clean Python exception -> non-zero worker exit -> fail-closed BLOCK; KILL adds no containment (syscall is blocked either way) but risks breaking benign CPython/lxml feature-probes on minor-version bumps.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "_group": "memory + interpreter runtime",
+      "names": [
+        "arch_prctl", "brk", "mmap", "mprotect", "munmap", "madvise",
+        "mremap", "membarrier", "memfd_create", "rseq",
+        "prctl", "set_robust_list", "set_tid_address", "get_robust_list",
+        "getrandom", "sysinfo", "uname"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "file IO on stdin/stdout/tmpfs only (no network fds — see review)",
+      "names": [
+        "read", "readv", "pread64", "preadv", "preadv2",
+        "write", "writev", "pwrite64", "pwritev", "pwritev2",
+        "close", "close_range", "lseek", "dup", "dup2", "dup3",
+        "fcntl", "ioctl", "fstat", "newfstatat", "fstatfs", "statx",
+        "open", "openat", "openat2", "stat", "lstat", "access",
+        "faccessat", "faccessat2", "readlink", "readlinkat", "getcwd",
+        "getdents", "getdents64", "ftruncate", "fsync", "fdatasync",
+        "unlink", "unlinkat", "rename", "renameat", "renameat2",
+        "mkdir", "mkdirat", "rmdir", "pipe", "pipe2", "fadvise64",
+        "fchmod", "fchmodat", "fchdir", "chdir"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "threading + scheduling (CPython threads; clone is flag-filtered below)",
+      "names": [
+        "futex", "futex_waitv",
+        "sched_yield", "sched_getaffinity", "sched_setaffinity",
+        "sched_getparam", "sched_getscheduler", "nanosleep",
+        "clock_nanosleep", "clock_gettime", "clock_getres", "gettimeofday",
+        "getpid", "gettid", "getppid", "getuid", "geteuid", "getgid",
+        "getegid", "getrlimit", "prlimit64", "getrusage"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "signals + clean exit",
+      "names": [
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "rt_sigtimedwait",
+        "rt_sigpending", "rt_sigsuspend", "sigaltstack",
+        "kill", "tgkill", "tkill", "restart_syscall",
+        "exit", "exit_group", "wait4", "waitid",
+        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait",
+        "epoll_pwait", "poll", "ppoll", "select", "pselect6", "eventfd",
+        "eventfd2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "process startup (execve REQUIRED for the OCI entrypoint exec; execveat dropped — no parser path needs it, Su 2026-06-09)",
+      "names": [
+        "execve"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_group": "clone — thread creation ONLY: allow when arg0 (flags) carries no CLONE_NEW* bit. Mask 0x7e020000 = CLONE_NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET. SCMP_CMP_MASKED_EQ (flags & mask) == 0 (this is the docker-default strategy). CPython thread creation (CLONE_VM|FS|FILES|SIGHAND|THREAD|...) carries none of these bits and is permitted; an attempt to create a new namespace (e.g. clone(CLONE_NEWUSER)) is denied with EPERM.",
+      "names": [
+        "clone"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2114060288,
+          "valueTwo": 0,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "_group": "clone3 — cannot flag-filter (args are in a struct, not a register). Force ENOSYS (38) so glibc falls back to the flag-filtered clone above. Matches the docker-default profile.",
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
+    }
+  ]
+}

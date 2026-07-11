@@ -714,7 +714,67 @@ test_decision_redact_args_is_set_in_compound_doc if {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Security regression tests — Laura PoC probes + gate fixes
+# 11. FIX-004 — caller echoed in mcp_decision output (audit visibility)
+#
+# Verifies that input.caller.agent_id is surfaced in mcp_decision.caller
+# for both allowed and denied requests.  The field is the policy-author
+# extension point for per-agent enforcement in custom policies; the default
+# policy does NOT use it to alter allow/deny semantics.
+# ---------------------------------------------------------------------------
+
+test_fix004_caller_agent_id_echoed_in_allowed_decision if {
+    d := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "caller": {"agent_id": "my-orchestrator", "user_id": "alice"},
+    }
+    d.allow == true
+    d.caller.agent_id == "my-orchestrator"
+}
+
+test_fix004_caller_agent_id_echoed_in_denied_decision if {
+    d := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": ""},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "caller": {"agent_id": "my-orchestrator", "user_id": "alice"},
+    }
+    d.allow == false
+    d.caller.agent_id == "my-orchestrator"
+}
+
+test_fix004_caller_agent_id_defaults_empty_when_absent if {
+    # When caller is absent from input, _mcp_caller_info falls back to ""
+    d := data.yashigani.mcp.mcp_decision with input as _mcp_a_tool_input
+    d.caller.agent_id == ""
+}
+
+test_fix004_caller_field_present_in_decision_shape if {
+    # mcp_decision must always have a "caller" key (non-breaking addition)
+    d := data.yashigani.mcp.mcp_decision with input as _mcp_a_tool_input
+    # Verify the key exists and is an object
+    is_object(d.caller)
+}
+
+test_fix004_caller_does_not_affect_allow_semantics if {
+    # Providing a caller must NOT change allow/deny outcome
+    # Allow case: caller present → still allow
+    d_with := data.yashigani.mcp.mcp_decision with input as {
+        "posture": "mcp-a",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/test"},
+        "tool": {"name": "web_search", "args_redacted": {}},
+        "caller": {"agent_id": "some-agent", "user_id": "bob"},
+    }
+    d_without := data.yashigani.mcp.mcp_decision with input as _mcp_a_tool_input
+    d_with.allow == d_without.allow
+}
+
+# ---------------------------------------------------------------------------
+# 12. Security regression tests — Laura PoC probes + gate fixes
 #     Reference: LAURA-MCP-001..004, LU-MCP-01..02, FINDING-MCP-001
 # ---------------------------------------------------------------------------
 
@@ -1411,4 +1471,364 @@ test_fix_p3002_move_clean_args_allowed_readwrite if {
     data.yashigani.mcp.filesystem_tool_allowed with input as {
         "tool": {"name": "move_file", "args": {"source": "old.txt", "destination": "new.txt"}},
     } with data.yashigani.mcp.filesystem_write_posture as "readwrite"
+}
+
+# ---------------------------------------------------------------------------
+# 16. Capability-envelope decision contract (3.0 / YSG-RISK-060)
+#
+# The structural diff + invocation gate are enforced in the broker (code is the
+# authority — an LLM never grants).  OPA carries only the SELF-DESCRIBING
+# decision contract (I6): policy_id + code + layman user_message keyed by the
+# broker's envelope deny_reason.  These tests assert the contract is stable,
+# closed-world (unknown reason => fail-closed wording), and code is constant.
+# ---------------------------------------------------------------------------
+
+# 16.1 policy_id is the stable envelope identifier.
+test_capability_envelope_policy_id if {
+    data.yashigani.mcp.capability_envelope_policy_id == "mcp.capability_envelope"
+}
+
+# 16.2 not-active reason maps to the re-approval contract with code.
+test_capability_envelope_not_active_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_not_active")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    out.user_message != ""
+}
+
+# 16.3 tool-not-approved reason has its own message.
+test_capability_envelope_tool_not_approved_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_tool_not_approved")
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "approved capability set")
+}
+
+# 16.4 stale-surface reason has its own message.
+test_capability_envelope_stale_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("capability_envelope_surface_stale")
+    contains(out.user_message, "changed since it was last approved")
+}
+
+# 16.5 refresh_* expansion reasons share the expansion message.
+test_capability_envelope_refresh_expanding_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_expanding")
+    contains(out.user_message, "expand what it can do")
+}
+
+test_capability_envelope_refresh_uncertain_contract if {
+    out := data.yashigani.mcp.capability_envelope_contract("refresh_uncertain")
+    contains(out.user_message, "expand what it can do")
+}
+
+# 16.6 CLOSED-WORLD: an unknown/unmapped reason still yields a fail-closed
+# contract (never undefined) — a new reason we have not typed defaults to the
+# conservative review wording.
+test_capability_envelope_unknown_reason_fail_closed if {
+    out := data.yashigani.mcp.capability_envelope_contract("some_brand_new_reason")
+    out.policy_id == "mcp.capability_envelope"
+    out.code == "TOOL_SURFACE_REAPPROVAL_REQUIRED"
+    contains(out.user_message, "requires operator review")
+}
+
+# ---------------------------------------------------------------------------
+# 17. G-ORCH-OPA-1 — mcp_response_decision (egress OPA gate)
+#
+# Tests for the MCP egress decision: result sensitivity ceiling check + PII gate.
+# Mirrors section structure of tests for agent_response_decision (agents_test.rego).
+# ---------------------------------------------------------------------------
+
+# Test helpers — egress base inputs
+_egress_allow_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "RESTRICTED",
+        "groups": ["mcp_users"],
+    },
+    "result": {
+        "sensitivity": "PUBLIC",
+        "pii_detected": false,
+    },
+    "tool": {"name": "web_search"},
+}
+
+_egress_restricted_result_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "INTERNAL",
+        "groups": [],
+    },
+    "result": {
+        "sensitivity": "RESTRICTED",
+        "pii_detected": false,
+    },
+    "tool": {"name": "db_query"},
+}
+
+_egress_pii_input := {
+    "caller": {
+        "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+        "sensitivity_ceiling": "RESTRICTED",
+        "groups": [],
+    },
+    "result": {
+        "sensitivity": "PUBLIC",
+        "pii_detected": true,
+    },
+    "tool": {"name": "customer_lookup"},
+}
+
+# --- 17.1 Allow path — result at or below ceiling ---
+
+# PUBLIC result, RESTRICTED ceiling → allow
+test_egress_allow_public_result_restricted_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as _egress_allow_input
+}
+
+# CONFIDENTIAL result, RESTRICTED ceiling → allow
+test_egress_allow_confidential_result_restricted_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "CONFIDENTIAL", "pii_detected": false},
+    }
+}
+
+# RESTRICTED result, RESTRICTED ceiling → allow (boundary: at ceiling)
+test_egress_allow_result_exactly_at_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "RESTRICTED", "pii_detected": false},
+    }
+}
+
+# PUBLIC result, PUBLIC ceiling → allow
+test_egress_allow_public_result_public_ceiling if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "PUBLIC",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# --- 17.2 Deny: result above caller ceiling ---
+
+# RESTRICTED result, INTERNAL ceiling → deny
+test_egress_deny_result_above_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _egress_restricted_result_input
+}
+
+test_egress_deny_reason_sensitivity_exceeds_ceiling if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_restricted_result_input
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+    d.policy_id == "mcp.response_decision"
+    d.code == "MCP_RESULT_SENSITIVITY_EXCEEDED"
+    d.user_message != ""
+}
+
+# CONFIDENTIAL result, PUBLIC ceiling → deny
+test_egress_deny_confidential_above_public_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "PUBLIC",
+            "groups": [],
+        },
+        "result": {"sensitivity": "CONFIDENTIAL", "pii_detected": false},
+    }
+}
+
+# --- 17.3 Deny: PII detected ---
+
+test_egress_deny_pii_detected if {
+    not data.yashigani.mcp.mcp_response_allowed with input as _egress_pii_input
+}
+
+test_egress_deny_reason_pii_detected if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_pii_input
+    d.allow == false
+    d.deny_reason == "pii_detected_in_result"
+    d.code == "MCP_RESULT_PII_BLOCKED"
+    d.user_message != ""
+}
+
+# PII + below ceiling → pii reason (ceiling-check passes, pii blocks)
+test_egress_pii_blocks_even_below_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "INTERNAL", "pii_detected": true},
+    }
+}
+
+# Ceiling violation takes priority over PII
+# (result_sensitivity_exceeds_caller_ceiling fires when both breach ceiling AND pii)
+test_egress_ceiling_violation_takes_priority_over_pii if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "INTERNAL",
+            "groups": [],
+        },
+        "result": {"sensitivity": "RESTRICTED", "pii_detected": true},
+    }
+    d.allow == false
+    d.deny_reason == "result_sensitivity_exceeds_caller_ceiling"
+}
+
+# --- 17.4 Fail-closed defaults ---
+
+# Fail-closed: missing caller spiffe → deny
+test_egress_deny_missing_spiffe if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+test_egress_deny_reason_missing_identity if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+    d.allow == false
+    d.deny_reason == "missing_caller_identity"
+    d.code == "MCP_RESULT_IDENTITY_MISSING"
+}
+
+# Fail-closed: caller spiffe is not a string (integer) → deny
+test_egress_deny_non_string_spiffe if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": 1,
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# Fail-closed: invalid/unknown caller ceiling → deny
+test_egress_deny_invalid_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "COSMIC_TOP_SECRET",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+test_egress_deny_reason_invalid_ceiling if {
+    d := data.yashigani.mcp.mcp_response_decision with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "COSMIC_TOP_SECRET",
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+    d.allow == false
+    d.deny_reason == "invalid_or_missing_caller_ceiling"
+    d.code == "MCP_RESULT_CEILING_INVALID"
+}
+
+# Fail-closed: null ceiling → deny (null is not in ceiling map)
+test_egress_deny_null_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": null,
+            "groups": [],
+        },
+        "result": {"sensitivity": "PUBLIC", "pii_detected": false},
+    }
+}
+
+# Fail-closed: unknown result sensitivity → rank 5 (above RESTRICTED) → deny any ceiling
+test_egress_deny_unknown_result_sensitivity_fails_closed if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": "RESTRICTED",
+            "groups": [],
+        },
+        "result": {"sensitivity": "TOP_SECRET", "pii_detected": false},
+    }
+}
+
+# Default mcp_response_allowed is false (fail-closed with empty input)
+test_egress_default_deny_empty_input if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {}
+}
+
+# --- 17.5 Compound document shape ---
+
+# Allow case: correct shape
+test_egress_decision_allow_shape if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_allow_input
+    d.allow == true
+    d.deny_reason == "ok"
+    d.policy_id == "mcp.response_decision"
+    d.code == "MCP_RESULT_OK"
+    d.user_message != ""
+}
+
+# Deny case: correct shape
+test_egress_decision_deny_shape if {
+    d := data.yashigani.mcp.mcp_response_decision with input as _egress_restricted_result_input
+    d.allow == false
+    d.deny_reason != ""
+    d.deny_reason != "ok"
+    d.policy_id == "mcp.response_decision"
+    d.code != ""
+    d.user_message != ""
+}
+
+# --- 17.6 Numeric sensitivity levels (R14/R15 shim) ---
+
+# Numeric level 1 (INTERNAL equivalent), ceiling 3 (RESTRICTED) → allow
+test_egress_allow_numeric_sensitivity_levels if {
+    data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": 3,
+            "groups": [],
+        },
+        "result": {"sensitivity": 1, "pii_detected": false},
+    }
+}
+
+# Numeric result 4, ceiling 3 → deny (result above ceiling)
+test_egress_deny_numeric_result_above_ceiling if {
+    not data.yashigani.mcp.mcp_response_allowed with input as {
+        "caller": {
+            "spiffe": "spiffe://cluster.local/ns/default/sa/agent",
+            "sensitivity_ceiling": 3,
+            "groups": [],
+        },
+        "result": {"sensitivity": 4, "pii_detected": false},
+    }
 }

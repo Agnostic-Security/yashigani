@@ -1,6 +1,7 @@
 // Yashigani Backoffice — PKI admin panel
 // v2.23.3 (#51 + #53) — CSP-compliant external JS (no inline scripts)
-// Last updated: 2026-05-09T00:00:00+01:00
+// ZAP 10015/10049 (3.0) — all inline style attributes replaced with CSS classes
+// Last updated: 2026-06-27T00:00:00+01:00
 //
 // Depends on: dashboard.js (api, apiMutate, escapeHtml)
 // Loaded as: <script src="/static/js/pki.js" defer></script>
@@ -26,7 +27,7 @@ async function loadPkiStatus() {
 
     var data = await api('/api/v1/admin/pki/status');
     if (!data) {
-        container.innerHTML = '<span style="color:#ef4444">Failed to load PKI status. Check authentication.</span>';
+        container.innerHTML = '<span class="pki-err-text">Failed to load PKI status. Check authentication.</span>';
         return;
     }
 
@@ -34,15 +35,15 @@ async function loadPkiStatus() {
     var services = data.services || [];
 
     if (services.length === 0) {
-        container.innerHTML = '<p style="color:#64748b">No services found in manifest.</p>';
+        container.innerHTML = '<p class="pki-muted-text">No services found in manifest.</p>';
         return;
     }
 
     // CA Mode banner — prominent, on top (issuing authority for all certs).
-    var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;">'
-        + '<span style="font-size:0.75rem;color:#475569;text-transform:uppercase;letter-spacing:0.05em;">CA Mode</span>'
-        + '<strong style="font-size:1rem;color:#1e3a8a;">' + escapeHtml(caMode) + '</strong>'
-        + '<span style="font-size:0.78rem;color:#64748b;margin-left:auto;">Issuing authority for all service certificates</span>'
+    var html = '<div class="pki-camode-banner">'
+        + '<span class="pki-camode-label">CA Mode</span>'
+        + '<strong class="pki-camode-value">' + escapeHtml(caMode) + '</strong>'
+        + '<span class="pki-camode-issuer">Issuing authority for all service certificates</span>'
         + '</div>';
 
     function badgeFor(svc) {
@@ -53,26 +54,26 @@ async function loadPkiStatus() {
     function expiresFor(svc) {
         return svc.not_after
             ? escapeHtml(svc.not_after.replace('T', ' ').replace(/\+.*$/, ' UTC').replace(/\.\d+/, ''))
-            : (svc.error ? '<span style="color:#ef4444">Unknown</span>' : '—');
+            : (svc.error ? '<span class="pki-err-text">Unknown</span>' : '—');
     }
     function rowHtml(svc) {
-        return '<tr style="border-bottom:1px solid #f1f5f9;">'
-            + '<td style="padding:8px 12px;font-family:monospace;">' + escapeHtml(svc.service) + '</td>'
-            + '<td style="padding:8px 12px;">' + badgeFor(svc) + '</td>'
-            + '<td style="padding:8px 12px;font-size:0.8rem;color:#475569;">' + expiresFor(svc) + '</td>'
-            + '<td style="padding:8px 12px;">'
-            + '<button class="btn btn-sm" data-action="pkiView" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">View</button>'
-            + '<button class="btn btn-sm btn-warning" data-action="pkiRotate" data-service="' + escapeHtml(svc.service) + '" style="margin-right:4px;">Rotate</button>'
+        return '<tr class="pki-row">'
+            + '<td class="pki-td-mono">' + escapeHtml(svc.service) + '</td>'
+            + '<td class="pki-td">' + badgeFor(svc) + '</td>'
+            + '<td class="pki-td-exp">' + expiresFor(svc) + '</td>'
+            + '<td class="pki-td">'
+            + '<button class="btn btn-sm pki-btn-gap" data-action="pkiView" data-service="' + escapeHtml(svc.service) + '">View</button>'
+            + '<button class="btn btn-sm btn-warning pki-btn-gap" data-action="pkiRotate" data-service="' + escapeHtml(svc.service) + '">Rotate</button>'
             + '<button class="btn btn-sm" data-action="pkiDownload" data-service="' + escapeHtml(svc.service) + '">Download</button>'
             + '</td></tr>';
     }
     function tableHtml(rowsHtml) {
-        return '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
-            + '<thead><tr style="background:#f1f5f9;text-align:left;">'
-            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Service</th>'
-            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Status</th>'
-            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Expires</th>'
-            + '<th style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">Actions</th>'
+        return '<table class="pki-table">'
+            + '<thead><tr class="pki-thead-row">'
+            + '<th class="pki-th">Service</th>'
+            + '<th class="pki-th">Status</th>'
+            + '<th class="pki-th">Expires</th>'
+            + '<th class="pki-th">Actions</th>'
             + '</tr></thead><tbody>' + rowsHtml + '</tbody></table>';
     }
 
@@ -83,11 +84,11 @@ async function loadPkiStatus() {
     var internal = services.filter(function(s) { return s.service !== 'caddy'; });
 
     if (frontend.length) {
-        html += '<h3 style="margin:0 0 6px;font-size:0.95rem;">Front-end certificate '
-            + '<span style="font-weight:400;color:#64748b;font-size:0.8rem;">(browser-facing — admin UI &amp; Open WebUI edge)</span></h3>';
+        html += '<h3 class="pki-section-title">Front-end certificate '
+            + '<span class="pki-section-sub">(browser-facing — admin UI &amp; Open WebUI edge)</span></h3>';
         html += tableHtml(frontend.map(rowHtml).join(''));
     }
-    html += '<h3 style="margin:16px 0 6px;font-size:0.95rem;">Internal service certificates</h3>';
+    html += '<h3 class="pki-section-title-mt">Internal service certificates</h3>';
     html += tableHtml(internal.map(rowHtml).join(''));
     container.innerHTML = html;
 }
@@ -106,7 +107,7 @@ async function showPkiChain(serviceName) {
 
     var data = await api('/api/v1/admin/pki/chain/' + encodeURIComponent(serviceName));
     if (!data) {
-        detailContainer.innerHTML = '<span style="color:#ef4444">Failed to load chain info for ' + escapeHtml(serviceName) + '.</span>';
+        detailContainer.innerHTML = '<span class="pki-err-text">Failed to load chain info for ' + escapeHtml(serviceName) + '.</span>';
         return;
     }
 
@@ -114,10 +115,10 @@ async function showPkiChain(serviceName) {
         ['Service', escapeHtml(data.service || serviceName)],
         ['Subject CN', escapeHtml(data.subject_cn || '—')],
         ['Issuer CN', escapeHtml(data.issuer_cn || '—')],
-        ['Serial', '<code style="font-size:0.8rem;background:#f1f5f9;padding:2px 6px;border-radius:3px;">' + escapeHtml(data.serial_hex || '—') + '</code>'],
+        ['Serial', '<code class="pki-code">' + escapeHtml(data.serial_hex || '—') + '</code>'],
         ['Not Before', escapeHtml((data.not_before || '—').replace('T', ' ').replace(/\+.*$/, ' UTC').replace(/\.\d+/, ''))],
         ['Not After', escapeHtml((data.not_after || '—').replace('T', ' ').replace(/\+.*$/, ' UTC').replace(/\.\d+/, ''))],
-        ['SHA-256', '<code style="font-size:0.75rem;background:#f1f5f9;padding:2px 6px;border-radius:3px;word-break:break-all;">' + escapeHtml(data.fingerprint_sha256 || '—') + '</code>'],
+        ['SHA-256', '<code class="pki-code-fp">' + escapeHtml(data.fingerprint_sha256 || '—') + '</code>'],
         ['DNS SANs', data.dns_sans && data.dns_sans.length ? escapeHtml(data.dns_sans.join(', ')) : '—'],
         ['URI SANs', data.uri_sans && data.uri_sans.length ? escapeHtml(data.uri_sans.join(', ')) : '—'],
         ['IP SANs', data.ip_sans && data.ip_sans.length ? escapeHtml(data.ip_sans.join(', ')) : '—'],
@@ -126,19 +127,19 @@ async function showPkiChain(serviceName) {
         ['Needs Renewal', data.needs_renewal ? '<span class="badge badge-yellow">Yes</span>' : '<span class="badge badge-green">No</span>'],
     ];
 
-    var tableHtml = '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">';
+    var tableHtml = '<table class="pki-table">';
     rows.forEach(function(row) {
         tableHtml += '<tr>'
-            + '<td style="padding:6px 10px;color:#64748b;white-space:nowrap;font-weight:500;border-bottom:1px solid #f1f5f9;width:140px;">' + row[0] + '</td>'
-            + '<td style="padding:6px 10px;border-bottom:1px solid #f1f5f9;">' + row[1] + '</td>'
+            + '<td class="pki-detail-label">' + row[0] + '</td>'
+            + '<td class="pki-detail-value">' + row[1] + '</td>'
             + '</tr>';
     });
     tableHtml += '</table>';
 
-    var html = '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin-top:12px;">'
-        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">'
+    var html = '<div class="pki-chain-panel">'
+        + '<div class="pki-chain-header-row">'
         + '<strong>Chain details — ' + escapeHtml(serviceName) + '</strong>'
-        + '<button class="btn btn-sm" data-action="pkiClose" style="font-size:0.75rem;">Close</button>'
+        + '<button class="btn btn-sm pki-chain-close" data-action="pkiClose">Close</button>'
         + '</div>'
         + tableHtml
         + '</div>';
@@ -161,7 +162,8 @@ function hidePkiChain() {
 async function pkiRotate(serviceName) {
     var resultEl = document.getElementById('pki-rotate-result');
     if (resultEl) {
-        resultEl.style.color = '#64748b';
+        resultEl.className = 'pki-rotate-result pki-muted-text';
+        resultEl.style.display = 'block';
         resultEl.textContent = 'Requesting rotation for ' + serviceName + '…';
     }
 
@@ -172,7 +174,7 @@ async function pkiRotate(serviceName) {
 
     if (!resp) {
         if (resultEl) {
-            resultEl.style.color = '#ef4444';
+            resultEl.className = 'pki-rotate-result pki-err-text';
             resultEl.textContent = 'Network error. Check step-up TOTP or try again.';
         }
         return;
@@ -184,7 +186,7 @@ async function pkiRotate(serviceName) {
     if (resp.status === 401 && body && body.detail && body.detail.error === 'step_up_required') {
         // Handled by apiMutate step-up modal — will retry automatically
         if (resultEl) {
-            resultEl.style.color = '#64748b';
+            resultEl.className = 'pki-rotate-result pki-muted-text';
             resultEl.textContent = 'Step-up required — enter TOTP code in the modal.';
         }
         return;
@@ -192,7 +194,7 @@ async function pkiRotate(serviceName) {
 
     if (!resp.ok) {
         if (resultEl) {
-            resultEl.style.color = '#ef4444';
+            resultEl.className = 'pki-rotate-result pki-err-text';
             resultEl.textContent = 'Rotation failed (HTTP ' + resp.status + '): ' + ((body && body.detail && body.detail.message) || 'see server logs');
         }
         return;
@@ -200,6 +202,7 @@ async function pkiRotate(serviceName) {
 
     if (body.success) {
         if (resultEl) {
+            resultEl.className = 'pki-rotate-result';
             resultEl.style.color = '#16a34a';
             var newExpiry = (body.new_chain && body.new_chain.not_after)
                 ? ' New expiry: ' + body.new_chain.not_after.replace('T', ' ').replace(/\+.*$/, ' UTC').replace(/\.\d+/, '')
@@ -213,7 +216,7 @@ async function pkiRotate(serviceName) {
         }
     } else {
         if (resultEl) {
-            resultEl.style.color = '#ef4444';
+            resultEl.className = 'pki-rotate-result pki-err-text';
             resultEl.textContent = 'Rotation failed: ' + escapeHtml(body.error || 'unknown error');
         }
     }
@@ -235,7 +238,8 @@ async function pkiDownloadBundle(serviceName) {
             try { body = await resp.json(); } catch (_) { /* empty */ }
             var resultEl = document.getElementById('pki-rotate-result');
             if (resultEl) {
-                resultEl.style.color = '#ef4444';
+                resultEl.className = 'pki-rotate-result pki-err-text';
+                resultEl.style.display = 'block';
                 resultEl.textContent = 'Download failed (HTTP ' + resp.status + '): ' + ((body && body.detail && body.detail.message) || 'see server logs');
             }
             return;
@@ -252,7 +256,8 @@ async function pkiDownloadBundle(serviceName) {
     } catch (err) {
         var resultEl2 = document.getElementById('pki-rotate-result');
         if (resultEl2) {
-            resultEl2.style.color = '#ef4444';
+            resultEl2.className = 'pki-rotate-result pki-err-text';
+            resultEl2.style.display = 'block';
             resultEl2.textContent = 'Download error: ' + String(err);
         }
     }

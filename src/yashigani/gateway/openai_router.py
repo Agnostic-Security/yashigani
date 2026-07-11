@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -90,8 +91,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
-    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+def _client_enforce_input(identity, request_path, route_reason="", provider="", model="", data_tags=(), obligations=()):
+    """Build the clients-contract input doc shared by ingress + egress (#16).
+
+    data_tags: normalised content-tag list derived from prompt/response text by
+    _detect_content_tags() (e.g. ["pii", "pci"]).  Populated on every
+    content-bearing hop (LAURA-31RT-001); empty list on hops where content is
+    unavailable.  OPA policies read this as ``input.data_tags``.
+
+    obligations: list of obligation tokens already fulfilled this turn (e.g.
+    ["pii_redacted"] if the PII redactor processed content before this OPA call).
+    MUST always be a present list — never absent/undefined — so Rego membership
+    checks (``"pii_redacted" in input.obligations``) evaluate correctly.
+    LAURA-31DR-001: in Rego v1, ``"pii_redacted" in undefined`` evaluates to
+    undefined → ``not undefined`` → rule body undefined → deny never fires →
+    silent allow-bypass.  An explicit empty list short-circuits that path and
+    makes the deny fire as designed.  At ingress the obligations list is always []
+    (PII processing has not run yet); at egress it may include "pii_redacted" if
+    the response was PII-redacted by step 7c.
+    """
     ident = identity or {}
     return {
         "identity": {
@@ -102,7 +120,126 @@ def _client_enforce_input(identity, request_path, route_reason="", provider="", 
         },
         "request": {"path": request_path, "method": "POST"},
         "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+        # LAURA-31RT-001: content tags derived from prompt/response text so OPA
+        # client-policies that inspect content (pii_redaction_policy, pci_data_block,
+        # classified_marking_local) can actually evaluate and fire.
+        "data_tags": list(data_tags),
+        # LAURA-31DR-001: obligations MUST be a present list (never undefined) so
+        # Rego membership checks do not silently evaluate to undefined→allow.
+        "obligations": list(obligations),
     }
+
+
+# ---------------------------------------------------------------------------
+# Content-tag detection — LAURA-31RT-001
+# ---------------------------------------------------------------------------
+
+# LAURA-31DR-002: raised from 10 KB to 1 MB so that PII anywhere in the
+# content is detected (the 10 KB prefix cap allowed an attacker to place SSN
+# after the scan boundary and evade tagging).  1 MB covers all realistic chat
+# turns; payloads larger than 1 MB will have their tail unscanned.  Any
+# content from a RESTRICTED user that triggers the scan limit is blocked
+# downstream by OPA's clearance-ceiling gate regardless.
+_CONTENT_TAGS_MAX_BYTES: int = 1_048_576  # 1 MB
+
+# PiiType values whose detection also implies PCI relevance.
+_PCI_PII_TYPES: frozenset[str] = frozenset({"CREDIT_CARD", "IBAN"})
+
+# Classification marking banner patterns (UK/NATO — banner-style, not bare word).
+# Matches: TOP SECRET, SECRET, OFFICIAL-SENSITIVE, OFFICIAL SENSITIVE.
+# Deliberately conservative — a single bare "SECRET" word in a sentence is
+# flagged; the upstream sensitivity_classifier and OPA routing_decision.sensitivity
+# provide defence-in-depth if the user's clearance is already checked.
+_CLASSIFICATION_RE: re.Pattern = re.compile(
+    r"\b(?:TOP\s+SECRET|OFFICIAL[- ]SENSITIVE|SECRET)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_content_tags(text: str, pii_detector) -> list[str]:
+    """Derive OPA input.data_tags from a content string (LAURA-31RT-001/31DR-002/31DR-003).
+
+    Reuses the configured PiiDetector (yashigani.pii.detector) — no new
+    classifier.  Tags produced:
+
+    ``"pii"``        — any PII finding (SSN, email, phone, passport, etc.)
+    ``"pci"``        — CREDIT_CARD or IBAN specifically (PCI DSS scope)
+    ``"classified"`` — classification-banner keywords (SECRET / TOP SECRET /
+                       OFFICIAL-SENSITIVE) found in the text
+
+    LAURA-31DR-002: scans the FULL content up to _CONTENT_TAGS_MAX_BYTES (1 MB)
+    rather than only the first 10 KB prefix.  The old 10 KB cap allowed PII
+    placed after the cap to evade detection silently.  1 MB covers all realistic
+    chat turns.  Payloads larger than 1 MB will have their tail unscanned; those
+    are blocked by OPA's clearance-ceiling gate regardless for RESTRICTED users.
+
+    LAURA-31DR-003: cross-message fragmentation evasion.  The caller joins
+    message contents with ``"\\n"`` (see prompt_text construction); a PII value
+    that straddles the message boundary is broken by the newline — e.g.
+    "123-45-\\n6789" (dash-boundary split) or "123-45\\n6789" (mid-value split)
+    are never matched by the SSN regex.  Fix: in addition to the raw scan, also
+    scan two separator-collapsed views:
+      - ``text.replace("\\n", "")``  — collapses the newline; "123-45-\\n6789"
+        becomes "123-45-6789" → dashed SSN match.
+      - ``text.replace("\\n", "-")`` — inserts a dash; "123-45\\n6789" becomes
+        "123-45-6789" → dashed SSN match (covers the evasion where the attacker
+        omits the separator character between messages).
+    Tags are unioned across all three views; the collapsed views are only scanned
+    when the input actually contains a newline (no overhead for single-message
+    prompts).  Bounded/cheap: each extra scan is the same O(n) regex pass as the
+    primary scan, over the same _CONTENT_TAGS_MAX_BYTES cap.
+
+    Fail-open: returns [] on any exception so a scan error never blocks the
+    request.  OPA client-policies that need "pii" absent to permit a request
+    must default-deny (``default allow := false``) to stay fail-closed.
+    """
+    if not text:
+        return []
+    try:
+        tags: set[str] = set()
+        # LAURA-31DR-002: scan the full content up to the 1 MB limit (not just
+        # the first 10 KB).  Scanning the whole string at once avoids any PII
+        # pattern split across a chunk boundary.
+        scan_text = text[:_CONTENT_TAGS_MAX_BYTES]
+
+        # PII + PCI detection via the existing configured PiiDetector.
+        # detect_decoded() scans the raw text AND decoded views (base64/hex/url)
+        # to catch encoded PII — the same decode-before-classify discipline that
+        # the main PII pipeline uses (F-RT1).  Read-only (detect, not process);
+        # does not alter the text or take any mode-driven action.
+        if pii_detector is not None:
+            pii_result = pii_detector.detect_decoded(scan_text)
+            if pii_result.detected:
+                tags.add("pii")
+                for finding in pii_result.findings:
+                    if finding.pii_type.value in _PCI_PII_TYPES:
+                        tags.add("pci")
+
+            # LAURA-31DR-003: also scan separator-collapsed views so that PII
+            # fragmented across message boundaries is caught.  Only run when the
+            # text actually contains newlines (single-message prompts skip this).
+            if "\n" in scan_text:
+                for _sep in ("", "-"):
+                    _collapsed = scan_text.replace("\n", _sep)
+                    _c_result = pii_detector.detect_decoded(_collapsed)
+                    if _c_result.detected:
+                        tags.add("pii")
+                        for _finding in _c_result.findings:
+                            if _finding.pii_type.value in _PCI_PII_TYPES:
+                                tags.add("pci")
+                    # Short-circuit: once both pii and pci are set there is
+                    # nothing further the collapsed scans can add.
+                    if "pii" in tags and "pci" in tags:
+                        break
+
+        # Classification-marking keyword scan — independent of the PII detector.
+        if _CLASSIFICATION_RE.search(scan_text):
+            tags.add("classified")
+
+        return sorted(tags)
+    except Exception as exc:  # pragma: no cover — must never raise on hot path
+        logger.debug("_detect_content_tags: content-tag scan failed: %s", exc)
+        return []
 
 
 def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
@@ -148,16 +285,16 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
     "routing_unsafe_sensitive_to_cloud":
         "This request contains sensitive content and cannot be sent to a cloud provider. Contact an administrator to adjust your routing policy.",
     "sensitivity_ceiling_exceeded":
-        "This request exceeds your sensitivity clearance level. Contact an administrator.",
+        "This request exceeds your data classification clearance level. Contact an administrator.",
     "model_not_allocated":
         "You are not allocated this model. Ask an administrator to grant access.",
     # response-path (OPA v1_routing.rego `response_reason`)
     "denied_default_deny":
         "Your request was denied by policy. Contact an administrator for details.",
     "invalid_identity_ceiling":
-        "Your account's sensitivity clearance does not permit this response. Contact an administrator.",
+        "Your account's data classification clearance does not permit this response. Contact an administrator.",
     "response_sensitivity_exceeds_ceiling":
-        "The response contains content that exceeds your sensitivity clearance level. Contact an administrator.",
+        "The response contains content that exceeds your data classification clearance level. Contact an administrator.",
     "response_blocked_by_inspection":
         "The response was blocked by the security inspection policy. Contact an administrator.",
     # OPA infrastructure
@@ -184,6 +321,16 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
         "The maximum number of concurrent sessions for this agent has been reached. Please try again shortly.",
     "pool_backend_unavailable":
         "The agent's container backend is temporarily unavailable. Contact an administrator.",
+    # 3.1 Phase 6 — cloud-model deny-by-default gate (INV-1 + INV-2)
+    "cloud_model_not_granted":
+        "Access to this cloud model is not permitted. Contact an administrator to enable cloud model access.",
+    "cloud_model_opa_coupling_failed":
+        "The data-protection policy for this cloud model could not be verified. Contact an administrator.",
+    "cloud_model_no_opa_policy_ref":
+        "The data-protection policy for this cloud model is not configured. Contact an administrator.",
+    # FIX-005 — permission store unavailable in enforcing env → fail-closed deny.
+    "permission_store_unavailable":
+        "The access control store is temporarily unavailable. Please try again shortly.",
 }
 
 _OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
@@ -339,60 +486,112 @@ def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
     is therefore trustworthy at this point and never consulted elsewhere, which
     is the whole spoofing defence.
 
-    Returns a registered identity dict (per-user RBAC applies) when the email
-    maps to one; otherwise the configured default-slug identity; otherwise the
-    synthetic baseline-RESTRICTED identity. NEVER returns None and NEVER returns
-    a privilege higher than the matched identity — fail-closed by construction.
-    Returns None only to signal "no forwarded user present" so the caller can
-    fall through to the flat `internal` service identity (preserves the
-    orchestration / brain path, which carries NO forwarded-user header).
+    3.1 FAIL-CLOSED CHANGE (Iris UID unification, §3.1):
+      - Returns a registered identity dict when the email maps to a known,
+        identity_id-bearing identity in the registry.
+      - Returns None when no forwarded-user email is present (allows caller to
+        fall through to the flat `internal` service identity — brain/in-mesh path).
+      - RAISES HTTPException(403) for:
+          * OWUI email present but identity_registry is unavailable
+          * OWUI email present but NOT in the registry (unregistered user)
+          * OWUI email present, registry match found, but identity has no identity_id
+        In all three cases, the request is DENIED — the synthetic baseline-RESTRICTED
+        identity (_baseline_owui_identity) is NO LONGER used as a fallback.
+
+    Rationale: the baseline identity allowed the request to proceed to OPA, which
+    could permit an unregistered user.  True fail-closed means: unregistered user →
+    no identity → denied.  The admin must register the user before OWUI access works.
     """
+    from fastapi import HTTPException as _HTTPException
+
     if not _OWUI_FORWARD_ENABLED:
         return None
     email = request.headers.get(_OWUI_USER_EMAIL_HEADER, "").strip()
     if not email:
-        # No forwarded user -> not an OWUI per-user call (e.g. brain self-call,
+        # No forwarded user → not an OWUI per-user call (e.g. brain self-call,
         # in-mesh agent). Caller falls back to flat `internal`.
         return None
     email_l = email.lower()
 
-    # Registry unavailable -> fail-closed to baseline (NEVER internal/elevated).
+    # Registry unavailable → DENY (fail-closed; registry is a hard dependency
+    # for the OWUI per-user path; baseline fallback removed in 3.1).
     if _state.identity_registry is None:
         logger.warning(
             "OWUI forwarded user %r present but identity_registry unavailable — "
-            "baseline-RESTRICTED", email,
+            "DENY 403 (fail-closed; baseline fallback removed in 3.1)",
+            email,
         )
-        return _baseline_owui_identity()
+        raise _HTTPException(
+            status_code=403,
+            detail={
+                "error": "identity_registry_unavailable",
+                "message": (
+                    "Identity registry is unavailable. "
+                    "Your access cannot be verified. Contact your administrator."
+                ),
+            },
+        )
 
     # Resolve candidate slug: explicit map override first, else canonical email slug.
-    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
-    # kept (e.g. "dana.lee"), which never matched the identity registered at login
-    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
-    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
     slug = _OWUI_SLUG_MAP.get(email_l)
     if not slug:
         try:
             from yashigani.identity.slug import email_to_slug as _email_to_slug
             slug = _email_to_slug(email_l)
         except (ValueError, Exception) as _exc:
-            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
-            slug = ""
+            logger.warning("OWUI slug derivation failed for %r (%s) — DENY 403", email, _exc)
+            raise _HTTPException(
+                status_code=403,
+                detail={
+                    "error": "owui_identity_unresolvable",
+                    "message": "Your user identity could not be resolved. Contact your administrator.",
+                },
+            )
 
     identity = None
     if slug:
         try:
             identity = _state.identity_registry.get_by_slug(slug)
-        except Exception as exc:  # registry blip — fail-closed to baseline
-            logger.warning("OWUI slug lookup failed for %r (%s) — baseline", slug, exc)
-            identity = None
+        except Exception as exc:
+            logger.warning(
+                "OWUI slug lookup failed for %r (%s) — DENY 403 (registry error)",
+                slug, exc,
+            )
+            raise _HTTPException(
+                status_code=403,
+                detail={
+                    "error": "identity_lookup_failed",
+                    "message": "Identity lookup failed. Contact your administrator.",
+                },
+            )
 
-    if identity:
+    if identity is not None:
         identity = dict(identity)
+        # 3.1 FAIL-CLOSED: identity MUST have a valid identity_id.
+        # An identity without identity_id is a registry data integrity issue —
+        # never pass it downstream as "some kind of identity".
+        if not identity.get("identity_id"):
+            logger.error(
+                "OWUI identity for slug %r has no identity_id field — DENY 403 "
+                "(registry data integrity; do not fall back)",
+                slug,
+            )
+            raise _HTTPException(
+                status_code=403,
+                detail={
+                    "error": "identity_missing_id",
+                    "message": (
+                        "Your identity record is incomplete (missing identity_id). "
+                        "Contact your administrator."
+                    ),
+                },
+            )
         identity["_owui_forwarded"] = True
         identity["_owui_email"] = email
         return identity
 
-    # No per-user match -> configured default-slug identity if registered.
+    # No per-user match for this slug AND no configured default slug match.
+    # Check default slug as a last resort before denying.
     if _OWUI_DEFAULT_SLUG:
         try:
             default_ident = _state.identity_registry.get_by_slug(_OWUI_DEFAULT_SLUG)
@@ -400,17 +599,29 @@ def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
             default_ident = None
         if default_ident:
             default_ident = dict(default_ident)
-            default_ident["_owui_forwarded"] = True
-            default_ident["_owui_email"] = email
-            default_ident["_owui_default"] = True
-            return default_ident
+            if default_ident.get("identity_id"):
+                default_ident["_owui_forwarded"] = True
+                default_ident["_owui_email"] = email
+                default_ident["_owui_default"] = True
+                return default_ident
 
-    # Nothing registered -> synthetic baseline-RESTRICTED.
-    logger.info(
-        "OWUI user %r mapped to baseline (no identity for slug %r, no default %r)",
-        email, slug, _OWUI_DEFAULT_SLUG,
+    # Nothing registered for this email / no valid default → DENY 403.
+    # The baseline-RESTRICTED synthetic identity is no longer used (3.1 change).
+    logger.warning(
+        "OWUI user %r (slug %r) not found in registry and no valid default — "
+        "DENY 403 (fail-closed; baseline fallback removed in 3.1)",
+        email, slug,
     )
-    return _baseline_owui_identity()
+    raise _HTTPException(
+        status_code=403,
+        detail={
+            "error": "owui_user_not_registered",
+            "message": (
+                "Your user account is not registered on this Yashigani instance. "
+                "Contact your administrator to be provisioned access."
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +688,32 @@ def is_orchestration_self_call(request) -> bool:
     guard that makes the self-call loop terminate (build sheet §3.1/§6).
     """
     return bool(request.headers.get("x-yashigani-orchestration-depth"))
+
+
+def is_auto_orchestrate_model(model: str) -> bool:
+    """True when the requested model is in the YASHIGANI_ORCH_AUTO_MODELS list.
+
+    YASHIGANI_ORCH_AUTO_MODELS is a comma-separated list of model ids (or
+    virtual names) for which the gateway auto-fires the qwen-brain orchestration
+    executor, even when the client does NOT set orchestrate=true.  This is the
+    OWUI-facing wiring for the cloud-9 demo: OWUI sends a plain chat request
+    with model="cloud9-orchestrate" (a virtual name in the OWUI model selector);
+    the gateway promotes it to orchestration and substitutes the real brain model
+    (YASHIGANI_ORCH_BRAIN_MODEL, default qwen2.5:3b).  The caller never sees the
+    brain model — they address the virtual name.
+
+    SECURITY NOTE: the same seed-prompt adjudication and every-hop OPA gate apply
+    identically to auto-triggered orchestration.  The auto-trigger is not an auth
+    bypass: it is a routing convenience that sets body.orchestrate=True for a
+    pre-approved set of virtual model names.  Identity, sensitivity, OPA ingress,
+    per-hop egress, and ResponseInspection all fire as normal.  The model name
+    itself is resolved to the configured brain model before any downstream hop.
+    """
+    raw = os.environ.get("YASHIGANI_ORCH_AUTO_MODELS", "").strip()
+    if not raw or not model:
+        return False
+    names = {m.strip().lower() for m in raw.split(",") if m.strip()}
+    return (model or "").strip().lower() in names
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +933,36 @@ class ModelListResponse(BaseModel):
     data: list[ModelInfo]
 
 
+# ── Embeddings models ─────────────────────────────────────────────────────
+
+class EmbeddingRequest(BaseModel):
+    """OpenAI-compatible embeddings request body."""
+    model: str = Field(description="Model name or alias to use for embeddings")
+    input: str | list[str] = Field(description="Text(s) to embed")
+    encoding_format: Optional[str] = None  # "float" (default) or "base64"
+    dimensions: Optional[int] = None       # returned vector size (provider-dependent)
+    user: Optional[str] = None             # end-user identifier (OpenAI passthrough)
+
+
+class EmbeddingObject(BaseModel):
+    """Single embedding result (OpenAI shape)."""
+    object: str = "embedding"
+    embedding: list[float]
+    index: int = 0
+
+
+class EmbeddingUsage(BaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: list[EmbeddingObject]
+    model: str
+    usage: EmbeddingUsage
+
+
 # ── State (injected at startup) ─────────────────────────────────────────
 
 class OpenAIRouterState:
@@ -731,6 +998,23 @@ class OpenAIRouterState:
         self.content_relay_detector = None
         # v2.4.1 — PoolManager for container-per-identity dispatch
         self.pool_manager = None          # PoolManager | None
+        # Cloud key resolution: KMS provider + per-provider short-TTL cache.
+        # Cache entry: {"value": str | None, "ts": float}; TTL = 60 s so a
+        # newly-set key takes effect within one minute without a restart.
+        # The env-var fallback (OPENAI_API_KEY / ANTHROPIC_API_KEY) keeps
+        # existing Helm/env-only deployments working unchanged.
+        self.kms_provider = None   # KSMProvider | None
+        self._cloud_key_cache: dict[str, dict] = {}  # provider -> {value, ts}
+        # 3.1 Phase 6+7 — cloud-model deny-by-default gate + strict dial.
+        # permission_store: PermissionStore | None — resolves boolean grants for
+        #   blast-radius resource types (cloud_model, mcp_server, agent, external_api).
+        # permission_strict: when True (YASHIGANI_PERMISSION_STRICT=true), local
+        #   Ollama models also require an explicit grant (deny-unless-permitted for ALL
+        #   models).  Default False so local-LLM usage works out of the box.
+        self.permission_store = None
+        self.permission_strict: bool = (
+            os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
+        )
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -748,6 +1032,116 @@ class OpenAIRouterState:
 
 
 _state = OpenAIRouterState()
+
+# ---------------------------------------------------------------------------
+# Cloud provider configuration: API endpoint URL, key env-var fallback,
+# request body/response body adapters.
+#
+# OpenAI uses the OpenAI-compatible /v1/chat/completions API (JSON same shape
+# as our request body).  Anthropic uses a different messages API — we translate
+# to their format here and normalise the response back to the OpenAI shape so
+# downstream code is unaffected.
+#
+# Key resolution order (per request / per provider, with 60 s TTL):
+#   1. kms_provider.get_secret("{provider}_api_key")  — UI-set key (KMS)
+#   2. os.environ.get("{PROVIDER}_API_KEY")           — env-var / Helm fallback
+#   3. None → HTTPException(503)
+#
+# A restart is NOT required when a key is changed via the admin UI.  The
+# 60-second TTL cache (per provider) bounds the propagation delay.
+# ---------------------------------------------------------------------------
+_CLOUD_PROVIDER_CONFIG: dict[str, dict] = {
+    "openai": {
+        "kms_key": "openai_api_key",
+        "env_var": "OPENAI_API_KEY",
+        "base_url": os.getenv("YASHIGANI_OPENAI_BASE_URL", "https://api.openai.com"),
+    },
+    "anthropic": {
+        "kms_key": "anthropic_api_key",
+        "env_var": "ANTHROPIC_API_KEY",
+        "base_url": os.getenv("YASHIGANI_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+    },
+}
+
+_CLOUD_KEY_TTL: float = 60.0  # seconds
+
+# ---------------------------------------------------------------------------
+# Cloud embedding model configuration (per-provider).
+#
+# Most cloud LLM providers have a SEPARATE dedicated embedding model (e.g.
+# OpenAI text-embedding-3-small) that is NOT a chat model. We therefore cannot
+# simply forward the caller's model name when routing to cloud.
+#
+# Resolution order per provider:
+#   1. YASHIGANI_<PROVIDER>_EMBEDDING_MODEL env var (operator override)
+#   2. _CLOUD_EMBEDDING_DEFAULTS[provider] built-in default
+#   3. None → provider has no embedding API → fall back to local Ollama
+#
+# Anthropic has no public embeddings API as of the knowledge cutoff; its entry
+# is None → any cloud-routed embeddings request for an Anthropic-hosted model
+# falls back to the local Ollama embedder automatically.
+# ---------------------------------------------------------------------------
+_CLOUD_EMBEDDING_DEFAULTS: dict[str, Optional[str]] = {
+    "openai": "text-embedding-3-small",
+    "anthropic": None,  # Anthropic has no embeddings API → Ollama fallback
+}
+
+
+def _get_cloud_embedding_model(provider: str) -> Optional[str]:
+    """Return the embedding model to use for a cloud provider.
+
+    Reads YASHIGANI_<PROVIDER>_EMBEDDING_MODEL from env (operator override),
+    then falls back to the built-in default. Returns None when the provider
+    has no embeddings API (e.g. Anthropic) — callers must then fall back to
+    the local Ollama embedder.
+    """
+    env_var = f"YASHIGANI_{provider.upper()}_EMBEDDING_MODEL"
+    env_val = os.getenv(env_var, "").strip()
+    if env_val:
+        return env_val
+    return _CLOUD_EMBEDDING_DEFAULTS.get(provider)  # may be None
+
+
+def _get_cloud_api_key(provider: str) -> Optional[str]:
+    """Resolve the API key for a cloud provider.
+
+    Reads from KMS with a 60 s per-provider TTL cache, then falls back to the
+    environment variable.  Never logs the key value.
+
+    Returns None if no key is available (KMS miss + env var absent).
+    """
+    cfg = _CLOUD_PROVIDER_CONFIG.get(provider)
+    if cfg is None:
+        return None
+
+    now = time.monotonic()
+    cache_entry = _state._cloud_key_cache.get(provider, {})
+    if now - cache_entry.get("ts", 0.0) < _CLOUD_KEY_TTL:
+        return cache_entry.get("value")
+
+    key: Optional[str] = None
+
+    # 1. KMS — preferred when the admin has set the key via the UI.
+    if _state.kms_provider is not None:
+        try:
+            val = _state.kms_provider.get_secret(cfg["kms_key"])
+            if val:
+                key = val
+        except Exception as exc:
+            # KeyNotFoundError = key not set in KMS yet — not an error.
+            logger.debug(
+                "_get_cloud_api_key: KMS miss for provider=%s kms_key=%s (%s)",
+                provider, cfg["kms_key"], type(exc).__name__,
+            )
+
+    # 2. Env-var fallback — for Helm / docker-compose env-based deployments.
+    if not key:
+        key = os.environ.get(cfg["env_var"]) or None
+
+    # Cache the resolved value (including None — so a missing key does not
+    # hammer KMS on every request while the TTL runs).
+    _state._cloud_key_cache[provider] = {"value": key, "ts": now}
+    return key
 
 
 def configure(
@@ -771,6 +1165,8 @@ def configure(
     pool_manager=None,    # v2.4.1 — PoolManager | None
     model_allocation_store=None,  # Track B1 — ModelAllocationStore | None
     model_alias_store=None,       # Track B1 — ModelAliasStore | None
+    kms_provider=None,            # KSMProvider | None — for cloud API key resolution
+    permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -804,6 +1200,12 @@ def configure(
     _state.pool_manager = pool_manager  # v2.4.1
     _state.model_allocation_store = model_allocation_store  # Track B1
     _state.model_alias_store = model_alias_store            # Track B1
+    _state.kms_provider = kms_provider                      # cloud API key resolution
+    _state._cloud_key_cache = {}                            # reset cache on reconfigure
+    _state.permission_store = permission_store              # 3.1 Phase 6 — cloud-model gate
+    _state.permission_strict = (
+        os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
+    )
 
     # ── Zero-trust OPA startup validation (Path 3) ─────────────────────────
     # OPA is mandatory in production.  In development mode, fail-closed by
@@ -1152,6 +1554,30 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             },
         )
 
+    # ── 1b-ii. Stash ResolvedPrincipal on request.state (3.1 UID unification) ──
+    # Written once at the boundary so every downstream consumer (proxy.py security
+    # headers, mcp_router_runtime, cap_policy resolver) reads a single typed record
+    # instead of raw headers.  Must be set BEFORE orchestration delegation (the
+    # delegate path calls back into this pipeline on a fresh request).
+    try:
+        from yashigani.gateway.types import ResolvedPrincipal as _RP
+        _rp_kind = identity.get("kind", "unknown") if identity else "unknown"
+        _rp_iid  = identity.get("identity_id", "anonymous") if identity else "anonymous"
+        _rp_scope: Optional[str] = "user" if _rp_kind in ("human", "user") else None
+        request.state.ysg_principal = _RP(
+            identity_id=_rp_iid,
+            principal_scope=_rp_scope,
+            group_ids=list(identity.get("groups", []) if identity else []),
+            org_id=os.getenv("YASHIGANI_ORG_ID", "default"),
+            kind=_rp_kind,
+        )
+    except Exception as _rp_exc:
+        logger.error(
+            "openai_router: failed to set request.state.ysg_principal: %s — "
+            "downstream consumers may fall back to anonymous (fail-closed)",
+            _rp_exc,
+        )
+
     # ── 1c. Orchestration delegation (2.25.4, build sheet §3.1/§3.5) ──────
     # When the caller supplies `tools` (or opts in via `orchestrate=true`), the
     # request is a tool-calling orchestration, not a plain chat.  Delegate to the
@@ -1179,6 +1605,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if not is_orchestration_self_call(request):
         from yashigani.gateway.letta_brain import is_letta_orchestration
         letta_brain = is_letta_orchestration(body.model, body)
+        # YASHIGANI_ORCH_AUTO_MODELS: virtual model names that auto-trigger
+        # the qwen-brain orchestration executor from a plain OWUI chat request.
+        # The model field is rewritten to the brain model before the executor
+        # runs (body.model is mutated in-place so every downstream reference
+        # sees the real model; the original virtual name is logged for audit).
+        auto_orch = (not letta_brain and not body.orchestrate
+                     and is_auto_orchestrate_model(body.model))
+        if auto_orch:
+            import os as _os  # noqa: PLC0415  — local import avoids scope shadow
+            brain_model = (_os.environ.get("YASHIGANI_ORCH_BRAIN_MODEL", "")
+                           .strip()) or "qwen2.5:3b"
+            logger.info(
+                "orchestration: auto-trigger for model=%r → brain=%s (YASHIGANI_ORCH_AUTO_MODELS)",
+                body.model, brain_model,
+            )
+            body = body.model_copy(update={"model": brain_model, "orchestrate": True})
         if body.orchestrate or letta_brain:
             from yashigani.gateway.orchestrator import run_orchestration
             return await run_orchestration(
@@ -1496,6 +1938,186 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
             route_reason = "sensitivity_local"
 
+    # ── 6a-perm. Cloud-model deny-by-default gate (Phase 6+7 / INV-1 + INV-2) ──
+    #
+    # Phase 6 — INV-1 (deny by default for blast-radius types):
+    #   Cloud providers are deny-by-default.  A request routed to ANY cloud
+    #   provider (openai / anthropic) MUST have an explicit org-level cloud_model
+    #   grant for the resolved model.  No grant → 403, fail-closed.
+    #
+    # Phase 6 — INV-2 (OPA coupling):
+    #   A cloud_model grant carries a mandatory opa_policy_ref.  At runtime, the
+    #   referenced OPA data-protection policy is traversed.  If the policy is
+    #   absent/unresolvable the cloud call is DENIED (never sent in the clear).
+    #   INV-2 is enforced at write time (store.set_boolean_grant) AND here at
+    #   runtime as a belt-and-braces guard.
+    #
+    # Phase 7 — strict dial (YASHIGANI_PERMISSION_STRICT=true, default OFF):
+    #   When strict mode is on, LOCAL Ollama models also require an explicit
+    #   cloud_model grant (deny-unless-permitted for ALL models).  Default OFF
+    #   so out-of-the-box local-LLM usage works without any grant configuration.
+    #
+    # Exemptions — must NOT be gated:
+    #   • Agent calls (is_agent_call=True) — use their own MCP/auth path.
+    #   • Brain-reasoning leg (brain_reasoning_leg=True) — server-minted, UNFORGEABLE;
+    #     internal cognition, never delivered to a user; holds no allocation.
+    #
+    # Anti-masquerade: classification is derived solely from selected_provider
+    # (server-resolved, never from caller input) — _CLOUD_PROVIDER_CONFIG contains
+    # only "openai"/"anthropic"; "ollama" and "agent" are always local.
+    _perm_is_cloud = selected_provider in _CLOUD_PROVIDER_CONFIG
+
+    # FIX-005: Fail-closed when permission store unavailable in enforcing envs.
+    #
+    # In production/staging, the permission store (Redis) MUST be available.
+    # A missing store is a misconfiguration — deny blast-radius cloud/strict
+    # calls rather than silently allowing (violates deny-by-default mandate).
+    # Dev/test envs retain the current allow/warn behaviour for usability.
+    #
+    # Gate applies to the same scope as _perm_needs_check: cloud calls and
+    # strict-dial local calls (is_agent_call + brain_reasoning_leg exempt).
+    _perm_gate_scope = not is_agent_call and not brain_reasoning_leg and (
+        _perm_is_cloud or _state.permission_strict
+    )
+    if (
+        _perm_gate_scope
+        and _state.permission_store is None
+        and os.getenv("YASHIGANI_ENV", "").strip().lower() in {"production", "staging"}
+    ):
+        _perm_deny_reason = "permission_store_unavailable"
+        logger.error(
+            "PERM FAIL-CLOSED (FIX-005): permission_store unavailable in %r env — "
+            "DENYING cloud/strict-dial request fail-closed. "
+            "provider=%s model=%s identity=%s. "
+            "Restore Redis/permission-store to re-enable cloud model access.",
+            os.getenv("YASHIGANI_ENV", ""),
+            selected_provider,
+            selected_model,
+            identity_id,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": _owui_deny_message(_perm_deny_reason),
+                    "type": "policy_denied",
+                    "code": _perm_deny_reason,
+                }
+            },
+            headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+        )
+
+    _perm_needs_check = (
+        not is_agent_call
+        and not brain_reasoning_leg
+        and _state.permission_store is not None
+        and (_perm_is_cloud or _state.permission_strict)
+    )
+
+    if _perm_needs_check:
+        from yashigani.permissions import resolve_boolean_grant as _resolve_grant
+        from yashigani.permissions import ResourceType as _RT
+        from yashigani.permissions import DEFAULT_ORG_ID as _PERM_ORG_ID
+
+        _perm_org_id = _PERM_ORG_ID
+        _perm_groups: list = identity.get("groups", []) if identity else []
+        # User-level grants for narrowing — only for human/user principals.
+        # Service/agent/gateway identities use org+group tiers only.
+        # 3.1 UID unification: principal_id = identity_id (idnt_{12hex}).
+        # Slug and email are NEVER used as the grant key.
+        _perm_kind = identity.get("kind", "") if identity else ""
+        _perm_user_id: Optional[str] = (
+            identity.get("identity_id")
+            if _perm_kind in ("human", "user") else None
+        )
+
+        _perm_allowed = _resolve_grant(
+            _RT.CLOUD_MODEL,
+            selected_model,
+            org_id=_perm_org_id,
+            group_ids=_perm_groups,
+            principal_scope="user" if _perm_user_id else None,
+            principal_id=_perm_user_id if _perm_user_id else None,
+            store=_state.permission_store,
+        )
+        if not _perm_allowed:
+            _perm_deny_reason = "cloud_model_not_granted"
+            logger.warning(
+                "PERM DENIED (cloud-model gate INV-1): provider=%s model=%s "
+                "identity=%s org=%s%s — no org grant",
+                selected_provider, selected_model, identity_id, _perm_org_id,
+                " [strict-dial: local model]" if not _perm_is_cloud else "",
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": _owui_deny_message(_perm_deny_reason),
+                        "type": "policy_denied",
+                        "code": _perm_deny_reason,
+                    }
+                },
+                headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+            )
+
+        # INV-2 coupling: cloud models only.  Local models in strict mode do NOT
+        # require an OPA data-protection policy (no egress risk).
+        if _perm_is_cloud:
+            # Read the org-level grant to retrieve the mandatory opa_policy_ref.
+            _org_grant = _state.permission_store.get_boolean_grant(
+                _RT.CLOUD_MODEL, "org", _perm_org_id, selected_model
+            )
+            _opa_ref = (_org_grant.opa_policy_ref or "").strip() if _org_grant else ""
+
+            if not _opa_ref:
+                # Belt-and-braces: INV-2 should have been enforced at write time,
+                # but defend here too (fail-closed).
+                logger.error(
+                    "PERM DENIED (INV-2 runtime): cloud_model grant for model=%s "
+                    "(org=%s) missing opa_policy_ref — fail-closed",
+                    selected_model, _perm_org_id,
+                )
+                _perm_deny_reason = "cloud_model_no_opa_policy_ref"
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": _owui_deny_message(_perm_deny_reason),
+                            "type": "policy_denied",
+                            "code": _perm_deny_reason,
+                        }
+                    },
+                    headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+                )
+
+            # Traverse the OPA data-protection policy (INV-2 runtime gate).
+            _opa_dp_result = await _opa_cloud_model_policy_check(
+                _opa_ref,
+                identity=identity,
+                model=selected_model,
+                provider=selected_provider,
+                sensitivity_level=sensitivity_level,
+            )
+            if not _opa_dp_result.get("allow", False):
+                _perm_deny_reason = "cloud_model_opa_coupling_failed"
+                logger.warning(
+                    "PERM DENIED (INV-2 OPA coupling): provider=%s model=%s "
+                    "policy_ref=%s identity=%s reason=%s — cloud call blocked",
+                    selected_provider, selected_model, _opa_ref, identity_id,
+                    _opa_dp_result.get("reason", "unknown"),
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": _owui_deny_message(_perm_deny_reason),
+                            "type": "policy_denied",
+                            "code": _perm_deny_reason,
+                        }
+                    },
+                    headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
+                )
+
     # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
     # Runs on the model that will ACTUALLY be served (after optimisation OR the
     # fallback path), so the optimiser cannot escape the allocation by
@@ -1632,11 +2254,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # Runs STRICTLY AFTER the core _opa_v1_check gate above so it can only ADD
     # denials, never remove one. Fail-closed (evaluate_client_policies denies on
     # any OPA error/undefined). No-op for callers with no bound policies.
+    #
+    # LAURA-31RT-001: derive content tags from the prompt BEFORE the enforce call
+    # so OPA policies that inspect content (pii_redaction_policy, pci_data_block,
+    # classified_marking_local) receive a populated input.data_tags array.
+    # This is a read-only detect_decoded() scan — does NOT alter prompt_text,
+    # does NOT apply mode-driven actions, and never raises (fail-open on error).
     _ce_scope_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ingress_data_tags = _detect_content_tags(prompt_text, _state.pii_detector)
     _ce_in = await evaluate_client_policies(
         _state, _ce_scope_kind, identity_id, "ingress",
         _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
-                              provider=selected_provider, model=selected_model),
+                              provider=selected_provider, model=selected_model,
+                              data_tags=_ingress_data_tags),
     )
     if not _ce_in.get("allow", False):
         _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -1978,11 +2608,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     agent_body["temperature"] = body.temperature
 
                 # Read agent auth token from env var or secrets file
-                import os
+                # OBS-3.1-001: use aliased import to avoid shadowing the module-level
+                # `os` name.  A bare `import os` here would make Python treat `os` as
+                # a local variable for the ENTIRE chat_completions() function scope,
+                # causing UnboundLocalError at the earlier os.getenv("YASHIGANI_ORG_ID")
+                # call in the identity-resolution block (~150 lines above).
+                import os as _os  # noqa: PLC0415  — local import avoids scope shadow
                 from pathlib import Path as _Path
                 agent_headers: dict[str, str] = {"Content-Type": "application/json"}
                 # Check env var first (e.g., OPENCLAW_GATEWAY_TOKEN), then secrets file
-                env_token = os.getenv(f"{agent_name_lower.upper()}_GATEWAY_TOKEN", "")
+                env_token = _os.getenv(f"{agent_name_lower.upper()}_GATEWAY_TOKEN", "")
                 if not env_token:
                     # V232-CSCAN-01a: resolve-and-confine before touching the filesystem.
                     # agent_name_lower comes from the registry (admin-registered) and is
@@ -2047,29 +2682,174 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     route_reason = f"agent:{selected_model[1:]}"
 
         if not is_agent_call:
-            # Standard Ollama routing (buffered)
-            ollama_body = {
-                "model": selected_model if not is_agent_call else _state.default_model,
-                "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
-                "stream": False,
-            }
-            if body.temperature is not None:
-                ollama_body["temperature"] = body.temperature
+            if selected_provider in _CLOUD_PROVIDER_CONFIG:
+                # ── 7b-cloud. Cloud provider call (OpenAI / Anthropic) ────────
+                # Resolve API key from KMS (TTL-cached, per-request) then env-var.
+                # Never log the key value.
+                cloud_api_key = _get_cloud_api_key(selected_provider)
+                if not cloud_api_key:
+                    logger.error(
+                        "Cloud provider %r selected but no API key available "
+                        "(KMS miss and env-var absent) request_id=%s",
+                        selected_provider, request_id,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Cloud provider '{selected_provider}' is not configured. "
+                            "Set the API key via the admin UI (Cloud Provider API Keys) "
+                            f"or the {_CLOUD_PROVIDER_CONFIG[selected_provider]['env_var']} "
+                            "environment variable."
+                        ),
+                    )
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{_state.ollama_url}/api/chat",
-                    json=ollama_body,
-                )
+                cloud_cfg = _CLOUD_PROVIDER_CONFIG[selected_provider]
+                messages_payload = [
+                    {"role": m.role, "content": m.content or ""}
+                    for m in body.messages
+                ]
 
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Backend error: {resp.text[:200]}",
-                )
+                if selected_provider == "openai":
+                    # OpenAI-compatible /v1/chat/completions
+                    cloud_body: dict = {
+                        "model": selected_model,
+                        "messages": messages_payload,
+                        "stream": False,
+                    }
+                    if body.temperature is not None:
+                        cloud_body["temperature"] = body.temperature
+                    if body.max_tokens is not None:
+                        cloud_body["max_tokens"] = body.max_tokens
 
-            backend_body = resp.json()
-            assistant_content = backend_body.get("message", {}).get("content", "")
+                    cloud_headers = {
+                        "Authorization": f"Bearer {cloud_api_key}",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        resp = await client.post(
+                            f"{cloud_cfg['base_url']}/v1/chat/completions",
+                            json=cloud_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "OpenAI upstream error %d request_id=%s",
+                            resp.status_code, request_id,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    choices = resp_json.get("choices", [])
+                    assistant_content = (
+                        choices[0].get("message", {}).get("content", "") if choices else ""
+                    )
+                    # Normalise to Ollama-compatible shape for downstream code.
+                    backend_body = {
+                        "model": selected_model,
+                        "message": {"role": "assistant", "content": assistant_content},
+                        "done": True,
+                        "prompt_eval_count": resp_json.get("usage", {}).get("prompt_tokens", 0),
+                        "eval_count": resp_json.get("usage", {}).get("completion_tokens", 0),
+                    }
+
+                elif selected_provider == "anthropic":
+                    # Anthropic Messages API — different wire format.
+                    # Extract system message (if any) and user/assistant turns.
+                    system_text = ""
+                    anthropic_messages = []
+                    for m in body.messages:
+                        if m.role == "system":
+                            system_text = m.content or ""
+                        else:
+                            anthropic_messages.append(
+                                {"role": m.role, "content": m.content or ""}
+                            )
+
+                    anthropic_body: dict = {
+                        "model": selected_model,
+                        "messages": anthropic_messages,
+                        "max_tokens": body.max_tokens or 1024,
+                    }
+                    if system_text:
+                        anthropic_body["system"] = system_text
+                    if body.temperature is not None:
+                        anthropic_body["temperature"] = body.temperature
+
+                    cloud_headers = {
+                        "x-api-key": cloud_api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        resp = await client.post(
+                            f"{cloud_cfg['base_url']}/v1/messages",
+                            json=anthropic_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "Anthropic upstream error %d request_id=%s",
+                            resp.status_code, request_id,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    # Anthropic response: {"content": [{"type":"text","text":"..."}], ...}
+                    content_blocks = resp_json.get("content", [])
+                    assistant_content = " ".join(
+                        b.get("text", "") for b in content_blocks if b.get("type") == "text"
+                    )
+                    usage = resp_json.get("usage", {})
+                    # Normalise to Ollama-compatible shape for downstream code.
+                    backend_body = {
+                        "model": selected_model,
+                        "message": {"role": "assistant", "content": assistant_content},
+                        "done": True,
+                        "prompt_eval_count": usage.get("input_tokens", 0),
+                        "eval_count": usage.get("output_tokens", 0),
+                    }
+
+                else:
+                    # Unreachable: _CLOUD_PROVIDER_CONFIG only contains "openai"/"anthropic".
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Unknown cloud provider: {selected_provider!r}",
+                    )
+
+            else:
+                # ── 7b-local. Standard Ollama routing (buffered) ──────────────
+                ollama_body = {
+                    "model": selected_model,
+                    "messages": [{"role": m.role, "content": m.content or ""} for m in body.messages],
+                    "stream": False,
+                }
+                if body.temperature is not None:
+                    ollama_body["temperature"] = body.temperature
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        f"{_state.ollama_url}/api/chat",
+                        json=ollama_body,
+                    )
+
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=f"Backend error: {resp.text[:200]}",
+                    )
+
+                backend_body = resp.json()
+                assistant_content = backend_body.get("message", {}).get("content", "")
 
     except httpx.ConnectError:
         raise HTTPException(
@@ -2158,6 +2938,63 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 # systems (e.g. Open WebUI plugins) can act on it.
         except Exception as exc:
             logger.warning("Response inspection raised unexpectedly: %s", exc)
+
+    # ── 7b-ii. Always-on MCP/agent result injection pattern scan (I5 invariant) ──
+    # INDEPENDENT of YASHIGANI_INSPECT_RESPONSES — MCP/agent results are UNTRUSTED.
+    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-057),
+    # but injection pattern detection on untrusted agent results is MANDATORY.
+    # Closes LAURA-30-002 / I5 invariant violation.
+    if response_verdict == "clean" and assistant_content:
+        try:
+            from yashigani.mcp._content_filter import _COMPILED_PATTERN as _inj_pattern
+            import unicodedata as _unicodedata
+            _scan_text = _unicodedata.normalize("NFKC", assistant_content)
+            if _inj_pattern.search(_scan_text):
+                _inj_layman_msg = (
+                    "Your request was blocked because the agent's response contained "
+                    "content that attempted to override your AI assistant's instructions. "
+                    "This is a security protection. Please contact your administrator if you "
+                    "believe this is an error."
+                )
+                logger.warning(
+                    "LAURA-30-002: agent result injection pattern detected request_id=%s "
+                    "— BLOCKING delivery (always-on I5 gate)",
+                    request_id,
+                )
+                if _state.audit_writer:
+                    try:
+                        _inj_hash = hashlib.sha256(
+                            assistant_content.encode("utf-8", errors="replace")
+                        ).hexdigest()
+                        _state.audit_writer.write(
+                            ResponseInjectionDetectedEvent(
+                                verdict="BLOCKED",
+                                request_id=request_id,
+                                session_id=identity.get("identity_id", request_id) if identity else request_id,
+                                agent_id=identity.get("slug", "agent-result") if identity else "agent-result",
+                                confidence_score=0.95,
+                                action_taken="blocked_injection_pattern",
+                                content_type="text/plain",
+                                response_content_hash=_inj_hash,
+                                classifier_only_mode=True,
+                            )
+                        )
+                    except Exception as _audit_exc:
+                        logger.warning("Audit write failed for injection block: %s", _audit_exc)
+                response_verdict = "blocked"
+                response_inspection_confidence = 0.95
+                assistant_content = _inj_layman_msg
+        except Exception as _inj_exc:
+            # Fail-closed: if the scan itself errors, block to avoid delivering
+            # potentially unsafe content.
+            logger.error(
+                "LAURA-30-002: injection scan raised %s — fail-closed block", _inj_exc
+            )
+            response_verdict = "blocked"
+            assistant_content = (
+                "Your request was blocked due to a safety check error. "
+                "Please contact your administrator."
+            )
 
     # ── 7c. PII detection on response (buffered path only) ────────────
     #
@@ -2323,10 +3160,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
     # the caller has no bound egress policies.
+    #
+    # LAURA-31RT-001: derive content tags from the response text BEFORE the enforce
+    # call.  assistant_content may already be PII-redacted by step 7c; tags reflect
+    # what is actually being delivered to the caller.  Read-only scan, never raises.
     _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _egress_data_tags = _detect_content_tags(assistant_content, _state.pii_detector)
     _ce_eg = await evaluate_client_policies(
         _state, _ce_eg_kind, identity_id, "egress",
-        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model,
+                              data_tags=_egress_data_tags),
     )
     if not _ce_eg.get("allow", False):
         _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -2423,6 +3266,419 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     return JSONResponse(
         content=_completion,
         headers=headers,
+    )
+
+
+@router.post("/embeddings", response_model=EmbeddingResponse)
+async def create_embeddings(body: EmbeddingRequest, request: Request):
+    """
+    OpenAI-compatible embeddings endpoint.
+
+    Pipeline (mirrors /v1/chat/completions):
+    1. Identity resolution + anonymous-caller reject (401)
+    2. Sensitivity classification of input text(s) — SAME classifier as chat
+    3. OPA ingress policy check (fail-closed)
+    4. Sensitivity × routing gate: sensitive input + cloud provider → refuse
+       (routing_unsafe_sensitive_to_cloud, same code as chat path via OPA)
+    5. Provider routing:
+       a. Ollama local  → POST <ollama_url>/api/embed (native multi-input API)
+          or /v1/embeddings (OpenAI-compat — TO BE CONFIRMED on live stack)
+       b. Cloud (OpenAI) → POST <base_url>/v1/embeddings with embedding model
+       c. Cloud (Anthropic) → no embeddings API; fall back to Ollama + log
+    6. Normalise response to OpenAI embeddings shape
+    7. Audit via GatewayRequestEvent
+
+    Security invariants:
+    - Sensitive text (CONFIDENTIAL/RESTRICTED) MUST NOT egress to cloud for
+      embedding — archival memory stored via cloud embedder would leak to the
+      provider. This is the key gate for Letta archival memory.
+    - OPA denial from routing_unsafe_sensitive_to_cloud is the same code path
+      as chat; the OPA v1_routing.rego `routing_safe` rule covers both.
+
+    Uncertainty (flag for live stack verification):
+    - Ollama < 0.5.0 may not expose /v1/embeddings (OpenAI-compat path).
+      We use /api/embed (native, available from Ollama 0.1.x); if that also
+      errors the caller gets 503.  Confirm the installed Ollama version exposes
+      /api/embed on the live 3.1 stack.
+    - Letta archival-memory embedding model: Letta may send any model name;
+      this handler resolves the provider from the model name just like chat,
+      so the model name Letta is configured to use must exist in Ollama or
+      match a cloud-routing alias.
+    """
+    from yashigani.audit.schema import GatewayRequestEvent
+
+    request_id = f"embed-{uuid.uuid4().hex[:12]}"
+    start_time = time.time()
+
+    # ── 1. Identity resolution ────────────────────────────────────────
+    identity = _resolve_identity(request)
+    identity_id = identity.get("identity_id", "anonymous") if identity else "anonymous"
+
+    if identity is None:
+        logger.warning(
+            "Anonymous /v1/embeddings caller rejected (request_id=%s) — "
+            "zero-trust fail-closed",
+            request_id,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "AUTHENTICATION_REQUIRED",
+                "detail": (
+                    "POST /v1/embeddings requires an authenticated identity. "
+                    "Provide Authorization: Bearer <api_key> or authenticate via "
+                    "the SSO flow (X-Forwarded-User header from Caddy)."
+                ),
+                "request_id": request_id,
+            },
+        )
+
+    # ── 2. Normalise input to a single classification string ──────────
+    # Classify the concatenation of all inputs so a multi-input request is
+    # gated on its strictest member. We do NOT forward the raw inputs to
+    # the classifier one-by-one (that would miss cross-input context and
+    # be slower). The routing gate below uses this single level.
+    raw_input = body.input
+    if isinstance(raw_input, list):
+        input_texts: list[str] = [t for t in raw_input if t]
+        classification_text = " ".join(input_texts)
+    else:
+        input_texts = [raw_input] if raw_input else []
+        classification_text = raw_input or ""
+
+    # ── 3. Sensitivity classification ─────────────────────────────────
+    sensitivity_level = "PUBLIC"
+    s_result = None
+    if _state.sensitivity_classifier and classification_text:
+        s_result = _state.sensitivity_classifier.classify_decoded(classification_text)
+        from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+        sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
+    if s_result is None:
+        from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
+        s_result = SensitivityResult(level=SensitivityLevel.PUBLIC)
+
+    # ── 4. Route decision ─────────────────────────────────────────────
+    selected_model = body.model or _state.default_model
+    selected_provider = "ollama"  # safe default
+    route_reason = "embedding_local"
+
+    if _state.optimization_engine and _state.sensitivity_classifier and _state.complexity_scorer:
+        # Reuse the optimisation engine — embeddings use a minimal complexity
+        # stub (no token count / heuristic) so the engine sees a MEDIUM budget.
+        from yashigani.optimization.complexity_scorer import ComplexityLevel, ComplexityResult
+        stub_complexity = ComplexityResult(
+            level=ComplexityLevel.MEDIUM,
+            token_count=len(classification_text) // 4,
+            heuristic_score=0.0,
+            reasons=[],
+        )
+        from yashigani.billing.budget_enforcer import BudgetSignal, BudgetState
+        stub_budget = BudgetState(
+            identity_id=identity_id, provider="cloud",
+            used=0, total=0, signal=BudgetSignal.NORMAL, pct=0,
+        )
+        try:
+            decision = _state.optimization_engine.route(
+                requested_model=selected_model,
+                sensitivity=s_result,
+                complexity=stub_complexity,
+                budget=stub_budget,
+                force_local=False,
+                force_cloud=False,
+            )
+            selected_provider = decision.provider
+            selected_model = decision.model
+            route_reason = f"embedding:{decision.rule}:{decision.reason}"
+        except Exception as _route_exc:
+            logger.warning(
+                "Embeddings route decision failed (%s) — falling back to ollama",
+                _route_exc,
+            )
+            selected_provider = "ollama"
+            route_reason = "embedding_local_fallback"
+    else:
+        selected_provider = "ollama"
+        route_reason = "embedding_local"
+        if sensitivity_level in ("CONFIDENTIAL", "RESTRICTED"):
+            route_reason = "embedding_sensitivity_local"
+
+    # ── 5. OPA ingress check ──────────────────────────────────────────
+    opa_decision = await _opa_v1_check(
+        identity=identity,
+        selected_model=selected_model,
+        selected_provider=selected_provider,
+        sensitivity_level=sensitivity_level,
+        route_reason=route_reason,
+        request_path="/v1/embeddings",
+    )
+    if not opa_decision.get("allow", False):
+        opa_reason = opa_decision.get("reason", "policy_denied")
+        logger.warning(
+            "OPA DENIED /v1/embeddings: identity=%s model=%s reason=%s",
+            identity_id, selected_model, opa_reason,
+        )
+        # Audit the deny
+        if _state.audit_writer is not None:
+            try:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                _state.audit_writer.write(
+                    GatewayRequestEvent(
+                        request_id=request_id,
+                        method="POST",
+                        path="/v1/embeddings",
+                        action="DENIED",
+                        reason=opa_reason,
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except Exception as _ae:
+                logger.warning("Embeddings OPA-deny audit write failed: %s", _ae)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": _owui_deny_message(opa_reason),
+                    "type": "policy_denied",
+                    "code": opa_reason,
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": opa_reason},
+        )
+
+    # ── 6. Sensitive-to-cloud gate (belt-and-braces, independent of OPA) ─
+    # OPA's routing_safe rule already covers this via v1_routing.rego, but we
+    # apply it explicitly here too so a misconfigured OPA bundle (which might
+    # return allow=True with routing_safe=False) cannot silently egress sensitive
+    # archival-memory embeddings to cloud. The check is: if the resolved
+    # provider is a cloud provider AND sensitivity >= CONFIDENTIAL, refuse.
+    # This mirrors the OPA reason code so the client error is identical.
+    _SENSITIVE_LEVELS = {"CONFIDENTIAL", "RESTRICTED"}
+    if selected_provider in _CLOUD_PROVIDER_CONFIG and sensitivity_level in _SENSITIVE_LEVELS:
+        logger.warning(
+            "EMBEDDINGS routing_unsafe_sensitive_to_cloud: identity=%s "
+            "sensitivity=%s provider=%s — refusing (fail-closed)",
+            identity_id, sensitivity_level, selected_provider,
+        )
+        if _state.audit_writer is not None:
+            try:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                _state.audit_writer.write(
+                    GatewayRequestEvent(
+                        request_id=request_id,
+                        method="POST",
+                        path="/v1/embeddings",
+                        action="DENIED",
+                        reason="routing_unsafe_sensitive_to_cloud",
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except Exception as _ae:
+                logger.warning("Embeddings routing-unsafe audit write failed: %s", _ae)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": _owui_deny_message("routing_unsafe_sensitive_to_cloud"),
+                    "type": "policy_denied",
+                    "code": "routing_unsafe_sensitive_to_cloud",
+                }
+            },
+            headers={"X-Yashigani-OPA-Reason": "routing_unsafe_sensitive_to_cloud"},
+        )
+
+    # ── 7. Forward to backend ─────────────────────────────────────────
+    try:
+        import httpx as _httpx
+
+        embedding_data: list[dict] = []
+        prompt_tokens = 0
+        actual_model = selected_model
+
+        if selected_provider in _CLOUD_PROVIDER_CONFIG:
+            # ── 7a. Cloud provider ────────────────────────────────────
+            cloud_embedding_model = _get_cloud_embedding_model(selected_provider)
+
+            if cloud_embedding_model is None:
+                # Provider has no embeddings API (e.g. Anthropic) → fall back to Ollama.
+                logger.info(
+                    "Cloud provider %r has no embeddings API — falling back to "
+                    "local Ollama embedder (request_id=%s)",
+                    selected_provider, request_id,
+                )
+                selected_provider = "ollama"
+                route_reason += ":no_cloud_embeddings_fallback_local"
+                # Fall through to the Ollama branch below (no early return).
+            else:
+                cloud_api_key = _get_cloud_api_key(selected_provider)
+                if not cloud_api_key:
+                    logger.error(
+                        "Cloud provider %r selected for embeddings but no API key "
+                        "(KMS miss and env-var absent) request_id=%s",
+                        selected_provider, request_id,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Cloud provider '{selected_provider}' is not configured. "
+                            "Set the API key via the admin UI or the "
+                            f"{_CLOUD_PROVIDER_CONFIG[selected_provider]['env_var']} "
+                            "environment variable."
+                        ),
+                    )
+
+                cloud_cfg = _CLOUD_PROVIDER_CONFIG[selected_provider]
+                actual_model = cloud_embedding_model
+
+                if selected_provider == "openai":
+                    cloud_body: dict = {"model": actual_model, "input": raw_input}
+                    if body.encoding_format:
+                        cloud_body["encoding_format"] = body.encoding_format
+                    if body.dimensions:
+                        cloud_body["dimensions"] = body.dimensions
+                    if body.user:
+                        cloud_body["user"] = body.user
+
+                    cloud_headers = {
+                        "Authorization": f"Bearer {cloud_api_key}",
+                        "Content-Type": "application/json",
+                    }
+
+                    async with _httpx.AsyncClient(timeout=60.0) as _client:
+                        resp = await _client.post(
+                            f"{cloud_cfg['base_url']}/v1/embeddings",
+                            json=cloud_body,
+                            headers=cloud_headers,
+                        )
+
+                    if resp.status_code != 200:
+                        logger.error(
+                            "OpenAI embeddings upstream error %d request_id=%s: %s",
+                            resp.status_code, request_id, resp.text[:200],
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Cloud provider error. Try again or contact your administrator.",
+                        )
+
+                    resp_json = resp.json()
+                    embedding_data = resp_json.get("data", [])
+                    usage = resp_json.get("usage", {})
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    actual_model = resp_json.get("model", actual_model)
+
+                else:
+                    # Unreachable: only openai has a non-None cloud_embedding_model
+                    # in _CLOUD_EMBEDDING_DEFAULTS; but guard for future additions.
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Unknown cloud provider for embeddings: {selected_provider!r}",
+                    )
+
+        if selected_provider == "ollama":
+            # ── 7b. Ollama local embeddings ───────────────────────────
+            # Ollama exposes two endpoints:
+            #   /api/embeddings  — legacy single-input (model + prompt)
+            #   /api/embed       — v0.5.x multi-input (model + input: str|list)
+            # We prefer /api/embed (accepts both str and list natively).
+            # If the installed Ollama does not expose /api/embed (< 0.5.x),
+            # callers will receive 404 from Ollama which surfaces as 502 here.
+            # VERIFY on live 3.1 stack: `curl http://ollama:11434/api/embed`
+            # returns 405 (Method Not Allowed, not 404) on 0.5.x when GET is used.
+            # Use POST with model+input.
+            ollama_body: dict = {
+                "model": selected_model,
+                "input": raw_input,  # Ollama /api/embed accepts str or list[str]
+            }
+            async with _httpx.AsyncClient(timeout=60.0) as _client:
+                resp = await _client.post(
+                    f"{_state.ollama_url}/api/embed",
+                    json=ollama_body,
+                )
+
+            if resp.status_code != 200:
+                logger.error(
+                    "Ollama embeddings error %d request_id=%s: %s",
+                    resp.status_code, request_id, resp.text[:200],
+                )
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Embedding backend error: {resp.text[:200]}",
+                )
+
+            resp_json = resp.json()
+            # Ollama /api/embed returns {"model": ..., "embeddings": [[...], ...]}
+            # (list of float-lists, one per input item).
+            # Ollama /api/embeddings (legacy single) returns {"embedding": [...]}
+            raw_embeddings = resp_json.get("embeddings") or []
+            if not raw_embeddings and "embedding" in resp_json:
+                # Legacy single-input shape fallback
+                raw_embeddings = [resp_json["embedding"]]
+            embedding_data = [
+                {"object": "embedding", "embedding": vec, "index": i}
+                for i, vec in enumerate(raw_embeddings)
+            ]
+            actual_model = resp_json.get("model", selected_model)
+            # Ollama does not report token counts for embeddings; estimate
+            prompt_tokens = len(classification_text) // 4
+
+    except _httpx.ConnectError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding backend unavailable. Ollama may be starting up.",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Embeddings backend call failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Embedding backend communication error",
+        )
+
+    # ── 8. Build OpenAI-compatible response ───────────────────────────
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    embedding_objects = [
+        EmbeddingObject(
+            embedding=item.get("embedding", []) if isinstance(item, dict) else item,
+            index=item.get("index", i) if isinstance(item, dict) else i,
+        )
+        for i, item in enumerate(embedding_data)
+    ]
+    response = EmbeddingResponse(
+        data=embedding_objects,
+        model=actual_model,
+        usage=EmbeddingUsage(
+            prompt_tokens=prompt_tokens,
+            total_tokens=prompt_tokens,
+        ),
+    )
+
+    # ── 9. Audit ──────────────────────────────────────────────────────
+    if _state.audit_writer is not None:
+        try:
+            _state.audit_writer.write(
+                GatewayRequestEvent(
+                    request_id=request_id,
+                    method="POST",
+                    path="/v1/embeddings",
+                    action="FORWARDED",
+                    reason=route_reason,
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+        except Exception as _ae:
+            logger.warning("Embeddings audit write failed: %s", _ae)
+
+    return JSONResponse(
+        content=response.model_dump(),
+        headers={
+            "X-Yashigani-Request-Id": request_id,
+            "X-Yashigani-Routed-Via": selected_provider,
+            "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
+            "X-Yashigani-Model": actual_model,
+            "X-Yashigani-Sensitivity": sensitivity_level,
+            "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
+        },
     )
 
 
@@ -2575,6 +3831,22 @@ async def list_models(request: Request):
                 created=0,
                 owned_by=m.get("provider", "yashigani"),
             ))
+
+    # Add virtual orchestration models from YASHIGANI_ORCH_AUTO_MODELS.
+    # These are placeholder model names that auto-trigger the qwen-brain executor
+    # when selected in OWUI's model picker.  They appear in the full list only
+    # (same visibility rule as agents) so users see them but service accounts
+    # that enumerate the model list for routing decisions do not.
+    if opa_filter == "full":
+        _auto_raw = os.environ.get("YASHIGANI_ORCH_AUTO_MODELS", "").strip()
+        for _vname in (_auto_raw.split(",") if _auto_raw else []):
+            _vname = _vname.strip()
+            if _vname and not any(m.id == _vname for m in models):
+                models.append(ModelInfo(
+                    id=_vname,
+                    created=0,
+                    owned_by="yashigani-orchestration",
+                ))
 
     # Audit: MODELS_LIST_REQUESTED with count of models returned.
     # Count only — no model names stored (prevents log-based topology disclosure).
@@ -2808,6 +4080,96 @@ def model_denied_for_caller(
         _state.model_alias_store,
         brain_leg=brain_leg,
     )
+
+
+async def _opa_cloud_model_policy_check(
+    policy_ref: str,
+    *,
+    identity: dict | None,
+    model: str,
+    provider: str,
+    sensitivity_level: str,
+) -> dict:
+    """INV-2 runtime coupling: traverse the OPA data-protection policy referenced
+    by a cloud_model grant's opa_policy_ref (Phase 6 / 3.1).
+
+    Fail-closed: returns {"allow": False} on any error, missing OPA path, empty
+    policy result, or invalid policy_ref.  A grant with a valid opa_policy_ref
+    pointing at an OPA bundle path that evaluates to {"allow": true} is the ONLY
+    passing case.
+
+    Dev opt-in: when YASHIGANI_OPA_OPTIONAL=true (non-production) and OPA is not
+    configured, the coupling check is bypassed so local dev works without a full
+    OPA bundle (consistent with _opa_v1_check dev-opt-in handling).
+
+    policy_ref format: "yashigani/cloud_model/gpt4o"
+        → OPA path: {opa_url}/v1/data/yashigani/cloud_model/gpt4o
+    """
+    import re as _re
+
+    if not _state.opa_url:
+        _ysg_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+        _opa_optional = os.getenv("YASHIGANI_OPA_OPTIONAL", "false").strip().lower() == "true"
+        if _opa_optional and _ysg_env != "production":
+            logger.warning(
+                "cloud_model OPA coupling skipped — OPA not configured "
+                "(YASHIGANI_OPA_OPTIONAL=true, env=%s)",
+                _ysg_env,
+            )
+            return {"allow": True, "reason": "opa_not_configured_dev_opt_in"}
+        return {"allow": False, "reason": "opa_not_configured"}
+
+    # Sanitise policy_ref to prevent path traversal / injection.
+    # Valid chars: alphanumeric, underscore, hyphen, forward-slash.
+    if not policy_ref or not _re.match(r'^[a-zA-Z0-9_/\-]+$', policy_ref.strip()):
+        logger.warning(
+            "cloud_model OPA coupling: invalid policy_ref %r — fail-closed", policy_ref,
+        )
+        return {"allow": False, "reason": "invalid_policy_ref"}
+
+    opa_input = {
+        "identity": {
+            "status": identity.get("status", "active") if identity else "anonymous",
+            "kind": identity.get("kind", "unknown") if identity else "unknown",
+            "groups": identity.get("groups", []) if identity else [],
+            "sensitivity_ceiling": (
+                identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "RESTRICTED"
+            ),
+        },
+        "model": model,
+        "provider": provider,
+        "sensitivity": sensitivity_level,
+    }
+
+    policy_path = policy_ref.strip("/")
+    try:
+        async with internal_httpx_client(timeout=5.0) as client:
+            resp = await client.post(
+                _state.opa_url.rstrip("/") + f"/v1/data/{policy_path}",
+                json={"input": opa_input},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            if not result:
+                # Empty result: OPA path does not exist in the bundle → fail-closed.
+                logger.warning(
+                    "cloud_model OPA coupling: policy_ref=%r resolved to empty result "
+                    "(path not defined in OPA bundle) — fail-closed",
+                    policy_ref,
+                )
+                return {"allow": False, "reason": "policy_not_found"}
+            allowed = bool(result.get("allow", False))
+            return {
+                "allow": allowed,
+                "reason": result.get("reason", "policy_evaluated"),
+            }
+    except Exception as exc:
+        logger.error(
+            "cloud_model OPA coupling: policy check failed (ref=%r): %s — fail-closed",
+            policy_ref, exc,
+        )
+        return {"allow": False, "reason": "opa_unreachable"}
 
 
 async def _opa_v1_check(

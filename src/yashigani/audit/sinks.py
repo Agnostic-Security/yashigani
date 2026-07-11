@@ -183,10 +183,15 @@ class PostgresSink(AuditSink):
         async with pool.acquire() as conn:
             async with conn.transaction():
                 for event in batch:
+                    # FIND-C-AUDIT (3.1 gate): broker events use tenant_id="default"
+                    # (string) from YASHIGANI_MCP_SERVERS; that fails uuid validation
+                    # on the PostgreSQL RLS set_config call.  Coerce non-UUID values
+                    # to the all-zeros platform UUID before setting app.tenant_id.
                     tenant_id = event.get("tenant_id") or "00000000-0000-0000-0000-000000000000"
+                    _rls_tid = str(_coerce_uuid(tenant_id) or _NULL_TENANT_UUID)
                     await conn.execute(
                         "SELECT set_config('app.tenant_id', $1, true)",
-                        str(tenant_id),
+                        _rls_tid,
                     )
                     req_id = event.get("request_id")
 
@@ -592,10 +597,15 @@ def _audit_checkpoint_signing() -> tuple[Optional[Any], str]:
     import os
     from pathlib import Path
 
+    from yashigani.identity.trust_domain import audit_signer_spiffe_id
+
+    # MI-6 (YSG-RISK-061): the explicit env var (compose sets it per instance)
+    # takes precedence; the fallback default is derived from THIS instance's
+    # trust domain so a non-legacy instance signs in its own audit namespace.
     key_path_str = os.environ.get("YASHIGANI_AUDIT_SIGNING_KEY_PATH", "").strip()
     spiffe_id = os.environ.get(
         "YASHIGANI_AUDIT_SIGNING_SPIFFE_ID",
-        "spiffe://yashigani.internal/audit",
+        audit_signer_spiffe_id(),
     ).strip()
     if key_path_str:
         kp = Path(key_path_str)

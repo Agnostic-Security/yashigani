@@ -149,6 +149,11 @@ class EventType(str, Enum):
     WEBAUTHN_LOGIN_SUCCESS = "WEBAUTHN_LOGIN_SUCCESS"
     WEBAUTHN_LOGIN_FAILURE = "WEBAUTHN_LOGIN_FAILURE"
     WEBAUTHN_CREDENTIAL_REVOKED = "WEBAUTHN_CREDENTIAL_REVOKED"
+    # 3.1 — WebAuthn user-tier login events (dual-tier FIDO2)
+    WEBAUTHN_USER_LOGIN_SUCCESS = "WEBAUTHN_USER_LOGIN_SUCCESS"
+    WEBAUTHN_USER_LOGIN_FAILURE = "WEBAUTHN_USER_LOGIN_FAILURE"
+    WEBAUTHN_USER_CREDENTIAL_REGISTERED = "WEBAUTHN_USER_CREDENTIAL_REGISTERED"
+    WEBAUTHN_USER_CREDENTIAL_REVOKED = "WEBAUTHN_USER_CREDENTIAL_REVOKED"
     # v2.1 — SSO / OIDC
     SSO_LOGIN_SUCCESS = "SSO_LOGIN_SUCCESS"
     SSO_LOGIN_FAILURE = "SSO_LOGIN_FAILURE"
@@ -302,12 +307,57 @@ class EventType(str, Enum):
     # MCP data-plane events
     MCP_CALL = "MCP_CALL"
     MCP_TOOL_DESCRIPTION_FETCHED = "MCP_TOOL_DESCRIPTION_FETCHED"
+    # v2.26 / YSG-RISK-057 — semantic-intent sidecar escalation (content-filter
+    # v2 caught an encoded injection the v1 heuristic missed).
+    SEMANTIC_INTENT_ESCALATED = "SEMANTIC_INTENT_ESCALATED"
     # KMS secret distribution to a ring-fenced agent
     KMS_SECRET_DISTRIBUTED_TO_AGENT = "KMS_SECRET_DISTRIBUTED_TO_AGENT"
     # OPA decision on an MCP tool call (distinct from OPA_RESPONSE_CHECK_FAILED)
     OPA_DECISION_ON_MCP = "OPA_DECISION_ON_MCP"
     # Egress allowlist entry exercised (covert-channel audit — TM-URF-023 / G3)
     EGRESS_ALLOW_USED = "EGRESS_ALLOW_USED"
+    # 3.0 / YSG-RISK-060 — imported-MCP capability-envelope tool-surface pin.
+    # Benign sub-envelope refresh auto-allowed + byte-hash re-pinned (no operator).
+    MCP_ENVELOPE_BENIGN_UPDATE = "MCP_ENVELOPE_BENIGN_UPDATE"
+    # Capability-expanding OR sidecar-uncertain refresh blocked (latched until
+    # step-up re-approval).  The invocation gate also emits this on a stale /
+    # unpinned tool surface at call time.
+    MCP_ENVELOPE_BLOCKED = "MCP_ENVELOPE_BLOCKED"
+    # Shared privileged-mutation gate fired (envelope re-approval / #4 / #5).
+    PRIVILEGED_MUTATION = "PRIVILEGED_MUTATION"
+    # AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config changes.
+    # These are compliance/legal-relevant decision points: a sensitivity pattern
+    # controls what data the gateway flags and blocks.  Changes MUST be in the
+    # SHA-384 hash chain + signed checkpoint ledger so tampering is detectable.
+    # NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+    SENSITIVITY_PATTERN_CREATED = "SENSITIVITY_PATTERN_CREATED"
+    SENSITIVITY_PATTERN_DELETED = "SENSITIVITY_PATTERN_DELETED"
+    SENSITIVITY_PATTERN_AI_GENERATED = "SENSITIVITY_PATTERN_AI_GENERATED"
+    TAXONOMY_LEVEL_CHANGED = "TAXONOMY_LEVEL_CHANGED"
+    ADMIN_CLOUD_KEY_SET = "ADMIN_CLOUD_KEY_SET"
+    # FIND-3.1-INT-AGENT-AUDIT: agent upstream unreachable (502 / connection error).
+    # Emitted when the agent router's upstream HTTP call fails with a network error
+    # or connect-level exception.  Closes the OWASP A09 logging blind-spot on the
+    # agent proxy path.  The error_type field distinguishes connect vs. timeout vs.
+    # other transport failures.  Raw exception messages are never stored — only
+    # a truncated, sanitised error_type label.
+    # OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    AGENT_UPSTREAM_UNREACHABLE = "AGENT_UPSTREAM_UNREACHABLE"
+    # 3.0 — Admin-configurable browser Permissions-Policy (capability-policy feature).
+    # CAPABILITY_POLICY_CHANGED: emitted on every create/update/delete of a
+    # capability-policy setting (global / per-group / per-user).  Security-control
+    # changes MUST appear in the tamper-evident SHA-384 hash chain + signed Merkle
+    # checkpoint ledger.  scope identifies which tier changed ("global" / "group" /
+    # "user"); scope_id carries the group_id or email (empty for global).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    CAPABILITY_POLICY_CHANGED = "CAPABILITY_POLICY_CHANGED"
+    # 3.1 — Unified permission store (Phase 2 core model).
+    # PERMISSION_GRANT_CHANGED generalises CAPABILITY_POLICY_CHANGED to cover all
+    # resource_types (mcp_server, external_api, cloud_model, agent,
+    # browser_capability).  One event type covers any grant create/update/delete
+    # on any scope (org/group/user/agent).
+    # ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    PERMISSION_GRANT_CHANGED = "PERMISSION_GRANT_CHANGED"
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +854,80 @@ class RBACPolicyPushEvent(AuditEvent):
 
 
 # ---------------------------------------------------------------------------
+# Capability Policy events (3.0 — browser Permissions-Policy)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CapabilityPolicyChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a capability-policy setting.
+
+    Security invariants:
+    - The policy value IS recorded (it is a non-secret security configuration,
+      not a credential); this matches the RBAC config audit pattern.
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - scope: "org" | "group" | "user"
+    - scope_id: org_id (for org scope), group_id (for group scope), or email
+      (for user scope).
+    - change_type: "set" | "deleted"
+    - capabilities_changed: list of capability names that were affected.
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.CAPABILITY_POLICY_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    scope: str = ""         # "org" | "group" | "user"
+    scope_id: str = ""      # org_id, group_id, or email (depending on scope)
+    change_type: str = ""   # "set" | "deleted"
+    capabilities_changed: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Unified permission grant events (3.1 — Phase 2 core model)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PermissionGrantChangedEvent(AuditEvent):
+    """
+    Written on every create/update/delete of a permission grant in the unified
+    PermissionStore (Phase 2, yashigani.permissions).
+
+    Generalises CapabilityPolicyChangedEvent to cover all resource_types:
+        mcp_server, external_api, cloud_model, agent, browser_capability.
+
+    Security invariants:
+    - The grant value IS recorded (non-secret security configuration — matches
+      the RBAC config audit pattern).
+    - masking_applied=True suppresses the record in lower-assurance sinks.
+    - resource_type: one of the ResourceType enum values.
+    - resource_id:   server_id / api_id / model_name / agent_id / capability_name.
+    - scope:         "org" | "group" | "user" | "agent".
+    - scope_id:      org_id, group_id, identity_id (idnt_{12hex} — NOT email), or agent_id.
+    - change_type:   "set" | "deleted".
+
+    ASVS V4.1.3 / NIST AU-2 / SOC 2 CC6.1 / CMMC AU.L2-3.3.2.
+    """
+
+    event_type: str = EventType.PERMISSION_GRANT_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    resource_type: str = ""    # ResourceType value
+    resource_id: str = ""      # per-resource identifier
+    scope: str = ""            # "org" | "group" | "user" | "agent"
+    scope_id: str = ""         # org_id, group_id, identity_id (idnt_{12hex} — NOT email), or agent_id
+    change_type: str = ""      # "set" | "deleted"
+    # For boolean grants: {"allow": True/False, "opa_policy_ref": ...}
+    # For browser_capability: {"value": "off|self|allow_list", "allow_list": [...]}
+    grant_value: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Agent registry events
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1055,36 @@ class AgentResponseBlockedByOpaEvent(AuditEvent):
     deny_reason: str = ""                 # response_sensitivity_exceeds_caller_ceiling | pii_detected_in_response | missing_agent_identity | opa_unreachable
     request_id: str = ""
     pii_detected: bool = False
+
+
+@dataclass
+class AgentUpstreamUnreachableEvent(AuditEvent):
+    """
+    Emitted when the agent router fails to reach the upstream agent URL
+    (network error, connection refused, timeout, or similar transport failure).
+
+    FIND-3.1-INT-AGENT-AUDIT: closes the OWASP A09 logging blind-spot on the
+    agent proxy path — a 502 from an unreachable upstream was previously silent
+    in the audit chain.
+
+    Security invariants:
+    - Raw exception messages are NEVER stored — error_type is a sanitised label
+      (connect_error | timeout | unknown) derived from the exception class.
+    - target_upstream_url is NOT stored — it may contain internal network
+      addresses; only target_agent_id is recorded.
+    - masking_applied is always True.
+
+    OWASP A09:2021 / ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    """
+
+    event_type: str = EventType.AGENT_UPSTREAM_UNREACHABLE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    caller_agent_id: str = ""
+    target_agent_id: str = ""
+    remainder_path: str = ""
+    request_id: str = ""
+    error_type: str = ""     # connect_error | timeout | unknown
 
 
 # ---------------------------------------------------------------------------
@@ -1397,6 +1551,56 @@ class WebAuthnCredentialRevokedEvent(AuditEvent):
     account_tier: str = AccountTier.ADMIN
     masking_applied: bool = True
     admin_account: str = ""
+    credential_uuid: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 3.1 — WebAuthn user-tier login events (dual-tier FIDO2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WebAuthnUserLoginSuccessEvent(AuditEvent):
+    """Written on successful WebAuthn authentication ceremony (user hardware key login)."""
+
+    event_type: str = EventType.WEBAUTHN_USER_LOGIN_SUCCESS
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    user_account: str = ""
+    credential_uuid: str = ""
+
+
+@dataclass
+class WebAuthnUserLoginFailureEvent(AuditEvent):
+    """Written on failed WebAuthn assertion for a user-tier account."""
+
+    event_type: str = EventType.WEBAUTHN_USER_LOGIN_FAILURE
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    user_account: str = ""
+    failure_reason: str = ""
+
+
+@dataclass
+class WebAuthnUserCredentialRegisteredEvent(AuditEvent):
+    """Written when a user-tier account registers a new WebAuthn credential."""
+
+    event_type: str = EventType.WEBAUTHN_USER_CREDENTIAL_REGISTERED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    user_account: str = ""
+    credential_name: str = ""
+    outcome: str = "success"
+
+
+@dataclass
+class WebAuthnUserCredentialRevokedEvent(AuditEvent):
+    """Written when a user-tier account revokes a WebAuthn credential."""
+
+    event_type: str = EventType.WEBAUTHN_USER_CREDENTIAL_REVOKED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    user_account: str = ""
     credential_uuid: str = ""
 
 
@@ -2530,6 +2734,12 @@ class McpCallEvent(AuditEvent):
         args_redacted (a boolean flag) plus OPA decision.
       - identity_id is the resolved agent SPIFFE identity slug.
       - request_id correlates with GatewayRequestEvent.
+      - agent_id carries the CALLING agent's identity (McpCallContext.caller_agent_id).
+        Distinct from agent_name (the MCP server being called).  Maps to the
+        audit_events.agent_id DB column for forensic queries by caller.
+        FIND-A-AUD (3.1.2): previously NULL in the DB; now populated from
+        McpCallContext.caller_agent_id so the acting identity appears in the
+        tamper-evident audit chain.
 
     v2.25.0 / Lu-Gap-06 / W0a / P3 MCP broker.
     """
@@ -2546,6 +2756,15 @@ class McpCallEvent(AuditEvent):
     opa_decision: str = ""       # "allow" | "deny" | "redact"
     args_redacted: bool = False
     elapsed_ms: Optional[int] = None
+    # FIND-A-AUD: calling agent identity → audit_events.agent_id DB column.
+    # Populated from McpCallContext.caller_agent_id; None when caller is
+    # unauthenticated (unknown path).
+    agent_id: Optional[str] = None
+    # 3.1 UID unification: resolved identity_id (idnt_{12hex}) of the caller,
+    # keyed from the unified identity registry.  Populated from ctx.user_id
+    # which is the identity_id after mcp_router_runtime boundary resolution.
+    # Empty string when the caller has no resolved identity.
+    caller_identity_id: str = ""
 
 
 @dataclass
@@ -2571,6 +2790,166 @@ class McpToolDescriptionFetchedEvent(AuditEvent):
     filtered_count: int = 0      # number of descriptors modified by sanitiser
     rejected_count: int = 0      # number of descriptors rejected (over cap / pattern)
     fetch_type: str = ""         # "tools_list" | "prompts_list"
+
+
+@dataclass
+class SemanticIntentEscalatedEvent(AuditEvent):
+    """
+    Emitted when the semantic-intent sidecar (content-filter v2 / YSG-RISK-057)
+    ESCALATES a tool-description / prompt that the v1 surface-pattern heuristic
+    passed — i.e. the sidecar caught what the heuristic missed (an encoded /
+    obfuscated injection: base64/hex/url/rot13 in an MCP tool description).
+
+    Self-describing per the user-alert / OPA-decision contract (2026-06-06):
+    every enforcement action carries a stable ``rule_id`` (the "id"), a layman
+    ``user_message`` (education + deterrence), and an HTTP ``code``.  This lets
+    the unified ``yashigani_alert`` envelope surface a consistent explanation at
+    this enforcement point without a gateway lookup table.
+
+    Security invariants:
+      - The raw attacker content is NEVER stored.  ``flagged_segment`` is the
+        already-masked encoded token (pii.decode._mask_token: first4…last4 +
+        length), ``flagged_view`` is a codec name (raw|base64|hex|url|rot13|
+        suspicious_blob), and ``intent_score`` is the aggregate 0–1 score.
+      - masking_applied is always True.
+
+    v2.26.0 / YSG-RISK-057 / CWE-184 / content-filter v2.
+    """
+
+    event_type: str = EventType.SEMANTIC_INTENT_ESCALATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True  # immutable floor — always True
+    tenant_id: str = ""
+    server_id: str = ""
+    # What was being filtered when the sidecar escalated.
+    fetch_type: str = ""          # "tools_list" | "prompts_get"
+    item_name: str = ""           # tool_name or prompt_name (NOT the content)
+    # Sidecar verdict detail — all audit-safe / masked.
+    flagged_view: str = ""        # decoded view that drove the verdict (codec name)
+    flagged_segment: str = ""     # MASKED encoded token (first4…last4 + length)
+    intent_score: float = 0.0     # aggregate injection-intent score (0.0–1.0)
+    # Self-describing contract (id + layman message + code).
+    rule_id: str = "yashigani.inspection.semantic-intent"
+    user_message: str = (
+        "This tool description contained a hidden, encoded instruction that "
+        "tries to manipulate the AI. It was blocked before reaching the agent."
+    )
+    code: int = 403
+
+
+@dataclass
+class McpEnvelopeBenignUpdateEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool-surface refresh is
+    triaged BENIGN (structurally within the approved capability envelope AND
+    the escalate-only sidecar found no injection intent) and auto-allowed.
+
+    The envelope's typed dimensions are UNCHANGED; only the byte-surface-hash
+    change-detector is re-pinned (Iris §2.2).  No operator involvement.
+
+    Self-describing per the user-alert / OPA-decision contract: rule_id +
+    layman user_message + code.  The raw surface text is NEVER stored.
+
+    Security invariants:
+      - The decision was made by the deterministic STRUCTURAL diff (authority),
+        not the LLM (Laura must-have #2).
+      - provenance_id binds the envelope to the P8 transport identity.
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BENIGN_UPDATE
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""              # H(server_id ‖ pin-material)
+    envelope_version: int = 0            # the unchanged active envelope version
+    new_surface_hash: str = ""           # the re-pinned byte-hash (audit-safe)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool was updated. The change did not add any new "
+        "capability, so it was accepted automatically and recorded for audit."
+    )
+    code: int = 200
+
+
+@dataclass
+class McpEnvelopeBlockedEvent(AuditEvent):
+    """
+    3.0 / YSG-RISK-060 — emitted when an imported-MCP tool surface is BLOCKED:
+      - a refresh that EXPANDS capability vs the approved envelope (block +
+        step-up re-approve), OR
+      - a refresh the escalate-only sidecar flagged / fail-closed (UNCERTAIN),
+        OR
+      - the invocation hard gate in broker.enforce() denying a call whose tool
+        surface is unpinned / blocked / stale (the load-bearing security
+        boundary — Laura R3-3).
+
+    The block LATCHES on the provenance until a step-up re-approval; a surface
+    reversion does NOT auto-clear it (Laura §3 bypass B / Δ1).
+
+    Self-describing contract.  The raw surface text is NEVER stored — only the
+    expansion dimension labels + masked detail.
+
+    Security invariants:
+      - The block decision was structural (authority) or fail-closed; the LLM
+        can never DOWNGRADE this to an allow (Laura must-have #2).
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""
+    # "refresh_expanding" | "refresh_uncertain" | "invocation_unpinned" |
+    # "invocation_stale" | "invocation_blocked"
+    block_reason: str = ""
+    # Sorted list of expansion dimension labels (NOT the raw text), e.g.
+    # ["effect_class", "arg_shape", "tool_set"].
+    expansion_dimensions: list = field(default_factory=list)
+    finding_count: int = 0
+    tool_name: str = ""                  # the tool at invocation time (if any)
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "An imported tool tried to expand what it can do beyond what was "
+        "approved, so it was blocked. An operator must review and re-approve "
+        "the change before this tool can be used again."
+    )
+    code: int = 403
+
+
+@dataclass
+class PrivilegedMutationEvent(AuditEvent):
+    """
+    Shared privileged-mutation audit shape (Iris §5.2 / Laura R3-9).
+
+    Emitted by ``auth.stepup.assert_privileged_mutation`` after BOTH the
+    operator-RBAC and fresh-step-up gates pass, for EVERY privileged-mutation
+    surface across tensions #3 (MCP envelope re-approval), #4, and #5.  One
+    uniform tamper-evident shape so all privileged actions are auditable
+    consistently (rides YSG-RISK-059 immutability).
+
+    Security invariants:
+      - Emitted only AFTER fresh TOTP + operator RBAC are proven.
+      - ``before``/``after`` carry state snapshots (e.g. the envelope
+        field-level diff) — callers must pass audit-safe (non-secret) values.
+    """
+
+    event_type: str = EventType.PRIVILEGED_MUTATION
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""                     # e.g. "mcp.envelope.reapprove"
+    principal: str = ""                  # operator identity (sub / account_id)
+    target: str = ""                     # object mutated (e.g. provenance_id)
+    justification: str = ""              # operator free-text (recorded, untrusted)
+    before: Optional[dict] = None
+    after: Optional[dict] = None
+    rule_id: str = "yashigani.auth.privileged-mutation"
+    user_message: str = (
+        "A privileged operator action was performed after fresh identity "
+        "re-verification and recorded for audit."
+    )
+    code: int = 200
 
 
 @dataclass
@@ -2641,6 +3020,13 @@ class OpaDecisionOnMcpEvent(AuditEvent):
     identity_chain: list = field(default_factory=list)
     chain_depth: int = 0         # JWT identity chain depth (multi-hop) — kept for backward compat
     elapsed_ms: Optional[int] = None
+    # FIND-A-AUD: calling agent identity → audit_events.agent_id DB column.
+    # Mirrors McpCallEvent.agent_id.  Populated from McpCallContext.caller_agent_id.
+    # None when caller is unauthenticated.
+    agent_id: Optional[str] = None
+    # 3.1 UID unification: resolved identity_id (idnt_{12hex}) of the caller.
+    # Mirrors McpCallEvent.caller_identity_id.
+    caller_identity_id: str = ""
 
 
 @dataclass
@@ -2674,3 +3060,119 @@ class EgressAllowUsedEvent(AuditEvent):
     path_truncated: str = ""     # request path, max 128 chars, query stripped
     upstream_status: Optional[int] = None
     elapsed_ms: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config audit events.
+#
+# Sensitivity patterns control what data the gateway flags and blocks.
+# Changes are compliance/legal-relevant and MUST be in the tamper-evident
+# hash chain (SHA-384 prev_hash links + daily ECDSA-signed Merkle-root
+# checkpoint).  An admin or an injected AI-generated pattern installed
+# without an audit record is not acceptable.
+#
+# Security invariants (all four classes):
+#   - The raw regex pattern is never stored in full in the audit record;
+#     only its SHA-256 is stored (pattern_hash) alongside its length and
+#     description.  This prevents the audit log from becoming a secondary
+#     source of potentially malicious patterns.
+#   - masking_applied is always True (admin email is a PII field).
+#   - admin_account = session.account_id from the StepUpAdminSession.
+#
+# NIST AU-2 / AU-12 / SOC 2 CC7.1 / CMMC AU.L2-3.3.2.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SensitivityPatternCreatedEvent(AuditEvent):
+    """Emitted when an admin creates a new sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (create requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_CREATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # auto-assigned numeric id
+    classification: str = ""      # numeric level "1"–"5"
+    pattern_type: str = ""        # regex | keyword | classifier | fasttext | ollama
+    pattern_hash: str = ""        # SHA-256 of raw pattern (pattern itself not stored)
+    description: str = ""         # user-supplied description (max 256 chars)
+    step_up_verified: bool = True  # always True — create requires step-up
+
+
+@dataclass
+class SensitivityPatternDeletedEvent(AuditEvent):
+    """Emitted when an admin deletes a sensitivity / DLP pattern.
+
+    Security invariant: the raw regex is hashed (SHA-256) — never stored raw.
+    step_up_verified is always True (delete requires StepUpAdminSession).
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_DELETED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    pattern_id: str = ""          # the deleted pattern's id
+    step_up_verified: bool = True  # always True — delete requires step-up
+
+
+@dataclass
+class SensitivityPatternAIGeneratedEvent(AuditEvent):
+    """Emitted when the AI generate-pattern endpoint is called.
+
+    Note: this records the GENERATION call (the draft produced by the LLM).
+    The admin still reviews and must call POST /patterns to actually create it
+    (which emits SensitivityPatternCreatedEvent).  Both records together provide
+    a complete chain: generated-by-AI → reviewed-by-admin → created.
+
+    Security invariant: raw AI-generated regex is hashed (SHA-256), not stored.
+    """
+
+    event_type: str = EventType.SENSITIVITY_PATTERN_AI_GENERATED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    description_length: int = 0   # length of user description (not the text itself)
+    model: str = ""               # Ollama model that generated the pattern
+    generated_regex_hash: str = ""  # SHA-256 of generated regex (raw not stored)
+    suggested_level: int = 0      # AI-suggested sensitivity level 1–5
+    parse_ok: bool = False        # True if the LLM response parsed cleanly
+
+
+@dataclass
+class TaxonomyLevelChangedEvent(AuditEvent):
+    """Emitted when an admin upserts or deletes a taxonomy level.
+
+    The taxonomy defines human-readable labels for sensitivity levels 1–5.
+    Changes affect how the UI and reports describe classifications.
+    step_up_verified is always True (write taxonomy ops require StepUpAdminSession).
+    """
+
+    event_type: str = EventType.TAXONOMY_LEVEL_CHANGED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    level: int = 0                 # taxonomy level number (1–10)
+    change_type: str = ""          # "upsert" | "delete"
+    label: str = ""                # new label (empty on delete)
+    colour_class: str = ""         # new colour_class (empty on delete)
+    step_up_verified: bool = True  # always True — write ops require step-up
+
+
+@dataclass
+class AdminCloudKeySetEvent(AuditEvent):
+    """Emitted when an admin stores or updates a cloud provider API key via KMS.
+
+    Key VALUE is never logged. Only the provider name and KMS key name are
+    recorded. Step-up TOTP is required to reach the endpoint (ASVS V6.8.4).
+    """
+
+    event_type: str = EventType.ADMIN_CLOUD_KEY_SET
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    provider: str = ""     # e.g. "openai" | "anthropic"
+    kms_key: str = ""      # KMS key name (e.g. "openai_api_key") — never the value

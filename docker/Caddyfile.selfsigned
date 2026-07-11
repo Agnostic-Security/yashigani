@@ -207,6 +207,8 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     # - X-Content-Type-Options: nosniff (prevents MIME sniffing)
     # - X-Frame-Options: DENY (prevents clickjacking)
     # - COOP: Cross-Origin-Opener-Policy: same-origin
+    # - COEP: Cross-Origin-Embedder-Policy: require-corp
+    # - CORP: Cross-Origin-Resource-Policy: same-origin (ZAP 90004; single-origin app; pairs with COEP require-corp)
     # - Referrer-Policy: no-referrer
     # Fallback: if a browser lacks these features, Yashigani's
     # server-side controls (OPA, session validation, CSRF via SameSite)
@@ -218,7 +220,12 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
         # CSP is set per-path below (strict everywhere except the Wazuh SIEM
         # subpath, whose OSD bundles need unsafe-eval). Not set here to avoid the
         # global SET shadowing the per-path override.
-        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Opener-Policy  "same-origin"
+        # Single-origin deployment (no cross-origin subresources, no iframes,
+        # no external CDN/fonts) → require-corp is safe. Closes ZAP 90004.
+        Cross-Origin-Embedder-Policy "require-corp"
+        # CORP: single-origin app; ZAP 90004; pairs with COEP require-corp.
+        Cross-Origin-Resource-Policy "same-origin"
         # Product / fingerprint hygiene (QA Wave 2 observations 5 + 6).
         -Server
         -Via
@@ -248,6 +255,11 @@ https://{$YASHIGANI_TLS_DOMAIN}:443 {
     @strict_ui {
         path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
+        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
+        # sole CSP source for those two routes. Without this, both @strict_ui and
+        # @redoc_ui set a CSP header, producing two headers on every /admin/api-redoc
+        # and /redoc response. Browsers intersect; not exploitable but a config defect.
+        not path /admin/api-redoc /redoc
     }
     @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
     @lenient_subapp path /admin/grafana/* /admin/wazuh/* /admin/prometheus/*
@@ -348,6 +360,16 @@ Hiring: https://agnosticsec.com/careers
 
     # ── MCP proxy — /mcp/* ─────────────────────────────────────────────
     handle /mcp/* {
+        # FIND-3.1-003 (LOW, defense-in-depth): strip inbound identity headers to
+        # close the X-Forwarded-User spoof vector at the edge. Mirrors /v1/* treatment.
+        # OPA blocks /mcp/* before these headers are consulted, but stripping here
+        # removes the spoof surface entirely rather than relying solely on the
+        # application-layer gate.
+        request_header -X-OpenWebUI-User-Email
+        request_header -X-OpenWebUI-User-Id
+        request_header -X-OpenWebUI-User-Name
+        request_header -X-OpenWebUI-User-Role
+        request_header -X-Forwarded-User
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
         import internal-mtls
@@ -404,9 +426,9 @@ Hiring: https://agnosticsec.com/careers
     # service_identities.yaml endpoint_acls["/admin/agents"].
     handle /admin/* {
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -416,7 +438,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /auth/* {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -426,7 +448,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /me/* {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -436,7 +458,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /dashboard/* {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -446,7 +468,7 @@ Hiring: https://agnosticsec.com/careers
 
     handle /scim/* {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -467,9 +489,9 @@ Hiring: https://agnosticsec.com/careers
         # compose was missing SIDE-001 on this block (added v2.23.3, predates
         # SIDE-001 hardening).
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "{$YASHIGANI_CADDY_SPIFFE_ID}"
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -548,7 +570,7 @@ Hiring: https://agnosticsec.com/careers
     # ── Static assets — public, no auth required (CSS/JS for admin UI) ────
     handle /static/* {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -559,7 +581,7 @@ Hiring: https://agnosticsec.com/careers
     # ── User login page — /login (before catch-all) ────────────────────────
     handle /login {
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
@@ -586,7 +608,7 @@ Hiring: https://agnosticsec.com/careers
     # here.  inject-caddy-verified is applied for header uniformity but OWUI
     # does not validate it.
     handle /app/webui* {
-        # OWUI is served at ROOT (see root catch-all). Back-compat redirect.
+        # OWUI served at ROOT (root catch-all). Back-compat redirect.
         redir * / 302
     }
 
@@ -797,7 +819,7 @@ http://{$YASHIGANI_TLS_DOMAIN}:80 {
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
 
         reverse_proxy https://backoffice:8443 {
-            header_down -Content-Security-Policy  # YSG-RISK-080: Caddy is sole CSP source
+            header_down -Content-Security-Policy  # single CSP at edge
             import internal-mtls
             import inject-caddy-verified
             header_up X-Forwarded-Proto https

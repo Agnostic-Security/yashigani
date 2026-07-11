@@ -76,26 +76,39 @@ from cryptography.hazmat.primitives import serialization
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _noop_client_enforce(monkeypatch):
-    """No-op the #16 client-policy enforce gate (Step 2d of broker.enforce).
+async def _allow_client_policies(*_args, **_kwargs):
+    """No-op client-policy result (allow) — these broker tests bind no client
+    policies, so prod semantics are pass-through (deny-only / additive)."""
+    return {"allow": True, "deny": [], "obligations": []}
 
-    The broker config used by these tests carries a non-empty opa_url
-    (http://localhost:8181) so the global mcp_decision gate can be MOCKED.  The
-    deny-only client-policy gate added in 59c8004 runs AFTER that mock and takes
-    the real-OPA branch of evaluate_client_policies, which constructs an mTLS
-    internal_httpx_client that fail-closes ('YASHIGANI_SERVICE_NAME is not set')
-    in the unit environment.  These are broker-LOGIC tests; the client-policy
-    aggregator is exercised by its own (rego/integration) coverage.  Patch the
-    gate to its no-op allow shape so the broker's allow-path logic is what is
-    under test.  Deny-path tests mock upstream gates and return before Step 2d,
-    so this fixture does not affect them.
+
+@pytest.fixture(autouse=True)
+def _service_identity_env(monkeypatch):
+    """Close the client-enforce fixture gap (Su ``ccae785``, #16).
+
+    The broker's INGRESS client-policy gate (broker.py step 2d) calls
+    ``evaluate_client_policies`` which opens an mTLS OPA round-trip via
+    ``pki.client.internal_httpx_client`` → ``pki.identity.current_service()``.
+    That requires the container's own identity (``YASHIGANI_SERVICE_NAME``) AND a
+    service manifest + bootstrap-token + cert tree — production compose/helm
+    provision all of these per service, but these in-process unit fixtures cannot,
+    so the gate fails CLOSED (``client_enforce_unavailable``) on the allow-path
+    tests.  This is an ENV/INFRA fixture gap, NOT a regression: the fail-closed
+    behaviour on genuinely-missing identity is correct (covered by pki/identity
+    tests), and these broker tests bind no client policies (prod = pass-through).
+
+    We set ``YASHIGANI_SERVICE_NAME`` for completeness and patch
+    ``evaluate_client_policies`` to the benign allow result — mirroring the
+    established pattern in test_g_new_5_agent_principal_signing.py (which patches
+    the same symbol).  The broker imports it function-locally, so we patch at the
+    source module (``yashigani.gateway._client_enforce``).
     """
-    async def _allow(*_a, **_kw):
-        return {"allow": True, "deny": [], "obligations": []}
+    monkeypatch.setenv("YASHIGANI_SERVICE_NAME", "gateway")
     monkeypatch.setattr(
-        "yashigani.gateway._client_enforce.evaluate_client_policies", _allow,
-        raising=True)
+        "yashigani.gateway._client_enforce.evaluate_client_policies",
+        _allow_client_policies,
+        raising=False,
+    )
 
 
 def _make_p384_key_pem_b64() -> str:

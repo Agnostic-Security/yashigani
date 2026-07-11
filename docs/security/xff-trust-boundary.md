@@ -1,7 +1,7 @@
 # X-Forwarded-For Trust Boundary
 
 **Control:** CWE-345 (Insufficient Verification of Data Authenticity)
-**Finding:** V232-NEG03
+**Finding:** V232-NEG03 / LAURA-2026-04-29-006
 **Code path:** `src/yashigani/gateway/proxy.py:987–1080` (`_parse_trusted_proxy_cidrs`, `_get_client_ip`)
 
 ---

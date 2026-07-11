@@ -30,12 +30,27 @@ export PATH
 # without this definition, set -euo pipefail aborts before any cleanup runs.
 # (UNINSTALL-LOG_INFO-BUG — Ava phase2-verdict.md:69, v2.23.4)
 log_info() { printf "    --> %s\n" "$1"; }
+log_warn() { printf "    !!  %s\n" "$1" >&2; }
+log_error() { printf "    XX  %s\n" "$1" >&2; }
+log_success() { printf "    ok  %s\n" "$1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
 REMOVE_VOLUMES="false"
 RUNTIME="${RUNTIME:-}"
 YES="false"
+# Multi-instance (3.0 — scoping-draft §4a): explicit --project=<name> override to
+# target a specific named instance. When empty, the project is read from the install
+# state file's PROJECT field (which falls back to "docker" for legacy installs).
+PROJECT_FLAG="${PROJECT_FLAG:-}"
+
+# MI-4 (step-up on destructive lifecycle ops / YSG-RISK-061): proof that a fresh
+# step-up TOTP verification was performed before this privileged mutation. May be
+# supplied via --stepup-token=<value> or the YASHIGANI_STEPUP_TOKEN env var; the
+# explicit --i-have-stepped-up acknowledgement is an interactive-operator escape
+# for the host-shell path where no token is minted. See _require_stepup_mi4.
+STEPUP_TOKEN="${STEPUP_TOKEN:-${YASHIGANI_STEPUP_TOKEN:-}}"
+STEPUP_ACK="${STEPUP_ACK:-false}"
 
 # ---------------------------------------------------------------------------
 # Canonical named volumes declared in docker/docker-compose.yml top-level
@@ -610,7 +625,15 @@ for arg in "$@"; do
     case "$arg" in
         --remove-volumes) REMOVE_VOLUMES="true" ;;
         --runtime=*)      RUNTIME="${arg#*=}" ;;
+        --project=*)      PROJECT_FLAG="${arg#*=}" ;;
         --yes|-y)         YES="true" ;;
+        # MI-4 (step-up on destructive lifecycle ops): operator proof that a fresh
+        # step-up TOTP verification was performed for this privileged mutation. The
+        # API/WebUI path enforces step-up via auth/stepup.py (Tom's shared gate) and
+        # passes the resulting token here; on the host-shell path the operator sets
+        # --stepup-token=<value> or YASHIGANI_STEPUP_TOKEN. See _require_stepup_mi4.
+        --stepup-token=*) STEPUP_TOKEN="${arg#*=}" ;;
+        --i-have-stepped-up) STEPUP_ACK="true" ;;
         --help|-h)
             cat <<'EOF'
 Usage: ./uninstall.sh [OPTIONS]
@@ -622,10 +645,20 @@ Options:
                       (Redis, audit logs, Ollama models, metrics history)
   --runtime=RUNTIME   Force a specific container runtime
                       (docker|podman|k8s — normally auto-detected)
+  --project=NAME      Target a specific named instance (multi-instance hosts).
+                      Normally read from the install state file's PROJECT field;
+                      use this to uninstall one of several side-by-side instances.
   --yes, -y           Skip confirmation prompts (for unattended/CI use).
                       Safety note: when combined with --remove-volumes this
                       will DELETE ALL DATA without prompting. Pass both flags
                       only when you are certain data loss is acceptable.
+  --stepup-token=TOK  MI-4 step-up proof for this destructive mutation. The
+                      admin API/WebUI mints this after a fresh TOTP step-up
+                      (auth/stepup.py) and passes it through. Also read from the
+                      YASHIGANI_STEPUP_TOKEN environment variable.
+  --i-have-stepped-up Interactive-operator acknowledgement that a step-up was
+                      performed out-of-band (host-shell path with no token). Only
+                      honoured on an interactive TTY; never in unattended --yes runs.
   --help, -h          Print this message and exit
 EOF
             exit 0
@@ -660,11 +693,27 @@ done
 _STATE_FILE="${SCRIPT_DIR}/docker/.yashigani-install-state"
 _INSTALL_UID=""
 _INSTALL_USER=""
+# Multi-instance (3.0): the compose project read from the state file. Empty until
+# the state file is parsed; feeds _PROJECT_PREFIX below. `|| true` guards the
+# no-match case (legacy state files have no PROJECT= line) under set -euo pipefail.
+_state_project=""
+# MI-2: per-instance identity token from this tree's state file (empty for legacy).
+_state_instance_id=""
 
 if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
     _state_runtime="$(grep -E '^RUNTIME=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_UID="$(grep -E '^INSTALL_UID=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
     _INSTALL_USER="$(grep -E '^INSTALL_USER=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]')"
+    # Multi-instance (3.0): the project name to tear down. cut -d= -f2- preserves
+    # any '=' (project names never contain it, but be defensive). || true: legacy
+    # state files predate this field — absent line leaves _state_project empty.
+    _state_project="$(grep -E '^PROJECT=' "$_STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
+    # MI-2 (authenticated lifecycle target): the per-instance identity token this
+    # tree was installed with. Used to PROVE that a teardown targets the instance
+    # this tree owns, rather than a sibling instance named via a free-form
+    # --project string. Legacy state files have none → empty → backward-compat
+    # single-instance behaviour (no binding to enforce). `|| true` for set -e.
+    _state_instance_id="$(grep -E '^INSTANCE_ID=' "$_STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
     # #21 FIX: grep exits 1 when the pattern is absent (compose state files have
     # no NAMESPACE= or HELM_RELEASE= lines).  Under `set -euo pipefail` the
     # command substitution propagates the non-zero exit and the script aborts
@@ -826,6 +875,71 @@ echo "Caller UID:  ${_CALLER_UID} ($(id -un))"
 [ -n "$_INSTALL_USER" ] && echo "Install user: ${_INSTALL_USER} (UID: ${_INSTALL_UID:-unknown})"
 echo ""
 
+# ===========================================================================
+# MI-4 (step-up on destructive lifecycle ops / YSG-RISK-061)
+# ---------------------------------------------------------------------------
+# Uninstall is a privileged mutation. The shared step-up gate lives in
+# src/yashigani/auth/stepup.py (Tom's surface) and is enforced on the API/WebUI
+# path that triggers a lifecycle op: that path performs a fresh TOTP step-up and
+# passes the resulting token here via --stepup-token / YASHIGANI_STEPUP_TOKEN.
+#
+# Host-shell path (operator runs uninstall.sh directly): no FastAPI session
+# exists, so we cannot call the Python gate. We require an explicit step-up proof
+# nonetheless so an unattended/automated destructive run cannot silently skip the
+# step-up that the product mandates for this action:
+#   * --stepup-token / YASHIGANI_STEPUP_TOKEN present  → accepted (API-minted proof),
+#   * interactive TTY + --i-have-stepped-up            → accepted (operator ack),
+#   * interactive TTY without --yes                    → prompt for the ack inline,
+#   * unattended (--yes) with neither token nor ack    → REFUSE (fail-closed).
+#
+# DEPENDENCY FLAG: Tom's shared gate is to expose a named `privileged_mutation`
+# entry point + a token-mint/verify contract. Until that lands, this validates
+# *presence* of a step-up proof (not its cryptographic freshness). When the gate
+# lands, wire token verification here (verify the token against the running
+# instance's step-up secret) — do NOT duplicate the gate logic.
+# ===========================================================================
+_require_stepup_mi4() {
+    # Token supplied (API-minted or operator-provided) → accept. Cryptographic
+    # verification is deferred to Tom's gate (flagged above); presence is enforced.
+    if [ -n "${STEPUP_TOKEN:-}" ]; then
+        log_info "MI-4: step-up token supplied — privileged mutation authorised."
+        return 0
+    fi
+    # Interactive operator acknowledgement (only on a real TTY — never honoured in
+    # an unattended pipeline where stdin is not a terminal).
+    if [ "${STEPUP_ACK:-false}" = "true" ] && [ -t 0 ]; then
+        log_info "MI-4: interactive operator step-up acknowledgement accepted."
+        return 0
+    fi
+    # Interactive TTY, no --yes: prompt for the acknowledgement inline.
+    if [ -t 0 ] && [ "$YES" != "true" ]; then
+        printf 'MI-4 step-up: confirm you have completed a fresh TOTP step-up for this destructive action.\n'
+        printf 'Type STEPPED-UP to proceed: '
+        read -r _su_ack || _su_ack=""
+        if [ "$_su_ack" = "STEPPED-UP" ]; then
+            log_info "MI-4: interactive step-up confirmation accepted."
+            return 0
+        fi
+        log_error "MI-4: step-up not confirmed — aborting destructive lifecycle op."
+        exit 1
+    fi
+    # Unattended (no TTY or --yes) with no token and no ack → fail closed.
+    log_error "MI-4 safety stop: destructive lifecycle op requires step-up proof."
+    log_error "  Supply --stepup-token=<value> (or YASHIGANI_STEPUP_TOKEN) minted by"
+    log_error "  the admin API after a fresh TOTP step-up, or run interactively with"
+    log_error "  --i-have-stepped-up. Refusing to proceed unattended without step-up."
+    exit 1
+}
+# Only gate genuinely destructive runs: a volume-removing teardown, or any teardown
+# of a non-legacy named instance (multi-instance hosts — tearing down the wrong one
+# is the high-impact mistake). A plain stop of the single legacy instance keeps the
+# existing UX. k8s teardown is also destructive — gate it the same way.
+if [ "$REMOVE_VOLUMES" = "true" ] \
+   || { [ -n "${_PROJECT_PREFIX:-}" ] && [ "${_PROJECT_PREFIX}" != "docker" ]; } \
+   || [ "$RUNTIME" = "k8s" ]; then
+    _require_stepup_mi4
+fi
+
 if [ "$REMOVE_VOLUMES" = "true" ]; then
     echo "WARNING: --remove-volumes will PERMANENTLY DELETE all data:"
     echo "  - Redis data (sessions, RBAC, rate-limit state)"
@@ -935,8 +1049,86 @@ fi
 
 # ===========================================================================
 # Project prefix for container/volume enumeration
+# ---------------------------------------------------------------------------
+# Multi-instance (3.0 — scoping-draft §4a): the compose project that scopes the
+# container/volume/network names to tear down. Precedence:
+#   1. --project=<name> flag (operator explicitly targets one instance)
+#   2. PROJECT from the install state file (the install recorded its own name)
+#   3. "docker" (legacy single-instance default — pre-3.0 installs had no PROJECT)
+# This makes `uninstall.sh --project apac` tear down exactly that named instance
+# while leaving every other instance on a shared host untouched.
 # ===========================================================================
-_PROJECT_PREFIX="docker"
+if [ -n "${PROJECT_FLAG:-}" ]; then
+    _PROJECT_PREFIX="$PROJECT_FLAG"
+    log_info "Targeting instance project: ${_PROJECT_PREFIX} (from --project flag)"
+elif [ -n "${_state_project:-}" ]; then
+    _PROJECT_PREFIX="$_state_project"
+    log_info "Targeting instance project: ${_PROJECT_PREFIX} (from install state file)"
+else
+    _PROJECT_PREFIX="docker"
+fi
+# ===========================================================================
+# MI-2 (authenticated lifecycle target / YSG-RISK-061)
+# ---------------------------------------------------------------------------
+# A bare --project string must NOT let an operator tear down a SIBLING instance
+# from the wrong install tree. Bind the teardown target to this tree's recorded
+# identity: if the running gateway container for the resolved project carries a
+# com.yashigani.instance-id label that DIFFERS from the INSTANCE_ID in THIS tree's
+# state file, refuse — this tree is not authoritative for that instance.
+#
+# Enforced ONLY when BOTH tokens are present:
+#   * this tree's state file has INSTANCE_ID  (3.0+ install), AND
+#   * the running container exposes a non-empty instance-id label.
+# Legacy installs (no token either side) fall through unchanged (single-instance
+# backward-compat). A missing/stopped container (no label to read) is NOT a
+# mismatch — teardown of an already-stopped instance from its own tree is allowed.
+# ===========================================================================
+_mi2_validate_target() {
+  # Only meaningful for compose runtimes (k8s isolates by namespace/release).
+  case "$RUNTIME" in docker|podman) : ;; *) return 0 ;; esac
+  # Nothing to bind to if this tree predates MI-2.
+  [ -n "${_state_instance_id:-}" ] || return 0
+  local _rt
+  _rt="$(command -v "$RUNTIME" 2>/dev/null || true)"
+  [ -n "$_rt" ] || return 0
+
+  # Read the instance-id label off the running gateway container for the target
+  # project. Try both compose-project label keys (docker/podman). Read-only.
+  local _running_id="" _lk _cid
+  for _lk in "com.docker.compose.project" "io.podman.compose.project"; do
+    _cid="$("$_rt" ps -q \
+        --filter "label=${_lk}=${_PROJECT_PREFIX}" \
+        --filter "name=gateway" 2>/dev/null | head -n1 || true)"
+    if [ -n "$_cid" ]; then
+      _running_id="$("$_rt" inspect --format '{{ index .Config.Labels "com.yashigani.instance-id" }}' "$_cid" 2>/dev/null | tr -d '\r\n[:space:]' || true)"
+      break
+    fi
+  done
+
+  # No running container / no label → not a mismatch (allow self-teardown of a
+  # stopped instance from its own tree; the project-prefix scoping still applies).
+  [ -n "$_running_id" ] || return 0
+
+  if [ "$_running_id" != "$_state_instance_id" ]; then
+    log_error "MI-2 safety stop: refusing to tear down project '${_PROJECT_PREFIX}'."
+    log_error "  The running instance's identity token does not match this install tree's."
+    log_error "  running com.yashigani.instance-id=${_running_id}"
+    log_error "  this tree INSTANCE_ID=${_state_instance_id}"
+    log_error "  You are operating from the wrong instance's directory. Run uninstall.sh"
+    log_error "  from the install tree that owns project '${_PROJECT_PREFIX}'."
+    exit 1
+  fi
+  log_info "MI-2: lifecycle target authenticated (instance-id matches install tree)."
+}
+_mi2_validate_target
+
+# Export COMPOSE_PROJECT_NAME so the graceful `compose down` in the teardown
+# functions targets THIS project (compose otherwise derives the project from the
+# compose-file directory name, "docker", and would skip a renamed instance —
+# the label-based belt-and-braces passes would then do all the work). Both Docker
+# and Podman compose honour COMPOSE_PROJECT_NAME. Only meaningful for compose
+# runtimes; harmless on k8s (helm/kubectl ignore it).
+export COMPOSE_PROJECT_NAME="$_PROJECT_PREFIX"
 
 # ===========================================================================
 # Step 3: Runtime-specific teardown
@@ -1043,7 +1235,7 @@ fi
 # Final assertion exits 1 if any survive.
 # ---------------------------------------------------------------------------
 _PROJECT_PREFIX="${_PROJECT_PREFIX:-docker}"
-_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated"
+_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated demo_mcp_isolated extractor_svc"
 
 echo "=== Canonical network cleanup ==="
 _net_removed=0
@@ -1087,6 +1279,33 @@ if [ -n "$_residual_networks" ]; then
     exit 1
 fi
 echo "=== Network assertion passed — all canonical networks removed. ==="
+
+# ---------------------------------------------------------------------------
+# ROOTLESS-CDI-002 (2026-06-27): sweep stale CNI config FILES.
+# On the CNI backend, rootless podman reads ~/.config/cni/net.d/*.conflist.
+# `network rm` usually deletes the matching .conflist, but orphaned project
+# configs accumulate across install/teardown cycles and POISON the next install:
+# a leftover *.conflist referencing a missing plugin (e.g. 'dnsname') wedges
+# every container at create-time, so the stack hangs half-up. Removing networks
+# alone is NOT enough — the config files must go too. Remove OUR project's
+# leftover .conflist here; list foreign ones as WARN (never auto-remove).
+# ---------------------------------------------------------------------------
+_cni_dir="${HOME}/.config/cni/net.d"
+if [ -d "$_cni_dir" ] && [ -n "${_PROJECT_PREFIX:-}" ]; then
+    echo "=== CNI config-file cleanup (${_cni_dir}) ==="
+    _cni_removed=0
+    for _cf in "${_cni_dir}/${_PROJECT_PREFIX}_"*.conflist "${_cni_dir}/ringfence_"*.conflist; do
+        [ -e "$_cf" ] || continue
+        rm -f "$_cf" && { echo "  [removed] $(basename "$_cf")"; _cni_removed=$(( _cni_removed + 1 )); }
+    done
+    echo "  CNI config files removed: ${_cni_removed}"
+    _cni_foreign="$(ls "${_cni_dir}"/*.conflist 2>/dev/null | grep -vE "/(87-podman|${_PROJECT_PREFIX}_|ringfence_)" || true)"
+    if [ -n "$_cni_foreign" ]; then
+        echo "  [WARN] foreign CNI configs remain (not this project — review/remove if unused):" >&2
+        echo "$_cni_foreign" | sed 's/^/    /' >&2
+        echo "    On the CNI backend a stale config (missing plugin) can wedge installs." >&2
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
@@ -1283,7 +1502,8 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     for _bm_dir in \
             "${SCRIPT_DIR}/docker/data" \
             "${SCRIPT_DIR}/docker/certs" \
-            "${SCRIPT_DIR}/docker/logs"; do
+            "${SCRIPT_DIR}/docker/logs" \
+            "${SCRIPT_DIR}/docker/wazuh-mtls"; do
         [ -d "$_bm_dir" ] || { echo "  [skip] $_bm_dir (absent)"; continue; }
         if rm -rf "$_bm_dir" 2>/dev/null; then
             echo "  [removed] $_bm_dir"
@@ -1390,6 +1610,28 @@ echo ""
 # Wipe both files always (not gated on --remove-volumes). They are install-
 # time artefacts; uninstall = inverse of install.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Podman GPU CDI spec cleanup — task #40 / ROOTLESS-CDI-001
+#
+# install.sh generates CDI spec files at docker/cdi/ (nvidia-raw.yaml from
+# nvidia-ctk, nvidia.yaml as the 0.6.0-transformed version) and writes the
+# transformed spec to /etc/cdi/nvidia.yaml with 0644 permissions via the
+# Docker Engine daemon (no interactive sudo).
+#
+# On uninstall: remove the docker/cdi/ working dir. /etc/cdi/nvidia.yaml is
+# intentionally left in place — it is a system-level CDI spec that any CUDA
+# workload on the host can use; clearing it would break non-Yashigani uses.
+# To reset /etc/cdi manually after uninstall: sudo nvidia-ctk cdi generate.
+# ---------------------------------------------------------------------------
+echo "=== Podman GPU CDI spec cleanup (task #40) ==="
+_cdi_dir="${SCRIPT_DIR}/docker/cdi"
+if [ -d "${_cdi_dir}" ]; then
+    rm -rf "${_cdi_dir}" && echo "  [removed] ${_cdi_dir}" || echo "  [WARN] could not remove ${_cdi_dir}" >&2
+else
+    echo "  [ok]    ${_cdi_dir} not present"
+fi
+
 echo "=== Install-time state file cleanup ==="
 _statefile_removed=0
 for _statefile in \

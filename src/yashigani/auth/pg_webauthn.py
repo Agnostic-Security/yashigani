@@ -36,7 +36,7 @@ from yashigani.auth.webauthn import (
     _map_attestation,
     _to_json_str,
 )
-from yashigani.db.postgres import tenant_transaction
+from yashigani.db.postgres import tenant_transaction, PGP_SYM_OPTS  # Issue #144: AES-256 cipher pin
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ class PgWebAuthnCredentialStore:
         """Persist a new credential. Raises IntegrityError on duplicate credential_id."""
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             await conn.execute(
-                """
+                f"""
                 INSERT INTO webauthn_credentials (
                     id, user_id, admin_id,
                     credential_id, public_key,
@@ -113,7 +113,7 @@ class PgWebAuthnCredentialStore:
                     created_at, last_used_at
                 ) VALUES (
                     $1::uuid, $2, $3::uuid,
-                    $4, pgp_sym_encrypt($5::text, current_setting('app.aes_key'))::bytea,
+                    $4, pgp_sym_encrypt($5::text, current_setting('app.aes_key'), '{PGP_SYM_OPTS}')::bytea,
                     $6, $7,
                     $8, $9,
                     $10,

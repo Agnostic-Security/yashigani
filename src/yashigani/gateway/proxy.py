@@ -90,6 +90,12 @@ _HOP_BY_HOP_HEADERS = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade",
 })
 
+# FIND-3.1-004: single-segment /mcp/* path suffixes that are gateway-owned
+# endpoints (not MCP agent names).  These must never be dispatched via
+# dispatch_mcp_call(); the dedicated routes registered before the catch-all
+# handle them.  Evaluated once at module load (frozenset constant).
+_MCP_INFO_RESERVED: frozenset[str] = frozenset({"health"})
+
 
 def _content_hash(content: str) -> str:
     """SHA-256 hex digest of a string — used for privacy-safe hashing."""
@@ -135,6 +141,13 @@ def create_gateway_app(
     pii_detector=None,   # v2.2 — PiiDetector | None
     mcp_broker_registry=None,  # v2.25.0 P3 — McpBrokerRegistry | None
     mcp_jwks_store=None,       # v2.25.0 P3 — JwksStore | None
+    document_pipeline=None,  # v2.26 — DocumentInspectionPipeline | None (mode-B egress)
+    principal_signer=None,    # #47/G-NEW-5 — OrchestrationPrincipalSigner | None
+    principal_verifier=None,  # #47/G-NEW-5 — OrchestrationPrincipalVerifier | None
+    principal_tenant_id="default",  # #47/G-NEW-5 — tenant for caller SPIFFE derivation
+    capability_policy_store=None,  # 3.0 — CapabilityPolicyStore | None
+    permission_store=None,          # 3.1 Phase 4 — PermissionStore | None (agent allow-list)
+    identity_registry=None,         # 3.1 UID unification — IdentityRegistry | None
 ) -> FastAPI:
     """
     Create the Yashigani gateway FastAPI application.
@@ -161,6 +174,16 @@ def create_gateway_app(
         "pii_detector": pii_detector,      # v2.2
         "mcp_broker_registry": mcp_broker_registry,  # v2.25.0 P3
         "mcp_jwks_store": mcp_jwks_store,             # v2.25.0 P3
+        "document_pipeline": document_pipeline,  # v2.26 — mode-B egress round-trip
+        # #47/G-NEW-5 — signed orchestration-principal claim machinery.  The
+        # gateway SIGNS the principal on forward and VERIFIES it (SPIFFE-bound,
+        # replay-deduped) on re-entry so OPA adjudicates a verified fact.
+        "principal_signer": principal_signer,
+        "principal_verifier": principal_verifier,
+        "principal_tenant_id": principal_tenant_id,
+        "capability_policy_store": capability_policy_store,  # 3.0 — Permissions-Policy
+        "permission_store": permission_store,  # 3.1 Phase 4 — agent connection allow-list
+        "identity_registry": identity_registry,  # 3.1 UID unification boundary resolver
         "http_client": None,
     }
 
@@ -287,6 +310,35 @@ def create_gateway_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        # ZAP 10015/10049: Dynamic responses (API endpoints, auth flows) must not
+        # be stored in any cache.  Static assets under /static/ (Swagger UI,
+        # fingerprinted resources) are intentionally excluded — they are safe to
+        # cache.
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        # Permissions-Policy: resolve per user identity (3.0).
+        # 3.1 UID unification: read identity_id from request.state.ysg_principal
+        # (set by the boundary resolver in openai_router, mcp_router_runtime, or
+        # the catch-all _resolve_gateway_principal).  Fall back to the raw header
+        # only when ysg_principal is absent (e.g. health-check routes with no auth).
+        _cap_store = _state.get("capability_policy_store")
+        if _cap_store is not None:
+            try:
+                _rp = getattr(request.state, "ysg_principal", None)
+                _user_id = _rp.identity_id if _rp is not None else (
+                    request.headers.get("x-yashigani-user-id", "") or None
+                )
+                from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
+                from yashigani.capability_policy.header import render_permissions_policy as _render_pp
+                _resolved = _resolve_cap(
+                    _user_id,
+                    _state.get("rbac_store"),
+                    _cap_store,
+                )
+                response.headers["Permissions-Policy"] = _render_pp(_resolved)
+            except Exception as _pp_exc:
+                logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
 
     # Internal health check — used by Caddy and container health probe
@@ -402,6 +454,64 @@ def create_gateway_app(
             favicon_url="/static/swagger-ui/favicon.png",
         )
 
+    # ── FIND-3.1-004/005: JWKS + /mcp/health gateway-owned endpoint guards ────
+    #
+    # These routes ensure that /.well-known/yashigani-mcp-jwks.json and
+    # /mcp/health are ALWAYS handled by the gateway and NEVER forwarded to
+    # the upstream (demo-mcp or any configured MCP server).
+    #
+    # Primary defence: the mcp_info_router in extra_routers (registered above via
+    # include_router) handles both paths when MCP servers are configured.  These
+    # guards are the belt-and-suspenders for the case where no MCP servers are
+    # configured and mcp_info_router is therefore absent from extra_routers.
+    #
+    # Both endpoints are public (no auth required):
+    #   - JWKS: upstream verifiers fetch it without Yashigani credentials.
+    #   - /mcp/health: monitoring probe used by Caddy and operators.
+    #
+    # Both are registered BEFORE the catch-all so they match first, bypassing
+    # the catch-all's rate-limit / OPA / upstream-forwarding pipeline entirely.
+    @app.get("/.well-known/yashigani-mcp-jwks.json", include_in_schema=False)
+    async def _gateway_mcp_jwks_guard(response: Response):
+        """JWKS guard — always gateway-handled, never forwarded to upstream."""
+        store = _state.get("mcp_jwks_store")
+        if store is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "mcp_not_configured",
+                         "detail": "No MCP servers are configured on this gateway."},
+            )
+        from yashigani.mcp._jwks import JWKS_CACHE_CONTROL
+        response.headers["Cache-Control"] = JWKS_CACHE_CONTROL
+        response.headers["Content-Type"] = "application/json"
+        return store.response()
+
+    @app.get("/mcp/health", include_in_schema=False)
+    async def _gateway_mcp_health_guard():
+        """MCP health guard — always gateway-handled, never forwarded to upstream."""
+        reg = _state.get("mcp_broker_registry")
+        if reg is None:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_not_configured"},
+            )
+        try:
+            brokers = reg.all_brokers()  # type: ignore[attr-defined]
+        except Exception:
+            brokers = []
+        if not brokers:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "mcp_no_brokers"},
+            )
+        opa_ok = await brokers[0].opa_health()  # type: ignore[attr-defined]
+        if opa_ok:
+            return {"status": "ok", "opa": "healthy"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "detail": "opa_unreachable"},
+        )
+
     # Catch-all reverse proxy route
     @app.api_route(
         "/{path:path}",
@@ -511,20 +621,80 @@ async def _proxy_request_body(
                 },
             )
 
+    # 0b-pre. Gateway boundary resolution — resolves identity_id once before any
+    # auth-sensitive processing (rate limiting, OPA, audit).
+    # For requests handled by openai_router or mcp_router_runtime (mounted as
+    # extra_routers), request.state.ysg_principal is already set by those handlers.
+    # For the catch-all proxy (anything not matched by extra_routers), we resolve
+    # from the raw Caddy-injected slug header here.
+    # Fail-closed: if the header is absent or registry unavailable, ysg_principal
+    # stays None; downstream consumers treat None as anonymous (DENY).
+    if not hasattr(request.state, "ysg_principal") or request.state.ysg_principal is None:
+        _id_reg = state.get("identity_registry")
+        _slug_raw = request.headers.get("x-forwarded-user", "").strip() or None
+        if _slug_raw and _id_reg is not None:
+            try:
+                _pr_rec = _id_reg.get_by_slug(_slug_raw)
+                if _pr_rec is not None:
+                    from yashigani.gateway.types import ResolvedPrincipal as _RP
+                    import os as _os
+                    _pr_iid = (
+                        _pr_rec.get("identity_id")
+                        if isinstance(_pr_rec, dict)
+                        else getattr(_pr_rec, "identity_id", None)
+                    ) or "anonymous"
+                    _pr_kind = (
+                        _pr_rec.get("kind", "unknown")
+                        if isinstance(_pr_rec, dict)
+                        else str(getattr(_pr_rec, "kind", "unknown"))
+                    )
+                    _pr_groups = (
+                        list(_pr_rec.get("groups") or [])
+                        if isinstance(_pr_rec, dict)
+                        else list(getattr(_pr_rec, "groups", []) or [])
+                    )
+                    request.state.ysg_principal = _RP(
+                        identity_id=_pr_iid,
+                        principal_scope="user" if _pr_kind in ("human", "user") else None,
+                        group_ids=_pr_groups,
+                        org_id=_os.getenv("YASHIGANI_ORG_ID", "default"),
+                        kind=_pr_kind,
+                    )
+                else:
+                    # LOW fix (spec §7 / Laura Finding 4): slug was injected by
+                    # Caddy but resolves to no registry record (deprovisioned
+                    # principal). Deny immediately — never fall back to the raw
+                    # x-yashigani-user-id header so an attacker holding a valid
+                    # Caddy session cannot supply an arbitrary identity_id via
+                    # that header.
+                    logger.info(
+                        "proxy: boundary resolution: slug %r not in registry "
+                        "(deprovisioned principal) — denying request fail-closed "
+                        "request_id=%s",
+                        _slug_raw, request_id,
+                    )
+                    return _error_response(request_id, 401, "IDENTITY_NOT_FOUND")
+            except Exception as _pr_exc:
+                logger.debug("proxy: boundary resolution failed for slug %r: %s", _slug_raw, _pr_exc)
+
     # 0b. Rate limiting — before any expensive processing
     rate_limiter = state["rate_limiter"]
     if rate_limiter is not None:
         client_ip = _get_client_ip(request)
         agent_id_rl = request.headers.get("x-yashigani-agent-id", "unknown")
         session_id_rl = request.cookies.get("__Host-yashigani_session", "")
-        user_email_rl = request.headers.get("x-yashigani-user-id", "")
+        # 3.1 UID unification (Laura T-2): rate-limit bucket keyed by identity_id.
+        # Read from request.state.ysg_principal (set by boundary resolver above).
+        # Falls back to empty string (no per-user bucket) if unresolved.
+        _rp_rl = getattr(request.state, "ysg_principal", None)
+        user_id_rl: str = _rp_rl.identity_id if _rp_rl is not None else ""
 
         # Apply per-role rate limit override: use the most permissive (highest) RPS
         # across all groups the user belongs to that have an override configured.
         rbac_store_rl = state.get("rbac_store")
-        if rbac_store_rl is not None and user_email_rl:
+        if rbac_store_rl is not None and user_id_rl:
             try:
-                user_groups = rbac_store_rl.get_user_groups(user_email_rl)
+                user_groups = rbac_store_rl.get_user_groups(user_id_rl)
                 best_rps = None
                 best_burst = None
                 for grp in user_groups:
@@ -542,7 +712,7 @@ async def _proxy_request_body(
             except Exception as exc:
                 logger.debug("RBAC rate limit override lookup failed: %s", exc)
 
-        rl_result = rate_limiter.check(client_ip, agent_id_rl, session_id_rl, user_email_rl)
+        rl_result = rate_limiter.check(client_ip, agent_id_rl, session_id_rl, user_id_rl)
         if not rl_result.allowed:
             retry_sec = max(1, rl_result.retry_after_ms // 1000)
             try:
@@ -551,12 +721,12 @@ async def _proxy_request_body(
             except Exception:
                 logger.debug("proxy: metric increment failed for ratelimit_violations_total", exc_info=True)
             # Per-user breach: increment dedicated metric + emit admin-alert audit event.
-            if rl_result.dimension == "user" and user_email_rl:
+            if rl_result.dimension == "user" and user_id_rl:
                 _admin_alert_user_rate_limit(
                     audit_writer=state["audit_writer"],
                     request_id=request_id,
                     result=rl_result,
-                    user_id=user_email_rl,
+                    user_id=user_id_rl,
                     agent_id=agent_id_rl,
                     session_id=session_id_rl,
                     rate_limiter=rate_limiter,
@@ -676,8 +846,17 @@ async def _proxy_request_body(
         pass
 
     # 2. Extract session / API key identity
-    session_id, agent_id, user_id = _extract_identity(request)
-    # Prefer JWT sub over header-provided user_id
+    session_id, agent_id, _raw_user_id = _extract_identity(request)
+    # 3.1 UID unification (Laura T-1): override user_id with identity_id from
+    # request.state.ysg_principal (set by boundary resolver above).
+    # Falls back to _raw_user_id (header) only when ysg_principal is absent.
+    _rp_ext = getattr(request.state, "ysg_principal", None)
+    user_id: str = (
+        _rp_ext.identity_id
+        if _rp_ext is not None
+        else _raw_user_id
+    )
+    # Prefer JWT sub over header-provided user_id (for internal bearer path)
     if jwt_claims.get("sub"):
         user_id = jwt_claims["sub"]
     # Internal service identity (Open WebUI, etc.)
@@ -790,13 +969,8 @@ async def _proxy_request_body(
 
     # 4. OPA policy check
     with (_tracer.start_as_current_span("opa-check") if _tracer else _NullSpan()) as _opa_span:
-        _opa_span.set_attribute("opa.path", norm_path)
+        _opa_span.set_attribute("opa.path", path)
         _opa_span.set_attribute("yashigani.agent_id", agent_id)
-        # Pass norm_path (leading-slash-normalised, as every other check in this
-        # function already does) so OPA input.path matches the rego rules (which
-        # key on "/.well-known/..." etc.). Raw `path` from FastAPI /{path:path}
-        # drops the leading slash, so allowlist rules on normalised paths never
-        # matched → fail-closed 403 on those paths. (YSG-RISK-081)
         opa_allowed = await _opa_check(cfg, request, norm_path, session_id, agent_id, user_id)
         _opa_span.set_attribute("opa.allowed", opa_allowed)
     if not opa_allowed:
@@ -850,15 +1024,126 @@ async def _proxy_request_body(
     mcp_broker_registry = state.get("mcp_broker_registry")
     if mcp_broker_registry is not None and norm_path.startswith("/mcp/"):
         _mcp_suffix = norm_path[len("/mcp/"):]   # e.g. "filesystem-mcp"
-        if _mcp_suffix and "/" not in _mcp_suffix:
-            # Valid single-segment agent_name — dispatch to the MCP handler
+        if _mcp_suffix and "/" not in _mcp_suffix and _mcp_suffix not in _MCP_INFO_RESERVED:
+            # Valid single-segment agent_name — dispatch to the MCP handler.
+            # _MCP_INFO_RESERVED excludes "health" (FIND-3.1-004 belt-and-suspenders):
+            # /mcp/health is a gateway-owned endpoint handled by the route registered
+            # before the catch-all and must never be dispatched as an agent name.
+            # Pass response_inspection_pipeline so the G-ORCH-OPA-1 egress gate
+            # can classify the tool result sensitivity before calling enforce_result().
+            #
+            # G-ORCH-OPA-1 / Option A: pass the identity registry so the egress
+            # gate can look up the caller's sensitivity_ceiling from the registry
+            # keyed by X-Forwarded-User.  Reuses the SAME registry the openai_router
+            # uses for all other identity resolution — no new store.
             from yashigani.gateway.mcp_router_runtime import dispatch_mcp_call
+            from yashigani.gateway import openai_router as _openai_router
             return await dispatch_mcp_call(
                 agent_name=_mcp_suffix,
                 request=request,
                 registry=mcp_broker_registry,
+                response_inspection_pipeline=state.get("response_inspection_pipeline"),
+                identity_registry=_openai_router._state.identity_registry,
+                # 3.1 Phase 3 — pass agent_registry so caller allowed_tools
+                # can be resolved from the identity registry at call time.
+                agent_registry=state.get("agent_registry"),
             )
         # Multi-segment or empty suffix falls through to generic upstream forwarding
+
+    # 4d. Document enforcement on PROXY EGRESS (v2.26) — POLICY-driven, not
+    # flag-driven.  A document leaving via the proxy is run through the SAME
+    # decision source the backoffice /inspect path uses (evaluate_document_decision
+    # over the REAL OPA + the operator's persisted matrix): OPA decides the action
+    # + mode per route / data-class / sensitivity — LOG (forward unchanged), REDACT
+    # (forward the stripped artefact), PSEUDONYMIZE mode A (forward tokens, user
+    # holds the table), PSEUDONYMIZE mode B (forward tokens AND hold a request-
+    # scoped round-trip for the response-leg restore), or BLOCK (held).  ONE
+    # decision source of truth for UI + proxy.
+    # Hooked into the EXISTING request→upstream→response seam (no parallel path).
+    # Hard-guarded: both flags must be ON and the body must look like a supported
+    # document, else this is a no-op and normal traffic is untouched.  Fail-closed-
+    # but-non-fatal: an unexpected fault forwards the ORIGINAL bytes (egress
+    # disengages); a real OPA BLOCK holds the document.  See documents/proxy_modeb.py.
+    _modeb_round_trip = None  # type: ignore[var-annotated]
+    _document_pipeline = state.get("document_pipeline")
+    if _document_pipeline is not None and forwarded_body:
+        from yashigani.documents.proxy_modeb import (
+            egress_decide,
+            is_modeb_proxy_active,
+            looks_like_document_egress,
+        )
+        _req_content_type = request.headers.get("content-type", "")
+        if is_modeb_proxy_active() and looks_like_document_egress(
+            _req_content_type, forwarded_body
+        ):
+            _egress = await egress_decide(
+                _document_pipeline,
+                opa_url=cfg.opa_url,
+                body=forwarded_body,
+                content_type=_req_content_type,
+                request_id=request_id,
+            )
+            if _egress.blocked:
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_opa_block",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_BLOCKED",
+                        "detail": (
+                            "The document was held by Yashigani document enforcement "
+                            "and not forwarded."
+                        ),
+                        "reason": _egress.block_reason or "document_blocked",
+                        "request_id": request_id,
+                    },
+                    headers={"X-Yashigani-Request-Id": request_id},
+                )
+            if _egress.route_local:
+                # OPA decided ROUTE_LOCAL (PART 2 / Laura D1): the document carries
+                # an OPERATE_ON sensitive field a cloud model would hallucinate over,
+                # so it must be handled by the LOCAL model, not this CLOUD-bound MCP
+                # upstream.  This proxy egress has NO local-model leg attached, so
+                # the only fail-closed-correct action is to HOLD the document (never
+                # forward an operate-on sensitive value to the cloud).  The operator
+                # routes such documents through the local-model path; the header
+                # tells the caller why.  Mirrors the pipeline's no-local-route
+                # fail-closed (OPERATE_ON_BLOCK) — hold, never leak.
+                _audit_request(
+                    audit_writer, request_id, "BLOCKED", "document_route_local_no_cloud",
+                    request, path,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "DOCUMENT_ROUTED_LOCAL",
+                        "detail": (
+                            "The document contains values an external model would "
+                            "compute on (e.g. amounts, dates of birth, account "
+                            "numbers). Replacing them with placeholders would make "
+                            "the external model invent wrong values, so it was not "
+                            "forwarded to the cloud upstream. Route this document "
+                            "through the local-model path."
+                        ),
+                        "operate_on_classes": _egress.operate_on_classes,
+                        "request_id": request_id,
+                    },
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Document-Route": "local",
+                    },
+                )
+            if _egress.transformed and _egress.forward_bytes is not None:
+                # OPA decided REDACT or PSEUDONYMIZE — send the transformed
+                # (stripped/tokenized) artefact to the upstream, never the original.
+                forwarded_body = _egress.forward_bytes
+                # mode B also holds the round-trip for the response-leg restore;
+                # REDACT / mode A do not (round_trip is None).
+                if _egress.engaged:
+                    _modeb_round_trip = _egress.round_trip
+            # LOG / non-engaged: forward the ORIGINAL bytes unchanged (no transform).
 
     # 5. Forward to upstream MCP server
     client: httpx.AsyncClient = state["http_client"]
@@ -928,9 +1213,33 @@ async def _proxy_request_body(
                     },
                 )
 
+    # 5a-modeB. Document PSEUDONYMIZE mode-B INGRESS restore (v2.26).
+    # Restore the untrusted upstream/cloud response on the trusted host through the
+    # binder (verbatim-echo rejection + position binding + namespace-harvest cap),
+    # AFTER response-injection inspection (5a) has already cleared the tokenized
+    # response.  Fail-closed-but-non-fatal: any fault forwards the STILL-TOKENIZED
+    # response (never cleartext that failed the binder, never a crash).  The
+    # crown-jewel map is destroyed inside ingress_restore on every path.
+    _modeb_tainted = False
+    _upstream_content = upstream_response.content
+    if _modeb_round_trip is not None and _document_pipeline is not None:
+        from yashigani.documents.proxy_modeb import ingress_restore
+        _ingress = ingress_restore(
+            _document_pipeline,
+            _modeb_round_trip,
+            response_bytes=_upstream_content,
+            request_id=request_id,
+        )
+        _upstream_content = _ingress.restored_bytes
+        _modeb_tainted = _ingress.tainted
+        # A tainted round-trip (echo or flagged) MUST NOT be cached — the cached
+        # body would be the tokenized/echo response, bypassing the binder on a
+        # later hit.  A clean restore carries cleartext that likewise must not be
+        # cached against the tokenized request key.  Either way, skip the cache.
+        response_cache = None
+
     # 5b_pii. PII detection on response body
     pii_detected_on_response = False
-    _upstream_content = upstream_response.content
     if pii_detector is not None and _upstream_content:
         _resp_body_text = _decode_body_safe(_upstream_content)
         if _resp_body_text:
@@ -1077,6 +1386,13 @@ async def _proxy_request_body(
     if response_verdict is not None:
         response.headers["X-Yashigani-Response-Verdict"] = response_verdict
 
+    # 5e-modeB. Surface a tainted mode-B round-trip (echo rejected / flagged) so a
+    # downstream consumer treats the body as not-cleanly-restored (still tokenized).
+    if _modeb_round_trip is not None:
+        response.headers["X-Yashigani-Document-ModeB"] = (
+            "tainted" if _modeb_tainted else "restored"
+        )
+
     # 5e-T10. F-T10-001: Generated-content disclaimer + inspection confidence.
     # X-Yashigani-Generated-Content is always true for proxy responses — the
     # upstream (MCP server, LLM, tool) produces content that downstream consumers
@@ -1129,8 +1445,11 @@ async def _opa_check(
         "session_id": session_id,
         "agent_id": agent_id,
         "user_id": user_id,
-        # session.email is consumed by rbac.rego allow_rbac
-        "session": {"email": user_id},
+        # session.identity_id is consumed by rbac.rego allow_rbac (3.1 UID unification).
+        # After the rego update, user_groups is keyed by identity_id, not email.
+        # COORDINATED CHANGE: rbac.rego must be updated to read session.identity_id
+        # BEFORE this proxy.py change goes live (see §8 Risk 1 ordering constraint).
+        "session": {"identity_id": user_id},
         "request": {"method": request.method, "path": path},
         "headers": {
             k: v for k, v in request.headers.items()
@@ -1174,7 +1493,7 @@ async def _opa_denial_alert(
             "session_id": session_id,
             "agent_id": agent_id,
             "user_id": user_id,
-            "session": {"email": user_id},
+            "session": {"identity_id": user_id},
             "request": {"method": request.method, "path": path},
             "headers": {
                 k: v for k, v in request.headers.items()

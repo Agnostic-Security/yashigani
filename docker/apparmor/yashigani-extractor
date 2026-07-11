@@ -1,0 +1,92 @@
+# Yashigani AppArmor profile — SANDBOXED EXTRACTOR (plan §6 B1, Captain).
+#
+# Confines the per-job jail that runs UNTRUSTED document parsers. This is
+# INTENTIONALLY tighter than yashigani-gateway: the worker reads stdin, parses
+# in-memory, writes stdout, and exits — it has NO network at all (egress=none at
+# the runtime layer; this profile DENIES every network class as defence-in-depth),
+# NO secrets mount, and only a small noexec tmpfs to write to.
+#
+# Load on the host before running the sandbox:
+#   sudo apparmor_parser -r docker/apparmor/yashigani-extractor
+# Verify:
+#   sudo apparmor_status | grep yashigani-extractor
+# The SandboxedExtractorRunner requests `apparmor=yashigani-extractor`; where
+# AppArmor is unavailable (rootless Podman, non-AppArmor hosts) the request is a
+# no-op and the seccomp + cap-drop + network=none layers still confine the jail.
+#
+# Su security-review: confirm the deny-network-* set is exhaustive and that the
+# tmpfs is the ONLY writable path (rootfs is read-only at runtime; this asserts it).
+
+#include <tunables/global>
+
+profile yashigani-extractor flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  # Read-only system + interpreter. 'm' (mmap/execute) for shared libs + zipimport.
+  /etc/ r,
+  /etc/** r,
+  /usr/ r,
+  /usr/** rm,
+  /lib/ r,
+  /lib/** rm,
+  /lib64/ r,
+  /lib64/** rm,
+  /usr/local/lib/** rm,
+  /usr/local/lib/python*/** r,
+  /usr/local/bin/python* rix,
+
+  # Worker code + the baked bomb-guard (read-only — rootfs is read_only:true too).
+  /app/ r,
+  /app/** r,
+
+  # The ONLY writable path: the small noexec/nosuid/nodev tmpfs mounted at /tmp.
+  # Parser libs may spill temp files here; nothing else is writable.
+  /tmp/ rw,
+  /tmp/** rw,
+
+  # Minimal /proc reads the CPython runtime needs.
+  @{PROC}/sys/kernel/cap_last_cap r,
+  @{PROC}/@{pid}/status r,
+  @{PROC}/@{pid}/maps r,
+  @{PROC}/@{pid}/fd/ r,
+
+  # Deny ALL networking — the jail has no egress (kills SSRF/exfil from a
+  # malicious parser, plan §6 / red-team F1). Su 2026-06-09: use the BARE
+  # `deny network,` rule, which denies EVERY address family. The previous
+  # enumerated list (inet, inet6, raw, packet, netlink, unix, bluetooth) was NOT
+  # exhaustive — it missed vsock, xdp, qipcrtr, can, tipc, smc, kcm, mctp and
+  # others a hostile parser could try. The bare rule is future-proof and cannot
+  # be bypassed via an unlisted family. (Defence-in-depth: network=none at the
+  # runtime layer + the seccomp profile's absence of socket() are the primary
+  # egress controls; this is the AppArmor backstop.)
+  deny network,
+
+  # Deny every dangerous capability + kernel/hardware surface.
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_rawio,
+  deny capability sys_ptrace,
+  deny capability sys_boot,
+  deny capability net_admin,
+  deny capability net_raw,
+  deny capability setuid,
+  deny capability setgid,
+  deny capability setpcap,
+  deny capability dac_override,
+  deny capability chown,
+
+  deny @{PROC}/sys/kernel/modules_disabled w,
+  deny /proc/sysrq-trigger w,
+  deny /sys/** w,
+  deny /dev/mem r,
+  deny /dev/kmem r,
+  deny /dev/port r,
+
+  # No process injection, no namespace fiddling, no mounts.
+  deny ptrace,
+  deny ptrace peer=**,
+  deny mount,
+  deny umount,
+  deny pivot_root,
+}

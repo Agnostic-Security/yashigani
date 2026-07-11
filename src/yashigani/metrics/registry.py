@@ -153,6 +153,22 @@ inspection_model = _G(
     ["model"],
 )
 
+# v2.26 / YSG-RISK-057 — semantic-intent sidecar (content-filter v2) verdicts.
+# Emitted at the sidecar decision point (inspection.semantic_intent.evaluate).
+# verdict: escalated | clean | error
+#   escalated — the sidecar flagged injection intent the v1 heuristic missed
+#               (the YSG-RISK-057 encoded-injection residual).
+#   clean     — the sidecar ran and agreed with the heuristic (no escalation).
+#   error     — fail-closed: backend unreachable/unparseable/indeterminate.
+# view: the decoded view that drove the verdict (raw | base64 | hex | url |
+#       rot13 | suspicious_blob | indeterminate_fail_closed | none).  Engine-
+#       agnostic — never a model or library name.
+inspection_semantic_intent_total = _C(
+    "yashigani_inspection_semantic_intent_total",
+    "Semantic-intent sidecar verdicts (content-filter v2) by verdict and decoded view.",
+    ["verdict", "view"],
+)
+
 # ---------------------------------------------------------------------------
 # Rate limiter metrics
 # ---------------------------------------------------------------------------

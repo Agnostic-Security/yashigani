@@ -146,6 +146,9 @@ tr:hover { background: #f8fafc; }
 .card-clickable { cursor: pointer; }
 .card-value-lg { font-size: 1.2rem; font-weight: 700; color: #1e293b; }
 .card-desc { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+/* tile-disabled: optional-service card whose profile is not deployed.
+   Renders greyed-out and non-interactive. JS (loadMonitoring) toggles this. */
+.tile-disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.4); pointer-events: none; }
 
 /* ── Text helpers ───────────────────────────────────────────── */
 .txt-sm { font-size: 0.85rem; }
@@ -154,6 +157,9 @@ tr:hover { background: #f8fafc; }
 .txt-muted { font-size: 0.8rem; color: #64748b; }
 .txt-muted-sm { font-size: 0.75rem; color: #64748b; }
 .txt-note { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; }
+/* UX-001 (2026-06-14): group multi-select dropdowns */
+.select-multi { overflow-y: auto; }
+.txt-hint { font-size: 0.72rem; color: #94a3b8; font-weight: normal; }
 .txt-note-sm { font-size: 0.75rem; color: #94a3b8; margin-bottom: 8px; }
 .txt-body { font-size: 0.85rem; color: #334155; margin-bottom: 12px; }
 .txt-body-mb8 { font-size: 0.85rem; color: #334155; margin-bottom: 8px; }
@@ -188,6 +194,33 @@ tr:hover { background: #f8fafc; }
 .pki-rotate-result { font-size: 0.85rem; min-height: 1.2em; margin-bottom: 8px; display: none; }
 .pki-chain-detail { display: none; }
 .pki-chain-table { font-size: 0.82rem; width: 100%; border-collapse: collapse; }
+/* PKI JS-generated HTML classes — ZAP 10015/10049 CSP inline-style fix.
+   pki.js dynamically builds HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.pki-err-text { color: #ef4444; }
+.pki-muted-text { color: #64748b; }
+.pki-camode-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; padding: 12px 14px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; }
+.pki-camode-label { font-size: 0.75rem; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
+.pki-camode-value { font-size: 1rem; color: #1e3a8a; }
+.pki-camode-issuer { font-size: 0.78rem; color: #64748b; margin-left: auto; }
+.pki-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.pki-thead-row { background: #f1f5f9; text-align: left; }
+.pki-th { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
+.pki-row { border-bottom: 1px solid #f1f5f9; }
+.pki-td-mono { padding: 8px 12px; font-family: monospace; }
+.pki-td { padding: 8px 12px; }
+.pki-td-exp { padding: 8px 12px; font-size: 0.8rem; color: #475569; }
+.pki-btn-gap { margin-right: 4px; }
+.pki-section-title { margin: 0 0 6px; font-size: 0.95rem; }
+.pki-section-sub { font-weight: 400; color: #64748b; font-size: 0.8rem; }
+.pki-section-title-mt { margin: 16px 0 6px; font-size: 0.95rem; }
+.pki-code { font-size: 0.8rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }
+.pki-code-fp { font-size: 0.75rem; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; word-break: break-all; }
+.pki-detail-label { padding: 6px 10px; color: #64748b; white-space: nowrap; font-weight: 500; border-bottom: 1px solid #f1f5f9; width: 140px; }
+.pki-detail-value { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; }
+.pki-chain-panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin-top: 12px; }
+.pki-chain-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.pki-chain-close { font-size: 0.75rem; }
 
 /* ── Backup page ────────────────────────────────────────────── */
 .backup-actions { margin-top: 12px; }
@@ -219,6 +252,11 @@ tr:hover { background: #f8fafc; }
 .hibp-key-result { font-size: 0.8rem; min-height: 1.2em; margin-bottom: 4px; }
 .hibp-probe-result { font-size: 0.8rem; min-height: 1.2em; color: #334155; }
 .hibp-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
+/* HIBP JS-generated HTML classes — CSP inline-style fix (FIND-3.1-001).
+   hibp.js builds status HTML via innerHTML; these classes replace every
+   style="..." attribute so the page is compatible with style-src 'self'. */
+.hibp-status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.hibp-source-lbl { font-size: 0.85rem; color: #334155; }
 
 /* ── Classify textarea ──────────────────────────────────────── */
 .classify-textarea { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; resize: vertical; }
@@ -266,6 +304,28 @@ tr:hover { background: #f8fafc; }
 /* wrapping control row with bottom margin (client-policy bindings) */
 .form-row--wrap-mb { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 12px; }
 
+/* Document Enforcement panel — v2.26 */
+.badge-amber { background: #fffbeb; color: #b45309; }
+.doc-hidden { display: none; }
+.doc-row-hidden { background: #fff7ed; }
+.doc-verdict-summary { margin-bottom: 10px; font-size: 0.9rem; line-height: 1.6; }
+.doc-block-reason { color: #b91c1c; font-size: 0.8rem; }
+.doc-user-alert { margin: 8px 0; }
+.doc-alert-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #7f1d1d; }
+.doc-alert-pol { color: #9ca3af; font-size: 0.75rem; font-family: monospace; }
+/* 2.26 set-scoped-salt + field-role + integrity surfaces */
+.doc-routing-note { margin: 6px 0; font-size: 0.82rem; }
+.doc-integrity-row { margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.doc-set-note { background: #fffbeb; border-color: #fcd34d; color: #78350f; margin-bottom: 10px; }
+.doc-fieldrole-local { background: #ecfdf5; }
+.badge-salt-file { background: #dbeafe; color: #1e40af; }
+.badge-salt-set { background: #fef3c7; color: #92400e; }
+
+/* MCP capability-envelope re-approval panel — 3.0 (YSG-RISK-060) */
+.env-hidden { display: none; }
+.env-h3 { font-size: 0.95rem; color: #1e293b; margin: 18px 0 4px; }
+.env-actions { margin-top: 18px; display: flex; gap: 10px; }
+.env-headline-box { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 12px 14px; font-size: 0.9rem; line-height: 1.6; color: #7f1d1d; margin-bottom: 12px; }
 /* ── Strict-CSP page-load helpers (v2.25.4 — zero inline styles) ──────
    The admin plane serves `style-src 'self'` with no `style-src-attr`, so both
    inline `style=` attributes and `element.style` CSSOM writes are blocked.
@@ -530,3 +590,46 @@ tr:hover { background: #f8fafc; }
 .audit-mini-table th { text-align: left; padding: 4px 8px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
 .audit-mini-table td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; color: #334155; }
 .audit-mini-table tr:last-child td { border-bottom: none; }
+
+/* ── Capability Policy page (3.0) — browser Permissions-Policy ────────────── */
+/* CSP-safe: classes only, no inline style= attributes.                        */
+.cap-pol-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.cap-pol-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.cap-pol-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-pol-table tr:last-child td { border-bottom: none; }
+.cap-th-name { width: 160px; }
+.cap-th-value { width: 220px; }
+.cap-name-cell { font-weight: 500; }
+.cap-origins-area { font-size: 0.85rem; }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 4px; min-height: 4px; margin-bottom: 4px; }
+.cap-origin-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; font-size: 0.78rem; font-family: monospace; }
+.cap-origin-add { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.cap-origin-err { display: block; font-size: 0.78rem; color: #dc2626; margin-top: 3px; }
+.cap-origins-display { font-family: monospace; font-size: 0.8rem; line-height: 1.6; }
+.cap-pol-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+.cap-scope-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 4px; }
+.cap-scope-picker { display: flex; flex-direction: column; gap: 4px; }
+.cap-eff-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; margin-top: 8px; }
+.cap-eff-table th { text-align: left; padding: 6px 10px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.75rem; }
+.cap-eff-table td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+.cap-eff-table tr:last-child td { border-bottom: none; }
+.w-250 { width: 250px; }
+
+/* ── 3.1 Phase 8 — Resource Permissions admin page ─────────────────────── */
+.perm-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.perm-table th { text-align: left; padding: 8px 12px; font-weight: 500; color: #64748b; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-size: 0.78rem; }
+.perm-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+.perm-table tr:last-child td { border-bottom: none; }
+.perm-decl-just { font-size: 0.8rem; color: #475569; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.perm-code { font-family: monospace; font-size: 0.82rem; background: #f1f5f9; border-radius: 3px; padding: 1px 4px; }
+.perm-allow-label { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; padding: 6px 0; }
+.perm-required { font-size: 0.72rem; color: #dc2626; font-weight: normal; }
+.perm-grants-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.perm-grant-form-title { font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; color: #1e293b; }
+/* Effective resolution path display */
+.perm-eff-result-box { margin-top: 12px; font-size: 0.85rem; min-height: 20px; }
+.perm-eff-path { margin-top: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden; font-size: 0.83rem; }
+.perm-eff-path-row { display: flex; align-items: center; gap: 16px; padding: 7px 14px; border-bottom: 1px solid #f1f5f9; }
+.perm-eff-path-row:last-child { border-bottom: none; }
+.perm-eff-path-row--result { background: #eff6ff; font-weight: 600; }
+.perm-eff-path-lbl { font-size: 0.78rem; color: #64748b; min-width: 120px; }

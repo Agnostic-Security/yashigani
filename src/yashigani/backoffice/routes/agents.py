@@ -36,6 +36,8 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
+from yashigani.backoffice._ssrf import assert_safe_outbound_url
+
 # ---------------------------------------------------------------------------
 # AVA-2026-04-29-001 — Stored XSS: reject HTML tags in free-text agent fields
 # (ASVS v5 V5.3.3 | CWE-79 | WSTG-INPV-02)
@@ -109,102 +111,22 @@ router = APIRouter()
 def _assert_safe_upstream_url(url: str) -> str:
     """Assert that ``url`` is safe to store as an agent's upstream_url.
 
-    Pentest #95 (TM-V231-004): the prior validator was just `Field(min_length=1,
-    max_length=512)`. An authenticated admin could register an agent with
-    ``file:///etc/passwd``, ``gopher://redis:6380/``, ``http://169.254.169.254/``
-    (cloud metadata SSRF), or any internal-service URL. OPA's identity-active
-    gate at invocation time was the only compensating control, and that gate
-    is bypassable by an admin who can also activate the caller identity
-    (TA-3 insider). Admin-trust-boundary SSRF is admin-trust-boundary SSRF.
+    Delegates to the shared SSRF guard (backoffice/_ssrf.py — FIND-3.0-001).
+    Pentest #95 (TM-V231-004): previously hand-rolled inline; extracted into a
+    shared helper so that every admin-configurable outbound URL (agents,
+    SIEM endpoint, …) uses one tested guard.
 
-    Allowed:
-      - Scheme: http or https ONLY. Anything else (file, gopher, ftp, dict,
-        ldap, jar, ws, ...) is rejected outright.
-      - Host: must NOT be a loopback / link-local / multicast / cloud-metadata
-        IP. The link-local 169.254.169.254 is the AWS/GCP/Azure metadata
-        endpoint and is the primary SSRF target.
-      - Optional internal-service allowlist via ``YASHIGANI_AGENT_UPSTREAM_HOSTNAMES``
-        (comma-separated, case-insensitive). Hosts in the allowlist are
-        permitted to be RFC 1918 / loopback / Docker-bridge — needed so
-        operators can run agents like ``yashigani-letta`` or ``openclaw`` on
-        the internal mesh. Empty default — operator MUST explicitly allow
-        internal hosts to permit them.
+    Allowed: http/https, public-routable hosts, or hosts in YASHIGANI_AGENT_UPSTREAM_HOSTNAMES.
+    Rejected: non-http(s) scheme, loopback, link-local/IMDS, RFC-1918, multicast, reserved.
 
     Returns the URL unchanged on PASS. Raises ValueError on any violation
     (Pydantic v2 turns this into HTTP 422 with the structured error body).
     """
-    import ipaddress
-    import socket
-
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
-
-    if scheme not in ("http", "https"):
-        raise ValueError(
-            f"upstream_url scheme {scheme!r} not allowed — only http and https are accepted (CWE-918 / TM-V231-004)"
-        )
-
-    if not host:
-        raise ValueError(
-            f"upstream_url has no hostname (parsed from {url!r}) — agent upstreams "
-            "must be addressable HTTP(S) endpoints"
-        )
-
-    raw_allowlist = os.getenv("YASHIGANI_AGENT_UPSTREAM_HOSTNAMES", "")
-    internal_allowed = {h.strip().lower() for h in raw_allowlist.split(",") if h.strip()}
-    if host in internal_allowed:
-        return url  # Operator explicitly allowed this internal host.
-
-    # For everything else: refuse SSRF-prone IPs. Resolve hostname to IP if
-    # given a name; if resolution fails, refuse (we don't store URLs that
-    # can't be resolved at registration time).
-    try:
-        addrinfo = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        addrs = {info[4][0] for info in addrinfo}
-    except (socket.gaierror, socket.herror):
-        # Hostname doesn't resolve — could be intentional (e.g., DNS not yet
-        # populated for a service that's about to come up). Fall through to
-        # the literal-IP check below; if `host` is itself a literal IP we
-        # check it directly.
-        addrs = {host}
-
-    for addr_str in addrs:
-        try:
-            ip = ipaddress.ip_address(addr_str)
-        except ValueError:
-            continue  # not an IP literal, skip
-        if ip.is_loopback:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to loopback {addr_str} — "
-                "loopback addresses are SSRF targets; add the hostname to "
-                "YASHIGANI_AGENT_UPSTREAM_HOSTNAMES if intentional "
-                "(CWE-918 / TM-V231-004)"
-            )
-        if ip.is_link_local:
-            # 169.254.169.254 is the cloud-metadata endpoint — primary SSRF target.
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to link-local {addr_str} — "
-                "link-local addresses (incl. cloud metadata 169.254.169.254) "
-                "are SSRF targets and never valid for agent upstreams "
-                "(CWE-918 / TM-V231-004)"
-            )
-        if ip.is_multicast:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to multicast {addr_str} — "
-                "multicast addresses are not valid HTTP(S) endpoints"
-            )
-        if ip.is_private:
-            raise ValueError(
-                f"upstream_url host {host!r} resolves to RFC 1918 private "
-                f"{addr_str} — private addresses are SSRF-prone; add the "
-                "hostname to YASHIGANI_AGENT_UPSTREAM_HOSTNAMES if "
-                "intentional (CWE-918 / TM-V231-004)"
-            )
-        if ip.is_reserved:
-            raise ValueError(f"upstream_url host {host!r} resolves to reserved {addr_str} (CWE-918 / TM-V231-004)")
-
-    return url
+    return assert_safe_outbound_url(
+        url,
+        allowlist_env="YASHIGANI_AGENT_UPSTREAM_HOSTNAMES",
+        label="upstream_url",
+    )
 
 
 # ---------------------------------------------------------------------------

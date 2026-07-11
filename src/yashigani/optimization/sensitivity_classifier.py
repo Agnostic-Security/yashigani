@@ -267,6 +267,11 @@ class SensitivityClassifier:
         if decode_result.suspicious_blob:
             all_triggers.append("decode:suspicious-blob")
             if final_level < SensitivityLevel.RESTRICTED:
+                # CodeQL py/clear-text-logging (#1869) — WON'T FIX (operational):
+                # the flagged high-entropy tokens are required in the logs for
+                # security forensics (which blob floored sensitivity to RESTRICTED).
+                # Logs are the access-controlled / tamper-evident audit channel, not
+                # a public surface. Keep logging the tokens by design.
                 logger.warning(
                     "F-RT1: undecodable high-entropy encoded blob present — "
                     "flooring sensitivity at RESTRICTED/level-4 (tokens=%s)",

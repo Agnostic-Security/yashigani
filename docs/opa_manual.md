@@ -56,7 +56,7 @@ Agent / User
   [Rate limiter — Redis fixed-window]
      │
      ▼
-  [Inspection pipeline — sklearn ML + LLM]
+  [Inspection pipeline — FastText + LLM]
      │
      ▼
   [OPA policy check] ──── deny → 403 POLICY_DENIED
@@ -274,7 +274,7 @@ likely routing loop, confused-deputy, or injection attempt. 9 covers complex mul
 workflows; each hop is independently JWT/SPIFFE-authenticated, so depth is a sanity backstop,
 not the authentication control.
 
-- **Why it is a constant, not data (CWE-15):** it was previously read from
+- **Why it is a constant, not data (YSG-RISK-056 / CWE-15):** it was previously read from
   `data.yashigani.mcp.policy.chain_max_depth`, which is writable at runtime through the OPA
   REST data API (the same path the RBAC sync uses). Any holder of a policy-write cert could
   raise the limit and defeat the guard. Pinning removes that external-control surface.

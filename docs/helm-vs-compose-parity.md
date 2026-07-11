@@ -1,5 +1,6 @@
 # Helm vs Docker/Podman Compose — Deployment Footprint Differences
 
+**Finding:** B11 — DRIFT-001 (Iris) / Lu A.8.15/A.8.16  
 **Resolution:** v2.25.0 P2 wave 2  
 
 This document explicitly enumerates the components available in Yashigani's

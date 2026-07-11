@@ -155,7 +155,7 @@ helm test yashigani -n yashigani --logs
 | Key | Default | Description |
 |-----|---------|-------------|
 | `global.imageRegistry` | `ghcr.io` | Container registry prefix |
-| `global.imageOwner` | `agnosticsec-com` | Registry namespace/org |
+| `global.imageOwner` | `Agnostic-Security` | Registry namespace/org |
 | `global.tlsDomain` | `yashigani.example.com` | **REQUIRED** — your public domain |
 | `global.tlsMode` | `nginx` | `nginx` (cert-manager) or `caddy` (edge proxy) |
 | `global.certManagerIssuer` | `letsencrypt-prod` | ClusterIssuer name for TLS |

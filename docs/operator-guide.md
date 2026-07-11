@@ -14,7 +14,7 @@ inline in `docker-compose.yml` or `docker-compose.override.yml`.
 
 ## 2. Enabling OPA + Response Inspection Pairing (Compliance Customers)
 
-> **Authority:** Accepted design decision (2026-05-24).
+> **Authority:** YSG-RISK-057 (risk-register.yml, accepted 2026-05-24, Tiago).
 > **Controls:** ASVS V14.1.1, CMMC SC.L2-3.13.10, ISO 27001 A.8.3.
 
 ### 2.1 What the pairing does
@@ -171,7 +171,7 @@ Setting `YASHIGANI_PASSWORD_MAX_AGE_DAYS=pci` raises `ValueError: invalid litera
 
 ## 5. Admin / User Account Separation
 
-**MANDATORY — NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4.**
+**MANDATORY — Tiago directive 2026-05-25 / Iris #96 / NIST AC-5 / SOC 2 CC6.3 / ISO 27001 A.5.16 / CMMC AC.L2-3.1.4.**
 
 ### 5.1 Core principle
 
@@ -230,7 +230,8 @@ If your SSO IdP (OIDC or SAML) uses the same email address for both admin and us
 
 ## 6. PoolManager — Per-Identity Pod Spawning in Kubernetes
 
-> **Authority:** Accepted design decision (2026-05-25) — K8s API backend.
+> **Authority:** YSG-RISK-070 (risk-register.yml, accepted 2026-05-25, Tiago).
+> **Closes:** Tom #56 commit `7e653b1` option (b) — K8s API backend.
 
 ### 6.1 What the K8s backend does
 
@@ -356,5 +357,147 @@ The gateway logs `"K8s backend: pod <name> phase=Pending, waiting..."` every 2 s
 1. Node capacity: `kubectl top nodes`
 2. Pod events: `kubectl describe pod <ysg-*> -n <namespace>`
 3. Increase `podReadyTimeoutSeconds` if image pull is consistently slow
+
+---
+
+## 7. OpenWebUI (end-user chat surface)
+
+### 7.1 Served at the site root
+OpenWebUI (v0.9.2) is served at the **site root** (`https://<domain>/`), not under a
+subpath. OWUI hardcodes the SvelteKit `base=""` and ignores `WEBUI_BASE_URL`, so a
+`/app/webui` subpath renders a blank page. The Caddy root catch-all reverse-proxies
+OWUI behind `forward_auth /auth/verify-user` (+ anti-spoof header strip, WebSocket
+pass-through, and an admin→`/admin` bounce). The legacy `/app/webui*` path 302-redirects
+to `/` for back-compat. Do **not** set `WEBUI_BASE_URL`/`WEBUI_URL`.
+
+### 7.2 Access is opt-in (owui-users group)
+Yashigani is API-first: a user-tier account gets API access by default, but reaching
+OpenWebUI additionally requires membership of the **`owui-users`** RBAC group. A user
+not in `owui-users` is denied with a clear 403 (`X-Authz-Reason: owui_access_required`).
+Add a user to OWUI access via the admin console (Groups → `owui-users`) or the API.
+The check skip-allows when the RBAC store / `owui-users` group is absent (community
+deploys are never locked out).
+
+### 7.3 Default user role + RAG embeddings
+`WEBUI_DEFAULT_USER_ROLE=user` makes non-first OWUI users active (not "pending").
+RAG retrieval uses an Ollama embedding model — `RAG_EMBEDDING_MODEL=nomic-embed-text`
+(pulled by `ollama-init`); the OWUI default `sentence-transformers/...` is not an Ollama
+model and 404s on every retrieval.
+
+> Demo-reliability note (YSG-RISK-089, tracked for v3.0.1): on some fresh deploys an
+> OWUI user may still appear in the "pending" role on first login despite
+> `WEBUI_DEFAULT_USER_ROLE=user`. If a demo/end user cannot access chat, an admin can
+> activate them in the OWUI Admin Panel → Users (set role to "user").
+
+### 7.4 cloud-9 MCP-injection demo (demo mode)
+`install.sh --deploy demo` wires the headline cloud-9 demo: the `cloud9-orchestrate`
+virtual model appears in the OWUI model picker; selecting it and sending a tool call
+whose argument trips the bundled rogue `demo-mcp` causes the upstream to return a
+credential-exfil payload, which the gateway's ResponseInspection + egress OPA **block**
+before it reaches the user. A benign tool call passes through normally. This requires
+`YASHIGANI_INSPECT_RESPONSES=true` (demo mode sets it; off by default in prod —
+YSG-RISK-057).
+
+---
+
+## 8. External MCP Upstream Certificate Revocation
+
+> **Authority:** YSG-RISK-051 (risk register); code label YSG-RISK-058.
+> Implemented v3.0; strict-by-default and env-gated from v3.1.
+> **Controls:** ASVS V10.3.5 (sender-constrained certificates), NIST SP 800-204C §4.
+
+### 8.1 What the revocation-watch covers
+
+Yashigani verifies every external MCP upstream server's TLS identity via a
+fingerprint pin or SPIFFE ID before forwarding calls (Phase-2 / P8, YSG-RISK-056).
+The fingerprint pin proves *identity continuity* — the live cert is the cert that was
+onboarded — but does NOT prove *validity*: a revoked-but-unrotated leaf still matches
+the pinned SHA-256 fingerprint and would otherwise be accepted.
+
+The revocation-watch (`mcp._upstream_revocation`) closes this residual.  After a
+fingerprint or SPIFFE match, the gateway actively queries revocation status from the
+upstream cert's own AIA OCSP responder **before** forwarding the call.  (A CRL
+distribution point, if the cert advertises one, satisfies the strict
+"has-a-revocation-channel" check but is **not** actively fetched — active CRL
+retrieval is a 3.2 item; today revocation is evaluated via OCSP.)
+
+| Verdict | Meaning | Action |
+|---------|---------|--------|
+| `GOOD` | CA says valid; evidence is fresh | Proceed |
+| `REVOKED` | CA says revoked | **Refuse — always, every environment** |
+| `STALE` | OCSP response past `next_update` or too old | **Refuse — always, every environment** |
+| `NO_CHANNEL` | Cert has no OCSP URL and no CRL DP | See §8.2 |
+| `PIN_EXPIRED` | Pin age > `max_pin_age` with no fresh `GOOD` verdict | **Refuse** |
+| `ERROR` / `UNKNOWN` | Network error; fingerprint pin remains the control | Allow |
+
+### 8.2 Strict-by-default: NO_CHANNEL posture (env-gated)
+
+From v3.1 `strict_mode` defaults to **True** (env var `YASHIGANI_MCP_REVOCATION_STRICT`,
+default unset = `true`).
+
+Fingerprint-pinned self-signed MCP upstreams inherently have **no** OCSP responder and
+no CRL distribution point — they present NO_CHANNEL.  Refusing NO_CHANNEL universally
+would break the dev TLS-MCP demo flow and integration re-gate.  The refusal is therefore
+**environment-gated**:
+
+| `YASHIGANI_ENV` | strict_mode=True (default) + NO_CHANNEL | Result |
+|-----------------|----------------------------------------|--------|
+| `production` | **Refuse** | Connection rejected |
+| `staging` | **Refuse** | Connection rejected |
+| unset / `development` / anything else | Warn + allow | Logged; call proceeds |
+
+REVOKED and STALE are **never** env-gated — they block unconditionally in all
+environments, regardless of strict_mode.
+
+### 8.3 Operator overrides
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `YASHIGANI_MCP_REVOCATION_STRICT` | `true` | Set `false` to allow NO_CHANNEL upstreams (e.g. self-signed) in production. Residual bounded by `YASHIGANI_MCP_PIN_MAX_AGE_SECONDS`. |
+| `YASHIGANI_MCP_PIN_MAX_AGE_SECONDS` | `86400` (24 h) | Maximum pin age. A pin older than this with no fresh `GOOD` verdict causes `PIN_EXPIRED` → refuse. |
+| `YASHIGANI_MCP_OCSP_MAX_AGE_SECONDS` | `3600` (1 h) | Maximum OCSP response age. A `this_update` older than this window is treated as `STALE`. |
+| `YASHIGANI_MCP_REVOCATION_TIMEOUT` | `5` | Seconds before an OCSP/CRL fetch times out (fingerprint pin holds on timeout). |
+
+**To pin a self-signed upstream in production** (accepting the bounded residual):
+
+```dotenv
+# Allow a self-signed MCP upstream with no revocation channel in production.
+# Residual exposure bounded by YASHIGANI_MCP_PIN_MAX_AGE_SECONDS (default 24 h).
+YASHIGANI_MCP_REVOCATION_STRICT=false
+```
+
+### 8.4 Accepted residual (YSG-RISK-051)
+
+When `YASHIGANI_MCP_REVOCATION_STRICT=false` (or when running in a dev/test
+environment), a revoked-but-unrotated self-signed cert whose fingerprint still
+matches the pin is accepted until the pin ages past `max_pin_age`.  The exposure
+window equals `max_pin_age` (default 24 h).
+
+In production with the default strict posture, such an upstream is refused
+entirely — no residual.
+
+---
+
+## 9. Logging, audit + SIEM storage encryption
+
+Yashigani emits operational logs (`/var/log/yashigani`, Loki), the tamper-evident
+**audit chain** (Postgres `audit_events`, SHA-384 hash-chain + daily ECDSA-signed
+Merkle checkpoints), and forwards events to your SIEM (Wazuh/Splunk/Elasticsearch).
+
+Some log/audit records intentionally retain sensitive material **in clear text**
+for forensics — e.g. the flagged high-entropy tokens that floored a request to
+RESTRICTED (YSG-RISK-092). This is required: support + the SIEM need the values
+as-is to investigate *what* was flagged.
+
+**Operator requirement — encrypt log + audit storage at rest.** Because logs can
+contain sensitive content, the deployment MUST provide encryption-at-rest for:
+
+- the Docker/host volumes backing `postgres` (audit DB), `loki`, and any
+  file-log mounts (use an encrypted filesystem / LUKS / cloud-provider volume
+  encryption);
+- the SIEM's own datastore (Wazuh indexer / Splunk / Elasticsearch).
+
+Access to these stores is already restricted to the audit/SIEM plane (mTLS,
+RBAC); encryption-at-rest closes the residual disk-theft / snapshot exposure.
 
 *Operator guide — Yashigani. Maintained by Agnostic Security.*

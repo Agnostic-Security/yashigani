@@ -17,9 +17,9 @@
 #   builder  — builds the yashigani wheel
 #   runtime  — Python + bridge + mcp-server-git + git binary (minimal final image)
 #
-# Verified digests (2026-05-30):
-#   python:3.14.5-slim  amd64: sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7
-#   python:3.14.5-slim  arm64: sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075
+# Verified digests (2026-07-03):
+#   python:3.14.6-slim  amd64: sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170
+#   python:3.14.6-slim  arm64: sha256:8b48630e688730a22bd25f3c9e04606b37fa1488cf70e665932ef78a3ee1e4d0
 #
 # Python package pins (verified 2026-05-30 against PyPI):
 #   mcp-server-git==2026.1.14
@@ -39,8 +39,8 @@
 # InvalidBaseImagePlatform warning under emulation.
 ARG TARGETARCH=amd64
 
-FROM python:3.14.5-slim@sha256:7d8de339aa8619f9b25e7d474d687ae4f6ef9704adad90a136af0f485adeccb7 AS python-amd64
-FROM python:3.14.5-slim@sha256:4701f9885ba369bf50a80ae4b5e1f637be3aa961dbb9b676d295e98fb2c01075 AS python-arm64
+FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS python-amd64
+FROM python:3.14.6-slim@sha256:8b48630e688730a22bd25f3c9e04606b37fa1488cf70e665932ef78a3ee1e4d0 AS python-arm64
 
 # Select the correct python stage based on TARGETARCH.
 FROM python-${TARGETARCH} AS python-base

@@ -229,10 +229,22 @@ async def create_admin(body: CreateAdminRequest, session: AdminSession):
 
     # Generate TOTP secret for provisioning — installer-privileged path
     # because another admin is onboarding this account out-of-band.
-    from yashigani.auth.totp import generate_provisioning
+    # Phase 13: admin tier → SHA-512/8-digit TOTP.
+    from yashigani.auth.totp import (
+        generate_provisioning,
+        TOTP_ALGO_SHA512,
+        TOTP_DIGITS_ADMIN,
+    )
 
-    totp = generate_provisioning(account_name=body.username, issuer="Yashigani")
-    await state.auth_service.set_totp_secret_direct(body.username, totp.secret_b32)
+    totp = generate_provisioning(
+        account_name=body.username,
+        issuer="Yashigani",
+        algorithm=TOTP_ALGO_SHA512,
+        digits=TOTP_DIGITS_ADMIN,
+    )
+    await state.auth_service.set_totp_secret_direct(
+        body.username, totp.secret_b32, algorithm=TOTP_ALGO_SHA512
+    )
     record.totp_secret = totp.secret_b32
     record.force_totp_provision = False  # pre-provisioned
 
@@ -300,8 +312,12 @@ async def disable_admin(username: str, session: StepUpAdminSession):
 
     await state.auth_service.disable(username)
     state.session_store.invalidate_all_for_account(record.account_id)
-    # LF-DISABLE-PARTIAL: suspend identity-registry entries for this admin.
-    _suspend_identity_registry_for_account(record.account_id)
+    # LF-DISABLE-PARTIAL / LAURA-DK-001: suspend identity-registry entries for this admin.
+    _suspend_identity_registry_for_account(
+        record.account_id,
+        username=username,
+        email=getattr(record, "email", None),
+    )
     state.audit_writer.write(_config_event(session.account_id, "admin_account_disabled", username, "disabled", account_tier=session.account_tier))
     return {"status": "ok"}
 
@@ -411,7 +427,11 @@ async def update_admin(username: str, body: UpdateAdminRequest, session: StepUpA
                 )
             await state.auth_service.disable(username)
             state.session_store.invalidate_all_for_account(record.account_id)
-            _suspend_identity_registry_for_account(record.account_id)
+            _suspend_identity_registry_for_account(
+                record.account_id,
+                username=username,
+                email=getattr(record, "email", None),
+            )
             state.audit_writer.write(_config_event(session.account_id, "admin_account_disabled", username, "disabled", account_tier=session.account_tier))
         else:
             from yashigani.licensing.enforcer import check_admin_seat_limit, LicenseLimitExceeded
@@ -429,36 +449,64 @@ async def update_admin(username: str, body: UpdateAdminRequest, session: StepUpA
     return {"status": "ok", "changed": changed}
 
 
-def _suspend_identity_registry_for_account(account_id: str) -> None:
+def _suspend_identity_registry_for_account(
+    account_id: str,
+    *,
+    username: str = "",
+    email: str | None = None,
+) -> None:
     """Suspend all identity-registry entries owned by account_id.
 
     LF-DISABLE-PARTIAL (2026-04-27): mirrors users.py equivalent.
-    SEC-240-7: now uses suspend_owned_by() — O(1) index lookup instead of
-    full registry scan.
-    Fail-soft on registry unavailability.
+    SEC-240-7: uses suspend_owned_by() — O(1) org_id index lookup.
+
+    LAURA-DK-001 (2026-07-04): slug-based fallback for identities registered
+    before the org_id fix (admin identities don't get HUMAN identities so
+    this is a no-op for them in practice, but the fallback is harmless and
+    ensures parity with users.py).  Fail-soft on registry unavailability.
     """
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
     registry = backoffice_state.identity_registry
     if registry is None:
-        import logging as _log
-
-        _log.getLogger(__name__).warning(
+        _logger.warning(
             "LF-DISABLE-PARTIAL: identity_registry not available — API keys for account %s NOT suspended",
             account_id,
         )
         return
     try:
         suspended = registry.suspend_owned_by(account_id)
-        import logging as _log
 
-        _log.getLogger(__name__).info(
+        # LAURA-DK-001 slug fallback — see users.py for rationale.
+        if suspended == 0 and (username or email):
+            from yashigani.backoffice.routes.auth import _auth_email_to_slug
+            slug_email = email or f"{username}@yashigani.local"
+            try:
+                slug = _auth_email_to_slug(slug_email)
+                identity = registry.get_by_slug(slug)
+                if identity is not None and identity.get("status") == "active":
+                    registry.suspend(identity["identity_id"])
+                    suspended = 1
+                    _logger.info(
+                        "LAURA-DK-001: suspended identity %s for account %s via slug fallback",
+                        identity["identity_id"],
+                        account_id,
+                    )
+            except Exception as slug_exc:
+                _logger.error(
+                    "LAURA-DK-001: slug fallback suspend FAILED for account %s: %s",
+                    account_id,
+                    slug_exc,
+                )
+
+        _logger.info(
             "LF-DISABLE-PARTIAL: suspended %d identity-registry entries for account %s",
             suspended,
             account_id,
         )
     except Exception as exc:
-        import logging as _log
-
-        _log.getLogger(__name__).error(
+        _logger.error(
             "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
             account_id,
             exc,

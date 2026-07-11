@@ -7,9 +7,12 @@
 # via a PUT to /v1/data/yashigani/rbac.
 #
 # Input fields consumed:
-#   input.session.email    — user email resolved from the gateway session
-#   input.request.method   — HTTP method
-#   input.request.path     — request path
+#   input.session.identity_id — resolved identity_id (idnt_{12hex}) from
+#                               request.state.ysg_principal.identity_id.
+#                               Set by the gateway boundary resolver (3.1
+#                               UID unification — NOT the raw email header).
+#   input.request.method      — HTTP method
+#   input.request.path        — request path
 
 package yashigani
 
@@ -25,11 +28,12 @@ allow_rbac if {
     # Require RBAC data to be present and non-empty
     count(data.yashigani.rbac.groups) > 0
 
-    email := input.session.email
-    email != ""
+    identity_id := input.session.identity_id
+    identity_id != ""
 
-    # Walk user → group → pattern
-    group_id := data.yashigani.rbac.user_groups[email][_]
+    # Walk identity → group → pattern
+    # user_groups is keyed by identity_id after the 3.1 UID migration.
+    group_id := data.yashigani.rbac.user_groups[identity_id][_]
     group    := data.yashigani.rbac.groups[group_id]
     pattern  := group.allowed_resources[_]
 

@@ -70,11 +70,10 @@ _pw_required = pytest.mark.skipif(
 
 def _wait_for_fresh_totp_window() -> str:
     """Wait for a fresh TOTP time window and return a code."""
-    import hashlib
     import pyotp
 
     totp_secret = _read_secret("admin1_totp_secret")
-    totp_obj = pyotp.TOTP(totp_secret, digest=hashlib.sha256)
+    totp_obj = pyotp.TOTP(totp_secret)  # RFC 6238 default: HMAC-SHA1
 
     last = _api_totp_last_used.get(1, 0.0)
     now = time.time()

@@ -90,6 +90,42 @@ AdminSession = Annotated[Session, Depends(require_admin_session)]
 AnySession = Annotated[Session, Depends(require_any_session)]
 
 
+def require_user_session(
+    request: Request,
+    store: SessionStore = Depends(get_session_store),
+) -> Session:
+    """
+    FastAPI dependency that accepts only user-tier sessions.
+    Rejects admin sessions — prevents admins from calling user-scoped endpoints
+    (SoD-003 equivalent for the user plane).
+    """
+    token = _resolve_token(request)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "authentication_required"},
+        )
+
+    session = store.get(token)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "session_expired_or_invalid"},
+        )
+
+    if session.account_tier != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "user_tier_required"},
+        )
+
+    return session
+
+
+#: Annotated dependency alias for user-plane routes.
+UserSession = Annotated[Session, Depends(require_user_session)]
+
+
 def require_stepup_admin_session(
     session: Session = Depends(require_admin_session),
 ) -> Session:

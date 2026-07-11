@@ -52,6 +52,34 @@ def _read_uninstall() -> str:
     return UNINSTALL_SH.read_text(encoding="utf-8")
 
 
+def _state_write_pos(block: str) -> int:
+    """Return the index of the actual state-file redirect write in ``block``.
+
+    Robust to the redirect target being either the literal path
+    ``> "${WORK_DIR}/docker/.yashigani-install-state"`` or a path *variable*
+    (``> "$_k8s_state_path"`` / ``> "$_state_path"``) that was assigned the same
+    literal earlier in the block. Both are the same write; anchoring only on the
+    literal form was the brittle assumption that broke when the MI-2/MI-6 fields
+    introduced a path-variable for readability.
+
+    Returns -1 if no redirect-write is present.
+    """
+    import re
+    # Any `> "<...>.yashigani-install-state"`  OR  `> "$<var>"` where <var> was
+    # assigned a .yashigani-install-state path earlier in the same block.
+    m = re.search(r'>\s*"\$\{?WORK_DIR\}?/docker/\.yashigani-install-state"', block)
+    if m:
+        return m.start()
+    # Path-variable form: confirm the variable holds the install-state path, then
+    # anchor on the redirect that uses it.
+    for var_m in re.finditer(r'(\w+)="\$\{?WORK_DIR\}?/docker/\.yashigani-install-state"', block):
+        var = var_m.group(1)
+        redir = re.search(r'>\s*"\$\{?%s\}?"' % re.escape(var), block)
+        if redir:
+            return redir.start()
+    return -1
+
+
 def _main_k8s_block(script: str) -> str:
     """Return the k8s block from main() — the LAST occurrence of the k8s mode check.
 
@@ -143,13 +171,17 @@ class TestB1StateFileInstallSide:
         """State file write must be inside a DRY_RUN guard so dry runs stay clean."""
         script = _read_install()
         k8s_block = _main_k8s_block(script)
-        # Search for the actual redirect write (not the comment mention)
-        write_pos = k8s_block.find('> "${WORK_DIR}/docker/.yashigani-install-state"')
+        # Robust write-position lookup (literal OR path-variable redirect form).
+        write_pos = _state_write_pos(k8s_block)
         assert write_pos != -1, "Actual state file redirect not found in k8s block"
-        # The state file write must be preceded by a DRY_RUN guard
-        preceding = k8s_block[max(0, write_pos - 800):write_pos]
-        assert 'DRY_RUN' in preceding and '"true"' in preceding, (
-            "State file write is not inside a DRY_RUN != true guard"
+        # Anchor on the ENCLOSING `if [[ "$DRY_RUN" != "true" ]]; then` guard rather
+        # than a fragile fixed char-window (the MI-2/MI-6 fields + mint logic widened
+        # the preamble between the guard and the write). The guard is the last
+        # DRY_RUN-!= -"true" gate that opens before the write.
+        guard = 'if [[ "$DRY_RUN" != "true" ]]; then'
+        guard_pos = k8s_block.rfind(guard, 0, write_pos)
+        assert guard_pos != -1, (
+            "State file write is not inside a `if [[ \"$DRY_RUN\" != \"true\" ]]` guard"
         )
 
     def test_state_file_write_after_k8s_print_access(self):
@@ -168,11 +200,16 @@ class TestB1StateFileInstallSide:
         """State file write must mkdir -p the docker/ dir in case it doesn't exist on k8s."""
         script = _read_install()
         k8s_block = _main_k8s_block(script)
-        # Search for the actual redirect write (not the comment mention)
-        write_pos = k8s_block.find('> "${WORK_DIR}/docker/.yashigani-install-state"')
+        # Robust write-position lookup (literal OR path-variable redirect form).
+        write_pos = _state_write_pos(k8s_block)
         assert write_pos != -1, "Actual state file redirect not found in k8s block"
-        # Look at the 600 chars before the write for mkdir -p
-        preceding = k8s_block[max(0, write_pos - 600):write_pos]
+        # The `mkdir -p ${WORK_DIR}/docker` must occur within the SAME DRY_RUN guard
+        # block that contains the write, before the write. Anchor on the guard, not a
+        # fixed char-window, so added state-file fields cannot push mkdir out of range.
+        guard = 'if [[ "$DRY_RUN" != "true" ]]; then'
+        guard_pos = k8s_block.rfind(guard, 0, write_pos)
+        assert guard_pos != -1, "DRY_RUN guard preceding state-file write not found"
+        preceding = k8s_block[guard_pos:write_pos]
         assert 'mkdir -p' in preceding, (
             "State file write does not mkdir -p the docker/ directory first"
         )
@@ -181,8 +218,8 @@ class TestB1StateFileInstallSide:
         """State file must be chmod 0644 — uninstall.sh may run as different user."""
         script = _read_install()
         k8s_block = _main_k8s_block(script)
-        # Search for the actual redirect write (not the comment mention)
-        write_pos = k8s_block.find('> "${WORK_DIR}/docker/.yashigani-install-state"')
+        # Robust write-position lookup (literal OR path-variable redirect form).
+        write_pos = _state_write_pos(k8s_block)
         assert write_pos != -1, "Actual state file redirect not found in k8s block"
         # chmod 0644 follows within 200 chars after the redirect
         following = k8s_block[write_pos:write_pos + 200]

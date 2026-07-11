@@ -37,6 +37,18 @@ data:
 {{ .Files.Get "files/policy/agents.rego" | indent 4 }}
   mcp.rego: |
 {{ .Files.Get "files/policy/mcp.rego" | indent 4 }}
+  document.rego: |
+{{ .Files.Get "files/policy/document.rego" | indent 4 }}
+  clients_aggregate.rego: |
+{{ .Files.Get "files/policy/clients_aggregate.rego" | indent 4 }}
+  # LAURA-30-001 (2026-06-14): OPA management-API authorisation policy.
+  # Loaded by OPA as package system.authz (--authorization=basic). Stored under
+  # a flat ConfigMap key (system-authz.rego) and subPath-mounted at the path
+  # OPA recurses at startup (/policies/system/authz.rego). The system/ subdir
+  # is preserved in the mountPath so OPA loads it as data.system.authz
+  # (package name must match directory path for OPA's bundle loader).
+  system-authz.rego: |
+{{ .Files.Get "files/policy/system/authz.rego" | indent 4 }}
 {{- end }}
 
 {{- if .Values.otelCollector.enabled }}
@@ -443,16 +455,35 @@ data:
         X-Content-Type-Options    "nosniff"
         X-Frame-Options           "DENY"
         Referrer-Policy           "no-referrer"
-        Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+        # CSP is set per-path below (NOT here) — a global SET would produce a
+        # second CSP header when the per-path @redoc_ui override also fires.
+        # LAURA-2255-006 / LAURA-30-009: double CSP header on /admin/api-redoc
+        # and /redoc was caused by a global CSP here + @redoc_ui below both
+        # setting the header. Fixed by moving all CSP to named-matcher directives.
         Cross-Origin-Opener-Policy "same-origin"
         -Server
       }
+      # CSP, set per-path so exactly one policy applies per request.
+      # Mirrors docker/Caddyfile.{selfsigned,ca} @strict_ui / @lenient_ui pattern.
+      #
+      # STRICT: first-party admin plane + auth + static routes.
+      # LENIENT: Open WebUI catch-all (SvelteKit inline hydration + unsafe-eval).
+      # REDOC: /admin/api-redoc + /redoc only — blob: worker + unsafe-inline styles.
+      @strict_ui {
+        path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
+        # LAURA-2255-006 / LAURA-30-009: exclude ReDoc paths so @redoc_ui is the
+        # sole CSP source for those two routes.
+        not path /admin/api-redoc /redoc
+      }
+      @lenient_ui not path /admin/* /auth/* /me/* /dashboard/* /scim/* /api/v1/admin/* /static/* /login /login/* /docs /redoc /openapi.json
       # N2 (2.25.5): ReDoc requires worker-src blob: child-src blob: because it
       # spawns a Web Worker via blob: URL for syntax highlighting.  Scoped only
-      # to the two ReDoc routes; all other paths keep the default strict CSP above.
-      # 'unsafe-inline' on style-src is also required: Redoc injects inline CSS
+      # to the two ReDoc routes; all other strict_ui paths keep the strict CSP.
+      # 'unsafe-inline' on style-src is also required: ReDoc injects inline CSS
       # via its web component Shadow DOM at render time.
       @redoc_ui path /admin/api-redoc /redoc
+      header @strict_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
+      header @lenient_ui Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
       header @redoc_ui Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src blob:; child-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
       handle /healthz {
         import strip-orchestration-headers
@@ -549,11 +580,12 @@ data:
         # Caddy presents caddy_client.crt to backoffice via internal-mtls.
         # require_spiffe_id trusts x-spiffe-id when x-spiffe-id-peer-cert is
         # absent (uvicorn does not expose the ASGI TLS peer_cert extension).
-        # The hardcoded "spiffe://yashigani.internal/caddy" matches the ACL
+        # MI-6: the per-instance "spiffe://<trust-domain>/caddy" matches the ACL
         # entry in service_identities.yaml endpoint_acls["/admin/agents"].
+        # trust-domain = .Values.global.spiffeTrustDomain (default yashigani.internal).
         # Parity with docker/Caddyfile.{selfsigned,ca,acme} (commit 8a1dbf5).
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
         {{- end }}
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}
@@ -573,7 +605,7 @@ data:
       handle /api/v1/admin/* {
         {{- if .Values.mtls.enabled }}
         request_header -X-SPIFFE-ID
-        request_header X-SPIFFE-ID "spiffe://yashigani.internal/caddy"
+        request_header X-SPIFFE-ID "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/caddy"
         {{- end }}
         reverse_proxy https://yashigani-backoffice:8443 {
           {{- if .Values.mtls.enabled }}

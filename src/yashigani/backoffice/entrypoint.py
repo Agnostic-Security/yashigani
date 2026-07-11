@@ -192,6 +192,10 @@ def _bootstrap():
     rbac_store = None
     agent_registry = None
     binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
+    document_policy_store = None
+    document_set_store = None
+    envelope_pending_store = None    # 3.0 — capability-envelope re-approval queue
+    _cap_policy_store = None         # 3.0 — browser Permissions-Policy
     _RBAC_MAX_ATTEMPTS = 5
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
@@ -241,6 +245,51 @@ def _bootstrap():
             logger.info(
                 "Binding store initialised: %d client-policy binding(s) loaded",
                 len(binding_store.list()),
+            )
+            # Document-enforcement policy store (2.26) shares Redis db/3
+            # (key namespace "document:"); same persistence + startup-OPA-re-push
+            # pattern as the RBAC store. Seed the demo matrix on first boot only.
+            from yashigani.documents.policy_store import DocumentPolicyStore
+            document_policy_store = DocumentPolicyStore(redis_client=redis_rbac_client)
+            document_policy_store.seed_defaults()
+            logger.info(
+                "Document policy store initialised: %d policy(ies) loaded from Redis",
+                len(document_policy_store.list_policies()),
+            )
+            # Document-SET store (2.26 set-scoped-salt) shares Redis db/3
+            # (key namespace "document:set:"); holds the opaque per-set salt for
+            # operator-defined cross-file correlation sets.  No seeding — sets are
+            # operator-created (default stays per-file isolation).
+            from yashigani.documents.set_store import DocumentSetStore
+            document_set_store = DocumentSetStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Document set store initialised: %d set(s) loaded from Redis",
+                len(document_set_store.list_sets()),
+            )
+            # Capability-envelope PENDING re-approval store (3.0 / YSG-RISK-060)
+            # shares Redis db/3 (key namespace "mcp_envelope_pending:"). Holds the
+            # candidate (refreshed) tool surface for every BLOCKED imported-MCP
+            # refresh so the re-approval admin SPA can show the diff vs the
+            # ORIGINAL baseline and mint it on step-up approve. No seeding —
+            # entries are created by the broker when it latches a block.
+            from yashigani.mcp.envelope_pending_store import EnvelopePendingStore
+            envelope_pending_store = EnvelopePendingStore(redis_client=redis_rbac_client)
+            logger.info(
+                "Capability-envelope pending store initialised: %d pending re-approval(s)",
+                len(envelope_pending_store.list_for_tenant(
+                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+                )),
+            )
+            # 3.0 — browser Permissions-Policy store (Redis db/3, prefix cap_policy:*)
+            from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+            _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+            _cap_policy_store = _CapPolStore(
+                redis_client=redis_rbac_client,
+                default_org_id=_cap_pol_org_id,
+            )
+            logger.info(
+                "Capability policy store initialised (browser Permissions-Policy, 3.0, org=%s)",
+                _cap_pol_org_id,
             )
             break  # success
         except Exception as exc:
@@ -312,6 +361,28 @@ def _bootstrap():
         logger.warning(
             "Backend registry init failed (%s) — inspection pipeline uses legacy classifier",
             exc,
+        )
+
+    # DP-Y-003 §3.4 — semantic-intent sidecar for MCP import screening.
+    # Wraps an OllamaBackend at the same URL + model as the inspection pipeline
+    # so import-time screening runs the SAME classifier as the inference path.
+    # Stored in backoffice_state so envelope_import._screen_tools can reach it
+    # without a circular import.  Fail-safe: None when Ollama is unreachable at
+    # startup; envelope_import records classifier_status="unavailable" honestly.
+    _semantic_intent_sidecar = None
+    try:
+        from yashigani.inspection.semantic_intent import SemanticIntentSidecar
+        from yashigani.inspection.backends.ollama import OllamaBackend as _SidecarOllamaBackend
+        _sidecar_backend = _SidecarOllamaBackend(base_url=ollama_url, model=model)
+        _semantic_intent_sidecar = SemanticIntentSidecar.from_env(_sidecar_backend)
+        logger.info(
+            "Semantic-intent sidecar built for MCP import screening "
+            "(DP-Y-003 §3.4, backend=%s model=%s)", ollama_url, model,
+        )
+    except Exception as _sidecar_exc:
+        logger.warning(
+            "Semantic-intent sidecar unavailable (%s) — "
+            "envelope import screening falls back to heuristic-only", _sidecar_exc,
         )
 
     # ── Model alias store (Redis db/1, separate key namespace) ─────────────
@@ -407,6 +478,50 @@ def _bootstrap():
             exc,
         )
 
+    # ── Budget enforcer (budget-redis, db/0) — wires /admin/budget/usage/{id} ──
+    # FIND-3.0-005 fix: /admin/budget/usage/{identity_id} returns 503 because
+    # the backoffice never connected to budget-redis or instantiated a
+    # BudgetEnforcer.  The gateway wires one at startup (gateway/entrypoint.py
+    # line ~325).  The backoffice mirrors that wiring here so usage data written
+    # by the gateway can be read back via the admin UI.
+    #
+    # budget-redis sits on the `data` bridge (compose line 1056: "budget-redis
+    # is a data-plane dep of gateway/backoffice only") — accessible from the
+    # backoffice container.  We reuse build_redis_url() with an explicit host
+    # override (BUDGET_REDIS_HOST, default "budget-redis") and the backoffice
+    # client cert (same TLS CA, accepted by budget-redis --tls-auth-clients yes).
+    try:
+        import redis as _redis_br
+        from yashigani.billing.budget_enforcer import BudgetEnforcer as _BudgetEnforcer
+        from yashigani.backoffice.routes import budget as _budget_routes_be
+        _budget_redis_host = os.getenv("BUDGET_REDIS_HOST", "budget-redis")
+        _budget_redis_port = os.getenv("BUDGET_REDIS_PORT", "6380")
+        _budget_redis_url = build_redis_url(
+            0,
+            host=_budget_redis_host,
+            port=_budget_redis_port,
+            password=_redis_password,
+            use_tls=redis_use_tls,
+            secrets_dir=_secrets_dir,
+            client_cert_name="backoffice_client",
+        )
+        _budget_redis_client = _redis_br.from_url(_budget_redis_url, decode_responses=False)
+        _budget_redis_client.ping()
+        _budget_enforcer = _BudgetEnforcer(redis_client=_budget_redis_client)
+        _budget_routes_be.configure(
+            budget_enforcer=_budget_enforcer,
+            budget_store=budget_config_store,
+        )
+        logger.info(
+            "Budget enforcer wired to /admin/budget/usage/* (budget-redis at %s:%s)",
+            _budget_redis_host, _budget_redis_port,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Budget enforcer init failed (%s) — /admin/budget/usage/* will return 503",
+            exc,
+        )
+
     # ── OTEL tracing ───────────────────────────────────────────────────────
     try:
         from yashigani.tracing import setup_tracer
@@ -479,6 +594,10 @@ def _bootstrap():
     backoffice_state.rbac_store = rbac_store
     backoffice_state.binding_store = binding_store    # #16
     backoffice_state.agent_registry = agent_registry
+    backoffice_state.document_policy_store = document_policy_store
+    backoffice_state.document_set_store = document_set_store
+    backoffice_state.envelope_pending_store = envelope_pending_store
+    backoffice_state.capability_policy_store = _cap_policy_store  # 3.0 — Permissions-Policy
     backoffice_state.backend_registry = backend_registry
     backoffice_state.backend_config_store = backend_config_store
     backoffice_state.opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")
@@ -492,6 +611,7 @@ def _bootstrap():
     backoffice_state.license_state = license_state
     backoffice_state.model_alias_store = model_alias_store
     backoffice_state.model_allocation_store = model_allocation_store
+    backoffice_state.semantic_intent_sidecar = _semantic_intent_sidecar  # DP-Y-003 §3.4
 
     # v0.9.0 — WebAuthn + EventBus (optional, graceful degradation if unavailable)
     try:

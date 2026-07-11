@@ -1,7 +1,8 @@
 # E2E Coverage Guarantees
 
 **Last updated:** 2026-05-24
-**Owner:** QA team
+**Owner:** Ava (QA)
+**Linked risk:** YSG-RISK-059
 
 ---
 
@@ -14,7 +15,9 @@ Prior to v2.24.1, Yashigani E2E test sweeps (Tier 1 MAX) verified:
 - Service reachability (`GET /healthz` from inside the gateway container)
 - `/v1/models` returning a model list
 
-These checks all **passed** across five platforms even when the base-URL misconfiguration bug was present. The bug caused every langflow and letta inference dispatch to fail at runtime, but none of the above checks exercised the actual dispatch data path.
+These checks all **passed** across five platforms even when BUG-V241-LANGFLOW-LETTA-BASE-URL
+was present. The bug caused every langflow and letta inference dispatch to fail at runtime,
+but none of the above checks exercised the actual dispatch data path.
 
 This document records the **A1 amendment principle** applied to agent dispatch testing
 and the rules for extending coverage when new agent bundles are added.
@@ -30,7 +33,8 @@ These are two distinct properties:
 | **Container-healthy** | The process started; the health endpoint responds; no crash at startup | `docker inspect .State.Health.Status` or `GET /healthz` |
 | **Dispatch-working** | A real LLM inference request travels the full data path and returns a non-empty response | `POST /v1/chat/completions` with `model: @<agent>` and assertion on `choices[0].message.content` |
 
-Container-healthy does NOT imply dispatch-working. The specific failure mode was:
+Container-healthy does NOT imply dispatch-working. The specific failure mode for
+BUG-V241-LANGFLOW-LETTA-BASE-URL was:
 
 1. Langflow container starts successfully (healthcheck PASS).
 2. Agent registers in Redis with `upstream_url: http://langflow:7860` (registration PASS).
@@ -47,7 +51,7 @@ No prior E2E test asserted the outcome of step 7.
 
 ## The A1 amendment principle
 
-**Rule:**
+**Rule (from `feedback_admin_bootstrap_both_admins.md` §A1):**
 
 > Absence of a test artefact = SKIP, not PASS. PASS requires positive evidence
 > that each step of the test ran AND its expected artefact materialised.
@@ -153,6 +157,8 @@ will surface it in the nightly run.
 |---|---|
 | v2.23.4 | BUG-2: `open-webui` was using `gateway:8080` (mTLS). Fixed to `gateway:8081`. |
 | v2.24.0 | Langflow and letta added. Both inherited the pre-BUG-2 pattern: `gateway:8080`. No dispatch test added at inclusion time. |
-| v2.24.1 | Base-URL port misconfiguration in langflow/letta agent configuration confirmed. Fix: `8080 → 8081`. This document and `tests/contracts/test_agent_base_url_port.py` added as regression gate. |
+| v2.24.1 | BUG-V241-LANGFLOW-LETTA-BASE-URL confirmed. Fix: `8080 → 8081`. This document and `tests/contracts/test_agent_base_url_port.py` added as regression gate. |
 
-The lesson: new agent bundles require a security threat model review AND a dispatch-working test at inclusion time. Both were absent for langflow and letta.
+The lesson: new agent bundles added after BUG-2 needed a Laura threat model review
+(per `feedback_laura_review_new_third_party_components.md`) AND a dispatch-working
+test at inclusion time. Both were absent for langflow and letta.

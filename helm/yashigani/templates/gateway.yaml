@@ -107,6 +107,11 @@ spec:
               value: "/etc/yashigani/service_identities.yaml"
             - name: YASHIGANI_INTERNAL_CA_DIR
               value: "/run/secrets"
+            # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust domain
+            # for the app-layer validators. Default yashigani.internal (single
+            # instance). Compose parity: x-common-env YASHIGANI_SPIFFE_TRUST_DOMAIN.
+            - name: YASHIGANI_SPIFFE_TRUST_DOMAIN
+              value: {{ .Values.global.spiffeTrustDomain | default "yashigani.internal" | quote }}
             {{- end }}
             - name: YASHIGANI_AGENT_ROUTING_ENABLED
               value: {{ $gwEnv.agentRoutingEnabled | quote }}
@@ -156,6 +161,11 @@ spec:
             */}}
             - name: YASHIGANI_MCP_SERVERS
               value: {{ .Values.gateway.mcpServers | default list | toJson | quote }}
+            # DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
+            # Default true (default-on per DP-Y-003 coherence fix).
+            # Set gateway.semanticIntentSidecar: false in values to disable.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.gateway.semanticIntentSidecar | default true | toString | quote }}
             # Iris F-2: MCP broker OPA AsyncClient reads this CA path
             # (src/yashigani/mcp/_opa.py:_make_opa_http_client).  Without it on
             # K8s, OPA HTTPS verify falls through to system trust store and

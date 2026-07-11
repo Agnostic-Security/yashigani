@@ -2,10 +2,13 @@
 Yashigani RBAC — Redis-backed group/user store.
 
 Redis db/3 key schema:
-    rbac:group:{id}     — JSON-serialised RBACGroup (all fields)
-    rbac:user:{email}   — Redis SET of group IDs the user belongs to
+    rbac:group:{id}           — JSON-serialised RBACGroup (all fields)
+    rbac:user:{identity_id}   — Redis SET of group IDs the identity belongs to.
+                                identity_id = idnt_{12hex} from identity registry.
+                                NOT email. NOT slug. After the 3.1 UID migration,
+                                all user-index keys are identity_id-keyed.
 
-Deny-by-default: is_allowed() returns False when the user has no groups or
+Deny-by-default: is_allowed() returns False when the identity has no groups or
 no group has a pattern that matches the (method, path) pair.
 
 Glob rules for path matching (mirrors OPA rbac.rego):
@@ -25,7 +28,7 @@ from yashigani.rbac.model import RBACGroup, ResourcePattern
 logger = logging.getLogger(__name__)
 
 _KEY_GROUP = "rbac:group:{}"   # .format(group_id)
-_KEY_USER  = "rbac:user:{}"    # .format(email)
+_KEY_USER  = "rbac:user:{}"    # .format(identity_id) — idnt_{12hex} after 3.1 migration
 
 
 class RBACStore:
@@ -78,24 +81,30 @@ class RBACStore:
     # ------------------------------------------------------------------
 
     def add_group(self, group: RBACGroup) -> None:
-        """Add or overwrite a group.  Writes through to Redis."""
+        """Add or overwrite a group.  Writes through to Redis.
+
+        After the 3.1 UID migration, group.members contains identity_ids
+        (idnt_{12hex}), NOT emails.  The user→group index is keyed by identity_id.
+        """
         self._groups[group.id] = group
         self._redis.set(_KEY_GROUP.format(group.id), json.dumps(group.to_dict()))
-        # Ensure all members are reflected in the user index
-        for email in group.members:
-            self._redis.sadd(_KEY_USER.format(email), group.id)
+        # Ensure all members are reflected in the identity→group index
+        for identity_id in group.members:
+            self._redis.sadd(_KEY_USER.format(identity_id), group.id)
 
     def remove_group(self, group_id: str) -> None:
         """
-        Remove a group and clean up all user→group index entries.
+        Remove a group and clean up all identity→group index entries.
         No-op if the group does not exist.
+
+        After 3.1 UID migration, group.members contains identity_ids.
         """
         group = self._groups.pop(group_id, None)
         if group is None:
             return
         self._redis.delete(_KEY_GROUP.format(group_id))
-        for email in group.members:
-            self._redis.srem(_KEY_USER.format(email), group_id)
+        for identity_id in group.members:
+            self._redis.srem(_KEY_USER.format(identity_id), group_id)
 
     def get_group(self, group_id: str) -> Optional[RBACGroup]:
         """Return the group or None if it does not exist."""
@@ -109,49 +118,62 @@ class RBACStore:
     # Member management
     # ------------------------------------------------------------------
 
-    def add_member(self, group_id: str, email: str) -> None:
+    def add_member(self, group_id: str, identity_id: str) -> None:
         """
-        Add *email* to *group_id*.
+        Add *identity_id* to *group_id*.
+
+        identity_id must be the opaque UID (idnt_{12hex}) from the identity
+        registry.  Callers are responsible for resolving email → identity_id
+        before calling (see backoffice/routes/rbac.py and scim.py).
 
         Raises KeyError if the group does not exist.
-        Updates both the group object and the user→group Redis index.
+        Updates both the group object and the identity→group Redis index.
         """
         group = self._groups.get(group_id)
         if group is None:
             raise KeyError(f"RBAC group '{group_id}' does not exist")
-        group.members.add(email)
+        group.members.add(identity_id)
         self._redis.set(_KEY_GROUP.format(group_id), json.dumps(group.to_dict()))
-        self._redis.sadd(_KEY_USER.format(email), group_id)
+        self._redis.sadd(_KEY_USER.format(identity_id), group_id)
 
-    def remove_member(self, group_id: str, email: str) -> None:
+    def remove_member(self, group_id: str, identity_id: str) -> None:
         """
-        Remove *email* from *group_id*.
+        Remove *identity_id* from *group_id*.
+
+        identity_id must be the opaque UID (idnt_{12hex}) from the identity
+        registry.  Callers are responsible for resolving email → identity_id
+        before calling (see backoffice/routes/rbac.py and scim.py).
 
         Raises KeyError if the group does not exist.
         """
         group = self._groups.get(group_id)
         if group is None:
             raise KeyError(f"RBAC group '{group_id}' does not exist")
-        group.members.discard(email)
+        group.members.discard(identity_id)
         self._redis.set(_KEY_GROUP.format(group_id), json.dumps(group.to_dict()))
-        self._redis.srem(_KEY_USER.format(email), group_id)
+        self._redis.srem(_KEY_USER.format(identity_id), group_id)
 
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
 
-    def get_user_groups(self, email: str) -> list[RBACGroup]:
+    def get_user_groups(self, identity_id: str) -> list[RBACGroup]:
         """
-        Return all groups *email* belongs to.
+        Return all groups *identity_id* belongs to.
 
-        Reads the user→group index from Redis (authoritative) and resolves
+        identity_id must be the opaque UID (idnt_{12hex}) from the identity
+        registry.  After the 3.1 UID migration, all user-index keys are
+        identity_id-keyed.  Passing an email or slug will return [] — use
+        the identity registry to resolve to identity_id first.
+
+        Reads the identity→group index from Redis (authoritative) and resolves
         each group id from the in-memory cache.  Groups that no longer exist
         in the cache are silently skipped (stale index entries).
         """
         try:
-            group_ids: set[bytes] = self._redis.smembers(_KEY_USER.format(email))
+            group_ids: set[bytes] = self._redis.smembers(_KEY_USER.format(identity_id))
         except Exception as exc:
-            logger.error("RBAC store: smembers failed for %s: %s", email, exc)
+            logger.error("RBAC store: smembers failed for %s: %s", identity_id, exc)
             return []
 
         result: list[RBACGroup] = []
@@ -162,17 +184,21 @@ class RBACStore:
                 result.append(group)
         return result
 
-    def is_allowed(self, email: str, method: str, path: str) -> bool:
+    def is_allowed(self, identity_id: str, method: str, path: str) -> bool:
         """
         Deny-by-default RBAC check.
 
-        Returns True if *at least one* group that *email* belongs to has a
+        identity_id must be the opaque UID (idnt_{12hex}) from the identity
+        registry.  After the 3.1 UID migration, all user-index keys are
+        identity_id-keyed.
+
+        Returns True if *at least one* group that *identity_id* belongs to has a
         ResourcePattern that matches (*method*, *path*).
         Returns False if:
-          - the user has no groups, OR
+          - the identity has no groups, OR
           - no group has a matching pattern.
         """
-        groups = self.get_user_groups(email)
+        groups = self.get_user_groups(identity_id)
         if not groups:
             return False
 
@@ -204,10 +230,14 @@ class RBACStore:
                     ...
                 },
                 "user_groups": {
-                    "<email>": ["<group_id>", ...],
+                    "<identity_id>": ["<group_id>", ...],
                     ...
                 }
             }
+
+        After the 3.1 UID migration, user_groups keys are identity_ids
+        (idnt_{12hex}).  OPA rbac.rego reads input.session.identity_id to
+        look up user_groups — this document must be keyed by identity_id.
         """
         groups_doc: dict = {}
         user_groups_doc: dict = {}
@@ -218,10 +248,11 @@ class RBACStore:
                 "display_name": group.display_name,
                 "allowed_resources": [r.to_dict() for r in group.allowed_resources],
             }
-            for email in group.members:
-                user_groups_doc.setdefault(email, [])
-                if group.id not in user_groups_doc[email]:
-                    user_groups_doc[email].append(group.id)
+            # group.members contains identity_ids after the 3.1 UID migration.
+            for identity_id in group.members:
+                user_groups_doc.setdefault(identity_id, [])
+                if group.id not in user_groups_doc[identity_id]:
+                    user_groups_doc[identity_id].append(group.id)
 
         return {"groups": groups_doc, "user_groups": user_groups_doc}
 

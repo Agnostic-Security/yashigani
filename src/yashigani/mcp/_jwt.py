@@ -50,6 +50,8 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
 
 import jwt as pyjwt
 
+from yashigani.identity.trust_domain import agent_spiffe_uri, gateway_issuer_prefix
+
 logger = logging.getLogger(__name__)
 
 # Locked constants (Nico spec §1 / §3)
@@ -441,10 +443,10 @@ class McpJwtIssuer:
         exp = iat + self._ttl
         jti = str(uuid.uuid4())
 
-        spiffe_uri = (
-            f"spiffe://yashigani.internal/agents/{self._tenant_id}/{agent_name}"
-        )
-        iss = f"https://gateway.yashigani.internal/{self._tenant_id}"
+        # MI-6 (YSG-RISK-061): mint in THIS instance's trust domain so the SPIFFE
+        # URI + iss match the per-instance peer cert SAN.
+        spiffe_uri = agent_spiffe_uri(self._tenant_id, agent_name)
+        iss = f"{gateway_issuer_prefix()}{self._tenant_id}"
 
         # Build chain: for mcp-a / mcp-b (first hop), chain = [this hop's SPIFFE].
         # For mcp-c (relay), chain = upstream_chain + [this hop's SPIFFE].
@@ -540,7 +542,7 @@ class McpJwtVerifier:
         self,
         jwks_keys: list[EllipticCurvePublicKey],
         kid_to_key: Optional[dict[str, EllipticCurvePublicKey]] = None,
-        expected_issuer_prefix: str = "https://gateway.yashigani.internal/",
+        expected_issuer_prefix: Optional[str] = None,
         expected_audience: str = _AUDIENCE,
         skew_tolerance: float = _CLOCK_SKEW_SECONDS,
     ) -> None:
@@ -554,14 +556,22 @@ class McpJwtVerifier:
             Mapping of kid → public key (preferred — fast key selection).
 
         expected_issuer_prefix:
-            JWT iss must start with this prefix (tenant_id follows).
+            JWT iss must start with this prefix (tenant_id follows).  When None
+            (default), resolved from THIS instance's trust domain (MI-6 /
+            YSG-RISK-061) via ``gateway_issuer_prefix()`` — so a non-legacy
+            instance accepts only its own ``https://gateway.<project>...`` issuer
+            and rejects a foreign (incl. legacy) issuer.
 
         expected_audience:
             JWT aud must equal this value.
         """
         self._keys = jwks_keys
         self._kid_map = kid_to_key or {}
-        self._iss_prefix = expected_issuer_prefix
+        self._iss_prefix = (
+            expected_issuer_prefix
+            if expected_issuer_prefix is not None
+            else gateway_issuer_prefix()
+        )
         self._audience = expected_audience
         self._skew = skew_tolerance
 
@@ -588,7 +598,7 @@ class McpJwtVerifier:
         return cls(
             jwks_keys=[issuer._public_key],
             kid_to_key=kid_to_key,
-            expected_issuer_prefix=f"https://gateway.yashigani.internal/{issuer.tenant_id}",
+            expected_issuer_prefix=f"{gateway_issuer_prefix()}{issuer.tenant_id}",
         )
 
     def verify(self, token: str) -> dict:

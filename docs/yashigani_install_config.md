@@ -207,7 +207,7 @@ If you prefer to review every file before running anything, use the manual quick
 **Step 1.** Clone the repository:
 
 ```bash
-git clone https://github.com/agnosticsec-com/yashigani
+git clone https://github.com/Agnostic-Security/yashigani
 cd yashigani
 ```
 
@@ -347,7 +347,7 @@ The installer prompts for API keys immediately if you select a cloud backend, an
 
 **Step 14 — Optional services.** The installer prompts for optional service add-ons:
 
-- **Open WebUI:** `Enable Open WebUI chat interface? [y/N]` — deploys the Open WebUI container served at the root path `/`, authenticated by Caddy `forward_auth` with trusted-header identity propagation. Equivalent to `--with-openwebui` flag.
+- **Open WebUI:** `Enable Open WebUI chat interface? [y/N]` — deploys the Open WebUI container at `/chat/*` with trusted header authentication. Equivalent to `--with-openwebui` flag.
 - **Internal CA:** `Enable Internal CA (Smallstep step-ca)? [y/N]` — deploys an internal Certificate Authority for mTLS between services. Equivalent to `--with-internal-ca` flag.
 - **Wazuh SIEM:** If SIEM mode is `wazuh`, Wazuh is auto-enabled. Can also be enabled with the `--wazuh` flag.
 
@@ -366,12 +366,12 @@ All services are manageable from the admin panel via API after installation. The
   Admin 1 Username : phoenix
   Admin 1 Password : <36-char random>
   Admin 1 TOTP Key : <base32 secret>
-  Admin 1 TOTP URI : otpauth://totp/Yashigani%3Aphoenix?secret=...&algorithm=SHA256&digits=6&period=30
+  Admin 1 TOTP URI : otpauth://totp/Yashigani%3Aphoenix?secret=...&algorithm=SHA512&digits=8&period=30
 
   Admin 2 Username : condor
   Admin 2 Password : <36-char random>
   Admin 2 TOTP Key : <base32 secret>
-  Admin 2 TOTP URI : otpauth://totp/Yashigani%3Acondor?secret=...&algorithm=SHA256&digits=6&period=30
+  Admin 2 TOTP URI : otpauth://totp/Yashigani%3Acondor?secret=...&algorithm=SHA512&digits=8&period=30
 
   Postgres Password : <36-char random>
   Redis Password    : <36-char random>
@@ -398,15 +398,15 @@ This section is for operators who prefer full control over every configuration o
 **Step 1.** Clone the repository and enter the project directory:
 
 ```bash
-git clone https://github.com/agnosticsec-com/yashigani
+git clone https://github.com/Agnostic-Security/yashigani
 cd yashigani
 ```
 
 **Step 2.** Verify the release tag matches the version you intend to deploy:
 
 ```bash
-git tag --list | grep "v2."
-git checkout v2.23.2
+git tag --list | grep "v3."
+git checkout v3.1.2
 ```
 
 **Step 3.** Verify file integrity (if the project provides checksums):
@@ -900,7 +900,7 @@ Yashigani stores all sensitive credentials (API keys, passwords, tokens) through
 
 No configuration required. Secrets are stored as files in `docker/secrets/` on the host and mounted read-only into containers at `/run/secrets/`. The backoffice bootstrap manages creation and rotation.
 
-**PostgreSQL credential posture:** The default non-KMS deployment stores the PostgreSQL application password as cleartext in `docker/secrets/postgres_password` (mode 0600). PgBouncer's edoburu entrypoint writes a cleartext `userlist.txt` at startup from the `DATABASE_URL` environment variable. This is the dev/standalone posture (accepted LOW risk for non-KMS deployments). Production deployments should configure a KMS provider (`YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`); KMS-configured deployments fetch credentials at runtime via `src/yashigani/kms/` and do not rely on the on-disk cleartext userlist path.
+**PostgreSQL credential posture (YSG-RISK-049):** The default non-KMS deployment stores the PostgreSQL application password as cleartext in `docker/secrets/postgres_password` (mode 0600). PgBouncer's edoburu entrypoint writes a cleartext `userlist.txt` at startup from the `DATABASE_URL` environment variable. This is the dev/standalone posture (YSG-RISK-049 accepted LOW for non-KMS deployments). Production deployments should configure a KMS provider (`YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`); KMS-configured deployments fetch credentials at runtime via `src/yashigani/kms/` and do not rely on the on-disk cleartext userlist path.
 
 Verify secrets are present after first run:
 
@@ -935,8 +935,8 @@ AWS_DEFAULT_REGION=us-east-1
 **Step 2b.** If using static credentials (not recommended for production):
 
 ```dotenv
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+AWS_ACCESS_KEY_ID=AKIA_EXAMPLE_REPLACE_THIS
+AWS_SECRET_ACCESS_KEY=YOUR_SECRET_ACCESS_KEY_HERE
 ```
 
 All secrets are stored under the prefix `yashigani/` in Secrets Manager.
@@ -1170,7 +1170,7 @@ The SAML Service Provider (SP) private key **must** be RSA. Yashigani enforces
 this at runtime and refuses to enable SAML if the SP key is EC, DSA, or any
 other algorithm.
 
-**Rationale (CVE-2026-41989):** libgcrypt contains a
+**Rationale (YSG-RISK-044 / CVE-2026-41989):** libgcrypt contains a
 heap-buffer-overflow in `gcry_pk_decrypt` on the ECDH decryption path (CVSS 7.5).
 This path is only exercised when the SP key is EC-type and the IdP sends an
 EncryptedAssertion with ECDH-ES key transport. RSA SP keys route through a
@@ -1194,7 +1194,7 @@ a non-RSA key is supplied.
 
 **Future:** When post-quantum (PQR) key algorithms (ML-KEM / Kyber) are
 supported across the SAML 2.0 + xmlsec + IdP ecosystem, this requirement will
-be revisited.
+be revisited (YSG-RISK-044 forward-tracking note).
 
 **Step 1.** Configure your IdP with the following ACS URL:
 
@@ -2445,33 +2445,28 @@ All credentials are also written to `docker/secrets/` with chmod 600. On upgrade
 
 ---
 
-## 21. Open WebUI Configuration
+## 21. Open WebUI Configuration (since v2.0)
 
-Open WebUI is the optional human chat interface, served by Caddy at the **site root (`/`)** and enabled with the `--with-openwebui` install flag (the `openwebui` compose profile). All Open WebUI traffic is authenticated by Caddy `forward_auth` against the gateway *before* it reaches the container, and every LLM call still flows through the gateway — so OPA policy and identity-binding apply to chat exactly as they do to the API.
-
-> **Serving-path history:** Open WebUI moved to the root path in **v2.25.5** — OpenWebUI v0.9.x hard-codes its SvelteKit asset base to the root, so a sub-path never renders. Earlier builds served it under a sub-path.
+v2.0 integrates Open WebUI as the primary chat interface, served at `/chat/*` behind Caddy. Open WebUI uses trusted headers injected by the gateway for seamless identity propagation.
 
 ### 21.1 Routing
 
-Caddy's root catch-all proxies to the Open WebUI container behind `forward_auth → /auth/verify-user` (user-tier sessions only; admin sessions are bounced to `/admin/`). On success Caddy injects the trusted identity headers `X-Forwarded-User`, `X-Forwarded-Name`, and `X-Forwarded-Email`, which Open WebUI consumes for session establishment. Inbound copies of these headers are stripped first (anti-spoofing).
+Caddy routes all `/chat/*` requests to the Open WebUI container. Authentication is handled by the gateway before the request reaches Open WebUI — the gateway injects trusted headers (`X-Yashigani-User-Id`, `X-Yashigani-User-Kind`, `X-Yashigani-Groups`) that Open WebUI consumes for session establishment.
 
-### 21.2 Settings (set automatically in compose)
+### 21.2 `.env` Settings
 
 ```dotenv
-WEBUI_AUTH=false                                  # Caddy/gateway is the auth boundary
-WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-User
-WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-Name
-WEBUI_DEFAULT_USER_ROLE=user                      # new users land active (not "pending")
-RAG_EMBEDDING_MODEL=nomic-embed-text              # file-upload RAG embeddings (pulled on install)
+YASHIGANI_OPENWEBUI_ENABLED=true              # Enable Open WebUI (default: true in v2.0)
+YASHIGANI_OPENWEBUI_TRUSTED_HEADER=X-Yashigani-User-Id   # Header containing authenticated user identity
 ```
 
 ### 21.3 Disabling Open WebUI
 
-Install **without** `--with-openwebui` (the `openwebui` compose profile stays off and the container is not deployed).
+Set `YASHIGANI_OPENWEBUI_ENABLED=false` in `.env` and restart Caddy. The `/chat/*` routes will return 404.
 
 ### 21.4 Populating the model picker — `gateway.models.service_account_full_list`
 
-Open WebUI authenticates to the gateway with the shared **internal service bearer**, so to the gateway every Open WebUI request is one *service-account* identity. By default, as part of the internal-topology-disclosure hardening, service accounts get a **RESTRICTED** `GET /v1/models` listing — only their `allowed_models` allowlist, empty by default — so the Open WebUI **model picker shows nothing** and end users cannot start a chat.
+Open WebUI authenticates to the gateway with the shared **internal service bearer**, so to the gateway every Open WebUI request is one *service-account* identity. By default (OPA GAP-001/002 / FINDING-59-01 internal-topology-disclosure hardening) service accounts get a **RESTRICTED** `GET /v1/models` listing — only their `allowed_models` allowlist, empty by default — so the Open WebUI **model picker shows nothing** and end users cannot start a chat.
 
 To make the picker populate, an operator enables the runtime setting:
 
@@ -2906,24 +2901,24 @@ Images are signed with cosign using keyless signing (Sigstore Fulcio CA + Rekor 
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2
 ```
 
 **Verify backoffice image:**
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-backoffice:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-backoffice:3.1.2
 ```
 
 A successful verification prints:
 
 ```
-Verification for ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 --
+Verification for ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 --
 The following checks were performed on each of these signatures:
   - The cosign claims were validated
   - Existence of the claims in the transparency log was verified offline
@@ -2937,9 +2932,9 @@ The SBOM is attached as a cosign attestation with predicate type `cyclonedx`. Re
 ```bash
 cosign verify-attestation \
   --type cyclonedx \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
   | jq '.[0].payload | @base64d | fromjson'
 ```
 
@@ -2948,9 +2943,9 @@ To extract just the component list:
 ```bash
 cosign verify-attestation \
   --type cyclonedx \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
   | jq '.[0].payload | @base64d | fromjson | .predicate.components[] | {name,version,purl}'
 ```
 
@@ -2959,21 +2954,21 @@ cosign verify-attestation \
 The SBOM and CryptoBoM are also attached directly to each GitHub release:
 
 ```bash
-# Download SBOM for v2.23.2
-gh release download v2.23.2 \
-  --repo agnosticsec-com/yashigani \
+# Download SBOM for v3.1.2
+gh release download v3.1.2 \
+  --repo Agnostic-Security/yashigani \
   --pattern 'sbom-yashigani-*.cdx.json' \
   --dir ./dist
 
-# Download CryptoBoM for v2.23.2
-gh release download v2.23.2 \
-  --repo agnosticsec-com/yashigani \
+# Download CryptoBoM for v3.1.2
+gh release download v3.1.2 \
+  --repo Agnostic-Security/yashigani \
   --pattern 'cryptobom-yashigani-*.json' \
   --dir ./dist
 ```
 
 Or download from the GitHub releases page at:
-`https://github.com/agnosticsec-com/yashigani/releases`
+`https://github.com/Agnostic-Security/yashigani/releases`
 
 ### 27.6 CryptoBoM — Cryptographic Algorithm Inventory
 
@@ -2988,7 +2983,7 @@ The CryptoBoM (`cryptobom-yashigani-<version>.json`) lists every cryptographic a
 To query which algorithms are not post-quantum resistant:
 
 ```bash
-cat dist/cryptobom-yashigani-2.23.2.json \
+cat dist/cryptobom-yashigani-3.1.2.json \
   | jq '.algorithms[] | select(.pq_status == "not_resistant") | {id, name, usage}'
 ```
 
@@ -3002,11 +2997,11 @@ cosign generate-key-pair
 
 # Sign with local key
 COSIGN_PASSWORD=<passphrase> bash scripts/sign_image.sh \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
-  ghcr.io/agnosticsec-com/yashigani-backoffice:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
+  ghcr.io/Agnostic-Security/yashigani-backoffice:3.1.2
 
 # Verify with public key
-cosign verify --key cosign.pub ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
+cosign verify --key cosign.pub ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2
 ```
 
 The `sign_image.sh` script detects signing mode automatically: if `COSIGN_PRIVATE_KEY` is set or `cosign.key` is present it uses local-key mode; otherwise it falls back to keyless.
@@ -3306,7 +3301,7 @@ Removal of a BYO CA (reverting to a Yashigani-generated PKI) is **not supported 
 
 ---
 
-## 30. FIPS mode (v2.24.4)
+## 30. FIPS mode (v2.24.4, Nico N-001)
 
 ### 30.1 What FIPS mode does
 

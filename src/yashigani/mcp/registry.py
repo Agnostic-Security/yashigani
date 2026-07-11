@@ -114,9 +114,34 @@ class McpBrokerRegistry:
 def build_registry_from_env(
     opa_url: str,
     audit_writer: Optional[object] = None,
+    semantic_intent_sidecar: Optional[object] = None,
+    envelope_service: Optional[object] = None,
+    permission_store: Optional[object] = None,  # PermissionStore — 3.1 Phase 4
+    org_id: str = "default",                    # 3.1 Phase 4 — org ceiling
+    pending_store: Optional[object] = None,     # EnvelopePendingStore — 3.1 drift sink
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
+
+    ``semantic_intent_sidecar`` / ``envelope_service`` (3.0 / YSG-RISK-060):
+    when supplied, every broker built here is wired with the escalate-only
+    semantic-intent sidecar AND the capability-envelope service, so the
+    tool-surface refresh/import path (``McpBroker.refresh_and_triage_tools``)
+    can run the envelope triage at refresh — the structural diff vs the
+    ORIGINAL baseline plus the escalate-only sidecar over the network-reachable
+    inference backend (mesh-mTLS gateway→ollama edge; see
+    helm/.../networkpolicy.yaml allow-gateway-egress + allow-ollama-ingress,
+    and compose OLLAMA_BASE_URL/YASHIGANI_INSPECTION_DEFAULT_BACKEND).  When
+    None (dev / feature OFF / pre-pool), the broker triage no-ops and the
+    invocation gate still fail-closes in prod.
+
+    ``pending_store`` (3.1 / YSG-RISK-060 full-close):
+    when supplied (``EnvelopePendingStore`` over Redis db/3), every broker
+    is wired with a ``pending_block_sink`` closure that calls
+    ``pending_store.record_block(...)`` on drift — populating the operator-
+    visible ``/admin/mcp/envelopes/pending`` queue.  None ⇒ drift is still
+    latched + blocked in the DB, but the re-approval queue stays empty
+    (backward-compatible dev/test mode).
 
     YASHIGANI_MCP_SERVERS is a JSON array of objects:
     [
@@ -237,6 +262,98 @@ def build_registry_from_env(
         is_filesystem_agent = bool(entry.get("is_filesystem_agent", False))
         is_git_agent = bool(entry.get("is_git_agent", False))
 
+        # Broker companion (FIX-003-companion) — wire P8 upstream pin config.
+        #
+        # If the YASHIGANI_MCP_SERVERS entry carries cert/SPIFFE pin material
+        # (cert_fingerprint_sha256 or spiffe_id), build an UpstreamPinConfig and
+        # pass it to McpBrokerConfig.upstream_pin_configs.  This activates:
+        #   • broker.verify_upstream() Step 2f in enforce() (cert-fingerprint / SPIFFE check)
+        #   • broker._provenance_id_for() → non-None → capability-envelope gate LIVE
+        #
+        # Without this wiring _upstream_pin_map is always empty → _provenance_id_for
+        # returns None for ALL servers → envelope enforcement is inert for every
+        # server regardless of whether an envelope v1 has been minted (FIX-003).
+        #
+        # Security note: the provenance_id is H(server_id ‖ pin_material).  A bare
+        # server_id name-fallback (no pin material) is NOT used — a name can be
+        # spoofed.  No pin material → no envelope binding → gate stays inert for
+        # that server (correct fail-open only in dev; in prod P8 also raises on the
+        # missing pin, so the call is denied at Step 2f before the envelope gate).
+        _upstream_pin_configs = None
+        _cert_fp = (entry.get("cert_fingerprint_sha256") or "").strip()
+        _spiffe_id_val = (entry.get("spiffe_id") or "").strip()
+        if _cert_fp or _spiffe_id_val:
+            from urllib.parse import urlparse as _urlparse
+            from yashigani.mcp._upstream_pin import UpstreamPinConfig, PinMode
+            _parsed_url = _urlparse(upstream_url)
+            _pin_host = (entry.get("pin_host") or "").strip() or (_parsed_url.hostname or "")
+            # Port: explicit pin_port > URL port > 443 (TLS default for external)
+            _raw_pin_port = entry.get("pin_port") or _parsed_url.port or 443
+            try:
+                _pin_port = int(_raw_pin_port)
+            except (TypeError, ValueError):
+                _pin_port = 443
+            _pin_mode_raw = (entry.get("pin_mode") or "cert_fingerprint").strip()
+            try:
+                _pin_mode = PinMode(_pin_mode_raw)
+            except ValueError:
+                logger.warning(
+                    "mcp-registry: [P8] unknown pin_mode=%r for agent=%r — "
+                    "defaulting to cert_fingerprint",
+                    _pin_mode_raw, agent_name,
+                )
+                _pin_mode = PinMode.CERT_FINGERPRINT
+            _upstream_pin_configs = [UpstreamPinConfig(
+                server_id=agent_name,
+                host=_pin_host,
+                port=_pin_port,
+                pin_mode=_pin_mode,
+                cert_fingerprint_sha256=_cert_fp or None,
+                spiffe_id=_spiffe_id_val or None,
+            )]
+            logger.info(
+                "mcp-registry: [P8] pin config wired for agent=%r "
+                "mode=%r host=%r port=%d — provenance_id + envelope gate ACTIVE",
+                agent_name, _pin_mode.value, _pin_host, _pin_port,
+            )
+
+        # 3.1 / YSG-RISK-060 full-close — build a pending-block sink so that
+        # drift detected by refresh_and_triage_tools() is handed to the
+        # operator re-approval queue (Redis db/3).  The closure captures a
+        # reference to the shared pending_store (constructed once in the gateway
+        # lifespan); a new closure per server is correct here because each
+        # broker instance is per-server, but they all write to the SAME store.
+        # Decoupling: the broker imports nothing from backoffice or Redis.
+        _pending_block_sink = None
+        if pending_store is not None:
+            def _make_sink(_store: object) -> object:
+                def _sink(
+                    *,
+                    provenance_id: str,
+                    tenant_id: str,
+                    server_id: str,
+                    candidate: object,
+                    triage_class: str,
+                    new_surface_hash: str,
+                    findings: list,
+                ) -> None:
+                    _store.record_block(  # type: ignore[attr-defined]
+                        provenance_id=provenance_id,
+                        tenant_id=tenant_id,
+                        server_id=server_id,
+                        candidate=candidate,
+                        triage_class=triage_class,
+                        new_surface_hash=new_surface_hash,
+                        findings=findings,
+                    )
+                return _sink
+            _pending_block_sink = _make_sink(pending_store)
+            logger.info(
+                "mcp-registry: pending_block_sink wired for agent=%r — drift "
+                "writes to operator re-approval queue (YSG-RISK-060)",
+                agent_name,
+            )
+
         broker_cfg = McpBrokerConfig(
             opa_url=opa_url,
             tenant_id=tenant_id,
@@ -245,6 +362,21 @@ def build_registry_from_env(
             is_filesystem_agent=is_filesystem_agent,
             is_git_agent=is_git_agent,
             nonce_store=_nonce_store,
+            # 3.0 / YSG-RISK-060 — wire the refresh-path envelope triage:
+            # escalate-only sidecar (over the mesh-mTLS gateway→ollama edge) +
+            # the capability-envelope durable store.  None ⇒ triage no-ops.
+            semantic_intent_sidecar=semantic_intent_sidecar,
+            envelope_service=envelope_service,
+            # 3.1 / YSG-RISK-060 full-close — operator re-approval queue sink.
+            # None ⇒ drift is blocked in DB but queue stays empty (dev/test).
+            pending_block_sink=_pending_block_sink,
+            # 3.1 Phase 4 — connection allow-list enforcement.
+            # When permission_store is None (dev/test), the check is a no-op.
+            permission_store=permission_store,
+            org_id=org_id,
+            # FIX-003-companion: P8 pin configs extracted from YASHIGANI_MCP_SERVERS entry.
+            # None when no pin material configured (local/stdio agents, no envelope binding).
+            upstream_pin_configs=_upstream_pin_configs,
         )
         broker = McpBroker(config=broker_cfg)
 

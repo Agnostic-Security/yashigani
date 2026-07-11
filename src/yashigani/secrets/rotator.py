@@ -511,7 +511,7 @@ def _pg_alter_user_password(dsn: Optional[str], username: str, new_pw: str) -> N
             # Use parameterized-style quoting; psycopg2 identifier quoting via
             # sql.Identifier prevents SQL injection on the username.
             from psycopg2 import sql
-            cur.execute(
+            cur.execute(  # nosem: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query -- DDL utility statement; username is a service-account identifier quoted via psycopg2 sql.Identifier; password is passed as a bound parameter tuple (new_pw,), never concatenated
                 sql.SQL("ALTER USER {} WITH PASSWORD %s").format(
                     sql.Identifier(username)
                 ),

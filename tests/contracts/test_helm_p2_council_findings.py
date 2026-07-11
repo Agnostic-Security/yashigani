@@ -561,7 +561,7 @@ class TestB6OpaBundleParity:
     to the canonical files.
     """
 
-    REGO_FILES = ["yashigani.rego", "agents.rego", "v1_routing.rego", "rbac.rego"]
+    REGO_FILES = ["yashigani.rego", "agents.rego", "v1_routing.rego", "rbac.rego", "document.rego"]
 
     @pytest.mark.parametrize("filename", REGO_FILES)
     def test_helm_file_matches_canonical_sha256(self, filename: str) -> None:
@@ -620,17 +620,17 @@ class TestB6OpaBundleParity:
             "fail-closed in K8s (B6 P0)."
         )
 
-    def test_rendered_configmap_has_all_four_rego_files(
+    def test_rendered_configmap_has_all_rego_files(
         self, config_maps: dict[str, Any]
     ) -> None:
-        """ConfigMap data must have all four rego keys."""
+        """ConfigMap data must have all five rego keys (incl. document.rego, 2.26)."""
         policy_cm = config_maps.get("yashigani-policy-bundle")
         assert policy_cm is not None, "yashigani-policy-bundle ConfigMap not found"
         data_keys = set(policy_cm.get("data", {}).keys())
-        required = {"yashigani.rego", "agents.rego", "v1_routing.rego", "rbac.rego"}
+        required = {"yashigani.rego", "agents.rego", "v1_routing.rego", "rbac.rego", "document.rego"}
         missing = required - data_keys
         assert not missing, (
-            f"yashigani-policy-bundle ConfigMap missing rego files: {missing} (B6 P0)"
+            f"yashigani-policy-bundle ConfigMap missing rego files: {missing} (B6 P0 / 2.26)"
         )
 
 

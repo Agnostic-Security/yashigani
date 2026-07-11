@@ -125,19 +125,21 @@ approval basis, and its status under FIPS_MODE=1.
 | SHA-256 | Install-time integrity checks | FIPS 180-4 | APPROVED — `openssl dgst -sha256` via CMVP #4985 |
 | PBKDF2-HMAC-SHA384 | KDF for backup key wrap#2 | SP 800-132 | APPROVED — via Python `cryptography` + CMVP #4985 |
 | ECDH P-256 | TLS key exchange (mTLS, leaf certs) | FIPS 186-5; SP 800-56A rev 3 | APPROVED — via CMVP #4985 |
-| SHA-256 TOTP | MFA (HMAC-SHA256 per RFC 6238) | FIPS 180-4 / FIPS 198-1 | APPROVED — SHA-256 variant; see note below |
+| SHA-512/SHA-256 TOTP (role-tiered) | MFA (HMAC-SHA512 admin / HMAC-SHA256 user, per RFC 6238) | FIPS 180-4 / FIPS 198-1 | APPROVED — both SHA-256 and SHA-512 variants; see note below |
 | argon2id | Admin password hash | Not FIPS-approved | BLOCKED in FIPS mode — wrap#1 absent by design |
 | cosign/Sigstore | Manifest signature verification | Go `crypto` (BoringCrypto #3678 expired) | BLOCKED in FIPS mode — see §4 |
 
-**TOTP note.** Yashigani uses HMAC-SHA256 for TOTP (`digest=hashlib.sha256` at
-`src/yashigani/auth/totp.py:84,125`). SHA-256 is FIPS 180-4 approved and routes
-through CMVP #4985 when FIPS Provider is active. Provisioning URIs include
-`algorithm=SHA256`. Do not use authenticator apps that default to SHA-1 without
-explicit SHA-256 support.
+**TOTP note.** Yashigani uses role-tiered TOTP since v3.1: admin accounts use
+HMAC-SHA-512 with 8-digit codes (`algorithm=SHA512&digits=8`); user accounts use
+HMAC-SHA-256 with 6-digit codes (`algorithm=SHA256&digits=6`). Both SHA-256 and
+SHA-512 are FIPS 180-4 / FIPS 198-1 approved and route through CMVP #4985 when
+FIPS Provider is active. Do not use authenticator apps that default to SHA-1
+without reading the `algorithm=` parameter from the provisioning URI. agnosticOTP,
+Authy, and Raivo all support both SHA-256 and SHA-512.
 
 **argon2id note.** argon2id is a memory-hard function, not a FIPS-approved KDF.
 Under `FIPS_MODE=1`, the admin password wrap#1 (argon2id path) is absent by design
-Only PBKDF2-HMAC-SHA384 wrap#2 is written. This is
+(Nico ruling 2026-05-28). Only PBKDF2-HMAC-SHA384 wrap#2 is written. This is
 documented in `install.sh` lines 2729-2790.
 
 ---
@@ -152,7 +154,7 @@ When `YASHIGANI_FIPS=1`:
 
 - `signatures.py::verify_manifest_signature` raises `ManifestSignatureError` if
   `spec.signature.algorithm = cosign-bundled-key` is present in any manifest (FIX-2,
-  `signatures.py` lines 367-377).
+  NICO-005 gate, `signatures.py` lines 367-377).
 - This check fires before the `YSG_REQUIRE_SIGNED_MANIFEST` enforcement level — it
   cannot be bypassed with `=warn` or `=skip`.
 - Manifest verification routes exclusively to the RSA-PSS-3072/SHA-384 path
@@ -193,7 +195,13 @@ SHA-384). This is FIPS-assertable via the OpenSSL FIPS Provider when the gateway
 starts with the environment in §2.
 
 The full signing key spec, claim set, TTL, nonce dedup, JWKS format, and chain
-construction rules follow the MCP identity JWT specification. FIPS-specific facts:
+construction rules are in the canonical design authority document:
+
+```
+Agnostic Security/Products/Yashigani/mcp-identity-jwt-spec-20260529.md
+```
+
+FIPS-specific facts from that spec:
 
 - Key type: EC P-384, generated at install time via `openssl ecparam -genkey -name
   secp384r1` with FIPS Provider active.
@@ -415,7 +423,7 @@ and the name of the operator completing each check.
 ```
 [ ] Manifest with cosign-bundled-key algorithm rejected in FIPS mode:
       YASHIGANI_FIPS=1 yashigani validate test-cosign-manifest.yaml
-      Expected: ManifestSignatureError (FIPS-incompatible algorithm)
+      Expected: ManifestSignatureError citing NICO-005/FIX-2
 
 [ ] Manifest with rsa-pss-3072-sha384 algorithm accepted:
       YASHIGANI_FIPS=1 yashigani validate signed-manifest.yaml \
@@ -517,7 +525,7 @@ base image and retry.
 
 **`ManifestSignatureError: FIPS mode requires algorithm rsa-pss-3072-sha384`**
 A manifest with `algorithm: cosign-bundled-key` was submitted in FIPS mode. This is
-the FIPS-mode signature gate. Re-sign the manifest with the RSA-PSS-3072 key and update
+the NICO-005/FIX-2 gate. Re-sign the manifest with the RSA-PSS-3072 key and update
 `spec.signature.algorithm` to `rsa-pss-3072-sha384`.
 
 **`ManifestSignatureError: FIPS RSA key must be exactly 3072 bits`**
@@ -535,5 +543,5 @@ is not FIPS-validated. Upgrade to Vault Enterprise FIPS build.
 
 ---
 
-*CMVP #4985 re-fetch due 2026-06-28.*
+*Document owner: Nico (crypto / FIPS / attestation). CMVP #4985 re-fetch due 2026-06-28.*
 *Cross-references: `mcp-identity-jwt-spec-20260529.md` (ES384 spec); `signatures.py` (RSA-PSS implementation); `lib/yashigani-fips.sh` (shell FIPS helpers); `install.sh` (FIPS_MODE flag, CMVP_CERT, wrap#1 absence); `docker/docker-compose.yml` line 108 (FIPS_MODE propagation); `helm/yashigani/values.yaml` line 1577 (fips block).*

@@ -489,7 +489,7 @@ class TestR23LicenseEntitlements:
         return app
 
     def test_community_tier_entitlements(self):
-        """Community tier: OIDC/SAML/SCIM/PII all unavailable."""
+        """Community tier: OIDC/SAML/SCIM unavailable; PII absent from catalogue (ENT-001)."""
         from yashigani.licensing.model import COMMUNITY_LICENSE
         from yashigani.licensing import enforcer as _enforcer
         _enforcer._license = COMMUNITY_LICENSE
@@ -507,7 +507,16 @@ class TestR23LicenseEntitlements:
         assert "entitlements" in body
         assert len(body["entitlements"]) > 0
 
-        # On community tier, no feature should be available
+        # ENT-001: PII must NOT appear in the entitlements catalogue at all.
+        feature_keys = {ent["feature"] for ent in body["entitlements"]}
+        assert "pii_log" not in feature_keys, (
+            "ENT-001: pii_log must NOT be in the entitlements catalogue (PII is always available)"
+        )
+        assert "pii_redact" not in feature_keys, (
+            "ENT-001: pii_redact must NOT be in the entitlements catalogue (PII is always available)"
+        )
+
+        # On community tier, gated features (OIDC/SAML/SCIM) must be unavailable
         for ent in body["entitlements"]:
             assert ent["available"] is False, (
                 f"R23: community tier must not grant feature '{ent['feature']}'"
@@ -580,6 +589,64 @@ class TestR23LicenseEntitlements:
         for ent in body["entitlements"]:
             missing = required_ent_keys - ent.keys()
             assert not missing, f"R23: entitlement missing fields: {missing}"
+
+    def test_ent001_pii_not_in_catalogue_any_tier(self):
+        """ENT-001 regression: pii_log / pii_redact must never appear in the
+        entitlements catalogue on ANY tier (Community through Enterprise).
+
+        PII detection is always available — it is not a tier-gated feature.
+        Putting it in the catalogue would imply it can be locked, which is wrong.
+        """
+        from yashigani.licensing.model import LicenseState, LicenseTier, TIER_DEFAULTS
+        from yashigani.licensing import enforcer as _enforcer
+        from datetime import datetime, timezone
+        import uuid
+
+        tiers_to_check = [
+            LicenseTier.COMMUNITY,
+            LicenseTier.STARTER,
+            LicenseTier.PROFESSIONAL,
+            LicenseTier.PROFESSIONAL_PLUS,
+            LicenseTier.ENTERPRISE,
+        ]
+
+        for tier in tiers_to_check:
+            tier_name = tier.value
+            if tier_name not in TIER_DEFAULTS:
+                continue
+            defs = TIER_DEFAULTS[tier_name]
+            lic = LicenseState(
+                tier=tier,
+                org_domain="*",
+                max_agents=defs["max_agents"],
+                max_end_users=defs["max_end_users"],
+                max_admin_seats=defs["max_admin_seats"],
+                max_orgs=defs["max_orgs"],
+                features=frozenset(),
+                issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                expires_at=None,
+                license_id=str(uuid.uuid4()),
+                valid=True,
+                error=None,
+            )
+            _enforcer._license = lic
+
+            app = self._app()
+
+            async def go():
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                    return await c.get("/admin/license/entitlements")
+
+            r = asyncio.run(go())
+            assert r.status_code == 200, f"{tier_name}: {r.text}"
+            body = r.json()
+            feature_keys = {ent["feature"] for ent in body["entitlements"]}
+            assert "pii_log" not in feature_keys, (
+                f"ENT-001: pii_log must not be in entitlements catalogue on {tier_name}"
+            )
+            assert "pii_redact" not in feature_keys, (
+                f"ENT-001: pii_redact must not be in entitlements catalogue on {tier_name}"
+            )
 
     def test_auth_required(self):
         """GET entitlements requires admin session."""

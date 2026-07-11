@@ -45,6 +45,8 @@ class TestEnums:
         expected = {
             "SSN", "CREDIT_CARD", "EMAIL", "PHONE", "IBAN",
             "PASSPORT", "NHS_NUMBER", "DRIVERS_LICENCE", "IP_ADDRESS", "DATE_OF_BIRTH",
+            # L-01 / red-team F2 breadth: identifying/QI classes for documents.
+            "NATIONAL_INSURANCE", "POSTAL_ADDRESS",
         }
         assert {t.value for t in PiiType} == expected
 
@@ -257,6 +259,78 @@ class TestPassportDetection:
     def test_uk_passport(self):
         _, result = self.det.process("UK passport GB1234567")
         assert result.detected is True
+
+    # EU / wide-form passports that contain digits — must still match.
+    def test_eu_de_passport_with_digits(self):
+        # German-style: 1 letter + mixed alphanumeric containing digits
+        _, result = self.det.process("passport C3045988")
+        assert result.detected is True
+
+    def test_eu_nl_passport_with_mixed(self):
+        # NL-style: 2 letters + alphanumeric containing digits
+        _, result = self.det.process("NL1234AB5")
+        assert result.detected is True
+
+    def test_canadian_passport(self):
+        _, result = self.det.process("CA passport AB123456")
+        assert result.detected is True
+
+
+class TestPassportFalsePositiveResistance:
+    """PII-PASSPORT-FP-001 — all-alpha uppercase words must NOT match passport patterns.
+
+    Before the fix, the EU-wide pattern `[A-Z]{1,2}[0-9A-Z]{6,9}` matched any
+    uppercase English word of 7–11 chars (CUSTOMER, CLINICAL, PARTICIPANT, etc.).
+    This caused document-enforcement to record them as PII "originals" and then fail
+    CLOSED when the residual-presence check found the same words in the rendered output.
+    """
+
+    def setup_method(self):
+        self.det = PiiDetector(enabled_types={PiiType.PASSPORT})
+
+    @pytest.mark.parametrize("word", [
+        "CUSTOMER",
+        "CLINICAL",
+        "PARTICIPANT",
+        "RECORDS",
+        "SUMMARY",
+        "HANDLING",
+        "PROTOCOL",
+        "BIOSTATISTICS",
+        "RESOLUTION",
+        "DESTINATION",
+    ])
+    def test_all_alpha_word_not_passport(self, word):
+        _, result = self.det.process(word)
+        assert result.detected is False, (
+            f"{word!r} should NOT be flagged as a passport number "
+            "(PII-PASSPORT-FP-001: all-alpha words lack digits)"
+        )
+
+    def test_demo_file_01_no_spurious_passport(self):
+        """01_support_export_REDACT.txt: uppercase header words must not match passport."""
+        text = (
+            "CUSTOMER SUPPORT CASE EXPORT — Case #CS-2026-04812\n"
+            "SUMMARY\n"
+            "AGENT NOTES\n"
+            "RESOLUTION\n"
+        )
+        _, result = self.det.process(text)
+        assert result.detected is False, (
+            f"Spurious passport hits on demo file 01 headers: {result.findings}"
+        )
+
+    def test_demo_file_02_no_spurious_passport(self):
+        """02_research_log_PSEUDONYMIZE.txt: CLINICAL/PARTICIPANT/RECORDS must not match."""
+        text = (
+            "CLINICAL STUDY PARTICIPANT LOG — Protocol AGS-2026-NEU-07\n"
+            "VISIT RECORDS\n"
+            "NOTE FOR ANALYSIS\n"
+        )
+        _, result = self.det.process(text)
+        assert result.detected is False, (
+            f"Spurious passport hits on demo file 02 headers: {result.findings}"
+        )
 
 
 class TestNhsDetection:

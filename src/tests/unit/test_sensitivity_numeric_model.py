@@ -140,7 +140,7 @@ def test_default_pattern_email():
 # T12 — API key → SENSITIVE (5)
 def test_default_pattern_api_key():
     sc = SensitivityClassifier()
-    result = sc.classify("Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456")
+    result = sc.classify("Authorization: Bearer " + "sk-" + "abcdefghijklmnopqrstuvwxyz123456")
     assert result.level == SensitivityLevel.SENSITIVE  # 5
 
 

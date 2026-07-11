@@ -122,13 +122,29 @@ services:
   promtail:
     security_opt:
       - label=disable
-    # Promtail cannot access container logs in Podman rootless mode —
-    # /var/lib/docker/containers does not exist and Podman stores logs
-    # in the user's home directory which is not bind-mountable from
-    # within a rootless container. Disable promtail; use journald or
-    # Loki's Podman log driver instead.
-    profiles:
-      - promtail-disabled
+    # FINDING-5 fix (3.1.1): Podman rootless uses journald log driver.
+    # docker-compose.podman-init-deps.yml resets the Docker-specific volumes
+    # (/var/lib/docker/containers, /var/run/docker.sock, docker promtail.yml)
+    # and the promtail-disabled profile. This block re-adds:
+    #   - journald-compatible volumes (system journal + machine-id)
+    #   - retained volumes (secrets, positions)
+    #   - promtail-podman.yml config (journald scrape, no docker_sd_configs)
+    # profiles: intentionally absent — promtail is active on Podman path.
+    command: -config.file=/etc/promtail/promtail.yml
+    volumes:
+      # Promtail-Podman config (journald scrape — replaces docker_sd_configs).
+      - ../config/promtail/promtail-podman.yml:/etc/promtail/promtail.yml:ro
+      # System journal: Podman uses journald log driver; container logs appear
+      # here with CONTAINER_NAME / CONTAINER_ID_FULL journal fields.
+      # /var/log/journal/<machine-id>/ has group:adm:r-x ACL; rootless Podman
+      # maps container-root to host UID 1000 (max, in adm group) — readable.
+      - /var/log/journal:/var/log/journal:ro
+      # machine-id: required by the journald client library to identify the host.
+      - /etc/machine-id:/etc/machine-id:ro
+      # PKI certs for mTLS push to Loki (same as Docker path).
+      - ./secrets:/run/secrets:ro
+      # Persist read positions across restarts (same named volume as Docker path).
+      - promtail_positions:/var/lib/promtail
 
   otel-collector:
     security_opt:
@@ -149,3 +165,49 @@ services:
   budget-redis:
     security_opt:
       - label=disable
+
+  # ── FINDING-1 fix: re-add depends_on WITHOUT init-container entries ─────
+  # docker-compose.podman-init-deps.yml (loaded before this file) resets
+  # depends_on for letta, letta-pgbouncer, and wazuh-manager via !reset.
+  # This block re-adds the desired deps WITH correct service_healthy conditions
+  # but WITHOUT agent-db-init / wazuh-security-init, which triggered the
+  # Podman 4.9.3 dep-graph error:
+  #
+  #   "container <init-id> depends on <svc-id> not found in input list"
+  #
+  # The init containers (agent-db-init, wazuh-security-init) have already run
+  # sequentially before letta / wazuh-manager start; removing them from
+  # --requires does not change the actual startup ordering (the init containers
+  # are processed in an earlier podman-compose batch). Service_healthy is
+  # preserved for the non-init deps (postgres, wazuh-indexer, gateway) so the
+  # health gate still holds before dependent services start.
+  # Docker path (docker-compose.yml + docker-compose.wazuh.yml) UNTOUCHED.
+
+  letta:
+    depends_on:
+      gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      letta-pgbouncer:
+        condition: service_healthy
+      # agent-db-init: service_completed_successfully REMOVED.
+      # Podman 4.9.3 dep-graph limitation: exited init containers in the
+      # --requires chain cause fatal startup errors (see above). The init
+      # container always runs before letta in podman-compose's sequential
+      # batch ordering; this gate is not needed in the Podman path.
+
+  letta-pgbouncer:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # agent-db-init: service_completed_successfully REMOVED — see letta above.
+
+  wazuh-manager:
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+      # wazuh-security-init: service_completed_successfully REMOVED.
+      # Same Podman dep-graph limitation. wazuh-security-init runs its
+      # securityadmin loop before wazuh-manager is scheduled; wazuh-manager
+      # has its own filebeat retry logic for transient indexer unavailability.

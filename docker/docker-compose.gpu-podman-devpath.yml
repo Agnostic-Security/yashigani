@@ -1,0 +1,23 @@
+# GPU overlay (Podman runtime, direct device passthrough) — ROOTLESS-CDI-001
+#
+# Fallback overlay for Podman builds where CDI is unavailable or the system CDI
+# spec cannot be parsed (e.g. Ubuntu Podman 4.9.3+ds1 which includes the CDI
+# library but does not successfully load /etc/cdi/nvidia.yaml v0.7.0 specs).
+#
+# install.sh selects this overlay when a CDI probe fails at install time:
+#   podman run --rm --device nvidia.com/gpu=0 ... echo probe
+# If that fails → direct device passthrough via this file.
+# If it succeeds → docker-compose.gpu-podman.yml (CDI path) is used instead.
+#
+# YSG_GPU_DEV:   set by install.sh to /dev/nvidia<N> for the selected GPU index
+# YSG_GPU_INDEX: 0-based index set by --gpu-index / _select_nvidia_gpu
+services:
+  ollama:
+    devices:
+      - "${YSG_GPU_DEV:-/dev/nvidia0}"
+      - "/dev/nvidiactl"
+      - "/dev/nvidia-uvm"
+      - "/dev/nvidia-uvm-tools"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${YSG_GPU_INDEX:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility

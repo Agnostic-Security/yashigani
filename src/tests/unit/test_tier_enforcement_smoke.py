@@ -61,14 +61,19 @@ from yashigani.licensing.model import (
 # ---------------------------------------------------------------------------
 # Canonical tier feature matrix (from README.md §8 / pricing page). Pinned
 # here so the test fails loud if the matrix ever drifts in either direction.
+#
+# ENT-001 (2026-06-14): pii_log / pii_redact removed from this matrix.
+# PII detection is ALWAYS AVAILABLE on every tier (including Community) and is
+# no longer tier-gated.  The enforcer short-circuits on those feature keys via
+# _ALWAYS_AVAILABLE_FEATURES so a license payload need not carry them.
 # ---------------------------------------------------------------------------
 _TIER_FEATURES: dict[str, set[str]] = {
     "community":          set(),
     "igniter":            {"oidc"},
     "starter":            {"oidc"},
     "professional":       {"oidc", "saml", "scim"},
-    "professional_plus":  {"oidc", "saml", "scim", "pii_log", "pii_redact"},
-    "enterprise":         {"oidc", "saml", "scim", "pii_log", "pii_redact"},
+    "professional_plus":  {"oidc", "saml", "scim"},
+    "enterprise":         {"oidc", "saml", "scim"},
     "academic_nonprofit": {"oidc", "saml", "scim"},
 }
 
@@ -362,10 +367,15 @@ def test_register_agent_route_returns_201_below_limit():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("tier_name", _TIER_NAMES_SCOPE)
-@pytest.mark.parametrize("feature_str", ("oidc", "saml", "scim", "pii_log", "pii_redact"))
+@pytest.mark.parametrize("feature_str", ("oidc", "saml", "scim"))
 def test_require_feature_matches_tier_matrix(tier_name: str, feature_str: str):
     """For every (tier, feature) pair, require_feature() raises iff the tier
-    does NOT have that feature per the README §8 matrix."""
+    does NOT have that feature per the README §8 matrix.
+
+    ENT-001: pii_log / pii_redact removed from this parametrize — they are
+    always available and never raise LicenseFeatureGated (tested separately
+    in test_pii_always_available_on_all_tiers).
+    """
     set_license(_build_license(tier_name))
     expected_present = feature_str in _TIER_FEATURES[tier_name]
 
@@ -376,6 +386,21 @@ def test_require_feature_matches_tier_matrix(tier_name: str, feature_str: str):
             require_feature(feature_str)
         assert exc_info.value.feature == feature_str
         assert exc_info.value.tier == LicenseTier(tier_name)
+
+
+# ENT-001 (2026-06-14): PII is available on ALL tiers — no gate, no 402.
+@pytest.mark.parametrize("tier_name", _TIER_NAMES_SCOPE)
+@pytest.mark.parametrize("pii_feature", ("pii_log", "pii_redact"))
+def test_pii_always_available_on_all_tiers(tier_name: str, pii_feature: str):
+    """require_feature(pii_log/pii_redact) MUST NOT raise on any tier.
+
+    PII detection (LOG / REDACT / BLOCK) is available on every tier
+    including Community/free per README §8 Feature Matrix and the
+    "PII filtering runs on all traffic, by default" product narrative.
+    """
+    set_license(_build_license(tier_name))
+    # Must not raise regardless of what the license payload carries
+    require_feature(pii_feature)
 
 
 def test_feature_gated_response_body_is_descriptive():

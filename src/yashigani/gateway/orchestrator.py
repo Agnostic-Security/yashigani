@@ -506,11 +506,154 @@ _BLOCK_NOTICE = (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LAURA-DK-002 fix — connection allow-list on the orchestrator MCP path
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ORCH_ENFORCE_ENVS: frozenset[str] = frozenset({"production", "staging"})
+
+
+def _check_orchestrator_mcp_grant(
+    identity, server: str, tool: str, request_id: str, root_rid: str, depth: int
+) -> Optional[ToolResult]:
+    """
+    LAURA-DK-002: connection allow-list guard for the orchestrator MCP path.
+
+    The orchestrator previously called _opa_ingress_for_mcp (OPA content /
+    sensitivity inspection) but skipped resolve_boolean_grant, allowing a
+    principal with a confirmed user-level DENY grant on an MCP server to still
+    invoke tools on it via the cloud9-orchestrate model path.  This function
+    closes that gap by applying the SAME grant check the broker runs in
+    _check_connection_permit, with the SAME 3-way principal dispatch, BEFORE
+    the OPA ingress is even queried.
+
+    3-way principal dispatch (mirrors broker._check_connection_permit):
+      - Human caller (identity.kind in "human"/"user", valid identity_id)
+        → principal_scope="user", principal_id=identity_id
+      - Agent caller (identity.kind="agent", valid identity_id)
+        → principal_scope="agent", principal_id=identity_id
+      - Orchestrator / internal service / unauthenticated
+        → principal_scope=None (org+group ceiling only)
+
+    Returns None when the call is permitted (caller proceeds to OPA ingress).
+    Returns a fail-closed ToolResult(blocked=True) when denied.
+
+    Fail-closed on missing permission_store in prod/staging.
+    No-op (None) on missing permission_store in dev/test.
+    """
+    from yashigani.gateway.openai_router import _state
+    from yashigani.audit.schema import OrchestrationBlockedStepEvent
+
+    perm_store = getattr(_state, "permission_store", None)
+    _env = os.environ.get("YASHIGANI_ENV", "").lower().strip()
+
+    if perm_store is None:
+        if _env in _ORCH_ENFORCE_ENVS:
+            logger.error(
+                "orchestration: [LAURA-DK-002] permission_store is None in %r env — "
+                "DENYING orchestrator mcp tool call fail-closed (deny-by-default). "
+                "server=%s identity=%s",
+                _env, server, _principal_id(identity),
+            )
+            _audit(OrchestrationBlockedStepEvent(
+                root_request_id=root_rid, request_id=request_id,
+                identity_id=_principal_id(identity),
+                session_id=_principal_id(identity), agent_id="orchestrator",
+                tool_name=f"mcp__{server}__{tool}", tool_kind="mcp", depth=depth,
+                block_source="grant:permission_store_unavailable",
+                egress_opa_decision="not_reached",
+                inspection_verdict="not_reached", inspection_confidence=0.0,
+            ))
+            return ToolResult(
+                f"[BLOCKED BY YASHIGANI POLICY] The MCP call {server}.{tool} was denied "
+                "because the permission store is unavailable "
+                "(policy_id=LAURA-DK-002 code=permission_store_unavailable "
+                "user_message=Contact an administrator to restore access); "
+                "it was not executed.",
+                blocked=True,
+                ingress_opa="deny:permission_store_unavailable",
+                egress_opa="not_reached",
+                inspection_verdict="not_reached",
+                http_status=403,
+                block_source="grant:permission_store_unavailable",
+            )
+        # Dev / test: no permission store → no-op (backwards-compatible).
+        return None
+
+    from yashigani.permissions import ResourceType, resolve_boolean_grant
+
+    org_id: str = os.environ.get("YASHIGANI_ORG_ID", "default")
+    group_ids: list[str] = list(identity.get("groups", []) if identity else [])
+
+    # 3-way principal dispatch — mirrors broker._check_connection_permit exactly:
+    #   human/user → user scope (per-user deny grants honoured)
+    #   agent       → agent scope (per-agent deny grants honoured)
+    #   internal / service / unauthenticated → org+group ceiling only (scope=None)
+    _kind: str = (identity.get("kind", "") if identity else "") or ""
+    _iid: Optional[str] = (identity.get("identity_id") if identity else None) or None
+    _iid_valid = _iid is not None and _iid not in ("internal", "anonymous", "unknown", "")
+
+    if _kind in ("human", "user") and _iid_valid:
+        principal_scope: Optional[str] = "user"
+        principal_id: Optional[str] = _iid
+    elif _kind == "agent" and _iid_valid:
+        principal_scope = "agent"
+        principal_id = _iid
+    else:
+        # Orchestrator / internal / service / unauthenticated: org+group only.
+        principal_scope = None
+        principal_id = None
+
+    allowed = resolve_boolean_grant(
+        ResourceType.MCP_SERVER,
+        server,
+        org_id=org_id,
+        group_ids=group_ids,
+        principal_scope=principal_scope,
+        principal_id=principal_id,
+        store=perm_store,
+    )
+
+    if allowed:
+        return None  # Permitted — caller proceeds to OPA ingress.
+
+    # DENY — fail closed: emit audit + return blocked ToolResult with
+    # self-describing decision contract (policy_id / code / user_message).
+    logger.warning(
+        "orchestration: [LAURA-DK-002] connection allow-list DENIED mcp=%s.%s "
+        "identity=%s scope=%s/%s org=%s",
+        server, tool, _principal_id(identity), principal_scope, principal_id, org_id,
+    )
+    _audit(OrchestrationBlockedStepEvent(
+        root_request_id=root_rid, request_id=request_id,
+        identity_id=_principal_id(identity),
+        session_id=_principal_id(identity), agent_id="orchestrator",
+        tool_name=f"mcp__{server}__{tool}", tool_kind="mcp", depth=depth,
+        block_source="grant:mcp_server_not_permitted",
+        egress_opa_decision="not_reached",
+        inspection_verdict="not_reached", inspection_confidence=0.0,
+    ))
+    return ToolResult(
+        f"[BLOCKED BY YASHIGANI POLICY] The MCP call {server}.{tool} was denied "
+        "by the connection allow-list (mcp_server_not_permitted); it was not executed. "
+        "policy_id=LAURA-DK-002 code=mcp_server_not_permitted "
+        "user_message=You are not permitted to access this MCP server.",
+        blocked=True,
+        ingress_opa="deny:mcp_server_not_permitted",
+        egress_opa="not_reached",
+        inspection_verdict="not_reached",
+        http_status=403,
+        block_source="grant:mcp_server_not_permitted",
+    )
+
+
 async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: dict,
                             identity, depth: int, root_rid: str, request_id: str) -> ToolResult:
     """Run one MCP tool hop end-to-end with full per-hop adjudication.
 
     Order (build sheet §3.3 / §3.4 / §0.1):
+      0. CONNECTION ALLOW-LIST (LAURA-DK-002).  Grant check before OPA.
+         Deny → blocked notice, never reach OPA or upstream.
       1. OPA INGRESS decision (A→M).  Deny → blocked notice, never reach upstream.
       2. JSON-RPC tools/call to the upstream.
       3. ResponseInspection on the RESULT (untrusted upstream content).
@@ -520,6 +663,16 @@ async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: 
     """
     import httpx
     from yashigani.audit.schema import OrchestrationBlockedStepEvent
+
+    # 0) Connection allow-list (LAURA-DK-002): must run BEFORE OPA ingress.
+    #    The broker enforces this on the direct MCP path; the orchestrator path
+    #    previously skipped it, letting a DENY grant holder invoke tools by
+    #    routing through cloud9-orchestrate.  Fail-closed on deny or missing
+    #    permission_store in prod/staging.
+    _grant_deny = _check_orchestrator_mcp_grant(
+        identity, server, tool, request_id, root_rid, depth)
+    if _grant_deny is not None:
+        return _grant_deny
 
     # 1) OPA ingress.
     ingress = await _opa_ingress_for_mcp(identity, server, tool)
@@ -906,11 +1059,17 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
 def _seed_denied(request_id: str, reason: str, sensitivity_level: str):
     """Fail-closed 403 for a denied orchestration seed prompt (FIX M1)."""
     safe_reason = (reason or "policy_denied").encode("ascii", "replace").decode("ascii")
+    # Show the user a human-readable message; the raw reason code stays in the
+    # `code` field + X-Yashigani-OPA-Reason header for support/automation (decode
+    # via the reason map / decision-code-legend.yml). Deferred import avoids a
+    # module-load cycle (openai_router lazy-imports run_orchestration from here).
+    from yashigani.gateway.openai_router import _owui_deny_message
+    human_message = _owui_deny_message(safe_reason)
     return JSONResponse(
         status_code=403,
         content={
             "error": {
-                "message": f"Orchestration denied by policy: {safe_reason}",
+                "message": human_message,
                 "type": "policy_denied",
                 "code": safe_reason,
                 "request_id": request_id,
@@ -1253,7 +1412,10 @@ async def run_orchestration(*, body, identity, request, request_id: str,
                                 "You are a helpful assistant with access to tools. When the user asks "
                                 "you to use a tool, contact an agent, or tell/ask a server something, "
                                 "call the matching tool with the right arguments. If a tool result says "
-                                "it was BLOCKED, do not retry it — tell the user the step was blocked.\n\n"
+                                "it was BLOCKED, do not retry it. Tell the user plainly that the step was "
+                                "blocked by a security policy and cannot be completed. Do NOT tell the user "
+                                "to try again later — the block is a policy decision, not a transient error. "
+                                "If they need access, suggest they contact an administrator.\n\n"
                                 + _QUARANTINE_SYSTEM)})
 
     # ── FIX M1 (§0.1.1 H→A ingress): adjudicate the SEED PROMPT before the brain ──
@@ -1525,17 +1687,39 @@ def _finalize(body, identity, request_id, final_text, transcript, blocked_any,
     skip them — it relaxes ONLY the brain's internal cognition leg, never the
     tool-result or final-answer egress that this envelope carries.
     """
-    # Append a compact transcript so the customer "record all outputs" requirement
-    # is met inline; full per-hop evidence is in the audit sink.
-    summary_lines = []
-    for step in transcript:
-        flag = "BLOCKED" if step["status"] == "blocked" else "ok"
-        summary_lines.append(
-            f"  - {step['tool']} (depth {step['depth']}): {flag} "
-            f"[ingress_opa={step['ingress_opa']} egress_opa={step['egress_opa']} "
-            f"inspection={step['inspection']}]")
+    # OPA-UX TRY-AGAIN (deterministic): on a policy BLOCK the brain (a small local
+    # LLM) sometimes ignores its system-prompt instruction and appends transient-
+    # retry phrasing ("please try again later"), which misrepresents a policy
+    # DECISION as a temporary glitch and tells users to retry a request that will
+    # always be denied. Prompt-only control is non-deterministic; strip the phrase
+    # here so the wording is GUARANTEED regardless of which model answered.
+    if blocked_any and final_text:
+        import re as _re
+        # Strip the transient-retry phrase AND any trailing "... if <clause>" tail it
+        # left dangling (e.g. "try again later if needed" -> ""), then collapse the
+        # double-space the removal leaves. Guaranteed clean regardless of model phrasing.
+        final_text = _re.sub(
+            r'\s*(?:please\s+)?try\s+again\s+(?:later|shortly|soon|in\s+a\s+(?:moment|bit|little while|few\s+\w+))\b(?:\s+if\b[^.!?]*)?[.!]?',
+            '', final_text, flags=_re.IGNORECASE)
+        final_text = _re.sub(r'[ \t]{2,}', ' ', final_text).strip()
+
+    # Append a COMPACT, OPAQUE coded transcript so the customer "record all
+    # outputs" requirement is met inline WITHOUT leaking the security logic
+    # (tool names, policy reasons, which leg fired) to whoever can read a chat
+    # answer. Each line is the stable coded tuple
+    # <tooluid>:<depth>:<status>:<leg>:<action>:<reason> — support decodes it
+    # with docs/decision-code-legend.yml / scripts/decode-steps.py. The full
+    # human-readable per-hop reason stays in the tamper-evident audit sink.
+    from yashigani.gateway.decision_codes import encode_step
+    summary_lines = [
+        f"  {encode_step(step)}"
+        for step in transcript
+        if step.get("type") == "step"
+    ]
     if summary_lines:
-        final_text = final_text + "\n\n[Orchestration steps]\n" + "\n".join(summary_lines)
+        final_text = (final_text
+                      + "\n\n[Decision codes — decode with decision-code-legend.yml]\n"
+                      + "\n".join(summary_lines))
 
     completion = {
         "id": request_id,

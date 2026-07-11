@@ -29,8 +29,11 @@ class PatternSet(NamedTuple):
 # ---------------------------------------------------------------------------
 
 SSN_PATTERNS: list[re.Pattern[str]] = [
-    # Formatted:  123-45-6789
+    # Formatted with dashes:  123-45-6789
     re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"),
+    # Formatted with spaces: 123 45 6789 (LAURA-31DR-002 — spaced-digit variant
+    # not previously covered; must be detected before reaching OPA).
+    re.compile(r"\b(?!000|666|9\d{2})\d{3}\s(?!00)\d{2}\s(?!0000)\d{4}\b"),
     # Unformatted 9-digit block — only flag when surrounded by non-digits
     # to avoid matching credit card sub-sequences.
     re.compile(r"(?<!\d)(?!000|666|9\d{2})\d{3}(?!00)\d{2}(?!0000)\d{4}(?!\d)"),
@@ -106,8 +109,15 @@ PASSPORT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b[A-Z]\d{8}\b"),
     # UK: 2 letters + 7 digits
     re.compile(r"\b[A-Z]{2}\d{7}\b"),
-    # EU (DE, FR, NL, etc.): 1–2 letters + 6–9 alphanumeric, wide form
-    re.compile(r"\b[A-Z]{1,2}[0-9A-Z]{6,9}\b"),
+    # EU (DE, FR, NL, etc.): 1–2 letters + 6–9 alphanumeric, wide form.
+    # PII-PASSPORT-FP-001: the original `[A-Z]{1,2}[0-9A-Z]{6,9}` matched every
+    # uppercase English word of 7–11 chars (CUSTOMER, CLINICAL, PARTICIPANT, etc.).
+    # Document-enforcement records these as PII "originals"; the residual check then
+    # fails CLOSED on every document that contains uppercase words.
+    # Fix: require at least one digit anywhere in the token via a lookahead
+    # `(?=[A-Z0-9]*[0-9])`. Real passport numbers always contain digits;
+    # all-alpha words (plain English) do not.
+    re.compile(r"\b(?=[A-Z0-9]*[0-9])[A-Z]{1,2}[0-9A-Z]{6,9}\b"),
     # Canadian: 2 letters + 6 digits
     re.compile(r"\b[A-Z]{2}\d{6}\b"),
 ]
@@ -195,19 +205,57 @@ DATE_OF_BIRTH_PATTERNS: list[re.Pattern[str]] = [
 
 
 # ---------------------------------------------------------------------------
+# UK National Insurance number (NINO)
+# ---------------------------------------------------------------------------
+# Format: two prefix letters + six digits + one suffix letter (A–D), printed
+# with or without single spaces between the groups (e.g. "AA 10 10 10 A" or
+# "AA101010A").  The prefix excludes the invalid first/second letters per
+# HMRC rules (D, F, I, Q, U, V never as either prefix letter; O never second);
+# the suffix is A–D.  Distinctive enough to match on a lone cell without a
+# proximity keyword.
+
+NATIONAL_INSURANCE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?!BG|GB|NK|KN|TN|NT|ZZ)"
+        r"[ABCEGHJ-PRSTW-Z][ABCEGHJ-NPRSTW-Z]"  # 2 valid prefix letters
+        r"[\s]?\d{2}[\s]?\d{2}[\s]?\d{2}[\s]?"   # 6 digits (optional spaces)
+        r"[A-D]\b",                               # suffix A-D
+        re.IGNORECASE,
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# UK postal address — anchored on the postcode (the address's identifying core)
+# ---------------------------------------------------------------------------
+# A UK postcode (e.g. "SW1A 1AA", "M1 2WD", "BS1 4ST") is the re-identifying
+# core of a postal address; flagging it catches the whole address cell.  The
+# outward code is 2–4 chars (letter(s)+digit(s), optional trailing letter), a
+# space (optional in storage), then the inward code (digit + 2 letters).
+
+POSTAL_ADDRESS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b[A-Z]{1,2}\d[A-Z\d]?[\s]?\d[A-Z]{2}\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # Registry — maps PiiType string key to its pattern list
 # (imported by detector.py to keep coupling explicit)
 # ---------------------------------------------------------------------------
 
 PATTERN_REGISTRY: dict[str, list[re.Pattern[str]]] = {
-    "SSN":              SSN_PATTERNS,
-    "CREDIT_CARD":      CREDIT_CARD_PATTERNS,
-    "EMAIL":            EMAIL_PATTERNS,
-    "PHONE":            PHONE_PATTERNS,
-    "IBAN":             IBAN_PATTERNS,
-    "PASSPORT":         PASSPORT_PATTERNS,
-    "NHS_NUMBER":       NHS_PATTERNS,
-    "DRIVERS_LICENCE":  DRIVERS_LICENCE_PATTERNS,
-    "IP_ADDRESS":       IP_ADDRESS_PATTERNS,
-    "DATE_OF_BIRTH":    DATE_OF_BIRTH_PATTERNS,
+    "SSN":                  SSN_PATTERNS,
+    "CREDIT_CARD":          CREDIT_CARD_PATTERNS,
+    "EMAIL":                EMAIL_PATTERNS,
+    "PHONE":                PHONE_PATTERNS,
+    "IBAN":                 IBAN_PATTERNS,
+    "PASSPORT":             PASSPORT_PATTERNS,
+    "NHS_NUMBER":           NHS_PATTERNS,
+    "DRIVERS_LICENCE":      DRIVERS_LICENCE_PATTERNS,
+    "IP_ADDRESS":           IP_ADDRESS_PATTERNS,
+    "DATE_OF_BIRTH":        DATE_OF_BIRTH_PATTERNS,
+    "NATIONAL_INSURANCE":   NATIONAL_INSURANCE_PATTERNS,
+    "POSTAL_ADDRESS":       POSTAL_ADDRESS_PATTERNS,
 }

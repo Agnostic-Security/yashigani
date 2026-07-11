@@ -50,7 +50,8 @@ class SuggestResponse(BaseModel):
     suggestion: Optional[dict] = None
     valid: bool
     error: Optional[str] = None
-    raw_response: str = ""
+    # LAURA-2255-004: raw_response removed from client-facing schema.
+    # Raw LLM output is logged server-side only (opa_assistant/generator.py).
 
 
 class ApplyRequest(BaseModel):
@@ -124,13 +125,11 @@ async def suggest(
             suggestion=None,
             valid=False,
             error=error or "unknown_error",
-            raw_response=result.get("raw_response", ""),
         )
 
     return SuggestResponse(
         suggestion=suggestion,
         valid=True,
-        raw_response=result.get("raw_response", ""),
     )
 
 

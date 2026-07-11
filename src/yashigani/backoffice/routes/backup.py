@@ -301,12 +301,23 @@ def _encrypt_and_sign_backup(dest: Path, dump_path: Path) -> dict:
     # Remove the plaintext dump — no plaintext survives in the backup dir
     dump_path.unlink()
 
-    # MANIFEST.sha256: hash of bundle.enc
-    h = hashlib.sha256()
+    # MANIFEST.sha256: hash of bundle.enc + backup-meta.json (FIND-3.0-002).
+    # Including backup-meta.json gives it integrity protection: the verify
+    # endpoint will detect any tampering with the key-derivation parameters.
+    h_bundle = hashlib.sha256()
     with open(bundle_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    manifest_text = f"{h.hexdigest()}  {_BUNDLE_FILE}\n"
+            h_bundle.update(chunk)
+
+    h_meta = hashlib.sha256()
+    with open(meta_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h_meta.update(chunk)
+
+    manifest_text = (
+        f"{h_bundle.hexdigest()}  {_BUNDLE_FILE}\n"
+        f"{h_meta.hexdigest()}  {_META_FILE}\n"
+    )
     manifest_path = dest / _MANIFEST_FILE
     manifest_path.write_text(manifest_text, encoding="utf-8")
     manifest_path.chmod(0o400)

@@ -142,3 +142,65 @@ test_human_mcp_allowed_when_rbac_permits if {
         "request": {"method": "GET", "path": "/mcp/filesystem-mcp"},
     }
 }
+
+# ── LAURA-30-006: JWKS endpoint allows anonymous GET ─────────────────────
+#
+# The public JWKS path must be reachable with no session, no agent_id, no
+# RBAC context — external MCP validators need to fetch the gateway public key.
+
+# Unauthenticated GET → allowed (no session, no agent_id).
+test_jwks_endpoint_allows_anonymous_get if {
+    data.yashigani.allow with input as {
+        "method": "GET",
+        "path": "/.well-known/yashigani-mcp-jwks.json",
+        "session_id": "",
+        "agent_id": "",
+    }
+}
+
+# Unauthenticated GET → also allowed when session is "anonymous".
+test_jwks_endpoint_allows_anonymous_session if {
+    data.yashigani.allow with input as {
+        "method": "GET",
+        "path": "/.well-known/yashigani-mcp-jwks.json",
+        "session_id": "anonymous",
+        "agent_id": "unknown",
+    }
+}
+
+# POST to the JWKS path is NOT allowed anonymously (must fail default-deny).
+test_jwks_endpoint_rejects_anonymous_post if {
+    not data.yashigani.allow with input as {
+        "method": "POST",
+        "path": "/.well-known/yashigani-mcp-jwks.json",
+        "session_id": "",
+        "agent_id": "",
+    }
+}
+
+# RBAC gate must NOT widen the JWKS allow: when RBAC is loaded but the
+# anonymous caller is not in any group, the JWKS allow still fires because
+# deny_rbac only applies inside allow rules that carry `not _denied`.
+# The JWKS allow rule does NOT carry `not _denied` — intentional: public key
+# material is not gated by session policy.
+test_jwks_endpoint_allowed_even_with_rbac_loaded if {
+    data.yashigani.allow with data.yashigani.rbac as {
+        "groups": {"admins": ["u9"]},
+        "users": {},
+    } with input as {
+        "method": "GET",
+        "path": "/.well-known/yashigani-mcp-jwks.json",
+        "session_id": "",
+        "agent_id": "",
+    }
+}
+
+# Non-JWKS /.well-known/* paths remain gated (no widening).
+test_well_known_internal_still_blocked if {
+    not data.yashigani.allow with input as {
+        "method": "GET",
+        "path": "/.well-known/internal/something",
+        "session_id": "",
+        "agent_id": "",
+    }
+}

@@ -1,8 +1,8 @@
 # AI Assets Inventory
 
 **Product:** Yashigani MCP Security Gateway
-**Version:** 3.1.1
-**Last updated:** 2026-07-10T00:00:00+01:00
+**Version:** 2.23.4
+**Last updated:** 2026-05-16T18:00:00+01:00
 **ACS control:** ASSET.1 — AI model inventory file required at repo root
 **Asset owners:** Gateway engineering, container engineering, and product ownership (Agnostic Security Ltd)
 
@@ -37,14 +37,6 @@ Yashigani is an inference gateway. It does not host model weights itself. All mo
 | **Langflow** | Visual workflow runtime proxy | Langflow (self-hosted, port 7860) | Operator-configured inside Langflow flow | HTTP adapter; no SDK pinning required | No — third-party |
 
 **Note on model identity:** The specific model weights loaded by Ollama, LM Studio, or Letta are determined by the operator's deployment configuration. Yashigani enforces policy on all traffic regardless of which model is loaded upstream.
-
-### 1.3 Embedding model (RAG, optional Open WebUI)
-
-| Backend | Role | Upstream provider | Default model | Version pinning | Trained by us? |
-|---|---|---|---|---|---|
-| **Ollama (embeddings)** | RAG document-embedding for the optional Open WebUI chat surface | Ollama (self-hosted, local) | `nomic-embed-text` | Pulled at deploy time by `ollama-init`; set as `RAG_EMBEDDING_MODEL` on the Open WebUI service (since v2.25.5) | No — third-party weights |
-
-`nomic-embed-text` is pulled on install (since v2.25.5) so file-upload RAG in the optional Open WebUI surface resolves embeddings locally rather than reaching an external embedding API. It is used only for retrieval embeddings, not for inference or inspection.
 
 ### 1.2 Inspection backends (classification-only — see section 3)
 

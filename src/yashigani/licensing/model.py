@@ -93,7 +93,11 @@ class LicenseFeature(str, Enum):
     OIDC       = "oidc"
     SAML       = "saml"
     SCIM       = "scim"
-    # v2.2 — PII detection (Professional Plus+)
+    # ENT-001 (2026-06-14): PII detection is available on ALL tiers including Community.
+    # README §8 Feature Matrix and "PII filtering runs on all traffic, by default" are
+    # the source of truth.  These enum values are kept for license-payload back-compat
+    # (older tokens may carry them in their features list) but are NEVER enforced as a
+    # gate — see enforcer.py _ALWAYS_AVAILABLE_FEATURES.
     PII_LOG    = "pii_log"      # LOG mode: detect and record findings only
     PII_REDACT = "pii_redact"   # REDACT and BLOCK modes: mutate or block payloads
 

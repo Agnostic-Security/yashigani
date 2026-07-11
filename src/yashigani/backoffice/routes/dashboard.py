@@ -367,12 +367,17 @@ async def services_health(session: AdminSession):
         _add("redis", "not_configured")
 
     # --- OPA: check via opa_url if configured ---
+    # AVA-30-002: use the internal CA bundle via client_ssl_context() — the
+    # established internal-mTLS pattern.  The bare urllib.request.urlopen()
+    # call used previously had no CA trust, causing CERTIFICATE_VERIFY_FAILED.
     opa_url = getattr(state, "opa_url", None)
     if opa_url:
         try:
             import urllib.request as _ureq
+            from yashigani.pki.ssl_context import client_ssl_context as _client_ssl_context
+            _ssl_ctx = _client_ssl_context()
             req = _ureq.Request(opa_url.rstrip("/") + "/health", method="GET")
-            with _ureq.urlopen(req, timeout=3) as resp:
+            with _ureq.urlopen(req, timeout=3, context=_ssl_ctx) as resp:
                 opa_ok = resp.status == 200
             _add("opa", "ok" if opa_ok else "degraded", f"opa_url={opa_url}")
         except Exception as exc:

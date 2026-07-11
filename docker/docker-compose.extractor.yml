@@ -1,0 +1,61 @@
+# Yashigani sandboxed-extractor overlay (2.26 document-OPA feature, B1, Captain).
+#
+# The extractor sandbox is a PER-JOB EPHEMERAL container the gateway spawns on
+# demand (the same model as the Pool Manager's container-per-identity), NOT a
+# long-running service. So this overlay does two things only:
+#
+#   1. Defines a `build-only` service `extractor` so the hardened image is built
+#      alongside the stack:
+#        docker compose -f docker/docker-compose.yml \
+#                       -f docker/docker-compose.extractor.yml build extractor
+#      It uses a no-op profile so `up` never STARTS it (it's spawned per job).
+#
+#   2. Wires the gateway's extractor-sandbox knobs (image tag + caps) so the
+#      SandboxedExtractorRunner finds the image and applies the limits. The
+#      gateway already has the container backend (Pool Manager) — it reuses it.
+#
+# Hardening of each spawned job (egress=none, ro-rootfs, cap-drop ALL, non-root,
+# seccomp, AppArmor, mem/cpu/pids/wall-clock caps) is applied by the runner at
+# spawn time (src/yashigani/documents/sandbox.py), NOT here — a per-job container
+# cannot be expressed as a static compose service.
+#
+# Feature flag: the whole document path is OFF by default
+# (YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=false). Set it true to enable.
+
+services:
+  extractor:
+    # Versioned tag tracks the release line like every other in-tree image
+    # (gateway/backoffice/caddy use ${YASHIGANI_VERSION}).  This removes the
+    # hardcoded 2.26.0 drift: when the release captain bumps VERSION (3.0), the
+    # extractor image tracks automatically.  install.sh builds + tags this as
+    # part of the release image set (compose_pull step), so the image EXISTS
+    # when the operator flips YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true.
+    image: yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.extractor
+    # Build-only: this service is NEVER started by `up`. The gateway spawns
+    # per-job instances from the image. The unsatisfiable profile keeps it out
+    # of the default `up` set while still being built by `build extractor`.
+    profiles:
+      - build-only
+    # Documented defaults for the spawned jobs (the runner reads these from the
+    # GATEWAY's env below; repeated here only as the canonical reference).
+    command: ["--help"]
+
+  gateway:
+    environment:
+      # Point the runner at the built, digest-pinnable image (Verification §7).
+      # Tracks ${YASHIGANI_VERSION} so the runner names the same tag install.sh
+      # built; the release pipeline can pin this to @sha256 in the deploy job.
+      YASHIGANI_EXTRACTOR_IMAGE: "yashigani/extractor:${YASHIGANI_VERSION:-3.0.0}"
+      # Per-job hardening caps (fail-closed defaults; tune per host capacity).
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"     # wall-clock kill
+      YASHIGANI_EXTRACTOR_MEM_LIMIT: "512m"   # cgroup mem kill (no host OOM)
+      YASHIGANI_EXTRACTOR_CPUS: "1.0"         # cpu quota where delegated
+      YASHIGANI_EXTRACTOR_PIDS_LIMIT: "64"    # fork-bomb cap
+      YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"  # 32 MiB output cap (F6)
+      YASHIGANI_EXTRACTOR_SECCOMP_PATH: "/app/docker/seccomp/yashigani-extractor.json"
+      YASHIGANI_EXTRACTOR_APPARMOR: "yashigani-extractor"
+      # Document enforcement stays OFF until the operator opts in.
+      YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: "false"

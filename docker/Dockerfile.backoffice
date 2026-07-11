@@ -5,7 +5,7 @@
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS builder
+FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS builder
 
 WORKDIR /build
 
@@ -20,7 +20,7 @@ RUN python -m build --wheel --outdir /dist
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
+FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS runtime
 
 RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
@@ -40,6 +40,13 @@ RUN apt-get update \
         libxmlsec1-openssl \
         postgresql-client-17 \
         age=1.2.1-1+b5 \
+        # LAURA-300-002: docker-cli REMOVED. The extractor now runs via
+        # HttpExtractorBackend (YASHIGANI_EXTRACTOR_RUNTIME=http) — the legacy
+        # CliContainerBackend that shelled out to docker-cli is no longer wired,
+        # no docker socket/proxy is reachable from this image, and no Python code
+        # invokes the binary. It was therefore dead weight carrying a CRITICAL
+        # BuildKit CVE (CVE-2026-33747). If the CLI extractor path is ever
+        # revived, reinstall docker-cli here AND restore the socket-proxy mount.
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -84,6 +91,15 @@ RUN chmod 0755 /usr/local/bin/backoffice-start.sh
 USER yashigani
 
 EXPOSE 8443
+
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 # mTLS healthcheck — Pattern A for Python ssl: trust anchor is the PUBLIC
 # ca_root.crt. Python 3.14/OpenSSL 3.0 strict-chain validation rejects

@@ -3,7 +3,8 @@
 Last updated: 2026-06-04
 
 This document describes the database role model and the tamper-evident audit
-chain controls introduced in v2.25.2. It is aimed at operators and
+chain controls introduced in v2.25.2 (Lu wire-sink-gate findings P1 + P2;
+combined "irrevocable audit" remediation). It is aimed at operators and
 auditors.
 
 ## Role model
@@ -62,7 +63,7 @@ now actually **enforced** (a superuser/owner previously bypassed them).
 5. **Independent file anchor.** The append-only file sink remains the canonical
    durability anchor, independent of the DB.
 
-## Residual risk (accepted)
+## Residual risk (YSG-RISK-058 — accepted)
 
 A rogue install-admin who holds the `yashigani_admin` superuser password **can**
 mutate the live database. They **cannot** do so undetectably:
@@ -75,4 +76,6 @@ mutate the live database. They **cannot** do so undetectably:
 
 The fully-out-of-scope case is **simultaneous** compromise of BOTH the admin DB
 credential AND the backoffice signing key. This is an accepted calculated risk
-a rogue senior IT admin with that level of access has far more impactful options than subverting the AI audit trail.
+(Tiago 2026-06-04): a rogue senior IT admin with that level of access has far
+more impactful options than subverting the AI audit trail. See risk register
+`YSG-RISK-058`.

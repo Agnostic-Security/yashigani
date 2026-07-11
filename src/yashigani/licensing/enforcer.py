@@ -52,11 +52,30 @@ class LicenseLimitExceeded(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Features that are always available regardless of tier (ENT-001, 2026-06-14)
+# ---------------------------------------------------------------------------
+# PII detection (LOG / REDACT / BLOCK) is available on every tier including
+# Community/free.  This aligns with README §8 Feature Matrix (only OIDC/SAML/SCIM
+# are tier-gated) and the product narrative "PII filtering runs on all traffic,
+# by default".  The LicenseFeature enum values are kept for back-compat with
+# license payloads issued under v2.2 that carry pii_log/pii_redact in their
+# features claim — but those claims are never *required* at gate time.
+
+_ALWAYS_AVAILABLE_FEATURES: frozenset[str] = frozenset({"pii_log", "pii_redact"})
+
+
+# ---------------------------------------------------------------------------
 # Gate functions
 # ---------------------------------------------------------------------------
 
 def require_feature(feature: str) -> None:
-    """Raise LicenseFeatureGated if feature not in active license."""
+    """Raise LicenseFeatureGated if feature not in active license.
+
+    Features listed in _ALWAYS_AVAILABLE_FEATURES are unconditionally permitted
+    regardless of tier or what the license payload carries.
+    """
+    if feature in _ALWAYS_AVAILABLE_FEATURES:
+        return  # ENT-001: PII is always available
     if not _license.has_feature(feature):
         raise LicenseFeatureGated(feature=feature, tier=_license.tier)
 
@@ -217,13 +236,13 @@ def count_canonical_end_users() -> int:
 # FastAPI exception handler helpers
 # ---------------------------------------------------------------------------
 
-# Which tier unlocks each feature — used in upgrade messages
+# Which tier unlocks each feature — used in upgrade messages.
+# ENT-001 (2026-06-14): pii_log/pii_redact removed — PII is always available
+# and will never reach this lookup via license_feature_gated_response().
 _FEATURE_UPGRADE_TIER: dict[str, str] = {
-    "oidc":       "Starter",
-    "saml":       "Professional",
-    "scim":       "Professional",
-    "pii_log":    "Professional Plus",
-    "pii_redact": "Professional Plus",
+    "oidc":  "Starter",
+    "saml":  "Professional",
+    "scim":  "Professional",
 }
 
 

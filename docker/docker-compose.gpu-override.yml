@@ -1,0 +1,5 @@
+# E2E GPU override — attach RTX 3060 (CDI) to Ollama. Applied post-install.
+services:
+  ollama:
+    devices:
+      - nvidia.com/gpu=1

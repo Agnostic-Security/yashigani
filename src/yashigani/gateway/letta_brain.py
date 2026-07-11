@@ -56,6 +56,16 @@ import os
 import re
 import uuid
 
+
+def _letta_brain_model() -> str:
+    """Return the brain model for letta orchestration agents (configurable).
+
+    P1.5 (fix/medlow-findings): consolidate model resolution here and in
+    letta_client.py so both use YASHIGANI_LETTA_BRAIN_MODEL; this lets the
+    installer set a single env var to swap the brain model for all letta paths.
+    """
+    return os.environ.get("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+
 logger = logging.getLogger(__name__)
 
 
@@ -310,8 +320,14 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
     `persona` memory block so they persist across turns WITHOUT re-sending them
     each turn (keeps the per-turn payload small).  The agent is deleted on
     teardown (close_letta_brain).
+
+    SC-AGENT-003: uses _letta_embedding_config() (imported from letta_client) to
+    build an explicit embedding_config pointing at the gateway's /v1/embeddings
+    instead of the cloud handle "letta/letta-free" (which resolves to
+    embeddings.letta.com — unreachable from the network-isolated Letta container).
     """
     import httpx
+    from yashigani.gateway.letta_client import _letta_embedding_config
 
     persona = (
         "I am a Yashigani orchestration BRAIN. I have NO network access; the only "
@@ -319,7 +335,10 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
         "gateway executes on my behalf.\n\n"
         + _BRAIN_PROTOCOL.format(tools=_tool_lines(catalog))
     )
+    brain_model = _letta_brain_model()
     async with httpx.AsyncClient(timeout=timeout) as client:
+        # SC-AGENT-003: explicit embedding_config replaces cloud handle.
+        embedding_cfg = await _letta_embedding_config(client)
         resp = await client.post(f"{base_url}/v1/agents/", json={
             "name": f"yashigani-orch-{uuid.uuid4().hex[:8]}",
             "memory_blocks": [
@@ -327,12 +346,16 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
                                             "orchestration request."},
                 {"label": "persona", "value": persona},
             ],
-            "model": "openai-proxy/qwen2.5:3b",
-            "embedding": "letta/letta-free",
+            "model": brain_model,
+            "embedding_config": embedding_cfg,
         })
         if resp.status_code not in (200, 201):
-            raise RuntimeError(f"letta brain-agent creation failed: "
-                               f"{resp.status_code} {resp.text[:200]}")
+            # P1.5: include the model name for fast diagnostics (404 on model
+            # means the model name is wrong or not configured in Letta's proxy).
+            raise RuntimeError(
+                f"letta brain-agent creation failed (model={brain_model!r}): "
+                f"HTTP {resp.status_code} {resp.text[:300]}"
+            )
         return resp.json()["id"]
 
 

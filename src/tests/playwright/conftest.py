@@ -145,25 +145,23 @@ def get_admin_credentials() -> tuple[str, str]:
 
 
 def get_admin_totp_code() -> str:
-    """Return a current SHA-256 TOTP code for admin1.
+    """Return a current HMAC-SHA1 TOTP code for admin1.
 
-    The server uses pyotp.TOTP(secret, digest=hashlib.sha256) — standard SHA-1
-    TOTP will produce wrong codes. Uses ±1 window tolerance.
+    The server uses pyotp.TOTP(secret) (RFC 6238 default, HMAC-SHA1).
+    Uses ±1 window tolerance.
     """
-    import hashlib
     import pyotp
 
     secret = _read_secret("admin1_totp_secret")
-    return pyotp.TOTP(secret, digest=hashlib.sha256).now()
+    return pyotp.TOTP(secret).now()
 
 
 def get_admin2_totp_code() -> str:
-    """Return a current SHA-256 TOTP code for admin2 (orchid)."""
-    import hashlib
+    """Return a current HMAC-SHA1 TOTP code for admin2."""
     import pyotp
 
     secret = _read_secret("admin2_totp_secret")
-    return pyotp.TOTP(secret, digest=hashlib.sha256).now()
+    return pyotp.TOTP(secret).now()
 
 
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
@@ -254,7 +252,6 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
     if not force_fresh and admin in _session_cookie_cache:
         return _session_cookie_cache[admin]
 
-    import hashlib
     import time
 
     import httpx
@@ -271,7 +268,7 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
             password = _read_secret("admin_initial_password")
         totp_secret = _read_secret("admin2_totp_secret")
 
-    totp_obj = pyotp.TOTP(totp_secret, digest=hashlib.sha256)
+    totp_obj = pyotp.TOTP(totp_secret)  # RFC 6238 default: HMAC-SHA1
 
     # Wait at least 62s since the last TOTP use for this admin to avoid replay.
     # Also wait until we're in the first 27s of a 30s window.
@@ -316,7 +313,7 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     """
     Full Playwright login for admin1 (or admin2 if admin=2).
 
-    Fills the login form with the admin's credentials and SHA-256 TOTP code.
+    Fills the login form with the admin's credentials and HMAC-SHA1 TOTP code.
     Waits for a fresh TOTP window if one was used recently (within 62s) to
     prevent TOTP replay rejection across multiple Playwright tests.
 
@@ -330,7 +327,6 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
 
     Last updated: 2026-05-09 (v2.23.3: BUG-LOGIN-REDIRECT-01 fixed)
     """
-    import hashlib
     import time
 
     import pyotp
@@ -346,7 +342,7 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
             password = _read_secret("admin_initial_password")
         totp_secret = _read_secret("admin2_totp_secret")
 
-    totp_obj = pyotp.TOTP(totp_secret, digest=hashlib.sha256)
+    totp_obj = pyotp.TOTP(totp_secret)  # RFC 6238 default: HMAC-SHA1
 
     # Wait for a fresh TOTP window if we used a code for this admin recently.
     # Server TTL for used codes is 60s. We wait until at least 62s have passed

@@ -4,7 +4,7 @@ Status of the items surfaced during the live in-place upgrade. All fixes are cod
 the repo, pre-push-reviewed (SOP 4.3), and validated end-to-end on the live AMD64/Docker
 29.1.3 stack unless noted.
 
-## ✅ A. Dual-wrap pre-upgrade backup vs read-only containers — DONE (`91adde0`)
+## ✅ A. Dual-wrap pre-upgrade backup vs read-only containers (YSG-RISK-050/051) — DONE (`91adde0`)
 `docker cp` refuses ReadonlyRootfs=true containers in BOTH directions (Docker 29), so the
 encrypted-backup step aborted ("Failed to copy staging data into container") on our
 read_only gateway/backoffice. Fixed transport-only (LOCKED crypto unchanged): tar-over-`exec`

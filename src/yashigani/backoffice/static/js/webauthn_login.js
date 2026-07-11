@@ -212,10 +212,17 @@
         var waSection = document.getElementById('webauthn-section');
         if (!waSection) return;
 
+        // The section ships hidden (class="hidden") so it never flashes on
+        // unsupported browsers.  Reveal it only when we confirm support; that
+        // way the UX intent is: "hidden until JS says yes".
+        // CSSOM-only manipulation — no inline styles, no unsafe-inline needed.
         if (!isWebAuthnSupported()) {
-            waSection.style.display = 'none';
+            // Already hidden via class; ensure it stays that way and bail.
+            waSection.classList.add('hidden');
             return;
         }
+        // Browser confirmed WebAuthn support — reveal the section.
+        waSection.classList.remove('hidden');
 
         var waBtn = document.getElementById('webauthn-login-btn');
         if (!waBtn) return;

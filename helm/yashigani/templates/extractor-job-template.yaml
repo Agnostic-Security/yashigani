@@ -1,0 +1,129 @@
+{{- /*
+Sandboxed-extractor runtime — K8s parity (2.26 document-OPA feature, B1, Captain).
+
+The extractor sandbox is a PER-JOB EPHEMERAL pod the gateway creates at runtime
+via the K8s API (KubernetesBackend.run_extractor_job) — NOT a long-running
+Deployment. So this template does NOT render a running workload; it renders:
+
+  1. A deny-all egress NetworkPolicy that selects the extractor pods by label
+     (yashigani.role=extractor-sandbox). THIS is how egress=NONE is enforced in
+     K8s — a pod spec alone cannot remove the pod network; the NetworkPolicy
+     denies all egress so a malicious parser cannot SSRF/exfil (plan §6 / F1).
+
+  2. An RBAC addition allowing the gateway ServiceAccount to create/delete the
+     ephemeral extractor pods (least privilege — pods CRUD in this namespace
+     only, mirroring rbac-pool-manager.yaml).
+
+  3. A documented PodTemplate (as a ConfigMap) capturing the canonical hardened
+     spec the backend builds programmatically — the single source of truth for
+     the securityContext + resource limits, auditable by Lu/Su without reading
+     Python. runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation
+     false, drop ALL caps, RuntimeDefault seccomp, no SA token, memory tmpfs,
+     active_deadline_seconds wall-clock kill.
+
+Gated on .Values.documentEnforcement.enabled (default false — ships dark).
+*/ -}}
+{{- if .Values.documentEnforcement.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "yashigani.fullname" . }}-extractor-deny-egress
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      yashigani.role: extractor-sandbox
+  policyTypes:
+    - Egress
+    - Ingress
+  # egress = NONE: no egress rules => all egress denied. Kills SSRF/exfil from a
+  # malicious parser running in the jail (plan §6, red-team F1).
+  egress: []
+  # ingress = NONE: nothing needs to reach a one-shot batch worker.
+  ingress: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "yashigani.fullname" . }}-extractor-pods
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+rules:
+  # Least privilege: the gateway SA may manage ONLY the ephemeral extractor pods
+  # (create to spawn a job, delete to reap, get/list/watch to collect the result
+  # + exit code, and pods/attach to stream stdin + read stdout).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/attach", "pods/log"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "yashigani.fullname" . }}-extractor-pods
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    # Reuse the existing `yashigani` ServiceAccount (serviceaccount.yaml) — the
+    # same SA the Pool Manager uses (rbac-pool-manager.yaml).
+    name: yashigani
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "yashigani.fullname" . }}-extractor-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "yashigani.fullname" . }}-extractor-pod-template
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+data:
+  # Canonical hardened spec the gateway's KubernetesBackend builds at runtime.
+  # Kept here as the auditable source of truth (Lu/Su review without reading
+  # Python). Any drift between this and backend.run_extractor_job is a bug.
+  pod-template.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      labels:
+        yashigani.role: extractor-sandbox      # selected by the deny-egress NetworkPolicy
+        yashigani.managed: "true"
+        yashigani.ephemeral: "true"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false       # no SA token in the jail
+      activeDeadlineSeconds: {{ .Values.documentEnforcement.timeoutSeconds | default 20 }}  # wall-clock kill
+      containers:
+        - name: extractor
+          image: "{{ .Values.documentEnforcement.image.repository | default "yashigani/extractor" }}:{{ .Values.documentEnforcement.image.tag | default .Chart.AppVersion }}"
+          stdin: true
+          stdinOnce: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true        # ro rootfs
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]                      # all caps dropped
+            seccompProfile:
+              type: RuntimeDefault               # or Localhost: yashigani-extractor.json
+          resources:
+            limits:
+              memory: {{ .Values.documentEnforcement.memLimit | default "512Mi" | quote }}
+              cpu: {{ .Values.documentEnforcement.cpuLimit | default "1" | quote }}
+          volumeMounts:
+            - name: scratch
+              mountPath: /tmp                    # only writable path
+      volumes:
+        - name: scratch
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+{{- end }}

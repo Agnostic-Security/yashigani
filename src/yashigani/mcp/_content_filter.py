@@ -49,8 +49,11 @@ TODO [M4-v2]: replace heuristic pattern set with an LLM-classifier sidecar
               heuristic approach is conservative by design — it rejects
               injections that match common patterns and caps description size;
               it does NOT catch all semantic injection variants.
-              Base64/hex-encoded payloads are out of scope for v1 (inherent
-              risk; LLM-classifier sidecar is the v2 mitigation).
+              FIND-3.0-LLM-B64: a bounded base64 decode pre-pass (step 7c)
+              is now wired into filter_description so naively-encoded payloads
+              are caught by the same heuristic patterns.  Deeper semantic
+              coverage (multi-encoding chains, hex, rot13, URL-encode) remains
+              in scope for the LLM-classifier sidecar (v2 / YSG-RISK-057).
 
 v2.25.0 / P1 Phase-2 / M4 / YSG-RISK-054 (tool-description audit) /
   LAURA-MCP-005 (injection vector in tool descriptions) /
@@ -60,6 +63,7 @@ v2.25.0 / P1 Phase-2 / M4 / YSG-RISK-054 (tool-description audit) /
 """
 from __future__ import annotations
 
+import base64
 import re
 import threading
 import unicodedata
@@ -206,6 +210,81 @@ def _collapse_separators(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# FIND-3.0-LLM-B64 — bounded base64 decode pre-pass
+#
+# Robustness improvement: a base64-encoded injection payload is invisible to
+# the raw-text heuristic scan.  A single decode step exposes the plaintext
+# so the existing injection patterns catch it.
+#
+# Design constraints (pragmatic, NOT full semantic coverage — that lives in
+# the LLM-sidecar v2 path per YSG-RISK-057):
+#  • Decode depth = 1.  We do NOT recurse (no "base64 of base64 of base64…").
+#    An attacker can still nest, but each additional layer costs them
+#    significantly and the sidecar handles deeper obfuscation.
+#  • Size cap: decode only when the blob is ≤ _B64_MAX_BYTES after decoding.
+#    Prevents DoS via a huge base64 blob that would be decoded and re-scanned.
+#  • Require the decoded bytes to be valid UTF-8 with a plausible ratio of
+#    printable characters — this cuts out binary/compressed blobs that are
+#    noise, not injection attempts.
+#  • Malformed base64 → silently skip (never crash the filter path).
+#  • The pre-pass runs AFTER the main scan (step 7) — only if the raw text
+#    passed clean.  This keeps the hot path fast (the common case is clean).
+#
+# This is a LOW/robustness addition. It does not replace the sidecar.
+# ---------------------------------------------------------------------------
+
+# Minimum blob length that might be a meaningful base64 payload.
+# Short base64 (<= 20 chars) is common in tool IDs and is not worth decoding.
+_B64_MIN_ENCODED_CHARS: int = 20
+# Maximum decoded byte length we will accept and re-scan.
+_B64_MAX_BYTES: int = 512
+# Minimum fraction of printable ASCII in the decoded text to treat it as text.
+_B64_MIN_PRINTABLE_RATIO: float = 0.80
+
+# Matches a contiguous base64 blob: standard or URL-safe alphabet + optional
+# padding.  At least _B64_MIN_ENCODED_CHARS characters long.
+_B64_BLOB_RE = re.compile(
+    r"(?:[A-Za-z0-9+/\-_]{" + str(_B64_MIN_ENCODED_CHARS) + r",}={0,2})"
+)
+
+
+def _try_decode_b64_blob(blob: str) -> str | None:
+    """
+    Attempt to base64-decode *blob* (standard or URL-safe).
+
+    Returns the decoded UTF-8 string if the result is plausible text (mostly
+    printable ASCII, within size bounds), otherwise returns None.
+
+    Never raises — malformed input silently returns None.
+    """
+    try:
+        # Accept both standard and URL-safe alphabets; add padding if missing.
+        b = blob.replace("-", "+").replace("_", "/")
+        # Pad to a multiple of 4
+        padding = (4 - len(b) % 4) % 4
+        decoded_bytes = base64.b64decode(b + "=" * padding)
+    except Exception:
+        return None
+
+    if len(decoded_bytes) > _B64_MAX_BYTES:
+        return None
+
+    try:
+        decoded_str = decoded_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    # Require a minimum ratio of printable characters.
+    if not decoded_str:
+        return None
+    printable = sum(1 for c in decoded_str if c.isprintable() or c in "\t\n\r")
+    if printable / len(decoded_str) < _B64_MIN_PRINTABLE_RATIO:
+        return None
+
+    return decoded_str
+
+
+# ---------------------------------------------------------------------------
 # Pattern set — v1 heuristic
 #
 # Design notes:
@@ -312,6 +391,14 @@ class FilterResult:
     reject_reason: str
     safe_text: str
     matched_pattern: Optional[str] = None
+    # v2.26 / YSG-RISK-057 — populated only when the semantic-intent sidecar
+    # ran and contributed to the verdict.  None when the sidecar was OFF or not
+    # supplied (v1 heuristic-only behaviour is byte-identical to before).
+    semantic_intent_score: Optional[float] = None
+    semantic_intent_view: Optional[str] = None
+    # MASKED encoded token (pii.decode._mask_token: first4…last4 + length) of the
+    # decoded view that drove the verdict — audit-safe, never raw content.
+    semantic_intent_segment: Optional[str] = None
 
 
 def filter_description(text: str) -> FilterResult:
@@ -331,6 +418,12 @@ def filter_description(text: str) -> FilterResult:
       5. 2048-char cap (applied after normalisation).
       6. Control-char scan.
       7. Pattern scan on detection text AND on separator-collapsed variant.
+      7c. FIND-3.0-LLM-B64 — bounded base64 decode pre-pass: extract
+          plausible base64 blobs from the clean text, decode each once (no
+          recursion), and run the injection patterns over the decoded text.
+          Malformed blobs are silently skipped.  Depth-1 only; deeper
+          obfuscation chains remain in scope for the LLM-sidecar (v2 /
+          YSG-RISK-057).
     """
     original_length = len(text)
 
@@ -405,6 +498,40 @@ def filter_description(text: str) -> FilterResult:
                 matched_pattern=collapsed_match.group()[:64],
             )
 
+    # Step 7c: FIND-3.0-LLM-B64 — bounded base64 decode pre-pass.
+    # Only runs when the raw heuristic (steps 7a+7b) passed clean.  Extracts
+    # plausible base64 blobs, decodes each once (depth-1, bounded size), and
+    # re-runs the injection patterns over the decoded text.  Fail-safe: any
+    # exception or malformed blob is silently skipped (never crashes the
+    # filter path).  This is a LOW/robustness addition — deeper obfuscation
+    # (multi-layer, hex, rot13, URL-encode) remains in scope for the
+    # LLM-sidecar v2 path (YSG-RISK-057).
+    #
+    # IMPORTANT: scan 'prepared' (pre-leet), NOT 'detection' (post-leet).
+    # Leet normalisation corrupts base64 characters (e.g. '3' → 'e' inside
+    # a b64 blob), making the blob undecodeable.  'prepared' has had only
+    # Cf-strip and homoglyph normalisation applied — those do not affect the
+    # base64 alphabet.
+    for blob_match in _B64_BLOB_RE.finditer(prepared):
+        decoded_str = _try_decode_b64_blob(blob_match.group())
+        if decoded_str is None:
+            continue
+        # Apply the full normalisation pipeline to the decoded view so
+        # homoglyphs/leet/Cf-chars INSIDE the encoded payload are also caught.
+        decoded_det = _leet_normalise(_homoglyph_normalise(
+            _strip_cf_chars(unicodedata.normalize("NFKC", decoded_str))
+        ))
+        b64_match = _COMPILED_PATTERN.search(decoded_det)
+        if b64_match:
+            return FilterResult(
+                original_length=original_length,
+                normalised_length=normalised_length,
+                rejected=True,
+                reject_reason="injection_pattern:b64_decoded",
+                safe_text=_REPLACEMENT_TEXT,
+                matched_pattern=b64_match.group()[:64],
+            )
+
     # Clean — pass through the NFKC-normalised (but NOT Cf-stripped or
     # homoglyph-normalised) text so the downstream agent receives the
     # original semantics.  The Cf-stripped/normalised form is an internal
@@ -416,6 +543,92 @@ def filter_description(text: str) -> FilterResult:
         reject_reason="",
         safe_text=normalised,
     )
+
+
+# ---------------------------------------------------------------------------
+# v2.26 / YSG-RISK-057 — content-filter v2: heuristic + semantic-intent sidecar
+#
+# Defence-in-depth composition.  The v1 heuristic (filter_description) is the
+# fast, always-on stage.  filter_description_v2 runs it first, and ONLY if the
+# heuristic passed AND a sidecar is supplied AND the feature flag is ON, it asks
+# the semantic-intent sidecar for a second, encoding-aware opinion (the sidecar
+# decodes base64/hex/url/rot13 before classifying — the YSG-RISK-057 residual).
+#
+# The sidecar can only ESCALATE (clean -> rejected), never downgrade a heuristic
+# rejection.  When the sidecar is OFF / not supplied, behaviour is byte-identical
+# to filter_description (the v1 path is untouched).
+# ---------------------------------------------------------------------------
+
+
+def filter_description_v2(
+    text: str,
+    sidecar=None,  # Optional[SemanticIntentSidecar]
+) -> FilterResult:
+    """
+    Content-filter v2: v1 heuristic + optional semantic-intent sidecar.
+
+    Stage 1 (always): the v1 heuristic ``filter_description``.  If it rejects,
+    return immediately — no need to spend a GPU inference on already-blocked
+    content.
+
+    Stage 2 (flag-gated, defence-in-depth): if a ``sidecar`` is supplied and the
+    feature flag is ON, evaluate the ORIGINAL text for semantic injection intent
+    across decoded views.  An injection verdict ESCALATES a clean heuristic
+    result to rejected (reject_reason="semantic_intent").  Fail-closed semantics
+    live in the sidecar; here we simply honour ``verdict.is_injection``.
+
+    The sidecar is hostile-input-aware (it quotes content as a literal) and
+    fail-closed; see ``inspection.semantic_intent``.
+    """
+    base = filter_description(text)
+
+    # Heuristic already rejected, or no sidecar wired — return v1 result as-is.
+    if base.rejected or sidecar is None:
+        return base
+
+    try:
+        verdict = sidecar.evaluate(text)
+    except Exception as exc:  # sidecar must not break the filter path
+        # A crashing sidecar (not just an unreachable backend — the sidecar
+        # already fail-closes that internally) is a code fault.  Be honest in
+        # the audit trail but do not weaken the heuristic verdict that passed.
+        import logging
+        logging.getLogger(__name__).error(
+            "filter_description_v2: sidecar.evaluate raised %s — heuristic verdict stands",
+            type(exc).__name__,
+        )
+        return base
+
+    if verdict.skipped:
+        # Flag OFF — v1 behaviour.
+        return base
+
+    # Masked encoded token of the view that drove the verdict (audit-safe).
+    # ViewVerdict.segment is already masked by pii.decode._mask_token.
+    flagged_segment = ""
+    for vv in verdict.view_verdicts:
+        if vv.view_name == verdict.flagged_view:
+            flagged_segment = vv.segment or ""
+            break
+
+    # Annotate for audit regardless of disposition.
+    base.semantic_intent_score = verdict.score
+    base.semantic_intent_view = verdict.flagged_view
+    base.semantic_intent_segment = flagged_segment
+
+    if verdict.is_injection:
+        return FilterResult(
+            original_length=base.original_length,
+            normalised_length=base.normalised_length,
+            rejected=True,
+            reject_reason="semantic_intent",
+            safe_text=_REPLACEMENT_TEXT,
+            matched_pattern=f"semantic_intent:{verdict.flagged_view}",
+            semantic_intent_score=verdict.score,
+            semantic_intent_view=verdict.flagged_view,
+            semantic_intent_segment=flagged_segment,
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +673,11 @@ class TenantCatalogue:
     server_id: str
     tools: list[ToolDescriptor] = field(default_factory=list)
     prompts: list[PromptDescriptor] = field(default_factory=list)
+    # 3.0 / YSG-RISK-060 — byte-surface-hash of the raw surface this catalogue
+    # was built from (the capability-envelope change-detector).  Populated by
+    # build_catalogue; "" when not computed.  Used by the invocation gate to
+    # detect a surface that mutated between fetch and call.
+    surface_set_hash: str = ""
 
     # Aggregate stats for audit emission
     @property
@@ -544,10 +762,17 @@ def build_catalogue(
     server_id: str,
     raw_tools: list[dict],
     raw_prompts: Optional[list[dict]] = None,
+    sidecar=None,  # Optional[SemanticIntentSidecar]
 ) -> TenantCatalogue:
     """
     Build a TenantCatalogue from raw tools/list and optional prompts/list
-    responses by running each description through filter_description().
+    responses by running each description through the content filter.
+
+    Filtering uses ``filter_description_v2`` so that — when a ``sidecar`` is
+    supplied AND the YSG-RISK-057 feature flag is ON — each clean-heuristic
+    description gets a second, encoding-aware look (decode-before-classify).
+    When ``sidecar`` is None or the flag is OFF, behaviour is byte-identical to
+    the v1 ``filter_description`` path.
 
     Parameters
     ----------
@@ -562,12 +787,15 @@ def build_catalogue(
     raw_prompts:
         List of prompt dicts from prompts/list or prompts/get.  Expected
         keys: ``name`` (str) and ``description``/``content`` (str).
+    sidecar:
+        Optional semantic-intent sidecar (content-filter v2).  Escalate-only,
+        flag-gated, fail-closed — see ``filter_description_v2``.
     """
     tools: list[ToolDescriptor] = []
     for raw in raw_tools:
         name = str(raw.get("name") or "")
         desc = str(raw.get("description") or "")
-        result = filter_description(desc)
+        result = filter_description_v2(desc, sidecar=sidecar)
         tools.append(ToolDescriptor(
             tool_name=name,
             safe_description=result.safe_text,
@@ -579,16 +807,25 @@ def build_catalogue(
         name = str(raw.get("name") or "")
         # MCP prompts/get response uses "content" or "description"
         content = str(raw.get("content") or raw.get("description") or "")
-        result = filter_description(content)
+        result = filter_description_v2(content, sidecar=sidecar)
         prompts.append(PromptDescriptor(
             prompt_name=name,
             safe_content=result.safe_text,
             filter_result=result,
         ))
 
+    # 3.0 / YSG-RISK-060 — compute the byte-surface-hash change-detector over
+    # the raw surface (lazy import to avoid a cycle at module load).
+    try:
+        from yashigani.mcp._envelope import surface_set_hash as _ssh
+        _hash = _ssh(raw_tools, raw_prompts)
+    except Exception:  # pragma: no cover — never let hashing break the filter
+        _hash = ""
+
     return TenantCatalogue(
         tenant_id=tenant_id,
         server_id=server_id,
         tools=tools,
         prompts=prompts,
+        surface_set_hash=_hash,
     )

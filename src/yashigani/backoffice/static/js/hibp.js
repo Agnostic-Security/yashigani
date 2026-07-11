@@ -18,7 +18,7 @@ async function loadHibpStatus() {
 
     var data = await api('/api/v1/admin/auth/hibp/status');
     if (!data) {
-        container.innerHTML = '<span style="color:#ef4444">Failed to load HIBP key status.</span>';
+        container.innerHTML = '<span class="pki-err-text">Failed to load HIBP key status.</span>';
         _hibpSetButtons(false);
         return;
     }
@@ -35,12 +35,12 @@ async function loadHibpStatus() {
         var maskedVal = data.masked_value ? escapeHtml(data.masked_value) : '(set)';
         var updatedAt = data.updated_at ? escapeHtml(data.updated_at) : '';
         var updatedBy = data.updated_by ? escapeHtml(data.updated_by) : '';
-        html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+        html += '<div class="hibp-status-row">'
             + '<span class="badge badge-green">Configured</span>'
-            + '<span style="font-size:0.85rem;color:#334155;">Source: <strong>' + sourceLabel + '</strong></span>'
+            + '<span class="hibp-source-lbl">Source: <strong>' + sourceLabel + '</strong></span>'
             + '</div>';
-        html += '<div style="font-size:0.8rem;color:#64748b;">'
-            + 'Key: <code style="background:#f1f5f9;padding:2px 6px;border-radius:3px;">' + maskedVal + '</code>';
+        html += '<div class="txt-muted">'
+            + 'Key: <code class="cred-code">' + maskedVal + '</code>';
         if (updatedAt) {
             html += ' &mdash; set ' + updatedAt;
         }
@@ -49,9 +49,9 @@ async function loadHibpStatus() {
         }
         html += '</div>';
     } else {
-        html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+        html += '<div class="hibp-status-row">'
             + '<span class="badge badge-yellow">Not configured</span>'
-            + '<span style="font-size:0.8rem;color:#64748b;">Using anonymous k-Anonymity requests (free tier).</span>'
+            + '<span class="txt-muted">Using anonymous k-Anonymity requests (free tier).</span>'
             + '</div>';
     }
 

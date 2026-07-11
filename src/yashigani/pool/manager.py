@@ -36,12 +36,18 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-# FIX-3 (Nico gate): SPIFFE identity prefix enforced at dataclass init time.
-# Any non-empty spiffe_identity MUST start with this prefix — no caller can
-# silently flow an arbitrary SPIFFE URI into ContainerInfo.
-_SPIFFE_REQUIRED_PREFIX_RE = re.compile(
-    r"^spiffe://yashigani\.internal/agents/"
-)
+from yashigani.identity.trust_domain import spiffe_agents_prefix
+
+
+def _spiffe_required_prefix() -> str:
+    """``spiffe://<trust_domain>/agents/`` for THIS instance (MI-6 / YSG-RISK-061).
+
+    Computed per-call (not module-import-time) so the env-provisioned trust
+    domain is honoured and a foreign domain (incl. legacy
+    ``yashigani.internal`` on a non-legacy instance) is rejected by the
+    ``__post_init__`` guard below.
+    """
+    return spiffe_agents_prefix() + "/"
 
 logger = logging.getLogger(__name__)
 
@@ -79,16 +85,18 @@ class CertMount:
             ValueError: if spiffe_identity is non-empty and does not start with
                         the required ``spiffe://yashigani.internal/agents/`` prefix.
         """
-        if self.spiffe_identity and not _SPIFFE_REQUIRED_PREFIX_RE.match(
-            self.spiffe_identity
+        required_prefix = _spiffe_required_prefix()
+        if self.spiffe_identity and not self.spiffe_identity.startswith(
+            required_prefix
         ):
             raise ValueError(
                 f"CertMount.spiffe_identity {self.spiffe_identity!r} does not match the required prefix "
-                "spiffe://yashigani.internal/agents/ — arbitrary SPIFFE identities "
+                f"{required_prefix!r} — arbitrary SPIFFE identities "
                 "must not flow silently into ContainerInfo. "
-                "Use spiffe://yashigani.internal/agents/<tenant_id>/<agent_name> "
+                f"Use {required_prefix}<tenant_id>/<agent_name> "
                 "or leave spiffe_identity empty for non-agent containers. "
-                "(FIX-3 / Nico gate, POOL_MANAGER_CONTRACT.md §2)"
+                "(FIX-3 / Nico gate, POOL_MANAGER_CONTRACT.md §2; "
+                "MI-6 per-instance trust domain, YSG-RISK-061)"
             )
 
 

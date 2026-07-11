@@ -863,3 +863,73 @@ test_empty_ceiling_denies_agents if {
         "response_pii_detected": false,
     }
 }
+
+# ---------------------------------------------------------------------------
+# 10. #47 / G-NEW-5 / R3 — verified signed-principal contract.
+#
+# The orchestration principal is verified at the GATEWAY (ES384 signature +
+# SPIFFE binding + jti replay dedup) BEFORE OPA is queried — a forged or
+# replayed principal never reaches OPA (the gateway returns 403 fail-closed,
+# proven by test_g_new_5_agent_principal_signing.py).  These tests assert the
+# rego CONTRACT: it adjudicates on input.principal (now the VERIFIED principal
+# id) and the carried `verified` provenance fact is non-load-bearing (it does
+# not, on its own, change the allow/deny — authority is group + path).
+# ---------------------------------------------------------------------------
+
+# 10a. A relay hop: verified principal feeds OPA as a verified fact → ALLOW by
+# group + path exactly as before (the verified id is just the principal).
+test_verified_relay_principal_allows if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-orig",
+            "groups": ["analytics-agents"],
+            "verified": true,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}
+
+# 10b. First hop: the gateway is the asserting authority and mints the signed
+# claim on forward, so a verified=false principal still adjudicates normally by
+# group + path (the gateway has already authenticated the immediate caller).
+test_first_hop_unverified_principal_still_adjudicates if {
+    data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-alpha",
+            "groups": ["analytics-agents"],
+            "verified": false,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}
+
+# 10c. The verified principal is still bound by group: a verified principal NOT
+# in the allowed caller groups is DENIED (verification ≠ authorisation).
+test_verified_principal_wrong_group_denied if {
+    not data.yashigani.agent_call_allowed with input as {
+        "principal": {
+            "type": "agent",
+            "agent_id": "agent-orig",
+            "groups": ["other-agents"],
+            "verified": true,
+        },
+        "target_agent": {
+            "agent_id": "agent-beta",
+            "allowed_caller_groups": ["analytics-agents"],
+            "allowed_paths": ["/v1/run"],
+        },
+        "request": {"remainder_path": "/v1/run"},
+    }
+}

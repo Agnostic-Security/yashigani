@@ -135,6 +135,44 @@ class BudgetConfigStore:
         )
         return doc
 
+    # ── delete ───────────────────────────────────────────────────────────────
+
+    async def delete_org_cap(
+        self, tenant_id: str, org_id: str, provider: str,
+    ) -> bool:
+        """Delete an org cap.  Returns True if found+deleted, False if absent."""
+        key = _ORGCAP.format(tenant=tenant_id, org=org_id, provider=provider)
+        try:
+            deleted = self._r.delete(key)
+            return bool(deleted)
+        except Exception as exc:
+            logger.warning("BudgetConfigStore delete_org_cap failed: %s", exc)
+            return False
+
+    async def delete_group_budget(
+        self, tenant_id: str, group_id: str, provider: str, period: str = "monthly",
+    ) -> bool:
+        """Delete a group budget.  Returns True if found+deleted, False if absent."""
+        key = _GROUP.format(tenant=tenant_id, group=group_id, provider=provider, period=period)
+        try:
+            deleted = self._r.delete(key)
+            return bool(deleted)
+        except Exception as exc:
+            logger.warning("BudgetConfigStore delete_group_budget failed: %s", exc)
+            return False
+
+    async def delete_individual_budget(
+        self, tenant_id: str, identity_id: str, provider: str, period: str = "monthly",
+    ) -> bool:
+        """Delete an individual budget.  Returns True if found+deleted, False if absent."""
+        key = _INDIV.format(tenant=tenant_id, identity=identity_id, provider=provider, period=period)
+        try:
+            deleted = self._r.delete(key)
+            return bool(deleted)
+        except Exception as exc:
+            logger.warning("BudgetConfigStore delete_individual_budget failed: %s", exc)
+            return False
+
     # ── pricing / aliases (parity stubs — not used by the admin UI) ──────────
 
     async def get_model_pricing(self) -> list[dict]:

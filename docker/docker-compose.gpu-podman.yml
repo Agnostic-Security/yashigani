@@ -9,5 +9,13 @@ services:
   ollama:
     devices:
       - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+    # ROOTLESS-CDI-004: relax read_only ONLY on the podman GPU path. podman's
+    # nvidia-cdi-hook is a crun createContainer hook that writes driver-lib
+    # symlinks + ld.so.cache INTO the container rootfs; against the base
+    # `read_only: true` it exits 1 and the container never starts (proven:
+    # `podman run --read-only --device nvidia.com/gpu=1` → hook exit 1;
+    # without --read-only → RTX 3060 visible). Docker's CDI doesn't need this.
+    # ollama stays cap_drop:[ALL] + no-new-privileges + non-privileged.
+    read_only: false
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility

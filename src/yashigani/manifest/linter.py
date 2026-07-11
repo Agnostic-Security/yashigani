@@ -84,6 +84,8 @@ import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from yashigani.identity.trust_domain import spiffe_agents_prefix
+
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -364,8 +366,12 @@ def verify_digests_live(parsed: dict, *, _inspector: Any = None) -> list[LintErr
 # N1 — SPIFFE identity prefix mandate + URI resolver (P1-F-01)
 # ---------------------------------------------------------------------------
 
-_SPIFFE_TRUST_DOMAIN = "yashigani.internal"
-_SPIFFE_AGENTS_PREFIX = "spiffe://%s/agents" % _SPIFFE_TRUST_DOMAIN
+# MI-6 (YSG-RISK-061): the SPIFFE agents prefix is per-instance, derived from the
+# env-provisioned trust domain via ``spiffe_agents_prefix()`` at each call site.
+# A non-legacy instance resolves/validates against its OWN
+# ``spiffe://<project>.yashigani.internal/agents`` namespace and the N1 linter
+# rejects an override in a foreign (incl. legacy) namespace.  Resolved per-call,
+# never frozen at import time.
 
 
 def resolve_spiffe_uri(parsed: dict) -> str:
@@ -414,7 +420,7 @@ def resolve_spiffe_uri(parsed: dict) -> str:
             "and/or metadata.name, and no spec.identity.spiffe.override_id is set."
         )
 
-    return "%s/%s/%s" % (_SPIFFE_AGENTS_PREFIX, tenant_id, name)
+    return "%s/%s/%s" % (spiffe_agents_prefix(), tenant_id, name)
 
 
 def _lint_spiffe_prefix(parsed: dict) -> list[LintError]:
@@ -448,7 +454,7 @@ def _lint_spiffe_prefix(parsed: dict) -> list[LintError]:
     if not (tenant_id and name):
         return errors  # M2 / schema will catch missing fields
 
-    required_prefix = "spiffe://yashigani.internal/agents/%s/" % tenant_id
+    required_prefix = "%s/%s/" % (spiffe_agents_prefix(), tenant_id)
 
     override = (
         ((parsed.get("spec") or {}).get("identity") or {})

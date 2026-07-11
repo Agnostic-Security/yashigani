@@ -2,8 +2,8 @@ apiVersion: v2
 name: yashigani
 description: Security enforcement gateway for MCP servers and agentic AI systems
 type: application
-version: 2.24.0
-appVersion: "2.24.0"
+version: 3.0.0
+appVersion: "3.0.0"
 keywords:
   - mcp
   - security
@@ -11,6 +11,6 @@ keywords:
   - ai
 maintainers:
   - name: Yashigani Platform Team
-home: https://github.com/agnosticsec-com/yashigani
+home: https://github.com/Agnostic-Security/yashigani
 # NOTE: All services are rendered via templates in this umbrella chart.
 # No external Helm sub-chart dependencies are required.

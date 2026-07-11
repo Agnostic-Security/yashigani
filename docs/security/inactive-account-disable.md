@@ -3,11 +3,13 @@
 <!-- Last updated: 2026-05-08T00:00:00+00:00 — v2.23.3 -->
 
 This document describes the automated inactive-account disable mechanism
-introduced in v2.23.3 to satisfy FedRAMP Moderate baseline control AC-2(F2).
+introduced in v2.23.3 to satisfy FedRAMP Moderate baseline control AC-2(F2)
+and LU-YSG-002.
 
-**FedRAMP evidence pointer:** This document, migration `0007`, and the
+**FedRAMP evidence pointer (Lu):** This document, migration `0007`, and the
 `INACTIVE_ACCOUNT_DISABLED` audit event class in `src/yashigani/audit/schema.py`
-are the primary evidence artefacts. AU-3.F field coverage is documented in the
+are the primary evidence artefacts for LU-YSG-002. Reference these in the
+v2.23.3 compliance evidence pack. AU-3.F field coverage is documented in the
 audit event class docstring.
 
 ---

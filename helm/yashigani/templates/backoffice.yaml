@@ -149,6 +149,11 @@ spec:
               value: "/etc/yashigani/service_identities.yaml"
             - name: YASHIGANI_INTERNAL_CA_DIR
               value: "/run/secrets"
+            # MI-6 (multi-instance / YSG-RISK-061): per-instance SPIFFE trust domain
+            # for the app-layer validators. Default yashigani.internal (single
+            # instance). Compose parity: x-common-env YASHIGANI_SPIFFE_TRUST_DOMAIN.
+            - name: YASHIGANI_SPIFFE_TRUST_DOMAIN
+              value: {{ .Values.global.spiffeTrustDomain | default "yashigani.internal" | quote }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -196,7 +201,7 @@ spec:
             - name: YASHIGANI_AUDIT_SIGNING_KEY_PATH
               value: "/run/audit-signing/audit_signing.key"
             - name: YASHIGANI_AUDIT_SIGNING_SPIFFE_ID
-              value: "spiffe://yashigani.internal/audit/checkpoint-signer"
+              value: "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/audit/checkpoint-signer"
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
@@ -299,6 +304,16 @@ spec:
             - name: YASHIGANI_AUDIT_RETENTION_DAYS
               value: {{ .Values.auditLog.retentionDays | quote }}
             {{- end }}
+            # DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
+            # Backoffice reads OLLAMA_BASE_URL to reach the Ollama service
+            # (same backend as the gateway; K8s service name is yashigani-ollama).
+            # Without an explicit value the code default "http://ollama:11434" does
+            # not resolve in K8s — this env var wires the correct K8s DNS name.
+            - name: OLLAMA_BASE_URL
+              value: {{ .Values.backoffice.ollamaUrl | default "http://yashigani-ollama:11434" | quote }}
+            # Default ON (DP-Y-003 coherence fix). Override via backoffice.semanticIntentSidecar.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.backoffice.semanticIntentSidecar | default true | toString | quote }}
           envFrom:
             - secretRef:
                 name: {{ .Values.backoffice.existingSecretName | default "yashigani-backoffice-secrets" }}

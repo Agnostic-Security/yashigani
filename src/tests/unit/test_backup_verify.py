@@ -361,7 +361,10 @@ class TestB12EncryptAndSignBackup:
         assert meta["version"] == "ondemand-v1"
 
     def test_bundle_enc_hashes_match_manifest(self, tmp_path, monkeypatch):
-        """MANIFEST.sha256 hash of bundle.enc must match actual bundle.enc."""
+        """MANIFEST.sha256 hash of bundle.enc must match actual bundle.enc.
+        Updated for FIND-3.0-002: manifest now has two lines (bundle.enc + backup-meta.json).
+        Parse the bundle.enc line by name rather than assuming it's the only line.
+        """
         _fake_env_key(monkeypatch)
         dest = tmp_path / "backup_b12_manifest_hash"
         dest.mkdir()
@@ -372,10 +375,17 @@ class TestB12EncryptAndSignBackup:
 
         bundle_bytes = (dest / "bundle.enc").read_bytes()
         expected_hash = hashlib.sha256(bundle_bytes).hexdigest()
-        manifest_line = (dest / "MANIFEST.sha256").read_text().strip()
-        recorded_hash, recorded_name = manifest_line.split("  ", 1)
+
+        manifest_text = (dest / "MANIFEST.sha256").read_text()
+        # Find the bundle.enc line — manifest now has >= 2 entries (FIND-3.0-002)
+        bundle_line = next(
+            (line for line in manifest_text.splitlines() if "bundle.enc" in line),
+            None,
+        )
+        assert bundle_line is not None, "No bundle.enc line in MANIFEST.sha256"
+        recorded_hash, recorded_name = bundle_line.split("  ", 1)
         assert recorded_hash == expected_hash
-        assert recorded_name == "bundle.enc"
+        assert recorded_name.strip() == "bundle.enc"
 
     def test_missing_key_raises_valueerror(self, tmp_path, monkeypatch):
         """_get_db_aes_key must raise ValueError if env var is absent."""
@@ -401,3 +411,95 @@ class TestB12EncryptAndSignBackup:
         bundle_a = (tmp_path / "backup_b12_diff_0" / "bundle.enc").read_bytes()
         bundle_b = (tmp_path / "backup_b12_diff_1" / "bundle.enc").read_bytes()
         assert bundle_a != bundle_b
+
+    # -----------------------------------------------------------------------
+    # FIND-3.0-002: backup-meta.json must be in MANIFEST.sha256
+    # -----------------------------------------------------------------------
+
+    def test_meta_json_in_manifest(self, tmp_path, monkeypatch):
+        """FIND-3.0-002: backup-meta.json must appear in MANIFEST.sha256 so that
+        verify returns ok=True (not file_not_in_manifest mismatch)."""
+        _fake_env_key(monkeypatch)
+        dest = tmp_path / "backup_b12_meta_in_manifest"
+        dest.mkdir()
+        dump_path = dest / "database.dump"
+        dump_path.write_bytes(b"-- dump data")
+
+        backup_mod._encrypt_and_sign_backup(dest, dump_path)
+
+        manifest_text = (dest / "MANIFEST.sha256").read_text(encoding="utf-8")
+        assert "backup-meta.json" in manifest_text, (
+            "backup-meta.json must be included in MANIFEST.sha256 (FIND-3.0-002)"
+        )
+
+    def test_meta_json_hash_correct_in_manifest(self, tmp_path, monkeypatch):
+        """The hash recorded for backup-meta.json in MANIFEST.sha256 must match
+        the actual file on disk (regression: verify must pass ok=True)."""
+        import hashlib as _hashlib
+
+        _fake_env_key(monkeypatch)
+        dest = tmp_path / "backup_b12_meta_hash_correct"
+        dest.mkdir()
+        dump_path = dest / "database.dump"
+        dump_path.write_bytes(b"-- sensitive dump data")
+
+        backup_mod._encrypt_and_sign_backup(dest, dump_path)
+
+        meta_bytes = (dest / "backup-meta.json").read_bytes()
+        expected_hash = _hashlib.sha256(meta_bytes).hexdigest()
+
+        manifest_text = (dest / "MANIFEST.sha256").read_text(encoding="utf-8")
+        # Find the line for backup-meta.json
+        meta_line = next(
+            (line for line in manifest_text.splitlines() if "backup-meta.json" in line),
+            None,
+        )
+        assert meta_line is not None, "No backup-meta.json line found in manifest"
+        recorded_hash = meta_line.split("  ", 1)[0].strip()
+        assert recorded_hash == expected_hash, (
+            f"MANIFEST hash for backup-meta.json {recorded_hash!r} != actual {expected_hash!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_ondemand_backup_ok_true(self, tmp_path, monkeypatch):
+        """End-to-end: a backup created by _encrypt_and_sign_backup must verify
+        as ok=True with no mismatches (FIND-3.0-002 — backup-meta.json included)."""
+        monkeypatch.setenv("YASHIGANI_DB_AES_KEY", _TEST_AES_KEY_HEX)
+        monkeypatch.setattr(backup_mod, "_BACKUPS_DIR", tmp_path)
+
+        backup_name = "ondemand_test_verify"
+        dest = tmp_path / backup_name
+        dest.mkdir()
+        dump_path = dest / "database.dump"
+        dump_path.write_bytes(b"-- test dump for verify e2e")
+
+        backup_mod._encrypt_and_sign_backup(dest, dump_path)
+
+        # Now run verify via the API
+        from yashigani.backoffice.middleware import require_admin_session, require_stepup_admin_session
+        from yashigani.backoffice.routes.backup import router
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        app = FastAPI()
+
+        class _FakeSession:
+            account_id = "test-admin"
+
+        async def _fake_admin_session():
+            return _FakeSession()
+
+        app.dependency_overrides[require_admin_session] = _fake_admin_session
+        app.dependency_overrides[require_stepup_admin_session] = _fake_admin_session
+        app.include_router(router)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/admin/backup/verify", json={"backup_name": backup_name})
+
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True, (
+            f"verify returned ok=False with mismatches: {data.get('mismatches')}"
+        )
+        assert data["manifest_state"] == "signed"
+        assert data["mismatches"] == []

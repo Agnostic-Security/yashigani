@@ -94,6 +94,31 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("sklearn backend unavailable (%s) — LLM-only inspection", exc)
 
+    # DP-Y-003 §3.4 — semantic-intent sidecar for MCP import screening.
+    # Wraps the same OllamaBackend the broker uses (same URL + model), so
+    # import-time screening runs the IDENTICAL classifier as the inference path.
+    # Stored in backoffice_state so envelope_import._screen_tools can reach it
+    # without a circular import.  None when Ollama is unreachable at startup
+    # (envelope_import records classifier_status="unavailable" honestly).
+    _semantic_intent_sidecar = None
+    try:
+        from yashigani.inspection.semantic_intent import SemanticIntentSidecar
+        from yashigani.inspection.backends.ollama import OllamaBackend as _SidecarOllamaBackend
+        _sidecar_backend = _SidecarOllamaBackend(
+            base_url=ollama_url,
+            model=model,
+        )
+        _semantic_intent_sidecar = SemanticIntentSidecar.from_env(_sidecar_backend)
+        logger.info(
+            "Semantic-intent sidecar built for MCP import screening "
+            "(DP-Y-003 §3.4, backend=%s model=%s)", ollama_url, model,
+        )
+    except Exception as _sidecar_exc:
+        logger.warning(
+            "Semantic-intent sidecar unavailable (%s) — "
+            "envelope import screening falls back to heuristic-only", _sidecar_exc,
+        )
+
     # Gateway config
     upstream_url = os.environ["YASHIGANI_UPSTREAM_URL"]
     opa_url = os.getenv("YASHIGANI_OPA_URL", "https://policy:8181")
@@ -191,6 +216,9 @@ def _build_app(mesh_mode: bool = False):
     rbac_store = None
     agent_registry = None
     redis_client_rbac = None
+    capability_policy_store = None  # 3.0 — browser Permissions-Policy
+    permission_store = None          # 3.1 Phase 4 — MCP connection allow-list
+    _mcp_envelope_pending_store = None  # 3.1 / YSG-RISK-060 — drift sink for pending queue
     try:
         import redis as _redis
         redis_client_rbac = _redis.from_url(_gw_redis_url(3), decode_responses=False)
@@ -202,9 +230,56 @@ def _build_app(mesh_mode: bool = False):
             "Gateway agent registry ready: %d agent(s)",
             agent_registry.count("all"),
         )
+        # 3.0 — Capability policy store shares Redis db/3 (key prefix cap_policy:*)
+        from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
+        _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+        capability_policy_store = _CapPolStore(
+            redis_client=redis_client_rbac,
+            default_org_id=_cap_pol_org_id,
+        )
+        logger.info(
+            "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
+            _cap_pol_org_id,
+        )
+        # 3.1 Phase 4 — Unified Permission Store shares Redis db/3 (key prefix
+        # perm:grant:*).  Used by the MCP broker connection allow-list check.
+        from yashigani.permissions import PermissionStore as _PermStore
+        permission_store = _PermStore(redis_client=redis_client_rbac)
+        logger.info(
+            "Gateway permission store ready (Phase 4 MCP allow-list, org=%s)",
+            _cap_pol_org_id,
+        )
+        # 3.1 / YSG-RISK-060 full-close — capability-envelope pending re-approval
+        # store (key namespace "mcp_envelope_pending:").  The MCP broker writes
+        # drift-triggered block entries here via the pending_block_sink; the
+        # backoffice reads the same Redis db/3 keys via its own instance.
+        # Redis is the shared source of truth across the two services; both
+        # instances call _refresh_from_redis() on every read to stay coherent.
+        from yashigani.mcp.envelope_pending_store import EnvelopePendingStore as _EnvPendingStore
+        _mcp_envelope_pending_store = _EnvPendingStore(redis_client=redis_client_rbac)
+        logger.info(
+            "Gateway envelope pending store wired (Redis db/3) — "
+            "drift sink active for YSG-RISK-060 re-approval queue",
+        )
     except Exception as exc:
         logger.warning(
             "RBAC/Agent Redis unavailable (%s) — RBAC and agent routing disabled", exc
+        )
+
+    # FIX-005: Startup signal when permission store is unavailable in enforcing envs.
+    # In production/staging, Redis MUST be available for the deny-by-default
+    # permission gate.  Log at ERROR so ops/monitoring surfaces it immediately.
+    # MCP connection allow-list and cloud-model gate will DENY all requests until
+    # Redis is restored — this is intentional fail-closed behaviour (not a warn).
+    _startup_env = os.getenv("YASHIGANI_ENV", "").strip().lower()
+    if permission_store is None and _startup_env in {"production", "staging"}:
+        logger.error(
+            "FIX-005 STARTUP: permission_store (Redis) is unavailable in %r env. "
+            "MCP connection allow-list AND cloud-model gate will DENY all requests "
+            "fail-closed until Redis is restored. "
+            "Restore Redis connectivity to re-enable normal operation. "
+            "YSG deny-by-default mandate.",
+            _startup_env,
         )
 
     # JWT inspector — Phase 7
@@ -413,6 +488,36 @@ def _build_app(mesh_mode: bool = False):
         )
     except Exception as exc:
         logger.warning("PII detector unavailable (%s) — PII filtering disabled", exc)
+
+    # ── v2.26: Document PSEUDONYMIZE mode-B egress pipeline (gap #1).
+    # Built ONLY when the operator opts into mode-B-via-proxy (both the
+    # document-enforcement flag AND the dedicated mode-B-proxy flag).  Default
+    # OFF (dark): when not opted in, document_pipeline stays None and the proxy
+    # hot path is completely untouched.  A construction failure here disables the
+    # OPTIONAL feature (document_pipeline=None) — it does NOT crash startup, since
+    # mode-B-proxy is opt-in and its absence simply means documents are not
+    # tokenized on egress (the proxy's existing PII/OPA controls still apply).
+    document_pipeline = None
+    try:
+        from yashigani.documents.proxy_modeb import is_modeb_proxy_active
+        if is_modeb_proxy_active():
+            from yashigani.documents.config import DocumentEnforcementConfig
+            from yashigani.documents.pipeline import DocumentInspectionPipeline
+            _doc_cfg = DocumentEnforcementConfig.from_env()
+            document_pipeline = DocumentInspectionPipeline(
+                registry=_doc_cfg.build_registry(),
+            )
+            logger.info(
+                "Document mode-B egress pipeline ready (max_bytes=%d, max_segments=%d)",
+                _doc_cfg.max_document_bytes, _doc_cfg.max_segments,
+            )
+        else:
+            logger.info("Document mode-B egress pipeline disabled (flag off — dark)")
+    except Exception as exc:
+        logger.warning(
+            "Document mode-B egress pipeline unavailable (%s) — mode-B egress disabled",
+            exc,
+        )
 
     # ── v2.4.1: Pool Manager — create early so it can be wired into the
     # OpenAI router before create_gateway_app().  Health monitor is started
@@ -763,6 +868,8 @@ def _build_app(mesh_mode: bool = False):
         ddos_protector=ddos_protector,
         model_allocation_store=model_allocation_store,
         model_alias_store=model_alias_store,
+        kms_provider=kms_provider,
+        permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
     )
 
     # ── MCP broker wiring (P3 — v2.25.0) ──────────────────────────────────────
@@ -776,9 +883,22 @@ def _build_app(mesh_mode: bool = False):
         # The call router is no longer mounted as an extra_router (Fix-1).
         # proxy.py dispatches /mcp/<agent> via dispatch_mcp_call() in the catch-all.
 
+        # 3.1 Phase 4 — org ID for permission store seeding.
+        # Reuse the same YASHIGANI_ORG_ID that the capability policy store uses.
+        _perm_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
+
         _mcp_registry, _mcp_jwks_store = build_registry_from_env(
             opa_url=opa_url,
             audit_writer=audit_writer,
+            # 3.1 Phase 4 — wire permission store + org_id for connection allow-list.
+            # When permission_store is None (Redis unavailable), the check no-ops.
+            permission_store=permission_store,
+            org_id=_perm_org_id,
+            # 3.1 / YSG-RISK-060 full-close — drift sink for operator re-approval queue.
+            # When None (Redis unavailable), drift is still latched+blocked in DB
+            # but the /admin/mcp/envelopes/pending queue stays empty (backward-compat).
+            pending_store=_mcp_envelope_pending_store,
+            semantic_intent_sidecar=_semantic_intent_sidecar,  # DP-Y-003 §3.4
         )
         _extra_routers: list = [openai_router]
 
@@ -798,6 +918,42 @@ def _build_app(mesh_mode: bool = False):
                 "(call routes wired through catch-all — Fix-1)",
                 len(_mcp_registry),
             )
+
+            # 3.1 Phase 4 — seed org-level MCP server grants (B1 / auto-seed).
+            # Idempotent; runs at every startup so grants stay in sync with
+            # YASHIGANI_MCP_SERVERS.  Only runs when permission_store is available.
+            if permission_store is not None:
+                try:
+                    from yashigani.permissions import seed_mcp_grants
+                    import json as _json
+                    _mcp_raw = os.environ.get("YASHIGANI_MCP_SERVERS", "").strip()
+                    _server_ids: list = []
+                    if _mcp_raw:
+                        try:
+                            _server_ids = [
+                                str(e.get("agent_name", ""))
+                                for e in _json.loads(_mcp_raw)
+                                if isinstance(e, dict) and e.get("agent_name")
+                            ]
+                        except Exception:
+                            pass
+                    seed_mcp_grants(
+                        perm_store=permission_store,
+                        server_ids=_server_ids,
+                        org_id=_perm_org_id,
+                    )
+                    logger.info(
+                        "MCP permission seeder: seeded %d server grant(s) for org=%s",
+                        len(_server_ids), _perm_org_id,
+                    )
+                except Exception as _seed_exc:
+                    # Seeding failure is non-fatal at startup but deny-by-default
+                    # will apply to ALL MCP servers until next restart seeds them.
+                    logger.warning(
+                        "MCP permission seeder FAILED (%s) — deny-by-default "
+                        "applies to all MCP servers until next restart",
+                        _seed_exc,
+                    )
         else:
             _mcp_registry = None
             _mcp_jwks_store = None
@@ -809,6 +965,150 @@ def _build_app(mesh_mode: bool = False):
         logger.exception("MCP broker wiring failed at startup: %s", exc)
         raise RuntimeError(
             f"MCP broker wiring failed — gateway cannot start safely: {exc}"
+        ) from exc
+
+    # ── LAURA-DK-002-fix — seed orchestrator-path MCP server grants ──────────
+    # The DK-002 fix wires _check_orchestrator_mcp_grant (resolve_boolean_grant)
+    # as step-0 of _execute_mcp_tool.  That check uses server names resolved by
+    # _resolve_mcp_servers() in tool_catalog.py — which reads
+    # YASHIGANI_ORCH_MCP_SERVERS (JSON {name: url}) or, for the default demo,
+    # YASHIGANI_UPSTREAM_URL / UPSTREAM_MCP_URL containing "demo-mcp" → name
+    # "demo".  These names are DISTINCT from the broker-path names (agent_name
+    # values from YASHIGANI_MCP_SERVERS) seeded above inside the registry block.
+    #
+    # Without this block, the default demo ("demo") never receives an org-allow
+    # grant → _check_orchestrator_mcp_grant denies every cloud9-orchestrate MCP
+    # tool call out of the box (regression introduced by DK-002 fix).
+    #
+    # Single-source-of-truth: _resolve_mcp_servers() is the SAME function the
+    # orchestrator calls to populate its server map, so the seeder and the
+    # enforcement path can never diverge again.
+    #
+    # Idempotent: set_boolean_grant is a Redis SET; safe at every startup.
+    # Only org-level allow is seeded; user/group DENY grants are never touched
+    # so the DK-002 deny narrowing (Laura-verified) stays intact.
+    if permission_store is not None:
+        try:
+            from yashigani.permissions import seed_mcp_grants
+            from yashigani.gateway.tool_catalog import _resolve_mcp_servers
+            _orch_server_ids: list[str] = list(_resolve_mcp_servers().keys())
+            if _orch_server_ids:
+                seed_mcp_grants(
+                    perm_store=permission_store,
+                    server_ids=_orch_server_ids,
+                    org_id=_perm_org_id,
+                )
+                logger.info(
+                    "MCP orchestrator-path seeder: seeded org-allow for %d "
+                    "server(s) %s org=%s (LAURA-DK-002-fix; "
+                    "source: _resolve_mcp_servers())",
+                    len(_orch_server_ids), _orch_server_ids, _perm_org_id,
+                )
+            else:
+                logger.debug(
+                    "MCP orchestrator-path seeder: no servers resolved "
+                    "(YASHIGANI_ORCH_MCP_SERVERS unset, no demo-mcp upstream) "
+                    "— no-op; orchestrator has no MCP tools to gate"
+                )
+        except Exception as _orch_seed_exc:
+            # Non-fatal: log and continue — deny-by-default applies to
+            # orchestrator-path servers until next restart seeds them.
+            logger.warning(
+                "MCP orchestrator-path seeder FAILED (%s) — deny-by-default "
+                "applies to orchestrator-path servers until next restart "
+                "(LAURA-DK-002-fix)",
+                _orch_seed_exc,
+            )
+
+    # ── 3.1 Phase 4 — auto-seed AGENT grants ─────────────────────────────────
+    # Seed org-level allow grants for all active agents at startup (idempotent).
+    # Without this seed, every agent→agent call would be DENIED in prod/staging
+    # after the grant check lands (deny-by-default), until an admin manually
+    # creates grants via the backoffice.  This seed mirrors the MCP_SERVER seed.
+    #
+    # Idempotent: PermissionStore.set_boolean_grant is a Redis SET (overwrite);
+    # running this at every startup is safe and keeps grants in sync with the
+    # live agent registry.
+    #
+    # Operator narrowing: admins can still create group-level or user-level
+    # DENY grants post-seed via the backoffice to restrict access to specific
+    # agents.  The seed only sets the org-level allow; narrowing is additive.
+    if permission_store is not None and agent_registry is not None:
+        try:
+            from yashigani.permissions import seed_agent_grants
+            _agent_records = agent_registry.list_active() or []
+            _agent_ids = [
+                a.get("agent_id", "")
+                for a in _agent_records
+                if isinstance(a, dict) and a.get("agent_id")
+            ]
+            seed_agent_grants(
+                perm_store=permission_store,
+                agent_ids=_agent_ids,
+                org_id=_perm_org_id,
+            )
+            logger.info(
+                "Agent permission seeder: seeded %d agent grant(s) for org=%s",
+                len(_agent_ids), _perm_org_id,
+            )
+        except Exception as _agent_seed_exc:
+            # Seeding failure is non-fatal at startup but deny-by-default
+            # will apply to ALL agents until next restart seeds them.
+            logger.warning(
+                "Agent permission seeder FAILED (%s) — deny-by-default "
+                "applies to all agents until next restart",
+                _agent_seed_exc,
+            )
+
+    # ── 3.1 UID unification — startup migrations (pre-serving) ──────────────────
+    # Re-key RBAC and permission grants from email/slug → identity_id.
+    # Must run BEFORE any request is served.  Idempotent (safe to re-run).
+    # Unmapped entries are logged at CRITICAL and treated fail-closed.
+    if rbac_store is not None and identity_registry is not None:
+        try:
+            from yashigani.gateway.uid_migrations import migrate_rbac_to_identity_id
+            migrate_rbac_to_identity_id(rbac_store, identity_registry)
+        except Exception as _mig_exc:
+            logger.error(
+                "3.1 UID migration (RBAC): unexpected error — %s. "
+                "RBAC group memberships may be partially email-keyed.",
+                _mig_exc,
+            )
+
+    if permission_store is not None and identity_registry is not None:
+        try:
+            from yashigani.gateway.uid_migrations import migrate_perm_grants_to_identity_id
+            migrate_perm_grants_to_identity_id(permission_store, identity_registry)
+        except Exception as _mperm_exc:
+            logger.error(
+                "3.1 UID migration (perm grants): unexpected error — %s. "
+                "Permission grants may be partially email-keyed.",
+                _mperm_exc,
+            )
+
+    # ── Signed orchestration-principal machinery (#47 / G-NEW-5 / R3) ─────────
+    # The gateway SIGNS the orchestration principal (ES384, the SAME signing key
+    # the MCP broker uses) bound to the caller's SPIFFE identity, and VERIFIES it
+    # (SPIFFE-bound + jti replay-deduped) on re-entry — so the agent-to-agent OPA
+    # adjudication receives the principal as a VERIFIED fact, not a trusted
+    # header.  Fail-closed: a key/FIPS misconfiguration (or a missing persistent
+    # key in production/staging) raises here at startup, not at request time.
+    _principal_tenant_id = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+    try:
+        from yashigani.gateway.principal_token import build_principal_machinery
+        _principal_signer, _principal_verifier = build_principal_machinery(
+            tenant_id=_principal_tenant_id,
+        )
+        logger.info(
+            "orchestration-principal: signer+verifier wired (tenant=%s) — "
+            "agent principal is now a verified signed claim (#47/G-NEW-5)",
+            _principal_tenant_id,
+        )
+    except Exception as exc:
+        logger.exception("orchestration-principal machinery wiring failed: %s", exc)
+        raise RuntimeError(
+            f"orchestration-principal machinery wiring failed — gateway cannot "
+            f"start safely (fail-closed, #47/G-NEW-5): {exc}"
         ) from exc
 
     gateway_app = create_gateway_app(
@@ -831,6 +1131,13 @@ def _build_app(mesh_mode: bool = False):
         ddos_protector=ddos_protector,
         mcp_broker_registry=_mcp_registry,
         mcp_jwks_store=_mcp_jwks_store,
+        document_pipeline=document_pipeline,
+        principal_signer=_principal_signer,
+        principal_verifier=_principal_verifier,
+        principal_tenant_id=_principal_tenant_id,
+        capability_policy_store=capability_policy_store,  # 3.0
+        permission_store=permission_store,  # 3.1 Phase 4 — agent connection allow-list
+        identity_registry=identity_registry,  # 3.1 UID unification — boundary resolver
     )
     logger.info("OpenAI-compatible /v1 router mounted (before catch-all)")
 

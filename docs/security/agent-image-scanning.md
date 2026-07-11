@@ -39,7 +39,7 @@ Schema per entry:
   "TEST_ID_OR_RULE_ID": {
     "severity": "HIGH",
     "reason": "explanation of why this is accepted or a false positive",
-    "reviewer": "security-team",
+    "reviewer": "captain",
     "expiry_date": "YYYY-MM-DD",
     "upstream_issue": "URL or 'pending'"
   }
@@ -67,4 +67,5 @@ When shared-tenant agent containers ever ship (v2.25+ design), this scan becomes
 allowing it to run. The allowlist mechanism, gate thresholds, and SARIF upload pattern
 are all designed to be reused in that admission context.
 
-The v2.25+ design is intentionally deferred — it requires the full user-upload admission policy design, which is out of scope for N1.
+The v2.25+ design is intentionally deferred — it requires the full Iris design for
+user-upload admission policy, which is out of scope for N1.

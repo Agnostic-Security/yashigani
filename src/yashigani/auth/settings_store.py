@@ -21,6 +21,8 @@ import logging
 import os
 from typing import Optional
 
+from yashigani.db.postgres import PGP_SYM_OPTS  # Issue #144: AES-256 cipher pin
+
 logger = logging.getLogger(__name__)
 
 _AES_KEY_ENV = "YASHIGANI_DB_AES_KEY"
@@ -89,16 +91,16 @@ class AuthSettingsStore:
                     aes_key,
                 )
                 await conn.execute(
-                    """
+                    f"""
                     INSERT INTO auth_settings (key, value_encrypted, updated_at, updated_by)
                     VALUES (
                         $1,
-                        pgp_sym_encrypt($2, current_setting('app.aes_key')),
+                        pgp_sym_encrypt($2, current_setting('app.aes_key'), '{PGP_SYM_OPTS}'),
                         $3,
                         $4
                     )
                     ON CONFLICT (key) DO UPDATE
-                        SET value_encrypted = pgp_sym_encrypt($2, current_setting('app.aes_key')),
+                        SET value_encrypted = pgp_sym_encrypt($2, current_setting('app.aes_key'), '{PGP_SYM_OPTS}'),
                             updated_at      = $3,
                             updated_by      = $4
                     """,

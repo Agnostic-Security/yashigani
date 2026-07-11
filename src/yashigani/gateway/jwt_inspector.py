@@ -16,7 +16,15 @@ Three streams (YASHIGANI_DEPLOYMENT_STREAM):
   corporate   — per-tenant first, platform fallback
   saas        — per-tenant mandatory
 
-Last updated: 2026-05-03
+SSRF note (LAURA-2255-010 / CWE-918): PyJWKClient uses urllib.request internally
+and bypasses this project's SSRF guard. We no longer use PyJWKClient. Instead we
+fetch the JWKS document ourselves via the guarded HttpClient and parse it with
+PyJWKSet.from_dict(). This ensures the SSRF guard runs on every fetch — not just
+at client-construction time — which is required because PyJWKClient.get_jwk_set()
+calls fetch_data() unconditionally on each lookup (cache_keys=True only caches at
+the kid level, not the network call).
+
+Last updated: 2026-06-19
 """
 from __future__ import annotations
 
@@ -29,7 +37,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import jwt as pyjwt
-from jwt import PyJWKClient
+from jwt import PyJWKSet
+
+from yashigani.net.http_client import BlockedByPolicy, HttpClient
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +86,7 @@ class JWTInspector:
             return JWTInspectionResult(valid=False, error=type(exc).__name__)
 
     async def _inspect(self, token: str, tenant_id: str) -> JWTInspectionResult:
+        # Parse header once — used for alg:none check AND kid extraction.
         try:
             header = pyjwt.get_unverified_header(token)
             if header.get("alg", "").lower() == "none":
@@ -85,13 +96,19 @@ class JWTInspector:
             _inc_counter("invalid")
             return JWTInspectionResult(valid=False, error=f"header_parse_error: {exc}")
 
+        kid = header.get("kid")
+
         config = await self._resolve_config(tenant_id)
         if config is None:
             _inc_counter("fetch_error")
             return JWTInspectionResult(valid=False, error="no_jwks_configured")
 
         try:
-            jwks_client = await self._get_jwks_client(config.jwks_url)
+            jwk_set = await self._fetch_jwks(config.jwks_url)
+        except BlockedByPolicy as exc:
+            logger.warning("JWKS fetch blocked by SSRF policy for %s: %s", config.jwks_url, exc)
+            _inc_counter("fetch_error")
+            return JWTInspectionResult(valid=False, error="jwks_ssrf_blocked")
         except Exception as exc:
             logger.warning("JWKS fetch failed for %s: %s", config.jwks_url, exc)
             _inc_counter("fetch_error")
@@ -100,7 +117,7 @@ class JWTInspector:
             return JWTInspectionResult(valid=True, error="jwks_fetch_failed_fail_open")
 
         try:
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            signing_key = _get_signing_key_from_set(jwk_set, kid)
             options: dict[str, object] = {}
             decode_kwargs: dict = dict(
                 algorithms=self.ALLOWED_ALGORITHMS,
@@ -169,65 +186,102 @@ class JWTInspector:
             logger.warning("jwt_config DB lookup failed: %s", exc)
         return None
 
-    @staticmethod
-    def _assert_safe_jwks_url(url: str) -> None:
-        """SSRF guard (YSG-RISK-083): https-only (blocks file:// and http://) + resolve
-        the host and reject non-public IPs (blocks cloud-metadata 169.254.0.0/16 and
-        internal RFC1918/loopback/reserved). Primary compensating controls remain the
-        egress-default-deny firewall + mTLS mesh; the gold-plated DNS-rebind-proof +
-        configurable host-allowlist is deferred to a future release."""
-        import ipaddress
-        import socket
-        from urllib.parse import urlparse
+    async def _fetch_jwks(self, jwks_url: str) -> PyJWKSet:
+        """Fetch the JWKS document via the SSRF-guarded HttpClient.
 
-        parsed = urlparse(url)
-        if parsed.scheme != "https":
-            raise ValueError(f"JWKS URL must be https, got scheme={parsed.scheme!r}")
-        if not parsed.hostname:
-            raise ValueError("JWKS URL has no host")
-        for *_unused, sockaddr in socket.getaddrinfo(
-            parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP
-        ):
-            ip = ipaddress.ip_address(sockaddr[0])
-            if (
-                ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast
-            ):
-                raise ValueError(f"JWKS URL resolves to non-public IP {ip}")
+        Two-level cache (memory + Redis) with JWKS_CACHE_TTL TTL.  The
+        HttpClient._check_policy() runs on every fetch — not just the first
+        one — because PyJWKClient.get_jwk_set() calls urllib.request on every
+        lookup and that bypass cannot be contained (LAURA-2255-010 / CWE-918).
+        By fetching ourselves we guarantee the SSRF guard runs for every
+        network call, cached or not; a cache hit returns the parsed PyJWKSet
+        without touching the network.
 
-    async def _get_jwks_client(self, jwks_url: str):
-        self._assert_safe_jwks_url(jwks_url)
+        Raises
+        ------
+        BlockedByPolicy
+            If ``jwks_url`` violates the SSRF policy.  Caller maps this to
+            ``jwks_ssrf_blocked`` (always fail-closed, regardless of
+            ``fail_closed`` config).
+        httpx.HTTPError / OSError
+            Network errors; caller handles per ``fail_closed`` flag.
+        """
         url_hash = hashlib.sha256(jwks_url.encode()).hexdigest()[:16]
         now = time.monotonic()
 
+        # Policy check BEFORE any cache/network access. BlockedByPolicy is
+        # raised here and must not be caught below — it must surface to the
+        # caller so it can be treated as unconditionally fail-closed.
+        _http = HttpClient(timeout_s=10.0)
+        _http._check_policy(jwks_url)
+
+        # Memory cache hit — no network call.
         if jwks_url in _MEMORY_CACHE:
-            cached_at, client = _MEMORY_CACHE[jwks_url]
+            cached_at, jwk_set = _MEMORY_CACHE[jwks_url]
             if now - cached_at < JWKS_CACHE_TTL:
                 _hit_counter("memory")
-                return client
+                return jwk_set
 
+        # Redis cache hit — avoid re-fetching from the IdP.
         if self._redis is not None:
             try:
                 cached = self._redis.get(f"jwks:{url_hash}")
                 if cached:
                     _hit_counter("redis")
-                    client = PyJWKClient(jwks_url)
-                    _MEMORY_CACHE[jwks_url] = (now, client)
-                    return client
+                    jwk_data = json.loads(cached)
+                    jwk_set = PyJWKSet.from_dict(jwk_data)
+                    _MEMORY_CACHE[jwks_url] = (now, jwk_set)
+                    return jwk_set
             except Exception:
                 logger.debug("jwt_inspector: Redis JWKS cache read failed for url_hash=%s", url_hash, exc_info=True)
 
-        client = PyJWKClient(jwks_url, cache_keys=True)
-        client.fetch_data()
-        _MEMORY_CACHE[jwks_url] = (now, client)
+        # Guarded network fetch — HttpClient enforces SSRF policy on the
+        # actual HTTP call (scheme, host, IP-category).
+        resp = await _http.get(jwks_url)
+        resp.raise_for_status()
+        jwk_data = resp.json()
+
+        jwk_set = PyJWKSet.from_dict(jwk_data)
+        _MEMORY_CACHE[jwks_url] = (now, jwk_set)
 
         if self._redis is not None:
             try:
-                self._redis.setex(f"jwks:{url_hash}", JWKS_CACHE_TTL, json.dumps({}))
+                self._redis.setex(f"jwks:{url_hash}", JWKS_CACHE_TTL, json.dumps(jwk_data))
             except Exception:
                 logger.debug("jwt_inspector: Redis JWKS cache write failed for url_hash=%s", url_hash, exc_info=True)
 
-        return client
+        return jwk_set
+
+
+def _get_signing_key_from_set(jwk_set: PyJWKSet, kid: Optional[str]):
+    """Return the PyJWK in ``jwk_set`` that matches ``kid``.
+
+    Replaces PyJWKClient.get_signing_key_from_jwt() so we can use a
+    PyJWKSet obtained via our own guarded HTTP fetch rather than via
+    PyJWKClient (which uses urllib.request internally — LAURA-2255-010).
+
+    Raises
+    ------
+    pyjwt.PyJWKClientError
+        If no signing key matching ``kid`` is found in the set.
+    """
+    from jwt.exceptions import PyJWKClientError
+
+    signing_keys = [
+        k for k in jwk_set.keys
+        if k.public_key_use in ("sig", None) and k.key_id
+    ]
+    if not signing_keys:
+        raise PyJWKClientError("The JWKS endpoint did not contain any signing keys")
+
+    if kid:
+        for k in signing_keys:
+            if k.key_id == kid:
+                return k
+        raise PyJWKClientError(f'Unable to find a signing key that matches: "{kid}"')
+
+    # No kid in token header — use the first signing key (common for single-key sets).
+    return signing_keys[0]
 
 
 def _inc_counter(result: str) -> None:

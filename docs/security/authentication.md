@@ -121,11 +121,67 @@ deleted.
 
 ## TOTP Multi-Factor Authentication
 
+**Phase 13 (Yashigani 3.1): Role-tiered TOTP algorithms.**
+
 Every local-auth account must enrol a TOTP authenticator before being
 granted access. The enrolment flow is split into two steps
 (`/api/v1/auth/totp/provision/start` and `/api/v1/auth/totp/provision/confirm`)
 to ensure the user proves possession of the seed before the account is
 unlocked.
+
+### Role-tiered algorithm selection
+
+| Role | Algorithm | Digits | Notes |
+|---|---|---|---|
+| Admin | HMAC-SHA-512 | 8 | Stronger HMAC; 8-digit codes reduce brute-force window |
+| User | HMAC-SHA-256 | 6 | Standard HMAC; 6 digits |
+
+The algorithm and digit count are embedded in the `otpauth://` URI returned by
+the provisioning endpoint and printed during install. The `totp_algorithm`
+column on `admin_accounts` records the active algorithm for each enrolment.
+
+### Crypto properties
+
+- Dynamic truncation per RFC 4226 §5.3 (works identically for SHA-256 and
+  SHA-512 — offset = HMAC[-1] & 0x0F, extract 4 bytes, mask 0x7FFFFFFF,
+  mod 10^digits).
+- Constant-time comparison via `hmac.compare_digest` (ASVS V11.2.4).
+- A code computed with the wrong algorithm or wrong digit count WILL NOT
+  match — algorithm isolation is cryptographically enforced, not just
+  validated by the code length.
+
+### Required authenticator app
+
+**Classic Google Authenticator (SHA-1 only) is NOT compatible** with
+role-tiered TOTP. Use an app that reads all `otpauth://` URI parameters:
+
+- **agnosticOTP** (recommended — supports SHA-256/512, 6/8 digits, iOS/Android)
+- **Aegis** (Android, open-source, full URI parameter support)
+- **1Password** (iOS/Android/desktop, full URI support)
+
+When displaying provisioning instructions, always recommend **agnosticOTP**
+explicitly to avoid silent algorithm mismatches.
+
+### Migration from SHA-1 (legacy accounts)
+
+Pre-3.1 accounts have `totp_algorithm = 'SHA1'` in the database (set by
+migration `0023_totp_role_tier`). At first login after the upgrade:
+
+1. Password authentication succeeds.
+2. The server detects `totp_algorithm != expected_for_role` and sets
+   `force_totp_provision = true`.
+3. A restricted `totp_provisioning` session is issued — the user cannot
+   access admin/user functions until re-enrolment completes.
+4. The user scans a new QR code (with the role-appropriate algorithm/digits)
+   and confirms a code.
+5. `force_totp_provision` is cleared; `totp_algorithm` is updated.
+
+**Dual-admin safety**: all admins can be in re-enrolment state simultaneously
+without lockout. The `totp_provisioning` session allows access to
+`/auth/totp/provision/start` and `/auth/totp/provision/confirm` without a
+TOTP code, only a valid password.
+
+### TOTP failure backoff and replay prevention
 
 TOTP failures trigger exponential backoff (1s, 2s, 4s, 8s) with a hard
 30-minute lockout on the fifth failure, matching the password lockout policy.

@@ -81,6 +81,12 @@ from yashigani.backoffice.routes import (
     models_router,
     sensitivity_router,
     sso_router,
+    # v2.26 — Document Enforcement admin surface
+    documents_router,
+    # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
+    envelope_reapproval_router,
+    # 3.1.2 — Capability-envelope first-import ceremony (v1 mint) — FIX-003
+    envelope_import_router,
     # v2.23.2 — Backup status + verify (#47)
     backup_router,
     # v2.23.3 — Admin-triggered secret rotation
@@ -100,6 +106,13 @@ from yashigani.backoffice.routes import (
     # v2.25.5 — R13: RBAC sources / R26: version check
     rbac_sources_router,
     version_check_router,
+    cloud_keys_router,
+    # 3.0 — admin-configurable browser Permissions-Policy
+    capability_policy_router,
+    # 3.1 Phase 8 — unified permission grant admin API
+    permissions_router,
+    # 3.1 — WebAuthn user-tier FIDO2 (dual-tier support)
+    webauthn_user_router,
 )
 
 
@@ -121,15 +134,6 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
     if ctx is None:
         return
 
-    # Install-path service account — seeded INDEPENDENTLY of the human-admin
-    # guard below. It must exist on every deployment (fresh OR existing/upgrade),
-    # because its whole purpose is making programmatic admin-API re-runs robust
-    # on a long-lived stack (e.g. re-registering agents after a redis recreate
-    # wipes the registry). If it were gated behind total_admin_count()==0 it
-    # would never appear on an upgraded stack — defeating the fix. Its own
-    # existence check makes it idempotent across restarts.
-    await _bootstrap_service_account(auth_service, ctx["secrets_dir"], _log)
-
     if await auth_service.total_admin_count() != 0:
         _log.info("Bootstrap: admin accounts already present — skipping seed")
         return
@@ -148,9 +152,10 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
         totp_secret = open(totp_file).read().strip()
         if totp_secret:
             # installer-privileged bootstrap path — see docstring on
-            # PostgresLocalAuthService.set_totp_secret_direct
-            await auth_service.set_totp_secret_direct(admin_username, totp_secret)
-            _log.info("Bootstrap: TOTP pre-provisioned from installer secret")
+            # PostgresLocalAuthService.set_totp_secret_direct.
+            # Phase 13: admin accounts use SHA-512/8-digit TOTP.
+            await auth_service.set_totp_secret_direct(admin_username, totp_secret, algorithm="SHA512")
+            _log.info("Bootstrap: TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
     _log.info("Bootstrap: initial admin account created — %s", admin_username)
 
     # --- Admin 2 (backup — anti-lockout) -------------------------------------
@@ -169,66 +174,11 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
             if _os.path.exists(totp2_file):
                 totp2_secret = open(totp2_file).read().strip()
                 if totp2_secret:
-                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret)
-                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret")
+                    # Phase 13: admin tier → SHA-512/8-digit TOTP.
+                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret, algorithm="SHA512")
+                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
             _log.info("Bootstrap: backup admin account created — %s", admin2_username)
 
-
-async def _bootstrap_service_account(auth_service, secrets_dir, _log) -> None:
-    """Seed the install-path service account (idempotent, guard-independent).
-
-    ISSUE-AGENT-REG-STALE-PW (Iris, 2026-06-10): register_agent_bundles()
-    previously authenticated as admin1 using docker/secrets/admin1_password.
-    After the human admin's forced first-login rotation, admin1_password on
-    disk is intentionally stale (the rotation control writes the new hash to
-    Postgres only — never back to disk). Any post-rotation re-run of agent
-    registration (e.g. the Redis-durability re-registration after a redis
-    recreate wipes the agent registry) then authenticated with a dead password
-    and broke; Iris had to fall back to a saved creds file.
-
-    Fix (option a): a dedicated NON-INTERACTIVE service admin whose credential
-    is never subject to human rotation. force_password_change=False so its
-    on-disk secret stays valid indefinitely; force_totp_provision=False (TOTP is
-    pre-provisioned from the installer secret). The human admin's forced
-    first-login rotation is UNCHANGED — admin1 still has
-    force_password_change=True. This account exists solely for install.sh's
-    programmatic admin-API calls and is never advertised for human login.
-
-    Seeded here (NOT under the total_admin_count()==0 first-boot guard) so it
-    appears on existing/upgraded stacks too, where the re-registration need is
-    most acute. The _fetch_by_username existence check makes it idempotent.
-    """
-    import os as _os
-
-    svc_user_file = _os.path.join(secrets_dir, "svc_admin_username")
-    svc_pwd_file = _os.path.join(secrets_dir, "svc_admin_password")
-    if not (_os.path.exists(svc_user_file) and _os.path.exists(svc_pwd_file)):
-        return
-    svc_username = open(svc_user_file).read().strip()
-    svc_password = open(svc_pwd_file).read().strip()
-    if not (svc_username and svc_password):
-        return
-
-    # Idempotent: skip if the row already exists (restart / upgrade re-run).
-    existing = await auth_service.get_account(svc_username)
-    if existing is not None:
-        _log.info("Bootstrap: install-path service account already present — %s", svc_username)
-        return
-
-    await auth_service.create_admin(
-        username=svc_username,
-        auto_generate=False,
-        plaintext_password=svc_password,
-        force_password_change=False,
-        force_totp_provision=False,
-    )
-    svc_totp_file = _os.path.join(secrets_dir, "svc_admin_totp_secret")
-    if _os.path.exists(svc_totp_file):
-        svc_totp_secret = open(svc_totp_file).read().strip()
-        if svc_totp_secret:
-            await auth_service.set_totp_secret_direct(svc_username, svc_totp_secret)
-            _log.info("Bootstrap: service-account TOTP pre-provisioned from installer secret")
-    _log.info("Bootstrap: install-path service account created — %s", svc_username)
 
 
 @asynccontextmanager
@@ -597,18 +547,22 @@ async def lifespan(app: FastAPI):
 
         logging.getLogger(__name__).warning("Could not start backoffice scheduler: %s", exc)
 
-    # v2.25.1 (OPA-PERSIST): re-sync OPA from the durable Redis-backed RBAC store at the END of
+    # (OPA-PERSIST): re-sync OPA from the durable Redis-backed stores at the END of
     # lifespan startup — NOT in _bootstrap(), which runs at module import before the internal-PKI
-    # client is ready (it fails with "no bootstrap_token_sha256 in the manifest"). OPA holds the
-    # RBAC document in memory ONLY, so an OPA (or upgrade) restart drops it even though the store
-    # persists to Redis db/3 — leaving OPA empty until the next mutation. Re-pushing here recovers
-    # OPA's view from the durable store on every deploy/upgrade/restart. Best-effort with retries;
-    # groups are safe in Redis, so a transient OPA-not-ready never blocks backoffice startup.
+    # client is ready (it fails with "no bootstrap_token_sha256 in the manifest"). OPA holds its
+    # data documents in memory ONLY, so an OPA (or upgrade) restart drops them even though the
+    # stores persist to Redis db/3 — leaving OPA empty until the next mutation. Re-pushing here
+    # recovers OPA's view from the durable stores on every deploy/upgrade/restart. Best-effort with
+    # retries; the data is safe in Redis, so a transient OPA-not-ready never blocks startup.
+    import asyncio  # noqa: PLC0415 — local; the await sleep below must not depend on the
+    #                                 scheduler block having imported it.
+    _osync_log = _logging.getLogger("yashigani.backoffice.lifespan")
+
+    # --- RBAC + agents data document (data.yashigani.rbac / .agents) ---
     try:
         _rbac_store = backoffice_state.rbac_store
         if _rbac_store is not None:
             from yashigani.rbac.opa_push import push_rbac_data
-            _osync_log = _logging.getLogger("yashigani.backoffice.lifespan")
             _grp_n = len(_rbac_store.list_groups())
             for _attempt in range(1, 4):
                 try:
@@ -626,13 +580,11 @@ async def lifespan(app: FastAPI):
                         await asyncio.sleep(2)
                     else:
                         _osync_log.warning(
-                            "OPA-PERSIST: startup re-sync failed after 3 attempts (%s) — groups "
+                            "OPA-PERSIST: RBAC startup re-sync failed after 3 attempts (%s) — groups "
                             "remain in Redis; OPA will sync on next mutation", _push_exc
                         )
     except Exception as _outer_exc:
-        _logging.getLogger("yashigani.backoffice.lifespan").warning(
-            "OPA-PERSIST: startup re-sync skipped (%s)", _outer_exc
-        )
+        _osync_log.warning("OPA-PERSIST: RBAC startup re-sync skipped (%s)", _outer_exc)
 
     # #16 (OPA Phase 2): re-push client-policy bindings to OPA on startup (OPA holds
     # data in memory only). SEPARATE /v1/data/client_bindings namespace — does not
@@ -748,6 +700,34 @@ async def lifespan(app: FastAPI):
             "AGENT-RECONCILE: startup reconcile FAILED (%s) — @agent routes may "
             "return agent_not_found until the registry is restored", _areconcile_exc
         )
+
+    # --- Document-enforcement policy matrix (data.yashigani.document) — 2.26 ---
+    # Same persistence + re-push pattern as RBAC, targeting the document sub-tree
+    # so the production rego (policy/document.rego) evaluates the operator's live
+    # matrix after any policy-container restart.
+    try:
+        _doc_store = backoffice_state.document_policy_store
+        if _doc_store is not None:
+            from yashigani.documents.opa_push import push_document_data
+            _pol_n = len(_doc_store.list_policies())
+            for _attempt in range(1, 6):
+                try:
+                    push_document_data(_doc_store, backoffice_state.opa_url)
+                    _osync_log.info(
+                        "OPA-PERSIST: re-synced OPA from document policy store on startup "
+                        "(%d policy(ies))", _pol_n
+                    )
+                    break
+                except Exception as _push_exc:
+                    if _attempt < 5:
+                        await asyncio.sleep(3)
+                    else:
+                        _osync_log.warning(
+                            "OPA-PERSIST: document startup re-sync failed after 5 attempts (%s) — "
+                            "policies remain in Redis; OPA will sync on next mutation", _push_exc
+                        )
+    except Exception as _outer_exc:
+        _osync_log.warning("OPA-PERSIST: document startup re-sync skipped (%s)", _outer_exc)
 
     # B1 follow-on (2.25.5) — IdentityDurableStore startup reconcile.
     # Re-hydrates identities from Postgres into Redis db/3 if they are absent.
@@ -874,6 +854,13 @@ def create_backoffice_app() -> FastAPI:
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
+        # ZAP 10015/10049: Authenticated/sensitive dynamic responses must not be
+        # stored in any cache.  Fingerprinted static assets (/static/*) are
+        # intentionally excluded — they carry content-hashed filenames and are
+        # safe to cache.
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
         # CSP: strict for all pages — no inline scripts or styles allowed.
         # ASVS 3.4.3: object-src 'none' + base-uri 'none'; 3.4.7: report-uri.
         # N2 (2.25.5): some routes (ReDoc) need a scoped CSP that adds
@@ -884,6 +871,32 @@ def create_backoffice_app() -> FastAPI:
         _strict_csp = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; report-uri /admin/csp-report; report-to default"
         if "content-security-policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _strict_csp
+        # Permissions-Policy: resolve per admin identity (3.0).
+        # Resolve from the capability policy store; fall back silently if the
+        # store is not yet wired (e.g. dev/test without Redis).
+        from yashigani.backoffice.state import backoffice_state  # noqa: PLC0415
+        _cap_store = getattr(backoffice_state, "capability_policy_store", None)
+        if _cap_store is not None:
+            try:
+                _pp_email: str | None = None
+                _session_token = request.cookies.get("__Host-yashigani_admin_session")
+                if _session_token and backoffice_state.session_store is not None:
+                    _sess = backoffice_state.session_store.get(_session_token)
+                    if _sess is not None:
+                        _pp_email = _sess.account_id
+                from yashigani.capability_policy.resolver import resolve_policy as _resolve_cap
+                from yashigani.capability_policy.header import render_permissions_policy as _render_pp
+                _resolved = _resolve_cap(
+                    _pp_email,
+                    backoffice_state.rbac_store,
+                    _cap_store,
+                )
+                response.headers["Permissions-Policy"] = _render_pp(_resolved)
+            except Exception as _pp_exc:
+                import logging as _pplog
+                _pplog.getLogger(__name__).debug(
+                    "cap_policy: backoffice security_headers failed: %s", _pp_exc
+                )
         return response
 
     # Per-endpoint body-size limits (ASVS 4.3.1).
@@ -910,6 +923,8 @@ def create_backoffice_app() -> FastAPI:
         ("/api/v1/admin/auth/hibp", 512),  # HIBP key (UUID ≤128 + envelope)
         ("/api/v1/admin/pki", 256),        # PKI rotate body (service name in URL, no body)
         ("/admin/ratelimit", 8 * 1024),
+        ("/admin/api/permissions", 16 * 1024),
+        ("/admin/api/capability-policy", 8 * 1024),
         ("/admin/rbac", 32 * 1024),
         ("/admin/alerts", 32 * 1024),
         ("/admin/budget", 16 * 1024),
@@ -945,15 +960,24 @@ def create_backoffice_app() -> FastAPI:
                     )
         return await call_next(request)
 
-    # Uniform 401 for unauthenticated /admin/* requests (QA Wave 2 Issue 10).
+    # Uniform 401 for unauthenticated /admin/* requests (QA Wave 2 Issue 10;
+    # extended LAURA-3X-002).
+    #
     # Before this middleware, some admin endpoints returned 401 (route exists,
     # auth dep failed) while others returned 404 (no root route under that
     # prefix, e.g. /admin/license/status existed but /admin/license didn't).
     # The inconsistency leaked which routes were mounted. This middleware
-    # inspects the response AFTER routing: if the result is 404 for an
-    # /admin/* path AND the caller has no session cookie, we mask the 404
+    # inspects the response AFTER routing: if the result is 404 OR 405 for an
+    # /admin/* path AND the caller has no session cookie, we mask the response
     # as 401 authentication_required so every /admin/* probe looks the same
     # pre-auth.
+    #
+    # 404 → route does not exist (path not mounted).
+    # 405 → route exists but wrong HTTP method used — leaks path existence as
+    #        an enumeration oracle pre-auth (LAURA-3X-002, Low, 3.1 re-gate).
+    #
+    # Authenticated callers (session cookie present) receive real 404/405 so
+    # developers and tooling can distinguish "not found" from "wrong method".
     _ADMIN_SESSION_COOKIES = (
         "__Host-yashigani_admin_session",
         "__Host-yashigani_session",
@@ -962,7 +986,7 @@ def create_backoffice_app() -> FastAPI:
     @app.middleware("http")
     async def uniform_admin_404_as_401(request: Request, call_next):
         response = await call_next(request)
-        if response.status_code == 404 and request.url.path.startswith("/admin/"):
+        if response.status_code in (404, 405) and request.url.path.startswith("/admin/"):
             has_session = any(request.cookies.get(k) for k in _ADMIN_SESSION_COOKIES)
             if not has_session:
                 return JSONResponse(
@@ -1172,6 +1196,16 @@ def create_backoffice_app() -> FastAPI:
     # v2.1 — Model alias management + Sensitivity patterns
     app.include_router(models_router, prefix="/admin/models", tags=["models"])
     app.include_router(sensitivity_router, prefix="/admin/sensitivity", tags=["sensitivity"])
+    # v2.26 — Document Enforcement admin surface (ships dark; flag-gated routes)
+    app.include_router(documents_router, prefix="/admin/documents", tags=["documents"])
+    # 3.0 — Capability-envelope re-approval admin surface (YSG-RISK-060)
+    app.include_router(
+        envelope_reapproval_router, prefix="/admin/mcp/envelopes", tags=["mcp-envelopes"]
+    )
+    # 3.1.2 — Capability-envelope first-import ceremony (v1 mint) — FIX-003
+    app.include_router(
+        envelope_import_router, prefix="/admin/mcp/envelopes", tags=["mcp-envelopes"]
+    )
     # v2.1 — SSO / OIDC login flow (no auth required — serves anonymous users)
     app.include_router(sso_router, prefix="/auth", tags=["sso"])
 
@@ -1240,5 +1274,59 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(rbac_sources_router, prefix="/admin/rbac", tags=["rbac"])
     # v2.25.5 — R26: version check (opt-in egress)
     app.include_router(version_check_router, prefix="/admin/version", tags=["version"])
+    # fix/medlow-findings — cloud provider API key management (KMS-backed)
+    app.include_router(cloud_keys_router, tags=["cloud-keys"])
+
+    # 3.0 — admin-configurable browser Permissions-Policy
+    app.include_router(
+        capability_policy_router,
+        prefix="/admin/api/capability-policy",
+        tags=["capability-policy"],
+    )
+
+    # 3.1 Phase 8 — unified permission grant admin API
+    app.include_router(
+        permissions_router,
+        prefix="/admin/api/permissions",
+        tags=["permissions"],
+    )
+
+    # 3.1 — WebAuthn user-tier FIDO2 (dual-tier support)
+    app.include_router(webauthn_user_router, tags=["webauthn-user"])
+
+    # LAURA-2255-007 (2026-06-14): declare AdminSessionCookie security scheme in the
+    # OpenAPI schema and annotate all /scim/v2/* paths with the scheme reference.
+    # Previously SCIM routes showed security:[] — they always required an admin session
+    # but the requirement was invisible in the schema.  This is a cosmetic (schema-only)
+    # fix; the actual enforcement is unchanged (require_admin_session dependency).
+    _orig_openapi = app.openapi
+
+    def _openapi_with_scim_security() -> dict:
+        schema = _orig_openapi()
+        # Inject the AdminSessionCookie security scheme into components once.
+        components = schema.setdefault("components", {})
+        security_schemes = components.setdefault("securitySchemes", {})
+        security_schemes.setdefault("AdminSessionCookie", {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "__Host-yashigani_admin_session",
+            "description": (
+                "Yashigani admin session cookie. Issued by POST /auth/session "
+                "(admin-tier credentials + TOTP). All /admin/* and /scim/v2/* "
+                "endpoints require this cookie."
+            ),
+        })
+        # Add the security requirement to all SCIM paths.
+        scim_security = [{"AdminSessionCookie": []}]
+        for path, path_item in schema.get("paths", {}).items():
+            if path.startswith("/scim/v2/"):
+                for _method, operation in path_item.items():
+                    if isinstance(operation, dict):
+                        operation.setdefault("security", scim_security)
+        # Cache the augmented schema so subsequent calls don't re-compute.
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = _openapi_with_scim_security  # type: ignore[method-assign]
 
     return app

@@ -28,6 +28,12 @@ from yashigani.backoffice.routes.audit_search import router as audit_search_rout
 from yashigani.backoffice.routes.models import router as models_router
 from yashigani.backoffice.routes.sensitivity import router as sensitivity_router
 from yashigani.backoffice.routes.sso import router as sso_router
+# v2.26 — Document Enforcement admin surface (document-content OPA enforcement)
+from yashigani.backoffice.routes.documents import router as documents_router
+# 3.0 — Capability-envelope RE-APPROVAL admin surface (YSG-RISK-060)
+from yashigani.backoffice.routes.envelope_reapproval import router as envelope_reapproval_router
+# 3.1.2 — Capability-envelope FIRST-IMPORT ceremony (v1 mint) — FIX-003
+from yashigani.backoffice.routes.envelope_import import router as envelope_import_router
 # v2.2
 from yashigani.backoffice.routes.pii import router as pii_router
 # v2.3 — ASVS 11.1.3 crypto inventory
@@ -56,6 +62,14 @@ from yashigani.backoffice.routes.runtime_settings import router as runtime_setti
 from yashigani.backoffice.routes.rbac_sources import router as rbac_sources_router
 # v2.25.5 — R26: version check endpoint
 from yashigani.backoffice.routes.version_check import router as version_check_router
+# fix/medlow-findings — cloud provider API key management
+from yashigani.backoffice.routes.cloud_keys import router as cloud_keys_router
+# 3.0 — admin-configurable browser Permissions-Policy
+from yashigani.backoffice.routes.capability_policy import router as capability_policy_router
+# 3.1 Phase 8 — unified permission grant admin API
+from yashigani.backoffice.routes.permissions import router as permissions_router
+# 3.1 — WebAuthn user-tier FIDO2 (dual-tier support)
+from yashigani.backoffice.routes.webauthn_user import router as webauthn_user_router
 
 __all__ = [
     "auth_router", "accounts_router", "users_router",
@@ -73,6 +87,10 @@ __all__ = [
     "models_router",
     "sensitivity_router",
     "sso_router",
+    "documents_router",
+    # 3.0
+    "envelope_reapproval_router",
+    "envelope_import_router",
     # v2.2
     "pii_router",
     # v2.3
@@ -101,4 +119,12 @@ __all__ = [
     "rbac_sources_router",
     # v2.25.5 — R26: version check
     "version_check_router",
+    # fix/medlow-findings — cloud provider API key management
+    "cloud_keys_router",
+    # 3.0 — browser Permissions-Policy
+    "capability_policy_router",
+    # 3.1 Phase 8 — unified permission grant admin API
+    "permissions_router",
+    # 3.1 — WebAuthn user-tier FIDO2
+    "webauthn_user_router",
 ]

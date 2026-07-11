@@ -25,7 +25,7 @@ artefact proving FIPS mode was active at request time.
 Also sets the Prometheus gauge yashigani_fips_mode_active (1/0) at module
 load time so auditors can query historical FIPS status from the time-series.
 
-Last updated: 2026-05-27T00:00:00+00:00
+Last updated: 2026-07-04T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -64,8 +64,18 @@ _CRYPTO_INVENTORY = {
     "algorithms": [
         {"name": "Argon2id", "usage": "password hashing", "strength": "256-bit"},
         {"name": "ECDSA P-256", "usage": "license signing", "strength": "128-bit equivalent"},
-        {"name": "AES-256-GCM", "usage": "database column encryption", "strength": "256-bit"},
-        {"name": "SHA-256", "usage": "TOTP digest, HMAC email hashing", "strength": "256-bit"},
+        # pgcrypto pgp_sym_encrypt uses OpenPGP symmetric format (CFB mode), NOT GCM.
+        # cipher-algo=aes256 pin applied via PGP_SYM_OPTS (Issue #144).
+        {"name": "AES-256-CFB (OpenPGP)", "usage": "database column encryption (pgcrypto pgp_sym_encrypt)", "strength": "256-bit"},
+        # Application-layer AESGCM — distinct from the pgcrypto path above.
+        {"name": "AES-256-GCM", "usage": "document pseudonymization map encryption; on-demand backup bundle encryption", "strength": "256-bit"},
+        # Phase 13 (v3.1): role-tiered TOTP.  HMAC-SHA-1 is NOT deployed for
+        # new enrolments — it is only a legacy-detection sentinel that triggers
+        # forced re-enrolment.  Ground truth: auth/totp.py TOTP_ALGO_SHA256
+        # (users, 6-digit) and TOTP_ALGO_SHA512 (admins, 8-digit).
+        {"name": "HMAC-SHA-256", "usage": "TOTP digest — user tier (6-digit, 30-second period; HMAC-SHA-1 NOT deployed)", "strength": "256-bit"},
+        {"name": "HMAC-SHA-512", "usage": "TOTP digest — admin tier (8-digit, 30-second period)", "strength": "512-bit"},
+        {"name": "SHA-256", "usage": "HMAC email hashing", "strength": "256-bit"},
         {"name": "SHA-384", "usage": "audit chain integrity", "strength": "384-bit"},
         {"name": "X25519+ML-KEM-768", "usage": "TLS key exchange (hybrid PQ)", "strength": "256-bit + PQ"},
         {"name": "bcrypt", "usage": "agent token hashing", "strength": "184-bit"},

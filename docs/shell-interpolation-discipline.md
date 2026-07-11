@@ -241,5 +241,12 @@ Before committing a new service block to any `docker/docker-compose*.yml`:
 
 ## 6. References
 
+- `internal-docs/yashigani/sanitization-map-20260523.md` — Stage 1 exhaustive
+  map of all VEB bug instances, severity table, and fix specification
+- `internal-docs/yashigani/iris-v240-sanitization-structural-design.md` — Iris
+  design memo: option analysis, drift map, lint scope constraints
+- `internal-docs/yashigani/laura-v240-sanitization-structural-threat-model.md` —
+  Laura threat model: OWASP mapping, fail-open/fail-closed assessment, CI
+  enforcement requirement
 - `scripts/lint_compose_command_vars.sh` — the lint implementation
 - `docker/docker-compose.yml:720` — canonical `$$(cat ...)` example (redis)

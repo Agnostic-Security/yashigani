@@ -1,0 +1,129 @@
+# Yashigani sandboxed-extractor image (plan §6 B1, Captain).
+#
+# This image runs UNTRUSTED document parsers in a per-job ephemeral container.
+# It is spawned by SandboxedExtractorRunner with: egress=none, read-only rootfs,
+# all caps dropped, non-root, no-new-privileges, seccomp, AppArmor, and
+# mem/cpu/pids/wall-clock caps. The image itself is minimal so the in-jail
+# attack surface is small.
+#
+# The worker (docker/extractor/worker.py) reads the doc on stdin, runs the
+# decompression-bomb guard (bomb_guard.py — baked from the yashigani package so
+# there is ONE source of truth, no copy-drift, Verification Protocol §4), then
+# dispatches to the format parser. THIS slice ships the env + guard; Tom adds
+# the parser/re-render bodies inside this same image next slice.
+#
+# Pinned by digest in production (Verification Protocol §7). amd64 is the native
+# test surface on this box; the image is arch-agnostic (pure-Python + lxml wheel).
+
+# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS runtime
+
+# nonroot numeric UID/GID 65532 (distroless convention) — the sandbox runs the
+# worker as this user; combined with --user 65532:65532 at run-time it can never
+# be root even if the entrypoint is overridden.
+RUN groupadd --gid 65532 nonroot \
+ && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+
+# Patch base CVEs at build time (hygiene; same pattern as the gateway image).
+# libxml2 is pulled in by lxml's wheel but we upgrade the system copy too.
+RUN apt-get update \
+    && apt-get -y upgrade \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# CIS Docker 4.8 — strip ALL setuid/setgid bits from the base image (Su 2026-06-09).
+# python:3.14-slim ships 11 setuid/setgid binaries (su, mount, umount, passwd,
+# gpasswd, newgrp, chfn, chsh, chage, expiry, unix_chkpwd). The one-shot worker is
+# a single non-root python process that needs NONE of them. In the jail they are
+# already neutered by no-new-privileges + cap_drop ALL + the seccomp mount-block,
+# but they are pure attack surface a parser-RCE should not find — so remove the
+# elevation bits outright. We clear the bits (not delete the files) so package
+# metadata stays consistent; the result is asserted below at build time.
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true \
+ && remaining="$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null)" \
+ && if [ -n "$remaining" ]; then \
+        echo "CIS 4.8 FAIL: setuid/setgid binaries remain:" >&2; \
+        echo "$remaining" >&2; exit 1; \
+    fi
+
+WORKDIR /app
+
+# Parser/guard deps — EXTRACTOR IMAGE ONLY (never the gateway image; these
+# untrusted-format parsers run isolated in the per-job jail). All are pure-Python
+# py3-none-any wheels (no compiler) so the image stays minimal and arch-agnostic:
+#   - lxml         : the hardened XML parser (XXE/billion-laughs safe) used for
+#                    docx/pptx direct-part parsing + openpyxl's safe XML path.
+#   - openpyxl     : xlsx — surfaces hidden sheets/rows/cols, cell comments,
+#                    defined names, formula text, workbook metadata. Its only
+#                    runtime dep is et-xmlfile; it parses untrusted XML with
+#                    resolve_entities=False and prefers defusedxml when present.
+#   - defusedxml   : forces openpyxl onto the hardened ElementTree path.
+#   - pypdf[crypto]: pdf — native text + DocInfo/XMP metadata; the [crypto] extra
+#                    (cryptography) lets it DETECT encrypted PDFs so we fail-closed
+#                    BLOCK instead of crashing. pypdf is pure-Python (no native pdf
+#                    lib) → smaller in-jail attack surface than pdfminer's C bits.
+# docx + pptx are parsed via direct hardened-lxml (NOT python-docx/python-pptx) so
+# the heavyweight object models — and python-pptx's Pillow + XlsxWriter deps —
+# stay OUT of the jail; the hidden parts (comments, tracked changes, speaker
+# notes, masters) are read straight from the zip's XML parts.
+# lxml is pinned to the 6.0.x line: it is the FIRST series shipping prebuilt
+# cp314 manylinux wheels (the base is python:3.14-slim). 5.x has NO 3.14 wheel and
+# would compile from source against libxml2 dev headers we deliberately do not
+# install — keeping the jail minimal. The hardened-parser settings in
+# bomb_guard.harden_xml_parser() (resolve_entities/no_network/load_dtd/
+# dtd_validation/huge_tree) are all stable across the lxml 5→6 API.
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" \
+ && pip install --no-cache-dir \
+        "lxml>=6.0.1,<6.2" \
+        "openpyxl==3.1.5" \
+        "et-xmlfile>=2.0.0" \
+        "defusedxml>=0.7.1" \
+        "pypdf[crypto]==6.13.1" \
+ && pip uninstall -y pip
+
+# Bake the bomb-guard module as the SINGLE source of truth (no copy-drift). We
+# install just the guard + segment model the worker needs, under the real
+# package path so `from yashigani.documents.bomb_guard import ...` resolves.
+RUN mkdir -p /app/yashigani/documents
+COPY src/yashigani/__init__.py            /app/yashigani/__init__.py
+COPY src/yashigani/documents/__init__marker /app/yashigani/documents/__init__.py
+COPY src/yashigani/documents/bomb_guard.py /app/yashigani/documents/bomb_guard.py
+COPY docker/extractor/worker.py            /app/worker.py
+# LAURA-30-001 / YSG-RISK-080 (Design A): long-running HTTP server mode.
+# The server wraps worker.py: each POST /run forks a worker subprocess and returns
+# the result as JSON. Backoffice calls this service instead of the docker socket.
+COPY docker/extractor/server.py            /app/server.py
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONPATH=/app \
+    YASHIGANI_EXTRACTOR_IN_SANDBOX=1 \
+    YASHIGANI_WORKER_PATH=/app/worker.py \
+    YASHIGANI_EXTRACTOR_HOST=0.0.0.0 \
+    YASHIGANI_EXTRACTOR_PORT=8090
+
+# Cache-busting build arg consumed AFTER all COPY/pip steps so only the
+# final image layer re-executes when the source SHA changes; base + dep
+# layers remain cached.  The arg is stamped as a standard OCI label so
+# the installer can verify the built image matches the current source.
+# install.sh passes --build-arg GIT_SHA=$(git rev-parse --short HEAD).
+# Default "dev" is used in local docker build invocations without the arg.
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+
+USER 65532:65532
+
+# EXPOSE 8090: the extractor service listens on this port (internal bridge only).
+# Compose maps extractor_svc network (backoffice ↔ extractor-svc). No external
+# port binding — the network bridge is internal: true (no internet reachability).
+EXPOSE 8090
+
+# HEALTHCHECK: GET /healthz confirms the server is up and worker.py is importable.
+# Used by compose to gate backoffice startup on the extractor service being ready.
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=30s \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8090/healthz', timeout=4)" || exit 1
+
+# Default: long-running server mode (Design A).
+# Override with CMD ["python", "/app/worker.py"] for per-job invocation (legacy/test).
+ENTRYPOINT ["python", "/app/server.py"]
