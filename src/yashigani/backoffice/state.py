@@ -71,6 +71,9 @@ class BackofficeState:
     # available.  None when not configured — the import route degrades safely
     # (records "not_configured" in the envelope scan verdict).
     semantic_intent_sidecar: Optional[Any] = None    # SemanticIntentSidecar | None
+    # 5.0 — crypto-shred erasure Shredder (GDPR Art 17). Set in the backoffice
+    # bootstrap when crypto-shred is enabled; used by POST /admin/privacy/erase.
+    crypto_shredder: Optional[Any] = None            # crypto_shred.Shredder | None
     # v2.24.1 — RuntimeSettingsService (admin-surfaces-all-runtime-settings rule)
     # Initialised after DB pool is ready. None in dev/test without DB.
     runtime_settings: Optional[Any] = None
