@@ -1458,8 +1458,8 @@ async def _opa_check(
         "session_id": session_id,
         "agent_id": agent_id,
         "user_id": user_id,
-        # session.email is consumed by rbac.rego allow_rbac
-        "session": {"email": user_id},
+        # session.identity_id is consumed by rbac.rego allow_rbac (idnt_{12hex})
+        "session": {"identity_id": user_id},
         "request": {"method": request.method, "path": path},
         "headers": {
             k: v for k, v in request.headers.items()
@@ -1503,7 +1503,8 @@ async def _opa_denial_alert(
             "session_id": session_id,
             "agent_id": agent_id,
             "user_id": user_id,
-            "session": {"email": user_id},
+            # session.identity_id is consumed by rbac.rego allow_rbac (idnt_{12hex})
+            "session": {"identity_id": user_id},
             "request": {"method": request.method, "path": path},
             "headers": {
                 k: v for k, v in request.headers.items()

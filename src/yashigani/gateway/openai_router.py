@@ -2660,7 +2660,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # stay alive for the duration of the generator, so we wrap the
             # response in a local async generator that owns the client lifetime.
             async def _sse_generator():
-                async with httpx.AsyncClient(timeout=120.0) as _client:
+                # F-001 (chat-stream seam): bare httpx.AsyncClient has no SSL
+                # context → CERTIFICATE_VERIFY_FAILED when ollama_url is
+                # https://caddy:11435/ollama (Mac Metal / mTLS-Ollama front).
+                # Route through ollama_async_client (same fix as model-list).
+                from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                    ollama_async_client as _ollama_ac_sse,
+                )
+                async with _ollama_ac_sse(_state.ollama_url, timeout=120.0) as _client:
                     try:
                         async with _client.stream(
                             "POST",
@@ -3020,7 +3027,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if body.temperature is not None:
                     ollama_body["temperature"] = body.temperature
 
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                # F-001 (chat-nonstream seam): bare httpx.AsyncClient has no
+                # SSL context → fails when ollama_url is https:// (Mac Metal /
+                # mTLS-Ollama).  Route through ollama_async_client.
+                from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                    ollama_async_client as _ollama_ac_chat,
+                )
+                async with _ollama_ac_chat(_state.ollama_url, timeout=120.0) as client:
                     resp = await client.post(
                         f"{_state.ollama_url}/api/chat",
                         json=ollama_body,
@@ -3789,7 +3802,13 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 "model": selected_model,
                 "input": raw_input,  # Ollama /api/embed accepts str or list[str]
             }
-            async with _httpx.AsyncClient(timeout=60.0) as _client:
+            # F-001 (embed seam): bare httpx.AsyncClient has no SSL context →
+            # fails when ollama_url is https:// (Mac Metal / mTLS-Ollama front).
+            # Route through ollama_async_client (same fix as model-list / chat).
+            from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                ollama_async_client as _ollama_ac_embed,
+            )
+            async with _ollama_ac_embed(_state.ollama_url, timeout=60.0) as _client:
                 resp = await _client.post(
                     f"{_state.ollama_url}/api/embed",
                     json=ollama_body,

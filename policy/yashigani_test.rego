@@ -31,23 +31,23 @@ test_rbac_not_permitted_clean_deny_no_conflict if {
         "agent_id": "agentX",
         "method": "GET",
         "path": "/v1/chat",
-        "session": {"email": "nope@x"},
+        "session": {"identity_id": "idnt_nopexx00001"},
     }
 }
 
 # Decision preserved: when RBAC permits the caller, allow stays true (no regression).
-# allow_rbac (rbac.rego) matches input.session.email → user_groups → group
+# allow_rbac (rbac.rego) matches input.session.identity_id → user_groups → group
 # allowed_resources (method + path_glob); reads input.request.{method,path}.
 test_rbac_permitted_still_allows if {
     data.yashigani.allow with data.yashigani.rbac as {
         "groups": {"eng": {"allowed_resources": [{"method": "*", "path_glob": "**"}]}},
-        "user_groups": {"nope@x": ["eng"]},
+        "user_groups": {"idnt_aabbccdd0001": ["eng"]},
     } with input as {
         "session_id": "sh",
         "agent_id": "agentX",
         "method": "GET",
         "path": "/v1/chat",
-        "session": {"email": "nope@x"},
+        "session": {"identity_id": "idnt_aabbccdd0001"},
         "request": {"method": "GET", "path": "/v1/chat"},
     }
 }
@@ -133,12 +133,12 @@ test_human_mcp_denied_by_rbac_no_conflict if {
 test_human_mcp_allowed_when_rbac_permits if {
     data.yashigani.allow with data.yashigani.rbac as {
         "groups": {"users": {"allowed_resources": [{"method": "*", "path_glob": "**"}]}},
-        "user_groups": {"u@x": ["users"]},
+        "user_groups": {"idnt_aabbccdd0002": ["users"]},
     } with input as {
         "session_id": "cookiehash",
         "method": "GET",
         "path": "/mcp/filesystem-mcp",
-        "session": {"email": "u@x"},
+        "session": {"identity_id": "idnt_aabbccdd0002"},
         "request": {"method": "GET", "path": "/mcp/filesystem-mcp"},
     }
 }

@@ -292,12 +292,16 @@ class McpBroker:
 
         # LAURA-411-002 / YSG-RISK-055: InMemoryNonceStore is NOT crash-safe.
         # A gateway restart loses the nonce store → replay of in-flight tokens is
-        # possible within the TTL window.  Accepted for dev/test; refused for prod/staging.
-        # Production deployments MUST supply a RedisNonceStore via McpBrokerConfig.nonce_store
-        # (wired via YASHIGANI_MCP_NONCE_REDIS_URL by the entrypoint).
-        if isinstance(self._nonce_store, InMemoryNonceStore) and _env in _prod_envs:
+        # possible within the TTL window.  Accepted ONLY for explicit dev/test;
+        # refused for ANY other environment (qa, preprod, staging, production, …).
+        # Inverting the check (allow-list of safe envs) ensures future env names
+        # like "qa" or "preprod" fail-closed rather than silently accepting an
+        # in-memory store.  Production deployments MUST supply a RedisNonceStore
+        # via McpBrokerConfig.nonce_store (wired via YASHIGANI_MCP_NONCE_REDIS_URL).
+        _safe_envs = {"dev", "test", ""}
+        if isinstance(self._nonce_store, InMemoryNonceStore) and _env not in _safe_envs:
             raise RuntimeError(
-                "McpBroker: InMemoryNonceStore is not suitable for production/staging "
+                "McpBroker: InMemoryNonceStore is not suitable outside dev/test "
                 f"(YASHIGANI_ENV={_env!r}). A restart loses the nonce store and allows "
                 "replay of in-flight tokens within the TTL window. "
                 "Supply a RedisNonceStore via McpBrokerConfig.nonce_store. "
