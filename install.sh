@@ -5396,11 +5396,23 @@ _build_ringfence_images() {
   # overlay gate in compose_up (non-interactive --agent-bundles is only
   # pushed into COMPOSE_PROFILES at step 8).
   local _rf_active="false"
-  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
-    _rf_active="true"
-  else
+  # Build ringfence images whenever ANY bundle that layers an egress-forwarder
+  # overlay is active — not just openclaw.  langflow and letta overlays also
+  # reference ghcr.io/agnosticsec/ringfence-init (ringfence-init-egress-langflow
+  # and ringfence-init-egress-letta services).  A clean install without a
+  # pre-seeded image fails on the ghcr.io pull when only openclaw triggered the
+  # build.  Fix: activate for langflow, letta, OR openclaw.
+  local _rf_bundle
+  for _rf_bundle in langflow letta openclaw; do
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "$_rf_bundle"; then
+      _rf_active="true"
+      break
+    fi
+  done
+  if [[ "$_rf_active" != "true" ]]; then
     local _rf_ab=",${AGENT_BUNDLES//[[:space:]]/},"
-    if [[ "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
+    if [[ "$_rf_ab" == *",langflow,"* || "$_rf_ab" == *",letta,"* || \
+          "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
       _rf_active="true"
     fi
   fi
@@ -7936,6 +7948,33 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         log_info "postgres SSL injection complete — starting remaining services..."
       fi
     fi
+    # Podman-compose stale-container guard (Bug 5 / BUG-411-PODMAN-STALE-CTR):
+    # When a previous install attempt created containers but failed before they
+    # started (e.g. secret permission errors), podman-compose leaves them in
+    # "created" state.  On re-run, dependency resolution fails:
+    #   "container X depends on container Y not found in input list"
+    # because the old container IDs are referenced by new containers whose
+    # peers no longer exist.  Docker Compose and podman-compose's --remove-orphans
+    # do NOT cover this case (they only remove orphans for services no longer
+    # defined, not containers that failed to start).
+    # Fix: remove all "created"-state containers for this compose project before
+    # each compose up.  Running containers are untouched.
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+      local _proj_name="${COMPOSE_PROJECT_NAME:-docker}"
+      local _stale_ctrs
+      _stale_ctrs="$(podman ps --all --filter "status=created" \
+          --format '{{.Names}}' 2>/dev/null \
+        | grep "^${_proj_name}_" || true)"
+      if [[ -n "$_stale_ctrs" ]]; then
+        log_info "Podman: removing stale 'created'-state containers for project '${_proj_name}'"
+        while IFS= read -r _ctr; do
+          [[ -z "$_ctr" ]] && continue
+          podman rm -f "$_ctr" 2>/dev/null && \
+            log_info "  removed stale container: ${_ctr}" || \
+            log_warn "  could not remove ${_ctr} — proceeding (non-fatal)"
+        done <<< "$_stale_ctrs"
+      fi
+    fi
     log_info "Starting services (upgrade — removing orphaned containers)..."
     # ROOTLESS-9 (v2.23.1): podman-compose up -d returns non-zero when optional
     # services (otel-collector, promtail, grafana) fail to start — even if all
@@ -7953,8 +7992,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     # The compose file on disk is NOT modified — the temp file is used only for up.
     # This is equivalent to the --air-gap bundle behaviour.
     local _compose_files_up=("${compose_files[@]}")
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
       local _digest_stripped_compose
       _digest_stripped_compose="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
@@ -7971,17 +8009,32 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
     # Clean up temp compose file if it was created
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose:-}" 2>/dev/null || true
     fi
   else
+    # Podman stale-container guard (same as upgrade path above — see comment).
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+      local _proj_name2="${COMPOSE_PROJECT_NAME:-docker}"
+      local _stale_ctrs2
+      _stale_ctrs2="$(podman ps --all --filter "status=created" \
+          --format '{{.Names}}' 2>/dev/null \
+        | grep "^${_proj_name2}_" || true)"
+      if [[ -n "$_stale_ctrs2" ]]; then
+        log_info "Podman: removing stale 'created'-state containers for project '${_proj_name2}'"
+        while IFS= read -r _ctr2; do
+          [[ -z "$_ctr2" ]] && continue
+          podman rm -f "$_ctr2" 2>/dev/null && \
+            log_info "  removed stale container: ${_ctr2}" || \
+            log_warn "  could not remove ${_ctr2} — proceeding (non-fatal)"
+        done <<< "$_stale_ctrs2"
+      fi
+    fi
     log_info "Starting services..."
     # ROOTLESS-9: same rationale as upgrade path above.
     # v2.23.3: same digest-strip for pre-seeded images (fresh install path).
     local _compose_files_up2=("${compose_files[@]}")
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
       local _digest_stripped_compose2
       _digest_stripped_compose2="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
@@ -7997,8 +8050,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
     fi
   fi
@@ -13031,6 +13083,38 @@ _pki_chown_client_keys() {
       fi
     done < <(grep -E '^[[:space:]]*# BEGIN YSG-ONBOARD-' "$_sid_runtime" 2>/dev/null || true)
   fi
+
+  # Podman-specific: podman-compose ignores the uid/gid/mode fields in a
+  # service's secrets: section — secrets are bind-mounted directly from the
+  # host file, so the host file permissions govern what the container can read.
+  # Docker is not affected: Docker Compose creates an in-container tmpfs file
+  # with the compose-spec mode regardless of host file permissions.
+  #
+  # Two non-sensitive token files need to be world-readable (0444) so that
+  # their container users (langflow uid=1000, grafana uid=472) can read them:
+  #   langflow_yashigani_token — chowned to 0:0 0440 in generate_secrets();
+  #     under non-root podman unshare the ownership resolves to the installer
+  #     user's uid:gid (not root), leaving uid=1000 with no read access.
+  #   grafana_admin_password   — chowned to 1001:1001 0600 above; grafana
+  #     runs as uid=472 which has no access to a 1001-owned 0600 file.
+  # Security posture: both files contain non-sensitive generated tokens
+  # (grafana dashboard admin password, per-agent LLM gateway bearer) not
+  # used in mTLS or inter-service auth; 0444 is acceptable.
+  if [[ "$_effective_runtime" == "podman" ]]; then
+    log_info "Podman: chmod 0444 on bind-mount secrets (langflow_yashigani_token, grafana_admin_password)"
+    local _podman_readable_secrets=(langflow_yashigani_token grafana_admin_password)
+    local _prs _prs_path
+    for _prs in "${_podman_readable_secrets[@]}"; do
+      _prs_path="${_secrets_dir}/${_prs}"
+      if [[ -f "$_prs_path" ]]; then
+        if chmod 0444 "$_prs_path"; then
+          log_info "  ${_prs}: chmod 0444 OK"
+        else
+          log_warn "  ${_prs}: chmod 0444 failed — container may not read it (EACCES)"
+        fi
+      fi
+    done
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -13308,12 +13392,28 @@ _chown_agent_volumes() {
   elif [[ "$_effective_runtime" == "podman" ]]; then
     # Determine Podman sub-mode (same logic as _pki_chown_client_keys).
     if [[ "$(id -u)" == "0" ]]; then
-      # Rootful Podman: use podman run (plain chown not available for named volumes).
-      if podman run --rm \
-           --volume "${_lf_vol}:/vol:rw" \
-           "$_alpine_image" \
-           chown 1000:1000 /vol 2>/dev/null; then
-        _chown_ok=1
+      # Rootful Podman: pre-create the volume, inspect its storage mountpoint,
+      # then chown directly.  Avoids the pinned alpine digest
+      # (alpine@sha256:... only available in the online cache; offline/airgap
+      # installs hit a "no such image" error on podman run with a digest ref).
+      # Confirmed fix: VM rootful-podman coldsmoke 2026-07-12.
+      podman volume create "${_lf_vol}" 2>/dev/null || true
+      local _lf_vol_path_root
+      _lf_vol_path_root="$(podman volume inspect "${_lf_vol}" \
+          --format '{{.Mountpoint}}' 2>/dev/null || echo "")"
+      if [[ -n "$_lf_vol_path_root" && -d "$_lf_vol_path_root" ]]; then
+        if chown 1000:1000 "$_lf_vol_path_root"; then
+          _chown_ok=1
+        fi
+      fi
+      # Fallback: podman run (if storage path inspection failed).
+      if [[ "$_chown_ok" == "0" ]]; then
+        if podman run --rm \
+             --volume "${_lf_vol}:/vol:rw" \
+             "$_alpine_image" \
+             chown 1000:1000 /vol 2>/dev/null; then
+          _chown_ok=1
+        fi
       fi
     elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
            /etc/subuid 2>/dev/null; then
