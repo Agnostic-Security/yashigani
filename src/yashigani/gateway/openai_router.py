@@ -3982,9 +3982,16 @@ async def list_models(request: Request):
     # Add local Ollama models — exposed on full filter; for restricted filter,
     # only models in allowed_models_set (if set is non-empty).
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{_state.ollama_url}/api/tags")
+        # F-001 (model-list seam): bare httpx.AsyncClient has no SSL context and
+        # fails CERTIFICATE_VERIFY_FAILED when ollama_url is
+        # https://caddy:11435/ollama (Mac Metal / any mTLS-Ollama front).
+        # Route through ollama_async_client so the internal PKI context is loaded
+        # for https URLs; plain http://ollama:11434 falls through unchanged.
+        from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+            ollama_async_client as _ollama_async_client,
+        )
+        async with _ollama_async_client(_state.ollama_url, timeout=5.0) as client:
+            resp = await client.get(f"{_state.ollama_url.rstrip('/')}/api/tags")
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
                     model_name = m.get("name", "")
