@@ -1634,7 +1634,12 @@ services:
       # The admin-session gate (forward_auth /auth/verify-admin) prevents any
       # non-admin access — anonymous Viewer role is harmless behind that gate.
       GF_SECURITY_ALLOW_EMBEDDING: "true"
-      GF_SERVER_ROOT_URL: "${YASHIGANI_PUBLIC_URL:-https://${YASHIGANI_TLS_DOMAIN}}/admin/grafana"
+      # YASHIGANI_PUBLIC_URL is always written to .env by install.sh (before
+      # compose up) so the nested-default fallback is unnecessary.  The nested
+      # ${...:-https://${YASHIGANI_TLS_DOMAIN}} form is not supported by
+      # podman-compose: it strips the inner ${} but leaves a stray "}" which
+      # Grafana rejects as an invalid host character ("yashiganilocal}").
+      GF_SERVER_ROOT_URL: "${YASHIGANI_PUBLIC_URL}/admin/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # retro #83: Grafana ingress mTLS.
       # Grafana serves HTTPS on port 3443. Caddy proxies /admin/grafana/* over
