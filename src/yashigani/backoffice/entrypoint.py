@@ -372,6 +372,23 @@ def _bootstrap():
             "Backend registry initialised: active=%s, chain=%s",
             ollama_backend.name, fallback_chain,
         )
+
+        # G1 (5.0): activate the always-on day-one tool-poisoning scan at MCP
+        # registration. `backoffice_state.semantic_intent_sidecar` was declared
+        # but never assigned, so `_screen_tools` always reported "not_configured"
+        # and the built poison screen was dead code. Instantiate it directly
+        # (not via from_env) behind a DEDICATED flag so registration scanning is
+        # decoupled from YASHIGANI_SEMANTIC_INTENT_SIDECAR, which also gates
+        # live-traffic request/response inspection (kept opt-in for support-load
+        # reasons, YSG-RISK-057). Default ON.
+        if os.environ.get("YASHIGANI_REGISTRATION_SCAN", "true").strip().lower() \
+                not in ("false", "0", "no", "off"):
+            from yashigani.inspection.semantic_intent import SemanticIntentSidecar
+            backoffice_state.semantic_intent_sidecar = SemanticIntentSidecar(ollama_backend)
+            logger.info(
+                "G1 registration-scan sidecar ACTIVE — day-one tool-poisoning "
+                "screen runs on every MCP import"
+            )
     except Exception as exc:
         logger.warning(
             "Backend registry init failed (%s) — inspection pipeline uses legacy classifier",
