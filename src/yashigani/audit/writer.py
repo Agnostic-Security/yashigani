@@ -238,6 +238,9 @@ class AuditLogWriter:
         # request path and from the file write.  Typed loosely to avoid an
         # import cycle (sinks.py imports nothing from writer at module load).
         self._db_sink = None  # type: ignore[var-annotated]
+        # Crypto-shred (5.0): per-subject envelope sealing of data-subject fields.
+        # Deferred-attached (like _db_sink) once Redis/KMS are available.
+        self._shredder = None  # type: ignore[var-annotated]
 
     # -- Public API ----------------------------------------------------------
 
@@ -265,6 +268,16 @@ class AuditLogWriter:
             # misled by the dataclass default of masking_applied=True.
             # YCS-20260529-v250-W6-01 / FIX-01 (honesty — Lu GRC gate).
             object.__setattr__(event, "masking_applied", False) if dataclasses.is_dataclass(event) else setattr(event, "masking_applied", False)
+
+        # Crypto-shred (5.0): seal data-subject fields AFTER masking and BEFORE
+        # to_dict()/hash — so file/DB/SIEM all receive identical ciphertext and
+        # the SHA-384 chain leaf hash covers ciphertext (a later DEK destroy
+        # never changes the ciphertext, so verify_integrity() survives erasure).
+        if self._shredder is not None:
+            try:
+                event = self._shredder.seal(event)
+            except Exception:  # never drop the audit event on a seal error
+                logger.error("crypto_shred seal failed in audit write path", exc_info=True)
 
         with self._lock:
             # Compute and inject prev_event_hash before serialisation
@@ -359,6 +372,15 @@ class AuditLogWriter:
         durability anchor; nothing about the file write path depends on this.
         """
         self._db_sink = db_sink
+
+    def attach_crypto_shred(self, shredder) -> None:
+        """Attach a crypto_shred.Shredder once Redis/KMS are available.
+
+        Called from the service lifespan (like attach_db_sink). Once attached,
+        write() seals data-subject fields before serialisation so every sink
+        receives ciphertext and the hash chain covers ciphertext. Idempotent.
+        """
+        self._shredder = shredder
 
     def _mirror_to_db_sink(self, event_dict: dict) -> None:
         """Fire-and-forget mirror of a masked event_dict to the DB sink.
