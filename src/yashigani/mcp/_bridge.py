@@ -47,6 +47,8 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from yashigani.mcp import _frame_shape  # G8 — server-initiated primitive gating
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SUBPROCESS_READ_TIMEOUT = 30.0   # seconds
@@ -243,7 +245,37 @@ class _BridgeProcess:
                     logger.warning("mcp-bridge: non-JSON line from subprocess: %s (err=%s)", raw[:200], exc)
                     continue
 
-                # Deliver to the matching waiter by id
+                # G8 — server-initiated primitive gating (default-DENY).
+                # A frame carrying `method` is a server-INITIATED request, not a
+                # response (JSON-RPC 2.0 §5). It must NEVER be delivered to a
+                # waiting caller as the tool-call result (Laura F1 id-reuse hijack).
+                frame_kind = _frame_shape.classify_inbound_frame(msg)
+                if frame_kind != _frame_shape.FRAME_RESPONSE:
+                    method = msg.get("method")
+                    hijacked_id = msg.get("id")
+                    if hijacked_id is not None:
+                        # Server tried to answer a pending call with a reverse
+                        # primitive / malformed frame — fail that call fast with a
+                        # clean deny error instead of delivering attacker content.
+                        fut = self._pending.pop(str(hijacked_id), None)
+                        if fut is not None and not fut.done():
+                            fut.set_result(json.dumps(
+                                _frame_shape.build_deny_error(hijacked_id, method)))
+                            logger.warning(
+                                "mcp-bridge: DENIED server frame hijacking pending "
+                                "id=%r method=%r (default-deny G8)", hijacked_id, method)
+                            continue
+                    if _frame_shape.is_reverse_primitive(msg):
+                        logger.warning(
+                            "mcp-bridge: DENIED server-initiated primitive method=%r "
+                            "(default-deny G8)", method)
+                    else:
+                        logger.debug(
+                            "mcp-bridge: discarded non-response frame kind=%s method=%r",
+                            frame_kind, method)
+                    continue
+
+                # Deliver to the matching waiter by id (genuine response only)
                 msg_id = msg.get("id")
                 if msg_id is not None:
                     msg_id_str = str(msg_id)
@@ -253,11 +285,8 @@ class _BridgeProcess:
                     else:
                         logger.debug(
                             "mcp-bridge: response for id=%r has no waiter "
-                            "(notification from server or stale response)", msg_id_str
+                            "(stale response)", msg_id_str
                         )
-                else:
-                    # Server-initiated notification (no id) — log and discard
-                    logger.debug("mcp-bridge: server-sent notification method=%r", msg.get("method"))
 
         except asyncio.CancelledError:
             pass
