@@ -327,7 +327,8 @@ def create_gateway_app(
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        # X-Frame-Options: DENY — emitted by Caddy (header @not_embed); removed
+        # here to prevent duplicate headers (LAURA-411-006).
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         # ZAP 10015/10049: Dynamic responses (API endpoints, auth flows) must not
         # be stored in any cache.  Static assets under /static/ (Swagger UI,
