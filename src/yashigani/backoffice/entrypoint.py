@@ -322,6 +322,27 @@ def _bootstrap():
                     _RBAC_MAX_ATTEMPTS, exc,
                 )
 
+    # Crypto-shred (5.0) — attach the per-subject sealing Shredder (sync; deps
+    # kms_provider + sync redis already built above). Dedicated Redis DB 7; same
+    # posture as the gateway attach.
+    if audit_config.crypto_shred_enabled:
+        try:
+            import redis as _redis
+            from yashigani.audit.crypto_shred import CryptoShredKeyStore, Shredder
+            _cs_redis = _redis.from_url(_backoffice_redis_url(7), decode_responses=False)
+            _cs_redis.ping()
+            audit_writer.attach_crypto_shred(
+                Shredder(CryptoShredKeyStore(_cs_redis, kms_provider, dsn=None))
+            )
+            logger.info("Backoffice: crypto-shred Shredder attached (Redis DB 7)")
+        except Exception as exc:
+            logger.error(
+                "Backoffice: crypto-shred UNAVAILABLE (%s) — data-subject fields "
+                "will NOT be sealed until restart. Privacy-control gap.", exc,
+            )
+    else:
+        logger.info("Backoffice: crypto-shred disabled (YASHIGANI_CRYPTO_SHRED=false)")
+
     # ── Backend registry + config store (Redis db/1, separate key namespace) ─
     backend_registry = None
     backend_config_store = None

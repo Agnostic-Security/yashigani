@@ -20,6 +20,12 @@ class AuditConfig:
     #     2026-06-04 (WIRE in 2.25.2), but safely disableable via
     #     YASHIGANI_AUDIT_DB_SINK=false for community / file-only deploys.
     db_sink_enabled: bool = True
+    # 5.0 — crypto-shred erasure (GDPR Art 17). When True, data-subject fields in
+    # audit events are sealed under a per-subject DEK before fan-out (so all sinks
+    # get ciphertext and erasure = destroying the DEK). Default ON EVERYWHERE incl.
+    # dev — unlike db_sink_enabled this is a privacy control, and a dev-off default
+    # risks a misconfigured prod deploy inheriting a "dev" env template.
+    crypto_shred_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "AuditConfig":
@@ -36,6 +42,10 @@ class AuditConfig:
             ),
             db_sink_enabled=os.environ.get(
                 "YASHIGANI_AUDIT_DB_SINK", "true"
+            ).strip().lower()
+            not in ("false", "0", "no", "off"),
+            crypto_shred_enabled=os.environ.get(
+                "YASHIGANI_CRYPTO_SHRED", "true"
             ).strip().lower()
             not in ("false", "0", "no", "off"),
         )
