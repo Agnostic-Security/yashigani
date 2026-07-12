@@ -543,10 +543,17 @@ async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: 
                           http_status=403, block_source="opa_ingress")
 
     # 2) Forward to the JSON-RPC MCP upstream (reachable from the gateway netns).
+    # F-001 (audit): MCP upstreams can be https://caddy:<port>/mcp/... — build the
+    # internal PKI client for https URLs; fall through to plain httpx for http.
     rpc = {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
            "params": {"name": tool, "arguments": args}}
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        if upstream_url.lower().startswith("https://"):
+            from yashigani.pki.client import internal_httpx_client as _internal_httpx_client
+            _mcp_http = _internal_httpx_client(timeout=120.0)
+        else:
+            _mcp_http = httpx.AsyncClient(timeout=120.0)
+        async with _mcp_http as client:
             resp = await client.post(upstream_url, json=rpc,
                                      headers={"Content-Type": "application/json"})
         upstream = resp.json()
@@ -1002,8 +1009,12 @@ async def _call_orchestrator(messages: list[dict], catalog, model: str,
     gated when each tool is executed.  Returns the assistant message dict with
     normalised OpenAI-shaped tool_calls.
     """
-    import httpx
     from yashigani.gateway.openai_router import _state
+    # F-001: use the mesh-aware transport so https://caddy:11435/ollama (Mac Metal
+    # + any mTLS-Ollama front) gets the internal PKI client SSL context.  Plain
+    # http://ollama:11434 is unaffected (ollama_async_client falls through to a
+    # bare httpx.AsyncClient when the scheme is http).
+    from yashigani.inspection._ollama_transport import ollama_async_client
 
     ollama_body = {"model": model, "stream": False,
                    "messages": _messages_for_ollama(messages)}
@@ -1015,7 +1026,7 @@ async def _call_orchestrator(messages: list[dict], catalog, model: str,
         if tool_choice is not None:
             ollama_body["tool_choice"] = tool_choice
     url = _state.ollama_url.rstrip("/") + "/api/chat"
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with ollama_async_client(_state.ollama_url, timeout=120.0) as client:
         resp = await client.post(url, json=ollama_body)
         resp.raise_for_status()
         data = resp.json()
