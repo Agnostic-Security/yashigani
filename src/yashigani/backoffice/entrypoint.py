@@ -331,9 +331,10 @@ def _bootstrap():
             from yashigani.audit.crypto_shred import CryptoShredKeyStore, Shredder
             _cs_redis = _redis.from_url(_backoffice_redis_url(7), decode_responses=False)
             _cs_redis.ping()
-            audit_writer.attach_crypto_shred(
-                Shredder(CryptoShredKeyStore(_cs_redis, kms_provider, dsn=None))
-            )
+            _cs_shredder = Shredder(CryptoShredKeyStore(_cs_redis, kms_provider, dsn=None))
+            audit_writer.attach_crypto_shred(_cs_shredder)
+            # Expose for the erasure route (POST /admin/privacy/erase).
+            backoffice_state.crypto_shredder = _cs_shredder
             logger.info("Backoffice: crypto-shred Shredder attached (Redis DB 7)")
         except Exception as exc:
             logger.error(
