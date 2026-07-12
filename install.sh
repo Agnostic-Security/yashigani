@@ -7948,25 +7948,29 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         log_info "postgres SSL injection complete — starting remaining services..."
       fi
     fi
-    # Podman-compose stale-container guard (Bug 5 / BUG-411-PODMAN-STALE-CTR):
+    # Podman-compose stale-container guard (Bug 5 / BUG-411-PODMAN-STALE-CTR v2):
     # When a previous install attempt created containers but failed before they
-    # started (e.g. secret permission errors), podman-compose leaves them in
-    # "created" state.  On re-run, dependency resolution fails:
+    # started, those containers remain in "created" or "exited" state.
+    # On re-run, dependency resolution fails with:
     #   "container X depends on container Y not found in input list"
-    # because the old container IDs are referenced by new containers whose
-    # peers no longer exist.  Docker Compose and podman-compose's --remove-orphans
-    # do NOT cover this case (they only remove orphans for services no longer
-    # defined, not containers that failed to start).
-    # Fix: remove all "created"-state containers for this compose project before
-    # each compose up.  Running containers are untouched.
+    # because new containers pick up --requires=<old-container-id> via name
+    # lookup, and that old container references an even-older dependency that
+    # no longer exists.  podman-compose down and --remove-orphans do NOT cover
+    # this: down removes containers whose services are still defined, but stale
+    # containers from earlier install attempts (with different dependency chain
+    # IDs) survive and pollute the dependency graph for new containers.
+    # Fix v2: remove ALL non-running (created + exited + stopped) project
+    # containers before compose up, not just "created"-state ones.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       local _proj_name="${COMPOSE_PROJECT_NAME:-docker}"
       local _stale_ctrs
-      _stale_ctrs="$(podman ps --all --filter "status=created" \
-          --format '{{.Names}}' 2>/dev/null \
-        | grep "^${_proj_name}_" || true)"
+      _stale_ctrs="$(
+        { podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=exited" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=stopped" --format '{{.Names}}' 2>/dev/null
+        } | grep "^${_proj_name}_" | sort -u || true)"
       if [[ -n "$_stale_ctrs" ]]; then
-        log_info "Podman: removing stale 'created'-state containers for project '${_proj_name}'"
+        log_info "Podman: removing stale non-running containers for project '${_proj_name}'"
         while IFS= read -r _ctr; do
           [[ -z "$_ctr" ]] && continue
           podman rm -f "$_ctr" 2>/dev/null && \
@@ -8014,14 +8018,17 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     fi
   else
     # Podman stale-container guard (same as upgrade path above — see comment).
+    # v2: also covers exited/stopped containers, not just created-state.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       local _proj_name2="${COMPOSE_PROJECT_NAME:-docker}"
       local _stale_ctrs2
-      _stale_ctrs2="$(podman ps --all --filter "status=created" \
-          --format '{{.Names}}' 2>/dev/null \
-        | grep "^${_proj_name2}_" || true)"
+      _stale_ctrs2="$(
+        { podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=exited" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=stopped" --format '{{.Names}}' 2>/dev/null
+        } | grep "^${_proj_name2}_" | sort -u || true)"
       if [[ -n "$_stale_ctrs2" ]]; then
-        log_info "Podman: removing stale 'created'-state containers for project '${_proj_name2}'"
+        log_info "Podman: removing stale non-running containers for project '${_proj_name2}'"
         while IFS= read -r _ctr2; do
           [[ -z "$_ctr2" ]] && continue
           podman rm -f "$_ctr2" 2>/dev/null && \
@@ -13090,30 +13097,36 @@ _pki_chown_client_keys() {
   # Docker is not affected: Docker Compose creates an in-container tmpfs file
   # with the compose-spec mode regardless of host file permissions.
   #
-  # Two non-sensitive token files need to be world-readable (0444) so that
-  # their container users (langflow uid=1000, grafana uid=472) can read them:
-  #   langflow_yashigani_token — chowned to 0:0 0440 in generate_secrets();
-  #     under non-root podman unshare the ownership resolves to the installer
-  #     user's uid:gid (not root), leaving uid=1000 with no read access.
-  #   grafana_admin_password   — chowned to 1001:1001 0600 above; grafana
-  #     runs as uid=472 which has no access to a 1001-owned 0600 file.
-  # Security posture: both files contain non-sensitive generated tokens
-  # (grafana dashboard admin password, per-agent LLM gateway bearer) not
-  # used in mTLS or inter-service auth; 0444 is acceptable.
+  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2):
+  #
+  # generate_secrets() sets langflow_yashigani_token to root:root 0440 via
+  # _do_chown "0:0" ... "0440".  langflow runs uid=1000 gid=0 inside the
+  # container; the group bit (0440 group=0) should allow read access.
+  #
+  # Root cause: _prepare_secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/"
+  # for rootful Podman (just before _pki_run_issuer).  This recursively clobbers
+  # ALL secret file ownership — including langflow_yashigani_token — to 1001:1001.
+  # After the sweep the file is maxine:ysgteam 0440 (uid=1001 != 1000, gid=1001 != 0):
+  # langflow gets EACCES.
+  #
+  # Fix: re-apply chown 0:0 0440 here so the group-read path (langflow gid=0 ==
+  # file group 0) is restored AFTER _prepare_secrets_dir_for_pki's sweep and AFTER
+  # the PKI issuer's own writes.  Mode 0440 (NOT 0444) avoids CWE-732: world-read
+  # is not needed because gid=0 is sufficient for langflow's access path.
+  # _fix_config_perms() strips world-read (chmod o-rwx) — 0440 is unaffected.
+  #
+  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from 1001:1001
+  # back to 0:0), not just the mode.  _do_chown handles all three dispatch modes
+  # (direct / unshare / podman_run) consistently across Podman rootful/rootless.
   if [[ "$_effective_runtime" == "podman" ]]; then
-    log_info "Podman: chmod 0444 on bind-mount secrets (langflow_yashigani_token, grafana_admin_password)"
-    local _podman_readable_secrets=(langflow_yashigani_token grafana_admin_password)
-    local _prs _prs_path
-    for _prs in "${_podman_readable_secrets[@]}"; do
-      _prs_path="${_secrets_dir}/${_prs}"
-      if [[ -f "$_prs_path" ]]; then
-        if chmod 0444 "$_prs_path"; then
-          log_info "  ${_prs}: chmod 0444 OK"
-        else
-          log_warn "  ${_prs}: chmod 0444 failed — container may not read it (EACCES)"
-        fi
+    local _lf_tok_path="${_secrets_dir}/langflow_yashigani_token"
+    if [[ -f "$_lf_tok_path" ]]; then
+      if _do_chown "0:0" "$_lf_tok_path" "langflow_yashigani_token" "0440" "${_secrets_dir}"; then
+        log_info "Podman: langflow_yashigani_token re-chown 0:0 0440 OK (restored after _prepare_secrets_dir_for_pki sweep)"
+      else
+        log_warn "Podman: langflow_yashigani_token re-chown 0:0 0440 failed — langflow may EACCES on startup"
       fi
-    done
+    fi
   fi
 }
 
