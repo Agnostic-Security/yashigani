@@ -1347,16 +1347,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             "zero-trust fail-closed (Path 2)",
             request_id,
         )
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "POST /v1/chat/completions requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Yashigani-Identity-Id header forwarded by Caddy)."
-                ),
-                "request_id": request_id,
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
 
@@ -2241,6 +2241,79 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     },
                     headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
                 )
+
+    # ── LAURA-411-001: explicit DENY on requested model — routing-independent ──────
+    # The gate above (6a-perm) only fires when selected_provider is a configured cloud
+    # provider (openai/anthropic) or permission_strict is on.  When no cloud key is
+    # configured, selected_provider becomes "ollama" → _perm_is_cloud=False →
+    # _perm_needs_check=False → an explicit user/group DENY grant on the originally-
+    # requested model name (e.g. perm:grant:cloud_model:user:{uid}:openai:gpt-4o =
+    # {allow:false}) is silently skipped and the request is served via Ollama.
+    #
+    # This gate checks ONLY the user/group tiers for an explicit allow=False on
+    # body.model.  It deliberately does NOT consult the org-level ceiling: a missing
+    # org grant for a cloud model on a local-only stack is expected and MUST NOT block
+    # local fallback (that would break every non-cloud Ollama deployment).  Only an
+    # explicit per-user or per-group DENY triggers this path.
+    #
+    # MUST NOT fire when: agent call, brain-reasoning leg, perm_needs_check already ran
+    # (cloud or strict path already handled it), no permission_store, or body.model empty.
+    if (
+        body.model
+        and not is_agent_call
+        and not brain_reasoning_leg
+        and not _perm_needs_check          # cloud gate already ran — don't double-check
+        and _state.permission_store is not None
+    ):
+        from yashigani.permissions import ResourceType as _RT_411
+        _411_kind = identity.get("kind", "") if identity else ""
+        _411_uid: Optional[str] = (
+            identity.get("identity_id")
+            if _411_kind in ("human", "user") else None
+        ) if identity else None
+        _411_groups: list = identity.get("groups", []) if identity else []
+        _411_explicit_deny = False
+        try:
+            if _411_uid:
+                _411_ug = _state.permission_store.get_boolean_grant(
+                    _RT_411.CLOUD_MODEL, "user", _411_uid, body.model
+                )
+                if _411_ug is not None and not _411_ug.allow:
+                    _411_explicit_deny = True
+            if not _411_explicit_deny:
+                for _411_gid in _411_groups:
+                    _411_gg = _state.permission_store.get_boolean_grant(
+                        _RT_411.CLOUD_MODEL, "group", _411_gid, body.model
+                    )
+                    if _411_gg is not None and not _411_gg.allow:
+                        _411_explicit_deny = True
+                        break
+        except Exception as _411_exc:
+            logger.error(
+                "PERM (LAURA-411-001) requested-model DENY probe failed: %s — "
+                "fail-closed (denying request)", _411_exc,
+            )
+            _411_explicit_deny = True  # fail-closed per SOP 1
+
+        if _411_explicit_deny:
+            _411_deny_reason = "cloud_model_not_granted"
+            logger.warning(
+                "PERM DENIED (LAURA-411-001): provider=%s routed-model=%s "
+                "requested=%s identity=%s — explicit DENY on requested model "
+                "blocks Ollama fallback",
+                selected_provider, selected_model, body.model, identity_id,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": _deny_message(_411_deny_reason),
+                        "type": "policy_denied",
+                        "code": _411_deny_reason,
+                    }
+                },
+                headers={"X-Yashigani-Permission-Reason": _411_deny_reason},
+            )
 
     # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
     # Runs on the model that will ACTUALLY be served (after optimisation OR the
@@ -3447,16 +3520,16 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             "zero-trust fail-closed",
             request_id,
         )
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "POST /v1/embeddings requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Yashigani-Identity-Id header forwarded by Caddy)."
-                ),
-                "request_id": request_id,
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
 
@@ -3834,15 +3907,16 @@ async def list_models(request: Request):
 
     identity = _resolve_identity(request)
     if not identity:
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "GET /v1/models requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate "
-                    "via the admin SSO flow."
-                ),
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
 

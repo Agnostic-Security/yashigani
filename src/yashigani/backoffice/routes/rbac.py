@@ -173,6 +173,56 @@ def _push(store, admin_account: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helpers (email → identity_id resolution)
+# ---------------------------------------------------------------------------
+
+def _email_to_identity_id(email: str) -> str:
+    """
+    Resolve an email address to the opaque identity_id (idnt_{12hex}).
+
+    After the 4.1 UID migration, RBACStore.add_member/remove_member/get_user_groups
+    expect identity_id, not email.  The identity_registry.get_by_email() resolves
+    via the slug index (email_to_slug → get_by_slug).
+
+    Raises HTTPException(422) if:
+      - The identity registry is not available
+      - No registered identity is found for the email
+    This is a 422 (validation error) not 404, because the group exists but the
+    member cannot be resolved to a valid, registered identity.
+    """
+    registry = backoffice_state.identity_registry
+    if registry is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "identity_registry_not_available"},
+        )
+    identity = registry.get_by_email(email)
+    if identity is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "identity_not_found",
+                "detail": (
+                    f"No registered identity found for email {email!r}. "
+                    "The user must have logged in at least once before being "
+                    "added to an RBAC group."
+                ),
+            },
+        )
+    identity_id = (
+        identity.get("identity_id")
+        if isinstance(identity, dict)
+        else getattr(identity, "identity_id", None)
+    )
+    if not identity_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "identity_id_missing", "email": email},
+        )
+    return identity_id
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -299,8 +349,12 @@ async def add_member(
     session: StepUpAdminSession,
 ):
     store = _get_store()
+    # RBAC-BUG-4.1.1: RBACStore.add_member expects identity_id (idnt_{12hex}) after
+    # the 4.1 UID migration.  Resolve email → identity_id here so new entries are
+    # identity_id-keyed immediately (vs email-keyed until next startup migration run).
+    identity_id = _email_to_identity_id(body.email)
     try:
-        store.add_member(group_id, body.email)
+        store.add_member(group_id, identity_id)
     except KeyError:
         raise HTTPException(status_code=404, detail={"error": "group_not_found"})
 
@@ -323,8 +377,10 @@ async def remove_member(
     session: StepUpAdminSession,
 ):
     store = _get_store()
+    # RBAC-BUG-4.1.1: same resolution as add_member — store expects identity_id.
+    identity_id = _email_to_identity_id(email)
     try:
-        store.remove_member(group_id, email)
+        store.remove_member(group_id, identity_id)
     except KeyError:
         raise HTTPException(status_code=404, detail={"error": "group_not_found"})
 
@@ -342,7 +398,26 @@ async def remove_member(
 @router.get("/users/{email}/groups")
 async def get_user_groups(email: str, session: AdminSession):
     store = _get_store()
-    groups = store.get_user_groups(email)
+    # RBAC-BUG-4.1.1: store.get_user_groups expects identity_id (idnt_{12hex}).
+    # Resolve email → identity_id; return [] gracefully if no registered identity.
+    registry = backoffice_state.identity_registry
+    if registry is not None:
+        identity = registry.get_by_email(email)
+        if identity is not None:
+            iid = (
+                identity.get("identity_id")
+                if isinstance(identity, dict)
+                else getattr(identity, "identity_id", None)
+            )
+            if iid:
+                groups = store.get_user_groups(iid)
+            else:
+                groups = []
+        else:
+            groups = []
+    else:
+        # Registry unavailable: fall back to email-keyed lookup (pre-4.1 compat).
+        groups = store.get_user_groups(email)
     return {
         "email": email,
         "groups": [_group_to_response(g) for g in groups],
