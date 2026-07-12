@@ -1,0 +1,154 @@
+# GPU overlay — Mac / Apple Metal — Podman runtime path.
+# last-updated: 2026-07-12 (fix(gpu): podman-mac host-ollama routing via gvproxy)
+#
+# CONTEXT: identical intent to docker-compose.gpu-mac-metal.yml (Docker path).
+# Apple Metal cannot be passed into a Linux VM container on macOS. Podman machine
+# runs containers inside a Linux VM (qemu/virtiofs); there is no Metal passthrough.
+# A host-native ollama (library=metal) must be running on the Mac. This overlay
+# routes Caddy's ollama-front upstream to that host-native process.
+#
+# RUNTIME: Podman machine on macOS ONLY. DO NOT apply on Docker Desktop Mac
+# (use docker-compose.gpu-mac-metal.yml) or on Linux (no Metal).
+#
+# MECHANISM — caddy service changes ONLY:
+#   1. extra_hosts "ollama:192.168.127.254"
+#      Caddyfile.ollama-front uses `reverse_proxy http://ollama:11434`.
+#      /etc/hosts resolution takes precedence over aardvark-dns, so caddy's
+#      TCP dial for "ollama" goes to gvproxy at 192.168.127.254, which relays
+#      the connection to 127.0.0.1:11434 on the Mac host.
+#      The Caddyfile is NOT modified — Helm ConfigMap parity preserved.
+#   2. extra_hosts "host.containers.internal:192.168.127.254"
+#      host.docker.internal:192.168.127.254 — Podman auto-injects both names
+#      into every container /etc/hosts, but explicit entries here guarantee
+#      that caddy-entrypoint.sh Step 6 (`getent ahosts`) resolves them to the
+#      correct gvproxy IP even if auto-injection behaviour changes.
+#   3. YASHIGANI_CADDY_EGRESS_ALLOWLIST=host.containers.internal:11434
+#      caddy-entrypoint.sh Step 6 resolves host.containers.internal → 192.168.127.254,
+#      then adds: iptables -A OUTPUT -p tcp --dport 11434 -d 192.168.127.254 -j ACCEPT
+#      gvproxy translates the container→192.168.127.254:11434 connection to
+#      127.0.0.1:11434 on the Mac. This is the ONLY host-egress port opened.
+#
+# GVPROXY RELAY (confirmed mechanism — 2026-07-12):
+#   Podman machine on macOS uses gvproxy (github.com/containers/gvisor-tap-vsock).
+#   From inside a container:
+#     curl http://host.containers.internal:11434/api/version  →  {"version":"0.31.2"}
+#   gvproxy relays to 127.0.0.1:11434 on the Mac host.
+#   - 192.168.127.254 is gvproxy's canonical virtual host IP — stable across
+#     Podman versions and machine init cycles (documented in gvproxy source).
+#   - Binding host ollama to ONLY 127.0.0.1:11434 is sufficient AND correct
+#     (same Laura C3 constraint as the Docker path — loopback-only, no LAN).
+#   - Caddy reaches 127.0.0.1:11434 on the Mac via this relay.
+#   Verified: Podman machine on macOS, host ollama 0.31.2 on 127.0.0.1:11434,
+#   {"version":"0.31.2"} returned from inside the container.
+#
+# DIFFERENCE FROM docker-compose.gpu-mac-metal.yml (Docker path):
+#   Docker:  extra_hosts[ollama:host-gateway] (Docker-resolved bridge IP +
+#            VPNKit relay to host loopback). EGRESS uses host.docker.internal.
+#   Podman:  extra_hosts[ollama:192.168.127.254] (gvproxy canonical IP,
+#            no host-gateway token needed). EGRESS uses host.containers.internal.
+#   Services changed (caddy, ollama, gateway, ollama-init): IDENTICAL behaviour.
+#
+# C4 — CONTAINER OLLAMA DISABLED (same as Docker path):
+#   1. services.ollama: entrypoint no-op (["true"]) — starts and exits immediately.
+#   2. services.gateway.depends_on.ollama.condition: service_started
+#      (merged over base service_healthy) — gateway no longer waits for ollama
+#      healthcheck, which never fires since the container exits immediately.
+#   3. services.ollama-init: also no-op (models are pre-pulled on the host).
+#   Frees ~4 GB VRAM / VM RAM.
+#
+# HOST-EGRESS SURFACE (mirrors LAURA-METAL-01 constraints):
+#   Path opened:  caddy container → 192.168.127.254:11434 via gvproxy
+#   Actual target: 127.0.0.1:11434 on the Mac (loopback, not LAN-routable)
+#   Who can use:  caddy ONLY (extra_hosts + EGRESS_ALLOWLIST applied to caddy only)
+#   iptables:     Step 6 adds ACCEPT for 192.168.127.254:11434.
+#                 Rootless Podman without NET_ADMIN: entrypoint logs a warning
+#                 and continues (Caddy starts without iptables restriction;
+#                 primary isolation is loopback binding on the host ollama).
+#   Other containers: cannot reach host:11434 (no extra_hosts, no iptables rule)
+#   Internet reachability of host ollama: NONE (loopback binding blocks all LAN)
+#   Auth gate:    all /ollama/* requests still pass Caddyfile.ollama-front
+#                 require_and_verify mTLS gate (SPIFFE leaf + intermediate CA)
+#                 before reaching host ollama — auth perimeter unchanged.
+#   C7 preserved: X-SPIFFE-ID header_up forwarding unchanged in Caddyfile.
+#
+# OPERATOR REQUIREMENTS (before install.sh runs on Mac Metal + Podman):
+#   1. Host ollama installed:
+#        brew install ollama
+#   2. Start host ollama with LOOPBACK binding (Laura C3 — required):
+#        OLLAMA_HOST=127.0.0.1:11434 ollama serve
+#        # Do NOT use 0.0.0.0 (LAN exposure).
+#        # gvproxy relays container→192.168.127.254:11434 to 127.0.0.1 on the Mac.
+#   3. Models pre-pulled on the host (ollama-init is disabled here):
+#        ollama pull qwen2.5:3b
+#        ollama pull qwen2.5:7b   # or whichever VRAM-tier model is selected
+#   4. Verify Metal is in use:
+#        curl -s http://127.0.0.1:11434/api/tags   # host must respond
+#        # ollama logs show: library=metal
+#   5. OLLAMA_ORIGINS must NOT be set to * — inference-only, no tool/fs extensions.
+#
+# INSTALL.SH AUTO-SELECTS THIS OVERLAY when:
+#   YSG_GPU_TYPE=apple_metal AND uname==Darwin AND Podman runtime AND not K8s.
+#   Preflight check: curl -fs http://127.0.0.1:11434/api/tags — aborts if unreachable.
+#
+# MANUAL APPLY (for testing without full reinstall):
+#   cd /path/to/yashigani/docker && \
+#   podman compose -f docker-compose.yml \
+#     -f docker-compose.podman-override.yml \
+#     -f docker-compose.podman-virtiofs-override.yml \
+#     -f docker-compose.gpu-mac-metal-podman.yml \
+#     up -d --force-recreate caddy ollama gateway
+#
+# NOT APPLICABLE TO:
+#   - Linux (no Metal)
+#   - Kubernetes (no host-gateway concept; use dedicated K8s inference service)
+#   - Docker Desktop on Mac (use docker-compose.gpu-mac-metal.yml instead)
+
+services:
+  caddy:
+    extra_hosts:
+      # gvproxy canonical virtual host IP — Podman machine on macOS (stable).
+      # Podman auto-injects host.containers.internal + host.docker.internal at
+      # this address, but explicit entries guarantee Step 6 getent ahosts works.
+      - "host.containers.internal:192.168.127.254"
+      - "host.docker.internal:192.168.127.254"
+      # Reroute Caddyfile.ollama-front's `reverse_proxy http://ollama:11434` to
+      # gvproxy. /etc/hosts takes priority over aardvark-dns (Podman's embedded
+      # DNS). gvproxy relays 192.168.127.254:11434 → 127.0.0.1:11434 on Mac.
+      # header_up Host "localhost" in Caddyfile ensures ollama accepts request
+      # regardless of the upstream IP (same fix as the Docker VPNKit path).
+      - "ollama:192.168.127.254"
+    environment:
+      # Step 6: add host-ollama to caddy-entrypoint.sh iptables egress allowlist.
+      # Resolved at container startup: host.containers.internal → 192.168.127.254
+      # iptables rule: -A OUTPUT -p tcp --dport 11434 -d 192.168.127.254 -j ACCEPT
+      # gvproxy relays to 127.0.0.1 on Mac. ONLY host-egress TCP path opened.
+      # Rootless Podman without NET_ADMIN: logged as warning; Caddy starts anyway
+      # (loopback binding is the primary isolation; iptables is defence-in-depth).
+      YASHIGANI_CADDY_EGRESS_ALLOWLIST: "host.containers.internal:11434"
+
+  # C4: disable container ollama. Starts as no-op and exits immediately (exit 0).
+  # gateway.depends_on.ollama is overridden below to service_started so gateway
+  # does not wait for a healthcheck that will never fire.
+  ollama:
+    entrypoint: ["true"]
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # C4: override gateway depends_on — ollama condition service_healthy → service_started.
+  # Docker/podman-compose merges depends_on by key; this changes only the ollama entry.
+  # gateway.depends_on.redis/pgbouncer/extractor-svc (from base) remain unchanged.
+  gateway:
+    depends_on:
+      ollama:
+        condition: service_started
+
+  # C4 (partial): neutralise ollama-init — models are managed on the host ollama.
+  # ollama-init runs when agent-bundle profiles (langflow/letta/openclaw) are active.
+  # On Mac Metal it would wastefully pull models to the container volume (unused).
+  # Override to a no-op so it exits 0 without pulling. healthcheck disabled.
+  ollama-init:
+    entrypoint: ["true"]
+    restart: "no"
+    healthcheck:
+      disable: true
