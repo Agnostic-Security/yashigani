@@ -1095,8 +1095,10 @@ def create_backoffice_app() -> FastAPI:
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+        # X-Frame-Options: DENY — emitted by Caddy (header @not_embed); removed
+        # here to prevent duplicate headers (LAURA-411-006).
+        # X-XSS-Protection removed — deprecated, removed from modern browsers, can
+        # introduce vulns; CSP (below) is the correct control (LAURA-411-005).
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
         # ZAP 10015/10049: Authenticated/sensitive dynamic responses must not be
