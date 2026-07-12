@@ -233,6 +233,30 @@ def _build_app(mesh_mode: bool = False):
             "RBAC/Agent Redis unavailable (%s) — RBAC and agent routing disabled", exc
         )
 
+    # Crypto-shred (5.0) — attach the per-subject sealing Shredder. Both deps
+    # (kms_provider above, sync redis) exist here, so attach synchronously (no
+    # lifespan deferral needed). Dedicated Redis DB 7 keeps DEK material isolated
+    # (DBs 0-6 are allocated to other subsystems). dsn=None -> the key-store reads
+    # the DB DSN lazily at write time (after ${POSTGRES_PASSWORD} substitution).
+    if audit_config.crypto_shred_enabled:
+        try:
+            import redis as _redis
+            from yashigani.audit.crypto_shred import CryptoShredKeyStore, Shredder
+            _cs_redis = _redis.from_url(_gw_redis_url(7), decode_responses=False)
+            _cs_redis.ping()
+            audit_writer.attach_crypto_shred(
+                Shredder(CryptoShredKeyStore(_cs_redis, kms_provider, dsn=None))
+            )
+            logger.info("Gateway: crypto-shred Shredder attached (Redis DB 7)")
+        except Exception as exc:
+            logger.error(
+                "Gateway: crypto-shred UNAVAILABLE (%s) — data-subject fields will "
+                "NOT be sealed until restart. Privacy-control gap, not a cache miss.",
+                exc,
+            )
+    else:
+        logger.info("Gateway: crypto-shred disabled (YASHIGANI_CRYPTO_SHRED=false)")
+
     # JWT inspector — Phase 7
     jwt_inspector = None
     try:
