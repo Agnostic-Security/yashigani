@@ -78,6 +78,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from yashigani.mcp._types import McpCallContext, McpPosture, PostureBinding
+from yashigani.mcp import _frame_shape  # G8 — server-initiated primitive gating
 from yashigani.mcp._transport_http import McpHttpTransport, HttpTransportError
 
 logger = logging.getLogger(__name__)
@@ -586,6 +587,29 @@ async def _handle_mcp_call_inner(
             return JSONResponse(
                 status_code=502,
                 content={"error": "UPSTREAM_ERROR"},
+            )
+
+        # ── G8 — server-initiated primitive gating (default-DENY, HTTP leg) ──
+        # An HTTP MCP server returns one response body per POST. If that body is
+        # a server-INITIATED request frame (method-bearing, e.g.
+        # sampling/createMessage) instead of a tool-call result, deny the whole
+        # call — it must never reach inspection/enforce_result or the caller
+        # (Laura F1). HTTP leg is deny-only: no duplex channel to answer a
+        # reverse primitive (allowlist + step-up over SSE is a v2 item).
+        try:
+            _resp_msg = json.loads(upstream_response) if upstream_response else None
+        except (ValueError, TypeError):
+            _resp_msg = None
+        if isinstance(_resp_msg, dict) and \
+                _frame_shape.classify_inbound_frame(_resp_msg) == _frame_shape.FRAME_REVERSE_REQUEST:
+            logger.warning(
+                "mcp-runtime: DENIED server-initiated primitive from upstream "
+                "agent=%r call_id=%s method=%r (default-deny G8)",
+                agent_name, call_id, _resp_msg.get("method"),
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": "SERVER_INITIATED_PRIMITIVE_DENIED"},
             )
 
         # ── G-ORCH-OPA-1 egress gate ──────────────────────────────────────
