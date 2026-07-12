@@ -545,14 +545,14 @@ class TestCloudModelGate:
     # G — INV-2: deny messages wired correctly
 
     def test_g_deny_messages_present(self):
-        """Cloud-model deny messages exist in _OWUI_DENY_MESSAGES."""
-        from yashigani.gateway.openai_router import _OWUI_DENY_MESSAGES, _owui_deny_message
-        assert "cloud_model_not_granted" in _OWUI_DENY_MESSAGES
-        assert "cloud_model_opa_coupling_failed" in _OWUI_DENY_MESSAGES
-        assert "cloud_model_no_opa_policy_ref" in _OWUI_DENY_MESSAGES
+        """Cloud-model deny messages exist in _DENY_MESSAGES (renamed from _OWUI_DENY_MESSAGES in 4.1)."""
+        from yashigani.gateway.openai_router import _DENY_MESSAGES, _deny_message
+        assert "cloud_model_not_granted" in _DENY_MESSAGES
+        assert "cloud_model_opa_coupling_failed" in _DENY_MESSAGES
+        assert "cloud_model_no_opa_policy_ref" in _DENY_MESSAGES
         # Messages must be human-readable (not machine codes)
         for code in ("cloud_model_not_granted", "cloud_model_opa_coupling_failed"):
-            msg = _owui_deny_message(code)
+            msg = _deny_message(code)
             assert len(msg) > 20
             assert code not in msg  # must not echo the machine code back
 

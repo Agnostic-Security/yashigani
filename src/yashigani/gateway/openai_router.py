@@ -139,7 +139,7 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Keep messages under ~120 chars so they fit the OWUI error pill.
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
-_OWUI_DENY_MESSAGES: dict[str, str] = {
+_DENY_MESSAGES: dict[str, str] = {
     # v1 ingress (OPA v1_routing.rego `reason`)
     "identity_not_active":
         "Your account is not active. Contact an administrator to restore access.",
@@ -193,16 +193,16 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
         "The data-protection policy for this cloud model is not configured. Contact an administrator.",
 }
 
-_OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
+_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
 
 
-def _owui_deny_message(reason: str) -> str:
-    """Return a human-readable deny message for OWUI chat display.
+def _deny_message(reason: str) -> str:
+    """Return a human-readable deny message for chat display.
 
     Falls back to the generic message for any reason code not in the table.
     Never leaks the raw reason code into the returned string.
     """
-    return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+    return _DENY_MESSAGES.get(reason, _GENERIC_DENY)
 
 
 # ---------------------------------------------------------------------------
@@ -253,50 +253,14 @@ _INTERNAL_BEARER: str = _load_internal_bearer()
 
 
 # ---------------------------------------------------------------------------
-# Track C (F-B) — per-user identity through Open WebUI.
+# 4.1 SEC-GAP-1: Track C (F-B) — per-user identity via X-Yashigani-Identity-Id.
 #
-# THE GAP: Open WebUI (OWUI) authenticates to the gateway's internal mesh port
-# (8081) with the shared `yashigani_internal_bearer`. Historically the resolver
-# mapped that bearer to a flat `internal` service identity (RESTRICTED, empty
-# allowed_models) BEFORE any per-user path, so every OWUI user shared one
-# identity and per-user/group/org RBAC (models, agents, sensitivity ceiling)
-# NEVER applied to OWUI traffic.
-#
-# THE FIX (trusted-forwarder model): the internal bearer establishes OWUI as a
-# TRUSTED FORWARDER — exactly the same trust anchor already used for the
-# orchestration-principal header. When (and ONLY when) a request carries the
-# internal bearer, the gateway honours OWUI's forwarded-user headers
-# (X-OpenWebUI-User-Email etc., emitted when ENABLE_FORWARD_USER_INFO_HEADERS=
-# true on the OWUI service) and resolves the ACTUAL per-user Yashigani identity.
-#
-# MAPPING (email -> Yashigani identity), in priority order:
-#   1. The forwarded email's local-part is matched as an identity SLUG
-#      (alice@corp.example -> slug "alice"); if a registered identity exists,
-#      that identity (with its own groups/allowed_models/sensitivity_ceiling)
-#      is used. Operators provision OWUI users by creating a Yashigani identity
-#      whose slug equals the user's email local-part.
-#   2. Optionally, an explicit slug override map (YASHIGANI_OWUI_SLUG_MAP, JSON
-#      object "email": "slug") lets an operator pin specific emails to slugs.
-#   3. No match / missing / malformed email -> the configurable baseline
-#      OWUI-users default identity (YASHIGANI_OWUI_DEFAULT_SLUG, default
-#      "owui-users"). If that slug is not registered either, fall back to a
-#      synthetic baseline-RESTRICTED identity (NEVER a higher privilege).
-#
-# SPOOFING DEFENSE (load-bearing): the forwarded-user header is honoured ONLY
-# under the internal bearer. A direct/external caller WITHOUT the bearer can set
-# X-OpenWebUI-User-* freely and it is IGNORED — the resolver never consults it
-# off the internal-bearer path. Caddy also strips inbound X-OpenWebUI-User-* /
-# X-Forwarded-User on the public path (defence in depth). Fail-closed: under the
-# bearer, an unmatched/missing/malformed forwarded user resolves to the
-# baseline-restricted default, NEVER to elevated privilege.
+# The 3.x X-OpenWebUI-User-Email forwarding path has been removed.  Identity on
+# the internal-bearer path is now resolved ONLY from X-Yashigani-Identity-Id
+# (idnt_ PK).  X-Forwarded-User / email / slug derivation paths are gone.
+# Fail-closed: no valid UID header on the forwarder path → service "internal"
+# identity (RESTRICTED).  No phantom owui-users default identity.
 # ---------------------------------------------------------------------------
-_OWUI_FORWARD_ENABLED: bool = (
-    os.environ.get("YASHIGANI_OWUI_FORWARD_USER", "true").strip().lower() == "true"
-)
-_OWUI_DEFAULT_SLUG: str = os.environ.get(
-    "YASHIGANI_OWUI_DEFAULT_SLUG", "owui-users"
-).strip()
-_OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
 
 # ---------------------------------------------------------------------------
 # 4.0 native WebUI trusted-forwarder header (LAURA-4.0-S1-001 close / identity_id contract)
@@ -308,10 +272,10 @@ _OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
 # Contract:
 #   - Value: idnt_ PK string (e.g. "idnt_abc123")
 #   - Trust boundary: honoured ONLY on the internal-bearer path (p2_forwarder
-#     or _INTERNAL_BEARER) — same trust gate as X-OpenWebUI-User-Email.
+#     or _INTERNAL_BEARER).  4.1 SEC-GAP-1: X-OpenWebUI-User-Email path removed.
 #   - Caddy MUST strip this header at the public edge (Su's Caddyfile task).
 #   - If the header is present but the identity cannot be resolved: fail-closed
-#     (HTTP 403), do NOT fall back to the email path or an unauthenticated principal.
+#     (HTTP 403), do NOT fall back to a default/unauthenticated principal.
 # ---------------------------------------------------------------------------
 _YASHIGANI_IDENTITY_ID_HEADER = "x-yashigani-identity-id"
 
@@ -414,125 +378,9 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
     return identity
 
 
-def _load_owui_slug_map() -> dict[str, str]:
-    """Parse YASHIGANI_OWUI_SLUG_MAP (JSON object email->slug). Fail-safe: {}."""
-    raw = os.environ.get("YASHIGANI_OWUI_SLUG_MAP", "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return {str(k).strip().lower(): str(v).strip() for k, v in parsed.items() if v}
-    except Exception as exc:  # malformed map must not break startup
-        logger.warning("YASHIGANI_OWUI_SLUG_MAP is not valid JSON (%s) — ignoring", exc)
-    return {}
-
-
-_OWUI_SLUG_MAP: dict[str, str] = _load_owui_slug_map()
-
-
-def _baseline_owui_identity() -> dict:
-    """Synthetic fail-closed baseline for OWUI users with no registered identity.
-
-    RESTRICTED ceiling, empty allowed_models — strictly the LOWEST privilege.
-    Used only when neither the per-user slug NOR the configured default slug
-    resolves to a registered identity. kind="service" keeps it out of the
-    end-user seat count while still being subject to OPA RBAC. It is NEVER the
-    `internal` identity_id, so the brain-reasoning marker cannot be tripped by
-    an OWUI user (that marker keys on identity_id == "internal").
-    """
-    return {
-        "identity_id": _OWUI_DEFAULT_SLUG or "owui-users",
-        "status": "active",
-        "kind": "service",
-        "groups": ["owui-users"],
-        "allowed_models": [],
-        "sensitivity_ceiling": "RESTRICTED",
-        "_owui_forwarded": True,
-        "_owui_baseline": True,
-    }
-
-
-def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
-    """Resolve the ACTUAL OWUI user identity from forwarded headers.
-
-    CALLED ONLY from the internal-bearer fast-path — i.e. the request is already
-    proven to come from the trusted forwarder (OWUI). The forwarded-user header
-    is therefore trustworthy at this point and never consulted elsewhere, which
-    is the whole spoofing defence.
-
-    Returns a registered identity dict (per-user RBAC applies) when the email
-    maps to one; otherwise the configured default-slug identity; otherwise the
-    synthetic baseline-RESTRICTED identity. NEVER returns None and NEVER returns
-    a privilege higher than the matched identity — fail-closed by construction.
-    Returns None only to signal "no forwarded user present" so the caller can
-    fall through to the flat `internal` service identity (preserves the
-    orchestration / brain path, which carries NO forwarded-user header).
-    """
-    if not _OWUI_FORWARD_ENABLED:
-        return None
-    email = request.headers.get(_OWUI_USER_EMAIL_HEADER, "").strip()
-    if not email:
-        # No forwarded user -> not an OWUI per-user call (e.g. brain self-call,
-        # in-mesh agent). Caller falls back to flat `internal`.
-        return None
-    email_l = email.lower()
-
-    # Registry unavailable -> fail-closed to baseline (NEVER internal/elevated).
-    if _state.identity_registry is None:
-        logger.warning(
-            "OWUI forwarded user %r present but identity_registry unavailable — "
-            "baseline-RESTRICTED", email,
-        )
-        return _baseline_owui_identity()
-
-    # Resolve candidate slug: explicit map override first, else canonical email slug.
-    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
-    # kept (e.g. "dana.lee"), which never matched the identity registered at login
-    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
-    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
-    slug = _OWUI_SLUG_MAP.get(email_l)
-    if not slug:
-        try:
-            from yashigani.identity.slug import email_to_slug as _email_to_slug
-            slug = _email_to_slug(email_l)
-        except (ValueError, Exception) as _exc:
-            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
-            slug = ""
-
-    identity = None
-    if slug:
-        try:
-            identity = _state.identity_registry.get_by_slug(slug)
-        except Exception as exc:  # registry blip — fail-closed to baseline
-            logger.warning("OWUI slug lookup failed for %r (%s) — baseline", slug, exc)
-            identity = None
-
-    if identity:
-        identity = dict(identity)
-        identity["_owui_forwarded"] = True
-        identity["_owui_email"] = email
-        return identity
-
-    # No per-user match -> configured default-slug identity if registered.
-    if _OWUI_DEFAULT_SLUG:
-        try:
-            default_ident = _state.identity_registry.get_by_slug(_OWUI_DEFAULT_SLUG)
-        except Exception:
-            default_ident = None
-        if default_ident:
-            default_ident = dict(default_ident)
-            default_ident["_owui_forwarded"] = True
-            default_ident["_owui_email"] = email
-            default_ident["_owui_default"] = True
-            return default_ident
-
-    # Nothing registered -> synthetic baseline-RESTRICTED.
-    logger.info(
-        "OWUI user %r mapped to baseline (no identity for slug %r, no default %r)",
-        email, slug, _OWUI_DEFAULT_SLUG,
-    )
-    return _baseline_owui_identity()
+# (4.1 SEC-GAP-1: _load_owui_slug_map, _OWUI_SLUG_MAP, _baseline_owui_identity,
+#  and _resolve_owui_forwarded_user removed.  Identity resolved from
+#  X-Yashigani-Identity-Id only; no email/slug derivation in the authz path.)
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +762,7 @@ class OpenAIRouterState:
         # fast hmac.compare_digest on every request.
         #
         # Role classes:
-        #   "p2_forwarder"   — OWUI trusted forwarder; may set X-OpenWebUI-User-Email
+        #   "p2_forwarder"   — backoffice/chat trusted forwarder; sets X-Yashigani-Identity-Id
         #   "p2_orchestrator"— Gateway orchestrator self-call; may set X-Yashigani-
         #                      Orchestration-Principal
         #   "p1_agent"       — Bundled agent (Letta, Langflow, OpenClaw); resolves as
@@ -1506,7 +1354,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "detail": (
                     "POST /v1/chat/completions requires an authenticated identity. "
                     "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Forwarded-User header from Caddy)."
+                    "the SSO flow (X-Yashigani-Identity-Id header forwarded by Caddy)."
                 ),
                 "request_id": request_id,
             },
@@ -2208,7 +2056,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 content={
                     "error": {
                         # R2: human-readable message so OWUI displays it in chat.
-                        "message": _owui_deny_message("model_not_allocated"),
+                        "message": _deny_message("model_not_allocated"),
                         "type": "policy_denied",
                         "code": "model_not_allocated",
                     }
@@ -2328,7 +2176,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 status_code=403,
                 content={
                     "error": {
-                        "message": _owui_deny_message(_perm_deny_reason),
+                        "message": _deny_message(_perm_deny_reason),
                         "type": "policy_denied",
                         "code": _perm_deny_reason,
                     }
@@ -2358,7 +2206,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": _owui_deny_message(_perm_deny_reason),
+                            "message": _deny_message(_perm_deny_reason),
                             "type": "policy_denied",
                             "code": _perm_deny_reason,
                         }
@@ -2386,7 +2234,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": _owui_deny_message(_perm_deny_reason),
+                            "message": _deny_message(_perm_deny_reason),
                             "type": "policy_denied",
                             "code": _perm_deny_reason,
                         }
@@ -2445,7 +2293,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message("model_not_allocated"),
+                    "message": _deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -2478,7 +2326,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message(opa_reason),
+                    "message": _deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -2518,7 +2366,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message("model_not_allocated"),
+                    "message": _deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -2546,7 +2394,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # R2: human-readable message so OWUI displays it in chat.
             # _ce_reason is a comma-joined set of machine deny codes; it is kept
             # in `code` for operator tooling but never shown to the end user.
-            content={"error": {"message": _owui_deny_message("client_policy_denied"),
+            content={"error": {"message": _deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_reason}},
             headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
@@ -2613,7 +2461,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             status_code=status.HTTP_403_FORBIDDEN,
                             content={
                                 "error": {
-                                    "message": _owui_deny_message("pii_detected"),
+                                    "message": _deny_message("pii_detected"),
                                     "type": "pii_blocked",
                                     "code": "pii_detected",
                                     # Operator/diagnostic fields — not shown in OWUI chat.
@@ -2642,7 +2490,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                         status_code=status.HTTP_403_FORBIDDEN,
                                         content={
                                             "error": {
-                                                "message": _owui_deny_message("pii_detected_encoded"),
+                                                "message": _deny_message("pii_detected_encoded"),
                                                 "type": "pii_blocked",
                                                 "code": "pii_detected_encoded",
                                                 "matched_views": sorted(_msg_res.matched_views),
@@ -3409,7 +3257,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     content={
                         "error": {
                             # R2: human-readable message so OWUI displays it in chat.
-                            "message": _owui_deny_message(resp_opa_reason),
+                            "message": _deny_message(resp_opa_reason),
                             "type": "response_policy_denied",
                             "code": resp_opa_reason,
                         }
@@ -3435,7 +3283,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         return JSONResponse(
             status_code=403,
             # R2: human-readable message so OWUI displays it in chat.
-            content={"error": {"message": _owui_deny_message("client_policy_denied"),
+            content={"error": {"message": _deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_eg_reason}},
             headers={"X-Yashigani-Request-Id": request_id,
                      "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
@@ -3606,7 +3454,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 "detail": (
                     "POST /v1/embeddings requires an authenticated identity. "
                     "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Forwarded-User header from Caddy)."
+                    "the SSO flow (X-Yashigani-Identity-Id header forwarded by Caddy)."
                 ),
                 "request_id": request_id,
             },
@@ -3716,7 +3564,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message(opa_reason),
+                    "message": _deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -3757,7 +3605,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message("routing_unsafe_sensitive_to_cloud"),
+                    "message": _deny_message("routing_unsafe_sensitive_to_cloud"),
                     "type": "policy_denied",
                     "code": "routing_unsafe_sensitive_to_cloud",
                 }
@@ -3973,7 +3821,7 @@ async def list_models(request: Request):
     Open WebUI carries the admin session cookie (it lives at /chat/* behind
     the same Caddy auth) so the picker still populates after login. MCP
     clients that hit `/v1/models` directly must present a valid Bearer
-    token or X-Forwarded-User header to enumerate.
+    token or X-Yashigani-Identity-Id (SSO via Caddy) to enumerate.
 
     v2.24.1 — GAP-001 (Iris audit): OPA evaluation added after identity
     resolution.  Human/admin principals receive full list; service-account
@@ -4327,13 +4175,18 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     """
     Resolve identity from request.
 
-    Priority:
+    Priority (4.1 SEC-GAP-1):
     1. yashigani-internal Bearer token (mesh-port internal service calls)
-    2. X-Forwarded-User header (SSO via Caddy)
+       → X-Yashigani-Identity-Id for per-user on forwarder path
+    2. request.state.ysg_principal (pre-resolved by proxy.py boundary block
+       from X-Yashigani-Identity-Id for SSO/browser-session path via Caddy)
     3. Authorization: Bearer <api_key> (registry lookup)
 
+    X-Forwarded-User / X-OpenWebUI-User-Email paths REMOVED in 4.1.
+    Fail-closed: no bearer + no pre-resolved UID + no api-key → returns None → 401.
+
     The yashigani-internal check is intentionally placed BEFORE the
-    identity_registry null-guard so that Open WebUI's hardcoded internal
+    identity_registry null-guard so that the hardcoded internal
     token resolves even when the identity registry is temporarily
     unavailable (e.g. Redis not yet reachable at startup).  Network
     isolation on the data bridge / K8s NetworkPolicy is the transport-
@@ -4379,33 +4232,27 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
                     )
-                # 4.0: prefer X-Yashigani-Identity-Id (idnt_ PK) over the email header.
+                # 4.1 SEC-GAP-1: X-Yashigani-Identity-Id only — no email/slug path.
                 # _resolve_yashigani_identity_id_header raises 403/503 on failure so
-                # control NEVER falls through to the email path when the idnt_ header
-                # is present (fail-closed per LAURA-4.0-S1-001).
+                # control NEVER falls through when the idnt_ header is present
+                # (fail-closed per LAURA-4.0-S1-001).
                 yashigani_identity = _resolve_yashigani_identity_id_header(request)
                 if yashigani_identity is not None:
                     return yashigani_identity
-                # Backward compat: 3.x OWUI forwarder sends X-OpenWebUI-User-Email.
-                owui_identity = _resolve_owui_forwarded_user(request)
-                if owui_identity is not None:
-                    return owui_identity
+                # No UID header → service internal (RESTRICTED), no phantom default.
                 return {"identity_id": "internal", "status": "active", "kind": "service",
                         "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
 
             elif role_class in ("p1_agent", "p1_nhi"):
                 # P1 agent/NHI: resolve as OWN identity only.
                 # Strip any P2 impersonation headers and emit security event.
+                # 4.1 SEC-GAP-1: X-OpenWebUI-User-Email check removed; strip
+                # X-Yashigani-Identity-Id + orchestration-principal only.
                 orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
-                owui_hdr = request.headers.get(_OWUI_USER_EMAIL_HEADER, "")
                 identity_id_hdr = request.headers.get(_YASHIGANI_IDENTITY_ID_HEADER, "")
                 if orch_hdr:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
-                    )
-                if owui_hdr:
-                    _emit_agent_header_stripped(
-                        _OWUI_USER_EMAIL_HEADER, role_class, token_identity_id
                     )
                 if identity_id_hdr:
                     _emit_agent_header_stripped(
@@ -4474,26 +4321,16 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     return real
 
             # ── Track C (F-B): trusted-forwarder per-user resolution ──
-            # Priority 1 (4.0 native WebUI): X-Yashigani-Identity-Id (idnt_ PK).
-            #   The 4.0 backoffice chat proxy resolves identity_id from the session's
-            #   account_id and forwards the idnt_ PK directly.  No slug/email
-            #   derivation needed — the PK is looked up directly in the registry.
-            #   Fail-closed: if header present but identity not found → 403 (no fallback).
-            #
-            # Priority 2 (3.x OWUI backward compat): X-OpenWebUI-User-Email.
-            #   OWUI (3.x) sets this to the user's email; the gateway derives a slug.
-            #   Preserved so existing 3.x deployments are unaffected.
-            #
+            # 4.1 SEC-GAP-1: X-Yashigani-Identity-Id ONLY (idnt_ PK).
+            #   The backoffice chat proxy forwards the idnt_ PK directly.
+            #   Fail-closed: header present but not in registry → 403 (no fallback).
+            #   X-OpenWebUI-User-Email / X-Forwarded-User paths removed.
             # ORDERING: runs AFTER orchestration-principal check. Brain/in-mesh agent
-            # self-calls carry NEITHER header; they fall through to `internal`.
-            # SPOOFING DEFENSE: only inside the proven-internal-bearer branch; an
-            # external caller without the bearer never reaches this code.
+            # self-calls carry neither header; they fall through to `internal`.
+            # SPOOFING DEFENSE: only inside the proven-internal-bearer branch.
             yashigani_identity = _resolve_yashigani_identity_id_header(request)
             if yashigani_identity is not None:
                 return yashigani_identity
-            owui_identity = _resolve_owui_forwarded_user(request)
-            if owui_identity is not None:
-                return owui_identity
 
             return {"identity_id": "internal", "status": "active", "kind": "service",
                     "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
@@ -4522,37 +4359,14 @@ def _resolve_identity(request: Request) -> Optional[dict]:
         if _oir_identity is not None:
             return _oir_identity
         # principal was pre-resolved but registry blip prevented dict fetch —
-        # fall through to legacy paths rather than fail-open with partial data
+        # fall through to API-key auth rather than fail-open with partial data
 
-    # ── SSO headers (from Caddy) ── LAURA-OBS-B: trust-gate X-Forwarded-User ──
-    # X-Forwarded-User is the 3.x SSO identity Caddy's forward_auth re-injects.
-    # In 4.x the canonical header is X-Yashigani-Identity-Id (above); this path
-    # is preserved for backward-compat with 3.x Caddyfile deployments only.
-    #
-    # ASYMMETRY CLOSED: X-OpenWebUI-User-* is honoured ONLY inside the proven
-    # internal-bearer branch above, but X-Forwarded-User was previously honoured
-    # here UNCONDITIONALLY.  On the mesh listener (8081) CaddyVerifiedMiddleware is
-    # NOT active (mesh_entrypoint: "N/A for direct mesh calls"), so a raw in-mesh
-    # caller (e.g. OWUI's own network) could set `X-Forwarded-User: coderuser` and
-    # be served coderuser's identity — an in-mesh identity-reassignment primitive.
-    # Caddy strips it at the public edge so it is not edge-exploitable today, but
-    # the latent asymmetry is closed here.
-    #
-    # FIX: honour X-Forwarded-User ONLY when the request carries a VALID
-    # X-Caddy-Verified-Secret — the SAME cryptographic trust proof that anchors the
-    # legitimate Caddy forward_auth/SSO path.  A genuine SSO request (proxied
-    # through Caddy 8080) always carries it, so the per-user API/SSO path is
-    # preserved byte-for-byte.  A raw mesh caller without the secret is IGNORED
-    # (falls through to API-key auth below).  validate_caddy_secret fail-closes
-    # when the secret is unloaded (returns False), so this never fail-opens.
-    from yashigani.auth.caddy_verified import validate_caddy_secret
-    forwarded_user = request.headers.get("X-Forwarded-User")
-    if forwarded_user and validate_caddy_secret(
-        request.headers.get("X-Caddy-Verified-Secret", "")
-    ):
-        identity = _state.identity_registry.get_by_slug(forwarded_user)
-        if identity:
-            return identity
+    # 4.1 SEC-GAP-1: X-Forwarded-User / slug-based SSO path removed.
+    # SSO identity now flows exclusively via X-Yashigani-Identity-Id (idnt_ PK),
+    # pre-resolved by proxy.py 0b boundary block into request.state.ysg_principal
+    # (handled above).  No X-Forwarded-User / get_by_slug() on this path.
+    # Fail-closed: no valid UID pre-resolution → falls through to API-key auth
+    # below; no bearer + no api-key → returns None → 401.
 
     # API key (registry lookup)
     if auth.startswith("Bearer "):

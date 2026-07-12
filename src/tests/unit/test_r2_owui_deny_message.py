@@ -4,7 +4,7 @@ R2 — fix/2.25.5-owui-deny-message: gateway deny responses carry human-readable
 in chat instead of a generic "Oops! There was an error."
 
 Tests cover:
-  1. _owui_deny_message() lookup table — known codes, unknown code fallback
+  1. _deny_message() lookup table — known codes, unknown code fallback
   2. model_not_allocated deny (explicit-pin + alloc-bind) returns
      OpenAI error schema with human-readable message
   3. OPA v1 ingress deny (identity_not_active, sensitivity_ceiling_exceeded)
@@ -23,60 +23,60 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 
 # ---------------------------------------------------------------------------
-# Section 1 — _owui_deny_message lookup table
+# Section 1 — _deny_message lookup table
 # ---------------------------------------------------------------------------
 
 class TestOwuiDenyMessageLookup:
-    """_owui_deny_message() returns layman strings from the lookup table."""
+    """_deny_message() returns layman strings from the lookup table."""
 
     def test_model_not_allocated_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("model_not_allocated")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("model_not_allocated")
         assert "model" in msg.lower() or "administrator" in msg.lower()
         # Must NOT contain the machine code
         assert "model_not_allocated" not in msg
 
     def test_identity_not_active_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("identity_not_active")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("identity_not_active")
         assert "account" in msg.lower() or "active" in msg.lower()
         assert "identity_not_active" not in msg
 
     def test_sensitivity_ceiling_exceeded_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("sensitivity_ceiling_exceeded")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("sensitivity_ceiling_exceeded")
         assert "sensitivity" in msg.lower() or "clearance" in msg.lower()
         assert "sensitivity_ceiling_exceeded" not in msg
 
     def test_opa_unreachable_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("opa_unreachable")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("opa_unreachable")
         assert "temporarily" in msg.lower() or "unavailable" in msg.lower()
         assert "opa_unreachable" not in msg
 
     def test_pii_detected_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("pii_detected")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("pii_detected")
         assert "personal" in msg.lower() or "data" in msg.lower()
         assert "pii_detected" not in msg
 
     def test_pii_detected_encoded_is_human_readable(self):
-        from yashigani.gateway.openai_router import _owui_deny_message
-        msg = _owui_deny_message("pii_detected_encoded")
+        from yashigani.gateway.openai_router import _deny_message
+        msg = _deny_message("pii_detected_encoded")
         assert "encoded" in msg.lower() or "personal" in msg.lower()
         assert "pii_detected_encoded" not in msg
 
     def test_unknown_code_returns_generic_message(self):
-        from yashigani.gateway.openai_router import _owui_deny_message, _OWUI_GENERIC_DENY
-        msg = _owui_deny_message("totally_unknown_reason_xyz")
-        assert msg == _OWUI_GENERIC_DENY
+        from yashigani.gateway.openai_router import _deny_message, _GENERIC_DENY
+        msg = _deny_message("totally_unknown_reason_xyz")
+        assert msg == _GENERIC_DENY
         # Generic message must be human-readable, no machine code
         assert "totally_unknown" not in msg
         assert len(msg) > 20
 
     def test_all_table_entries_are_strings(self):
-        from yashigani.gateway.openai_router import _OWUI_DENY_MESSAGES
-        for code, msg in _OWUI_DENY_MESSAGES.items():
+        from yashigani.gateway.openai_router import _DENY_MESSAGES
+        for code, msg in _DENY_MESSAGES.items():
             assert isinstance(msg, str), f"Entry for {code!r} is not a string"
             assert len(msg) > 10, f"Entry for {code!r} is suspiciously short"
             # The machine code must not appear verbatim in its own message
@@ -84,8 +84,8 @@ class TestOwuiDenyMessageLookup:
 
     def test_all_table_messages_mention_action_or_contact(self):
         """Every deny message should tell the user what to do next."""
-        from yashigani.gateway.openai_router import _OWUI_DENY_MESSAGES
-        for code, msg in _OWUI_DENY_MESSAGES.items():
+        from yashigani.gateway.openai_router import _DENY_MESSAGES
+        for code, msg in _DENY_MESSAGES.items():
             msg_lower = msg.lower()
             has_guidance = (
                 "administrator" in msg_lower
@@ -326,9 +326,9 @@ class TestOPAIngressDenyMessages:
     @pytest.mark.asyncio
     async def test_opa_ingress_reason_maps_to_human_message(self, reason, expected_substring):
         """_opa_v1_check deny with known reason → human-readable error.message."""
-        from yashigani.gateway.openai_router import _owui_deny_message
+        from yashigani.gateway.openai_router import _deny_message
 
-        msg = _owui_deny_message(reason)
+        msg = _deny_message(reason)
         # message must be human-readable and contain the expected word
         assert expected_substring in msg.lower(), (
             f"For reason={reason!r}, expected {expected_substring!r} in message: {msg!r}"
@@ -365,9 +365,9 @@ class TestOPAResponseDenyShape:
     ])
     def test_response_deny_message_is_human_readable(self, reason, expected_substring):
         """Response-path OPA reason codes map to human-readable messages."""
-        from yashigani.gateway.openai_router import _owui_deny_message
+        from yashigani.gateway.openai_router import _deny_message
 
-        msg = _owui_deny_message(reason)
+        msg = _deny_message(reason)
         assert expected_substring in msg.lower(), (
             f"For reason={reason!r}, expected {expected_substring!r} in: {msg!r}"
         )
@@ -387,13 +387,13 @@ class TestEnforcementUnchanged:
         """model_not_allocated deny is still HTTP 403 after the message fix."""
         # Verify via direct JSONResponse construction (shape test)
         from fastapi.responses import JSONResponse
-        from yashigani.gateway.openai_router import _owui_deny_message
+        from yashigani.gateway.openai_router import _deny_message
 
         resp = JSONResponse(
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message("model_not_allocated"),
+                    "message": _deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -404,13 +404,13 @@ class TestEnforcementUnchanged:
     def test_opa_deny_still_403(self):
         """OPA ingress deny is still HTTP 403 after the message fix."""
         from fastapi.responses import JSONResponse
-        from yashigani.gateway.openai_router import _owui_deny_message
+        from yashigani.gateway.openai_router import _deny_message
 
         resp = JSONResponse(
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message("identity_not_active"),
+                    "message": _deny_message("identity_not_active"),
                     "type": "policy_denied",
                     "code": "identity_not_active",
                 }
@@ -421,14 +421,14 @@ class TestEnforcementUnchanged:
     def test_error_schema_has_all_three_fields(self):
         """error.message, error.type, and error.code are all present."""
         from fastapi.responses import JSONResponse
-        from yashigani.gateway.openai_router import _owui_deny_message
+        from yashigani.gateway.openai_router import _deny_message
         import json
 
         resp = JSONResponse(
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message("sensitivity_ceiling_exceeded"),
+                    "message": _deny_message("sensitivity_ceiling_exceeded"),
                     "type": "policy_denied",
                     "code": "sensitivity_ceiling_exceeded",
                 }

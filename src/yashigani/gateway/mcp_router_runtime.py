@@ -28,7 +28,7 @@ G-ORCH-OPA-1 (egress gate — v3.1):
 
   Caller sensitivity ceiling (G-ORCH-OPA-1 / Option A — v3.1):
     ctx.caller_sensitivity_ceiling is populated from the identity registry at
-    call time (Option A: registry lookup keyed by user_id from X-Forwarded-User).
+    call time (Option A: registry lookup keyed by identity_id from X-Yashigani-Identity-Id — 4.1 SEC-GAP-1).
     The identity registry is passed from the proxy (openai_router._state) so no
     new store is introduced.
 
@@ -91,8 +91,8 @@ def _mesh_caller_is_internal(request: Request) -> bool:
     The per-install YASHIGANI_INTERNAL_BEARER is present on ALL legitimate
     mesh callers (orchestrator self-calls, OWUI, 4.0 native chat path).
     Only when this token is verified should identity-forwarding headers
-    (X-Forwarded-User, X-Yashigani-Orchestration-Depth/Principal,
-    X-Yashigani-Identity-Id) be trusted.
+    (X-Yashigani-Identity-Id, X-Yashigani-Orchestration-Depth/Principal)
+    be trusted.  4.1 SEC-GAP-1: X-Forwarded-User removed from the trusted set.
 
     An anonymous caller on port :8081 cannot know the per-install bearer —
     so any identity header without it is a header-spoof attempt.
@@ -198,7 +198,7 @@ async def dispatch_mcp_call(
     identity_registry:
         Optional IdentityRegistry instance.  When provided, the caller's
         sensitivity_ceiling is looked up from the registry (keyed by the
-        X-Forwarded-User slug) and set on McpCallContext.caller_sensitivity_ceiling
+        X-Yashigani-Identity-Id — 4.1 SEC-GAP-1) and set on McpCallContext.caller_sensitivity_ceiling
         before the G-ORCH-OPA-1 egress enforce_result() call.  When absent,
         ctx.caller_sensitivity_ceiling remains None → OPA fails-closed.
         Passed from the proxy (openai_router._state.identity_registry) —
@@ -245,8 +245,10 @@ async def _handle_mcp_call_inner(
     # Runs BEFORE any resource lookup so that spoof attempts against any path
     # (including non-existent agents that would 404) are caught and audited.
     #
-    # Identity-forwarding headers (X-Forwarded-User, X-Yashigani-Orchestration-*)
+    # Identity-forwarding headers (X-Yashigani-Identity-Id, X-Yashigani-Orchestration-*)
     # are ONLY trusted if the caller proves internal mesh identity via:
+    # 4.1 SEC-GAP-1: X-Forwarded-User removed; X-Yashigani-Identity-Id is the
+    # canonical identity rail.
     #   (a) YASHIGANI_INTERNAL_BEARER — present on ALL legitimate mesh callers
     #       (orchestrator self-calls, OWUI, 4.0 native chat path), OR
     #   (b) X-Caddy-Verified-Secret — present on requests proxied through Caddy

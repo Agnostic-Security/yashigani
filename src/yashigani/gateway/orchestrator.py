@@ -1163,8 +1163,8 @@ def _seed_denied(request_id: str, reason: str, sensitivity_level: str):
     # `code` field + X-Yashigani-OPA-Reason header for support/automation (decode
     # via the reason map / decision-code-legend.yml). Deferred import avoids a
     # module-load cycle (openai_router lazy-imports run_orchestration from here).
-    from yashigani.gateway.openai_router import _owui_deny_message
-    human_message = _owui_deny_message(safe_reason)
+    from yashigani.gateway.openai_router import _deny_message
+    human_message = _deny_message(safe_reason)
     return JSONResponse(
         status_code=403,
         content={
