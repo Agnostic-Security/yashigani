@@ -412,12 +412,13 @@ OPTIONS
                        Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
     Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
                        Container ollama bypassed; host ollama must be pre-installed
-                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding,
-                       Docker Desktop VPNKit relays container→host.docker.internal
-                       to Mac loopback — LAN fully isolated):
+                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding):
                          OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       Docker: VPNKit relays container→host.docker.internal to Mac loopback.
+                       Podman: gvproxy (192.168.127.254) relays container→host.containers.internal.
+                       Both runtimes: LAN fully isolated, loopback-only binding.
                        Auto-detected on Darwin arm64.
-                       Overlay: docker-compose.gpu-mac-metal.yml. [TESTED: Apple M4 ✓]
+                       Overlay: gpu-mac-metal.yml (Docker) / gpu-mac-metal-podman.yml (Podman). [TESTED: Apple M4 ✓]
     Vulkan           — Linux: Intel Arc (A/B-series) + Intel iGPU (HD/UHD/Iris/Xe)
     (Intel iGPU /      + AMD Ryzen AI APUs (gfx1150/1151 — ROCm experimental on APU,
      AMD APU)           Vulkan preferred). Requires mesa-vulkan-drivers + /dev/dri.
@@ -7164,6 +7165,39 @@ compose_up() {
     log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
     log_info "  ollama-init disabled (models managed on host)"
     log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
+  fi
+
+  # GPU overlay — Apple Metal / macOS host-native ollama — Podman runtime path.
+  # Identical intent to the Docker path above; different host-loopback relay.
+  # Podman machine on macOS uses gvproxy (192.168.127.254) — no VPNKit.
+  # Container→192.168.127.254:11434 → gvproxy → 127.0.0.1:11434 on Mac host.
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via gvproxy (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
+    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
+    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
+    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      log_error "Apple Metal (Podman): host ollama not reachable on 127.0.0.1:11434"
+      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
+      log_error "  Then pre-pull models:"
+      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+      log_error "  gvproxy will relay caddy→host.containers.internal:11434 to 127.0.0.1."
+      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
+      return 1
+    fi
+    compose_files+=("-f" "$_gpu_overlay_mac_metal_podman")
+    log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml)"
+    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:192.168.127.254]"
+    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
+    log_info "  ollama-init disabled (models managed on host)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via gvproxy 192.168.127.254 (loopback only)"
   fi
 
   # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).
