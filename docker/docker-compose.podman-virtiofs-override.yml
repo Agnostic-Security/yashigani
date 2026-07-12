@@ -4,7 +4,7 @@
 #   -f docker/docker-compose.podman-override.yml \
 #   -f docker/docker-compose.podman-virtiofs-override.yml \
 #   up -d
-# Last updated: 2026-07-11T01:00:00+00:00 (fix(deps): GHSA-537c-gmf6-5ccf — OPENSSL_armcap=0x8fd baked globally; remove mac-only armcap override)
+# Last updated: 2026-07-12T00:00:00+00:00 (fix(podman-mac): langflow OPENSSL_armcap=0x8fd — suppress SVE SIGILL on applehv VM; GHSA-537c-gmf6-5ccf was baked into gateway/backoffice Dockerfiles; third-party langflow image requires compose-layer fix)
 #
 # WHY THIS FILE EXISTS (LINUX-SHARED-MOUNT-UID-CLOBBER regression — PR #138):
 #
@@ -123,3 +123,21 @@ services:
   budget-redis:
     volumes:
       - ./secrets:/run/secrets:ro,U
+
+  # langflow — third-party image, cannot bake OPENSSL_armcap into Dockerfile.
+  # Root cause: cryptography >=46.0.0 ships a Rust/OpenSSL arm64 binary
+  # (_rust.abi3.so) that calls `cntb x0` (SVE) inside OPENSSL_cpuid_setup based
+  # on HWCAP2 SVE2 flag.  The podman applehv VM (Apple Hypervisor.framework) sets
+  # the SVE2 HWCAP2 bit but SVE instructions fault with SIGILL at runtime —
+  # the hypervisor advertises the feature but does not expose the SVE execution
+  # context to the guest.
+  # Fix: OPENSSL_armcap=0x8fd masks out all SVE/SVE2 bits (bits ≥10 unset)
+  # while keeping AES/PMULL/SHA1/SHA256/SHA512/CPUID/RNG/SHA3 (bits 0-7+11).
+  # Bit 14 = 0 so the `tbz w0, #0xe` guard in OPENSSL_cpuid_setup skips the
+  # `bl _armv8_sve_get_vl_bytes` call entirely.  Same value baked into
+  # gateway/backoffice Dockerfiles (GHSA-537c-gmf6-5ccf, 2026-07-11).
+  # macOS-Podman ONLY: Linux Podman on aarch64 hardware has correct SVE support;
+  # this override must NOT be applied on Linux (install.sh gates on uname Darwin).
+  langflow:
+    environment:
+      OPENSSL_armcap: "0x8fd"

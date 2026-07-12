@@ -1483,11 +1483,22 @@ resolve_compose_cmd() {
       log_error "If you meant Docker, set YSG_RUNTIME=docker instead."
       exit 1
     fi
-    # podman-compose (Python) FIRST: sequential, stable, native to Podman.
-    # We do NOT fall through to docker-compose — passing docker-compose a Podman
-    # socket via DOCKER_HOST works for simple cases but breaks on seccomp profile
-    # paths (Pentest #95 TM-V231-005), security_opt parsing, and a few other places
-    # where docker-compose makes Docker-specific assumptions about the socket.
+    # `podman compose` (v2 engine, delegates to docker-compose) FIRST:
+    # docker-compose v2 correctly handles `depends_on: condition: service_healthy`
+    # and `service_completed_successfully`. podman-compose 1.x ignores those
+    # conditions — a container whose only depends_on entries are service_healthy
+    # never advances past Created (podman-compose bug, confirmed v1.5.0–v1.6.0;
+    # reproduces on macOS applehv VM with letta / letta-pgbouncer / langflow).
+    # `podman compose` passes the Podman socket via DOCKER_HOST; docker-compose v2
+    # is Podman-socket-aware and handles security_opt / userns_mode / cap_drop
+    # correctly.  We do NOT fall through to bare docker-compose — this branch is
+    # Podman-only and the tool MUST be reached via the Podman provider path.
+    if podman compose version >/dev/null 2>&1; then
+      COMPOSE_CMD=("podman" "compose")
+      YSG_PODMAN_RUNTIME=true
+      log_info "Compose tool: podman compose (v2 engine — service_healthy-aware)"
+      return 0
+    fi
     if command -v podman-compose >/dev/null 2>&1; then
       # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
       # podman-compose defaults to one pod per project; the NVIDIA CDI hook
@@ -1495,15 +1506,11 @@ resolve_compose_cmd() {
       # inside that pod, wedging ollama + everything that depends on it. The same
       # CDI device works in a standalone `podman run` (no pod), so we disable the
       # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
+      # NOTE: podman-compose 1.x does NOT handle service_healthy depends_on
+      # conditions — use only as a last resort when `podman compose` is absent.
       COMPOSE_CMD=("podman-compose" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
-      return 0
-    fi
-    if podman compose version >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (Podman 4+ built-in)"
+      log_info "Compose tool: podman-compose (fallback; service_healthy may not be honoured)"
       return 0
     fi
     log_error "YSG_RUNTIME=podman but no native Podman compose tool found. Install:"
@@ -1522,16 +1529,21 @@ resolve_compose_cmd() {
   # Docker branch only considers docker compose / docker-compose. No mixing.
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    if command -v podman-compose >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman-compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (auto-detect)"
-      return 0
-    fi
+    # Prefer `podman compose` (v2 engine) over podman-compose (1.x Python).
+    # podman-compose 1.x ignores depends_on service_healthy / service_completed_
+    # successfully conditions — containers stay Created forever (confirmed v1.5.0-v1.6.0).
+    # `podman compose` delegates to the docker-compose v2 binary which handles
+    # these conditions correctly.
     if podman compose version >/dev/null 2>&1; then
       COMPOSE_CMD=("podman" "compose")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (auto-detect, built-in)"
+      log_info "Compose tool: podman compose (auto-detect, v2 engine)"
+      return 0
+    fi
+    if command -v podman-compose >/dev/null 2>&1; then
+      COMPOSE_CMD=("podman-compose")
+      YSG_PODMAN_RUNTIME=true
+      log_info "Compose tool: podman-compose (auto-detect, fallback)"
       return 0
     fi
     # Podman is reachable but neither podman-compose nor `podman compose` is
