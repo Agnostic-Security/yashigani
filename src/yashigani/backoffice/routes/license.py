@@ -58,19 +58,37 @@ def get_license_banner_context(now: Optional[datetime] = None) -> dict:
     Return a context dict suitable for injection into every Jinja2 template.
 
     Keys:
-      license_mode      — str value of LicenseExpiryMode (e.g. "active", "warning")
+      license_mode      — str value of LicenseExpiryMode (e.g. "active", "warning"),
+                          OR "tampered" (design §5 — build-integrity violation)
       license_days      — int | None (days remaining; negative = past expiry; None = perpetual)
       license_expires   — ISO-8601 string | None
       license_banner    — dict with keys: show (bool), severity (str), message (str)
 
     This helper is safe to call before the licence is fully loaded (returns ACTIVE defaults
     if the licensing module is unavailable).
+
+    Design §5 fail-mode ("Module tampered / hash mismatch / leaf-cert invalid"):
+    the persistent tamper banner takes priority over the expiry-based banner —
+    checked FIRST, unconditionally, via enforcer.is_license_tampered() (distinct
+    from get_license() returning COMMUNITY_LICENSE, which is ALSO the return
+    value for "no license configured at all" — the tamper banner must only show
+    for a GENUINE integrity violation, never for a plain Community deployment
+    that never added a key).
     """
     try:
         from yashigani.licensing import get_license
+        from yashigani.licensing.enforcer import is_license_tampered
         from yashigani.licensing.model import LicenseExpiryMode  # noqa: F401 — used in _build_banner
     except ImportError:
         return _banner_defaults()
+
+    try:
+        if is_license_tampered():
+            return _tampered_banner_context()
+    except Exception:
+        # Never let the tamper-status check itself break the banner render —
+        # fall through to the normal expiry-based banner path below.
+        pass
 
     try:
         lic = get_license()
@@ -91,6 +109,31 @@ def get_license_banner_context(now: Optional[datetime] = None) -> dict:
         "license_days": days,
         "license_expires": expires_at_str,
         "license_banner": banner,
+    }
+
+
+def _tampered_banner_context() -> dict:
+    """
+    Design §5: "Community + persistent user-facing banner 'Yashigani license
+    tampered' shown to ALL users. NO user deletion/suspension." — honest
+    status to the operator's own users, not a taunt to an attacker (the
+    banner is unconditional and unmissable; it never blocks login or deletes
+    accounts).
+    """
+    return {
+        "license_mode": "tampered",
+        "license_days": None,
+        "license_expires": None,
+        "license_banner": {
+            "show": True,
+            "severity": "tampered",
+            "message": (
+                "Yashigani license tampered. This deployment's build integrity "
+                "could not be verified — running in Community mode. No accounts "
+                "have been affected. Contact support@agnosticsec.com or "
+                "re-install from a verified release."
+            ),
+        },
     }
 
 

@@ -161,36 +161,43 @@ def set_license(lic: LicenseState) -> None:
     _emit_set_license_audit(lic)
 
 
-def get_license() -> LicenseState:
+def _any_integrity_violated() -> bool:
     """
-    Return the currently active license.
+    T5 / design §5: check ALL five integrity flags (verifier — which also
+    covers the chain-based build-integrity check §4a, enforcer, loader,
+    agents_registry, identity_registry). Returns True if ANY flag is set.
+    Lazy imports to avoid circular dependencies.
 
-    T5: Checks ALL five integrity flags (verifier, enforcer, loader,
-    agents_registry, identity_registry). If ANY flag is True → returns
-    COMMUNITY_LICENSE. Lazy imports to avoid circular dependencies.
+    Shared by get_license() (fails the active license to COMMUNITY) and
+    is_license_tampered() (the standalone tamper-banner signal, §5:
+    "Community + persistent user-facing banner ... to ALL users, NO user
+    deletion") — kept as ONE function so the two call sites can never drift
+    on what counts as tampered.
     """
-    # Verifier integrity (lazy import — circular-safe)
+    # Verifier integrity (lazy import — circular-safe). This also reflects
+    # the chain-based build-integrity check (§4a) — verifier._integrity_violated
+    # is set by BOTH _check_self_integrity() and _check_build_integrity_chain().
     try:
         from yashigani.licensing.verifier import get_integrity_status as _v_status
         if _v_status():
-            return COMMUNITY_LICENSE
+            return True
     except Exception:
         pass  # verifier unavailable — conservative: don't block
 
     if _enforcer_integrity_violated:
-        return COMMUNITY_LICENSE
+        return True
 
     try:
         from yashigani.licensing.loader import get_loader_integrity_status as _l_status
         if _l_status():
-            return COMMUNITY_LICENSE
+            return True
     except Exception:
         pass
 
     try:
         from yashigani.agents.registry import get_agents_registry_integrity_status as _a_status
         if _a_status():
-            return COMMUNITY_LICENSE
+            return True
     except Exception as _exc_agents:
         # IMPL-03: import failure of an integrity module is treated as a
         # violation — an attacker who can cause the import to fail while
@@ -201,12 +208,12 @@ def get_license() -> LicenseState:
             "treating as integrity violation and restraining to Community (IMPL-03): %s",
             _exc_agents,
         )
-        return COMMUNITY_LICENSE
+        return True
 
     try:
         from yashigani.identity.registry import get_identity_registry_integrity_status as _id_status
         if _id_status():
-            return COMMUNITY_LICENSE
+            return True
     except Exception as _exc_identity:
         # IMPL-03: same treatment as agents.registry — import failure → Community.
         logger.critical(
@@ -214,8 +221,37 @@ def get_license() -> LicenseState:
             "treating as integrity violation and restraining to Community (IMPL-03): %s",
             _exc_identity,
         )
-        return COMMUNITY_LICENSE
+        return True
 
+    return False
+
+
+def is_license_tampered() -> bool:
+    """
+    Design §5: standalone signal for the persistent "Yashigani license
+    tampered" banner — distinct from get_license() returning COMMUNITY_LICENSE,
+    which is ALSO the (indistinguishable) return value for "no license
+    configured at all". A caller that needs to show the tamper banner (vs.
+    silently running Community because no key was ever added) must call
+    this, not infer tamper from get_license().tier == COMMUNITY.
+
+    Never raises — any integrity-check import failure is itself treated as
+    a violation by _any_integrity_violated() (IMPL-03), so this function is
+    safe to call from a request-handling path without its own try/except.
+    """
+    return _any_integrity_violated()
+
+
+def get_license() -> LicenseState:
+    """
+    Return the currently active license.
+
+    T5: Checks ALL five integrity flags (verifier, enforcer, loader,
+    agents_registry, identity_registry). If ANY flag is True → returns
+    COMMUNITY_LICENSE.
+    """
+    if _any_integrity_violated():
+        return COMMUNITY_LICENSE
     return _license
 
 
