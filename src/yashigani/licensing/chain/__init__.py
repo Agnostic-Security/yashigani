@@ -31,6 +31,13 @@ from yashigani.licensing.chain.algorithms import (
     verify_signature,
 )
 from yashigani.licensing.chain.anchors import AnchorSet, AnchorStatus, TrustAnchor
+from yashigani.licensing.chain.build_integrity import (
+    BuildIntegrityResult,
+    anchor_set_from_json,
+    kill_list_from_json,
+    leaf_cert_from_json,
+    verify_build_integrity_chain,
+)
 from yashigani.licensing.chain.canonical import (
     CTX_AUDIT_CHECKPOINT,
     CTX_BUNDLE,
@@ -43,7 +50,18 @@ from yashigani.licensing.chain.canonical import (
     leaf_cert_signing_digest,
     licence_payload_signing_digest,
 )
+from yashigani.licensing.chain.kill_list import KillList, KillListEntry, KillListSemantics
 from yashigani.licensing.chain.leaf_cert import SHARED_CLIENT_ID, LeafCert, Role
+from yashigani.licensing.chain.licence_v5 import (
+    LICENCE_WIRE_SEGMENTS,
+    LicenceV5FormatError,
+    LicenceV5VerifyResult,
+    ParsedLicenceV5,
+    build_licence_payload_v5,
+    parse_licence_v5,
+    sign_licence_v5,
+    verify_licence_v5,
+)
 from yashigani.licensing.chain.signer import KmsSigner, PemSigner, PivSigner, Signer
 
 __all__ = [
@@ -66,6 +84,12 @@ __all__ = [
     "AnchorSet",
     "AnchorStatus",
     "TrustAnchor",
+    # build_integrity
+    "BuildIntegrityResult",
+    "anchor_set_from_json",
+    "kill_list_from_json",
+    "leaf_cert_from_json",
+    "verify_build_integrity_chain",
     # canonical
     "CTX_AUDIT_CHECKPOINT",
     "CTX_BUNDLE",
@@ -77,10 +101,23 @@ __all__ = [
     "domain_separated_digest",
     "leaf_cert_signing_digest",
     "licence_payload_signing_digest",
+    # kill_list
+    "KillList",
+    "KillListEntry",
+    "KillListSemantics",
     # leaf_cert
     "SHARED_CLIENT_ID",
     "LeafCert",
     "Role",
+    # licence_v5
+    "LICENCE_WIRE_SEGMENTS",
+    "LicenceV5FormatError",
+    "LicenceV5VerifyResult",
+    "ParsedLicenceV5",
+    "build_licence_payload_v5",
+    "parse_licence_v5",
+    "sign_licence_v5",
+    "verify_licence_v5",
     # signer
     "KmsSigner",
     "PemSigner",
