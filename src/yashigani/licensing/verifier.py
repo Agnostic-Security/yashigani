@@ -1,38 +1,61 @@
 """
-Offline license verifier — ECDSA P-256 (migrating to ML-DSA-65 when cryptography ships FIPS 204).
+Offline license verifier — v5 chain-of-trust (root master -> leaf -> licence).
 
-Last updated: 2026-04-27T21:53:12+01:00
+Last updated: 2026-07-14T00:00:00+00:00 (licence-hardening-v2 Phase B-CORE)
+
+Ref: AgnosticSecurity/Products/Yashigani/licence-hardening-v2-design-20260713.md
+     §3.2 (Licence format v5) + §4a (Build-integrity verify) +
+     §4b (Licence v5 verify) + §5 (Fail-modes) + §6 (kill-list).
 
 License file format:
-    v4 (current): {base64url(utf8(json_payload))}.{base64url(primary_signature)}.{base64url(counter_signature)}
+    v5 (current, ONLY accepted format):
+        base64url(payload) . base64url(leaf_sig) . base64url(canonical(leaf_cert)) . base64url(leaf_cert_sig)
+        (4 dot-separated segments)
 
-v3 format (2-segment, primary signature only) is NO LONGER ACCEPTED.
-LAURA-V231-003: dropping v3 support makes the counter-signature mandatory — an
-attacker with primary-key compromise cannot issue accepted licenses.
+v3 (2-segment) and v4 (3-segment, primary+counter signature) formats are
+NO LONGER ACCEPTED — "v3/v4 dropped — v5 mandatory, no downgrade path"
+(design §3.2). Anything that isn't exactly 4 segments is rejected before
+any signature is attempted (see chain.licence_v5.parse_licence_v5()).
 
-Current key algorithm: ECDSA P-256 (SHA-256).
-Future: ML-DSA-65 (FIPS 204 / CRYSTALS-Dilithium Level 3) — pending cryptography library support.
-The verifier is algorithm-agnostic: load_pem_public_key() + .verify() dispatches by key type.
+Chain-of-trust model (supersedes the old two-parallel-key v4 model): every
+build embeds a master trust-anchor SET (never a single key —
+_integrity.MASTER_ANCHOR_SET_JSON) and this release's code leaf_cert. A v5
+licence carries its OWN licence-role leaf_cert + the master's signature over
+it, so the verifier — holding only the embedded anchor-SET — validates the
+whole chain offline. Because verification is "chains to master", a licence
+signed by leaf-N still verifies on release N+1, N+2, ... (this closes the
+v4 bug where a licence's counter-signature stopped verifying after a
+release rotated the counter key — see design §0).
 
-Payload versions:
+Payload versions (unchanged field-resolution logic from v4 — see
+_build_license_state()):
     v1 — max_agents, max_orgs only
     v2 — adds max_users (renamed to max_end_users in v3)
-    v3 — max_agents, max_end_users, max_admin_seats, max_orgs, key_alg (current)
+    v3 — max_agents, max_end_users, max_admin_seats, max_orgs, key_alg
+    v5 — v3's fields carried forward unchanged, PLUS client_id,
+         licence_serial, signed_at, alg (design §3.2)
 
 Backwards compat: v1/v2 payloads missing new fields fall back to
 TIER_DEFAULTS[tier] so existing customer license files keep working.
-(These are payload versions, distinct from the license-file format version above.)
 
-Fail-open on corrupt/unparseable licenses; fail-closed on invalid signatures.
-All licenses must be in v4 format (3-segment). 2-segment licenses are rejected
-with error "license_format_too_old".
+Fail-modes (design §5):
+    - No licence / invalid / chain fails / revoked -> COMMUNITY tier, never
+      block, never delete users.
+    - Build's OWN integrity fails (tamper / self-hash mismatch / leaf_cert
+      won't chain) -> COMMUNITY + persistent tamper banner (surfaced via
+      get_integrity_status(); backoffice/routes/license.py reads it).
 
 Self-integrity check
 --------------------
-At module load this file computes its own SHA-256 digest and compares it against
-_integrity.VERIFIER_HASH.  A mismatch (when the hash is not a placeholder)
-indicates post-build tampering.  The system logs a CRITICAL alert and forces
-COMMUNITY tier for any subsequently verified license.
+At module load this file computes its own SHA-256 digest and compares it
+against _integrity.VERIFIER_HASH (T1-T4 self-hash bundle, unchanged
+mechanism). A mismatch (when the hash is not a placeholder) indicates
+post-build tampering. Separately, the chain-based build-integrity check
+(§4a: anchor-chain + bundle_sig, chain.build_integrity.
+verify_build_integrity_chain()) supersedes the old counter-key/
+HASH_BUNDLE_SIG/EXPECTED_TOKEN_HMAC scheme. Either failure sets
+_integrity_violated and forces COMMUNITY tier for any subsequently
+verified license.
 
 Requires: cryptography>=42.
 """
@@ -47,6 +70,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from yashigani.licensing import _integrity
+from yashigani.licensing.chain import (
+    AnchorSet,
+    KillList,
+    anchor_set_from_json,
+    kill_list_from_json,
+    leaf_cert_from_json,
+    verify_build_integrity_chain,
+    verify_licence_v5,
+)
 from yashigani.licensing.model import (
     COMMUNITY_LICENSE,
     TIER_DEFAULTS,
@@ -54,21 +87,8 @@ from yashigani.licensing.model import (
     LicenseState,
     LicenseTier,
 )
-from yashigani.licensing import _integrity
 
 logger = logging.getLogger(__name__)
-
-# ECDSA P-256 production public key — private key stored in KMS.
-# Will migrate to ML-DSA-65 (FIPS 204) when cryptography library ships support.
-_PUBLIC_KEY_PEM = """\
------BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9v3e5INc8Mr7yoN5rSsaJROahk58
-HPYAxfkKlcJDVSH47HIERSL19ceu3JVS28uHRJw1WJ13JbUYI/vWAE1zNQ==
------END PUBLIC KEY-----
-"""
-
-_PLACEHOLDER_MARKER = "PLACEHOLDER_YASHIGANI_PUBLIC_KEY_MLDSA65"
-_placeholder_warned = False
 
 # ---------------------------------------------------------------------------
 # Self-integrity state (set at module load)
@@ -168,98 +188,21 @@ def _emit_licence_integrity_violation_event(
 
 
 # ---------------------------------------------------------------------------
-# T6: KDF-derived integrity token
+# §4a — chain-based build-integrity verify (supersedes the v1 counter-key/
+# HASH_BUNDLE_SIG/EXPECTED_TOKEN_HMAC mechanism)
 # ---------------------------------------------------------------------------
 
-def _derive_integrity_token(hash_bundle_str: str, licence_id: str, seat_policy: str) -> bytes:
+def _build_hash_bundle_str() -> str:
+    """Canonical hash-bundle string (5 module hashes, sorted by key name).
+
+    DESIGN-NOTE (carried from v1, still applies): INTEGRITY_HASH is
+    intentionally excluded from the signed bundle — including it creates an
+    unresolvable circularity in the injection pipeline (INTEGRITY_HASH
+    covers the final _integrity.py, including BUNDLE_SIG, but BUNDLE_SIG
+    must be signed before INTEGRITY_HASH is finalised). INTEGRITY_HASH
+    already receives independent protection via the enforcer cross-check.
     """
-    Derive a 32-byte integrity token using HKDF-SHA-256.
-
-    IKM  = SHA-256(hash_bundle_str.encode("utf-8"))
-    salt = SHA-256(licence_id.encode("utf-8") + seat_policy.encode("utf-8"))
-    info = b"yashigani-integrity-v1"
-    L    = 32
-
-    DG-01: inputs are ONLY (hash_bundle_str, licence_id, seat_policy) — no CA fingerprint.
-    DG-03: Community seat_policy is "20,5,2".
-    """
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives.hashes import SHA256 as CryptoSHA256
-    from cryptography.hazmat.backends import default_backend
-
-    ikm = hashlib.sha256(hash_bundle_str.encode("utf-8")).digest()
-    salt = hashlib.sha256(
-        licence_id.encode("utf-8") + seat_policy.encode("utf-8")
-    ).digest()
-    hkdf = HKDF(
-        algorithm=CryptoSHA256(),
-        length=32,
-        salt=salt,
-        info=b"yashigani-integrity-v1",
-        backend=default_backend(),
-    )
-    return hkdf.derive(ikm)
-
-
-def _check_hash_bundle_attestation() -> None:
-    """
-    T6: Verify HASH_BUNDLE_SIG is a valid ECDSA P-256 signature over the canonical
-    hash-bundle string.  Sets _integrity_violated on failure.
-
-    Placeholder behaviour:
-      - If is_any_hash_placeholder() → skip (dev) / fail-closed (prod).
-      - If is_bundle_sig_placeholder() → skip (dev) / fail-closed (prod).
-    """
-    global _integrity_violated
-
-    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
-
-    if _integrity.is_any_hash_placeholder():
-        if is_dev:
-            return  # dev: skip
-        _integrity_violated = True
-        logger.critical(
-            "LICENSE INTEGRITY VIOLATION: one or more file hashes are still placeholders "
-            "in a non-dev environment — hash bundle attestation cannot proceed; "
-            "forcing COMMUNITY tier (T6)"
-        )
-        _emit_licence_integrity_violation_event(
-            module="verifier",
-            check_type="bundle_sig",
-            expected_hash="<real_hash>",
-            actual_hash="<placeholder>",
-        )
-        return
-
-    if _integrity.is_bundle_sig_placeholder():
-        if is_dev:
-            return  # dev: skip
-        _integrity_violated = True
-        logger.critical(
-            "LICENSE INTEGRITY VIOLATION: HASH_BUNDLE_SIG is still a placeholder "
-            "in a non-dev environment — build pipeline did not embed bundle signature; "
-            "forcing COMMUNITY tier (T6)"
-        )
-        _emit_licence_integrity_violation_event(
-            module="verifier",
-            check_type="bundle_sig",
-            expected_hash="<sig>",
-            actual_hash="<placeholder>",
-        )
-        return
-
-    # Build canonical bundle string (sorted by key name, 5 module hashes only).
-    # DESIGN-NOTE (Su 2026-06-15): INTEGRITY_HASH is intentionally excluded from
-    # the signed bundle.  Including it creates an unresolvable circularity in the
-    # injection pipeline: INTEGRITY_HASH covers the final _integrity.py (including
-    # HASH_BUNDLE_SIG), but HASH_BUNDLE_SIG must be signed before INTEGRITY_HASH
-    # is finalized.  INTEGRITY_HASH already receives independent protection via the
-    # enforcer cross-check (_check_enforcer_integrity → cross-checks _integrity.py
-    # hash via INTEGRITY_HASH), which catches any attacker who patches _integrity.py
-    # to substitute their own bundle sig.  The 5-module bundle covers all module
-    # files that gate the licence; _integrity.py tamper evidence comes from the
-    # enforcer cross-check path.  Security goal is identical to Nico's §2.4 design.
-    bundle_str = "\n".join([
+    return "\n".join([
         f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
         f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
         f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
@@ -267,153 +210,104 @@ def _check_hash_bundle_attestation() -> None:
         f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
     ])
 
-    try:
-        import base64 as _b64
-        sig_bytes = _b64.b64decode(_integrity.HASH_BUNDLE_SIG + "==")
-    except Exception:
-        try:
-            sig_bytes = bytes.fromhex(_integrity.HASH_BUNDLE_SIG)
-        except Exception:
-            _integrity_violated = True
-            logger.critical(
-                "LICENSE INTEGRITY VIOLATION: HASH_BUNDLE_SIG is not valid base64 or hex — "
-                "forcing COMMUNITY tier (T6)"
-            )
-            _emit_licence_integrity_violation_event(
-                module="verifier",
-                check_type="bundle_sig",
-                expected_hash="<valid_sig>",
-                actual_hash="<unparseable>",
-            )
-            return
 
-    try:
-        from cryptography.hazmat.primitives.serialization import load_pem_public_key
-        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey
-        from cryptography.hazmat.primitives.hashes import SHA256 as CryptoSHA256
-        from cryptography.exceptions import InvalidSignature
-
-        if _integrity.is_counter_key_placeholder():
-            if is_dev:
-                return
-            _integrity_violated = True
-            logger.critical(
-                "LICENSE INTEGRITY VIOLATION: cannot verify bundle signature — "
-                "COUNTER_PUBLIC_KEY_PEM is placeholder in non-dev environment (T6)"
-            )
-            _emit_licence_integrity_violation_event(
-                module="verifier",
-                check_type="bundle_sig",
-                expected_hash="<key>",
-                actual_hash="<placeholder>",
-            )
-            return
-
-        pub_key = load_pem_public_key(_integrity.COUNTER_PUBLIC_KEY_PEM.encode("utf-8"))
-        if not isinstance(pub_key, EllipticCurvePublicKey):
-            raise ValueError(f"Not an EC key: {type(pub_key).__name__}")
-
-        bundle_digest = hashlib.sha256(bundle_str.encode("utf-8")).digest()
-        pub_key.verify(sig_bytes, bundle_digest, ECDSA(CryptoSHA256()))
-        # Signature valid — no action
-
-    except InvalidSignature:
-        _integrity_violated = True
-        logger.critical(
-            "LICENSE INTEGRITY VIOLATION: hash bundle signature verification failed — "
-            "binary may have been tampered with; forcing COMMUNITY tier (T6). "
-            "License integrity check failed — system restrained to Community limits. "
-            "Contact support@agnosticsec.com or re-activate."
-        )
-        _emit_licence_integrity_violation_event(
-            module="verifier",
-            check_type="bundle_sig",
-            expected_hash=_integrity.HASH_BUNDLE_SIG[:16],
-            actual_hash="<invalid>",
-        )
-    except Exception as exc:
-        logger.warning("License integrity: bundle attestation check failed unexpectedly: %s", exc)
-        if not is_dev:
-            _integrity_violated = True
-
-
-def _check_kdf_token() -> None:
+def _check_build_integrity_chain() -> None:
     """
-    T7: Verify EXPECTED_TOKEN_HMAC matches SHA-256(token || b"yashigani-kdf-gate-v1")
-    where token = _derive_integrity_token(bundle_str, "", "20,5,2").
+    §4a steps 1-5: validate the embedded code leaf_cert chains to the
+    embedded master anchor-SET, then verify BUNDLE_SIG against that leaf's
+    public key. Step 6 (per-module self-hashes, T1-T4) is unchanged and
+    lives in _check_self_integrity() (this module) + enforcer.py/
+    agents/registry.py/identity/registry.py's own independent checks.
 
-    Placeholder behaviour: skip (dev) / fail-closed (prod).
+    Placeholder behaviour: skip (dev) / fail-closed (prod) — mirrors the v1
+    _check_hash_bundle_attestation()/_check_kdf_token() placeholder
+    handling this function replaces.
     """
     global _integrity_violated
 
     is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
 
-    if _integrity.is_kdf_token_placeholder():
+    if _integrity.is_any_hash_placeholder():
         if is_dev:
-            return
+            return  # dev: skip — no per-module hashes to bind the bundle to
         _integrity_violated = True
         logger.critical(
-            "LICENSE INTEGRITY VIOLATION: EXPECTED_TOKEN_HMAC is still a placeholder "
-            "in a non-dev environment; forcing COMMUNITY tier (T7)"
+            "LICENSE INTEGRITY VIOLATION: one or more module hashes are still "
+            "placeholders in a non-dev environment — build-integrity chain check "
+            "cannot proceed; forcing COMMUNITY tier"
         )
         _emit_licence_integrity_violation_event(
             module="verifier",
-            check_type="kdf_token",
-            expected_hash="<hmac>",
+            check_type="build_integrity_chain",
+            expected_hash="<real_hash>",
             actual_hash="<placeholder>",
         )
         return
 
-    if _integrity.is_any_hash_placeholder():
+    if _integrity.is_any_chain_placeholder():
         if is_dev:
-            return
+            return  # dev: skip — no anchor set / code leaf_cert / bundle_sig to verify
         _integrity_violated = True
         logger.critical(
-            "LICENSE INTEGRITY VIOLATION: KDF token check skipped — hash placeholders "
-            "in non-dev; forcing COMMUNITY tier (T7)"
+            "LICENSE INTEGRITY VIOLATION: master anchor-set / code leaf_cert / "
+            "leaf_cert_sig / bundle_sig is still a placeholder in a non-dev "
+            "environment — build pipeline did not embed the chain; forcing "
+            "COMMUNITY tier"
         )
         _emit_licence_integrity_violation_event(
             module="verifier",
-            check_type="kdf_token",
-            expected_hash="<token>",
+            check_type="build_integrity_chain",
+            expected_hash="<chain>",
             actual_hash="<placeholder>",
         )
         return
 
     try:
-        # 5-module bundle (INTEGRITY_HASH excluded — see DESIGN-NOTE in _check_hash_bundle_attestation)
-        bundle_str = "\n".join([
-            f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
-            f"ENFORCER_HASH={_integrity.ENFORCER_HASH}",
-            f"IDENTITY_REGISTRY_HASH={_integrity.IDENTITY_REGISTRY_HASH}",
-            f"LOADER_HASH={_integrity.LOADER_HASH}",
-            f"VERIFIER_HASH={_integrity.VERIFIER_HASH}",
-        ])
-        # DG-01 + DG-03: Community KDF uses licence_id="" and seat_policy="20,5,2"
-        token = _derive_integrity_token(bundle_str, "", "20,5,2")
-        actual_hmac = hashlib.sha256(token + b"yashigani-kdf-gate-v1").hexdigest()
-
-        expected = _integrity.EXPECTED_TOKEN_HMAC.strip()
-        if actual_hmac != expected:
-            _integrity_violated = True
-            logger.critical(
-                "LICENSE INTEGRITY VIOLATION: KDF token mismatch — "
-                "expected=%s actual=%s; forcing COMMUNITY tier (T7). "
-                "License integrity check failed — system restrained to Community limits. "
-                "Contact support@agnosticsec.com or re-activate.",
-                expected[:16],
-                actual_hmac[:16],
-            )
-            _emit_licence_integrity_violation_event(
-                module="verifier",
-                check_type="kdf_token",
-                expected_hash=expected[:16],
-                actual_hash=actual_hmac[:16],
-            )
+        anchor_set = anchor_set_from_json(_integrity.MASTER_ANCHOR_SET_JSON)
+        code_leaf_cert = leaf_cert_from_json(_integrity.CODE_LEAF_CERT_JSON)
+        code_leaf_cert_sig = base64.b64decode(_integrity.CODE_LEAF_CERT_SIG)
+        bundle_sig = base64.b64decode(_integrity.BUNDLE_SIG)
+        kill_list = kill_list_from_json(_integrity.KILL_LIST_JSON)
     except Exception as exc:
-        logger.warning("License integrity: KDF token check failed unexpectedly: %s", exc)
-        if not is_dev:
-            _integrity_violated = True
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: could not parse embedded chain constants "
+            "(anchor set / code leaf_cert / bundle_sig / kill-list) — forcing "
+            "COMMUNITY tier: %s",
+            exc,
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="build_integrity_chain",
+            expected_hash="<parseable>",
+            actual_hash="<parse_error>",
+        )
+        return
+
+    bundle_str = _build_hash_bundle_str()
+    result = verify_build_integrity_chain(
+        anchor_set=anchor_set,
+        code_leaf_cert=code_leaf_cert,
+        code_leaf_cert_sig=code_leaf_cert_sig,
+        bundle_str=bundle_str,
+        bundle_sig=bundle_sig,
+        kill_list=kill_list,
+    )
+    if not result.valid:
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: build-integrity chain check failed "
+            "(error=%s) — binary may have been tampered with; forcing COMMUNITY "
+            "tier. License integrity check failed — system restrained to "
+            "Community limits. Contact support@agnosticsec.com or re-activate.",
+            result.error,
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="build_integrity_chain",
+            expected_hash=result.error or "<unknown>",
+            actual_hash="<invalid>",
+        )
 
 
 def get_integrity_status() -> bool:
@@ -423,8 +317,42 @@ def get_integrity_status() -> bool:
 
 # Run at module load.
 _check_self_integrity()
-_check_hash_bundle_attestation()
-_check_kdf_token()
+_check_build_integrity_chain()
+
+
+# ---------------------------------------------------------------------------
+# Cached embedded chain state — loaded once at module load for use by
+# verify_license()'s v5 path. Reuses the SAME anchor-set/kill-list already
+# parsed above where possible; re-parsed defensively here in case
+# _check_build_integrity_chain() bailed early (placeholder/dev) and never
+# populated a module-level cache.
+# ---------------------------------------------------------------------------
+
+def _load_anchor_set() -> AnchorSet:
+    try:
+        return anchor_set_from_json(_integrity.MASTER_ANCHOR_SET_JSON)
+    except Exception as exc:
+        logger.warning("License verifier: could not parse MASTER_ANCHOR_SET_JSON: %s", exc)
+        return AnchorSet([])
+
+
+def _load_kill_list() -> KillList:
+    try:
+        return kill_list_from_json(_integrity.KILL_LIST_JSON)
+    except Exception as exc:
+        logger.warning("License verifier: could not parse KILL_LIST_JSON: %s", exc)
+        return KillList.empty()
+
+
+def _load_client_domain_registry() -> Optional[dict]:
+    try:
+        raw = _integrity.CLIENT_DOMAIN_REGISTRY_JSON
+        if not raw or not raw.strip() or raw.strip() == "{}":
+            return {}
+        return json.loads(raw)
+    except Exception as exc:
+        logger.warning("License verifier: could not parse CLIENT_DOMAIN_REGISTRY_JSON: %s", exc)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -437,21 +365,6 @@ def base64url_decode(s: str) -> bytes:
     if padding != 4:
         s += "=" * padding
     return base64.urlsafe_b64decode(s)
-
-
-def _is_placeholder() -> bool:
-    return _PLACEHOLDER_MARKER in _PUBLIC_KEY_PEM
-
-
-def _warn_placeholder_once() -> None:
-    global _placeholder_warned
-    if not _placeholder_warned:
-        logger.warning(
-            "Yashigani license verifier: public key is a placeholder — "
-            "all license files will be ignored and COMMUNITY tier will be used. "
-            "Replace _PUBLIC_KEY_PEM in verifier.py before release."
-        )
-        _placeholder_warned = True
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -597,6 +510,11 @@ def _build_license_state(payload: dict, valid: bool, error: Optional[str] = None
     max_admin_seats = _safe_int(payload.get("max_admin_seats"),                                  defaults["max_admin_seats"])
     max_orgs        = _safe_int(payload.get("max_orgs"),                                         defaults["max_orgs"])
 
+    # v5: licence_serial is the per-issued-licence identifier (design §3.2)
+    # and maps onto the existing LicenseState.license_id field (v4's
+    # per-token identifier concept — unchanged shape, renamed source field).
+    license_id = payload.get("licence_serial") or payload.get("license_id")
+
     return LicenseState(
         tier=tier,
         org_domain=org_domain,
@@ -607,7 +525,7 @@ def _build_license_state(payload: dict, valid: bool, error: Optional[str] = None
         features=features,
         issued_at=issued_at,
         expires_at=expires_at,
-        license_id=payload.get("license_id"),
+        license_id=license_id,
         valid=valid,
         error=error,
     )
@@ -633,144 +551,6 @@ def _community_invalid(error: str) -> LicenseState:
 
 
 # ---------------------------------------------------------------------------
-# Counter-signature verification (v4 format)
-# ---------------------------------------------------------------------------
-
-def _compute_counter_sig_message(payload_bytes: bytes, primary_public_key_pem: str) -> bytes:
-    """
-    Return the message that the counter-signature covers.
-
-    counter_sig_message = sha256(payload_bytes + sha256(primary_public_key_pem_bytes))
-
-    Using the SHA-256 of the primary public key (rather than the raw PEM) as the
-    binding value avoids embedding a variable-length PEM blob in the signed
-    message while still tying the counter-signature irrevocably to one specific
-    primary key.
-    """
-    pem_bytes = primary_public_key_pem.encode("utf-8")
-    pem_hash = hashlib.sha256(pem_bytes).digest()
-    combined = payload_bytes + pem_hash
-    return hashlib.sha256(combined).digest()
-
-
-def _verify_counter_signature(
-    payload_bytes: bytes,
-    primary_public_key_pem: str,
-    counter_sig_bytes: bytes,
-) -> bool:
-    """
-    Verify the counter-signature for a v4 license.
-
-    Returns True on success, False on any failure (including invalid signature,
-    missing key, or crypto errors).
-
-    Skips verification and returns True when COUNTER_PUBLIC_KEY_PEM is still a
-    placeholder — allows dev/CI builds to issue v4 licenses without a real
-    counter-signing key.
-    """
-    if _integrity.is_counter_key_placeholder():
-        # #103 (LICENSE-2024-001 / CVSS 9.1) — placeholder skip is NOT
-        # permitted here regardless of YASHIGANI_ENV.  The dev/placeholder
-        # case is already handled by _check_hash_bundle_attestation() which
-        # skips bundle-sig verification in dev and fails closed in prod.
-        # _verify_counter_signature() must NEVER have its own env-based skip:
-        # a runtime YASHIGANI_ENV=dev override (docker run -e / Helm) must
-        # not bypass counter-sig crypto in a prod image (IMPL-01).
-        logger.critical(
-            "License verifier: COUNTER_PUBLIC_KEY_PEM is still a placeholder "
-            "— build pipeline did not embed counter key; "
-            "failing counter-signature (LICENSE-2024-001 / IMPL-01)"
-        )
-        # Fall through — attempt to parse placeholder string as PEM,
-        # which will raise an exception and trigger the return-False path.
-
-    try:
-        from cryptography.hazmat.primitives.serialization import load_pem_public_key
-        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey
-        from cryptography.hazmat.primitives.hashes import SHA256
-        from cryptography.exceptions import InvalidSignature
-
-        _raw_counter_key = load_pem_public_key(
-            _integrity.COUNTER_PUBLIC_KEY_PEM.encode("utf-8")
-        )
-        if not isinstance(_raw_counter_key, EllipticCurvePublicKey):
-            raise ValueError(
-                f"Counter public key is not EC: {type(_raw_counter_key).__name__}"
-            )
-        counter_public_key: EllipticCurvePublicKey = _raw_counter_key
-        message = _compute_counter_sig_message(payload_bytes, primary_public_key_pem)
-        # message is already a 32-byte digest; sign/verify with Prehashed would
-        # be cleaner but ECDSA(SHA256()) on a 32-byte input is also correct and
-        # keeps the call-site identical to the primary signature path.
-        counter_public_key.verify(counter_sig_bytes, message, ECDSA(SHA256()))
-        return True
-    except InvalidSignature:
-        logger.warning("License verifier: counter-signature verification failed")
-        return False
-    except Exception as exc:
-        logger.warning(
-            "License verifier: unexpected error during counter-signature verification: %s", exc
-        )
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Primary verification helpers (shared between v3 and v4)
-# ---------------------------------------------------------------------------
-
-def _verify_primary_signature(payload_bytes: bytes, sig_bytes: bytes) -> bool:
-    """
-    Verify the primary ECDSA P-256 signature.
-
-    Returns True on success, False on InvalidSignature, raises on other errors.
-
-    Note (ASVS 11.2.4): ECDSA verification via the ``cryptography`` library
-    delegates to OpenSSL's constant-time C implementation. The verify() call
-    raises InvalidSignature on mismatch — no timing-vulnerable byte comparison
-    occurs at the Python level.
-
-    Algorithm allowlist (Compliance review finding #11): we dispatch verify() only
-    when the embedded public key is EllipticCurvePublicKey on curve SECP256R1
-    (aka P-256 / NIST P-256 / prime256v1). Any other key type — even if it
-    parses successfully from the bundled PEM — raises RuntimeError before
-    reaching verify(). This defends against future key-type confusion when
-    we add ML-DSA / Ed25519 alternative key slots to the licence format.
-    """
-    from cryptography.hazmat.primitives.serialization import load_pem_public_key
-    from cryptography.hazmat.primitives.asymmetric.ec import (
-        ECDSA,
-        EllipticCurvePublicKey,
-        SECP256R1,
-    )
-    from cryptography.hazmat.primitives.hashes import SHA256
-    from cryptography.exceptions import InvalidSignature
-
-    public_key = load_pem_public_key(_PUBLIC_KEY_PEM.encode("utf-8"))
-
-    # Explicit allowlist: must be an EC public key on P-256. Refuse to verify
-    # with any other key type. Without this gate the cryptography library
-    # would happily accept (for example) an RSA or Ed25519 key at the same
-    # PEM slot and silently change the algorithm envelope, an attack class
-    # known as "key-type confusion".
-    if not isinstance(public_key, EllipticCurvePublicKey):
-        raise RuntimeError(
-            f"License verifier: unexpected public key type "
-            f"{type(public_key).__name__}; expected EllipticCurvePublicKey"
-        )
-    if not isinstance(public_key.curve, SECP256R1):
-        raise RuntimeError(
-            f"License verifier: unexpected curve "
-            f"{public_key.curve.name}; expected secp256r1"
-        )
-
-    try:
-        public_key.verify(sig_bytes, payload_bytes, ECDSA(SHA256()))
-        return True
-    except InvalidSignature:
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -779,109 +559,102 @@ def verify_license(content: str) -> LicenseState:
     Verify a license string and return a LicenseState.
 
     Format detection:
-        3 dot-separated segments → v4 (payload + primary sig + counter sig) — ONLY accepted format
-        2 dot-separated segments → rejected: "license_format_too_old" (LAURA-V231-003)
+        4 dot-separated segments → v5 (payload + leaf_sig + leaf_cert +
+                                   leaf_cert_sig) — the ONLY accepted format
+        3 or 2 segments          → rejected: "license_format_deprecated_v5_required"
+                                   (v3/v4 dropped — no downgrade path, design §3.2)
         Anything else            → fail-open (COMMUNITY_LICENSE)
 
     Security behaviour:
-        - v4 licenses: both primary and counter-signature must pass.
-          A counter-signature failure returns LicenseState(valid=False,
-          error="counter_signature_invalid") — never falls back to v3.
-        - 2-segment (v3) licenses are always rejected — counter-signature is mandatory.
-          This closes the LAURA-V231-003 bypass: primary-key compromise alone is not
-          sufficient to issue accepted licenses.
-        - Tampered verifier (integrity violation at module load): all licenses
-          are downgraded to COMMUNITY tier regardless of signature validity.
+        - v5 licences: chain.verify_licence_v5() runs the full §4b sequence
+          (role check, anchor-chain validation, kill-list, client_id bind,
+          leaf_sig verify, own-term expiry). Any failure returns
+          LicenseState(valid=False, error=<specific>) — COMMUNITY tier,
+          never block, never delete users (§5).
+        - Tampered build (integrity violation at module load): all licenses
+          are downgraded to COMMUNITY tier regardless of licence validity.
 
-    Returns COMMUNITY_LICENSE if the public key is a placeholder.
-    Returns LicenseState(valid=False, error="license_format_too_old") for 2-segment licenses.
-    Returns LicenseState(valid=False, error="invalid_signature") for bad primary sigs.
-    Returns LicenseState(valid=False, error="counter_signature_invalid") for bad counter sigs.
-    Returns LicenseState(valid=False, error="license_expired") for expired licenses.
-    Returns COMMUNITY_LICENSE (fail-open) for any other parse/crypto error.
+    Returns COMMUNITY_LICENSE for empty/garbage content that doesn't even
+    split into segments.
+    Returns LicenseState(valid=False, error="license_format_deprecated_v5_required")
+    for 2- or 3-segment (old v3/v4) licences.
+    Returns LicenseState(valid=False, error=<see chain.licence_v5 error codes>)
+    for v5 licences that fail any §4b check.
+    Returns LicenseState(valid=False, error="license_expired") for expired licences.
 
     Requires: cryptography>=42.
     """
-    # If the verifier itself has been tampered with, deny all non-community access.
+    # If the build itself has been tampered with, deny all non-community access.
     if _integrity_violated:
         return COMMUNITY_LICENSE
 
-    if _is_placeholder():
-        _warn_placeholder_once()
+    content = content.strip()
+    if not content:
         return COMMUNITY_LICENSE
 
-    content = content.strip()
-
-    # Determine format version by dot count.
     segments = content.split(".")
-    if len(segments) == 3:
-        return _verify_v4(segments[0], segments[1], segments[2])
-    elif len(segments) == 2:
-        # LAURA-V231-003: v3 format (2-segment, no counter-signature) is no longer
-        # accepted. Counter-signature is mandatory; reject clearly so tooling can
-        # report a useful error to the admin.
+    if len(segments) == 4:
+        return _verify_v5(content)
+    elif len(segments) in (2, 3):
+        # v3/v4 dropped — v5 mandatory, no downgrade path (design §3.2).
         logger.warning(
-            "License verifier: rejected 2-segment license — v3 format is no longer "
-            "supported; re-issue license in v4 format (LAURA-V231-003)"
+            "License verifier: rejected %d-segment license — only v5 (4-segment) "
+            "format is accepted; v3/v4 are no longer supported (re-issue in v5)",
+            len(segments),
         )
-        return _community_invalid("license_format_too_old")
+        return _community_invalid("license_format_deprecated_v5_required")
     else:
         logger.warning("License verifier: unexpected segment count (%d) in license content", len(segments))
         return COMMUNITY_LICENSE
 
 
-def _verify_v4(payload_b64: str, sig_b64: str, counter_sig_b64: str) -> LicenseState:
-    """Verify a v4 license (primary signature + counter-signature)."""
+def _verify_v5(content: str) -> LicenseState:
+    """Verify a v5 license via the chain-of-trust (§4b)."""
+    anchor_set = _load_anchor_set()
+    kill_list = _load_kill_list()
+    client_domain_registry = _load_client_domain_registry()
+
     try:
-        payload_bytes = base64url_decode(payload_b64)
-        sig_bytes = base64url_decode(sig_b64)
-        counter_sig_bytes = base64url_decode(counter_sig_b64)
+        result = verify_licence_v5(
+            content,
+            anchor_set=anchor_set,
+            kill_list=kill_list,
+            client_domain_registry=client_domain_registry,
+        )
     except Exception as exc:
-        logger.warning("License verifier: base64url decode failed: %s", exc)
+        # LAURA-V231-002 discipline: any uncaught exception during v5 verify
+        # must not crash the caller — fail-closed to COMMUNITY.
+        logger.warning("License verifier: unexpected error during v5 verification: %s", exc)
         return COMMUNITY_LICENSE
 
-    # Primary signature first.
-    try:
-        valid_primary = _verify_primary_signature(payload_bytes, sig_bytes)
-    except Exception as exc:
-        logger.warning("License verifier: unexpected error during primary verification: %s", exc)
-        return COMMUNITY_LICENSE
+    if result.payload is None:
+        # Parse-level failure — nothing usable to build a LicenseState from.
+        return _community_invalid(result.error or "licence_format_invalid")
 
-    if not valid_primary:
-        logger.warning("License verifier: primary signature verification failed (v4)")
+    if not result.valid:
         try:
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            return _build_license_state(payload, valid=False, error="invalid_signature")
+            return _build_license_state(result.payload, valid=False, error=result.error)
         except Exception:
-            return _community_invalid("invalid_signature")
+            return _community_invalid(result.error or "invalid_licence")
 
-    # Counter-signature — never fall back to v3 on failure.
-    if not _verify_counter_signature(payload_bytes, _PUBLIC_KEY_PEM, counter_sig_bytes):
-        try:
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            return _build_license_state(payload, valid=False, error="counter_signature_invalid")
-        except Exception:
-            return _community_invalid("counter_signature_invalid")
-
-    return _parse_and_finalise(payload_bytes)
+    return _parse_and_finalise_v5(result.payload)
 
 
-def _parse_and_finalise(payload_bytes: bytes) -> LicenseState:
-    """Parse payload JSON and apply expiry check.  Called after all signatures pass."""
-    try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except Exception as exc:
-        logger.warning("License verifier: JSON parse error after valid signature: %s", exc)
-        return COMMUNITY_LICENSE
+def _parse_and_finalise_v5(payload: dict) -> LicenseState:
+    """Build the final LicenseState after all v5 chain checks passed.
 
+    Re-applies the licence's own expiry as a defence-in-depth belt-and-
+    braces check (verify_licence_v5() already checked this at step 7; this
+    mirrors v4's _parse_and_finalise() shape so LicenseState.error is
+    populated identically for callers that branch on it)."""
     try:
         license_state = _build_license_state(payload, valid=True)
     except Exception as exc:
         # Defensive catch: _build_license_state should not raise with _safe_int in place,
         # but guard against any future field additions or model changes (LAURA-V231-002).
         logger.warning(
-            "License verifier: unexpected error building license state after valid signature: %s "
-            "— failing to COMMUNITY tier",
+            "License verifier: unexpected error building license state after valid v5 "
+            "verification: %s — failing to COMMUNITY tier",
             exc,
         )
         return COMMUNITY_LICENSE
