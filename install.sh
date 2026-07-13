@@ -275,6 +275,16 @@ PKI_ACTION=""             # --pki-action=bootstrap|rotate-leaves|rotate-intermed
 # resolve_compose_cmd() completes. Used by the onboard codegen path.
 YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}"
 
+# Host-native ollama port for the Apple Metal / Mac path (feat/v411-mac-ollama-port-detect-ask).
+# Resolved by _resolve_host_ollama_port() inside compose_up() via:
+#   a. --ollama-port flag or this env var (if pre-set)
+#   b. OLLAMA_HOST env parse (host:port or :port)
+#   c. probe 127.0.0.1:11434; if absent, lsof-scan for listening ollama port
+#   d. interactive prompt (if TTY + not --non-interactive)
+#   e. non-interactive + unresolved → abort with --ollama-port hint
+# Default empty → resolution runs. Override: --ollama-port N or YASHIGANI_HOST_OLLAMA_PORT=N.
+YASHIGANI_HOST_OLLAMA_PORT="${YASHIGANI_HOST_OLLAMA_PORT:-}"
+
 # P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
 ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
 OFFBOARD_AGENT=""         # --offboard <agent-name>
@@ -400,6 +410,18 @@ OPTIONS
                                           VRAM and prompts interactively when multiple cards
                                           are present. Equivalent to setting YSG_GPU_INDEX.
                                           Example: --gpu-index 1 (selects the second card).
+  --ollama-port  N                        Mac Apple Metal only. Port where the host-native
+                                          ollama process is listening on 127.0.0.1.
+                                          Without this flag install.sh resolves the port
+                                          automatically (detection order):
+                                            1. YASHIGANI_HOST_OLLAMA_PORT env var
+                                            2. OLLAMA_HOST env (host:port or :port)
+                                            3. probe 127.0.0.1:11434 (normal case)
+                                            4. lsof-scan for listening ollama process
+                                            5. interactive prompt (TTY only)
+                                            6. abort — use --ollama-port or start ollama
+                                          Equivalent to setting YASHIGANI_HOST_OLLAMA_PORT.
+                                          Not applicable to Linux or Kubernetes installs.
 
   GPU support (source: docs.ollama.com/gpu — Linux + macOS platforms):
     NVIDIA CUDA      — Linux: compute capability 5.0+ (GTX 750 Ti/K2200 through RTX/GB10);
@@ -412,8 +434,10 @@ OPTIONS
                        Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
     Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
                        Container ollama bypassed; host ollama must be pre-installed
-                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding):
-                         OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       and bound to 127.0.0.1 (Laura C3: loopback binding):
+                         OLLAMA_HOST=127.0.0.1:11434 ollama serve   # standard port
+                         OLLAMA_HOST=127.0.0.1:<N>  ollama serve    # non-standard: use --ollama-port N
+                       Port auto-detected (probe→OLLAMA_HOST→lsof→prompt); see --ollama-port.
                        Docker: VPNKit relays container→host.docker.internal to Mac loopback.
                        Podman: gvproxy (192.168.127.254) relays container→host.containers.internal.
                        Both runtimes: LAN fully isolated, loopback-only binding.
@@ -713,6 +737,20 @@ parse_args() {
         fi
         YSG_GPU_INDEX="$_raw_gpu_index"
         export YSG_GPU_INDEX
+        shift 2
+        ;;
+      --ollama-port)
+        # Apple Metal / Mac only: explicit host ollama listen port on 127.0.0.1.
+        # Overrides the auto-detection order (probe → OLLAMA_HOST → lsof → prompt).
+        # Equivalent to setting YASHIGANI_HOST_OLLAMA_PORT in the environment.
+        _raw_ollama_port="${2:?'--ollama-port requires a port number (1-65535)'}"
+        if ! [[ "$_raw_ollama_port" =~ ^[0-9]+$ ]] || \
+           [[ "$_raw_ollama_port" -lt 1 || "$_raw_ollama_port" -gt 65535 ]]; then
+          log_error "--ollama-port must be an integer 1-65535, got: ${_raw_ollama_port}"
+          exit 1
+        fi
+        YASHIGANI_HOST_OLLAMA_PORT="$_raw_ollama_port"
+        export YASHIGANI_HOST_OLLAMA_PORT
         shift 2
         ;;
       --pki-action)
@@ -7027,6 +7065,152 @@ _ensure_agent_databases() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# _resolve_host_ollama_port — Apple Metal / Darwin path only
+#
+# Resolves the port where the host-native ollama process is listening on
+# 127.0.0.1.  Called once from compose_up() before both Docker and Podman
+# Mac Metal GPU overlay blocks.  Exports YASHIGANI_HOST_OLLAMA_PORT on success;
+# returns non-zero on failure (caller must handle with || return 1).
+#
+# Resolution order (Tiago req 2026-07-13, feat/v411-mac-ollama-port-detect-ask):
+#   a. YASHIGANI_HOST_OLLAMA_PORT already set (pre-set env or --ollama-port flag)
+#   b. Parse OLLAMA_HOST env (accepts host:port and bare :port)
+#   c. Probe 127.0.0.1:11434 (normal case); if absent, lsof-scan for listening
+#      process named "ollama" and probe the discovered port
+#   d. Interactive prompt if [ -t 0 ] and not --non-interactive
+#   e. Non-interactive + unresolved → abort with --ollama-port hint
+#
+# Final gate: curl probe against the resolved port (fail-closed, Laura C3).
+# Backward-compat: ollama on 11434 + no flag → step c succeeds immediately,
+#   behaviour identical to the pre-v411 hardcoded path.
+# -----------------------------------------------------------------------------
+_resolve_host_ollama_port() {
+  local _port=""
+  local _source=""
+
+  # ── a. Explicit flag / env already set ─────────────────────────────────────
+  if [[ -n "${YASHIGANI_HOST_OLLAMA_PORT:-}" ]]; then
+    _port="${YASHIGANI_HOST_OLLAMA_PORT}"
+    _source="YASHIGANI_HOST_OLLAMA_PORT / --ollama-port"
+    log_info "ollama port: using pre-set value ${_port} (${_source})"
+  fi
+
+  # ── b. Parse OLLAMA_HOST env (host:port or :port) ──────────────────────────
+  if [[ -z "$_port" ]] && [[ -n "${OLLAMA_HOST:-}" ]]; then
+    # Extract the token after the last colon; handles "host:port" and ":port".
+    local _oh_port="${OLLAMA_HOST##*:}"
+    if [[ "$_oh_port" =~ ^[0-9]+$ ]] && \
+       [[ "$_oh_port" -ge 1 ]] && [[ "$_oh_port" -le 65535 ]]; then
+      _port="$_oh_port"
+      _source="OLLAMA_HOST=${OLLAMA_HOST}"
+      log_info "ollama port: parsed ${_port} from OLLAMA_HOST=${OLLAMA_HOST}"
+    else
+      log_warn "ollama port: OLLAMA_HOST=${OLLAMA_HOST} — no valid port extracted; continuing detection"
+    fi
+  fi
+
+  # ── c. Probe 11434 (default); then lsof-scan for non-default port ──────────
+  if [[ -z "$_port" ]]; then
+    if curl -fs --max-time 2 --connect-timeout 2 \
+         http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      _port=11434
+      _source="probe:11434"
+      log_info "ollama port: responding on default port 11434"
+    else
+      log_info "ollama: not on 11434 — scanning via lsof for listening port..."
+      # lsof -nP -iTCP -sTCP:LISTEN: list all listening TCP ports.
+      # Filter process name containing "ollama" (case-insensitive), extract port
+      # from the last colon-delimited field of the NAME column (format: *:PORT
+      # or host:PORT). Takes the first match — if multiple ollama processes are
+      # listening, the operator should disambiguate via --ollama-port.
+      local _lsof_port=""
+      _lsof_port=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+        | awk 'tolower($1) ~ /ollama/ {
+            n = split($9, a, ":");
+            p = a[n];
+            if (p+0 >= 1 && p+0 <= 65535) { print p; exit }
+          }')
+      if [[ -n "$_lsof_port" ]]; then
+        # Verify the discovered port is actually the ollama API before accepting.
+        if curl -fs --max-time 2 --connect-timeout 2 \
+             "http://127.0.0.1:${_lsof_port}/api/tags" >/dev/null 2>&1; then
+          _port="$_lsof_port"
+          _source="lsof-detect:${_lsof_port}"
+          log_info "ollama port: found via lsof on port ${_port} (reachable)"
+        else
+          log_warn "ollama port: lsof found port ${_lsof_port} but /api/tags not reachable on 127.0.0.1:${_lsof_port}"
+        fi
+      else
+        log_info "ollama port: lsof found no listening process named ollama"
+      fi
+    fi
+  fi
+
+  # ── d. Interactive prompt ───────────────────────────────────────────────────
+  if [[ -z "$_port" ]]; then
+    if [[ "${NON_INTERACTIVE}" != "true" ]] && [[ -t 0 ]]; then
+      local _prompt_input
+      printf '\nApple Metal: host ollama not found on default port 11434.\n' >&2
+      printf 'Enter the port where host ollama is listening [11434]: ' >&2
+      read -r _prompt_input
+      _prompt_input="${_prompt_input:-11434}"
+      if [[ "$_prompt_input" =~ ^[0-9]+$ ]] && \
+         [[ "$_prompt_input" -ge 1 ]] && [[ "$_prompt_input" -le 65535 ]]; then
+        _port="$_prompt_input"
+        _source="interactive-prompt"
+        log_info "ollama port: using prompted port ${_port}"
+      else
+        log_error "Invalid port entered: '${_prompt_input}' — must be an integer 1-65535"
+        return 1
+      fi
+    fi
+  fi
+
+  # ── e. Non-interactive + unresolved → abort ─────────────────────────────────
+  if [[ -z "$_port" ]]; then
+    log_error "Apple Metal: host ollama port could not be determined."
+    log_error "  127.0.0.1:11434 not reachable; lsof found no listening ollama process."
+    log_error "  Running in non-interactive mode — cannot prompt for port."
+    log_error "  Fix options:"
+    log_error "    --ollama-port <N>                (CLI flag)"
+    log_error "    YASHIGANI_HOST_OLLAMA_PORT=<N>   (env var)"
+    log_error "    OLLAMA_HOST=127.0.0.1:<N>        (ollama env — used by install.sh)"
+    log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+    log_error "    OLLAMA_HOST=127.0.0.1:<N> ollama serve"
+    return 1
+  fi
+
+  # ── Validate + final reachability gate ─────────────────────────────────────
+  # Validate port range (catches values from steps a/b that were not probe-verified).
+  if ! [[ "$_port" =~ ^[0-9]+$ ]] || \
+     [[ "$_port" -lt 1 ]] || [[ "$_port" -gt 65535 ]]; then
+    log_error "ollama port '${_port}' is not a valid port number 1-65535 (source: ${_source})"
+    return 1
+  fi
+
+  # Definitive reachability check — covers all resolution paths including
+  # steps a/b (where no probe was done during resolution).
+  if ! curl -fs --max-time 2 --connect-timeout 2 \
+       "http://127.0.0.1:${_port}/api/tags" >/dev/null 2>&1; then
+    log_error "Apple Metal: host ollama not reachable on 127.0.0.1:${_port} (source: ${_source})"
+    log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+    log_error "    OLLAMA_HOST=127.0.0.1:${_port} ollama serve"
+    log_error "  Then pre-pull models:"
+    log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
+    else
+      log_error "  gvproxy will relay caddy→host.containers.internal:${_port} to 127.0.0.1."
+    fi
+    log_error "Aborting — host ollama must be running on 127.0.0.1:${_port} before install."
+    return 1
+  fi
+
+  export YASHIGANI_HOST_OLLAMA_PORT="$_port"
+  log_info "Apple Metal: ollama confirmed on 127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} (source: ${_source}, Laura C3: loopback)"
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -7149,67 +7333,71 @@ compose_up() {
   # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
   # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
   # service_started). ollama-init is also a no-op (models managed on host).
-  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via VPNKit (TCP only). Laura C3: CLOSED.
-  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
-  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:<PORT> via VPNKit (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve   (standard port — auto-detected)
+  #   OLLAMA_HOST=127.0.0.1:<N>   ollama serve   (non-standard — see --ollama-port)
   #   VPNKit relays container→host.docker.internal to Mac loopback; LAN fully isolated.
+
+  # Port resolution — runs once, before both Docker and Podman apple_metal blocks.
+  # _resolve_host_ollama_port() implements the probe→OLLAMA_HOST→lsof→prompt→abort
+  # chain and exports YASHIGANI_HOST_OLLAMA_PORT. Both overlay files then pick it up
+  # via ${YASHIGANI_HOST_OLLAMA_PORT:-11434} compose interpolation.
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "$MODE" != "k8s" ]]; then
+    _resolve_host_ollama_port || return 1
+    # Persist to docker/.env so future compose re-runs (upgrade, docker compose restart)
+    # pick up the same port without needing to re-run install.sh.
+    local _env_file="${WORK_DIR}/docker/.env"
+    if [[ -f "$_env_file" ]]; then
+      if grep -q "^YASHIGANI_HOST_OLLAMA_PORT=" "$_env_file" 2>/dev/null; then
+        local _tmp_env
+        _tmp_env="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+        sed "s|^YASHIGANI_HOST_OLLAMA_PORT=.*|YASHIGANI_HOST_OLLAMA_PORT=${YASHIGANI_HOST_OLLAMA_PORT}|" \
+          "$_env_file" > "$_tmp_env"
+        mv "$_tmp_env" "$_env_file"
+      else
+        printf 'YASHIGANI_HOST_OLLAMA_PORT=%s\n' "${YASHIGANI_HOST_OLLAMA_PORT}" >> "$_env_file"
+      fi
+      log_info "ollama port ${YASHIGANI_HOST_OLLAMA_PORT} persisted to docker/.env"
+    fi
+  fi
+
   local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
   if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
      [[ "$(uname -s)" == "Darwin" ]] && \
      [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
      [[ "$MODE" != "k8s" ]] && \
      [[ -f "$_gpu_overlay_mac_metal" ]]; then
-    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
-    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
-    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-      log_error "Apple Metal: host ollama not reachable on 127.0.0.1:11434"
-      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
-      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
-      log_error "  Then pre-pull models:"
-      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
-      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
-      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
-      return 1
-    fi
     compose_files+=("-f" "$_gpu_overlay_mac_metal")
     log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
-    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:host-gateway]"
+    log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:host-gateway]"
     log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
     log_info "  ollama-init disabled (models managed on host)"
-    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via VPNKit (Laura C3: CLOSED — loopback only)"
   fi
 
   # GPU overlay — Apple Metal / macOS host-native ollama — Podman runtime path.
   # Identical intent to the Docker path above; different host-loopback relay.
   # Podman machine on macOS uses gvproxy (192.168.127.254) — no VPNKit.
-  # Container→192.168.127.254:11434 → gvproxy → 127.0.0.1:11434 on Mac host.
-  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via gvproxy (TCP only). Laura C3: CLOSED.
-  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
-  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  # Container→192.168.127.254:<PORT> → gvproxy → 127.0.0.1:<PORT> on Mac host.
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:<PORT> via gvproxy (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve   (standard — auto-detected)
+  #   OLLAMA_HOST=127.0.0.1:<N>   ollama serve   (non-standard — see --ollama-port)
   local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
   if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
      [[ "$(uname -s)" == "Darwin" ]] && \
      [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && \
      [[ "$MODE" != "k8s" ]] && \
      [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
-    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
-    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
-    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-      log_error "Apple Metal (Podman): host ollama not reachable on 127.0.0.1:11434"
-      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
-      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
-      log_error "  Then pre-pull models:"
-      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
-      log_error "  gvproxy will relay caddy→host.containers.internal:11434 to 127.0.0.1."
-      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
-      return 1
-    fi
     compose_files+=("-f" "$_gpu_overlay_mac_metal_podman")
     log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml)"
-    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:192.168.127.254]"
+    log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:192.168.127.254]"
     log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
     log_info "  ollama-init disabled (models managed on host)"
-    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via gvproxy 192.168.127.254 (loopback only)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via gvproxy 192.168.127.254 (loopback only)"
   fi
 
   # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).
