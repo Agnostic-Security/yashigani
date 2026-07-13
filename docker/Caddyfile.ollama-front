@@ -48,7 +48,17 @@
         # (mtls_capable:false); the identity boundary is the mesh mTLS Caddy
         # verifies above, not Ollama-level TLS. Long write timeout: model
         # cold-load / generate can exceed the default (WARMUP-001 rationale).
-        reverse_proxy http://ollama:11434 {
+        #
+        # Port is env-parameterized: {$YASHIGANI_HOST_OLLAMA_PORT:11434}
+        # Container ollama (Linux/NVIDIA/AMD/Vulkan): port always 11434; env unset
+        #   → Caddy uses default 11434 (backward-compatible, no config change needed).
+        # Mac Metal host-native ollama: install.sh resolves the actual listen port
+        #   (probe → OLLAMA_HOST parse → lsof-detect → interactive prompt) and
+        #   exports YASHIGANI_HOST_OLLAMA_PORT; the Mac GPU compose overlay
+        #   (docker-compose.gpu-mac-metal{,-podman}.yml) passes it into the caddy
+        #   container env so Caddy expands the correct port at startup.
+        #   Implements Tiago req 2026-07-13 (feat/v411-mac-ollama-port-detect-ask).
+        reverse_proxy http://ollama:{$YASHIGANI_HOST_OLLAMA_PORT:11434} {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
             # Rewrite Host to localhost so ollama's checkHostMiddleware accepts

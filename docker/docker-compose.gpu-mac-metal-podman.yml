@@ -120,11 +120,17 @@ services:
     environment:
       # Step 6: add host-ollama to caddy-entrypoint.sh iptables egress allowlist.
       # Resolved at container startup: host.containers.internal → 192.168.127.254
-      # iptables rule: -A OUTPUT -p tcp --dport 11434 -d 192.168.127.254 -j ACCEPT
+      # iptables rule: -A OUTPUT -p tcp --dport <PORT> -d 192.168.127.254 -j ACCEPT
       # gvproxy relays to 127.0.0.1 on Mac. ONLY host-egress TCP path opened.
       # Rootless Podman without NET_ADMIN: logged as warning; Caddy starts anyway
       # (loopback binding is the primary isolation; iptables is defence-in-depth).
-      YASHIGANI_CADDY_EGRESS_ALLOWLIST: "host.containers.internal:11434"
+      # Port is resolved by install.sh _resolve_host_ollama_port() (feat/v411-mac-ollama-port-detect-ask):
+      #   probe 11434 → OLLAMA_HOST parse → lsof-detect → interactive prompt → abort.
+      # ${YASHIGANI_HOST_OLLAMA_PORT:-11434}: export from install.sh or default 11434.
+      YASHIGANI_CADDY_EGRESS_ALLOWLIST: "host.containers.internal:${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
+      # Pass resolved port into caddy container so Caddyfile.ollama-front expands
+      # {$YASHIGANI_HOST_OLLAMA_PORT:11434} to the correct port at Caddy startup.
+      YASHIGANI_HOST_OLLAMA_PORT: "${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
 
   # C4: disable container ollama. Starts as no-op and exits immediately (exit 0).
   # gateway.depends_on.ollama is overridden below to service_started so gateway
