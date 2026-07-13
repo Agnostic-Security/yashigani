@@ -320,7 +320,7 @@ class TestLeafCertSchema(unittest.TestCase):
         self.assertEqual(restored.to_canonical_dict(), d)
 
     def test_round_trip_audit_leaf(self):
-        cert = _make_leaf_cert(role=Role.AUDIT, client_id="acme-corp", licence_serial=None)
+        cert = _make_leaf_cert(role=Role.AUDIT, client_id="acme-corp")
         d = cert.to_canonical_dict()
         restored = LeafCert.from_canonical_dict(d)
         self.assertEqual(restored.role, Role.AUDIT)
