@@ -477,7 +477,8 @@ class TestGroup1_1_RoundTrip:
         assert state.org_domain == "customer.example.com"
 
     def test_two_segment_token_rejected(self):
-        """2-segment (v3) tokens are rejected with license_format_too_old."""
+        """2-segment (v3) tokens are rejected: license_format_deprecated_v5_required
+        (design §3.2 — v3/v4 dropped, v5 mandatory, no downgrade path)."""
         # Build a minimal 2-segment token
         payload = json.dumps({"tier": "professional", "org_domain": "x.com"})
         payload_b64 = _b64url_encode(payload.encode())
@@ -487,7 +488,7 @@ class TestGroup1_1_RoundTrip:
         from yashigani.licensing.verifier import verify_license
         state = verify_license(token)
         assert not state.valid
-        assert state.error == "license_format_too_old"
+        assert state.error == "license_format_deprecated_v5_required"
 
 
 # ---------------------------------------------------------------------------

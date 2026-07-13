@@ -30,6 +30,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from yashigani.licensing.model import (
     COMMUNITY_LICENSE,
@@ -55,6 +57,16 @@ from yashigani.licensing.verifier import (
     base64url_decode,
     verify_license,
 )
+from yashigani.licensing.chain import (
+    Alg,
+    LeafCert,
+    PemSigner,
+    Role,
+    build_licence_payload_v5,
+    sign_licence_v5,
+)
+from yashigani.licensing.chain.algorithms import sign_message
+from yashigani.licensing.chain.canonical import leaf_cert_signing_digest
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,56 +360,122 @@ class TestBase64UrlDecode:
         assert base64url_decode(encoded) == data
 
 
+def _gen_p384():
+    return ec.generate_private_key(ec.SECP384R1())
+
+
+def _pem_pub_p384(key) -> str:
+    return key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+
+def _make_v5_licence_leaf(master_key, client_id: str = "acme-corp", serial: str = "lic-leaf-0001"):
+    now = datetime.now(timezone.utc)
+    licence_key = _gen_p384()
+    leaf_cert = LeafCert(
+        role=Role.LICENCE, client_id=client_id, leaf_pubkey_pem=_pem_pub_p384(licence_key),
+        not_before=now - timedelta(days=1), not_after=now + timedelta(days=60),
+        serial=serial, signed_at=now, alg=Alg.ECDSA_P384_SHA384,
+    )
+    leaf_cert_sig = sign_message(
+        Alg.ECDSA_P384_SHA384, master_key, leaf_cert_signing_digest(leaf_cert.to_canonical_dict())
+    )
+    return leaf_cert, leaf_cert_sig, licence_key
+
+
+def _sign_v5(payload: dict, leaf_cert, leaf_cert_sig: bytes, licence_key) -> str:
+    signer = PemSigner(role=Role.LICENCE, private_key=licence_key, leaf_cert=leaf_cert)
+    return sign_licence_v5(payload, signer, leaf_cert, leaf_cert_sig)
+
+
 class TestVerifyLicensePlaceholder:
-    """When public key is the placeholder, verify_license returns COMMUNITY_LICENSE."""
+    """When the master anchor-set is empty/unpopulated, no v5 licence can
+    chain — verify_license() falls back to a COMMUNITY-tier invalid state
+    (mirrors the old placeholder-key behaviour for v4)."""
 
     @pytest.fixture(autouse=True)
-    def force_placeholder_key(self, monkeypatch):
+    def force_empty_anchor_set(self, monkeypatch):
+        import yashigani.licensing._integrity as integrity_mod
         import yashigani.licensing.verifier as verifier_mod
-        monkeypatch.setattr(
-            verifier_mod,
-            "_PUBLIC_KEY_PEM",
-            "PLACEHOLDER_YASHIGANI_PUBLIC_KEY_MLDSA65",
-        )
-        monkeypatch.setattr(verifier_mod, "_placeholder_warned", False)
+        monkeypatch.setattr(integrity_mod, "MASTER_ANCHOR_SET_JSON", "[]")
+        monkeypatch.setattr(verifier_mod, "_integrity_violated", False)
 
-    def test_returns_community_on_placeholder(self):
+    def test_returns_community_on_empty_anchor_set(self):
+        master_key = _gen_p384()
+        leaf_cert, leaf_cert_sig, licence_key = _make_v5_licence_leaf(master_key)
+        payload = build_licence_payload_v5(
+            org_domain="test.example.com", tier="professional", client_id="acme-corp",
+            licence_serial="lic-0001", max_agents=500, max_end_users=1000, max_admin_seats=50,
+            max_orgs=1, expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        )
+        license_str = _sign_v5(payload, leaf_cert, leaf_cert_sig, licence_key)
+        result = verify_license(license_str)
+        # valid=False; tier/org info from the payload is still carried for
+        # diagnostics (matches the pre-existing v4 architecture) — actual
+        # enforcement of the Community fallback happens in loader.py, which
+        # checks .valid and returns COMMUNITY_LICENSE (see load_license()).
+        assert result.valid is False
+        assert result.error == "leaf_cert_untrusted"
+
+    def test_returns_community_on_garbage_content(self):
+        # "any.content" splits into 2 segments — rejected as an old-format
+        # (v3) license, not silently fail-open (no downgrade path, §3.2).
         result = verify_license("any.content")
         assert result.tier == LicenseTier.COMMUNITY
+        assert result.valid is False
+        assert result.error == "license_format_deprecated_v5_required"
 
-    def test_returns_valid_state_on_placeholder(self):
-        result = verify_license("any.content")
+    def test_returns_community_on_truly_unparseable_content(self):
+        """Content with no dots at all (not even an old-format shape) still
+        fail-opens to COMMUNITY_LICENSE (valid=True) — mirrors the pre-v5
+        behaviour for genuinely unrecognisable input."""
+        result = verify_license("nodotsatall")
+        assert result.tier == LicenseTier.COMMUNITY
         assert result.valid is True
 
 
 class TestVerifyLicenseWithRealKey:
-    """Uses a generated keypair to test the full v4 signature verification path."""
+    """Uses a generated P-384 master + licence leaf to test the full v5
+    chain-of-trust verification path (§4b)."""
 
     @pytest.fixture(autouse=True)
-    def setup_keypair(self, monkeypatch):
-        # Primary keypair
-        keys = _make_test_keypair()
-        self.private_key, self.public_key, self.private_pem, self.public_pem = keys
-        _patch_verifier_key(self.public_pem, monkeypatch)
-
-        # Counter keypair — patch _integrity so counter-sig verification uses our test key
-        counter_keys = _make_test_keypair()
-        self.counter_private_key = counter_keys[0]
-        self.counter_public_key = counter_keys[1]
-        self.counter_private_pem = counter_keys[2]
-        self.counter_public_pem = counter_keys[3]
-
+    def setup_chain(self, monkeypatch):
         import yashigani.licensing._integrity as integrity_mod
-        monkeypatch.setattr(integrity_mod, "COUNTER_PUBLIC_KEY_PEM", self.counter_public_pem.decode("utf-8"))
-        # Patch is_counter_key_placeholder() to return False so real verification runs
-        monkeypatch.setattr(integrity_mod, "_PLACEHOLDER_INTEGRITY", "__NEVER_MATCHES__")
+        import yashigani.licensing.verifier as verifier_mod
+
+        self.master_key = _gen_p384()
+        anchor_set_json = json.dumps([{
+            "anchor_id": "M1", "pubkey_pem": _pem_pub_p384(self.master_key),
+            "alg": Alg.ECDSA_P384_SHA384.value, "status": "active",
+            "added": datetime.now(timezone.utc).isoformat(),
+        }])
+        monkeypatch.setattr(integrity_mod, "MASTER_ANCHOR_SET_JSON", anchor_set_json)
+        monkeypatch.setattr(integrity_mod, "KILL_LIST_JSON", "[]")
+        monkeypatch.setattr(integrity_mod, "CLIENT_DOMAIN_REGISTRY_JSON", "{}")
+        monkeypatch.setattr(verifier_mod, "_integrity_violated", False)
+
+        self.leaf_cert, self.leaf_cert_sig, self.licence_key = _make_v5_licence_leaf(self.master_key)
+
+    def _make_v5_payload(
+        self,
+        tier="professional", org_domain="test.example.com", client_id="acme-corp",
+        licence_serial="lic-0001", max_agents=500, max_end_users=1000, max_admin_seats=50,
+        max_orgs=1, features=None, expires_offset_days=30,
+    ) -> dict:
+        return build_licence_payload_v5(
+            org_domain=org_domain, tier=tier, client_id=client_id, licence_serial=licence_serial,
+            max_agents=max_agents, max_end_users=max_end_users, max_admin_seats=max_admin_seats,
+            max_orgs=max_orgs, features=features if features is not None else ["oidc", "saml", "scim"],
+            expires_at=datetime.now(timezone.utc) + timedelta(days=expires_offset_days),
+        )
 
     def _sign(self, payload: dict) -> str:
-        """Produce a v4 license string signed with both test keypairs."""
-        return _sign_payload(payload, self.private_pem, self.counter_private_pem)
+        return _sign_v5(payload, self.leaf_cert, self.leaf_cert_sig, self.licence_key)
 
-    def test_valid_v4_license(self):
-        payload = _make_payload()
+    def test_valid_v5_license(self):
+        payload = self._make_v5_payload()
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.valid is True
@@ -408,7 +486,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_orgs == 1
 
     def test_valid_starter_license(self):
-        payload = _make_payload(
+        payload = self._make_v5_payload(
             tier="starter",
             max_agents=100, max_end_users=250, max_admin_seats=25, max_orgs=1,
             features=["oidc"],
@@ -423,7 +501,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_admin_seats == 25
 
     def test_valid_professional_plus_license(self):
-        payload = _make_payload(
+        payload = self._make_v5_payload(
             tier="professional_plus",
             max_agents=2000, max_end_users=10000, max_admin_seats=200, max_orgs=5,
         )
@@ -434,7 +512,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_orgs == 5
 
     def test_valid_enterprise_unlimited(self):
-        payload = _make_payload(
+        payload = self._make_v5_payload(
             tier="enterprise",
             max_agents=-1, max_end_users=-1, max_admin_seats=-1, max_orgs=-1,
         )
@@ -445,7 +523,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_agents == -1
 
     def test_expired_license_returns_invalid(self):
-        payload = _make_payload(expires_offset_days=-1)  # expired yesterday
+        payload = self._make_v5_payload(expires_offset_days=-1)  # expired yesterday
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.valid is False
@@ -455,11 +533,11 @@ class TestVerifyLicenseWithRealKey:
         assert result.org_domain == "test.example.com"
 
     def test_invalid_signature_returns_invalid(self):
-        payload = _make_payload()
+        payload = self._make_v5_payload()
         license_str = self._sign(payload)
-        # Corrupt the primary signature portion (segment 1)
+        # Corrupt the leaf_sig segment (segment 2 of 4)
         parts = license_str.split(".")
-        corrupted = parts[0] + ".AAAAAAAAAAAAAAAAAAAAAAAA." + parts[2]
+        corrupted = ".".join([parts[0], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", parts[2], parts[3]])
         result = verify_license(corrupted)
         assert result.valid is False
         assert result.error == "invalid_signature"
@@ -469,7 +547,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.tier == LicenseTier.COMMUNITY
 
     def test_features_parsed_correctly(self):
-        payload = _make_payload(features=["oidc", "saml", "scim"])
+        payload = self._make_v5_payload(features=["oidc", "saml", "scim"])
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.has_feature("oidc") is True
@@ -477,29 +555,29 @@ class TestVerifyLicenseWithRealKey:
         assert result.has_feature("scim") is True
 
     def test_community_features_empty(self):
-        payload = _make_payload(tier="community", features=[], max_agents=20,
+        payload = self._make_v5_payload(tier="community", features=[], max_agents=20,
                                 max_end_users=50, max_admin_seats=10, max_orgs=1)
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.has_feature("oidc") is False
 
     def test_org_domain_stored(self):
-        payload = _make_payload(org_domain="mycorp.io")
+        payload = self._make_v5_payload(org_domain="mycorp.io")
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.org_domain == "mycorp.io"
 
     def test_license_id_stored(self):
         lid = str(uuid.uuid4())
-        payload = _make_payload(license_id=lid)
+        payload = self._make_v5_payload(licence_serial=lid)
         license_str = self._sign(payload)
         result = verify_license(license_str)
         assert result.license_id == lid
 
     def test_v1_payload_backwards_compat(self):
-        """v1 payloads lack max_end_users and max_admin_seats — must fall back to tier defaults."""
-        payload = _make_payload(version=1)
-        # Remove v3-only fields to simulate v1
+        """Payloads lacking max_end_users and max_admin_seats — must fall back to tier defaults
+        (field-resolution logic unchanged from v4, independent of wire format version)."""
+        payload = self._make_v5_payload()
         del payload["max_end_users"]
         del payload["max_admin_seats"]
         license_str = self._sign(payload)
@@ -509,8 +587,8 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_admin_seats == TIER_DEFAULTS["professional"]["max_admin_seats"]
 
     def test_v2_max_users_field_maps_to_max_end_users(self):
-        """v2 payloads use 'max_users' instead of 'max_end_users'."""
-        payload = _make_payload(version=2)
+        """Legacy payloads may use 'max_users' instead of 'max_end_users'."""
+        payload = self._make_v5_payload()
         del payload["max_end_users"]
         payload["max_users"] = 999
         license_str = self._sign(payload)
@@ -518,7 +596,7 @@ class TestVerifyLicenseWithRealKey:
         assert result.max_end_users == 999
 
     def test_unknown_tier_falls_back_to_community(self):
-        payload = _make_payload()
+        payload = self._make_v5_payload()
         payload["tier"] = "nonexistent_tier"
         license_str = self._sign(payload)
         result = verify_license(license_str)
@@ -774,25 +852,41 @@ class TestNullSeatFieldsFailClosed:
     not raise TypeError and must return a fail-closed COMMUNITY LicenseState.
 
     Verifies fix for LAURA-V231-002: int(None) DoS-on-boot.
-    Uses v4 license format (counter-sig mandatory, LAURA-V231-003).
+    Uses v5 license format.
     """
 
     @pytest.fixture(autouse=True)
-    def setup_keypair(self, monkeypatch):
-        keys = _make_test_keypair()
-        self.private_key, self.public_key, self.private_pem, self.public_pem = keys
-        _patch_verifier_key(self.public_pem, monkeypatch)
-
-        counter_keys = _make_test_keypair()
-        self.counter_private_pem = counter_keys[2]
-        self.counter_public_pem = counter_keys[3]
-
+    def setup_chain(self, monkeypatch):
         import yashigani.licensing._integrity as integrity_mod
-        monkeypatch.setattr(integrity_mod, "COUNTER_PUBLIC_KEY_PEM", self.counter_public_pem.decode("utf-8"))
-        monkeypatch.setattr(integrity_mod, "_PLACEHOLDER_INTEGRITY", "__NEVER_MATCHES__")
+        import yashigani.licensing.verifier as verifier_mod
+
+        self.master_key = _gen_p384()
+        anchor_set_json = json.dumps([{
+            "anchor_id": "M1", "pubkey_pem": _pem_pub_p384(self.master_key),
+            "alg": Alg.ECDSA_P384_SHA384.value, "status": "active",
+            "added": datetime.now(timezone.utc).isoformat(),
+        }])
+        monkeypatch.setattr(integrity_mod, "MASTER_ANCHOR_SET_JSON", anchor_set_json)
+        monkeypatch.setattr(integrity_mod, "KILL_LIST_JSON", "[]")
+        monkeypatch.setattr(integrity_mod, "CLIENT_DOMAIN_REGISTRY_JSON", "{}")
+        monkeypatch.setattr(verifier_mod, "_integrity_violated", False)
+
+        self.leaf_cert, self.leaf_cert_sig, self.licence_key = _make_v5_licence_leaf(self.master_key)
 
     def _sign(self, payload: dict) -> str:
-        return _sign_payload(payload, self.private_pem, self.counter_private_pem)
+        """Sign a legacy-shaped (_make_payload()) dict as v5 — injects the
+        v5-only fields (client_id/licence_serial/alg/signed_at) that
+        _make_payload() (a v4-era helper reused here for its seat-field
+        shape) does not set, so these null-seat-field tests exercise the
+        SAME field-resolution logic against a v5 wire format."""
+        payload = dict(payload)
+        payload.setdefault("client_id", self.leaf_cert.client_id)
+        payload.setdefault("licence_serial", payload.get("license_id", "lic-0001"))
+        payload.setdefault("alg", Alg.ECDSA_P384_SHA384.value)
+        payload.setdefault("signed_at", datetime.now(timezone.utc).isoformat())
+        if "expires_at" not in payload:
+            payload["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        return _sign_v5(payload, self.leaf_cert, self.leaf_cert_sig, self.licence_key)
 
     def test_null_max_end_users_no_typeerror(self):
         """max_end_users: null in JSON must not raise TypeError."""
@@ -903,28 +997,42 @@ class TestLoadLicenseCorruptPayloadFailClosed:
 # LAURA-V231-003: v3 license format (2-segment) rejected
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sign_payload_v3(payload: dict, private_pem: bytes) -> str:
+    """Build an old-format 2-segment string (no valid v5 crypto needed — the
+    v5 verifier rejects on segment count before any signature is attempted)."""
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return f"{base64.urlsafe_b64encode(payload_bytes).rstrip(b'=').decode()}.AAAA"
+
+
+def _sign_payload_v4(payload: dict, private_pem: bytes) -> str:
+    """Build an old-format 3-segment string (no valid v5 crypto needed)."""
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    seg = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode()
+    return f"{seg}.AAAA.AAAA"
+
+
 class TestV3LicenseRejected:
     """
-    LAURA-V231-003: 2-segment (v3) licenses must be rejected with
-    error="license_format_too_old".  Counter-signature is mandatory;
-    accepting v3 would allow a primary-key-compromise to bypass the
-    counter-sig defence.
+    Design §3.2: "v3/v4 dropped — v5 mandatory, no downgrade path." Both the
+    old 2-segment (v3) and 3-segment (v4) formats must be rejected with
+    error="license_format_deprecated_v5_required", regardless of payload
+    content or signature validity (rejected on segment count alone, before
+    any crypto runs). Class name preserved for test-history continuity.
     """
 
     @pytest.fixture(autouse=True)
     def setup_keypair(self, monkeypatch):
         keys = _make_test_keypair()
         self.private_key, self.public_key, self.private_pem, self.public_pem = keys
-        _patch_verifier_key(self.public_pem, monkeypatch)
 
     def test_two_segment_license_rejected(self):
-        """A validly-signed 2-segment license must be rejected (no counter-sig)."""
+        """A 2-segment (v3) license must be rejected (no downgrade path)."""
         payload = _make_payload()
         license_str = _sign_payload_v3(payload, self.private_pem)
         assert len(license_str.split(".")) == 2, "helper must produce 2-segment string"
         result = verify_license(license_str)
         assert result.valid is False
-        assert result.error == "license_format_too_old"
+        assert result.error == "license_format_deprecated_v5_required"
 
     def test_two_segment_license_returns_community_tier(self):
         """Rejected v3 license falls back to COMMUNITY tier."""
@@ -946,6 +1054,28 @@ class TestV3LicenseRejected:
         """load_license() with a v3-format file → COMMUNITY (loader sees invalid)."""
         payload = _make_payload()
         license_str = _sign_payload_v3(payload, self.private_pem)
+        lic_path = tmp_path / "license.ysg"
+        lic_path.write_text(license_str, encoding="utf-8")
+        monkeypatch.setenv("YASHIGANI_LICENSE_FILE", str(lic_path))
+
+        from yashigani.licensing.loader import load_license
+        result = load_license()
+        assert result.tier == LicenseTier.COMMUNITY
+
+    def test_three_segment_v4_license_rejected(self):
+        """A 3-segment (old v4) license must ALSO be rejected — no downgrade path."""
+        payload = _make_payload()
+        license_str = _sign_payload_v4(payload, self.private_pem)
+        assert len(license_str.split(".")) == 3, "helper must produce 3-segment string"
+        result = verify_license(license_str)
+        assert result.valid is False
+        assert result.error == "license_format_deprecated_v5_required"
+        assert result.tier == LicenseTier.COMMUNITY
+
+    def test_three_segment_via_file_returns_community(self, tmp_path, monkeypatch):
+        """load_license() with a v4-format file → COMMUNITY (loader sees invalid)."""
+        payload = _make_payload()
+        license_str = _sign_payload_v4(payload, self.private_pem)
         lic_path = tmp_path / "license.ysg"
         lic_path.write_text(license_str, encoding="utf-8")
         monkeypatch.setenv("YASHIGANI_LICENSE_FILE", str(lic_path))

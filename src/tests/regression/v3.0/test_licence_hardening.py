@@ -196,81 +196,102 @@ class TestLicenceIntegrityViolationEventToDict(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 7: KDF token is deterministic
+# Test 7/8 (superseded): the v1 KDF-gate token (_derive_integrity_token /
+# T7 / EXPECTED_TOKEN_HMAC) is REMOVED as of licence-hardening-v2 Phase
+# B-CORE — the chain-based build-integrity verify (§4a,
+# chain.build_integrity.verify_build_integrity_chain(), wired via
+# verifier._check_build_integrity_chain()) supersedes both the old
+# HASH_BUNDLE_SIG/counter-key scheme AND the KDF-gate token. See
+# TestBuildIntegrityChainBadSig below for the direct replacement regression
+# test, and src/tests/unit/test_license_integrity.py::
+# TestBuildIntegrityChainPlaceholder for the placeholder/dev/prod coverage
+# this class also used to provide.
 # ---------------------------------------------------------------------------
-
-class TestKdfTokenDeterministic(unittest.TestCase):
-    def test_kdf_token_community_derivation_deterministic(self):
-        """T7: Same inputs → same token on repeated calls."""
-        from yashigani.licensing.verifier import _derive_integrity_token
-
-        token1 = _derive_integrity_token("bundle", "", "20,5,2")
-        token2 = _derive_integrity_token("bundle", "", "20,5,2")
-        self.assertEqual(token1, token2)
-        self.assertEqual(len(token1), 32)
-
-
-# ---------------------------------------------------------------------------
-# Test 8: KDF token differs when seat_policy changes
-# ---------------------------------------------------------------------------
-
-class TestKdfTokenNoCaFingerprint(unittest.TestCase):
-    def test_kdf_token_no_ca_fingerprint_input(self):
-        """DG-01: Different seat_policy → different token (no CA fingerprint in inputs)."""
-        from yashigani.licensing.verifier import _derive_integrity_token
-
-        token_community = _derive_integrity_token("bundle", "", "20,5,2")
-        token_different = _derive_integrity_token("bundle", "", "5,5,2")
-        self.assertNotEqual(token_community, token_different)
 
 
 # ---------------------------------------------------------------------------
-# Test 9: bundle attestation with bad sig sets violation flag
+# Test 9 (superseded): bundle attestation with bad sig sets violation flag —
+# now via the chain-based build-integrity check (§4a), not the old
+# counter-key/HASH_BUNDLE_SIG mechanism.
 # ---------------------------------------------------------------------------
 
-class TestBundleAttestationBadSig(unittest.TestCase):
-    def test_bundle_attestation_bad_sig_sets_flag(self):
-        """T6: Bad HASH_BUNDLE_SIG with no placeholder → _integrity_violated = True."""
-        import yashigani.licensing.verifier as verifier
+class TestBuildIntegrityChainBadSig(unittest.TestCase):
+    def test_build_integrity_chain_bad_bundle_sig_sets_flag(self):
+        """§4a: a fully-populated chain (real anchor/leaf/leaf_cert_sig) with
+        a BUNDLE_SIG that does not verify against the code leaf's own key
+        must set _integrity_violated = True. Direct successor to the old T6
+        HASH_BUNDLE_SIG test."""
+        import base64
+        import json
+        from datetime import datetime, timedelta, timezone
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
         import yashigani.licensing._integrity as _integrity
+        import yashigani.licensing.verifier as verifier
+        from yashigani.licensing.chain import Alg, LeafCert, Role
+        from yashigani.licensing.chain.algorithms import sign_message
+        from yashigani.licensing.chain.canonical import bundle_signing_digest, leaf_cert_signing_digest
+
+        def _gen():
+            return ec.generate_private_key(ec.SECP384R1())
+
+        def _pem_pub(key):
+            return key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode("utf-8")
 
         original_violated = verifier._integrity_violated
 
-        # Save original values
-        orig_bundle_sig = _integrity.HASH_BUNDLE_SIG
-        orig_verifier_hash = _integrity.VERIFIER_HASH
-        orig_enforcer_hash = _integrity.ENFORCER_HASH
-        orig_loader_hash = _integrity.LOADER_HASH
-        orig_integrity_hash = _integrity.INTEGRITY_HASH
-        orig_agents_hash = _integrity.AGENTS_REGISTRY_HASH
-        orig_identity_hash = _integrity.IDENTITY_REGISTRY_HASH
-        orig_counter_key = _integrity.COUNTER_PUBLIC_KEY_PEM
+        orig = {
+            name: getattr(_integrity, name)
+            for name in (
+                "VERIFIER_HASH", "ENFORCER_HASH", "LOADER_HASH", "INTEGRITY_HASH",
+                "AGENTS_REGISTRY_HASH", "IDENTITY_REGISTRY_HASH",
+                "MASTER_ANCHOR_SET_JSON", "CODE_LEAF_CERT_JSON", "CODE_LEAF_CERT_SIG",
+                "BUNDLE_SIG", "KILL_LIST_JSON",
+            )
+        }
 
         try:
-            # Set non-placeholder values (fake hashes and a bad sig)
-            _integrity.HASH_BUNDLE_SIG = "deadbeef" * 8  # 64-char hex, not a real sig
             _integrity.VERIFIER_HASH = "a" * 64
             _integrity.ENFORCER_HASH = "b" * 64
             _integrity.LOADER_HASH = "c" * 64
             _integrity.INTEGRITY_HASH = "d" * 64
             _integrity.AGENTS_REGISTRY_HASH = "e" * 64
             _integrity.IDENTITY_REGISTRY_HASH = "f" * 64
-            # Counter key is real PEM from verifier.py
-            _integrity.COUNTER_PUBLIC_KEY_PEM = verifier._PUBLIC_KEY_PEM
-            verifier._integrity_violated = False
 
-            verifier._check_hash_bundle_attestation()
+            now = datetime.now(timezone.utc)
+            master_key = _gen()
+            code_key = _gen()
+            code_leaf = LeafCert(
+                role=Role.CODE, client_id="*", release="4.1.1", leaf_pubkey_pem=_pem_pub(code_key),
+                not_before=now - timedelta(days=1), not_after=now + timedelta(days=60),
+                serial="code-leaf-4.1.1", signed_at=now, alg=Alg.ECDSA_P384_SHA384,
+            )
+            code_leaf_sig = sign_message(
+                Alg.ECDSA_P384_SHA384, master_key, leaf_cert_signing_digest(code_leaf.to_canonical_dict())
+            )
+            _integrity.MASTER_ANCHOR_SET_JSON = json.dumps([{
+                "anchor_id": "M1", "pubkey_pem": _pem_pub(master_key),
+                "alg": Alg.ECDSA_P384_SHA384.value, "status": "active", "added": now.isoformat(),
+            }])
+            _integrity.CODE_LEAF_CERT_JSON = json.dumps(code_leaf.to_canonical_dict())
+            _integrity.CODE_LEAF_CERT_SIG = base64.b64encode(code_leaf_sig).decode()
+            # BUNDLE_SIG signed by a DIFFERENT key — must fail against code_leaf's key.
+            rogue_key = _gen()
+            bad_sig = sign_message(Alg.ECDSA_P384_SHA384, rogue_key, bundle_signing_digest("garbage"))
+            _integrity.BUNDLE_SIG = base64.b64encode(bad_sig).decode()
+            _integrity.KILL_LIST_JSON = "[]"
+
+            verifier._integrity_violated = False
+            verifier._check_build_integrity_chain()
             self.assertTrue(verifier._integrity_violated)
         finally:
             verifier._integrity_violated = original_violated
-            _integrity.HASH_BUNDLE_SIG = orig_bundle_sig
-            _integrity.VERIFIER_HASH = orig_verifier_hash
-            _integrity.ENFORCER_HASH = orig_enforcer_hash
-            _integrity.LOADER_HASH = orig_loader_hash
-            _integrity.INTEGRITY_HASH = orig_integrity_hash
-            _integrity.AGENTS_REGISTRY_HASH = orig_agents_hash
-            _integrity.IDENTITY_REGISTRY_HASH = orig_identity_hash
-            _integrity.COUNTER_PUBLIC_KEY_PEM = orig_counter_key
+            for name, value in orig.items():
+                setattr(_integrity, name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -484,31 +505,82 @@ class TestIdentityRegistryIntegrityViolation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Test 15: IMPL-01 — no runtime YASHIGANI_ENV=dev bypass in _verify_counter_signature
+# Test 15: IMPL-01 — no runtime YASHIGANI_ENV=dev bypass in v5 chain verify
 # ---------------------------------------------------------------------------
 
-class TestNoDevBypassInCounterSigVerification(unittest.TestCase):
-    def test_counter_sig_placeholder_with_dev_env_returns_false(self):
-        """IMPL-01: YASHIGANI_ENV=dev must NOT make _verify_counter_signature return True on placeholder key."""
-        import yashigani.licensing.verifier as verifier
-        import yashigani.licensing._integrity as _integrity
+class TestNoDevBypassInChainVerification(unittest.TestCase):
+    def test_untrusted_leaf_cert_rejected_even_with_dev_env(self):
+        """IMPL-01 successor: chain.licence_v5.verify_licence_v5() has NO
+        YASHIGANI_ENV branch at all — a licence whose leaf_cert does not
+        chain to a trusted anchor must be rejected regardless of
+        YASHIGANI_ENV=dev. (The v1 property this superseded was scoped to
+        _verify_counter_signature(); the v2 chain design structurally
+        removes the class of bug entirely — there is no dev-mode skip
+        anywhere in the §4b verify sequence.)"""
+        import json
+        from datetime import datetime, timedelta, timezone
 
-        orig_key = _integrity.COUNTER_PUBLIC_KEY_PEM
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        import yashigani.licensing._integrity as _integrity
+        import yashigani.licensing.verifier as verifier
+        from yashigani.licensing.chain import (
+            Alg, LeafCert, PemSigner, Role, build_licence_payload_v5, sign_licence_v5,
+        )
+        from yashigani.licensing.chain.algorithms import sign_message
+        from yashigani.licensing.chain.canonical import leaf_cert_signing_digest
+
+        def _gen():
+            return ec.generate_private_key(ec.SECP384R1())
+
+        def _pem_pub(key):
+            return key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode("utf-8")
+
+        orig_anchor_set = _integrity.MASTER_ANCHOR_SET_JSON
+        orig_violated = verifier._integrity_violated
         try:
-            # Ensure placeholder key
-            _integrity.COUNTER_PUBLIC_KEY_PEM = (
-                "PLACEHOLDER_YASHIGANI_INTEGRITY_COUNTER_KEY"
+            # Embedded anchor set trusts master M1 only.
+            m1 = _gen()
+            _integrity.MASTER_ANCHOR_SET_JSON = json.dumps([{
+                "anchor_id": "M1", "pubkey_pem": _pem_pub(m1),
+                "alg": Alg.ECDSA_P384_SHA384.value, "status": "active",
+                "added": datetime.now(timezone.utc).isoformat(),
+            }])
+            verifier._integrity_violated = False
+
+            # Licence signed under a ROGUE master (M2), not in the anchor set.
+            m2_rogue = _gen()
+            now = datetime.now(timezone.utc)
+            licence_key = _gen()
+            leaf_cert = LeafCert(
+                role=Role.LICENCE, client_id="acme-corp", leaf_pubkey_pem=_pem_pub(licence_key),
+                not_before=now - timedelta(days=1), not_after=now + timedelta(days=60),
+                serial="lic-leaf-rogue", signed_at=now, alg=Alg.ECDSA_P384_SHA384,
             )
+            leaf_cert_sig = sign_message(
+                Alg.ECDSA_P384_SHA384, m2_rogue, leaf_cert_signing_digest(leaf_cert.to_canonical_dict())
+            )
+            payload = build_licence_payload_v5(
+                org_domain="acme.example.com", tier="enterprise", client_id="acme-corp",
+                licence_serial="lic-0001", max_agents=-1, max_end_users=-1, max_admin_seats=-1,
+                max_orgs=-1, expires_at=now + timedelta(days=365),
+            )
+            signer = PemSigner(role=Role.LICENCE, private_key=licence_key, leaf_cert=leaf_cert)
+            wire = sign_licence_v5(payload, signer, leaf_cert, leaf_cert_sig)
+
             with patch.dict("os.environ", {"YASHIGANI_ENV": "dev"}):
-                result = verifier._verify_counter_signature(
-                    payload_bytes=b"test-payload",
-                    primary_public_key_pem=verifier._PUBLIC_KEY_PEM,
-                    counter_sig_bytes=b"\x00" * 64,
-                )
-            # Must NOT return True — IMPL-01 closed the dev-bypass
-            self.assertFalse(result)
+                result = verifier.verify_license(wire)
+
+            # Must NOT be accepted — IMPL-01's "no env-based crypto bypass"
+            # property, now structurally enforced (no dev branch exists).
+            self.assertFalse(result.valid)
+            self.assertEqual(result.error, "leaf_cert_untrusted")
         finally:
-            _integrity.COUNTER_PUBLIC_KEY_PEM = orig_key
+            _integrity.MASTER_ANCHOR_SET_JSON = orig_anchor_set
+            verifier._integrity_violated = orig_violated
 
 
 if __name__ == "__main__":
