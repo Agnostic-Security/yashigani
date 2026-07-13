@@ -1521,22 +1521,24 @@ resolve_compose_cmd() {
       log_error "If you meant Docker, set YSG_RUNTIME=docker instead."
       exit 1
     fi
-    # `podman compose` (v2 engine, delegates to docker-compose) FIRST:
-    # docker-compose v2 correctly handles `depends_on: condition: service_healthy`
-    # and `service_completed_successfully`. podman-compose 1.x ignores those
-    # conditions — a container whose only depends_on entries are service_healthy
-    # never advances past Created (podman-compose bug, confirmed v1.5.0–v1.6.0;
-    # reproduces on macOS applehv VM with letta / letta-pgbouncer / langflow).
-    # `podman compose` passes the Podman socket via DOCKER_HOST; docker-compose v2
-    # is Podman-socket-aware and handles security_opt / userns_mode / cap_drop
-    # correctly.  We do NOT fall through to bare docker-compose — this branch is
-    # Podman-only and the tool MUST be reached via the Podman provider path.
-    if podman compose version >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (v2 engine — service_healthy-aware)"
-      return 0
-    fi
+    # podman-compose (Python) FIRST: sequential, stable, native to Podman.
+    # We do NOT prefer `podman compose` (v2 engine) here even though it honours
+    # depends_on: service_healthy — because `podman compose` passes
+    # security_opt: seccomp=<abs-path> by INLINING the file content and sending
+    # it as the option value to the Podman socket, which then treats the multi-KB
+    # JSON blob as a filename → ENAMETOOLONG → caddy/gateway/backoffice cannot be
+    # created → whole stack fails to come up on rootless Podman.  Root cause:
+    # docker-compose v2 serialises security_opt values differently from what the
+    # Podman socket expects for path-based seccomp profiles.  Confirmed against
+    # Podman 5.x + docker-compose 2.x; podman-compose passes the path string
+    # directly to `podman run --security-opt seccomp=/abs/path`, which works.
+    # Ref: Pentest #95 TM-V231-005 (original cross-runtime seccomp finding).
+    #
+    # The letta/letta-pgbouncer "stuck Created" issue (podman-compose 1.x ignores
+    # depends_on: service_healthy) is handled by _podman_compose_letta_waitloop()
+    # in compose_up(), which explicitly gates letta on its deps once they are
+    # confirmed healthy. This keeps the correct provider order AND fixes the
+    # letta startup ordering.
     if command -v podman-compose >/dev/null 2>&1; then
       # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
       # podman-compose defaults to one pod per project; the NVIDIA CDI hook
@@ -1544,11 +1546,15 @@ resolve_compose_cmd() {
       # inside that pod, wedging ollama + everything that depends on it. The same
       # CDI device works in a standalone `podman run` (no pod), so we disable the
       # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
-      # NOTE: podman-compose 1.x does NOT handle service_healthy depends_on
-      # conditions — use only as a last resort when `podman compose` is absent.
       COMPOSE_CMD=("podman-compose" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (fallback; service_healthy may not be honoured)"
+      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
+      return 0
+    fi
+    if podman compose version >/dev/null 2>&1; then
+      COMPOSE_CMD=("podman" "compose")
+      YSG_PODMAN_RUNTIME=true
+      log_info "Compose tool: podman compose (Podman 4+ built-in)"
       return 0
     fi
     log_error "YSG_RUNTIME=podman but no native Podman compose tool found. Install:"
@@ -1567,21 +1573,16 @@ resolve_compose_cmd() {
   # Docker branch only considers docker compose / docker-compose. No mixing.
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    # Prefer `podman compose` (v2 engine) over podman-compose (1.x Python).
-    # podman-compose 1.x ignores depends_on service_healthy / service_completed_
-    # successfully conditions — containers stay Created forever (confirmed v1.5.0-v1.6.0).
-    # `podman compose` delegates to the docker-compose v2 binary which handles
-    # these conditions correctly.
-    if podman compose version >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (auto-detect, v2 engine)"
-      return 0
-    fi
     if command -v podman-compose >/dev/null 2>&1; then
       COMPOSE_CMD=("podman-compose")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (auto-detect, fallback)"
+      log_info "Compose tool: podman-compose (auto-detect)"
+      return 0
+    fi
+    if podman compose version >/dev/null 2>&1; then
+      COMPOSE_CMD=("podman" "compose")
+      YSG_PODMAN_RUNTIME=true
+      log_info "Compose tool: podman compose (auto-detect, built-in)"
       return 0
     fi
     # Podman is reachable but neither podman-compose nor `podman compose` is
@@ -7211,6 +7212,204 @@ _resolve_host_ollama_port() {
   log_info "Apple Metal: ollama confirmed on 127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} (source: ${_source}, Laura C3: loopback)"
 }
 
+# =============================================================================
+# _podman_compose_letta_waitloop — Part-2 fix for cacc23da regression
+# =============================================================================
+# podman-compose 1.x does not honour `depends_on: condition: service_healthy`
+# or `service_completed_successfully`. As a result, after `podman-compose up -d`
+# the following services remain stuck in "Created" state (never started):
+#   • agent-db-init  — depends_on postgres: service_healthy
+#   • letta-pgbouncer — depends_on postgres: service_healthy
+#                                  agent-db-init: service_completed_successfully
+#   • letta           — depends_on gateway: service_healthy
+#                                  postgres: service_healthy
+#                                  letta-pgbouncer: service_healthy
+#                                  agent-db-init: service_completed_successfully
+#
+# This function detects that state and explicitly walks the dependency chain:
+#   1. Wait for postgres to report healthy (no compose dep — starts unconditionally).
+#   2. `podman start agent-db-init`; wait for it to exit 0.
+#   3. `podman start letta-pgbouncer`; wait for it to be healthy.
+#   4. Wait for gateway healthy; `podman start letta`.
+#
+# Design constraints:
+#   • NO-OP when:
+#       – provider is NOT podman-compose (i.e. podman compose or docker — those
+#         honour service_healthy natively)
+#       – letta profile is not active (lean installs without --letta flag)
+#       – K8s path (YSG_PODMAN_RUNTIME=false)
+#       – DRY_RUN=true
+#   • Idempotent: `podman start` on an already-running container returns exit 0.
+#   • Fail-closed on postgres timeout (required dep; no point starting chain).
+#   • Warn-and-continue on letta-pgbouncer / agent-db-init failures (letta may
+#     crash-loop, but core gateway/backoffice are unaffected — non-fatal).
+#   • Timeout: YSG_LETTA_WAITLOOP_TIMEOUT_S (default 300s).
+#   • Does NOT touch K8s bootstrap or modify compose files.
+#   • Uses podman-compose naming convention:
+#       ${COMPOSE_PROJECT_NAME}_${service}_1
+#
+# Root cause of why provider was NOT swapped to `podman compose` here:
+#   `podman compose` passes security_opt:seccomp=<abs-path> by inlining the JSON
+#   content as the option value sent to the Podman socket, which then treats the
+#   multi-KB blob as a filename → ENAMETOOLONG → caddy/gateway/backoffice fail to
+#   create. `podman-compose` passes the path string directly to `podman run
+#   --security-opt seccomp=/abs/path`, which the kernel accepts correctly.
+#   Ref: Pentest #95 TM-V231-005 (original cross-runtime seccomp finding).
+#   The seccomp regression is a BLOCKER; the letta ordering issue is fixable here.
+#
+# Called from compose_up() after both upgrade and fresh-install compose-up paths
+# converge, before log_success "Services started".
+# =============================================================================
+_podman_compose_letta_waitloop() {
+  # ── Guard 1: only applies when podman-compose is the selected tool ─────────
+  # `podman compose` and `docker compose` honour service_healthy natively.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] \
+     || [[ "${COMPOSE_CMD[0]:-}" != "podman-compose" ]]; then
+    return 0
+  fi
+
+  # ── Guard 2: only when letta profile is active ─────────────────────────────
+  local _letta_active="false"
+  local _wl_p
+  for _wl_p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+    [[ "$_wl_p" == "letta" ]] && _letta_active="true" && break
+  done
+  if [[ "$_letta_active" != "true" ]]; then
+    return 0
+  fi
+
+  # ── Guard 3: skip dry-run ──────────────────────────────────────────────────
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "_podman_compose_letta_waitloop: would gate letta on dependency health"
+    return 0
+  fi
+
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  local _timeout_s="${YSG_LETTA_WAITLOOP_TIMEOUT_S:-300}"
+  local _deadline=$(( $(date +%s) + _timeout_s ))
+
+  # Container names follow podman-compose convention: ${project}_${service}_1
+  local _pg_ctr="${_proj}_postgres_1"
+  local _gw_ctr="${_proj}_gateway_1"
+  local _adb_ctr="${_proj}_agent-db-init_1"
+  local _lpgb_ctr="${_proj}_letta-pgbouncer_1"
+  local _letta_ctr="${_proj}_letta_1"
+
+  # ── Quick probe: are letta-tier containers actually stuck in created? ───────
+  local _stuck_ctrs
+  _stuck_ctrs="$(
+    podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null \
+    | grep -E "^${_proj}_(letta|agent-db-init)" | sort -u || true
+  )"
+  if [[ -z "$_stuck_ctrs" ]]; then
+    log_info "Letta wait-loop: no letta/agent-db-init containers in created state — skipping"
+    return 0
+  fi
+
+  log_info "Letta wait-loop: podman-compose 1.x service_healthy workaround (timeout ${_timeout_s}s)"
+  log_info "Letta wait-loop: stuck containers: $(printf '%s ' ${_stuck_ctrs})"
+
+  # ── Helper: poll container health from OCI inspect ─────────────────────────
+  _letta_wl_health() {
+    podman inspect --format '{{.State.Health.Status}}' "$1" 2>/dev/null || echo ""
+  }
+  # ── Helper: container lifecycle state ─────────────────────────────────────
+  _letta_wl_state() {
+    podman inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo "absent"
+  }
+  # ── Helper: exit code of a one-shot container ──────────────────────────────
+  _letta_wl_exitcode() {
+    podman inspect --format '{{.State.ExitCode}}' "$1" 2>/dev/null || echo "-1"
+  }
+
+  # ── Step 1: wait for postgres healthy ─────────────────────────────────────
+  log_info "Letta wait-loop [1/4]: waiting for postgres healthy..."
+  local _pg_ok=0
+  while [[ $(date +%s) -lt $_deadline ]]; do
+    [[ "$(_letta_wl_health "$_pg_ctr")" == "healthy" ]] && { _pg_ok=1; break; }
+    sleep 3
+  done
+  if [[ "$_pg_ok" -eq 0 ]]; then
+    log_error "Letta wait-loop: timed out waiting for postgres healthy (${_timeout_s}s)"
+    log_error "Letta wait-loop: letta tier will not start; check: podman logs ${_pg_ctr}"
+    return 1
+  fi
+  log_success "Letta wait-loop [1/4]: postgres healthy"
+
+  # ── Step 2: start agent-db-init; wait for exit 0 ──────────────────────────
+  if [[ "$(_letta_wl_state "$_adb_ctr")" == "absent" ]]; then
+    log_warn "Letta wait-loop [2/4]: agent-db-init container absent — letta DB may be missing"
+  else
+    log_info "Letta wait-loop [2/4]: starting agent-db-init..."
+    # `podman start` on an already-running container is a no-op exit-0; safe to call.
+    podman start "$_adb_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start agent-db-init returned non-zero — proceeding"
+    log_info "Letta wait-loop [2/4]: waiting for agent-db-init to exit 0..."
+    local _adb_ok=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      local _adb_s _adb_x
+      _adb_s="$(_letta_wl_state "$_adb_ctr")"
+      _adb_x="$(_letta_wl_exitcode "$_adb_ctr")"
+      if [[ "$_adb_s" == "exited" && "$_adb_x" == "0" ]]; then
+        _adb_ok=1; break
+      fi
+      # Failed exit — don't keep waiting
+      [[ "$_adb_s" == "exited" && "$_adb_x" != "0" ]] && break
+      sleep 3
+    done
+    if [[ "$_adb_ok" -eq 1 ]]; then
+      log_success "Letta wait-loop [2/4]: agent-db-init completed (exit 0)"
+    else
+      local _final_x
+      _final_x="$(_letta_wl_exitcode "$_adb_ctr")"
+      log_warn "Letta wait-loop [2/4]: agent-db-init did not exit 0 (exit=${_final_x}) — letta may crash on missing DB"
+    fi
+  fi
+
+  # ── Step 3: start letta-pgbouncer; wait for healthy ───────────────────────
+  if [[ "$(_letta_wl_state "$_lpgb_ctr")" == "absent" ]]; then
+    log_warn "Letta wait-loop [3/4]: letta-pgbouncer container absent"
+  else
+    log_info "Letta wait-loop [3/4]: starting letta-pgbouncer..."
+    podman start "$_lpgb_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start letta-pgbouncer returned non-zero — proceeding"
+    log_info "Letta wait-loop [3/4]: waiting for letta-pgbouncer healthy..."
+    local _lpgb_ok=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_health "$_lpgb_ctr")" == "healthy" ]] && { _lpgb_ok=1; break; }
+      sleep 3
+    done
+    if [[ "$_lpgb_ok" -eq 1 ]]; then
+      log_success "Letta wait-loop [3/4]: letta-pgbouncer healthy"
+    else
+      log_warn "Letta wait-loop [3/4]: letta-pgbouncer not healthy before timeout — letta may fail DB connect"
+    fi
+  fi
+
+  # ── Step 4: wait for gateway healthy; start letta ─────────────────────────
+  # gateway has no service_healthy depends_on so podman-compose starts it
+  # unconditionally, but it may still be converging. letta depends on it.
+  if [[ "$(_letta_wl_health "$_gw_ctr")" != "healthy" ]]; then
+    log_info "Letta wait-loop [4/4]: waiting for gateway healthy (letta dep)..."
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_health "$_gw_ctr")" == "healthy" ]] && break
+      sleep 3
+    done
+    if [[ "$(_letta_wl_health "$_gw_ctr")" != "healthy" ]]; then
+      log_warn "Letta wait-loop [4/4]: gateway not healthy before timeout — letta start proceeding anyway"
+    fi
+  fi
+
+  if [[ "$(_letta_wl_state "$_letta_ctr")" == "absent" ]]; then
+    log_warn "Letta wait-loop [4/4]: letta container absent — cannot start"
+  else
+    log_info "Letta wait-loop [4/4]: starting letta..."
+    podman start "$_letta_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start letta returned non-zero — proceeding"
+    log_success "Letta wait-loop [4/4]: letta started"
+  fi
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -8295,6 +8494,14 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
     fi
   fi
+
+  # ── podman-compose letta wait-loop ─────────────────────────────────────────
+  # podman-compose 1.x ignores depends_on: service_healthy, leaving letta,
+  # letta-pgbouncer, and agent-db-init stuck in "Created" state. This call
+  # detects that case and explicitly sequences them on their dep health.
+  # NO-OP for all other providers (podman compose, docker) and lean installs.
+  # See _podman_compose_letta_waitloop() definition above for full rationale.
+  _podman_compose_letta_waitloop
 
   log_success "Services started"
 
