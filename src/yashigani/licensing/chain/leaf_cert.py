@@ -71,26 +71,26 @@ class LeafCert:
                          (per-release for code leaves, per-client for
                          licence/audit leaves; LOCKED DECISIONS: "leaf-serial
                          kill-list ONLY").
-      licence_serial    Optional. ROUND-3 fix 5 (Laura R3-F3): "licence_serial
-                         added to the kill-list plumbing now — so one leaked
-                         .ysg can be killed without nuking the client's other
-                         licences." NOTE (Phase A judgement call — flagged in
-                         the delivery report for Tiago/Nico): semantically
-                         this is a PER-ISSUED-LICENCE identifier, which lives
-                         naturally on the v5 licence PAYLOAD (Phase B), not on
-                         the leaf_cert (one leaf_cert is shared across every
-                         licence a client's licence-leaf issues). It is
-                         included here, Optional and unset for LEAF_CERT
-                         objects, purely so the field name/type is defined
-                         once in the shared foundation per the brief's
-                         literal field list; Phase B's v5 payload schema is
-                         the structure that should actually populate and
-                         sign it per-issued-licence.
       signed_at         forensic signing timestamp (LOCKED DECISIONS: "Signing
                          timestamp (signed_at) in the licence — forensic trail").
       alg               closed Alg enum member. Lives INSIDE this dataclass
                          (and therefore inside the canonicalised, signed
                          digest) — never as an unsigned wrapper.
+      csr_pop           Optional self-signed CSR / proof-of-possession the
+                         requester submitted at provisioning time (Phase B /
+                         Su addition — LOCKED DECISIONS bullet 9 + §3.1: "the
+                         master only signs a pubkey that proves it holds the
+                         private key"). Shape:
+                         {"leaf_pubkey_pem", "client_id", "role", "csr_self_sig"}.
+                         The MASTER verifies csr_self_sig against
+                         leaf_pubkey_pem BEFORE certifying (keygen.py mint
+                         flow) — this field is carried on the cert purely as
+                         a provenance record; it is NOT re-verified at
+                         runtime (§4a/§4b/§4c never re-check csr_pop, only
+                         the mint-time master does). None for leaves minted
+                         before this field existed / where PoP is out of
+                         scope (kept Optional for backward compatibility with
+                         Phase A round-trip tests).
     """
 
     role: Role
@@ -102,7 +102,7 @@ class LeafCert:
     signed_at: datetime
     alg: Alg
     release: Optional[str] = None
-    licence_serial: Optional[str] = None
+    csr_pop: Optional[dict] = None
 
     def __post_init__(self) -> None:
         if self.role == Role.CODE and self.client_id != SHARED_CLIENT_ID:
@@ -146,6 +146,7 @@ class LeafCert:
             "licence_serial": self.licence_serial,
             "signed_at": self.signed_at.astimezone(timezone.utc).isoformat(),
             "alg": self.alg.value,
+            "csr_pop": self.csr_pop,
         }
 
     @classmethod
@@ -163,6 +164,7 @@ class LeafCert:
             licence_serial=d.get("licence_serial"),
             signed_at=datetime.fromisoformat(d["signed_at"]),
             alg=Alg.from_wire(d["alg"]),
+            csr_pop=d.get("csr_pop"),
         )
 
     def signing_digest(self) -> bytes:

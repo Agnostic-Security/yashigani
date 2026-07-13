@@ -40,6 +40,14 @@ CTX_BUNDLE = "YSG-BUNDLE-v2"
 # naming choice, not a locked decision — trivial to bump to -v2 pre-ship if
 # Nico/Tiago want a different literal.
 CTX_AUDIT_CHECKPOINT = "YSG-AUDIT-CHECKPOINT-v1"
+# Generic leaf-provisioning CSR/PoP tag (Phase B / Su, licence-hardening-v2 dispatch
+# "Master signs the leaf_cert ... csr_pop"). Generalises LOCKED DECISIONS bullet 9
+# ("Leaf provisioning uses a self-signed CSR (proof-of-possession)") to CODE and
+# LICENCE leaf minting (keygen.py / licgen new-leaf). Deliberately DISTINCT from
+# "YSG-AUDIT-CSR-v1" (§3.4.1) — that literal tag is reserved for the audit-leaf
+# onboarding CSR tool, which is explicit Phase C / out-of-scope here; using a
+# different tag avoids any digest collision with that future work.
+CTX_LEAF_CSR = "YSG-LEAF-CSR-v1"
 
 
 def canonical(obj: Any) -> str:
@@ -109,6 +117,19 @@ def bundle_signing_digest(bundle_str: str) -> bytes:
     exposed here so the digest formula is defined exactly once).
     """
     return domain_separated_digest(CTX_BUNDLE, bundle_str.encode("utf-8"))
+
+
+def leaf_csr_signing_digest(csr_pop_payload_canonical_dict: dict) -> bytes:
+    """digest = SHA384( CTX_LEAF_CSR || canonical(csr_pop_payload) )
+
+    The message a NEW leaf's own private key signs to produce csr_self_sig —
+    the proof-of-possession the master verifies BEFORE certifying that leaf
+    (design doc §3.4.1 pattern, generalised here to code/licence leaves per
+    LOCKED DECISIONS bullet 9). csr_pop_payload is typically
+    {"leaf_pubkey_pem":..., "client_id":..., "role":...}.
+    """
+    payload_bytes = canonical(csr_pop_payload_canonical_dict).encode("utf-8")
+    return domain_separated_digest(CTX_LEAF_CSR, payload_bytes)
 
 
 def audit_checkpoint_signing_digest(
