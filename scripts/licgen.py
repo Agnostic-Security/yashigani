@@ -42,7 +42,6 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
 DEMO_DEFAULT_DIR = (
     Path(__file__).resolve().parent.parent.parent

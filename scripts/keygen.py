@@ -449,8 +449,8 @@ def _cmd_leaf_new(args: argparse.Namespace) -> None:
     role = Role(args.role)
     if role not in (Role.CODE, Role.LICENCE):
         print(
-            f"ERROR: keygen.py leaf new only mints role=code|licence — role=audit "
-            f"onboarding is Phase C (§3.4.1, audit-leaf CSR tool, out of scope)",
+            "ERROR: keygen.py leaf new only mints role=code|licence — role=audit "
+            "onboarding is Phase C (§3.4.1, audit-leaf CSR tool, out of scope)",
             file=sys.stderr,
         )
         sys.exit(1)
