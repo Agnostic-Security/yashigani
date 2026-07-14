@@ -489,9 +489,45 @@ async def login(body: LoginRequest, request: Request, response: Response):
     #     are invalidated (ASVS V2.1.4); the user must log in again to get a full
     #     session.
     #
-    # Admin accounts with force_password_change=True are NOT restricted here —
-    # they already go through the totp_provisioning path if applicable, and the
-    # admin plane has separate controls. This fix targets user-plane bypass only.
+    # LAURA-411-003 (ASVS V2.1.7): enforce force_password_change for ADMIN accounts.
+    # A session issued with force_password_change=True is a restricted
+    # account_tier="admin_password_change_required" — accepted by require_any_session
+    # (so /auth/password/change and /auth/logout remain reachable) but REJECTED by
+    # require_admin_session (so all /admin/* GET/POST endpoints are blocked until
+    # the password is changed and the admin re-authenticates for a full session).
+    # Mirrors the totp_provisioning pattern at lines 428-450 above.
+    if record.force_password_change and record.account_tier == "admin":
+        restricted_session = state.session_store.create(
+            account_id=record.account_id,
+            account_tier="admin_password_change_required",
+            client_ip=client_ip,
+        )
+        state.audit_writer.write(
+            _make_login_event(
+                body.username,
+                "admin_password_change_restricted",
+                None,
+                account_tier=record.account_tier,
+            )
+        )
+        _log.info(
+            "LAURA-411-003: admin_password_change_required session issued for %s "
+            "(force_password_change=True). All /admin/* endpoints blocked until "
+            "password is changed via /auth/password/change.",
+            body.username,
+        )
+        _set_session_cookie(response, restricted_session.token, "admin_password_change_required")
+        return {
+            "status": "admin_password_change_required",
+            "force_password_change": True,
+            "force_totp_provision": record.force_totp_provision,
+            "message": (
+                "Your password must be changed before you can access admin functions. "
+                "POST to /auth/password/change to set a new password."
+            ),
+        }
+
+    # User-tier force-password-change restriction (LAURA-V400-NEW-002).
     if record.force_password_change and record.account_tier == "user":
         restricted_session = state.session_store.create(
             account_id=record.account_id,

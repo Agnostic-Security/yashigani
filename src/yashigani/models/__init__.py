@@ -8,6 +8,7 @@ from yashigani.models.allocation_durable_store import (
 from yashigani.models.effective import (
     EffectiveModels,
     model_denied_for_caller,
+    normalize_model_for_deny,
     resolve_effective_allowed_models,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "reconcile_allocations_from_durable",
     "EffectiveModels",
     "model_denied_for_caller",
+    "normalize_model_for_deny",
     "resolve_effective_allowed_models",
 ]

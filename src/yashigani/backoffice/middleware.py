@@ -67,6 +67,21 @@ def require_admin_session(
             detail={"error": "session_expired_or_invalid"},
         )
 
+    if session.account_tier == "admin_password_change_required":
+        # LAURA-411-003: a force-password-change admin session must not grant
+        # full admin access.  Only /auth/password/change (require_any_session)
+        # and /auth/logout (require_any_session) are reachable with this tier.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_password_change_required",
+                "message": (
+                    "You must change your password before accessing admin functions. "
+                    "POST to /auth/password/change to set a new password."
+                ),
+            },
+        )
+
     if session.account_tier != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
