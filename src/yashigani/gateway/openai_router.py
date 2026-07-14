@@ -214,6 +214,7 @@ def _validate_model_string(model: str) -> Optional[str]:
 
     Rejects:
       • URL-like strings  (http://, https://, //, ftp://)
+      • Any ``://`` scheme form (e.g. ``openai://gpt-4o``) — LAURA-412-001
       • Path-traversal patterns (../, ..\\)
       • Absolute paths (starts with /)
       • Null-sentinel literals (``"null"``, ``"none"``, ``"undefined"``)
@@ -229,6 +230,12 @@ def _validate_model_string(model: str) -> Optional[str]:
     for prefix in ("http://", "https://", "//", "ftp://"):
         if s_lower.startswith(prefix):
             return "url_not_allowed"
+    # LAURA-412-001: reject ANY ://-scheme form (e.g. openai://gpt-4o).
+    # The leading-prefix check above catches http:// and https:// at the start;
+    # this catches provider-scheme forms like openai://model that don't start
+    # with a standard protocol prefix.
+    if "://" in s_lower:
+        return "url_not_allowed"
     if "../" in s or "..\\" in s or s.startswith("/") or s.startswith(".."):
         return "path_traversal_not_allowed"
     if s_lower in ("null", "none", "undefined"):
@@ -300,17 +307,28 @@ def _is_known_model(
     """
     if not model:
         return False
-    norm = model.strip().lower()
+    # LAURA-412-001: canonicalize via normalize_model_for_deny so that the
+    # cloud-provider prefix check and the local-model equality check both
+    # operate on the same canonical form that the DENY lookup uses.  This
+    # prevents a model being "known" under one form (e.g. "openai::gpt-4o")
+    # while the DENY lookup misses it because the stored grant key is the
+    # canonical "openai:gpt-4o".
+    from yashigani.models.effective import normalize_model_for_deny as _norm_for_known
+    norm = _norm_for_known(model)
+    if not norm:
+        return False
 
     # 1. Cloud provider-qualified: ``provider:model`` where provider is known.
     #    We trust the cloud provider to reject an unrecognised model name.
+    #    Operating on the canonical norm ensures openai::gpt-4o and
+    #    openai:gpt-4o. both canonicalize to openai:gpt-4o before this check.
     if ":" in norm:
         provider_prefix = norm.split(":", 1)[0]
         if provider_prefix in _CLOUD_PROVIDER_CONFIG:
             return True
 
     # 2. Alias store (configured aliases: "smart", "fast", "gpt-4o", …).
-    #    Try the original case first then the normalized lowercase form.
+    #    Try the original case first then the normalized canonical form.
     if alias_store is not None:
         try:
             if (
