@@ -276,8 +276,11 @@ def _is_known_model(
             return True
 
     # 3. Available (installed Ollama) models.
+    # BUG-B FIX (4.1.2): _state.available_models stores dicts keyed "id"
+    # (populated via the Ollama /api/tags response); "name" is absent, so
+    # all local models wrongly missed this check → 422 model_not_found.
     for m in available_models or []:
-        name = (m.get("name") or "").lower()
+        name = (m.get("name") or m.get("id") or "").lower()
         if name and name == norm:
             return True
 
@@ -2438,17 +2441,24 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         ) if identity else None
         _411_groups: list = identity.get("groups", []) if identity else []
         _411_explicit_deny = False
+        # BUG-A FIX (4.1.2): normalize body.model before deny-grant lookup so
+        # that "openai/gpt-4o", "OPENAI/GPT-4O", and "openai:gpt-4o" all
+        # resolve to the canonical key used when the grant was stored.
+        # normalize_model_for_deny already imported inline at ~1634 for routing;
+        # import again locally to keep the fix self-contained.
+        from yashigani.models.effective import normalize_model_for_deny as _norm_deny_fn
+        _411_model_key = _norm_deny_fn(body.model) or body.model
         try:
             if _411_uid:
                 _411_ug = _state.permission_store.get_boolean_grant(
-                    _RT_411.CLOUD_MODEL, "user", _411_uid, body.model
+                    _RT_411.CLOUD_MODEL, "user", _411_uid, _411_model_key
                 )
                 if _411_ug is not None and not _411_ug.allow:
                     _411_explicit_deny = True
             if not _411_explicit_deny:
                 for _411_gid in _411_groups:
                     _411_gg = _state.permission_store.get_boolean_grant(
-                        _RT_411.CLOUD_MODEL, "group", _411_gid, body.model
+                        _RT_411.CLOUD_MODEL, "group", _411_gid, _411_model_key
                     )
                     if _411_gg is not None and not _411_gg.allow:
                         _411_explicit_deny = True
