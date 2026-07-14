@@ -2355,6 +2355,10 @@ class CloudOverrideEvent(AuditEvent):
     initiated_by: str = ""
     approver: str = ""
     expires_at: str = ""
+    # SOD-1 (YCS-20260705-v4.1.2-SOD-1): the SHA-256 fingerprint the approver supplied
+    # to bind their approval to the exact proposal they reviewed.  Present on
+    # CLOUD_OVERRIDE_ACTIVATED; empty string on PROPOSED/REVOKED.
+    confirming_fingerprint: str = ""
 
 
 @dataclass
