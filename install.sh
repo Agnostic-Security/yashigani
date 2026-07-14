@@ -285,6 +285,12 @@ YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}"
 # Default empty → resolution runs. Override: --ollama-port N or YASHIGANI_HOST_OLLAMA_PORT=N.
 YASHIGANI_HOST_OLLAMA_PORT="${YASHIGANI_HOST_OLLAMA_PORT:-}"
 
+# LAURA-411-001 — inference-backend firewall hardening (consent-gated convenience).
+# Non-interactive: applies only when --secure-backend-firewall is passed.
+# Interactive: prompts the operator at the end of install.
+# The function never breaks an install — errors warn + point at the doc and continue.
+SECURE_BACKEND_FIREWALL=false
+
 # P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
 ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
 OFFBOARD_AGENT=""         # --offboard <agent-name>
@@ -775,6 +781,12 @@ parse_args() {
         YASHIGANI_INTERMEDIATE_LIFETIME_DAYS="${2:?}"; shift 2 ;;
       --cert-lifetime-days)
         YASHIGANI_CERT_LIFETIME_DAYS="${2:?}"; shift 2 ;;
+      --secure-backend-firewall)
+        # LAURA-411-001: non-interactive consent gate for inference-backend firewall.
+        # In interactive mode the operator is prompted; this flag forces apply without prompt.
+        SECURE_BACKEND_FIREWALL=true
+        shift
+        ;;
       --help|-h)         usage; exit 0 ;;
       *)
         log_error "Unknown option: $1"
@@ -7154,6 +7166,213 @@ _ensure_agent_databases() {
     log_warn "Agent-DB provisioning returned non-zero (rc=${_rc}) — agents may be unreachable:"
     printf '%s\n' "$_out" | sed 's/^/    /' >&2
   fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# _apply_inference_backend_firewall — LAURA-411-001 consent-gated convenience
+#
+# Detects the active firewall on macOS (pf) and Linux (ufw → firewalld →
+# nftables → iptables) and applies the loopback+gateway-allow / external-drop
+# rule for the host inference-backend port (default 11434).
+#
+# Consent gate:
+#   interactive  → prompts "Apply firewall rule? [y/N]"; applies on 'y'/'Y'
+#   non-interactive → applies only when SECURE_BACKEND_FIREWALL=true
+#                     (set by --secure-backend-firewall flag)
+#
+# Fail-safe contract:
+#   - ANY error in detection or apply → log_warn + doc reference, return 0
+#   - Missing privilege (not root) → print exact rule + doc reference, return 0
+#   - NEVER propagates failure out of this function; install never aborts here.
+#
+# Called from main() after run_health_check, before print_completion_summary.
+# -----------------------------------------------------------------------------
+_apply_inference_backend_firewall() {
+  # ── Resolve backend port ────────────────────────────────────────────────────
+  # Reuse the value already resolved by _resolve_host_ollama_port (or the env
+  # default). Fall back to 11434 when the Mac GPU path was not exercised.
+  local _port="${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
+  if ! [[ "$_port" =~ ^[0-9]+$ ]] || [[ "$_port" -lt 1 || "$_port" -gt 65535 ]]; then
+    log_warn "backend-firewall: YASHIGANI_HOST_OLLAMA_PORT='${_port}' is not a valid port — skipping."
+    log_warn "  See: docs/security/securing-inference-backend.md"
+    return 0
+  fi
+
+  local _doc="docs/security/securing-inference-backend.md"
+
+  # ── Detect active firewall ──────────────────────────────────────────────────
+  local _fw=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    _fw="pf"
+  else
+    # Linux precedence: ufw (active) → firewalld (running) → nftables → iptables
+    if command -v ufw >/dev/null 2>&1 && \
+       ufw status 2>/dev/null | grep -q "^Status: active"; then
+      _fw="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1 && \
+         firewall-cmd --state 2>/dev/null | grep -q "^running"; then
+      _fw="firewalld"
+    elif command -v nft >/dev/null 2>&1 && \
+         nft list ruleset 2>/dev/null | grep -q .; then
+      _fw="nftables"
+    elif command -v iptables >/dev/null 2>&1; then
+      _fw="iptables"
+    fi
+  fi
+
+  if [[ -z "$_fw" ]]; then
+    log_warn "backend-firewall: no supported firewall detected (pf/ufw/firewalld/nftables/iptables)."
+    log_warn "  Apply rules manually — see: ${_doc}"
+    return 0
+  fi
+
+  log_info "backend-firewall: detected firewall '${_fw}' (port ${_port})"
+
+  # ── Derive gateway subnet ───────────────────────────────────────────────────
+  # Attempt to read the subnet from the compose/podman network; fall back to
+  # known defaults (podman: 10.89.0.0/16, docker: 172.16.0.0/12).
+  local _gw_subnet=""
+  local _runtime="${YSG_RUNTIME:-docker}"
+  if [[ "$_runtime" == "podman" ]]; then
+    _gw_subnet="$( { podman network inspect yashigani 2>/dev/null || \
+                     podman network inspect "${PROJECT:-docker}" 2>/dev/null; } \
+      | grep -oE '"subnet":[[:space:]]*"[^"]+"' \
+      | head -1 \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+      2>/dev/null || true )"
+    [[ -z "$_gw_subnet" ]] && _gw_subnet="10.89.0.0/16"
+  else
+    _gw_subnet="$( { docker network inspect yashigani 2>/dev/null || \
+                     docker network inspect "${PROJECT:-docker}" 2>/dev/null; } \
+      | grep -oE '"Subnet":[[:space:]]*"[^"]+"' \
+      | head -1 \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+      2>/dev/null || true )"
+    [[ -z "$_gw_subnet" ]] && _gw_subnet="172.16.0.0/12"
+  fi
+
+  log_info "backend-firewall: gateway subnet resolved as ${_gw_subnet}"
+
+  # ── Generate firewall rule commands ────────────────────────────────────────
+  local _rule_cmds=()
+  local _rule_note=""
+
+  case "$_fw" in
+    pf)
+      # macOS: block on the active physical interface; loopback is untouched.
+      # The operator may be multi-homed — we detect the default-route interface.
+      local _iface
+      _iface="$(route get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+      [[ -z "$_iface" ]] && _iface="en0"
+      # Write anchor file then load it; enable pf if not already running.
+      _rule_cmds=(
+        "sudo sh -c 'printf \"block drop in quick on ${_iface} proto tcp to any port ${_port}\\n\" > /etc/pf.anchors/com.yashigani.backend'"
+        "sudo pfctl -a com.yashigani.backend -f /etc/pf.anchors/com.yashigani.backend"
+        "sudo pfctl -e"
+      )
+      _rule_note="pf anchor written to /etc/pf.anchors/com.yashigani.backend (interface: ${_iface})"
+      ;;
+    ufw)
+      _rule_cmds=(
+        "sudo ufw allow from ${_gw_subnet} to any port ${_port} proto tcp"
+        "sudo ufw deny ${_port}/tcp"
+      )
+      _rule_note="ufw: allow gateway subnet ${_gw_subnet}, deny remainder"
+      ;;
+    firewalld)
+      _rule_cmds=(
+        "sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${_gw_subnet} port port=${_port} protocol=tcp accept'"
+        "sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 port port=${_port} protocol=tcp drop'"
+        "sudo firewall-cmd --reload"
+      )
+      _rule_note="firewalld: allow gateway subnet ${_gw_subnet}, drop remainder (permanent, reloaded)"
+      ;;
+    nftables)
+      _rule_cmds=(
+        "sudo nft add rule inet filter input tcp dport ${_port} iif lo accept"
+        "sudo nft add rule inet filter input tcp dport ${_port} ip saddr ${_gw_subnet} accept"
+        "sudo nft add rule inet filter input tcp dport ${_port} drop"
+      )
+      _rule_note="nftables: loopback + gateway ${_gw_subnet} accept, drop remainder"
+      ;;
+    iptables)
+      _rule_cmds=(
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -i lo -j ACCEPT"
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -s ${_gw_subnet} -j ACCEPT"
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -j DROP"
+      )
+      _rule_note="iptables: loopback + gateway ${_gw_subnet} accept, drop remainder"
+      ;;
+  esac
+
+  # ── Consent gate ────────────────────────────────────────────────────────────
+  local _apply=false
+  if [[ "${SECURE_BACKEND_FIREWALL}" == "true" ]]; then
+    # Non-interactive explicit opt-in via --secure-backend-firewall flag.
+    _apply=true
+  elif [[ "${NON_INTERACTIVE}" != "true" ]] && [[ -t 0 ]]; then
+    # Interactive: prompt the operator.
+    local _answer
+    printf '\n[security] Apply %s rule to restrict port %s to the gateway?\n' \
+           "$_fw" "$_port" >&2
+    printf '  (%s)\n' "$_rule_note" >&2
+    printf '  [y/N]: ' >&2
+    read -r _answer
+    if [[ "${_answer}" =~ ^[Yy]$ ]]; then
+      _apply=true
+    else
+      printf '[security] Skipped. To apply later, run:\n' >&2
+      local _cmd
+      for _cmd in "${_rule_cmds[@]}"; do
+        printf '  %s\n' "$_cmd" >&2
+      done
+      printf '  See: %s\n' "$_doc" >&2
+    fi
+  else
+    # Non-interactive without --secure-backend-firewall: print + point at doc.
+    log_info "backend-firewall: non-interactive; pass --secure-backend-firewall to auto-apply."
+    log_info "  Manual commands for ${_fw} (port ${_port}, subnet ${_gw_subnet}):"
+    local _cmd
+    for _cmd in "${_rule_cmds[@]}"; do
+      log_info "    ${_cmd}"
+    done
+    log_info "  See: ${_doc}"
+    return 0
+  fi
+
+  [[ "$_apply" != "true" ]] && return 0
+
+  # ── Privilege check ────────────────────────────────────────────────────────
+  if [[ "$(id -u)" -ne 0 ]]; then
+    log_warn "backend-firewall: root/sudo required to apply ${_fw} rules."
+    log_warn "  Run these commands manually:"
+    local _cmd
+    for _cmd in "${_rule_cmds[@]}"; do
+      log_warn "    ${_cmd}"
+    done
+    log_warn "  See: ${_doc}"
+    return 0
+  fi
+
+  # ── Apply rules ────────────────────────────────────────────────────────────
+  local _rc=0
+  local _cmd
+  for _cmd in "${_rule_cmds[@]}"; do
+    log_info "backend-firewall: applying: ${_cmd}"
+    eval "$_cmd" 2>&1 | while IFS= read -r _line; do
+      log_info "  ${_line}"
+    done || { _rc=1; break; }
+  done
+
+  if [[ "$_rc" -ne 0 ]]; then
+    log_warn "backend-firewall: one or more ${_fw} commands failed — rules may be partially applied."
+    log_warn "  Verify manually and see: ${_doc}"
+    return 0   # fail-safe: never abort install
+  fi
+
+  log_success "backend-firewall: ${_fw} rule applied — port ${_port} restricted to loopback + ${_gw_subnet}."
+  log_info "  See '${_doc}' for the honest-limitation note on same-host loopback residual."
   return 0
 }
 
@@ -16847,6 +17066,11 @@ main() {
     chmod 0644 "$_state_path"
     log_info "Install state written: ${_state_path}"
     log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}  TRUST_DOMAIN=${_trust_domain}"
+
+    # Step 12c: Inference-backend firewall hardening (LAURA-411-001, item B).
+    # Consent-gated: interactive prompts, non-interactive requires --secure-backend-firewall.
+    # Fail-safe: never aborts install on error.
+    _apply_inference_backend_firewall || true
 
     # Step 13: Completion summary
     print_completion_summary
