@@ -28,7 +28,7 @@ from yashigani.metrics.collectors import MetricsCollector
 from yashigani.metrics.middleware import PrometheusMiddleware
 from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
 from yashigani.gateway.agent_auth import AgentAuthMiddleware
-from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router
+from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router, _fetch_ollama_models_sync
 from yashigani.gateway.egress_proxy import router as egress_proxy_router, configure as configure_egress_proxy
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
@@ -38,6 +38,7 @@ from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def _build_app(mesh_mode: bool = False):
     # ── OTEL tracing — initialise before anything else ─────────────────────
@@ -817,6 +818,13 @@ def _build_app(mesh_mode: bool = False):
             "WorkflowScheduler unavailable (%s) — scheduled workflows disabled", exc
         )
 
+    # ── Bug B (LAURA-411-002 wiring gap) — fetch installed Ollama models so
+    # _is_known_model() can recognise local model IDs (qwen2.5:3b, qwen2.5:7b …).
+    # Failure (backend unreachable at startup) → None → permissive fallback in
+    # _is_known_model: let Ollama itself arbitrate unknown names.  Gateway never
+    # bricks due to a slow-starting inference backend.
+    _available_models = _fetch_ollama_models_sync(ollama_url, timeout=3.0)
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -829,6 +837,7 @@ def _build_app(mesh_mode: bool = False):
         audit_writer=audit_writer,
         ollama_url=ollama_url,
         default_model=model,
+        available_models=_available_models,
         agent_registry=agent_registry,
         response_inspection_pipeline=response_pipeline,
         pii_detector=pii_detector,
