@@ -254,26 +254,26 @@ def _fetch_ollama_models_sync(
               itself will reject a genuinely unknown model, so the gateway must
               never brick itself because its model list is temporarily unavailable.
     """
-    try:
-        import httpx
-        url = f"{ollama_url.rstrip('/')}/api/tags"
-        resp = httpx.get(url, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        models: list[dict] = data.get("models") or []
-        logger.info(
-            "gateway: ollama model list fetched — %d model(s) from %s",
-            len(models), url,
-        )
-        return models
-    except Exception as exc:
+    # F-001 class: use the internal mesh mTLS transport for https ollama fronts
+    # (Mac Metal / mTLS installs), NOT bare httpx. ollama_get_json() presents this
+    # service's leaf + trusts the internal CA and returns None on any error, which
+    # is exactly the permissive-fallback contract this function needs.
+    from yashigani.inspection._ollama_transport import ollama_get_json
+    data = ollama_get_json(ollama_url, "/api/tags", timeout=timeout)
+    if data is None:
         logger.warning(
-            "gateway: could not fetch ollama model list from %s/api/tags (%s) — "
+            "gateway: could not fetch ollama model list from %s/api/tags — "
             "available_models=None; _is_known_model will be permissive until a "
             "gateway reload populates the list",
-            ollama_url, exc,
+            ollama_url,
         )
         return None
+    models: list[dict] = data.get("models") or []
+    logger.info(
+        "gateway: ollama model list fetched — %d model(s) from %s/api/tags",
+        len(models), ollama_url,
+    )
+    return models
 
 
 def _is_known_model(
