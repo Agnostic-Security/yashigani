@@ -1065,6 +1065,8 @@ docker compose up -d ollama
 
 **AMD (ROCm):** Requires ROCm-compatible driver and runtime. Contact support for ROCm-specific Compose configuration.
 
+**Step 4 — Secure a self-run backend (important).** Ollama (and LM Studio, llama.cpp, vLLM, …) have **no built-in authentication** on their API. If you run the inference server yourself — especially host-native on macOS (Metal GPU) — an open port lets any local process call it directly, bypassing Yashigani's auth, RBAC, OPA, budget, audit, and PII inspection. Lock it down per **[Securing Your Self-Run Inference Backend](security/securing-inference-backend.md)** — bind to loopback, apply the copy-paste firewall rules for your OS (`pf` / `iptables` / `nftables` / `ufw` / `firewalld`), and route its egress through Caddy.
+
 ### 7.2 Cloud Backends (Anthropic, Gemini, Azure OpenAI)
 
 Cloud backends are supported on all tiers.
