@@ -54,26 +54,26 @@ _extract_fn() {
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 setup() {
-  # ── Extract _podman_compose_letta_waitloop from install.sh ────────────────
-  local _wl_body
-  _wl_body="$(_extract_fn "_podman_compose_letta_waitloop" "${INSTALL_SH}")"
-  if [[ -z "$_wl_body" ]]; then
-    echo "ERROR: _podman_compose_letta_waitloop() not found in ${INSTALL_SH}" >&2
-    return 1
-  fi
-  eval "$_wl_body"
-
-  # ── Extract resolve_compose_cmd from install.sh ────────────────────────────
-  local _rcmd_body
-  _rcmd_body="$(_extract_fn "resolve_compose_cmd" "${INSTALL_SH}")"
-  if [[ -z "$_rcmd_body" ]]; then
-    echo "ERROR: resolve_compose_cmd() not found in ${INSTALL_SH}" >&2
-    return 1
-  fi
-  eval "$_rcmd_body"
+  # ── Extract helpers + resolve_compose_cmd + waitloop from install.sh ──────
+  # resolve_compose_cmd now calls _podman_compose_usable, _podman_client_major,
+  # and _podman_compose_version_major_minor; all four must be extracted together.
+  for _fn in _podman_compose_version_major_minor \
+              _podman_client_major \
+              _podman_compose_usable \
+              _podman_compose_letta_waitloop \
+              resolve_compose_cmd; do
+    local _body
+    _body="$(_extract_fn "$_fn" "${INSTALL_SH}")"
+    if [[ -z "$_body" ]]; then
+      echo "ERROR: ${_fn}() not found in ${INSTALL_SH}" >&2
+      return 1
+    fi
+    eval "$_body"
+  done
 
   # ── Global state that install.sh declares at module level ─────────────────
   YSG_PODMAN_RUNTIME=false
+  YSG_PODMAN_COMPOSE_V2=false
   COMPOSE_CMD=()
   COMPOSE_PROFILES=()
   COMPOSE_PROJECT_NAME="docker"
@@ -90,15 +90,31 @@ setup() {
   log_step()    { :; }
 
   # ── podman stub: default all calls to "no containers" / "absent" ──────────
+  # --version added so _podman_client_major() returns a controllable value.
+  # Default major=5 so _podman_compose_usable() does NOT gate on podman 6+,
+  # letting podman-compose (when present) be the selected provider.
   podman() {
     case "$1" in
-      ps)       echo ""          ;;  # no stuck containers
-      inspect)  echo "absent"    ;;  # state=absent, health=absent
-      start)    return 0         ;;  # start succeeds (no-op)
-      healthcheck) return 0      ;;
-      info)     return 0         ;;
-      compose)  return 0         ;;
-      *)        return 1         ;;
+      --version)   echo "podman version ${STUB_PODMAN_MAJOR:-5}.0.0" ;;
+      ps)          echo ""          ;;  # no stuck containers
+      inspect)     echo "absent"    ;;  # state=absent, health=absent
+      start)       return 0         ;;  # start succeeds (no-op)
+      healthcheck) return 0         ;;
+      info)        return 0         ;;
+      compose)     return 0         ;;
+      *)           return 1         ;;
+    esac
+  }
+
+  # ── podman-compose stub ───────────────────────────────────────────────────
+  # _podman_compose_version_major_minor() calls `podman-compose --version`.
+  # Stub it as a shell function so tests are hermetic (not affected by the
+  # system podman-compose 1.6.x). Default version = 1.5.0 (usable).
+  # shellcheck disable=SC2317
+  podman-compose() {
+    case "$1" in
+      --version) echo "podman-compose version ${STUB_PC_VERSION:-1.5.0}" ;;
+      *)         return 0 ;;
     esac
   }
 
@@ -107,7 +123,7 @@ setup() {
   command() {
     if [[ "$1" == "-v" ]]; then
       case "$2" in
-        podman-compose) return 0 ;;
+        podman-compose) return "${STUB_PC_PRESENT:-0}" ;;
         podman)         return 0 ;;
         docker)         return 1 ;;
         docker-compose) return 1 ;;
@@ -117,11 +133,17 @@ setup() {
     # Fallback to real command for other uses (e.g. 'command -v bats')
     builtin command "$@"
   }
+
+  # Default stub config: podman 5 + podman-compose 1.5.0 (both usable).
+  STUB_PODMAN_MAJOR=5
+  STUB_PC_VERSION="1.5.0"
+  STUB_PC_PRESENT=0
 }
 
 teardown() {
-  unset YSG_PODMAN_RUNTIME COMPOSE_CMD COMPOSE_PROFILES COMPOSE_PROJECT_NAME \
-        DRY_RUN YSG_RUNTIME YSG_LETTA_WAITLOOP_TIMEOUT_S 2>/dev/null || true
+  unset YSG_PODMAN_RUNTIME YSG_PODMAN_COMPOSE_V2 COMPOSE_CMD COMPOSE_PROFILES \
+        COMPOSE_PROJECT_NAME DRY_RUN YSG_RUNTIME YSG_LETTA_WAITLOOP_TIMEOUT_S \
+        STUB_PODMAN_MAJOR STUB_PC_VERSION STUB_PC_PRESENT 2>/dev/null || true
 }
 
 # ── Lint gates ────────────────────────────────────────────────────────────────

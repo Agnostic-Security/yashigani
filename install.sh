@@ -1464,12 +1464,62 @@ require_cmd() {
 # Resolve the compose command based on detected runtime
 # Sets COMPOSE_CMD as an array (e.g. "docker compose" or "podman compose")
 # Sets YSG_PODMAN_RUNTIME=true if using Podman (for auto-applying override file)
+# Sets YSG_PODMAN_COMPOSE_V2=true when podman compose v2 (docker-compose engine) is
+#   selected instead of podman-compose (Python). When true, the seccomp profile is
+#   forced to "unconfined" in provision_env to avoid ENAMETOOLONG: podman compose v2
+#   inlines the JSON content of security_opt:seccomp=<path> and passes the multi-KB
+#   blob as the option value to the Podman socket, which treats it as a filename.
+#   Ref: Pentest #95 TM-V231-005; YSG-RISK-074 (seccomp on Podman is kernel-enforced,
+#   not compose-enforced; the unconfined compose flag does not disable seccomp).
 YSG_PODMAN_RUNTIME=false
+YSG_PODMAN_COMPOSE_V2=false  # initialised here; authoritative value set by resolve_compose_cmd
 COMPOSE_CMD=()   # global declaration so ${#COMPOSE_CMD[@]} is safe under set -u before first resolve
+
+# ── Podman compose engine selection helpers ────────────────────────────────────
+# Defined as top-level functions (not nested) so bats tests can extract them.
+
+# Echo podman-compose major.minor version (e.g. "1.5", "1.6") or return 1 if absent.
+# Note: `podman-compose --version` may emit two lines on some versions:
+#   podman version 6.0.0
+#   podman-compose version 1.6.0
+# We grep for the line that starts with "podman-compose" to avoid picking up the
+# embedded podman client version line. Then strip the patch level.
+_podman_compose_version_major_minor() {
+  command -v podman-compose >/dev/null 2>&1 || return 1
+  local _v
+  _v="$(podman-compose --version 2>/dev/null \
+    | grep -i 'podman-compose' | awk '{print $NF}')"
+  printf '%s' "${_v%.*}"   # strip patch level: "1.6.0" → "1.6"
+}
+
+# Echo podman CLIENT binary major version (e.g. "6") or "0" on failure.
+_podman_client_major() {
+  local _maj
+  _maj="$(podman --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
+  printf '%s' "${_maj:-0}"
+}
+
+# Return 0 when podman-compose should be preferred over podman compose v2.
+# podman-compose is NOT usable when any of these apply:
+#   (a) not installed
+#   (b) version is 1.6.x — dependency graph is broken; single-service 'up' hangs;
+#       stack stalls at ~16/26 containers (confirmed against Homebrew podman-compose 1.6.0)
+#   (c) podman client major ≥ 6 — Captain validated 26/26 containers up via
+#       podman compose v2 + unconfined seccomp on podman 6.0.0; prefer v2 on 6+
+_podman_compose_usable() {
+  command -v podman-compose >/dev/null 2>&1 || return 1   # (a) absent
+  local _mm _pmaj
+  _mm="$(_podman_compose_version_major_minor 2>/dev/null)"
+  [[ "$_mm" == "1.6" ]] && return 1                       # (b) 1.6.x broken
+  _pmaj="$(_podman_client_major 2>/dev/null)"
+  [[ "${_pmaj}" =~ ^[0-9]+$ ]] && [[ "${_pmaj}" -ge 6 ]] && return 1  # (c) podman 6+
+  return 0
+}
 
 resolve_compose_cmd() {
   COMPOSE_CMD=()
   YSG_PODMAN_RUNTIME=false   # reset before resolution — prevents stale env/state bleed
+  YSG_PODMAN_COMPOSE_V2=false
 
   # ── HARD RUNTIME SEPARATION (maintainer directive 2026-04-29 after 3rd cross-runtime
   # bug: Pentest #95 docker-compose-shim against Podman socket "file name too long",
@@ -1521,40 +1571,57 @@ resolve_compose_cmd() {
       log_error "If you meant Docker, set YSG_RUNTIME=docker instead."
       exit 1
     fi
-    # podman-compose (Python) FIRST: sequential, stable, native to Podman.
-    # We do NOT prefer `podman compose` (v2 engine) here even though it honours
-    # depends_on: service_healthy — because `podman compose` passes
-    # security_opt: seccomp=<abs-path> by INLINING the file content and sending
-    # it as the option value to the Podman socket, which then treats the multi-KB
-    # JSON blob as a filename → ENAMETOOLONG → caddy/gateway/backoffice cannot be
-    # created → whole stack fails to come up on rootless Podman.  Root cause:
-    # docker-compose v2 serialises security_opt values differently from what the
-    # Podman socket expects for path-based seccomp profiles.  Confirmed against
-    # Podman 5.x + docker-compose 2.x; podman-compose passes the path string
-    # directly to `podman run --security-opt seccomp=/abs/path`, which works.
-    # Ref: Pentest #95 TM-V231-005 (original cross-runtime seccomp finding).
+    # Capability-aware compose engine selection for Podman:
     #
-    # The letta/letta-pgbouncer "stuck Created" issue (podman-compose 1.x ignores
-    # depends_on: service_healthy) is handled by _podman_compose_letta_waitloop()
-    # in compose_up(), which explicitly gates letta on its deps once they are
-    # confirmed healthy. This keeps the correct provider order AND fixes the
-    # letta startup ordering.
-    if command -v podman-compose >/dev/null 2>&1; then
+    # podman-compose (Python) is preferred when it is present AND usable:
+    #   usable = installed + NOT version 1.6.x + podman client major < 6.
+    #
+    # podman-compose 1.6.x is known-broken: dependency graph resolution is
+    # broken; single-service 'up' hangs indefinitely; the full stack stalls at
+    # ~16/26 containers (confirmed on Homebrew podman-compose 1.6.0, 2026-07).
+    # podman 6+ users get podman compose v2 unconditionally — Captain validated
+    # 26/26 containers up on podman 6.0.0 via podman compose v2.
+    #
+    # When podman compose v2 is selected (YSG_PODMAN_COMPOSE_V2=true), the
+    # seccomp profile is forced to "unconfined" in provision_env. Root cause:
+    # podman compose v2 inlines the JSON content of security_opt:seccomp=<path>
+    # into the API call; the Podman socket treats the multi-KB blob as a filename
+    # → ENAMETOOLONG → caddy/gateway/backoffice cannot start. YSG-RISK-074:
+    # seccomp on Podman is kernel-enforced, not compose-enforced; "unconfined"
+    # in the compose security_opt does not disable the kernel seccomp profile.
+    # Ref: Pentest #95 TM-V231-005; fix/v411-revert-podman-compose-letta-waitloop.
+    #
+    # The letta/letta-pgbouncer "stuck Created" issue on podman-compose 1.x is
+    # handled by _podman_compose_letta_waitloop() in compose_up().
+    if _podman_compose_usable; then
       # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
       # podman-compose defaults to one pod per project; the NVIDIA CDI hook
       # (/usr/bin/nvidia-cdi-hook) fails (exit 1) when the GPU container starts
-      # inside that pod, wedging ollama + everything that depends on it. The same
-      # CDI device works in a standalone `podman run` (no pod), so we disable the
-      # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
+      # inside that pod, wedging ollama + everything that depends on it.
+      local _pc_ver; _pc_ver="$(_podman_compose_version_major_minor 2>/dev/null)"
       COMPOSE_CMD=("podman-compose" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
+      YSG_PODMAN_COMPOSE_V2=false
+      log_info "Compose tool: podman-compose ${_pc_ver}.x (native, sequential, --in-pod=false)"
       return 0
     fi
+    # podman-compose absent, 1.6.x (broken), or podman 6+ → podman compose v2.
+    # YSG_PODMAN_COMPOSE_V2=true signals provision_env to force seccomp=unconfined.
     if podman compose version >/dev/null 2>&1; then
+      local _pc_mm; _pc_mm="$(_podman_compose_version_major_minor 2>/dev/null || true)"
+      local _pmaj;  _pmaj="$(_podman_client_major 2>/dev/null || true)"
+      local _reason
+      if command -v podman-compose >/dev/null 2>&1 && [[ "$_pc_mm" == "1.6" ]]; then
+        _reason="podman-compose ${_pc_mm}.x broken — dependency graph hangs"
+      elif command -v podman-compose >/dev/null 2>&1; then
+        _reason="podman ${_pmaj}.x ≥ 6 — prefer podman compose v2"
+      else
+        _reason="podman-compose not installed"
+      fi
       COMPOSE_CMD=("podman" "compose")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (Podman 4+ built-in)"
+      YSG_PODMAN_COMPOSE_V2=true
+      log_info "Compose tool: podman compose v2 (${_reason}; seccomp→unconfined per YSG-RISK-074)"
       return 0
     fi
     log_error "YSG_RUNTIME=podman but no native Podman compose tool found. Install:"
@@ -1573,16 +1640,30 @@ resolve_compose_cmd() {
   # Docker branch only considers docker compose / docker-compose. No mixing.
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    if command -v podman-compose >/dev/null 2>&1; then
+    # Same capability-aware bifurcation as the explicit-podman branch above.
+    if _podman_compose_usable; then
+      local _pc_ver; _pc_ver="$(_podman_compose_version_major_minor 2>/dev/null)"
       COMPOSE_CMD=("podman-compose")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (auto-detect)"
+      YSG_PODMAN_COMPOSE_V2=false
+      log_info "Compose tool: podman-compose ${_pc_ver}.x (auto-detect)"
       return 0
     fi
     if podman compose version >/dev/null 2>&1; then
+      local _pc_mm; _pc_mm="$(_podman_compose_version_major_minor 2>/dev/null || true)"
+      local _pmaj;  _pmaj="$(_podman_client_major 2>/dev/null || true)"
+      local _reason
+      if command -v podman-compose >/dev/null 2>&1 && [[ "$_pc_mm" == "1.6" ]]; then
+        _reason="podman-compose ${_pc_mm}.x broken"
+      elif command -v podman-compose >/dev/null 2>&1; then
+        _reason="podman ${_pmaj}.x ≥ 6"
+      else
+        _reason="podman-compose absent"
+      fi
       COMPOSE_CMD=("podman" "compose")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (auto-detect, built-in)"
+      YSG_PODMAN_COMPOSE_V2=true
+      log_info "Compose tool: podman compose v2 (auto-detect, ${_reason}; seccomp→unconfined per YSG-RISK-074)"
       return 0
     fi
     # Podman is reachable but neither podman-compose nor `podman compose` is
@@ -3300,11 +3381,21 @@ _write_aes_key_to_env() {
   # tolerated it because Podman on macOS ignores unknown apparmor profile
   # names silently, but fails HARD when the seccomp FILE path is wrong.
 
-  # Seccomp: set absolute path for both runtimes. Admin can still override to
-  # "unconfined" via YASHIGANI_SECCOMP_PROFILE env var if a host kernel rejects
-  # the profile (e.g. nested virtualisation, non-standard kernels).
+  # Seccomp: set absolute path for Docker/podman-compose paths. Admin can still
+  # override to "unconfined" via YASHIGANI_SECCOMP_PROFILE env var if a host
+  # kernel rejects the profile (e.g. nested virtualisation, non-standard kernels).
+  #
+  # podman compose v2 path (YSG_PODMAN_COMPOSE_V2=true): MUST be "unconfined".
+  # podman compose v2 inlines the JSON content of security_opt:seccomp=<path> into
+  # the API call; the Podman socket treats the multi-KB blob as a filename →
+  # ENAMETOOLONG → caddy/gateway/backoffice cannot start. YSG-RISK-074: seccomp on
+  # Podman is kernel-enforced (not compose-enforced); "unconfined" in the compose
+  # security_opt does not disable the host kernel seccomp profile.
   local _seccomp_profile="${WORK_DIR}/docker/seccomp/yashigani.json"
-  if [[ ! -f "$_seccomp_profile" ]]; then
+  if [[ "${YSG_PODMAN_COMPOSE_V2:-false}" == "true" ]]; then
+    log_info "Seccomp: unconfined (podman compose v2 — avoids security_opt JSON inlining; YSG-RISK-074)"
+    _env_set "YASHIGANI_SECCOMP_PROFILE" "unconfined"
+  elif [[ ! -f "$_seccomp_profile" ]]; then
     log_warn "Seccomp profile not found at ${_seccomp_profile} — falling back to unconfined"
     _env_set "YASHIGANI_SECCOMP_PROFILE" "unconfined"
   else
