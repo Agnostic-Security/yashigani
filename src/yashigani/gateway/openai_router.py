@@ -206,6 +206,108 @@ def _deny_message(reason: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
+# ---------------------------------------------------------------------------
+
+def _validate_model_string(model: str) -> Optional[str]:
+    """Return an error-reason string if *model* is an invalid input, else None.
+
+    Rejects:
+      • URL-like strings  (http://, https://, //, ftp://)
+      • Path-traversal patterns (../, ..\\)
+      • Absolute paths (starts with /)
+      • Null-sentinel literals (``"null"``, ``"none"``, ``"undefined"``)
+      • Empty strings (after strip)
+
+    Called before RBAC deny and optimisation so that none of these bypass
+    variants can reach the silent local-default fallback.
+    """
+    s = (model or "").strip()
+    if not s:
+        return "empty_model"
+    s_lower = s.lower()
+    for prefix in ("http://", "https://", "//", "ftp://"):
+        if s_lower.startswith(prefix):
+            return "url_not_allowed"
+    if "../" in s or "..\\" in s or s.startswith("/") or s.startswith(".."):
+        return "path_traversal_not_allowed"
+    if s_lower in ("null", "none", "undefined"):
+        return "null_not_allowed"
+    return None
+
+
+def _is_known_model(
+    model: str,
+    alias_store,
+    available_models: list,
+) -> bool:
+    """True if *model* is a known alias, installed local model, or cloud-provider-
+    qualified model (``openai:X`` / ``anthropic:X``).
+
+    LAURA-411-002 / Ava FINDING-1 (part b): an unresolvable model must return
+    HTTP 422 rather than silently falling back to the local default (qwen2.5:3b).
+
+    Returns True (permissive / skip check) when BOTH alias_store and
+    available_models are absent — so minimally-configured deployments and test
+    stubs do not receive false 422s.
+    """
+    if not model:
+        return False
+    norm = model.strip().lower()
+
+    # 1. Cloud provider-qualified: ``provider:model`` where provider is known.
+    #    We trust the cloud provider to reject an unrecognised model name.
+    if ":" in norm:
+        provider_prefix = norm.split(":", 1)[0]
+        if provider_prefix in _CLOUD_PROVIDER_CONFIG:
+            return True
+
+    # 2. Alias store (configured aliases: "smart", "fast", "gpt-4o", …).
+    #    Try the original case first then the normalized lowercase form.
+    if alias_store is not None:
+        try:
+            if (
+                alias_store.get(model) is not None
+                or (norm != model and alias_store.get(norm) is not None)
+            ):
+                return True
+        except Exception:
+            # Store blip → assume known to avoid false 422 on transient errors.
+            return True
+
+    # 3. Available (installed Ollama) models.
+    for m in available_models or []:
+        name = (m.get("name") or "").lower()
+        if name and name == norm:
+            return True
+
+    # 4. No alias_store AND no available_models → cannot verify; skip the gate
+    #    to avoid false 422s in minimally-configured or test deployments.
+    if alias_store is None and not available_models:
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# LAURA-411-004 (Info): routing-telemetry headers gate
+# ---------------------------------------------------------------------------
+
+def _routing_telemetry_enabled() -> bool:
+    """True when routing-telemetry headers should be included in /v1/* responses.
+
+    LAURA-411-004: ``x-yashigani-route-reason``, ``x-yashigani-routed-via``,
+    ``x-yashigani-sensitivity``, and ``x-yashigani-complexity`` expose internal
+    routing decisions to every caller.  These are now gated behind
+    ``YASHIGANI_ROUTING_TELEMETRY=true`` (default OFF).
+
+    ``x-yashigani-model`` and ``x-yashigani-generated-content`` are always
+    present — the UI depends on them.
+    """
+    return os.getenv("YASHIGANI_ROUTING_TELEMETRY", "false").strip().lower() == "true"
+
+
+# ---------------------------------------------------------------------------
 # OPA fail-closed Prometheus counter (Path 1 + Path 3)
 #
 # yashigani_opa_response_check_failures_total — increments whenever the
@@ -1502,6 +1604,69 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # Agent routing: if model starts with @, forward to the agent's upstream
     is_agent_call = selected_model.startswith("@")
+
+    # ── LAURA-411-002 / Ava FINDING-1: model input validation + normalization ──
+    # Runs BEFORE RBAC deny and optimisation so URL/path/null variants cannot
+    # bypass the deny check by triggering the silent local-default fallback.
+    # Exempt: agent calls (start with @), brain-reasoning leg (server-minted,
+    # no alloc), and calls where body.model is absent (explicit default-model
+    # path — preserved per brief).
+    if body.model and not is_agent_call and not brain_reasoning_leg:
+        _mv_err = _validate_model_string(body.model)
+        if _mv_err is not None:
+            logger.warning(
+                "LAURA-411-002: invalid model string %r from identity=%s (%s) → 422",
+                body.model, identity_id, _mv_err,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "message": f"The model name is invalid ({_mv_err}).",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
+        # Normalize: lowercase + provider/model → provider:model.
+        # The normalized form flows through optimisation and RBAC;
+        # body.model (original) is retained for audit/logging.
+        from yashigani.models.effective import normalize_model_for_deny as _norm_model_fn
+        _norm = _norm_model_fn(body.model)
+        if _norm and _norm != selected_model:
+            logger.debug(
+                "LAURA-411-002: model normalized %r → %r",
+                body.model, _norm,
+            )
+            selected_model = _norm
+
+        # Part (b): reject models that resolve to no known alias or installed
+        # model → HTTP 422 model_not_found instead of silent fallback to
+        # qwen2.5:3b.  Skipped when alias_store and available_models are both
+        # absent (minimally-configured / test deployments).
+        if not _is_known_model(
+            selected_model,
+            _state.model_alias_store,
+            _state.available_models,
+        ):
+            logger.warning(
+                "LAURA-411-002: unknown model %r (normalized: %r) from identity=%s → 422",
+                body.model, selected_model, identity_id,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "message": (
+                            f"The model '{body.model}' is not available. "
+                            "Contact an administrator to check the model name."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
+
     agent_upstream = None
     agent_protocol = "openai"
     if is_agent_call and _state.agent_registry:
@@ -2708,28 +2873,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         )
                         yield "data: [DONE]\n\n"
 
+            # LAURA-411-004: routing-telemetry headers gated behind flag.
+            # Always present: Request-Id, Model, Generated-Content, PII, Confidence.
+            # Debug-only (YASHIGANI_ROUTING_TELEMETRY=true): Route-Reason, Routed-Via,
+            # Sensitivity, Complexity.
+            _stream_headers: dict[str, str] = {
+                "X-Yashigani-Request-Id": request_id,
+                "X-Yashigani-Model": selected_model,
+                # Budget headers intentionally omitted — see module docstring.
+                # PII header reflects request-path scan only (response is streamed).
+                "X-Yashigani-PII-Detected": "true" if pii_detected_on_request else "false",
+                # F-T10-001: generated-content disclaimer always present.
+                # Confidence defaults to 1.0 on streaming (response body not
+                # yet available when headers are committed); StreamingInspector
+                # flags anomalies in-band via SSE event field, not via header.
+                "X-Yashigani-Generated-Content": "true",
+                "X-Yashigani-Response-Inspection-Confidence": "1.0000",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+            }
+            if _routing_telemetry_enabled():
+                _stream_headers["X-Yashigani-Routed-Via"] = selected_provider
+                _stream_headers["X-Yashigani-Route-Reason"] = (
+                    route_reason.encode("ascii", "replace").decode("ascii")
+                )
+                _stream_headers["X-Yashigani-Sensitivity"] = sensitivity_level
+                _stream_headers["X-Yashigani-Complexity"] = complexity_level
             return StreamingResponse(
                 _sse_generator(),
                 media_type="text/event-stream",
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-Routed-Via": selected_provider,
-                    "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
-                    "X-Yashigani-Model": selected_model,
-                    "X-Yashigani-Sensitivity": sensitivity_level,
-                    "X-Yashigani-Complexity": complexity_level,
-                    # Budget headers intentionally omitted — see module docstring.
-                    # PII header reflects request-path scan only (response is streamed).
-                    "X-Yashigani-PII-Detected": "true" if pii_detected_on_request else "false",
-                    # F-T10-001: generated-content disclaimer always present.
-                    # Confidence defaults to 1.0 on streaming (response body not
-                    # yet available when headers are committed); StreamingInspector
-                    # flags anomalies in-band via SSE event field, not via header.
-                    "X-Yashigani-Generated-Content": "true",
-                    "X-Yashigani-Response-Inspection-Confidence": "1.0000",
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
-                },
+                headers=_stream_headers,
             )
 
         # ── 7b. Buffered path (agent calls + stream=False + streaming disabled) ──
@@ -3395,14 +3568,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     )
 
     # ── 10. Return with budget + PII headers ─────────────────────────
+    # LAURA-411-004: routing-telemetry headers gated behind flag (default OFF).
+    # Always present: Request-Id, Model, Elapsed-Ms, Verdict, PII, Generated-Content,
+    # Inspection-Confidence.
+    # Debug-only (YASHIGANI_ROUTING_TELEMETRY=true): Routed-Via, Route-Reason,
+    # Sensitivity, Complexity.
     _pii_detected_any = pii_detected_on_request or pii_detected_on_response
     headers = {
         "X-Yashigani-Request-Id": request_id,
-        "X-Yashigani-Routed-Via": selected_provider,
-        "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
         "X-Yashigani-Model": selected_model,
-        "X-Yashigani-Sensitivity": sensitivity_level,
-        "X-Yashigani-Complexity": complexity_level,
         "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
         "X-Yashigani-Response-Verdict": response_verdict,
         "X-Yashigani-PII-Detected": "true" if _pii_detected_any else "false",
@@ -3412,6 +3586,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         "X-Yashigani-Generated-Content": "true",
         "X-Yashigani-Response-Inspection-Confidence": f"{response_inspection_confidence:.4f}",
     }
+    if _routing_telemetry_enabled():
+        headers["X-Yashigani-Routed-Via"] = selected_provider
+        headers["X-Yashigani-Route-Reason"] = (
+            route_reason.encode("ascii", "replace").decode("ascii")
+        )
+        headers["X-Yashigani-Sensitivity"] = sensitivity_level
+        headers["X-Yashigani-Complexity"] = complexity_level
     # G-ORCH-OPA-3: signal a relaxed brain-reasoning turn so the orchestration
     # loop routes any relaxed final/prose answer through the NON-relaxed egress
     # gate (the load-bearing leak guard, condition 4).  Present ONLY on a leg
@@ -3888,16 +4069,21 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
         except Exception as _ae:
             logger.warning("Embeddings audit write failed: %s", _ae)
 
+    # LAURA-411-004: routing-telemetry headers gated (same gate as /v1/chat/completions).
+    _emb_headers: dict[str, str] = {
+        "X-Yashigani-Request-Id": request_id,
+        "X-Yashigani-Model": actual_model,
+        "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
+    }
+    if _routing_telemetry_enabled():
+        _emb_headers["X-Yashigani-Routed-Via"] = selected_provider
+        _emb_headers["X-Yashigani-Route-Reason"] = (
+            route_reason.encode("ascii", "replace").decode("ascii")
+        )
+        _emb_headers["X-Yashigani-Sensitivity"] = sensitivity_level
     return JSONResponse(
         content=response.model_dump(),
-        headers={
-            "X-Yashigani-Request-Id": request_id,
-            "X-Yashigani-Routed-Via": selected_provider,
-            "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
-            "X-Yashigani-Model": actual_model,
-            "X-Yashigani-Sensitivity": sensitivity_level,
-            "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
-        },
+        headers=_emb_headers,
     )
 
 

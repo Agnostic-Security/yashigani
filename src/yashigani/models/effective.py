@@ -46,6 +46,34 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def normalize_model_for_deny(model: str) -> str:
+    """Return a canonical form of *model* for RBAC deny-check comparisons.
+
+    LAURA-411-002 / Ava FINDING-1 — deny-normalization:
+      • Lowercase (``GPT-4O`` → ``gpt-4o``)
+      • Collapse provider-separator variant: ``openai/gpt-4o`` → ``openai:gpt-4o``
+        (exactly one ``/`` between two non-empty segments, no existing ``:``).
+
+    Does NOT validate; never raises.  URL/path-traversal validation is the
+    caller's responsibility (handled in gateway via ``_validate_model_string``).
+    """
+    if not model:
+        return ""
+    norm = model.strip().lower()
+    # Normalize '/' separator only for the ``provider/model`` pattern:
+    # exactly one '/', no existing ':', no trailing path components.
+    if "/" in norm and ":" not in norm:
+        parts = norm.split("/", 1)
+        if (
+            len(parts) == 2
+            and parts[0]
+            and parts[1]
+            and "/" not in parts[1]
+        ):
+            norm = ":".join(parts)
+    return norm
+
+
 @dataclass
 class EffectiveModels:
     """Result of effective-allowed-models resolution for one caller."""
@@ -70,17 +98,53 @@ class EffectiveModels:
     def is_model_denied(self, model: str) -> bool:
         """True iff *model* must be denied to this caller.
 
+        LAURA-411-002 / Ava FINDING-1 (deny-normalization):
+        Normalizes the incoming model name before comparison so that ALL variant
+        forms of the same model hit the same deny rule:
+          • ``GPT-4O``        → case-folded to ``gpt-4o``
+          • ``openai/gpt-4o`` → separator-normalized to ``openai:gpt-4o``
+          • ``gpt-4o`` (bare) → expanded to ``openai:gpt-4o`` via a suffix
+            scan of the gated/allowed sets.
+
         Deny when:
-          • a restriction applies and the model is not in the allowlist, OR
-          • the model is allocation-gated globally and not in this caller's
-            allowed set (gated-but-not-allocated → denied even for unrestricted
+          • a restriction applies and NO candidate form is in the allowlist, OR
+          • the model is allocation-gated globally and NO candidate form is
+            allowed (gated-but-not-allocated → denied even for unrestricted
             callers).
+
+        Allows when at least ONE candidate form is in the normalized allowed
+        set — so a user allocated ``openai:gpt-4o`` can still request
+        ``openai/gpt-4o`` or ``GPT-4O`` without being incorrectly denied.
         """
         if not model:
             return False
-        if self.has_restriction and model not in self.allowed:
+        norm = normalize_model_for_deny(model)
+        if not norm:
+            return False
+
+        # Build the set of canonical candidate forms to compare.  For a bare
+        # name (no ':' after normalization) also expand to any provider-qualified
+        # form that appears in gated or allowed (e.g. "gpt-4o" → "openai:gpt-4o").
+        candidates: set[str] = {norm}
+        if ":" not in norm:
+            suffix = f":{norm}"
+            for m in self.gated | self.allowed:
+                mn = normalize_model_for_deny(m)
+                if mn.endswith(suffix):
+                    candidates.add(mn)
+
+        # Normalized copies of allow-set and gate-set for comparison.
+        norm_allowed: set[str] = {normalize_model_for_deny(a) for a in self.allowed}
+        norm_gated: set[str] = {normalize_model_for_deny(g) for g in self.gated}
+
+        # The request is allowed if ANY candidate form is explicitly permitted.
+        if any(c in norm_allowed for c in candidates):
+            return False
+
+        # No candidate form is in the allowed set.  Apply restriction / gate.
+        if self.has_restriction:
             return True
-        if model in self.gated and model not in self.allowed:
+        if any(c in norm_gated for c in candidates):
             return True
         return False
 
