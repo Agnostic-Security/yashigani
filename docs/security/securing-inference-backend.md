@@ -43,11 +43,17 @@ Block inbound to the backend port on the physical interface(s); loopback (where 
 block drop in quick on en0 proto tcp to any port 11434
 # add a line per active interface if multi-homed (en1, en5, utun*, ...)
 ```
-Load and enable:
+Load and enable. **The anchor must be *referenced* in the main ruleset (`/etc/pf.conf`), or its rules are loaded into the kernel but never evaluated** — `pfctl -a … -s rules` will show them yet packets are never matched, giving false confidence:
 ```bash
+# 1. Reference the anchor in the main ruleset (once):
+echo 'anchor "com.yashigani.backend"' | sudo tee -a /etc/pf.conf
+sudo pfctl -f /etc/pf.conf
+# 2. Load the anchor's rules and enable pf:
 sudo pfctl -a com.yashigani.backend -f /etc/pf.anchors/com.yashigani.backend
 sudo pfctl -e            # if pf is not already enabled
 ```
+> Without the `anchor "com.yashigani.backend"` line in `pf.conf`, `pfctl -e` alone does **not** activate the anchor's rules. Verify enforcement by actually connecting from a non-loopback address, not just by listing the rules.
+
 Find your active interface with `route get default | awk '/interface/{print $2}'`.
 
 ### Linux — `iptables`
@@ -57,6 +63,8 @@ sudo iptables -A INPUT -p tcp --dport 11434 -i lo -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 11434 -s 10.89.0.0/16 -j ACCEPT   # podman default; docker is typically 172.16.0.0/12
 sudo iptables -A INPUT -p tcp --dport 11434 -j DROP
 ```
+> If your `INPUT` chain has a default `ACCEPT` policy or an existing broad `ACCEPT` rule, the appended (`-A`) `DROP` is evaluated *after* it and never fires. In that case use `-I INPUT 1 …` (insert at the top) instead of `-A INPUT …` so these rules are matched first. Same applies to `nft add rule` (append) vs `nft insert rule`.
+
 Persist with `iptables-save` / your distro's `netfilter-persistent`.
 
 ### Linux — `nftables`
