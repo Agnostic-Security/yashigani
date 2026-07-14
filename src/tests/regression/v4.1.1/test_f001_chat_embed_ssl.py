@@ -87,6 +87,12 @@ def _make_mock_state(
     state.content_relay_detector = None
     state.model_alias_store = None
     state.model_allocation_store = None
+    # LAURA-411-002 fix: available_models must be an explicit empty list so that
+    # the _is_known_model guard 'alias_store is None AND not available_models →
+    # skip 422 check' fires correctly.  Production _GatewayState always inits
+    # this to [] (openai_router.py:842); a bare MagicMock() is truthy and would
+    # wrongly defeat the guard, causing a false 422 before the SSL routing runs.
+    state.available_models = []
     state.audit_writer = None
     state.rbac_store = None
     state.identity_registry = None
