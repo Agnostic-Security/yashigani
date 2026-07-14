@@ -236,10 +236,50 @@ def _validate_model_string(model: str) -> Optional[str]:
     return None
 
 
+def _fetch_ollama_models_sync(
+    ollama_url: str,
+    timeout: float = 3.0,
+) -> list[dict] | None:
+    """Fetch the installed model list from Ollama /api/tags (synchronous).
+
+    Called once at gateway startup (via the entrypoint) before
+    configure_openai_router() so that _is_known_model() can gate genuinely-
+    unknown models with HTTP 422 while recognising every model that Ollama
+    actually has installed.
+
+    Returns:
+        list[dict]: raw model dicts from the API response on success.
+        None: on ANY error (connection refused, timeout, JSON parse failure).
+              None signals _is_known_model() to be *permissive* — the backend
+              itself will reject a genuinely unknown model, so the gateway must
+              never brick itself because its model list is temporarily unavailable.
+    """
+    try:
+        import httpx
+        url = f"{ollama_url.rstrip('/')}/api/tags"
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        models: list[dict] = data.get("models") or []
+        logger.info(
+            "gateway: ollama model list fetched — %d model(s) from %s",
+            len(models), url,
+        )
+        return models
+    except Exception as exc:
+        logger.warning(
+            "gateway: could not fetch ollama model list from %s/api/tags (%s) — "
+            "available_models=None; _is_known_model will be permissive until a "
+            "gateway reload populates the list",
+            ollama_url, exc,
+        )
+        return None
+
+
 def _is_known_model(
     model: str,
     alias_store,
-    available_models: list,
+    available_models: list | None,
 ) -> bool:
     """True if *model* is a known alias, installed local model, or cloud-provider-
     qualified model (``openai:X`` / ``anthropic:X``).
@@ -247,9 +287,16 @@ def _is_known_model(
     LAURA-411-002 / Ava FINDING-1 (part b): an unresolvable model must return
     HTTP 422 rather than silently falling back to the local default (qwen2.5:3b).
 
-    Returns True (permissive / skip check) when BOTH alias_store and
-    available_models are absent — so minimally-configured deployments and test
-    stubs do not receive false 422s.
+    ``available_models`` semantics:
+      - ``None`` : startup fetch of /api/tags failed (backend unreachable at boot).
+                   Treat as "unknown list" → permissive; let the backend arbitrate.
+      - ``[]``   : fetched successfully; ollama reported no installed models.
+                   Strict gate applies (or minimally-configured path if alias_store
+                   is also absent).
+      - ``[...]``: populated list; strict gate applies.
+
+    Permissive (True) when alias_store is also absent (minimally-configured /
+    test deployments) so those environments do not receive false 422s.
     """
     if not model:
         return False
@@ -284,8 +331,18 @@ def _is_known_model(
         if name and name == norm:
             return True
 
-    # 4. No alias_store AND no available_models → cannot verify; skip the gate
-    #    to avoid false 422s in minimally-configured or test deployments.
+    # 4. Permissive fallback rules (checked after the list scan so a loaded list
+    #    always gates correctly).
+    #
+    #    a) available_models is None → startup fetch of /api/tags failed.
+    #       We cannot distinguish "model exists" from "model unknown" so we permit
+    #       and let the backend (Ollama) return its own 404.  This prevents the
+    #       gateway from bricking itself when the inference backend is slow to start.
+    if available_models is None:
+        return True
+
+    #    b) No alias_store AND empty available_models → minimally-configured or
+    #       test deployment; skip the gate to avoid false 422s.
     if alias_store is None and not available_models:
         return True
 
@@ -842,7 +899,7 @@ class OpenAIRouterState:
         self.optimization_engine = None
         self.ollama_url: str = "http://ollama:11434"
         self.default_model: str = "qwen2.5:3b"
-        self.available_models: list[dict] = []
+        self.available_models: list[dict] | None = None  # None=fetch-failed/permissive; []=fetched-empty; [...]= populated
         self.agent_registry = None
         # Track B1 (model-RBAC): durable allocation store + alias store, read on
         # the request path to compute effective-allowed-models for the caller.
@@ -1078,7 +1135,7 @@ def configure(
     _state.audit_writer = audit_writer
     _state.ollama_url = ollama_url
     _state.default_model = default_model
-    _state.available_models = available_models or []
+    _state.available_models = available_models  # preserve None (fetch-failed) vs [] (fetched-empty) vs [...] (populated)
     _state.agent_registry = agent_registry
     _state.response_inspection_pipeline = response_inspection_pipeline
     _state.ddos_protector = ddos_protector
@@ -4246,7 +4303,7 @@ async def list_models(request: Request):
             logger.warning("Failed to list agents for models: %s", exc)
 
     # Add any statically configured models
-    for m in _state.available_models:
+    for m in (_state.available_models or []):
         model_id = m.get("id", "")
         if opa_filter == "full" or (allowed_models_set is not None and model_id in allowed_models_set):
             models.append(ModelInfo(
