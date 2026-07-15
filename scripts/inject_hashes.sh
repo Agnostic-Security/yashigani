@@ -5,31 +5,44 @@
 # Tom's _integrity.py rewrite for licence-hardening-v2).
 #
 # Ref: AgnosticSecurity/Products/Yashigani/licence-hardening-v2-design-20260713.md
-#      §2.2 (anchor-SET) + §3.1 (leaf_cert) + §3.3 (six-file bundle — v1's
-#      5-module-hash mechanics retained; INTEGRITY_HASH excluded from the
-#      signed bundle, same circularity-avoidance deviation carried forward
-#      unchanged, documented in verifier._build_hash_bundle_str()).
+#      §2.2 (anchor-SET) + §3.1 (leaf_cert) + §3.3 (six-file bundle) plus the
+#      LAURA-V2-001/002 fix (2026-07-15): INTEGRITY_HASH is now a REAL, wired
+#      self-hash (blank-then-hash convention) folded in as the bundle's 6th
+#      line — closing both "self-checks live inside the file they protect"
+#      (LAURA-V2-001) and "kill-list/anchor-set/leaf-cert are unsigned"
+#      (LAURA-V2-002). This SUPERSEDES the old "INTEGRITY_HASH excluded from
+#      the signed bundle — unresolvable circularity" deviation: the
+#      blank-then-hash convention (both INTEGRITY_HASH's and BUNDLE_SIG's own
+#      line-values are replaced with a fixed placeholder before hashing)
+#      resolves that circularity, so order of embedding INTEGRITY_HASH vs
+#      BUNDLE_SIG no longer matters. This script's algorithm for computing
+#      INTEGRITY_HASH MUST stay byte-identical to
+#      verifier._compute_integrity_self_hash() — see Step 4 below.
 #
-# Steps:
+# Steps (ORDER MATTERS — INTEGRITY_HASH in Step 4 must be computed AFTER
+# every OTHER constant is finalised, so it actually covers them):
 #   Step 1: Compute SHA-256 of 5 licensing/agent/identity modules → write
 #           into VERIFIER_HASH/ENFORCER_HASH/LOADER_HASH/AGENTS_REGISTRY_HASH/
 #           IDENTITY_REGISTRY_HASH (T1-T4 bundle — unchanged v1 mechanism).
-#   Step 2: Compute SHA-256(_integrity.py) after Step 1 → write pre-sig
-#           INTEGRITY_HASH (unchanged v1 mechanism).
-#   Step 3: Embed the chain-of-trust constants — MASTER_ANCHOR_SET_JSON,
+#   Step 2: Embed the chain-of-trust constants — MASTER_ANCHOR_SET_JSON,
 #           CODE_LEAF_CERT_JSON, CODE_LEAF_CERT_SIG — from files produced by
 #           `licgen release` / `keygen.py leaf new` + `licgen anchor-set emit`.
-#   Step 4: Build the canonical 5-hash bundle string (SAME construction as
-#           verifier._build_hash_bundle_str() — sorted KEY=hex lines,
-#           \n-joined, no trailing newline) → sign with the CODE leaf's
-#           private key via sign_bundle_v2.py (P-384/SHA-384, chain digest
-#           §3.3) → BUNDLE_SIG.
-#   Step 5: Optionally embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
+#   Step 3: Optionally embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
 #           provided (both have SAFE defaults "[]"/"{}" already in source —
-#           unlike Steps 1-4, an unset Step 5 is not a placeholder failure).
-#   Step 6: Re-compute FINAL SHA-256(_integrity.py) → overwrite INTEGRITY_HASH
-#           (now covers every chain constant — same tamper-evidence property
-#           as v1's final INTEGRITY_HASH).
+#           unlike Steps 1-2, an unset Step 3 is not a placeholder failure).
+#   Step 4: Compute INTEGRITY_HASH — the blank-then-hash self-referential
+#           digest of _integrity.py's CURRENT bytes (Steps 1-3 already
+#           embedded; the INTEGRITY_HASH and BUNDLE_SIG line-values are
+#           blanked to a fixed placeholder before hashing, regardless of
+#           their current contents) → write it.
+#   Step 5: Build the canonical SIX-line bundle string (5 T1-T4 hashes +
+#           INTEGRITY_HASH, sorted KEY=hex lines, \n-joined, no trailing
+#           newline — SAME construction as
+#           verifier._compute_live_hash_bundle_str()) → sign with the CODE
+#           leaf's private key via sign_bundle_v2.py (P-384/SHA-384, chain
+#           digest §3.3) → BUNDLE_SIG. Embedding BUNDLE_SIG does NOT
+#           invalidate the Step 4 INTEGRITY_HASH (its own line is blanked
+#           out of that computation).
 #
 # Usage:
 #   CODE_LEAF_KEY_PATH=/run/secrets/code_leaf_private_key \\
@@ -278,23 +291,10 @@ _replace_constant "${INTEGRITY_PY}" "IDENTITY_REGISTRY_HASH" "${IDENTITY_REGISTR
 printf '[inject_hashes v2] Step 1 complete\n'
 
 # ---------------------------------------------------------------------------
-# STEP 2: Compute SHA-256(_integrity.py) after Step 1 → write pre-sig
-#         INTEGRITY_HASH (unchanged v1 mechanism/deviation — see module
-#         docstring + verifier._build_hash_bundle_str()'s own DESIGN-NOTE).
+# STEP 2: Embed the chain-of-trust constants (§2.2/§3.1).
 # ---------------------------------------------------------------------------
 
-printf '[inject_hashes v2] Step 2: computing pre-sig INTEGRITY_HASH\n'
-
-INTEGRITY_HASH_STEP2="$(_sha256_file "${INTEGRITY_PY}")"
-_replace_constant "${INTEGRITY_PY}" "INTEGRITY_HASH" "${INTEGRITY_HASH_STEP2}"
-
-printf '[inject_hashes v2] INTEGRITY_HASH (step 2) = %s\n' "$INTEGRITY_HASH_STEP2"
-
-# ---------------------------------------------------------------------------
-# STEP 3: Embed the chain-of-trust constants (§2.2/§3.1).
-# ---------------------------------------------------------------------------
-
-printf '[inject_hashes v2] Step 3: embedding master anchor-SET + code leaf_cert + leaf_cert_sig\n'
+printf '[inject_hashes v2] Step 2: embedding master anchor-SET + code leaf_cert + leaf_cert_sig\n'
 
 MASTER_ANCHOR_SET_JSON="$(_compact_json_file "${MASTER_ANCHOR_SET_PATH}")"
 CODE_LEAF_CERT_JSON="$(_compact_json_file "${CODE_LEAF_CERT_PATH}")"
@@ -311,19 +311,97 @@ _replace_constant "${INTEGRITY_PY}" "CODE_LEAF_CERT_SIG" "${CODE_LEAF_CERT_SIG}"
 printf '[inject_hashes v2] MASTER_ANCHOR_SET_JSON = %s...\n' "${MASTER_ANCHOR_SET_JSON:0:64}"
 printf '[inject_hashes v2] CODE_LEAF_CERT_JSON    = %s...\n' "${CODE_LEAF_CERT_JSON:0:64}"
 printf '[inject_hashes v2] CODE_LEAF_CERT_SIG     = %s...\n' "${CODE_LEAF_CERT_SIG:0:32}"
-printf '[inject_hashes v2] Step 3 complete\n'
+printf '[inject_hashes v2] Step 2 complete\n'
 
 # ---------------------------------------------------------------------------
-# STEP 4: Build canonical bundle string (5 module hashes, NO INTEGRITY_HASH
-#         — SAME construction as verifier._build_hash_bundle_str())
-#         → sign with the CODE leaf → write BUNDLE_SIG.
+# STEP 3: Optional — embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
+#         provided. Both have SAFE defaults ("[]"/"{}") already in source —
+#         unset is a legitimate, non-placeholder state (unlike Steps 1-2).
+#         Both are now COVERED by INTEGRITY_HASH+BUNDLE_SIG (Steps 4-5,
+#         LAURA-V2-002) even when left at their safe defaults — editing
+#         either one later, outside this pipeline, is detected at verify
+#         time because it changes _integrity.py's bytes without a matching
+#         re-sign.
 # ---------------------------------------------------------------------------
 
-printf '[inject_hashes v2] Step 4: building canonical bundle string and signing with code leaf\n'
+if [ -n "${KILL_LIST_PATH:-}" ]; then
+    printf '[inject_hashes v2] Step 3a: embedding KILL_LIST_JSON from %s\n' "${KILL_LIST_PATH}"
+    KILL_LIST_JSON="$(_compact_json_file "${KILL_LIST_PATH}")"
+    _replace_constant "${INTEGRITY_PY}" "KILL_LIST_JSON" "${KILL_LIST_JSON}"
+    printf '[inject_hashes v2] KILL_LIST_JSON = %s...\n' "${KILL_LIST_JSON:0:64}"
+else
+    printf '[inject_hashes v2] Step 3a: KILL_LIST_PATH unset — leaving safe default "[]"\n'
+fi
+
+if [ -n "${CLIENT_DOMAIN_REGISTRY_PATH:-}" ]; then
+    printf '[inject_hashes v2] Step 3b: embedding CLIENT_DOMAIN_REGISTRY_JSON from %s\n' "${CLIENT_DOMAIN_REGISTRY_PATH}"
+    CLIENT_DOMAIN_REGISTRY_JSON="$(_compact_json_file "${CLIENT_DOMAIN_REGISTRY_PATH}")"
+    _replace_constant "${INTEGRITY_PY}" "CLIENT_DOMAIN_REGISTRY_JSON" "${CLIENT_DOMAIN_REGISTRY_JSON}"
+    printf '[inject_hashes v2] CLIENT_DOMAIN_REGISTRY_JSON = %s...\n' "${CLIENT_DOMAIN_REGISTRY_JSON:0:64}"
+else
+    printf '[inject_hashes v2] Step 3b: CLIENT_DOMAIN_REGISTRY_PATH unset — leaving safe default "{}"\n'
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 4: Compute INTEGRITY_HASH — the blank-then-hash self-referential
+#         digest of _integrity.py's CURRENT bytes (Steps 1-3 already
+#         embedded above). MUST stay byte-identical to
+#         verifier._compute_integrity_self_hash() (LAURA-V2-002 fix):
+#         both the INTEGRITY_HASH line's value and the BUNDLE_SIG line's
+#         value are replaced with a fixed placeholder ("0"*64) before
+#         hashing, regardless of whatever currently sits in those two
+#         lines — this resolves the chicken-and-egg self-reference problem
+#         and makes the digest reproducible independent of injection order.
+# ---------------------------------------------------------------------------
+
+printf '[inject_hashes v2] Step 4: computing INTEGRITY_HASH (blank-then-hash)\n'
+
+INTEGRITY_HASH="$(python3 - "${INTEGRITY_PY}" <<'PYEOF'
+import hashlib, re, sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+
+BLANK = "0" * 64
+# Match to end of line, NOT just a `"..."` quoted-literal shape — the
+# PRISTINE placeholder state of these two constants is a Python EXPRESSION
+# (`_PLACEHOLDER_INTEGRITY + "_BUNDLE_SIG"`), not a bare string literal.
+# A `"[^"]*"`-only pattern silently fails to match (and therefore fails to
+# blank) that pristine form on a FIRST build, producing a different digest
+# than a later re-verify (where the line has since become a quoted literal)
+# — a false-positive tamper report on every freshly-built package. Mirrors
+# _replace_constant()'s own `.*$` pattern above and MUST stay byte-identical
+# to verifier._compute_integrity_self_hash()'s regexes.
+integrity_re = re.compile(r'^(INTEGRITY_HASH\s*:\s*str\s*=\s*).*$', re.MULTILINE)
+bundle_re = re.compile(r'^(BUNDLE_SIG\s*:\s*str\s*=\s*).*$', re.MULTILINE)
+
+blanked = integrity_re.sub(lambda m: m.group(1) + '"' + BLANK + '"', text, count=1)
+blanked = bundle_re.sub(lambda m: m.group(1) + '"' + BLANK + '"', blanked, count=1)
+
+print(hashlib.sha256(blanked.encode("utf-8")).hexdigest())
+PYEOF
+)"
+[ -n "${INTEGRITY_HASH}" ] || { printf 'ERROR: INTEGRITY_HASH computation produced empty output\n' >&2; exit 1; }
+_replace_constant "${INTEGRITY_PY}" "INTEGRITY_HASH" "${INTEGRITY_HASH}"
+
+printf '[inject_hashes v2] INTEGRITY_HASH = %s\n' "$INTEGRITY_HASH"
+printf '[inject_hashes v2] Step 4 complete\n'
+
+# ---------------------------------------------------------------------------
+# STEP 5: Build canonical SIX-line bundle string (5 module hashes +
+#         INTEGRITY_HASH, sorted by key — SAME construction as
+#         verifier._compute_live_hash_bundle_str()) → sign with the CODE
+#         leaf → write BUNDLE_SIG. Embedding BUNDLE_SIG does NOT invalidate
+#         the Step 4 INTEGRITY_HASH (its own line is blanked out of that
+#         computation, per the blank-then-hash convention above).
+# ---------------------------------------------------------------------------
+
+printf '[inject_hashes v2] Step 5: building canonical 6-line bundle string and signing with code leaf\n'
 
 BUNDLE_STR="AGENTS_REGISTRY_HASH=${AGENTS_REGISTRY_HASH}
 ENFORCER_HASH=${ENFORCER_HASH}
 IDENTITY_REGISTRY_HASH=${IDENTITY_REGISTRY_HASH}
+INTEGRITY_HASH=${INTEGRITY_HASH}
 LOADER_HASH=${LOADER_HASH}
 VERIFIER_HASH=${VERIFIER_HASH}"
 
@@ -333,46 +411,7 @@ BUNDLE_SIG="$(PYTHONPATH="${SRC_ROOT}" python3 "${SIGN_BUNDLE_PY}" \
 [ -n "${BUNDLE_SIG}" ] || { printf 'ERROR: sign_bundle_v2.py produced empty output\n' >&2; exit 1; }
 _replace_constant "${INTEGRITY_PY}" "BUNDLE_SIG" "${BUNDLE_SIG}"
 printf '[inject_hashes v2] BUNDLE_SIG = %s...\n' "${BUNDLE_SIG:0:32}"
-printf '[inject_hashes v2] Step 4 complete\n'
-
-# ---------------------------------------------------------------------------
-# STEP 5: Optional — embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
-#         provided. Both have SAFE defaults ("[]"/"{}") already in source —
-#         unset is a legitimate, non-placeholder state (unlike Steps 1-4).
-# ---------------------------------------------------------------------------
-
-if [ -n "${KILL_LIST_PATH:-}" ]; then
-    printf '[inject_hashes v2] Step 5a: embedding KILL_LIST_JSON from %s\n' "${KILL_LIST_PATH}"
-    KILL_LIST_JSON="$(_compact_json_file "${KILL_LIST_PATH}")"
-    _replace_constant "${INTEGRITY_PY}" "KILL_LIST_JSON" "${KILL_LIST_JSON}"
-    printf '[inject_hashes v2] KILL_LIST_JSON = %s...\n' "${KILL_LIST_JSON:0:64}"
-else
-    printf '[inject_hashes v2] Step 5a: KILL_LIST_PATH unset — leaving safe default "[]"\n'
-fi
-
-if [ -n "${CLIENT_DOMAIN_REGISTRY_PATH:-}" ]; then
-    printf '[inject_hashes v2] Step 5b: embedding CLIENT_DOMAIN_REGISTRY_JSON from %s\n' "${CLIENT_DOMAIN_REGISTRY_PATH}"
-    CLIENT_DOMAIN_REGISTRY_JSON="$(_compact_json_file "${CLIENT_DOMAIN_REGISTRY_PATH}")"
-    _replace_constant "${INTEGRITY_PY}" "CLIENT_DOMAIN_REGISTRY_JSON" "${CLIENT_DOMAIN_REGISTRY_JSON}"
-    printf '[inject_hashes v2] CLIENT_DOMAIN_REGISTRY_JSON = %s...\n' "${CLIENT_DOMAIN_REGISTRY_JSON:0:64}"
-else
-    printf '[inject_hashes v2] Step 5b: CLIENT_DOMAIN_REGISTRY_PATH unset — leaving safe default "{}"\n'
-fi
-
-# ---------------------------------------------------------------------------
-# STEP 6: Re-compute final INTEGRITY_HASH (Steps 3+4+5 changed _integrity.py).
-#         The signed bundle (Step 4) does NOT need to be recomputed — it
-#         covers the 5 module hashes only, which haven't changed since
-#         Step 1. Same circularity-avoidance rationale as v1.
-# ---------------------------------------------------------------------------
-
-printf '[inject_hashes v2] Step 6: computing final INTEGRITY_HASH\n'
-
-INTEGRITY_HASH_FINAL="$(_sha256_file "${INTEGRITY_PY}")"
-_replace_constant "${INTEGRITY_PY}" "INTEGRITY_HASH" "${INTEGRITY_HASH_FINAL}"
-
-printf '[inject_hashes v2] INTEGRITY_HASH (final) = %s\n' "$INTEGRITY_HASH_FINAL"
-printf '[inject_hashes v2] Step 6 complete\n'
+printf '[inject_hashes v2] Step 5 complete\n'
 
 # ---------------------------------------------------------------------------
 # Post-injection assertion: no placeholders remain
@@ -381,4 +420,4 @@ printf '[inject_hashes v2] Step 6 complete\n'
 _assert_no_placeholders "${INTEGRITY_PY}"
 
 printf '[inject_hashes v2] All steps complete. _integrity.py is fully injected (chain-of-trust).\n'
-printf '[inject_hashes v2] Final INTEGRITY_HASH: %s\n' "${INTEGRITY_HASH_FINAL}"
+printf '[inject_hashes v2] Final INTEGRITY_HASH: %s\n' "${INTEGRITY_HASH}"

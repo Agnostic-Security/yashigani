@@ -66,6 +66,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -193,14 +194,30 @@ def _emit_licence_integrity_violation_event(
 # ---------------------------------------------------------------------------
 
 def _build_hash_bundle_str() -> str:
-    """Canonical hash-bundle string (5 module hashes, sorted by key name).
+    """Canonical hash-bundle string built from the STATIC constants
+    _integrity.py claims (5 module hashes, sorted by key name).
 
-    DESIGN-NOTE (carried from v1, still applies): INTEGRITY_HASH is
-    intentionally excluded from the signed bundle — including it creates an
-    unresolvable circularity in the injection pipeline (INTEGRITY_HASH
-    covers the final _integrity.py, including BUNDLE_SIG, but BUNDLE_SIG
-    must be signed before INTEGRITY_HASH is finalised). INTEGRITY_HASH
-    already receives independent protection via the enforcer cross-check.
+    HISTORICAL NOTE / CORRECTION (LAURA-V2-001, 2026-07-15): earlier
+    revisions of this docstring claimed "INTEGRITY_HASH already receives
+    independent protection via the enforcer cross-check" — that claim was
+    FALSE (grep confirmed no module anywhere read _integrity.py's own bytes
+    and compared to INTEGRITY_HASH; the enforcer cross-check only ever
+    covered verifier.py). It has been corrected here rather than left
+    standing (honest-claims discipline).
+
+    This function is kept, UNCHANGED IN BEHAVIOUR, only because existing
+    test fixtures (src/tests/integration/test_licence_hardening_v2_integration.py
+    ::_embed_build) call it by name to build a bundle_str for signing in
+    test setup. It is NOT what module-load-time verification actually
+    checks BUNDLE_SIG against any more — see
+    _compute_live_hash_bundle_str() below, which is the authoritative,
+    externally-computed (outside every one of the 5 protected files)
+    bundle string _check_build_integrity_chain() verifies BUNDLE_SIG
+    against. The distinction matters: this function proves "_integrity.py's
+    own claimed hashes are internally self-consistent" (tautological — it
+    reads the constants and re-states them); it does NOT prove "the file on
+    disk right now matches those hashes" (that was root cause #3 of
+    LAURA-V2-001 — BUNDLE_SIG only ever covered this tautology).
     """
     return "\n".join([
         f"AGENTS_REGISTRY_HASH={_integrity.AGENTS_REGISTRY_HASH}",
@@ -211,13 +228,210 @@ def _build_hash_bundle_str() -> str:
     ])
 
 
+# ---------------------------------------------------------------------------
+# LAURA-V2-001/002 fix (2026-07-15) — external, live-from-disk re-derivation.
+#
+# Root causes closed here:
+#   (LAURA-V2-001 #2/#3) Every module's self-check previously lived INSIDE
+#   the file it protects (enforcer.py checks enforcer.py; loader.py checks
+#   loader.py) — a single coordinated edit to one of those files can neuter
+#   both the gate AND its own checker in the same edit, with zero external
+#   evidence. The functions below live in verifier.py — a SEPARATE FILE —
+#   and read every protected module's bytes straight off disk at THIS
+#   module's own load time, independent of what any of those files'
+#   in-process code currently does. An edit confined to enforcer.py (or
+#   loader.py) cannot suppress this computation.
+#
+#   (LAURA-V2-001 #3) BUNDLE_SIG previously only ever covered
+#   _build_hash_bundle_str() above — the STATIC constants _integrity.py
+#   claims, which is tautological (it never touched a live file).
+#   _check_build_integrity_chain() below now verifies BUNDLE_SIG against
+#   _compute_live_hash_bundle_str()'s output instead — a bundle built from
+#   hashes computed from the CURRENT bytes on disk. Any post-build edit to
+#   any of the 6 covered files invalidates the signature.
+#
+#   (LAURA-V2-002) INTEGRITY_HASH — previously dead code (nothing computed
+#   or compared it) — is now wired as the 6th line of that live bundle,
+#   computed via the blank-then-hash self-referential convention below.
+#   Because INTEGRITY_HASH's live value spans the ENTIRE current
+#   _integrity.py file (kill-list, client-domain registry, anchor-set, code
+#   leaf_cert/leaf_cert_sig — everything except its own line and BUNDLE_SIG's
+#   own line, which must be blanked to avoid the chicken-and-egg problem of
+#   a hash containing itself), editing ANY of those fields (e.g. Laura's
+#   PoC: KILL_LIST_JSON="[]") without re-signing now invalidates either the
+#   live INTEGRITY_HASH comparison, the live BUNDLE_SIG check, or both.
+#
+# Honest ceiling (do not overclaim): this raises the cost of a silent,
+# undetected patch — it does NOT make source-available Python
+# tamper-*proof*. An attacker who edits enforcer.py's require_feature() body
+# in isolation can still, unavoidably, cause THAT specific call to grant
+# access (no code living inside a function can defend against the entire
+# function body being replaced by someone with local write access to the
+# file it's defined in — see enforcer.require_feature()'s own docstring for
+# the full honest-ceiling note). What THIS fix guarantees is that such an
+# edit can no longer ALSO suppress the alarm: verifier.get_integrity_status()
+# (and therefore enforcer.get_license()/is_license_tampered(), which read
+# it) will correctly report tamper = True, log CRITICAL, and emit a typed
+# audit event, regardless of what enforcer.py's own code does — matching
+# design §11's accepted residual ("a knowing, unambiguous act with a
+# visible diff") rather than the previous "zero alarm, zero evidence"
+# behaviour, which was worse than that residual. No hardware root of trust
+# is available in this design (Apache-2.0, offline, readable source).
+# ---------------------------------------------------------------------------
+
+_LICENSING_DIR = Path(__file__).parent
+_YASHIGANI_PKG_DIR = _LICENSING_DIR.parent  # .../src/yashigani
+
+# The 5 T1-T4 protected files, keyed by their _integrity.py constant name —
+# resolved by PATH, never by importing those modules (importing would run
+# their own, potentially-tampered, code).
+_LIVE_HASH_TARGETS: dict[str, Path] = {
+    "VERIFIER_HASH": _LICENSING_DIR / "verifier.py",
+    "ENFORCER_HASH": _LICENSING_DIR / "enforcer.py",
+    "LOADER_HASH": _LICENSING_DIR / "loader.py",
+    "AGENTS_REGISTRY_HASH": _YASHIGANI_PKG_DIR / "agents" / "registry.py",
+    "IDENTITY_REGISTRY_HASH": _YASHIGANI_PKG_DIR / "identity" / "registry.py",
+}
+
+_INTEGRITY_PY_PATH = _LICENSING_DIR / "_integrity.py"
+
+# Fixed, deterministic placeholders used ONLY inside the blank-then-hash
+# self-referential digest below — never real hash/signature values, never
+# compared against anything themselves. Any fixed string works as long as
+# scripts/inject_hashes.sh's independent Python implementation of this same
+# algorithm uses the IDENTICAL placeholders (see that script's Step —
+# "compute INTEGRITY_HASH" — comment cross-referencing this function).
+_SELF_HASH_BLANK_INTEGRITY_HASH = "0" * 64
+_SELF_HASH_BLANK_BUNDLE_SIG = "0" * 64
+
+# Match the WHOLE right-hand-side of the assignment, to end of line — NOT
+# just a `"..."` quoted-literal shape. _integrity.py's PRISTINE placeholder
+# state is a Python EXPRESSION (`_PLACEHOLDER_INTEGRITY + "_BUNDLE_SIG"`),
+# not a bare string literal; a regex that only matched `"[^"]*"` silently
+# failed to blank that pristine form (no match => no substitution => the
+# literal placeholder-expression text stayed in the hashed bytes), while the
+# SAME regex correctly matched and blanked the line once a real value had
+# been injected (`"deadbeef...".`) — producing two DIFFERENT digests for
+# what should be the identical blanked file, and a false-positive tamper
+# report on every freshly-built, wholly untampered package. Matching to end
+# of line (mirroring inject_hashes.sh's own `_replace_constant()` pattern)
+# handles both the pristine-expression and injected-literal shapes
+# identically. Caught by end-to-end verification against a freshly signed
+# build (2026-07-15) — see
+# src/tests/regression/v4.1.1/test_laura_v2_001_002_external_authority.py::
+# TestIntegrityHashAlgorithmRoundTrip and
+# TestLauraV2001EnforcerNeuterNowAlarms::test_clean_build_no_violation.
+_INTEGRITY_HASH_LINE_RE = re.compile(r'^(INTEGRITY_HASH\s*:\s*str\s*=\s*).*$', re.MULTILINE)
+_BUNDLE_SIG_LINE_RE = re.compile(r'^(BUNDLE_SIG\s*:\s*str\s*=\s*).*$', re.MULTILINE)
+
+
+def _compute_integrity_self_hash(file_text: str) -> str:
+    """
+    Compute _integrity.py's own self-referential integrity hash
+    (LAURA-V2-002 — wires up the previously dead-code INTEGRITY_HASH).
+
+    Self-referential file hashing has a chicken-and-egg problem: a file's
+    hash can't include the hash's own final value. This uses the standard
+    "blank-then-hash" convention — BOTH the INTEGRITY_HASH line's value AND
+    the BUNDLE_SIG line's value are replaced with fixed, deterministic
+    placeholders before hashing, regardless of whatever value currently sits
+    in those two lines. That makes the digest reproducible independent of
+    injection order (INTEGRITY_HASH is folded into the bundle BUNDLE_SIG
+    signs — see _compute_live_hash_bundle_str() — so BUNDLE_SIG is always
+    written to the file AFTER INTEGRITY_HASH; blanking BUNDLE_SIG too means
+    that write does not change what a fresh recompute of INTEGRITY_HASH
+    would produce).
+
+    scripts/inject_hashes.sh implements this EXACT SAME algorithm
+    independently, in its own Python heredoc (deliberately NOT by importing
+    this function — importing from _integrity.py's own package for the
+    BUILD side is fine, but this function must stay usable for the VERIFY
+    side without ever importing anything from a file it is trying to
+    verify). The two implementations must be kept byte-identical; a
+    regression test round-trips build-time embed -> verify-time recompute
+    against a synthetic _integrity.py to catch drift.
+
+    Callers MUST pass text read directly off disk (never anything derived
+    from `import yashigani.licensing._integrity` or any of its functions) —
+    the whole point of this living in verifier.py is that the computation is
+    independent of whatever code currently executes inside _integrity.py.
+    """
+    blanked = _INTEGRITY_HASH_LINE_RE.sub(
+        lambda m: m.group(1) + '"' + _SELF_HASH_BLANK_INTEGRITY_HASH + '"',
+        file_text,
+        count=1,
+    )
+    blanked = _BUNDLE_SIG_LINE_RE.sub(
+        lambda m: m.group(1) + '"' + _SELF_HASH_BLANK_BUNDLE_SIG + '"',
+        blanked,
+        count=1,
+    )
+    return hashlib.sha256(blanked.encode("utf-8")).hexdigest()
+
+
+def _compute_live_hash_bundle_str() -> "tuple[Optional[str], dict[str, Optional[str]]]":
+    """
+    Read the CURRENT bytes of every T1-T4-protected file straight off disk —
+    independent of any of those modules' own in-process state/self-checks —
+    plus _integrity.py's own blanked self-hash, and build the SAME canonical
+    "KEY=hex" bundle-string shape BUNDLE_SIG is signed over (6 lines now,
+    sorted by key name: the 5 T1-T4 hashes + INTEGRITY_HASH).
+
+    Returns (bundle_str, live_hashes). bundle_str is None if ANY file could
+    not be read — the caller must treat that as a verification failure
+    (fail-closed), never silently skip the check.
+    """
+    live_hashes: dict[str, Optional[str]] = {}
+    ok = True
+    for const_name, path in _LIVE_HASH_TARGETS.items():
+        try:
+            live_hashes[const_name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except Exception as exc:
+            logger.warning(
+                "License integrity: could not read %s for live hash re-derivation: %s",
+                path, exc,
+            )
+            live_hashes[const_name] = None
+            ok = False
+
+    try:
+        integrity_text = _INTEGRITY_PY_PATH.read_text(encoding="utf-8")
+        live_hashes["INTEGRITY_HASH"] = _compute_integrity_self_hash(integrity_text)
+    except Exception as exc:
+        logger.warning(
+            "License integrity: could not read _integrity.py for live self-hash "
+            "re-derivation: %s", exc,
+        )
+        live_hashes["INTEGRITY_HASH"] = None
+        ok = False
+
+    if not ok:
+        return None, live_hashes
+
+    bundle_str = "\n".join([
+        f"AGENTS_REGISTRY_HASH={live_hashes['AGENTS_REGISTRY_HASH']}",
+        f"ENFORCER_HASH={live_hashes['ENFORCER_HASH']}",
+        f"IDENTITY_REGISTRY_HASH={live_hashes['IDENTITY_REGISTRY_HASH']}",
+        f"INTEGRITY_HASH={live_hashes['INTEGRITY_HASH']}",
+        f"LOADER_HASH={live_hashes['LOADER_HASH']}",
+        f"VERIFIER_HASH={live_hashes['VERIFIER_HASH']}",
+    ])
+    return bundle_str, live_hashes
+
+
 def _check_build_integrity_chain() -> None:
     """
     §4a steps 1-5: validate the embedded code leaf_cert chains to the
     embedded master anchor-SET, then verify BUNDLE_SIG against that leaf's
-    public key. Step 6 (per-module self-hashes, T1-T4) is unchanged and
-    lives in _check_self_integrity() (this module) + enforcer.py/
-    agents/registry.py/identity/registry.py's own independent checks.
+    public key — using a bundle built from LIVE hashes re-derived from disk
+    (LAURA-V2-001/002 fix, see _compute_live_hash_bundle_str()), not the
+    static _integrity.py constants alone. Each protected module's own local
+    self-check (enforcer._check_enforcer_integrity(),
+    loader._check_loader_integrity(), agents/registry.py's and
+    identity/registry.py's own checks) still runs independently too —
+    defense in depth — but is no longer the ONLY place tamper of those
+    files is detected: this function is now the external, un-suppressible
+    authority.
 
     Placeholder behaviour: skip (dev) / fail-closed (prod) — mirrors the v1
     _check_hash_bundle_attestation()/_check_kdf_token() placeholder
@@ -284,12 +498,71 @@ def _check_build_integrity_chain() -> None:
         )
         return
 
-    bundle_str = _build_hash_bundle_str()
+    # LAURA-V2-001/002 fix: live re-derivation from disk, computed entirely
+    # in THIS file (external to every one of the 5 protected modules and to
+    # _integrity.py itself) — see the block comment above
+    # _compute_live_hash_bundle_str() for the full rationale.
+    live_bundle_str, live_hashes = _compute_live_hash_bundle_str()
+
+    if live_bundle_str is None:
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: could not independently re-derive one "
+            "or more protected module hashes from disk (files missing/unreadable) "
+            "— treating as tamper (fail-closed); forcing COMMUNITY tier"
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="live_hash_rederivation",
+            expected_hash="<readable>",
+            actual_hash="<unreadable>",
+        )
+        return
+
+    # Diagnostic per-module comparison — identifies WHICH file was tampered,
+    # computed and logged from verifier.py regardless of whether that file's
+    # OWN self-check (e.g. enforcer._check_enforcer_integrity()) was also
+    # neutered by the same edit (LAURA-V2-001 #2). This is what guarantees
+    # the alarm cannot be suppressed by an edit confined to any one of the
+    # other protected files.
+    _static_hash_constants = {
+        "VERIFIER_HASH": _integrity.VERIFIER_HASH,
+        "ENFORCER_HASH": _integrity.ENFORCER_HASH,
+        "LOADER_HASH": _integrity.LOADER_HASH,
+        "AGENTS_REGISTRY_HASH": _integrity.AGENTS_REGISTRY_HASH,
+        "IDENTITY_REGISTRY_HASH": _integrity.IDENTITY_REGISTRY_HASH,
+        "INTEGRITY_HASH": _integrity.INTEGRITY_HASH,
+    }
+    any_module_mismatch = False
+    for const_name, expected in _static_hash_constants.items():
+        live = live_hashes.get(const_name)
+        if live is not None and live != expected:
+            any_module_mismatch = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: %s live re-derivation from disk does "
+                "NOT match the embedded, signed value (expected=%s, actual=%s) — "
+                "this file has been modified since the build was signed; forcing "
+                "COMMUNITY tier. Detected externally by verifier.py, independent "
+                "of the protected file's own self-check (LAURA-V2-001).",
+                const_name, expected[:16], live[:16],
+            )
+            _emit_licence_integrity_violation_event(
+                module="verifier",
+                check_type=f"live_hash_{const_name.lower()}",
+                expected_hash=expected,
+                actual_hash=live,
+            )
+
+    if any_module_mismatch:
+        _integrity_violated = True
+        # Continue to the cryptographic bundle_sig check too (defense in
+        # depth / additional evidence) rather than returning early.
+
     result = verify_build_integrity_chain(
         anchor_set=anchor_set,
         code_leaf_cert=code_leaf_cert,
         code_leaf_cert_sig=code_leaf_cert_sig,
-        bundle_str=bundle_str,
+        bundle_str=live_bundle_str,
         bundle_sig=bundle_sig,
         kill_list=kill_list,
     )

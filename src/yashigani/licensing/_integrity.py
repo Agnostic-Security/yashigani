@@ -14,7 +14,27 @@ replaced at Docker build time by the build pipeline:
       SHA-256 hex digest of src/yashigani/licensing/loader.py
 
   INTEGRITY_HASH
-      SHA-256 hex digest of this file (src/yashigani/licensing/_integrity.py)
+      Self-referential SHA-256 hex digest of this file
+      (src/yashigani/licensing/_integrity.py), computed with the
+      "blank-then-hash" convention: the INTEGRITY_HASH line's own value and
+      the BUNDLE_SIG line's own value are both replaced with a fixed
+      placeholder before hashing (avoids the chicken-and-egg problem of a
+      hash containing itself). Wired 2026-07-15 (LAURA-V2-002 fix — this
+      constant was previously computed by the build pipeline but never
+      independently re-derived or compared by anything at verify time,
+      making it dead code; a docstring claim that it was "already protected
+      via the enforcer cross-check" was FALSE — grepped, no such cross-check
+      existed). The live re-derivation and comparison now live OUTSIDE this
+      file, in verifier.py's _compute_integrity_self_hash()/
+      _compute_live_hash_bundle_str() — deliberately not here, so that a
+      tampered _integrity.py cannot also patch the function used to check
+      it. INTEGRITY_HASH is folded in as the 6th line of the same bundle
+      BUNDLE_SIG signs, which means every OTHER constant in this file
+      (kill-list, client-domain registry, anchor-set, code leaf_cert/sig —
+      everything except INTEGRITY_HASH's and BUNDLE_SIG's own lines) is now
+      transitively covered by that signature too: editing any of them
+      without re-signing invalidates either the live INTEGRITY_HASH
+      comparison, the BUNDLE_SIG check, or both.
 
   AGENTS_REGISTRY_HASH
       SHA-256 hex digest of src/yashigani/agents/registry.py
@@ -70,17 +90,28 @@ prod. KILL_LIST_JSON and CLIENT_DOMAIN_REGISTRY_JSON are the two exceptions
 noted above — their unset/empty state is itself a safe value, not a
 placeholder requiring build-time substitution.
 
-Build pipeline contract
------------------------
-The build script must:
-  1. Compute SHA-256(file) AFTER all edits are finalised (T1-T4 hashes).
+Build pipeline contract (scripts/inject_hashes.sh, updated 2026-07-15 for the
+LAURA-V2-001/002 fix — INTEGRITY_HASH now folded into the signed bundle)
+-----------------------------------------------------------------------
+The build script must, IN THIS ORDER:
+  1. Compute SHA-256(file) for each of the 5 T1-T4 protected files.
   2. Mint/obtain this release's code leaf_cert + leaf_cert_sig from the
      master (Su's `licgen new-leaf` / `licgen sign-build`).
-  3. Sign the six-file hash bundle with the code leaf -> BUNDLE_SIG.
-  4. Emit the current trust-anchor SET (Su's `licgen`/registry tooling) ->
-     MASTER_ANCHOR_SET_JSON.
-  5. Replace the placeholder strings in this file with the real values.
-  6. Rebuild / reinstall the package so the updated constants are imported.
+  3. Embed the current trust-anchor SET (Su's `licgen`/registry tooling) ->
+     MASTER_ANCHOR_SET_JSON, plus KILL_LIST_JSON/CLIENT_DOMAIN_REGISTRY_JSON
+     if provided.
+  4. Compute INTEGRITY_HASH — the "blank-then-hash" self-referential digest
+     of THIS file's current bytes (step 1-3 output already embedded; the
+     INTEGRITY_HASH and BUNDLE_SIG lines themselves are blanked before
+     hashing, so their current placeholder/prior values don't matter) —
+     using the SAME algorithm as verifier._compute_integrity_self_hash().
+     Embed it.
+  5. Build the SIX-line canonical bundle string (5 T1-T4 hashes +
+     INTEGRITY_HASH, sorted by key) and sign it with the code leaf ->
+     BUNDLE_SIG. Embed it (this write does NOT change what INTEGRITY_HASH
+     would recompute to, since BUNDLE_SIG's own line is blanked).
+  6. Assert no placeholder strings remain, then rebuild / reinstall the
+     package so the updated constants are imported.
 
 Do NOT embed any private key here or anywhere in the image — only public
 keys, certs, and signatures.

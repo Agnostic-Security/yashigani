@@ -298,58 +298,113 @@ def require_feature(feature: str) -> None:
 
     Features listed in _ALWAYS_AVAILABLE_FEATURES are unconditionally permitted
     regardless of tier or what the license payload carries.
+
+    LAURA-V2-001 fix (2026-07-15): this now reads get_license() — which
+    fails closed to COMMUNITY_LICENSE when ANY of the five integrity flags
+    (verifier/enforcer/loader/agents_registry/identity_registry) is set —
+    instead of the raw module-global `_license`. Previously this function
+    consulted `_license` directly, completely bypassing the tamper-detection
+    state that get_license() already aggregated: even when a self-check
+    correctly fired (e.g. loader.py or verifier.py was tampered, with
+    enforcer.py itself untouched), this gate ignored it and kept granting
+    whatever tier `_license` happened to hold. Routing through get_license()
+    closes that class of bypass for every file OTHER than this one.
+
+    HONEST CEILING (do not overclaim — state this plainly, per design §11):
+    if an attacker with local write access to this exact file replaces this
+    entire function's body (not merely adds a bypass branch), no code living
+    inside the function — including this integrity check — can prevent the
+    resulting grant. That is an unavoidable property of any enforcement
+    point implemented in readable, locally-writable Python source; it is not
+    unique to this design and is not solvable without a hardware root of
+    trust or a compiled/obfuscated runtime, neither of which exists here
+    (Apache-2.0, offline, source-available by design).
+    What THIS fix DOES guarantee, even under that worst case: the resulting
+    tamper is never silent. verifier._check_build_integrity_chain() (a
+    SEPARATE file, external to this one, re-derived live from disk — see
+    verifier.py's module docstring) independently detects that enforcer.py's
+    bytes no longer match ENFORCER_HASH and sets verifier._integrity_violated
+    = True, which get_license()/is_license_tampered() correctly surface
+    (CRITICAL log + typed audit event + persistent tamper banner) regardless
+    of what this function's body has been replaced with. This raises the
+    bypass from "silent, zero-evidence" (worse than the design's own
+    accepted residual) up to "a knowing, unambiguous act with a visible
+    diff, always alarmed, always audited" — the accepted §11 residual — not
+    further than that, and this docstring says so rather than implying more.
     """
     if feature in _ALWAYS_AVAILABLE_FEATURES:
         return  # ENT-001: PII is always available
-    if not _license.has_feature(feature):
-        raise LicenseFeatureGated(feature=feature, tier=_license.tier)
+    active = get_license()
+    if not active.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=active.tier)
 
 
 def check_agent_limit(current_count: int) -> None:
-    """Raise LicenseLimitExceeded if current_count >= max_agents (and max != -1)."""
-    if _license.max_agents == -1:
+    """Raise LicenseLimitExceeded if current_count >= max_agents (and max != -1).
+
+    LAURA-V2-001 fix: reads get_license() (integrity-checked), not the raw
+    `_license` global — see require_feature()'s docstring for the full
+    rationale and honest ceiling, which applies identically here.
+    """
+    active = get_license()
+    if active.max_agents == -1:
         return
-    if current_count >= _license.max_agents:
+    if current_count >= active.max_agents:
         raise LicenseLimitExceeded(
             limit_name="max_agents",
             current=current_count,
-            max_val=_license.max_agents,
+            max_val=active.max_agents,
         )
 
 
 def check_end_user_limit(current_count: int) -> None:
-    """Raise LicenseLimitExceeded if current_count >= max_end_users (and max != -1)."""
-    if _license.max_end_users == -1:
+    """Raise LicenseLimitExceeded if current_count >= max_end_users (and max != -1).
+
+    LAURA-V2-001 fix: reads get_license() (integrity-checked) — see
+    require_feature()'s docstring.
+    """
+    active = get_license()
+    if active.max_end_users == -1:
         return
-    if current_count >= _license.max_end_users:
+    if current_count >= active.max_end_users:
         raise LicenseLimitExceeded(
             limit_name="max_end_users",
             current=current_count,
-            max_val=_license.max_end_users,
+            max_val=active.max_end_users,
         )
 
 
 def check_admin_seat_limit(current_count: int) -> None:
-    """Raise LicenseLimitExceeded if current_count >= max_admin_seats (and max != -1)."""
-    if _license.max_admin_seats == -1:
+    """Raise LicenseLimitExceeded if current_count >= max_admin_seats (and max != -1).
+
+    LAURA-V2-001 fix: reads get_license() (integrity-checked) — see
+    require_feature()'s docstring.
+    """
+    active = get_license()
+    if active.max_admin_seats == -1:
         return
-    if current_count >= _license.max_admin_seats:
+    if current_count >= active.max_admin_seats:
         raise LicenseLimitExceeded(
             limit_name="max_admin_seats",
             current=current_count,
-            max_val=_license.max_admin_seats,
+            max_val=active.max_admin_seats,
         )
 
 
 def check_org_limit(current_count: int) -> None:
-    """Raise LicenseLimitExceeded if current_count >= max_orgs (and max != -1)."""
-    if _license.max_orgs == -1:
+    """Raise LicenseLimitExceeded if current_count >= max_orgs (and max != -1).
+
+    LAURA-V2-001 fix: reads get_license() (integrity-checked) — see
+    require_feature()'s docstring.
+    """
+    active = get_license()
+    if active.max_orgs == -1:
         return
-    if current_count >= _license.max_orgs:
+    if current_count >= active.max_orgs:
         raise LicenseLimitExceeded(
             limit_name="max_orgs",
             current=current_count,
-            max_val=_license.max_orgs,
+            max_val=active.max_orgs,
         )
 
 
@@ -519,7 +574,10 @@ def license_feature_gated_response(exc: LicenseFeatureGated) -> dict:
 
 
 def license_limit_exceeded_response(exc: LicenseLimitExceeded) -> dict:
-    tier = _license.tier.value
+    # LAURA-V2-001 fix: reflect get_license() (integrity-checked), not the
+    # raw `_license` global, so a degraded-to-COMMUNITY tier is reported
+    # accurately in this error payload too.
+    tier = get_license().tier.value
     limit_label = {
         "max_agents":      "Agent",
         "max_end_users":   "End user",
