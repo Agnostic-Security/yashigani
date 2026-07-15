@@ -378,8 +378,8 @@ class TestDenyVariantsE2EL412:
         ("openai//gpt-4o",   403),  # double slash
         ("OPENAI://GPT-4O",  422),  # upper + URL-proto → 422
         ("openai:gpt-4o..",  403),  # double trailing dot
-        ("openai:gpt-4o;",   403),  # trailing semicolon
-        ("openai:gpt-4o,",   403),  # trailing comma
+        ("openai:gpt-4o;",   422),  # trailing semicolon — LAURA-412-002: layer 1 catches ; (not in allowlist) → invalid_model
+        ("openai:gpt-4o,",   422),  # trailing comma — LAURA-412-002: layer 1 catches , (not in allowlist) → invalid_model
         (" openai:gpt-4o ",  403),  # surrounding spaces
         ("openai/gpt-4o",    403),  # slash separator (LAURA-411 existing)
         ("openai:gpt-4o",    403),  # canonical (regression guard)

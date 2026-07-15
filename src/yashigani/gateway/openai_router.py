@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -209,37 +210,64 @@ def _deny_message(reason: str) -> str:
 # LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
 # ---------------------------------------------------------------------------
 
+# LAURA-412-002 (layer 1): compiled ASCII-only positive allowlist for model strings.
+# Any char outside [a-zA-Z0-9._:/@-] is rejected, closing the ENTIRE class of
+# bypass vectors regardless of position:
+#   • Printable non-set chars: |#!~<\ and any other symbol not listed
+#   • All Unicode Cf/whitespace/control chars: ZWSP (U+200B), ZWNJ (U+200C),
+#     ZWJ (U+200D), BOM (U+FEFF), Word-Joiner (U+2060), Invisible-Sep (U+2063),
+#     NUL (\x00), embedded newlines (\n, \r)
+# re.ASCII ensures the char-class [a-zA-Z0-9] is strictly 7-bit ASCII; no
+# Unicode letter/digit will match.  \Z (not $) anchors the end to prevent
+# a trailing \n from slipping through (Python's $ matches before a terminal \n).
+# Callers with @-prefix (agent calls) are exempted BEFORE _validate_model_string
+# is invoked, so @ appears in the allowlist only for digest formats (model@sha256:…).
+_MODEL_VALID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
+
+
 def _validate_model_string(model: str) -> Optional[str]:
     """Return an error-reason string if *model* is an invalid input, else None.
 
-    Rejects:
-      • URL-like strings  (http://, https://, //, ftp://)
-      • Any ``://`` scheme form (e.g. ``openai://gpt-4o``) — LAURA-412-001
-      • Path-traversal patterns (../, ..\\)
-      • Absolute paths (starts with /)
+    LAURA-412-002: POSITIVE VALIDATION replaces the prior denylist as the
+    primary gate.  Any model string that does not match the strict ASCII
+    allowlist ``^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\\Z`` is rejected with
+    ``invalid_model``.  This closes the ENTIRE class of bypass vectors at once:
+      • Printable non-set chars (|#!~<\\)
+      • All Unicode Cf/whitespace/control chars (ZWSP, ZWNJ, ZWJ, BOM,
+        Word-Joiner, Invisible-Sep, NUL \\x00, embedded \\n/\\r)
+      • Any combination thereof, regardless of position in the string
+
+    Legacy explicit checks are kept AHEAD of positive validation so that
+    existing tests retain their specific error codes and for clarity when
+    the permission store is absent (the explicit-deny gate cannot fire):
+      • URL-scheme forms (http://, https://, //, ftp://, any ://)
+      • Path-traversal patterns (../, ..\\\\)
       • Null-sentinel literals (``"null"``, ``"none"``, ``"undefined"``)
       • Empty strings (after strip)
 
-    Called before RBAC deny and optimisation so that none of these bypass
-    variants can reach the silent local-default fallback.
+    Called before RBAC deny and optimisation so that no bypass variant can
+    reach the silent local-default fallback.
     """
     s = (model or "").strip()
     if not s:
         return "empty_model"
     s_lower = s.lower()
+    # Explicit URL-scheme rejection (kept for backward-compat error code +
+    # for deployments where permission_store is None and layer 2 cannot fire).
     for prefix in ("http://", "https://", "//", "ftp://"):
         if s_lower.startswith(prefix):
             return "url_not_allowed"
     # LAURA-412-001: reject ANY ://-scheme form (e.g. openai://gpt-4o).
-    # The leading-prefix check above catches http:// and https:// at the start;
-    # this catches provider-scheme forms like openai://model that don't start
-    # with a standard protocol prefix.
     if "://" in s_lower:
         return "url_not_allowed"
     if "../" in s or "..\\" in s or s.startswith("/") or s.startswith(".."):
         return "path_traversal_not_allowed"
     if s_lower in ("null", "none", "undefined"):
         return "null_not_allowed"
+    # LAURA-412-002 (layer 1): positive allowlist — reject anything outside
+    # the ASCII-safe model-name charset.
+    if not _MODEL_VALID_RE.match(s):
+        return "invalid_model"
     return None
 
 
@@ -1744,6 +1772,98 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     }
                 },
             )
+
+        # LAURA-412-002 (layer 2): No silent local fallback for cloud-prefixed
+        # models that are not recognized/granted.
+        #
+        # ROOT CAUSE closed: _is_known_model() returns True for ANY model whose
+        # canonical prefix is in _CLOUD_PROVIDER_CONFIG (e.g. "openai:anything").
+        # After _resolve_alias, a cloud-prefixed string with no "/" falls through
+        # as ("ollama", model, False) → selected_provider="ollama" → the 6a-perm
+        # cloud gate (_perm_is_cloud=False) never fires → LAURA-411-001's
+        # explicit-deny lookup uses the CANONICAL key so a junk suffix
+        # ("openai:gpt-4oAAAA") never matches the stored grant ("openai:gpt-4o")
+        # → no deny → silent qwen2.5:3b fallback → 200.
+        #
+        # FIX: if the canonical model has a known cloud provider prefix, it MUST
+        # have either (a) an alias-store entry (resolves to a real provider/model)
+        # OR (b) a permission grant (allow or deny — any grant proves the admin
+        # configured this model) at org/user/group level.  If neither → 422.
+        #
+        # PRESERVE: power_user with a GRANTED openai:gpt-4o on a keyless demo
+        # stack still gets a 200 via local-fallback because a grant EXISTS for the
+        # exact canonical model → _412_has_grant=True → gate passes → 6a-perm and
+        # LAURA-411-001 handle allow/deny correctly.
+        #
+        # SKIPPED when permission_store is None (no grant system configured) —
+        # consistent with 6a-perm and LAURA-411-001 gates that also require it.
+        if ":" in selected_model and _state.permission_store is not None:
+            _412_prefix = selected_model.split(":", 1)[0]
+            if _412_prefix in _CLOUD_PROVIDER_CONFIG:
+                # Check for a known alias (resolves this exact canonical string)
+                _412_alias_known = False
+                if _state.model_alias_store is not None:
+                    try:
+                        _412_alias_known = _state.model_alias_store.get(selected_model) is not None
+                    except Exception:  # noqa: BLE001 — store blip; treat as unknown
+                        _412_alias_known = False
+                _412_has_grant = _412_alias_known
+                if not _412_has_grant:
+                    from yashigani.permissions import ResourceType as _RT_412
+                    from yashigani.permissions import DEFAULT_ORG_ID as _ORG_412
+                    try:
+                        # Org level — primary tier for cloud_model grants
+                        if _state.permission_store.get_boolean_grant(
+                            _RT_412.CLOUD_MODEL, "org", _ORG_412, selected_model
+                        ) is not None:
+                            _412_has_grant = True
+                        # User level
+                        if not _412_has_grant and identity:
+                            _412_kind = identity.get("kind", "")
+                            _412_uid = (
+                                identity.get("identity_id")
+                                if _412_kind in ("human", "user") else None
+                            )
+                            if _412_uid and _state.permission_store.get_boolean_grant(
+                                _RT_412.CLOUD_MODEL, "user", _412_uid, selected_model
+                            ) is not None:
+                                _412_has_grant = True
+                        # Group level
+                        if not _412_has_grant and identity:
+                            for _412_gid in (identity.get("groups") or []):
+                                if _state.permission_store.get_boolean_grant(
+                                    _RT_412.CLOUD_MODEL, "group", str(_412_gid), selected_model
+                                ) is not None:
+                                    _412_has_grant = True
+                                    break
+                    except Exception as _412_exc:  # noqa: BLE001
+                        # Fail-closed: grant-check failure → unknown grant → 422
+                        logger.warning(
+                            "LAURA-412-002: permission store check failed (%s) — "
+                            "fail-closed, treating cloud-prefixed model %r as ungranted",
+                            _412_exc, selected_model,
+                        )
+                        _412_has_grant = False
+                if not _412_has_grant:
+                    logger.warning(
+                        "LAURA-412-002: cloud-prefixed model %r (canonical: %r, "
+                        "provider: %s) has no alias or permission grant — "
+                        "422 (no silent local fallback). LAURA-412.",
+                        body.model, selected_model, _412_prefix,
+                    )
+                    return JSONResponse(
+                        status_code=422,
+                        content={
+                            "error": {
+                                "message": (
+                                    f"The model '{body.model}' is not available. "
+                                    "Contact an administrator to check the model name."
+                                ),
+                                "type": "invalid_request_error",
+                                "code": "model_not_found",
+                            }
+                        },
+                    )
 
     agent_upstream = None
     agent_protocol = "openai"
