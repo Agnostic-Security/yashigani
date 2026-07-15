@@ -16,7 +16,9 @@ Security invariants:
     IdentityRegistry, then a session is issued via SessionStore.
   - Email is never stored in audit logs — HMAC-SHA256 hash only.
   - All state/nonce keys use a dedicated Redis namespace (sso:state:).
-  - require_feature("oidc") is called before any OIDC-specific work (tier gate).
+  - _licence_hard_gate("oidc") is called before any OIDC-specific work (tier
+    gate; LAURA-V2-001 follow-up, 2026-07-16 — reads the signed integrity
+    authority directly, no longer delegates to enforcer.require_feature()).
 
 V6.8.4 — acr/amr allowlist validation (ASVS V6.3.3):
   - OIDC: required_acr_values (allowlist) and required_amr_values (subset check)
@@ -47,14 +49,74 @@ from yashigani.backoffice.state import backoffice_state
 from yashigani.auth.session import _mask_ip
 from yashigani.backoffice.schemas.bopla import IdPPublic
 from yashigani.licensing.enforcer import (
-    require_feature,
     LicenseFeatureGated,
+    LicenseTier,
     license_feature_gated_response,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate, route layer (LAURA-V2-001 follow-up,
+    2026-07-16).
+
+    Deliberately does NOT call enforcer.require_feature() — see
+    sso/oidc.py's `_licence_hard_gate()` docstring for the full rationale.
+    This is a SEPARATE local copy (not a shared import with oidc.py/saml.py/
+    routes/scim.py) so patching any ONE of those guards, or
+    enforcer.require_feature() itself, does not affect this one. Reads
+    verifier.get_integrity_status() (signed, live re-derived) and
+    enforcer.get_enforcer_integrity_status() directly; hard-refuses (raises)
+    on any integrity violation or missing feature; never silently passes on
+    error (IMPL-03).
+
+    One of THREE independent layers for OIDC/SAML (this route-level gate,
+    sso/oidc.py's / sso/saml.py's provider-level gate,
+    licensing/gate_middleware.py's ASGI-level gate) — see
+    gate_middleware.py's module docstring.
+    """
+    try:
+        from yashigani.licensing import verifier as _verifier
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SSO routes: could not import verifier/enforcer for integrity "
+            "check — treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        if _verifier.get_integrity_status() or _enforcer.get_enforcer_integrity_status():
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: SSO routes hard-refusing "
+                "feature=%s — build integrity violated", feature,
+            )
+            raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+    except LicenseFeatureGated:
+        raise
+    except Exception as exc:
+        logger.critical(
+            "SSO routes: integrity check raised — treating as violation and "
+            "refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SSO routes: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
 
 # Redis TTL for OIDC state tokens (10 minutes — generous for slow IdPs).
 _STATE_TTL_SECONDS = 600
@@ -498,7 +560,7 @@ async def initiate_oidc(idp_id: str, request: Request):
     with a 10-minute TTL, then redirects the browser to the IdP.
     """
     try:
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -603,7 +665,7 @@ async def oidc_callback(
 
     # Verify feature gate
     try:
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -1070,7 +1132,7 @@ async def saml_acs(idp_id: str, request: Request):
     client_ip = request.client.host if request.client else "unknown"
 
     try:
-        require_feature("saml")
+        _licence_hard_gate("saml")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,

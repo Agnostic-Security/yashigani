@@ -1069,6 +1069,18 @@ def create_backoffice_app() -> FastAPI:
 
     app.add_middleware(SpiffePeerCertMiddleware)
 
+    # Licence gate middleware (LAURA-V2-001 follow-up, 2026-07-16) — third,
+    # independent, ASGI-layer enforcement point for OIDC/SAML/SCIM. Hard-
+    # refuses matching requests BEFORE routing if build-integrity has been
+    # violated OR the active licence lacks the feature — redundant with, and
+    # deliberately independent of, each point-of-use file's own local
+    # `_licence_hard_gate()` (sso/oidc.py, sso/saml.py, routes/sso.py,
+    # routes/scim.py). See yashigani.licensing.gate_middleware module
+    # docstring for the full rationale.
+    from yashigani.licensing.gate_middleware import LicenseGateMiddleware
+
+    app.add_middleware(LicenseGateMiddleware)
+
     # CORS: backoffice serves its own frontend — no cross-origin needed
     app.add_middleware(
         CORSMiddleware,

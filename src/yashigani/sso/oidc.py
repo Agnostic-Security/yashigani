@@ -28,9 +28,89 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
-from yashigani.licensing.enforcer import require_feature
+from yashigani.licensing.enforcer import LicenseFeatureGated, LicenseTier
 
 logger = logging.getLogger(__name__)
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate (LAURA-V2-001 follow-up, 2026-07-16).
+
+    Deliberately does NOT call enforcer.require_feature() — a single edit to
+    that one function, in that one file (enforcer.py), previously defeated
+    every call site across the whole codebase simultaneously. This function
+    is defined LOCALLY in THIS file (a genuinely separate copy from the ones
+    in saml.py / backoffice/routes/sso.py / backoffice/routes/scim.py — not
+    a shared import) and reads the SIGNED hash authority directly:
+
+      - verifier.get_integrity_status(): the live, externally re-derived
+        (verifier.py, a SEPARATE file), BUNDLE_SIG-verified flag — True if
+        ANY protected file's bytes (including this file's own — see
+        _integrity.OIDC_MODULE_HASH / verifier._LIVE_HASH_TARGETS) no
+        longer match what was signed at build time.
+      - enforcer.get_enforcer_integrity_status(): enforcer.py's own
+        independent cross-check of verifier.py's bytes — covers the case
+        where verifier.py itself (not this file) was the one tampered with.
+
+    Because the expected hash is SIGNED (the attacker has no code-leaf
+    private key), a tampered enforcement file is flagged unforgeably; this
+    gate then HARD-REFUSES (raises, does not merely log/banner — design §5)
+    rather than falling through to a tier check that a tampered enforcer.py
+    could lie about.
+
+    Never silently passes on error: any failure importing/consulting the
+    authority is itself treated as a violation (IMPL-03 discipline) and
+    refuses.
+
+    HONEST CEILING: this defends against a SINGLE-file edit confined to
+    enforcer.py, or confined to this file, or confined to verifier.py alone.
+    A coordinated edit touching ALL of {this file, its own guard, enforcer.py
+    AND verifier.py/its signed constants simultaneously} is the accepted
+    design §11 residual (equivalent to forking and re-signing your own
+    build) — out of scope, see gate_middleware.py's module docstring for the
+    full defense-in-depth picture (this is one of THREE independent layers:
+    this provider-level gate, backoffice/routes/sso.py's route-level gate,
+    and licensing/gate_middleware.py's ASGI-level gate).
+    """
+    try:
+        from yashigani.licensing import verifier as _verifier
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "OIDC provider: could not import verifier/enforcer for integrity "
+            "check — treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        if _verifier.get_integrity_status() or _enforcer.get_enforcer_integrity_status():
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: OIDC provider hard-refusing "
+                "feature=%s — build integrity violated", feature,
+            )
+            raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+    except LicenseFeatureGated:
+        raise
+    except Exception as exc:
+        logger.critical(
+            "OIDC provider: integrity check raised — treating as violation "
+            "and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "OIDC provider: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
 
 # ---------------------------------------------------------------------------
 # ACS gap #95 — 3p response validation: OIDC discovery metadata model
@@ -148,7 +228,7 @@ class OIDCProvider:
         Returns (url, code_verifier). Caller MUST persist code_verifier in
         session state alongside the CSRF state token.
         """
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
         OAuth2Session, *_ = _import_authlib()
         meta = self._get_metadata()
         session = OAuth2Session(
@@ -173,7 +253,7 @@ class OIDCProvider:
         Returns OIDCUserInfo on success.
         code_verifier is sent to the token endpoint for PKCE validation (ASVS 10.4.6).
         """
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
         OAuth2Session, jwt_lib, _, JoseError = _import_authlib()
         meta = self._get_metadata()
         session = OAuth2Session(

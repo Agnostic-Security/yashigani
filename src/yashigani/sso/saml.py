@@ -14,9 +14,66 @@ from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-from yashigani.licensing.enforcer import require_feature
+from yashigani.licensing.enforcer import LicenseFeatureGated, LicenseTier
 
 logger = logging.getLogger(__name__)
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate (LAURA-V2-001 follow-up, 2026-07-16).
+
+    Mirrors sso/oidc.py's `_licence_hard_gate()` — see that function's
+    docstring for the full rationale (deliberately a SEPARATE local copy,
+    not a shared import, so patching enforcer.require_feature() — or this
+    same function as defined in oidc.py/routes/sso.py/routes/scim.py — has
+    no effect on this file's own gate). Reads verifier.get_integrity_status()
+    (signed, live re-derived) and enforcer.get_enforcer_integrity_status()
+    directly; never calls enforcer.require_feature(). Hard-refuses (raises)
+    on any integrity violation or missing feature — never silently passes on
+    error (IMPL-03).
+
+    One of THREE independent layers for SAML (this provider-level gate,
+    backoffice/routes/sso.py's route-level gate, licensing/gate_middleware.py's
+    ASGI-level gate) — see gate_middleware.py's module docstring.
+    """
+    try:
+        from yashigani.licensing import verifier as _verifier
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SAML provider: could not import verifier/enforcer for integrity "
+            "check — treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        if _verifier.get_integrity_status() or _enforcer.get_enforcer_integrity_status():
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: SAML provider hard-refusing "
+                "feature=%s — build integrity violated", feature,
+            )
+            raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+    except LicenseFeatureGated:
+        raise
+    except Exception as exc:
+        logger.critical(
+            "SAML provider: integrity check raised — treating as violation "
+            "and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SAML provider: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
 
 
 def _assert_rsa_sp_key(sp_private_key: str) -> None:
@@ -136,7 +193,7 @@ class SAMLProvider:
 
     def get_login_url(self, request_data: dict) -> str:
         """Build the IdP redirect URL for SP-initiated SSO."""
-        require_feature("saml")
+        _licence_hard_gate("saml")
         auth = self._build_auth(request_data)
         return auth.login()
 
@@ -145,7 +202,7 @@ class SAMLProvider:
         Process the IdP SAMLResponse (POST binding).
         Validates signature and returns SAMLUserInfo on success.
         """
-        require_feature("saml")
+        _licence_hard_gate("saml")
         auth = self._build_auth(request_data)
         auth.process_response()
         errors = auth.get_errors()

@@ -40,11 +40,11 @@ from yashigani.backoffice.state import backoffice_state
 from yashigani.backoffice.routes.rbac import _push
 from yashigani.rbac.model import RBACGroup
 from yashigani.licensing.enforcer import (
-    require_feature,
     check_end_user_limit,
     count_canonical_end_users,
     LicenseFeatureGated,
     LicenseLimitExceeded,
+    LicenseTier,
     license_feature_gated_response,
     license_limit_exceeded_response,
 )
@@ -52,6 +52,61 @@ from yashigani.licensing.enforcer import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate, route layer (LAURA-V2-001 follow-up,
+    2026-07-16).
+
+    Deliberately does NOT call enforcer.require_feature() — see
+    sso/oidc.py's `_licence_hard_gate()` docstring for the full rationale.
+    SCIM has no separate provider module (unlike OIDC/SAML's oidc.py/
+    saml.py), so this route-level gate plus
+    licensing/gate_middleware.py's independent ASGI-level gate are the TWO
+    layers for SCIM — both read verifier.get_integrity_status() (signed,
+    live re-derived) and enforcer.get_enforcer_integrity_status() directly,
+    never enforcer.require_feature(). Hard-refuses (raises) on any integrity
+    violation or missing feature; never silently passes on error (IMPL-03).
+    """
+    try:
+        from yashigani.licensing import verifier as _verifier
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SCIM routes: could not import verifier/enforcer for integrity "
+            "check — treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        if _verifier.get_integrity_status() or _enforcer.get_enforcer_integrity_status():
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: SCIM routes hard-refusing "
+                "feature=%s — build integrity violated", feature,
+            )
+            raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+    except LicenseFeatureGated:
+        raise
+    except Exception as exc:
+        logger.critical(
+            "SCIM routes: integrity check raised — treating as violation and "
+            "refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SCIM routes: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
 
 # SCIM schema URNs
 _URN_USER = "urn:ietf:params:scim:schemas:core:2.0:User"
@@ -245,7 +300,7 @@ async def scim_provision_user(
     Membership is assigned separately via SCIM Group PATCH.
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -330,7 +385,7 @@ async def scim_deprovision_user(
     user_id is treated as the user's email address.
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -379,7 +434,7 @@ async def scim_create_group(
     session: AdminSession,
 ):
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -431,7 +486,7 @@ async def scim_patch_group(
         [{"value": "<email>", "display": "<optional>"}, ...]
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -523,7 +578,7 @@ async def scim_delete_group(
     session: AdminSession,
 ):
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
