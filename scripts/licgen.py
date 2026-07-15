@@ -374,8 +374,12 @@ def _cmd_issue(args: argparse.Namespace) -> None:
         features=args.features,
     )
 
-    passphrase = os.environ.get("YASHIGANI_LICENCE_KEY_PASSPHRASE")
-    passphrase_bytes = passphrase.rstrip("\n").encode("utf-8") if passphrase else None
+    # Resolve via sign_license's OWN canonical resolver (single source of
+    # truth for the YASHIGANI_KEY_PASSPHRASE / YASHIGANI_LICENCE_KEY_PASSPHRASE
+    # precedence — see its docstring) rather than duplicating the env lookup
+    # here, which is exactly how the two call sites drifted onto different
+    # var names in the first place (2026-07-15 fix).
+    passphrase_bytes = sign_license._resolve_passphrase()
 
     wire = sign_license.sign_licence_file(
         payload=payload,
@@ -524,7 +528,14 @@ def main() -> None:
     p_sign_build.add_argument("--client-domain-registry", default=None)
     p_sign_build.set_defaults(func=_cmd_sign_build)
 
-    p_issue = sub.add_parser("issue", help="Sign a v5 licence for an onboarded client")
+    p_issue = sub.add_parser(
+        "issue",
+        help=(
+            "Sign a v5 licence for an onboarded client "
+            "(decrypts the licence leaf using YASHIGANI_KEY_PASSPHRASE — the "
+            "SAME var `licgen new-leaf`/keygen.py used to encrypt it)"
+        ),
+    )
     _add_channel_args(p_issue)
     p_issue.add_argument("--domain", required=True)
     p_issue.add_argument("--tier", required=True)
