@@ -284,10 +284,10 @@ class TestSoD002bScimProvisionCollision:
         body = MagicMock()
         body.userName = "admin@example.com"
 
-        # Patch require_feature in the scim module's own namespace (it uses 'from ... import')
+        # Patch _licence_hard_gate in the scim module's own namespace (LAURA-V2-001 follow-up: no longer imported as require_feature)
         with patch.object(_scim_mod, "backoffice_state", mock_state):
             with patch.object(_scim_mod, "_get_store", return_value=mock_store):
-                with patch.object(_scim_mod, "require_feature"):
+                with patch.object(_scim_mod, "_licence_hard_gate"):
                     result = await _scim_mod.scim_provision_user(body, mock_session)
 
         assert result.status_code == 409
@@ -315,7 +315,7 @@ class TestSoD002bScimProvisionCollision:
 
         with patch.object(_scim_mod, "backoffice_state", mock_state):
             with patch.object(_scim_mod, "_get_store", return_value=mock_store):
-                with patch.object(_scim_mod, "require_feature"):
+                with patch.object(_scim_mod, "_licence_hard_gate"):
                     with patch.object(_scim_mod, "check_end_user_limit"):
                         with patch.object(_scim_mod, "count_canonical_end_users", return_value=0):
                             result = await _scim_mod.scim_provision_user(body, mock_session)
@@ -345,7 +345,7 @@ class TestSoD002bScimProvisionCollision:
 
         with patch.object(_scim_mod, "backoffice_state", mock_state):
             with patch.object(_scim_mod, "_get_store", return_value=mock_store):
-                with patch.object(_scim_mod, "require_feature"):
+                with patch.object(_scim_mod, "_licence_hard_gate"):
                     await _scim_mod.scim_provision_user(body, mock_session)
 
         calls = mock_state.audit_writer.write.call_args_list

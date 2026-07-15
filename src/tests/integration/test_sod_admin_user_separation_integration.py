@@ -119,7 +119,7 @@ class TestSsoCallbackExploitReplay:
         mock_request.client.host = "10.0.0.5"
 
         with patch.object(_sso_mod, "backoffice_state", mock_state):
-            with patch.object(_sso_mod, "require_feature"):
+            with patch.object(_sso_mod, "_licence_hard_gate"):
                 with patch.object(_sso_mod, "_consume_state", return_value={"idp_id": "test-idp", "nonce": "n", "code_verifier": ""}):
                     with patch.object(_sso_mod, "_build_redirect_uri", return_value="https://example.com/callback"):
                         with patch.object(_sso_mod, "_email_hash", return_value="test-hash-abc123"):
@@ -181,7 +181,7 @@ class TestSsoCallbackExploitReplay:
             return "would-be-identity-id"
 
         with patch.object(_sso_mod, "backoffice_state", mock_state):
-            with patch.object(_sso_mod, "require_feature"):
+            with patch.object(_sso_mod, "_licence_hard_gate"):
                 with patch.object(_sso_mod, "_consume_state", return_value={"idp_id": "test-idp", "nonce": "n", "code_verifier": ""}):
                     with patch.object(_sso_mod, "_build_redirect_uri", return_value="https://example.com/callback"):
                         with patch.object(_sso_mod, "_email_hash", return_value="test-hash-abc123"):
@@ -238,7 +238,7 @@ class TestSsoCallbackExploitReplay:
         mock_request.client.host = "10.0.0.5"
 
         with patch.object(_sso_mod, "backoffice_state", mock_state):
-            with patch.object(_sso_mod, "require_feature"):
+            with patch.object(_sso_mod, "_licence_hard_gate"):
                 with patch.object(_sso_mod, "_consume_state", return_value={"idp_id": "test-idp", "nonce": "n", "code_verifier": ""}):
                     with patch.object(_sso_mod, "_build_redirect_uri", return_value="https://example.com/callback"):
                         with patch.object(_sso_mod, "_email_hash", return_value="test-hash-abc123"):
@@ -388,7 +388,7 @@ class TestSoD004EndToEndChain:
         mock_request.client.host = "10.0.0.1"
 
         with patch.object(_sso_mod, "backoffice_state", mock_state_sso):
-            with patch.object(_sso_mod, "require_feature"):
+            with patch.object(_sso_mod, "_licence_hard_gate"):
                 with patch.object(_sso_mod, "_consume_state", return_value={"idp_id": "corp-idp", "nonce": "n", "code_verifier": ""}):
                     with patch.object(_sso_mod, "_build_redirect_uri", return_value="https://corp.com/cb"):
                         with patch.object(_sso_mod, "_email_hash", return_value="test-hash-abc123"):
