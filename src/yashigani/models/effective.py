@@ -40,6 +40,7 @@ transient fault cannot silently grant unrestricted access.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -54,14 +55,24 @@ def normalize_model_for_deny(model: str) -> str:
       • Collapse provider-separator variant: ``openai/gpt-4o`` → ``openai:gpt-4o``
         (exactly one ``/`` between two non-empty segments, no existing ``:``).
 
+    LAURA-412-001 — robust canonicalization (whack-a-mole fix):
+      • Collapse any run of consecutive colons/slashes → single colon so
+        ``openai::gpt-4o``, ``openai://gpt-4o``, ``openai:/gpt-4o``,
+        ``openai//gpt-4o`` all resolve to ``openai:gpt-4o``.
+      • Strip leading/trailing punctuation (space, dot, colon, semicolon,
+        comma, slash) so ``openai:gpt-4o.``, ``:openai:gpt-4o``,
+        ``openai:gpt-4o,,`` all resolve to ``openai:gpt-4o``.
+      The combination guarantees ANY separator/punctuation trick around a
+      known grant key canonicalizes to that key — ending the bypass cycle.
+
     Does NOT validate; never raises.  URL/path-traversal validation is the
     caller's responsibility (handled in gateway via ``_validate_model_string``).
     """
     if not model:
         return ""
     norm = model.strip().lower()
-    # Normalize '/' separator only for the ``provider/model`` pattern:
-    # exactly one '/', no existing ':', no trailing path components.
+    # Step 1 (existing): Normalize single-slash provider/model pattern with no
+    # existing colon: openai/gpt-4o → openai:gpt-4o.
     if "/" in norm and ":" not in norm:
         parts = norm.split("/", 1)
         if (
@@ -71,6 +82,15 @@ def normalize_model_for_deny(model: str) -> str:
             and "/" not in parts[1]
         ):
             norm = ":".join(parts)
+    # LAURA-412-001 Step 2: Collapse one-or-more consecutive colons/slashes
+    # into a single colon.  Handles openai::gpt-4o, openai://gpt-4o,
+    # openai:/gpt-4o, openai//gpt-4o → openai:gpt-4o.
+    norm = re.sub(r"[:/]+", ":", norm)
+    # LAURA-412-001 Step 3: Strip leading/trailing punctuation characters
+    # (but NOT the single internal ':'). Handles openai:gpt-4o. (trailing
+    # dot), openai:gpt-4o; (semicolon), openai:gpt-4o, (comma),
+    # :openai:gpt-4o (leading colon), and surrounding spaces.
+    norm = norm.strip(" .:;,/")
     return norm
 
 
