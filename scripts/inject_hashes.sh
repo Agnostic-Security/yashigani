@@ -5,10 +5,10 @@
 # Tom's _integrity.py rewrite for licence-hardening-v2).
 #
 # Ref: AgnosticSecurity/Products/Yashigani/licence-hardening-v2-design-20260713.md
-#      §2.2 (anchor-SET) + §3.1 (leaf_cert) + §3.3 (six-file bundle) plus the
+#      §2.2 (anchor-SET) + §3.1 (leaf_cert) + §3.3 (hash bundle) plus the
 #      LAURA-V2-001/002 fix (2026-07-15): INTEGRITY_HASH is now a REAL, wired
-#      self-hash (blank-then-hash convention) folded in as the bundle's 6th
-#      line — closing both "self-checks live inside the file they protect"
+#      self-hash (blank-then-hash convention) folded into the signed bundle —
+#      closing both "self-checks live inside the file they protect"
 #      (LAURA-V2-001) and "kill-list/anchor-set/leaf-cert are unsigned"
 #      (LAURA-V2-002). This SUPERSEDES the old "INTEGRITY_HASH excluded from
 #      the signed bundle — unresolvable circularity" deviation: the
@@ -19,11 +19,22 @@
 #      INTEGRITY_HASH MUST stay byte-identical to
 #      verifier._compute_integrity_self_hash() — see Step 4 below.
 #
+#      2026-07-16 follow-up (LAURA-V2-001, "replacing require_feature()'s
+#      whole body still yields the feature"): the bundle now ALSO covers 5
+#      point-of-use (POU) files — sso/oidc.py, sso/saml.py,
+#      backoffice/routes/sso.py, backoffice/routes/scim.py, and
+#      licensing/gate_middleware.py — the files that do the ACTUAL privileged
+#      work of a licence-gated capability and each carry their own local
+#      `_licence_hard_gate()`. The bundle is now ELEVEN lines (was six).
+#
 # Steps (ORDER MATTERS — INTEGRITY_HASH in Step 4 must be computed AFTER
 # every OTHER constant is finalised, so it actually covers them):
-#   Step 1: Compute SHA-256 of 5 licensing/agent/identity modules → write
-#           into VERIFIER_HASH/ENFORCER_HASH/LOADER_HASH/AGENTS_REGISTRY_HASH/
-#           IDENTITY_REGISTRY_HASH (T1-T4 bundle — unchanged v1 mechanism).
+#   Step 1: Compute SHA-256 of 10 licensing/agent/identity/sso/routes/
+#           middleware modules → write into VERIFIER_HASH/ENFORCER_HASH/
+#           LOADER_HASH/AGENTS_REGISTRY_HASH/IDENTITY_REGISTRY_HASH (T1-T4
+#           bundle — unchanged v1 mechanism) plus OIDC_MODULE_HASH/
+#           SAML_MODULE_HASH/SSO_ROUTES_HASH/SCIM_ROUTES_HASH/
+#           GATE_MIDDLEWARE_HASH (POU bundle, added 2026-07-16).
 #   Step 2: Embed the chain-of-trust constants — MASTER_ANCHOR_SET_JSON,
 #           CODE_LEAF_CERT_JSON, CODE_LEAF_CERT_SIG — from files produced by
 #           `licgen release` / `keygen.py leaf new` + `licgen anchor-set emit`.
@@ -35,9 +46,9 @@
 #           embedded; the INTEGRITY_HASH and BUNDLE_SIG line-values are
 #           blanked to a fixed placeholder before hashing, regardless of
 #           their current contents) → write it.
-#   Step 5: Build the canonical SIX-line bundle string (5 T1-T4 hashes +
-#           INTEGRITY_HASH, sorted KEY=hex lines, \n-joined, no trailing
-#           newline — SAME construction as
+#   Step 5: Build the canonical ELEVEN-line bundle string (5 T1-T4 hashes +
+#           5 POU hashes + INTEGRITY_HASH, sorted KEY=hex lines, \n-joined,
+#           no trailing newline — SAME construction as
 #           verifier._compute_live_hash_bundle_str()) → sign with the CODE
 #           leaf's private key via sign_bundle_v2.py (P-384/SHA-384, chain
 #           digest §3.3) → BUNDLE_SIG. Embedding BUNDLE_SIG does NOT
@@ -102,6 +113,17 @@ LOADER_PY="${SRC_ROOT}/yashigani/licensing/loader.py"
 AGENTS_REGISTRY_PY="${SRC_ROOT}/yashigani/agents/registry.py"
 IDENTITY_REGISTRY_PY="${SRC_ROOT}/yashigani/identity/registry.py"
 
+# Point-of-use (POU) protected files — added 2026-07-16 (LAURA-V2-001
+# follow-up: "replacing require_feature()'s whole body still yields the
+# feature"). These are the files that do the ACTUAL privileged work of a
+# licence-gated capability, covered by the same live-hash + BUNDLE_SIG
+# mechanism as the T1-T4 files above. See _integrity.py's module docstring.
+OIDC_MODULE_PY="${SRC_ROOT}/yashigani/sso/oidc.py"
+SAML_MODULE_PY="${SRC_ROOT}/yashigani/sso/saml.py"
+SSO_ROUTES_PY="${SRC_ROOT}/yashigani/backoffice/routes/sso.py"
+SCIM_ROUTES_PY="${SRC_ROOT}/yashigani/backoffice/routes/scim.py"
+GATE_MIDDLEWARE_PY="${SRC_ROOT}/yashigani/licensing/gate_middleware.py"
+
 SIGN_BUNDLE_PY="${SCRIPT_DIR}/sign_bundle_v2.py"
 
 # ---------------------------------------------------------------------------
@@ -116,6 +138,7 @@ SIGN_BUNDLE_PY="${SCRIPT_DIR}/sign_bundle_v2.py"
 for _f in \
     "$INTEGRITY_PY" "$VERIFIER_PY" "$ENFORCER_PY" "$LOADER_PY" \
     "$AGENTS_REGISTRY_PY" "$IDENTITY_REGISTRY_PY" \
+    "$OIDC_MODULE_PY" "$SAML_MODULE_PY" "$SSO_ROUTES_PY" "$SCIM_ROUTES_PY" "$GATE_MIDDLEWARE_PY" \
     "$SIGN_BUNDLE_PY" \
     "$CODE_LEAF_KEY_PATH" "$CODE_LEAF_CERT_PATH" "$CODE_LEAF_CERT_SIG_PATH" "$MASTER_ANCHOR_SET_PATH"; do
     if [ ! -f "$_f" ]; then
@@ -238,6 +261,8 @@ content = path.read_text(encoding="utf-8")
 INJECTED_CONSTS = [
     "VERIFIER_HASH", "ENFORCER_HASH", "LOADER_HASH",
     "AGENTS_REGISTRY_HASH", "IDENTITY_REGISTRY_HASH",
+    "OIDC_MODULE_HASH", "SAML_MODULE_HASH", "SSO_ROUTES_HASH",
+    "SCIM_ROUTES_HASH", "GATE_MIDDLEWARE_HASH",
     "INTEGRITY_HASH",
     "MASTER_ANCHOR_SET_JSON", "CODE_LEAF_CERT_JSON", "CODE_LEAF_CERT_SIG",
     "BUNDLE_SIG",
@@ -275,18 +300,33 @@ ENFORCER_HASH="$(_sha256_file "${ENFORCER_PY}")"
 LOADER_HASH="$(_sha256_file "${LOADER_PY}")"
 AGENTS_REGISTRY_HASH="$(_sha256_file "${AGENTS_REGISTRY_PY}")"
 IDENTITY_REGISTRY_HASH="$(_sha256_file "${IDENTITY_REGISTRY_PY}")"
+OIDC_MODULE_HASH="$(_sha256_file "${OIDC_MODULE_PY}")"
+SAML_MODULE_HASH="$(_sha256_file "${SAML_MODULE_PY}")"
+SSO_ROUTES_HASH="$(_sha256_file "${SSO_ROUTES_PY}")"
+SCIM_ROUTES_HASH="$(_sha256_file "${SCIM_ROUTES_PY}")"
+GATE_MIDDLEWARE_HASH="$(_sha256_file "${GATE_MIDDLEWARE_PY}")"
 
 printf '[inject_hashes v2] VERIFIER_HASH          = %s\n' "$VERIFIER_HASH"
 printf '[inject_hashes v2] ENFORCER_HASH          = %s\n' "$ENFORCER_HASH"
 printf '[inject_hashes v2] LOADER_HASH            = %s\n' "$LOADER_HASH"
 printf '[inject_hashes v2] AGENTS_REGISTRY_HASH   = %s\n' "$AGENTS_REGISTRY_HASH"
 printf '[inject_hashes v2] IDENTITY_REGISTRY_HASH = %s\n' "$IDENTITY_REGISTRY_HASH"
+printf '[inject_hashes v2] OIDC_MODULE_HASH       = %s\n' "$OIDC_MODULE_HASH"
+printf '[inject_hashes v2] SAML_MODULE_HASH       = %s\n' "$SAML_MODULE_HASH"
+printf '[inject_hashes v2] SSO_ROUTES_HASH        = %s\n' "$SSO_ROUTES_HASH"
+printf '[inject_hashes v2] SCIM_ROUTES_HASH       = %s\n' "$SCIM_ROUTES_HASH"
+printf '[inject_hashes v2] GATE_MIDDLEWARE_HASH   = %s\n' "$GATE_MIDDLEWARE_HASH"
 
 _replace_constant "${INTEGRITY_PY}" "VERIFIER_HASH" "${VERIFIER_HASH}"
 _replace_constant "${INTEGRITY_PY}" "ENFORCER_HASH" "${ENFORCER_HASH}"
 _replace_constant "${INTEGRITY_PY}" "LOADER_HASH" "${LOADER_HASH}"
 _replace_constant "${INTEGRITY_PY}" "AGENTS_REGISTRY_HASH" "${AGENTS_REGISTRY_HASH}"
 _replace_constant "${INTEGRITY_PY}" "IDENTITY_REGISTRY_HASH" "${IDENTITY_REGISTRY_HASH}"
+_replace_constant "${INTEGRITY_PY}" "OIDC_MODULE_HASH" "${OIDC_MODULE_HASH}"
+_replace_constant "${INTEGRITY_PY}" "SAML_MODULE_HASH" "${SAML_MODULE_HASH}"
+_replace_constant "${INTEGRITY_PY}" "SSO_ROUTES_HASH" "${SSO_ROUTES_HASH}"
+_replace_constant "${INTEGRITY_PY}" "SCIM_ROUTES_HASH" "${SCIM_ROUTES_HASH}"
+_replace_constant "${INTEGRITY_PY}" "GATE_MIDDLEWARE_HASH" "${GATE_MIDDLEWARE_HASH}"
 
 printf '[inject_hashes v2] Step 1 complete\n'
 
@@ -388,7 +428,7 @@ printf '[inject_hashes v2] INTEGRITY_HASH = %s\n' "$INTEGRITY_HASH"
 printf '[inject_hashes v2] Step 4 complete\n'
 
 # ---------------------------------------------------------------------------
-# STEP 5: Build canonical SIX-line bundle string (5 module hashes +
+# STEP 5: Build canonical ELEVEN-line bundle string (10 module hashes +
 #         INTEGRITY_HASH, sorted by key — SAME construction as
 #         verifier._compute_live_hash_bundle_str()) → sign with the CODE
 #         leaf → write BUNDLE_SIG. Embedding BUNDLE_SIG does NOT invalidate
@@ -396,13 +436,18 @@ printf '[inject_hashes v2] Step 4 complete\n'
 #         computation, per the blank-then-hash convention above).
 # ---------------------------------------------------------------------------
 
-printf '[inject_hashes v2] Step 5: building canonical 6-line bundle string and signing with code leaf\n'
+printf '[inject_hashes v2] Step 5: building canonical 11-line bundle string and signing with code leaf\n'
 
 BUNDLE_STR="AGENTS_REGISTRY_HASH=${AGENTS_REGISTRY_HASH}
 ENFORCER_HASH=${ENFORCER_HASH}
+GATE_MIDDLEWARE_HASH=${GATE_MIDDLEWARE_HASH}
 IDENTITY_REGISTRY_HASH=${IDENTITY_REGISTRY_HASH}
 INTEGRITY_HASH=${INTEGRITY_HASH}
 LOADER_HASH=${LOADER_HASH}
+OIDC_MODULE_HASH=${OIDC_MODULE_HASH}
+SAML_MODULE_HASH=${SAML_MODULE_HASH}
+SCIM_ROUTES_HASH=${SCIM_ROUTES_HASH}
+SSO_ROUTES_HASH=${SSO_ROUTES_HASH}
 VERIFIER_HASH=${VERIFIER_HASH}"
 
 BUNDLE_SIG="$(PYTHONPATH="${SRC_ROOT}" python3 "${SIGN_BUNDLE_PY}" \

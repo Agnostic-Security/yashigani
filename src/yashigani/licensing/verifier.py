@@ -282,15 +282,33 @@ def _build_hash_bundle_str() -> str:
 _LICENSING_DIR = Path(__file__).parent
 _YASHIGANI_PKG_DIR = _LICENSING_DIR.parent  # .../src/yashigani
 
-# The 5 T1-T4 protected files, keyed by their _integrity.py constant name —
+# The T1-T4 protected files, keyed by their _integrity.py constant name —
 # resolved by PATH, never by importing those modules (importing would run
 # their own, potentially-tampered, code).
+#
+# Extended 2026-07-16 (LAURA-V2-001 follow-up — "replacing require_feature()'s
+# whole body still yields the feature"): the 5 point-of-use (POU) files below
+# do the ACTUAL privileged work of a licence-gated capability. Each of them
+# now carries its OWN local `_licence_hard_gate()` (see oidc.py/saml.py/
+# routes/sso.py/routes/scim.py) that reads verifier.get_integrity_status()
+# and enforcer.get_enforcer_integrity_status() directly — NOT via
+# enforcer.require_feature() — so patching require_feature() alone has zero
+# effect on them. Adding them here closes the OTHER half: tampering with a
+# POU file itself (e.g. deleting its own `_licence_hard_gate()` call) changes
+# that file's bytes, which THIS dict causes verifier.py — a separate file,
+# untouched by that edit — to detect independently at its own module-load
+# time, exactly like ENFORCER_HASH/LOADER_HASH always have.
 _LIVE_HASH_TARGETS: dict[str, Path] = {
     "VERIFIER_HASH": _LICENSING_DIR / "verifier.py",
     "ENFORCER_HASH": _LICENSING_DIR / "enforcer.py",
     "LOADER_HASH": _LICENSING_DIR / "loader.py",
     "AGENTS_REGISTRY_HASH": _YASHIGANI_PKG_DIR / "agents" / "registry.py",
     "IDENTITY_REGISTRY_HASH": _YASHIGANI_PKG_DIR / "identity" / "registry.py",
+    "OIDC_MODULE_HASH": _YASHIGANI_PKG_DIR / "sso" / "oidc.py",
+    "SAML_MODULE_HASH": _YASHIGANI_PKG_DIR / "sso" / "saml.py",
+    "SSO_ROUTES_HASH": _YASHIGANI_PKG_DIR / "backoffice" / "routes" / "sso.py",
+    "SCIM_ROUTES_HASH": _YASHIGANI_PKG_DIR / "backoffice" / "routes" / "scim.py",
+    "GATE_MIDDLEWARE_HASH": _LICENSING_DIR / "gate_middleware.py",
 }
 
 _INTEGRITY_PY_PATH = _LICENSING_DIR / "_integrity.py"
@@ -371,11 +389,12 @@ def _compute_integrity_self_hash(file_text: str) -> str:
 
 def _compute_live_hash_bundle_str() -> "tuple[Optional[str], dict[str, Optional[str]]]":
     """
-    Read the CURRENT bytes of every T1-T4-protected file straight off disk —
-    independent of any of those modules' own in-process state/self-checks —
-    plus _integrity.py's own blanked self-hash, and build the SAME canonical
-    "KEY=hex" bundle-string shape BUNDLE_SIG is signed over (6 lines now,
-    sorted by key name: the 5 T1-T4 hashes + INTEGRITY_HASH).
+    Read the CURRENT bytes of every T1-T4 + point-of-use (POU) protected file
+    straight off disk — independent of any of those modules' own in-process
+    state/self-checks — plus _integrity.py's own blanked self-hash, and build
+    the SAME canonical "KEY=hex" bundle-string shape BUNDLE_SIG is signed
+    over (11 lines: the 5 T1-T4 hashes + INTEGRITY_HASH + the 5 POU hashes —
+    OIDC/SAML/SSO-routes/SCIM-routes/gate-middleware, added 2026-07-16).
 
     Returns (bundle_str, live_hashes). bundle_str is None if ANY file could
     not be read — the caller must treat that as a verification failure
@@ -411,9 +430,14 @@ def _compute_live_hash_bundle_str() -> "tuple[Optional[str], dict[str, Optional[
     bundle_str = "\n".join([
         f"AGENTS_REGISTRY_HASH={live_hashes['AGENTS_REGISTRY_HASH']}",
         f"ENFORCER_HASH={live_hashes['ENFORCER_HASH']}",
+        f"GATE_MIDDLEWARE_HASH={live_hashes['GATE_MIDDLEWARE_HASH']}",
         f"IDENTITY_REGISTRY_HASH={live_hashes['IDENTITY_REGISTRY_HASH']}",
         f"INTEGRITY_HASH={live_hashes['INTEGRITY_HASH']}",
         f"LOADER_HASH={live_hashes['LOADER_HASH']}",
+        f"OIDC_MODULE_HASH={live_hashes['OIDC_MODULE_HASH']}",
+        f"SAML_MODULE_HASH={live_hashes['SAML_MODULE_HASH']}",
+        f"SCIM_ROUTES_HASH={live_hashes['SCIM_ROUTES_HASH']}",
+        f"SSO_ROUTES_HASH={live_hashes['SSO_ROUTES_HASH']}",
         f"VERIFIER_HASH={live_hashes['VERIFIER_HASH']}",
     ])
     return bundle_str, live_hashes
@@ -532,6 +556,11 @@ def _check_build_integrity_chain() -> None:
         "AGENTS_REGISTRY_HASH": _integrity.AGENTS_REGISTRY_HASH,
         "IDENTITY_REGISTRY_HASH": _integrity.IDENTITY_REGISTRY_HASH,
         "INTEGRITY_HASH": _integrity.INTEGRITY_HASH,
+        "OIDC_MODULE_HASH": _integrity.OIDC_MODULE_HASH,
+        "SAML_MODULE_HASH": _integrity.SAML_MODULE_HASH,
+        "SSO_ROUTES_HASH": _integrity.SSO_ROUTES_HASH,
+        "SCIM_ROUTES_HASH": _integrity.SCIM_ROUTES_HASH,
+        "GATE_MIDDLEWARE_HASH": _integrity.GATE_MIDDLEWARE_HASH,
     }
     any_module_mismatch = False
     for const_name, expected in _static_hash_constants.items():

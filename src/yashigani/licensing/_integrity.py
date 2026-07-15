@@ -45,6 +45,34 @@ replaced at Docker build time by the build pipeline:
 Above (T1-T4 self-hash bundle): unchanged v1 mechanism — SHA-256 file
 hashes, independent of the licence-hardening-v2 chain design.
 
+Point-of-use (POU) protected files — added 2026-07-16 (LAURA-V2-001
+follow-up: "replacing require_feature()'s whole body still yields the
+feature"). These are the files that do the ACTUAL privileged work of a
+licence-gated capability (OIDC/SAML/SCIM), not just the shared enforcer.py
+gate. Each is covered by verifier.py's live, external, signed-bundle
+re-derivation exactly like the T1-T4 files above — so tampering with any of
+them (including deleting their own local point-of-use guard, see each
+file's `_licence_hard_gate()`) is independently detected by verifier.py, a
+SEPARATE file the edit never touches:
+
+  OIDC_MODULE_HASH
+      SHA-256 hex digest of src/yashigani/sso/oidc.py
+
+  SAML_MODULE_HASH
+      SHA-256 hex digest of src/yashigani/sso/saml.py
+
+  SSO_ROUTES_HASH
+      SHA-256 hex digest of src/yashigani/backoffice/routes/sso.py
+
+  SCIM_ROUTES_HASH
+      SHA-256 hex digest of src/yashigani/backoffice/routes/scim.py
+
+  GATE_MIDDLEWARE_HASH
+      SHA-256 hex digest of src/yashigani/licensing/gate_middleware.py
+      (the independent ASGI-layer gate — a THIRD, cross-cutting layer,
+      external to both the route file and the provider file, so patching
+      either of those alone still leaves this layer blocking).
+
 Licence-hardening-v2 chain constants (design doc §2.2/§3.1/§3.3 — supersede
 the v1 COUNTER_PUBLIC_KEY_PEM/HASH_BUNDLE_SIG/EXPECTED_TOKEN_HMAC scheme
 this build embedded before):
@@ -150,6 +178,32 @@ AGENTS_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_AGENTS_REGISTRY_HASH"
 IDENTITY_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_IDENTITY_REGISTRY_HASH"
 
 # ---------------------------------------------------------------------------
+# Point-of-use (POU) protected-file hashes — 2026-07-16, LAURA-V2-001
+# follow-up. Same mechanism as T1-T4 above; separate section only to keep
+# the historical T1-T4 naming intact.
+# ---------------------------------------------------------------------------
+
+# OIDC_MODULE_HASH
+# Replace with: sha256sum src/yashigani/sso/oidc.py | cut -d' ' -f1
+OIDC_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_OIDC_MODULE_HASH"
+
+# SAML_MODULE_HASH
+# Replace with: sha256sum src/yashigani/sso/saml.py | cut -d' ' -f1
+SAML_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_SAML_MODULE_HASH"
+
+# SSO_ROUTES_HASH
+# Replace with: sha256sum src/yashigani/backoffice/routes/sso.py | cut -d' ' -f1
+SSO_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SSO_ROUTES_HASH"
+
+# SCIM_ROUTES_HASH
+# Replace with: sha256sum src/yashigani/backoffice/routes/scim.py | cut -d' ' -f1
+SCIM_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SCIM_ROUTES_HASH"
+
+# GATE_MIDDLEWARE_HASH
+# Replace with: sha256sum src/yashigani/licensing/gate_middleware.py | cut -d' ' -f1
+GATE_MIDDLEWARE_HASH: str = _PLACEHOLDER_INTEGRITY + "_GATE_MIDDLEWARE_HASH"
+
+# ---------------------------------------------------------------------------
 # Licence-hardening-v2 chain constants (design §2.2/§3.1/§3.3, §4a)
 # ---------------------------------------------------------------------------
 
@@ -191,10 +245,15 @@ def is_verifier_hash_placeholder() -> bool:
 
 
 def is_any_hash_placeholder() -> bool:
-    """Return True when ANY of the six T1-T4 file hashes is still a placeholder.
+    """Return True when ANY of the eleven T1-T4 + POU file hashes is still a
+    placeholder.
 
     Used by _check_self_integrity() to detect incomplete build pipeline runs
-    in non-dev environments (GROUP-3-1 v2.23.2).
+    in non-dev environments (GROUP-3-1 v2.23.2). Extended 2026-07-16
+    (LAURA-V2-001 follow-up) to also cover the point-of-use protected files
+    (OIDC/SAML/SSO-routes/SCIM-routes/gate-middleware) — an incomplete build
+    that never embedded THEIR hashes must fail closed exactly like a missing
+    ENFORCER_HASH does today.
     """
     return (
         _PLACEHOLDER_INTEGRITY in VERIFIER_HASH
@@ -203,6 +262,11 @@ def is_any_hash_placeholder() -> bool:
         or _PLACEHOLDER_INTEGRITY in INTEGRITY_HASH
         or _PLACEHOLDER_INTEGRITY in AGENTS_REGISTRY_HASH
         or _PLACEHOLDER_INTEGRITY in IDENTITY_REGISTRY_HASH
+        or _PLACEHOLDER_INTEGRITY in OIDC_MODULE_HASH
+        or _PLACEHOLDER_INTEGRITY in SAML_MODULE_HASH
+        or _PLACEHOLDER_INTEGRITY in SSO_ROUTES_HASH
+        or _PLACEHOLDER_INTEGRITY in SCIM_ROUTES_HASH
+        or _PLACEHOLDER_INTEGRITY in GATE_MIDDLEWARE_HASH
     )
 
 
@@ -224,6 +288,31 @@ def is_agents_registry_hash_placeholder() -> bool:
 def is_identity_registry_hash_placeholder() -> bool:
     """Return True when IDENTITY_REGISTRY_HASH has not been set at build time."""
     return _PLACEHOLDER_INTEGRITY in IDENTITY_REGISTRY_HASH
+
+
+def is_oidc_module_hash_placeholder() -> bool:
+    """Return True when OIDC_MODULE_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in OIDC_MODULE_HASH
+
+
+def is_saml_module_hash_placeholder() -> bool:
+    """Return True when SAML_MODULE_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in SAML_MODULE_HASH
+
+
+def is_sso_routes_hash_placeholder() -> bool:
+    """Return True when SSO_ROUTES_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in SSO_ROUTES_HASH
+
+
+def is_scim_routes_hash_placeholder() -> bool:
+    """Return True when SCIM_ROUTES_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in SCIM_ROUTES_HASH
+
+
+def is_gate_middleware_hash_placeholder() -> bool:
+    """Return True when GATE_MIDDLEWARE_HASH has not been set at build time."""
+    return _PLACEHOLDER_INTEGRITY in GATE_MIDDLEWARE_HASH
 
 
 def is_master_anchor_set_placeholder() -> bool:
