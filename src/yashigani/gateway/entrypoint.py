@@ -850,6 +850,7 @@ def _build_app(mesh_mode: bool = False):
         model_alias_store=model_alias_store,
         kms_provider=kms_provider,
         permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
+        rbac_store=rbac_store,               # W3-008 — RBAC group membership backfill
     )
 
     # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────

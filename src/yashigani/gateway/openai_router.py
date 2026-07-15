@@ -1007,6 +1007,13 @@ class OpenAIRouterState:
         self.permission_strict: bool = (
             os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
         )
+        # W3-008: RBAC store for group membership backfill.
+        # The identity registry stores groups only as set at REGISTRATION time.
+        # Memberships granted later via RBAC add_member live solely in
+        # rbac:user:{identity_id} in the RBAC store and are never written back to
+        # the registry record.  Wired here so chat_completions can call
+        # get_user_groups() to union the complete set before any group-tier check.
+        self.rbac_store = None   # RBACStore | None
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -1159,6 +1166,7 @@ def configure(
     model_alias_store=None,       # Track B1 — ModelAliasStore | None
     kms_provider=None,            # KSMProvider | None — for cloud API key resolution
     permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
+    rbac_store=None,              # W3-008 — RBACStore | None (group membership backfill)
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -1198,6 +1206,7 @@ def configure(
     _state.permission_strict = (
         os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
     )
+    _state.rbac_store = rbac_store                         # W3-008 — group backfill
 
     # ── 4.0 Phase 3 — P1/P2 token role map (RISK-108) ──────────────────────
     # Populate from YASHIGANI_TOKEN_ROLE_MAP env var (JSON dict for dev/test):
@@ -1567,6 +1576,59 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             },
         )
+
+    # ── 1b-2. W3-008: RBAC group membership backfill ─────────────────────────
+    # The identity registry persists `groups` only at REGISTRATION time.  Group
+    # memberships added later via RBAC add_member are stored exclusively in
+    # `rbac:user:{identity_id}` (Redis SADD) and are NEVER written back into
+    # `identity:reg:{identity_id}`.  Without backfill every group-tier check in
+    # this function (Layer 2 cloud gate, W3-007, LAURA-411-001 deny probe, perm
+    # gate) iterates an empty list — silently over-blocking group-grantees
+    # (power_user → 422) AND silently failing-open on group-deny grants.
+    #
+    # Backfill logic (human/user principals only):
+    #   1. Call rbac_store.get_user_groups(identity_id) — reads rbac:user:{id}
+    #      in Redis, which is authoritative for post-registration membership.
+    #   2. Union the RBAC set with the reg-record set (preserves reg-record
+    #      groups; dedupes; does not drop any existing membership).
+    #   3. Shallow-copy the identity dict before mutating so the registry's
+    #      cached dict is never modified in place.
+    #
+    # Fail-safe: if the rbac store is unavailable (None or raises), keep the
+    # reg-record groups and log a warning.  This is intentionally NOT fail-
+    # closed (a store blip must not hard-block ALL users); the group-tier gates
+    # below already have their own fail-closed behaviour for missing grants.
+    #
+    # Service/agent/internal identities (kind ∉ {"human","user"}) legitimately
+    # have groups=[] and are NOT backfilled — their access is controlled via
+    # org-level grants, not group membership.
+    if _state.rbac_store is not None and identity is not None:
+        _w3008_kind = identity.get("kind", "")
+        if _w3008_kind in ("human", "user"):
+            _w3008_iid = identity.get("identity_id")
+            if _w3008_iid:
+                try:
+                    _w3008_rbac_groups = _state.rbac_store.get_user_groups(_w3008_iid)
+                    _w3008_rbac_gids: set[str] = {g.id for g in _w3008_rbac_groups}
+                    _w3008_reg_gids: set[str] = set(identity.get("groups") or [])
+                    _w3008_all_gids = _w3008_reg_gids | _w3008_rbac_gids
+                    if _w3008_all_gids != _w3008_reg_gids:
+                        # New memberships found — shallow-copy identity before mutating
+                        identity = dict(identity)
+                        identity["groups"] = list(_w3008_all_gids)
+                        logger.debug(
+                            "W3-008: backfilled groups for %s: reg=%s rbac=%s final=%s",
+                            _w3008_iid,
+                            sorted(_w3008_reg_gids),
+                            sorted(_w3008_rbac_gids),
+                            sorted(_w3008_all_gids),
+                        )
+                except Exception as _w3008_exc:
+                    logger.warning(
+                        "W3-008: RBAC group backfill failed for %s: %s — "
+                        "keeping reg-record groups (fail-safe, not fail-closed)",
+                        _w3008_iid, _w3008_exc,
+                    )
 
     # ── 1c. Orchestration delegation (2.25.4, build sheet §3.1/§3.5) ──────
     # When the caller supplies `tools` (or opts in via `orchestrate=true`), the

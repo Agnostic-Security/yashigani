@@ -1,31 +1,35 @@
 """
 Regression tests for LAURA-V250-W3-008 — power_user over-block (groups empty).
 
-ROOT CAUSE (test-data fixture bug, not a gateway code bug):
-  populate_411.py called ensure_group_member at step [4] BEFORE UIDs were
-  minted at step [8].  The RBAC membership write back-fills the identity
-  registry (identity:reg:{idnt_*} groups field) only when the identity already
-  exists in the registry.  Because the identity didn't exist yet at step [4],
-  the back-fill was a no-op → groups=[] in the identity registry → Layer 2
-  group-tier lookup iterates nothing → 422 even for granted users.
+REVISED ROOT CAUSE (W3-008 real integration bug — NOT merely a fixture issue):
+  The identity registry stores the `groups` field only as set at REGISTRATION.
+  Group memberships granted later via RBAC add_member are stored ONLY in
+  rbac:user:{identity_id} in Redis and are NEVER written back to the registry
+  record.  chat_completions called `identity.get("groups")` which returns only
+  the reg-record snapshot → empty for a post-registration grant → Layer 2's
+  group-tier loops iterate nothing → 422 for group-grantees (over-block) AND
+  group-deny grants are silently bypassed (fail-open).
 
-  Postgres rbac_members table: 0 rows at the time Laura inspected it.
-  identity:reg:idnt_cd26ea8a10f6 groups = "[]".
+ORIGINAL MISDIAGNOSIS (now corrected):
+  The previous determination was "fixture bug in populate_411.py."  That was
+  partially true (the fixture ordering was also wrong), but the real structural
+  bug is in chat_completions: the group backfill was missing entirely.
 
-DETERMINATION: test-data fixture bug in populate_411.py (Su/Tom fix):
-  The gateway Layer 2 group-tier code path is CORRECT.  When groups IS
-  correctly populated with the group ID, the loop iterates, the grant is found,
-  and the request proceeds.  This test suite PROVES that.
+GATEWAY FIX (W3-008 — this commit):
+  After identity resolution in chat_completions, for human/user principals,
+  call _state.rbac_store.get_user_groups(identity_id) and union the result
+  with the reg-record groups.  Fail-safe: rbac_store=None → keep reg-record
+  groups (no crash); rbac store exception → warning + keep reg-record groups.
 
-FIX in populate_411.py (step 8b):
-  Re-apply ensure_group_member for each user AFTER their UID is minted (i.e.
-  after identity exists in the registry) so the membership back-fill succeeds.
-
-REGRESSION TESTS here:
-  1. Group-tier grant + identity groups populated → Layer 2 passes (not 422).
-  2. Group-tier grant + identity groups empty (fixture bug state) → 422
-     (documents the broken state; test confirms code path correct when fixed).
+REGRESSION TESTS here (pre-backfill contracts — rbac_store=None in all mocks):
+  1. Group-tier grant + identity groups pre-populated → Layer 2 passes (not 422).
+     [still valid: reg-record groups work when correctly set]
+  2. Group-tier grant + identity groups empty + rbac_store=None → 422.
+     [valid: without backfill wired, empty groups → no grant found]
   3. No permission_store → Layer 2 gate skips, group-tier path unreachable.
+
+See test_w3_008_rbac_backfill.py for the integration tests that verify
+the real backfill fix (groups=[] in reg-record + RBAC membership → passes).
 
 Last updated: 2026-07-15T00:00:00+00:00
 """
@@ -95,6 +99,10 @@ def _make_state_with_group_grant(*, group_id: str = _GROUP_ID, model: str = _CLO
     state.kms_provider = None
     state._cloud_key_cache = {}
     state.permission_store = perm_store
+    # W3-008 fix: explicitly None so the backfill block is skipped in these
+    # pre-backfill contract tests (they test the Layer 2 code path directly
+    # with groups pre-populated in the identity dict).
+    state.rbac_store = None
     return state
 
 
@@ -276,15 +284,17 @@ class TestW3008GroupTierGrantCodePathCorrect:
 # ---------------------------------------------------------------------------
 
 class TestW3008EmptyGroupsIs422:
-    """When groups=[] (the fixture-bug state seen by Laura), Layer 2's group-tier
-    loop iterates nothing → grant not found → 422.  This documents the broken
-    state so a regression would be caught if populate_411.py is reverted."""
+    """When groups=[] AND rbac_store=None (backfill disabled), Layer 2's
+    group-tier loop iterates nothing → grant not found → 422.  This tests
+    the no-backfill fallback: the real fix is in test_w3_008_rbac_backfill.py."""
 
     @pytest.mark.asyncio
-    async def test_empty_groups_with_group_tier_grant_is_blocked(self):
-        """power_user with groups=[] (fixture bug) gets 422 even though a
-        group-tier ALLOW grant exists for openai:gpt-4o.  This IS the bug
-        observed by Laura. Gateway code is correct; fixture is wrong."""
+    async def test_empty_groups_no_rbac_store_is_blocked(self):
+        """power_user with groups=[] and rbac_store=None gets 422 even though a
+        group-tier ALLOW grant exists.  Without the RBAC store wired, the
+        backfill block is a no-op → groups stays empty → no grant found → 422.
+        This is the 'backfill disabled' baseline; see test_w3_008_rbac_backfill.py
+        for the real fix exercised with a live RBACStore."""
         import contextlib
         from fastapi.responses import JSONResponse
         from yashigani.models.effective import EffectiveModels
@@ -354,6 +364,8 @@ class TestW3008EmptyGroupsIs422:
         state.kms_provider = None
         state._cloud_key_cache = {}
         state.permission_store = perm_store
+        # W3-008: None → backfill block is skipped; groups stays []; 422 expected.
+        state.rbac_store = None
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("yashigani.gateway.openai_router._state", state))
@@ -377,14 +389,16 @@ class TestW3008EmptyGroupsIs422:
             result = await chat_completions(body, _make_request())
 
         assert isinstance(result, JSONResponse)
-        # With groups=[], the group-tier loop iterates nothing → no grant found.
-        # The 422 is expected here (documenting the fixture-bug state).
-        # The gateway code is CORRECT; populate_411.py was WRONG.
+        # With groups=[] AND rbac_store=None (backfill disabled), the group-tier
+        # loop iterates nothing → no grant found → 422.  This is the expected
+        # behaviour when no RBAC store is wired (e.g. in tests or cold-start
+        # before Redis is available).  The real fix is exercised with a live
+        # RBACStore in test_w3_008_rbac_backfill.py.
         assert result.status_code == 422, (
-            f"W3-008 fixture-bug state: expected 422 when groups=[], "
-            f"got {result.status_code}. Body: {result.body}. "
-            "This test documents the broken state — if this fails, the "
-            "gateway may be masking the fixture bug."
+            f"W3-008 no-backfill baseline: expected 422 when groups=[] and "
+            f"rbac_store=None, got {result.status_code}. Body: {result.body}. "
+            "If this fails, the backfill fired when it should not have "
+            "(rbac_store=None should skip the backfill block entirely)."
         )
         body_json = json.loads(result.body)
         assert body_json["error"]["code"] == "model_not_found"
