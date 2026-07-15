@@ -43,8 +43,19 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# CLAUDE.md: all install/build/deploy scratch state lives under
+# `~/Documents/Claude/testing_runs/<product>/`, never inside a repo. This
+# repo lives at `~/Documents/Claude/YSG/<repo-name>/` (canonical `YSG/yashigani/`
+# or a worktree such as `YSG/yashigani-licence-v2/`) — i.e. TWO levels under
+# the `Claude/` workspace root. From scripts/licgen.py that's FOUR `.parent`
+# hops: scripts/ -> <repo-name>/ -> YSG/ -> Claude/. A prior version used
+# THREE hops, resolving one directory short to `YSG/testing_runs/...`
+# instead of `Claude/testing_runs/...` — every `licgen` call this session
+# needed an explicit --keys-dir/--registry to work around it (Ava's finding,
+# 2026-07-15). A stray `YSG/testing_runs/...` tree, if one ever existed,
+# would silently sign against the wrong keys with no error — fixed here.
 DEMO_DEFAULT_DIR = (
-    Path(__file__).resolve().parent.parent.parent
+    Path(__file__).resolve().parent.parent.parent.parent
     / "testing_runs"
     / "yashigani"
     / "demo-license-system"
