@@ -1,6 +1,6 @@
-# Yashigani v2.25.0 — Umbrella Chart Top-Level Values
+# Yashigani v4.1.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-27 (v2.25.0 P2 wave 2 — B10/B11/B12/B13/B14-captain/A6 + Iris coord)
+# Last updated: 2026-07-15 (v4.1.2: version bump — Deny/RBAC hardening + complete logout + podman 6.x)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -246,7 +246,7 @@ adminBootstrap:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -289,7 +289,7 @@ gateway:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -436,7 +436,7 @@ backoffice:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.

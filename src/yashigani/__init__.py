@@ -13,4 +13,4 @@ Modules:
 """
 # Last updated: 2026-06-27T00:00:00+01:00 (v4.0.0: remove OWUI, serve ui4 from backoffice)
 
-__version__ = "4.1.1"
+__version__ = "4.1.2"

@@ -2,8 +2,8 @@ apiVersion: v2
 name: yashigani
 description: Security enforcement gateway for MCP servers and agentic AI systems
 type: application
-version: 4.1.1
-appVersion: "4.1.1"
+version: 4.1.2
+appVersion: "4.1.2"
 keywords:
   - mcp
   - security

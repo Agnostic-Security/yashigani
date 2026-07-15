@@ -82,7 +82,7 @@ else
 fi
 
 # =============================================================================
-# Yashigani Installer
+# Yashigani v4.1.2 Installer
 # https://yashigani.io
 #
 # Usage:
@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="4.1.0"
+YASHIGANI_VERSION="4.1.2"
 # GIT_SHA: git short-hash of the current source tree used as a cache-busting
 # build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
 # backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
