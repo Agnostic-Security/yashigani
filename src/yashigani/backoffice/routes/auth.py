@@ -26,7 +26,22 @@ Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
     OWUI's WEBUI_AUTH_SIGNOUT_REDIRECT_URL points here so its logout button clears
     the Yashigani session cookie.  See Phase 2 notes.
 
-Last updated: 2026-06-13T00:00:00+00:00
+WA-10 fix (2026-07-15, fix/v412-wa10-logout):
+  - Both logout() and logout_redirect() now enumerate ALL cookie slots and
+    revoke every distinct session token present in the request — not just the
+    single token resolved by the AnySession/cookie-priority logic.  Holding
+    both __Host-yashigani_admin_session and __Host-yashigani_session (dual-
+    session browser state) previously left one session live after logout.
+  - Every __Host- cookie clearance now emits Secure; HttpOnly; SameSite=Strict;
+    Path=/ — symmetric with the SET path (_set_session_cookie).  Starlette's
+    bare delete_cookie() omits Secure, so the browser silently ignores the
+    Max-Age=0 directive, leaving the original token in place.
+  - change_password() clearance extended: previously only cleared the admin
+    cookie; now clears both cookies with the correct attributes.
+  - _clear_session_cookie() helper added adjacent to _set_session_cookie() so
+    the two paths can never drift independently.  (WA-10 / ASVS V3.4.1)
+
+Last updated: 2026-07-15T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -604,27 +619,54 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 @router.post("/logout")
 async def logout(
+    request: Request,  # WA-10: enumerate ALL cookie slots for full revocation
     session: AnySession,  # Phase 1 fix: was AdminSession — user-tier sessions were trapped (no end-user logout bug)
     response: Response,
     store=Depends(get_session_store),
 ):
     """
-    Single-logout endpoint.  Clears the session regardless of tier (admin or user).
+    Single-logout endpoint.  Clears ALL sessions regardless of tier (admin or user).
 
     Phase 1 / 2.25.5-auth-ingress: changed from AdminSession → AnySession so
     user-tier accounts can reach this endpoint.  Previously a user-tier session
     received HTTP 403 from require_admin_session and was permanently trapped
     (no working end-user logout).
 
-    Security: the session token is invalidated in Redis and BOTH cookies
-    (__Host-yashigani_admin_session and __Host-yashigani_session) are cleared.
-    An expired/invalidated session calling this endpoint returns HTTP 401 from
-    require_any_session before reaching this handler — no unauthenticated
-    session-clearing is possible.
+    WA-10 fix: when a browser holds BOTH an admin cookie (__Host-yashigani_admin_session)
+    and a user cookie (__Host-yashigani_session), the AnySession dependency resolves
+    only the FIRST matching token (admin-cookie preferred by _resolve_token).  The
+    other session would remain live in Redis after the first token is invalidated,
+    and a follow-up request using that cookie would pass /auth/verify-admin with HTTP
+    200.  This handler now enumerates every cookie slot and revokes each distinct
+    token independently.
+
+    Security: all distinct session tokens present in the request are invalidated in
+    Redis.  BOTH __Host- cookies are cleared with Secure; HttpOnly; Path=/ (symmetric
+    with _set_session_cookie — bare delete_cookie() omits Secure, causing browsers to
+    ignore the Max-Age=0 clearance for __Host- cookies).  An expired/invalidated
+    session calling this endpoint returns HTTP 401 from require_any_session before
+    reaching this handler — no unauthenticated session-clearing is possible.
     """
-    store.invalidate(session.token)
-    response.delete_cookie(_SESSION_COOKIE, path="/")
-    response.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    # WA-10: collect every distinct session token present in the request.
+    # _resolve_token (used by AnySession) picks admin-cookie first; if the
+    # browser also holds a user-cookie backed by a DIFFERENT session, that
+    # second session must also be revoked.
+    tokens_to_revoke: set[str] = {session.token}
+    for _cookie_name in (_SESSION_COOKIE, _USER_SESSION_COOKIE):
+        _raw = request.cookies.get(_cookie_name)
+        if _raw and _raw not in tokens_to_revoke:
+            tokens_to_revoke.add(_raw)
+
+    for _tok in tokens_to_revoke:
+        try:
+            store.invalidate(_tok)
+        except Exception:
+            pass  # already expired / gone — cookie clearance still proceeds
+
+    # WA-10: use _clear_session_cookie (not delete_cookie) so the clearance
+    # directive carries Secure; HttpOnly; Path=/ — required for __Host- cookies.
+    _clear_session_cookie(response, _SESSION_COOKIE)
+    _clear_session_cookie(response, _USER_SESSION_COOKIE)
     # AU.L2-3.3.1 / OWASP A09: emit audit event for every auth lifecycle action.
     state = backoffice_state
     if state.audit_writer is not None:
@@ -660,31 +702,40 @@ async def logout_redirect(
       2. OWUI does NOT support submitting a POST form redirect via WEBUI_AUTH_SIGNOUT_REDIRECT_URL;
          it only performs a browser navigation (window.location).
       3. The action is idempotent — a forged logout just forces a re-login.
+
+    WA-10 fix: previously only one token was resolved (user-cookie preferred) and
+    only that one session was revoked.  Now BOTH cookie slots are checked and every
+    distinct token is independently invalidated server-side.
     """
-    # Try to read the session token from either cookie name.
-    token = (
-        request.cookies.get(_USER_SESSION_COOKIE)
-        or request.cookies.get(_SESSION_COOKIE)
-    )
+    # WA-10: collect every distinct session token present in the request.
+    # The original code used user-cookie-first priority, leaving the admin session
+    # live when both cookies were present.  Enumerate ALL slots.
+    tokens_to_revoke: set[str] = set()
+    for _cookie_name in (_USER_SESSION_COOKIE, _SESSION_COOKIE):
+        _raw = request.cookies.get(_cookie_name)
+        if _raw:
+            tokens_to_revoke.add(_raw)
 
     state = backoffice_state
-    if token:
+    for _tok in tokens_to_revoke:
         try:
-            store.invalidate(token)
+            # Resolve account_id BEFORE invalidation (store.get returns None after).
+            _session_data = store.get(_tok)
+            _account_id = _session_data.account_id if _session_data else "unknown"
+            store.invalidate(_tok)
             if state.audit_writer is not None:
-                # Resolve the account_id from the session if it is still valid.
-                session_data = store.get(token)
-                account_id = session_data.account_id if session_data else "unknown"
                 state.audit_writer.write(
-                    _make_login_event(account_id, "logout", None)
+                    _make_login_event(_account_id, "logout", None)
                 )
         except Exception:
             # Session already expired / gone — still clear the cookies.
             pass
 
     redirect = _RedirectResponse(url="/login", status_code=302)
-    redirect.delete_cookie(_SESSION_COOKIE, path="/")
-    redirect.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    # WA-10: use _clear_session_cookie (not delete_cookie) so the clearance
+    # directive carries Secure; HttpOnly; Path=/ — required for __Host- cookies.
+    _clear_session_cookie(redirect, _SESSION_COOKIE)
+    _clear_session_cookie(redirect, _USER_SESSION_COOKIE)
     return redirect
 
 
@@ -1635,7 +1686,10 @@ async def change_password(
 
     # Invalidate ALL sessions including current (ASVS V2.1.4)
     store.invalidate_all_for_account(session.account_id)
-    response.delete_cookie(_SESSION_COOKIE)
+    # WA-10: clear BOTH cookie slots with proper __Host- attributes.
+    # The previous call only cleared the admin cookie and omitted Secure.
+    _clear_session_cookie(response, _SESSION_COOKIE)
+    _clear_session_cookie(response, _USER_SESSION_COOKIE)
 
     # ACS gap #95 (auth_log): dedicated PASSWORD_CHANGED event replaces the
     # generic ConfigChangedEvent, providing cleaner forensic queries.
@@ -1995,6 +2049,35 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
         secure=True,
         samesite="strict",
         max_age=14400,
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response, name: str) -> None:
+    """Clear a __Host- prefixed session cookie, symmetric with _set_session_cookie.
+
+    The __Host- cookie prefix mandates that EVERY Set-Cookie directive for that
+    cookie — including clearance (Max-Age=0) — carries Secure=True and Path=/.
+    Starlette/FastAPI's Response.delete_cookie() does NOT include Secure by
+    default, so a bare delete_cookie() call produces:
+
+        Set-Cookie: __Host-yashigani_admin_session=""; Max-Age=0; Path=/; SameSite=lax
+
+    Browsers validate the __Host- prefix constraints on the clearance response
+    exactly as they do on the original Set-Cookie, and silently ignore the
+    Max-Age=0 when Secure is absent — leaving the original valid token in place.
+
+    This helper mirrors the exact attribute set used by _set_session_cookie so
+    the two paths are always in lockstep and cannot drift independently.
+    (WA-10 / ASVS V3.4.1 / RFC 6265bis §4.1.3)
+    """
+    response.set_cookie(
+        key=name,
+        value="",
+        max_age=0,
+        httponly=True,
+        secure=True,
+        samesite="strict",
         path="/",
     )
 
