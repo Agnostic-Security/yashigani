@@ -249,6 +249,8 @@ class TestBuildIntegrityChainBadSig(unittest.TestCase):
             for name in (
                 "VERIFIER_HASH", "ENFORCER_HASH", "LOADER_HASH", "INTEGRITY_HASH",
                 "AGENTS_REGISTRY_HASH", "IDENTITY_REGISTRY_HASH",
+                "OIDC_MODULE_HASH", "SAML_MODULE_HASH", "SSO_ROUTES_HASH",
+                "SCIM_ROUTES_HASH", "GATE_MIDDLEWARE_HASH",
                 "MASTER_ANCHOR_SET_JSON", "CODE_LEAF_CERT_JSON", "CODE_LEAF_CERT_SIG",
                 "BUNDLE_SIG", "KILL_LIST_JSON",
             )
@@ -261,6 +263,16 @@ class TestBuildIntegrityChainBadSig(unittest.TestCase):
             _integrity.INTEGRITY_HASH = "d" * 64
             _integrity.AGENTS_REGISTRY_HASH = "e" * 64
             _integrity.IDENTITY_REGISTRY_HASH = "f" * 64
+            # POU hashes (LAURA-V2-001 follow-up, 2026-07-16) — arbitrary
+            # non-placeholder values, same rationale as the T1-T4 hashes
+            # above (this test exercises BUNDLE_SIG failure, not module-hash
+            # matching; all that matters is is_any_hash_placeholder() is False
+            # so the check reaches the signature verification).
+            _integrity.OIDC_MODULE_HASH = "1" * 64
+            _integrity.SAML_MODULE_HASH = "2" * 64
+            _integrity.SSO_ROUTES_HASH = "3" * 64
+            _integrity.SCIM_ROUTES_HASH = "4" * 64
+            _integrity.GATE_MIDDLEWARE_HASH = "5" * 64
 
             now = datetime.now(timezone.utc)
             master_key = _gen()

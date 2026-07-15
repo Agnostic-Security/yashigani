@@ -136,7 +136,9 @@ def _live_hash_env(tmp_path, monkeypatch):
     import yashigani.licensing._integrity as integrity_mod
     import yashigani.licensing.verifier as verifier_mod
 
-    # 5 T1-T4 "protected files" — start as clean, arbitrary content.
+    # T1-T4 + point-of-use (POU) "protected files" — start as clean, arbitrary
+    # content. POU files added 2026-07-16 (LAURA-V2-001 follow-up) — see
+    # verifier._LIVE_HASH_TARGETS / _integrity.py module docstring.
     targets = {}
     for name, content in [
         ("VERIFIER_HASH", "# verifier.py contents (unpatched)\n"),
@@ -144,6 +146,11 @@ def _live_hash_env(tmp_path, monkeypatch):
         ("LOADER_HASH", "# loader.py contents (unpatched)\n"),
         ("AGENTS_REGISTRY_HASH", "# agents/registry.py contents (unpatched)\n"),
         ("IDENTITY_REGISTRY_HASH", "# identity/registry.py contents (unpatched)\n"),
+        ("OIDC_MODULE_HASH", "# sso/oidc.py contents (unpatched)\n"),
+        ("SAML_MODULE_HASH", "# sso/saml.py contents (unpatched)\n"),
+        ("SSO_ROUTES_HASH", "# backoffice/routes/sso.py contents (unpatched)\n"),
+        ("SCIM_ROUTES_HASH", "# backoffice/routes/scim.py contents (unpatched)\n"),
+        ("GATE_MIDDLEWARE_HASH", "# licensing/gate_middleware.py contents (unpatched)\n"),
     ]:
         p = tmp_path / f"{name}.py"
         p.write_text(content, encoding="utf-8")

@@ -640,6 +640,15 @@ class TestBuildIntegrityChainPlaceholder:
         bad_bundle_sig = sign_message(Alg.ECDSA_P384_SHA384, rogue_key, bundle_signing_digest("garbage"))
         monkeypatch.setattr(integrity_mod, "BUNDLE_SIG", base64.b64encode(bad_bundle_sig).decode())
         monkeypatch.setattr(integrity_mod, "KILL_LIST_JSON", "[]")
+        # POU hashes (LAURA-V2-001 follow-up, 2026-07-16) — arbitrary
+        # non-placeholder values so is_any_hash_placeholder() is False and
+        # the check reaches BUNDLE_SIG verification (this test exercises
+        # signature failure, not module-hash matching).
+        monkeypatch.setattr(integrity_mod, "OIDC_MODULE_HASH", "b" * 64)
+        monkeypatch.setattr(integrity_mod, "SAML_MODULE_HASH", "b" * 64)
+        monkeypatch.setattr(integrity_mod, "SSO_ROUTES_HASH", "b" * 64)
+        monkeypatch.setattr(integrity_mod, "SCIM_ROUTES_HASH", "b" * 64)
+        monkeypatch.setattr(integrity_mod, "GATE_MIDDLEWARE_HASH", "b" * 64)
 
         monkeypatch.setattr(verifier_mod, "_integrity_violated", False)
         verifier_mod._check_build_integrity_chain()
