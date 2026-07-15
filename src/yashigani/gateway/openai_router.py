@@ -1707,6 +1707,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 6. Route decision ──────────────────────────────────────────────
     selected_model = body.model or _state.default_model
+    # W3-007 (LAURA-V250-W3-007): resolved cloud target from alias pre-resolution.
+    # Set inside the body.model validation block below; consumed by the Layer 2
+    # extension and the LAURA-411-001 extension later in this function.
+    _w3007_resolved_cloud_target: str | None = None
 
     # Agent routing: if model starts with @, forward to the agent's upstream
     is_agent_call = selected_model.startswith("@")
@@ -1772,6 +1776,35 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     }
                 },
             )
+
+        # W3-007 (LAURA-V250-W3-007): Pre-resolve alias to its canonical cloud target.
+        # Layer 2 (below) gates on ":" in selected_model — a plain alias name has no
+        # colon and is therefore skipped, allowing an alias that resolves to a cloud
+        # model to bypass the cloud RBAC gate entirely (PoC: model="smart" resolves to
+        # "anthropic:claude-sonnet-4-6"; no Anthropic API key → local fallback;
+        # _perm_is_cloud=False → cloud gate never fires → LAURA-411-001 checks "smart"
+        # literal — no deny grant for that name → 200 with qwen content).
+        #
+        # Fix: resolve the alias here so _w3007_resolved_cloud_target carries the
+        # resolved cloud canonical.  Both the Layer 2 extension and the LAURA-411-001
+        # extension below then enforce the RESOLVED model's permission requirements
+        # regardless of whether the caller supplied an alias name or a direct string.
+        if _state.model_alias_store is not None:
+            try:
+                _w3007_alias_cfg = _state.model_alias_store.get(selected_model)
+                if _w3007_alias_cfg is not None:
+                    _w3007_alias_canonical = (
+                        f"{_w3007_alias_cfg.provider}:{_w3007_alias_cfg.model}"
+                    )
+                    # Defence-in-depth: validate the resolved canonical through Layer 1.
+                    # Admin-stored aliases are trusted, but any alias whose resolved
+                    # provider:model fails validation is rejected rather than silently
+                    # smuggled through the cloud RBAC gate.
+                    if _validate_model_string(_w3007_alias_canonical) is None:
+                        if _w3007_alias_cfg.provider in _CLOUD_PROVIDER_CONFIG:
+                            _w3007_resolved_cloud_target = _w3007_alias_canonical
+            except Exception:  # noqa: BLE001 — store blip; treat as no cloud alias
+                pass
 
         # LAURA-412-002 (layer 2): No silent local fallback for cloud-prefixed
         # models that are not recognized/granted.
@@ -1864,6 +1897,89 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             }
                         },
                     )
+
+        # W3-007 (Layer 2 extension — LAURA-V250-W3-007): alias→cloud RBAC gate.
+        # Fires when selected_model is an alias resolving to a cloud model (e.g.
+        # "smart" → "anthropic:claude-sonnet-4-6").  The Layer 2 block above only
+        # fires when ":" is in selected_model; a bare alias name has no colon →
+        # the existing check was skipped → resolved cloud target never checked →
+        # bypass (PoC: 200 with local fallback content).
+        #
+        # Logic mirrors Layer 2: ANY grant (allow OR deny) for the resolved cloud
+        # target proves the admin configured this model → gate passes and LAURA-411-001
+        # below handles explicit-deny.  NO grant → 422 (no silent local fallback).
+        # PRESERVE: a user granted the resolved cloud model still gets the by-design
+        # local-fallback 200 on a keyless demo stack (grant found → gate passes).
+        # Local-target aliases (e.g. fast→qwen2.5:3b, provider=ollama) have
+        # _w3007_resolved_cloud_target=None → this block is skipped entirely.
+        if _w3007_resolved_cloud_target is not None and _state.permission_store is not None:
+            _w3007_target = _w3007_resolved_cloud_target
+            _w3007_prefix = _w3007_target.split(":", 1)[0]
+            _w3007_alias_known = False
+            if _state.model_alias_store is not None:
+                try:
+                    _w3007_alias_known = (
+                        _state.model_alias_store.get(_w3007_target) is not None
+                    )
+                except Exception:  # noqa: BLE001 — store blip; treat as unknown
+                    _w3007_alias_known = False
+            _w3007_has_grant = _w3007_alias_known
+            if not _w3007_has_grant:
+                from yashigani.permissions import ResourceType as _RT_W3007
+                from yashigani.permissions import DEFAULT_ORG_ID as _ORG_W3007
+                try:
+                    # Org level
+                    if _state.permission_store.get_boolean_grant(
+                        _RT_W3007.CLOUD_MODEL, "org", _ORG_W3007, _w3007_target
+                    ) is not None:
+                        _w3007_has_grant = True
+                    # User level
+                    if not _w3007_has_grant and identity:
+                        _w3007_kind = identity.get("kind", "")
+                        _w3007_uid = (
+                            identity.get("identity_id")
+                            if _w3007_kind in ("human", "user") else None
+                        )
+                        if _w3007_uid and _state.permission_store.get_boolean_grant(
+                            _RT_W3007.CLOUD_MODEL, "user", _w3007_uid, _w3007_target
+                        ) is not None:
+                            _w3007_has_grant = True
+                    # Group level
+                    if not _w3007_has_grant and identity:
+                        for _w3007_gid in (identity.get("groups") or []):
+                            if _state.permission_store.get_boolean_grant(
+                                _RT_W3007.CLOUD_MODEL, "group", str(_w3007_gid), _w3007_target
+                            ) is not None:
+                                _w3007_has_grant = True
+                                break
+                except Exception as _w3007_exc:  # noqa: BLE001
+                    # Fail-closed: permission check failure → treat as ungranted → 422
+                    logger.warning(
+                        "W3-007: alias→cloud permission check failed (%s) for "
+                        "alias=%r → resolved=%r — fail-closed (422)",
+                        _w3007_exc, body.model, _w3007_target,
+                    )
+                    _w3007_has_grant = False
+            if not _w3007_has_grant:
+                logger.warning(
+                    "W3-007 DENIED (Layer 2 ext): alias=%r → resolved=%r "
+                    "(provider=%s) has no permission grant for identity=%s — "
+                    "422. LAURA-V250-W3-007.",
+                    body.model, _w3007_target, _w3007_prefix, identity_id,
+                )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": {
+                            "message": (
+                                f"The model '{body.model}' is not available. "
+                                "Contact an administrator to check the model name."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    },
+                )
 
     agent_upstream = None
     agent_protocol = "openai"
@@ -2658,6 +2774,28 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     if _411_gg is not None and not _411_gg.allow:
                         _411_explicit_deny = True
                         break
+            # W3-007 (LAURA-411-001 extension): also probe the RESOLVED cloud target.
+            # If body.model is an alias pointing to a cloud model, a DENY grant on the
+            # resolved canonical (e.g. deny on anthropic:claude-sonnet-4-6) must block
+            # the alias too — deny follows the resolved target, not just the alias name.
+            # Without this, a caller denied the resolved cloud model could still use its
+            # alias to route through (the alias name has no matching deny grant).
+            if not _411_explicit_deny and _w3007_resolved_cloud_target:
+                _w3007_deny_key = _w3007_resolved_cloud_target
+                if _411_uid:
+                    _w3007_ug = _state.permission_store.get_boolean_grant(
+                        _RT_411.CLOUD_MODEL, "user", _411_uid, _w3007_deny_key
+                    )
+                    if _w3007_ug is not None and not _w3007_ug.allow:
+                        _411_explicit_deny = True
+                if not _411_explicit_deny:
+                    for _w3007_gid in _411_groups:
+                        _w3007_gg = _state.permission_store.get_boolean_grant(
+                            _RT_411.CLOUD_MODEL, "group", _w3007_gid, _w3007_deny_key
+                        )
+                        if _w3007_gg is not None and not _w3007_gg.allow:
+                            _411_explicit_deny = True
+                            break
         except Exception as _411_exc:
             logger.error(
                 "PERM (LAURA-411-001) requested-model DENY probe failed: %s — "
