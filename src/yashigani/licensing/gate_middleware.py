@@ -21,13 +21,17 @@ The fix has two parts, both required:
 
   1. Each point-of-use file (oidc.py, saml.py, routes/sso.py, routes/scim.py)
      now carries its OWN local `_licence_hard_gate()` — a genuinely separate
-     function definition per file (not a shared import) that reads the
-     SIGNED hash authority directly: verifier.get_integrity_status() (the
-     live, externally-re-derived, BUNDLE_SIG-verified flag) OR
-     enforcer.get_enforcer_integrity_status() (enforcer's own independent
-     cross-check of verifier.py's bytes — covers the "verifier.py tampered
-     alone" case). This means patching enforcer.require_feature() has ZERO
-     effect on any of them — none of them call it anymore.
+     function definition per file (not a shared import). As of Phase D
+     (2026-07-17, LAURA-V2-003 RE-VERIFY hardening — see below), each gate's
+     decision is derived SOLELY from that file's own inline full-mesh check
+     (every OTHER mesh member's bytes, independently re-derived and compared
+     against the SIGNED hash constants in _integrity.py) — none of them
+     route their decision through verifier.get_integrity_status()/
+     enforcer.get_enforcer_integrity_status() any more. This means patching
+     enforcer.require_feature() has ZERO effect on any of them — none of
+     them call it anymore — and patching verifier.py+enforcer.py together no
+     longer silently defeats every OTHER gate's alarm either (the exact
+     Laura RE-VERIFY finding this fix closes).
 
   2. THIS middleware — a FOURTH, wholly independent file, wired at ASGI
      level in app.py (mounted before routing) — re-runs the identical check
@@ -41,47 +45,71 @@ The fix has two parts, both required:
      file alone, routes/sso.py's and sso/oidc.py's own local guards
      (untouched) still block once the route handler / provider method runs.
 
-All four guards (this middleware + 3 point-of-use files) are themselves
-listed in verifier._LIVE_HASH_TARGETS (GATE_MIDDLEWARE_HASH,
-OIDC_MODULE_HASH, SAML_MODULE_HASH, SSO_ROUTES_HASH, SCIM_ROUTES_HASH) —
-tampering with ANY of them, including this file, changes that file's bytes
-and is independently detected by verifier.py's live re-derivation (a file
-none of these edits ever touches).
+All five guards (this middleware + 4 point-of-use files: oidc.py, saml.py,
+routes/sso.py, routes/scim.py) are themselves listed in
+verifier._LIVE_HASH_TARGETS (GATE_MIDDLEWARE_HASH, OIDC_MODULE_HASH,
+SAML_MODULE_HASH, SSO_ROUTES_HASH, SCIM_ROUTES_HASH) — tampering with ANY of
+them, including this file, changes that file's bytes and is independently
+detected by verifier.py's live re-derivation (a file none of these edits
+ever touches), AND by every other mesh member's own full-mesh check below.
 
-HONEST CEILING (Phase C, 2026-07-16 — updated after red-team LAURA-V2-003
-proved the PREVIOUS version of this claim wrong; do NOT overclaim again):
+HONEST CEILING (Phase D, 2026-07-17 — updated after Laura's independent
+RE-VERIFY of the Phase C ring proved THAT version of this claim wrong; do
+NOT overclaim again):
 
-  The PREVIOUS claim here (Phase B) was that the only remaining bypass was a
-  2-file edit of verifier.py + enforcer.py, "materially cheaper [than
-  fork-and-recompile] but not equivalent to it". LAURA-V2-003 (2026-07-16)
-  proved that framing was ALSO wrong in the OTHER direction: because every
-  comparison for every OTHER protected file (OIDC_MODULE_HASH,
-  SSO_ROUTES_HASH, GATE_MIDDLEWARE_HASH, etc.) physically lived INSIDE
-  verifier.py, a 2-file edit confined to verifier.py+enforcer.py didn't just
-  hide their own tamper — it silently suppressed the tamper ALARM for every
-  file in the system, with zero CRITICAL logs and zero audit events. That
-  was worse than a "cheap but honest" residual; it was a silent, total
-  bypass of the detection layer.
+  Phase B's claim was that the only remaining bypass was a 2-file edit of
+  verifier.py + enforcer.py. LAURA-V2-003 (2026-07-16) proved that wrong in
+  the other direction: because every comparison for every OTHER protected
+  file physically lived INSIDE verifier.py, a 2-file edit confined to
+  verifier.py+enforcer.py silently suppressed the tamper ALARM for every
+  file in the system. Phase C's fix (2026-07-16) connected all 6 mesh files
+  (verifier, enforcer, this file, oidc.py, routes/sso.py, routes/scim.py)
+  into a RING, each checking its 2 neighbours, and claimed "any 1-5 file
+  edit is caught, only a full 6-file edit escapes".
 
-  THE FIX (this file, 2026-07-16): verifier.py, enforcer.py, this file, and
-  the OIDC/SCIM/SSO-routes point-of-use files now form a genuine mesh — each
-  independently re-derives the SHA-256 of its two RING-NEIGHBOURS (per this
-  release's topology — see MESH_TOPOLOGY_JSON / licensing/chain/
-  mesh_topology.py) straight off disk, using a distinctly-shaped inline
-  comparison per file (not a shared function), and hard-refuses + writes a
-  typed audit event the moment a licence-gated feature is invoked while any
-  such mismatch is standing. Because the 6 files form ONE connected cycle
-  (not 3 isolated pairs), tampering ANY 1 to 5 of them — including the
-  verifier.py+enforcer.py pair Laura used — leaves at least one untouched
-  file whose ring-check independently catches it (basic graph connectivity:
-  a proper nonempty subset of a connected cycle always has an edge crossing
-  to its complement). Confirmed by direct test against every such subset
-  (see src/tests/regression/v4.1.1/test_laura_v2_003_mesh_hardening.py and
-  the real-signed-build edit-matrix proof in the dispatch verification run).
+  LAURA'S RE-VERIFY (2026-07-17) DISPROVED THAT CLAIM: she found a live,
+  silent 3-file {verifier.py, enforcer.py, gate_middleware.py} edit that
+  fully defeated BOTH of SCIM's real enforcement layers (gate_middleware's
+  ASGI gate and routes/scim.py's route gate) with ZERO CRITICAL log or
+  audit event mentioning "scim" anywhere, and a 4-file {..., routes/sso.py}
+  edit that fully defeated all THREE of SAML's real enforcement layers
+  (gate_middleware, routes/sso.py, sso/saml.py) with ZERO mention of "saml"
+  anywhere. Root cause: a ring only gives each file 2 neighbours; for that
+  release's specific random permutation, routes/scim.py's 2 neighbours
+  didn't happen to include the touched files, so its OWN ring-check never
+  fired — and its FALLBACK (calling verifier.get_integrity_status()/
+  enforcer.get_enforcer_integrity_status()) was exactly the pair the
+  attacker had already neutered. "Some detector fires somewhere in the
+  process" (true — oidc.py/routes.sso DID log CRITICAL for the V+E edit)
+  is NOT the same guarantee as "the gate deciding THIS feature is blocked"
+  (false — SCIM's and SAML's own gates silently granted). sso/saml.py's
+  complete exclusion from the Phase C ring (zero mesh coverage of its own)
+  compounded this for the SAML case specifically.
 
-  THE HONEST REMAINING CEILING: only a coordinated edit touching ALL 6
+  THE FIX (Phase D, this file, 2026-07-17): verifier.py, enforcer.py, this
+  file, sso/oidc.py, sso/saml.py (now a full member for the first time),
+  routes/sso.py, and routes/scim.py — ALL SEVEN files — now form a
+  COMPLETE graph, not a ring: each independently re-derives the SHA-256 of
+  EVERY OTHER mesh member (6 peer-checks per file, not 2 ring-neighbour
+  checks) straight off disk, using a distinctly-shaped inline comparison
+  per file (not a shared function), and hard-refuses + writes a typed audit
+  event the moment a licence-gated feature is invoked while any such
+  mismatch is standing. Critically, each gate's decision now comes SOLELY
+  from its own inline full-mesh result — the shared verifier/enforcer-getter
+  fallback that Laura's 3-/4-file attacks exploited has been REMOVED from
+  every point-of-use gate, not merely supplemented. Because every member
+  checks every OTHER member, ANY untouched member independently detects ANY
+  nonempty subset of tampered members in FULL — there is no "blind
+  neighbour" configuration to land in, for any per-release topology, for
+  any feature. Confirmed by direct test against every proper subset (see
+  src/tests/regression/v4.1.1/test_laura_v2_003_mesh_hardening.py) and by
+  reproducing Laura's exact 3-file SCIM and 4-file SAML attacks against a
+  real signed build and showing both are now caught (dispatch verification
+  run, testing_runs/yashigani/).
+
+  THE HONEST REMAINING CEILING: only a coordinated edit touching ALL 7
   mesh files AT ONCE — replacing each one's gate-function body so neither
-  the neighbour-hash comparison NOR the audit-emit call ever executes —
+  the peer-hash comparison NOR the audit-emit call ever executes —
   removes every detector simultaneously. Even then, the CRITICAL log lines
   already written at each file's own module-load time (before the
   coordinated edit could apply, if the attacker edits a running deployment
@@ -89,7 +117,7 @@ proved the PREVIOUS version of this claim wrong; do NOT overclaim again):
   by an EARLIER gate invocation are not retroactively erased — but a
   from-scratch tampered build that never runs the real check code at all
   produces no such trail. AND: this raises the coordinated-edit cost from 2
-  files to 6, but a determined box owner with local write access to all 6
+  files to 7, but a determined box owner with local write access to all 7
   files CAN still do it, and can also suppress the audit write itself (the
   audit hash-chain's own tamper-evidence depends on a customer-held signing/
   verification key outside this process — see audit/schema.py). This is
@@ -99,14 +127,18 @@ proved the PREVIOUS version of this claim wrong; do NOT overclaim again):
   licence-FORGING (creating a new, differently-tiered licence that verifies)
   remains cryptographically impossible without the master/leaf private keys
   — completely unaffected by any of this; (b) the per-release randomized
-  ring topology means a strip-script written against one release's specific
+  member order means a strip-script written against one release's specific
   file-edit recipe does not carry over to the next, forcing the attacker to
   re-derive the topology every release (raises attacker TIME, not a new
-  cryptographic property); (c) any INCOMPLETE (1-5 file) coordinated edit is
-  always caught and audited; (d) contract, trademark, and the release
-  treadmill carry the remainder, same as before. Closing the FULL 6-file
-  ceiling needs a hardware root of trust or an out-of-process watchdog —
-  OUT OF SCOPE for source-available, offline, Apache-2.0 Python.
+  cryptographic property — and, unlike Phase C, this no longer matters for
+  detection COMPLETENESS, only for strip-script reuse cost, since every
+  member checks every other member regardless of order); (c) any
+  INCOMPLETE (1-6 file) coordinated edit is always caught and audited, for
+  every feature, not just "for some functionally-unrelated gate somewhere
+  in the process"; (d) contract, trademark, and the release treadmill carry
+  the remainder, same as before. Closing the FULL 7-file ceiling needs a
+  hardware root of trust or an out-of-process watchdog — OUT OF SCOPE for
+  source-available, offline, Apache-2.0 Python.
 """
 from __future__ import annotations
 
@@ -127,9 +159,9 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Mesh ring-check (licence-hardening-v2 Phase C, 2026-07-16 — LAURA-V2-003
-# hardening). See verifier.py's module-level comment block above
-# _check_mesh_ring_neighbours() for the full rationale. This is
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See verifier.py's module-level comment
+# block above _check_mesh_full() for the full rationale. This is
 # gate_middleware.py's OWN independently-authored copy — deliberately a
 # DIFFERENT code shape (a small stateful class) from verifier.py's for-loop
 # and enforcer.py's list-comprehension, so a single AST/regex strip-script
@@ -137,7 +169,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class _MeshRingChecker:
+class _MeshFullChecker:
     """Style: stateful class, instantiated once at module load."""
 
     _ROLE = "GATE_MIDDLEWARE"
@@ -150,23 +182,22 @@ class _MeshRingChecker:
             "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
             "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
             "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+            "SAML": ("SAML_MODULE_HASH", pkg_dir / "sso" / "saml.py"),
             "SSO_ROUTES": ("SSO_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "sso.py"),
             "SCIM_ROUTES": ("SCIM_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "scim.py"),
         }
         self.violated = False
 
-    def _neighbours(self):
+    def _peers(self):
         try:
-            ring_order = json.loads(_integrity.MESH_TOPOLOGY_JSON)["ring_order"]
+            member_order = json.loads(_integrity.MESH_TOPOLOGY_JSON)["member_order"]
         except Exception:
             return None
-        if not isinstance(ring_order, list) or sorted(ring_order) != sorted(self._targets):
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(self._targets):
             return None
-        if ring_order.count(self._ROLE) != 1:
+        if member_order.count(self._ROLE) != 1:
             return None
-        i = ring_order.index(self._ROLE)
-        n = len(ring_order)
-        return ring_order[i - 1], ring_order[(i + 1) % n]
+        return [role for role in member_order if role != self._ROLE]
 
     def run(self) -> bool:
         is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
@@ -174,23 +205,23 @@ class _MeshRingChecker:
             if not is_dev:
                 self.violated = True
                 logger.critical(
-                    "LICENSE INTEGRITY VIOLATION: mesh ring-check "
+                    "LICENSE INTEGRITY VIOLATION: mesh full-check "
                     "(gate_middleware.py) — hash or topology constants still "
                     "placeholders in a non-dev environment; hard-refusing"
                 )
             return self.violated
 
-        neighbours = self._neighbours()
-        if neighbours is None:
+        peers = self._peers()
+        if peers is None:
             self.violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check "
                 "(gate_middleware.py) — MESH_TOPOLOGY_JSON malformed or "
                 "missing this file's role; treating as tamper (fail-closed)"
             )
             return self.violated
 
-        for role in neighbours:
+        for role in peers:
             const_name, path = self._targets[role]
             expected = getattr(_integrity, const_name, "")
             try:
@@ -198,30 +229,30 @@ class _MeshRingChecker:
             except Exception as exc:
                 self.violated = True
                 logger.critical(
-                    "LICENSE INTEGRITY VIOLATION: mesh ring-check "
-                    "(gate_middleware.py) — could not read ring-neighbour "
+                    "LICENSE INTEGRITY VIOLATION: mesh full-check "
+                    "(gate_middleware.py) — could not read mesh peer "
                     "role=%s (%s): %s", role, path, exc,
                 )
                 continue
             if live != expected:
                 self.violated = True
                 logger.critical(
-                    "LICENSE INTEGRITY VIOLATION: mesh ring-check "
-                    "(gate_middleware.py) — ring-neighbour role=%s (%s) live "
+                    "LICENSE INTEGRITY VIOLATION: mesh full-check "
+                    "(gate_middleware.py) — mesh peer role=%s (%s) live "
                     "hash mismatch (expected=%s, actual=%s) — independent "
-                    "detection (LAURA-V2-003 hardening)",
+                    "detection (LAURA-V2-003 Phase D hardening)",
                     role, const_name, expected[:16], live[:16],
                 )
         return self.violated
 
 
-_mesh_checker = _MeshRingChecker()
+_mesh_checker = _MeshFullChecker()
 _mesh_checker.run()
 
 
 def get_mesh_integrity_status() -> bool:
-    """Return True if this file's independent ring-check has detected a
-    ring-neighbour tamper (LAURA-V2-003 hardening)."""
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
     return _mesh_checker.violated
 
 
@@ -270,66 +301,51 @@ def _licence_hard_gate(feature: str) -> "tuple[bool, str]":
 
     Returns (allowed, reason). Never raises: any failure while consulting
     the authority (ImportError, AttributeError, or any other exception —
-    e.g. because an attacker's edit to enforcer.py/verifier.py broke their
-    import entirely) is treated as an integrity violation and fails closed
+    e.g. because an attacker's edit to enforcer.py broke its import
+    entirely) is treated as an integrity violation and fails closed
     (IMPL-03 discipline, matching enforcer._any_integrity_violated()).
 
     Deliberately does NOT call enforcer.require_feature() — the whole point
     of this layer is to be unaffected by an edit confined to that one
     function/file.
+
+    Phase D (2026-07-17, LAURA-V2-003 RE-VERIFY): the integrity decision
+    below comes SOLELY from `_mesh_checker.violated` — this file's OWN
+    inline full-mesh check of every OTHER mesh member's bytes. Phase C's
+    fallback (calling verifier.get_integrity_status()/enforcer.get_enforcer_
+    integrity_status() when the ring-check itself hadn't fired) has been
+    REMOVED, not merely supplemented: that fallback was the single point of
+    failure Laura's 3-file SCIM / 4-file SAML re-verify attacks exploited —
+    it was exactly the {verifier.py, enforcer.py} pair the attacker had
+    already neutered, called by a gate whose own (then 2-neighbour) check
+    hadn't happened to cover the touched files. Under the complete graph,
+    `_mesh_checker.violated` already reflects ALL 6 other members' bytes,
+    so no fallback is needed — and none is consulted. `enforcer.get_license()`
+    below is still called (it is a DATA read, not an integrity decision):
+    it is safe precisely because enforcer.py's own bytes are one of the 6
+    peers `_mesh_checker` already verified above.
     """
     if _mesh_checker.violated:
         logger.critical(
             "LICENSE INTEGRITY VIOLATION: gate middleware hard-refusing "
-            "feature=%s — this file's own mesh ring-check detected a "
-            "tampered neighbour (LAURA-V2-003 hardening, independent of "
-            "verifier.py/enforcer.py)",
+            "feature=%s — this file's own full-mesh check detected a "
+            "tampered peer (LAURA-V2-003 Phase D hardening, no fallback to "
+            "verifier.py/enforcer.py getters)",
             feature,
         )
-        _emit_mesh_tamper_event("mesh_ring_neighbour_mismatch", "clean", "tampered")
-        return False, "mesh_ring_integrity_violated"
+        _emit_mesh_tamper_event("mesh_full_check_mismatch", "clean", "tampered")
+        return False, "mesh_full_integrity_violated"
 
     try:
-        from yashigani.licensing import verifier as _verifier
         from yashigani.licensing import enforcer as _enforcer
     except Exception as exc:
         logger.critical(
-            "Licence gate middleware: could not import verifier/enforcer for "
-            "integrity check — treating as violation and refusing (IMPL-03): %s",
+            "Licence gate middleware: could not import enforcer for license "
+            "state — treating as violation and refusing (IMPL-03): %s",
             exc,
         )
         _emit_mesh_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
         return False, "integrity_module_unavailable"
-
-    try:
-        verifier_violated = bool(_verifier.get_integrity_status())
-    except Exception as exc:
-        logger.critical(
-            "Licence gate middleware: verifier.get_integrity_status() raised — "
-            "treating as violation and refusing: %s", exc,
-        )
-        _emit_mesh_tamper_event("verifier_integrity_check_failed", "n/a", "raised")
-        return False, "verifier_integrity_check_failed"
-
-    try:
-        enforcer_violated = bool(_enforcer.get_enforcer_integrity_status())
-    except Exception as exc:
-        logger.critical(
-            "Licence gate middleware: enforcer.get_enforcer_integrity_status() "
-            "raised — treating as violation and refusing: %s", exc,
-        )
-        _emit_mesh_tamper_event("enforcer_integrity_check_failed", "n/a", "raised")
-        return False, "enforcer_integrity_check_failed"
-
-    if verifier_violated or enforcer_violated:
-        logger.critical(
-            "LICENSE INTEGRITY VIOLATION: gate middleware refusing feature=%s "
-            "(verifier_violated=%s, enforcer_violated=%s) — hard-refuse, not "
-            "merely a banner (design §5/§11)",
-            feature, verifier_violated, enforcer_violated,
-        )
-        _emit_mesh_tamper_event("build_integrity_violated", "clean", "tampered")
-        return False, "build_integrity_violated"
 
     try:
         lic = _enforcer.get_license()

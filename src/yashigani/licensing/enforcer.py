@@ -128,17 +128,23 @@ def _check_enforcer_integrity() -> None:
 def get_enforcer_integrity_status() -> bool:
     """Return True if the enforcer integrity has been violated.
 
-    LAURA-V2-003 hardening: also reflects this file's own mesh ring-check
-    (_check_enforcer_mesh_ring(), a genuinely separate code path from
-    _check_enforcer_integrity() above)."""
+    LAURA-V2-003 Phase D hardening: also reflects this file's own full-mesh
+    check (_check_enforcer_mesh_full(), a genuinely separate code path from
+    _check_enforcer_integrity() above). This getter remains an accessor to
+    THIS file's own state (used by _any_integrity_violated() below, the
+    unrelated T1-T4 aggregation) — as of Phase D no OTHER mesh file's
+    point-of-use gate calls this getter as part of its OWN tamper decision
+    any more (see gate_middleware.py's module docstring: that shared-getter
+    fallback was itself the single point of failure Laura's 3-/4-file
+    bypasses exploited)."""
     return _enforcer_integrity_violated or _enforcer_mesh_integrity_violated
 
 
 # ---------------------------------------------------------------------------
-# Mesh ring-check (licence-hardening-v2 Phase C, 2026-07-16 — LAURA-V2-003
-# follow-up). See verifier.py's module-level comment block above
-# _check_mesh_ring_neighbours() for the full rationale (hexagonal ring,
-# randomized per-release topology, graph-connectivity guarantee). This is
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See verifier.py's module-level comment
+# block above _check_mesh_full() for the full rationale (complete graph,
+# randomized per-release member order, why a ring was insufficient). This is
 # enforcer.py's OWN independently-authored copy — deliberately a DIFFERENT
 # code shape (list-comprehension + collected-mismatch list) from
 # verifier.py's plain for-loop, so a single strip-script pattern cannot
@@ -152,7 +158,7 @@ _MY_MESH_ROLE = "ENFORCER"
 
 def _mesh_role_targets() -> dict:
     """role -> (signed hash constant name, path). Built fresh each call
-    (cheap — 6 entries) rather than cached at import time, a deliberate
+    (cheap — 7 entries) rather than cached at import time, a deliberate
     stylistic difference from verifier.py's module-level dict."""
     licensing_dir = Path(__file__).parent
     pkg_dir = licensing_dir.parent
@@ -161,6 +167,7 @@ def _mesh_role_targets() -> dict:
         "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
         "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
         "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+        "SAML": ("SAML_MODULE_HASH", pkg_dir / "sso" / "saml.py"),
         "SSO_ROUTES": ("SSO_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "sso.py"),
         "SCIM_ROUTES": ("SCIM_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "scim.py"),
     }
@@ -173,9 +180,9 @@ def _live_hash_or_none(path: Path) -> Optional[str]:
         return None
 
 
-def _check_enforcer_mesh_ring() -> None:
+def _check_enforcer_mesh_full() -> None:
     """
-    Style: resolve neighbours, build a list of mismatch tuples via
+    Style: resolve peers, build a list of mismatch tuples via
     list-comprehension, then act on the collected list — deliberately not a
     for-loop (verifier.py's shape) or a while-loop (sso/oidc.py's shape).
     """
@@ -189,7 +196,7 @@ def _check_enforcer_mesh_ring() -> None:
         if not is_dev:
             _enforcer_mesh_integrity_violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (enforcer.py) — "
                 "hash or topology constants still placeholders in a non-dev "
                 "environment; forcing COMMUNITY tier"
             )
@@ -197,18 +204,16 @@ def _check_enforcer_mesh_ring() -> None:
 
     targets = _mesh_role_targets()
     try:
-        ring_order = _json.loads(_integrity.MESH_TOPOLOGY_JSON)["ring_order"]
-        if not isinstance(ring_order, list) or sorted(ring_order) != sorted(targets.keys()):
-            raise ValueError("ring_order is not a permutation of the 6 mesh roles")
-        if ring_order.count(_MY_MESH_ROLE) != 1:
-            raise ValueError("ring_order missing this file's role")
-        idx = ring_order.index(_MY_MESH_ROLE)
-        n = len(ring_order)
-        neighbour_roles = (ring_order[(idx - 1) % n], ring_order[(idx + 1) % n])
+        member_order = _json.loads(_integrity.MESH_TOPOLOGY_JSON)["member_order"]
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(targets.keys()):
+            raise ValueError("member_order is not a permutation of the 7 mesh roles")
+        if member_order.count(_MY_MESH_ROLE) != 1:
+            raise ValueError("member_order missing this file's role")
+        peer_roles = [role for role in member_order if role != _MY_MESH_ROLE]
     except Exception as exc:
         _enforcer_mesh_integrity_violated = True
         logger.critical(
-            "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (enforcer.py) — "
             "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s — "
             "treating as tamper (fail-closed)", exc,
         )
@@ -216,7 +221,7 @@ def _check_enforcer_mesh_ring() -> None:
 
     checks = [
         (role, targets[role][0], getattr(_integrity, targets[role][0], ""), _live_hash_or_none(targets[role][1]))
-        for role in neighbour_roles
+        for role in peer_roles
     ]
     mismatches = [c for c in checks if c[3] is None or c[3] != c[2]]
 
@@ -224,9 +229,9 @@ def _check_enforcer_mesh_ring() -> None:
         _enforcer_mesh_integrity_violated = True
         for role, const_name, expected, live in mismatches:
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
-                "ring-neighbour role=%s (%s) %s (expected=%s, actual=%s) — "
-                "independent detection (LAURA-V2-003 hardening)",
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (enforcer.py) — "
+                "mesh peer role=%s (%s) %s (expected=%s, actual=%s) — "
+                "independent detection (LAURA-V2-003 Phase D hardening)",
                 role, const_name,
                 "could not be read" if live is None else "live hash mismatch",
                 (expected or "")[:16], (live or "<unreadable>")[:16],
@@ -234,8 +239,8 @@ def _check_enforcer_mesh_ring() -> None:
 
 
 def get_enforcer_mesh_integrity_status() -> bool:
-    """Return True if this file's independent ring-check has detected a
-    ring-neighbour tamper (LAURA-V2-003 hardening)."""
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
     return _enforcer_mesh_integrity_violated
 
 
@@ -710,5 +715,5 @@ def license_limit_exceeded_response(exc: LicenseLimitExceeded) -> dict:
 
 # Run integrity check at module load (T1 / DG-04)
 _check_enforcer_integrity()
-# LAURA-V2-003 hardening: mesh ring-check (separate code path, see above)
-_check_enforcer_mesh_ring()
+# LAURA-V2-003 Phase D hardening: mesh full-check (separate code path, see above)
+_check_enforcer_mesh_full()

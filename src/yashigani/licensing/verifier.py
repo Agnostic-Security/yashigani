@@ -289,11 +289,15 @@ _YASHIGANI_PKG_DIR = _LICENSING_DIR.parent  # .../src/yashigani
 # Extended 2026-07-16 (LAURA-V2-001 follow-up — "replacing require_feature()'s
 # whole body still yields the feature"): the 5 point-of-use (POU) files below
 # do the ACTUAL privileged work of a licence-gated capability. Each of them
-# now carries its OWN local `_licence_hard_gate()` (see oidc.py/saml.py/
-# routes/sso.py/routes/scim.py) that reads verifier.get_integrity_status()
-# and enforcer.get_enforcer_integrity_status() directly — NOT via
-# enforcer.require_feature() — so patching require_feature() alone has zero
-# effect on them. Adding them here closes the OTHER half: tampering with a
+# carries its OWN local `_licence_hard_gate()` (see oidc.py/saml.py/
+# routes/sso.py/routes/scim.py) — NOT via enforcer.require_feature() — so
+# patching require_feature() alone has zero effect on them. As of Phase D
+# (2026-07-17, LAURA-V2-003 RE-VERIFY) each POU gate's decision comes
+# SOLELY from its own inline full-mesh check (see _check_mesh_full() below)
+# rather than by calling verifier.get_integrity_status()/
+# enforcer.get_enforcer_integrity_status() — that shared-getter fallback was
+# itself the single point of failure Laura's 3-/4-file bypasses exploited.
+# Adding them here closes the OTHER half: tampering with a
 # POU file itself (e.g. deleting its own `_licence_hard_gate()` call) changes
 # that file's bytes, which THIS dict causes verifier.py — a separate file,
 # untouched by that edit — to detect independently at its own module-load
@@ -613,109 +617,129 @@ def _check_build_integrity_chain() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mesh ring-check (licence-hardening-v2 Phase C, 2026-07-16 — LAURA-V2-003
-# follow-up: "coordinated verifier.py+enforcer.py checker-neutering silently
-# suppresses the tamper alarm"). See gate_middleware.py's module docstring
-# for the full 6-file mesh picture.
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening: Laura's independent re-verify of the
+# Phase C ring found a live, silent 3-file {verifier.py, enforcer.py,
+# gate_middleware.py} SCIM bypass and a 4-file {..., routes/sso.py} SAML
+# bypass — both well below the "any 1-5 file edit is caught" bar the ring
+# was supposed to guarantee). See gate_middleware.py's module docstring for
+# the full 7-file mesh picture.
 #
-# ROOT CAUSE THIS CLOSES: everything above this point in this file (T1-T4 +
-# POU live-hash re-derivation, _check_build_integrity_chain()) is itself
-# CODE THAT LIVES IN verifier.py. An attacker who edits verifier.py doesn't
-# just hide verifier.py's own tamper — they gut the ONLY comparison logic
-# that ever independently re-derived OIDC_MODULE_HASH/SSO_ROUTES_HASH/etc,
-# because that logic physically lived here. Pairing that with an edit to
-# enforcer.py (which cross-checks verifier.py's bytes, but is itself edited
-# in the same attack) leaves NOTHING outside {verifier.py, enforcer.py} that
-# ever reads either file's bytes and compares — Laura's 2-file, no-key
-# bypass (LAURA-V2-003).
+# ROOT CAUSE THIS CLOSES (two layers):
+#   1. (Phase C's original problem, still true) Everything above this point
+#      in this file (T1-T4 + POU live-hash re-derivation,
+#      _check_build_integrity_chain()) is itself CODE THAT LIVES IN
+#      verifier.py. An attacker who edits verifier.py doesn't just hide
+#      verifier.py's own tamper — they gut the ONLY comparison logic that
+#      ever independently re-derived OIDC_MODULE_HASH/SSO_ROUTES_HASH/etc,
+#      because that logic physically lived here.
+#   2. (Phase D's NEW finding) A RING only gives each file 2 neighbours. For
+#      a given release's permutation, a specific gate's 2 neighbours often
+#      did NOT include the files an attacker actually touched — that gate's
+#      ring-check never fired, and its FALLBACK (calling
+#      verifier.get_integrity_status()/enforcer.get_enforcer_integrity_
+#      status()) was exactly the {verifier.py, enforcer.py} pair already
+#      neutered by the same edit. "Some detector fires somewhere in the
+#      process" is not the same guarantee as "the gate deciding THIS
+#      feature is blocked" — conflating the two is what let Laura's 3- and
+#      4-file attacks through silently.
 #
-# FIX: verifier.py, enforcer.py, gate_middleware.py, sso/oidc.py,
-# backoffice/routes/sso.py, and backoffice/routes/scim.py each now carry
-# their OWN independently-authored (distinct control-flow shape per file —
-# not copy-pasted, not a shared function) inline check of their two
-# RING-NEIGHBOURS' bytes, straight off disk, against the ALREADY-SIGNED hash
-# constants in _integrity.py (no new hash values needed — VERIFIER_HASH/
-# ENFORCER_HASH/GATE_MIDDLEWARE_HASH/OIDC_MODULE_HASH/SSO_ROUTES_HASH/
-# SCIM_ROUTES_HASH already existed and were already part of BUNDLE_SIG).
-# sso/saml.py is the 5th rotation candidate NOT selected for this release's
-# ring (still protected by the T1-T4+POU mechanism above, and its own
-# point-of-use gate).
+# FIX (Phase D): verifier.py, enforcer.py, gate_middleware.py, sso/oidc.py,
+# sso/saml.py, backoffice/routes/sso.py, and backoffice/routes/scim.py —
+# ALL SEVEN files, sso/saml.py now a full mesh member for the first time —
+# each carry their OWN independently-authored (distinct control-flow shape
+# per file — not copy-pasted, not a shared function) inline check of EVERY
+# OTHER mesh member's bytes (6 peer-checks per file, not 2), straight off
+# disk, against the ALREADY-SIGNED hash constants in _integrity.py (no new
+# hash values needed for the pre-existing 6 — VERIFIER_HASH/ENFORCER_HASH/
+# GATE_MIDDLEWARE_HASH/OIDC_MODULE_HASH/SSO_ROUTES_HASH/SCIM_ROUTES_HASH
+# already existed and were already part of BUNDLE_SIG; SAML_MODULE_HASH
+# likewise already existed, just wasn't consulted by any mesh peer-check
+# before Phase D). Additionally, each of the 5 point-of-use gate functions
+# (gate_middleware.py, oidc.py, saml.py, routes/sso.py, routes/scim.py) now
+# derives its enforcement decision SOLELY from its own inline full-mesh
+# result — none of them fall back to calling verifier.get_integrity_status()/
+# enforcer.get_enforcer_integrity_status() any more (that fallback WAS the
+# single point of failure duplicated 5 times that Laura's report identified
+# as the actual root cause).
 #
-# WHY A RING BEATS 3 ISOLATED PAIRS: if verifier.py and enforcer.py only
-# ever checked EACH OTHER (a disjoint 2-node pair, isolated from the other
-# 4 files), editing both simultaneously reproduces LAURA-V2-003 exactly.
-# Chaining all 6 files into ONE cycle guarantees, by simple graph
-# connectivity, that ANY nonempty PROPER subset of the 6 files being
-# tampered (1 up to 5 files, in any combination) leaves at least one
-# UNTOUCHED file whose ring-check target is one of the tampered files — so
-# at least one independent detector always fires. Only tampering ALL 6
-# files simultaneously removes every detector (the honest ceiling).
+# WHY A COMPLETE GRAPH BEATS A RING: a ring guarantees "some untouched file
+# has a tampered ring-neighbour" — true, but that untouched file might be
+# functionally irrelevant to the feature under attack (e.g. oidc.py firing
+# CRITICAL while SCIM's two real enforcement layers are both blind and both
+# grant). A COMPLETE graph — every member checks every OTHER member — means
+# ANY untouched member independently detects ANY nonempty subset of
+# tampered members, in FULL, every time, for every feature, regardless of
+# per-release permutation. There is no "blind neighbour" configuration to
+# land in. Only tampering ALL 7 files simultaneously removes every detector
+# (the honest ceiling — see the honest-ceiling docstrings in
+# gate_middleware.py/oidc.py/saml.py/routes/sso.py/routes/scim.py).
 #
-# RANDOMIZED PER-RELEASE TOPOLOGY (Tiago 2026-07-16): WHICH two files each
-# ring member checks is not hardcoded — it is read from MESH_TOPOLOGY_JSON,
-# a signed constant (transitively covered by INTEGRITY_HASH like every
-# other constant in _integrity.py) holding this release's ring order,
-# itself deterministically derived from a per-release seed
-# (licensing/chain/mesh_topology.py:compute_ring_order(), invoked ONLY at
-# build time by scripts/inject_hashes.sh — never at runtime). This is
-# per-build POLYMORPHISM/OBSCURITY, not a new cryptographic property: the
-# graph-connectivity guarantee above holds IDENTICALLY for every possible
-# permutation — randomizing the order only means a coordinated-edit
-# strip-script written against release N's specific ring does not carry
-# over to release N+1, raising ATTACKER TIME, not closing a new class of
-# bypass.
+# RANDOMIZED PER-RELEASE TOPOLOGY (Tiago 2026-07-16, retained Phase D):
+# MESH_TOPOLOGY_JSON is still a signed constant (transitively covered by
+# INTEGRITY_HASH like every other constant in _integrity.py) holding this
+# release's member order, deterministically derived from a per-release seed
+# (licensing/chain/mesh_topology.py:compute_mesh_order(), invoked ONLY at
+# build time by scripts/inject_hashes.sh — never at runtime). Under the
+# complete graph it no longer determines WHO checks WHOM (everyone checks
+# everyone, unconditionally) — it now only determines each file's own
+# PEER-ITERATION order, kept for per-build POLYMORPHISM/strip-script
+# resistance (a coordinated-edit script hardcoded against one release's
+# specific check-order does not carry over to the next), not for detection
+# completeness (completeness holds identically regardless of order).
 # ---------------------------------------------------------------------------
 
 _mesh_integrity_violated = False
 
 # role -> (signed hash constant name, absolute path). Static address-book
-# data, not decision logic — safe to duplicate in shape across the 6 mesh
+# data, not decision logic — safe to duplicate in shape across the 7 mesh
 # files (the actual CHECK below is deliberately styled differently per
-# file — see gate_middleware.py/sso/oidc.py/backoffice/routes/sso.py/
-# backoffice/routes/scim.py for the sibling implementations, each a
-# distinct control-flow shape so a single AST/regex strip-script cannot
-# pattern-match and remove all 6 uniformly).
+# file — see gate_middleware.py/sso/oidc.py/sso/saml.py/
+# backoffice/routes/sso.py/backoffice/routes/scim.py for the sibling
+# implementations, each a distinct control-flow shape so a single AST/regex
+# strip-script cannot pattern-match and remove all 7 uniformly).
 _MESH_ROLE_TARGETS: dict = {
     "VERIFIER": ("VERIFIER_HASH", _LICENSING_DIR / "verifier.py"),
     "ENFORCER": ("ENFORCER_HASH", _LICENSING_DIR / "enforcer.py"),
     "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", _LICENSING_DIR / "gate_middleware.py"),
     "OIDC": ("OIDC_MODULE_HASH", _YASHIGANI_PKG_DIR / "sso" / "oidc.py"),
+    "SAML": ("SAML_MODULE_HASH", _YASHIGANI_PKG_DIR / "sso" / "saml.py"),
     "SSO_ROUTES": ("SSO_ROUTES_HASH", _YASHIGANI_PKG_DIR / "backoffice" / "routes" / "sso.py"),
     "SCIM_ROUTES": ("SCIM_ROUTES_HASH", _YASHIGANI_PKG_DIR / "backoffice" / "routes" / "scim.py"),
 }
 _MY_MESH_ROLE = "VERIFIER"
 
 
-def _resolve_ring_neighbours() -> "Optional[list[str]]":
+def _resolve_mesh_peers() -> "Optional[list[str]]":
     """
-    Parse MESH_TOPOLOGY_JSON and return this file's two ring-neighbour role
-    names, or None if the topology is a placeholder, malformed, or does not
-    contain this file's own role exactly once.
+    Parse MESH_TOPOLOGY_JSON and return ALL SIX of this file's peer role
+    names (every other mesh member — Phase D complete graph, not just 2
+    ring-neighbours), in this release's member-order sequence, or None if
+    the topology is a placeholder, malformed, or does not contain this
+    file's own role exactly once.
     """
     if _integrity.is_mesh_topology_placeholder():
         return None
     try:
         topology = json.loads(_integrity.MESH_TOPOLOGY_JSON)
-        ring_order = topology["ring_order"]
+        member_order = topology["member_order"]
     except Exception:
         return None
-    if not isinstance(ring_order, list) or sorted(ring_order) != sorted(_MESH_ROLE_TARGETS.keys()):
+    if not isinstance(member_order, list) or sorted(member_order) != sorted(_MESH_ROLE_TARGETS.keys()):
         return None
-    if ring_order.count(_MY_MESH_ROLE) != 1:
+    if member_order.count(_MY_MESH_ROLE) != 1:
         return None
-    idx = ring_order.index(_MY_MESH_ROLE)
-    n = len(ring_order)
-    return [ring_order[(idx - 1) % n], ring_order[(idx + 1) % n]]
+    return [role for role in member_order if role != _MY_MESH_ROLE]
 
 
-def _check_mesh_ring_neighbours() -> None:
+def _check_mesh_full() -> None:
     """
-    Style: plain for-loop, early-continue on unreadable neighbour.
+    Style: plain for-loop, early-continue on unreadable peer.
 
-    Independently re-derives the SHA-256 of this file's two ring-neighbours
-    (per this release's randomized topology) straight off disk and compares
-    each to the already-signed hash constant in _integrity.py. Deliberately
-    a SEPARATE code path from _compute_live_hash_bundle_str()/
+    Independently re-derives the SHA-256 of EVERY OTHER mesh member (Phase
+    D complete graph — 6 peers, not 2 ring-neighbours) straight off disk
+    and compares each to the already-signed hash constant in _integrity.py.
+    Deliberately a SEPARATE code path from _compute_live_hash_bundle_str()/
     _check_build_integrity_chain() above — the whole point is genuine
     independence, not layered calls into the same function.
     """
@@ -727,23 +751,23 @@ def _check_mesh_ring_neighbours() -> None:
         if not is_dev:
             _mesh_integrity_violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (verifier.py) — "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (verifier.py) — "
                 "hash or topology constants still placeholders in a non-dev "
                 "environment; forcing COMMUNITY tier"
             )
         return
 
-    neighbours = _resolve_ring_neighbours()
-    if neighbours is None:
+    peers = _resolve_mesh_peers()
+    if peers is None:
         _mesh_integrity_violated = True
         logger.critical(
-            "LICENSE INTEGRITY VIOLATION: mesh ring-check (verifier.py) — "
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (verifier.py) — "
             "MESH_TOPOLOGY_JSON is malformed or does not contain this file's "
             "role exactly once; treating as tamper (fail-closed)"
         )
         return
 
-    for role in neighbours:
+    for role in peers:
         const_name, path = _MESH_ROLE_TARGETS[role]
         expected = getattr(_integrity, const_name, "")
         try:
@@ -751,8 +775,8 @@ def _check_mesh_ring_neighbours() -> None:
         except Exception as exc:
             _mesh_integrity_violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (verifier.py) — "
-                "could not read ring-neighbour role=%s (%s): %s — treating as "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (verifier.py) — "
+                "could not read mesh peer role=%s (%s): %s — treating as "
                 "tamper (fail-closed)",
                 role, path, exc,
             )
@@ -760,18 +784,18 @@ def _check_mesh_ring_neighbours() -> None:
         if live != expected:
             _mesh_integrity_violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (verifier.py) — "
-                "ring-neighbour role=%s (%s) live hash does not match signed "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (verifier.py) — "
+                "mesh peer role=%s (%s) live hash does not match signed "
                 "value (expected=%s, actual=%s) — independent detection, "
                 "separate from _check_build_integrity_chain()'s own logic "
-                "above (LAURA-V2-003 hardening)",
+                "above (LAURA-V2-003 Phase D hardening)",
                 role, const_name, expected[:16], live[:16],
             )
 
 
 def get_mesh_integrity_status() -> bool:
-    """Return True if this file's independent ring-check has detected a
-    ring-neighbour tamper (LAURA-V2-003 hardening)."""
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
     return _mesh_integrity_violated
 
 
@@ -788,7 +812,7 @@ def get_integrity_status() -> bool:
 # Run at module load.
 _check_self_integrity()
 _check_build_integrity_chain()
-_check_mesh_ring_neighbours()
+_check_mesh_full()
 
 
 # ---------------------------------------------------------------------------

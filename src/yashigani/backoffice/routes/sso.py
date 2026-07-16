@@ -62,15 +62,16 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# Mesh ring-check (licence-hardening-v2 Phase C, 2026-07-16 — LAURA-V2-003
-# hardening). See licensing/verifier.py's module-level comment block above
-# _check_mesh_ring_neighbours() for the full rationale. This is
-# routes/sso.py's OWN independently-authored copy — deliberately a
-# DIFFERENT code shape (gather both neighbours via dict-comprehension, then
-# decide via a generator/any() pass) from verifier.py's for-loop,
-# enforcer.py's list-comprehension, gate_middleware.py's class, and
-# sso/oidc.py's while-loop, so a single AST/regex strip-script cannot
-# pattern-match and remove all five at once.
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See licensing/verifier.py's
+# module-level comment block above _check_mesh_full() for the full
+# rationale. This is routes/sso.py's OWN independently-authored copy —
+# deliberately a DIFFERENT code shape (gather every peer's live hash via
+# dict-comprehension, then decide via a generator/any() pass) from
+# verifier.py's for-loop, enforcer.py's list-comprehension,
+# gate_middleware.py's class, sso/oidc.py's while-loop, and sso/saml.py's
+# functional map()/all(), so a single AST/regex strip-script cannot
+# pattern-match and remove all six at once.
 # ---------------------------------------------------------------------------
 
 _MESH_ROLE = "SSO_ROUTES"
@@ -86,15 +87,16 @@ def _mesh_targets() -> dict:
         "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
         "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
         "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+        "SAML": ("SAML_MODULE_HASH", pkg_dir / "sso" / "saml.py"),
         "SSO_ROUTES": ("SSO_ROUTES_HASH", routes_dir / "sso.py"),
         "SCIM_ROUTES": ("SCIM_ROUTES_HASH", routes_dir / "scim.py"),
     }
 
 
-def _check_mesh_ring() -> None:
-    """Style: dict-comprehension gathers {role: live_hash_or_None} for both
-    neighbours in one expression, then a generator/any() decides the
-    verdict."""
+def _check_mesh_full() -> None:
+    """Style: dict-comprehension gathers {role: live_hash_or_None} for
+    EVERY peer (6, not 2) in one expression, then a generator/any() pass
+    decides the verdict."""
     global _mesh_integrity_violated
     is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
     targets = _mesh_targets()
@@ -103,25 +105,23 @@ def _check_mesh_ring() -> None:
         if not is_dev:
             _mesh_integrity_violated = True
             logger.critical(
-                "LICENSE INTEGRITY VIOLATION: mesh ring-check (routes/sso.py) "
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/sso.py) "
                 "— hash or topology constants still placeholders in a "
                 "non-dev environment; hard-refusing"
             )
         return
 
     try:
-        ring_order = json.loads(_mesh_integrity.MESH_TOPOLOGY_JSON)["ring_order"]
-        if not isinstance(ring_order, list) or sorted(ring_order) != sorted(targets):
-            raise ValueError("ring_order is not a permutation of the 6 mesh roles")
-        if ring_order.count(_MESH_ROLE) != 1:
-            raise ValueError("ring_order missing this file's role")
-        i = ring_order.index(_MESH_ROLE)
-        n = len(ring_order)
-        neighbour_roles = (ring_order[i - 1], ring_order[(i + 1) % n])
+        member_order = json.loads(_mesh_integrity.MESH_TOPOLOGY_JSON)["member_order"]
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(targets):
+            raise ValueError("member_order is not a permutation of the 7 mesh roles")
+        if member_order.count(_MESH_ROLE) != 1:
+            raise ValueError("member_order missing this file's role")
+        peer_roles = [role for role in member_order if role != _MESH_ROLE]
     except Exception as exc:
         _mesh_integrity_violated = True
         logger.critical(
-            "LICENSE INTEGRITY VIOLATION: mesh ring-check (routes/sso.py) — "
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/sso.py) — "
             "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s", exc,
         )
         return
@@ -132,7 +132,7 @@ def _check_mesh_ring() -> None:
         except Exception:
             return None
 
-    live_by_role = {role: _try_hash(targets[role][1]) for role in neighbour_roles}
+    live_by_role = {role: _try_hash(targets[role][1]) for role in peer_roles}
 
     if any(
         live is None or live != getattr(_mesh_integrity, targets[role][0], "")
@@ -144,10 +144,10 @@ def _check_mesh_ring() -> None:
             expected = getattr(_mesh_integrity, const_name, "")
             if live is None or live != expected:
                 logger.critical(
-                    "LICENSE INTEGRITY VIOLATION: mesh ring-check "
-                    "(routes/sso.py) — ring-neighbour role=%s (%s) %s "
+                    "LICENSE INTEGRITY VIOLATION: mesh full-check "
+                    "(routes/sso.py) — mesh peer role=%s (%s) %s "
                     "(expected=%s, actual=%s) — independent detection "
-                    "(LAURA-V2-003 hardening)",
+                    "(LAURA-V2-003 Phase D hardening)",
                     role, const_name,
                     "could not be read" if live is None else "live hash mismatch",
                     (expected or "")[:16], (live or "<unreadable>")[:16],
@@ -155,8 +155,8 @@ def _check_mesh_ring() -> None:
 
 
 def get_mesh_integrity_status() -> bool:
-    """Return True if this file's independent ring-check has detected a
-    ring-neighbour tamper (LAURA-V2-003 hardening)."""
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
     return _mesh_integrity_violated
 
 
@@ -182,74 +182,65 @@ def _emit_mesh_tamper_event(check_type: str, expected_hash: str, actual_hash: st
         pass
 
 
-_check_mesh_ring()
+_check_mesh_full()
 
 
 def _licence_hard_gate(feature: str) -> None:
     """
     Point-of-use licence gate, route layer (LAURA-V2-001 follow-up,
-    2026-07-16).
+    2026-07-16; Phase D full-mesh hardening, 2026-07-17).
 
     Deliberately does NOT call enforcer.require_feature() — see
     sso/oidc.py's `_licence_hard_gate()` docstring for the full rationale.
     This is a SEPARATE local copy (not a shared import with oidc.py/saml.py/
     routes/scim.py) so patching any ONE of those guards, or
-    enforcer.require_feature() itself, does not affect this one. Reads
-    verifier.get_integrity_status() (signed, live re-derived) and
-    enforcer.get_enforcer_integrity_status() directly; hard-refuses (raises)
-    on any integrity violation or missing feature; never silently passes on
-    error (IMPL-03).
+    enforcer.require_feature() itself, does not affect this one.
+
+    Phase D (2026-07-17, LAURA-V2-003 RE-VERIFY): the integrity decision
+    below comes SOLELY from `_mesh_integrity_violated` — this file's OWN
+    inline full-mesh check (_check_mesh_full() above). The Phase C fallback
+    (calling verifier.get_integrity_status()/enforcer.get_enforcer_
+    integrity_status()) has been REMOVED, not merely supplemented — this
+    file (routes/sso.py) was ITSELF one of the 4 files in Laura's re-verify
+    4-file SAML bypass; its own Phase C ring-check didn't happen to cover
+    the touched files for that release's permutation, and the removed
+    fallback was exactly the neutered {verifier.py, enforcer.py} pair.
+    Hard-refuses (raises) on any integrity violation or missing feature;
+    never silently passes on error (IMPL-03).
 
     One of THREE independent layers for OIDC/SAML (this route-level gate,
     sso/oidc.py's / sso/saml.py's provider-level gate,
     licensing/gate_middleware.py's ASGI-level gate) — see
     gate_middleware.py's module docstring.
 
-    HONEST CEILING (Phase C, 2026-07-16 — see gate_middleware.py's module
-    docstring for the full statement): this file is now also part of the
-    6-file mesh — tampering ANY 1-5 of the 6 mesh files, including
-    verifier.py+enforcer.py together, is always caught by at least one
-    untouched ring-check and audited. Only a coordinated edit of ALL 6
-    removes every detector — tamper-EVIDENT and high-cost, not tamper-proof.
+    HONEST CEILING (Phase D, 2026-07-17 — see gate_middleware.py's module
+    docstring for the full statement): this file is now part of the 7-file
+    COMPLETE graph — tampering ANY 1-6 of the 7 mesh files, including
+    verifier.py+enforcer.py+gate_middleware.py together (the exact 3-file
+    combination that fooled Phase C's ring), is always caught by every
+    untouched member's own full-mesh check and audited. Only a coordinated
+    edit of ALL 7 removes every detector — tamper-EVIDENT and high-cost,
+    not tamper-proof.
     """
-    try:
-        from yashigani.licensing import verifier as _verifier
-        from yashigani.licensing import enforcer as _enforcer
-    except Exception as exc:
-        logger.critical(
-            "SSO routes: could not import verifier/enforcer for integrity "
-            "check — treating as violation and refusing (IMPL-03): %s", exc,
-        )
-        _emit_mesh_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
-        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
-
     if _mesh_integrity_violated:
         logger.critical(
             "LICENSE INTEGRITY VIOLATION: SSO routes hard-refusing "
-            "feature=%s — this file's own mesh ring-check detected a "
-            "tampered neighbour (LAURA-V2-003 hardening, independent of "
-            "verifier.py/enforcer.py)",
+            "feature=%s — this file's own full-mesh check detected a "
+            "tampered peer (LAURA-V2-003 Phase D hardening, no fallback to "
+            "verifier.py/enforcer.py getters)",
             feature,
         )
-        _emit_mesh_tamper_event("mesh_ring_neighbour_mismatch", "clean", "tampered")
+        _emit_mesh_tamper_event("mesh_full_check_mismatch", "clean", "tampered")
         raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
 
     try:
-        if _verifier.get_integrity_status() or _enforcer.get_enforcer_integrity_status():
-            logger.critical(
-                "LICENSE INTEGRITY VIOLATION: SSO routes hard-refusing "
-                "feature=%s — build integrity violated", feature,
-            )
-            _emit_mesh_tamper_event("build_integrity_violated", "clean", "tampered")
-            raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
-    except LicenseFeatureGated:
-        raise
+        from yashigani.licensing import enforcer as _enforcer
     except Exception as exc:
         logger.critical(
-            "SSO routes: integrity check raised — treating as violation and "
-            "refusing: %s", exc,
+            "SSO routes: could not import enforcer for license state — "
+            "treating as violation and refusing (IMPL-03): %s", exc,
         )
-        _emit_mesh_tamper_event("integrity_check_raised", "n/a", "raised")
+        _emit_mesh_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
         raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
 
     try:

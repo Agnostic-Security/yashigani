@@ -80,11 +80,11 @@
 #   CLIENT_DOMAIN_REGISTRY_PATH Path to {client_id:org_domain} JSON (public).
 #                               Unset leaves the safe "{}" default untouched.
 #   RELEASE_VERSION             This release's version string, folded into the
-#                               mesh ring topology seed derivation (Step 3c).
+#                               mesh full-topology seed derivation (Step 3c).
 #                               Defaults to a placeholder if unset (dev/test
 #                               convenience) — set it for real releases.
 #   MESH_SEED                   Per-release mesh-topology seed (Step 3c,
-#                               LAURA-V2-003 hardening). Auto-generated
+#                               LAURA-V2-003 Phase D hardening). Auto-generated
 #                               (openssl rand -hex 16) and PRINTED if unset —
 #                               record it to reproduce the exact topology.
 #   FIPS_MODE=1                 Use lib/yashigani-fips.sh:_fips_sha256 for T1-T4.
@@ -392,22 +392,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# STEP 3c: Mesh ring topology (licence-hardening-v2 Phase C, LAURA-V2-003
-#          hardening, 2026-07-16) — deterministically derive this release's
-#          randomized 6-file ring order from (RELEASE_VERSION, MESH_SEED)
-#          via licensing/chain/mesh_topology.py:compute_ring_order()
-#          (BUILD-TIME ONLY — never imported by any of the 6 runtime
+# STEP 3c: Mesh FULL topology (licence-hardening-v2 Phase D, LAURA-V2-003
+#          RE-VERIFY hardening, 2026-07-17) — deterministically derive this
+#          release's randomized 7-file member order from (RELEASE_VERSION,
+#          MESH_SEED) via licensing/chain/mesh_topology.py:compute_mesh_order()
+#          (BUILD-TIME ONLY — never imported by any of the 7 runtime
 #          enforcement files; they only ever read the resulting, already-
 #          signed MESH_TOPOLOGY_JSON). UNLIKE Steps 3a/3b, this step is
 #          MANDATORY — it always embeds a real value, never leaves the
-#          placeholder default, because every ring-check file fail-closes
+#          placeholder default, because every mesh-check file fail-closes
 #          on a placeholder/malformed topology in non-dev environments.
+#          Phase D: every mesh member checks EVERY OTHER member (a complete
+#          graph, not a ring) — the member order no longer selects who
+#          checks whom (that's now unconditional/complete), only each
+#          file's own peer-iteration order.
 #
 #          MESH_SEED: if unset, a fresh random seed is generated
 #          (openssl rand -hex 16) and PRINTED — the operator MUST record it
 #          (e.g. release notes / build manifest) to reproduce this exact
 #          topology later for audit/debug. The SAME (RELEASE_VERSION,
-#          MESH_SEED) pair always reproduces the SAME ring order
+#          MESH_SEED) pair always reproduces the SAME member order
 #          (deterministic — see mesh_topology.py's docstring). Randomizing
 #          the topology per release is per-build polymorphism/obscurity —
 #          it raises the cost of a coordinated-edit strip-script written
@@ -415,7 +419,7 @@ fi
 #          change the underlying detection guarantee (see mesh_topology.py).
 # ---------------------------------------------------------------------------
 
-printf '[inject_hashes v2] Step 3c: computing mesh ring topology\n'
+printf '[inject_hashes v2] Step 3c: computing mesh full topology\n'
 
 RELEASE_VERSION="${RELEASE_VERSION:-0.0.0-unset}"
 if [ "${RELEASE_VERSION}" = "0.0.0-unset" ]; then
@@ -432,12 +436,12 @@ fi
 
 MESH_TOPOLOGY_JSON="$(PYTHONPATH="${SRC_ROOT}" python3 -c "
 import json, sys
-from yashigani.licensing.chain.mesh_topology import compute_ring_order
+from yashigani.licensing.chain.mesh_topology import compute_mesh_order
 
 version = sys.argv[1]
 seed = sys.argv[2]
-ring_order = compute_ring_order(version, seed)
-print(json.dumps({'version': version, 'seed': seed, 'ring_order': ring_order}, sort_keys=True, separators=(',', ':')))
+member_order = compute_mesh_order(version, seed)
+print(json.dumps({'version': version, 'seed': seed, 'member_order': member_order}, sort_keys=True, separators=(',', ':')))
 " "${RELEASE_VERSION}" "${MESH_SEED}")"
 
 [ -n "${MESH_TOPOLOGY_JSON}" ] || { printf 'ERROR: mesh topology computation produced empty output\n' >&2; exit 1; }
