@@ -63,15 +63,17 @@ def _licence_hard_gate(feature: str) -> None:
     authority is itself treated as a violation (IMPL-03 discipline) and
     refuses.
 
-    HONEST CEILING: this defends against a SINGLE-file edit confined to
-    enforcer.py, or confined to this file, or confined to verifier.py alone.
-    A coordinated edit touching ALL of {this file, its own guard, enforcer.py
-    AND verifier.py/its signed constants simultaneously} is the accepted
-    design §11 residual (equivalent to forking and re-signing your own
-    build) — out of scope, see gate_middleware.py's module docstring for the
-    full defense-in-depth picture (this is one of THREE independent layers:
-    this provider-level gate, backoffice/routes/sso.py's route-level gate,
-    and licensing/gate_middleware.py's ASGI-level gate).
+    HONEST CEILING (red-team LAURA-V2-003, 2026-07-16 — do NOT overclaim):
+    defends against any SINGLE-file edit (a sibling layer blocks + the signed-
+    hash authority flags it). It does NOT stop a 2-file edit of verifier.py +
+    enforcer.py (the checker + its cross-check), which can grant this feature
+    AND suppress the tamper flag with NO private key / re-sign / recompile —
+    the fundamental limit of in-process self-checking on source-available code
+    (BUNDLE_SIG signs the data, not the code that reads it). NOT equivalent to
+    fork-and-recompile — materially cheaper. Accepted ceiling (Tiago
+    2026-07-16): forging is crypto-impossible, the treadmill forces redoing it
+    each release, contract/trademark do the rest. See gate_middleware.py's
+    docstring for the 3-layer defense-in-depth picture.
     """
     try:
         from yashigani.licensing import verifier as _verifier

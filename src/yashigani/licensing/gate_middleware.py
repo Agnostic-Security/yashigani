@@ -48,19 +48,23 @@ tampering with ANY of them, including this file, changes that file's bytes
 and is independently detected by verifier.py's live re-derivation (a file
 none of these edits ever touches).
 
-HONEST CEILING (do not overclaim, per design §11 / verifier.py's own honest-
-ceiling notes): a "coordinated multi-file edit" that touches ALL of {this
-middleware, every point-of-use file, enforcer.py, AND either verifier.py or
-_integrity.py's signed constants} simultaneously is not defended against by
-source-available Python running without a hardware root of trust — that
-residual is architecturally identical to forking and recompiling your own
-binary (Apache-2.0 + the release treadmill is the accepted answer to that
-class, per design §11) and is explicitly OUT OF SCOPE for this fix. What
-THIS design guarantees is that no SINGLE file edit — including specifically
-patching enforcer.require_feature()'s body, or patching any ONE of the four
-independent point-of-use/middleware guards individually — yields a
-licence-gated capability without either a valid licence or the hard-refuse
-described in §5 firing.
+HONEST CEILING (proven by red-team LAURA-V2-003, 2026-07-16 — do NOT
+overclaim): no SINGLE-file edit yields a gated capability — patching
+enforcer.require_feature()'s body, or any ONE of the four independent guards,
+is still blocked by a sibling layer and flagged by verifier.py's live-hash
+re-derivation. BUT the tamper flag is NOT unforgeable against the checker
+code itself: an attacker with local write access can edit just TWO plaintext
+files — verifier.py (the live-hash authority) and enforcer.py (its cross-
+check) — to both grant the feature AND suppress the alarm, with NO code-leaf
+private key, NO re-signing, NO recompilation. This is the fundamental limit
+of in-process self-checking on source-available code: BUNDLE_SIG protects the
+DATA it signs, not the CODE that reads it, and there is no root of trust
+outside the process. It is therefore NOT "equivalent to fork-and-recompile" —
+it is materially cheaper (a 2-file edit). The accepted moat (Tiago 2026-07-16):
+licence-forging is cryptographically impossible (no private key), the release
+treadmill forces redoing the patch every version, non-checker tampering is
+flagged, and contract/trademark carry the rest. Closing this fully needs a
+hardware root of trust or an out-of-process watchdog — OUT OF SCOPE.
 """
 from __future__ import annotations
 
