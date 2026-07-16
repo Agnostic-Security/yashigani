@@ -73,6 +73,38 @@ SEPARATE file the edit never touches:
       external to both the route file and the provider file, so patching
       either of those alone still leaves this layer blocking).
 
+Mesh ring topology — Phase C, 2026-07-16 (LAURA-V2-003 hardening: "coordinated
+verifier.py+enforcer.py checker-neutering silently suppresses the tamper
+alarm"). Root cause: every comparison above lived INSIDE verifier.py (the
+live-hash re-derivation) or enforcer.py (the cross-check of verifier.py) —
+an attacker who edits BOTH of those two files at once leaves nothing
+outside them that ever reads their bytes and compares. Fix: verifier.py,
+enforcer.py, gate_middleware.py, sso/oidc.py, backoffice/routes/sso.py, and
+backoffice/routes/scim.py each now carry their OWN independently-authored
+(distinct code shape per file — not copy-pasted, not a shared function)
+inline check of their two RING-NEIGHBOURS' bytes, forming a hexagonal cycle
+that chains all 6 files together (rather than 3 isolated pairs) — see
+verifier.py's module-level comment above _check_mesh_ring_neighbours() for
+the full graph-connectivity rationale. sso/saml.py is the 5th rotation
+candidate not selected for this release's ring.
+
+  MESH_TOPOLOGY_JSON
+      {"version": "<release>", "seed": "<hex>", "ring_order": [six role
+      names, a permutation of VERIFIER/ENFORCER/GATE_MIDDLEWARE/OIDC/
+      SSO_ROUTES/SCIM_ROUTES]}. Deterministically derived per-release from
+      (version, seed) by licensing/chain/mesh_topology.py:
+      compute_ring_order() — invoked ONLY by scripts/inject_hashes.sh at
+      build time, never by any runtime file. Randomized per release
+      (different seed each release) so a coordinated-edit strip-script
+      written against one release's specific ring topology does not carry
+      over to the next — per-build POLYMORPHISM/OBSCURITY, not a new
+      cryptographic property (the graph-connectivity detection guarantee is
+      identical for every possible permutation; only the DEGREE OF EFFORT
+      to write reusable attacker tooling changes). Transitively covered by
+      INTEGRITY_HASH like every other constant in this file — no separate
+      signature needed. A malformed/placeholder value is treated as tamper
+      (fail-closed in non-dev) by every ring-check file.
+
 Licence-hardening-v2 chain constants (design doc §2.2/§3.1/§3.3 — supersede
 the v1 COUNTER_PUBLIC_KEY_PEM/HASH_BUNDLE_SIG/EXPECTED_TOKEN_HMAC scheme
 this build embedded before):
@@ -204,6 +236,19 @@ SCIM_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SCIM_ROUTES_HASH"
 GATE_MIDDLEWARE_HASH: str = _PLACEHOLDER_INTEGRITY + "_GATE_MIDDLEWARE_HASH"
 
 # ---------------------------------------------------------------------------
+# Mesh ring topology — Phase C, 2026-07-16 (LAURA-V2-003 hardening). See
+# module docstring above. Computed ONLY by scripts/inject_hashes.sh via
+# licensing/chain/mesh_topology.py:compute_ring_order() — never at runtime.
+# ---------------------------------------------------------------------------
+
+# MESH_TOPOLOGY_JSON
+# Emit via: PYTHONPATH=src python3 -c "from yashigani.licensing.chain.mesh_topology
+# import compute_ring_order; import json; print(json.dumps({'version': V,
+# 'seed': S, 'ring_order': compute_ring_order(V, S)}))"  (scripts/inject_hashes.sh
+# Step 3c does this automatically; MESH_SEED auto-generates if unset).
+MESH_TOPOLOGY_JSON: str = _PLACEHOLDER_INTEGRITY + "_MESH_TOPOLOGY_JSON"
+
+# ---------------------------------------------------------------------------
 # Licence-hardening-v2 chain constants (design §2.2/§3.1/§3.3, §4a)
 # ---------------------------------------------------------------------------
 
@@ -313,6 +358,16 @@ def is_scim_routes_hash_placeholder() -> bool:
 def is_gate_middleware_hash_placeholder() -> bool:
     """Return True when GATE_MIDDLEWARE_HASH has not been set at build time."""
     return _PLACEHOLDER_INTEGRITY in GATE_MIDDLEWARE_HASH
+
+
+def is_mesh_topology_placeholder() -> bool:
+    """Return True when MESH_TOPOLOGY_JSON has not been set at build time.
+
+    Checked independently by each of the 6 mesh ring-check files
+    (LAURA-V2-003 hardening) before trusting the ring order it encodes —
+    a placeholder/missing topology is treated as tamper (fail-closed in
+    non-dev), never silently skipped."""
+    return _PLACEHOLDER_INTEGRITY in MESH_TOPOLOGY_JSON
 
 
 def is_master_anchor_set_placeholder() -> bool:

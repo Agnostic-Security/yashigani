@@ -79,6 +79,14 @@
 #                               leaves the safe "[]" default untouched.
 #   CLIENT_DOMAIN_REGISTRY_PATH Path to {client_id:org_domain} JSON (public).
 #                               Unset leaves the safe "{}" default untouched.
+#   RELEASE_VERSION             This release's version string, folded into the
+#                               mesh ring topology seed derivation (Step 3c).
+#                               Defaults to a placeholder if unset (dev/test
+#                               convenience) — set it for real releases.
+#   MESH_SEED                   Per-release mesh-topology seed (Step 3c,
+#                               LAURA-V2-003 hardening). Auto-generated
+#                               (openssl rand -hex 16) and PRINTED if unset —
+#                               record it to reproduce the exact topology.
 #   FIPS_MODE=1                 Use lib/yashigani-fips.sh:_fips_sha256 for T1-T4.
 #   SCRIPT_DIR                  Directory containing sign_bundle_v2.py
 #                               (default: same directory as this script).
@@ -263,6 +271,7 @@ INJECTED_CONSTS = [
     "AGENTS_REGISTRY_HASH", "IDENTITY_REGISTRY_HASH",
     "OIDC_MODULE_HASH", "SAML_MODULE_HASH", "SSO_ROUTES_HASH",
     "SCIM_ROUTES_HASH", "GATE_MIDDLEWARE_HASH",
+    "MESH_TOPOLOGY_JSON",
     "INTEGRITY_HASH",
     "MASTER_ANCHOR_SET_JSON", "CODE_LEAF_CERT_JSON", "CODE_LEAF_CERT_SIG",
     "BUNDLE_SIG",
@@ -381,6 +390,60 @@ if [ -n "${CLIENT_DOMAIN_REGISTRY_PATH:-}" ]; then
 else
     printf '[inject_hashes v2] Step 3b: CLIENT_DOMAIN_REGISTRY_PATH unset — leaving safe default "{}"\n'
 fi
+
+# ---------------------------------------------------------------------------
+# STEP 3c: Mesh ring topology (licence-hardening-v2 Phase C, LAURA-V2-003
+#          hardening, 2026-07-16) — deterministically derive this release's
+#          randomized 6-file ring order from (RELEASE_VERSION, MESH_SEED)
+#          via licensing/chain/mesh_topology.py:compute_ring_order()
+#          (BUILD-TIME ONLY — never imported by any of the 6 runtime
+#          enforcement files; they only ever read the resulting, already-
+#          signed MESH_TOPOLOGY_JSON). UNLIKE Steps 3a/3b, this step is
+#          MANDATORY — it always embeds a real value, never leaves the
+#          placeholder default, because every ring-check file fail-closes
+#          on a placeholder/malformed topology in non-dev environments.
+#
+#          MESH_SEED: if unset, a fresh random seed is generated
+#          (openssl rand -hex 16) and PRINTED — the operator MUST record it
+#          (e.g. release notes / build manifest) to reproduce this exact
+#          topology later for audit/debug. The SAME (RELEASE_VERSION,
+#          MESH_SEED) pair always reproduces the SAME ring order
+#          (deterministic — see mesh_topology.py's docstring). Randomizing
+#          the topology per release is per-build polymorphism/obscurity —
+#          it raises the cost of a coordinated-edit strip-script written
+#          against one release being reusable against the next; it does NOT
+#          change the underlying detection guarantee (see mesh_topology.py).
+# ---------------------------------------------------------------------------
+
+printf '[inject_hashes v2] Step 3c: computing mesh ring topology\n'
+
+RELEASE_VERSION="${RELEASE_VERSION:-0.0.0-unset}"
+if [ "${RELEASE_VERSION}" = "0.0.0-unset" ]; then
+    printf '[inject_hashes v2] WARNING: RELEASE_VERSION not set — using placeholder version for topology derivation (fine for dev/test builds; set RELEASE_VERSION for real releases so the seed record is meaningful)\n' >&2
+fi
+
+if [ -z "${MESH_SEED:-}" ]; then
+    MESH_SEED="$(openssl rand -hex 16)"
+    printf '[inject_hashes v2] MESH_SEED not provided — generated fresh: %s\n' "${MESH_SEED}"
+    printf '[inject_hashes v2] RECORD THIS SEED (with RELEASE_VERSION=%s) to reproduce this exact mesh topology later.\n' "${RELEASE_VERSION}"
+else
+    printf '[inject_hashes v2] MESH_SEED (provided) = %s\n' "${MESH_SEED}"
+fi
+
+MESH_TOPOLOGY_JSON="$(PYTHONPATH="${SRC_ROOT}" python3 -c "
+import json, sys
+from yashigani.licensing.chain.mesh_topology import compute_ring_order
+
+version = sys.argv[1]
+seed = sys.argv[2]
+ring_order = compute_ring_order(version, seed)
+print(json.dumps({'version': version, 'seed': seed, 'ring_order': ring_order}, sort_keys=True, separators=(',', ':')))
+" "${RELEASE_VERSION}" "${MESH_SEED}")"
+
+[ -n "${MESH_TOPOLOGY_JSON}" ] || { printf 'ERROR: mesh topology computation produced empty output\n' >&2; exit 1; }
+_replace_constant "${INTEGRITY_PY}" "MESH_TOPOLOGY_JSON" "${MESH_TOPOLOGY_JSON}"
+printf '[inject_hashes v2] MESH_TOPOLOGY_JSON = %s\n' "${MESH_TOPOLOGY_JSON}"
+printf '[inject_hashes v2] Step 3c complete\n'
 
 # ---------------------------------------------------------------------------
 # STEP 4: Compute INTEGRITY_HASH — the blank-then-hash self-referential
