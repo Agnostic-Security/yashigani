@@ -36,6 +36,24 @@ def _licence_hard_gate(feature: str) -> None:
     One of THREE independent layers for SAML (this provider-level gate,
     backoffice/routes/sso.py's route-level gate, licensing/gate_middleware.py's
     ASGI-level gate) — see gate_middleware.py's module docstring.
+
+    HONEST CEILING (Phase C, 2026-07-16 — mesh-topology note): unlike
+    verifier.py/enforcer.py/gate_middleware.py/sso/oidc.py/
+    backoffice/routes/sso.py/backoffice/routes/scim.py, this file is NOT one
+    of this release's 6 mesh ring members (5 rotation candidates existed —
+    gate_middleware.py, oidc.py, saml.py, routes/sso.py, routes/scim.py —
+    only 4 were selected; saml.py is the one held out this release, and is
+    a candidate for a future release's rotation). It remains protected the
+    Phase B way: verifier.py's central live-hash re-derivation (still
+    covers SAML_MODULE_HASH) plus this file's own verifier/enforcer-flag
+    read below. It does NOT get the additional independent ring-neighbour
+    check the other 5 files have this release — a coordinated edit confined
+    to verifier.py+enforcer.py+saml.py (3 files, all outside the ring) is
+    therefore not covered by the NEW mesh guarantee, only by the pre-existing
+    T1-T4+POU mechanism (see verifier.py's module docstring for what that
+    mechanism alone can and cannot detect). See gate_middleware.py's module
+    docstring for the full honest-ceiling statement covering the ring
+    members.
     """
     try:
         from yashigani.licensing import verifier as _verifier
@@ -45,6 +63,7 @@ def _licence_hard_gate(feature: str) -> None:
             "SAML provider: could not import verifier/enforcer for integrity "
             "check — treating as violation and refusing (IMPL-03): %s", exc,
         )
+        _emit_saml_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
         raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
 
     try:
@@ -53,6 +72,7 @@ def _licence_hard_gate(feature: str) -> None:
                 "LICENSE INTEGRITY VIOLATION: SAML provider hard-refusing "
                 "feature=%s — build integrity violated", feature,
             )
+            _emit_saml_tamper_event("build_integrity_violated", "clean", "tampered")
             raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
     except LicenseFeatureGated:
         raise
@@ -61,6 +81,7 @@ def _licence_hard_gate(feature: str) -> None:
             "SAML provider: integrity check raised — treating as violation "
             "and refusing: %s", exc,
         )
+        _emit_saml_tamper_event("integrity_check_raised", "n/a", "raised")
         raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
 
     try:
@@ -74,6 +95,33 @@ def _licence_hard_gate(feature: str) -> None:
 
     if not lic.has_feature(feature):
         raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
+
+def _emit_saml_tamper_event(check_type: str, expected_hash: str, actual_hash: str) -> None:
+    """Emit a tamper-evidence audit event at gate-invocation time — own
+    inline copy, see gate_middleware.py's twin function for the full
+    rationale (LAURA-V2-003: no shared chokepoint). saml.py is not a mesh
+    ring member this release (see _licence_hard_gate()'s honest-ceiling
+    note above) but still emits on the verifier/enforcer-flag path so
+    "any INCOMPLETE tamper is logged" holds uniformly across all 5
+    point-of-use gates, not just the 4 ring members."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        writer.write(LicenceIntegrityViolationEvent(
+            module="sso.saml",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        ))
+    except Exception:
+        pass
 
 
 def _assert_rsa_sp_key(sp_private_key: str) -> None:
