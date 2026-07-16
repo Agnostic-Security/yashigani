@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+from typing import Optional
 
 from yashigani.licensing.model import COMMUNITY_LICENSE, LicenseState, LicenseTier
 
@@ -125,8 +126,117 @@ def _check_enforcer_integrity() -> None:
 
 
 def get_enforcer_integrity_status() -> bool:
-    """Return True if the enforcer integrity has been violated."""
-    return _enforcer_integrity_violated
+    """Return True if the enforcer integrity has been violated.
+
+    LAURA-V2-003 hardening: also reflects this file's own mesh ring-check
+    (_check_enforcer_mesh_ring(), a genuinely separate code path from
+    _check_enforcer_integrity() above)."""
+    return _enforcer_integrity_violated or _enforcer_mesh_integrity_violated
+
+
+# ---------------------------------------------------------------------------
+# Mesh ring-check (licence-hardening-v2 Phase C, 2026-07-16 — LAURA-V2-003
+# follow-up). See verifier.py's module-level comment block above
+# _check_mesh_ring_neighbours() for the full rationale (hexagonal ring,
+# randomized per-release topology, graph-connectivity guarantee). This is
+# enforcer.py's OWN independently-authored copy — deliberately a DIFFERENT
+# code shape (list-comprehension + collected-mismatch list) from
+# verifier.py's plain for-loop, so a single strip-script pattern cannot
+# match and remove both at once.
+# ---------------------------------------------------------------------------
+
+_enforcer_mesh_integrity_violated = False
+
+_MY_MESH_ROLE = "ENFORCER"
+
+
+def _mesh_role_targets() -> dict:
+    """role -> (signed hash constant name, path). Built fresh each call
+    (cheap — 6 entries) rather than cached at import time, a deliberate
+    stylistic difference from verifier.py's module-level dict."""
+    licensing_dir = Path(__file__).parent
+    pkg_dir = licensing_dir.parent
+    return {
+        "VERIFIER": ("VERIFIER_HASH", licensing_dir / "verifier.py"),
+        "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
+        "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
+        "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+        "SSO_ROUTES": ("SSO_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "sso.py"),
+        "SCIM_ROUTES": ("SCIM_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "scim.py"),
+    }
+
+
+def _live_hash_or_none(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _check_enforcer_mesh_ring() -> None:
+    """
+    Style: resolve neighbours, build a list of mismatch tuples via
+    list-comprehension, then act on the collected list — deliberately not a
+    for-loop (verifier.py's shape) or a while-loop (sso/oidc.py's shape).
+    """
+    global _enforcer_mesh_integrity_violated
+    from yashigani.licensing import _integrity
+    import json as _json
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_any_hash_placeholder() or _integrity.is_mesh_topology_placeholder():
+        if not is_dev:
+            _enforcer_mesh_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
+                "hash or topology constants still placeholders in a non-dev "
+                "environment; forcing COMMUNITY tier"
+            )
+        return
+
+    targets = _mesh_role_targets()
+    try:
+        ring_order = _json.loads(_integrity.MESH_TOPOLOGY_JSON)["ring_order"]
+        if not isinstance(ring_order, list) or sorted(ring_order) != sorted(targets.keys()):
+            raise ValueError("ring_order is not a permutation of the 6 mesh roles")
+        if ring_order.count(_MY_MESH_ROLE) != 1:
+            raise ValueError("ring_order missing this file's role")
+        idx = ring_order.index(_MY_MESH_ROLE)
+        n = len(ring_order)
+        neighbour_roles = (ring_order[(idx - 1) % n], ring_order[(idx + 1) % n])
+    except Exception as exc:
+        _enforcer_mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
+            "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s — "
+            "treating as tamper (fail-closed)", exc,
+        )
+        return
+
+    checks = [
+        (role, targets[role][0], getattr(_integrity, targets[role][0], ""), _live_hash_or_none(targets[role][1]))
+        for role in neighbour_roles
+    ]
+    mismatches = [c for c in checks if c[3] is None or c[3] != c[2]]
+
+    if mismatches:
+        _enforcer_mesh_integrity_violated = True
+        for role, const_name, expected, live in mismatches:
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: mesh ring-check (enforcer.py) — "
+                "ring-neighbour role=%s (%s) %s (expected=%s, actual=%s) — "
+                "independent detection (LAURA-V2-003 hardening)",
+                role, const_name,
+                "could not be read" if live is None else "live hash mismatch",
+                (expected or "")[:16], (live or "<unreadable>")[:16],
+            )
+
+
+def get_enforcer_mesh_integrity_status() -> bool:
+    """Return True if this file's independent ring-check has detected a
+    ring-neighbour tamper (LAURA-V2-003 hardening)."""
+    return _enforcer_mesh_integrity_violated
 
 
 def _emit_set_license_audit(lic: LicenseState) -> None:
@@ -600,3 +710,5 @@ def license_limit_exceeded_response(exc: LicenseLimitExceeded) -> dict:
 
 # Run integrity check at module load (T1 / DG-04)
 _check_enforcer_integrity()
+# LAURA-V2-003 hardening: mesh ring-check (separate code path, see above)
+_check_enforcer_mesh_ring()
