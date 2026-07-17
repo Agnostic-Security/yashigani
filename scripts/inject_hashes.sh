@@ -393,14 +393,51 @@ fi
 
 printf '[inject_hashes v2] Step 0c: computing + stamping root-of-trust pin (LAURA-V2-005)\n'
 
-INTEGRITY_ROOT_HASH="$(python3 - <<PYEOF
-import hashlib
+# BUG FIX (LAURA-V2-006 sweep finding, 2026-07-17): the previous version of
+# this block spliced ${MASTER_ANCHOR_SET_JSON} et al. directly into an
+# UNQUOTED heredoc (`<<PYEOF`), which shell-expands the variables BEFORE
+# Python ever sees the script, landing their content inside a Python
+# triple-quoted string LITERAL (`"""${VAR}"""`). Since MASTER_ANCHOR_SET_JSON/
+# CODE_LEAF_CERT_JSON always embed PEM public keys (JSON-escaped, containing
+# literal 2-character `\n` sequences), Python's own string-literal parser
+# interpreted those `\n` sequences as REAL newline characters at parse time —
+# producing a digest that could never match verifier._live_integrity_root_hash()
+# (and each mesh file's own copy), which read the injected constant as a
+# runtime string (the literal 2-char `\n` preserved, exactly as
+# _replace_constant() wrote it via sys.argv, never re-parsed as Python
+# source). Result: Step 0c's stamped pin failed EVERY real build, genuine or
+# forged — an availability bug that would have silently degraded every
+# customer's OIDC/SAML/SCIM (and, pre-LAURA-V2-006, everything else) to
+# COMMUNITY on day one.
+#
+# Fix: mirror _replace_constant()'s own safe-interpolation pattern — pass the
+# values as `sys.argv` (a quoted heredoc marker, `<<'PYEOF'`, so the shell
+# performs ZERO expansion inside the script; argv delivers the bytes to
+# Python unparsed, exactly like _replace_constant() already does for these
+# same values).
+INTEGRITY_ROOT_HASH="$(python3 - \
+    "${MASTER_ANCHOR_SET_JSON}" \
+    "${CODE_LEAF_CERT_JSON}" \
+    "${CODE_LEAF_CERT_SIG}" \
+    "${KILL_LIST_JSON}" \
+    "${CLIENT_DOMAIN_REGISTRY_JSON}" \
+    <<'PYEOF'
+import hashlib, sys
+
+(
+    master_anchor_set_json,
+    code_leaf_cert_json,
+    code_leaf_cert_sig,
+    kill_list_json,
+    client_domain_registry_json,
+) = sys.argv[1:6]
+
 canonical = "\n".join([
-    "MASTER_ANCHOR_SET_JSON=" + """${MASTER_ANCHOR_SET_JSON}""",
-    "CODE_LEAF_CERT_JSON=" + """${CODE_LEAF_CERT_JSON}""",
-    "CODE_LEAF_CERT_SIG=" + """${CODE_LEAF_CERT_SIG}""",
-    "KILL_LIST_JSON=" + """${KILL_LIST_JSON}""",
-    "CLIENT_DOMAIN_REGISTRY_JSON=" + """${CLIENT_DOMAIN_REGISTRY_JSON}""",
+    "MASTER_ANCHOR_SET_JSON=" + master_anchor_set_json,
+    "CODE_LEAF_CERT_JSON=" + code_leaf_cert_json,
+    "CODE_LEAF_CERT_SIG=" + code_leaf_cert_sig,
+    "KILL_LIST_JSON=" + kill_list_json,
+    "CLIENT_DOMAIN_REGISTRY_JSON=" + client_domain_registry_json,
 ])
 print(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
 PYEOF
