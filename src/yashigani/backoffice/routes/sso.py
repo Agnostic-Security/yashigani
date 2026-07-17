@@ -182,7 +182,53 @@ def _emit_mesh_tamper_event(check_type: str, expected_hash: str, actual_hash: st
         pass
 
 
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — this file's OWN copy of the
+# _integrity.py root-of-trust pin. See licensing/verifier.py's module-level
+# comment block above _check_integrity_root_pin() for the full rationale
+# (self-reference solved by hardcoding the expected hash HERE, injected at
+# build time before this file's own SSO_ROUTES_HASH is computed — no
+# circularity) and the named residual (covers only the 5 root-of-trust
+# fields; the rest of _integrity.py stays covered by BUNDLE_SIG/
+# INTEGRITY_HASH). Style: dict-driven verdict lookup, mirroring this file's
+# existing dict-comprehension flavour above. Note the `_mesh_integrity`
+# import alias (this file imports _integrity as _mesh_integrity already).
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_mesh_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_mesh_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_mesh_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_mesh_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_mesh_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    is_placeholder = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH
+
+    reasons = {
+        "placeholder": is_placeholder and not is_dev,
+        "mismatch": (not is_placeholder) and _live_integrity_root_hash() != _EXPECTED_INTEGRITY_ROOT_HASH,
+    }
+    if any(reasons.values()):
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (routes/sso.py) "
+            "— reason=%s (LAURA-V2-005)",
+            [k for k, v in reasons.items() if v],
+        )
+
+
 _check_mesh_full()
+_check_integrity_root_pin()
 
 
 def _licence_hard_gate(feature: str) -> None:

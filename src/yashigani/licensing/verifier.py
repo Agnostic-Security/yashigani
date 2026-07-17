@@ -447,6 +447,112 @@ def _compute_live_hash_bundle_str() -> "tuple[Optional[str], dict[str, Optional[
     return bundle_str, live_hashes
 
 
+# ---------------------------------------------------------------------------
+# LAURA-V2-005 fix (2026-07-17) — pinned root of trust.
+#
+# Root cause closed here: MASTER_ANCHOR_SET_JSON (and everything else in
+# _integrity.py) is a trust STATEMENT, not a trust FACT — nothing previously
+# compared it against any value living outside _integrity.py, so an attacker
+# with local write access could mint their OWN master keypair, embed it as
+# MASTER_ANCHOR_SET_JSON, self-certify a CODE leaf under it, recompute
+# INTEGRITY_HASH/BUNDLE_SIG (both trivially self-consistent, since the
+# attacker holds the private keys they signed with), and self-issue an
+# ENTERPRISE licence — every existing check (T1-T4, POU, mesh full-check,
+# build-integrity chain) passed, because all of them ultimately trust
+# whatever _integrity.py says the root is. Laura's PoC proved this touching
+# ZERO bytes of any of the 7 mesh files (testing_runs/yashigani/
+# licence-v2-redteam-mesh-final-20260717T000000Z/scratch/
+# poc_forge_root_of_trust.py).
+#
+# Fix: hardcode the REAL master anchor pubkey(s) as a Python literal INSIDE
+# THIS FILE (verifier.py — a mesh-protected file, LAURA-V2-003 Phase D) and
+# require EVERY anchor _integrity.py's MASTER_ANCHOR_SET_JSON currently
+# trusts (ACTIVE/RETIRING) to match one of these pins exactly, by re-encoded
+# DER bytes (robust to PEM whitespace/line-ending variance — a naive string
+# comparison is a common source of false-negative pin bugs). An anchor set
+# forged from an attacker's own keypair fails here regardless of how
+# internally self-consistent the rest of the forged chain is, because the
+# pin comparison never reads anything the attacker's edit could have
+# touched. Checking the WHOLE trusted set — not just whichever anchor
+# happened to validate the code leaf — also closes a narrower variant: an
+# attacker who leaves the REAL anchor entry untouched but ADDS a second,
+# self-minted anchor to the SAME MASTER_ANCHOR_SET_JSON list (to self-issue
+# a LICENCE leaf under the added entry, which chain.licence_v5's own
+# anchor-chain check would otherwise accept unconditionally) is caught too —
+# the added anchor is not pinned, so the set as a whole is rejected.
+#
+# Rotation: adding a new pin is a code change to THIS file — reviewed,
+# committed, shipped as a new release — exactly the "coordinated, visible-
+# diff, full-mesh-cost" honest ceiling the rest of this design already
+# accepts as the accepted residual (see the block comment above
+# _check_mesh_full() below). This is deliberately NOT build-time-injected
+# data like VERIFIER_HASH etc.: a pin that could be silently swapped at
+# build time by whoever controls the build pipeline would not be a pin.
+#
+# CURRENT PIN: the licence-hardening-v2 DEMO/interim master anchor "M1"
+# (testing_runs/yashigani/demo-license-system/keys/master_public.pem,
+# CREDENTIALS-20260715.md: "Interim PEM master (real production master =
+# YubiKey PIV, Phase C)"). Production release-prep MUST replace/extend this
+# tuple with the real production master pubkey(s) via the same mechanism —
+# tracked as a release-blocking checklist item, not silently assumed done by
+# this fix.
+#
+# Testability: tests that mint their own throwaway master keypair (as most
+# of this test suite does) monkeypatch _PINNED_MASTER_ANCHOR_PEMS to include
+# their generated pubkey — the same established pattern already used for
+# every other verifier.py internal in this test suite (e.g. _LIVE_HASH_
+# TARGETS, _INTEGRITY_PY_PATH).
+# ---------------------------------------------------------------------------
+
+_PINNED_MASTER_ANCHOR_PEMS: tuple[str, ...] = (
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEDma++nz50wbNWi401tWqderBCXzUr84G\n"
+    "C029LvM6eJo9A2KvvZC6H4js11TAkwyFUyxHG0rhZbTj5GYbmPJNXcMmiRzj4mIf\n"
+    "Za1apDAAPGipJKkzPtXQ/e5DmR7TZ5w3\n"
+    "-----END PUBLIC KEY-----\n",
+)
+
+
+def _pubkey_pem_to_der(pem: str) -> Optional[bytes]:
+    """Load *pem* and re-encode as canonical DER SubjectPublicKeyInfo bytes.
+
+    Robust to whitespace/line-ending variance in the PEM text itself.
+    Returns None on any parse failure (a malformed PEM is treated as
+    non-matching, never as a crash — this runs against attacker-controlled
+    input at module-load time and must never raise)."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        key = serialization.load_pem_public_key(pem.encode("utf-8"))
+        return key.public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except Exception:
+        return None
+
+
+def _pinned_pubkey_ders() -> "frozenset[bytes]":
+    ders = (_pubkey_pem_to_der(pem) for pem in _PINNED_MASTER_ANCHOR_PEMS)
+    return frozenset(der for der in ders if der is not None)
+
+
+def _anchor_set_is_pinned(anchor_set: AnchorSet) -> bool:
+    """True iff EVERY currently-trusted (ACTIVE/RETIRING) anchor in
+    *anchor_set* re-encodes to one of the pinned DER pubkeys above.
+
+    Fails closed (returns False) if the pin tuple itself doesn't parse to
+    at least one usable DER key — refusing to vacuously "trust everything"
+    when the pin is misconfigured."""
+    pinned = _pinned_pubkey_ders()
+    if not pinned:
+        return False
+    for anchor in anchor_set.trusted_anchors():
+        der = _pubkey_pem_to_der(anchor.pubkey_pem)
+        if der is None or der not in pinned:
+            return False
+    return True
+
+
 def _check_build_integrity_chain() -> None:
     """
     §4a steps 1-5: validate the embedded code leaf_cert chains to the
@@ -525,6 +631,32 @@ def _check_build_integrity_chain() -> None:
             actual_hash="<parse_error>",
         )
         return
+
+    # LAURA-V2-005 fix: pin ratification — independent of, and evaluated
+    # BEFORE, the leaf_cert-chains-to-anchor / bundle_sig checks below (a
+    # self-consistent FORGED root would otherwise pass both of those, since
+    # they only ever check internal consistency of whatever _integrity.py
+    # currently claims — see the block comment above _anchor_set_is_pinned()
+    # for the full rationale). Does not return early — falls through to the
+    # existing checks below too, for full diagnostic evidence, mirroring
+    # any_module_mismatch's continue-don't-return style.
+    if not _anchor_set_is_pinned(anchor_set):
+        _integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: embedded MASTER_ANCHOR_SET_JSON "
+            "contains an anchor that does not match any pinned master public "
+            "key — this build's root of trust does not match the pin "
+            "hardcoded in verifier.py (LAURA-V2-005); forcing COMMUNITY tier. "
+            "A self-consistent forged root (attacker's own master+code "
+            "leaf+bundle_sig) would otherwise pass every other check in this "
+            "function, since those only verify internal consistency."
+        )
+        _emit_licence_integrity_violation_event(
+            module="verifier",
+            check_type="anchor_pin_mismatch",
+            expected_hash="<pinned_master_anchor>",
+            actual_hash="<unpinned_anchor_in_set>",
+        )
 
     # LAURA-V2-001/002 fix: live re-derivation from disk, computed entirely
     # in THIS file (external to every one of the 5 protected modules and to
@@ -809,10 +941,106 @@ def get_integrity_status() -> bool:
     return _integrity_violated or _mesh_integrity_violated
 
 
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — brings _integrity.py's OWN
+# root-of-trust fields (MASTER_ANCHOR_SET_JSON / CODE_LEAF_CERT_JSON /
+# CODE_LEAF_CERT_SIG / KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON) under
+# THIS file's independent detection — closing the gap the 7-file mesh above
+# left open: _integrity.py itself was NOT a mesh member, so an attacker
+# could edit ONLY that file — forge their own master anchor set + code
+# leaf + bundle_sig (all internally self-consistent, since they hold the
+# forged private keys) — and every one of the 7 mesh files' peer-hash
+# checks above passed, because none of them ever looked at _integrity.py's
+# bytes at all. (The pin ratification above, _anchor_set_is_pinned(),
+# already independently closes Laura's exact PoC by itself — this is
+# additional, cheaper, non-cryptographic defense-in-depth: a plain hash
+# comparison that fires even before any signature is touched.)
+#
+# Self-reference, solved: _integrity.py cannot carry the expected hash of
+# its OWN root-of-trust fields — that's circular (an attacker rewriting the
+# file rewrites its own expected value too, exactly the class of problem
+# INTEGRITY_HASH's blank-then-hash convention solves for the WHOLE file).
+# Here the expected hash is instead a Python literal HARDCODED IN THIS FILE
+# (verifier.py's mesh-protected bytes), injected at build time by
+# scripts/inject_hashes.sh BEFORE this file's own SHA-256 (VERIFIER_HASH) is
+# computed — so it is itself covered by the SAME peer-hash mesh above, with
+# NO circularity: this constant depends only on _integrity.py's root-data
+# fields (finalized earlier in the build pipeline), never on this file's own
+# bytes. Each of the other 6 mesh files carries its OWN independent copy of
+# this same pin (see their module docstrings) — editing verifier.py to
+# remove or weaken this check is caught the same way any other verifier.py
+# edit is: by the 6 untouched peers' own VERIFIER_HASH comparison.
+#
+# Named residual (honest ceiling): this hash covers ONLY the 5 root-of-trust
+# fields named above — NOT the per-module *_HASH constants / INTEGRITY_HASH
+# / BUNDLE_SIG / MESH_TOPOLOGY_JSON, which are deliberately excluded because
+# covering them here WOULD be circular (their correct build-time values
+# depend on the mesh files' own post-stamp bytes, including this constant).
+# Those other fields remain protected instead by the pre-existing
+# BUNDLE_SIG/INTEGRITY_HASH blank-then-hash mechanism (LAURA-V2-001/002) —
+# editing them without a matching re-sign is already caught there, and
+# re-signing requires the code leaf's private key, which in turn must chain
+# to a PINNED anchor per _anchor_set_is_pinned() above. Combined, every
+# field of _integrity.py is now covered by at least one external,
+# un-suppressible check.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    """SHA-256 of a canonical string built from _integrity.py's CURRENT
+    (possibly-tampered) root-of-trust field VALUES — read live off the
+    already-imported _integrity module, which always reflects whatever is
+    on disk right now, tampered or not."""
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    """Independent 8th-member check: _integrity.py's root-of-trust fields
+    against THIS file's own hardcoded pin (see block comment above). A
+    genuinely separate code path from _check_mesh_full() (different target,
+    different constant) — style: plain sequential checks, verifier.py's
+    signature shape throughout this file."""
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH:
+        if not is_dev:
+            _mesh_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: root-of-trust pin (verifier.py) "
+                "— _EXPECTED_INTEGRITY_ROOT_HASH is still a placeholder in a "
+                "non-dev environment; hard-refusing"
+            )
+        return
+
+    live = _live_integrity_root_hash()
+    if live != _EXPECTED_INTEGRITY_ROOT_HASH:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (verifier.py) — "
+            "_integrity.py's root-of-trust fields (MASTER_ANCHOR_SET_JSON/"
+            "CODE_LEAF_CERT_JSON/CODE_LEAF_CERT_SIG/KILL_LIST_JSON/"
+            "CLIENT_DOMAIN_REGISTRY_JSON) do not match this file's hardcoded "
+            "pin (expected=%s, actual=%s) — _integrity.py has been modified "
+            "since this build was signed (LAURA-V2-005)",
+            _EXPECTED_INTEGRITY_ROOT_HASH[:16], live[:16],
+        )
+
+
 # Run at module load.
 _check_self_integrity()
 _check_build_integrity_chain()
 _check_mesh_full()
+_check_integrity_root_pin()
 
 
 # ---------------------------------------------------------------------------

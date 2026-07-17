@@ -256,6 +256,63 @@ def get_mesh_integrity_status() -> bool:
     return _mesh_checker.violated
 
 
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — this file's OWN copy of the
+# _integrity.py root-of-trust pin. See licensing/verifier.py's module-level
+# comment block above _check_integrity_root_pin() for the full rationale
+# (self-reference solved by hardcoding the expected hash HERE, injected at
+# build time before this file's own GATE_MIDDLEWARE_HASH is computed — no
+# circularity) and the named residual (covers only the 5 root-of-trust
+# fields; the rest of _integrity.py stays covered by BUNDLE_SIG/
+# INTEGRITY_HASH). Style: a standalone module-level function that writes
+# straight into `_mesh_checker.violated`, deliberately NOT a method on
+# _MeshFullChecker (a different code shape from the class-based mesh check
+# above, matching this file's own "distinct shape per check" convention).
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH:
+        if not is_dev:
+            _mesh_checker.violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: root-of-trust pin "
+                "(gate_middleware.py) — _EXPECTED_INTEGRITY_ROOT_HASH is "
+                "still a placeholder in a non-dev environment; hard-refusing"
+            )
+        return
+
+    live = _live_integrity_root_hash()
+    if live != _EXPECTED_INTEGRITY_ROOT_HASH:
+        _mesh_checker.violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin "
+            "(gate_middleware.py) — _integrity.py's root-of-trust fields do "
+            "not match this file's hardcoded pin (expected=%s, actual=%s) — "
+            "_integrity.py has been modified since this build was signed "
+            "(LAURA-V2-005)",
+            _EXPECTED_INTEGRITY_ROOT_HASH[:16], live[:16],
+        )
+
+
+_check_integrity_root_pin()
+
+
 def _emit_mesh_tamper_event(check_type: str, expected_hash: str, actual_hash: str) -> None:
     """
     Emit a tamper-evidence audit event AT THE POINT a licence-gated feature

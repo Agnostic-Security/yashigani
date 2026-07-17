@@ -156,6 +156,41 @@ this build embedded before):
       registry is not yet populated by any build-tooling in Phase B-CORE;
       Su's licgen/registry work is the intended writer).
 
+Root-of-trust pin (LAURA-V2-005, 2026-07-17)
+---------------------------------------------
+Everything in THIS file — including MASTER_ANCHOR_SET_JSON, CODE_LEAF_CERT_
+JSON/SIG and BUNDLE_SIG above — is a trust STATEMENT, not a trust FACT: it
+is attacker-writable local source, exactly like every other constant here.
+Laura's LAURA-V2-005 finding proved that an attacker with local write access
+could edit ONLY this file — mint their own master keypair, embed it as
+MASTER_ANCHOR_SET_JSON, self-certify a CODE leaf under it, recompute
+INTEGRITY_HASH/BUNDLE_SIG (both trivially self-consistent, since they hold
+the private keys they signed with) — and self-issue an ENTERPRISE licence,
+with every one of the 7 mesh files (verifier.py/enforcer.py/gate_middleware.
+py/sso/oidc.py/sso/saml.py/backoffice/routes/{sso,scim}.py) reporting clean,
+because none of them looks at this file's bytes at all.
+
+Fixed by moving the root of trust OUTSIDE this file entirely:
+  1. verifier.py hardcodes the REAL master anchor pubkey(s) as a Python
+     literal (`_PINNED_MASTER_ANCHOR_PEMS`) and requires every anchor
+     MASTER_ANCHOR_SET_JSON claims to be currently trusted to match one of
+     them, by re-encoded DER bytes (`_anchor_set_is_pinned()`). A forged
+     anchor set fails this regardless of internal self-consistency.
+  2. Each of the 7 mesh files ALSO carries its own hardcoded expected hash
+     of this file's root-of-trust fields (MASTER_ANCHOR_SET_JSON/
+     CODE_LEAF_CERT_JSON/CODE_LEAF_CERT_SIG/KILL_LIST_JSON/CLIENT_DOMAIN_
+     REGISTRY_JSON — see `_EXPECTED_INTEGRITY_ROOT_HASH` in each of those
+     files) — this file cannot carry the expected hash of its own root data
+     (circular), so the expected value lives in the mesh files instead,
+     injected at build time BEFORE those files' own SHA-256 is computed.
+     Edits to THIS file's root-of-trust fields alone are now caught by
+     EVERY one of the 7 mesh files independently, even without touching any
+     signature.
+Together: an attacker can no longer substitute the root of trust by editing
+only this file. Substitution now requires either the real master private
+key, or a coordinated edit of this file PLUS at least one of the 7
+mesh-protected files (which the existing mesh already catches).
+
 Placeholder sentinel
 --------------------
 When any hash/chain constant still contains _PLACEHOLDER_INTEGRITY the

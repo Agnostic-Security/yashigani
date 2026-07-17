@@ -27,22 +27,42 @@
 #      work of a licence-gated capability and each carry their own local
 #      `_licence_hard_gate()`. The bundle is now ELEVEN lines (was six).
 #
-# Steps (ORDER MATTERS — INTEGRITY_HASH in Step 4 must be computed AFTER
-# every OTHER constant is finalised, so it actually covers them):
+#      2026-07-17 fix (LAURA-V2-005 — root-of-trust substitution via
+#      _integrity.py alone, zero mesh files touched): the root-of-trust
+#      constants (MASTER_ANCHOR_SET_JSON/CODE_LEAF_CERT_JSON/
+#      CODE_LEAF_CERT_SIG/KILL_LIST_JSON/CLIENT_DOMAIN_REGISTRY_JSON) are now
+#      embedded FIRST (Step 0a/0b, was Steps 2/3), and a derived pin
+#      (_EXPECTED_INTEGRITY_ROOT_HASH — Step 0c) is stamped into ALL 7 mesh
+#      files' own bytes BEFORE their SHA-256 (Step 1) is taken, so editing
+#      ONLY _integrity.py's root-of-trust fields is now caught by every one
+#      of the 7 mesh files independently (see licensing/verifier.py's
+#      module-level comment above _check_integrity_root_pin()). verifier.py
+#      separately hardcodes the real master pubkey(s)
+#      (_PINNED_MASTER_ANCHOR_PEMS) and rejects any anchor set that doesn't
+#      chain to one — this is NOT build-injected, it is a source-level pin
+#      that changes only via a reviewed code release.
+#
+# Steps (ORDER MATTERS — Step 0c's pin must be stamped into the 7 mesh files
+# BEFORE Step 1 hashes them, and INTEGRITY_HASH in Step 4 must be computed
+# AFTER every OTHER constant is finalised, so it actually covers them):
+#   Step 0a: Embed the chain-of-trust root constants — MASTER_ANCHOR_SET_JSON,
+#            CODE_LEAF_CERT_JSON, CODE_LEAF_CERT_SIG — from files produced by
+#            `licgen release` / `keygen.py leaf new` + `licgen anchor-set emit`.
+#   Step 0b: Optionally embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
+#            provided (both have SAFE defaults "[]"/"{}" already in source —
+#            unlike Step 0a, an unset Step 0b is not a placeholder failure).
+#   Step 0c: Derive _EXPECTED_INTEGRITY_ROOT_HASH from the Step 0a/0b values
+#            and stamp it into all 7 mesh files (LAURA-V2-005).
 #   Step 1: Compute SHA-256 of 10 licensing/agent/identity/sso/routes/
-#           middleware modules → write into VERIFIER_HASH/ENFORCER_HASH/
-#           LOADER_HASH/AGENTS_REGISTRY_HASH/IDENTITY_REGISTRY_HASH (T1-T4
-#           bundle — unchanged v1 mechanism) plus OIDC_MODULE_HASH/
-#           SAML_MODULE_HASH/SSO_ROUTES_HASH/SCIM_ROUTES_HASH/
-#           GATE_MIDDLEWARE_HASH (POU bundle, added 2026-07-16).
-#   Step 2: Embed the chain-of-trust constants — MASTER_ANCHOR_SET_JSON,
-#           CODE_LEAF_CERT_JSON, CODE_LEAF_CERT_SIG — from files produced by
-#           `licgen release` / `keygen.py leaf new` + `licgen anchor-set emit`.
-#   Step 3: Optionally embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
-#           provided (both have SAFE defaults "[]"/"{}" already in source —
-#           unlike Steps 1-2, an unset Step 3 is not a placeholder failure).
+#           middleware modules (now including the Step 0c stamp) → write
+#           into VERIFIER_HASH/ENFORCER_HASH/LOADER_HASH/AGENTS_REGISTRY_
+#           HASH/IDENTITY_REGISTRY_HASH (T1-T4 bundle — unchanged v1
+#           mechanism) plus OIDC_MODULE_HASH/SAML_MODULE_HASH/SSO_ROUTES_
+#           HASH/SCIM_ROUTES_HASH/GATE_MIDDLEWARE_HASH (POU bundle, added
+#           2026-07-16).
+#   Step 3c: Mesh full topology (member-order polymorphism, unchanged).
 #   Step 4: Compute INTEGRITY_HASH — the blank-then-hash self-referential
-#           digest of _integrity.py's CURRENT bytes (Steps 1-3 already
+#           digest of _integrity.py's CURRENT bytes (Steps 0-3 already
 #           embedded; the INTEGRITY_HASH and BUNDLE_SIG line-values are
 #           blanked to a fixed placeholder before hashing, regardless of
 #           their current contents) → write it.
@@ -260,13 +280,18 @@ print(json.dumps(data, sort_keys=True, separators=(',', ':')))
 
 _assert_no_placeholders() {
     local _file="$1"
-    python3 - "$_file" <<'PYEOF'
+    # Second arg (optional): space-separated constant names to check instead
+    # of the default _integrity.py list — used for the 7 mesh files' own
+    # `_EXPECTED_INTEGRITY_ROOT_HASH` pin (LAURA-V2-005, 2026-07-17).
+    local _consts="${2:-}"
+    python3 - "$_file" "$_consts" <<'PYEOF'
 import sys, re, pathlib
 
 path = pathlib.Path(sys.argv[1])
+override = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2] else None
 content = path.read_text(encoding="utf-8")
 
-INJECTED_CONSTS = [
+INJECTED_CONSTS = override or [
     "VERIFIER_HASH", "ENFORCER_HASH", "LOADER_HASH",
     "AGENTS_REGISTRY_HASH", "IDENTITY_REGISTRY_HASH",
     "OIDC_MODULE_HASH", "SAML_MODULE_HASH", "SSO_ROUTES_HASH",
@@ -297,6 +322,97 @@ if errors:
     sys.exit(1)
 PYEOF
 }
+
+# ---------------------------------------------------------------------------
+# STEP 0: Embed the chain-of-trust root-of-trust constants into _integrity.py
+#         (MASTER_ANCHOR_SET_JSON, CODE_LEAF_CERT_JSON, CODE_LEAF_CERT_SIG,
+#         optionally KILL_LIST_JSON/CLIENT_DOMAIN_REGISTRY_JSON) — MOVED
+#         AHEAD of Step 1 (LAURA-V2-005, 2026-07-17): the new root-of-trust
+#         pin (Step 0c below) must be computed from these FINAL values and
+#         stamped into the 7 mesh files BEFORE their own SHA-256 is taken in
+#         Step 1 — otherwise stamping them afterward would silently
+#         invalidate the module hashes Step 1 already wrote. Order MATTERS:
+#         0a/0b (embed root data) -> 0c (derive + stamp the pin into the 7
+#         mesh files) -> 1 (hash the NOW-stamped mesh files, among others).
+# ---------------------------------------------------------------------------
+
+printf '[inject_hashes v2] Step 0a: embedding master anchor-SET + code leaf_cert + leaf_cert_sig\n'
+
+MASTER_ANCHOR_SET_JSON="$(_compact_json_file "${MASTER_ANCHOR_SET_PATH}")"
+CODE_LEAF_CERT_JSON="$(_compact_json_file "${CODE_LEAF_CERT_PATH}")"
+CODE_LEAF_CERT_SIG="$(tr -d '\n' < "${CODE_LEAF_CERT_SIG_PATH}")"
+
+[ -n "${MASTER_ANCHOR_SET_JSON}" ] || { printf 'ERROR: MASTER_ANCHOR_SET_PATH produced empty JSON\n' >&2; exit 1; }
+[ -n "${CODE_LEAF_CERT_JSON}" ] || { printf 'ERROR: CODE_LEAF_CERT_PATH produced empty JSON\n' >&2; exit 1; }
+[ -n "${CODE_LEAF_CERT_SIG}" ] || { printf 'ERROR: CODE_LEAF_CERT_SIG_PATH is empty\n' >&2; exit 1; }
+
+_replace_constant "${INTEGRITY_PY}" "MASTER_ANCHOR_SET_JSON" "${MASTER_ANCHOR_SET_JSON}"
+_replace_constant "${INTEGRITY_PY}" "CODE_LEAF_CERT_JSON" "${CODE_LEAF_CERT_JSON}"
+_replace_constant "${INTEGRITY_PY}" "CODE_LEAF_CERT_SIG" "${CODE_LEAF_CERT_SIG}"
+
+printf '[inject_hashes v2] MASTER_ANCHOR_SET_JSON = %s...\n' "${MASTER_ANCHOR_SET_JSON:0:64}"
+printf '[inject_hashes v2] CODE_LEAF_CERT_JSON    = %s...\n' "${CODE_LEAF_CERT_JSON:0:64}"
+printf '[inject_hashes v2] CODE_LEAF_CERT_SIG     = %s...\n' "${CODE_LEAF_CERT_SIG:0:32}"
+printf '[inject_hashes v2] Step 0a complete\n'
+
+if [ -n "${KILL_LIST_PATH:-}" ]; then
+    printf '[inject_hashes v2] Step 0b: embedding KILL_LIST_JSON from %s\n' "${KILL_LIST_PATH}"
+    KILL_LIST_JSON="$(_compact_json_file "${KILL_LIST_PATH}")"
+    _replace_constant "${INTEGRITY_PY}" "KILL_LIST_JSON" "${KILL_LIST_JSON}"
+    printf '[inject_hashes v2] KILL_LIST_JSON = %s...\n' "${KILL_LIST_JSON:0:64}"
+else
+    printf '[inject_hashes v2] Step 0b: KILL_LIST_PATH unset — leaving safe default "[]"\n'
+    KILL_LIST_JSON="[]"
+fi
+
+if [ -n "${CLIENT_DOMAIN_REGISTRY_PATH:-}" ]; then
+    printf '[inject_hashes v2] Step 0b: embedding CLIENT_DOMAIN_REGISTRY_JSON from %s\n' "${CLIENT_DOMAIN_REGISTRY_PATH}"
+    CLIENT_DOMAIN_REGISTRY_JSON="$(_compact_json_file "${CLIENT_DOMAIN_REGISTRY_PATH}")"
+    _replace_constant "${INTEGRITY_PY}" "CLIENT_DOMAIN_REGISTRY_JSON" "${CLIENT_DOMAIN_REGISTRY_JSON}"
+    printf '[inject_hashes v2] CLIENT_DOMAIN_REGISTRY_JSON = %s...\n' "${CLIENT_DOMAIN_REGISTRY_JSON:0:64}"
+else
+    printf '[inject_hashes v2] Step 0b: CLIENT_DOMAIN_REGISTRY_PATH unset — leaving safe default "{}"\n'
+    CLIENT_DOMAIN_REGISTRY_JSON="{}"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 0c: Derive _EXPECTED_INTEGRITY_ROOT_HASH (LAURA-V2-005, 2026-07-17)
+#          from the root-of-trust fields JUST embedded above, and stamp the
+#          SAME value into each of the 7 mesh files' own local
+#          `_EXPECTED_INTEGRITY_ROOT_HASH` constant — see
+#          licensing/verifier.py's module-level comment block above
+#          `_check_integrity_root_pin()` for the full self-reference
+#          rationale (this MUST happen before Step 1 computes the mesh
+#          files' own module hashes, or stamping them here would silently
+#          invalidate those hashes).
+#
+#          MUST stay byte-identical to verifier._live_integrity_root_hash()
+#          (and its sibling copy in each of the other 6 mesh files) — same
+#          5-field canonical "KEY=value" \n-joined string, SHA-256 hex.
+# ---------------------------------------------------------------------------
+
+printf '[inject_hashes v2] Step 0c: computing + stamping root-of-trust pin (LAURA-V2-005)\n'
+
+INTEGRITY_ROOT_HASH="$(python3 - <<PYEOF
+import hashlib
+canonical = "\n".join([
+    "MASTER_ANCHOR_SET_JSON=" + """${MASTER_ANCHOR_SET_JSON}""",
+    "CODE_LEAF_CERT_JSON=" + """${CODE_LEAF_CERT_JSON}""",
+    "CODE_LEAF_CERT_SIG=" + """${CODE_LEAF_CERT_SIG}""",
+    "KILL_LIST_JSON=" + """${KILL_LIST_JSON}""",
+    "CLIENT_DOMAIN_REGISTRY_JSON=" + """${CLIENT_DOMAIN_REGISTRY_JSON}""",
+])
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+PYEOF
+)"
+[ -n "${INTEGRITY_ROOT_HASH}" ] || { printf 'ERROR: INTEGRITY_ROOT_HASH computation produced empty output\n' >&2; exit 1; }
+
+for _mesh_file in "$VERIFIER_PY" "$ENFORCER_PY" "$GATE_MIDDLEWARE_PY" "$OIDC_MODULE_PY" "$SAML_MODULE_PY" "$SSO_ROUTES_PY" "$SCIM_ROUTES_PY"; do
+    _replace_constant "${_mesh_file}" "_EXPECTED_INTEGRITY_ROOT_HASH" "${INTEGRITY_ROOT_HASH}"
+done
+
+printf '[inject_hashes v2] _EXPECTED_INTEGRITY_ROOT_HASH = %s (stamped into all 7 mesh files)\n' "${INTEGRITY_ROOT_HASH}"
+printf '[inject_hashes v2] Step 0c complete\n'
 
 # ---------------------------------------------------------------------------
 # STEP 1: Compute 5 module hashes (T1-T4 bundle — unchanged v1 mechanism)
@@ -340,56 +456,13 @@ _replace_constant "${INTEGRITY_PY}" "GATE_MIDDLEWARE_HASH" "${GATE_MIDDLEWARE_HA
 printf '[inject_hashes v2] Step 1 complete\n'
 
 # ---------------------------------------------------------------------------
-# STEP 2: Embed the chain-of-trust constants (§2.2/§3.1).
+# STEPS 2/3 (Steps 2 "embed chain-of-trust constants" and 3a/3b "embed
+# KILL_LIST_JSON/CLIENT_DOMAIN_REGISTRY_JSON") — MOVED to Step 0a/0b above
+# (LAURA-V2-005, 2026-07-17): the root-of-trust pin computed there
+# (Step 0c) must be derived from these FINAL values and stamped into the 7
+# mesh files BEFORE Step 1's module hashes are taken, so embedding them here
+# (after Step 1) would be too late. See the Step 0 block comment above.
 # ---------------------------------------------------------------------------
-
-printf '[inject_hashes v2] Step 2: embedding master anchor-SET + code leaf_cert + leaf_cert_sig\n'
-
-MASTER_ANCHOR_SET_JSON="$(_compact_json_file "${MASTER_ANCHOR_SET_PATH}")"
-CODE_LEAF_CERT_JSON="$(_compact_json_file "${CODE_LEAF_CERT_PATH}")"
-CODE_LEAF_CERT_SIG="$(tr -d '\n' < "${CODE_LEAF_CERT_SIG_PATH}")"
-
-[ -n "${MASTER_ANCHOR_SET_JSON}" ] || { printf 'ERROR: MASTER_ANCHOR_SET_PATH produced empty JSON\n' >&2; exit 1; }
-[ -n "${CODE_LEAF_CERT_JSON}" ] || { printf 'ERROR: CODE_LEAF_CERT_PATH produced empty JSON\n' >&2; exit 1; }
-[ -n "${CODE_LEAF_CERT_SIG}" ] || { printf 'ERROR: CODE_LEAF_CERT_SIG_PATH is empty\n' >&2; exit 1; }
-
-_replace_constant "${INTEGRITY_PY}" "MASTER_ANCHOR_SET_JSON" "${MASTER_ANCHOR_SET_JSON}"
-_replace_constant "${INTEGRITY_PY}" "CODE_LEAF_CERT_JSON" "${CODE_LEAF_CERT_JSON}"
-_replace_constant "${INTEGRITY_PY}" "CODE_LEAF_CERT_SIG" "${CODE_LEAF_CERT_SIG}"
-
-printf '[inject_hashes v2] MASTER_ANCHOR_SET_JSON = %s...\n' "${MASTER_ANCHOR_SET_JSON:0:64}"
-printf '[inject_hashes v2] CODE_LEAF_CERT_JSON    = %s...\n' "${CODE_LEAF_CERT_JSON:0:64}"
-printf '[inject_hashes v2] CODE_LEAF_CERT_SIG     = %s...\n' "${CODE_LEAF_CERT_SIG:0:32}"
-printf '[inject_hashes v2] Step 2 complete\n'
-
-# ---------------------------------------------------------------------------
-# STEP 3: Optional — embed KILL_LIST_JSON / CLIENT_DOMAIN_REGISTRY_JSON if
-#         provided. Both have SAFE defaults ("[]"/"{}") already in source —
-#         unset is a legitimate, non-placeholder state (unlike Steps 1-2).
-#         Both are now COVERED by INTEGRITY_HASH+BUNDLE_SIG (Steps 4-5,
-#         LAURA-V2-002) even when left at their safe defaults — editing
-#         either one later, outside this pipeline, is detected at verify
-#         time because it changes _integrity.py's bytes without a matching
-#         re-sign.
-# ---------------------------------------------------------------------------
-
-if [ -n "${KILL_LIST_PATH:-}" ]; then
-    printf '[inject_hashes v2] Step 3a: embedding KILL_LIST_JSON from %s\n' "${KILL_LIST_PATH}"
-    KILL_LIST_JSON="$(_compact_json_file "${KILL_LIST_PATH}")"
-    _replace_constant "${INTEGRITY_PY}" "KILL_LIST_JSON" "${KILL_LIST_JSON}"
-    printf '[inject_hashes v2] KILL_LIST_JSON = %s...\n' "${KILL_LIST_JSON:0:64}"
-else
-    printf '[inject_hashes v2] Step 3a: KILL_LIST_PATH unset — leaving safe default "[]"\n'
-fi
-
-if [ -n "${CLIENT_DOMAIN_REGISTRY_PATH:-}" ]; then
-    printf '[inject_hashes v2] Step 3b: embedding CLIENT_DOMAIN_REGISTRY_JSON from %s\n' "${CLIENT_DOMAIN_REGISTRY_PATH}"
-    CLIENT_DOMAIN_REGISTRY_JSON="$(_compact_json_file "${CLIENT_DOMAIN_REGISTRY_PATH}")"
-    _replace_constant "${INTEGRITY_PY}" "CLIENT_DOMAIN_REGISTRY_JSON" "${CLIENT_DOMAIN_REGISTRY_JSON}"
-    printf '[inject_hashes v2] CLIENT_DOMAIN_REGISTRY_JSON = %s...\n' "${CLIENT_DOMAIN_REGISTRY_JSON:0:64}"
-else
-    printf '[inject_hashes v2] Step 3b: CLIENT_DOMAIN_REGISTRY_PATH unset — leaving safe default "{}"\n'
-fi
 
 # ---------------------------------------------------------------------------
 # STEP 3c: Mesh FULL topology (licence-hardening-v2 Phase D, LAURA-V2-003
@@ -531,5 +604,13 @@ printf '[inject_hashes v2] Step 5 complete\n'
 
 _assert_no_placeholders "${INTEGRITY_PY}"
 
+# LAURA-V2-005: also assert the 7 mesh files' own root-of-trust pin was
+# actually stamped (Step 0c) — a build that skipped that step must fail
+# closed the same way a missing VERIFIER_HASH etc. does.
+for _mesh_file in "$VERIFIER_PY" "$ENFORCER_PY" "$GATE_MIDDLEWARE_PY" "$OIDC_MODULE_PY" "$SAML_MODULE_PY" "$SSO_ROUTES_PY" "$SCIM_ROUTES_PY"; do
+    _assert_no_placeholders "${_mesh_file}" "_EXPECTED_INTEGRITY_ROOT_HASH"
+done
+
 printf '[inject_hashes v2] All steps complete. _integrity.py is fully injected (chain-of-trust).\n'
 printf '[inject_hashes v2] Final INTEGRITY_HASH: %s\n' "${INTEGRITY_HASH}"
+printf '[inject_hashes v2] Final _EXPECTED_INTEGRITY_ROOT_HASH (all 7 mesh files): %s\n' "${INTEGRITY_ROOT_HASH}"
