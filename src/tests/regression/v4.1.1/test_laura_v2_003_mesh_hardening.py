@@ -578,3 +578,169 @@ class TestAuditEmitOnGateInvocation:
         finally:
             enforcer_mod._license = original
         assert fake_audit_writer.events == []
+
+
+# ---------------------------------------------------------------------------
+# LAURA-V2-005 (2026-07-17): root-of-trust substitution via _integrity.py
+# ALONE — zero of the 7 mesh files touched. Laura's PoC: forge an entirely
+# self-consistent master keypair + code leaf + bundle_sig (all internally
+# consistent, since she holds the forged private keys), embed it into
+# _integrity.py's MASTER_ANCHOR_SET_JSON/CODE_LEAF_CERT_JSON/
+# CODE_LEAF_CERT_SIG/BUNDLE_SIG — leaving all 7 mesh files byte-for-byte
+# pristine. Every check above (Phase D complete-graph mesh) reported clean,
+# because none of it ever looked at _integrity.py's bytes.
+#
+# Fix under test here: each of the 7 mesh files now ALSO carries its own
+# hardcoded `_EXPECTED_INTEGRITY_ROOT_HASH` pin of _integrity.py's 5
+# root-of-trust fields (see licensing/verifier.py's module-level comment
+# above _check_integrity_root_pin()) — an edit confined to ONLY
+# _integrity.py's root-of-trust fields is now caught by every one of the 7
+# mesh files independently, exactly mirroring the completeness property the
+# rest of this file already proves for the original 7-way peer-hash mesh.
+# ---------------------------------------------------------------------------
+
+_ROOT_PIN_CHECK = {
+    "VERIFIER": verifier_mod._check_integrity_root_pin,
+    "ENFORCER": enforcer_mod._check_enforcer_root_pin,
+    "GATE_MIDDLEWARE": gate_mw_mod._check_integrity_root_pin,
+    "OIDC": oidc_mod._check_integrity_root_pin,
+    "SAML": saml_mod._check_integrity_root_pin,
+    "SSO_ROUTES": sso_routes._check_integrity_root_pin,
+    "SCIM_ROUTES": scim_routes._check_integrity_root_pin,
+}
+_ROOT_PIN_MODULE = {
+    "VERIFIER": verifier_mod,
+    "ENFORCER": enforcer_mod,
+    "GATE_MIDDLEWARE": gate_mw_mod,
+    "OIDC": oidc_mod,
+    "SAML": saml_mod,
+    "SSO_ROUTES": sso_routes,
+    "SCIM_ROUTES": scim_routes,
+}
+_ROOT_PIN_STATUS_GETTER = {
+    "VERIFIER": verifier_mod.get_mesh_integrity_status,
+    "ENFORCER": enforcer_mod.get_enforcer_mesh_integrity_status,
+    "GATE_MIDDLEWARE": lambda: gate_mw_mod._mesh_checker.violated,
+    "OIDC": oidc_mod.get_mesh_integrity_status,
+    "SAML": saml_mod.get_mesh_integrity_status,
+    "SSO_ROUTES": sso_routes.get_mesh_integrity_status,
+    "SCIM_ROUTES": scim_routes.get_mesh_integrity_status,
+}
+
+_TEST_ROOT_ANCHOR_SET_JSON = json.dumps([{
+    "anchor_id": "M1-test", "pubkey_pem": "test-pinned-pubkey-pem-placeholder",
+    "alg": "ecdsa-p384-sha384", "status": "active", "added": "2026-07-17T00:00:00+00:00",
+}])
+_TEST_ROOT_CODE_LEAF_CERT_JSON = '{"role":"code","client_id":"*","serial":"code-leaf-test"}'
+_TEST_ROOT_CODE_LEAF_CERT_SIG = "test-code-leaf-cert-sig-b64"
+_TEST_ROOT_KILL_LIST_JSON = "[]"
+_TEST_ROOT_CLIENT_DOMAIN_REGISTRY_JSON = "{}"
+
+
+def _test_root_data_hash() -> str:
+    """Mirrors verifier._live_integrity_root_hash() / each mesh file's own
+    copy exactly — the SAME 5-field canonical string + SHA-256 algorithm."""
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_TEST_ROOT_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_TEST_ROOT_CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_TEST_ROOT_CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_TEST_ROOT_KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_TEST_ROOT_CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture()
+def clean_root_pinned_build(monkeypatch, clean_signed_build):
+    """Extends clean_signed_build: embeds a fixed set of root-of-trust field
+    VALUES into _integrity.py and stamps the matching pin into all 7 mesh
+    files' own `_EXPECTED_INTEGRITY_ROOT_HASH` — a genuinely clean state for
+    the NEW LAURA-V2-005 check, layered on top of the already-clean 7-way
+    peer-hash mesh state clean_signed_build provides."""
+    monkeypatch.setattr(integrity_mod, "MASTER_ANCHOR_SET_JSON", _TEST_ROOT_ANCHOR_SET_JSON)
+    monkeypatch.setattr(integrity_mod, "CODE_LEAF_CERT_JSON", _TEST_ROOT_CODE_LEAF_CERT_JSON)
+    monkeypatch.setattr(integrity_mod, "CODE_LEAF_CERT_SIG", _TEST_ROOT_CODE_LEAF_CERT_SIG)
+    monkeypatch.setattr(integrity_mod, "KILL_LIST_JSON", _TEST_ROOT_KILL_LIST_JSON)
+    monkeypatch.setattr(integrity_mod, "CLIENT_DOMAIN_REGISTRY_JSON", _TEST_ROOT_CLIENT_DOMAIN_REGISTRY_JSON)
+
+    expected = _test_root_data_hash()
+    for mod in _ROOT_PIN_MODULE.values():
+        monkeypatch.setattr(mod, "_EXPECTED_INTEGRITY_ROOT_HASH", expected)
+    yield expected
+
+
+def _run_all_root_pin_checks() -> None:
+    for check in _ROOT_PIN_CHECK.values():
+        check()
+
+
+class TestLauraV2005RootOfTrustPinCleanBuild:
+    def test_zero_violations_on_clean_root_pinned_build(self, clean_root_pinned_build):
+        _run_all_root_pin_checks()
+        violated = {role: getter() for role, getter in _ROOT_PIN_STATUS_GETTER.items()}
+        assert not any(violated.values()), f"false positive on clean root-pinned build: {violated}"
+
+
+class TestLauraV2005ExactPoCReproduced:
+    """The exact Laura PoC shape: edit ONLY _integrity.py's root-of-trust
+    fields (here, just MASTER_ANCHOR_SET_JSON — simulating a self-forged
+    anchor set), leaving every one of the 7 mesh files' OWN
+    `_EXPECTED_INTEGRITY_ROOT_HASH` pin untouched (still pointing at the
+    REAL, pristine root data). Every one of the 7 files must independently
+    detect the mismatch — none of them may depend on any OTHER file's
+    check having already fired."""
+
+    def test_anchor_set_tamper_alone_caught_by_every_one_of_seven(self, monkeypatch, clean_root_pinned_build):
+        monkeypatch.setattr(integrity_mod, "MASTER_ANCHOR_SET_JSON", json.dumps([{
+            "anchor_id": "attacker-forged-master-1",
+            "pubkey_pem": "attacker-controlled-pubkey-pem",
+            "alg": "ecdsa-p384-sha384", "status": "active", "added": "2026-07-17T00:00:00+00:00",
+        }]))
+        # Deliberately do NOT touch any of the 7 mesh files' pins or bytes.
+
+        _run_all_root_pin_checks()
+        violated = {role: getter() for role, getter in _ROOT_PIN_STATUS_GETTER.items()}
+        assert all(violated.values()), (
+            f"LAURA-V2-005 REGRESSION: a root-of-trust substitution confined to "
+            f"_integrity.py alone (zero mesh files touched) was not caught by "
+            f"every one of the 7 mesh files: {violated}"
+        )
+
+    def test_code_leaf_cert_tamper_alone_caught_by_every_one_of_seven(self, monkeypatch, clean_root_pinned_build):
+        monkeypatch.setattr(
+            integrity_mod, "CODE_LEAF_CERT_JSON",
+            '{"role":"code","client_id":"*","serial":"attacker-forged-leaf"}',
+        )
+        _run_all_root_pin_checks()
+        violated = {role: getter() for role, getter in _ROOT_PIN_STATUS_GETTER.items()}
+        assert all(violated.values()), violated
+
+    def test_bundle_and_leaf_sig_tamper_alone_caught_by_every_one_of_seven(self, monkeypatch, clean_root_pinned_build):
+        monkeypatch.setattr(integrity_mod, "CODE_LEAF_CERT_SIG", "attacker-forged-sig-b64")
+        _run_all_root_pin_checks()
+        violated = {role: getter() for role, getter in _ROOT_PIN_STATUS_GETTER.items()}
+        assert all(violated.values()), violated
+
+    def test_kill_list_tamper_alone_caught_by_every_one_of_seven(self, monkeypatch, clean_root_pinned_build):
+        """The narrower, pre-existing LAURA-V2-002 scenario (KILL_LIST_JSON
+        edited alone) is ALSO now caught by this cheaper, non-cryptographic
+        check — defense in depth alongside the existing INTEGRITY_HASH/
+        BUNDLE_SIG mechanism."""
+        monkeypatch.setattr(integrity_mod, "KILL_LIST_JSON", '[{"type":"leaf","id":"unrevoke-me"}]')
+        _run_all_root_pin_checks()
+        violated = {role: getter() for role, getter in _ROOT_PIN_STATUS_GETTER.items()}
+        assert all(violated.values()), violated
+
+
+class TestLauraV2005PlaceholderFailClosed:
+    def test_placeholder_pin_fails_closed_in_prod(self, monkeypatch, clean_root_pinned_build):
+        monkeypatch.delenv("YASHIGANI_ENV", raising=False)
+        monkeypatch.setattr(verifier_mod, "_EXPECTED_INTEGRITY_ROOT_HASH", "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH")
+        verifier_mod._check_integrity_root_pin()
+        assert verifier_mod.get_mesh_integrity_status() is True
+
+    def test_placeholder_pin_skipped_in_dev(self, monkeypatch, clean_root_pinned_build):
+        monkeypatch.setenv("YASHIGANI_ENV", "dev")
+        monkeypatch.setattr(verifier_mod, "_EXPECTED_INTEGRITY_ROOT_HASH", "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH")
+        verifier_mod._check_integrity_root_pin()
+        assert verifier_mod.get_mesh_integrity_status() is False

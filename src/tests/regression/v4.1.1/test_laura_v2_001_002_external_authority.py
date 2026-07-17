@@ -163,6 +163,14 @@ def _live_hash_env(tmp_path, monkeypatch):
     master_key = _gen_p384()
     code_leaf, code_leaf_sig, code_key = _make_code_leaf(master_key)
 
+    # LAURA-V2-005 (2026-07-17): verifier._check_build_integrity_chain() now
+    # additionally requires every trusted anchor in the embedded
+    # MASTER_ANCHOR_SET_JSON to match verifier._PINNED_MASTER_ANCHOR_PEMS.
+    # This fixture mints its own throwaway master per the established
+    # test-overridable-pin pattern — override the pin to include it, exactly
+    # like every other verifier.py internal this fixture already patches.
+    monkeypatch.setattr(verifier_mod, "_PINNED_MASTER_ANCHOR_PEMS", (_pem_pub(master_key),))
+
     def _sign_and_embed(kill_list_json: str = "[]") -> None:
         """(Re)compute live hashes from the CURRENT tmp files, fold
         INTEGRITY_HASH in, sign the 6-line bundle with the code leaf, and
