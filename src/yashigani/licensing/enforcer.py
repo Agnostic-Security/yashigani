@@ -335,10 +335,47 @@ def set_license(lic: LicenseState) -> None:
 
 def _any_integrity_violated() -> bool:
     """
-    T5 / design §5: check ALL five integrity flags (verifier — which also
-    covers the chain-based build-integrity check §4a, enforcer, loader,
-    agents_registry, identity_registry). Returns True if ANY flag is set.
-    Lazy imports to avoid circular dependencies.
+    T5 / design §5: check integrity flags across the FULL trust surface —
+    verifier (which also covers the chain-based build-integrity check §4a
+    and, as of LAURA-V2-005, verifier's own root-of-trust pin), enforcer
+    (its own T1 self/cross-hash AND, as of LAURA-V2-006 below, its Phase D
+    full-mesh + root-pin flags via get_enforcer_integrity_status()), loader,
+    agents_registry, identity_registry, and — LAURA-V2-006 (2026-07-17) —
+    the five OTHER Phase D mesh members that were previously never
+    consulted here: gate_middleware.py, sso/oidc.py, sso/saml.py,
+    backoffice/routes/sso.py, backoffice/routes/scim.py. Returns True if
+    ANY flag is set. Lazy imports to avoid circular dependencies.
+
+    LAURA-V2-006 fix: prior to this fix, this function only read the raw
+    `_enforcer_integrity_violated` global (T1 self-hash only) and never
+    consulted `get_enforcer_integrity_status()` (which ORs in THIS file's
+    own Phase D mesh + root-pin flags), and never consulted the other 5
+    mesh members' independently-computed `get_mesh_integrity_status()` at
+    all. Consequence: a 2-file {verifier.py, _integrity.py} root-swap that
+    left all 7 mesh files' OWN hash-comparison code untouched still forged
+    the core get_license()/require_feature()/check_*_limit() surface, even
+    though 5 of those 6 untouched mesh files correctly, independently
+    detected and CRITICAL-logged the tamper via their own point-of-use
+    gates. See Agnostic Security/Operations/Compliance/yashigani/v4.1.1/
+    laura-pentest/findings/LAURA-V2-006_core_grant_bypasses_phase_d_mesh_2file.md.
+
+    DISTRIBUTED, not a new chokepoint: each of the 5 new checks below reads
+    that OTHER file's OWN already-computed module-level flag (set by that
+    file's own _check_mesh_full()/_check_integrity_root_pin(), which
+    independently re-derives every OTHER member's on-disk bytes against the
+    SIGNED hash constants in _integrity.py) — this function does not
+    recompute anything itself, and none of those 5 files' own point-of-use
+    gates (oidc.py's/saml.py's/routes/sso.py's/routes/scim.py's own
+    `_licence_hard_gate()`) are changed to depend on THIS function (they
+    deliberately still don't call back into enforcer.get_license() for
+    their integrity DECISION — only for the license STATE read, same as
+    before Phase D). Patching enforcer.py alone (e.g. to make this whole
+    function return False) does not touch what the other 5 files computed
+    about their OWN full-mesh checks — importing and reading their getters
+    from a genuine, unpatched enforcer.py still surfaces True. Only a
+    coordinated edit of ALL 7 mesh files removes every detector — the same
+    honest ceiling already documented in gate_middleware.py's module
+    docstring.
 
     Shared by get_license() (fails the active license to COMMUNITY) and
     is_license_tampered() (the standalone tamper-banner signal, §5:
@@ -348,7 +385,9 @@ def _any_integrity_violated() -> bool:
     """
     # Verifier integrity (lazy import — circular-safe). This also reflects
     # the chain-based build-integrity check (§4a) — verifier._integrity_violated
-    # is set by BOTH _check_self_integrity() and _check_build_integrity_chain().
+    # is set by BOTH _check_self_integrity() and _check_build_integrity_chain() —
+    # and verifier's own Phase D mesh-check + LAURA-V2-005 root-pin (both ORed
+    # into get_integrity_status() already).
     try:
         from yashigani.licensing.verifier import get_integrity_status as _v_status
         if _v_status():
@@ -356,8 +395,59 @@ def _any_integrity_violated() -> bool:
     except Exception:
         pass  # verifier unavailable — conservative: don't block
 
-    if _enforcer_integrity_violated:
-        return True
+    # LAURA-V2-006: read via get_enforcer_integrity_status(), not the raw
+    # T1-only global — this ORs in THIS file's own Phase D full-mesh check
+    # (_check_enforcer_mesh_full()) and LAURA-V2-005 root-pin
+    # (_check_enforcer_root_pin()) results, both of which were computed at
+    # module load but, before this fix, never actually consulted here.
+    # Wrapped the same way as the verifier check immediately above (swallow
+    # and continue, don't block) — this getter is a trivial OR of two
+    # already-computed module-level booleans with no I/O, so a raised
+    # exception here can only mean the getter's own body was replaced by an
+    # attacker (test_laura_v2_001_pou_hardening.py's
+    # TestSharedGetterFallbackRemoved proves this exact resilience property
+    # for the POU gates' identical fallback license-state read) — the same
+    # already-documented "whole function body replaced" honest ceiling
+    # require_feature() describes, not a new gap: that scenario is still
+    # tamper-EVIDENT via every OTHER untouched mesh member's own full-mesh
+    # check (which independently re-derives enforcer.py's live bytes),
+    # exactly as before this fix.
+    try:
+        if get_enforcer_integrity_status():
+            return True
+    except Exception:
+        pass  # conservative: don't block — see comment above
+
+    # LAURA-V2-006: the five OTHER Phase D mesh members — each read is that
+    # file's OWN independently-computed get_mesh_integrity_status() (set by
+    # that file's own full-mesh re-derivation of every OTHER member's bytes
+    # against the SIGNED hash constants in _integrity.py, ORing in that
+    # file's own LAURA-V2-005 root-pin result too). Import failure is
+    # itself treated as a violation (IMPL-03 discipline, matching the
+    # agents_registry/identity_registry checks below) — an attacker who
+    # breaks the import while having tampered the target module would
+    # otherwise silently bypass this check.
+    import importlib
+
+    for _mesh_module_name, _mesh_member_label in (
+        ("yashigani.licensing.gate_middleware", "gate_middleware"),
+        ("yashigani.sso.oidc", "sso.oidc"),
+        ("yashigani.sso.saml", "sso.saml"),
+        ("yashigani.backoffice.routes.sso", "backoffice.routes.sso"),
+        ("yashigani.backoffice.routes.scim", "backoffice.routes.scim"),
+    ):
+        try:
+            _mesh_module = importlib.import_module(_mesh_module_name)
+            if _mesh_module.get_mesh_integrity_status():
+                return True
+        except Exception as _exc_mesh:
+            logger.critical(
+                "License gate: failed to import/consult %s's mesh integrity "
+                "check — treating as integrity violation and restraining to "
+                "Community (IMPL-03, LAURA-V2-006): %s",
+                _mesh_member_label, _exc_mesh,
+            )
+            return True
 
     try:
         from yashigani.licensing.loader import get_loader_integrity_status as _l_status
