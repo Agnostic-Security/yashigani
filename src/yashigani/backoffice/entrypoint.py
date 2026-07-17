@@ -635,7 +635,12 @@ def _bootstrap():
     # v2.1 — Identity broker (OIDC/SAML SSO)
     try:
         from yashigani.auth.broker import IdentityBroker, IdPConfig
-        tier_name = license_state.tier.value if license_state else "community"
+        # LAURA-V2-007: read the tamper-AGGREGATED tier via enforcer.get_license()
+        # (set_license() already ran above), NOT the raw loaded license_state — a
+        # forged/tampered build must build the broker at COMMUNITY, mirroring
+        # gateway/entrypoint.py's verified pattern.
+        from yashigani.licensing.enforcer import get_license as _get_license_for_broker
+        tier_name = _get_license_for_broker().tier.value
         identity_broker = IdentityBroker(tier=tier_name)
 
         # Read IdP configurations from environment.
