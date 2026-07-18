@@ -334,8 +334,35 @@ _check_compose_exec "Redis" "redis" \
 # 5. OPA — internal network only, check via docker compose exec
 _check_compose_exec "OPA" "policy" "/opa eval true"
 
-# 6. Ollama — internal network only, check via docker compose exec
-_check_compose_exec "Ollama" "ollama" "bash -c '</dev/tcp/localhost/11434'"
+# 6. Ollama.
+#
+# FINDING-V412-RESTART-003: on Apple-Metal Mac installs (Docker OR Podman
+# runtime), the container `ollama` service is INTENTIONALLY disabled by
+# design — see docker/docker-compose.gpu-mac-metal[-podman].yml "C4 —
+# CONTAINER OLLAMA DISABLED" (entrypoint: ["true"], restart: "no",
+# healthcheck: disable: true; it starts and exits 0 immediately). The real
+# data path in that mode is caddy -> host loopback via gvproxy (Podman) or
+# VPNKit (Docker) -> host-native ollama on 127.0.0.1. Exec-ing into the
+# (never-running) container can never succeed there, independent of any
+# container-naming fix.
+#
+# Positive detection, not guessing: YASHIGANI_HOST_OLLAMA_PORT is written
+# to docker/.env EXCLUSIVELY by install.sh's Apple-Metal-only
+# _resolve_host_ollama_port() path (install.sh --ollama-port flag doc:
+# "Mac Apple Metal only ... Not applicable to Linux or Kubernetes
+# installs."). It is never set for containerized ollama (Linux/x8x
+# NVIDIA/AMD/Vulkan/CPU-only legs). Already sourced into this shell from
+# docker/.env above (lines ~56-79) — no new plumbing needed. Its presence
+# is therefore a config-derived signal of the deployment mode, not an
+# inference from uname/GPU/runtime probing.
+if [ -n "${YASHIGANI_HOST_OLLAMA_PORT:-}" ]; then
+  # Host-relay mode: probe the real endpoint directly (matches this file's
+  # own documented check in --help: "Ollama /api/tags -> HTTP 200").
+  _check_http "Ollama" "http://127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT}/api/tags"
+else
+  # Containerized ollama (Linux/x8x and any non-relay platform) — unchanged.
+  _check_compose_exec "Ollama" "ollama" "bash -c '</dev/tcp/localhost/11434'"
+fi
 
 # ---------------------------------------------------------------------------
 # On failure: print logs for each failed service
