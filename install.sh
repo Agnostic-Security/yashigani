@@ -5620,6 +5620,151 @@ _build_ringfence_images() {
 }
 
 # =============================================================================
+# FINDING-V412-RESTART-001: bounded progress watchdog + native Podman image
+# build (decouples gateway/backoffice/gateway-only builds from the compose
+# provider on the Podman runtime).
+# =============================================================================
+#
+# ROOT CAUSE (measured, RESTART leg, macOS podman-6 rootless, 2026-07-18):
+# On a virgin host, `"${COMPOSE_CMD[@]}" build gateway backoffice` under
+# podman-compose-v2 (item D: podman compose → external provider, observed
+# /usr/local/bin/docker-compose v5.1.3) hung INDEFINITELY (59 min at 0% CPU,
+# zero buildah/build activity server-side). Direct `podman build` of the
+# identical Dockerfile progressed normally (probe 2b/2d). Discriminator:
+# re-running the exact same external-provider build with DOCKER_CONFIG
+# pointed at a config.json with no credsStore/credHelpers completed
+# successfully end-to-end (both images tagged). Root cause: the external
+# compose provider's client-side registry-credential lookup
+# (docker-credential-desktop, driven by the operator's real
+# ~/.docker/config.json "credsStore":"desktop") blocks forever when Docker
+# Desktop's backend is not running — the default state on a Podman-only
+# host. This is a client-side hang before any request reaches podman's
+# socket; it is not a BuildKit-protocol or podman-compat-API defect.
+#
+# FIX: on the Podman runtime, gateway/backoffice images are built via
+# `podman build` directly (proven healthy in probes 2b/2d) instead of via
+# the compose provider — this is the SAME pattern the codebase already uses
+# for the extractor image and already used, downstream, in compose_up()
+# ("compose build uses Docker buildx"). Extracting it into a shared
+# function and calling it from compose_pull() (step 9, so PKI bootstrap at
+# step 9b has an image) removes ALL THREE Podman-path compose-build call
+# sites (step 9 cold build, step 9 parallel-pull-retry rebuild, step 10
+# compose_up fallback) in one place — single source of truth, no duplicate
+# `podman build` invocations drifting out of sync.
+#
+# The Docker runtime path is untouched: it still builds via
+# "${COMPOSE_CMD[@]} build" (docker compose / buildx), which is unaffected
+# by this finding — the Docker runtime path is only selected when the
+# Docker daemon (and therefore Docker Desktop, when applicable) is already
+# confirmed running by _ensure_docker_running.
+#
+# DEFENSE IN DEPTH (required regardless of root cause — an install must
+# never hang silently): every build invocation below, on BOTH runtimes, is
+# wrapped in `_run_with_progress_watchdog`, which independently tracks
+# output growth and kills the whole process tree (not just the top-level
+# PID — orphaned credential-helper children were observed to outlive a
+# plain top-level kill) if a build produces literally zero output for
+# YASHIGANI_BUILD_WATCHDOG_SECS (default 300s). A real build — even a slow
+# one — always produces periodic step/layer output; total silence for
+# multiple minutes is the confirmed hang signature (59 min at 0% CPU, zero
+# output) for this finding.
+_YSG_BUILD_WATCHDOG_SECS_DEFAULT=300
+
+# Recursively kill a process tree (children before parent). Portable: pgrep
+# -P is available on both macOS/BSD and Linux. Used so a killed build cannot
+# leave orphaned grandchildren running (observed: docker-credential-desktop
+# children survived a top-level-only kill in this finding's evidence).
+_kill_process_tree() {
+  local _root="$1" _sig="${2:-TERM}"
+  local _child
+  for _child in $(pgrep -P "$_root" 2>/dev/null || true); do
+    _kill_process_tree "$_child" "$_sig"
+  done
+  kill -"$_sig" "$_root" 2>/dev/null || true
+}
+
+# Usage: _run_with_progress_watchdog <command> [args...]
+# Runs <command> in the background; the operator still sees its output live
+# (stdout/stderr are inherited from the current shell exactly as a
+# foreground call would, so terminal display and install.log capture are
+# unchanged). Independently tees a private, disposable copy of that output
+# purely to detect silence — this works even when global logging is
+# disabled (YSG_NO_LOG=true), so the watchdog does not depend on
+# install.log existing.
+_run_with_progress_watchdog() {
+  local _limit="${YASHIGANI_BUILD_WATCHDOG_SECS:-$_YSG_BUILD_WATCHDOG_SECS_DEFAULT}"
+  local _poll=15
+  local _progress_dir="${WORK_DIR:-${HOME:-.}}/.ysg_build_watchdog"
+  mkdir -p "$_progress_dir" 2>/dev/null || true
+  local _progress_file
+  _progress_file="$(mktemp "${_progress_dir}/progress.XXXXXX" 2>/dev/null || echo "/dev/null")"
+
+  "$@" > >(tee "$_progress_file") 2>&1 &
+  local _pid=$!
+
+  local _last_size=-1 _stall=0
+  while kill -0 "$_pid" 2>/dev/null; do
+    sleep "$_poll"
+    kill -0 "$_pid" 2>/dev/null || break
+    local _size
+    _size="$(wc -c < "$_progress_file" 2>/dev/null | tr -d '[:space:]')"
+    _size="${_size:-0}"
+    if [[ "$_size" == "$_last_size" ]]; then
+      _stall=$((_stall + _poll))
+    else
+      _stall=0
+      _last_size="$_size"
+    fi
+    if [[ "$_stall" -ge "$_limit" ]]; then
+      log_error "Build watchdog: '$*' produced no output for ${_stall}s while still running — presumed HUNG, not merely slow."
+      log_error "See FINDING-V412-RESTART-001: a build/compose client can block indefinitely on a"
+      log_error "client-side dependency (e.g. a registry credential helper) at 0% CPU with no error."
+      log_error "Killing process tree (root PID ${_pid}) and failing this step instead of hanging forever."
+      _kill_process_tree "$_pid" TERM
+      sleep 3
+      _kill_process_tree "$_pid" KILL
+      wait "$_pid" 2>/dev/null || true
+      rm -rf "$_progress_dir"
+      return 124
+    fi
+  done
+  wait "$_pid"
+  local _rc=$?
+  rm -rf "$_progress_dir"
+  return "$_rc"
+}
+
+# Native podman-build primitives — no compose provider involved at all.
+_podman_build_gateway_image() {
+  _run_with_progress_watchdog podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
+    --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+    "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+    -t "yashigani/gateway:${YASHIGANI_VERSION}" \
+    -t yashigani/gateway:latest "${WORK_DIR}"
+}
+
+_podman_build_backoffice_image() {
+  _run_with_progress_watchdog podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
+    --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+    "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+    -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
+    -t yashigani/backoffice:latest "${WORK_DIR}"
+}
+
+_podman_build_gateway_backoffice_images() {
+  log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
+  _podman_build_gateway_image || {
+    log_error "Podman build failed for gateway (Dockerfile.gateway). See output above."
+    return 1
+  }
+  _podman_build_backoffice_image || {
+    log_error "Podman build failed for backoffice (Dockerfile.backoffice). See output above."
+    return 1
+  }
+  log_success "Images built with Podman"
+}
+
+# =============================================================================
 # STEP 9 (compose/vm): docker compose pull
 # =============================================================================
 compose_pull() {
@@ -5813,9 +5958,16 @@ except Exception:
     # images are pre-seeded by a trusted source (harness tarball cache, airgap
     # bundle); fresh installs build+pull with digest verification as usual.
     YASHIGANI_COMPOSE_PULL_POLICY="never"
+  elif [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    # FINDING-V412-RESTART-001: build via podman directly, never via the
+    # compose provider — see the block comment above _run_with_progress_watchdog.
+    _podman_build_gateway_backoffice_images || {
+      log_error "Failed to build gateway/backoffice images (Podman). Check Dockerfiles."
+      exit 1
+    }
   else
     log_info "Building gateway and backoffice images from source (SHA ${YASHIGANI_GIT_SHA})..."
-    "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
+    _run_with_progress_watchdog "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
       log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
       exit 1
     }
@@ -5902,7 +6054,8 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
     done
     if [[ "$_gw_check" == "0" ]]; then
       log_error "Gateway image not found after parallel pull — rebuilding..."
-      "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway || {
+      # FINDING-V412-RESTART-001: native podman build, not the compose provider.
+      _podman_build_gateway_image || {
         log_error "Gateway rebuild failed — cannot continue"
         exit 1
       }
@@ -8195,7 +8348,6 @@ compose_up() {
           "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
       log_info "Images already current (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping rebuild (Podman)"
     else
-      log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
       # retro #32: do NOT pipe through `tail -1`. The script's outer exec
       # redirect at the top of main() already tees stdout+stderr to
       # install.log. Piping through `tail -1` here truncates build output
@@ -8203,17 +8355,11 @@ compose_up() {
       # errors ("no space left on device"), Dockerfile syntax errors, and
       # cache-eviction warnings are silently dropped from the log.
       # Verbose terminal output is the explicit tradeoff for visibility.
-      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
-        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
-        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
-        -t "yashigani/gateway:${YASHIGANI_VERSION}" \
-        -t yashigani/gateway:latest "${WORK_DIR}"
-      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
-        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
-        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
-        -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
-        -t yashigani/backoffice:latest "${WORK_DIR}"
-      log_success "Images built with Podman"
+      # FINDING-V412-RESTART-001: shared with compose_pull() step 9 — see
+      # _podman_build_gateway_backoffice_images (single source of truth for
+      # the native-podman build path; usually a no-op here since step 9
+      # already built current images, but re-runs safely if invoked alone).
+      _podman_build_gateway_backoffice_images
     fi
 
     # 3.0 doc-OPA: build the per-job extractor image (release artifact) under
