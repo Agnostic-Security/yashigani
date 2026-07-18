@@ -276,15 +276,22 @@ spec:
 # supplied object metadata. An earlier draft exempted pods by
 # ownerReferences[0].kind != Job, but K8s does not validate submitted
 # ownerReferences — the gateway SA could forge ownerReferences:[{kind:Job}] on a
-# bare pod and bypass every rule. These rules instead fire ONLY when the pod's
-# CREATOR is the gateway ServiceAccount (system:serviceaccount:<ns>:yashigani) —
-# the sole non-admin identity holding pods:create. request.userInfo is set by the
-# API server from the bearer token and cannot be spoofed by the caller. Legit PKI
-# pods (yashigani-pki-bootstrap Job, mtls-rotation CronJob) are created by the
-# kube-system controllers, never by this SA, so they are never matched.
-# INVARIANT: this scoping assumes only SA `yashigani` holds pods:create in-ns
-# (verified rbac-pool-manager.yaml). If a future SA is granted pods:create, add
-# it to the precondition value set below.
+# bare pod and bypass every rule. These rules instead fire when the pod's CREATOR
+# (request.userInfo.username, set by the API server from the bearer token — not
+# spoofable) matches the gateway ServiceAccount. The precondition uses AnyIn over
+# BOTH (a) the chart's SA-name helper — the gateway's ACTUAL runtime identity,
+# which tracks a serviceAccount.name override (IRSA/Workload-Identity); a hardcoded
+# literal would be silently defeated by that override (Captain R2 HIGH) — and (b)
+# the literal `yashigani` that rbac-pool-manager.yaml hard-binds pods:create to, so
+# the pods:create holder is always covered even if it diverges from the gateway SA.
+# Legit PKI pods (yashigani-pki-bootstrap Job, mtls-rotation CronJob) are created by
+# the kube-system controllers, never by these identities, so they are never matched.
+# INVARIANT: only the gateway SA holds pods:create in-ns (verified
+# rbac-pool-manager.yaml + extractor-job-template.yaml). NOTE (chart wart, out of
+# this finding's scope, flagged for the team): rbac-pool-manager binds pods:create
+# to literal `yashigani` while gateway.yaml runs under the helper — under a
+# serviceAccount.name override these DIVERGE and the pool backend loses pods:create
+# (functional bug); the AnyIn set here keeps policy 6 safe regardless.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -323,8 +330,15 @@ spec:
         all:
           # NON-FORGEABLE gate — the authenticated creator identity (see header).
           - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
-            operator: Equals
-            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
       validate:
         message: >-
           FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
@@ -349,8 +363,15 @@ spec:
       preconditions:
         all:
           - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
-            operator: Equals
-            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
       validate:
         message: >-
           FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
@@ -390,8 +411,15 @@ spec:
       preconditions:
         all:
           - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
-            operator: Equals
-            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
       validate:
         message: >-
           FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
