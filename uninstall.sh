@@ -229,6 +229,101 @@ _list_project_containers() {
 }
 
 # ---------------------------------------------------------------------------
+# _RINGFENCE_NAME_PATTERN — SINGLE SOURCE OF TRUTH for "which networks does
+# the J12 sweep own" (Ava 2026-05-30), shared between _list_project_networks()'s
+# exclusion filter (below) and the J12 sweep's own `network ls --filter`
+# call further down in this file. Defining it once here means the two
+# sweeps cannot drift apart again the way they did in the regression
+# Captain caught in review of 5ddb0c99 (2026-07-18):
+#
+# The exclusion filter originally read `grep -v '^ringfence_'` — anchored on
+# a BARE, unprefixed name. But install.sh's onboard code path
+# (ringfence_net="ringfence_${agent}", ~line 15702) writes this as a plain
+# top-level compose `networks:` key with NO `name:` override — identical
+# to every other network in the file (edge, caddy_internal, etc.) — so
+# standard compose semantics project-prefix it at creation time. The real,
+# on-disk name is ALWAYS "<project>_ringfence_<agent>" (e.g.
+# localhost_ringfence_git), confirmed live 2026-07-18 both by Captain
+# (`podman network create localhost_ringfence_testagent ...`) and
+# independently in this session's own install run
+# (localhost_ringfence_openclaw_in — created by the base compose file's
+# static 3-agent-wrap ringfences, same naming shape as dynamically onboarded
+# ones). There is no bare/unprefixed case in practice.
+#
+# A bare-anchor exclusion (`^ringfence_`) therefore never matched the real
+# name, so ringfence networks were NOT excluded from the strict sweep — they
+# were removed-or-hard-failed by the strict completeness assertion (exit 1)
+# BEFORE the script ever reached the permissive J12 sweep further down,
+# defeating J12's deliberately-permissive (WARN, not fatal) handling of a
+# foreign-attached onboard container — a hard uninstall failure for any
+# customer with an active onboarded agent at uninstall time.
+#
+# Fix: substring match (no anchor), mirroring the J12 sweep's OWN
+# `network ls --filter name=...` semantics (substring containment, not a
+# prefix anchor) — so both sweeps see the identical set regardless of
+# whether "ringfence_" is the start of the name or an infix after the
+# project prefix.
+# ---------------------------------------------------------------------------
+_RINGFENCE_NAME_PATTERN="ringfence_"
+
+# ---------------------------------------------------------------------------
+# _list_project_networks — enumerate ALL project-scoped compose networks
+# (EXCLUDING ringfence_<agent> networks — see _RINGFENCE_NAME_PATTERN above
+# — which have their own dedicated sweep further down -- J12 fix, Ava
+# 2026-05-30 -- and deliberately treat residuals as non-fatal since they may
+# be attached to a foreign onboard-created container; that permissive
+# semantic stays scoped to that sweep, not silently inherited here) using
+# the SAME two-strategy pattern as _list_project_containers():
+#
+#   1. Label filter: compose-label variants for both podman-compose (Python
+#      tool) and Docker Compose v2 / native `podman compose` v2.  Measured
+#      2026-07-18 on this host: native `podman compose` v2 labels every
+#      network it creates with com.docker.compose.project=<project>
+#      (confirmed via `podman network inspect` on a live compose-v2-created
+#      network) -- the SAME label _list_project_containers already relies on.
+#   2. Name-prefix fallback: <project>_<network> underscore naming
+#      convention -- confirmed the norm for volumes/networks even under
+#      compose-v2 (FINDING-V412-RESTART-002), independent of the hyphen
+#      convention compose-v2 uses for container names.
+#
+# FINDING-V412-RESTART-004a: replaces the hardcoded _CANONICAL_NETWORKS list,
+# which drifted every time a compose file added a network -- missed
+# demo_mcp_isolated, extractor_svc, ollama_ringfence (3 real project
+# networks defined in docker-compose.yml but absent from the list) -- and
+# caused uninstall.sh to print a FALSE "Network assertion passed" while
+# localhost_demo_mcp_isolated genuinely survived a --remove-volumes nuke.
+#
+# Outputs deduplicated network NAMES, one per line, to stdout.
+# Returns 0 regardless of whether any were found.
+#
+# Args: $1 = runtime binary (podman or docker)
+#       $2 = project prefix (default: "docker")
+# ---------------------------------------------------------------------------
+_list_project_networks() {
+  local _rt="${1:?_list_project_networks: runtime required}"
+  local _pfx="${2:-docker}"
+  local _names=""
+
+  for _label_key in "io.podman.compose.project" "com.docker.compose.project"; do
+    local _l
+    _l="$("$_rt" network ls --filter "label=${_label_key}=${_pfx}" --format "{{.Name}}" 2>/dev/null || true)"
+    if [ -n "$_l" ]; then
+      _names="${_names}${_l}
+"
+    fi
+  done
+
+  local _by_name
+  _by_name="$("$_rt" network ls --filter "name=^${_pfx}_" --format "{{.Name}}" 2>/dev/null || true)"
+  if [ -n "$_by_name" ]; then
+    _names="${_names}${_by_name}
+"
+  fi
+
+  printf '%s' "$_names" | sort -u | grep -v '^$' | grep -v "$_RINGFENCE_NAME_PATTERN" || true
+}
+
+# ---------------------------------------------------------------------------
 # _remove_containers — stop then force-remove a newline-separated list of
 # container IDs. Uses --depend first (Podman >=4.x), falls back to plain
 # rm -f (Docker / older Podman).
@@ -1230,25 +1325,32 @@ fi
 # (varies by version + restart-policy state). Result: post-uninstall enumeration
 # shows containers=0 volumes=0 BUT networks=7 — operator sees stale networks
 # in `podman network ls`, gets confused on re-install (false "already exists").
-# Fix: explicit network removal of every canonical compose project network,
+# Fix: explicit network removal of every project-scoped network,
 # regardless of REMOVE_VOLUMES flag (networks hold no data; safe to remove).
 # Final assertion exits 1 if any survive.
+#
+# FINDING-V412-RESTART-004a (2026-07-18): the previous fix used a hardcoded
+# _CANONICAL_NETWORKS list, which went stale as compose files gained networks
+# (demo_mcp_isolated, extractor_svc, ollama_ringfence were never added) —
+# `localhost_demo_mcp_isolated` survived a full nuke while this exact
+# assertion printed "Network assertion passed" (a false positive: the
+# assertion only ever checked the stale list, never the actual runtime
+# state). Fix: derive the network set from the runtime itself
+# (_list_project_networks — label + name-prefix enumeration, the SAME
+# pattern _list_project_containers already uses for containers) so this
+# sweep can never again drift behind the compose files it is meant to clean
+# up after, and so the completeness assertion re-checks the SAME
+# runtime-derived set rather than a filtered view.
 # ---------------------------------------------------------------------------
 _PROJECT_PREFIX="${_PROJECT_PREFIX:-docker}"
-# v4.1 three-agent wrap (2026-07-07): the *_isolated bridges are still
-# DEFINED in docker-compose.yml (dead — no agent joins them), so keep them
-# here for clean removal. letta_db is the new 2-member letta↔pgbouncer lane.
-# The §2.6 split ringfences (ringfence_<agent>_{in,eg}) are swept by the
-# J12 ringfence_* filter below — no need to list each.
-_CANONICAL_NETWORKS="edge caddy_internal data obs langflow_isolated letta_isolated openclaw_isolated letta_db"
 
 echo "=== Canonical network cleanup ==="
 _net_removed=0
-_net_skipped=0
 _net_failed=0
-for _net in $_CANONICAL_NETWORKS; do
-    _full="${_PROJECT_PREFIX}_${_net}"
-    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
+_net_targets="$(_list_project_networks "$RUNTIME" "$_PROJECT_PREFIX")"
+if [ -n "$_net_targets" ]; then
+    while IFS= read -r _full; do
+        [ -z "$_full" ] && continue
         if "$RUNTIME" network rm "$_full" >/dev/null 2>&1; then
             echo "  [removed] $_full"
             _net_removed=$(( _net_removed + 1 ))
@@ -1256,24 +1358,21 @@ for _net in $_CANONICAL_NETWORKS; do
             echo "  [WARN] network rm failed: $_full (in-use by foreign container?)" >&2
             _net_failed=$(( _net_failed + 1 ))
         fi
-    else
-        _net_skipped=$(( _net_skipped + 1 ))
-    fi
-done
-echo "Network cleanup: ${_net_removed} removed, ${_net_skipped} not present, ${_net_failed} failed."
+    done <<< "$_net_targets"
+else
+    echo "  [ok] No project networks found."
+fi
+echo "Network cleanup: ${_net_removed} removed, ${_net_failed} failed."
 
-# Final network assertion.
-_residual_networks=""
-for _net in $_CANONICAL_NETWORKS; do
-    _full="${_PROJECT_PREFIX}_${_net}"
-    if "$RUNTIME" network inspect "$_full" >/dev/null 2>&1; then
-        _residual_networks="${_residual_networks}${_full}\n"
-    fi
-done
+# Final network assertion — re-derives from the runtime (NOT a hardcoded
+# list) so this can never again silently "pass" while a survivor exists
+# outside a static list's coverage (FINDING-V412-RESTART-004a).
+_residual_networks="$(_list_project_networks "$RUNTIME" "$_PROJECT_PREFIX")"
 if [ -n "$_residual_networks" ]; then
+    _residual_count="$(printf '%s\n' "$_residual_networks" | grep -c '.' || echo 0)"
     echo "" >&2
-    echo "ERROR: ${_net_failed} canonical network(s) survived removal:" >&2
-    printf '%b' "$_residual_networks" | sed 's/^/      /' >&2
+    echo "ERROR: ${_residual_count} project network(s) survived removal:" >&2
+    printf '%s\n' "$_residual_networks" | sed 's/^/      /' >&2
     echo "" >&2
     echo "Likely cause: a non-yashigani container is attached to one of these networks." >&2
     echo "Manual remediation:" >&2
@@ -1283,7 +1382,7 @@ if [ -n "$_residual_networks" ]; then
     echo "Yashigani uninstall INCOMPLETE — network residual. Exit 1." >&2
     exit 1
 fi
-echo "=== Network assertion passed — all canonical networks removed. ==="
+echo "=== Network assertion passed — all project networks removed. ==="
 
 # ---------------------------------------------------------------------------
 # ROOTLESS-CDI-002 (2026-06-27): sweep stale CNI config FILES.
@@ -1314,12 +1413,21 @@ fi
 
 # ---------------------------------------------------------------------------
 # J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
-# `yashigani onboard` (Shape-C MCP agents).  These networks are NOT in the
-# hardcoded _CANONICAL_NETWORKS list above because they are dynamically named
-# at onboard time (ringfence_git, ringfence_filesystem, etc.).
+# `yashigani onboard` (Shape-C MCP agents) and the base file's static
+# 3-agent-wrap ringfences.  These networks are deliberately EXCLUDED from
+# _list_project_networks() above (FINDING-V412-RESTART-004a) via the SAME
+# _RINGFENCE_NAME_PATTERN this sweep's own filter uses (single source of
+# truth — see the definition above _list_project_networks() for why the two
+# sweeps must never define this boundary independently again) because this
+# sweep's residual-handling is intentionally permissive (WARN, not exit-1)
+# — a ringfence network may legitimately still be attached to a foreign
+# onboard container.
 #
-# Discovery: `docker/podman network ls --filter name=ringfence_` lists all
-# networks whose name contains "ringfence_".  We then remove each one.
+# Discovery: `docker/podman network ls --filter name=<pattern>` lists all
+# networks whose name CONTAINS the pattern (substring, not anchored) — this
+# is why _RINGFENCE_NAME_PATTERN itself has no anchor: it must match both
+# the never-actually-occurring bare form and the real, always-project-
+# prefixed on-disk form (<project>_ringfence_<agent>).
 #
 # The assertion below logs residuals as WARN (not exit-1): a ringfence network
 # may survive removal if a non-yashigani container joined it.  The operator
@@ -1341,14 +1449,14 @@ while IFS= read -r _rfnet; do
         echo "  [WARN] ringfence network rm failed: $_rfnet (may be in use)" >&2
         _ringfence_failed=$(( _ringfence_failed + 1 ))
     fi
-done < <("$RUNTIME" network ls --filter "name=ringfence_" --format "{{.Name}}" 2>/dev/null || true)
+done < <("$RUNTIME" network ls --filter "name=${_RINGFENCE_NAME_PATTERN}" --format "{{.Name}}" 2>/dev/null || true)
 
 if [ "$_ringfence_removed" -gt 0 ] || [ "$_ringfence_failed" -gt 0 ]; then
     echo "Ringfence network cleanup: ${_ringfence_removed} removed, ${_ringfence_failed} failed."
     if [ "$_ringfence_failed" -gt 0 ]; then
         echo "  [WARN] Some ringfence networks could not be removed (in use by a foreign container?)." >&2
         echo "  Manual remediation:" >&2
-        echo "    ${RUNTIME} network ls --filter name=ringfence_   # list survivors" >&2
+        echo "    ${RUNTIME} network ls --filter name=${_RINGFENCE_NAME_PATTERN}   # list survivors" >&2
         echo "    ${RUNTIME} network rm <name>                     # after detaching foreign containers" >&2
     fi
 else
@@ -1518,7 +1626,8 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
             "${SCRIPT_DIR}/docker/data" \
             "${SCRIPT_DIR}/docker/certs" \
             "${SCRIPT_DIR}/docker/logs" \
-            "${SCRIPT_DIR}/docker/wazuh-mtls"; do
+            "${SCRIPT_DIR}/docker/wazuh-mtls" \
+            "${SCRIPT_DIR}/docker/tls"; do
         [ -d "$_bm_dir" ] || { echo "  [skip] $_bm_dir (absent)"; continue; }
         if rm -rf "$_bm_dir" 2>/dev/null; then
             echo "  [removed] $_bm_dir"
