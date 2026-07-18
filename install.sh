@@ -5765,6 +5765,72 @@ _podman_build_gateway_backoffice_images() {
 }
 
 # =============================================================================
+# FINDING-V412-RESTART-002 / YSG-RISK-091: scheme-agnostic container-name
+# resolution.
+# =============================================================================
+# Root cause (measured, r2 restart leg, macOS podman-6 rootless, 2026-07-18):
+# podman-compose (Python, present+broken at 1.6.x on the affected host) and
+# native `podman compose` v2 / `docker compose` construct DIFFERENT container
+# names for the same service — podman-compose uses
+# "${project}_${service}_1" (underscore); compose-v2 uses
+# "${project}-${service}-N" (hyphen). Any code that CONSTRUCTS a container
+# name by string interpolation, instead of asking the runtime what it
+# actually is, silently targets a container that does not exist whenever
+# the naming scheme guessed does not match the one actually in use —
+# exactly what happened at scripts/health-check.sh (separate finding fix)
+# and at the two install.sh call sites fixed below.
+#
+# Fix: derive the name from the RUNTIME via compose labels (present
+# regardless of which compose tool created the container — positive
+# derivation, not version-sniffing or inference), with a scheme-agnostic
+# name-pattern fallback. This is the same pattern already proven correct in
+# uninstall.sh's _list_project_containers() (label filter on BOTH
+# com.docker.compose.project/service AND io.podman.compose.project/service,
+# plus a bracket-class name fallback that matches either separator) and in
+# install.sh's own _backup_existing_data() / restore.sh's
+# find_pg_container() (substring-grep on live `ps` output). Volumes and
+# networks are NOT affected by this bug class — measured empirically on the
+# standing r2 stack: compose-v2 containers are hyphen-named but volumes and
+# networks remain underscore-named regardless of scheme (do not "fix" the
+# volume/network helpers in uninstall.sh — they are already correct).
+#
+# Usage: ysg_resolve_compose_container <runtime-binary> <project> <service>
+# Prints the first matching RUNNING container's name to stdout; prints
+# nothing and returns 1 if no match (callers MUST check — never assume a
+# `-1` or `_1` suffix).
+ysg_resolve_compose_container() {
+  local _rt="${1:?ysg_resolve_compose_container: runtime binary required}"
+  local _proj="${2:?ysg_resolve_compose_container: project required}"
+  local _svc="${3:?ysg_resolve_compose_container: service required}"
+  local _name="" _label_prefix
+
+  # Primary: compose labels. Stamped by every compose implementation this
+  # codebase supports, regardless of container-naming scheme.
+  for _label_prefix in "com.docker.compose" "io.podman.compose"; do
+    _name="$("$_rt" ps \
+      --filter "label=${_label_prefix}.project=${_proj}" \
+      --filter "label=${_label_prefix}.service=${_svc}" \
+      --format '{{.Names}}' 2>/dev/null | head -1)"
+    if [[ -n "$_name" ]]; then
+      printf '%s\n' "$_name"
+      return 0
+    fi
+  done
+
+  # Fallback: scheme-agnostic name pattern (bracket class matches either
+  # separator) in case labels are ever absent.
+  _name="$("$_rt" ps \
+    --filter "name=^${_proj}[_-]${_svc}[_-]" \
+    --format '{{.Names}}' 2>/dev/null | head -1)"
+  if [[ -n "$_name" ]]; then
+    printf '%s\n' "$_name"
+    return 0
+  fi
+
+  return 1
+}
+
+# =============================================================================
 # STEP 9 (compose/vm): docker compose pull
 # =============================================================================
 compose_pull() {
@@ -8704,7 +8770,21 @@ compose_up() {
       # before calling _upgrade_postgres_ssl. _upgrade_postgres_ssl reads the
       # certs from /run/secrets inside the container; this cp makes them available
       # regardless of which bind-mount directory is active.
-      local _pg_container_name="docker_postgres_1"
+      # FINDING-V412-RESTART-002 / YSG-RISK-091: was hardcoded
+      # "docker_postgres_1" — wrong project name (ignored
+      # COMPOSE_PROJECT_NAME) AND wrong separator on any compose-v2-created
+      # stack (hyphen, not underscore). Resolve the real name from the
+      # runtime instead of guessing it.
+      # `|| true` is required: "not found" is a legitimate outcome this
+      # block checks for below, not a script-fatal error — without it,
+      # `set -e` would abort compose_up()/install.sh here, before the
+      # log_error + return 1 below ever runs.
+      local _pg_container_name
+      _pg_container_name="$(ysg_resolve_compose_container "podman" "${COMPOSE_PROJECT_NAME:-docker}" "postgres")" || true
+      if [[ -z "$_pg_container_name" ]]; then
+        log_error "FINDING-V412-RESTART-002: could not resolve a running postgres container (project '${COMPOSE_PROJECT_NAME:-docker}') for SSL cert injection"
+        return 1
+      fi
       local _host_secrets="${WORK_DIR}/docker/secrets"
       if ! "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
              test -f /run/secrets/postgres_client.crt 2>/dev/null; then
@@ -14511,10 +14591,19 @@ bootstrap_internal_pki() {
 #
 # Cross-platform: works on Docker Engine (macOS + Linux) and Podman (rootful +
 # rootless) by trying the docker exec path first, then the podman exec path.
-# The postgres container name follows the compose project naming convention:
-#   Docker Engine: docker-postgres-1 (project prefix "docker")
-#   Podman Compose: docker_postgres_1 (project prefix "docker", underscore separator)
-# Both patterns are tried.
+#
+# FINDING-V412-RESTART-002 / YSG-RISK-091: the postgres container name does
+# NOT reliably follow a guessable convention — it depends on
+# COMPOSE_PROJECT_NAME (which this function previously ignored, hardcoding
+# only "docker"/"yashigani") AND on which compose tool created the stack
+# (podman-compose: underscore separator; podman/docker compose v2: hyphen).
+# A hardcoded 4-entry guess list silently matched nothing on any other
+# project name (e.g. a project named "localhost"), causing this function to
+# conclude "postgres container not running" when it was in fact up and
+# healthy — skipping the CA trust-bundle resync after a BYO-CA rotation.
+# Fixed: resolve the real name from the runtime via
+# ysg_resolve_compose_container() (label-based, scheme-agnostic) instead of
+# guessing it.
 #
 # IMPORTANT: This function is Captain's scope only. It does NOT perform any
 # validation of the BYO CA files (Su's scope) or any PKI issuer operations
@@ -14525,15 +14614,7 @@ _postgres_byo_ca_trust_sync() {
 
   local _script_path="/docker-entrypoint-initdb.d/05-enable-ssl.sh"
   local _sync_ok=false
-
-  # Enumerate candidate container names in order of likelihood.
-  # Docker Compose v2 uses hyphen separator; Podman Compose uses underscore.
-  local _pg_names=(
-    "docker-postgres-1"
-    "docker_postgres_1"
-    "yashigani-postgres-1"
-    "yashigani_postgres_1"
-  )
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
 
   # Fall back to trying docker then podman directly.
   local _exec_tools=()
@@ -14552,30 +14633,31 @@ _postgres_byo_ca_trust_sync() {
   fi
 
   for _tool in "${_exec_tools[@]}"; do
-    for _cname in "${_pg_names[@]}"; do
-      # Check if the container exists and is running.
-      if "${_tool}" inspect --format '{{.State.Running}}' "${_cname}" 2>/dev/null | grep -q '^true$'; then
-        log_info "  Found running postgres container: ${_cname} (via ${_tool})"
-        log_info "  Invoking trust-bundle sync inside container..."
+    local _cname
+    # `|| true`: "not found" (try the next tool) is expected here, not
+    # script-fatal — see the same note at the compose_up() call site.
+    _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "postgres" 2>/dev/null)" || true
+    if [[ -n "$_cname" ]]; then
+      log_info "  Found running postgres container: ${_cname} (via ${_tool})"
+      log_info "  Invoking trust-bundle sync inside container..."
 
-        # Run the idempotent 05-enable-ssl.sh inside the container.
-        # It will detect the checksum change, update root.crt atomically, and
-        # issue pg_ctl reload. Output is forwarded to the installer log.
-        if "${_tool}" exec "${_cname}" bash "${_script_path}" 2>&1 | while IFS= read -r _line; do
-            log_info "    [postgres] ${_line}"
-          done; then
-          log_success "BYO CA trust-bundle synced in running postgres container (${_cname})"
-          log_info "  Postgres re-reads root.crt via pg_ctl reload — no restart required"
-          _sync_ok=true
-          break 2
-        else
-          log_warn "BYO CA trust-bundle sync via ${_tool} exec ${_cname} failed (exit non-zero)"
-          log_warn "  Manual remediation: docker compose restart postgres"
-          _sync_ok=false
-          break 2
-        fi
+      # Run the idempotent 05-enable-ssl.sh inside the container.
+      # It will detect the checksum change, update root.crt atomically, and
+      # issue pg_ctl reload. Output is forwarded to the installer log.
+      if "${_tool}" exec "${_cname}" bash "${_script_path}" 2>&1 | while IFS= read -r _line; do
+          log_info "    [postgres] ${_line}"
+        done; then
+        log_success "BYO CA trust-bundle synced in running postgres container (${_cname})"
+        log_info "  Postgres re-reads root.crt via pg_ctl reload — no restart required"
+        _sync_ok=true
+        break
+      else
+        log_warn "BYO CA trust-bundle sync via ${_tool} exec ${_cname} failed (exit non-zero)"
+        log_warn "  Manual remediation: docker compose restart postgres"
+        _sync_ok=false
+        break
       fi
-    done
+    fi
   done
 
   if [[ "$_sync_ok" == "false" ]]; then
