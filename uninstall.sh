@@ -675,8 +675,42 @@ _teardown_k8s() {
       echo "  [ok] No residual pods in namespace ${_ns}."
     fi
 
-    # Step 3: remove PVCs when --remove-volumes is set.
-    if [ "$REMOVE_VOLUMES" = "true" ]; then
+    # FINDING-V412-UNIVERSAL-001 — keep-vs-nuke Secret contract on k8s.
+    #
+    # The chart's credential/PKI/licence Secrets now carry
+    # helm.sh/resource-policy: keep (secrets.yaml, licensing-secret.yaml,
+    # mtls-rbac.yaml + re-asserted by the bootstrap Job). So `helm uninstall`
+    # (Step 1 above) LEAVES them — matching the compose contract: plain uninstall
+    # preserves secrets/PKI for reinstall/upgrade; only --remove-volumes nukes.
+    local _kept
+    _kept="$(kubectl get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+              --no-headers 2>/dev/null | grep -c . || echo 0)"
+
+    if [ "$REMOVE_VOLUMES" != "true" ]; then
+      # Step 3 (keep-mode): PRESERVE secrets/PKI/PVCs/namespace.
+      echo "  [keep] Preserving ${_kept} yashigani Secret(s) + PKI + PVCs for reinstall/upgrade."
+      echo "  [keep] Run 'uninstall.sh --remove-volumes' to purge secrets/PVCs/namespace."
+    else
+      # Step 3 (NUKE): purge kept Secrets, PVCs, then namespace. Delete the kept
+      # Secrets explicitly and BEFORE the namespace so a namespace-delete timeout
+      # can never leave credential material behind reporting a false-clean.
+      echo "  [nuke] --remove-volumes set — purging ${_kept} Secret(s), PVCs, namespace."
+
+      # 3a: Secrets. Instance-labelled selector covers the 12 app Secrets +
+      # licensing + PKI placeholders. The two PKI Secrets are re-applied
+      # imperatively by the bootstrap Job and may not retain the instance label,
+      # so also delete them (and licensing) by well-known name (idempotent).
+      kubectl delete secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+        --wait=true --timeout=60s 2>&1 || true
+      local _s
+      for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
+                "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
+                "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
+        kubectl delete secret "$_s" -n "$_ns" --ignore-not-found=true \
+          --wait=true --timeout=30s 2>&1 || true
+      done
+
+      # 3b: PVCs.
       local _pvc_count
       _pvc_count="$(kubectl get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
       if [ "$_pvc_count" -gt 0 ]; then
@@ -685,6 +719,31 @@ _teardown_k8s() {
       else
         echo "  [ok] No PVCs found in namespace ${_ns}."
       fi
+
+      # 3c: positive post-delete assertion — kept Secrets and PVCs MUST be gone.
+      # A nuke that leaves credential material is a FAILED nuke — do not swallow.
+      local _sec_remaining _pvc_remaining
+      _sec_remaining="$(kubectl get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+                          --no-headers 2>/dev/null | grep -c . || echo 0)"
+      for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
+                "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
+                "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
+        if kubectl get secret "$_s" -n "$_ns" >/dev/null 2>&1; then
+          _sec_remaining=$((_sec_remaining + 1))
+        fi
+      done
+      _pvc_remaining="$(kubectl get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
+      if [ "$_sec_remaining" -gt 0 ] || [ "$_pvc_remaining" -gt 0 ]; then
+        printf '\n' >&2
+        printf 'ERROR: uninstall.sh --remove-volumes FAILED to purge state in %s: %d Secret(s), %d PVC(s) remain\n' \
+               "$_ns" "$_sec_remaining" "$_pvc_remaining" >&2
+        kubectl get secret,pvc -n "$_ns" >&2 || true
+        printf '\nManual remediation:\n' >&2
+        printf '  kubectl delete secret,pvc --all -n %s\n' "$_ns" >&2
+        printf '\n' >&2
+        exit 1
+      fi
+      echo "  [ok] NUKE verified — 0 yashigani Secrets, 0 PVCs remain in ${_ns}."
 
       # Step 4: delete the namespace itself.
       if kubectl get namespace "$_ns" >/dev/null 2>&1; then

@@ -86,6 +86,16 @@ global:
 # ---------------------------------------------------------------------------
 networkPolicies:
   enabled: true
+  # FINDING-V412-UNIVERSAL-004: NetworkPolicy enforcement is CNI-dependent —
+  # Calico/Cilium enforce at the datapath; flannel (k3s default) and kindnet
+  # (kind default) silently NO-OP NetworkPolicy, so a green `helm install` could
+  # ship with NO ring-fence (egress bypassing Caddy->OPA), making Enterprise/k8s
+  # weaker than Professional/compose. Enforcement is VERIFIED by the INSTALLER,
+  # not by a chart value (a chart cannot probe the datapath): install.sh runs a
+  # positive enforcement probe (throwaway ns + default-deny + allow->deny->allow
+  # reachability test) and FAILS the k8s install if the CNI does not enforce.
+  # Override only with risk-register sign-off:
+  #   install.sh --skip-networkpolicy-probe   (or NETPOL_REQUIRE_ENFORCEMENT=false)
 
 # ---------------------------------------------------------------------------
 # Admission Control (YSG-RISK-008 — v2.23.2 P1)

@@ -316,6 +316,15 @@ spec:
                 --dry-run=client -o yaml \
               | kubectl apply -n {{ .Release.Namespace }} -f -
               echo "[applier] Secret {{ .Values.mtls.secretName }} applied (leaves + CA pubs + caddy_internal_hmac + bootstrap_tokens)."
+              # FINDING-V412-UNIVERSAL-001 (Nico): the imperative kubectl apply above
+              # rewrites this Secret; re-assert helm.sh/resource-policy=keep so a
+              # keep-mode `helm uninstall` (plain uninstall.sh) does NOT delete the live
+              # PKI Secret and break reinstall/upgrade. NUKE (uninstall.sh
+              # --remove-volumes) deletes it explicitly. Applying the annotation to the
+              # populated Secret is idempotent and independent of 3-way-merge behaviour.
+              kubectl annotate secret {{ .Values.mtls.secretName }} \
+                --namespace {{ .Release.Namespace }} \
+                helm.sh/resource-policy=keep --overwrite
               cd /tmp/cakeys
               kubectl create secret generic {{ .Values.mtls.caKeysSecretName }} \
                 --namespace {{ .Release.Namespace }} \
@@ -323,6 +332,12 @@ spec:
                 --dry-run=client -o yaml \
               | kubectl apply -n {{ .Release.Namespace }} -f -
               echo "[applier] Secret {{ .Values.mtls.caKeysSecretName }} applied (CA private keys)."
+              # FINDING-V412-UNIVERSAL-001 (Nico): re-assert keep on the CA-keys Secret
+              # too — losing this one on a keep-mode uninstall means undecryptable
+              # pgcrypto + a broken mTLS trust anchor on reinstall.
+              kubectl annotate secret {{ .Values.mtls.caKeysSecretName }} \
+                --namespace {{ .Release.Namespace }} \
+                helm.sh/resource-policy=keep --overwrite
           volumeMounts:
             - name: pki-certs
               mountPath: /secrets

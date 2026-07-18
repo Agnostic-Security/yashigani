@@ -80,6 +80,17 @@ roleRef:
 # overwritten by the bootstrap Job at weight -5. This lets us drop the
 # over-broad `create` verb from the RBAC Role above. resource-policy: keep
 # means it survives between helm upgrades, preserving live certs.
+{{- /* FINDING-V412-UNIVERSAL-001 (Nico/Captain): only seed the empty placeholder
+     on a FRESH install. On a keep-mode uninstall the populated Secret survives
+     (resource-policy: keep); a reinstall must NOT re-run this pre-install-hook
+     Create against the already-existing Secret — Helm's hook Create path has no
+     "AlreadyExists -> adopt" fallback (unlike the main manifest apply used by the
+     app Secrets), so the hook would fail and abort `helm install`, funnelling the
+     operator toward `--remove-volumes` = CA loss (the exact scenario -001 exists
+     to prevent). When the Secret already exists, skip the placeholder; the
+     bootstrap Job applier updates it in place (get/update/patch RBAC, no create).
+     Same lookup-preserve technique used in secrets.yaml / licensing-secret.yaml. */ -}}
+{{- if not (lookup "v1" "Secret" .Release.Namespace .Values.mtls.secretName) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -98,11 +109,17 @@ metadata:
     "helm.sh/resource-policy": keep
 type: Opaque
 data: {}
+{{- end }}
 ---
 # Retro #3aj — placeholder Secret for the CA private keys. Same pattern as
 # the leaves Secret (pre-install, keep), but workload pods MUST NOT be able
 # to project this volume. Only the bootstrap Job and rotation CronJob
 # (running under ServiceAccount yashigani-pki) reference it.
+{{- /* FINDING-V412-UNIVERSAL-001 (Nico/Captain): CA-keys placeholder — same
+     fresh-install-only guard as the leaves Secret above. Losing this one on a
+     failed reinstall is the worst case (undecryptable pgcrypto + broken mTLS
+     trust anchor), so it MUST survive keep-mode uninstall -> reinstall. */ -}}
+{{- if not (lookup "v1" "Secret" .Release.Namespace .Values.mtls.caKeysSecretName) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -118,4 +135,5 @@ metadata:
     "helm.sh/resource-policy": keep
 type: Opaque
 data: {}
+{{- end }}
 {{- end }}

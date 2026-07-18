@@ -235,6 +235,11 @@ if [[ -n "${YSG_RUNTIME:-}" ]]; then
 fi
 SKIP_PREFLIGHT=false
 SKIP_PULL=false
+# FINDING-V412-UNIVERSAL-004: skip the install-time NetworkPolicy-enforcement
+# probe (k8s only). Default off — the probe runs and fails the install if the
+# cluster CNI does not enforce NetworkPolicy. Skipping records a risk-register
+# exception (operator accepts an unverified ring-fence).
+SKIP_NETWORKPOLICY_PROBE=false
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
@@ -484,6 +489,11 @@ OPTIONS
                                           Useful when demos are accessed directly by IP.
   --skip-preflight                        Skip preflight checks
   --skip-pull                             Skip docker compose pull (use local images)
+  --skip-networkpolicy-probe              (k8s) Skip the NetworkPolicy-enforcement probe.
+                                          By default install.sh fails the k8s install if the
+                                          cluster CNI does not enforce NetworkPolicy (flannel/
+                                          kindnet silently no-op it — FINDING-V412-UNIVERSAL-004).
+                                          Skipping records a risk-register exception.
   --upgrade                               Upgrade an existing installation
   --reuse-volumes                         Skip pre-install contaminated-volume detection.
                                           Use only when deliberately reusing volumes from a
@@ -724,6 +734,7 @@ parse_args() {
         ;;
       --skip-preflight)  SKIP_PREFLIGHT=true;   shift ;;
       --skip-pull)       SKIP_PULL=true;         shift ;;
+      --skip-networkpolicy-probe) SKIP_NETWORKPOLICY_PROBE=true; shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
@@ -12851,6 +12862,166 @@ _write_helm_values() {
   log_info "  tlsDomain=${DOMAIN:-<unset>}  tlsMode=${TLS_MODE:-<unset>}  upstreamUrl=${UPSTREAM_URL:-<unset>}"
 }
 
+# ---------------------------------------------------------------------------
+# _probe_networkpolicy_enforcement — FINDING-V412-UNIVERSAL-004
+#
+# Positively verify the cluster CNI ENFORCES NetworkPolicy before deploying a
+# chart whose entire ring-fence (egress via Caddy->OPA, mesh isolation) depends
+# on it. flannel (k3s default) and kindnet (kind default) silently NO-OP
+# NetworkPolicy, so a green `helm install` could ship with NO ring-fence at all —
+# Enterprise/k8s weaker than Professional/compose.
+#
+# Method (positive verification, not CNI-name sniffing):
+#   1. throwaway namespace + a busybox server pod + a client pod.
+#   2. baseline: client CAN reach server with NO policy (rules out env faults —
+#      a broken overlay would else masquerade as "enforced").
+#   3. apply default-deny-ingress on the server; client MUST no longer reach it.
+#   If step 3 still connects, the CNI is not enforcing -> FAIL the install.
+#
+# Skippable with --skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false
+# (records a risk-register exception: operator accepts an unverified ring-fence).
+# ---------------------------------------------------------------------------
+_probe_networkpolicy_enforcement() {
+  if [[ "${SKIP_NETWORKPOLICY_PROBE:-false}" == "true" || "${NETPOL_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "NetworkPolicy enforcement probe SKIPPED (--skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  The k8s ring-fence (Caddy->OPA egress control) is NOT verified enforced on this cluster."
+    log_warn "  Record a risk-register exception (FINDING-V412-UNIVERSAL-004) before relying on it."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe NetworkPolicy enforcement (throwaway ns + default-deny reachability assertion)"
+    return 0
+  fi
+
+  require_cmd "kubectl"
+  local _ns="ysg-npprobe-$$"
+  local _img="${NETPOL_PROBE_IMAGE:-busybox:1.37}"
+  local _port=8080
+
+  log_info "Probing NetworkPolicy enforcement (FINDING-V412-UNIVERSAL-004)..."
+
+  # Always tear down the throwaway namespace on return.
+  # shellcheck disable=SC2317
+  _npprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
+  trap _npprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: could not create throwaway namespace ${_ns}"
+    return 1
+  fi
+  # Probe pods run non-root + drop-all + seccomp, so a restricted PSA is fine too.
+  kubectl label namespace "$_ns" --overwrite pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+
+  # Server: busybox httpd serving "ok" on :$_port. Top-level apiVersion in the
+  # override for older-kubectl tolerance (generator-era required it).
+  if ! kubectl run np-server -n "$_ns" --image="$_img" --restart=Never --labels="app=np-server" \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"np-server","image":"'"$_img"'","command":["sh","-c","echo ok > /tmp/i && httpd -f -p '"$_port"' -h /tmp"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: server pod failed to create"
+    return 1
+  fi
+  # Client: a LONG-LIVED pod we `kubectl exec` into (Captain MEDIUM) — avoids the
+  # `kubectl run --rm -i` attach race that could make a flaky connect look like a
+  # policy block, i.e. a false "enforced" verdict.
+  if ! kubectl run np-client -n "$_ns" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"np-client","image":"'"$_img"'","command":["sh","-c","sleep 3600"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: client pod failed to create"
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/np-server pod/np-client -n "$_ns" --timeout=90s >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: probe pods not Ready (image pull? set NETPOL_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+  local _svc_ip
+  _svc_ip="$(kubectl get pod np-server -n "$_ns" -o jsonpath='{.status.podIP}' 2>/dev/null)"
+  if [[ -z "$_svc_ip" ]]; then
+    log_error "NetworkPolicy probe: could not resolve server pod IP"
+    return 1
+  fi
+
+  # Reachability via exec into the persistent client. Returns 0 iff it fetched
+  # the server's "ok" within $1 attempts (retries absorb transient noise).
+  _np_reach() {
+    local _n="$1" _i=0
+    while [ "$_i" -lt "$_n" ]; do
+      if kubectl exec np-client -n "$_ns" -- wget -q -T 4 -O - "http://${_svc_ip}:${_port}/i" 2>/dev/null | grep -q ok; then
+        return 0
+      fi
+      _i=$((_i + 1)); sleep 2
+    done
+    return 1
+  }
+
+  # Phase A (baseline, NO policy): client MUST reach server. If not, environment
+  # fault (CNI overlay/DNS/scheduling) — abort; draw no enforcement conclusion.
+  if ! _np_reach 5; then
+    log_error "NetworkPolicy probe: baseline connectivity FAILED (server unreachable with NO policy)."
+    log_error "  Environment fault (CNI overlay/DNS/scheduling), not a policy result — aborting."
+    return 1
+  fi
+
+  # Phase B (default-deny-ingress applied): client MUST now be blocked.
+  if ! kubectl apply -n "$_ns" -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: npprobe-deny-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: np-server
+  policyTypes:
+    - Ingress
+EOF
+  then
+    log_error "NetworkPolicy probe: could not apply the test NetworkPolicy"
+    return 1
+  fi
+  sleep 3  # let the CNI program the datapath
+  local _blocked="no"
+  if _np_reach 3; then _blocked="no"; else _blocked="yes"; fi
+
+  # Phase C (policy REMOVED): connectivity MUST recover. This disambiguates a real
+  # policy block (recovers) from test-infra flakiness (does not) — the false-PASS
+  # Captain flagged. We declare ENFORCED only if B blocked AND C recovered.
+  kubectl delete networkpolicy npprobe-deny-ingress -n "$_ns" --ignore-not-found=true >/dev/null 2>&1 || true
+  sleep 2
+  local _recovered="no"
+  if _np_reach 5; then _recovered="yes"; fi
+
+  if [[ "$_blocked" == "no" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING-V412-UNIVERSAL-004: NetworkPolicy is NOT enforced by this cluster's CNI."
+    log_error "A default-deny-ingress policy did NOT block traffic to the server pod."
+    log_error "The Yashigani ring-fence (Caddy->OPA egress control, mesh isolation) would be"
+    log_error "SILENTLY ABSENT — Enterprise/k8s weaker than Professional/compose."
+    log_error ""
+    log_error "REMEDIATION: install a policy-enforcing CNI (Calico or Cilium). flannel (k3s"
+    log_error "default) and kindnet (kind default) do NOT enforce NetworkPolicy. For k3s:"
+    log_error "install with --flannel-backend=none --disable-network-policy and deploy Calico/"
+    log_error "Cilium, or use a distro that ships an enforcing CNI."
+    log_error ""
+    log_error "To proceed WITHOUT enforcement (records a risk-register exception):"
+    log_error "  re-run with --skip-networkpolicy-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  if [[ "$_recovered" != "yes" ]]; then
+    log_error "NetworkPolicy probe: INCONCLUSIVE — traffic was blocked under the test policy but did"
+    log_error "  NOT recover after the policy was removed. The block cannot be attributed to the"
+    log_error "  NetworkPolicy (likely test-infra/CNI flakiness), so enforcement is NOT verified."
+    log_error "  Re-run the install, or use --skip-networkpolicy-probe (records a risk exception)."
+    return 1
+  fi
+
+  log_success "NetworkPolicy enforcement VERIFIED — default-deny blocked traffic AND removal restored it (CNI enforces)."
+  return 0
+}
+
 # STEP 8 (k8s): helm upgrade --install
 # Last updated (k8s_helm_install): 2026-05-08T00:00:00+01:00
 k8s_helm_install() {
@@ -12940,6 +13111,15 @@ k8s_helm_install() {
     pod-security.kubernetes.io/audit-version=latest \
     >/dev/null
   log_success "PSA warn+audit baseline labels applied to namespace ${NAMESPACE}"
+
+  # FINDING-V412-UNIVERSAL-004: verify the CNI enforces NetworkPolicy BEFORE we
+  # deploy a ring-fence that depends on it. Fails fast on a non-enforcing CNI
+  # (flannel/kindnet) so we never ship a silently-absent ring-fence. Skippable
+  # with --skip-networkpolicy-probe (risk-register exception).
+  if ! _probe_networkpolicy_enforcement; then
+    log_error "Aborting k8s install: NetworkPolicy enforcement not verified (FINDING-V412-UNIVERSAL-004)."
+    exit 1
+  fi
 
   local helm_args=(
     upgrade --install yashigani "$chart_dir"

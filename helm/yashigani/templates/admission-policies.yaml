@@ -2,10 +2,12 @@
 {{- /*
 YSG-RISK-008 — Kyverno ClusterPolicy admission control.
 
-When admissionPolicies.enabled is true, this template renders five Kyverno
-ClusterPolicy resources that enforce the container-hardening baseline for the
-yashigani namespace. Pods that violate the baseline are REJECTED at admission
-time (validationFailureAction: Enforce) rather than discovered post-deployment.
+When admissionPolicies.enabled is true, this template renders six Kyverno
+ClusterPolicy resources. Policies 1-5 enforce the container-hardening baseline
+for the yashigani namespace; policy 6 (FINDING-V412-UNIVERSAL-003) restricts
+PKI trust-plane access from runtime/pool-managed pods. Pods that violate a
+policy are REJECTED at admission time (validationFailureAction: Enforce) rather
+than discovered post-deployment.
 
 PREREQUISITE: Kyverno must be installed cluster-wide before helm install/upgrade.
 Install with: helm install kyverno kyverno/kyverno -n kyverno --create-namespace
@@ -33,7 +35,7 @@ lookup always returns empty in that context (correct: no cluster connection).
 {{- fail "admissionPolicies.enabled=true but the Kyverno ClusterPolicy CRD is not installed in this cluster.\n\nREMEDIATION: Install Kyverno first, then re-run helm install/upgrade:\n\n  helm repo add kyverno https://kyverno.github.io/kyverno/\n  helm repo update\n  helm install kyverno kyverno/kyverno -n kyverno --create-namespace\n\nWait for Kyverno to become ready before deploying Yashigani:\n  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=kyverno -n kyverno --timeout=120s\n\nThen re-run your helm install/upgrade command.\nAlternatively, set --set admissionPolicies.enabled=false to install without Kyverno (document in risk register per YSG-RISK-008)." }}
 {{- end }}
 ---
-# Policy 1/5: require runAsNonRoot
+# Policy 1/6: require runAsNonRoot
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -75,7 +77,7 @@ spec:
                 operator: Equals
                 value: 0
 ---
-# Policy 2/5: require allowPrivilegeEscalation: false
+# Policy 2/6: require allowPrivilegeEscalation: false
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -117,7 +119,7 @@ spec:
                     operator: NotEquals
                     value: false
 ---
-# Policy 3/5: require seccomp RuntimeDefault or Localhost
+# Policy 3/6: require seccomp RuntimeDefault or Localhost
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -159,7 +161,7 @@ spec:
                   - Unconfined
                   - ""
 ---
-# Policy 4/5: require capabilities.drop: [ALL]
+# Policy 4/6: require capabilities.drop: [ALL]
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -200,7 +202,7 @@ spec:
                     operator: AnyNotIn
                     value: "{{ "{{" }} element.securityContext.capabilities.drop[] || `[]` {{ "}}" }}"
 ---
-# Policy 5/5: restrict runAsUser: 0
+# Policy 5/6: restrict runAsUser: 0
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -258,4 +260,184 @@ spec:
                   - key: "{{ "{{" }} element.securityContext.runAsUser || `1` {{ "}}" }}"
                     operator: Equals
                     value: 0
+---
+# Policy 6/6: restrict PKI trust-plane access (FINDING-V412-UNIVERSAL-003, CRITICAL)
+#
+# The gateway ServiceAccount holds pods:create in-namespace (YSG-RISK-070,
+# rbac-pool-manager.yaml) so it can spawn per-identity pool pods. Policies 1-5
+# stop those pods being PRIVILEGED, but NONE of them stop a compromised gateway
+# from creating a Pod that (a) assumes the yashigani-pki ServiceAccount — which
+# can read/update the CA private-key Secret — or (b) mounts/references that
+# CA-keys Secret directly (volume / projected-source / env). Either = full mTLS
+# trust-plane forgery.
+#
+# SCOPING (Nico+Captain CRITICAL-1): the deny is gated on the NON-FORGEABLE
+# authenticated caller identity (request.userInfo.username), NOT on client-
+# supplied object metadata. An earlier draft exempted pods by
+# ownerReferences[0].kind != Job, but K8s does not validate submitted
+# ownerReferences — the gateway SA could forge ownerReferences:[{kind:Job}] on a
+# bare pod and bypass every rule. These rules instead fire ONLY when the pod's
+# CREATOR is the gateway ServiceAccount (system:serviceaccount:<ns>:yashigani) —
+# the sole non-admin identity holding pods:create. request.userInfo is set by the
+# API server from the bearer token and cannot be spoofed by the caller. Legit PKI
+# pods (yashigani-pki-bootstrap Job, mtls-rotation CronJob) are created by the
+# kube-system controllers, never by this SA, so they are never matched.
+# INVARIANT: this scoping assumes only SA `yashigani` holds pods:create in-ns
+# (verified rbac-pool-manager.yaml). If a future SA is granted pods:create, add
+# it to the precondition value set below.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ .Release.Name }}-restrict-pki-trust-plane
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    policies.kyverno.io/title: "Restrict PKI trust-plane access (UNIVERSAL-003)"
+    policies.kyverno.io/category: "Privilege Escalation"
+    policies.kyverno.io/severity: "critical"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      FINDING-V412-UNIVERSAL-003: deny the gateway ServiceAccount from creating
+      Pods that assume the yashigani-pki ServiceAccount or mount/reference the CA
+      private-key Secret (volume/projected/env), closing the gateway pods:create
+      -> CA-key -> mTLS-forgery path.
+    yashigani.io/finding: "FINDING-V412-UNIVERSAL-003"
+    yashigani.io/risk-id: "YSG-RISK-070"
+spec:
+  validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
+  # background: false — request.userInfo (the gate below) is only present in the
+  # admission request, not in background scans of pre-existing resources.
+  background: false
+  rules:
+    # Rule 1: the gateway SA may not create a Pod that assumes yashigani-pki.
+    - name: deny-assume-pki-sa
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          # NON-FORGEABLE gate — the authenticated creator identity (see header).
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: Equals
+            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that assumes the
+          privileged 'yashigani-pki' ServiceAccount.
+        deny:
+          conditions:
+            all:
+              - key: "{{ "{{" }} request.object.spec.serviceAccountName || 'default' {{ "}}" }}"
+                operator: Equals
+                value: yashigani-pki
+    # Rule 2: the gateway SA may not create a Pod that mounts the CA-keys Secret
+    # as a volume — direct secret volume OR projected secret source.
+    - name: deny-mount-ca-keys-secret
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: Equals
+            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that mounts the CA
+          private-key Secret '{{ .Values.mtls.caKeysSecretName }}'.
+        foreach:
+          # Direct secret volume (null-safe list; a Pod may have no volumes).
+          - list: "request.object.spec.volumes[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secret.secretName || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          # CRITICAL-2 fix (Nico+Captain): projected secret sources use a
+          # different field path (element.secret.name); the direct-volume check
+          # above is null for a projected volume, so cover it explicitly.
+          - list: "request.object.spec.volumes[].projected.sources[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secret.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+    # Rule 3: the gateway SA may not create a Pod that references the CA-keys
+    # Secret via env (secretKeyRef) / envFrom (secretRef) — containers,
+    # initContainers, and ephemeralContainers (defense-in-depth; the gateway SA
+    # lacks pods/ephemeralcontainers per rbac-pool-manager.yaml, but cover it).
+    - name: deny-env-ca-keys-secret
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: Equals
+            value: "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that references the
+          CA private-key Secret '{{ .Values.mtls.caKeysSecretName }}' via env/envFrom.
+        foreach:
+          - list: "request.object.spec.containers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.containers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.initContainers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.initContainers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.ephemeralContainers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.ephemeralContainers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
 {{- end }}
