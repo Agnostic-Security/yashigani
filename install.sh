@@ -1474,64 +1474,141 @@ require_cmd() {
 }
 
 # Resolve the compose command based on detected runtime
-# Sets COMPOSE_CMD as an array (e.g. "docker compose" or "podman compose")
+# Sets COMPOSE_CMD as an array (e.g. "docker compose" or the vendored fork invocation)
 # Sets YSG_PODMAN_RUNTIME=true if using Podman (for auto-applying override file)
-# Sets YSG_PODMAN_COMPOSE_V2=true when podman compose v2 (docker-compose engine) is
-#   selected instead of podman-compose (Python). When true, the seccomp profile is
-#   forced to "unconfined" in provision_env to avoid ENAMETOOLONG: podman compose v2
-#   inlines the JSON content of security_opt:seccomp=<path> and passes the multi-KB
-#   blob as the option value to the Podman socket, which treats it as a filename.
+# Sets YSG_PODMAN_COMPOSE_FORK=true when the vendored podman-compose-ysg fork
+#   (vendor/podman-compose-ysg/podman_compose.py) is the selected driver — the
+#   ONLY Podman-path driver as of 2026-07-18 (Tiago directive). COMPOSE_CMD[0] is
+#   "python3" in this case, NOT a usable engine-binary name — call sites that
+#   need the underlying container engine must use _ysg_compose_engine_bin(),
+#   never parse COMPOSE_CMD[0] as if it were "podman"/"podman-compose" text.
+# Sets YSG_PODMAN_COMPOSE_V2=true whenever the YSG-RISK-074 unconfined-seccomp
+#   workaround must stay active for the selected Podman driver. Historically this
+#   flag distinguished podman-compose (Python) from `podman compose` v2 (which
+#   inlines the JSON content of security_opt:seccomp=<path> into the Podman socket
+#   call → ENAMETOOLONG). Both of those paths are now retired on the Podman
+#   runtime — the fork is the only driver — but the flag is KEPT and still forced
+#   true whenever the fork is selected (Captain review condition 2, ae45c678):
+#   the fork's AS-FIX-1 patch fixes the *path-resolution* bug that originally
+#   forced this workaround, but enforceability of the REAL seccomp profile across
+#   every podman-machine client/server split has not yet been live-validated
+#   (Laura condition 4) — retiring "unconfined" here is a separate, validation-
+#   gated follow-up, not decided by this wiring step.
 #   Ref: Pentest #95 TM-V231-005; YSG-RISK-074 (seccomp on Podman is kernel-enforced,
 #   not compose-enforced; the unconfined compose flag does not disable seccomp).
 YSG_PODMAN_RUNTIME=false
-YSG_PODMAN_COMPOSE_V2=false  # initialised here; authoritative value set by resolve_compose_cmd
+YSG_PODMAN_COMPOSE_V2=false        # initialised here; authoritative value set by resolve_compose_cmd
+YSG_PODMAN_COMPOSE_FORK=false      # initialised here; authoritative value set by resolve_compose_cmd
 COMPOSE_CMD=()   # global declaration so ${#COMPOSE_CMD[@]} is safe under set -u before first resolve
 
-# ── Podman compose engine selection helpers ────────────────────────────────────
+# ── Podman compose engine selection: vendored fork only ────────────────────────
 # Defined as top-level functions (not nested) so bats tests can extract them.
+#
+# Tiago directive (2026-07-18, post FINDING-V412-RESTART-001/005 + Captain's
+# GO-WITH-CONDITIONS review of the fork, ae45c678): on the Podman runtime,
+# install.sh invokes ONLY the vendored podman-compose-ysg fork
+# (vendor/podman-compose-ysg/podman_compose.py) as the compose driver. Two
+# previously-supported paths are permanently retired from this runtime:
+#   - pip podman-compose (any version) — 1.6.x's dependency-graph hang was the
+#     original reason to prefer podman compose v2; the fork supersedes both.
+#   - `podman compose` v2 — this Podman built-in subcommand dispatches to
+#     whatever external docker-compose-compatible binary happens to be on PATH
+#     (FINDING-V412-RESTART-001: the operator's real ~/.docker/config.json
+#     credsStore hung the client-side registry-credential lookup indefinitely
+#     on a virgin Podman-only host during a compose build). docker-compose must
+#     never drive Podman.
+# If the fork is unavailable (missing from the tree) or fails integrity
+# verification, we fail loud — never silently fall back to either retired path.
 
-# Echo podman-compose major.minor version (e.g. "1.5", "1.6") or return 1 if absent.
-# Note: `podman-compose --version` may emit two lines on some versions:
-#   podman version 6.0.0
-#   podman-compose version 1.6.0
-# We grep for the line that starts with "podman-compose" to avoid picking up the
-# embedded podman client version line. Then strip the patch level.
-_podman_compose_version_major_minor() {
-  command -v podman-compose >/dev/null 2>&1 || return 1
-  local _v
-  _v="$(podman-compose --version 2>/dev/null \
-    | grep -i 'podman-compose' | awk '{print $NF}')"
-  printf '%s' "${_v%.*}"   # strip patch level: "1.6.0" → "1.6"
+# Locate the vendored fork directory. Checks WORK_DIR first (the resolved
+# install tree), then the directory install.sh itself lives in (covers
+# relative/symlinked invocation before WORK_DIR is set), then $PWD as a last
+# resort — same search order as load_airgap_bundle()'s manifest lookup.
+# Echoes the directory path and returns 0 on success; returns 1 if the fork's
+# entrypoint file is not found anywhere.
+_ysg_fork_compose_dir() {
+  local _d
+  for _d in "${WORK_DIR:-}" \
+            "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" \
+            "$(pwd)"; do
+    [[ -z "$_d" ]] && continue
+    if [[ -f "${_d}/vendor/podman-compose-ysg/podman_compose.py" ]]; then
+      printf '%s' "${_d}/vendor/podman-compose-ysg"
+      return 0
+    fi
+  done
+  return 1
 }
 
-# Echo podman CLIENT binary major version (e.g. "6") or "0" on failure.
-_podman_client_major() {
-  local _maj
-  _maj="$(podman --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
-  printf '%s' "${_maj:-0}"
+# The fork requires PyYAML + python-dotenv (unlike the rest of install.sh's
+# python3 usage, which is stdlib-only). Verify both are importable by the
+# system python3 BEFORE selecting the fork as the compose driver — fail loud
+# with clear remediation rather than silently falling through to a retired path.
+_ysg_fork_compose_python_ready() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import yaml, dotenv" >/dev/null 2>&1
 }
 
-# Return 0 when podman-compose should be preferred over podman compose v2.
-# podman-compose is NOT usable when any of these apply:
-#   (a) not installed
-#   (b) version is 1.6.x — dependency graph is broken; single-service 'up' hangs;
-#       stack stalls at ~16/26 containers (confirmed against Homebrew podman-compose 1.6.0)
-#   (c) podman client major ≥ 6 — Captain validated 26/26 containers up via
-#       podman compose v2 + unconfined seccomp on podman 6.0.0; prefer v2 on 6+
-_podman_compose_usable() {
-  command -v podman-compose >/dev/null 2>&1 || return 1   # (a) absent
-  local _mm _pmaj
-  _mm="$(_podman_compose_version_major_minor 2>/dev/null)"
-  [[ "$_mm" == "1.6" ]] && return 1                       # (b) 1.6.x broken
-  _pmaj="$(_podman_client_major 2>/dev/null)"
-  [[ "${_pmaj}" =~ ^[0-9]+$ ]] && [[ "${_pmaj}" -ge 6 ]] && return 1  # (c) podman 6+
-  return 0
+_YSG_FORK_MANIFEST_VERIFIED=false  # process-local cache; verified once per run
+
+# Fail-closed integrity check for the vendored fork — run BEFORE the fork is
+# ever invoked (mirrors load_airgap_bundle()'s image-digest fail-closed
+# contract, install.sh's existing pattern for a vendored/downloaded artefact
+# whose provenance must be established before use). Exits the whole installer
+# non-zero on ANY mismatch or missing file — no downgrade-to-warning path
+# (S1/SOP4 discipline: never "treating as PASS"). Cached per process so the
+# ~10 resolve_compose_cmd() call sites in a single install run don't re-hash
+# the manifest repeatedly.
+_ysg_verify_fork_manifest() {
+  local _fork_dir="$1"
+  if [[ "${_YSG_FORK_MANIFEST_VERIFIED}" == "true" ]]; then
+    return 0
+  fi
+  local _verify_script="${_fork_dir}/verify-manifest.sh"
+  if [[ ! -f "$_verify_script" ]]; then
+    log_error "podman-compose-ysg vendored fork found at ${_fork_dir} but"
+    log_error "verify-manifest.sh is missing alongside it — cannot establish"
+    log_error "integrity. ABORTING (refusing to invoke an unverifiable fork)."
+    exit 1
+  fi
+  local _verify_out
+  if _verify_out="$(bash "$_verify_script" 2>&1)"; then
+    log_info "podman-compose-ysg fork integrity verified: ${_verify_out}"
+    _YSG_FORK_MANIFEST_VERIFIED=true
+    return 0
+  fi
+  log_error "podman-compose-ysg vendored-fork INTEGRITY VERIFICATION FAILED:"
+  log_error "$_verify_out"
+  log_error "The fork may be tampered or corrupted. ABORTING — refusing to"
+  log_error "invoke it. Re-fetch a clean Yashigani release tree and retry."
+  exit 1
+}
+
+# Return the underlying container-engine binary ("podman" or "docker") for the
+# currently-resolved compose driver. Prefers the authoritative YSG_PODMAN_RUNTIME
+# flag (set by resolve_compose_cmd for every Podman-path driver, including the
+# vendored fork, where COMPOSE_CMD[0] is "python3" — not a usable engine-binary
+# name on its own) — falls back to text-matching COMPOSE_CMD[0] (docker /
+# docker-compose / podman / podman-compose) when the flag is unset, e.g. a call
+# site that runs before resolve_compose_cmd has been invoked this process.
+_ysg_compose_engine_bin() {
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    printf 'podman'
+    return 0
+  fi
+  local _b="${COMPOSE_CMD[0]:-docker}"
+  _b="${_b%%-compose}"
+  case "$_b" in
+    podman*) printf 'podman' ;;
+    *)       printf 'docker' ;;
+  esac
 }
 
 resolve_compose_cmd() {
   COMPOSE_CMD=()
   YSG_PODMAN_RUNTIME=false   # reset before resolution — prevents stale env/state bleed
   YSG_PODMAN_COMPOSE_V2=false
+  YSG_PODMAN_COMPOSE_FORK=false
 
   # ── HARD RUNTIME SEPARATION (maintainer directive 2026-04-29 after 3rd cross-runtime
   # bug: Pentest #95 docker-compose-shim against Podman socket "file name too long",
@@ -1583,108 +1660,101 @@ resolve_compose_cmd() {
       log_error "If you meant Docker, set YSG_RUNTIME=docker instead."
       exit 1
     fi
-    # Capability-aware compose engine selection for Podman:
-    #
-    # podman-compose (Python) is preferred when it is present AND usable:
-    #   usable = installed + NOT version 1.6.x + podman client major < 6.
-    #
-    # podman-compose 1.6.x is known-broken: dependency graph resolution is
-    # broken; single-service 'up' hangs indefinitely; the full stack stalls at
-    # ~16/26 containers (confirmed on Homebrew podman-compose 1.6.0, 2026-07).
-    # podman 6+ users get podman compose v2 unconditionally — Captain validated
-    # 26/26 containers up on podman 6.0.0 via podman compose v2.
-    #
-    # When podman compose v2 is selected (YSG_PODMAN_COMPOSE_V2=true), the
-    # seccomp profile is forced to "unconfined" in provision_env. Root cause:
-    # podman compose v2 inlines the JSON content of security_opt:seccomp=<path>
-    # into the API call; the Podman socket treats the multi-KB blob as a filename
-    # → ENAMETOOLONG → caddy/gateway/backoffice cannot start. YSG-RISK-074:
-    # seccomp on Podman is kernel-enforced, not compose-enforced; "unconfined"
-    # in the compose security_opt does not disable the kernel seccomp profile.
-    # Ref: Pentest #95 TM-V231-005; fix/v411-revert-podman-compose-letta-waitloop.
-    #
-    # The letta/letta-pgbouncer "stuck Created" issue on podman-compose 1.x is
-    # handled by _podman_compose_letta_waitloop() in compose_up().
-    if _podman_compose_usable; then
+
+    # The vendored podman-compose-ysg fork is the ONLY accepted compose driver
+    # on this runtime (see the block comment above this helper section). Verify
+    # its integrity BEFORE it is ever invoked, then verify the interpreter has
+    # its two extra deps (PyYAML + python-dotenv) importable.
+    local _fork_dir
+    if _fork_dir="$(_ysg_fork_compose_dir)"; then
+      _ysg_verify_fork_manifest "$_fork_dir"   # fail-closed; exits 1 on mismatch
+      if ! _ysg_fork_compose_python_ready; then
+        log_error "podman-compose-ysg fork found at ${_fork_dir} but the system"
+        log_error "python3 cannot import PyYAML + python-dotenv (both required)."
+        log_error "Install both, e.g.:"
+        log_error "  python3 -m pip install --user pyyaml python-dotenv"
+        log_error "Then re-run this installer."
+        exit 1
+      fi
       # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
       # podman-compose defaults to one pod per project; the NVIDIA CDI hook
       # (/usr/bin/nvidia-cdi-hook) fails (exit 1) when the GPU container starts
       # inside that pod, wedging ollama + everything that depends on it.
-      local _pc_ver; _pc_ver="$(_podman_compose_version_major_minor 2>/dev/null)"
-      COMPOSE_CMD=("podman-compose" "--in-pod=false")
+      #
+      # The letta/letta-pgbouncer "stuck Created" issue (podman-compose 1.x does
+      # not honour service_healthy/service_completed_successfully) is handled by
+      # _podman_compose_letta_waitloop() in compose_up() — the fork inherits this
+      # limitation unchanged from upstream (none of AS-FIX-1/2/3 touch it).
+      COMPOSE_CMD=("python3" "${_fork_dir}/podman_compose.py" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      YSG_PODMAN_COMPOSE_V2=false
-      log_info "Compose tool: podman-compose ${_pc_ver}.x (native, sequential, --in-pod=false)"
-      return 0
-    fi
-    # podman-compose absent, 1.6.x (broken), or podman 6+ → podman compose v2.
-    # YSG_PODMAN_COMPOSE_V2=true signals provision_env to force seccomp=unconfined.
-    if podman compose version >/dev/null 2>&1; then
-      local _pc_mm; _pc_mm="$(_podman_compose_version_major_minor 2>/dev/null || true)"
-      local _pmaj;  _pmaj="$(_podman_client_major 2>/dev/null || true)"
-      local _reason
-      if command -v podman-compose >/dev/null 2>&1 && [[ "$_pc_mm" == "1.6" ]]; then
-        _reason="podman-compose ${_pc_mm}.x broken — dependency graph hangs"
-      elif command -v podman-compose >/dev/null 2>&1; then
-        _reason="podman ${_pmaj}.x ≥ 6 — prefer podman compose v2"
-      else
-        _reason="podman-compose not installed"
-      fi
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
+      YSG_PODMAN_COMPOSE_FORK=true
+      # YSG-RISK-074 unconfined-seccomp workaround: KEPT (Captain review
+      # condition 2, ae45c678 fork-review gate) even though the fork's AS-FIX-1
+      # fixes podman-compose's relative-seccomp-path realpath() bug. Enforceability
+      # of the REAL profile across every podman-machine client/server split (this
+      # Mac = applehv+virtiofs; Linux rootless subuid handling differs) is still
+      # an open live-test item (Laura condition 4) — retirement is validation-
+      # gated and tracked separately, not flipped at this wiring step.
       YSG_PODMAN_COMPOSE_V2=true
-      log_info "Compose tool: podman compose v2 (${_reason}; seccomp→unconfined per YSG-RISK-074)"
+      log_info "Compose tool: podman-compose-ysg 1.5.0+ysg.1 (vendored fork, --in-pod=false; seccomp→unconfined per YSG-RISK-074, pending validation-gated retirement)"
       return 0
     fi
-    log_error "YSG_RUNTIME=podman but no native Podman compose tool found. Install:"
-    log_error "  • podman-compose:  pip install podman-compose"
-    log_error "  • OR Podman 4+ with built-in compose subcommand"
+
+    log_error "YSG_RUNTIME=podman but the vendored podman-compose-ysg fork was"
+    log_error "not found (expected vendor/podman-compose-ysg/podman_compose.py"
+    log_error "under the install tree or alongside install.sh)."
     log_error ""
-    log_error "Do NOT install docker-compose against the Podman socket — that path"
-    log_error "is explicitly NOT supported (cross-runtime compatibility issues, see"
-    log_error "Pentest #95 TM-V231-005 + v2.23.1 retro #3a-fix)."
+    log_error "This installer no longer supports pip podman-compose or the"
+    log_error "native 'podman compose' v2 subcommand on the Podman runtime — both"
+    log_error "are retired: pip podman-compose 1.6.x hangs on dependency-graph"
+    log_error "resolution, and 'podman compose' v2 dispatches to whatever external"
+    log_error "docker-compose binary is on PATH, which must never drive Podman"
+    log_error "(FINDING-V412-RESTART-001; Tiago directive 2026-07-18)."
+    log_error ""
+    log_error "Re-fetch a complete Yashigani release tree (the fork ships in"
+    log_error "vendor/podman-compose-ysg/) and re-run."
     exit 1
   fi
 
   # ── Auto-detect (YSG_RUNTIME unset or =auto) ───────────────────────────────
   # Prefer Podman for rootless-first security posture. Strict-self-contained:
-  # the Podman branch only considers podman-compose / podman compose; the
+  # the Podman branch only considers the vendored podman-compose-ysg fork; the
   # Docker branch only considers docker compose / docker-compose. No mixing.
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    # Same capability-aware bifurcation as the explicit-podman branch above.
-    if _podman_compose_usable; then
-      local _pc_ver; _pc_ver="$(_podman_compose_version_major_minor 2>/dev/null)"
-      COMPOSE_CMD=("podman-compose")
-      YSG_PODMAN_RUNTIME=true
-      YSG_PODMAN_COMPOSE_V2=false
-      log_info "Compose tool: podman-compose ${_pc_ver}.x (auto-detect)"
-      return 0
-    fi
-    if podman compose version >/dev/null 2>&1; then
-      local _pc_mm; _pc_mm="$(_podman_compose_version_major_minor 2>/dev/null || true)"
-      local _pmaj;  _pmaj="$(_podman_client_major 2>/dev/null || true)"
-      local _reason
-      if command -v podman-compose >/dev/null 2>&1 && [[ "$_pc_mm" == "1.6" ]]; then
-        _reason="podman-compose ${_pc_mm}.x broken"
-      elif command -v podman-compose >/dev/null 2>&1; then
-        _reason="podman ${_pmaj}.x ≥ 6"
-      else
-        _reason="podman-compose absent"
+    # Same fork-only selection as the explicit-podman branch above.
+    local _fork_dir
+    if _fork_dir="$(_ysg_fork_compose_dir)"; then
+      # Fail-closed even in auto-detect: a tamper/corruption signal on the fork
+      # must never be silently downgraded to "just try Docker instead" — that
+      # would mask a genuine supply-chain integrity failure (SOP4 discipline).
+      _ysg_verify_fork_manifest "$_fork_dir"
+      if _ysg_fork_compose_python_ready; then
+        COMPOSE_CMD=("python3" "${_fork_dir}/podman_compose.py" "--in-pod=false")
+        YSG_PODMAN_RUNTIME=true
+        YSG_PODMAN_COMPOSE_FORK=true
+        # YSG-RISK-074 workaround kept — see rationale in the Podman-only branch above.
+        YSG_PODMAN_COMPOSE_V2=true
+        log_info "Compose tool: podman-compose-ysg 1.5.0+ysg.1 (vendored fork, auto-detect, --in-pod=false; seccomp→unconfined per YSG-RISK-074)"
+        return 0
       fi
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      YSG_PODMAN_COMPOSE_V2=true
-      log_info "Compose tool: podman compose v2 (auto-detect, ${_reason}; seccomp→unconfined per YSG-RISK-074)"
-      return 0
+      log_warn "Podman is installed and the podman-compose-ysg fork is present,"
+      log_warn "but the system python3 cannot import PyYAML + python-dotenv."
+      log_warn "Install both (python3 -m pip install --user pyyaml python-dotenv)"
+      log_warn "to use the Podman path, OR set YSG_RUNTIME=docker explicitly."
+      log_warn "Continuing auto-detect to look for Docker..."
+    else
+      # Podman is reachable but the vendored fork is not present in this tree.
+      # pip podman-compose and native `podman compose` v2 are both retired on
+      # this runtime (docker-compose must never drive Podman — FINDING-001) —
+      # we refuse to silently fall through to either. Tell the user and try Docker.
+      log_warn "Podman is installed but the vendored podman-compose-ysg fork was"
+      log_warn "not found under this install tree — pip podman-compose and native"
+      log_warn "'podman compose' v2 are no longer supported on this runtime."
+      log_warn "Set YSG_RUNTIME=docker if you intend to use Docker, or re-fetch a"
+      log_warn "complete Yashigani release tree (fork ships in vendor/podman-compose-ysg/)."
+      log_warn "Continuing auto-detect to look for Docker..."
     fi
-    # Podman is reachable but neither podman-compose nor `podman compose` is
-    # available. We refuse to silently fall through to docker-compose against
-    # the Podman socket (cross-runtime bug pattern). Tell the user.
-    log_warn "Podman is installed but no Podman-native compose tool found."
-    log_warn "Install podman-compose (pip install podman-compose) for the native"
-    log_warn "Podman path, OR set YSG_RUNTIME=docker if you intend to use Docker."
-    log_warn "Continuing auto-detect to look for Docker..."
   fi
 
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -3397,15 +3467,24 @@ _write_aes_key_to_env() {
   # override to "unconfined" via YASHIGANI_SECCOMP_PROFILE env var if a host
   # kernel rejects the profile (e.g. nested virtualisation, non-standard kernels).
   #
-  # podman compose v2 path (YSG_PODMAN_COMPOSE_V2=true): MUST be "unconfined".
-  # podman compose v2 inlines the JSON content of security_opt:seccomp=<path> into
-  # the API call; the Podman socket treats the multi-KB blob as a filename →
-  # ENAMETOOLONG → caddy/gateway/backoffice cannot start. YSG-RISK-074: seccomp on
-  # Podman is kernel-enforced (not compose-enforced); "unconfined" in the compose
-  # security_opt does not disable the host kernel seccomp profile.
+  # Podman path (YSG_PODMAN_COMPOSE_V2=true): MUST be "unconfined" for now.
+  # Historically this was forced because `podman compose` v2 inlines the JSON
+  # content of security_opt:seccomp=<path> into the API call; the Podman socket
+  # treats the multi-KB blob as a filename → ENAMETOOLONG → caddy/gateway/
+  # backoffice cannot start (YSG-RISK-074: seccomp on Podman is kernel-enforced,
+  # not compose-enforced — "unconfined" in the compose security_opt does not
+  # disable the host kernel seccomp profile, it only avoids that inlining bug).
+  # `podman compose` v2 is now retired from this runtime (2026-07-18, the
+  # vendored podman-compose-ysg fork is the only Podman driver — see
+  # resolve_compose_cmd()) and the fork's AS-FIX-1 patch fixes the underlying
+  # relative-path realpath() bug. The flag is nonetheless KEPT true whenever the
+  # fork is selected (Captain review condition 2, ae45c678): enforceability of
+  # the REAL profile across every podman-machine client/server split has not yet
+  # been live-validated (Laura condition 4). Retiring "unconfined" here is a
+  # separate, validation-gated follow-up — not decided by this wiring step.
   local _seccomp_profile="${WORK_DIR}/docker/seccomp/yashigani.json"
   if [[ "${YSG_PODMAN_COMPOSE_V2:-false}" == "true" ]]; then
-    log_info "Seccomp: unconfined (podman compose v2 — avoids security_opt JSON inlining; YSG-RISK-074)"
+    log_info "Seccomp: unconfined (Podman vendored-fork driver — YSG-RISK-074, pending validation-gated retirement)"
     _env_set "YASHIGANI_SECCOMP_PROFILE" "unconfined"
   elif [[ ! -f "$_seccomp_profile" ]]; then
     log_warn "Seccomp profile not found at ${_seccomp_profile} — falling back to unconfined"
@@ -4793,7 +4872,10 @@ check_existing_installation() {
       # Multi-instance (3.0): scope to THIS install's project (not hardcoded
       # "docker") and use the runtime's own compose-project label key (podman and
       # docker differ), so a 2nd named instance is detected correctly.
-      local _runtime_bin="${COMPOSE_CMD[0]%%[[:space:]]*}"
+      # _ysg_compose_engine_bin(): NOT COMPOSE_CMD[0] text-parsing — COMPOSE_CMD[0]
+      # is "python3" when the podman-compose-ysg fork is selected, which is not a
+      # usable engine-binary name (fork wiring, 2026-07-18).
+      local _runtime_bin; _runtime_bin="$(_ysg_compose_engine_bin)"
       local _proj="${COMPOSE_PROJECT_NAME:-docker}"
       local _label_key="com.docker.compose.project"
       [[ "$_runtime_bin" == podman* ]] && _label_key="io.podman.compose.project"
@@ -7769,8 +7851,10 @@ _resolve_host_ollama_port() {
 #
 # Design constraints:
 #   • NO-OP when:
-#       – provider is NOT podman-compose (i.e. podman compose or docker — those
-#         honour service_healthy natively)
+#       – provider is NOT the podman-compose-ysg fork (YSG_PODMAN_COMPOSE_FORK
+#         is the authoritative flag as of 2026-07-18's fork wiring — `podman
+#         compose` v2 and docker compose both honour service_healthy natively
+#         and are no longer selectable on the Podman runtime in any case)
 #       – letta profile is not active (lean installs without --letta flag)
 #       – K8s path (YSG_PODMAN_RUNTIME=false)
 #       – DRY_RUN=true
@@ -7796,10 +7880,15 @@ _resolve_host_ollama_port() {
 # converge, before log_success "Services started".
 # =============================================================================
 _podman_compose_letta_waitloop() {
-  # ── Guard 1: only applies when podman-compose is the selected tool ─────────
-  # `podman compose` and `docker compose` honour service_healthy natively.
+  # ── Guard 1: only applies when the podman-compose-ysg fork is the selected
+  # tool ───────────────────────────────────────────────────────────────────────
+  # `podman compose` v2 and `docker compose` honour service_healthy natively —
+  # neither is reachable here anyway (fork is the only Podman driver as of the
+  # 2026-07-18 wiring), but the guard is kept explicit and belt-and-suspenders.
+  # YSG_PODMAN_COMPOSE_FORK (not a COMPOSE_CMD[0] text match — COMPOSE_CMD[0] is
+  # "python3" for the fork, not a driver name) is the authoritative flag.
   if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] \
-     || [[ "${COMPOSE_CMD[0]:-}" != "podman-compose" ]]; then
+     || [[ "${YSG_PODMAN_COMPOSE_FORK:-false}" != "true" ]]; then
     return 0
   fi
 
@@ -8708,17 +8797,22 @@ compose_up() {
   # --pull never, `docker compose up` still issues Pulling calls for any image not
   # locally cached — failing on truly isolated networks.
   #
-  # docker compose v2 / docker-compose / podman compose: --pull never
-  # podman-compose (Python): does NOT support --pull never; omitting --pull is
-  #   correct (no flag = don't pull). We must not pass --pull never to podman-compose
-  #   or it will error ("unrecognized arguments").
+  # docker compose v2 / docker-compose: --pull never
+  # podman-compose-ysg (vendored fork, the only Podman driver as of 2026-07-18) /
+  # podman-compose (Python) upstream lineage: does NOT support --pull never (its
+  # argparse defines --pull as a boolean action=store_true flag, not a policy
+  # value — "--pull never" would be parsed as "--pull" followed by an unrecognised
+  # positional "never"). Omitting --pull is correct here (no flag = don't pull).
+  # We must not pass --pull never to the fork or it will error ("unrecognized
+  # arguments: never"). Gate on YSG_PODMAN_RUNTIME (not COMPOSE_CMD[0] text —
+  # COMPOSE_CMD[0] is "python3" for the fork, not a driver name).
   local _pull_flag=()
   if [[ "$AIR_GAP" == "true" ]]; then
-    if [[ "${COMPOSE_CMD[0]}" != "podman-compose" ]]; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
       _pull_flag=("--pull" "never")
       log_info "Air-gap mode: passing --pull never to compose up (BUG-AG-001)"
     else
-      log_info "Air-gap mode: podman-compose selected; omitting --pull (no flag = no pull)"
+      log_info "Air-gap mode: Podman fork selected; omitting --pull (no flag = no pull)"
     fi
   fi
 
@@ -15847,9 +15941,13 @@ PYEOF
         resolve_compose_cmd 2>/dev/null || true
       fi
       local _gw_container=""
-      local _runtime_bin_ps="${COMPOSE_CMD[0]:-docker}"
-      # strip -compose suffix: "docker-compose" → "docker", "podman-compose" → "podman"
-      _runtime_bin_ps="${_runtime_bin_ps%%-compose}"
+      # _ysg_compose_engine_bin(): NOT COMPOSE_CMD[0] text-parsing. COMPOSE_CMD[0]
+      # is "python3" when the podman-compose-ysg fork is selected (the only
+      # Podman driver as of the 2026-07-18 fork wiring) — stripping a "-compose"
+      # suffix off "python3" would leave "python3" unchanged, breaking all five
+      # detection tiers below on the Podman path. The engine-binary helper
+      # resolves the real engine ("podman"/"docker") via YSG_PODMAN_RUNTIME first.
+      local _runtime_bin_ps; _runtime_bin_ps="$(_ysg_compose_engine_bin)"
 
       # Derive the compose project name from the compose-file directory name
       # (same logic Docker Compose v2 uses by default).
@@ -16730,14 +16828,15 @@ main() {
     # Returns 0 if this is NOT a re-run path (continues full install).
     # Exits 0 or 1 if this IS a re-run path (does not return).
     _activate_byo_ca_rerun
-    # Derive RUNTIME from resolved COMPOSE_CMD: "podman-compose" or "podman compose"
-    # → podman; "docker compose" or "docker-compose" → docker.
+    # Derive RUNTIME from the resolved compose driver. Prefer the authoritative
+    # YSG_PODMAN_RUNTIME flag (_ysg_compose_engine_bin()) over text-matching
+    # COMPOSE_CMD[0] — COMPOSE_CMD[0] is "python3" when the podman-compose-ysg
+    # fork is selected (the only Podman driver as of the 2026-07-18 fork
+    # wiring), which the old podman*/docker* case match would silently miss and
+    # fall through to RUNTIME="${YSG_RUNTIME:-docker}" (wrong under auto-detect
+    # with YSG_RUNTIME unset).
     if [[ -z "${RUNTIME:-}" ]]; then
-      case "${COMPOSE_CMD[0]:-}" in
-        podman*) RUNTIME="podman" ;;
-        docker*) RUNTIME="docker" ;;
-        *)       RUNTIME="${YSG_RUNTIME:-docker}" ;;
-      esac
+      RUNTIME="$(_ysg_compose_engine_bin)"
     fi
     _check_contaminated_volumes
 

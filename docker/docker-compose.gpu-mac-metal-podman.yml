@@ -132,11 +132,48 @@ services:
       # {$YASHIGANI_HOST_OLLAMA_PORT:11434} to the correct port at Caddy startup.
       YASHIGANI_HOST_OLLAMA_PORT: "${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
 
-  # C4: disable container ollama. Starts as no-op and exits immediately (exit 0).
-  # gateway.depends_on.ollama is overridden below to service_started so gateway
-  # does not wait for a healthcheck that will never fire.
+  # C4: disable container ollama. gateway.depends_on.ollama is overridden below
+  # to service_started so gateway does not wait for a healthcheck that will
+  # never fire (host-native ollama is what actually serves inference here —
+  # see FINDING-V412-RESTART-003, health-check.sh branches on
+  # YASHIGANI_HOST_OLLAMA_PORT and never inspects this container's status).
+  #
+  # FINDING-V412-RESTART-005 fix (2026-07-18, option (b) chosen — see
+  # testing_runs/yashigani/v412-fork-build-20260718/FINDING-V412-RESTART-005.md
+  # for full root-cause + option analysis):
+  #   entrypoint was previously ["true"] (starts, exits 0 within
+  #   milliseconds). On Podman, gateway's `depends_on: ollama: condition:
+  #   service_started` compiles to `podman wait --condition=running ollama`,
+  #   which blocks FOREVER once the target has already exited before the wait
+  #   is issued (reproduces independently of podman-compose entirely — a
+  #   podman wait/compose-lifecycle semantics gap, not a podman-compose-ysg
+  #   fork defect; confirmed pre-existing by Captain's fork review,
+  #   ae45c678). Docker's compose implementation does not exhibit this hang
+  #   for the identical override (docker-compose.gpu-mac-metal.yml is
+  #   intentionally NOT touched by this fix — no regression there to fix).
+  #
+  #   Option (a) (drop the depends_on wait) was rejected: compose merge
+  #   semantics only ADD/merge depends_on keys per-key; there is no portable,
+  #   engine-agnostic way to DELETE a base-file depends_on entry from an
+  #   override that both `podman compose` v2 and the podman-compose-ysg
+  #   fork's parser are guaranteed to honor identically (compose-spec's
+  #   `!reset` merge tag is a newer Docker Compose v2.24+ extension, not
+  #   confirmed supported by the fork's podman-compose-1.5.0 lineage —
+  #   relying on it here would risk an unknown-YAML-tag failure on the fork).
+  #
+  #   Option (b) (this fix): keep the no-op container genuinely RUNNING
+  #   instead of exit-0-immediately, so `podman wait --condition=running`
+  #   (and Docker's equivalent `service_started` check) is satisfied
+  #   trivially and permanently — no engine-specific behaviour relied upon.
+  #   `sleep infinity` is a true no-op: it never starts the real `ollama`
+  #   binary (identical functional surface to the old `["true"]`), consumes
+  #   negligible CPU/RAM, exposes no new listener, and needs no restart
+  #   policy change (a process that never exits never needs restarting).
+  #   Healthcheck stays disabled — FINDING-003 already means nothing probes
+  #   this container's health; only its "is it running" state now matters,
+  #   and that state is now permanently true instead of racing an instant exit.
   ollama:
-    entrypoint: ["true"]
+    entrypoint: ["sleep", "infinity"]
     restart: "no"
     healthcheck:
       disable: true
