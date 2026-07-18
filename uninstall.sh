@@ -229,13 +229,51 @@ _list_project_containers() {
 }
 
 # ---------------------------------------------------------------------------
+# _RINGFENCE_NAME_PATTERN — SINGLE SOURCE OF TRUTH for "which networks does
+# the J12 sweep own" (Ava 2026-05-30), shared between _list_project_networks()'s
+# exclusion filter (below) and the J12 sweep's own `network ls --filter`
+# call further down in this file. Defining it once here means the two
+# sweeps cannot drift apart again the way they did in the regression
+# Captain caught in review of 5ddb0c99 (2026-07-18):
+#
+# The exclusion filter originally read `grep -v '^ringfence_'` — anchored on
+# a BARE, unprefixed name. But install.sh's onboard code path
+# (ringfence_net="ringfence_${agent}", ~line 15702) writes this as a plain
+# top-level compose `networks:` key with NO `name:` override — identical
+# to every other network in the file (edge, caddy_internal, etc.) — so
+# standard compose semantics project-prefix it at creation time. The real,
+# on-disk name is ALWAYS "<project>_ringfence_<agent>" (e.g.
+# localhost_ringfence_git), confirmed live 2026-07-18 both by Captain
+# (`podman network create localhost_ringfence_testagent ...`) and
+# independently in this session's own install run
+# (localhost_ringfence_openclaw_in — created by the base compose file's
+# static 3-agent-wrap ringfences, same naming shape as dynamically onboarded
+# ones). There is no bare/unprefixed case in practice.
+#
+# A bare-anchor exclusion (`^ringfence_`) therefore never matched the real
+# name, so ringfence networks were NOT excluded from the strict sweep — they
+# were removed-or-hard-failed by the strict completeness assertion (exit 1)
+# BEFORE the script ever reached the permissive J12 sweep further down,
+# defeating J12's deliberately-permissive (WARN, not fatal) handling of a
+# foreign-attached onboard container — a hard uninstall failure for any
+# customer with an active onboarded agent at uninstall time.
+#
+# Fix: substring match (no anchor), mirroring the J12 sweep's OWN
+# `network ls --filter name=...` semantics (substring containment, not a
+# prefix anchor) — so both sweeps see the identical set regardless of
+# whether "ringfence_" is the start of the name or an infix after the
+# project prefix.
+# ---------------------------------------------------------------------------
+_RINGFENCE_NAME_PATTERN="ringfence_"
+
+# ---------------------------------------------------------------------------
 # _list_project_networks — enumerate ALL project-scoped compose networks
-# (EXCLUDING dynamically-named ringfence_<agent> networks, which have their
-# own dedicated sweep further down -- J12 fix, Ava 2026-05-30 -- and
-# deliberately treat residuals as non-fatal since they may be attached to a
-# foreign onboard-created container; that permissive semantic stays scoped
-# to that sweep, not silently inherited here) using the SAME two-strategy
-# pattern as _list_project_containers():
+# (EXCLUDING ringfence_<agent> networks — see _RINGFENCE_NAME_PATTERN above
+# — which have their own dedicated sweep further down -- J12 fix, Ava
+# 2026-05-30 -- and deliberately treat residuals as non-fatal since they may
+# be attached to a foreign onboard-created container; that permissive
+# semantic stays scoped to that sweep, not silently inherited here) using
+# the SAME two-strategy pattern as _list_project_containers():
 #
 #   1. Label filter: compose-label variants for both podman-compose (Python
 #      tool) and Docker Compose v2 / native `podman compose` v2.  Measured
@@ -282,7 +320,7 @@ _list_project_networks() {
 "
   fi
 
-  printf '%s' "$_names" | sort -u | grep -v '^$' | grep -v '^ringfence_' || true
+  printf '%s' "$_names" | sort -u | grep -v '^$' | grep -v "$_RINGFENCE_NAME_PATTERN" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1375,15 +1413,21 @@ fi
 
 # ---------------------------------------------------------------------------
 # J12 FIX (Ava 2026-05-30): remove ringfence_<agent> networks created by
-# `yashigani onboard` (Shape-C MCP agents).  These networks are deliberately
-# EXCLUDED from _list_project_networks() above (FINDING-V412-RESTART-004a)
-# because they are dynamically named at onboard time (ringfence_git,
-# ringfence_filesystem, etc.) and this sweep's residual-handling is
-# intentionally permissive (WARN, not exit-1) — a ringfence network may
-# legitimately still be attached to a foreign onboard container.
+# `yashigani onboard` (Shape-C MCP agents) and the base file's static
+# 3-agent-wrap ringfences.  These networks are deliberately EXCLUDED from
+# _list_project_networks() above (FINDING-V412-RESTART-004a) via the SAME
+# _RINGFENCE_NAME_PATTERN this sweep's own filter uses (single source of
+# truth — see the definition above _list_project_networks() for why the two
+# sweeps must never define this boundary independently again) because this
+# sweep's residual-handling is intentionally permissive (WARN, not exit-1)
+# — a ringfence network may legitimately still be attached to a foreign
+# onboard container.
 #
-# Discovery: `docker/podman network ls --filter name=ringfence_` lists all
-# networks whose name contains "ringfence_".  We then remove each one.
+# Discovery: `docker/podman network ls --filter name=<pattern>` lists all
+# networks whose name CONTAINS the pattern (substring, not anchored) — this
+# is why _RINGFENCE_NAME_PATTERN itself has no anchor: it must match both
+# the never-actually-occurring bare form and the real, always-project-
+# prefixed on-disk form (<project>_ringfence_<agent>).
 #
 # The assertion below logs residuals as WARN (not exit-1): a ringfence network
 # may survive removal if a non-yashigani container joined it.  The operator
@@ -1405,14 +1449,14 @@ while IFS= read -r _rfnet; do
         echo "  [WARN] ringfence network rm failed: $_rfnet (may be in use)" >&2
         _ringfence_failed=$(( _ringfence_failed + 1 ))
     fi
-done < <("$RUNTIME" network ls --filter "name=ringfence_" --format "{{.Name}}" 2>/dev/null || true)
+done < <("$RUNTIME" network ls --filter "name=${_RINGFENCE_NAME_PATTERN}" --format "{{.Name}}" 2>/dev/null || true)
 
 if [ "$_ringfence_removed" -gt 0 ] || [ "$_ringfence_failed" -gt 0 ]; then
     echo "Ringfence network cleanup: ${_ringfence_removed} removed, ${_ringfence_failed} failed."
     if [ "$_ringfence_failed" -gt 0 ]; then
         echo "  [WARN] Some ringfence networks could not be removed (in use by a foreign container?)." >&2
         echo "  Manual remediation:" >&2
-        echo "    ${RUNTIME} network ls --filter name=ringfence_   # list survivors" >&2
+        echo "    ${RUNTIME} network ls --filter name=${_RINGFENCE_NAME_PATTERN}   # list survivors" >&2
         echo "    ${RUNTIME} network rm <name>                     # after detaching foreign containers" >&2
     fi
 else
