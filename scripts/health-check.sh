@@ -234,6 +234,8 @@ ysg_resolve_compose_container() {
   local _svc="${3:?ysg_resolve_compose_container: service required}"
   local _name="" _label_prefix
 
+  # Primary: compose labels. Stamped by every compose implementation this
+  # codebase supports, regardless of container-naming scheme.
   for _label_prefix in "com.docker.compose" "io.podman.compose"; do
     _name="$("$_rt" ps \
       --filter "label=${_label_prefix}.project=${_proj}" \
@@ -245,6 +247,8 @@ ysg_resolve_compose_container() {
     fi
   done
 
+  # Fallback: scheme-agnostic name pattern (bracket class matches either
+  # separator) in case labels are ever absent.
   _name="$("$_rt" ps \
     --filter "name=^${_proj}[_-]${_svc}[_-]" \
     --format '{{.Names}}' 2>/dev/null | head -1)"

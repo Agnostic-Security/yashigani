@@ -5798,6 +5798,12 @@ _podman_build_gateway_backoffice_images() {
 # Prints the first matching RUNNING container's name to stdout; prints
 # nothing and returns 1 if no match (callers MUST check — never assume a
 # `-1` or `_1` suffix).
+#
+# DUPLICATED in scripts/health-check.sh (that file cannot source install.sh —
+# it must run standalone). The function body below is kept BYTE-IDENTICAL to
+# that copy — if you change one, change both (Captain review of 507acee7:
+# the copies had drifted to be logically-but-not-byte identical; this
+# comment is the fix for that drift, in both directions).
 ysg_resolve_compose_container() {
   local _rt="${1:?ysg_resolve_compose_container: runtime binary required}"
   local _proj="${2:?ysg_resolve_compose_container: project required}"
@@ -14632,12 +14638,23 @@ _postgres_byo_ca_trust_sync() {
     return 0
   fi
 
+  # Captain review of 507acee7 (finding #4): distinguish "postgres confirmed
+  # NOT running" from "resolution failed" -- the finding's own contract.
+  # A runtime query that itself errors (unreachable socket, broken PATH, a
+  # project name that breaks the filter/regex, etc.) must NOT be silently
+  # read as "not running"; it must fail loudly instead.
+  # `_runtime_reachable` tracks whether at least one exec tool's `ps` query
+  # itself succeeded (proving the tool/runtime IS queryable), independent of
+  # whether postgres specifically was found by it.
+  local _runtime_reachable=false
+
   for _tool in "${_exec_tools[@]}"; do
     local _cname
     # `|| true`: "not found" (try the next tool) is expected here, not
     # script-fatal — see the same note at the compose_up() call site.
     _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "postgres" 2>/dev/null)" || true
     if [[ -n "$_cname" ]]; then
+      _runtime_reachable=true
       log_info "  Found running postgres container: ${_cname} (via ${_tool})"
       log_info "  Invoking trust-bundle sync inside container..."
 
@@ -14658,13 +14675,39 @@ _postgres_byo_ca_trust_sync() {
         break
       fi
     fi
+    # Postgres was not resolved via this tool. Independently confirm the
+    # tool itself is actually reachable (positive determination, not
+    # inference) by querying it for ANY container belonging to this project,
+    # in ANY state. If this query itself fails (nonzero exit), the tool
+    # cannot be trusted to have told us the truth about postgres either --
+    # do not count it as having confirmed "not running".
+    if "${_tool}" ps -a --filter "label=com.docker.compose.project=${_proj}" --format '{{.Names}}' >/dev/null 2>&1; then
+      _runtime_reachable=true
+    fi
   done
 
   if [[ "$_sync_ok" == "false" ]]; then
-    # Postgres is not running. Trust bundle will be picked up at next start.
-    log_info "BYO CA trust-bundle sync: postgres container not running"
-    log_info "  Updated ca_root.crt + ca_intermediate.crt will be consumed by"
-    log_info "  05-enable-ssl.sh at next postgres container start — no action needed now."
+    if [[ "$_runtime_reachable" == "true" ]]; then
+      # At least one tool was genuinely queryable and found no postgres
+      # container for this project in any state — postgres is CONFIRMED not
+      # running, not merely unresolved. Legitimate no-op: the trust bundle
+      # will be picked up at next start.
+      log_info "BYO CA trust-bundle sync: postgres container not running"
+      log_info "  Updated ca_root.crt + ca_intermediate.crt will be consumed by"
+      log_info "  05-enable-ssl.sh at next postgres container start — no action needed now."
+    else
+      # Every available runtime failed to even confirm reachability — we
+      # genuinely do NOT know whether postgres is running. Concluding "not
+      # running" here would be the exact silent-miss the finding named.
+      # Fail loud instead so an unresolvable-but-running postgres cannot
+      # silently keep serving a stale CA trust bundle after a BYO-CA rotation.
+      log_error "BYO CA trust-bundle sync: could not determine postgres container state"
+      log_error "  Every available runtime (${_exec_tools[*]}) failed to respond to 'ps' for project '${_proj}'."
+      log_error "  This is NOT the same as 'postgres is not running' — do not assume the trust bundle is safe."
+      log_error "  Manual remediation: verify the runtime is reachable, then either re-run this"
+      log_error "  step or manually sync: <tool> exec <postgres-container> bash ${_script_path}"
+      return 1
+    fi
   fi
 
   return 0
