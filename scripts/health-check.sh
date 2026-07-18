@@ -166,54 +166,125 @@ _check_http() {
   fi
 }
 
-  # Detect compose command (Docker or Podman)
-# Gate #ROOTFUL-2: honour YSG_RUNTIME / YSG_PODMAN_RUNTIME so the health-check
-# uses the same compose backend as the install. Without this, _compose_cmd()
-# picks docker compose when docker CLI is installed (even without a running
-# daemon), and then _check_compose_exec fails silently for every service
-# when the stack was started under rootful/rootless Podman.
-_compose_cmd() {
-  # Honour explicit runtime override first.
+  # ---------------------------------------------------------------------------
+# Runtime binary detection (Docker or Podman) — NOT compose-tool selection.
+#
+# FINDING-V412-RESTART-002 / YSG-RISK-091 (measured, r2 restart leg, macOS
+# podman-6 rootless, 2026-07-18): this file used to have its own compose-tool
+# selector (_compose_cmd(), picking between "docker compose" / "docker-compose"
+# / "podman compose" / "podman-compose") that was independent of, and could
+# disagree with, install.sh's resolve_compose_cmd(). In particular it had no
+# guard against podman-compose's broken 1.6.x release (install.sh's
+# _podman_compose_usable() explicitly excludes that version), so on a host
+# with podman-compose 1.6.x installed alongside a podman-6 client, this file
+# selected podman-compose (Python — constructs container names as
+# "${project}_${service}_1", underscore) even though install.sh actually
+# built/brought up the stack via native podman compose v2 ("${project}-
+# ${service}-N", hyphen). Every "exec by service name" check then failed
+# with "Error: no container with name or ID '<project>_<service>_1' found"
+# against a container that was, in fact, up and Healthy under its real
+# (hyphen) name — install.sh exited 1 on a fully healthy stack.
+#
+# Fix: never let a compose tool construct or resolve the container name.
+# Detect only the underlying RUNTIME BINARY (podman vs docker — both
+# container-naming schemes sit on top of the same binary/socket either way)
+# and resolve the actual container via ysg_resolve_compose_container()
+# (compose labels, scheme-agnostic — see that function), then exec/logs
+# directly against the resolved name. This also fixes a second, independent
+# bug in the same code path: the log-tail fallback derived the compose
+# service name from the display label ("OPA" -> "opa"), but the real
+# compose service is "policy" — see _ysg_svc_name_for_label().
+# ---------------------------------------------------------------------------
+_ysg_runtime_bin() {
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" || "${YSG_RUNTIME:-}" == "podman" ]]; then
-    if command -v podman-compose >/dev/null 2>&1; then
-      echo "podman-compose"; return
-    fi
-    if command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
-      echo "podman compose"; return
-    fi
+    echo "podman"; return
   fi
   if [[ "${YSG_RUNTIME:-}" == "docker" ]]; then
-    echo "docker compose"; return
+    echo "docker"; return
   fi
-  # Auto-detect: prefer Docker when available and daemon is reachable;
-  # fall back to Podman compose variants.
+  # Auto-detect: prefer Docker when its daemon is actually reachable.
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    echo "docker compose"
-  elif command -v docker-compose >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    echo "docker-compose"
-  elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
-    echo "podman compose"
-  elif command -v podman-compose >/dev/null 2>&1; then
-    echo "podman-compose"
-  else
-    echo "docker compose"  # last-resort fallback
+    echo "docker"; return
   fi
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    echo "podman"; return
+  fi
+  echo "docker"  # last-resort fallback, matches prior behaviour
 }
-COMPOSE_CMD="$(_compose_cmd)"
+RUNTIME_BIN="$(_ysg_runtime_bin)"
+
+# ---------------------------------------------------------------------------
+# ysg_resolve_compose_container <runtime-binary> <project> <service>
+# Scheme-agnostic container-name resolution. Prints the first matching
+# RUNNING container's real name to stdout; prints nothing and returns 1 on
+# no match (callers MUST check — never assume a "-1"/"_1" suffix).
+#
+# Positive derivation over inference: queries the RUNTIME via compose
+# labels (stamped by every compose implementation this codebase supports,
+# regardless of naming scheme) rather than guessing/constructing a name or
+# sniffing the compose-tool version. Falls back to a scheme-agnostic
+# name-pattern match (bracket class covers both separators) if labels are
+# ever absent. Same pattern already proven in uninstall.sh's
+# _list_project_containers() and install.sh's own copy of this function —
+# kept byte-identical to install.sh's; if you change one, change both.
+# ---------------------------------------------------------------------------
+ysg_resolve_compose_container() {
+  local _rt="${1:?ysg_resolve_compose_container: runtime binary required}"
+  local _proj="${2:?ysg_resolve_compose_container: project required}"
+  local _svc="${3:?ysg_resolve_compose_container: service required}"
+  local _name="" _label_prefix
+
+  # Primary: compose labels. Stamped by every compose implementation this
+  # codebase supports, regardless of container-naming scheme.
+  for _label_prefix in "com.docker.compose" "io.podman.compose"; do
+    _name="$("$_rt" ps \
+      --filter "label=${_label_prefix}.project=${_proj}" \
+      --filter "label=${_label_prefix}.service=${_svc}" \
+      --format '{{.Names}}' 2>/dev/null | head -1)"
+    if [[ -n "$_name" ]]; then
+      printf '%s\n' "$_name"
+      return 0
+    fi
+  done
+
+  # Fallback: scheme-agnostic name pattern (bracket class matches either
+  # separator) in case labels are ever absent.
+  _name="$("$_rt" ps \
+    --filter "name=^${_proj}[_-]${_svc}[_-]" \
+    --format '{{.Names}}' 2>/dev/null | head -1)"
+  if [[ -n "$_name" ]]; then
+    printf '%s\n' "$_name"
+    return 0
+  fi
+
+  return 1
+}
+
+# Maps a health-check DISPLAY label to the real compose service name. Only
+# OPA differs (compose service is "policy", not "opa") — every other label
+# already lowercases to its real service name.
+_ysg_svc_name_for_label() {
+  case "$1" in
+    OPA) echo "policy" ;;
+    *) printf '%s' "$1" | tr '[:upper:]' '[:lower:]' ;;
+  esac
+}
 
 _check_compose_exec() {
   local label="$1"
   local service="$2"
   local cmd="$3"
   local expect="${4:-}"
+  local proj="${COMPOSE_PROJECT_NAME:-docker}"
 
+  # Re-resolve the container on every retry (inside _wait_for's eval loop)
+  # so a not-yet-created container is tolerated exactly as the old
+  # compose-exec retry was — see FINDING-V412-RESTART-002.
   local check
   if [ -n "$expect" ]; then
-    check="${COMPOSE_CMD} -f '${PROJECT_ROOT}/docker/docker-compose.yml' \
-      exec -T ${service} ${cmd} 2>/dev/null | grep -q '${expect}'"
+    check="_ctr=\$(ysg_resolve_compose_container '${RUNTIME_BIN}' '${proj}' '${service}' 2>/dev/null); [ -n \"\$_ctr\" ] && ${RUNTIME_BIN} exec -i \"\$_ctr\" ${cmd} 2>/dev/null | grep -q '${expect}'"
   else
-    check="${COMPOSE_CMD} -f '${PROJECT_ROOT}/docker/docker-compose.yml' \
-      exec -T ${service} ${cmd}"
+    check="_ctr=\$(ysg_resolve_compose_container '${RUNTIME_BIN}' '${proj}' '${service}' 2>/dev/null); [ -n \"\$_ctr\" ] && ${RUNTIME_BIN} exec -i \"\$_ctr\" ${cmd}"
   fi
 
   if ! _wait_for "$label" "$check"; then
@@ -277,12 +348,28 @@ if [ "${#FAILED_SERVICES[@]}" -gt 0 ]; then
 
   printf "\n${YSG_YELLOW}Tailing last 20 lines of logs for failed services:${YSG_RESET}\n"
   for svc in "${FAILED_SERVICES[@]}"; do
-    # Map display name to compose service name
-    local_svc_lower="$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')"
+    # FINDING-V412-RESTART-002 / YSG-RISK-091: resolve the real compose
+    # service name (OPA's display label lowercases to "opa" but the real
+    # service is "policy") and the real container name (scheme-agnostic —
+    # was previously delegated to whichever compose tool _compose_cmd()
+    # happened to pick, which could disagree with the tool that actually
+    # created the stack) instead of guessing either.
+    local_svc_name="$(_ysg_svc_name_for_label "$svc")"
     printf "\n--- %s logs ---\n" "$svc"
-    ${COMPOSE_CMD} -f "${PROJECT_ROOT}/docker/docker-compose.yml" \
-      logs --tail=20 "$local_svc_lower" 2>/dev/null || \
-      printf "(could not retrieve logs for %s)\n" "$local_svc_lower"
+    # `|| true` is required here: a "no running container found" result is
+    # a legitimate, expected outcome this block explicitly checks for below
+    # (not a script-fatal error) — without it, `set -e` would silently abort
+    # the whole health-check script the first time resolution comes up
+    # empty (e.g. Ollama in host-relay mode, or any other failed service
+    # whose container never started at all), before the exit-1 summary and
+    # remaining log tails ever print.
+    local_ctr="$(ysg_resolve_compose_container "${RUNTIME_BIN}" "${COMPOSE_PROJECT_NAME:-docker}" "$local_svc_name" 2>/dev/null)" || true
+    if [ -n "$local_ctr" ]; then
+      ${RUNTIME_BIN} logs --tail=20 "$local_ctr" 2>/dev/null || \
+        printf "(could not retrieve logs for %s)\n" "$local_svc_name"
+    else
+      printf "(could not find a running container for service '%s')\n" "$local_svc_name"
+    fi
   done
 
   exit 1
