@@ -221,7 +221,15 @@ _check_compose() {
         ver="$(docker-compose version --short 2>/dev/null || echo "unknown")"
         _pass "Compose" "docker-compose (standalone) v${ver}"
       else
-        _warn_check "Compose" "podman-compose not found — install: pip install podman-compose"
+        # 2026-07-18 fork wiring: install.sh's own resolve_compose_cmd() no
+        # longer selects pip podman-compose on the Podman runtime at all — it
+        # invokes the vendored podman-compose-ysg fork
+        # (vendor/podman-compose-ysg/podman_compose.py) exclusively. This
+        # standalone preflight probe still reports "not found" here (it only
+        # checks for a bare `podman-compose` binary on PATH), which is
+        # harmless/informational (_warn_check, not _fail) but the old
+        # remediation text recommended the now-retired pip path — corrected.
+        _warn_check "Compose" "podman-compose (pip) not found on PATH — expected: install.sh's own vendored podman-compose-ysg fork drives the Podman path, no separate install needed"
       fi
       ;;
     *)

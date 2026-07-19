@@ -1790,7 +1790,9 @@ resolve_compose_cmd() {
 
   log_error "No compose command found. Install one of:"
   log_error "  • Docker:  Docker Desktop OR docker + docker compose plugin"
-  log_error "  • Podman:  podman + podman-compose (pip install podman-compose)"
+  log_error "  • Podman:  install Podman (this installer brings its own compose"
+  log_error "    driver — vendor/podman-compose-ysg — no separate pip install"
+  log_error "    needed; a complete Yashigani release tree already ships it)"
   log_error ""
   log_error "Then set YSG_RUNTIME=docker or YSG_RUNTIME=podman to lock the runtime."
   exit 1
