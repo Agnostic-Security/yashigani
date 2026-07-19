@@ -1,8 +1,11 @@
 """
-Regression tests — LAURA-412-CRITICAL (podman r4 pentest, 2026-07-19).
+Regression tests — LAURA-412-CRITICAL / HIGH / MEDIUM (podman r4/r5 pentest,
+2026-07-19).
 
-Finding: `_apply_auth_throttle` / `_record_auth_failure` / `_real_client_ip`
-keyed every failed login attempt SOLELY on the apparent client IP.  Under a
+## Round 1 (r4) — LAURA-412-CRITICAL
+
+`_apply_auth_throttle` / `_record_auth_failure` / `_real_client_ip` keyed
+every failed login attempt SOLELY on the apparent client IP.  Under a
 NAT/proxy/CGNAT/podman-pasta topology many distinct legitimate callers
 collapse onto one apparent address (proven live by Laura on podman r4, and
 independently root-caused by Su at the TCP/NAT layer — see
@@ -14,34 +17,52 @@ and the pre-auth block fired BEFORE authenticate() ever ran, so a legitimate
 caller could never reach the success path that would have self-healed the
 counter.
 
-Fix (fix/v412-auth-throttle-hardening): dual-bucket, ACCOUNT-GATED design.
-  * The per-account bucket (username-keyed, IP-independent) is the sole gate.
-  * The per-IP bucket is a severity modifier only — never an independent
-    gate.
-  * The global (any-IP) bucket is removed entirely.
-  * Escalation bounded at 900s (15 min); no permanent-block branch.
-  * Successful auth clears both the account gate and the IP severity bucket.
+Fix: dual-bucket, ACCOUNT-GATED design — per-account bucket is the sole
+gate, per-IP bucket is a severity modifier only, global bucket removed,
+escalation bounded at 900s, successful auth self-heals both buckets.
 
-Each test below would FAIL on the pre-fix code:
-  - test_shared_ip_does_not_lock_out_clean_account: pre-fix, cedar's login
-    from the same IP as the attacker's noise would 429 (both the old per-IP
-    and global buckets gate purely on IP-wide/any-IP failure counts).
-  - test_successful_login_self_heals_account_counter: pre-fix, a login
-    already blocked at the top of the request could never reach the
-    success path, so the counter could never be observed to clear via a
-    real login (this test proves the fixed code's reset function AND that
-    the gate reopens for the same account after a genuine success).
-  - test_escalation_is_bounded_no_permanent_block: pre-fix, level > 6
-    written `auth:blocked:{ip}` with NO TTL (ttl() == -1 == persistent).
-  - test_per_account_brute_force_still_throttled: proves the redesign has
-    not thrown out real brute-force protection — repeated failures against
-    ONE specific account still escalate and eventually gate that account.
+## Round 2 (r5) — LAURA-412-HIGH / LAURA-412-MEDIUM (Laura re-attack)
+
+Laura confirmed the round-1 CRITICAL closed (K=2), then found two new
+issues attacking the NEW design:
+
+  - HIGH (TOCTOU race): 25 concurrent wrong-password requests against one
+    real account ALL returned 401 — none were throttled; the gate only
+    escalated after the whole burst had landed (round-1 read the count,
+    then incremented it SEPARATELY after authenticate() resolved — a
+    classic check-then-act race under concurrency, CWE-362).  Fixed with
+    `_throttle_admit()`: one atomic Redis Lua script that increments BOTH
+    buckets and returns their PRIOR level in a single round-trip, called
+    BEFORE authenticate() runs for every attempt.
+
+  - MEDIUM (casefold-collision): round 1's `_hash_account()` casefolded
+    the username before hashing, but this system's identity model is
+    CASE-SENSITIVE — two accounts differing only by case
+    ("collision-probe-a" / "COLLISION-PROBE-A") are genuinely distinct,
+    independently-valid accounts that shared one bucket, reintroducing
+    cross-account lockout.  Fixed by keying the bucket on the account's
+    stable `account_id` (via `_account_bucket_key`) whenever the account
+    exists.
+
+Each test below would FAIL on the round-1 (post-CRITICAL-fix,
+pre-HIGH/MEDIUM-fix) code:
+  - TestConcurrentBurstDoesNotBypassGate: round 1's check-then-increment
+    let all 25 concurrent requests pass the gate.
+  - TestCaseVariantAccountsDoNotShareBucket: round 1's casefolded hash
+    collapsed two distinct accounts into one bucket.
+
+Each test in the original four classes below still passes post-round-2 —
+proving the original CRITICAL fix, self-heal, bounded escalation, and
+per-account brute-force protection all remain intact after the HIGH/MEDIUM
+fixes (the coordinator's "original Critical stays closed" requirement).
 
 Retro ref: T4 — every Python-level retro item must have a regression test.
 Last updated: 2026-07-19T00:00:00+00:00
 """
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -49,6 +70,7 @@ import pytest
 
 pytest.importorskip("fakeredis")
 pytest.importorskip("fastapi")
+pytest.importorskip("lupa")  # Lua runtime — required for fakeredis EVAL emulation
 
 
 # ---------------------------------------------------------------------------
@@ -109,15 +131,32 @@ def _import_auth_mod():
     return _auth_mod
 
 
-async def _attempt_login(mod, fake_redis, username: str, client_ip: str, auth_result, response=None):
+def _account_id_for(username: str, exists: bool) -> str | None:
+    """Mirror _make_account's account_id convention, or None for a bogus user."""
+    return f"uuid-{username}" if exists else None
+
+
+async def _attempt_login(
+    mod, fake_redis, username: str, client_ip: str, auth_result,
+    account_id: str | None = "__default__", response=None,
+):
     """
     Drive the real login() route handler with a fake Redis backing the
     throttle and a fully mocked backoffice_state/auth_service — exercises
-    the actual _check_ip_access -> _apply_auth_throttle -> authenticate ->
-    _record_auth_failure/_reset_auth_failures sequence exactly as the HTTP
-    route does, not a re-implementation of it.
+    the actual _check_ip_access -> _resolve_account_id_for_bucket ->
+    _apply_auth_throttle -> authenticate -> _reset_auth_failures sequence
+    exactly as the HTTP route does, not a re-implementation of it.
+
+    account_id: the value _resolve_account_id_for_bucket should return for
+    this username (patched out — this test suite is not exercising the
+    Postgres lookup itself, only the throttle logic that consumes it).
+    "__default__" derives it from auth_result's record (if any) so most
+    call sites don't need to specify it explicitly.
     """
     from fastapi import Response
+
+    if account_id == "__default__":
+        account_id = auth_result[1].account_id if auth_result[1] is not None else None
 
     body = MagicMock()
     body.username = username
@@ -129,8 +168,12 @@ async def _attempt_login(mod, fake_redis, username: str, client_ip: str, auth_re
     mock_state = _make_state(auth_result)
     with patch.object(mod, "backoffice_state", mock_state):
         with patch.object(mod, "_get_throttle_redis", return_value=fake_redis):
-            with patch.object(mod, "_register_human_identity_on_login"):
-                return await mod.login(body, request, resp)
+            with patch.object(
+                mod, "_resolve_account_id_for_bucket",
+                new=AsyncMock(return_value=account_id),
+            ):
+                with patch.object(mod, "_register_human_identity_on_login"):
+                    return await mod.login(body, request, resp)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +203,7 @@ class TestSharedIpDoesNotLockOutCleanAccount:
                 await _attempt_login(
                     mod, r, "nonexistent_attacker_probe", attacker_ip,
                     auth_result=(False, None, "invalid_credentials"),
+                    account_id=None,
                 )
             if i < 3:
                 assert exc_info.value.status_code == 401, f"attempt {i + 1}: expected 401"
@@ -189,7 +233,7 @@ class TestSharedIpDoesNotLockOutCleanAccount:
         """
         Even well past the old per-IP threshold (3) — many DIFFERENT clean
         accounts attempted once each from the same IP — no account is ever
-        gated, because no single account accumulates its own failures.
+        gated, because no single account accumulates its own attempts.
         """
         mod = _import_auth_mod()
         r = _fake_redis()
@@ -213,7 +257,7 @@ class TestSelfHealOnSuccess:
     @pytest.mark.asyncio
     async def test_successful_login_self_heals_account_counter(self):
         """
-        An account gated by its own prior failures must be able to recover
+        An account gated by its own prior attempts must be able to recover
         via a single correct login — not via manual Redis surgery.
         """
         from fastapi import HTTPException
@@ -222,12 +266,16 @@ class TestSelfHealOnSuccess:
         r = _fake_redis()
         ip = "203.0.113.5"
         bob = _make_account("bob")
+        bob_id = bob.account_id
 
         # 3 failed attempts against bob's OWN account trip the account gate
         # (threshold = 3).
         for _ in range(3):
             with pytest.raises(HTTPException):
-                await _attempt_login(mod, r, "bob", ip, auth_result=(False, None, "invalid_credentials"))
+                await _attempt_login(
+                    mod, r, "bob", ip, auth_result=(False, None, "invalid_credentials"),
+                    account_id=bob_id,
+                )
 
         # 4th attempt (even with correct creds) is now gated pre-auth.
         with pytest.raises(HTTPException) as exc_info:
@@ -239,11 +287,11 @@ class TestSelfHealOnSuccess:
         # e.g. after the bounded window elapses, or via WebAuthn which is
         # keyed on the same account bucket).
         with patch.object(mod, "_get_throttle_redis", return_value=r):
-            mod._reset_auth_failures(ip, "bob")
+            mod._reset_auth_failures(ip, "bob", bob_id)
 
-        acct_hash = mod._hash_account("bob")
-        assert r.get(f"auth:fail:acct:{acct_hash}") is None
-        assert r.get(f"auth:throttle:acct:{acct_hash}") is None
+        bucket_key = mod._account_bucket_key("bob", bob_id)
+        assert r.get(f"auth:fail:acct:{bucket_key}") is None
+        assert r.get(f"auth:throttle:acct:{bucket_key}") is None
         assert r.get(f"auth:fail:ip:{ip}") is None
         assert r.get(f"auth:throttle:ip:{ip}") is None
 
@@ -255,7 +303,7 @@ class TestSelfHealOnSuccess:
     async def test_login_route_clears_counters_on_success_without_manual_reset(self):
         """
         End-to-end via the real route: after a below-threshold failure, a
-        SUCCESSFUL login (still 2 failures short of the account gate) must
+        SUCCESSFUL login (still 2 attempts short of the account gate) must
         leave the account with a zeroed counter afterward — proving
         login()'s own success path (not a test helper) performs the heal.
         """
@@ -263,21 +311,25 @@ class TestSelfHealOnSuccess:
         r = _fake_redis()
         ip = "203.0.113.9"
         alice = _make_account("alice")
+        alice_id = alice.account_id
 
         # 2 failures — below the threshold (3), account not yet gated.
         for _ in range(2):
             from fastapi import HTTPException
             with pytest.raises(HTTPException) as exc_info:
-                await _attempt_login(mod, r, "alice", ip, auth_result=(False, None, "invalid_credentials"))
+                await _attempt_login(
+                    mod, r, "alice", ip, auth_result=(False, None, "invalid_credentials"),
+                    account_id=alice_id,
+                )
             assert exc_info.value.status_code == 401
 
-        acct_hash = mod._hash_account("alice")
-        assert int(r.get(f"auth:fail:acct:{acct_hash}") or 0) == 2
+        bucket_key = mod._account_bucket_key("alice", alice_id)
+        assert int(r.get(f"auth:fail:acct:{bucket_key}") or 0) == 2
 
         # Successful login — login()'s own _reset_auth_failures call must fire.
         result = await _attempt_login(mod, r, "alice", ip, auth_result=(True, alice, "ok"))
         assert result["status"] == "ok"
-        assert r.get(f"auth:fail:acct:{acct_hash}") is None, (
+        assert r.get(f"auth:fail:acct:{bucket_key}") is None, (
             "login() must clear the account failure counter on success "
             "without any manual/test intervention"
         )
@@ -293,15 +345,18 @@ class TestBoundedMaxDelayNotPermanent:
         mod = _import_auth_mod()
         r = _fake_redis()
         ip = "198.51.100.20"
-        acct_hash = mod._hash_account("attacked-account")
+        bucket_key = mod._account_bucket_key("attacked-account", None)
 
         # Drive far past the old 6-level escalation table (20 rounds of
-        # 3 failures each = 60 recorded failures against one account).
+        # 3 attempts each = 60 recorded attempts against one account).
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             for _ in range(20):
-                mod._record_auth_failure(ip, "attacked-account")
+                mod._throttle_admit(
+                    r, f"auth:fail:ip:{ip}", f"auth:throttle:ip:{ip}",
+                    f"auth:fail:acct:{bucket_key}", f"auth:throttle:acct:{bucket_key}",
+                )
 
-        level = int(r.get(f"auth:throttle:acct:{acct_hash}") or 0)
+        level = int(r.get(f"auth:throttle:acct:{bucket_key}") or 0)
         assert level == len(mod._THROTTLE_DELAYS), (
             f"level must cap at {len(mod._THROTTLE_DELAYS)}, got {level}"
         )
@@ -326,17 +381,19 @@ class TestBoundedMaxDelayNotPermanent:
         mod = _import_auth_mod()
         r = _fake_redis()
         ip = "198.51.100.21"
+        bucket_key = mod._account_bucket_key("another-attacked-account", None)
 
-        with patch.object(mod, "_get_throttle_redis", return_value=r):
-            for _ in range(10):
-                mod._record_auth_failure(ip, "another-attacked-account")
+        for _ in range(10):
+            mod._throttle_admit(
+                r, f"auth:fail:ip:{ip}", f"auth:throttle:ip:{ip}",
+                f"auth:fail:acct:{bucket_key}", f"auth:throttle:acct:{bucket_key}",
+            )
 
-        acct_hash = mod._hash_account("another-attacked-account")
         for key in (
             f"auth:fail:ip:{ip}",
             f"auth:throttle:ip:{ip}",
-            f"auth:fail:acct:{acct_hash}",
-            f"auth:throttle:acct:{acct_hash}",
+            f"auth:fail:acct:{bucket_key}",
+            f"auth:throttle:acct:{bucket_key}",
         ):
             ttl = r.ttl(key)
             assert ttl is not None and ttl > 0, (
@@ -366,11 +423,15 @@ class TestPerAccountThrottleStopsBruteForce:
         mod = _import_auth_mod()
         r = _fake_redis()
         ip = "192.0.2.50"
+        victim_id = "uuid-targeted-victim"
 
         # First 3 attempts fail normally (401) — below threshold.
         for _ in range(3):
             with pytest.raises(HTTPException) as exc_info:
-                await _attempt_login(mod, r, "targeted-victim", ip, auth_result=(False, None, "invalid_credentials"))
+                await _attempt_login(
+                    mod, r, "targeted-victim", ip, auth_result=(False, None, "invalid_credentials"),
+                    account_id=victim_id,
+                )
             assert exc_info.value.status_code == 401
 
         # 4th attempt (even with the RIGHT credentials this time — attacker
@@ -395,16 +456,227 @@ class TestPerAccountThrottleStopsBruteForce:
         """
         mod = _import_auth_mod()
         r = _fake_redis()
+        bucket_key = mod._account_bucket_key("distributed-target", None)
 
         resp = MagicMock()
         resp.headers = {}
         from fastapi import HTTPException
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             for i in range(3):
-                mod._record_auth_failure(f"203.0.113.{100 + i}", "distributed-target")
+                ip = f"203.0.113.{100 + i}"
+                mod._throttle_admit(
+                    r, f"auth:fail:ip:{ip}", f"auth:throttle:ip:{ip}",
+                    f"auth:fail:acct:{bucket_key}", f"auth:throttle:acct:{bucket_key}",
+                )
 
             with pytest.raises(HTTPException) as exc_info:
                 # A 4th attempt from yet ANOTHER new IP is still gated —
                 # the account bucket doesn't care which IP is asking.
-                mod._apply_auth_throttle("203.0.113.200", "distributed-target", resp)
+                mod._apply_auth_throttle("203.0.113.200", "distributed-target", None, resp)
         assert exc_info.value.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# 5. LAURA-412-HIGH (r5) — concurrent burst does NOT bypass the gate
+# ---------------------------------------------------------------------------
+
+class TestConcurrentBurstDoesNotBypassGate:
+    """
+    Laura's r5 reproduction: 25 concurrent wrong-password requests against
+    one real account all returned 401 under the round-1 (check-then-later-
+    increment) design — none were throttled, and the DB-side counter lost
+    updates too (25 real failures recorded as 5).  These tests exercise the
+    ACTUAL _throttle_admit()/_apply_auth_throttle() code (not a
+    reimplementation) under real concurrency and assert the gate holds.
+    """
+
+    def test_atomic_admit_under_real_concurrent_threads_never_loses_a_count(self):
+        """
+        Fires 25 concurrent calls to the real _throttle_admit() (the atomic
+        Lua-script helper) against a shared fakeredis instance using actual
+        OS threads (ThreadPoolExecutor) — this is what genuinely exercises
+        concurrency (unlike asyncio's single-threaded cooperative
+        scheduling, which would never reproduce the interleaving Laura's
+        live multi-connection PoC hit). Asserts: (a) the final count is
+        EXACTLY 25 — no lost updates (the round-1 bug's Postgres-side
+        symptom, mirrored here at the Redis layer) — and (b) EXACTLY
+        _THROTTLE_ACCOUNT_THRESHOLD requests observed "not yet gated"
+        (acct_level_before <= 0), matching the documented 3-genuine-
+        attempts-before-throttle contract even under full concurrency.
+        """
+        mod = _import_auth_mod()
+        r = _fake_redis()
+        ip = "10.89.9.9"
+        bucket_key = mod._account_bucket_key("nexus", "uuid-nexus")
+
+        def admit(_):
+            return mod._throttle_admit(
+                r, f"auth:fail:ip:{ip}", f"auth:throttle:ip:{ip}",
+                f"auth:fail:acct:{bucket_key}", f"auth:throttle:acct:{bucket_key}",
+            )
+
+        with ThreadPoolExecutor(max_workers=25) as ex:
+            results = list(ex.map(admit, range(25)))
+
+        final_acct_fails = int(r.get(f"auth:fail:acct:{bucket_key}"))
+        assert final_acct_fails == 25, (
+            f"expected exactly 25 recorded attempts (no lost updates under "
+            f"concurrency — CWE-362), got {final_acct_fails}"
+        )
+
+        admitted = sum(1 for res in results if res[3] <= 0)  # acct_level_before
+        assert admitted == mod._THROTTLE_ACCOUNT_THRESHOLD, (
+            f"expected exactly {mod._THROTTLE_ACCOUNT_THRESHOLD} of 25 concurrent "
+            f"requests to be admitted to real credential verification, got "
+            f"{admitted} — the gate was bypassed under concurrency"
+        )
+
+    @pytest.mark.asyncio
+    async def test_route_level_concurrent_burst_caps_authenticate_calls(self):
+        """
+        End-to-end via the real login() route: 25 concurrent wrong-password
+        requests against one real account, all sharing one fake Redis and
+        one mocked (but genuinely async, yielding) authenticate(), must
+        result in authenticate() being called AT MOST
+        _THROTTLE_ACCOUNT_THRESHOLD times — every request beyond that must
+        be gated with 429 BEFORE authenticate() is ever invoked.
+        """
+        from fastapi import HTTPException, Response
+
+        mod = _import_auth_mod()
+        r = _fake_redis()
+        ip = "10.89.9.10"
+        nexus_id = "uuid-nexus"
+
+        call_count = 0
+
+        async def _slow_fail(*_a, **_kw):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)  # force a genuine yield/interleaving window
+            return (False, None, "invalid_credentials")
+
+        mock_state = _make_state((False, None, "invalid_credentials"))
+        mock_state.auth_service.authenticate = AsyncMock(side_effect=_slow_fail)
+
+        async def _one_attempt():
+            body = MagicMock()
+            body.username = "nexus"
+            body.password = "wrong-password-guess"
+            body.totp_code = "000000"
+            request = _make_request(ip)
+            resp = Response()
+            with patch.object(mod, "backoffice_state", mock_state):
+                with patch.object(mod, "_get_throttle_redis", return_value=r):
+                    with patch.object(
+                        mod, "_resolve_account_id_for_bucket",
+                        new=AsyncMock(return_value=nexus_id),
+                    ):
+                        with patch.object(mod, "_register_human_identity_on_login"):
+                            try:
+                                await mod.login(body, request, resp)
+                                return "unexpected_success"
+                            except HTTPException as exc:
+                                return exc.status_code
+
+        results = await asyncio.gather(*[_one_attempt() for _ in range(25)])
+
+        assert set(results) <= {401, 429}, f"unexpected outcomes: {results}"
+        assert results.count(401) + results.count(429) == 25
+        assert call_count == results.count(401), (
+            "authenticate() must be called exactly once per admitted "
+            "(non-gated) attempt — every gated attempt must short-circuit "
+            "BEFORE authenticate() runs"
+        )
+        assert call_count <= mod._THROTTLE_ACCOUNT_THRESHOLD, (
+            f"expected authenticate() to be called at most "
+            f"{mod._THROTTLE_ACCOUNT_THRESHOLD} times across 25 concurrent "
+            f"requests, got {call_count} — the gate was bypassed under "
+            f"concurrency (this is the exact shape of Laura's r5 finding)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. LAURA-412-MEDIUM (r5) — case-variant distinct accounts do NOT share a bucket
+# ---------------------------------------------------------------------------
+
+class TestCaseVariantAccountsDoNotShareBucket:
+    """
+    Laura's r5 reproduction: two genuinely distinct accounts differing only
+    by case ("collision-probe-a" / "COLLISION-PROBE-A") shared one bucket
+    under round 1's casefolded-hash key — flooding one 429'd the other.
+    This system's identity model is CASE-SENSITIVE (confirmed via
+    db/migrations/versions/0006_admin_accounts.py: username is a
+    case-sensitive UNIQUE TEXT column; _fetch_by_username does an exact
+    match; create_admin/create_user perform no case-insensitive collision
+    check) — so these two usernames really can be two independent,
+    simultaneously-valid accounts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flooding_one_case_variant_does_not_lock_out_the_other(self):
+        from fastapi import HTTPException
+
+        mod = _import_auth_mod()
+        r = _fake_redis()
+        ip = "203.0.113.222"
+
+        account_a_id = "aaaaaaaa-0000-0000-0000-000000000001"
+        account_b_id = "bbbbbbbb-0000-0000-0000-000000000002"
+
+        # 3 wrong-password attempts against "collision-probe-a" trips ITS
+        # OWN gate — genuine per-account protection, not the bug.
+        for _ in range(3):
+            with pytest.raises(HTTPException):
+                await _attempt_login(
+                    mod, r, "collision-probe-a", ip,
+                    auth_result=(False, None, "invalid_credentials"),
+                    account_id=account_a_id,
+                )
+
+        # "COLLISION-PROBE-A" — a DIFFERENT, distinct account (different
+        # account_id) that merely happens to differ only by case — must
+        # NOT be affected. Correct creds → success, not 429.
+        variant_b = _make_account("COLLISION-PROBE-A")
+        variant_b.account_id = account_b_id
+        result = await _attempt_login(
+            mod, r, "COLLISION-PROBE-A", ip,
+            auth_result=(True, variant_b, "ok"),
+            account_id=account_b_id,
+        )
+        assert result["status"] == "ok", (
+            "a case-variant but genuinely DISTINCT account (different "
+            "account_id) must not be locked out by the other variant's "
+            "failures — this is the casefold-collision Laura proved live"
+        )
+
+    def test_bucket_keys_differ_for_distinct_account_ids(self):
+        mod = _import_auth_mod()
+        key_a = mod._account_bucket_key("collision-probe-a", "aaaaaaaa-0000-0000-0000-000000000001")
+        key_b = mod._account_bucket_key("COLLISION-PROBE-A", "bbbbbbbb-0000-0000-0000-000000000002")
+        assert key_a != key_b
+
+    def test_atomic_admit_keeps_distinct_counters_for_case_variant_ids(self):
+        """
+        Direct proof at the Redis layer: flooding the bucket for account_id
+        A must leave account_id B's bucket completely untouched, even
+        though both derive from usernames that only differ by case.
+        """
+        mod = _import_auth_mod()
+        r = _fake_redis()
+        ip = "203.0.113.223"
+
+        key_a = mod._account_bucket_key("collision-probe-a", "aaaaaaaa-0000-0000-0000-000000000001")
+        key_b = mod._account_bucket_key("COLLISION-PROBE-A", "bbbbbbbb-0000-0000-0000-000000000002")
+
+        for _ in range(5):
+            mod._throttle_admit(
+                r, f"auth:fail:ip:{ip}", f"auth:throttle:ip:{ip}",
+                f"auth:fail:acct:{key_a}", f"auth:throttle:acct:{key_a}",
+            )
+
+        assert int(r.get(f"auth:fail:acct:{key_a}")) == 5
+        assert r.get(f"auth:fail:acct:{key_b}") is None, (
+            "account B's bucket must remain completely untouched by "
+            "account A's failures despite the case-only username difference"
+        )

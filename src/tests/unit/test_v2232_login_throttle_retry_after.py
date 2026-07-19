@@ -7,25 +7,32 @@ L-2 (v2.23.2 origin): throttled login responses must include:
   - JSON body with a customer-facing "banner" message
   - No internal jargon, no agent names, no internal IDs in banner text
 
-LAURA-412-CRITICAL redesign (2026-07-19, fix/v412-auth-throttle-hardening):
-  The throttle is now ACCOUNT-GATED (dual-bucket): a login attempt is only
-  ever pre-auth-throttled if the SPECIFIC account being logged into
-  (`username`) already has its own recorded failures.  The per-IP bucket is
-  a severity MODIFIER only — it can never trigger a 429 on its own.  The
-  GLOBAL (any-IP) bucket is REMOVED entirely.  Escalation is bounded at
-  900s (15 min); the permanent-block tail is removed.
+LAURA-412-CRITICAL redesign (2026-07-19, fix/v412-auth-throttle-hardening,
+round 1): the throttle is ACCOUNT-GATED (dual-bucket) — a login attempt is
+only ever pre-auth-throttled if the SPECIFIC account being logged into
+already has its own recorded attempts.  The per-IP bucket is a severity
+MODIFIER only.  The GLOBAL (any-IP) bucket is REMOVED.  Escalation is
+bounded at 900s (15 min).
+
+LAURA-412-HIGH/MEDIUM fix (round 2, same date, Laura re-attack):
+  - HIGH: the round-1 design read the current count/level, then incremented
+    it SEPARATELY after authenticate() resolved — a TOCTOU race under
+    concurrency.  Fixed by _throttle_admit(): a single Redis Lua script
+    that atomically increments BOTH buckets and returns their PRIOR level
+    in one round-trip, called BEFORE authenticate() ever runs.
+    _record_auth_failure() no longer exists.
+  - MEDIUM: the account bucket now keys on the account's stable account_id
+    (via _account_bucket_key) rather than a casefolded username, closing a
+    cross-account lockout for accounts differing only by case (this
+    system's identity model is case-sensitive).
 
   Throttle schedule (bounded, index = level-1):
-    Level 1:   30s  (after 3 consecutive per-account failures)
+    Level 1:   30s  (after 3 consecutive per-account attempts)
     Level 2:   60s
     Level 3:  180s
     Level 4:  450s
-    Level 5:  900s  (CEILING — further failures refresh TTL, never escalate
+    Level 5:  900s  (CEILING — further attempts refresh TTL, never escalate
                      further, never convert to a permanent block)
-
-  See auth.py module docstring + project_v412_design_conflict_xrealip_podman_nat.md
-  + testing_runs/yashigani/v412r4-podman-20260719/laura/laura-podman-pentest.md
-  for the full root-cause history this redesign closes.
 
 Last updated: 2026-07-19T00:00:00+00:00
 """
@@ -124,29 +131,27 @@ class TestRetryAfterStructural:
 
     def test_apply_auth_throttle_is_sync(self):
         """
-        _apply_auth_throttle must be a plain def (not async def) since it
-        raises HTTPException instead of awaiting asyncio.sleep().
+        _apply_auth_throttle must be a plain def (not async def) — the
+        atomic Redis admit is a synchronous call; only the caller's account
+        resolution is async.
         """
         fn = _parse_fn("_apply_auth_throttle")
         assert isinstance(fn, ast.FunctionDef), (
-            "_apply_auth_throttle must be 'def' (sync), not 'async def' — "
-            "it raises HTTPException immediately rather than sleeping"
+            "_apply_auth_throttle must be 'def' (sync), not 'async def'"
         )
 
-    def test_apply_auth_throttle_accepts_username_and_response_params(self):
+    def test_apply_auth_throttle_accepts_all_required_params(self):
         """
-        _apply_auth_throttle must accept 'username' (the account-gating key,
-        LAURA-412-CRITICAL) AND 'response' (for the Retry-After header).
+        _apply_auth_throttle must accept 'username' (audit/banner text),
+        'account_id' (LAURA-412-MEDIUM — the identity-stable bucket key),
+        and 'response' (Retry-After header).
         """
         fn = _parse_fn("_apply_auth_throttle")
         param_names = [arg.arg for arg in fn.args.args]
-        assert "username" in param_names, (
-            "_apply_auth_throttle must accept a 'username' parameter — the "
-            f"account bucket is the sole gate (got: {param_names})"
-        )
-        assert "response" in param_names, (
-            f"_apply_auth_throttle must accept a 'response' parameter (got: {param_names})"
-        )
+        for required in ("client_ip", "username", "account_id", "response"):
+            assert required in param_names, (
+                f"_apply_auth_throttle must accept '{required}' (got: {param_names})"
+            )
 
     def test_retry_after_header_present_in_source(self):
         source = _get_source()
@@ -195,65 +200,84 @@ class TestRetryAfterStructural:
     def test_apply_auth_throttle_is_account_gated(self):
         """
         LAURA-412-CRITICAL: the function must return early (no 429) when the
-        account-level throttle level is zero — an implicated IP alone must
-        never gate the request. Structural proxy: the acct/account level
-        variable must be checked with a `<= 0` / `== 0` early-return BEFORE
-        the HTTPException is constructed.
+        account-level throttle level is zero.
         """
         fn = _parse_fn("_apply_auth_throttle")
         fn_src = ast.unparse(fn)
-        assert "acct_level" in fn_src, (
-            "_apply_auth_throttle must read an account-level throttle value "
-            "(acct_level) — the account dimension is the gate"
-        )
-        assert "return" in fn_src, (
-            "_apply_auth_throttle must contain an early return for the "
-            "clean-account (acct_level <= 0) case"
-        )
+        assert "acct_level" in fn_src
+        assert "return" in fn_src
 
     def test_no_global_bucket_in_apply_throttle(self):
+        """LAURA-412-CRITICAL: the GLOBAL (any-IP) bucket must be fully removed."""
+        fn = _parse_fn("_apply_auth_throttle")
+        fn_src = ast.unparse(fn)
+        assert "global" not in fn_src.lower()
+
+    def test_apply_auth_throttle_uses_atomic_admit(self):
         """
-        LAURA-412-CRITICAL: the GLOBAL (any-IP) bucket must be fully removed
-        from the throttle decision — it was the mechanism that let a single
-        unauthenticated stranger lock out every account tenant-wide.
+        LAURA-412-HIGH (round 2): _apply_auth_throttle must call the atomic
+        _throttle_admit helper — separate GET-then-later-INCR calls (the
+        pre-fix race shape) must not reappear.
         """
         fn = _parse_fn("_apply_auth_throttle")
         fn_src = ast.unparse(fn)
-        assert "global" not in fn_src.lower(), (
-            "_apply_auth_throttle must not reference any 'global' bucket — "
-            "removed per Laura's podman r4 CRITICAL finding"
+        assert "_throttle_admit(" in fn_src, (
+            "_apply_auth_throttle must call _throttle_admit() — the atomic "
+            "Lua-based check-and-increment that closes the TOCTOU race"
+        )
+        assert ".pipeline()" not in fn_src, (
+            "_apply_auth_throttle must not use a plain pipeline() (read-then-"
+            "act) — that is exactly the race Laura proved with 25 concurrent "
+            "requests"
         )
 
-    def test_record_auth_failure_has_no_permanent_block_branch(self):
+    def test_record_auth_failure_removed(self):
         """
-        LAURA-412-CRITICAL: _record_auth_failure must never write
-        auth:blocked:{ip} — the auto-permanent-block tail is removed.
+        LAURA-412-HIGH (round 2): _record_auth_failure must no longer exist
+        — counting now happens unconditionally inside the atomic admit,
+        before authenticate() runs, not after it fails.
         """
-        fn = _parse_fn("_record_auth_failure")
+        source = _get_source()
+        tree = ast.parse(source)
+        names = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        assert "_record_auth_failure" not in names, (
+            "_record_auth_failure must be removed — see LAURA-412-HIGH fix"
+        )
+
+    def test_account_bucket_key_prefers_account_id(self):
+        """
+        LAURA-412-MEDIUM (round 2): _account_bucket_key must key on
+        account_id (immune to any username normalisation) when the account
+        exists, falling back to a hashed username only when it doesn't.
+        """
+        fn = _parse_fn("_account_bucket_key")
         fn_src = ast.unparse(fn)
-        assert "auth:blocked" not in fn_src, (
-            "_record_auth_failure must NOT auto-populate auth:blocked:{ip} — "
-            "the unbounded permanent-block escalation tail is removed "
-            "(no unrecoverable state without an explicit admin action)"
-        )
+        assert "account_id" in fn_src
+        assert "id:" in fn_src, "must use an 'id:' prefixed key for real accounts"
+        assert "unk:" in fn_src, "must use a distinct 'unk:' prefix for the fallback case"
 
-    def test_login_route_calls_throttle_with_username_and_response(self):
+    def test_login_route_resolves_account_id_before_throttle(self):
         """
-        The login route must pass username AND the response object to
-        _apply_auth_throttle.
+        LAURA-412-MEDIUM: login() must resolve account_id BEFORE calling
+        _apply_auth_throttle, so the bucket keys on the stable identity.
         """
         fn = _parse_fn("login")
         fn_src = ast.unparse(fn)
-        assert "_apply_auth_throttle(client_ip, body.username, response)" in fn_src, (
-            "login() must call _apply_auth_throttle(client_ip, body.username, response)"
-        )
+        resolve_idx = fn_src.find("_resolve_account_id_for_bucket(")
+        throttle_idx = fn_src.find("_apply_auth_throttle(")
+        assert resolve_idx != -1 and throttle_idx != -1
+        assert resolve_idx < throttle_idx
 
     def test_login_route_not_awaiting_throttle(self):
         fn = _parse_fn("login")
         fn_src = ast.unparse(fn)
         assert "await _apply_auth_throttle" not in fn_src, (
             "login() must not 'await _apply_auth_throttle' — "
-            "the function is now synchronous (raises 429 immediately)"
+            "the function is synchronous (raises 429 immediately)"
         )
 
 
@@ -264,8 +288,8 @@ class TestRetryAfterStructural:
 class TestRetryAfterBehaviour:
     """
     Behaviour tests that exercise _apply_auth_throttle with a mocked Redis
-    client and assert the HTTPException is raised with the right headers
-    and body — and that the account dimension gates correctly.
+    ``eval`` return value and assert the HTTPException is raised with the
+    right headers and body, and that the account dimension gates correctly.
     """
 
     def _import(self):
@@ -274,23 +298,11 @@ class TestRetryAfterBehaviour:
         except pytest.skip.Exception:
             pytest.skip("deps not available")
 
-    def _make_mock_redis(self, ip_level: int = 0, acct_level: int = 0,
-                          ip_fails: int = 0, acct_fails: int = 0) -> MagicMock:
-        """Build a Redis mock whose pipeline().execute() returns the given state.
-
-        Order matches _apply_auth_throttle's pipe.get() call order:
-        ip_fail_key, ip_key, acct_fail_key, acct_key.
-        """
+    def _make_mock_redis(self, ip_fails: int, ip_level_before: int,
+                          acct_fails: int, acct_level_before: int) -> MagicMock:
+        """Mock the atomic admit's eval() return value directly."""
         r = MagicMock()
-        pipe = MagicMock()
-        r.pipeline.return_value = pipe
-        pipe.get.return_value = pipe
-        pipe.execute.return_value = [
-            str(ip_fails) if ip_fails else None,
-            str(ip_level) if ip_level else None,
-            str(acct_fails) if acct_fails else None,
-            str(acct_level) if acct_level else None,
-        ]
+        r.eval.return_value = [ip_fails, ip_level_before, acct_fails, acct_level_before]
         return r
 
     def _make_mock_response(self) -> MagicMock:
@@ -301,22 +313,22 @@ class TestRetryAfterBehaviour:
     def test_no_throttle_when_account_level_zero(self):
         """Account level 0 (clean account) — no exception, regardless of IP level."""
         mod = self._import()
-        r = self._make_mock_redis(ip_level=5, acct_level=0)  # hot IP, clean account
+        r = self._make_mock_redis(ip_fails=10, ip_level_before=5, acct_fails=1, acct_level_before=0)
         resp = self._make_mock_response()
         with patch.object(mod, "_get_throttle_redis", return_value=r):
-            mod._apply_auth_throttle("1.2.3.4", "cedar", resp)  # must not raise
+            mod._apply_auth_throttle("1.2.3.4", "cedar", None, resp)  # must not raise
 
     def test_429_raised_at_account_level_1(self):
-        """Account throttle level 1 → 429 raised with Retry-After: 30."""
+        """Account throttle level 1 (before this call) → 429 with Retry-After: 30."""
         mod = self._import()
         from fastapi import HTTPException as FE
 
-        r = self._make_mock_redis(ip_level=0, acct_level=1)
+        r = self._make_mock_redis(ip_fails=1, ip_level_before=0, acct_fails=4, acct_level_before=1)
         resp = self._make_mock_response()
 
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             with pytest.raises(FE) as exc_info:
-                mod._apply_auth_throttle("1.2.3.4", "cedar", resp)
+                mod._apply_auth_throttle("1.2.3.4", "cedar", "acct-uuid-1", resp)
 
         exc = exc_info.value
         assert exc.status_code == 429
@@ -330,50 +342,45 @@ class TestRetryAfterBehaviour:
         expected = {1: 30, 2: 60, 3: 180, 4: 450, 5: 900}
 
         for level, delay in expected.items():
-            r = self._make_mock_redis(ip_level=0, acct_level=level)
+            r = self._make_mock_redis(ip_fails=1, ip_level_before=0, acct_fails=99, acct_level_before=level)
             resp = self._make_mock_response()
 
             with patch.object(mod, "_get_throttle_redis", return_value=r):
                 with pytest.raises(FE) as exc_info:
-                    mod._apply_auth_throttle("1.2.3.4", "cedar", resp)
+                    mod._apply_auth_throttle("1.2.3.4", "cedar", "acct-uuid-1", resp)
 
             exc = exc_info.value
             assert exc.status_code == 429, f"Level {level}: expected 429"
             ra = exc.headers.get("Retry-After")
-            assert ra == str(delay), (
-                f"Level {level}: expected Retry-After={delay}, got {ra!r}"
-            )
+            assert ra == str(delay), f"Level {level}: expected Retry-After={delay}, got {ra!r}"
 
     def test_ip_level_alone_never_triggers_429(self):
         """
         LAURA-412-CRITICAL core invariant: an arbitrarily hot IP bucket with a
-        CLEAN account (acct_level=0) must never produce a 429. This is the
-        exact shape of Laura's proven exploit (shared/collapsed IP, unrelated
-        account noise) and must hold at every IP level.
+        CLEAN account (acct_level_before=0) must never produce a 429.
         """
         mod = self._import()
         for hot_ip_level in (1, 2, 3, 4, 5, 99):
-            r = self._make_mock_redis(ip_level=hot_ip_level, acct_level=0)
+            r = self._make_mock_redis(ip_fails=10, ip_level_before=hot_ip_level, acct_fails=1, acct_level_before=0)
             resp = self._make_mock_response()
             with patch.object(mod, "_get_throttle_redis", return_value=r):
-                mod._apply_auth_throttle("10.89.1.2", "cedar", resp)  # must not raise
+                mod._apply_auth_throttle("10.89.1.2", "cedar", "acct-uuid-1", resp)  # must not raise
 
     def test_ip_level_escalates_severity_once_account_implicated(self):
         """
-        When the account itself has failures (acct_level=2) AND its source IP
-        is also hot (ip_level=4), the effective delay uses the higher of the
-        two — the IP still contributes SEVERITY once the account is gated,
-        it just can never gate alone.
+        When the account itself has attempts (acct_level_before=2) AND its
+        source IP is also hot (ip_level_before=4), the effective delay uses
+        the higher of the two.
         """
         mod = self._import()
         from fastapi import HTTPException as FE
 
-        r = self._make_mock_redis(ip_level=4, acct_level=2)
+        r = self._make_mock_redis(ip_fails=10, ip_level_before=4, acct_fails=6, acct_level_before=2)
         resp = self._make_mock_response()
 
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             with pytest.raises(FE) as exc_info:
-                mod._apply_auth_throttle("1.2.3.4", "victim-account", resp)
+                mod._apply_auth_throttle("1.2.3.4", "victim-account", "acct-uuid-victim", resp)
 
         exc = exc_info.value
         assert exc.headers.get("Retry-After") == "450", (
@@ -384,16 +391,16 @@ class TestRetryAfterBehaviour:
         mod = self._import()
         from fastapi import HTTPException as FE
 
-        r = self._make_mock_redis(ip_level=0, acct_level=1)
+        r = self._make_mock_redis(ip_fails=1, ip_level_before=0, acct_fails=4, acct_level_before=1)
         resp = self._make_mock_response()
 
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             with pytest.raises(FE) as exc_info:
-                mod._apply_auth_throttle("1.2.3.4", "cedar", resp)
+                mod._apply_auth_throttle("1.2.3.4", "cedar", "acct-uuid-1", resp)
 
         detail = exc_info.value.detail
         assert isinstance(detail, dict), f"detail must be a dict, got {type(detail)}"
-        assert "banner" in detail, f"detail must contain 'banner' key, got {list(detail.keys())}"
+        assert "banner" in detail
 
         banner = detail["banner"]
         assert isinstance(banner, str) and len(banner) > 10
@@ -408,17 +415,57 @@ class TestRetryAfterBehaviour:
         mod = self._import()
         from fastapi import HTTPException as FE
 
-        r = self._make_mock_redis(ip_level=0, acct_level=3)
+        r = self._make_mock_redis(ip_fails=1, ip_level_before=0, acct_fails=99, acct_level_before=3)
         resp = self._make_mock_response()
 
         with patch.object(mod, "_get_throttle_redis", return_value=r):
             with pytest.raises(FE) as exc_info:
-                mod._apply_auth_throttle("1.2.3.4", "cedar", resp)
+                mod._apply_auth_throttle("1.2.3.4", "cedar", "acct-uuid-1", resp)
 
         exc = exc_info.value
         ra_header = int(exc.headers["Retry-After"])
         ra_body = exc.detail.get("retry_after_seconds")
         assert ra_body == ra_header
+
+
+# ---------------------------------------------------------------------------
+# Account bucket key — LAURA-412-MEDIUM
+# ---------------------------------------------------------------------------
+
+class TestAccountBucketKey:
+
+    def test_real_account_keys_on_account_id(self):
+        mod = _import_module_symbols()
+        key = mod._account_bucket_key("alice", "11111111-1111-1111-1111-111111111111")
+        assert key == "id:11111111-1111-1111-1111-111111111111"
+
+    def test_case_variants_of_a_real_account_share_no_bucket_when_ids_differ(self):
+        """
+        The whole point of the fix: two DIFFERENT account_ids (as would be
+        the case for two distinct, case-variant accounts) must produce two
+        DIFFERENT bucket keys, even though the underlying username strings
+        only differ by case.
+        """
+        mod = _import_module_symbols()
+        key_a = mod._account_bucket_key("collision-probe-a", "aaaaaaaa-0000-0000-0000-000000000001")
+        key_b = mod._account_bucket_key("COLLISION-PROBE-A", "bbbbbbbb-0000-0000-0000-000000000002")
+        assert key_a != key_b, "distinct account_ids must never collide, regardless of username casing"
+
+    def test_nonexistent_username_falls_back_to_hash(self):
+        mod = _import_module_symbols()
+        key = mod._account_bucket_key("nonexistent_attacker_probe", None)
+        assert key.startswith("unk:")
+
+    def test_fallback_hash_still_casefolds_for_nonexistent_usernames(self):
+        """
+        Casefolding is safe (and even helpful) for the NONEXISTENT-username
+        fallback only, since it can never collide with a real account_id
+        bucket (different key namespace/prefix entirely).
+        """
+        mod = _import_module_symbols()
+        key_a = mod._account_bucket_key("Nonexistent-Probe", None)
+        key_b = mod._account_bucket_key("nonexistent-probe", None)
+        assert key_a == key_b
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +508,9 @@ class TestThrottleDelaySchedule:
 
     def test_level_beyond_max_caps_at_900_not_permanent(self):
         """
-        LAURA-412-CRITICAL: any level above the table caps at the bounded
-        maximum (900s) — it must NEVER grow beyond that, and there is no
-        separate "permanent" sentinel value or behaviour.
+        Any level above the table caps at the bounded maximum (900s) — it
+        must NEVER grow beyond that, and there is no separate "permanent"
+        sentinel value or behaviour.
         """
         fn = self._get_delay_fn()
         for level in (6, 7, 50, 99, 10_000):

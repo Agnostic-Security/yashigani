@@ -459,13 +459,43 @@ class TestW20RateGate:
             "W20: webauthn_v1 must import and call _apply_auth_throttle"
         )
 
-    def test_login_finish_records_failure(self):
-        """webauthn_v1 must call _record_auth_failure on bad assertions."""
+    def test_login_finish_no_separate_record_failure_call(self):
+        """
+        LAURA-412-HIGH (r5, 2026-07-19): _record_auth_failure no longer
+        exists as a callable — webauthn_v1 must NOT call it (historical
+        comments referencing the removal by name are fine). Counting now
+        happens unconditionally inside _apply_auth_throttle's atomic admit,
+        before any DB query or assertion check, closing the TOCTOU race a
+        concurrent burst could previously exploit against the old
+        check-then-later-increment design.
+        """
         import inspect
         from yashigani.backoffice.routes import webauthn_v1
         source = inspect.getsource(webauthn_v1)
-        assert "_record_auth_failure" in source, (
-            "W20: webauthn_v1 must call _record_auth_failure on credential check failure"
+        assert "_record_auth_failure(" not in source, (
+            "W20: webauthn_v1 must not CALL the removed _record_auth_failure — "
+            "the atomic admit in _apply_auth_throttle now does the counting"
+        )
+        import yashigani.backoffice.routes.webauthn_v1 as wv1
+        assert not hasattr(wv1, "_record_auth_failure"), (
+            "webauthn_v1 must not import the removed _record_auth_failure"
+        )
+
+    def test_login_finish_resolves_admin_id_before_throttle(self):
+        """
+        LAURA-412-MEDIUM (r5, 2026-07-19): admin_id must be resolved BEFORE
+        _apply_auth_throttle is called, so the throttle bucket keys on the
+        stable account_id rather than a normalised username.
+        """
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1.login_finish)
+        resolve_idx = source.find("_resolve_admin_id(")
+        throttle_idx = source.find("_apply_auth_throttle(")
+        assert resolve_idx != -1 and throttle_idx != -1
+        assert resolve_idx < throttle_idx, (
+            "_resolve_admin_id must be called before _apply_auth_throttle "
+            "so the throttle bucket can key on account_id"
         )
 
     def test_login_finish_resets_on_success(self):

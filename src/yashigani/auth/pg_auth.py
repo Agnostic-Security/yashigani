@@ -187,11 +187,17 @@ class PostgresLocalAuthService:
         an ACCOUNT_LOCKOUT event whenever a lockout is triggered by this call.
         ACS gap #95: lockout events were previously only logged (logger.warning)
         with no structured audit trail.
+
+        LAURA-412-HIGH (r5, 2026-07-19): fetches the row with ``FOR UPDATE``
+        so concurrent authenticate() calls against the SAME account are
+        serialised at the database level — closes the lost-update race on
+        failed_attempts / totp_failed_attempts under concurrent load (see
+        ``_fetch_by_username`` docstring for the full rationale).
         """
         generic_fail = "invalid_credentials"
 
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
-            record = await self._fetch_by_username(conn, username)
+            record = await self._fetch_by_username(conn, username, for_update=True)
             if record is None or record.disabled:
                 # LAURA-3X-002 (ASVS V2.2.1): equalize timing. A non-existent or
                 # disabled username must take ~the same wall-clock as a wrong
@@ -854,11 +860,36 @@ class PostgresLocalAuthService:
             inactive_disabled_ts,
         )
 
-    async def _fetch_by_username(self, conn: asyncpg.Connection, username: str) -> Optional[AccountRecord]:
-        row = await conn.fetchrow(
-            "SELECT * FROM admin_accounts WHERE username = $1",
-            username,
-        )
+    async def _fetch_by_username(
+        self,
+        conn: asyncpg.Connection,
+        username: str,
+        *,
+        for_update: bool = False,
+    ) -> Optional[AccountRecord]:
+        """
+        Fetch an account row by username.
+
+        for_update — LAURA-412-HIGH fix (r5, 2026-07-19): pass True from
+        authenticate() ONLY.  Locks the row (``SELECT ... FOR UPDATE``) for
+        the remainder of the enclosing transaction, so concurrent
+        authenticate() calls against the SAME account are serialised by
+        Postgres itself rather than racing a read-modify-write on
+        failed_attempts/totp_failed_attempts.  Laura proved 25 concurrent
+        requests against one real account produced a lost-update: each
+        transaction read the same stale counter, incremented it in Python,
+        and wrote back independently, so 25 real failures were recorded as
+        only 5 (CWE-362).  Row-level locking closes this exactly the same
+        way the Redis-side atomic Lua admit closes the parallel race in
+        auth.py — by making the read-then-write a single serialised unit
+        instead of two independent round-trips.  Other call sites
+        (get_account, provision_totp_start, change_password, etc.) do not
+        mutate failure counters and do not need the lock.
+        """
+        query = "SELECT * FROM admin_accounts WHERE username = $1"
+        if for_update:
+            query += " FOR UPDATE"
+        row = await conn.fetchrow(query, username)
         return _row_to_record(row) if row else None
 
     async def _verify_totp_with_replay(
