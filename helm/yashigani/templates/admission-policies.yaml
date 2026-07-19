@@ -521,7 +521,20 @@ spec:
           '{{ "{{" }} request.object.metadata.name {{ "}}" }}'.
         pattern:
           spec:
+            # LAURA-CIL HIGH: cover ALL container types — a K8s >=1.28 native
+            # sidecar (initContainer with restartPolicy: Always) or an ephemeral
+            # container could otherwise bind :53 unblocked (same gap class Policy 6
+            # already closes for the CA-keys env check). initContainers/
+            # ephemeralContainers are optional → conditional anchors.
             containers:
+              - =(ports):
+                  - X(hostPort): "!53"
+                    X(containerPort): "!53"
+            =(initContainers):
+              - =(ports):
+                  - X(hostPort): "!53"
+                    X(containerPort): "!53"
+            =(ephemeralContainers):
               - =(ports):
                   - X(hostPort): "!53"
                     X(containerPort): "!53"

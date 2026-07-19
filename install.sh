@@ -13019,6 +13019,13 @@ _preflight_k8s_cilium_crds() {
     log_error "for a reference k3s+Cilium stand-up, or install Cilium directly:"
     log_error "  helm repo add cilium https://helm.cilium.io/"
     log_error "  helm install cilium cilium/cilium --version <pinned> -n kube-system"
+    log_error ""
+    log_error "EXISTING non-Cilium k8s cluster (migration — IRIS-CIL-002 / LAURA-CIL): Cilium"
+    log_error "is the ratified CNI standard (2026-07-19). Migrate this cluster's CNI to Cilium"
+    log_error "BEFORE upgrading Yashigani — see the migration section of"
+    log_error "Products/Yashigani/cni-decision-cilium-20260719.md. This is a one-way, cluster-"
+    log_error "wide change; plan a maintenance window. There is intentionally no run-without-"
+    log_error "Cilium bypass — the ring-fence + tenant segregation depend on an enforcing CNI."
     log_error "=============================================================="
     return 1
   fi

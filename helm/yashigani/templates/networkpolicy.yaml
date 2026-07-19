@@ -76,12 +76,17 @@ spec:
     - Egress
   egress:
     - to:
+        {{- /* IRIS-CIL-001: CoreDNS ns + pod labels are configurable. Defaults match
+               k3s/kubeadm (kube-system / k8s-app: kube-dns). Override via
+               dns.corednsNamespace + dns.corednsPodLabels if your distro differs —
+               otherwise DNS resolution is blocked (a post-install DNS-resolution
+               assertion should fail loud; see install.sh). */}}
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: kube-system
+              kubernetes.io/metadata.name: {{ .Values.dns.corednsNamespace | default "kube-system" }}
           podSelector:
             matchLabels:
-              k8s-app: kube-dns
+              {{- .Values.dns.corednsPodLabels | default (dict "k8s-app" "kube-dns") | toYaml | nindent 14 }}
       ports:
         - protocol: UDP
           port: 53

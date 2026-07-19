@@ -14,11 +14,16 @@ in templates/networkpolicy.yaml and templates/networkpolicy-caddy-egress.yaml:
      yashigani-caddy-acme-egress ipBlock as #2 on Calico/no-Cilium).
 
 Design authority: tom-chart.md (2026-07-19 REISSUED verdict) + yashigani-k8s-
-dns-hardening-design-20260719.md §3 (DNSSEC/DoT is the boundary toFQDNs
-transitively inherits — see the scoped allow-dns-egress fix in
-networkpolicy.yaml, FINDING-V412-DNS-001. A forged DNS answer for an
-allowlisted name never reaches these toFQDNs rules because the pod->CoreDNS
-path is locked down and CoreDNS's own upstream hop is DoT-authenticated).
+dns-hardening-design-20260719.md §3. DoT authenticates+encrypts the CoreDNS->
+upstream hop (blocks on-path poisoning) and the pod->CoreDNS path is locked down
+(allow-dns-egress scoped to kube-dns, FINDING-V412-DNS-001).
+CAVEAT (Laura MED, honest-claims): DNSSEC only validates SIGNED zones — the
+toFQDNs targets here (ollama registry, Let's Encrypt, Slack/Telegram) are
+typically UNSIGNED, so DNS hardening alone does NOT fully close a forged answer
+from a compromised/poisoned upstream for these names. The actual backstop for the
+final connection is app-layer TLS certificate validation (client verifies the
+server cert against the expected hostname). toFQDNs here = egress-surface
+reduction + name-based allowlisting, NOT an anti-spoofing guarantee.
 
 REPLACEMENT SEMANTICS (why this needs a companion edit, not just a new file):
 Cilium deny-always-wins over allow, but two co-existing ALLOW rules (an old

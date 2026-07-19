@@ -84,6 +84,17 @@ global:
 # network-layer absent; application-layer mTLS + SPIFFE gate remain active.
 # Document any disablement in the risk register with maintainer sign-off.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DNS (FINDING-V412-DNS-001 / IRIS-CIL-001): allow-dns-egress scopes :53 egress
+# to the cluster DNS pod only (closes the open DNS-exfil channel). These
+# selectors default to CoreDNS on k3s/kubeadm; OVERRIDE if your distro labels
+# CoreDNS differently — otherwise pod DNS resolution is blocked.
+# ---------------------------------------------------------------------------
+dns:
+  corednsNamespace: kube-system
+  corednsPodLabels:
+    k8s-app: kube-dns
+
 networkPolicies:
   enabled: true
   # FINDING-V412-UNIVERSAL-004: NetworkPolicy enforcement is CNI-dependent —

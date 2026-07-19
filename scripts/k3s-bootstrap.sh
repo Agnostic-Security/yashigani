@@ -126,7 +126,7 @@ else
   # (below) before trusting this cluster with anything.
   curl -fsSL https://get.k3s.io | \
     INSTALL_K3S_VERSION="$K3S_VERSION" \
-    INSTALL_K3S_EXEC="server --flannel-backend=none --disable-network-policy --write-kubeconfig-mode=644" \
+    INSTALL_K3S_EXEC="server --flannel-backend=none --disable-network-policy --write-kubeconfig-mode=0600" \
     sh -
 
   if ! command -v k3s >/dev/null 2>&1; then
