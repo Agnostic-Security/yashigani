@@ -41,7 +41,28 @@ WA-10 fix (2026-07-15, fix/v412-wa10-logout):
   - _clear_session_cookie() helper added adjacent to _set_session_cookie() so
     the two paths can never drift independently.  (WA-10 / ASVS V3.4.1)
 
-Last updated: 2026-07-15T00:00:00+00:00
+LAURA-412-CRITICAL fix (2026-07-19, fix/v412-auth-throttle-hardening):
+  - Auth-throttle redesigned: a per-ACCOUNT bucket (username-keyed, IP-
+    independent) is now the sole pre-auth GATE; the per-IP bucket becomes a
+    severity modifier only, never an independent gate.  A clean account can
+    no longer be locked out by unrelated noise sharing its apparent IP
+    (podman-pasta NAT, CGNAT, corporate proxy/LB — Laura proved a stranger's
+    4 garbage-credential requests 429'd an uninvolved, credential-correct
+    admin, podman r4, 2026-07-19).
+  - The GLOBAL (any-IP) bucket is REMOVED — on a self-hosted single-tenant
+    gateway it had no upside that offset letting any unauthenticated caller
+    contribute to blocking every other caller.
+  - Escalation is bounded at 900s (15 min); the old permanent-block tail
+    (`auth:blocked:{ip}` set with no TTL) is removed — no unrecoverable
+    state is ever reached without an explicit admin action.
+  - Self-heal: a successful login now clears both the account gate and the
+    IP severity bucket.  Previously the pre-auth block could prevent a
+    legitimate, credential-correct login from ever reaching the success
+    path that would have triggered the reset.
+  - See AgnosticSecurity memory project_v412_design_conflict_xrealip_podman_nat.md
+    and testing_runs/yashigani/v412r4-podman-20260719/laura/laura-podman-pentest.md.
+
+Last updated: 2026-07-19T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -126,35 +147,94 @@ def _totp_reset(session_prefix: str) -> None:
     r.delete(_totp_fail_key(session_prefix))
 
 # ---------------------------------------------------------------------------
-# Auth brute-force throttle (ASVS 6.3.5)
+# Auth brute-force throttle (ASVS 6.3.5) — LAURA-412-CRITICAL redesign
 #
-# Per-IP tracking:  3 consecutive failures from the same IP → throttle.
-# Global tracking:  5 failures from ANY IP(s) within a 15-min window → throttle.
-# Delay escalation: ×5 multiplier — 30s, 60s, 300s, 1500s, 7500s, cap 37500s.
+# Dual-bucket, ACCOUNT-GATED design (2026-07-19):
+#
+#   * Per-ACCOUNT bucket (username-keyed, IP-independent) is the sole GATE.
+#     A login attempt is only ever pre-auth-throttled if the SPECIFIC
+#     account being logged into already has its own recorded failures.
+#     A clean account can never be blocked by another account's — or
+#     another caller's — noise, even when they share an apparent IP.
+#   * Per-IP bucket is retained as a SEVERITY MODIFIER only, never an
+#     independent gate: once an account is implicated, the effective delay
+#     also reflects how hot its source IP looks, but the IP bucket alone
+#     can never trigger a 429.  This is what makes the design correct
+#     regardless of whether client-IP attribution is trustworthy — see
+#     project_v412_design_conflict_xrealip_podman_nat.md.  Under a NAT/
+#     proxy/CGNAT/podman-pasta topology many distinct legitimate callers
+#     collapse onto one apparent address; treating that shared bucket as a
+#     gate let one attacker's garbage credentials lock out every other
+#     account behind it (Laura, podman r4, 2026-07-19 — an uninvolved,
+#     credential-correct admin got 429'd by a stranger's 4 failed attempts).
+#   * The GLOBAL (any-IP) bucket is REMOVED.  On a self-hosted single-
+#     tenant gateway a global-failure bucket has no upside that offsets
+#     letting ANY unauthenticated caller, anywhere, contribute to blocking
+#     EVERY other caller — exactly the DoS primitive Laura proved.
+#   * Escalation is BOUNDED at 900s (15 min) — see _THROTTLE_DELAYS below.
+#     There is no permanent-block tail: the old design set
+#     `auth:blocked:{ip}` with no TTL once escalation exhausted the delay
+#     table, recoverable only by manual Redis surgery.  That branch is
+#     removed entirely.  900s is long enough to meaningfully slow a
+#     scripted brute-force loop (~96 guesses/day at sustained max delay vs
+#     ~2 880/day unthrottled) and short enough that a legitimately-
+#     throttled admin recovers automatically, with no operator action,
+#     well inside a working session.  It is deliberately SHORTER than the
+#     Postgres-backed per-account hard lockout (`_LOCKOUT_SECONDS` = 1800s,
+#     auth/local_auth.py / auth/pg_auth.py) so this Redis layer stays the
+#     "soft" first line of friction and the DB layer remains the
+#     authoritative "hard" backstop for a confirmed real-account attack —
+#     the two layers reinforce rather than fight each other.  The DB layer
+#     already self-heals (failed_attempts reset to 0 on success) and is
+#     already bounded (30 min, not permanent) — it needed no change here.
+#   * Self-heal: a SUCCESSFUL login clears both the account gate and the
+#     IP severity bucket immediately (`_reset_auth_failures`).  Under the
+#     old design the IP bucket was reset on success too, but a legitimate
+#     caller could never REACH success in the first place — the pre-auth
+#     block fired before authenticate() ever ran.  Gating on the account
+#     bucket (which starts clean for every account) is what makes the
+#     success path reachable again for anyone not actually implicated.
+#
 # Redis keys:
-#   auth:fail:ip:{ip}        — INCR on failure, EXPIRE 900
-#   auth:fail:global          — INCR on failure, EXPIRE 900
-#   auth:throttle:ip:{ip}    — current delay level for this IP
-#   auth:throttle:global      — current delay level globally
+#   auth:fail:ip:{ip}      — INCR on failure, EXPIRE 900s   (severity signal)
+#   auth:throttle:ip:{ip}  — current delay level for this IP (severity signal)
+#   auth:fail:acct:{h}     — INCR on failure, EXPIRE 900s   (gating signal)
+#   auth:throttle:acct:{h} — current delay level for this account (gating signal)
+#   auth:blocked:{ip}      — admin-managed manual block (GET/DELETE
+#                            /blocked-ips below); no longer auto-populated
+#                            by escalation.
+#   h = sha256(username.strip().casefold())[:16] — the raw username is
+#       never stored as a Redis key (no plaintext identity leakage from a
+#       `redis-cli KEYS` dump; mirrors the _hash_ip() style used elsewhere
+#       in this module for the same reason).
 # ---------------------------------------------------------------------------
 
-_THROTTLE_IP_THRESHOLD = 3  # per-IP consecutive failures before throttle
-_THROTTLE_GLOBAL_THRESHOLD = 5  # global failures (any IP) in 15-min window
-_THROTTLE_WINDOW_SECONDS = 900  # 15-minute window for counters
-_THROTTLE_BASE_DELAY = 30  # Level 1: 30 seconds
-_THROTTLE_MULTIPLIER = 5  # Each level multiplies by 5  (sic — see spec)
-_THROTTLE_MAX_DELAY = 37500  # Cap at 625 minutes
+_THROTTLE_IP_THRESHOLD = 3       # per-IP consecutive failures before it adds severity
+_THROTTLE_ACCOUNT_THRESHOLD = 3  # per-account consecutive failures before the account is gated
+_THROTTLE_WINDOW_SECONDS = 900   # 15-minute rolling window for counters
 
-# Delay schedule (pre-computed for clarity):
-# Level 1:     30s
-# Level 2:     60s   (but spec says ×5 from 30 → 150 would be naive; spec lists
-#              explicit values, so we use the explicit table)
-_THROTTLE_DELAYS = [30, 60, 300, 1500, 7500, 37500]
+# Bounded escalation schedule — capped at 900s (15 min).  Index = level-1.
+# The last entry is a CEILING: further failures within the window refresh
+# the TTL (holding the account/IP at the max delay) but never escalate
+# past it and never convert into a separate unrecoverable state.
+_THROTTLE_DELAYS = [30, 60, 180, 450, 900]
+_THROTTLE_MAX_DELAY = _THROTTLE_DELAYS[-1]
 
 
 def _get_throttle_redis():
     """Return the Redis client used by the session store (reuse existing connection)."""
     return backoffice_state.session_store._redis
+
+
+def _hash_account(username: str) -> str:
+    """SHA-256 hex digest (first 16 chars) of a normalised username.
+
+    Normalisation (strip + casefold) ensures "Alice" / "alice" / " alice "
+    all share one bucket — strictly MORE protective than case-sensitive
+    keying, never less.  Mirrors _hash_ip()'s style further down this
+    module: never store the raw identity as a Redis key or in a log line.
+    """
+    return hashlib.sha256(username.strip().casefold().encode()).hexdigest()[:16]
 
 
 def _throttle_delay_for_level(level: int) -> int:
@@ -170,18 +250,25 @@ def _check_ip_access(client_ip: str) -> None:
     Check IP allowlist and blocklist BEFORE any auth processing.
     Order: allowlist (if non-empty, reject unlisted) → blocklist → proceed.
     Supports IPv4, IPv6, and CIDR ranges.
+
+    LAURA-412-CRITICAL (2026-07-19): `auth:blocked:{ip}` is no longer
+    auto-populated by escalating login failures (see _record_auth_failure) —
+    the old design's unbounded permanent-block tail is removed.  This check
+    still exists to enforce a DELIBERATE, admin-managed block (an operator
+    with a threat-intel-driven reason to hard-block a specific address); it
+    is populated/cleared via the GET/DELETE /blocked-ips endpoints below.
     """
     import ipaddress
 
     r = _get_throttle_redis()
 
-    # 1. Check blocklist first (permanent bans)
+    # 1. Check blocklist first (admin-managed manual bans — see docstring)
     if r.exists(f"auth:blocked:{client_ip}"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "error": "ip_blocked",
-                "message": "This IP has been blocked due to excessive failed authentication attempts. Contact your administrator.",
+                "message": "This IP has been blocked. Contact your administrator.",
             },
         )
 
@@ -231,113 +318,147 @@ def _real_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _apply_auth_throttle(client_ip: str, response: Response) -> None:
+def _apply_auth_throttle(client_ip: str, username: str, response: Response) -> None:
     """
-    Check per-IP and global failure counters.  If either exceeds its threshold,
-    raise HTTP 429 with a ``Retry-After`` header (RFC 6585) and a user-facing
-    banner message.  The caller never proceeds past this point while throttled.
+    Account-gated brute-force throttle.  Raises HTTP 429 with a ``Retry-After``
+    header (RFC 6585) and a user-facing banner ONLY when the specific account
+    being logged into (``username``) already has recorded failures of its own.
+    An implicated IP alone — with zero failures against THIS account — is never
+    sufficient to block the request; see the module docstring above for the
+    full rationale (NAT/proxy IP-collapse cannot be allowed to lock out clean
+    accounts).  The caller never proceeds past this point while its account is
+    gated.
 
     ASVS 6.3.5: brute-force mitigation via rate-limiting and account lockout.
     """
     r = _get_throttle_redis()
-    ip_key = f"auth:throttle:ip:{client_ip}"
-    global_key = "auth:throttle:global"
-    ip_fail_key = f"auth:fail:ip:{client_ip}"
-    global_fail_key = "auth:fail:global"
+    acct_hash = _hash_account(username)
 
-    # Read current failure counts and throttle levels
+    ip_key = f"auth:throttle:ip:{client_ip}"
+    ip_fail_key = f"auth:fail:ip:{client_ip}"
+    acct_key = f"auth:throttle:acct:{acct_hash}"
+    acct_fail_key = f"auth:fail:acct:{acct_hash}"
+
     pipe = r.pipeline()
     pipe.get(ip_fail_key)
-    pipe.get(global_fail_key)
     pipe.get(ip_key)
-    pipe.get(global_key)
-    ip_fails, global_fails, ip_level, global_level = pipe.execute()
+    pipe.get(acct_fail_key)
+    pipe.get(acct_key)
+    ip_fails, ip_level, acct_fails, acct_level = pipe.execute()
 
     ip_fails = int(ip_fails or 0)
-    global_fails = int(global_fails or 0)
     ip_level = int(ip_level or 0)
-    global_level = int(global_level or 0)
+    acct_fails = int(acct_fails or 0)
+    acct_level = int(acct_level or 0)
 
-    # Determine the effective level (use the higher of ip/global)
-    effective_level = max(ip_level, global_level)
+    # Account-gated: an implicated IP with no failures recorded against THIS
+    # account must never block the request on its own.
+    if acct_level <= 0:
+        return
 
-    if effective_level > 0:
-        delay = _throttle_delay_for_level(effective_level)
-        _log.warning(
-            "Auth throttle: ip=%s level=%d delay=%ds",
-            client_ip,
-            effective_level,
-            delay,
+    effective_level = max(acct_level, ip_level)
+    delay = _throttle_delay_for_level(effective_level)
+    _log.warning(
+        "Auth throttle: account=%s ip=%s acct_level=%d ip_level=%d delay=%ds",
+        acct_hash,
+        client_ip,
+        acct_level,
+        ip_level,
+        delay,
+    )
+
+    state = backoffice_state
+    if state.audit_writer is not None:
+        from yashigani.audit.schema import AuthThrottleTriggeredEvent
+        from yashigani.auth.session import _mask_ip
+
+        state.audit_writer.write(
+            AuthThrottleTriggeredEvent(
+                admin_account=username,
+                client_ip_prefix=_mask_ip(client_ip),
+                account_throttle_level=acct_level,
+                ip_throttle_level=ip_level,
+                delay_seconds=delay,
+            )
         )
-        # RFC 6585 §4 — Retry-After header on 429.
-        # Set on the response object so the header is present on the HTTPException
-        # response (FastAPI propagates headers set before raise).
-        response.headers["Retry-After"] = str(delay)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": str(delay)},
-            detail={
-                "error": "too_many_requests",
-                "retry_after_seconds": delay,
-                "banner": (
-                    f"Too many failed login attempts. "
-                    f"Please wait {delay} second{'s' if delay != 1 else ''} before trying again."
-                ),
-            },
-        )
+
+    # RFC 6585 §4 — Retry-After header on 429.
+    # Set on the response object so the header is present on the HTTPException
+    # response (FastAPI propagates headers set before raise).
+    response.headers["Retry-After"] = str(delay)
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        headers={"Retry-After": str(delay)},
+        detail={
+            "error": "too_many_requests",
+            "retry_after_seconds": delay,
+            "banner": (
+                f"Too many failed login attempts. "
+                f"Please wait {delay} second{'s' if delay != 1 else ''} before trying again."
+            ),
+        },
+    )
 
 
-def _record_auth_failure(client_ip: str) -> None:
-    """Increment failure counters and escalate throttle level if thresholds are exceeded.
-    After exhausting the delay escalation (level > max), permanently block the IP."""
+def _record_auth_failure(client_ip: str, username: str) -> None:
+    """Increment the per-IP severity counter and the per-account gate counter,
+    escalating each throttle level if its threshold is exceeded.  Both levels
+    are BOUNDED at len(_THROTTLE_DELAYS) — there is no permanent-block branch.
+    Further failures once at the ceiling simply refresh the TTL, holding the
+    bucket at the max delay until _THROTTLE_WINDOW_SECONDS after the last
+    failure, at which point it clears itself automatically."""
     r = _get_throttle_redis()
+    acct_hash = _hash_account(username)
+
     ip_fail_key = f"auth:fail:ip:{client_ip}"
-    global_fail_key = "auth:fail:global"
     ip_throttle_key = f"auth:throttle:ip:{client_ip}"
-    global_throttle_key = "auth:throttle:global"
+    acct_fail_key = f"auth:fail:acct:{acct_hash}"
+    acct_throttle_key = f"auth:throttle:acct:{acct_hash}"
 
     pipe = r.pipeline()
     pipe.incr(ip_fail_key)
     pipe.expire(ip_fail_key, _THROTTLE_WINDOW_SECONDS)
-    pipe.incr(global_fail_key)
-    pipe.expire(global_fail_key, _THROTTLE_WINDOW_SECONDS)
+    pipe.incr(acct_fail_key)
+    pipe.expire(acct_fail_key, _THROTTLE_WINDOW_SECONDS)
     results = pipe.execute()
     ip_fails = results[0]
-    global_fails = results[2]
+    acct_fails = results[2]
 
-    # Escalate per-IP throttle if threshold exceeded
+    # Escalate per-IP severity level (bounded — no permanent state).
     if ip_fails >= _THROTTLE_IP_THRESHOLD:
         current = int(r.get(ip_throttle_key) or 0)
-        new_level = current + 1
-        # After max delay level → permanent block
-        if new_level > len(_THROTTLE_DELAYS):
-            import json
+        new_level = min(current + 1, len(_THROTTLE_DELAYS))
+        r.set(ip_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
 
-            r.set(
-                f"auth:blocked:{client_ip}",
-                json.dumps(
-                    {
-                        "blocked_at": time.time(),
-                        "reason": f"Exceeded max throttle level ({len(_THROTTLE_DELAYS)}) — permanent block",
-                        "ip_failures": ip_fails,
-                    }
-                ),
-            )  # No TTL = permanent
-            _log.critical("AUTH IP BLOCKED PERMANENTLY: ip=%s failures=%d", client_ip, ip_fails)
-        else:
-            r.set(ip_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
-
-    # Escalate global throttle if threshold exceeded
-    if global_fails >= _THROTTLE_GLOBAL_THRESHOLD:
-        current = int(r.get(global_throttle_key) or 0)
-        new_level = current + 1
-        r.set(global_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
+    # Escalate per-account gate level (bounded — no permanent state).
+    if acct_fails >= _THROTTLE_ACCOUNT_THRESHOLD:
+        current = int(r.get(acct_throttle_key) or 0)
+        new_level = min(current + 1, len(_THROTTLE_DELAYS))
+        r.set(acct_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
+        if new_level >= len(_THROTTLE_DELAYS):
+            _log.warning(
+                "Auth throttle at max bounded level (%ds) for account=%s — "
+                "self-clears %ds after the last failure; no admin action required.",
+                _THROTTLE_MAX_DELAY,
+                acct_hash,
+                _THROTTLE_WINDOW_SECONDS,
+            )
 
 
-def _reset_ip_auth_failures(client_ip: str) -> None:
-    """On successful login, reset the per-IP counter (global decays via TTL)."""
+def _reset_auth_failures(client_ip: str, username: str) -> None:
+    """On successful login, clear both the account gate and the IP severity
+    bucket.  A successful login proves the specific account is not currently
+    under active compromise; clearing the shared IP bucket too means the
+    NEXT (possibly different, legitimate) caller behind the same collapsed
+    address is not held back by stale severity from an unrelated attacker."""
     r = _get_throttle_redis()
-    r.delete(f"auth:fail:ip:{client_ip}", f"auth:throttle:ip:{client_ip}")
+    acct_hash = _hash_account(username)
+    r.delete(
+        f"auth:fail:ip:{client_ip}",
+        f"auth:throttle:ip:{client_ip}",
+        f"auth:fail:acct:{acct_hash}",
+        f"auth:throttle:acct:{acct_hash}",
+    )
 
 
 class LoginRequest(BaseModel):
@@ -376,9 +497,9 @@ async def login(body: LoginRequest, request: Request, response: Response):
     """
     client_ip = _real_client_ip(request)  # LAURA-3X-001: real peer, not Caddy IP
 
-    # Check order: allowlist → blocklist → throttle → auth
+    # Check order: allowlist → blocklist → throttle (account-gated) → auth
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
+    _apply_auth_throttle(client_ip, body.username, response)
 
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -398,14 +519,14 @@ async def login(body: LoginRequest, request: Request, response: Response):
             audit_writer=state.audit_writer,  # ACS gap #95: propagate for ACCOUNT_LOCKOUT
         )
     except (ValueError, TypeError):
-        _record_auth_failure(client_ip)
+        _record_auth_failure(client_ip, body.username)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "invalid_credentials_format"},
         )
 
     if not success:
-        _record_auth_failure(client_ip)
+        _record_auth_failure(client_ip, body.username)
         state.audit_writer.write(_make_login_event(body.username, "failure", reason))
         try:
             from yashigani.metrics.registry import auth_login_attempts_total
@@ -424,8 +545,8 @@ async def login(body: LoginRequest, request: Request, response: Response):
             },
         )
 
-    # Success — reset per-IP failure counter (global decays via TTL)
-    _reset_ip_auth_failures(client_ip)
+    # Success — self-heal: clear both the account gate and the IP severity bucket
+    _reset_auth_failures(client_ip, body.username)
 
     # LAURA-V232-003: when force_totp_provision=True, authenticate() returns
     # reason="totp_provision_required" meaning the account has NOT yet set up

@@ -469,12 +469,16 @@ class TestW20RateGate:
         )
 
     def test_login_finish_resets_on_success(self):
-        """webauthn_v1 must call _reset_ip_auth_failures on successful WebAuthn login."""
+        """webauthn_v1 must call _reset_auth_failures on successful WebAuthn login.
+
+        LAURA-412-CRITICAL (2026-07-19): renamed from _reset_ip_auth_failures —
+        the reset now clears both the account gate and the IP severity bucket.
+        """
         import inspect
         from yashigani.backoffice.routes import webauthn_v1
         source = inspect.getsource(webauthn_v1)
-        assert "_reset_ip_auth_failures" in source, (
-            "W20: webauthn_v1 must call _reset_ip_auth_failures on success"
+        assert "_reset_auth_failures" in source, (
+            "W20: webauthn_v1 must call _reset_auth_failures on success"
         )
 
     def test_blocked_ip_rejected_on_login_start(self):

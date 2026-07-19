@@ -98,7 +98,7 @@ class TestLoginRedirectTo:
         with patch.object(_auth_mod, "backoffice_state", mock_state):
             with patch.object(_auth_mod, "_check_ip_access"):
                 with patch.object(_auth_mod, "_apply_auth_throttle"):
-                    with patch.object(_auth_mod, "_reset_ip_auth_failures"):
+                    with patch.object(_auth_mod, "_reset_auth_failures"):
                         with patch.object(_auth_mod, "_register_human_identity_on_login"):
                             result = await _auth_mod.login(body, request, response)
 
@@ -134,7 +134,7 @@ class TestLoginRedirectTo:
         with patch.object(_auth_mod, "backoffice_state", mock_state):
             with patch.object(_auth_mod, "_check_ip_access"):
                 with patch.object(_auth_mod, "_apply_auth_throttle"):
-                    with patch.object(_auth_mod, "_reset_ip_auth_failures"):
+                    with patch.object(_auth_mod, "_reset_auth_failures"):
                         with patch.object(_auth_mod, "_register_human_identity_on_login"):
                             result = await _auth_mod.login(body, request, response)
 

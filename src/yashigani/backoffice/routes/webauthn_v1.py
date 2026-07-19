@@ -49,13 +49,18 @@ from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 
 # W20 fix (Iris PR #62): import auth throttle helpers so that the public
-# login/start and login/finish endpoints are guarded by the same per-IP
-# blocklist + progressive-delay throttle as the password login route.
+# login/start and login/finish endpoints are guarded by the same blocklist +
+# account-gated progressive-delay throttle as the password login route.
+# LAURA-412-CRITICAL (2026-07-19): _apply_auth_throttle / _record_auth_failure /
+# _reset_auth_failures now take a `username` argument — the account-level
+# bucket is the sole gate; see auth.py's module docstring for the full
+# rationale (IP-collapse under NAT/proxy/podman-pasta must not lock out a
+# clean account).
 from yashigani.backoffice.routes.auth import (
     _check_ip_access,
     _apply_auth_throttle,
     _record_auth_failure,
-    _reset_ip_auth_failures,
+    _reset_auth_failures,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,10 +220,10 @@ async def login_start(body: LoginStartRequest, request: Request, response: Respo
     throttle as the password login route.  An unauthenticated DB-query endpoint
     without a rate gate is an invitation to enumerate admin usernames at scale.
     """
-    # W20: apply per-IP blocklist + throttle BEFORE any DB query.
+    # W20: apply blocklist + account-gated throttle BEFORE any DB query.
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
+    _apply_auth_throttle(client_ip, body.username, response)
 
     # Resolve username → account_id via Postgres
     admin_id = await _resolve_admin_id(body.username)
@@ -269,15 +274,15 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
     on bad assertion (sign_count rollback, wrong key, bad challenge) so that
     automated probing accumulates throttle delay across attempts.
     """
-    # W20: apply per-IP blocklist + throttle BEFORE any DB query or assertion.
+    # W20: apply blocklist + account-gated throttle BEFORE any DB query or assertion.
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
+    _apply_auth_throttle(client_ip, body.username, response)
 
     # Resolve username → account_id
     admin_id = await _resolve_admin_id(body.username)
     if admin_id is None:
-        _record_auth_failure(client_ip)
+        _record_auth_failure(client_ip, body.username)
         _write_audit(
             body.username,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -300,7 +305,7 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
         )
     except ValueError as exc:
         logger.warning("WebAuthn login/finish failed for %s: %s", body.username, exc)
-        _record_auth_failure(client_ip)
+        _record_auth_failure(client_ip, body.username)
         _write_audit(
             admin_id,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -318,8 +323,8 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
             detail={"error": "webauthn_login_finish_failed"},
         )
 
-    # Success: clear failure counter for this IP before issuing session.
-    _reset_ip_auth_failures(client_ip)
+    # Success: self-heal — clear both the account gate and the IP severity bucket.
+    _reset_auth_failures(client_ip, body.username)
 
     # Issue admin session
     store = get_session_store()
