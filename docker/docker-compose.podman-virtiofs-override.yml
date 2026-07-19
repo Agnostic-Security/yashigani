@@ -4,7 +4,71 @@
 #   -f docker/docker-compose.podman-override.yml \
 #   -f docker/docker-compose.podman-virtiofs-override.yml \
 #   up -d
+# Last updated: 2026-07-19T00:00:00+00:00 (fix(podman-mac): FINDING-V412-RESTART-007 —
+#   gateway drops the /var/run/docker.sock bind-mount entirely on macOS Podman; see
+#   "GATEWAY DOCKER.SOCK REMOVAL" section below for full rationale)
 # Last updated: 2026-07-12T00:00:00+00:00 (fix(podman-mac): langflow OPENSSL_armcap=0x8fd — suppress SVE SIGILL on applehv VM; GHSA-537c-gmf6-5ccf was baked into gateway/backoffice Dockerfiles; third-party langflow image requires compose-layer fix)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# GATEWAY DOCKER.SOCK REMOVAL (FINDING-V412-RESTART-007, 2026-07-18/19):
+#
+#   docker-compose.yml:602 unconditionally mounts host `/var/run/docker.sock`
+#   into gateway (Pool Manager container-per-identity isolation). On macOS,
+#   that path is Docker Desktop's socket — Podman CANNOT statfs it (it is a
+#   non-standard grpc-fuse/VPNKit forward, not a plain AF_UNIX socket file).
+#   The base file's own comment already says "macOS Podman: socket can't be
+#   mounted from host — Pool Manager uses stub mode" — but the mount itself
+#   was never actually removed, so a podman install only "worked" by the
+#   ACCIDENT of no docker.sock file existing at all on that path (e.g. Docker
+#   Desktop not running). The instant a real docker.sock exists (Docker
+#   Desktop started for a parallel Docker-leg test, or any host that also has
+#   Docker installed), `podman create` hard-fails with
+#   `Error: statfs /Users/max/.docker/run/docker.sock: operation not
+#   supported` and the gateway container is never created — install-blocking,
+#   verified 2026-07-18/19 fork-wiring run (install.log line 4317).
+#
+#   FIX: gateway.volumes is fully replaced (`!override` — podman-compose-ysg's
+#   supported compose-spec merge-control tag, see podman_compose.py
+#   rec_merge_one()) with every base entry EXCEPT the docker.sock line, so the
+#   mount never reaches `podman create` on macOS regardless of whether a
+#   docker.sock happens to exist on the host. Pool Manager already falls back
+#   to stub mode cleanly when no socket backend is reachable
+#   (src/yashigani/pool/backend.py::_detect_backend, "STUB MODE" branch) — this
+#   makes that the ALWAYS-true state on macOS Podman, matching the documented
+#   design intent, instead of an accident of host state.
+#
+#   Why `!override` (full-list replace) instead of a plain merge entry:
+#   podman-compose's list-merge for `volumes` only supports REPLACING an
+#   inherited entry that shares the same in-container mount TARGET (see
+#   rec_merge_one()'s "clean duplicate mount targets" dedup) — there is no
+#   plain-merge primitive to DELETE an inherited entry outright. `!override`
+#   is the only way to drop the docker.sock line entirely rather than swap in
+#   a different (still-present) mount at that target.
+#
+#   MAINTENANCE / DRIFT GUARD: this is a full-list override — if
+#   docker-compose.yml's base `gateway.volumes` list ever changes, this list
+#   must be updated to match (same entries minus the docker.sock line).
+#   tests/install/test_gateway_socket_override.bats enforces this via a
+#   fixture-backed cross-file comparison; it fails loudly on drift instead of
+#   silently dropping a future gateway volume mount from the macOS Podman path.
+#
+#   Linux Podman is UNCHANGED by this fix — docker-compose.podman-override.yml
+#   (the ALL-podman file, not this one) still carries the base file's
+#   docker.sock mount unmodified. Linux's own real-Pool-Manager wiring (rootful
+#   podman socket resolution, install.sh:8265-8323, `CONTAINER_SOCKET` written
+#   to .env) is pre-existing, separate, and — per code inspection during this
+#   fix — appears to have its own dead-wiring gap (CONTAINER_SOCKET is computed
+#   and written but never interpolated into any compose file's mount source).
+#   NOT fixed here: that is a distinct Pool Manager / compose contract question
+#   (also touches src/yashigani/pool/backend.py's own socket-path fallback
+#   list, which references a DIFFERENT in-container target,
+#   `/var/run/container.sock`, than the compose file's actual
+#   `/var/run/docker.sock` target — a second, independent mismatch). Surfaced
+#   as a follow-up finding, not bundled into this override fix, to avoid
+#   shipping an unverified change to a cross-component (compose + Python)
+#   contract under this dispatch's "static verification only, no live re-run"
+#   constraint.
+# ─────────────────────────────────────────────────────────────────────────────
 #
 # WHY THIS FILE EXISTS (LINUX-SHARED-MOUNT-UID-CLOBBER regression — PR #138):
 #
@@ -50,12 +114,27 @@
 
 services:
   gateway:
-    volumes:
+    # !override: full-list replace, not a merge — see "GATEWAY DOCKER.SOCK
+    # REMOVAL" header comment above. This is the complete gateway.volumes list
+    # from docker-compose.yml with :U added to the two virtiofs-affected
+    # secrets mounts (unchanged from before this fix) AND the base file's
+    # `/var/run/docker.sock:/var/run/docker.sock:ro` line DELETED
+    # (FINDING-V412-RESTART-007 — Podman on macOS cannot statfs Docker
+    # Desktop's socket at that host path; Pool Manager already handles no
+    # socket present via its documented stub-mode fallback).
+    volumes: !override
+      - audit_data:/data/audit
+      - bootstrap_data:/data/bootstrap
       - ./secrets:/run/secrets:ro,U
       # YSG-RISK-053: scoped single-file mount needs :U on macOS virtiofs too
       # (same statfs-EPERM rationale as the dir mount). No clobber risk: the
       # hmac file is shared only by gateway + backoffice, both UID 1001.
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
+      - ./cloud-keys:/run/cloud-keys:rw
+      - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
+      # NO /var/run/docker.sock entry here — see header comment. Pool Manager
+      # runs in stub mode on macOS Podman, unconditionally, regardless of
+      # whether a docker.sock happens to exist on the host.
 
   backoffice:
     volumes:

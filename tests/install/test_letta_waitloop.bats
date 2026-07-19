@@ -1,25 +1,32 @@
 #!/usr/bin/env bats
 # tests/install/test_letta_waitloop.bats
 #
-# Unit tests for:
-#   (a) _podman_compose_letta_waitloop() — Part-2 letta stuck-Created fix
-#   (b) resolve_compose_cmd() provider preference — Part-1 revert of cacc23da
+# Unit tests for _podman_compose_letta_waitloop() — the letta stuck-Created
+# workaround for podman-compose's incomplete depends_on(service_healthy /
+# service_completed_successfully) support.
 #
-# Background (fix/v411-revert-podman-compose-letta-waitloop):
-#   cacc23da swapped resolve_compose_cmd to prefer `podman compose` (v2 engine)
-#   over `podman-compose` in an attempt to fix letta stuck-Created.  The swap
-#   introduced a seccomp regression: `podman compose` inlines the JSON content
-#   of security_opt:seccomp=<path> and passes the blob as the option value to the
-#   Podman socket, which treats the multi-KB string as a filename → ENAMETOOLONG
-#   → caddy/gateway/backoffice cannot be created on rootless Podman.
-#   Fix Part-1 reverts the provider order (podman-compose first).
-#   Fix Part-2 adds _podman_compose_letta_waitloop() to handle the letta
-#   stuck-Created condition directly in install.sh, without switching providers.
+# Updated 2026-07-18 (feat/v412-podman-fork-wiring): the guard that gates this
+# function used to text-match COMPOSE_CMD[0] == "podman-compose" (the pip
+# binary name). As of the fork wiring, the Podman runtime's ONLY compose
+# driver is the vendored podman-compose-ysg fork
+# (vendor/podman-compose-ysg/podman_compose.py, invoked via python3) — its
+# COMPOSE_CMD[0] is "python3", not a driver name, so the guard now checks the
+# authoritative YSG_PODMAN_COMPOSE_FORK flag (set by resolve_compose_cmd)
+# instead. The fork inherits podman-compose 1.5.0's incomplete
+# service_healthy support unchanged (none of AS-FIX-1/2/3 touch dependency-
+# condition semantics), so this workaround remains necessary and unchanged in
+# its own runtime behaviour — only the SELECTION GUARD changed.
+#
+# resolve_compose_cmd()'s own engine-selection behaviour (fork-only on
+# Podman, fail-closed manifest verification, etc.) has its own comprehensive
+# coverage in tests/install/test_compose_engine_selection.bats — this file
+# does not duplicate that; it exercises only enough of resolve_compose_cmd to
+# confirm YSG_PODMAN_COMPOSE_FORK is wired correctly into the waitloop guard.
 #
 # Tests are fully hermetic:
 #   - Functions extracted from install.sh via brace-count awk (same technique
-#     as test_ollama_port_resolution.bats).
-#   - `podman`, `command` and `log_*` are stubbed as shell functions.
+#     as test_ollama_port_resolution.bats and test_compose_engine_selection.bats).
+#   - `podman`, `python3`, `command` and `log_*` are stubbed as shell functions.
 #   - No live container daemon required.
 #
 # Call convention:
@@ -35,7 +42,7 @@
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 INSTALL_SH="${REPO_ROOT}/install.sh"
 
-# ── awk fragment extractor ─────────────────────────────────────────────────────
+# ── awk fragment extractor (brace-depth counting) ─────────────────────────────
 # Extract a top-level function by name using brace-depth counting.
 # Works with inner helper functions and {{ }} in format strings (net-zero depth).
 _extract_fn() {
@@ -51,15 +58,28 @@ _extract_fn() {
   ' "$src"
 }
 
+# ── Fixture: a fake vendored-fork directory with a passing manifest ──────────
+_make_fake_fork_dir() {
+  local _dir="$1"
+  mkdir -p "${_dir}/vendor/podman-compose-ysg"
+  printf '#!/usr/bin/env python3\nprint("stub fork")\n' \
+    > "${_dir}/vendor/podman-compose-ysg/podman_compose.py"
+  cat > "${_dir}/vendor/podman-compose-ysg/verify-manifest.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "OK: podman-compose-ysg vendored-fork integrity verified (stub)."
+exit 0
+EOF
+  chmod +x "${_dir}/vendor/podman-compose-ysg/verify-manifest.sh"
+}
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 setup() {
-  # ── Extract helpers + resolve_compose_cmd + waitloop from install.sh ──────
-  # resolve_compose_cmd now calls _podman_compose_usable, _podman_client_major,
-  # and _podman_compose_version_major_minor; all four must be extracted together.
-  for _fn in _podman_compose_version_major_minor \
-              _podman_client_major \
-              _podman_compose_usable \
+  # ── Extract fork-selection helpers + resolve_compose_cmd + waitloop ───────
+  for _fn in _ysg_fork_compose_dir \
+              _ysg_fork_compose_python_ready \
+              _ysg_verify_fork_manifest \
+              _ysg_compose_engine_bin \
               _podman_compose_letta_waitloop \
               resolve_compose_cmd; do
     local _body
@@ -74,12 +94,20 @@ setup() {
   # ── Global state that install.sh declares at module level ─────────────────
   YSG_PODMAN_RUNTIME=false
   YSG_PODMAN_COMPOSE_V2=false
+  YSG_PODMAN_COMPOSE_FORK=false
+  _YSG_FORK_MANIFEST_VERIFIED=false
   COMPOSE_CMD=()
   COMPOSE_PROFILES=()
   COMPOSE_PROJECT_NAME="docker"
   DRY_RUN=false
   YSG_RUNTIME=""
   YSG_LETTA_WAITLOOP_TIMEOUT_S=5   # fast timeout for tests
+
+  # Fixture fork directory — never under the repo tree, never /tmp directly.
+  FAKE_WORK_DIR="${BATS_TEST_TMPDIR}/work"
+  mkdir -p "$FAKE_WORK_DIR"
+  _make_fake_fork_dir "$FAKE_WORK_DIR"
+  WORK_DIR="$FAKE_WORK_DIR"
 
   # ── Logging stubs ─────────────────────────────────────────────────────────
   log_info()    { printf '[INFO]    %s\n' "$*" >&2; }
@@ -89,61 +117,45 @@ setup() {
   dry_print()   { printf '[DRY]     %s\n' "$*" >&2; }
   log_step()    { :; }
 
-  # ── podman stub: default all calls to "no containers" / "absent" ──────────
-  # --version added so _podman_client_major() returns a controllable value.
-  # Default major=5 so _podman_compose_usable() does NOT gate on podman 6+,
-  # letting podman-compose (when present) be the selected provider.
+  # ── podman stub: default all calls to "no containers" / info reachable ────
   podman() {
     case "$1" in
-      --version)   echo "podman version ${STUB_PODMAN_MAJOR:-5}.0.0" ;;
       ps)          echo ""          ;;  # no stuck containers
       inspect)     echo "absent"    ;;  # state=absent, health=absent
       start)       return 0         ;;  # start succeeds (no-op)
       healthcheck) return 0         ;;
       info)        return 0         ;;
-      compose)     return 0         ;;
       *)           return 1         ;;
     esac
   }
 
-  # ── podman-compose stub ───────────────────────────────────────────────────
-  # _podman_compose_version_major_minor() calls `podman-compose --version`.
-  # Stub it as a shell function so tests are hermetic (not affected by the
-  # system podman-compose 1.6.x). Default version = 1.5.0 (usable).
-  # shellcheck disable=SC2317
-  podman-compose() {
-    case "$1" in
-      --version) echo "podman-compose version ${STUB_PC_VERSION:-1.5.0}" ;;
-      *)         return 0 ;;
-    esac
+  # ── python3 stub: `import yaml, dotenv` always succeeds in this file — the
+  # letta-waitloop tests aren't exercising the python-deps gate (that's
+  # covered in test_compose_engine_selection.bats). ─────────────────────────
+  python3() {
+    if [[ "$1" == "-c" ]]; then return 0; fi
+    return 0
   }
 
   # ── command stub for resolve_compose_cmd guards ───────────────────────────
-  # Default: podman-compose and podman both available; docker not available.
   command() {
     if [[ "$1" == "-v" ]]; then
       case "$2" in
-        podman-compose) return "${STUB_PC_PRESENT:-0}" ;;
-        podman)         return 0 ;;
-        docker)         return 1 ;;
-        docker-compose) return 1 ;;
-        *)              return 1 ;;
+        podman)  return 0 ;;
+        python3) return 0 ;;
+        docker)  return 1 ;;
+        *)       return 1 ;;
       esac
     fi
-    # Fallback to real command for other uses (e.g. 'command -v bats')
     builtin command "$@"
   }
-
-  # Default stub config: podman 5 + podman-compose 1.5.0 (both usable).
-  STUB_PODMAN_MAJOR=5
-  STUB_PC_VERSION="1.5.0"
-  STUB_PC_PRESENT=0
 }
 
 teardown() {
-  unset YSG_PODMAN_RUNTIME YSG_PODMAN_COMPOSE_V2 COMPOSE_CMD COMPOSE_PROFILES \
+  unset YSG_PODMAN_RUNTIME YSG_PODMAN_COMPOSE_V2 YSG_PODMAN_COMPOSE_FORK \
+        _YSG_FORK_MANIFEST_VERIFIED COMPOSE_CMD COMPOSE_PROFILES \
         COMPOSE_PROJECT_NAME DRY_RUN YSG_RUNTIME YSG_LETTA_WAITLOOP_TIMEOUT_S \
-        STUB_PODMAN_MAJOR STUB_PC_VERSION STUB_PC_PRESENT 2>/dev/null || true
+        WORK_DIR FAKE_WORK_DIR 2>/dev/null || true
 }
 
 # ── Lint gates ────────────────────────────────────────────────────────────────
@@ -174,27 +186,11 @@ teardown() {
   [ "$call_line" -gt "$up_line" ]
 }
 
-@test "LINT: resolve_compose_cmd checks podman-compose BEFORE podman compose in Podman branch" {
-  # 'command -v podman-compose' line must appear before 'podman compose version' line
-  # within the Podman-only branch. We check file line ordering.
-  local pc_line pv_line
-  # First occurrence of 'command -v podman-compose' in the Podman-only branch
-  pc_line="$(grep -n 'command -v podman-compose' "${INSTALL_SH}" | head -1 | cut -d: -f1)"
-  # First occurrence of 'podman compose version' in the Podman-only branch
-  pv_line="$(grep -n 'podman compose version' "${INSTALL_SH}" | head -1 | cut -d: -f1)"
-  [ -n "$pc_line" ]
-  [ -n "$pv_line" ]
-  [ "$pc_line" -lt "$pv_line" ]
-}
-
-@test "LINT: resolve_compose_cmd checks podman-compose BEFORE podman compose in auto-detect branch" {
-  # Second occurrence covers the auto-detect branch
-  local pc_line pv_line
-  pc_line="$(grep -n 'command -v podman-compose' "${INSTALL_SH}" | sed -n '2p' | cut -d: -f1)"
-  pv_line="$(grep -n 'podman compose version' "${INSTALL_SH}" | sed -n '2p' | cut -d: -f1)"
-  [ -n "$pc_line" ]
-  [ -n "$pv_line" ]
-  [ "$pc_line" -lt "$pv_line" ]
+@test "LINT: guard checks YSG_PODMAN_COMPOSE_FORK, not a COMPOSE_CMD[0] text match" {
+  local fn_body
+  fn_body="$(_extract_fn "_podman_compose_letta_waitloop" "${INSTALL_SH}")"
+  [[ "$fn_body" == *'YSG_PODMAN_COMPOSE_FORK'* ]]
+  [[ "$fn_body" != *'COMPOSE_CMD[0]:-}" != "podman-compose"'* ]]
 }
 
 @test "LINT: virtiofs override still carries langflow OPENSSL_armcap=0x8fd" {
@@ -207,7 +203,7 @@ teardown() {
 
 @test "GUARD: no-op when YSG_PODMAN_RUNTIME=false" {
   YSG_PODMAN_RUNTIME=false
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   run _podman_compose_letta_waitloop
   [ "$status" -eq 0 ]
@@ -215,18 +211,9 @@ teardown() {
   [[ "$output" != *"wait-loop"* ]]
 }
 
-@test "GUARD: no-op when provider is 'podman compose' (not podman-compose)" {
-  YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman" "compose")
-  COMPOSE_PROFILES=("letta")
-  run _podman_compose_letta_waitloop
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"wait-loop"* ]]
-}
-
-@test "GUARD: no-op when provider is 'docker compose'" {
+@test "GUARD: no-op when YSG_PODMAN_COMPOSE_FORK=false (e.g. Docker runtime)" {
   YSG_PODMAN_RUNTIME=false
-  COMPOSE_CMD=("docker" "compose")
+  YSG_PODMAN_COMPOSE_FORK=false
   COMPOSE_PROFILES=("letta")
   run _podman_compose_letta_waitloop
   [ "$status" -eq 0 ]
@@ -235,7 +222,7 @@ teardown() {
 
 @test "GUARD: no-op when letta profile is not active (lean install)" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("langflow")   # letta not included
   run _podman_compose_letta_waitloop
   [ "$status" -eq 0 ]
@@ -244,7 +231,7 @@ teardown() {
 
 @test "GUARD: no-op when COMPOSE_PROFILES is empty (core-only install)" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=()
   run _podman_compose_letta_waitloop
   [ "$status" -eq 0 ]
@@ -253,7 +240,7 @@ teardown() {
 
 @test "GUARD: no-op in dry-run mode" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   DRY_RUN=true
   run _podman_compose_letta_waitloop
@@ -263,7 +250,7 @@ teardown() {
 
 @test "GUARD: no-op when no containers are stuck in created state" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   # podman ps returns empty (default stub) — no stuck containers
   run _podman_compose_letta_waitloop
@@ -274,9 +261,9 @@ teardown() {
 
 # ── Activation tests: waitloop triggers when conditions are met ───────────────
 
-@test "ACTIVATE: triggers when podman-compose + letta + containers in created state" {
+@test "ACTIVATE: triggers when fork + letta + containers in created state" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   COMPOSE_PROJECT_NAME="docker"
 
@@ -311,7 +298,7 @@ teardown() {
 
 @test "ACTIVATE: postgres timeout causes non-zero return and error log" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   COMPOSE_PROJECT_NAME="docker"
   YSG_LETTA_WAITLOOP_TIMEOUT_S=1  # 1-second timeout to force expiry
@@ -336,7 +323,7 @@ teardown() {
 
 @test "ACTIVATE: letta start called after postgres healthy" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   COMPOSE_PROJECT_NAME="docker"
 
@@ -372,7 +359,7 @@ teardown() {
 
 @test "ACTIVATE: agent-db-init and letta-pgbouncer started before letta" {
   YSG_PODMAN_RUNTIME=true
-  COMPOSE_CMD=("podman-compose" "--in-pod=false")
+  YSG_PODMAN_COMPOSE_FORK=true
   COMPOSE_PROFILES=("letta")
   COMPOSE_PROJECT_NAME="docker"
 
@@ -415,172 +402,38 @@ teardown() {
   [ "$_adb_pos" -lt "$_letta_pos" ]
 }
 
-# ── resolve_compose_cmd provider preference tests ─────────────────────────────
+# ── resolve_compose_cmd → YSG_PODMAN_COMPOSE_FORK wiring smoke test ───────────
+# (resolve_compose_cmd's full engine-selection behaviour — fork-only on
+# Podman, fail-closed manifest verification, pip podman-compose / podman
+# compose v2 retirement — is comprehensively covered in
+# tests/install/test_compose_engine_selection.bats. This is a single smoke
+# test confirming the waitloop's guard flag is actually wired end-to-end.)
 
-@test "PROVIDER: Podman-only branch selects podman-compose when both available" {
+@test "SMOKE: resolve_compose_cmd(--runtime podman) sets YSG_PODMAN_COMPOSE_FORK=true, and the waitloop guard honours it" {
   YSG_RUNTIME=podman
-  COMPOSE_CMD=()
-  YSG_PODMAN_RUNTIME=false
+  resolve_compose_cmd
+  [ "$YSG_PODMAN_COMPOSE_FORK" = "true" ]
 
-  # Both podman-compose and `podman compose` available; podman reachable
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 0 ;;
-        podman)         return 0 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
+  COMPOSE_PROFILES=("letta")
   podman() {
     case "$1" in
-      info)    return 0 ;;
-      compose) return 0 ;;  # `podman compose version` succeeds
-      *)       return 1 ;;
+      ps)      echo "docker_letta_1" ;;
+      inspect)
+        local _fmt="${3:-}"
+        if [[ "$_fmt" == *"Health.Status"* ]]; then
+          echo "healthy"
+        elif [[ "$_fmt" == *"ExitCode"* ]]; then
+          echo "0"
+        else
+          echo "exited"
+        fi
+        ;;
+      start) return 0 ;;
+      info)  return 0 ;;
+      *)     return 1 ;;
     esac
   }
-
-  resolve_compose_cmd
-  # Must select podman-compose (not podman compose)
-  [ "${COMPOSE_CMD[0]}" = "podman-compose" ]
-}
-
-@test "PROVIDER: Podman-only branch falls back to podman compose when podman-compose absent" {
-  YSG_RUNTIME=podman
-  COMPOSE_CMD=()
-  YSG_PODMAN_RUNTIME=false
-
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 1 ;;  # not available
-        podman)         return 0 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
-  podman() {
-    case "$1" in
-      info)    return 0 ;;
-      compose) return 0 ;;  # `podman compose version` succeeds
-      *)       return 1 ;;
-    esac
-  }
-
-  resolve_compose_cmd
-  # Must fall back to podman compose
-  [ "${COMPOSE_CMD[0]}" = "podman" ]
-  [ "${COMPOSE_CMD[1]}" = "compose" ]
-}
-
-@test "PROVIDER: auto-detect branch selects podman-compose when both available" {
-  YSG_RUNTIME=auto
-  COMPOSE_CMD=()
-  YSG_PODMAN_RUNTIME=false
-
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 0 ;;
-        podman)         return 0 ;;
-        docker)         return 1 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
-  podman() {
-    case "$1" in
-      info)    return 0 ;;
-      compose) return 0 ;;
-      *)       return 1 ;;
-    esac
-  }
-
-  resolve_compose_cmd
-  [ "${COMPOSE_CMD[0]}" = "podman-compose" ]
-}
-
-@test "PROVIDER: auto-detect falls back to podman compose when podman-compose absent" {
-  YSG_RUNTIME=auto
-  COMPOSE_CMD=()
-  YSG_PODMAN_RUNTIME=false
-
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 1 ;;
-        podman)         return 0 ;;
-        docker)         return 1 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
-  podman() {
-    case "$1" in
-      info)    return 0 ;;
-      compose) return 0 ;;
-      *)       return 1 ;;
-    esac
-  }
-
-  resolve_compose_cmd
-  [ "${COMPOSE_CMD[0]}" = "podman" ]
-  [ "${COMPOSE_CMD[1]}" = "compose" ]
-}
-
-@test "PROVIDER: Podman branch sets --in-pod=false on podman-compose" {
-  YSG_RUNTIME=podman
-  COMPOSE_CMD=()
-
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 0 ;;
-        podman)         return 0 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
-  podman() {
-    case "$1" in
-      info)    return 0 ;;
-      compose) return 0 ;;
-      *)       return 1 ;;
-    esac
-  }
-
-  resolve_compose_cmd
-  [ "${COMPOSE_CMD[0]}" = "podman-compose" ]
-  [ "${COMPOSE_CMD[1]}" = "--in-pod=false" ]
-}
-
-@test "PROVIDER: YSG_PODMAN_RUNTIME set to true when podman-compose selected" {
-  YSG_RUNTIME=podman
-  COMPOSE_CMD=()
-  YSG_PODMAN_RUNTIME=false
-
-  command() {
-    if [[ "$1" == "-v" ]]; then
-      case "$2" in
-        podman-compose) return 0 ;;
-        podman)         return 0 ;;
-        *)              return 1 ;;
-      esac
-    fi
-    builtin command "$@"
-  }
-  podman() {
-    case "$1" in
-      info)    return 0 ;;
-      *)       return 1 ;;
-    esac
-  }
-
-  resolve_compose_cmd
-  [ "$YSG_PODMAN_RUNTIME" = "true" ]
+  run _podman_compose_letta_waitloop
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"wait-loop"* ]]
 }
