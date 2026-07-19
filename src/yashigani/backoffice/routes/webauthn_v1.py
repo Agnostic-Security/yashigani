@@ -62,10 +62,24 @@ from yashigani.common.error_envelope import safe_error_envelope
 # credential verification runs, closing the TOCTOU race a concurrent
 # burst could previously exploit.  _record_auth_failure no longer exists —
 # counting happens unconditionally in the atomic admit step.
+#
+# Captain merge-review (2026-07-19, same date): _resolve_account_id_for_bucket
+# is imported SEPARATELY from this module's own _resolve_admin_id().
+# _resolve_admin_id() filters `disabled=false AND account_tier='admin'` —
+# correct for deciding whether the WebAuthn business logic (begin/complete
+# authentication) should proceed, but WRONG for throttle-bucket keying: a
+# disabled admin account or a user-tier account attempting this endpoint
+# would resolve to None from _resolve_admin_id() and fall through to the
+# unk: casefold-hash bucket fallback, narrowly reopening the LAURA-412-MEDIUM
+# collision class for exactly those account states.
+# _resolve_account_id_for_bucket() resolves ANY existing account regardless
+# of tier/disabled state, so the bucket always keys on a stable account_id
+# whenever the username corresponds to a real row at all.
 from yashigani.backoffice.routes.auth import (
     _check_ip_access,
     _apply_auth_throttle,
     _reset_auth_failures,
+    _resolve_account_id_for_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -229,14 +243,18 @@ async def login_start(body: LoginStartRequest, request: Request, response: Respo
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
 
-    # LAURA-412-MEDIUM: resolve account_id FIRST so the throttle bucket
-    # keys on the stable identity, not a normalised username — this is the
-    # same lookup login/start already needs, just reordered ahead of the
-    # throttle check instead of after it (no extra DB round-trip added).
-    admin_id = await _resolve_admin_id(body.username)
+    # LAURA-412-MEDIUM (Captain merge-review): the throttle bucket keys on
+    # the UNCONDITIONAL account_id (any tier, disabled or not) — this is
+    # deliberately a DIFFERENT resolution from admin_id below (which is
+    # admin-tier + active only, and drives the actual WebAuthn logic).
+    bucket_account_id = await _resolve_account_id_for_bucket(body.username)
 
     # LAURA-412-HIGH: atomically admits this attempt BEFORE any DB work.
-    _apply_auth_throttle(client_ip, body.username, admin_id, response)
+    _apply_auth_throttle(client_ip, body.username, bucket_account_id, response)
+
+    # admin_id: the admin-tier, active-only resolution the WebAuthn business
+    # logic actually needs (begin_authentication is legitimately admin-scoped).
+    admin_id = await _resolve_admin_id(body.username)
 
     if admin_id is None:
         # Return a generic error — do not reveal whether the user exists
@@ -290,13 +308,16 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
 
-    # LAURA-412-MEDIUM: resolve account_id FIRST — same reordering as
-    # login_start, no extra DB round-trip added.
-    admin_id = await _resolve_admin_id(body.username)
+    # LAURA-412-MEDIUM (Captain merge-review): unconditional account_id for
+    # bucket keying — see login_start / auth.py module docstring.
+    bucket_account_id = await _resolve_account_id_for_bucket(body.username)
 
     # LAURA-412-HIGH: atomically admits this attempt BEFORE any DB query or
     # assertion verification.
-    _apply_auth_throttle(client_ip, body.username, admin_id, response)
+    _apply_auth_throttle(client_ip, body.username, bucket_account_id, response)
+
+    # admin_id: admin-tier, active-only — drives the actual WebAuthn logic.
+    admin_id = await _resolve_admin_id(body.username)
 
     if admin_id is None:
         _write_audit(
@@ -338,8 +359,12 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
             detail={"error": "webauthn_login_finish_failed"},
         )
 
-    # Success: self-heal — clear both the account gate and the IP severity bucket.
-    _reset_auth_failures(client_ip, body.username, admin_id)
+    # Success: self-heal — clear both the account gate and the IP severity
+    # bucket.  Use bucket_account_id (the SAME identity that was checked/
+    # incremented by _apply_auth_throttle above), not admin_id — they are
+    # equal in the success path here, but keeping the reset keyed on
+    # whatever was actually gated is the correct invariant regardless.
+    _reset_auth_failures(client_ip, body.username, bucket_account_id)
 
     # Issue admin session
     store = get_session_store()

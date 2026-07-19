@@ -540,6 +540,26 @@ class TestConcurrentBurstDoesNotBypassGate:
         result in authenticate() being called AT MOST
         _THROTTLE_ACCOUNT_THRESHOLD times — every request beyond that must
         be gated with 429 BEFORE authenticate() is ever invoked.
+
+        Captain merge-review (2026-07-19): the original version of this test
+        entered/exited ``patch.object(mod, ...)`` ONCE PER concurrent
+        coroutine (25 nested enter/exit pairs racing on the SAME shared
+        module attributes via asyncio.gather).  ``unittest.mock.patch``'s
+        context-manager protocol is NOT safe for that: each ``__enter__``
+        records "whatever the attribute currently is" as the value to
+        restore on ``__exit__``.  If coroutine B enters after coroutine A
+        has already patched the attribute, B records A's mock as its own
+        "original" — so whichever coroutine's ``__exit__`` runs LAST
+        restores the attribute to another coroutine's mock, not the true
+        pre-test value, leaking a patched ``backoffice_state`` (etc.) past
+        this test's teardown and corrupting unrelated tests that run
+        afterward in the same session (confirmed: 3 net-new failures in
+        test_v2234_gap3_human_identity_on_login.py on the full suite).
+
+        Fix: patch EXACTLY ONCE, wrapping the whole ``asyncio.gather(...)``
+        call — all 25 tasks share the same patched values for the duration
+        of a single enter/exit pair, so there is no interleaving and no
+        leak, regardless of how the 25 coroutines are scheduled internally.
         """
         from fastapi import HTTPException, Response
 
@@ -566,20 +586,20 @@ class TestConcurrentBurstDoesNotBypassGate:
             body.totp_code = "000000"
             request = _make_request(ip)
             resp = Response()
-            with patch.object(mod, "backoffice_state", mock_state):
-                with patch.object(mod, "_get_throttle_redis", return_value=r):
-                    with patch.object(
-                        mod, "_resolve_account_id_for_bucket",
-                        new=AsyncMock(return_value=nexus_id),
-                    ):
-                        with patch.object(mod, "_register_human_identity_on_login"):
-                            try:
-                                await mod.login(body, request, resp)
-                                return "unexpected_success"
-                            except HTTPException as exc:
-                                return exc.status_code
+            try:
+                await mod.login(body, request, resp)
+                return "unexpected_success"
+            except HTTPException as exc:
+                return exc.status_code
 
-        results = await asyncio.gather(*[_one_attempt() for _ in range(25)])
+        with patch.object(mod, "backoffice_state", mock_state), \
+                patch.object(mod, "_get_throttle_redis", return_value=r), \
+                patch.object(
+                    mod, "_resolve_account_id_for_bucket",
+                    new=AsyncMock(return_value=nexus_id),
+                ), \
+                patch.object(mod, "_register_human_identity_on_login"):
+            results = await asyncio.gather(*[_one_attempt() for _ in range(25)])
 
         assert set(results) <= {401, 429}, f"unexpected outcomes: {results}"
         assert results.count(401) + results.count(429) == 25
@@ -680,3 +700,169 @@ class TestCaseVariantAccountsDoNotShareBucket:
             "account B's bucket must remain completely untouched by "
             "account A's failures despite the case-only username difference"
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. Captain merge-review — WebAuthn must use the UNCONDITIONAL bucket resolve
+# ---------------------------------------------------------------------------
+
+class TestWebAuthnBucketKeyingUsesUnconditionalResolve:
+    """
+    Captain merge-review (2026-07-19): webauthn_v1.py originally keyed the
+    throttle bucket on ``_resolve_admin_id()`` (filters
+    ``disabled=false AND account_tier='admin'``) — correct for deciding
+    whether the WebAuthn business logic should proceed, but WRONG for
+    throttle-bucket identity: a disabled admin account or a user-tier
+    account attempting this endpoint resolves to ``None`` from
+    ``_resolve_admin_id()`` and would fall through to the ``unk:``
+    casefold-hash bucket fallback, narrowly reopening the LAURA-412-MEDIUM
+    collision class for exactly those account states. Fixed by resolving
+    the bucket key via ``_resolve_account_id_for_bucket()`` (unconditional —
+    any tier, disabled or not) SEPARATELY from ``admin_id``.
+    """
+
+    def test_login_start_imports_and_uses_unconditional_resolve(self):
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1)
+        assert "_resolve_account_id_for_bucket" in source, (
+            "webauthn_v1 must import _resolve_account_id_for_bucket for "
+            "unconditional (any tier/disabled-state) bucket keying"
+        )
+
+    def test_login_start_resolves_bucket_id_before_throttle_and_before_admin_id(self):
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1.login_start)
+        bucket_idx = source.find("_resolve_account_id_for_bucket(")
+        throttle_idx = source.find("_apply_auth_throttle(")
+        admin_idx = source.find("_resolve_admin_id(")
+        assert bucket_idx != -1 and throttle_idx != -1 and admin_idx != -1
+        assert bucket_idx < throttle_idx, (
+            "the unconditional bucket resolve must run before the throttle "
+            "check, exactly like the password route"
+        )
+
+    def test_login_finish_resolves_bucket_id_before_throttle(self):
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1.login_finish)
+        bucket_idx = source.find("_resolve_account_id_for_bucket(")
+        throttle_idx = source.find("_apply_auth_throttle(")
+        assert bucket_idx != -1 and throttle_idx != -1
+        assert bucket_idx < throttle_idx
+
+    def test_reset_uses_bucket_account_id_not_admin_id(self):
+        """
+        The self-heal reset must key on the SAME identity that was checked/
+        incremented (bucket_account_id), not admin_id — they coincide on the
+        success path here, but the invariant must hold structurally.
+        """
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1.login_finish)
+        assert "_reset_auth_failures(client_ip, body.username, bucket_account_id)" in source
+
+    @pytest.mark.asyncio
+    async def test_disabled_admin_account_gets_id_keyed_bucket_not_unk_fallback(self):
+        """
+        Live-shaped proof: an account that _resolve_admin_id() would REJECT
+        (disabled, or wrong tier — simulated here by having it return None)
+        must still have its throttle bucket keyed on its real, stable
+        account_id via _resolve_account_id_for_bucket() — never the unk:
+        casefold-hash fallback that a normalisation-collision could exploit.
+
+        Asserts this by capturing the ARGUMENTS webauthn_v1 actually passes
+        to _apply_auth_throttle, rather than exercising the real Redis atomic
+        admit — this keeps the test focused purely on the WIRING regression
+        Captain flagged (which resolver feeds which parameter) and immune to
+        an unrelated cross-file test-order fragility: some other module in
+        this suite (test_sec4_totp_redis_counter.py) legitimately
+        importlib.reload()s auth.py to prove Redis-backed counters survive a
+        process restart; that reload can rebind auth.py's module-level
+        function objects out from under a same-process patch.object() aimed
+        at auth.py's globals when reached via a cross-module call chain
+        (webauthn_v1 -> auth._apply_auth_throttle -> auth._get_throttle_redis).
+        Patching webauthn_v1's OWN _apply_auth_throttle attribute directly
+        sidesteps that entirely — the atomic-admit Redis mechanics themselves
+        are already proven correct by TestConcurrentBurstDoesNotBypassGate
+        and the _account_bucket_key unit tests above.
+        """
+        from fastapi import HTTPException, Response
+        from yashigani.backoffice.routes import webauthn_v1
+
+        disabled_admin_id = "uuid-disabled-admin-real-id"
+
+        body = MagicMock()
+        body.username = "disabled-or-usertier-account"
+        request = _make_request("203.0.113.240")
+        resp = Response()
+
+        captured: dict = {}
+
+        def _capture_throttle(client_ip, username, account_id, response):
+            captured["client_ip"] = client_ip
+            captured["username"] = username
+            captured["account_id"] = account_id
+            return None  # do not gate — let login_start proceed to the admin_id check
+
+        with patch.object(webauthn_v1, "_check_ip_access"):
+            with patch.object(webauthn_v1, "_apply_auth_throttle", side_effect=_capture_throttle):
+                # _resolve_admin_id rejects this account (disabled/wrong tier)
+                with patch.object(
+                    webauthn_v1, "_resolve_admin_id",
+                    new=AsyncMock(return_value=None),
+                ):
+                    # but the account DOES exist — _resolve_account_id_for_bucket
+                    # unconditionally resolves it
+                    with patch.object(
+                        webauthn_v1, "_resolve_account_id_for_bucket",
+                        new=AsyncMock(return_value=disabled_admin_id),
+                    ):
+                        with pytest.raises(HTTPException) as exc_info:
+                            await webauthn_v1.login_start(body, request, resp)
+                        # 400 no_credentials_registered — admin_id was None,
+                        # exactly as _resolve_admin_id said; but the captured
+                        # call below must show the REAL account_id was used
+                        # for the throttle bucket regardless.
+                        assert exc_info.value.status_code == 400
+
+        assert captured.get("account_id") == disabled_admin_id, (
+            "_apply_auth_throttle must be called with the UNCONDITIONALLY "
+            "resolved account_id (from _resolve_account_id_for_bucket), "
+            "even though _resolve_admin_id separately rejected this account "
+            "— otherwise the throttle bucket falls back to the unk: "
+            "casefold-hash key, reopening LAURA-412-MEDIUM for disabled/"
+            "user-tier accounts"
+        )
+        assert captured.get("username") == "disabled-or-usertier-account"
+
+
+# ---------------------------------------------------------------------------
+# 8. Captain merge-review — atomic admit fails closed (503) on Redis error
+# ---------------------------------------------------------------------------
+
+class TestThrottleAdmitFailsClosedOn503:
+    """
+    Captain flagged (Low, non-blocking but cheap): a Redis error inside
+    _throttle_admit() previously propagated uncaught out of
+    _apply_auth_throttle(), landing on FastAPI's generic 500 handler.  This
+    module's established fail-closed pattern (see _totp_incr_failure call
+    sites) is to catch the error and raise an explicit 503 instead, so
+    monitoring/clients get an accurate signal rather than an opaque crash.
+    """
+
+    def test_apply_auth_throttle_returns_503_on_redis_error(self):
+        from fastapi import HTTPException, Response
+
+        mod = _import_auth_mod()
+        broken_redis = MagicMock()
+        broken_redis.eval.side_effect = ConnectionError("redis unreachable")
+        resp = Response()
+
+        with patch.object(mod, "_get_throttle_redis", return_value=broken_redis):
+            with pytest.raises(HTTPException) as exc_info:
+                mod._apply_auth_throttle("1.2.3.4", "someone", "uuid-someone", resp)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail.get("error") == "auth_throttle_unavailable"

@@ -584,12 +584,20 @@ def _apply_auth_throttle(
     this must run before any credential verification, not after, or the
     TOCTOU race Laura proved (25 concurrent requests all observing the
     pre-increment state) reopens.  ``account_id`` — resolved by the caller
-    via ``_resolve_account_id_for_bucket`` (or, for WebAuthn, the existing
-    ``_resolve_admin_id``) — selects the identity-stable bucket key
-    (LAURA-412-MEDIUM fix); see ``_account_bucket_key`` for the full
-    rationale.
+    via ``_resolve_account_id_for_bucket`` (both the password route and, as
+    of the Captain merge-review fix, the WebAuthn routes — never the
+    admin-tier-only ``_resolve_admin_id``, which would leave disabled/user-
+    tier accounts keyed on the ``unk:`` fallback) — selects the identity-
+    stable bucket key (LAURA-412-MEDIUM fix); see ``_account_bucket_key``
+    for the full rationale.
 
     ASVS 6.3.5: brute-force mitigation via rate-limiting and account lockout.
+
+    Fail-closed (Captain merge-review, 2026-07-19): if Redis is unavailable,
+    ``_throttle_admit`` propagates the underlying error — caught here and
+    converted to an explicit HTTP 503, matching this module's established
+    fail-closed pattern (see ``_totp_incr_failure`` call sites) rather than
+    falling through to FastAPI's generic 500 handler.
     """
     r = _get_throttle_redis()
     bucket_key = _account_bucket_key(username, account_id)
@@ -599,9 +607,22 @@ def _apply_auth_throttle(
     acct_fail_key = f"auth:fail:acct:{bucket_key}"
     acct_throttle_key = f"auth:throttle:acct:{bucket_key}"
 
-    ip_fails, ip_level, acct_fails, acct_level = _throttle_admit(
-        r, ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key,
-    )
+    try:
+        ip_fails, ip_level, acct_fails, acct_level = _throttle_admit(
+            r, ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key,
+        )
+    except Exception as exc:
+        # Fail-closed per SOP 1: Redis unavailable must not silently allow
+        # (nor silently deny with an opaque 500) — an explicit 503 tells the
+        # caller and any monitoring exactly what happened.
+        _log.error("Auth throttle: Redis unavailable during atomic admit: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "auth_throttle_unavailable",
+                "message": "Authentication service temporarily unavailable.",
+            },
+        )
 
     # Account-gated: an implicated IP with no attempts recorded against THIS
     # account's bucket must never block the request on its own.

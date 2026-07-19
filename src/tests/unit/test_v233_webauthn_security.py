@@ -481,21 +481,31 @@ class TestW20RateGate:
             "webauthn_v1 must not import the removed _record_auth_failure"
         )
 
-    def test_login_finish_resolves_admin_id_before_throttle(self):
+    def test_login_finish_resolves_bucket_account_id_before_throttle(self):
         """
-        LAURA-412-MEDIUM (r5, 2026-07-19): admin_id must be resolved BEFORE
-        _apply_auth_throttle is called, so the throttle bucket keys on the
-        stable account_id rather than a normalised username.
+        Captain merge-review (2026-07-19): the bucket-keying resolve must be
+        _resolve_account_id_for_bucket() (unconditional — any tier, disabled
+        or not) BEFORE _apply_auth_throttle is called, so the throttle
+        bucket keys on the stable account_id rather than a normalised
+        username. _resolve_admin_id() (admin-tier + active only) is a
+        SEPARATE resolution used only for the WebAuthn business logic
+        further down and is deliberately NOT required before the throttle
+        check anymore — see the dedicated regression coverage in
+        test_laura_412_critical_auth_throttle_hardening.py
+        (TestWebAuthnBucketKeyingUsesUnconditionalResolve) for the full
+        rationale (a disabled/user-tier account must not fall through to
+        the unk: casefold-hash bucket).
         """
         import inspect
         from yashigani.backoffice.routes import webauthn_v1
         source = inspect.getsource(webauthn_v1.login_finish)
-        resolve_idx = source.find("_resolve_admin_id(")
+        resolve_idx = source.find("_resolve_account_id_for_bucket(")
         throttle_idx = source.find("_apply_auth_throttle(")
         assert resolve_idx != -1 and throttle_idx != -1
         assert resolve_idx < throttle_idx, (
-            "_resolve_admin_id must be called before _apply_auth_throttle "
-            "so the throttle bucket can key on account_id"
+            "_resolve_account_id_for_bucket must be called before "
+            "_apply_auth_throttle so the throttle bucket can key on "
+            "account_id for ANY account state, not just admin-tier-active"
         )
 
     def test_login_finish_resets_on_success(self):
