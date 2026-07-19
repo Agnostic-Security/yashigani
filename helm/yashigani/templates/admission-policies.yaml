@@ -2,12 +2,13 @@
 {{- /*
 YSG-RISK-008 — Kyverno ClusterPolicy admission control.
 
-When admissionPolicies.enabled is true, this template renders six Kyverno
+When admissionPolicies.enabled is true, this template renders seven Kyverno
 ClusterPolicy resources. Policies 1-5 enforce the container-hardening baseline
 for the yashigani namespace; policy 6 (FINDING-V412-UNIVERSAL-003) restricts
-PKI trust-plane access from runtime/pool-managed pods. Pods that violate a
-policy are REJECTED at admission time (validationFailureAction: Enforce) rather
-than discovered post-deployment.
+PKI trust-plane access from runtime/pool-managed pods; policy 7
+(FINDING-V412-DNS-001 companion) denies tenant pods from binding the DNS port.
+Pods that violate a policy are REJECTED at admission time
+(validationFailureAction: Enforce) rather than discovered post-deployment.
 
 PREREQUISITE: Kyverno must be installed cluster-wide before helm install/upgrade.
 Install with: helm install kyverno kyverno/kyverno -n kyverno --create-namespace
@@ -261,7 +262,7 @@ spec:
                     operator: Equals
                     value: 0
 ---
-# Policy 6/6: restrict PKI trust-plane access (FINDING-V412-UNIVERSAL-003, CRITICAL)
+# Policy 6/7: restrict PKI trust-plane access (FINDING-V412-UNIVERSAL-003, CRITICAL)
 #
 # The gateway ServiceAccount holds pods:create in-namespace (YSG-RISK-070,
 # rbac-pool-manager.yaml) so it can spawn per-identity pool pods. Policies 1-5
@@ -468,4 +469,60 @@ spec:
                   - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
                     operator: Equals
                     value: {{ .Values.mtls.caKeysSecretName | quote }}
+---
+# Policy 7/7: deny rogue in-namespace DNS bind (FINDING-V412-DNS-001 companion)
+#
+# yashigani-k8s-dns-hardening-design-20260719.md §2: the network-layer half of
+# this finding is the scoped allow-dns-egress NetworkPolicy fix
+# (networkpolicy.yaml) restricting :53 egress to the real kube-dns/CoreDNS pod
+# only. This is the admission-time half: deny tenant-namespace pods from
+# declaring containerPort or hostPort 53 in the first place, so no rogue
+# in-cluster resolver can ever be scheduled to squat on the DNS port and
+# spoof answers for a same-node/same-namespace neighbor.
+#
+# Unlike policy 6, this does NOT need the non-forgeable request.userInfo gate
+# — the condition is a pure pod-spec field check (port number), not an
+# identity-dependent authorization decision, so the simpler pattern-validate
+# style (policies 1-5) applies. Scope is the tenant namespace only;
+# kube-system's real CoreDNS is unaffected (different namespace, not matched).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ .Release.Name }}-deny-rogue-dns-bind
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    policies.kyverno.io/title: "Deny tenant pods binding port 53"
+    policies.kyverno.io/category: "Network Security"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      FINDING-V412-DNS-001 companion control: deny tenant-namespace pods from
+      declaring containerPort or hostPort 53. CoreDNS in kube-system is the
+      sole permitted resolver.
+    yashigani.io/finding: "FINDING-V412-DNS-001"
+spec:
+  validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
+  background: true
+  rules:
+    - name: deny-hostport-or-containerport-53
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      validate:
+        message: >-
+          FINDING-V412-DNS-001: pods may not bind hostPort 53 or containerPort
+          53 — CoreDNS in kube-system is the sole resolver. Pod:
+          '{{ "{{" }} request.object.metadata.name {{ "}}" }}'.
+        pattern:
+          spec:
+            containers:
+              - =(ports):
+                  - X(hostPort): "!53"
+                    X(containerPort): "!53"
 {{- end }}

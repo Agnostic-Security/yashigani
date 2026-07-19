@@ -1,0 +1,202 @@
+{{- /* Last updated: 2026-07-19T00:00:00+00:00 */ -}}
+{{- /*
+Cilium FQDN-scoped egress hardening — 3 targeted CiliumNetworkPolicy toFQDNs
+rules narrowing the ipBlock-CIDR-guess residual gaps already flagged inline
+in templates/networkpolicy.yaml and templates/networkpolicy-caddy-egress.yaml:
+  1. Ollama model-registry pull (registry.ollama.ai) — networkpolicy.yaml
+     allow-ollama-egress, "SECURITY NOTE: Restrict to the registry.ollama.ai
+     CIDR in production" (comment near the top of that resource).
+  2. Caddy ACME (Let's Encrypt) — networkpolicy-caddy-egress.yaml
+     yashigani-caddy-acme-egress (YSG-RISK-061).
+  3. openclaw outbound Slack/Telegram messaging (FP-06 residual, registered
+     with Lu) — networkpolicy.yaml allow-openclaw-egress comment block,
+     dialled BY Caddy via its fixed-upstream egress gateway (same
+     yashigani-caddy-acme-egress ipBlock as #2 on Calico/no-Cilium).
+
+Design authority: tom-chart.md (2026-07-19 REISSUED verdict) + yashigani-k8s-
+dns-hardening-design-20260719.md §3 (DNSSEC/DoT is the boundary toFQDNs
+transitively inherits — see the scoped allow-dns-egress fix in
+networkpolicy.yaml, FINDING-V412-DNS-001. A forged DNS answer for an
+allowlisted name never reaches these toFQDNs rules because the pod->CoreDNS
+path is locked down and CoreDNS's own upstream hop is DoT-authenticated).
+
+REPLACEMENT SEMANTICS (why this needs a companion edit, not just a new file):
+Cilium deny-always-wins over allow, but two co-existing ALLOW rules (an old
+broad ipBlock allow next to a new narrow toFQDNs allow) do not narrow each
+other — the resolved FQDN IPs are still covered by the pre-existing broad
+CIDR grant, so layering toFQDNs on top of an unchanged ipBlock rule would be
+additive-only (Hubble visibility, no real tightening). To make "replacing"
+true, the 3 source ipBlock egress rules in networkpolicy.yaml /
+networkpolicy-caddy-egress.yaml are conditionally narrowed to render EMPTY
+when multiTenant.cilium.enabled=true (see the `{{ "{{- if not
+.Values.multiTenant.cilium.enabled }}" }}` guards added there) — the
+baseline 45-resource count and default (Calico/no-Cilium) behaviour are
+UNCHANGED; only the opt-in Cilium profile trims them, and this file backfills
+the (now FQDN-scoped, tighter) grant.
+*/ -}}
+{{- if .Values.multiTenant.cilium.enabled }}
+{{- /*
+Pre-install guard: verify the Cilium CiliumNetworkPolicy CRD is present
+before rendering. Same lookup-guard pattern as admission-policies.yaml /
+cilium-clusterwide-networkpolicy.yaml.
+*/ -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "ciliumnetworkpolicies.cilium.io" }}
+{{- if not $crd }}
+{{- fail "multiTenant.cilium.enabled=true but the Cilium CiliumNetworkPolicy CRD is not installed in this cluster.\n\nREMEDIATION: Install Cilium first:\n\n  helm repo add cilium https://helm.cilium.io/\n  helm repo update\n  helm install cilium cilium/cilium -n kube-system\n\nWait for Cilium to become ready:\n  kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=120s\n\nThen re-run your helm install/upgrade command.\nAlternatively, set --set multiTenant.cilium.enabled=false to keep the broader ipBlock-CIDR-guess egress rules (document in the risk register)." }}
+{{- end }}
+
+{{- if .Values.ollama.enabled }}
+---
+# 1/3 — Ollama model-registry pull, FQDN-scoped.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "yashigani.fullname" . }}-ollama-fqdn-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cilium-fqdn-egress
+  annotations:
+    yashigani.io/rationale: >-
+      Replaces allow-ollama-egress's broad IPv4-minus-RFC1918 ipBlock
+      (networkpolicy.yaml) with a named-FQDN allow for registry.ollama.ai,
+      when multiTenant.cilium.enabled=true.
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-ollama
+  egress:
+    # DNS visibility rule — required for Cilium's DNS-proxy to snoop the
+    # CoreDNS answer and learn the resolved IP; the toFQDNs allow below is a
+    # no-op without this.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: "registry.ollama.ai"
+              - matchPattern: "*.registry.ollama.ai"
+    - toFQDNs:
+        - matchName: "registry.ollama.ai"
+        - matchPattern: "*.registry.ollama.ai"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+{{- end }}
+
+{{- if .Values.caddy.enabled }}
+---
+# 2/3 — Caddy ACME (Let's Encrypt) + OCSP, FQDN-scoped.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "yashigani.fullname" . }}-caddy-acme-fqdn-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cilium-fqdn-egress
+  annotations:
+    yashigani.io/risk-id: "YSG-RISK-061"
+    yashigani.io/rationale: >-
+      Replaces yashigani-caddy-acme-egress's broad IPv4-minus-RFC1918 ipBlock
+      (networkpolicy-caddy-egress.yaml) with named-FQDN allows for the Let's
+      Encrypt ACME API + OCSP responders, when multiTenant.cilium.enabled=true.
+      Applies regardless of tlsMode (Caddyfile.acme/.ca/.selfsigned) — same
+      "does no harm if unused" rationale as the source ipBlock rule.
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-caddy
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: "acme-v02.api.letsencrypt.org"
+              - matchName: "acme-staging-v02.api.letsencrypt.org"
+              - matchPattern: "*.o.lencr.org"
+    - toFQDNs:
+        - matchName: "acme-v02.api.letsencrypt.org"
+        - matchName: "acme-staging-v02.api.letsencrypt.org"
+        - matchPattern: "*.o.lencr.org"
+      toPorts:
+        - ports:
+            # ACME API calls + TLS-ALPN-01 challenge response
+            - port: "443"
+              protocol: TCP
+            # OCSP HTTP-01 stapling (r10/r11/r12/e5/e6.o.lencr.org)
+            - port: "80"
+              protocol: TCP
+{{- end }}
+
+{{- if .Values.agentBundles.openclaw.enabled }}
+---
+# 3/3 — openclaw outbound Slack/Telegram messaging (FP-06 residual), FQDN-scoped.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "yashigani.fullname" . }}-caddy-openclaw-fqdn-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cilium-fqdn-egress
+  annotations:
+    yashigani.io/rationale: >-
+      Replaces the same yashigani-caddy-acme-egress ipBlock's Slack/Telegram
+      share (networkpolicy.yaml allow-openclaw-egress "FP-06 residual"
+      comment) with named-FQDN allows for the 3 fixed openclaw messaging
+      upstreams, when multiTenant.cilium.enabled=true. Egress is FROM the
+      Caddy pod (openclaw dials Caddy's :18790 fixed-upstream egress gateway,
+      which does the actual reverse_proxy dial to these 3 hosts — openclaw
+      itself has no direct internet egress, unchanged by this file).
+      NOTE: this closes the "any host on the CIDR allowlist" class only —
+      FP-06's registered residual (an attacker-OWNED Slack workspace or
+      Telegram bot reachable within these SAME 3 domains still passes) is
+      UNCHANGED and remains Lu's tracked Phase 2 item (token/workspace
+      pinning + egress DLP + outbound rate/audit).
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: yashigani-caddy
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: "slack.com"
+              - matchName: "hooks.slack.com"
+              - matchName: "api.telegram.org"
+    - toFQDNs:
+        - matchName: "slack.com"
+        - matchName: "hooks.slack.com"
+        - matchName: "api.telegram.org"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+{{- end }}
+{{- end }}

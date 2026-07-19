@@ -1,0 +1,130 @@
+{{- /* Last updated: 2026-07-19T00:00:00+00:00 */ -}}
+{{- /*
+Cilium multi-tenant additive layer — cross-tenant default-deny
+CiliumClusterwideNetworkPolicy (CCNP).
+
+Design authority: tom-chart.md (2026-07-19 REISSUED verdict — Cilium ratified
+as the CNI standard for the Enterprise/shared-cluster multi-tenant install
+profile) + yashigani-k8s-dns-hardening-design-20260719.md §3 (per-tenant
+toFQDNs interplay).
+
+ADDITIVE ONLY. The 45-resource standard NetworkPolicy baseline
+(templates/networkpolicy.yaml) is UNCHANGED and remains the CNI-portable
+source of truth for the intra-tenant-stack ring-fence on every profile,
+including this one. This CCNP is a SEPARATE backstop: it is applied per Helm
+release (this chart is one-release=one-namespace=one-tenant, confirmed —
+tom-chart.md grounding) and denies traffic between this release's namespace
+and any OTHER namespace not explicitly allowed, independent of whether that
+tenant's own 45 NetworkPolicy resources rendered/enforced correctly. This is
+a materially different security property than "more of the same NetworkPolicy
+dialect" — a single bad tenant `helm install` becoming an open cross-tenant
+path in a public multi-tenant product is a customer-data-boundary incident,
+not an internal miss (tom-chart.md §"Why this specific gap matters").
+
+MECHANISM NOTE (honest, not guessed): the design language keys this control
+on the "yashigani.io/tenant NAMESPACE label" (multiTenant.tenantLabel).
+Cilium does NOT, by default, propagate arbitrary Kubernetes NAMESPACE labels
+onto pod/endpoint security identity — only the pod's OWN labels and the
+reserved namespace-NAME label (`k8s:io.kubernetes.pod.namespace`) are
+guaranteed, version-independent Cilium identity inputs. Rather than assert an
+unverified Cilium capability (namespace-label propagation is version/config-
+gated and has not been confirmed against a live cluster here), this CCNP is
+built on the 100%-documented `k8s:io.kubernetes.pod.namespace` reserved
+label — which is exactly equivalent to the tenant boundary given this
+chart's one-release=one-namespace=one-tenant model. multiTenant.tenantLabel/
+tenantId remain wired as first-class values for (a) resource
+labeling/discoverability and (b) a future Kyverno-mutate label-propagation
+add-on IF literal namespace-LABEL-based (rather than namespace-NAME-based)
+endpoint matching is required later — flagged as an open dependency in the
+build report, not silently assumed.
+*/ -}}
+{{- if and .Values.multiTenant.enabled .Values.multiTenant.cilium.enabled }}
+{{- /*
+Pre-install guard: verify the Cilium CiliumClusterwideNetworkPolicy CRD is
+present before attempting to render one. Same lookup-guard pattern as
+admission-policies.yaml's Kyverno guard — lookup returns an empty dict when
+the CRD is absent; a non-empty dict means it is registered. Silently skipped
+under --dry-run=client (lookup always returns empty there — no cluster
+connection, correct).
+*/ -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "ciliumclusterwidenetworkpolicies.cilium.io" }}
+{{- if not $crd }}
+{{- fail "multiTenant.cilium.enabled=true but the Cilium CiliumClusterwideNetworkPolicy CRD is not installed in this cluster.\n\nREMEDIATION: Install Cilium as the cluster CNI first:\n\n  helm repo add cilium https://helm.cilium.io/\n  helm repo update\n  helm install cilium cilium/cilium -n kube-system\n\nWait for Cilium to become ready:\n  kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=120s\n\nThen re-run your helm install/upgrade command.\nAlternatively, set --set multiTenant.cilium.enabled=false to install without the Cilium cross-tenant backstop (document in the risk register with maintainer sign-off — the standard NetworkPolicy baseline still enforces the intra-tenant ring-fence on any enforcing CNI per FINDING-V412-UNIVERSAL-004, but the cross-tenant backstop is absent)." }}
+{{- end }}
+{{- if not .Values.multiTenant.tenantId }}
+{{- fail "multiTenant.enabled=true requires multiTenant.tenantId to be set to this Helm release's unique tenant identifier. This value labels the CCNP resource and MUST correspond to the yashigani.io/tenant namespace label install.sh stamps on this release's namespace before helm install/upgrade (Su's k8s_helm_install namespace pre-creation step — tom-chart.md item 5, NOT rendered by this chart)." }}
+{{- end }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: {{ include "yashigani.fullname" . }}-tenant-{{ .Values.multiTenant.tenantId }}-cross-tenant-deny
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cilium-multi-tenant
+    {{ .Values.multiTenant.tenantLabel }}: {{ .Values.multiTenant.tenantId | quote }}
+  annotations:
+    yashigani.io/rationale: >-
+      Cross-tenant default-deny backstop for this Helm release's namespace
+      ({{ .Release.Namespace }}), applied independent of whether this
+      release's own standard-NetworkPolicy baseline rendered/enforced
+      correctly. Denies ingress FROM and egress TO any namespace other than
+      this release's own, kube-system (CoreDNS — DNS must keep working, see
+      yashigani-k8s-dns-hardening-design-20260719.md §2), and any operator-
+      declared multiTenant.cilium.additionalAllowedNamespaces. Cilium deny
+      rules take precedence over any allow (standard NetworkPolicy or
+      CiliumNetworkPolicy) matching the same traffic — this is a real
+      tightening, not additive-only observability.
+spec:
+  description: >-
+    Cross-tenant isolation backstop for Helm release {{ .Release.Name }}
+    (tenant {{ .Values.multiTenant.tenantId }}, namespace
+    {{ .Release.Namespace }}).
+  endpointSelector:
+    matchExpressions:
+      - key: "k8s:io.kubernetes.pod.namespace"
+        operator: In
+        values:
+          - {{ .Release.Namespace | quote }}
+  # ingressDeny — traffic FROM other namespaces INTO this tenant's pods.
+  # fromEndpoints/toEndpoints selectors only match identified Cilium
+  # endpoints (pods); traffic from truly external IPs (reserved:world, e.g.
+  # Caddy's public :443/:80 LoadBalancer ingress) carries no
+  # k8s:io.kubernetes.pod.namespace label and is NOT matched here — external
+  # ingress is governed separately by the standard allow-caddy-ingress
+  # NetworkPolicy (networkpolicy.yaml), unaffected by this CCNP.
+  ingressDeny:
+    - fromEndpoints:
+        - matchExpressions:
+            - key: "k8s:io.kubernetes.pod.namespace"
+              operator: NotIn
+              values:
+                - {{ .Release.Namespace | quote }}
+                - "kube-system"
+                {{- if eq .Values.global.tlsMode "nginx" }}
+                # tlsMode=nginx: allow-gateway-ingress (networkpolicy.yaml,
+                # B10/M-LIOR-001) admits the ingress-nginx controller pod
+                # directly into the gateway when Caddy is bypassed.
+                - "ingress-nginx"
+                {{- end }}
+                {{- range .Values.multiTenant.cilium.additionalAllowedNamespaces }}
+                - {{ . | quote }}
+                {{- end }}
+  # egressDeny — traffic FROM this tenant's pods OUT to other namespaces.
+  # Same reserved:world exemption as above: this does not affect Ollama's
+  # registry pull, Caddy's ACME/Slack/Telegram egress, or any other
+  # external-internet egress — those remain governed by the standard NP
+  # ipBlock rules (or, when multiTenant.cilium.enabled=true, the FQDN-scoped
+  # CiliumNetworkPolicy rules in cilium-networkpolicy-fqdn.yaml).
+  egressDeny:
+    - toEndpoints:
+        - matchExpressions:
+            - key: "k8s:io.kubernetes.pod.namespace"
+              operator: NotIn
+              values:
+                - {{ .Release.Namespace | quote }}
+                - "kube-system"
+                {{- range .Values.multiTenant.cilium.additionalAllowedNamespaces }}
+                - {{ . | quote }}
+                {{- end }}
+{{- end }}

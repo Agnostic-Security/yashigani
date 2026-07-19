@@ -156,6 +156,66 @@ admissionPolicies:
   # Must be Enforce in production. Audit only during rollout evaluation.
   validationFailureAction: Enforce
 
+# ---------------------------------------------------------------------------
+# Multi-Tenant / Cilium additive layer (Enterprise install profile)
+# ---------------------------------------------------------------------------
+# tom-chart.md (2026-07-19 REISSUED verdict) + yashigani-k8s-dns-hardening-
+# design-20260719.md. ADDITIVE ONLY — the 45-resource standard NetworkPolicy
+# baseline (networkpolicy.yaml) remains the CNI-portable source of truth for
+# the intra-tenant-stack ring-fence, unchanged, on every profile. This block
+# gates a SEPARATE Cilium-only layer:
+#   - CiliumClusterwideNetworkPolicy cross-tenant default-deny
+#     (templates/cilium-clusterwide-networkpolicy.yaml)
+#   - 3 targeted CiliumNetworkPolicy toFQDNs egress rules narrowing the
+#     ollama-registry / Caddy-ACME / openclaw-Slack-Telegram ipBlock-CIDR-
+#     guess gaps already flagged inline in networkpolicy.yaml /
+#     networkpolicy-caddy-egress.yaml (templates/cilium-networkpolicy-fqdn.yaml)
+#
+# DEFAULT: OFF on every profile shipped by this chart today. Per the reissued
+# verdict this is intended to be DEFAULT-ON for the Enterprise/shared-cluster
+# multi-tenant install profile specifically (NOT Professional Plus, which is
+# namespace-per-release with no cross-tenant boundary to protect and stays
+# CNI-portable on Calico or any enforcing CNI). This chart does not yet
+# encode a Professional-Plus/Enterprise profile switch — flagged for
+# Maxine/Iris: an Enterprise values overlay (e.g. values-enterprise.yaml, not
+# present in this chart today) must set multiTenant.enabled=true AND
+# multiTenant.cilium.enabled=true; Professional Plus installs leave both false
+# (this file's defaults) and render byte-identical to today.
+#
+# HARD DEPENDENCY when enabled: Cilium must be installed cluster-wide BEFORE
+# helm install/upgrade (CiliumClusterwideNetworkPolicy + CiliumNetworkPolicy
+# CRDs). Both new templates fail closed with a remediation message if the CRD
+# is absent — same pattern as admissionPolicies' Kyverno guard.
+multiTenant:
+  enabled: false
+  # Namespace-boundary label KEY. install.sh's k8s_helm_install() namespace
+  # pre-creation step is the LOAD-BEARING side of this contract — it must
+  # stamp this label onto the Namespace (value = tenantId below) BEFORE helm
+  # install runs, or the tenant boundary this block documents has no
+  # namespace-level record. This chart's own Cilium templates do NOT depend
+  # on that stamp today (they key on the reserved namespace-NAME identity
+  # instead — see cilium-clusterwide-networkpolicy.yaml's "MECHANISM NOTE");
+  # the namespace label is still required for discoverability/audit and any
+  # future namespace-label-based selector. Su's lane, not this chart —
+  # flagged as a cross-team dependency (tom-chart.md item 5).
+  tenantLabel: "yashigani.io/tenant"
+  # This release's tenant identifier. REQUIRED (fail-closed in
+  # cilium-clusterwide-networkpolicy.yaml) when multiTenant.enabled=true.
+  # Distinct from agentBundles/agentIngressFronts tenantId (an
+  # agent-upstream routing key, not a k8s isolation boundary —
+  # tom-chart.md grounding).
+  tenantId: ""
+  cilium:
+    enabled: false
+    # Namespaces (beyond this release's own namespace + kube-system, which
+    # are always implicitly allowed by the cross-tenant CCNP for DNS) that
+    # cross-tenant traffic is permitted to/from — e.g. a shared ingress-nginx
+    # namespace (auto-added when global.tlsMode=nginx) or cert-manager.
+    # Empty by default; operators on a shared platform-services cluster with
+    # additional platform namespaces must add them here — this chart does
+    # not guess a cluster's platform-namespace layout.
+    additionalAllowedNamespaces: []
+
 mtls:
   # Hard-off switch. When false the chart renders the pre-v2.23.1 plaintext
   # topology (no PKI job, no cert mounts). Intended for deliberate testing

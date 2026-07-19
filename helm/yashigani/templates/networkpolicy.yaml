@@ -49,6 +49,18 @@ spec:
 
 ---
 # Allow DNS resolution for all pods (required for service discovery)
+#
+# FINDING-V412-DNS-001 (yashigani-k8s-dns-hardening-design-20260719.md §2):
+# the prior rule had NO `to:` selector, permitting every pod to open UDP/TCP:53
+# to ANY IP — not just CoreDNS. That let any in-namespace pod (a) talk to a
+# rogue same-namespace pod squatting on :53, or (b) run unrestricted DNS-tunnel
+# egress to an external host on port 53 under the guise of "DNS," bypassing
+# every other egress control in this file. Fixed with the same AND-semantics
+# podSelector+namespaceSelector pattern already used for allow-gateway-ingress
+# (B10/M-LIOR-001) — traffic to :53 is scoped to the kube-dns/CoreDNS pod only.
+# Companion admission-time control: admission-policies.yaml
+# deny-rogue-dns-bind (denies tenant pods from binding hostPort/containerPort
+# 53 in the first place).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -56,12 +68,21 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    yashigani.io/finding: "FINDING-V412-DNS-001"
 spec:
   podSelector: {}
   policyTypes:
     - Egress
   egress:
-    - ports:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
@@ -640,6 +661,7 @@ spec:
       app.kubernetes.io/name: yashigani-ollama
   policyTypes:
     - Egress
+  {{- if not .Values.multiTenant.cilium.enabled }}
   egress:
     # IPv4 public internet only — RFC1918 private ranges excluded.
     # This implicitly blocks IPv6 egress (no ::/0 entry = IPv6 denied).
@@ -655,6 +677,16 @@ spec:
           port: 443
         - protocol: TCP
           port: 80
+  {{- else }}
+  # multiTenant.cilium.enabled=true: this broad IPv4-minus-RFC1918 ipBlock
+  # grant is REPLACED by the FQDN-scoped CiliumNetworkPolicy pinning
+  # registry.ollama.ai (templates/cilium-networkpolicy-fqdn.yaml, 1/3). No
+  # egress rules render here — that Cilium deny-always-wins semantics only
+  # produces a real tightening (not additive-only Hubble visibility) if this
+  # rule stops granting the broad allow, so it is narrowed to empty instead
+  # of left in place alongside the new toFQDNs rule. Default (Calico/no-
+  # Cilium) behaviour above is unchanged.
+  {{- end }}
 
 ---
 # PostgreSQL — accept ingress from pgbouncer (app traffic) and backoffice

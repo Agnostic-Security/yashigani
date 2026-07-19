@@ -67,6 +67,7 @@ spec:
       app.kubernetes.io/name: yashigani-caddy
   policyTypes:
     - Egress
+  {{- if not .Values.multiTenant.cilium.enabled }}
   egress:
     # ACME challenge + OCSP stapling — external internet only.
     # Restricted to :443 (ACME TLS-ALPN-01 + ACME API calls) and
@@ -74,6 +75,11 @@ spec:
     # ipBlock except clause excludes RFC1918 private ranges to prevent
     # this rule from granting access to cluster-internal networks.
     # Adjust the except list if your cluster uses non-RFC1918 node/pod CIDRs.
+    #
+    # NOTE: this same broad grant is also the destination control for
+    # openclaw's Slack/Telegram fixed-upstream messaging (dialled BY Caddy on
+    # its own outbound, per networkpolicy.yaml allow-openclaw-egress FP-06
+    # comment) — this ipBlock covers both purposes on Calico/no-Cilium.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -93,4 +99,14 @@ spec:
         # r10.o.lencr.org, r11.o.lencr.org, r12.o.lencr.org, e5/e6.o.lencr.org)
         - protocol: TCP
           port: 80
+  {{- else }}
+  # multiTenant.cilium.enabled=true: this broad IPv4-minus-RFC1918 ipBlock
+  # grant (serving BOTH ACME/OCSP and openclaw's Slack/Telegram fixed-upstream
+  # dial) is REPLACED by the 2 FQDN-scoped CiliumNetworkPolicy resources in
+  # templates/cilium-networkpolicy-fqdn.yaml (2/3 Caddy ACME, 3/3 openclaw
+  # Slack/Telegram). No egress rules render here — see the ollama-egress
+  # comment in networkpolicy.yaml for why this must be narrowed to empty
+  # rather than left alongside the new toFQDNs rules. Default (Calico/no-
+  # Cilium) behaviour above is unchanged.
+  {{- end }}
 {{- end }}
