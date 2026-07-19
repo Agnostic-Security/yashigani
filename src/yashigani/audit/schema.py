@@ -46,6 +46,13 @@ class EventType(str, Enum):
     # ACCOUNT_LOCKOUT: emitted when an account is locked out due to failed
     # password or TOTP attempts (ASVS V2.1.5 / NIST 800-63B §5.2.2).
     ACCOUNT_LOCKOUT = "ACCOUNT_LOCKOUT"
+    # v4.1.2 LAURA-412-CRITICAL: AUTH_THROTTLE_TRIGGERED — emitted whenever
+    # /auth/login or the WebAuthn login flow is rejected with HTTP 429 by the
+    # pre-auth throttle gate, as opposed to a 401 credential failure. Gives a
+    # dedicated forensic trail distinguishing "denied for exceeding the
+    # throttle" from "denied for bad credentials" (previously only a
+    # logger.warning line existed). ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    AUTH_THROTTLE_TRIGGERED = "AUTH_THROTTLE_TRIGGERED"
     # PASSWORD_CHANGED: distinct from CONFIG_CHANGED — dedicated event for
     # self-service and forced password changes with audit-trail clarity.
     PASSWORD_CHANGED = "PASSWORD_CHANGED"
@@ -694,6 +701,34 @@ class AccountLockoutEvent(AuditEvent):
     lockout_type: str = ""  # "password" | "totp"
     failed_attempts: int = 0
     lockout_duration_seconds: int = 0
+
+
+@dataclass
+class AuthThrottleTriggeredEvent(AuditEvent):
+    """
+    Written whenever a login attempt is rejected with HTTP 429 by the
+    account-gated pre-auth throttle (auth.py::_apply_auth_throttle /
+    webauthn_v1.py), as distinct from a 401 credential failure.
+
+    v4.1.2 LAURA-412-CRITICAL fix: the throttle previously had no audit
+    trail of its own — only logger.warning lines — making it impossible to
+    forensically distinguish "denied by the throttle" from "denied for bad
+    credentials" after the fact. ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+
+    account_throttle_level / ip_throttle_level: the two bucket levels read
+    at decision time (see auth.py module docstring — the account level is
+    the sole gate, the IP level is a severity modifier only).
+    delay_seconds: the Retry-After value actually returned to the caller.
+    """
+
+    event_type: str = EventType.AUTH_THROTTLE_TRIGGERED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    client_ip_prefix: str = ""
+    account_throttle_level: int = 0
+    ip_throttle_level: int = 0
+    delay_seconds: int = 0
 
 
 @dataclass

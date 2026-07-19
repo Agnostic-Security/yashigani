@@ -49,13 +49,37 @@ from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 
 # W20 fix (Iris PR #62): import auth throttle helpers so that the public
-# login/start and login/finish endpoints are guarded by the same per-IP
-# blocklist + progressive-delay throttle as the password login route.
+# login/start and login/finish endpoints are guarded by the same blocklist +
+# account-gated progressive-delay throttle as the password login route.
+# LAURA-412-CRITICAL/HIGH/MEDIUM (2026-07-19): _apply_auth_throttle /
+# _reset_auth_failures now take (username, account_id) — the account-level
+# bucket, keyed on the account's stable id (not a normalised username), is
+# the sole gate; see auth.py's module docstring for the full rationale
+# (IP-collapse under NAT/proxy/podman-pasta must not lock out a clean
+# account; casefold-collision must not collapse two distinct, case-
+# sensitive accounts into one bucket).  _apply_auth_throttle now performs
+# an ATOMIC admit (Lua script) — every attempt is counted before any
+# credential verification runs, closing the TOCTOU race a concurrent
+# burst could previously exploit.  _record_auth_failure no longer exists —
+# counting happens unconditionally in the atomic admit step.
+#
+# Captain merge-review (2026-07-19, same date): _resolve_account_id_for_bucket
+# is imported SEPARATELY from this module's own _resolve_admin_id().
+# _resolve_admin_id() filters `disabled=false AND account_tier='admin'` —
+# correct for deciding whether the WebAuthn business logic (begin/complete
+# authentication) should proceed, but WRONG for throttle-bucket keying: a
+# disabled admin account or a user-tier account attempting this endpoint
+# would resolve to None from _resolve_admin_id() and fall through to the
+# unk: casefold-hash bucket fallback, narrowly reopening the LAURA-412-MEDIUM
+# collision class for exactly those account states.
+# _resolve_account_id_for_bucket() resolves ANY existing account regardless
+# of tier/disabled state, so the bucket always keys on a stable account_id
+# whenever the username corresponds to a real row at all.
 from yashigani.backoffice.routes.auth import (
     _check_ip_access,
     _apply_auth_throttle,
-    _record_auth_failure,
-    _reset_ip_auth_failures,
+    _reset_auth_failures,
+    _resolve_account_id_for_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -211,17 +235,27 @@ async def login_start(body: LoginStartRequest, request: Request, response: Respo
     Looks up the admin's account_id by username, then generates a challenge.
     Returns allow_credentials list and challenge for navigator.credentials.get().
 
-    W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
-    throttle as the password login route.  An unauthenticated DB-query endpoint
-    without a rate gate is an invitation to enumerate admin usernames at scale.
+    W20 (Iris PR #62): applies the same blocklist + account-gated,
+    atomically-admitted throttle as the password login route.  An
+    unauthenticated DB-query endpoint without a rate gate is an invitation
+    to enumerate admin usernames at scale.
     """
-    # W20: apply per-IP blocklist + throttle BEFORE any DB query.
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
 
-    # Resolve username → account_id via Postgres
+    # LAURA-412-MEDIUM (Captain merge-review): the throttle bucket keys on
+    # the UNCONDITIONAL account_id (any tier, disabled or not) — this is
+    # deliberately a DIFFERENT resolution from admin_id below (which is
+    # admin-tier + active only, and drives the actual WebAuthn logic).
+    bucket_account_id = await _resolve_account_id_for_bucket(body.username)
+
+    # LAURA-412-HIGH: atomically admits this attempt BEFORE any DB work.
+    _apply_auth_throttle(client_ip, body.username, bucket_account_id, response)
+
+    # admin_id: the admin-tier, active-only resolution the WebAuthn business
+    # logic actually needs (begin_authentication is legitimately admin-scoped).
     admin_id = await _resolve_admin_id(body.username)
+
     if admin_id is None:
         # Return a generic error — do not reveal whether the user exists
         # ASVS V2.1.5: enumerate-safe response
@@ -264,20 +298,28 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
 
     Audit events: WEBAUTHN_LOGIN_SUCCESS | WEBAUTHN_LOGIN_FAILURE.
 
-    W20 (Iris PR #62): applies the same per-IP blocklist + progressive-delay
-    throttle as login/start and the password login route.  Records auth failure
-    on bad assertion (sign_count rollback, wrong key, bad challenge) so that
-    automated probing accumulates throttle delay across attempts.
+    W20 (Iris PR #62): applies the same blocklist + account-gated,
+    atomically-admitted throttle as login/start and the password login
+    route.  Bad assertions (sign_count rollback, wrong key, bad challenge)
+    were already counted by the atomic admit before the assertion was even
+    checked, so automated probing still accumulates throttle delay across
+    attempts (LAURA-412-HIGH: counting no longer happens after the fact).
     """
-    # W20: apply per-IP blocklist + throttle BEFORE any DB query or assertion.
     client_ip = _client_ip(request)
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
 
-    # Resolve username → account_id
+    # LAURA-412-MEDIUM (Captain merge-review): unconditional account_id for
+    # bucket keying — see login_start / auth.py module docstring.
+    bucket_account_id = await _resolve_account_id_for_bucket(body.username)
+
+    # LAURA-412-HIGH: atomically admits this attempt BEFORE any DB query or
+    # assertion verification.
+    _apply_auth_throttle(client_ip, body.username, bucket_account_id, response)
+
+    # admin_id: admin-tier, active-only — drives the actual WebAuthn logic.
     admin_id = await _resolve_admin_id(body.username)
+
     if admin_id is None:
-        _record_auth_failure(client_ip)
         _write_audit(
             body.username,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -300,7 +342,6 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
         )
     except ValueError as exc:
         logger.warning("WebAuthn login/finish failed for %s: %s", body.username, exc)
-        _record_auth_failure(client_ip)
         _write_audit(
             admin_id,
             "WEBAUTHN_LOGIN_FAILURE",
@@ -318,8 +359,12 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
             detail={"error": "webauthn_login_finish_failed"},
         )
 
-    # Success: clear failure counter for this IP before issuing session.
-    _reset_ip_auth_failures(client_ip)
+    # Success: self-heal — clear both the account gate and the IP severity
+    # bucket.  Use bucket_account_id (the SAME identity that was checked/
+    # incremented by _apply_auth_throttle above), not admin_id — they are
+    # equal in the success path here, but keeping the reset keyed on
+    # whatever was actually gated is the correct invariant regardless.
+    _reset_auth_failures(client_ip, body.username, bucket_account_id)
 
     # Issue admin session
     store = get_session_store()

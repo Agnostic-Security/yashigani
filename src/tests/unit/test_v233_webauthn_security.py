@@ -459,22 +459,66 @@ class TestW20RateGate:
             "W20: webauthn_v1 must import and call _apply_auth_throttle"
         )
 
-    def test_login_finish_records_failure(self):
-        """webauthn_v1 must call _record_auth_failure on bad assertions."""
+    def test_login_finish_no_separate_record_failure_call(self):
+        """
+        LAURA-412-HIGH (r5, 2026-07-19): _record_auth_failure no longer
+        exists as a callable — webauthn_v1 must NOT call it (historical
+        comments referencing the removal by name are fine). Counting now
+        happens unconditionally inside _apply_auth_throttle's atomic admit,
+        before any DB query or assertion check, closing the TOCTOU race a
+        concurrent burst could previously exploit against the old
+        check-then-later-increment design.
+        """
         import inspect
         from yashigani.backoffice.routes import webauthn_v1
         source = inspect.getsource(webauthn_v1)
-        assert "_record_auth_failure" in source, (
-            "W20: webauthn_v1 must call _record_auth_failure on credential check failure"
+        assert "_record_auth_failure(" not in source, (
+            "W20: webauthn_v1 must not CALL the removed _record_auth_failure — "
+            "the atomic admit in _apply_auth_throttle now does the counting"
+        )
+        import yashigani.backoffice.routes.webauthn_v1 as wv1
+        assert not hasattr(wv1, "_record_auth_failure"), (
+            "webauthn_v1 must not import the removed _record_auth_failure"
+        )
+
+    def test_login_finish_resolves_bucket_account_id_before_throttle(self):
+        """
+        Captain merge-review (2026-07-19): the bucket-keying resolve must be
+        _resolve_account_id_for_bucket() (unconditional — any tier, disabled
+        or not) BEFORE _apply_auth_throttle is called, so the throttle
+        bucket keys on the stable account_id rather than a normalised
+        username. _resolve_admin_id() (admin-tier + active only) is a
+        SEPARATE resolution used only for the WebAuthn business logic
+        further down and is deliberately NOT required before the throttle
+        check anymore — see the dedicated regression coverage in
+        test_laura_412_critical_auth_throttle_hardening.py
+        (TestWebAuthnBucketKeyingUsesUnconditionalResolve) for the full
+        rationale (a disabled/user-tier account must not fall through to
+        the unk: casefold-hash bucket).
+        """
+        import inspect
+        from yashigani.backoffice.routes import webauthn_v1
+        source = inspect.getsource(webauthn_v1.login_finish)
+        resolve_idx = source.find("_resolve_account_id_for_bucket(")
+        throttle_idx = source.find("_apply_auth_throttle(")
+        assert resolve_idx != -1 and throttle_idx != -1
+        assert resolve_idx < throttle_idx, (
+            "_resolve_account_id_for_bucket must be called before "
+            "_apply_auth_throttle so the throttle bucket can key on "
+            "account_id for ANY account state, not just admin-tier-active"
         )
 
     def test_login_finish_resets_on_success(self):
-        """webauthn_v1 must call _reset_ip_auth_failures on successful WebAuthn login."""
+        """webauthn_v1 must call _reset_auth_failures on successful WebAuthn login.
+
+        LAURA-412-CRITICAL (2026-07-19): renamed from _reset_ip_auth_failures —
+        the reset now clears both the account gate and the IP severity bucket.
+        """
         import inspect
         from yashigani.backoffice.routes import webauthn_v1
         source = inspect.getsource(webauthn_v1)
-        assert "_reset_ip_auth_failures" in source, (
-            "W20: webauthn_v1 must call _reset_ip_auth_failures on success"
+        assert "_reset_auth_failures" in source, (
+            "W20: webauthn_v1 must call _reset_auth_failures on success"
         )
 
     def test_blocked_ip_rejected_on_login_start(self):
