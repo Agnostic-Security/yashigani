@@ -240,6 +240,21 @@ SKIP_PULL=false
 # cluster CNI does not enforce NetworkPolicy. Skipping records a risk-register
 # exception (operator accepts an unverified ring-fence).
 SKIP_NETWORKPOLICY_PROBE=false
+# Cilium ratified as the k8s CNI standard (2026-07-19 design). These two gates
+# are cheap/fast, static-ish checks that fail fast BEFORE the wizard runs.
+# Kernel check is skippable (soft heuristic, node kernels can legitimately
+# vary); the Cilium CRD precondition is intentionally NOT skippable anywhere
+# in this file — see _preflight_k8s_cilium_crds.
+SKIP_KERNEL_EBPF_PROBE=false
+# CoreDNS DNSSEC+DoT MUST-HAVE (design doc §1). Default on, skippable like the
+# NetworkPolicy probe (records a risk-register exception).
+SKIP_COREDNS_DNSSEC_PROBE=false
+# Opt-in: patch this cluster's kube-system CoreDNS Corefile with the DoT/DNSSEC
+# forward block via scripts/coredns-hardening-apply.sh before the DNS preflight
+# probe runs. Off by default — kube-system's CoreDNS is a shared cluster
+# resource, not owned by this Helm release; mutating it without explicit
+# operator consent on a BYO cluster is not a safe default.
+APPLY_COREDNS_HARDENING=false
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
@@ -493,7 +508,23 @@ OPTIONS
                                           By default install.sh fails the k8s install if the
                                           cluster CNI does not enforce NetworkPolicy (flannel/
                                           kindnet silently no-op it — FINDING-V412-UNIVERSAL-004).
+                                          This flag also skips the sibling cross-namespace
+                                          tenant-isolation probe (same underlying question).
                                           Skipping records a risk-register exception.
+  --skip-kernel-ebpf-probe                 (k8s) Skip the node-kernel eBPF/cgroupv2 preflight
+                                          (Cilium requires kernel >= 5.10 on every node).
+                                          Skipping records a risk-register exception.
+  --skip-coredns-dnssec-probe              (k8s) Skip the CoreDNS DNSSEC-delegated-validation
+                                          + DoT preflight (design doc §1, DNS-01/DNS-02). By
+                                          default install.sh fails the k8s install if CoreDNS
+                                          is not forwarding over tls:// with tls_servername
+                                          pinned, or if live external resolution fails.
+                                          Skipping records a risk-register exception.
+  --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
+                                          Corefile with the DNSSEC-delegated/DoT forward block
+                                          (scripts/coredns-hardening-apply.sh) before the
+                                          preflight probe runs. Off by default — kube-system's
+                                          CoreDNS is a shared cluster resource; this mutates it.
   --upgrade                               Upgrade an existing installation
   --reuse-volumes                         Skip pre-install contaminated-volume detection.
                                           Use only when deliberately reusing volumes from a
@@ -735,6 +766,9 @@ parse_args() {
       --skip-preflight)  SKIP_PREFLIGHT=true;   shift ;;
       --skip-pull)       SKIP_PULL=true;         shift ;;
       --skip-networkpolicy-probe) SKIP_NETWORKPOLICY_PROBE=true; shift ;;
+      --skip-kernel-ebpf-probe)   SKIP_KERNEL_EBPF_PROBE=true;   shift ;;
+      --skip-coredns-dnssec-probe) SKIP_COREDNS_DNSSEC_PROBE=true; shift ;;
+      --apply-coredns-hardening)  APPLY_COREDNS_HARDENING=true;  shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
@@ -12863,6 +12897,470 @@ _write_helm_values() {
 }
 
 # ---------------------------------------------------------------------------
+# Kubernetes CNI/DNS hardening gates — Cilium ratified as the CNI standard,
+# DNSSEC+DoT ratified as a MUST-HAVE (2026-07-19 design doc:
+# yashigani-k8s-dns-hardening-design-20260719.md). Four gates, cheapest/
+# fastest-failing first:
+#   1. _preflight_k8s_kernel_ebpf     — node kernels support Cilium's eBPF datapath
+#   2. _preflight_k8s_cilium_crds     — Cilium is actually installed (NON-SKIPPABLE)
+#   3. _preflight_coredns_dnssec_dot  — CoreDNS forwards over DoT w/ pinned tls_servername
+#   4. _probe_cross_tenant_isolation  — sibling of _probe_networkpolicy_enforcement
+# ---------------------------------------------------------------------------
+
+# _kernel_ge_5_10 — true if a kernelVersion string (e.g. "5.15.0-105-generic",
+# "6.8.0-51-generic", "5.15.133+") parses to >= 5.10. Unparseable -> false
+# (fail closed: an unrecognised format is treated as "not verified", not "ok").
+_kernel_ge_5_10() {
+  local v="$1" major minor
+  if [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if (( major > 5 )); then return 0; fi
+  if (( major == 5 && minor >= 10 )); then return 0; fi
+  return 1
+}
+
+# _preflight_k8s_kernel_ebpf — verify every cluster node's kernel supports
+# Cilium's eBPF/cgroupv2 datapath (>= 5.10) BEFORE spending time in the wizard.
+# Queries the TARGET CLUSTER's nodes via kubectl, not the operator's local
+# machine — install.sh commonly runs against a remote/BYO cluster.
+# Skippable with --skip-kernel-ebpf-probe / KERNEL_EBPF_REQUIRE_ENFORCEMENT=false
+# (records a risk-register exception).
+_preflight_k8s_kernel_ebpf() {
+  if [[ "${SKIP_KERNEL_EBPF_PROBE:-false}" == "true" || "${KERNEL_EBPF_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "Kernel eBPF preflight SKIPPED (--skip-kernel-ebpf-probe / KERNEL_EBPF_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  Cilium's eBPF datapath is NOT verified compatible with this cluster's node kernels."
+    log_warn "  Record a risk-register exception before relying on Cilium enforcement."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe cluster node kernel versions for eBPF/cgroupv2 support (Cilium requires >= 5.10)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Checking cluster node kernel versions for Cilium eBPF compatibility..."
+
+  local _nodes_raw
+  if ! _nodes_raw="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.nodeInfo.kernelVersion}{"\n"}{end}' 2>/dev/null)"; then
+    log_error "Kernel preflight: could not list cluster nodes (is kubectl configured against the target cluster?)"
+    return 1
+  fi
+  if [[ -z "$_nodes_raw" ]]; then
+    log_error "Kernel preflight: cluster reported zero nodes"
+    return 1
+  fi
+
+  local _fail_nodes="" _name _kver
+  while IFS='|' read -r _name _kver; do
+    [[ -z "$_name" ]] && continue
+    if ! _kernel_ge_5_10 "$_kver"; then
+      _fail_nodes+="  - ${_name}: ${_kver}"$'\n'
+    fi
+  done <<< "$_nodes_raw"
+
+  if [[ -n "$_fail_nodes" ]]; then
+    log_error "=============================================================="
+    log_error "Kernel preflight FAILED: Cilium requires kernel >= 5.10 (eBPF + cgroupv2) on every node."
+    log_error "Node(s) below this baseline:"
+    printf '%s' "$_fail_nodes" >&2
+    log_error ""
+    log_error "REMEDIATION: upgrade the affected node(s) to a kernel >= 5.10, or move Yashigani"
+    log_error "pods off them (taint/cordon), before installing with Cilium as CNI."
+    log_error ""
+    log_error "To proceed WITHOUT this check (records a risk-register exception):"
+    log_error "  re-run with --skip-kernel-ebpf-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  log_success "Cluster node kernels verified >= 5.10 (Cilium eBPF/cgroupv2 compatible)."
+  return 0
+}
+
+# _preflight_k8s_cilium_crds — verify Cilium is actually installed on the
+# target cluster (CRDs present AND the cilium agent DaemonSet is Ready).
+# Cilium is the ratified CNI standard for the k8s/multi-tenant path
+# (2026-07-19) — the DNSSEC/DoT-over-CoreDNS control (design §1) and the
+# toFQDNs egress-allowlist model (design §3) both depend transitively on
+# Cilium's DNS-proxy consuming CoreDNS's validated answer. A non-Cilium CNI
+# silently drops that dependency with no other local signal, so THIS CHECK
+# IS INTENTIONALLY NOT SKIPPABLE — there is no --skip-* flag for it anywhere
+# in this file, unlike every other probe in this section.
+_preflight_k8s_cilium_crds() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "verify Cilium CRDs + agent DaemonSet are installed and Ready (non-skippable)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Verifying Cilium is the cluster CNI (ratified standard, non-skippable)..."
+
+  local _crds=(ciliumnetworkpolicies.cilium.io ciliumendpoints.cilium.io ciliumidentities.cilium.io)
+  local _missing=() _crd
+  for _crd in "${_crds[@]}"; do
+    kubectl get crd "$_crd" >/dev/null 2>&1 || _missing+=("$_crd")
+  done
+
+  if (( ${#_missing[@]} > 0 )); then
+    log_error "=============================================================="
+    log_error "Cilium CRD precondition FAILED: this cluster does not have Cilium installed."
+    log_error "Missing CRD(s):"
+    local _m
+    for _m in "${_missing[@]}"; do log_error "  - ${_m}"; done
+    log_error ""
+    log_error "Cilium is the RATIFIED CNI standard for Yashigani's k8s path (2026-07-19) —"
+    log_error "this precondition is NOT skippable (no --skip flag exists for it)."
+    log_error ""
+    log_error "REMEDIATION: bootstrap Cilium on this cluster first — see scripts/k3s-bootstrap.sh"
+    log_error "for a reference k3s+Cilium stand-up, or install Cilium directly:"
+    log_error "  helm repo add cilium https://helm.cilium.io/"
+    log_error "  helm install cilium cilium/cilium --version <pinned> -n kube-system"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  # CRDs present is necessary but not sufficient — a cluster mid-uninstall could
+  # have stale CRDs with no running agents, which would silently give every pod
+  # zero enforcement. Confirm the agent DaemonSet exists and is Ready.
+  if ! kubectl -n kube-system get daemonset cilium >/dev/null 2>&1; then
+    log_error "Cilium CRD precondition FAILED: CRDs are present but no 'cilium' DaemonSet"
+    log_error "exists in kube-system — Cilium is only partially installed or was removed."
+    log_error "This precondition is not skippable. Re-run scripts/k3s-bootstrap.sh or repair"
+    log_error "the Cilium install before proceeding."
+    return 1
+  fi
+  if ! kubectl -n kube-system rollout status daemonset/cilium --timeout=120s >/dev/null 2>&1; then
+    log_error "Cilium CRD precondition FAILED: 'cilium' DaemonSet in kube-system did not"
+    log_error "reach Ready within 120s. Investigate with:"
+    log_error "  kubectl -n kube-system get pods -l k8s-app=cilium"
+    log_error "This precondition is not skippable."
+    return 1
+  fi
+
+  log_success "Cilium CRDs + agent DaemonSet verified Ready — CNI precondition satisfied."
+  return 0
+}
+
+# _apply_coredns_hardening — invoked only when --apply-coredns-hardening was
+# passed. Delegates to scripts/coredns-hardening-apply.sh (single source of
+# truth for the Corefile DoT/DNSSEC block — do NOT duplicate the block content
+# here) so k3s-bootstrap.sh and install.sh never drift on what "hardened"
+# means. Off by default: kube-system's CoreDNS is a shared cluster resource
+# not owned by this Helm release, so mutating it requires explicit consent.
+_apply_coredns_hardening() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "bash ${WORK_DIR}/scripts/coredns-hardening-apply.sh"
+    return 0
+  fi
+  local _script="${WORK_DIR}/scripts/coredns-hardening-apply.sh"
+  if [[ ! -f "$_script" ]]; then
+    log_error "--apply-coredns-hardening requested but ${_script} not found"
+    exit 1
+  fi
+  log_info "Applying CoreDNS DNSSEC/DoT hardening (kube-system, design doc §1)..."
+  if ! bash "$_script"; then
+    log_error "CoreDNS hardening patch failed — see output above. Aborting k8s install."
+    exit 1
+  fi
+  log_success "CoreDNS DNSSEC/DoT hardening applied."
+}
+
+# _preflight_coredns_dnssec_dot — DNS-01 + DNS-02 (design doc §6). Verifies
+# CoreDNS's external ("." ) zone forwards over DoT with a pinned tls_servername
+# (DNS-01, static Corefile inspection) AND that live external-name resolution
+# through cluster DNS actually succeeds (DNS-02, throwaway-pod probe). The
+# cluster.local zone is intentionally NOT inspected here — different, non-DNSSEC
+# integrity model (design §1: mTLS covers that case).
+# Fail-closed by default: per the design doc, a degraded/plaintext resolver
+# must never be silently accepted. Skippable with --skip-coredns-dnssec-probe /
+# COREDNS_REQUIRE_DOT_DNSSEC=false (records a risk-register exception).
+_preflight_coredns_dnssec_dot() {
+  if [[ "${SKIP_COREDNS_DNSSEC_PROBE:-false}" == "true" || "${COREDNS_REQUIRE_DOT_DNSSEC:-true}" == "false" ]]; then
+    log_warn "CoreDNS DNSSEC/DoT preflight SKIPPED (--skip-coredns-dnssec-probe / COREDNS_REQUIRE_DOT_DNSSEC=false)."
+    log_warn "  External DNS resolution is NOT verified DNSSEC-delegated-validated over DoT."
+    log_warn "  A forged toFQDNs-allowed answer could be silently accepted (design doc §3)."
+    log_warn "  Record a risk-register exception before relying on toFQDNs as a security control."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe kube-system CoreDNS Corefile for tls:// forward + live DoT resolution (DNS-01/DNS-02)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Verifying CoreDNS DNSSEC-delegated-validation over DoT (design doc §1, DNS-01/DNS-02)..."
+
+  # ---- DNS-01: static Corefile check ----
+  local _corefile
+  if ! _corefile="$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)" || [[ -z "$_corefile" ]]; then
+    log_error "CoreDNS DNSSEC preflight (DNS-01) FAILED: could not read a non-empty Corefile from"
+    log_error "configmap/coredns in kube-system."
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
+    log_error "--apply-coredns-hardening) to patch CoreDNS with the DoT/DNSSEC forward block."
+    return 1
+  fi
+
+  # Extract the "." (external) server block only.
+  local _root_block
+  _root_block="$(printf '%s\n' "$_corefile" | awk '/^\.:53[[:space:]]*\{/{f=1} f{print} f && /^\}/{exit}')"
+  if [[ -z "$_root_block" ]]; then
+    log_error "CoreDNS DNSSEC preflight (DNS-01) FAILED: no '.:53' external-zone server block found"
+    log_error "in the Corefile — cannot verify DoT forwarding is configured."
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh."
+    return 1
+  fi
+
+  if ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
+    log_error "=============================================================="
+    log_error "FINDING (DNS-01): CoreDNS's external-zone 'forward' block does NOT use tls://."
+    log_error "DNSSEC-delegated-validation (design doc §1) requires the upstream forward to be"
+    log_error "over DoT with a pinned tls_servername — a plaintext forward is spoofable on-path"
+    log_error "and silently defeats every toFQDNs egress-allowlist rule that trusts it (§3)."
+    log_error ""
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
+    log_error "--apply-coredns-hardening) to patch CoreDNS's Corefile."
+    log_error ""
+    log_error "To proceed WITHOUT this verified (records a risk-register exception):"
+    log_error "  re-run with --skip-coredns-dnssec-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+  if ! grep -qE 'tls_servername[[:space:]]+\S+' <<< "$_root_block"; then
+    log_error "FINDING (DNS-01): CoreDNS forward uses tls:// but has no 'tls_servername' pinned —"
+    log_error "  DoT without a pinned server name does not authenticate the upstream. Fix the"
+    log_error "  Corefile (scripts/coredns-hardening-apply.sh) or --skip-coredns-dnssec-probe."
+    return 1
+  fi
+  # Anti-pattern guard: a plaintext IP-literal fallback forward anywhere in the
+  # file (documented anti-pattern in the design doc — never add "forward . 8.8.8.8").
+  if printf '%s\n' "$_corefile" | grep -qE 'forward[[:space:]]+\.[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}([[:space:]]|$)'; then
+    log_error "FINDING (DNS-01): a plaintext IP-literal 'forward' stanza was found in the Corefile"
+    log_error "  in addition to the DoT block. This is a documented anti-pattern (design doc §1) —"
+    log_error "  a 'resilience' plaintext fallback silently defeats the DNSSEC/DoT control. Remove it."
+    return 1
+  fi
+  log_success "DNS-01 PASS: CoreDNS external-zone forward uses tls:// with tls_servername pinned, no plaintext fallback."
+
+  # ---- DNS-02: live resolution probe (throwaway pod) ----
+  local _ns="ysg-dnsprobe-$$"
+  # shellcheck disable=SC2317
+  _dnsprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
+  trap _dnsprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: could not create throwaway namespace ${_ns}"
+    return 1
+  fi
+  kubectl label namespace "$_ns" --overwrite pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _img="${DNS_PROBE_IMAGE:-busybox:1.37}"
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+  if ! kubectl run dns-probe -n "$_ns" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"dns-probe","image":"'"$_img"'","command":["sh","-c","sleep 120"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: probe pod did not create."
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/dns-probe -n "$_ns" --timeout=60s >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: probe pod not Ready (image pull? set DNS_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+
+  local _domain="${DNS_PROBE_DOMAIN:-cloudflare-dns.com}"
+  local _resolved="no" _attempt=0
+  while [[ "$_attempt" -lt 3 ]]; do
+    if kubectl exec dns-probe -n "$_ns" -- nslookup "$_domain" 2>/dev/null | grep -qE 'Address( 1)?:'; then
+      _resolved="yes"
+      break
+    fi
+    _attempt=$((_attempt + 1)); sleep 2
+  done
+
+  if [[ "$_resolved" != "yes" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING (DNS-02): live external-name resolution through cluster DNS FAILED"
+    log_error "(3 attempts, target: ${_domain}). Per the design doc's fail-closed forward"
+    log_error "behavior, this most likely means BOTH DoT upstreams are unreachable or failing"
+    log_error "the TLS handshake — CoreDNS is correctly SERVFAILing rather than downgrading,"
+    log_error "but that means external DNS resolution is currently BROKEN cluster-wide."
+    log_error ""
+    log_error "Do NOT work around this by adding a plaintext fallback forward — fix upstream"
+    log_error "reachability (egress to the configured DoT upstream, e.g. 1.1.1.1/1.0.0.1:853)."
+    log_error ""
+    log_error "To proceed WITHOUT this verified (records a risk-register exception):"
+    log_error "  re-run with --skip-coredns-dnssec-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  log_success "DNS-02 PASS: live external-name resolution through cluster DNS succeeded (DoT upstream reachable)."
+  return 0
+}
+
+# _probe_cross_tenant_isolation — sibling of _probe_networkpolicy_enforcement
+# (Iris/Ava gap). The existing probe only proves same-namespace ingress-deny
+# works. Tenant isolation in this chart rests on default-deny-ingress + bare
+# `podSelector` (no `namespaceSelector`) `from:` rules in networkpolicy.yaml,
+# which the k8s NetworkPolicy API scopes to the policy's OWN namespace by
+# construction — but that only protects tenants IF the CNI enforces that
+# namespace-boundary semantic identically to same-namespace enforcement, which
+# this probe verifies directly rather than assuming it from the other result.
+#
+# Method: two throwaway namespaces, each stamped yashigani.io/tenant=<own
+# name> (same label convention stamped on the real release namespace — see
+# k8s_helm_install), same allow->deny->allow 3-phase pattern as
+# _probe_networkpolicy_enforcement:
+#   Phase A (baseline, no policy in tenant-a): tenant-b client MUST reach
+#            tenant-a server (rules out an unrelated connectivity fault).
+#   Phase B (same-namespace-only ingress policy applied in tenant-a): tenant-b
+#            client MUST be blocked.
+#   Phase C (policy removed): tenant-b client MUST reconnect, disambiguating a
+#            real policy block from probe-infra flakiness.
+# Shares the NetworkPolicy-probe skip flag — this is the same underlying
+# CNI-enforcement question, cross-namespace instead of same-namespace.
+_probe_cross_tenant_isolation() {
+  if [[ "${SKIP_NETWORKPOLICY_PROBE:-false}" == "true" || "${NETPOL_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "Cross-tenant isolation probe SKIPPED (--skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  Cross-namespace tenant isolation is NOT verified enforced on this cluster."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe cross-namespace tenant isolation (two labeled namespaces, allow->deny->allow)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  local _ns_a="ysg-tenprobe-a-$$"
+  local _ns_b="ysg-tenprobe-b-$$"
+  local _img="${NETPOL_PROBE_IMAGE:-busybox:1.37}"
+  local _port=8080
+
+  log_info "Probing cross-namespace tenant isolation (K8S-GATE-TENANT-ISOLATION-001)..."
+
+  # shellcheck disable=SC2317
+  _tenprobe_cleanup() {
+    kubectl delete namespace "$_ns_a" "$_ns_b" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
+  }
+  trap _tenprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns_a" >/dev/null 2>&1 || ! kubectl create namespace "$_ns_b" >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: could not create throwaway namespaces"
+    return 1
+  fi
+  kubectl label namespace "$_ns_a" --overwrite yashigani.io/tenant="$_ns_a" pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+  kubectl label namespace "$_ns_b" --overwrite yashigani.io/tenant="$_ns_b" pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+
+  if ! kubectl run tp-server -n "$_ns_a" --image="$_img" --restart=Never --labels="app=tp-server" \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"tp-server","image":"'"$_img"'","command":["sh","-c","echo ok > /tmp/i && httpd -f -p '"$_port"' -h /tmp"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: server pod (tenant-a) failed to create"
+    return 1
+  fi
+  if ! kubectl run tp-client -n "$_ns_b" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"tp-client","image":"'"$_img"'","command":["sh","-c","sleep 3600"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: client pod (tenant-b) failed to create"
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/tp-server -n "$_ns_a" --timeout=90s >/dev/null 2>&1 || \
+     ! kubectl wait --for=condition=Ready pod/tp-client -n "$_ns_b" --timeout=90s >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: probe pods not Ready (image pull? set NETPOL_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+
+  local _svc_ip
+  _svc_ip="$(kubectl get pod tp-server -n "$_ns_a" -o jsonpath='{.status.podIP}' 2>/dev/null)"
+  if [[ -z "$_svc_ip" ]]; then
+    log_error "Cross-tenant probe: could not resolve server pod IP"
+    return 1
+  fi
+
+  _tp_reach() {
+    local _n="$1" _i=0
+    while [ "$_i" -lt "$_n" ]; do
+      if kubectl exec tp-client -n "$_ns_b" -- wget -q -T 4 -O - "http://${_svc_ip}:${_port}/i" 2>/dev/null | grep -q ok; then
+        return 0
+      fi
+      _i=$((_i + 1)); sleep 2
+    done
+    return 1
+  }
+
+  # Phase A (baseline, NO policy): tenant-b MUST reach tenant-a.
+  if ! _tp_reach 5; then
+    log_error "Cross-tenant probe: baseline connectivity FAILED (tenant-b could not reach tenant-a"
+    log_error "  with NO policy applied). Environment fault, not a policy result — aborting."
+    return 1
+  fi
+
+  # Phase B: same-namespace-only ingress policy in tenant-a — tenant-b MUST be
+  # blocked. Bare `podSelector` (no namespaceSelector) in a `from:` clause
+  # matches ONLY pods in the policy's own namespace, per k8s NetworkPolicy API
+  # semantics — the exact rule shape used by every allow-*-ingress policy in
+  # networkpolicy.yaml.
+  if ! kubectl apply -n "$_ns_a" -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenprobe-same-namespace-only
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+EOF
+  then
+    log_error "Cross-tenant probe: could not apply the same-namespace-only test NetworkPolicy"
+    return 1
+  fi
+  sleep 3
+  local _blocked="no"
+  if _tp_reach 3; then _blocked="no"; else _blocked="yes"; fi
+
+  # Phase C (policy REMOVED): tenant-b MUST reconnect (disambiguates a real
+  # policy block from probe-infra flakiness).
+  kubectl delete networkpolicy tenprobe-same-namespace-only -n "$_ns_a" --ignore-not-found=true >/dev/null 2>&1 || true
+  sleep 2
+  local _recovered="no"
+  if _tp_reach 5; then _recovered="yes"; fi
+
+  if [[ "$_blocked" == "no" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING (cross-tenant isolation): a same-namespace-only NetworkPolicy in tenant-a"
+    log_error "did NOT block ingress from a pod in a DIFFERENT namespace (tenant-b). This CNI is"
+    log_error "not enforcing the namespace boundary that Yashigani's default-deny-ingress +"
+    log_error "bare-podSelector allow rules rely on for tenant isolation — a co-tenant on a"
+    log_error "shared cluster could reach another tenant's pods directly."
+    log_error ""
+    log_error "REMEDIATION: install a policy-enforcing CNI (Cilium — see scripts/k3s-bootstrap.sh)."
+    log_error ""
+    log_error "To proceed WITHOUT enforcement (records a risk-register exception):"
+    log_error "  re-run with --skip-networkpolicy-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  if [[ "$_recovered" != "yes" ]]; then
+    log_error "Cross-tenant probe: INCONCLUSIVE — traffic was blocked under the test policy but did"
+    log_error "  NOT recover after removal. Cannot attribute the block to the NetworkPolicy"
+    log_error "  (likely test-infra/CNI flakiness) — enforcement is NOT verified."
+    log_error "  Re-run the install, or use --skip-networkpolicy-probe (records a risk exception)."
+    return 1
+  fi
+
+  log_success "Cross-tenant isolation VERIFIED — namespace-scoped default-deny blocked cross-tenant traffic AND removal restored it."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # _probe_networkpolicy_enforcement — FINDING-V412-UNIVERSAL-004
 #
 # Positively verify the cluster CNI ENFORCES NetworkPolicy before deploying a
@@ -13104,13 +13602,20 @@ k8s_helm_install() {
     kubectl create namespace "$NAMESPACE"
   fi
   # Apply / refresh PSA labels (idempotent via --overwrite). Safe on existing ns.
+  # yashigani.io/tenant: stamps the tenancy boundary this namespace represents
+  # (design doc §2/§4) — each Yashigani k8s install owns one namespace, which
+  # IS the tenancy boundary (see the instance-identity comment near
+  # _k8s_trust_domain below). Override via YASHIGANI_TENANT_ID for a
+  # customer-supplied tenant id; defaults to the namespace name itself so the
+  # label is always present even when no override is given.
   kubectl label namespace "$NAMESPACE" --overwrite \
     pod-security.kubernetes.io/warn=baseline \
     pod-security.kubernetes.io/warn-version=latest \
     pod-security.kubernetes.io/audit=baseline \
     pod-security.kubernetes.io/audit-version=latest \
+    "yashigani.io/tenant=${YASHIGANI_TENANT_ID:-$NAMESPACE}" \
     >/dev/null
-  log_success "PSA warn+audit baseline labels applied to namespace ${NAMESPACE}"
+  log_success "PSA warn+audit baseline labels + yashigani.io/tenant applied to namespace ${NAMESPACE}"
 
   # FINDING-V412-UNIVERSAL-004: verify the CNI enforces NetworkPolicy BEFORE we
   # deploy a ring-fence that depends on it. Fails fast on a non-enforcing CNI
@@ -13118,6 +13623,23 @@ k8s_helm_install() {
   # with --skip-networkpolicy-probe (risk-register exception).
   if ! _probe_networkpolicy_enforcement; then
     log_error "Aborting k8s install: NetworkPolicy enforcement not verified (FINDING-V412-UNIVERSAL-004)."
+    exit 1
+  fi
+
+  # Sibling probe: cross-namespace tenant isolation (Iris/Ava gap — the probe
+  # above only proves same-namespace ingress-deny works). Shares the same skip
+  # flag since it is the same underlying CNI-enforcement question.
+  if ! _probe_cross_tenant_isolation; then
+    log_error "Aborting k8s install: cross-namespace tenant isolation not verified."
+    exit 1
+  fi
+
+  # DNSSEC+DoT MUST-HAVE (design doc §1/§6, DNS-01/DNS-02). Fails closed if
+  # CoreDNS is not forwarding over tls:// with a pinned tls_servername, or if
+  # live external resolution through cluster DNS fails. Skippable with
+  # --skip-coredns-dnssec-probe (risk-register exception).
+  if ! _preflight_coredns_dnssec_dot; then
+    log_error "Aborting k8s install: CoreDNS DNSSEC/DoT hardening not verified (design doc §1)."
     exit 1
   fi
 
@@ -17466,6 +17988,25 @@ main() {
     # Step 4: n/a (no runtime install for k8s)
     # Step 5: Preflight
     run_preflight
+
+    # Kubernetes CNI/DNS hard gates (Cilium ratified CNI standard, DNSSEC+DoT
+    # MUST-HAVE — 2026-07-19 design). Cheap/fast checks first, before the
+    # wizard asks the operator anything. _preflight_k8s_cilium_crds has no
+    # skip flag anywhere in this file — it is intentionally non-skippable.
+    if ! _preflight_k8s_kernel_ebpf; then
+      log_error "Aborting k8s install: node kernel eBPF preflight not verified."
+      exit 1
+    fi
+    if ! _preflight_k8s_cilium_crds; then
+      log_error "Aborting k8s install: Cilium CNI precondition not satisfied (non-skippable)."
+      exit 1
+    fi
+
+    # Optional: patch this cluster's kube-system CoreDNS with the DoT/DNSSEC
+    # forward block before the (fail-closed) preflight probe verifies it.
+    if [[ "${APPLY_COREDNS_HARDENING:-false}" == "true" ]]; then
+      _apply_coredns_hardening
+    fi
 
     # Step 6: Wizard / config
     run_wizard
