@@ -16684,7 +16684,49 @@ handle_pki_subcommand() {
         --root-lifetime-years "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Full PKI rotated — restart all services"
+      local _rr_rc=$?
+      if [[ $_rr_rc -ne 0 ]]; then
+        log_error "rotate-root: issuer failed (exit ${_rr_rc}) — attestation NOT written, prior root remains pinned everywhere"
+        return 1
+      fi
+      # FINDING-LAURA-V412-PKI-PIN: root CAs are self-signed — there is no
+      # prior root to openssl-verify a NEW root against. The trust anchor for
+      # "is this an operator-sanctioned root swap, not a rogue in-mesh
+      # container write" is THIS ceremony itself: host shell access + the
+      # typed-YES confirmation above. Stamp the sha256 of the freshly-rotated
+      # root as an explicit, host-written attestation. 05-enable-ssl.sh (and
+      # any future trust-sync) requires this to match before accepting a root
+      # change — see docker/postgres/05-enable-ssl.sh. A compromised mesh
+      # service can overwrite ca_root.crt (pre-existing LIC-012 write
+      # primitive, now :ro everywhere except the issuer — see
+      # docker-compose.yml) but can never produce a matching attestation: it
+      # has no host shell (Laura Q3/Q4, LAURA-V412-RESTART-012-TM).
+      local _new_root="${WORK_DIR}/docker/secrets/ca_root.crt"
+      if [[ ! -f "$_new_root" ]]; then
+        log_error "rotate-root: issuer reported success but ${_new_root} not found — refusing to write attestation"
+        return 1
+      fi
+      local _new_root_sha
+      _new_root_sha="$(sha256sum "$_new_root" | cut -d' ' -f1)"
+      local _attest_tmp
+      _attest_tmp="$(mktemp "${WORK_DIR}/docker/secrets/.ca_root_attest.XXXXXX")"
+      printf '%s\n' "$_new_root_sha" > "$_attest_tmp"
+      chmod 0644 "$_attest_tmp"
+      mv -f "$_attest_tmp" "${WORK_DIR}/docker/secrets/ca_root.attested_sha256"
+      log_success "rotate-root: wrote operator-attested root pin (sha256=${_new_root_sha:0:12}...)"
+      # Propagate + verify, same as rotate-leaves/rotate-intermediate — root
+      # rotation used to be the ONE PKI action that never confirmed postgres
+      # (or the rest of the mesh) actually picked up the new material; it
+      # only printed a hint. Now fail-loud like its siblings.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-root: could not confirm the running postgres picked up the rotated root (chain-of-continuity check may have rejected it — see postgres logs)."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-root: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Full PKI rotated, attested, and propagated to every running mesh service"
       ;;
     status)
       _pki_run_issuer status
