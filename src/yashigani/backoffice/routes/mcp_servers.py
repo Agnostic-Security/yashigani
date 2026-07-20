@@ -28,13 +28,23 @@ Security properties:
   * POST /import requires StepUpAdminSession (fresh TOTP) — mutating.
   * server_id and upstream_url are validated (length, scheme) before use.
   * The tools/list HTTP call is made BY THE BACKOFFICE PROCESS (not the client).
-    The operator supplies the server URL; the backoffice fetches from it.  This
-    is operator-controlled egress (admin must already own the network), not SSRF.
-    Allowed schemes: http/https only; localhost/internal URLs are accepted in demo
-    mode (the demo MCP runs inside the compose network).
+    The operator supplies the server URL; the backoffice fetches from it. This
+    is operator-controlled egress by design (an operator-chosen internal MCP
+    server on the compose/mesh network is a legitimate target — e.g. demo mode
+    imports 'http://demo-mcp:8000'), so upstream_url is NOT allowlisted and
+    RFC-1918/private-mesh hosts are accepted. It is NOT blanket-exempt from
+    SSRF, though: codescan #1 (mustui triage 2026-07-20) proved the pre-fix
+    code let upstream_url reach cloud-metadata (IMDS) and loopback targets —
+    a blind-SSRF/internal-recon primitive. upstream_url is now gated by
+    assert_no_imds_or_loopback_url() (yashigani.alerts._url_guard) at both
+    the Pydantic field-validator (config-write time, fail 422 before any
+    fetch) and again immediately before the httpx call (defence-in-depth) —
+    same two-checkpoint pattern as the Slack/Teams webhook guard
+    (V232-CSCAN-01b), narrowed to IMDS/loopback only (no vendor allowlist, no
+    blanket private-range block) so internal MCP deployments keep working.
   * The envelope is operator-signed with the admin's account_id.
 
-Last updated: 2026-06-30T00:00:00+00:00
+Last updated: 2026-07-20T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -48,6 +58,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
+from yashigani.alerts._url_guard import WebhookUrlForbidden, assert_no_imds_or_loopback_url
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
@@ -380,6 +391,14 @@ class ImportMcpServerRequest(BaseModel):
             raise ValueError("upstream_url must start with http:// or https://")
         if len(v) > 2048:
             raise ValueError("upstream_url too long (max 2048 chars)")
+        # codescan #1 (mustui triage 2026-07-20): block IMDS/loopback SSRF
+        # targets at config-write time, before any fetch is attempted. Does
+        # NOT block RFC-1918/private-mesh hosts — internal MCP servers are a
+        # legitimate, by-design target for this field.
+        try:
+            assert_no_imds_or_loopback_url(v)
+        except WebhookUrlForbidden as exc:
+            raise ValueError(f"upstream_url rejected: {exc.reason}") from exc
         return v
 
     @field_validator("topology")
@@ -452,7 +471,22 @@ async def import_mcp_server(
     """
     from yashigani.mcp._envelope import project_surface, surface_set_hash
 
-    # 1. Fetch tools/list from the upstream.
+    # 1a. codescan #1 (mustui triage 2026-07-20): re-validate upstream_url
+    #     immediately before the outbound fetch — last-line-of-defence in
+    #     case the config-write-time field_validator was somehow bypassed
+    #     (same two-checkpoint pattern as slack_sink.py/teams_sink.py).
+    try:
+        assert_no_imds_or_loopback_url(body.upstream_url)
+    except WebhookUrlForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "upstream_url_forbidden",
+                "message": f"upstream_url rejected: {exc.reason}",
+            },
+        )
+
+    # 1b. Fetch tools/list from the upstream.
     rpc = {
         "jsonrpc": "2.0",
         "id": "import-ceremony",
