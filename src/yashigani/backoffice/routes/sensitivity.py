@@ -91,15 +91,41 @@ _REDOS_NESTED_RE = _re.compile(
 _OVERBROAD_RE = _re.compile(r"^\.\*$|^\.\+$|^\(\.\*\)$|^\(\.\+\)$")
 
 
+_MAX_REGEX_PATTERN_LEN = 512
+
+
 def _validate_regex_safety(pattern: str) -> None:
     """Validate a pattern string for ReDoS risk and compilability.
 
     Raises HTTPException 422 on:
+      - Patterns longer than _MAX_REGEX_PATTERN_LEN (#1900: hard cap enforced
+        HERE, first, so every caller is covered regardless of whether the
+        pattern came through a length-constrained Pydantic field (create_pattern,
+        PatternRequest.pattern max_length=512) or an unbounded source (the
+        LLM-generated `generated_regex` in generate_pattern, which has no field
+        constraint of its own) — the ReDoS heuristic below must never see input
+        longer than this cap.
       - Patterns that fail to compile (invalid regex).
       - Patterns with nested quantifiers on variable-length groups
         (catastrophic backtracking risk).
       - Trivially-overbroad patterns (bare .* / .+) with no context.
     """
+    # 0. Hard length cap — FIRST check, before any regex engine touches the
+    #    string. This is caller-independent: it covers both the length-capped
+    #    PatternRequest.pattern field AND the unbounded LLM-generated regex
+    #    fed in by generate_pattern() before this function is ever reached.
+    if len(pattern) > _MAX_REGEX_PATTERN_LEN:
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "pattern_too_long",
+                "message": (
+                    f"Pattern exceeds the maximum allowed length of "
+                    f"{_MAX_REGEX_PATTERN_LEN} characters."
+                ),
+            },
+        )
+
     # 1. Compilability guard — reject syntactically invalid regexes.
     try:
         _re.compile(pattern)
