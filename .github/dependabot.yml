@@ -14,6 +14,11 @@ updates:
     reviewers:
       - "n0n0iz"
     target-branch: "main"
+    groups:
+      minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
     # --- Manual-re-audit dependencies (security-critical, Lu/Laura sign-off required) ---
     # python3-saml — pinned at 1.16.x for YSG-RISK-044 + YSG-RISK-045 mitigation.
     #   Trigger: any python3-saml minor (1.17+) or major (2.x) bump emits a Dependabot
@@ -53,7 +58,7 @@ updates:
       prefix: "chore(ci)"
       include: "scope"
 
-  # Docker base images
+  # Docker base images — main service images (docker/Dockerfile.*)
   - package-ecosystem: "docker"
     directory: "/docker"
     schedule:
@@ -65,3 +70,44 @@ updates:
       - "dependencies"
     reviewers:
       - "n0n0iz"
+    groups:
+      minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Docker base images — Caddy reverse-proxy (docker/caddy/Dockerfile.caddy)
+  - package-ecosystem: "docker"
+    directory: "/docker/caddy"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "docker"
+      - "dependencies"
+    reviewers:
+      - "n0n0iz"
+    groups:
+      minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Docker base images — ringfence-init (docker/ringfence-init/Dockerfile)
+  - package-ecosystem: "docker"
+    directory: "/docker/ringfence-init"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "docker"
+      - "dependencies"
+    reviewers:
+      - "n0n0iz"
+    groups:
+      minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
