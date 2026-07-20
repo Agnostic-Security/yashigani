@@ -63,7 +63,7 @@
 #     | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
 # Re-pin for each architecture at buildx time via --platform flag.
 # TODO(captain,post-runtime): pin digest after first manifest inspect.
-FROM docker.io/library/alpine:3.22.0
+FROM docker.io/library/alpine:3.24.1
 
 # Install iptables (nf_tables shim on Alpine 3.21 — semantically equivalent
 # to legacy iptables for OUTPUT chain manipulation), ip6tables (same package),
