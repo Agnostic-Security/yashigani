@@ -898,14 +898,38 @@ services:
       # rw so the admin "Create backup" button can write on-demand DB snapshots
       # (pg_dump) here; the installer also writes its backups to the same host dir.
       - ${INSTALL_DIR:-..}/backups:/data/backups:rw
-      # LIC-007 / LIC-012 (v2.24.0 DEFERRED): This mount is writable because
-      # write_docker_secrets() writes admin credentials + license_key here during
-      # bootstrap. After bootstrap, license_key should be chmod 0400. The trivial
-      # fix (chmod in write_docker_secrets() post-write) is Tom Group 5.1.
-      # Schema-split (separate :ro PKI mount + writable bootstrap mount) = LIC-012
-      # for v2.24.0. K8s is already protected: backoffice.yaml initContainer runs
-      # chmod 0400 on all /secrets-rw/* files including license_key.
-      - ./secrets:/run/secrets
+      # FINDING-LIC-012 FIXED (Laura V412-PKI re-attack, 2026-07-20): this mount
+      # was flat-RW, so a compromised backoffice could overwrite ca_root.crt /
+      # ca_intermediate.crt / any *_client.{crt,key} — material EVERY other
+      # mesh member reads from this same host directory (proven live PoC,
+      # LAURA-V412-RESTART-012-TM Q1). Schema-split per the original LIC-012
+      # plan: the directory mount is now :ro (backoffice reads PKI material
+      # like every other service — see mount-audit table in commit body); the
+      # four filenames backoffice legitimately writes are individually
+      # shadow-mounted RW on top (same nesting technique already used for
+      # caddy_internal_hmac/redis_password elsewhere in this file — a more
+      # specific bind mount overrides the broader one for that one path).
+      # Only the in-namespace PKI issuer (ephemeral container spawned
+      # host-side by install.sh's _pki_run_issuer_*, NOT this long-running
+      # service) ever writes CA/intermediate/leaf trust material.
+      #
+      # Source files are pre-created by install.sh before compose up in the
+      # supported install flow (generate_secrets(): admin_initial_password,
+      # grafana_admin_password, redis_password; handle_license() step 7:
+      # license_key) so the bind source always exists at container start.
+      # write_docker_secrets() (src/yashigani/auth/bootstrap.py) is a dev-mode
+      # fallback only — in the production install.sh flow admin_initial_password
+      # already exists, so load_or_generate() short-circuits and this path
+      # never executes. prometheus_password (also in that mapping) is NOT
+      # given an RW override: nothing in the codebase reads
+      # /run/secrets/prometheus_password (vestigial field — see bootstrap.py);
+      # bootstrap.py now catches the resulting PermissionError per-field
+      # instead of crashing the entrypoint (see auth/bootstrap.py diff).
+      - ./secrets:/run/secrets:ro
+      - ./secrets/admin_initial_password:/run/secrets/admin_initial_password:rw
+      - ./secrets/grafana_admin_password:/run/secrets/grafana_admin_password:rw
+      - ./secrets/redis_password:/run/secrets/redis_password:rw
+      - ./secrets/license_key:/run/secrets/license_key:rw
       # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
       # dir (see caddy service). Single-file remount (ro) at the unchanged
       # in-container path for Layer-B verify + the step-up signer
@@ -934,13 +958,31 @@ services:
       # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-B):
       # Three mounts required for the MCP approve transaction.
       #
-      # (a) Artifact root — docker/ tree (writable). Codegen writes
-      #     docker/caddy/agents/<s>-mcp.caddy relative to YASHIGANI_MCP_ARTIFACT_ROOT
-      #     (/mnt/install). Mounting ./  at /mnt/install/docker exposes ONLY the
-      #     docker/ directory subtree (same blast radius as ./secrets:/run/secrets
-      #     which already exists). codegen._safe_write() rejects traversals outside
-      #     output_root. Caddy reads the same host path via ./caddy/agents:ro (above).
+      # (a) Artifact root — docker/ tree (writable). Codegen writes artifacts at
+      #     THREE distinct depths under this root — docker/<agent>-compose.override.yml
+      #     and docker/<agent>-egress-forwarder.override.yml at the top level,
+      #     docker/caddy/agents/*.caddy, and docker/caddy/egress/*.caddy (see
+      #     src/yashigani/manifest/codegen.py artifact-key literals) — so the
+      #     mount cannot be narrowed to a single subdirectory without breaking
+      #     compose-override generation. codegen._safe_write() rejects traversals
+      #     outside output_root at the PYTHON level only.
+      #
+      #     FINDING-LIC-012 FIXED (Laura V412-PKI re-attack, 2026-07-20): a
+      #     compromised backoffice process bypasses that Python-level check
+      #     entirely via the raw OS bind mount and reaches docker/secrets/ a
+      #     SECOND, independent way (proven live PoC, LAURA-V412-RESTART-012-TM
+      #     Q1 — this was flagged explicitly as the second write path). Nested
+      #     bind mounts shadow the broader mount for their subpath (same
+      #     technique used for /run/secrets above and caddy_internal_hmac
+      #     elsewhere in this file) — every trust-critical subtree reachable
+      #     under this mount is shadow-remounted :ro immediately below,
+      #     independent of and in addition to the Python-level guard.
       - ./:/mnt/install/docker:rw
+      - ./secrets:/mnt/install/docker/secrets:ro
+      - ./secrets-caddy:/mnt/install/docker/secrets-caddy:ro
+      - ./var:/mnt/install/docker/var:ro
+      - ./.env:/mnt/install/docker/.env:ro
+      - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/mnt/install/docker/Caddyfile.${YASHIGANI_TLS_MODE:-acme}:ro
       # (b) Caddy admin socket — shared named volume caddy_admin_sock. Caddy creates
       #     admin.sock with mode 0666 (Caddyfile |0666, compose variant). backoffice
       #     UID 1001 connects via httpx AsyncHTTPTransport(uds=...) to POST /load.
