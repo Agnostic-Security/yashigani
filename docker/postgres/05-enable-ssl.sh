@@ -1,20 +1,29 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Yashigani v2.24.0 — enable TLS + client-cert verification on Postgres.
-# Last updated: 2026-05-25 (fix(postgres): BUG-C4-001/002 — md5 clientcert=verify-ca; remove duplicate carveout from heredoc)
+# Yashigani v4.1.2 — enable TLS + client-cert verification on Postgres.
+# Last updated: 2026-07-20 (fix(postgres): FINDING-V412-RESTART-012 — resync
+#   server.crt/server.key on EVERY invocation, not just first-init. Previously
+#   the server leaf was installed once at initdb and frozen for the container's
+#   lifetime; a plain leaf rotation (time-based renewal / URI-SAN-drift, or BYO
+#   CA re-sync) updated docker/secrets/postgres_client.crt but postgres kept
+#   presenting its ORIGINAL leaf forever, drifting from what every other mounted
+#   trust store considered current. Closed with the same checksum-compare +
+#   atomic-write + pg_ctl-reload pattern already used for the trust bundle.
 #
 # This init script is invoked in two contexts:
 #
 #   1. FIRST INIT (initdb): the stock postgres entrypoint executes all scripts
 #      under /docker-entrypoint-initdb.d/ in alphabetical order before starting
-#      the server for real.  Full setup runs: server cert install, trust bundle
-#      write, postgresql.conf append, pg_hba.conf overwrite.
+#      the server for real.  Full setup runs: server cert + trust bundle sync,
+#      postgresql.conf append, pg_hba.conf overwrite.
 #
-#   2. TRUST-BUNDLE SYNC (BYO CA swap / rotation): called manually via
-#      `docker exec postgres sh /docker-entrypoint-initdb.d/05-enable-ssl.sh`
-#      after the host-side trust bundle changes.  Only the trust-bundle write
-#      and pg_ctl reload run — postgresql.conf and pg_hba.conf are not touched
-#      (they are already correctly configured from first-init).
+#   2. SYNC RE-RUN (BYO CA swap / rotation / leaf renewal): called manually via
+#      `docker exec postgres bash /docker-entrypoint-initdb.d/05-enable-ssl.sh`
+#      after the host-side secrets change.  The server-leaf sync and
+#      trust-bundle sync blocks run UNCONDITIONALLY on every invocation
+#      (first-init AND re-run) — only postgresql.conf and pg_hba.conf are
+#      skipped on re-run (they are already correctly configured from
+#      first-init).
 #
 # After first-init:
 #   * ssl = on in postgresql.conf
@@ -102,11 +111,53 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIRST-INIT ONLY — server cert install, postgresql.conf, pg_hba.conf
+# SERVER-LEAF SYNC — runs on EVERY invocation (first-init AND re-run)
+#
+# FINDING-V412-RESTART-012: the trust bundle (root.crt) above is resynced on
+# every invocation, but historically server.crt/server.key were installed
+# ONLY at first-init and frozen for the container's lifetime — including
+# across a plain `--pki-action=rotate-leaves` (re-issues postgres_client.crt
+# under the SAME intermediate). On a stack that lives long enough to hit a
+# leaf rotation (time-based renewal or URI-SAN-drift), postgres kept
+# presenting its ORIGINAL leaf forever; nothing re-copied the rotated leaf
+# into PGDATA. Server identity drifted from what install.sh/docker-secrets/
+# considered "current" — the exact class of drift Laura (r6) and Tom (r3)
+# reproduced against backoffice. Close it the same way the trust bundle is
+# already closed: checksum-compare, atomic write, pg_ctl reload if running.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_leaf_src_sha=$(cat /run/secrets/postgres_client.crt /run/secrets/postgres_client.key 2>/dev/null | sha256sum | cut -d' ' -f1)
+_leaf_dst_sha=$( { cat "${PGDATA}/server.crt" "${PGDATA}/server.key"; } 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "")
+
+if [[ -n "$_leaf_src_sha" && "$_leaf_src_sha" != "$_leaf_dst_sha" ]]; then
+  echo "[05-enable-ssl] Server leaf changed (src=${_leaf_src_sha:0:12} dst=${_leaf_dst_sha:0:12}) — updating server.crt/server.key"
+
+  _leaf_crt_tmp="${PGDATA}/server.crt.new.$$"
+  _leaf_key_tmp="${PGDATA}/server.key.new.$$"
+  install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt "${_leaf_crt_tmp}"
+  install -m 0600 -o postgres -g postgres /run/secrets/postgres_client.key "${_leaf_key_tmp}"
+  mv "${_leaf_crt_tmp}" "${PGDATA}/server.crt"
+  mv "${_leaf_key_tmp}" "${PGDATA}/server.key"
+
+  echo "[05-enable-ssl] server.crt/server.key updated"
+
+  if pg_ctl -D "${PGDATA}" status >/dev/null 2>&1; then
+    pg_ctl -D "${PGDATA}" reload
+    echo "[05-enable-ssl] pg_ctl reload sent — postgres re-read new server leaf"
+  else
+    echo "[05-enable-ssl] Postgres not yet running — new server leaf will be used at startup"
+  fi
+else
+  echo "[05-enable-ssl] Server leaf unchanged (sha=${_leaf_src_sha:0:12}) — no action"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRST-INIT ONLY — postgresql.conf + pg_hba.conf
 #
 # Guard: postgresql.conf already contains "ssl = on" → this is a re-run
-# (deferred activation / rotation).  Skip the first-init block entirely to
-# avoid duplicating settings in postgresql.conf or clobbering any operator
+# (deferred activation / rotation).  Server cert + trust bundle are already
+# resynced above (runs unconditionally); skip only the postgresql.conf /
+# pg_hba.conf block to avoid duplicating settings or clobbering any operator
 # customisations to pg_hba.conf.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -115,16 +166,15 @@ if grep -q '^ssl = on' "${PGDATA}/postgresql.conf" 2>/dev/null; then
   exit 0
 fi
 
-echo "[05-enable-ssl] First-init path — installing server cert and configuring postgresql.conf + pg_hba.conf"
+echo "[05-enable-ssl] First-init path — configuring postgresql.conf + pg_hba.conf"
 
-# Postgres requires SSL material inside PGDATA and owned by the postgres user.
-install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt "${PGDATA}/server.crt"
-install -m 0600 -o postgres -g postgres /run/secrets/postgres_client.key "${PGDATA}/server.key"
-
-# Trust bundle is already written above (in the sync block).
-# Ensure ownership is set correctly in case the sync block ran before server.crt was installed.
-chown postgres:postgres "${PGDATA}/root.crt"
+# Server cert + trust bundle are already installed above (unconditional sync
+# blocks run before this guard). Ensure ownership is correct in case the sync
+# blocks ran before PGDATA ownership was otherwise settled.
+chown postgres:postgres "${PGDATA}/root.crt" "${PGDATA}/server.crt" "${PGDATA}/server.key"
 chmod 0640 "${PGDATA}/root.crt"
+chmod 0644 "${PGDATA}/server.crt"
+chmod 0600 "${PGDATA}/server.key"
 
 # Append TLS settings to postgresql.conf (keep existing settings; our lines
 # win by virtue of being later in the file).
