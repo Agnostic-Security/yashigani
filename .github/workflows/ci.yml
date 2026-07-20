@@ -23,7 +23,7 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -122,7 +122,7 @@ jobs:
     # file outside the documented exclusion list introduces a forbidden sudo
     # pattern. See scripts/lint_sudo_pattern.sh for the two detected classes.
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Check for forbidden sudo patterns
         run: bash scripts/lint_sudo_pattern.sh .
@@ -134,7 +134,7 @@ jobs:
     # install dir, never /tmp). Excludes legitimate container-internal paths
     # (Dockerfile RUN layers, Helm tmpfs mounts, SSH heredoc VM-side paths).
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Check for host-filesystem /tmp/ paths
         run: bash scripts/lint_tmp_paths.sh .
@@ -145,7 +145,7 @@ jobs:
     # into an HTTP response body. Use safe_error_envelope() instead.
     # Pattern matches: {"error": str(exc)} or similar inline exception-to-response.
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Check for str(exc) in HTTP responses (V232-CSCAN-01e/01j)
         run: |
@@ -188,7 +188,7 @@ jobs:
     # required for a type-check gate (would just duplicate findings).
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -267,7 +267,7 @@ jobs:
     # 7 parametrised green-tip specs + 3 in-process mutation guards.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -286,7 +286,7 @@ jobs:
     # identical across runtimes (docker/ vs helm/) have not drifted. Fails fast
     # — no matrix, no Python version permutations needed for a file-hash check.
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Python 3.12
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

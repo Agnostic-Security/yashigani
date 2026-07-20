@@ -26,7 +26,7 @@ jobs:
     name: Trivy Container Scan / gateway
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       # V232-SMOKE-001 (pre-existing): Dockerfiles + docker-compose.yml pin arm64
       # digest SHAs generated on an M-chip Mac dev machine. On amd64 GH runners
       # those layers fail with "exec /bin/sh: exec format error" the moment
@@ -101,7 +101,7 @@ jobs:
     name: Trivy Container Scan / backoffice
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       # V232-SMOKE-001 (pre-existing): see "Strip arm64 digest pins" rationale in
       # trivy-gateway above. Duplicated here because the two jobs run in parallel
       # and each operates on its own checkout.
@@ -168,7 +168,7 @@ jobs:
     name: Bandit SAST
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
@@ -194,7 +194,7 @@ jobs:
     name: pip-audit Dependency Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
@@ -243,7 +243,7 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Install Opengrep
         # Opengrep is not on PyPI. Install via binary release from GitHub.
         # Pinned to v1.20.0 (verified current 2026-05-02). ubuntu-latest = x86_64.
@@ -283,7 +283,7 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Install Opengrep
         # Opengrep is not on PyPI. Install via binary release from GitHub.
@@ -392,7 +392,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - uses: dependency-check/Dependency-Check_Action@1e54355a8b4c8abaa8cc7d0b70aa655a3bb15a6c # 1.1.0
         with:
           project: yashigani
