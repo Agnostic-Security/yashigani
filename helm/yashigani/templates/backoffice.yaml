@@ -293,6 +293,15 @@ spec:
             # ollama:11434 directly. Default ON; set "false" to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document
+            # enforcement admin routes (routes/documents.py, dp_weaken.py,
+            # user_ui.py) read is_document_enforcement_enabled() directly.
+            # Compose parity: docker-compose.yml backoffice env
+            # YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED. Backoffice does NOT read
+            # the mode-B-proxy flag (gateway-only hot-path gate) — see
+            # gateway.yaml for that entry.
+            - name: YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED
+              value: {{ .Values.documentEnforcement.enabled | default false | quote }}
             # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
             # MCP approve-transaction env vars.
             # v4.1 SU-SEAM-1d-04 RESOLVED: the unix-socket admin path cannot

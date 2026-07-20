@@ -394,7 +394,11 @@ async def run_approve_transaction(
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
     """
-    from yashigani.manifest.codegen import CodegenError, approve_mcp_onboard
+    from yashigani.manifest.codegen import (
+        CodegenError,
+        approve_mcp_onboard,
+        is_artifact_relevant_for_runtime,
+    )
     from yashigani.pki.binding import tool_surface_hash
     from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
 
@@ -605,7 +609,18 @@ async def run_approve_transaction(
             "artifact write failed — onboarding aborted and rolled back.",
         ) from exc
 
-    artifact_paths = sorted(artifacts.keys())
+    # v4.1.2 fix (RESTART-013 MCP leg, Gap B): approve_mcp_onboard() returns
+    # the FULL rendered artifact map (unchanged contract, every runtime), but
+    # render()'s disk-write step now only PERSISTS the subset relevant to
+    # `runtime` (codegen.is_artifact_relevant_for_runtime — the
+    # artifact_write 502 root-cause fix). artifact_paths must reflect what is
+    # actually on disk — both for the rollback below (unlinking a key that
+    # was never written is harmless but wrong bookkeeping) and for the
+    # response's "svid_issued=True is backed by the cert on disk" evidentiary
+    # principle: report only what is actually there.
+    artifact_paths = sorted(
+        rel for rel in artifacts if is_artifact_relevant_for_runtime(rel, runtime)
+    )
 
     def _undo_artifacts() -> None:
         for rel in artifact_paths:

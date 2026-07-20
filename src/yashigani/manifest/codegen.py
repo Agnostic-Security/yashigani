@@ -572,6 +572,67 @@ def _safe_write(dest: Path, content: str, allowed_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# v4.1.2 fix (RESTART-013 MCP leg, Gap B) — runtime-scoped artifact persistence.
+#
+# Root cause of the ``artifact_write`` 502 (McpOnboardError, mcp_onboard.py):
+# CodegenEngine.render() / CodegenEngineShapeC.render() write EVERY key in the
+# rendered artifact map to ``output_root`` unconditionally on dry_run=False,
+# regardless of ``runtime``.  The artifact map mirrors the FULL install-tree
+# layout (docker/, helm/, opa/, tests/, plus loose top-level fragments) so
+# dry-run callers can introspect every rendered artifact for any runtime — but
+# a REAL install's output_root is (deliberately, for blast-radius reasons —
+# docker/docker-compose.yml backoffice volumes comment, iris-phase1d-audit
+# §5-B) scoped to only the ``docker/`` subtree on compose runtimes (the bind
+# mount is ``./:/mnt/install/docker:rw`` with the container's root filesystem
+# otherwise read-only).  Writing a "helm/..." key under that output_root asks
+# ``Path.mkdir(parents=True)`` to create a directory under a read-only parent,
+# which raises ``PermissionError`` (verified: mkdir under a chmod 0555 parent
+# raises errno 13) — NOT a CodegenError, so it falls into mcp_onboard.py's
+# generic ``except Exception`` and aborts the WHOLE approve transaction
+# (502 onboard_transaction_failed / artifact_write), even though the two
+# artifacts a compose runtime actually needs (the compose override + the
+# Caddy-front/egress snippet, both "docker/"-prefixed) had already been
+# written successfully moments earlier — exactly what Ava's 2026-07-20
+# byte-proof observed live for both ``mirror-mcp`` and ``cloud9-demo``.
+#
+# Fix: persist only the subset of the artifact map that the target runtime's
+# output_root is actually scoped to receive and that something reads back at
+# install time:
+#   * runtime == "k8s"                     -> "helm/"-prefixed keys only
+#     (consumed via `helm upgrade -f values-<agent>.yaml`; no docker-compose
+#     exists on K8s).
+#   * docker / podman-rootful / -rootless  -> "docker/"-prefixed keys only
+#     (the compose override + Caddy snippet Caddy/compose actually read back;
+#     no Helm release exists on a single-host compose install).
+# Every other key — service_identities.yaml.fragment, pki_ownership-<agent>.sh,
+# opa/<agent>.rego, tests/contracts/* — is advisory / dev-time-only: nothing
+# reads them back from output_root at approve-time for ANY runtime (OPA
+# grants/baselines are pushed live via the separate push_egress_grants data
+# API — mcp_onboard.py step 4b-iii — not from this static rego file;
+# service_identities.yaml.fragment and pki_ownership-<agent>.sh are for manual
+# operator review per this module's own docstring; tests/contracts/* are CI
+# fixtures). They remain in the FULL artifact map returned to the caller
+# (introspection / API response / dry-run contract unchanged) but are never
+# persisted to disk during a real approve transaction, so the intentionally
+# narrow compose bind mount is sufficient and this failure mode cannot recur.
+# ---------------------------------------------------------------------------
+
+
+def is_artifact_relevant_for_runtime(rel_path: str, runtime: str) -> bool:
+    """Whether *rel_path* should be PERSISTED to output_root for *runtime*.
+
+    Used only to scope the disk-write side effect of ``render(dry_run=False)``
+    — the returned artifact map itself is unchanged (still every rendered
+    key, for every runtime) so introspection/tests/API-display behaviour is
+    unaffected. See the module-level comment above this function for the
+    full rationale (RESTART-013 MCP leg Gap B / artifact_write 502 root cause).
+    """
+    if runtime == "k8s":
+        return rel_path.startswith("helm/")
+    return rel_path.startswith("docker/")
+
+
+# ---------------------------------------------------------------------------
 # S6 — shell fragment validation (bash -n + shellcheck)
 # ---------------------------------------------------------------------------
 
@@ -4764,6 +4825,17 @@ class CodegenEngineShapeC:
         if not dry_run:
             assert output_root is not None
             for rel_path, content in artifacts.items():
+                # v4.1.2 fix (RESTART-013 MCP leg, Gap B — artifact_write 502
+                # root cause): only persist artifacts the target runtime's
+                # output_root is actually scoped to receive. See
+                # is_artifact_relevant_for_runtime()'s module-level comment.
+                if not is_artifact_relevant_for_runtime(rel_path, runtime):
+                    _log.info(
+                        "codegen: skip write %s (not applicable to runtime=%r "
+                        "— advisory-only or other-runtime artifact)",
+                        rel_path, runtime,
+                    )
+                    continue
                 dest = output_root / rel_path
                 _safe_write(dest, content, output_root)
                 _log.info("codegen: wrote %s", rel_path)
@@ -4928,6 +5000,17 @@ class CodegenEngine:
         if not dry_run:
             assert output_root is not None  # already checked above
             for rel_path, content in artifacts.items():
+                # v4.1.2 fix (RESTART-013 MCP leg, Gap B — artifact_write 502
+                # root cause): only persist artifacts the target runtime's
+                # output_root is actually scoped to receive. See
+                # is_artifact_relevant_for_runtime()'s module-level comment.
+                if not is_artifact_relevant_for_runtime(rel_path, runtime):
+                    _log.info(
+                        "codegen: skip write %s (not applicable to runtime=%r "
+                        "— advisory-only or other-runtime artifact)",
+                        rel_path, runtime,
+                    )
+                    continue
                 dest = output_root / rel_path
                 _safe_write(dest, content, output_root)
                 _log.info("codegen: wrote %s", rel_path)

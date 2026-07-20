@@ -192,6 +192,21 @@ spec:
             # Set to "false" in values.yaml or via --set to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.gateway.semanticIntentSidecar | default "true" | quote }}
+            # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document-content
+            # enforcement (doc-OPA data protection). Compose parity:
+            # docker-compose.yml gateway env YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED /
+            # YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED. Both default false (ships
+            # dark); documents/proxy_modeb.is_modeb_proxy_active() requires BOTH
+            # true before the MCP tool-call document bridge engages on the
+            # gateway's hot egress path (deliberate double opt-in — see
+            # values.yaml documentEnforcement block and proxy_modeb.py module
+            # docstring). Previously absent from this template entirely, so the
+            # RESTART-013 document pipeline was dead code on every Helm/K8s
+            # install regardless of values.yaml documentEnforcement.enabled.
+            - name: YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED
+              value: {{ .Values.documentEnforcement.enabled | default false | quote }}
+            - name: YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED
+              value: {{ .Values.documentEnforcement.modeBProxyEnabled | default false | quote }}
             # FLAG-3 fix: per-instance /egress/eval LLM rate cap (EgressLimitEnforcer).
             # Compose parity: docker-compose.yml gateway env YASHIGANI_EGRESS_LIMIT_*.
             # mode: "cap" (default) deny+fail-closed; "monitor" meter-only, never deny.

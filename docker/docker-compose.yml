@@ -501,6 +501,25 @@ services:
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       # Opt-in flag; production deployments default false.  Set true in .env for demo.
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # v4.1.2 fix (RESTART-013 MCP leg, Gap A) — documents/proxy_modeb.py's
+      # is_modeb_proxy_active() is a DELIBERATE double opt-in gate: "Both the
+      # document-enforcement flag AND the dedicated mode-B-proxy flag must be
+      # on ... before any pipeline work runs" on the hot gateway egress path
+      # (see proxy_modeb.py module docstring, discipline #2). This second
+      # flag was defined in documents/config.py (ENV_MODEB_PROXY) and read via
+      # plain os.environ, but was NEVER added to this environment: block — no
+      # env_file, no key, nothing. An operator setting it in docker/.env had
+      # zero path into the gateway container (confirmed live via `podman exec
+      # gateway env | grep DOCUMENT`: only ENFORCEMENT_ENABLED reached the
+      # process). document_pipeline therefore stayed None even with
+      # YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true, making the whole
+      # RESTART-013 MCP-document-bridge wiring in proxy.py / mcp_router_runtime.py
+      # dead code via the standard compose install path. Default is false —
+      # this does NOT weaken or auto-link the double opt-in: an operator who
+      # wants the MCP tool-call document path enforced must still explicitly
+      # set BOTH flags true in docker/.env (documented in the ENFORCEMENT_ENABLED
+      # comment above; demo installs set both, per Ava's 2026-07-20 byte-proof).
+      YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED: ${YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
       # Default ON: every MCP tool import is screened by the LLM semantic-intent
       # classifier before approval (tool-poisoning / day-one-poison close).

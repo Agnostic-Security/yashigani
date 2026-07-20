@@ -1934,6 +1934,17 @@ licensing:
 # ---------------------------------------------------------------------------
 documentEnforcement:
   enabled: false
+  # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — DELIBERATE double
+  # opt-in, mirroring docker-compose.yml: documents/proxy_modeb.py's
+  # is_modeb_proxy_active() requires BOTH `enabled` above AND this flag before
+  # the gateway's hot egress path (MCP tool-call document bridge) engages
+  # ("Untouched unless opted in AND document-shaped" — proxy_modeb.py module
+  # docstring, discipline #2). Do NOT default this to `enabled`'s value — the
+  # two flags are intentionally independent so an operator can enable
+  # ingress-upload document enforcement (/user/documents) WITHOUT also
+  # activating the mode-B proxy/MCP-egress interception. Set true only when
+  # you also want MCP tool-call document enforcement.
+  modeBProxyEnabled: false
   # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
   # Pin a digest in production (Verification Protocol §7).
   image:
