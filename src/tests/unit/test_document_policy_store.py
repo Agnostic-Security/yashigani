@@ -95,6 +95,45 @@ def test_dps_04_rejects_out_of_vocab(redis_client):
         store.add_policy(data_class="PII", format="any", route="moon", action="LOG")
 
 
+def test_dps_04b_identity_scoped_policy_roundtrips(redis_client):
+    """RESTART-013 gap #4: a policy row can carry an identity_id and it
+    survives write-through + reload + OPA serialisation unchanged."""
+    store = DocumentPolicyStore(redis_client)
+    row = store.add_policy(
+        data_class="PII", format="any", route="egress-mcp-result",
+        action="REDACT", identity_id="idnt_userredact01",
+    )
+    assert row["identity_id"] == "idnt_userredact01"
+    fresh = DocumentPolicyStore(redis_client)
+    reloaded = next(p for p in fresh.list_policies() if p["id"] == row["id"])
+    assert reloaded["identity_id"] == "idnt_userredact01"
+    opa_row = next(
+        p for p in fresh.to_opa_document()["policies"] if p["data_class"] == "PII"
+    )
+    assert opa_row["identity_id"] == "idnt_userredact01"
+
+
+def test_dps_04c_identity_id_defaults_empty_global(redis_client):
+    """A policy created WITHOUT identity_id defaults to "" (global — applies
+    to any caller), preserving pre-existing behaviour for every operator who
+    never touches the new field."""
+    store = DocumentPolicyStore(redis_client)
+    row = store.add_policy(data_class="PII", format="any", route="any", action="LOG")
+    assert row["identity_id"] == ""
+
+
+def test_dps_04d_rejects_malformed_identity_id(redis_client):
+    """A non-empty identity_id that isn't a canonical 'idnt_' key is rejected
+    fail-closed — never silently persist a row that can never match any real
+    caller (RESTART-013 gap #4)."""
+    store = DocumentPolicyStore(redis_client)
+    with pytest.raises(ValueError):
+        store.add_policy(
+            data_class="PII", format="any", route="any", action="LOG",
+            identity_id="not-a-real-identity",
+        )
+
+
 def test_dps_05_remove(redis_client):
     store = DocumentPolicyStore(redis_client)
     store.seed_defaults()
@@ -122,11 +161,14 @@ def test_dps_07_to_opa_document_shape(redis_client):
     row = doc["policies"][0]
     # IRIS-DOC-META: policy_id / user_message / code are now included so the
     # rego can surface operator-supplied self-describing fields in the decision.
+    # RESTART-013 gap #4: identity_id is now included (empty by default for the
+    # seeded examples — they are global, apply-to-any-caller policies).
     assert set(row.keys()) == {
         "data_class", "format", "route", "action",
         "pseudonymize_mode", "small_set_escalation",
-        "policy_id", "user_message", "code",
+        "policy_id", "user_message", "code", "identity_id",
     }
+    assert row["identity_id"] == ""
     assert set(doc["config"].keys()) == {
         "detokenize_role", "map_ttl_seconds", "small_set_threshold",
     }

@@ -75,6 +75,7 @@ async def evaluate_document_decision(
     *,
     route: str = "any",
     pseudonymize_mode: str = "A",
+    identity_id: str = "",
     timeout_s: float = 5.0,
 ) -> dict:
     """Evaluate the document disposition through the REAL OPA engine.
@@ -90,6 +91,14 @@ async def evaluate_document_decision(
         matched against each policy's ``route``.
     pseudonymize_mode:
         ``"A"`` (give-the-user-the-table, default) | ``"B"`` (internal round-trip).
+    identity_id:
+        RESTART-013 gap #4 — the caller's canonical Yashigani identity_id
+        ("idnt_{12hex}"), when resolved.  Default "" (unresolved/unauthenticated
+        caller, or a caller intentionally not bound to any identity-scoped
+        policy).  Carried as ``input.identity.identity_id`` so
+        ``policy/document.rego`` can bind a REDACT/PSEUDONYMIZE policy to ONE
+        user while every pre-existing global policy (identity_id == "" on the
+        matrix row) keeps applying to everyone, unaffected.
 
     Returns
     -------
@@ -103,6 +112,7 @@ async def evaluate_document_decision(
             "document": document_input,
             "routing_decision": {"route": route},
             "request": {"pseudonymize_mode": pseudonymize_mode},
+            "identity": {"identity_id": identity_id},
         }
     }
     url = opa_url.rstrip("/") + _OPA_DECISION_PATH

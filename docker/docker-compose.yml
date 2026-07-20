@@ -507,9 +507,22 @@ services:
       # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
       # Backend: same OLLAMA_BASE_URL (http://ollama:11434) as the PII classifier.
       YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
-      # Extractor sandbox: gateway does NOT spawn containers — only backoffice does.
-      # These knobs are kept here only for completeness (MAX_OUTPUT_BYTES is read by
-      # the proxy_modeb pipeline in the gateway). The sandbox runtime vars live in backoffice.
+      # Extractor sandbox — Design A (RESTART-013 gap #2 fix, 2026-07-20).
+      # Gateway does NOT spawn containers (no docker socket / container API —
+      # unchanged), but it DOES now reach the pre-spawned extractor-svc over
+      # plain HTTP, exactly like backoffice does (see backoffice's own
+      # "Extractor sandbox — Design A" block below for the full rationale).
+      # Before this fix, YASHIGANI_EXTRACTOR_WORKER_URL was absent here, so
+      # create_extractor_backend() had nothing to select and every
+      # REDACT/PSEUDONYMIZE re-render from the gateway process (proxy egress
+      # step 4d + the MCP tool-call document path) fail-closed to BLOCK,
+      # unconditionally, regardless of policy (proven live —
+      # FINDING-V412-RESTART-013 gap #3/#2). A compromised gateway can still
+      # only POST document bytes to extractor-svc:8090 — no host-escape
+      # primitive is introduced (same Design A blast radius as backoffice).
+      YASHIGANI_EXTRACTOR_WORKER_URL: "http://extractor-svc:8090"
+      YASHIGANI_EXTRACTOR_RUNTIME: "http"
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
       # P3 MCP broker — JSON array of registered MCP server descriptors.
       # Written by install.sh --onboard (Shape C) and cleared by install.sh --offboard.
@@ -637,6 +650,14 @@ services:
         condition: service_healthy
       pgbouncer:
         condition: service_started
+      # RESTART-013 gap #2 fix — mirrors backoffice's existing hard dependency.
+      # extractor-svc has no profile gate (it always starts as part of the
+      # default topology, dark unless YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED is
+      # flipped); waiting for service_healthy avoids a startup race where the
+      # gateway's document_pipeline (when the mode-B-proxy flag is on) probes
+      # extractor-svc before it is ready.
+      extractor-svc:
+        condition: service_healthy
     healthcheck:
       # mTLS port now used — healthcheck uses the client cert inside the
       # container. Pattern A for Python ssl: trust anchor is the public ca_root.crt
@@ -666,6 +687,17 @@ services:
       # demo-mcp upstream dispatch path (demo opt-in). Harmless when the
       # demo-mcp profile is not active: the bridge exists, the service does not.
       - demo_mcp_isolated
+      # RESTART-013 gap #2 fix (2026-07-20): gateway → extractor-svc:8090 for
+      # document REDACT/PSEUDONYMIZE re-render (Design A — mirrors backoffice's
+      # existing extractor_svc membership below). Before this fix, gateway had
+      # NO route to extractor-svc at all, so its own document_pipeline
+      # (proxy egress step 4d + the MCP tool-call document path) fail-closed
+      # to BLOCK unconditionally, live-proven in
+      # FINDING-V412-RESTART-013 gap #3. internal:true (extractor_svc has no
+      # internet egress) — same isolation posture as backoffice's membership;
+      # a compromised gateway process can still only POST document bytes to
+      # extractor-svc:8090, nothing more.
+      - extractor_svc
 
   # ---------------------------------------------------------------------------
   # Backoffice — Admin control plane (generates first-run credentials)

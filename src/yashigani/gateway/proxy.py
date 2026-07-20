@@ -1060,6 +1060,15 @@ async def _proxy_request_body(
                 # YSG-RISK-108 — pass audit_writer so mesh identity-header
                 # rejection events (T-3/T-4) reach the tamper-evident chain.
                 audit_writer=state.get("audit_writer"),
+                # RESTART-013 gap #1 — the SAME document_pipeline step 4d
+                # (below) uses, so MCP tool-call traffic (previously
+                # unreachable — this dispatch returns before 4d) is now run
+                # through the SAME OPA-decided REDACT/PSEUDONYMIZE/BLOCK
+                # decision. None when mode-B-proxy is not opted in (dark) —
+                # document_pipeline stays None and MCP traffic is untouched,
+                # exactly as before this fix.
+                document_pipeline=state.get("document_pipeline"),
+                opa_url=cfg.opa_url,
             )
         # Multi-segment or empty suffix falls through to generic upstream forwarding
 
@@ -1095,6 +1104,12 @@ async def _proxy_request_body(
                 body=forwarded_body,
                 content_type=_req_content_type,
                 request_id=request_id,
+                # RESTART-013 gap #4 — thread the caller's resolved identity
+                # (same idnt_ rail _extract_identity() / mcp_router_runtime.py
+                # use) so a per-user REDACT/PSEUDONYMIZE policy can bind to
+                # this caller. "unknown" (unresolved) normalises to "" so the
+                # rego's global-only fallback applies, unchanged from before.
+                identity_id=user_id if user_id and user_id != "unknown" else "",
             )
             if _egress.blocked:
                 _audit_request(

@@ -696,3 +696,95 @@ test_iris_doc_meta_incomplete_extraction_uses_builtin_policy_id if {
 	d.action == "BLOCK"
 	d.policy_id == "DOC-ENFORCE-001"
 }
+
+# ---------------------------------------------------------------------------
+# 21. RESTART-013 gap #4 — per-user/identity policy dimension.
+#     A policy row may carry an optional identity_id.  "" (or absent) = applies
+#     to any caller (global — every pre-existing policy keeps working
+#     unmodified).  A non-empty identity_id scopes the row to ONE caller.
+# ---------------------------------------------------------------------------
+
+_policies_identity_scoped := [
+	{
+		"data_class": "PII", "format": "any", "route": "any",
+		"action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false,
+		"identity_id": "idnt_userredact01",
+	},
+	{
+		"data_class": "PII", "format": "any", "route": "any",
+		"action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false,
+		"identity_id": "idnt_userpseudo01",
+	},
+]
+
+# 21a — the caller bound to the REDACT policy gets REDACT.
+test_identity_scoped_policy_binds_to_caller_redact if {
+	document.action == "REDACT" with input as {
+		"document": _doc([_match_email], true, true),
+		"identity": {"identity_id": "idnt_userredact01"},
+	}
+		with data.yashigani.document.policies as _policies_identity_scoped
+}
+
+# 21b — a DIFFERENT caller bound to the PSEUDONYMIZE policy gets PSEUDONYMIZE,
+# not the other user's REDACT row (the identity dimension actually discriminates
+# between callers, not just "any row wins").
+test_identity_scoped_policy_binds_to_caller_pseudonymize if {
+	document.action == "PSEUDONYMIZE" with input as {
+		"document": _doc([_match_email], true, true),
+		"identity": {"identity_id": "idnt_userpseudo01"},
+	}
+		with data.yashigani.document.policies as _policies_identity_scoped
+}
+
+# 21c — a THIRD caller with no identity-scoped row of their own, and no global
+# fallback row, hits the fail-closed "no applicable policy" BLOCK — an
+# identity-scoped policy must not leak to a caller it wasn't bound to.
+test_identity_scoped_policy_does_not_leak_to_other_caller if {
+	document.action == "BLOCK" with input as {
+		"document": _doc([_match_email], true, true),
+		"identity": {"identity_id": "idnt_someoneelse0"},
+	}
+		with data.yashigani.document.policies as _policies_identity_scoped
+}
+
+# 21d — an UNRESOLVED caller (no input.identity at all — the pre-existing
+# behaviour, e.g. an anonymous/registry-unavailable path) also does not match
+# an identity-scoped policy and fails closed, exactly like 21c.
+test_identity_scoped_policy_does_not_match_unresolved_caller if {
+	document.action == "BLOCK" with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_identity_scoped
+}
+
+# 21e — mixing an identity-scoped row with a GLOBAL row for the SAME class:
+# the unresolved/other caller still gets the global row (global policies are
+# unaffected by the presence of identity-scoped rows for other users).
+test_identity_scoped_policy_coexists_with_global_policy if {
+	policies := array.concat(_policies_identity_scoped, _policies_log_pii)
+	document.action == "LOG" with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+}
+
+# 21f — the identity-scoped row still wins over the coexisting global LOG row
+# for the caller it IS bound to (precedence still applies among applicable
+# policies; REDACT > LOG).
+test_identity_scoped_policy_wins_over_global_for_bound_caller if {
+	policies := array.concat(_policies_identity_scoped, _policies_log_pii)
+	document.action == "REDACT" with input as {
+		"document": _doc([_match_email], true, true),
+		"identity": {"identity_id": "idnt_userredact01"},
+	}
+		with data.yashigani.document.policies as policies
+}
+
+# 21g — default identity_id ("" / key absent) on every pre-existing fixture
+# still applies to a caller with a resolved identity (regression guard: adding
+# the identity dimension must not require operators to retrofit identity_id on
+# every existing global row).
+test_global_policy_still_applies_to_resolved_identity if {
+	document.action == "LOG" with input as {
+		"document": _doc([_match_email], true, true),
+		"identity": {"identity_id": "idnt_anyresolved01"},
+	}
+		with data.yashigani.document.policies as _policies_log_pii
+}

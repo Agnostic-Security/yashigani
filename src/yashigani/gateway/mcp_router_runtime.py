@@ -166,6 +166,8 @@ async def dispatch_mcp_call(
     identity_registry: Optional[object] = None,  # IdentityRegistry | None — for ceiling lookup
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3 tool permit
     audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108 mesh audit
+    document_pipeline: Optional[object] = None,  # DocumentInspectionPipeline | None — RESTART-013 gap #1
+    opa_url: str = "",  # RESTART-013 gap #1 — needed by the document bridge's OPA decision
 ) -> Response:
     """
     Core MCP call handler.  Called DIRECTLY from the proxy catch-all AFTER the
@@ -213,6 +215,24 @@ async def dispatch_mcp_call(
         Optional AuditLogWriter instance.  When provided, mesh identity-header
         rejection events (YSG-RISK-108 T-3/T-4) are emitted to the tamper-
         evident audit chain.  When absent, rejections are logged only (WARNING).
+    document_pipeline:
+        Optional DocumentInspectionPipeline instance (RESTART-013 gap #1).
+        When provided, EVERY ``tools/call`` runs its ``arguments`` (outbound,
+        before forwarding to upstream) AND its upstream ``result`` (inbound,
+        before returning to the caller) through
+        ``documents/mcp_document_bridge.enforce_mcp_document_payload`` — the
+        SAME OPA-decided REDACT/PSEUDONYMIZE/BLOCK decision the generic proxy
+        egress (``gateway/proxy.py`` step 4d) uses. When ``None`` (the
+        default — document enforcement is opt-in, see
+        ``documents.proxy_modeb.is_modeb_proxy_active()``), MCP tool-call
+        content is NOT inspected for document enforcement at all (unchanged
+        pre-RESTART-013 behaviour) — the existing G-ORCH-OPA-1 response
+        inspection (PII/injection classifier) and ``broker.enforce()``/
+        ``enforce_result()`` OPA gates are untouched either way.
+    opa_url:
+        The OPA base URL (``cfg.opa_url`` in proxy.py) the document bridge
+        needs to evaluate ``policy/document.rego``. Only used when
+        ``document_pipeline`` is not None.
     """
     return await _handle_mcp_call_inner(
         agent_name=agent_name,
@@ -222,6 +242,8 @@ async def dispatch_mcp_call(
         identity_registry=identity_registry,
         agent_registry=agent_registry,
         audit_writer=audit_writer,
+        document_pipeline=document_pipeline,
+        opa_url=opa_url,
     )
 
 
@@ -233,6 +255,8 @@ async def _handle_mcp_call_inner(
     identity_registry: Optional[object] = None,  # IdentityRegistry | None
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3
     audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108
+    document_pipeline: Optional[object] = None,  # DocumentInspectionPipeline | None — RESTART-013 gap #1
+    opa_url: str = "",  # RESTART-013 gap #1
 ) -> Response:
     """
     Core MCP call processing logic — shared by dispatch_mcp_call (catch-all path)
@@ -561,6 +585,71 @@ async def _handle_mcp_call_inner(
                 },
             )
 
+        # ── RESTART-013 gap #1 — document enforcement on the OUTBOUND leg ──
+        # (agent → tool arguments), AFTER the call is authorized (no point
+        # inspecting content of a call that would be denied anyway) but
+        # BEFORE it is forwarded to the upstream MCP server. This is the
+        # FIRST place in the whole codebase a file inside an MCP tool-call
+        # argument is ever extracted/matched/redacted/tokenized — previously
+        # proxy.py's step 4d (the only document_pipeline call site) was
+        # unreachable from /mcp/<agent_name> traffic (step 4c returns first).
+        if document_pipeline is not None and isinstance(tool_args, dict) and tool_args:
+            from yashigani.documents.mcp_document_bridge import (
+                enforce_mcp_document_payload,
+            )
+            _doc_identity_id = user_id if user_id and user_id != "unknown" else ""
+            try:
+                _doc_outcome = await enforce_mcp_document_payload(
+                    document_pipeline,  # type: ignore[arg-type]
+                    opa_url=opa_url,
+                    payload=tool_args,
+                    request_id=request_id,
+                    identity_id=_doc_identity_id,
+                    tenant=server_cfg.tenant_id,
+                    surface="mcp-tool-call",
+                )
+            except Exception as exc:
+                # Fail-closed: the document bridge itself is designed to never
+                # raise (see its own module docstring), but an unexpected
+                # fault here must still withhold rather than silently forward
+                # an uninspected document to an external MCP server.
+                logger.error(
+                    "mcp-runtime: [RESTART-013] document bridge raised on "
+                    "tool-call arguments agent=%r call_id=%s: %s",
+                    agent_name, call_id, exc,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "MCP_DOCUMENT_ENFORCEMENT_ERROR",
+                        "deny_reason": "mcp_document_enforcement_error",
+                    },
+                )
+            if _doc_outcome.blocked:
+                logger.info(
+                    "mcp-runtime: [RESTART-013] document enforcement BLOCKED "
+                    "tool-call arguments agent=%r call_id=%s tool=%r reason=%s",
+                    agent_name, call_id, tool_name, _doc_outcome.block_reason,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "MCP_DOCUMENT_BLOCKED",
+                        "deny_reason": _doc_outcome.block_reason,
+                        "code": "DOCUMENT_BLOCKED",
+                        "user_message": (
+                            "A file in this tool call was held by Yashigani "
+                            "document enforcement and not forwarded."
+                        ),
+                    },
+                )
+            if _doc_outcome.transformed:
+                # tool_args was mutated in place (same dict object nested
+                # inside msg["params"]["arguments"]) — re-serialise the
+                # request body so the transformed bytes (not the original
+                # cleartext) are what actually reaches the upstream server.
+                body_str = json.dumps(msg)
+
         # Allowed — forward to the bridge with the issued JWT
         try:
             async with McpHttpTransport(
@@ -589,6 +678,70 @@ async def _handle_mcp_call_inner(
                 status_code=502,
                 content={"error": "UPSTREAM_ERROR"},
             )
+
+        # ── RESTART-013 gap #1 — document enforcement on the INBOUND leg ───
+        # (tool → agent result), BEFORE the G-ORCH-OPA-1 inspection below so
+        # the sensitivity classifier + broker.enforce_result() ever see the
+        # ALREADY-redacted/tokenized content (never MORE raw PII than
+        # necessary reaches a second classifier). Runs on the whole parsed
+        # JSON-RPC response object (envelope fields like "jsonrpc"/"id" are
+        # short strings and are never mistaken for a document candidate — see
+        # documents/mcp_document_bridge.py's payload-schema-agnostic walk).
+        if document_pipeline is not None and upstream_response:
+            from yashigani.documents.mcp_document_bridge import (
+                enforce_mcp_document_payload,
+            )
+            try:
+                _resp_obj = json.loads(upstream_response)
+            except (json.JSONDecodeError, ValueError):
+                _resp_obj = None
+            if _resp_obj is not None:
+                _doc_identity_id = user_id if user_id and user_id != "unknown" else ""
+                try:
+                    _doc_resp_outcome = await enforce_mcp_document_payload(
+                        document_pipeline,  # type: ignore[arg-type]
+                        opa_url=opa_url,
+                        payload=_resp_obj,
+                        request_id=request_id,
+                        identity_id=_doc_identity_id,
+                        tenant=server_cfg.tenant_id,
+                        surface="mcp-tool-call",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "mcp-runtime: [RESTART-013] document bridge raised on "
+                        "tool-call result agent=%r call_id=%s: %s",
+                        agent_name, call_id, exc,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "MCP_DOCUMENT_ENFORCEMENT_ERROR",
+                            "deny_reason": "mcp_document_enforcement_error",
+                        },
+                    )
+                if _doc_resp_outcome.blocked:
+                    logger.info(
+                        "mcp-runtime: [RESTART-013] document enforcement "
+                        "BLOCKED tool-call result agent=%r call_id=%s tool=%r "
+                        "reason=%s",
+                        agent_name, call_id, tool_name, _doc_resp_outcome.block_reason,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "MCP_DOCUMENT_BLOCKED",
+                            "deny_reason": _doc_resp_outcome.block_reason,
+                            "code": "DOCUMENT_BLOCKED",
+                            "user_message": (
+                                "A file returned by this tool call was held "
+                                "by Yashigani document enforcement and not "
+                                "delivered."
+                            ),
+                        },
+                    )
+                if _doc_resp_outcome.transformed:
+                    upstream_response = json.dumps(_resp_obj)
 
         # ── G-ORCH-OPA-1 egress gate ──────────────────────────────────────
         #
@@ -857,6 +1010,8 @@ def create_mcp_call_router(
     registry: object,
     response_inspection_pipeline: Optional[object] = None,
     identity_registry: Optional[object] = None,
+    document_pipeline: Optional[object] = None,  # RESTART-013 gap #1
+    opa_url: str = "",  # RESTART-013 gap #1
 ) -> APIRouter:  # McpBrokerRegistry
     """
     Create the MCP call APIRouter.
@@ -882,6 +1037,10 @@ def create_mcp_call_router(
         Optional IdentityRegistry instance.  When provided, caller sensitivity
         ceilings are looked up for the G-ORCH-OPA-1 egress gate.
         When None, ctx.caller_sensitivity_ceiling stays None → fail-closed deny.
+    document_pipeline / opa_url:
+        RESTART-013 gap #1 — see ``dispatch_mcp_call``'s docstring for the
+        full explanation. Optional; None/empty preserves pre-existing
+        behaviour (no document inspection on MCP traffic).
     """
     mcp_call_router = APIRouter()
 
@@ -898,6 +1057,8 @@ def create_mcp_call_router(
             registry=registry,
             response_inspection_pipeline=response_inspection_pipeline,
             identity_registry=identity_registry,
+            document_pipeline=document_pipeline,
+            opa_url=opa_url,
         )
 
     return mcp_call_router
