@@ -5,7 +5,7 @@
 
 # ── Stage 1: wheel builder ───────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS builder
+FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS builder
 
 WORKDIR /build
 
@@ -20,7 +20,7 @@ RUN python -m build --wheel --outdir /dist
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 # Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
-FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS runtime
+FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS runtime
 
 RUN groupadd --gid 1001 yashigani \
  && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false yashigani
