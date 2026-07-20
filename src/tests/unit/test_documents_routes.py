@@ -758,7 +758,7 @@ def test_doc_prod_05_inspect_applies_opa_action(store_client, monkeypatch):
     branch in the route."""
     tc, app, store, _ = store_client
 
-    async def _fake_decision(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+    async def _fake_decision(opa_url, document_input, *, route="any", pseudonymize_mode="A", identity_id="", timeout_s=5.0):
         return {
             "action": "LOG",
             "policy_id": "DOC-ENFORCE-001",
@@ -787,7 +787,7 @@ def test_doc_prod_06_inspect_block_carries_user_alert(store_client, monkeypatch)
     (policy_id + user_message + code) straight from the decision."""
     tc, app, store, _ = store_client
 
-    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", identity_id="", timeout_s=5.0):
         return {
             "action": "BLOCK",
             "policy_id": "DOC-ENFORCE-001",
@@ -886,7 +886,7 @@ def test_doc_set_04_inspect_unknown_set_id_404(set_client, monkeypatch):
     — never silently falls back to the per-file salt. [fail-closed]"""
     tc, app, store = set_client
 
-    async def _fake(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+    async def _fake(opa_url, document_input, *, route="any", pseudonymize_mode="A", identity_id="", timeout_s=5.0):
         return {"action": "LOG", "policy_id": "P", "code": "C", "user_message": "m", "deny": [], "obligations": []}
 
     monkeypatch.setattr(
@@ -1083,7 +1083,7 @@ def test_iris_meta_08_inspect_block_carries_operator_user_message(store_client, 
         code="DOCUMENT_PHI_BLOCKED",
     )
 
-    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", timeout_s=5.0):
+    async def _fake_block(opa_url, document_input, *, route="any", pseudonymize_mode="A", identity_id="", timeout_s=5.0):
         # Simulate OPA resolving to the operator-authored policy.
         return {
             "action": "BLOCK",

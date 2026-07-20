@@ -452,11 +452,23 @@ def _build_app(mesh_mode: bool = False):
     try:
         from yashigani.documents.proxy_modeb import is_modeb_proxy_active
         if is_modeb_proxy_active():
+            from yashigani.documents.audit_bridge import make_shared_document_audit_callback
             from yashigani.documents.config import DocumentEnforcementConfig
             from yashigani.documents.pipeline import DocumentInspectionPipeline
             _doc_cfg = DocumentEnforcementConfig.from_env()
+            # RESTART-013 gap #5: this pipeline is a SINGLETON reused by every
+            # concurrent request (state["document_pipeline"]), so it gets the
+            # contextvars-based shared callback (asyncio-task-safe), NOT the
+            # closure-dict variant documents.py/user_ui.py use (those build a
+            # fresh pipeline per request). Previously this construction passed
+            # NO on_audit at all — the pipeline default is a silent no-op, so
+            # every proxy-egress + MCP-tool-call document decision produced
+            # ZERO audit trail. See documents/audit_bridge.py.
             document_pipeline = DocumentInspectionPipeline(
                 registry=_doc_cfg.build_registry(),
+                on_audit=make_shared_document_audit_callback(
+                    audit_writer, surface="proxy-egress",
+                ),
             )
             logger.info(
                 "Document mode-B egress pipeline ready (max_bytes=%d, max_segments=%d)",

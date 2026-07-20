@@ -59,16 +59,25 @@
 #   input.routing_decision.route          "ingress-upload"|"egress-mcp-result"|
 #                                         "json-attachment"|... (matched against policy.route)
 #   input.request.pseudonymize_mode       "A" (give-the-user-the-table, DEFAULT) | "B"
+#   input.identity.identity_id            RESTART-013 gap #4 — the caller's canonical
+#                                         Yashigani identity_id ("idnt_{12hex}"), when
+#                                         resolved. "" when unresolved/unauthenticated —
+#                                         only identity-SCOPED policies (below) require a
+#                                         match; global (identity_id == "") policies are
+#                                         unaffected and keep applying to every caller.
 #
 # === DATA (documents/policy_store.py → push_document_data) ===
 #   data.yashigani.document.policies[]    the operator's action matrix, each:
 #                                           { data_class, format, route, action,
 #                                             pseudonymize_mode, small_set_escalation,
-#                                             policy_id, user_message, code }
-#                                         The last three are the operator-supplied
-#                                         self-describing fields (may be "").  When
-#                                         non-empty they override the built-in values
-#                                         in the decision (IRIS-DOC-META).
+#                                             policy_id, user_message, code, identity_id }
+#                                         The last four are optional operator-supplied
+#                                         fields (may be "").  policy_id/user_message/code
+#                                         override the built-in values in the decision
+#                                         (IRIS-DOC-META) when non-empty. identity_id scopes
+#                                         the policy to ONE caller (RESTART-013 gap #4) when
+#                                         non-empty; "" (default) = applies to any caller,
+#                                         preserving every pre-existing global policy.
 #   data.yashigani.document.config.detokenize_role       RBAC role for de-tokenize / table
 #   data.yashigani.document.config.map_ttl_seconds       fail-closed TTL for the replacer map
 #   data.yashigani.document.config.small_set_threshold   record_count at/under which QI gate fires
@@ -167,6 +176,15 @@ _format := object.get(object.get(input, "document", {}), "format", "")
 
 _route := object.get(object.get(input, "routing_decision", {}), "route", "any")
 
+# RESTART-013 gap #4 — per-user/identity policy dimension.
+# The caller's Yashigani identity_id (canonical "idnt_{12hex}" key from the
+# identity registry — see gateway/mcp_router_runtime.py user_id resolution and
+# backoffice user_ui.py id_registry.get_by_account_id()). Empty string when no
+# identity was resolved (unauthenticated / registry-unavailable path, or a
+# caller that intentionally supplies none) — policies scoped to "any identity"
+# still apply; only identity-SCOPED policies require a match.
+_identity_id := object.get(object.get(input, "identity", {}), "identity_id", "")
+
 _matches := object.get(object.get(input, "document", {}), "matches", [])
 
 _record_count := object.get(object.get(input, "document", {}), "record_count", 0)
@@ -200,11 +218,26 @@ _route_matches(policy_route) if policy_route == "any"
 
 _route_matches(policy_route) if policy_route == _route
 
+# RESTART-013 gap #4 — identity match.  A policy with NO identity_id (the
+# default — "" — every built-in/example policy) applies to ANY caller, exactly
+# as before this change (global policies keep working, identity is opt-in).
+# A policy with a non-empty identity_id ONLY applies when the caller's resolved
+# identity_id equals it (an unresolved caller — _identity_id == "" — never
+# matches a scoped policy; it falls through to whatever global policy applies,
+# or to the fail-closed "no applicable policy" BLOCK if none does).
+_identity_matches(policy_identity_id) if policy_identity_id == ""
+
+_identity_matches(policy_identity_id) if {
+	policy_identity_id != ""
+	policy_identity_id == _identity_id
+}
+
 # The set of policies that apply to at least one detected match.
 _applicable_policies contains p if {
 	some p in data.yashigani.document.policies
 	_format_matches(p.format)
 	_route_matches(p.route)
+	_identity_matches(object.get(p, "identity_id", ""))
 	some m in _matches
 	_class_matches(p.data_class, m.data_class)
 }

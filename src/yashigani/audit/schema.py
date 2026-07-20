@@ -510,6 +510,16 @@ class EventType(str, Enum):
     # An INERT pending registry record was written (no leaf, no grant, no envelope).
     # Surfaces in nhi-approvals.js as "discovered — pending admin approval".
     LANGFLOW_FLOW_DISCOVERED = "LANGFLOW_FLOW_DISCOVERED"
+    # ---------------------------------------------------------------------------
+    # RESTART-013 gap #5 — document enforcement decision + audit obligation
+    # execution.  policy/document.rego ALWAYS carries "audit_document_decision"
+    # in its obligations list; before this event existed nothing dispatched that
+    # obligation into the tamper-evident chain (both backoffice document routes
+    # + the gateway's own mode-B pipeline construction only ever logged to
+    # stdout, or nowhere at all).  Every DocumentInspectionPipeline decision
+    # (LOG/REDACT/PSEUDONYMIZE/BLOCK/ROUTE_LOCAL) now writes one of these.
+    # ASVS V7.3.4 (sensitive-data audit) / CMMC AU.L2-3.3.1.
+    DOCUMENT_ENFORCEMENT_DECISION = "DOCUMENT_ENFORCEMENT_DECISION"
 
 
 # ---------------------------------------------------------------------------
@@ -4450,3 +4460,53 @@ class LangflowFlowDiscoveredEvent(AuditEvent):
         "All flows under this instance share the union egress grant. "
         "Per-flow isolation requires per-instance containers (Track 3+)."
     )
+
+
+# ---------------------------------------------------------------------------
+# RESTART-013 gap #5 — document enforcement decision audit event
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DocumentEnforcementDecisionEvent(AuditEvent):
+    """Executes the "audit_document_decision" OPA obligation
+    (policy/document.rego) — the tamper-evident record of ONE
+    DocumentInspectionPipeline decision (LOG/REDACT/PSEUDONYMIZE/BLOCK/
+    ROUTE_LOCAL), replacing the pre-RESTART-013 state where every call site
+    either logged to stdout only (``logger.info``) or nowhere at all (the
+    gateway's own mode-B pipeline construction passed no ``on_audit`` at all).
+
+    Security invariants (immutable floors, mirrors PIIDetectedEvent):
+      - Raw document bytes / raw match values are NEVER stored — only
+        data_class labels + counts (the pipeline's own audit dict already
+        enforces this; this event just carries it through to the chain).
+      - masking_applied is always True.
+      - identity_id is the caller's canonical Yashigani identity ("idnt_...")
+        when resolved, else "" — the RESTART-013 gap #4 per-user dimension the
+        decision was evaluated under.
+
+    ASVS V7.3.4 (sensitive-data audit) / CMMC AU.L2-3.3.1.
+    """
+
+    event_type: str = EventType.DOCUMENT_ENFORCEMENT_DECISION
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    surface: str = ""              # "admin-inspect" | "user-upload" | "proxy-egress" | "mcp-tool-call" | ...
+    disposition: str = ""          # LOG | REDACT | PSEUDONYMIZE | BLOCK | ROUTE_LOCAL
+    detected_format: str = ""
+    match_count: int = 0
+    identity_id: str = ""          # RESTART-013 gap #4 — "" when unresolved
+    tenant: str = ""
+    obligations: list = None       # type: ignore[assignment]
+    # The pipeline's own per-decision audit fields (event_type/disposition/
+    # detected_format/segment_count/match_count/matches[masked]/etc — see
+    # documents/pipeline.py _log/_redact/_pseudonymize/_block). Never raw values.
+    pipeline_event_type: str = ""
+    pipeline_audit_fields: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.obligations is None:
+            self.obligations = []
+        if self.pipeline_audit_fields is None:
+            self.pipeline_audit_fields = {}
