@@ -85,8 +85,8 @@ RUN mkdir -p /opt/libatomic \
 # Originally pinned to amd64 only; that produced the InvalidBaseImagePlatform
 # warning under arm64 builds (manifest list ended up with amd64 python + arm64
 # node, broken under emulation).  Now properly multi-arch.
-FROM python:3.14.6-slim@sha256:8e4071294d046d45b31a902e02a8560a45c351898513b66ec659ca39fd30d170 AS python-amd64
-FROM python:3.14.6-slim@sha256:8b48630e688730a22bd25f3c9e04606b37fa1488cf70e665932ef78a3ee1e4d0 AS python-arm64
+FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS python-amd64
+FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS python-arm64
 FROM python-${TARGETARCH} AS python-base
 
 
