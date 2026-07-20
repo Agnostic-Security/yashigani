@@ -14612,6 +14612,30 @@ bootstrap_internal_pki() {
       # Lu wire-sink-gate P2 (v2.25.2): ensure the audit signing key exists after
       # rotation (idempotent — does not rotate the long-lived signing leaf).
       _provision_audit_signing_key || return 1
+      # FINDING-V412-RESTART-012: propagate rotated leaves to ANY ALREADY-RUNNING
+      # mesh member. On a fresh install this is a no-op (nothing is running yet
+      # — compose_up hasn't happened). On a stack that lives long enough to hit
+      # time-based renewal / URI-SAN-drift and gets install.sh re-run against
+      # it, every mesh member was previously left serving/trusting whatever
+      # material it loaded at its own last (re)start while docker/secrets/
+      # moved on — the exact drift Laura (r6) and Tom (r3) reproduced against
+      # backoffice, and independently full-stack reproduced+fixed live here
+      # (2026-07-20): redis, budget-redis, pgbouncer AND caddy all needed a
+      # restart too, not just postgres — Caddy specifically was found still
+      # rejecting backoffice's rotated leaf ("x509: certificate signed by
+      # unknown authority") until restarted. Fail loud (return 1) rather than
+      # let a silent miss here become a certificate-verify crash loop
+      # discovered only at runtime.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "Leaf rotation: could not confirm the running postgres picked up the rotated trust material."
+        log_error "  Refusing to continue with a possibly-stale postgres server leaf — see remediation above."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "Leaf rotation: could not confirm every mesh service picked up the rotated material."
+        log_error "  Refusing to continue with possibly-stale trust state — see remediation above."
+        return 1
+      fi
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
@@ -14805,6 +14829,101 @@ _postgres_byo_ca_trust_sync() {
       return 1
     fi
   fi
+
+  return 0
+}
+
+# =============================================================================
+# _pki_restart_mesh_services — propagate a rotation to any ALREADY-RUNNING
+# services that read their PKI material once at process start
+# =============================================================================
+# FINDING-V412-RESTART-012 (full live reproduction, 2026-07-20): forcing a
+# rotation and then walking the mesh one service at a time (redis,
+# budget-redis, pgbouncer, caddy, gateway, backoffice) proved EVERY one of
+# them keeps serving/trusting whatever material it read at its OWN last
+# process start — none of them re-read cert/key/CA files from the
+# bind-mounted secrets dir on their own. A plain restart (not a full
+# recreate) IS sufficient for all of them — each was confirmed to pick up
+# the rotated files correctly after `podman restart` — but the restart must
+# actually happen. The pre-fix behaviour only ever PRINTED a restart hint
+# (and that hint omitted caddy entirely, and separately told the operator to
+# "restart postgres", which is FALSE — see _postgres_byo_ca_trust_sync,
+# postgres needs the exec-based init-script re-run, not a bare restart,
+# because a restart does not re-execute docker-entrypoint-initdb.d/* against
+# an already-initialized PGDATA).
+#
+# Safe to restart: redis/budget-redis persist via AOF to a named volume (see
+# the B1 AOF-enablement note at the top of docker-compose.yml); pgbouncer,
+# caddy, gateway and backoffice are stateless proxies/app servers.
+#
+# Same honesty contract as _postgres_byo_ca_trust_sync: "not running" is only
+# ever concluded from a runtime query that itself succeeded. A runtime that
+# fails to answer is NOT the same as "service is down" — fail loud instead of
+# silently leaving stale trust material in place.
+#
+# Args: one or more compose service names to restart if currently running.
+# =============================================================================
+_pki_restart_mesh_services() {
+  local _services=("$@")
+  log_info "Leaf/intermediate rotation: propagating to running mesh services: ${_services[*]}"
+
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  local _exec_tools=()
+  command -v docker >/dev/null 2>&1 && _exec_tools+=("docker")
+  command -v podman >/dev/null 2>&1 && _exec_tools+=("podman")
+
+  if [[ ${#_exec_tools[@]} -eq 0 ]]; then
+    log_warn "Rotation propagation: no container runtime found (docker/podman) — skipping restarts"
+    log_warn "  Manual remediation: docker compose restart ${_services[*]}"
+    return 0
+  fi
+
+  local _runtime_reachable=false
+  local _svc
+  for _svc in "${_services[@]}"; do
+    local _restarted=false
+    local _tool
+    for _tool in "${_exec_tools[@]}"; do
+      local _cname
+      _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "${_svc}" 2>/dev/null)" || true
+      if [[ -n "$_cname" ]]; then
+        _runtime_reachable=true
+        log_info "  Found running ${_svc} container: ${_cname} (via ${_tool}) — restarting to pick up rotated material"
+        # FINDING-V412-RESTART-012 live-verify: podman's `restart` subcommand
+        # can refuse with "dependencies ... container state improper" when a
+        # one-shot init container (e.g. ollama-init) it depends on has
+        # already exited 0 (its correct terminal state) — a podman-compose
+        # dependency-tracking quirk, unrelated to PKI. Fall back to
+        # stop+start (proven live to work identically) rather than fail the
+        # whole rotation over an orchestration quirk.
+        if "${_tool}" restart "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} restarted (${_cname}) — rotated material now in effect"
+          _restarted=true
+        elif "${_tool}" stop "${_cname}" >/dev/null 2>&1 && "${_tool}" start "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} stopped+started (${_cname}) — rotated material now in effect (restart fallback)"
+          _restarted=true
+        else
+          log_error "Rotation propagation: both '${_tool} restart' and stop+start failed for ${_svc} (${_cname})"
+          return 1
+        fi
+        break
+      fi
+      if "${_tool}" ps -a --filter "label=com.docker.compose.project=${_proj}" --format '{{.Names}}' >/dev/null 2>&1; then
+        _runtime_reachable=true
+      fi
+    done
+    if [[ "$_restarted" == "false" ]]; then
+      if [[ "$_runtime_reachable" == "true" ]]; then
+        log_info "  ${_svc} container not running — rotated material will be used at next start (no action needed now)"
+      else
+        log_error "Rotation propagation: could not determine ${_svc} container state"
+        log_error "  Every available runtime (${_exec_tools[*]}) failed to respond to 'ps' for project '${_proj}'."
+        log_error "  This is NOT the same as '${_svc} is not running' — do not assume the rotated material is safe."
+        log_error "  Manual remediation: verify the runtime is reachable, then restart ${_svc} manually."
+        return 1
+      fi
+    fi
+  done
 
   return 0
 }
@@ -16478,6 +16597,17 @@ handle_offboard_subcommand() {
 
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
+  # FINDING-V412-RESTART-012: this maintenance entrypoint runs standalone (no
+  # full install(), no prior resolve_compose_cmd()/COMPOSE_PROJECT_NAME
+  # resolution). The rotate-leaves/rotate-intermediate branches below need
+  # both to actually propagate a rotation into a RUNNING stack instead of
+  # just printing a hint. Resolve them here, defensively, if not already set.
+  if [[ -z "${COMPOSE_PROJECT_NAME:-}" && -f "${WORK_DIR}/docker/.env" ]]; then
+    COMPOSE_PROJECT_NAME="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2-)"
+    [[ -n "$COMPOSE_PROJECT_NAME" ]] && export COMPOSE_PROJECT_NAME
+  fi
+  resolve_compose_cmd 2>/dev/null || true
+
   case "$PKI_ACTION" in
     bootstrap)
       _prepare_secrets_dir_for_pki
@@ -16503,15 +16633,42 @@ handle_pki_subcommand() {
       # offboard-triggered path (install.sh --pki-action rotate-leaves) therefore
       # left keys unreadable by their owning containers.
       _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-leaves — keys may be unreadable by containers"; return 1; }
-      log_success "Leaf certs rotated — restart services to pick up new certs"
-      log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
+      # FINDING-V412-RESTART-012 (full live reproduction + fix, 2026-07-20):
+      # this used to be a printed hint only ("restart these services
+      # yourself") — and the hint itself was wrong (told the operator to
+      # "restart postgres", which does not resync PGDATA; a bare restart
+      # does not re-run docker-entrypoint-initdb.d/* against an
+      # already-initialized data dir) and incomplete (omitted caddy, which
+      # live-testing proved ALSO needs a restart — it independently caches
+      # its upstream mTLS trust and was found rejecting backoffice's rotated
+      # leaf with "x509: certificate signed by unknown authority" until
+      # restarted). Now automated + fail-loud instead of a hope-the-operator-
+      # reads-the-log hint.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-leaves: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-leaves: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Leaf certs rotated and propagated to every running mesh service"
       ;;
     rotate-intermediate)
       log_step "-" "Rotating intermediate + leaf certs"
       _pki_run_issuer rotate-intermediate \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Intermediate + leaves rotated — restart the stack"
+      _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-intermediate — keys may be unreadable by containers"; return 1; }
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-intermediate: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-intermediate: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Intermediate + leaves rotated and propagated to every running mesh service"
       ;;
     rotate-root)
       log_warn "Root CA rotation is DESTRUCTIVE — every service's trust bundle"
