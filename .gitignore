@@ -23,6 +23,11 @@ docker/secrets/
 # rootless bind-mount fails on a missing host path); contents never committed.
 docker/secrets-caddy/*
 !docker/secrets-caddy/.gitkeep
+# FINDING-V412-RESTART-012: postgres-ONLY root-attestation pin (ca_root.attested_sha256).
+# Directory tracked via .gitkeep (same Podman rootless rationale as above); contents
+# never committed. No other compose service mounts this path — see docker-compose.yml.
+docker/secrets-pki-attest/*
+!docker/secrets-pki-attest/.gitkeep
 docker/.yashigani-install-state
 # docker/cdi/ — install-generated CDI spec (hardware-specific, task #40)
 docker/cdi/
@@ -98,6 +103,8 @@ backups/*
 docker/secrets/
 docker/secrets-caddy/*
 !docker/secrets-caddy/.gitkeep
+docker/secrets-pki-attest/*
+!docker/secrets-pki-attest/.gitkeep
 
 # Any secret files
 *.secret

@@ -14,10 +14,25 @@
 #       PINNED root before install. Reject loud otherwise.
 #     - root rotation (root changed): no prior root to chain to (self-signed)
 #       — require an explicit operator-attested pin
-#       (/run/secrets/ca_root.attested_sha256), written ONLY by install.sh's
-#       `--pki-action=rotate-root` ceremony (host-shell + typed-YES
-#       confirmation — a compromised container cannot produce this file).
-#       Reject loud otherwise.
+#       (/run/secrets-pki-attest/ca_root.attested_sha256), written ONLY by
+#       install.sh's `--pki-action=rotate-root` ceremony (host-shell +
+#       typed-YES confirmation — a compromised container cannot produce this
+#       file). Reject loud otherwise.
+#
+#   FINDING-V412-RESTART-012 (2026-07-21): the attestation file previously
+#   lived at /run/secrets/ca_root.attested_sha256 — inside the SAME shared
+#   docker/secrets/ directory that backoffice (and every other mesh service)
+#   also mounts. Laura proved the RO mount was not enforced for backoffice on
+#   podman-compose, so a compromised backoffice could forge this file via the
+#   same write primitive that overwrites ca_root.crt (laura-012-rogue-
+#   reattack.md, Attack 3). Fixed at TWO independent layers: (a) the RO-mount
+#   bug itself is closed (docker-compose.yml backoffice volumes — /run/secrets
+#   is now a pure :ro mount, no nested :rw children), AND (b) the attestation
+#   file has been relocated to a dedicated, postgres-ONLY host directory
+#   (docker/secrets-pki-attest/) that no other compose service mounts at all
+#   — see YASHIGANI_PG_ATTEST_DIR below. Even a future regression of (a) on
+#   ANY service cannot forge this file, because nothing but postgres can see
+#   the directory it lives in.
 #     - server leaf: must openssl-verify against the (now-verified) trust
 #       bundle, and its public key must match its own private key, before
 #       install. Reject loud otherwise.
@@ -151,11 +166,16 @@ _assemble_trust_bundle() {
 # interactive typed-YES confirmation (install.sh:handle_pki_subcommand,
 # rotate-root case) before it writes a NEW root at all. Immediately after a
 # successful rotate-root, install.sh stamps the sha256 of the new root into
-# /run/secrets/ca_root.attested_sha256 (also host-written, RO to every
-# container). A compromised mesh service (Laura's threat model — TA-3/TA-4,
-# no host shell, capabilities dropped, no docker socket) can overwrite
-# ca_root.crt itself but can NEVER produce a matching attestation file — so
-# a rogue root swap is provably rejectable here.
+# ${_ATTEST_DIR}/ca_root.attested_sha256 — a host-written file in a
+# DEDICATED, postgres-ONLY mount (FINDING-V412-RESTART-012: no longer inside
+# the shared docker/secrets/ tree — see YASHIGANI_PG_ATTEST_DIR below). A
+# compromised mesh service (Laura's threat model — TA-3/TA-4, no host shell,
+# capabilities dropped, no docker socket) can overwrite ca_root.crt itself
+# (it's in the flat, widely-mounted secrets dir) but can NEVER reach — let
+# alone produce — a matching attestation file: no container but postgres has
+# this directory mounted at all, at any permission. A rogue root swap is
+# provably rejectable here even if some OTHER service's /run/secrets RO
+# enforcement regresses in the future.
 #
 # Intermediate rotation under an UNCHANGED root is the common, safe case this
 # whole finding class exists to fix (leaf/intermediate renewal without a full
@@ -163,8 +183,14 @@ _assemble_trust_bundle() {
 # the incoming intermediate against the (pinned, unchanged) root.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# YASHIGANI_PG_ATTEST_DIR: override point for offline testing only (same
+# rationale as YASHIGANI_PG_SECRETS_DIR above). Defaults to the dedicated,
+# postgres-ONLY mount (docker-compose.yml / postgres.yaml) — NOT under
+# /run/secrets, and not shared with any other compose service or K8s volume.
+_ATTEST_DIR="${YASHIGANI_PG_ATTEST_DIR:-/run/secrets-pki-attest}"
+
 _PINNED_ROOT_FILE="${PGDATA}/.ysg_pinned_root_sha256"
-_ATTESTED_ROOT_FILE="${_SECRETS_DIR}/ca_root.attested_sha256"
+_ATTESTED_ROOT_FILE="${_ATTEST_DIR}/ca_root.attested_sha256"
 
 _new_root_sha="$(_sha256_of "${_SECRETS_DIR}/ca_root.crt")"
 _pinned_root_sha=""

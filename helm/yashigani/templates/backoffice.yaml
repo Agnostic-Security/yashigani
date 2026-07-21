@@ -207,6 +207,18 @@ spec:
               value: "https://yashigani-policy:8181"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
+            # FINDING-V412-RESTART-012: on docker/podman-compose, /run/secrets
+            # is now a pure :ro mount and the 4 dev-mode-fallback credential
+            # writes (admin_initial_password etc.) + the license-key write go
+            # to a SEPARATE /run/secrets-rw mount instead (see docker-compose.yml
+            # + auth/bootstrap.py write_docker_secrets()). On K8s, /run/secrets
+            # is ALREADY a genuinely writable emptyDir (seeded by the
+            # copy-pki-to-writable initContainer above) — there is no nested
+            # bind-mount to regress, so writes stay at the SAME path here.
+            # Without this override the Python default (/run/secrets-rw) would
+            # resolve to a path that doesn't exist in this pod.
+            - name: YASHIGANI_SECRETS_RW_DIR
+              value: "/run/secrets"
             - name: YASHIGANI_DEPLOYMENT_STREAM
               value: {{ (.Values.gateway.env | default dict).deploymentStream | quote }}
             {{- if .Values.mtls.enabled }}
