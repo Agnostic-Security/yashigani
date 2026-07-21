@@ -220,6 +220,50 @@ class TestC3DuplicateAgentAborts:
 
 
 # ---------------------------------------------------------------------------
+# C3-b — reserved base-compose-service-name collision guard
+# (onboarding-robustness batch finding #3, Su, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+class TestC3bReservedServiceName:
+    """C3-b (HIGH): metadata.name colliding with an existing base compose
+    service (e.g. the bundled "demo-mcp" opt-in demo upstream) must abort
+    codegen — proven live: Docker Compose v5.1.3 hard-rejects the resulting
+    duplicate security_opt/cap_drop merge ("services.demo-mcp.security_opt
+    items at 0 and 1 are equal"), refusing to start the whole stack."""
+
+    def test_reserved_name_aborts_shape_a(self) -> None:
+        from yashigani.manifest.codegen import CodegenEngine, CodegenError, reset_codegen_registry
+        reset_codegen_registry()
+        p = copy.deepcopy(_BASE_PARSED)
+        p["metadata"]["name"] = "demo-mcp"
+        with pytest.raises(CodegenError) as exc_info:
+            CodegenEngine(p, "docker").render(dry_run=True)
+        assert exc_info.value.code == "C3b_reserved_service_name"
+
+    def test_reserved_name_aborts_for_every_base_service(self) -> None:
+        """Every enumerated base-compose service name is rejected, not just
+        the one live-reproduced example (SOP-0 — audited, not guessed)."""
+        from yashigani.manifest.codegen import (
+            CodegenEngine, CodegenError, reset_codegen_registry,
+        )
+        from yashigani.manifest.linter import _RESERVED_BASE_SERVICE_NAMES
+        for reserved in sorted(_RESERVED_BASE_SERVICE_NAMES):
+            reset_codegen_registry()
+            p = copy.deepcopy(_BASE_PARSED)
+            p["metadata"]["name"] = reserved
+            with pytest.raises(CodegenError) as exc_info:
+                CodegenEngine(p, "docker").render(dry_run=True)
+            assert exc_info.value.code == "C3b_reserved_service_name", reserved
+
+    def test_non_reserved_name_passes(self) -> None:
+        from yashigani.manifest.codegen import CodegenEngine, reset_codegen_registry
+        reset_codegen_registry()
+        p = copy.deepcopy(_BASE_PARSED)
+        p["metadata"]["name"] = "hermes-agent"
+        CodegenEngine(p, "docker").render(dry_run=True)  # no exception
+
+
+# ---------------------------------------------------------------------------
 # C10 — Caddy validator injectable (HIGH ship-gate)
 # ---------------------------------------------------------------------------
 

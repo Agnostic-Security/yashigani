@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlsplit
 
-from yashigani.manifest.linter import _is_private_address
+from yashigani.manifest.linter import _is_private_address, _RESERVED_BASE_SERVICE_NAMES
 
 _log = logging.getLogger(__name__)
 
@@ -239,6 +239,38 @@ def reset_codegen_registry() -> None:
     Call between independent onboard sessions."""
     _SEEN_PAIRS.clear()
     _SEEN_MESH_PORTS.clear()
+
+
+def _assert_not_reserved_service_name(agent_id: str) -> None:
+    """
+    C3-b (HIGH, onboarding-robustness batch finding #3, Su, 2026-07-21):
+    reject an agent_id that collides with a service already defined in
+    docker/docker-compose.yml or one of its opt-in overlays.
+
+    Single source of truth: _RESERVED_BASE_SERVICE_NAMES lives in
+    linter.py (_lint_reserved_service_name is the primary gate — it runs
+    before codegen in the real onboarding flow, mcp_onboard.py.
+    _validate_manifest_or_raise). This is the defence-in-depth mirror for
+    any caller that constructs a CodegenEngine*/render() directly.
+
+    Raises:
+        CodegenError: C3b_reserved_service_name
+    """
+    if agent_id in _RESERVED_BASE_SERVICE_NAMES:
+        raise CodegenError(
+            "C3b_reserved_service_name",
+            "agent name %r collides with a service already defined in "
+            "docker/docker-compose.yml (or an opt-in overlay). The generated "
+            "compose override's services.%s: stanza would merge against the "
+            "EXISTING base service of the same name — Docker Compose hard-"
+            "rejects the resulting duplicate security_opt/cap_drop entries "
+            "at config-parse time (\"services.%s.security_opt items at 0 "
+            "and 1 are equal\"), refusing to start the whole stack. Choose "
+            "a different metadata.name; reserved names: %s." % (
+                agent_id, agent_id, agent_id,
+                ", ".join(sorted(_RESERVED_BASE_SERVICE_NAMES)),
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3414,8 +3446,13 @@ def _gen_svid_sidecar_service(
 
     Security:
       - ``user: "1002:2003"`` — UID 1002 (svid-sidecar), PRIMARY GID 2003
-        (svid GID).  Files written inherit GID 2003 → Caddy reads via
-        ``group_add: ["2003"]`` (emitted in the caddy stanza).
+        (svid GID).  Files written inherit GID 2003 → Caddy reads via the
+        STATIC ``group_add: ["2003"]`` on the BASE caddy: service in
+        docker/docker-compose.yml (batch-finding #3: this used to be
+        re-emitted per-agent here, which duplicated the value across every
+        Shape-C override file and hard-failed Docker Compose's merge —
+        "services.caddy.group_add items at 0 and 1 are equal" — once 2+
+        Shape-C agents were onboarded together).
       - ``read_only: true`` — root FS read-only; writable paths are the SVID
         named volume + the ringfence-ready tmpfs.
       - ``caddy_internal`` network ONLY — no ringfence bridge access; no
@@ -3452,7 +3489,8 @@ def _gen_svid_sidecar_service(
         "        source: %s" % init_dir_host,
         "        target: /init",
         "        read_only: true",
-        "      # SVID named volume (rw): sidecar writes; Caddy reads via group_add 2003.",
+        "      # SVID named volume (rw): sidecar writes; Caddy reads via the static",
+        "      # base group_add 2003 (docker/docker-compose.yml — batch-finding #3).",
         "      - %s:%s" % (svid_vol, svid_dir),
     ]
     if runtime == "podman-rootless":
@@ -3467,7 +3505,9 @@ def _gen_svid_sidecar_service(
         "      - caddy_internal",
         "    # UID 1002 (svid-sidecar image USER), primary GID 2003 (svid GID).",
         "    # Files written by rotate.sh inherit GID 2003 (belt+suspenders: rotate.sh",
-        "    # also does chown :2003 explicitly).  Caddy reads via group_add: [\"2003\"].",
+        "    # also does chown :2003 explicitly).  Caddy reads via the static base",
+        "    # group_add: [\"2003\"] (docker/docker-compose.yml, batch-finding #3 —",
+        "    # NOT re-declared per-agent anymore, see the caddy: stanza above).",
         '    user: "1002:%d"' % _MCP_SVID_GID,
         "    security_opt:",
         "      - no-new-privileges:true",
@@ -3718,17 +3758,38 @@ def _gen_compose_override_shape_c(
         "  # supp-group %d (shared with the svid-sidecar, _MCP_SVID_GID)." % _MCP_SVID_GID,
         "  # Key mode: 0440 (owner-read + group-read). NOT 0400, NOT 0444.",
         "  # Su: rotate.sh must chmod 0440 + chown :%d the key after each write." % _MCP_SVID_GID,
+        "  #",
+        "  # FINDING-V412-CADDYADMIN-002-e / batch-finding #3 (Su, 2026-07-21):",
+        "  # group_add: [\"%d\"] is intentionally NOT emitted here anymore. It used" % _MCP_SVID_GID,
+        "  # to be repeated in EVERY Shape-C agent's override (this is a fixed",
+        "  # constant, not agent-specific), so onboarding >=2 Shape-C MCPs (or any",
+        "  # sequence of onboard/offboard/re-onboard that leaves 2+ agent override",
+        "  # files live) fed `docker compose -f base -f agent1-override -f",
+        "  # agent2-override ...` with the SAME group_add value declared twice for",
+        "  # the shared `caddy:` service. Docker Compose v2 hard-validates",
+        "  # uniqueness for THIS specific attribute (confirmed live, compose",
+        "  # v5.1.3): \"services.caddy.group_add items at 0 and 1 are equal\" -- a",
+        "  # config-parse error that refuses to start ANYTHING, not a soft warning",
+        "  # (podman-compose silently tolerates the duplicate; Docker does not --",
+        "  # this is a real cross-runtime divergence, not a hypothetical). The",
+        "  # fix: GID %d is now a STATIC, always-present group_add on the BASE" % _MCP_SVID_GID,
+        "  # caddy: service in docker/docker-compose.yml (harmless no-op when no",
+        "  # Shape-C MCP is onboarded — the GID reads nothing until an SVID volume",
+        "  # exists) instead of being re-declared identically in every per-agent",
+        "  # override. `networks:`/`volumes:` below stay per-agent (each entry's",
+        "  # VALUE is unique per agent — a distinct ringfence bridge / SVID volume",
+        "  # name -- so compose's plain list-append merge for those keys is safe;",
+        "  # only a REPEATED IDENTICAL value like the fixed GID hit this class).",
         "  caddy:",
         "    networks:",
         "      - %s" % ringfence_bridge,
         "    # SVID volume: per-instance leaf+key written by the svid-sidecar.",
         "    # Sidecar mounts this same volume at the same path with SVID_DIR set.",
-        "    # Key perm: 0440 GID %d — Caddy reads via group_add below." % _MCP_SVID_GID,
+        "    # Key perm: 0440 GID %d — Caddy reads via the STATIC base group_add" % _MCP_SVID_GID,
+        "    # (docker/docker-compose.yml), not a per-agent override (see above).",
         "    volumes:",
         "      - %s:/run/secrets/svid/%s/%s" % (
             _mcp_svid_volume_name(tenant_id, agent_name), tenant_id, agent_name),
-        "    group_add:",
-        '      - "%d"' % _MCP_SVID_GID,
         "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
         "# Phase 1b-ii SVID volume: sidecar + Caddy share this; key mode 0440 GID %d." % _MCP_SVID_GID,
@@ -4701,6 +4762,20 @@ class CodegenEngineShapeC:
                 "(default %d)." % (self._agent_id, listen_port, _SC_BRIDGE_PORT),
             )
 
+        # C3-b (onboarding-robustness batch finding #3, Su, 2026-07-21):
+        # metadata.name must not collide with a reserved base-compose-
+        # service name (e.g. the bundled "demo-mcp" opt-in demo upstream —
+        # the LIVE failure this closes). The linter (_lint_reserved_service_
+        # name) already rejects this at manifest-lint time for the real
+        # onboarding flow (mcp_onboard.py._validate_manifest_or_raise runs
+        # BEFORE codegen); this is a defence-in-depth re-check here — same
+        # posture as _assert_unique_agent_pair (C3) — so a caller that
+        # invokes CodegenEngineShapeC directly, bypassing the linter, still
+        # cannot generate a compose override that collides with an existing
+        # service and hard-fails `docker compose config`
+        # ("services.<name>.security_opt items at 0 and 1 are equal").
+        _assert_not_reserved_service_name(self._agent_id)
+
     def render(
         self,
         *,
@@ -4971,6 +5046,11 @@ class CodegenEngine:
 
         # C3 — duplicate pair check
         _assert_unique_agent_pair(self._tenant_id, self._agent_id)
+
+        # C3-b — reserved base-compose-service-name collision guard
+        # (onboarding-robustness batch finding #3, Su, 2026-07-21 — see
+        # _assert_not_reserved_service_name docstring)
+        _assert_not_reserved_service_name(self._agent_id)
 
         agent_name = self._agent_id
         mhash = self._manifest_hash

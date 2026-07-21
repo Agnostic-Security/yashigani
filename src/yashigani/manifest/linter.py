@@ -773,6 +773,77 @@ def _lint_name_uniqueness(parsed: dict) -> list[LintError]:
 
 
 # ---------------------------------------------------------------------------
+# C3-b — reserved base-compose-service-name collision guard
+# (onboarding-robustness batch finding #3, Su, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+# Every `services:` key defined in docker/docker-compose.yml and the compose
+# overlay/variant files it ships (release/podman/wazuh/gpu/extractor
+# overlays) — enumerated live via `python3 -c "import yaml; ..."` against
+# each file (SOP-0: enumerate before edit), NOT guessed. codegen.py renders
+# a per-agent `docker/<agent_name>-compose.override.yml` whose top-level
+# `services: <agent_name>:` key is merged by `docker compose -f ...` directly
+# against these names. If an operator onboards an MCP/agent whose
+# metadata.name collides with one of these (the reported live case: an
+# agent named "demo-mcp" — coincidentally identical to the bundled
+# opt-in `demo-mcp` demo/`profiles: [demo-mcp]` upstream service, itself
+# already carrying `security_opt: [no-new-privileges:true]` +
+# `cap_drop: [ALL]`), the generated override's OWN identical
+# `security_opt`/`cap_drop` entries collide with the base service's when
+# compose merges the two files for the SAME service key. Docker Compose v2
+# hard-rejects this at config-parse time (confirmed live, compose v5.1.3):
+#   "services.demo-mcp.security_opt items at 0 and 1 are equal"
+# — refusing to start ANYTHING, not a soft warning. There is no safe
+# "merge"/dedupe fix here: two independently-authored services sharing one
+# literal compose service name is a genuine identity collision (the
+# operator's new agent and the bundled demo upstream would be
+# indistinguishable to compose/build/image resolution), so the correct fix
+# is to reject the onboarding outright with a clear, actionable error —
+# never to let a colliding override silently reach disk.
+_RESERVED_BASE_SERVICE_NAMES: frozenset[str] = frozenset({
+    # docker/docker-compose.yml (the base file every runtime starts from)
+    "agent-db-init", "alertmanager", "backoffice", "budget-redis", "caddy",
+    "caddy-config-broker", "demo-mcp", "extractor-svc", "gateway", "grafana",
+    "jaeger", "keycloak", "langflow", "letta", "letta-pgbouncer", "loki",
+    "ollama", "ollama-init", "openclaw", "otel-collector", "pgbouncer",
+    "policy", "postgres", "prometheus", "promtail", "redis", "step-ca",
+    "vault", "wazuh-dashboard", "wazuh-indexer", "wazuh-manager",
+    # docker/docker-compose.wazuh.yml (opt-in overlay)
+    "wazuh-security-init",
+    # docker/docker-compose.extractor.yml (opt-in overlay)
+    "extractor",
+})
+
+
+def _lint_reserved_service_name(parsed: dict) -> list[LintError]:
+    """
+    C3-b (HIGH): metadata.name must not collide with a service name already
+    defined in docker/docker-compose.yml or one of its opt-in overlay
+    variants — see module comment on _RESERVED_BASE_SERVICE_NAMES for the
+    live failure this closes (FINDING-V412 onboarding-robustness batch #3).
+    """
+    metadata = parsed.get("metadata") or {}
+    name = metadata.get("name", "")
+    if name and name in _RESERVED_BASE_SERVICE_NAMES:
+        return [LintError(
+            "C3b_reserved_service_name",
+            "metadata.name %r collides with a service already defined in "
+            "docker/docker-compose.yml (or an opt-in overlay). Onboarding an "
+            "agent under this name generates a compose override that "
+            "compose will try to merge into the EXISTING service of the "
+            "same name — Docker Compose hard-rejects the resulting "
+            "duplicate security_opt/cap_drop entries at config-parse time "
+            "(\"services.%s.security_opt items at 0 and 1 are equal\"), "
+            "refusing to start the whole stack." % (name, name),
+            field="metadata.name",
+            fix="Choose a different metadata.name that does not match any "
+                "reserved Yashigani service name: %s." % ", ".join(
+                    sorted(_RESERVED_BASE_SERVICE_NAMES)),
+        )]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # M7 — signature gate (delegates to signatures.py)
 # ---------------------------------------------------------------------------
 
@@ -1103,6 +1174,9 @@ def validate_manifest(
 
     # C3 — name/tenant_id presence
     errors.extend(_lint_name_uniqueness(parsed))
+
+    # C3-b — reserved base-compose-service-name collision guard
+    errors.extend(_lint_reserved_service_name(parsed))
 
     # P2 — gateway-enforced-only forbidden for CONFIDENTIAL/RESTRICTED
     errors.extend(_lint_identity_propagation_p2(parsed))

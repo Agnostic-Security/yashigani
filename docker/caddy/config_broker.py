@@ -749,10 +749,29 @@ class BrokerHandler(http.server.BaseHTTPRequestHandler):
                 dest = _write_route_file(tenant_id, server_id, snippet)
                 try:
                     _trigger_reload()
-                except BrokerError:
+                except Exception:
                     # Roll back the write — never leave an unreloaded/orphan
                     # file behind that a LATER reload (e.g. container
-                    # restart) could pick up unreviewed.
+                    # restart, or Caddy's own boot-time import) could pick up
+                    # unreviewed.
+                    #
+                    # FINDING-V412-CADDYADMIN-002 part 2 (Ava/Maxine,
+                    # 2026-07-21): this used to catch only `BrokerError`, but
+                    # `_trigger_reload` -> `_forward_caddyfile_to_real_admin`
+                    # dials a real unix socket and can raise RAW transport
+                    # errors that are NOT BrokerError instances — e.g.
+                    # `ConnectionRefusedError`/`FileNotFoundError` (admin
+                    # socket not up yet), `socket.timeout`, or
+                    # `http.client.RemoteDisconnected` (admin process
+                    # restarting mid-request). Any of those left the
+                    # just-written route file on disk with NO corresponding
+                    # successful reload — exactly the dangling/orphan file
+                    # class that caddy-entrypoint.sh's boot-time quarantine
+                    # logic has to work around later. Broadening this to
+                    # `except Exception` (still re-raised unchanged — the
+                    # outer handler's BrokerError-vs-500 classification is
+                    # unaffected) closes the write-succeeds/reload-fails
+                    # window regardless of the failure's exception type.
                     _delete_route_file(tenant_id, server_id)
                     raise
             except BrokerError as exc:
