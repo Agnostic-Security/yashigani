@@ -236,6 +236,45 @@ POSTAL_ADDRESS_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Person name — context-sensitive (RESTART-013 gap #2)
+# ---------------------------------------------------------------------------
+# FINDING-V412-RESTART-013: a document classified PII.SSN + PII.EMAIL but left
+# a person's name ("Alice Zhang" under a "Name:" label) in cleartext through
+# both REDACT and PSEUDONYMIZE. Free-text personal names have no fixed shape a
+# context-FREE regex can safely key on (any Title-Case bigram is a plausible
+# name AND a plausible non-name — "Report Summary", "New York" — so an
+# unconditional pattern would over-redact prose). We therefore mirror the
+# DATE_OF_BIRTH design: require a NAME-LABEL context keyword immediately
+# before the value (the overwhelmingly common real-world shape for a document
+# that identifies a person: "Name:", "Patient:", "Employee Name:", "Dear
+# <name>,") so bare capitalised prose is never touched.
+#
+# Each pattern below carries a CAPTURE GROUP around the name value only (the
+# label itself, e.g. "Name:", is never part of the match/redaction span — see
+# detector.py:_scan, which prefers group(1) when the compiled pattern has one).
+# `(?i:...)` is a Python 3.6+ scoped inline flag: it makes ONLY the label
+# alternation case-insensitive ("NAME:", "name:", "Name:" all match) while the
+# name-value part stays case-SENSITIVE (each word must start with an uppercase
+# letter) — the load-bearing signal that keeps this from matching ordinary
+# lowercase prose after a label.
+_PERSON_NAME_LABEL = (
+    r"(?i:(?:[A-Za-z]+\s+)?name|patient|customer|employee|client|contact|"
+    r"attn|attention|account\s+holder|cardholder|policyholder|applicant|"
+    r"next\s+of\s+kin|guardian)"
+)
+# Word separator is [ \t]+ (NOT \s+) so a multi-line document's next line —
+# which often also starts with a capitalised word ("Alice Zhang\nEnd of
+# record.") — is never absorbed into the same name match across a newline.
+_PERSON_NAME_VALUE = r"([A-Z][a-zA-Z'\-]+(?:[ \t]+[A-Z][a-zA-Z'\-]+){1,3})"
+
+PERSON_NAME_PATTERNS: list[re.Pattern[str]] = [
+    # "Name:", "Patient Name:", "Employee:", "Attn:", ... <Firstname Lastname...>
+    re.compile(rf"\b{_PERSON_NAME_LABEL}\s*:\s*{_PERSON_NAME_VALUE}"),
+    # "Dear <Firstname Lastname...>," / ":" salutation
+    re.compile(rf"\bDear\s+{_PERSON_NAME_VALUE}\s*[,:]"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Registry — maps PiiType string key to its pattern list
@@ -255,4 +294,5 @@ PATTERN_REGISTRY: dict[str, list[re.Pattern[str]]] = {
     "DATE_OF_BIRTH":        DATE_OF_BIRTH_PATTERNS,
     "NATIONAL_INSURANCE":   NATIONAL_INSURANCE_PATTERNS,
     "POSTAL_ADDRESS":       POSTAL_ADDRESS_PATTERNS,
+    "PERSON_NAME":          PERSON_NAME_PATTERNS,
 }

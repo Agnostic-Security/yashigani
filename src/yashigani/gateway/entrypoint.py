@@ -863,6 +863,15 @@ def _build_app(mesh_mode: bool = False):
         kms_provider=kms_provider,
         permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
         rbac_store=rbac_store,               # W3-008 — RBAC group membership backfill
+        # FINDING-V412-RESTART-013 gap #6 — the SAME document_pipeline singleton
+        # passed to create_gateway_app() below (proxy egress + mcp_router_runtime's
+        # /mcp/<agent_name> HTTP entrypoint) is mirrored onto the openai_router
+        # module-level _state so gateway/orchestrator.py:_execute_mcp_tool (the
+        # chat->MCP tool-dispatch path, which has no access to proxy.py's
+        # per-request state dict) can also enforce document REDACT/PSEUDONYMIZE/
+        # BLOCK on outbound tool-call arguments. None when mode-B-proxy is not
+        # opted in (dark) — unchanged pre-fix behaviour.
+        document_pipeline=document_pipeline,
     )
 
     # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────

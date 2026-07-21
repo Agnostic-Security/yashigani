@@ -47,6 +47,8 @@ class TestEnums:
             "PASSPORT", "NHS_NUMBER", "DRIVERS_LICENCE", "IP_ADDRESS", "DATE_OF_BIRTH",
             # L-01 / red-team F2 breadth: identifying/QI classes for documents.
             "NATIONAL_INSURANCE", "POSTAL_ADDRESS",
+            # RESTART-013 gap #2: person names were never a detected class.
+            "PERSON_NAME",
         }
         assert {t.value for t in PiiType} == expected
 
@@ -619,6 +621,96 @@ class TestPiiFindingFields:
         # Middle section "3-45-67" must not appear literally
         middle = raw_ssn[2:-2]
         assert middle not in f.masked_value
+
+
+# ---------------------------------------------------------------------------
+# PERSON_NAME detection (RESTART-013 gap #2)
+# ---------------------------------------------------------------------------
+# FINDING-V412-RESTART-013: a document classified PII.SSN + PII.EMAIL correctly
+# but left "Name: Alice Zhang" in cleartext under both REDACT and PSEUDONYMIZE
+# — the exact reproduction fixture from the finding is used below.
+
+class TestPersonNameDetection:
+    EMPLOYEE_RECORD = (
+        "Employee record.\n"
+        "SSN: 123-45-6789\n"
+        "Email: alice@acme.com\n"
+        "Name: Alice Zhang\n"
+        "End of record.\n"
+    )
+
+    def test_name_label_detected(self):
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process(self.EMPLOYEE_RECORD)
+        assert result.detected is True
+        assert len(result.findings) == 1
+        f = result.findings[0]
+        assert f.pii_type == PiiType.PERSON_NAME
+
+    def test_name_span_is_value_only_not_label(self):
+        """The finding span must cover 'Alice Zhang' only — never the 'Name:'
+        label — matching the existing SSN/EMAIL redaction shape (label stays
+        cleartext, only the sensitive value is replaced)."""
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process(self.EMPLOYEE_RECORD)
+        f = result.findings[0]
+        matched_span = self.EMPLOYEE_RECORD[f.start:f.end]
+        assert matched_span == "Alice Zhang"
+
+    def test_redact_mode_removes_name_from_document(self):
+        """Full finding-reproduction proof: with all types enabled (the real
+        deployment default), REDACT must strip SSN, EMAIL, AND the name —
+        'Alice Zhang' left cleartext was the exact bug."""
+        det = PiiDetector(mode=PiiMode.REDACT)
+        redacted, result = det.process(self.EMPLOYEE_RECORD)
+        assert result.detected is True
+        assert "123-45-6789" not in redacted
+        assert "alice@acme.com" not in redacted
+        assert "Alice Zhang" not in redacted
+        assert "[REDACTED:PERSON_NAME]" in redacted
+        # The label itself survives — only the value is stripped.
+        assert "Name: [REDACTED:PERSON_NAME]" in redacted
+        types = {f.pii_type for f in result.findings}
+        assert PiiType.SSN in types and PiiType.EMAIL in types and PiiType.PERSON_NAME in types
+
+    def test_pseudonymize_mode_removes_name_from_document(self):
+        det = PiiDetector(mode=PiiMode.PSEUDONYMIZE)
+        pseudo, result = det.process(self.EMPLOYEE_RECORD)
+        assert result.detected is True
+        assert "Alice Zhang" not in pseudo
+        assert "[PSEUDONYMIZED:PERSON_NAME]" in pseudo
+        assert "Name: [PSEUDONYMIZED:PERSON_NAME]" in pseudo
+
+    def test_dear_salutation_detected(self):
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process("Dear Bob Smith, thank you for your enquiry.")
+        assert result.detected is True
+        assert result.findings[0].masked_value != "****"  # real span captured
+
+    def test_patient_label_detected(self):
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process("Patient: John Doe\nDOB: n/a")
+        assert result.detected is True
+
+    def test_bare_lowercase_prose_not_flagged(self):
+        """No label context → no match. Prevents over-redaction of ordinary
+        capitalised prose ('New York', 'Report Summary')."""
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process("The New York office issued a Report Summary.")
+        assert result.detected is False
+
+    def test_lowercase_value_after_label_not_flagged(self):
+        """The name VALUE must be Title-Case — a label followed by lowercase
+        text (e.g. a filename) must not be treated as a person's name."""
+        det = PiiDetector(enabled_types={PiiType.PERSON_NAME})
+        _, result = det.process("File name: report_final_v2.docx")
+        assert result.detected is False
+
+    def test_data_class_is_pii_person_name(self):
+        """The document pipeline builds data_class = f'PII.{pii_type.value}' —
+        confirm the enum value produces the class field_role.py already
+        expects ('PERSON_NAME' is pre-listed in _REFERENCE_ONLY_CLASSES)."""
+        assert PiiType.PERSON_NAME.value == "PERSON_NAME"
 
 
 # ---------------------------------------------------------------------------

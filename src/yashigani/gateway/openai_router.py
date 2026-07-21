@@ -953,6 +953,18 @@ class OpenAIRouterState:
         self.model_alias_store = None        # ModelAliasStore | None
         self.response_inspection_pipeline = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
+        # FINDING-V412-RESTART-013 gap #6: DocumentInspectionPipeline | None.
+        # Same singleton instance entrypoint.py builds and hands to
+        # create_gateway_app()'s state["document_pipeline"] (proxy egress +
+        # gateway/mcp_router_runtime.py's /mcp/<agent_name> HTTP entrypoint).
+        # Mirrored here so the chat->MCP tool-dispatch path
+        # (gateway/orchestrator.py:_execute_mcp_tool) — which has NO access to
+        # proxy.py's per-request `state` dict, only this module-level
+        # singleton — can also invoke document REDACT/PSEUDONYMIZE/BLOCK
+        # enforcement on tool-call arguments before they leave the ring-fence.
+        # None (default/dark, mode-B-proxy opt-in flag off) preserves the
+        # exact pre-fix behaviour: MCP chat-tool-call traffic is untouched.
+        self.document_pipeline = None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
         self.streaming_inspect_interval: int = 200
@@ -1167,6 +1179,7 @@ def configure(
     kms_provider=None,            # KSMProvider | None — for cloud API key resolution
     permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
     rbac_store=None,              # W3-008 — RBACStore | None (group membership backfill)
+    document_pipeline=None,       # FINDING-V412-RESTART-013 gap #6 — DocumentInspectionPipeline | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -1207,6 +1220,7 @@ def configure(
         os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
     )
     _state.rbac_store = rbac_store                         # W3-008 — group backfill
+    _state.document_pipeline = document_pipeline           # RESTART-013 gap #6
 
     # ── 4.0 Phase 3 — P1/P2 token role map (RISK-108) ──────────────────────
     # Populate from YASHIGANI_TOKEN_ROLE_MAP env var (JSON dict for dev/test):
