@@ -297,6 +297,46 @@ class HttpClient:
             raise
         kwargs.setdefault("timeout", self.timeout_s)
         kwargs.setdefault("follow_redirects", False)  # explicit opt-in only
+
+        scheme = (urlparse(url).scheme or "").lower()
+        if self.bypass_private_for_allowlisted and scheme == "https":
+            # ── FINDING N1 (v4.1.2 onboarding e2e, Ava) ──────────────────────
+            # ``bypass_private_for_allowlisted=True`` is set ONLY by
+            # ``McpHttpTransport`` (see module docstring) to reach registered
+            # ring-fenced MCP upstreams — including per-instance Caddy fronts
+            # signed by the INTERNAL CA (e.g.
+            # ``https://caddy:<mesh_port>/mcp/<tenant>/<server>``, which
+            # terminates mesh mTLS with ``client_auth require_and_verify`` —
+            # see backoffice/mcp_onboard.py:328). A bare
+            # ``httpx.AsyncClient()`` uses the DEFAULT SYSTEM trust store,
+            # which does not trust the internal CA, so verification fails
+            # (502 UPSTREAM_UNREACHABLE) even though the agent is reachable
+            # and usable via the chat path.
+            #
+            # Mirror gateway/orchestrator.py:_execute_mcp_tool, which already
+            # switches to ``pki.client.internal_httpx_client()`` for
+            # ``https://`` MCP upstreams on the chat path. That helper both
+            # trusts the internal CA AND presents this service's own client
+            # cert (required by the per-instance listener's mTLS gate) — it
+            # is never a bare CA-trust-only relaxation, and ``verify=False``
+            # is never used here or anywhere in this module.
+            #
+            # This flag is the same one that already gates the RFC-1918
+            # private-IP SSRF bypass for this exact class of upstream — it is
+            # the existing "this destination is our own ring-fenced mesh"
+            # marker, so gating CA-trust selection on it (rather than on a
+            # host/IP heuristic) keeps a single source of truth and does not
+            # change behaviour for any other ``HttpClient`` caller (HIBP
+            # password checks, JWKS fetch, Open WebUI proxy, generic
+            # outbound) — those never set this flag and keep using the
+            # system CA bundle for genuinely-external hosts, unchanged.
+            from yashigani.pki.client import internal_httpx_client
+
+            async with internal_httpx_client() as client:
+                return await client.request(method, url, **kwargs)
+
+        # Genuinely-external (or non-TLS internal-bridge) traffic — default
+        # system CA trust store, unchanged from prior behaviour.
         async with httpx.AsyncClient() as client:
             return await client.request(method, url, **kwargs)
 

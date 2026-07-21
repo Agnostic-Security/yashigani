@@ -319,6 +319,93 @@ class TestDecommissionTransactionFailClosed:
         assert not override.exists()
 
 
+class TestDecommissionReleasesCodegenDedup:
+    """FINDING N2 (v4.1.2 finalized onboarding e2e, Ava, 2026-07-21):
+    decommission left the in-process codegen C3 duplicate-agent registry
+    populated, so re-onboarding the SAME server_id failed C3_duplicate_agent
+    until backoffice restarted. run_decommission_transaction must release the
+    (tenant_id, server_id) entry symmetrically with where onboarding adds it
+    (codegen._assert_unique_agent_pair)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_codegen_registry(self):
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()
+        yield
+        reset_codegen_registry()
+
+    @pytest.mark.asyncio
+    async def test_decommission_releases_registered_pair(self, dec_env):
+        from yashigani.manifest.codegen import _SEEN_PAIRS, _assert_unique_agent_pair
+
+        # Simulate onboarding having registered the pair (what
+        # approve_mcp_onboard() -> CodegenEngineShapeC.render() does).
+        _assert_unique_agent_pair(_TENANT, _SERVER)
+        assert (_TENANT, _SERVER) in _SEEN_PAIRS
+
+        svc = _svc(record=_active_record())
+        with patch(
+            "yashigani.backoffice.mcp_onboard.unregister_mcp_route",
+            new=AsyncMock(),
+        ):
+            result = await run_decommission_transaction(
+                tenant_id=_TENANT, server_id=_SERVER,
+                operator_identity="orchid", envelope_service=svc,
+                registry_store=None,
+            )
+
+        assert result.steps["codegen_dedup"] == "released"
+        assert (_TENANT, _SERVER) not in _SEEN_PAIRS
+
+    @pytest.mark.asyncio
+    async def test_decommission_when_pair_never_registered_is_idempotent(self, dec_env):
+        """Decommissioning a server_id whose codegen pair was never
+        registered in THIS process (e.g. onboarded in a prior process
+        lifetime) must not raise — the release is a no-op."""
+        svc = _svc(record=None)
+        with patch(
+            "yashigani.backoffice.mcp_onboard.unregister_mcp_route",
+            new=AsyncMock(),
+        ):
+            result = await run_decommission_transaction(
+                tenant_id=_TENANT, server_id="never-registered-in-codegen",
+                operator_identity="orchid", envelope_service=svc,
+                registry_store=None,
+            )
+        assert result.steps["codegen_dedup"] == "not_registered"
+
+    @pytest.mark.asyncio
+    async def test_onboard_decommission_reonboard_same_server_id_succeeds(self, dec_env):
+        """End-to-end contract: onboard -> decommission -> re-onboard the
+        SAME server_id must succeed (no C3_duplicate_agent), all within one
+        process (no restart) — this is the exact regression Ava hit live."""
+        from yashigani.manifest.codegen import CodegenError, _assert_unique_agent_pair
+
+        # 1) "Onboard" — codegen registers the pair (C3 guard engages).
+        _assert_unique_agent_pair(_TENANT, _SERVER)
+
+        # A duplicate onboard attempt (without decommission) is still
+        # correctly rejected — the C3 guard itself is not weakened.
+        with pytest.raises(CodegenError, match="C3_duplicate_agent"):
+            _assert_unique_agent_pair(_TENANT, _SERVER)
+
+        # 2) Decommission — must release the dedup entry as one of its steps.
+        svc = _svc(record=_active_record())
+        with patch(
+            "yashigani.backoffice.mcp_onboard.unregister_mcp_route",
+            new=AsyncMock(),
+        ):
+            result = await run_decommission_transaction(
+                tenant_id=_TENANT, server_id=_SERVER,
+                operator_identity="orchid", envelope_service=svc,
+                registry_store=None,
+            )
+        assert result.steps["codegen_dedup"] == "released"
+
+        # 3) Re-onboard the SAME server_id — must succeed now (FINDING N2).
+        _assert_unique_agent_pair(_TENANT, _SERVER)  # no raise
+
+
 class TestDecommissionComponentIsolation:
     @pytest.mark.asyncio
     async def test_only_named_server_touched_never_another_agent(self, dec_env):

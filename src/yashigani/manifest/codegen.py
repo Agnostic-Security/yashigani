@@ -241,6 +241,47 @@ def reset_codegen_registry() -> None:
     _SEEN_MESH_PORTS.clear()
 
 
+def release_agent_pair(tenant_id: str, agent_id: str) -> bool:
+    """
+    Symmetric counterpart to :func:`_assert_unique_agent_pair` (C3).
+
+    ``_assert_unique_agent_pair`` registers ``(tenant_id, agent_id)`` in the
+    in-process ``_SEEN_PAIRS`` set the FIRST time an agent is onboarded in a
+    backoffice process's lifetime, so that a second onboard of the SAME
+    server_id within the same process — without going through decommission —
+    is rejected (C3_duplicate_agent).
+
+    FINDING N2 (v4.1.2 finalized onboarding e2e, Ava, 2026-07-21): decommission
+    never released this entry, so a legitimate decommission -> re-onboard of
+    the SAME server_id failed C3_duplicate_agent until the backoffice process
+    restarted. Called from
+    ``backoffice.mcp_onboard.run_decommission_transaction`` so the in-process
+    dedup registry stays in sync with the durable registry it mirrors.
+
+    This is pure in-process bookkeeping with no security effect: C3 exists to
+    catch a single onboard SESSION silently double-registering an agent_id
+    (e.g. a retried request racing itself), not to block a legitimate
+    decommission -> re-onboard cycle for an operator-initiated removal.
+
+    Args:
+        tenant_id: same tenant_id used at onboard time.
+        agent_id:  the manifest's ``metadata.name`` / server_id — the same
+                   value passed to ``_assert_unique_agent_pair`` at onboard.
+
+    Returns:
+        True if the pair was registered and has now been removed. False if
+        the pair was never registered in this process (e.g. decommissioning
+        a server_id onboarded in a PRIOR process lifetime, or retrying an
+        already-released decommission) — idempotent, never raises for an
+        absent entry.
+    """
+    pair = (tenant_id, agent_id)
+    if pair in _SEEN_PAIRS:
+        _SEEN_PAIRS.discard(pair)
+        return True
+    return False
+
+
 def _assert_not_reserved_service_name(agent_id: str) -> None:
     """
     C3-b (HIGH, onboarding-robustness batch finding #3, Su, 2026-07-21):
