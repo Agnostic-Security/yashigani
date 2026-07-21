@@ -15291,7 +15291,7 @@ _ysg_onboard_stepup_gate() {
   read -rs _password </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read password from tty"; return 1; }
   printf "\n" >/dev/tty
 
-  printf "  TOTP code for login (6 digits): " >/dev/tty
+  printf "  TOTP code for login (6 or 8 digits per your tier): " >/dev/tty
   read -rs _totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read TOTP from tty"; return 1; }
   printf "\n" >/dev/tty
 
@@ -15301,7 +15301,7 @@ _ysg_onboard_stepup_gate() {
   # their authenticator (a fresh 30-second window).
   log_info "  Wait for the NEXT code in your authenticator (new 30-second window),"
   log_info "  then enter it below for the step-up verification."
-  printf "  TOTP code for step-up (6 digits, NEXT window): " >/dev/tty
+  printf "  TOTP code for step-up (6 or 8 digits per your tier, NEXT window): " >/dev/tty
   read -rs _stepup_totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read step-up TOTP from tty"; _username=""; _password=""; _totp=""; _stepup_totp=""; return 1; }
   printf "\n" >/dev/tty
 
@@ -15311,13 +15311,23 @@ _ysg_onboard_stepup_gate() {
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: login TOTP must be exactly 6 digits."
+  # FINDING-V412-STEPUP-TOTP-8DIGIT-REJECTED: admin-tier accounts are minted
+  # HMAC-SHA-512/8-digit (install.sh _gen_totp_uri, ~line 10500); user-tier
+  # accounts are HMAC-SHA-256/6-digit. This shell-side gate cannot know which
+  # tier the operator belongs to (it never sees the account record), so it
+  # must accept BOTH tiered lengths here. The server is the actual authority:
+  # /auth/login and /auth/stepup (src/yashigani/backoffice/routes/auth.py)
+  # already validate the exact digit count against the account's enrolled
+  # algorithm/digits after resolving the account tier — this regex is only a
+  # cheap pre-flight to avoid a wasted network round-trip on an obviously
+  # malformed code.
+  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: login TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: step-up TOTP must be exactly 6 digits."
+  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: step-up TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
