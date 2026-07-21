@@ -113,6 +113,18 @@ ENV PYTHONUNBUFFERED=1 \
     BROKER_LISTEN_MODE=unix \
     BROKER_LISTEN_SOCKET=/run/caddy-broker-route/route.sock
 
+# The broker (UID 65532) writes rendered route files into
+# /etc/caddy/agents-dynamic, which is a named volume (caddy_broker_agents). A
+# fresh named volume inherits ownership from THIS image directory at first
+# mount — so it MUST exist and be owned by 65532 here, or the volume inits
+# root:root and the nonroot broker cannot create its temp file →
+# "Permission denied" → every /route 500s (FINDING-V412-CADDYADMIN-002-d,
+# Laura). 0755 so caddy (different UID, cap_drop:[ALL]) can traverse it to
+# import the 0644 route files the broker writes.
+RUN mkdir -p /etc/caddy/agents-dynamic \
+    && chown 65532:65532 /etc/caddy/agents-dynamic \
+    && chmod 0755 /etc/caddy/agents-dynamic
+
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
