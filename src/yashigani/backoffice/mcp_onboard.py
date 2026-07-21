@@ -1304,6 +1304,16 @@ async def run_decommission_transaction(
          baseline + egress grant (Redis db/3), then re-push the egress-
          grants document so revocation (grant absence = kill switch, Nico
          Q3) is live immediately, not just on the next gateway restart.
+      2b. codegen_dedup — release the (tenant_id, server_id) entry from the
+         in-process codegen C3 duplicate-agent registry (FINDING N2, v4.1.2
+         finalized onboarding e2e, Ava, 2026-07-21). approve_mcp_onboard()
+         registers this pair on onboard via
+         codegen._assert_unique_agent_pair() so a second onboard within the
+         SAME backoffice process is rejected; without releasing it here,
+         re-onboarding the SAME server_id after a legitimate decommission
+         fails C3_duplicate_agent until the process restarts. Best-effort,
+         non-fail-closed (pure in-process bookkeeping, no access-control
+         effect) — symmetric with where onboarding adds it.
       3. route — DELETE the broker route (unregister_mcp_route): Caddy
          drops the per-instance :mesh_port wrap and reloads. Best-effort:
          even if this fails, step 1 already denies every request at the
@@ -1330,7 +1340,7 @@ async def run_decommission_transaction(
     ``container_teardown_mode`` only selects which scoped command guidance
     ``_agent_container_teardown_hint()`` returns for the operator to run.
     """
-    from yashigani.manifest.codegen import is_artifact_relevant_for_runtime
+    from yashigani.manifest.codegen import is_artifact_relevant_for_runtime, release_agent_pair
     from yashigani.pki.issuer import IssuerPaths
 
     provenance_id = "%s:%s" % (tenant_id, server_id)
@@ -1420,6 +1430,27 @@ async def run_decommission_transaction(
                 )
     else:
         steps["registry"] = "skipped_no_store"
+
+    # ── Step 2b: codegen dedup registry (FINDING N2) ─────────────────────────
+    # Symmetric release of the in-process C3 duplicate-agent guard that
+    # approve_mcp_onboard() sets via codegen._assert_unique_agent_pair().
+    # Without this, re-onboarding the SAME (tenant_id, server_id) pair in the
+    # SAME backoffice process fails C3_duplicate_agent until restart, even
+    # though the durable registry (step 2, above) and the envelope (step 1)
+    # have already been cleared.
+    try:
+        _released = release_agent_pair(tenant_id, server_id)
+        steps["codegen_dedup"] = "released" if _released else "not_registered"
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("codegen_dedup", exc)
+        steps["codegen_dedup"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: codegen dedup-registry release failed for %s "
+            "(%s) — continuing (envelope already decommissioned; a stuck C3 "
+            "entry only blocks a FUTURE re-onboard of this server_id, it does "
+            "not affect current access control)",
+            provenance_id, exc,
+        )
 
     # ── Step 3: route (broker DELETE /route) ─────────────────────────────────
     try:
