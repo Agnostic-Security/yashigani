@@ -250,13 +250,15 @@ spec:
               value: "127.0.0.1"
             - name: BROKER_LISTEN_PORT
               value: {{ .Values.caddy.configBroker.port | quote }}
-            # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): no more
-            # baseline concept — the broker computes its self-checks FRESH
-            # from this RO ConfigMap mount on every reload (safe: no chart
-            # RBAC grants any workload ServiceAccount configmaps access, so
-            # this file is never workload-writable — same safety argument
-            # the old "live" baseline mode already relied on, now the ONLY
-            # mode, on every runtime).
+            # FINDING-V412-CADDYADMIN-002-b (Captain, 2026-07-21): this
+            # broker NEVER adapts the monolith itself (see config_broker.py
+            # "ENV-VAR-FREE SELF-CHECKS" — the real monolith references
+            # ~12 `{$VAR}` placeholders only real Caddy's own environment
+            # carries; adapting it here without those vars hard-fails
+            # `caddy adapt`, which broke /healthz + every reload on the
+            # real install). It reads this file as RAW BYTES and forwards
+            # it verbatim to the real admin socket — real Caddy does the
+            # actual adapt server-side with its OWN real environment.
             - name: BROKER_CADDYFILE
               value: "/etc/caddy/Caddyfile"
             - name: BROKER_AGENTS_DYNAMIC_DIR
@@ -266,15 +268,13 @@ spec:
           resources:
             {{- toYaml .Values.caddy.configBroker.resources | nindent 12 }}
           volumeMounts:
-            # SAME ConfigMap mounts as the caddy container — the broker must
-            # resolve `import` directives identically to how real Caddy
-            # resolves them (config_broker.py module docstring).
+            # RO — read as raw bytes only, never adapted (see env comment
+            # above). The caddy-agents ConfigMap mount is REMOVED here
+            # (FINDING-V412-CADDYADMIN-002-b) — this broker no longer
+            # resolves any `import` itself, so it no longer needs it.
             - name: caddyfile
               mountPath: /etc/caddy/Caddyfile
               subPath: Caddyfile
-              readOnly: true
-            - name: caddy-agents
-              mountPath: /etc/caddy/agents
               readOnly: true
             # Broker-owned DYNAMIC MCP route directory — RW here (the sole
             # writer), RO in the caddy container above.

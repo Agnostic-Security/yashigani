@@ -264,31 +264,76 @@ class TestSelfCheckSnippet:
         assert "inline" in str(exc.value)
 
 
-class TestSelfCheckFullMerge:
-    def test_clean_monolith_passes(self, broker, tmp_path, monkeypatch):
+class TestEnvVarFreeSelfChecks:
+    """FINDING-V412-CADDYADMIN-002-b (Captain, 2026-07-21): the FIRST
+    version of this rework adapted the REAL monolith Caddyfile in-process
+    (both for /healthz and to build the /load payload). On the real
+    install this failed: the monolith references ~12 `{$VAR}` placeholders
+    (YASHIGANI_TLS_DOMAIN, per-service SPIFFE IDs, CADDY_INTERNAL_HMAC,
+    openclaw secrets, …) this broker's own environment deliberately does
+    not carry. An unset `{$VAR}` inside a single-argument directive (e.g.
+    `default_sni {$YASHIGANI_TLS_DOMAIN}`) expands to an empty argument and
+    `caddy adapt` hard-fails — /healthz 503'd and onboarding broke a SECOND
+    way. This class proves the fix: the broker never adapts the real
+    monolith at all — self-checks run against self-contained input only,
+    and the reload trigger forwards the monolith as raw, un-adapted TEXT so
+    real Caddy (which HAS the real environment) does the actual adapt."""
+
+    def test_self_check_snippet_substitutes_the_hmac_placeholder(self, broker):
+        """render_mcp_route()'s own output references
+        {$CADDY_INTERNAL_HMAC} — the self-check must substitute a fixed
+        LOCAL dummy before adapting, never require (or leak) the real
+        secret, and never leave the placeholder unresolved (which would
+        itself be a caddy adapt failure in SOME directive shapes)."""
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+        assert "{$CADDY_INTERNAL_HMAC}" in snip  # sanity: the fixture we're testing actually has it
+        broker._self_check_snippet(snip, 9611)  # must not raise
+
+    def test_self_check_pipeline_healthy_never_touches_real_monolith(
+        self, broker, tmp_path, monkeypatch,
+    ):
+        """GET /healthz's self-check must pass even when the monolith on
+        disk is the REAL production Caddyfile shape — i.e. full of unset
+        env-var placeholders that would fail to adapt if this broker tried
+        to adapt it directly. Only monolith EXISTENCE is checked, never its
+        content."""
         caddyfile = tmp_path / "Caddyfile"
-        caddyfile.write_text(_MONOLITH_FIXTURE, encoding="utf-8")
-        agents_dynamic = tmp_path / "agents-dynamic"
-        agents_dynamic.mkdir()
+        # A monolith shaped like the real one: an unset single-argument
+        # env-var placeholder that would hard-fail `caddy adapt` if this
+        # broker ever tried to adapt it (the exact live failure mode).
+        caddyfile.write_text(
+            "{\n    default_sni {$YASHIGANI_TLS_DOMAIN}\n}\n:443 {\n    respond \"ok\" 200\n}\n",
+            encoding="utf-8",
+        )
         monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
-        monkeypatch.setattr(broker, "_AGENTS_DYNAMIC_DIR", str(agents_dynamic))
+        monkeypatch.delenv("YASHIGANI_TLS_DOMAIN", raising=False)
 
-        cfg = broker._self_check_full_merge()
-        assert cfg is not None
+        broker._self_check_pipeline_healthy()  # must not raise
 
-    def test_pki_app_refused(self, broker, tmp_path, monkeypatch):
+    def test_self_check_pipeline_unhealthy_when_monolith_mount_absent(
+        self, broker, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(tmp_path / "missing"))
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._self_check_pipeline_healthy()
+        assert exc.value.http_status == 503
+
+    def test_read_raw_monolith_returns_bytes_unadapted(self, broker, tmp_path, monkeypatch):
+        """The reload trigger must read the monolith VERBATIM — no adapt,
+        no env-var resolution, no content inspection (that's real Caddy's
+        job now, server-side, with its own real environment)."""
         caddyfile = tmp_path / "Caddyfile"
         caddyfile.write_text(_MONOLITH_WITH_PKI_APP, encoding="utf-8")
         monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
 
-        with pytest.raises(broker.BrokerError) as exc:
-            broker._self_check_full_merge()
-        assert "pki" in str(exc.value)
+        raw = broker._read_raw_monolith()
+        assert raw == _MONOLITH_WITH_PKI_APP.encode("utf-8")
 
-    def test_unreadable_caddyfile_fails_closed(self, broker, tmp_path, monkeypatch):
+    def test_read_raw_monolith_unreadable_fails_closed(self, broker, tmp_path, monkeypatch):
         monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(tmp_path / "missing"))
-        with pytest.raises(broker.BrokerError):
-            broker._self_check_full_merge()
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._read_raw_monolith()
+        assert exc.value.http_status == 500
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +488,41 @@ class TestBrokerHttpServerLive:
         broker_sock, _stub_state, _agents_dynamic = live_env
         status, body = _request_unix(broker_sock, "GET", "/healthz", b"")
         assert status == 200, body
+
+    def test_healthz_ok_even_with_real_style_unset_env_placeholders(
+        self, broker, tmp_path, monkeypatch,
+    ):
+        """FINDING-V412-CADDYADMIN-002-b live reproduction: a monolith
+        shaped like the real production Caddyfile (an unset single-argument
+        `{$VAR}` placeholder — the EXACT live failure Maxine diagnosed,
+        `default_sni {$YASHIGANI_TLS_DOMAIN}` -> empty arg -> parse error)
+        must NOT make /healthz unhealthy, because this broker never adapts
+        the monolith at all anymore."""
+        sock_dir = pathlib.Path(tempfile.mkdtemp(prefix="ysgb-"))
+        broker_sock = str(sock_dir / "route.sock")
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text(
+            "{\n    default_sni {$YASHIGANI_TLS_DOMAIN}\n    admin unix//run/caddy-admin/admin.sock|0666\n}\n"
+            ":443 {\n    respond \"ok\" 200\n}\n"
+            "import /etc/caddy/agents-dynamic/*.caddy\n",
+            encoding="utf-8",
+        )
+        agents_dynamic = tmp_path / "agents-dynamic"
+        agents_dynamic.mkdir()
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
+        monkeypatch.setattr(broker, "_AGENTS_DYNAMIC_DIR", str(agents_dynamic))
+        monkeypatch.delenv("YASHIGANI_TLS_DOMAIN", raising=False)
+
+        httpd = broker.UnixHTTPServer(broker_sock, broker.BrokerHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        time.sleep(0.1)
+        try:
+            status, body = _request_unix(broker_sock, "GET", "/healthz", b"")
+            assert status == 200, body
+        finally:
+            httpd.shutdown()
+            server_thread.join(timeout=2)
 
     def test_wrong_path_404(self, live_env):
         broker_sock, _stub_state, _agents_dynamic = live_env

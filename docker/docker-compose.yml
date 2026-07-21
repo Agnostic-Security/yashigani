@@ -465,22 +465,23 @@ services:
     cpus: ${YASHIGANI_CADDY_BROKER_CPU_LIMIT:-0.25}
     volumes:
       # RO — the active monolith Caddyfile (SAME source Caddy itself reads).
-      # Read fresh on every reload (config_broker.py "NEW CONTRACT" —
-      # nothing feeding this is backoffice-writable anymore, so a live read
-      # is safe; no build-time-baked baseline needed post-rework).
+      # FINDING-V412-CADDYADMIN-002-b (Captain, 2026-07-21): this broker
+      # NEVER adapts this file itself anymore (see config_broker.py
+      # "ENV-VAR-FREE SELF-CHECKS" — the real monolith references ~12
+      # `{$VAR}` placeholders only real Caddy's own environment carries;
+      # adapting it here without those vars hard-fails `caddy adapt`,
+      # which broke /healthz + every reload on the real install). It is
+      # read as RAW BYTES and forwarded verbatim to the real admin socket
+      # — real Caddy (which HAS the real environment) does the actual
+      # adapt server-side, exactly as it already does at container start.
       - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
-      # RO — the SAME absolute paths + SAME host source files Caddy itself
-      # mounts, so the full-merge self-check (config_broker.py
-      # _self_check_full_merge) resolves imports identically to what real
-      # Caddy would load.
-      - ./Caddyfile.csp:/etc/caddy/Caddyfile.csp:ro
-      - ./Caddyfile.ollama-front:/etc/caddy/Caddyfile.ollama-front:ro
-      - ./Caddyfile.openclaw-egress:/etc/caddy/Caddyfile.openclaw-egress:ro
-      - ./Caddyfile.openclaw-webhooks:/etc/caddy/Caddyfile.openclaw-webhooks:ro
-      # RO — the install.sh/ringfence-init-authored static agents dir (SAME
-      # source Caddy reads). Read-only: this broker never writes here — its
-      # OWN dynamic dir (below) is the only thing it ever writes.
-      - ./caddy/agents:/etc/caddy/agents:ro
+      # FINDING-V412-CADDYADMIN-002-b: the Caddyfile.{csp,ollama-front,
+      # openclaw-egress,openclaw-webhooks} snippet-family mounts and the
+      # static docker/caddy/agents/ mount are REMOVED — this broker no
+      # longer resolves any `import` itself (it forwards the monolith
+      # unadapted; self-checks run against self-contained candidates only
+      # — see config_broker.py). Smaller mount surface, smaller blast
+      # radius, not a workaround.
       # RW — broker-owned DYNAMIC MCP-route directory. The ONLY thing this
       # process ever writes to disk. RO in caddy (see caddy service); NEVER
       # mounted into backoffice at all (closes R2 by construction).
@@ -494,10 +495,13 @@ services:
       - caddy_broker_route_sock:/run/caddy-broker-route
     healthcheck:
       # Dockerfile HEALTHCHECK already probes GET /healthz over the unix
-      # socket (confirms `caddy adapt` still succeeds against the live RO
-      # monolith — continuous proof the capability-strip fix holds, not just
-      # at image-build time); redeclared here only for consistent
-      # `docker/podman ps` visibility with every other service in this file.
+      # socket (confirms the render+adapt+self-check pipeline still works
+      # against a FIXED internal probe candidate under no-new-privileges —
+      # continuous proof the capability-strip fix holds, not just at image-
+      # build time; see config_broker.py "ENV-VAR-FREE SELF-CHECKS" for why
+      # this no longer touches the real monolith's env-var placeholders);
+      # redeclared here only for consistent `docker/podman ps` visibility
+      # with every other service in this file.
       test: ["CMD", "python3", "-c", "import socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.settimeout(4)\ns.connect('/run/caddy-broker-route/route.sock')\ns.sendall(b'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n')\nd=s.recv(64)\nsys.exit(0 if d.startswith(b'HTTP/1.0 200') else 1)"]
       interval: 15s
       timeout: 5s

@@ -66,11 +66,12 @@ NEW CONTRACT — data in, never raw Caddy content in:
       ALL hardcoded here, by convention identical to
       manifest/codegen.py's _mcp_svid_paths()/_gen_caddy_snippet_mcp() — see
       "DEVIATION FROM THE LITERAL BRIEF" below), self-checks the rendered
-      snippet + the freshly-recomputed FULL merged config Caddy would
-      actually load, writes it into this broker's OWN directory
-      (BROKER_AGENTS_DYNAMIC_DIR, a named volume never mounted into
-      backoffice), and triggers a real reload via the real (caddy-private)
-      admin socket. 200 on success.
+      snippet IN ISOLATION (see "ENV-VAR-FREE SELF-CHECKS" below), writes it
+      into this broker's OWN directory (BROKER_AGENTS_DYNAMIC_DIR, a named
+      volume never mounted into backoffice), and triggers a real reload by
+      forwarding the RO-trusted monolith Caddyfile TEXT verbatim to the real
+      (caddy-private) admin socket — real Caddy (which has the real
+      environment) does the actual adapt server-side. 200 on success.
 
       On FAIL: 422 (field validation), 500 (self-check — this broker's own
       rendering produced something unexpected; a bug, not an attack, but
@@ -84,10 +85,53 @@ NEW CONTRACT — data in, never raw Caddy content in:
       absent) and triggers a real reload so Caddy drops the route.
 
   GET /healthz
-      200 once this process can successfully `caddy adapt` its own RO-mounted
-      monolith Caddyfile (re-checked on every poll — cheap, <100ms, and
+      200 once this process can successfully run the render+adapt+self-check
+      pipeline end-to-end on a FIXED internal probe candidate (never the real
+      monolith — see "ENV-VAR-FREE SELF-CHECKS") plus confirm the monolith
+      Caddyfile mount exists. Re-checked on every poll — cheap, <100ms, and
       doubles as a continuous liveness proof that the capability-strip fix
-      holds for the life of the container, not just at image-build time).
+      holds for the life of the container, not just at image-build time.
+
+ENV-VAR-FREE SELF-CHECKS (FINDING-V412-CADDYADMIN-002-b, 2026-07-21):
+  The FIRST version of this rework adapted the REAL monolith Caddyfile
+  in-process (both for /healthz and to build the forwarded /load payload).
+  On the real install this FAILED: the monolith references ~12 `{$VAR}`
+  placeholders (YASHIGANI_TLS_DOMAIN, per-service SPIFFE IDs,
+  CADDY_INTERNAL_HMAC, openclaw Slack/Telegram secrets, …) that only the
+  REAL Caddy container's environment carries. This broker's environment
+  carries NONE of them (by design — it should not need to). An unset
+  `{$VAR}` inside a directive that requires exactly one argument (e.g.
+  `default_sni {$YASHIGANI_TLS_DOMAIN}`) expands to an EMPTY argument and
+  `caddy adapt` hard-fails with a parse error — `/healthz` 503'd and the
+  real reload never happened, breaking onboarding for a second, different
+  reason than BLOCKER-A.
+
+  Fix: this broker no longer adapts the real monolith AT ALL.
+    - Self-checks (`/route` candidate validation AND `/healthz`) run
+      against SELF-CONTAINED input only: the rendered candidate snippet
+      (or, for /healthz, a fixed internal probe rendered the same way),
+      wrapped in a minimal `{ admin off }` shell that references NO
+      external Caddyfile and NO env-var placeholder except the one THIS
+      module's own template emits (`{$CADDY_INTERNAL_HMAC}` in the
+      forward_auth hop) — substituted with a fixed LOCAL DUMMY value before
+      adapting (`_SELFCHECK_HMAC_DUMMY`). This is safe because `caddy adapt`
+      only parses SYNTAX/STRUCTURE — it never runs the config or opens the
+      files it references — so the self-check needs the placeholder to be
+      NON-EMPTY, never the real secret. The real value is never handled by
+      this process at all.
+    - The actual RELOAD trigger (`_trigger_reload`) reads the monolith
+      Caddyfile as raw TEXT (never adapts it) and forwards it VERBATIM
+      (`Content-Type: text/caddyfile`) to the real admin socket — the SAME
+      mechanism `mcp_onboard.py`'s pre-rework `default_caddy_reloader()`
+      already used successfully for months. Real Caddy — which has the
+      REAL environment — performs the adapt server-side, exactly as it
+      already does at every container start. This broker therefore needs
+      NO monolith-referenced env var, secret or otherwise, in its own
+      environment, and (as a consequence) no longer needs the
+      Caddyfile.{csp,ollama-front,openclaw-egress,openclaw-webhooks} or
+      static docker/caddy/agents/ mounts either — it never resolves an
+      `import` itself. Mounts trimmed accordingly (docker-compose.yml /
+      helm/caddy.yaml) — smaller blast radius, not just a workaround.
 
 WHY THIS CLOSES R1 STRUCTURALLY (not just "the body looked safe this time"):
   Backoffice has NO endpoint through which it can supply free-text Caddy
@@ -248,6 +292,25 @@ _C8_MAX_CONNS_PER_HOST_DEFAULT = 64
 _CA_INTERMEDIATE_PATH = "/run/secrets/ca_intermediate.crt"
 _CADDY_CLIENT_CERT = "/run/secrets/caddy_client.crt"
 _CADDY_CLIENT_KEY = "/run/secrets/caddy_client.key"
+
+# See module docstring "ENV-VAR-FREE SELF-CHECKS". render_mcp_route()'s own
+# output references {$CADDY_INTERNAL_HMAC} (real Caddy resolves the REAL
+# value from ITS environment at actual reload time). This broker's
+# self-check only verifies SYNTACTIC/STRUCTURAL shape via `caddy adapt` — it
+# never runs the config — so it substitutes this fixed, non-secret, LOCAL-
+# ONLY dummy before adapting. Never written to disk, never forwarded
+# anywhere; exists purely to give `caddy adapt` a non-empty argument.
+_SELFCHECK_HMAC_DUMMY = "SELFCHECK-DUMMY-NOT-A-SECRET"
+
+# Fixed internal probe candidate for GET /healthz — see "ENV-VAR-FREE
+# SELF-CHECKS". Rendered + self-checked on every poll, NEVER written to
+# disk, NEVER forwarded to the real admin socket. Proves the render+adapt+
+# self-check pipeline (i.e. the capability-strip fix) is functional without
+# depending on the real monolith's env-var placeholders.
+_HEALTHZ_PROBE_TENANT = "ysg-healthz-probe"
+_HEALTHZ_PROBE_SERVER = "self-check"
+_HEALTHZ_PROBE_MESH_PORT = 9599
+_HEALTHZ_PROBE_SHIM_PORT = 18000
 
 
 def _validate_route_fields(payload: dict) -> tuple[str, str, int, int]:
@@ -446,10 +509,15 @@ def _walk_invariants(cfg: dict) -> dict:
 
 def _self_check_snippet(snippet_text: str, expected_mesh_port: int) -> None:
     """Syntax + hardcoded-shape check on the snippet THIS process just
-    rendered, in isolation (no live filesystem dependency) — catches a
-    rendering bug in this module before it ever touches the live agents-dynamic
-    dir. Wrapped in `{ admin off }` exactly like codegen.py's own C10 gate."""
-    cfg = _adapt_text("{\n    admin off\n}\n\n" + snippet_text)
+    rendered, in COMPLETE isolation (no live filesystem dependency, no
+    external `import`, no env var except a fixed local dummy — see module
+    docstring "ENV-VAR-FREE SELF-CHECKS") — catches a rendering bug in this
+    module before it ever touches the live agents-dynamic dir. Wrapped in
+    `{ admin off }` exactly like codegen.py's own C10 gate."""
+    checkable_text = snippet_text.replace(
+        "{$CADDY_INTERNAL_HMAC}", _SELFCHECK_HMAC_DUMMY,
+    )
+    cfg = _adapt_text("{\n    admin off\n}\n\n" + checkable_text)
     inv = _walk_invariants(cfg)
 
     if inv["inline_hits"]:
@@ -481,35 +549,39 @@ def _self_check_snippet(snippet_text: str, expected_mesh_port: int) -> None:
             )
 
 
-def _self_check_full_merge() -> dict:
-    """Read the RO monolith Caddyfile + adapt it (imports resolve against the
-    SAME live paths real Caddy reads — static agents/, this broker's own
-    agents-dynamic/, and the snippet family), and assert the merged config
-    has no inline provider / pki app anywhere. Safe to compute fresh on every
-    call (nothing feeding it is backoffice-writable — see module docstring).
-    Returns the adapted config on success (forwarded to the real admin
-    socket, so we adapt exactly once per reload)."""
+def _read_raw_monolith() -> bytes:
+    """Read the RO monolith Caddyfile as raw BYTES — never adapted by this
+    broker (see module docstring "ENV-VAR-FREE SELF-CHECKS"). Forwarded
+    verbatim to the real admin socket; real Caddy resolves its own
+    `import`s and `{$VAR}` placeholders from ITS environment server-side."""
     try:
-        with open(_CADDYFILE_PATH, "r", encoding="utf-8") as f:
-            text = f.read()
+        with open(_CADDYFILE_PATH, "rb") as f:
+            return f.read()
     except OSError as exc:
         raise BrokerError(
             "cannot read monolith Caddyfile at %r: %s" % (_CADDYFILE_PATH, exc),
             http_status=500,
         )
-    cfg = _adapt_text(text)
-    inv = _walk_invariants(cfg)
-    if inv["inline_hits"]:
+
+
+def _self_check_pipeline_healthy() -> None:
+    """GET /healthz calls this. Proves the render+adapt+self-check pipeline
+    (the exact code path BLOCKER-A broke — `caddy adapt` under
+    no-new-privileges) is functional RIGHT NOW, using a FIXED internal probe
+    candidate — never the real monolith, never written to disk, never
+    forwarded anywhere (see "ENV-VAR-FREE SELF-CHECKS"). Also confirms the
+    monolith mount itself exists (cheap existence check, not an adapt) so a
+    mount-configuration regression still surfaces here."""
+    if not os.path.exists(_CADDYFILE_PATH):
         raise BrokerError(
-            "REFUSING reload: merged config contains an inline provider: %r "
-            "(fail-closed self-check)" % inv["inline_hits"], http_status=500,
+            "monolith Caddyfile not mounted at %r" % _CADDYFILE_PATH,
+            http_status=503,
         )
-    if inv["has_pki_app"]:
-        raise BrokerError(
-            "REFUSING reload: merged config defines a pki app "
-            "(fail-closed self-check)", http_status=500,
-        )
-    return cfg
+    probe = render_mcp_route(
+        _HEALTHZ_PROBE_TENANT, _HEALTHZ_PROBE_SERVER,
+        _HEALTHZ_PROBE_MESH_PORT, _HEALTHZ_PROBE_SHIM_PORT,
+    )
+    _self_check_snippet(probe, _HEALTHZ_PROBE_MESH_PORT)
 
 
 # ---------------------------------------------------------------------------
@@ -568,16 +640,19 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-def _forward_load_to_real_admin(adapted_json: dict) -> tuple[int, bytes]:
-    body = json.dumps(adapted_json).encode("utf-8")
+def _forward_caddyfile_to_real_admin(caddyfile_bytes: bytes) -> tuple[int, bytes]:
+    """POST the raw Caddyfile TEXT to the real admin socket — Content-Type:
+    text/caddyfile, exactly the contract mcp_onboard.py's pre-rework
+    default_caddy_reloader() already used successfully. Real Caddy adapts
+    it server-side with ITS OWN (real) environment."""
     conn = _UnixHTTPConnection(_REAL_ADMIN_SOCKET, timeout=_FORWARD_TIMEOUT_S)
     try:
         conn.request(
-            "POST", "/load", body=body,
+            "POST", "/load", body=caddyfile_bytes,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": "text/caddyfile",
                 "Host": "localhost",
-                "Content-Length": str(len(body)),
+                "Content-Length": str(len(caddyfile_bytes)),
             },
         )
         resp = conn.getresponse()
@@ -587,10 +662,11 @@ def _forward_load_to_real_admin(adapted_json: dict) -> tuple[int, bytes]:
 
 
 def _trigger_reload() -> None:
-    """Recompute the full merged config from RO-trusted sources and push it
-    to the real admin socket. Raises BrokerError on any failure."""
-    cfg = _self_check_full_merge()
-    status, resp_body = _forward_load_to_real_admin(cfg)
+    """Forward the RO-trusted monolith Caddyfile TEXT verbatim to the real
+    admin socket — see module docstring "ENV-VAR-FREE SELF-CHECKS" for why
+    this broker never adapts it itself. Raises BrokerError on any failure."""
+    caddyfile_bytes = _read_raw_monolith()
+    status, resp_body = _forward_caddyfile_to_real_admin(caddyfile_bytes)
     if status // 100 != 2:
         raise BrokerError(
             "real admin socket rejected /load (HTTP %d): %.300s"
@@ -644,14 +720,7 @@ class BrokerHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 — stdlib naming convention
         if self.path in ("/healthz", "/healthz/"):
             try:
-                if not os.path.exists(_CADDYFILE_PATH):
-                    raise BrokerError(
-                        "monolith Caddyfile not mounted at %r" % _CADDYFILE_PATH,
-                        http_status=503,
-                    )
-                with open(_CADDYFILE_PATH, "r", encoding="utf-8") as f:
-                    text = f.read()
-                _adapt_text(text)
+                _self_check_pipeline_healthy()
             except BrokerError as exc:
                 self._send(503, ("not healthy: %s\n" % exc).encode())
                 return
