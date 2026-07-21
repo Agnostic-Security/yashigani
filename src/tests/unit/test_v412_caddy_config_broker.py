@@ -214,6 +214,15 @@ class TestRenderMcpRoute:
         assert "forward_auth https://backoffice:8443" in snip
         assert "uri /auth/verify-mcp?tenant=acme-corp&server=filesystem" in snip
         assert "tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key" in snip
+        # FINDING-V412-ONBOARDING-ROBUSTNESS #1 regression: forward_auth's
+        # auth-subrequest does NOT inherit the request_header X-SPIFFE-ID set
+        # above it (empirically proven against a live caddy binary — see
+        # test_forward_auth_block_carries_own_spiffe_header_up below). The
+        # header_up MUST be declared inside the forward_auth block itself,
+        # or /auth/verify-mcp 401s no_spiffe_id for every caller.
+        fwd_auth_block = snip.split("forward_auth https://backoffice:8443", 1)[1]
+        fwd_auth_block = fwd_auth_block.split("reverse_proxy", 1)[0]
+        assert "header_up X-SPIFFE-ID {http.request.tls.client.san.uris.0}" in fwd_auth_block
         assert "reverse_proxy http://filesystem:8000" in snip
         assert "max_conns_per_host 64" in snip
         assert "tls_insecure_skip_verify" not in snip

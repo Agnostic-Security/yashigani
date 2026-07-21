@@ -240,6 +240,14 @@ class TestApproveTransactionCommit:
         assert result.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{result.instance_id}")
         assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" not in result.artifact_paths
 
+        # FINDING-V412-ONBOARDING-ROBUSTNESS #5 (Tom, 2026-07-21): the
+        # ceremony registers the envelope + route but does NOT start the
+        # container (backoffice has no docker socket, LAURA-30-001) — the
+        # result must carry actionable, server_id-scoped deploy guidance
+        # rather than leaving the operator to guess.
+        assert _SERVER in result.deploy_hint["commands"][0]
+        assert "compose.override.yml" in result.deploy_hint["commands"][0]
+
     @pytest.mark.asyncio
     async def test_nico_contract_kwargs_passed_to_mint(self, txn_env):
         _, secrets_dir = txn_env
@@ -257,6 +265,29 @@ class TestApproveTransactionCommit:
         assert captured["scope_hash"].startswith("sha384:")
         assert captured["image_digest"] == _DIGEST
         assert captured["approved_by"] == "orchid"
+
+
+class TestDeployHint:
+    """FINDING-V412-ONBOARDING-ROBUSTNESS #5 — _agent_container_deploy_hint()
+    in isolation (docker vs k8s; component isolation)."""
+
+    def test_docker_hint_scoped_to_server_id(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        assert hint["runtime"] == "docker"
+        assert f"{_SERVER}-compose.override.yml" in hint["commands"][0]
+        assert "install.sh --onboard" in hint["note"]  # explicitly disambiguated
+
+    def test_k8s_hint_uses_helm(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="k8s",
+        )
+        assert hint["runtime"] == "k8s"
+        assert "helm" in hint["commands"][0]
+        assert _SERVER in hint["commands"][0]
 
 
 class TestApproveTransactionFailClosed:

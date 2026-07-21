@@ -177,6 +177,24 @@ class McpOnboardResult:
     instance_id: str
     spiffe_id: str
     artifact_paths: list[str] = field(default_factory=list)
+    deploy_hint: dict = field(default_factory=dict)
+
+
+@dataclass
+class McpDecommissionResult:
+    """Outcome of a decommission transaction (FINDING-V412-ONBOARDING-
+    ROBUSTNESS #4). ``steps`` records the per-step outcome so a partial
+    failure is fully visible to the caller — see run_decommission_transaction
+    docstring for why decommission does not roll back on partial failure."""
+
+    server_id: str
+    tenant_id: str
+    already_decommissioned: bool
+    instance_id: str = ""
+    spiffe_id: str = ""
+    artifact_paths_removed: list[str] = field(default_factory=list)
+    steps: dict[str, str] = field(default_factory=dict)
+    container_teardown: dict[str, Any] = field(default_factory=dict)
 
 
 def _artifact_root() -> Path:
@@ -499,6 +517,70 @@ def _validate_manifest_or_raise(
             http_status=422,
         )
     return parsed
+
+
+def _agent_container_deploy_hint(
+    *, tenant_id: str, server_id: str, runtime: str,
+) -> dict:
+    """Deterministic, component-isolated compose/helm command guidance for
+    deploying the newly-approved agent's CONTAINER (FINDING-V412-ONBOARDING-
+    ROBUSTNESS #5, Tom, 2026-07-21 — "is onboard-without-deploy by design or
+    a gap?").
+
+    DETERMINATION (see the finding writeup for the full analysis): the
+    separation between "register the capability envelope + broker route"
+    (this transaction — an app-tier action) and "start the container" (a
+    host-tier action) IS deliberate — backoffice has no docker/podman socket
+    access (LAURA-30-001 / YSG-RISK-080, the SAME boundary
+    ``_agent_container_teardown_hint`` documents for decommission). That
+    separation is not the gap.
+
+    The GAP is the absence of any discoverable, actionable guidance for the
+    operator once ``POST /import`` returns. The pre-existing
+    ``install.sh --onboard <manifest>`` CLI is NOT that guidance: it is a
+    wholly separate, non-interoperating onboarding mechanism (its own
+    boot-env-only ``YASHIGANI_MCP_SERVERS`` registry, no capability-envelope
+    row, no caddy-config-broker route registration — it manipulates a Caddy
+    include line directly, pre-dating FINDING-V412-CADDYADMIN-002's broker
+    rework) — pointing an API-onboarded operator at it would either do
+    nothing useful or double-register the agent under two different
+    registries. Nor does ``install.sh --onboard`` itself deploy the new
+    agent's own container (it only recreates ``gateway`` — verified by
+    inspection; no ``compose up`` for the new service exists anywhere in
+    ``handle_onboard_subcommand``). This function closes the documentation
+    gap the same way ``_agent_container_teardown_hint`` closes it for
+    decommission: return the exact scoped command, never execute it.
+    """
+    compose_override = "docker/%s-compose.override.yml" % server_id
+    if runtime == "k8s":
+        return {
+            "runtime": "k8s",
+            "commands": [
+                "helm upgrade --install %s-mcp yashigani/yashigani-mcp-agent "
+                "-n yashigani -f helm/yashigani/values-%s.yaml" % (server_id, server_id),
+            ],
+            "note": (
+                "backoffice has no cluster-admin credentials by design "
+                "(LAURA-30-001 analogue) — run this from an operator "
+                "kubeconfig context, scoped to the yashigani namespace only."
+            ),
+        }
+    return {
+        "runtime": runtime,
+        "commands": [
+            "docker compose -f docker/docker-compose.yml -f %s up -d" % compose_override,
+        ],
+        "note": (
+            "backoffice has no docker/podman socket access by design "
+            "(LAURA-30-001 / YSG-RISK-080) — this envelope/route registration "
+            "does NOT start the container. Run this from the host/operator "
+            "shell, scoped to server_id=%r only via the -f override file; no "
+            "other agent or core service is named in this command. This is "
+            "NOT the same mechanism as `install.sh --onboard` (that CLI uses "
+            "a separate, non-interoperating registry — do not mix the two "
+            "for the same server_id)."
+        ) % server_id,
+    }
 
 
 async def run_approve_transaction(
@@ -1120,13 +1202,354 @@ async def run_approve_transaction(
         instance_id=instance_id,
         spiffe_id=spiffe_id,
         artifact_paths=artifact_paths,
+        deploy_hint=_agent_container_deploy_hint(
+            tenant_id=tenant_id, server_id=server_id, runtime=runtime,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decommission — the mirror-image of run_approve_transaction()
+# FINDING-V412-ONBOARDING-ROBUSTNESS #4 (Tom, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+def _agent_container_teardown_hint(
+    *, tenant_id: str, server_id: str, runtime: str, mode: str,
+) -> dict:
+    """Deterministic, component-isolated compose/helm command guidance for
+    the container+volume layer.
+
+    Backoffice deliberately has NO docker/podman socket access
+    (LAURA-30-001 / YSG-RISK-080 — the container-API surface was a proven
+    privilege-escalation vector; see docker-compose.yml's backoffice service
+    comment). This function therefore never executes anything — it returns
+    command GUIDANCE (the operator's real invocation combines this override
+    with the install's base docker-compose.yml, exactly as install.sh's own
+    ``COMPOSE_CMD`` array does) scoped ONLY to (tenant_id, server_id) via the
+    override filename / network name / helm release name, so it can never
+    accidentally target another agent or a core service.
+
+    mode="keep": stop the container, keep its volumes (re-onboardable later
+                 without losing state).
+    mode="nuke": remove container + the agent's dedicated ringfence network +
+                 named volumes (full teardown; matches uninstall.sh's own
+                 --remove-volumes convention for the same keep-vs-nuke split).
+    """
+    compose_override = "docker/%s-compose.override.yml" % server_id
+    network = "ringfence_%s" % server_id
+    if runtime == "k8s":
+        return {
+            "runtime": "k8s",
+            "mode": mode,
+            "commands": [
+                "helm uninstall %s-mcp -n yashigani" % server_id
+                if mode == "nuke" else
+                "kubectl scale deployment/%s-mcp -n yashigani --replicas=0" % server_id,
+            ],
+            "note": (
+                "backoffice has no cluster-admin credentials by design "
+                "(LAURA-30-001 analogue) — run this from an operator "
+                "kubeconfig context, scoped to the yashigani namespace only."
+            ),
+        }
+    down_cmd = "docker compose -f %s down" % compose_override
+    if mode == "nuke":
+        down_cmd += " --volumes --rmi local"
+    return {
+        "runtime": runtime,
+        "mode": mode,
+        "commands": [
+            down_cmd,
+            "docker network rm %s" % network if mode == "nuke" else
+            "# network %s left in place (mode=keep)" % network,
+        ],
+        "note": (
+            "backoffice has no docker/podman socket access by design "
+            "(LAURA-30-001 / YSG-RISK-080) — run this from the host/operator "
+            "shell (or install.sh's remove-agent op), scoped to server_id=%r "
+            "only via the -f override file and network name; no other "
+            "agent or core service is named in these commands."
+        ) % server_id,
+    }
+
+
+async def run_decommission_transaction(
+    *,
+    tenant_id: str,
+    server_id: str,
+    operator_identity: str,
+    envelope_service: Any,       # CapabilityEnvelopeService
+    audit_writer: Any = None,
+    registry_store: Any = None,  # DurableMcpRegistryStore — same store onboarding uses
+    container_teardown_mode: str = "keep",  # "keep" | "nuke" — informational only
+) -> McpDecommissionResult:
+    """Cleanly reverse a ring_fenced MCP agent's onboarding — component-
+    isolated (only this (tenant_id, server_id) pair's resources are ever
+    touched) and idempotent (safe to call repeatedly, including on a
+    server_id that was never onboarded).
+
+    Steps, in DENY-FIRST order (the opposite ordering rule from
+    run_approve_transaction's GRANT-LAST commit point — see that function's
+    module docstring "INVARIANT (Iris SEAM-1d-03)"): the goal there was
+    "never grant before everything is ready"; the goal here is "never leave
+    a live access path open a moment longer than necessary while cleanup
+    proceeds":
+
+      1. envelope_decommission — transition the ACTIVE envelope (if any) to
+         'decommissioned' FIRST. The instant this commits, /auth/verify-mcp
+         (get_active_envelope() -> None -> 403 server_not_onboarded) denies
+         every subsequent call, and GET /admin/mcp/servers/ stops listing
+         the server. This is the SECURITY-CRITICAL step.
+      2. registry — delete the durable broker descriptor + OPA grant +
+         baseline + egress grant (Redis db/3), then re-push the egress-
+         grants document so revocation (grant absence = kill switch, Nico
+         Q3) is live immediately, not just on the next gateway restart.
+      3. route — DELETE the broker route (unregister_mcp_route): Caddy
+         drops the per-instance :mesh_port wrap and reloads. Best-effort:
+         even if this fails, step 1 already denies every request at the
+         application layer.
+      4. svid — remove the per-instance leaf cert/key from
+         YASHIGANI_AGENTS_DIR and the svid-init staging files, using the
+         instance_id recorded on the envelope row (migration 0026 columns) —
+         no manifest is needed at decommission time.
+      5. artifacts — unlink the runtime-relevant codegen artifacts (compose
+         override / helm values — the SAME deterministic filenames
+         approve_mcp_onboard() writes, predictable from server_id alone).
+
+    UNLIKE the approve transaction, a failure partway through does NOT roll
+    back the steps already completed: every step here only TIGHTENS the
+    deny posture (removes a grant/route/cert), so a partial reversal is
+    strictly SAFER than the pre-decommission state, never worse. Each step's
+    outcome is recorded in the returned ``steps`` dict; the caller (the
+    DELETE /admin/mcp/servers/{server_id} route) surfaces the full picture
+    rather than an opaque single failure — the whole transaction is safe to
+    retry (every step is independently idempotent).
+
+    Container/volume teardown is INTENTIONALLY NOT performed here —
+    backoffice has no docker/podman socket (LAURA-30-001 / YSG-RISK-080).
+    ``container_teardown_mode`` only selects which scoped command guidance
+    ``_agent_container_teardown_hint()`` returns for the operator to run.
+    """
+    from yashigani.manifest.codegen import is_artifact_relevant_for_runtime
+    from yashigani.pki.issuer import IssuerPaths
+
+    provenance_id = "%s:%s" % (tenant_id, server_id)
+    runtime = _runtime()
+    steps: dict[str, str] = {}
+    instance_id = ""
+    spiffe_id = ""
+
+    def _audit_failure(step: str, exc: Exception) -> None:
+        if audit_writer is None:
+            return
+        try:
+            from yashigani.audit.schema import McpDecommissionTransactionFailedEvent
+            audit_writer.write(McpDecommissionTransactionFailedEvent(
+                approver_account=operator_identity,
+                tenant_id=tenant_id,
+                server_id=server_id,
+                instance_id=instance_id,
+                spiffe_id=spiffe_id,
+                failed_step=step,
+                error_type=type(exc).__name__,
+            ))
+        except Exception as audit_exc:  # noqa: BLE001 — audit never masks the abort
+            logger.error(
+                "mcp-decommission: MCP_DECOMMISSION_TRANSACTION_FAILED audit "
+                "write failed: %s", audit_exc,
+            )
+
+    # ── Step 1: envelope_decommission (SECURITY-CRITICAL, deny-first) ───────
+    try:
+        record = await envelope_service.get_active_envelope(provenance_id)
+        if record is not None:
+            instance_id = record.svid_instance_id or ""
+            spiffe_id = record.svid_spiffe_id or ""
+            decommissioned = await envelope_service.decommission_envelope(provenance_id)
+            steps["envelope"] = "decommissioned" if decommissioned else "already_inactive"
+        else:
+            steps["envelope"] = "already_inactive"
+    except Exception as exc:
+        _audit_failure("envelope_decommission", exc)
+        logger.error(
+            "mcp-decommission: envelope_decommission FAILED for %s (%s) — "
+            "aborting decommission (fail-closed: could not confirm the "
+            "server is no longer active, so no further reversal is safe to "
+            "attempt)", provenance_id, exc,
+        )
+        raise McpOnboardError(
+            "envelope_decommission",
+            "capability-envelope deactivation failed — decommission "
+            "aborted. The server may still be onboarded; retry.",
+        ) from exc
+
+    already_decommissioned = steps["envelope"] == "already_inactive" and not instance_id
+
+    # ── Step 2: registry (durable broker descriptor + OPA grant/baseline/egress) ─
+    if registry_store is not None:
+        try:
+            registry_store.delete(tenant_id, server_id)
+            registry_store.delete_grant(tenant_id, server_id)
+            registry_store.delete_baseline(tenant_id, server_id)
+            registry_store.delete_egress_grant(tenant_id, server_id)
+            steps["registry"] = "removed"
+        except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+            _audit_failure("registry", exc)
+            steps["registry"] = "error: %s" % type(exc).__name__
+            logger.error(
+                "mcp-decommission: registry cleanup failed for %s (%s) — "
+                "continuing (envelope already decommissioned; this is a "
+                "residual-cleanup failure, not an access-control failure)",
+                provenance_id, exc,
+            )
+        else:
+            try:
+                from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
+                from yashigani.mcp._opa_push import push_egress_grants  # noqa: PLC0415
+                _opa_url = os.environ.get(
+                    "YASHIGANI_OPA_URL", "https://policy:8181",
+                ).strip() or "https://policy:8181"
+                push_egress_grants(_opa_url, build_egress_grants_doc(registry_store))
+            except Exception as push_exc:  # noqa: BLE001 — revocation-by-absence still holds
+                logger.error(
+                    "mcp-decommission: post-decommission egress-grant OPA "
+                    "push failed (%s) — revocation is still recorded (grant "
+                    "absence = kill switch); the next gateway startup push "
+                    "or approve re-pushes data.yashigani.mcp.egress_grants",
+                    push_exc,
+                )
+    else:
+        steps["registry"] = "skipped_no_store"
+
+    # ── Step 3: route (broker DELETE /route) ─────────────────────────────────
+    try:
+        await unregister_mcp_route(tenant_id=tenant_id, server_id=server_id)
+        steps["route"] = "removed"
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("route_unregister", exc)
+        steps["route"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: broker route unregister failed for %s (%s) — "
+            "continuing (envelope already decommissioned so /auth/verify-mcp "
+            "denies regardless; Caddy may still 404/serve a stale wrap until "
+            "this is retried)", provenance_id, exc,
+        )
+
+    # ── Step 4: svid (per-instance leaf + svid-init staging) ────────────────
+    if instance_id:
+        try:
+            secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+            manifest_path = os.getenv(
+                "YASHIGANI_SERVICE_MANIFEST_PATH",
+                "/etc/yashigani/service_identities.yaml",
+            )
+            agents_dir = os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")
+            pki_paths = IssuerPaths(
+                secrets_dir=Path(secrets_dir),
+                manifest_path=Path(manifest_path),
+                agents_dir=Path(agents_dir),
+            )
+            cert_path = pki_paths.agent_cert(tenant_id, server_id, instance_id)
+            key_path = pki_paths.agent_key(tenant_id, server_id, instance_id)
+            for p in (cert_path, key_path):
+                Path(p).unlink(missing_ok=True)
+
+            if runtime in ("docker", "podman-rootful", "podman-rootless"):
+                svid_init_root = os.getenv(
+                    "YASHIGANI_SVID_INIT_DIR", "/run/secrets-rw/svid-init",
+                )
+                svid_init_dir = Path(svid_init_root) / tenant_id / server_id
+                for fname in ("client.crt", "client.key", "ca.crt"):
+                    (svid_init_dir / fname).unlink(missing_ok=True)
+            steps["svid"] = "removed"
+        except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+            _audit_failure("svid_revoke", exc)
+            steps["svid"] = "error: %s" % type(exc).__name__
+            logger.error(
+                "mcp-decommission: svid leaf removal failed for %s/%s "
+                "instance=%s (%s) — continuing (envelope already "
+                "decommissioned so the leaf is now orphaned/inert even if "
+                "the file removal itself failed)",
+                tenant_id, server_id, instance_id, exc,
+            )
+    else:
+        steps["svid"] = "skipped_no_instance" if already_decommissioned else "skipped_no_svid_on_record"
+
+    # ── Step 5: artifacts (compose override / helm values — deterministic) ──
+    artifact_paths_removed: list[str] = []
+    try:
+        output_root = _artifact_root()
+        candidates = [
+            "docker/%s-compose.override.yml" % server_id,
+            "helm/yashigani/values-%s.yaml" % server_id,
+            "helm/yashigani/values-%s-networkpolicy.yaml" % server_id,
+            "helm/yashigani/templates/agents/%s-policy-exception.yaml" % server_id,
+        ]
+        for rel in candidates:
+            if not is_artifact_relevant_for_runtime(rel, runtime):
+                continue
+            p = output_root / rel
+            if p.exists():
+                p.unlink(missing_ok=True)
+                artifact_paths_removed.append(rel)
+        steps["artifacts"] = "removed_%d" % len(artifact_paths_removed)
+    except McpOnboardError as exc:
+        # _artifact_root() not configured — dev/test only; not fatal.
+        steps["artifacts"] = "skipped: %s" % exc
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("artifacts", exc)
+        steps["artifacts"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: artifact cleanup failed for %s (%s) — "
+            "continuing (cosmetic — a stray compose-override file does not "
+            "grant access; the envelope is already decommissioned)",
+            provenance_id, exc,
+        )
+
+    if audit_writer is not None:
+        try:
+            from yashigani.audit.schema import McpDecommissionedEvent
+            audit_writer.write(McpDecommissionedEvent(
+                approver_account=operator_identity,
+                tenant_id=tenant_id,
+                server_id=server_id,
+                instance_id=instance_id,
+                spiffe_id=spiffe_id,
+                container_teardown_mode=container_teardown_mode,
+            ))
+        except Exception as audit_exc:  # noqa: BLE001 — audit never masks success
+            logger.error(
+                "mcp-decommission: MCP_DECOMMISSIONED audit write failed: %s",
+                audit_exc,
+            )
+
+    logger.info(
+        "mcp-decommission: %s for %s (instance=%s steps=%s)",
+        "ALREADY-DECOMMISSIONED" if already_decommissioned else "COMPLETE",
+        provenance_id, instance_id or "n/a", steps,
+    )
+
+    return McpDecommissionResult(
+        server_id=server_id,
+        tenant_id=tenant_id,
+        already_decommissioned=already_decommissioned,
+        instance_id=instance_id,
+        spiffe_id=spiffe_id,
+        artifact_paths_removed=artifact_paths_removed,
+        steps=steps,
+        container_teardown=_agent_container_teardown_hint(
+            tenant_id=tenant_id, server_id=server_id, runtime=runtime,
+            mode=container_teardown_mode,
+        ),
     )
 
 
 __all__ = [
     "McpOnboardError",
     "McpOnboardResult",
+    "McpDecommissionResult",
     "register_mcp_route",
     "unregister_mcp_route",
     "run_approve_transaction",
+    "run_decommission_transaction",
 ]

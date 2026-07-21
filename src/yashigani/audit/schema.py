@@ -408,6 +408,12 @@ class EventType(str, Enum):
     # v4.1 unified-sidecar Phase 1 (Lu M1) — a (caller SPIFFE, egress prefixes)
     # grant was written inside the step-up-gated approve transaction.
     MCP_EGRESS_GRANT_WRITTEN = "MCP_EGRESS_GRANT_WRITTEN"
+    # FINDING-V412-ONBOARDING-ROBUSTNESS #4 (Tom, 2026-07-21) — the per-agent
+    # decommission transaction (mirror-image of the approve transaction):
+    # broker route removed, SVID leaf revoked, durable-registry entries
+    # deleted, capability envelope transitioned active->decommissioned.
+    MCP_DECOMMISSION_TRANSACTION_FAILED = "MCP_DECOMMISSION_TRANSACTION_FAILED"
+    MCP_DECOMMISSIONED = "MCP_DECOMMISSIONED"
     # P1/P2 header isolation — SECURITY event (HIGH severity)
     # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
     # The header is silently stripped; this event is the regression canary.
@@ -3713,6 +3719,67 @@ class McpEgressGrantWrittenEvent(AuditEvent):
     instance_id: str = ""
     spiffe_id: str = ""
     prefixes: list = field(default_factory=list)
+
+
+@dataclass
+class McpDecommissionTransactionFailedEvent(AuditEvent):
+    """The MCP decommission transaction ABORTED partway through (best-effort
+    reversal — see mcp_onboard.py run_decommission_transaction docstring).
+
+    Unlike the approve transaction, decommission does NOT roll back what it
+    already undid: a partially-reversed onboarding is strictly SAFER than the
+    original state (every reversed step tightens, never loosens, the deny
+    posture — e.g. the broker route or the active envelope, once removed,
+    stays removed even if a later step fails). This event records exactly
+    which step raised so the operator can finish the remaining steps by hand
+    or retry (the whole transaction is idempotent).
+
+    failed_step: which reversal step raised (route_unregister / registry /
+                 envelope_decommission / svid_revoke).
+    error_type:  exception class name only (paths/messages stay in app logs).
+    """
+
+    event_type: str = EventType.MCP_DECOMMISSION_TRANSACTION_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    failed_step: str = ""
+    error_type: str = ""
+
+
+@dataclass
+class McpDecommissionedEvent(AuditEvent):
+    """A ring_fenced MCP agent was cleanly decommissioned (FINDING-V412-
+    ONBOARDING-ROBUSTNESS #4): broker route removed, SVID leaf revoked,
+    durable-registry entries deleted, capability envelope transitioned
+    active->decommissioned. Component-isolated — only this (tenant_id,
+    server_id) pair's resources are touched; no other agent or core service
+    is affected.
+
+    container_teardown_mode: "keep" (container/volumes preserved for a future
+                              re-onboard) or "nuke" (operator intends full
+                              removal) — informational only; backoffice has
+                              NO docker/podman socket access (LAURA-30-001 /
+                              YSG-RISK-080) and therefore performs the
+                              application-layer reversal only. The response
+                              carries the exact scoped compose/helm commands
+                              for the operator (or install.sh) to run for the
+                              container+volume layer.
+    """
+
+    event_type: str = EventType.MCP_DECOMMISSIONED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    container_teardown_mode: str = ""
 
 
 @dataclass

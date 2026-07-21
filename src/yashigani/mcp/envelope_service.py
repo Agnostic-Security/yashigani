@@ -45,6 +45,9 @@ _log = logging.getLogger("yashigani.mcp.envelope")
 STATUS_ACTIVE = "active"
 STATUS_BLOCKED = "blocked"
 STATUS_SUPERSEDED = "superseded"
+# FINDING-V412-ONBOARDING-ROBUSTNESS #4 (2026-07-21, migration 0028): explicit
+# teardown, distinct from 'superseded' (which implies a newer version exists).
+STATUS_DECOMMISSIONED = "decommissioned"
 
 TOPOLOGY_RING_FENCED = "ring_fenced"
 TOPOLOGY_EXTERNAL_RELAY = "external_relay"
@@ -371,6 +374,45 @@ class CapabilityEnvelopeService:
                 provenance_id,
             )
         return latched
+
+    # ------------------------------------------------------------------
+    # Decommission (FINDING-V412-ONBOARDING-ROBUSTNESS #4, 2026-07-21)
+    # ------------------------------------------------------------------
+
+    async def decommission_envelope(self, provenance_id: str) -> bool:
+        """
+        Transition the ACTIVE envelope to 'decommissioned' — the durable-
+        registry half of a clean MCP-agent teardown (mcp_onboard.py
+        run_decommission_transaction).
+
+        Append-only discipline preserved: no row is ever deleted or mutated
+        in place beyond the status column (same pattern as latch_block()).
+        get_active_envelope() returns None afterwards exactly as it already
+        does for 'blocked'/'superseded' — /auth/verify-mcp and
+        GET /admin/mcp/servers/ stop treating this server as onboarded,
+        without any change to their own logic.
+
+        Idempotent: if there is no active row (already decommissioned, or
+        never onboarded), returns False rather than raising — a repeat
+        DELETE /admin/mcp/servers/{server_id} call is always safe.
+        """
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE mcp_tool_surface_pins
+                SET    status = 'decommissioned'
+                WHERE  provenance_id = $1 AND status = 'active'
+                """,
+                provenance_id,
+            )
+        decommissioned = result.endswith(" 1")
+        if decommissioned:
+            _log.warning(
+                "CapabilityEnvelope: DECOMMISSIONED provenance=%.12s "
+                "(explicit teardown — distinct from superseded)",
+                provenance_id,
+            )
+        return decommissioned
 
     # ------------------------------------------------------------------
     # Read

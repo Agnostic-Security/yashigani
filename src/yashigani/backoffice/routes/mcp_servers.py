@@ -5,8 +5,15 @@ Admin surface for the MCP server registry: listing registered servers and
 importing (seeding) new ones through the governed capability-envelope ceremony.
 
 Endpoints (prefix /admin/mcp/servers):
-  GET  /               — list active registered MCP servers (with tool summary)
-  POST /import         — import/seed a new MCP server (step-up gated)
+  GET    /                    — list active registered MCP servers (with tool summary)
+  POST   /import              — import/seed a new MCP server (step-up gated)
+  DELETE /{server_id}         — decommission a ring_fenced MCP server (step-up
+                                 gated) — FINDING-V412-ONBOARDING-ROBUSTNESS #4.
+                                 See mcp_onboard.py run_decommission_transaction
+                                 for the full reversal (envelope deactivation,
+                                 broker-route removal, durable-registry
+                                 cleanup, SVID leaf revocation). Idempotent;
+                                 component-isolated to this server_id only.
 
 Import ceremony (POST /import):
   1. Receives server_id + upstream_url (+ optional topology/egress_posture).
@@ -631,4 +638,117 @@ async def import_mcp_server(
             "svid_issued": True,
         }
         response["artifacts"] = onboard_result.artifact_paths
+        # FINDING-V412-ONBOARDING-ROBUSTNESS #5 (Tom, 2026-07-21): this
+        # ceremony registers the capability envelope + broker route but does
+        # NOT start the agent's container — backoffice has no docker/podman
+        # socket access by design (LAURA-30-001 / YSG-RISK-080, the same
+        # boundary #4's decommission `container_teardown` field documents).
+        # `deploy` surfaces the exact scoped command the operator runs next,
+        # closing the "what do I do now" documentation gap without backoffice
+        # ever touching the container layer itself.
+        response["deploy"] = onboard_result.deploy_hint
     return response
+
+
+# ---------------------------------------------------------------------------
+# Decommission — FINDING-V412-ONBOARDING-ROBUSTNESS #4
+# ---------------------------------------------------------------------------
+
+_VALID_TEARDOWN_MODES = frozenset({"keep", "nuke"})
+
+
+@router.delete("/{server_id}")
+async def decommission_mcp_server(
+    server_id: str,
+    session: StepUpAdminSession,
+    mode: str = "keep",
+):
+    """Decommission (cleanly remove) a ring_fenced MCP server.
+
+    Step-up gated (destructive, matching POST /import's own gate): the admin
+    must have a fresh TOTP stamp in their session.
+
+    Reverses the approve transaction end to end (see mcp_onboard.py
+    run_decommission_transaction docstring for the full step sequence and
+    ordering rationale):
+      * the capability envelope is transitioned active -> decommissioned
+        (deny-first: /auth/verify-mcp starts denying immediately, before any
+        other cleanup runs);
+      * the durable broker-registry descriptor + OPA grant/baseline/egress
+        grant are deleted (Redis db/3) and the egress-grants revocation is
+        pushed live;
+      * the broker route is unregistered (Caddy drops the per-instance wrap);
+      * the per-instance SVID leaf cert/key and svid-init staging files are
+        removed;
+      * the runtime-relevant codegen artifacts (compose override / helm
+        values) are unlinked.
+
+    Component-isolated: every step above is keyed on (tenant_id, server_id)
+    ONLY — no other agent or core service is ever touched. Idempotent: safe
+    to call repeatedly, including for a server_id that was never onboarded
+    or was already decommissioned (returns 200 with
+    ``already_decommissioned: true`` rather than 404/409).
+
+    ``mode`` ("keep" | "nuke", default "keep") selects which command
+    guidance the response's ``container_teardown`` field carries for the
+    CONTAINER + VOLUME layer. Backoffice performs NO container-level action
+    itself — it has no docker/podman socket access by design (LAURA-30-001 /
+    YSG-RISK-080; see docker-compose.yml's backoffice service comment). The
+    operator (or install.sh) runs the returned scoped compose/helm command.
+
+    Returns: {server_id, tenant_id, already_decommissioned, steps,
+    artifacts_removed, svid, container_teardown}
+    """
+    if mode not in _VALID_TEARDOWN_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_mode",
+                "message": "mode must be one of %s" % sorted(_VALID_TEARDOWN_MODES),
+            },
+        )
+
+    from yashigani.backoffice.mcp_onboard import McpOnboardError, run_decommission_transaction
+
+    svc = _envelope_service()
+    tenant = _install_tenant()
+
+    try:
+        result = await run_decommission_transaction(
+            tenant_id=tenant,
+            server_id=server_id,
+            operator_identity=session.account_id,
+            envelope_service=svc,
+            audit_writer=backoffice_state.audit_writer,
+            registry_store=_durable_registry_store(),
+            container_teardown_mode=mode,
+        )
+    except McpOnboardError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={
+                "error": "decommission_transaction_failed",
+                "failed_step": exc.step,
+                "message": str(exc),
+            },
+        )
+
+    logger.info(
+        "mcp-servers: decommissioned server_id=%r tenant=%r by admin=%s "
+        "mode=%s already_decommissioned=%s steps=%s",
+        server_id, tenant, session.account_id, mode,
+        result.already_decommissioned, result.steps,
+    )
+
+    return {
+        "server_id": result.server_id,
+        "tenant_id": result.tenant_id,
+        "already_decommissioned": result.already_decommissioned,
+        "steps": result.steps,
+        "artifacts_removed": result.artifact_paths_removed,
+        "svid": {
+            "instance_id": result.instance_id,
+            "spiffe_id": result.spiffe_id,
+        },
+        "container_teardown": result.container_teardown,
+    }
