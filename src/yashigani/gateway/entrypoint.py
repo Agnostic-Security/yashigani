@@ -899,6 +899,7 @@ def _build_app(mesh_mode: bool = False):
         default_model=model,
         agent_registry=agent_registry,
         response_inspection_pipeline=response_pipeline,
+        request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,

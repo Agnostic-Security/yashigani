@@ -896,6 +896,10 @@ class OpenAIRouterState:
         self.model_allocation_store = None   # ModelAllocationStore | None
         self.model_alias_store = None        # ModelAliasStore | None
         self.response_inspection_pipeline = None
+        # 5.0 A1: request-leg prompt-injection pipeline on the primary /v1 chat
+        # path (previously only the MCP/proxy path ran it). Fail-closed:
+        # DISCARDED → 403, SANITIZED → forward the cleaned prompt.
+        self.request_inspection_pipeline = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1093,6 +1097,7 @@ def configure(
     available_models: list[dict] | None = None,
     agent_registry=None,
     response_inspection_pipeline=None,
+    request_inspection_pipeline=None,  # 5.0 A1 — request-leg injection scan
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1128,6 +1133,7 @@ def configure(
     _state.available_models = available_models or []
     _state.agent_registry = agent_registry
     _state.response_inspection_pipeline = response_inspection_pipeline
+    _state.request_inspection_pipeline = request_inspection_pipeline
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -1580,6 +1586,63 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
+
+    # ── 2a. Request-leg prompt-injection inspection (5.0 A1) ──────────
+    # The primary /v1 chat surface now runs the SAME injection pipeline the
+    # MCP/proxy path uses — closing the headline A1 gap. Fail-closed: any
+    # non-PASS verdict returns 403 and the request never reaches a backend.
+    #
+    # Why block (not sanitize-and-forward) here: the dispatched body is built
+    # from body.messages, while the pipeline operates on the joined prompt_text.
+    # Mapping a sanitizer's cleaned span back onto individual messages is not
+    # reliable for the multi-message case, and forwarding the ORIGINAL messages
+    # after logging SANITIZED would be a silent bypass. Blocking is the honest,
+    # safe disposition; per-message sanitize reconstruction is a tracked follow-up.
+    # The pipeline itself never raises; a bare-except here still fails closed.
+    if _state.request_inspection_pipeline is not None and prompt_text:
+        try:
+            _insp = _state.request_inspection_pipeline.process(
+                raw_query=prompt_text,
+                session_id=identity.get("identity_id", request_id) if identity else request_id,
+                agent_id=identity.get("slug", "openai-router") if identity else "openai-router",
+                user_id=identity_id,
+            )
+        except Exception as _insp_exc:
+            logger.error(
+                "Request inspection raised (%s) — fail-closed block request_id=%s",
+                _insp_exc, request_id,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message("request_inspection_error"),
+                    "type": "request_inspection_error",
+                    "code": "request_inspection_error",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+
+        if _insp.action != "PASS":
+            logger.warning(
+                "REQUEST INSPECTION BLOCKED /v1: identity=%s action=%s "
+                "classification=%s confidence=%.2f request_id=%s",
+                identity_id, _insp.action, _insp.classification,
+                _insp.confidence, request_id,
+            )
+            _reason_code = _insp.classification.lower()
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message(_reason_code),
+                    "type": "request_injection_blocked",
+                    "code": _reason_code,
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Request-Classification": _insp.classification,
+                },
+            )
 
     # ── 2b. Content relay detection (agent-to-agent laundering) ──────
     if _state.content_relay_detector and prompt_text:
@@ -3195,12 +3258,31 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         )
                     except Exception as _exc:
                         logger.warning("Audit write failed for response block: %s", _exc)
-                # Do NOT suppress the response — the content is already generated
-                # and withholding it creates a confusing UX (empty assistant turn).
-                # The BLOCKED verdict is surfaced via header so downstream
-                # systems (e.g. Open WebUI plugins) can act on it.
+                # 5.0 A1: a BLOCKED verdict must actually withhold the content —
+                # "mandatory response inspection" that still delivers the flagged
+                # response is theatre. Suppress it (same treatment as the always-on
+                # injection-pattern scan in 7b-ii below) and surface the block via
+                # verdict + header. The empty-assistant-turn UX concern is handled
+                # by the layman message + the RISK-105 verdict tail on streams.
+                assistant_content = (
+                    "This response was withheld by the Yashigani security policy "
+                    "because it failed response inspection. Contact your "
+                    "administrator if you believe this is an error."
+                )
         except Exception as exc:
-            logger.warning("Response inspection raised unexpectedly: %s", exc)
+            # 5.0 A1 (council P0): an inspection error on the main /v1 path must
+            # fail CLOSED, exactly like the classifier fail-closed disposition —
+            # a crash in the inspector cannot become a silent delivery.
+            logger.error(
+                "Response inspection raised unexpectedly (%s) — fail-closed block "
+                "request_id=%s", exc, request_id,
+            )
+            response_verdict = "blocked"
+            response_inspection_confidence = 0.0
+            assistant_content = (
+                "This response could not be security-checked and was withheld as a "
+                "protective measure. Please try again or contact your administrator."
+            )
 
     # ── 7b-ii. Always-on MCP/agent result injection pattern scan (I5 invariant) ──
     # INDEPENDENT of YASHIGANI_INSPECT_RESPONSES — MCP/agent results are UNTRUSTED.
