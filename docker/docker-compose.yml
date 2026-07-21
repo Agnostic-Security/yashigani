@@ -964,6 +964,29 @@ services:
       # host-side by install.sh's _pki_run_issuer_*, NOT this long-running
       # service) ever writes CA/intermediate/leaf trust material.
       #
+      # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21): the four
+      # single-file :rw shadow-mounts previously lived UNDER /run/secrets
+      # itself (e.g. ./secrets/admin_initial_password:/run/secrets/admin_
+      # initial_password:rw). Laura proved (laura-012-rogue-reattack.md) that
+      # on this podman-compose fork, a :rw child mount sharing a path prefix
+      # with a :ro parent silently drops the PARENT's ro flag — podman inspect
+      # showed /run/secrets RW=true, opts=[rbind], no "ro" — letting backoffice
+      # write ANYTHING under /run/secrets, including ca_root.crt and the
+      # attestation-pin file, defeating the whole PKI trust chain (rogue-CA
+      # injection, full chain proven live: forge attestation → poison
+      # .ysg_pinned_root_sha256 → pg_ctl reload of an attacker CA → rogue mTLS
+      # leaf accepted). Fix: the 4 writable secrets are now shadow-mounted at a
+      # SEPARATE top-level path (/run/secrets-rw/<name>) that shares no prefix
+      # with /run/secrets, so there is no nested-mount collision for the fork's
+      # -v emission to mishandle — /run/secrets is now a PURE :ro mount with
+      # zero nested children. Both mountpoints bind the SAME host file
+      # (./secrets/<name>), so a write via /run/secrets-rw/<name> is
+      # immediately visible to every reader still using /run/secrets/<name>
+      # (licensing/loader.py, DockerSecretsProvider, etc. — unchanged).
+      # write_docker_secrets()/license.py now write via YASHIGANI_SECRETS_RW_DIR
+      # (default /run/secrets-rw) — see src/yashigani/auth/bootstrap.py and
+      # src/yashigani/backoffice/routes/license.py.
+      #
       # Source files are pre-created by install.sh before compose up in the
       # supported install flow (generate_secrets(): admin_initial_password,
       # grafana_admin_password, redis_password; handle_license() step 7:
@@ -977,10 +1000,10 @@ services:
       # bootstrap.py now catches the resulting PermissionError per-field
       # instead of crashing the entrypoint (see auth/bootstrap.py diff).
       - ./secrets:/run/secrets:ro
-      - ./secrets/admin_initial_password:/run/secrets/admin_initial_password:rw
-      - ./secrets/grafana_admin_password:/run/secrets/grafana_admin_password:rw
-      - ./secrets/redis_password:/run/secrets/redis_password:rw
-      - ./secrets/license_key:/run/secrets/license_key:rw
+      - ./secrets/admin_initial_password:/run/secrets-rw/admin_initial_password:rw
+      - ./secrets/grafana_admin_password:/run/secrets-rw/grafana_admin_password:rw
+      - ./secrets/redis_password:/run/secrets-rw/redis_password:rw
+      - ./secrets/license_key:/run/secrets-rw/license_key:rw
       # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
       # dir (see caddy service). Single-file remount (ro) at the unchanged
       # in-container path for Layer-B verify + the step-up signer
@@ -1822,6 +1845,21 @@ services:
       # postgres cannot read redis_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
       - ./secrets/postgres_password:/run/secrets/postgres_password:ro
+      # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21) — defence-in-depth
+      # on top of the /run/secrets RO fix above (backoffice volumes, this file):
+      # the root-attestation pin (ca_root.attested_sha256) is now written by
+      # install.sh's --pki-action=rotate-root ceremony to a SEPARATE,
+      # postgres-ONLY host directory (docker/secrets-pki-attest/), never into
+      # the shared docker/secrets/ tree that backoffice/gateway/redis/etc also
+      # mount. No other compose service mounts this path — Laura's proven
+      # attack (forge ca_root.attested_sha256 via the RO-bypass write
+      # primitive, poison the pin, trigger pg_ctl reload of a rogue CA) is now
+      # structurally unreachable even if a FUTURE fork regression re-drops a
+      # :ro flag on some other service's /run/secrets mount: the attestation
+      # file simply isn't reachable from any container but this one.
+      # See docker/postgres/05-enable-ssl.sh (_ATTEST_DIR) + install.sh
+      # (_ensure_pki_attest_dir, rotate-root case).
+      - ./secrets-pki-attest:/run/secrets-pki-attest:ro
       # Init scripts run in alphabetical order — 05 must come before 10/11.
       # 05: TLS + client-cert verification on first initdb.
       # 10: pgbouncer_authenticator role + ysg_pgbouncer_get_auth function (YSG-RISK-049 close).

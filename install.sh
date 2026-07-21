@@ -4031,6 +4031,32 @@ _backup_existing_data() {
     fi
   fi
 
+  # FINDING-V412-RESTART-012: back up the postgres-only root-attestation dir
+  # (ca_root.attested_sha256, if present — most installs never run rotate-root
+  # so this is frequently empty) alongside docker/secrets — same pattern as
+  # secrets-caddy above. restore.sh restores it into docker/secrets-pki-attest/.
+  if [[ -d "${WORK_DIR}/docker/secrets-pki-attest" ]]; then
+    local _attest_src="${WORK_DIR}/docker/secrets-pki-attest"
+    local _attest_dest="${backup_dir}/secrets-pki-attest"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+      mkdir -p "$_attest_dest"
+      if podman unshare bash -c "tar -cf - -C '${_attest_src}' ." \
+           | tar -xpf - -C "$_attest_dest" 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up via podman unshare tar (FINDING-V412-RESTART-012)"
+      else
+        log_warn "  secrets-pki-attest/ backup via podman unshare failed — skipping (non-fatal; regenerated on next rotate-root)"
+        rm -rf "$_attest_dest"
+      fi
+    else
+      mkdir -p "$_attest_dest"
+      if cp -rp "$_attest_src"/. "$_attest_dest"/ 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets-pki-attest/ partial copy — non-fatal."
+      fi
+    fi
+  fi
+
   # Backup .env (contains passwords as env vars)
   if [[ -f "${WORK_DIR}/docker/.env" ]]; then
     cp "${WORK_DIR}/docker/.env" "${backup_dir}/.env"
@@ -6700,6 +6726,7 @@ _fix_config_perms() {
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
     -not \( -path "${work_dir}/docker/secrets-caddy" -prune \) \
+    -not \( -path "${work_dir}/docker/secrets-pki-attest" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
@@ -6715,8 +6742,15 @@ _fix_config_perms() {
   # Note: *.crt files are intentionally 0644 (public material — CA and client certs
   # must be readable by all container UIDs for mTLS peer verification). Only private
   # keys and password/token files are checked here.
-  # YSG-RISK-053: sweep BOTH secret dirs — the flat docker/secrets/ and the
-  # Caddy-scoped docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # YSG-RISK-053: sweep the flat docker/secrets/ and the Caddy-scoped
+  # docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # NOTE: docker/secrets-pki-attest/ (FINDING-V412-RESTART-012) is
+  # deliberately NOT swept here — ca_root.attested_sha256 holds a SHA-256
+  # digest, not key material; like *.crt below, its VALUE is public
+  # (disclosure confers no capability), only its ISOLATION matters (no other
+  # mesh container may mount the directory it lives in — see
+  # docker-compose.yml + test_i10_pki_chain_of_continuity.py). It is 0644 by
+  # design (install.sh rotate-root case); see the directory-level check below.
   local _sweep_dir
   for _sweep_dir in "${work_dir}/docker/secrets" "${work_dir}/docker/secrets-caddy"; do
     if [[ -d "$_sweep_dir" ]]; then
@@ -6738,6 +6772,20 @@ _fix_config_perms() {
       fi
     fi
   done
+
+  # FINDING-V412-RESTART-012: docker/secrets-pki-attest/ (postgres-only
+  # attestation dir) is not subject to the world-readable file sweep above
+  # (its one file's VALUE is non-sensitive — see comment above), but the
+  # DIRECTORY itself must never be world-writable/world-searchable-for-write
+  # — self-heal + assert, same fail-closed pattern as the loop above.
+  local _attest_dir="${work_dir}/docker/secrets-pki-attest"
+  if [[ -d "$_attest_dir" ]]; then
+    chmod o-w "$_attest_dir" 2>/dev/null || true
+    if find "$_attest_dir" -maxdepth 0 -perm -002 2>/dev/null | grep -q .; then
+      log_error "FINDING-V412-RESTART-012: ${_attest_dir} is world-writable after self-heal — investigate." >&2
+      exit 1
+    fi
+  fi
 
   log_success "Bind-mounted config permissions verified"
 }
@@ -10321,6 +10369,16 @@ run_health_check() {
   bash "$health_script"
   log_success "Health checks passed"
 
+  # FINDING-V412-RESTART-012 (Captain, 2026-07-21): fail-loud, hard-block
+  # assertion that the RO-mount fix actually took at RUNTIME, not just in the
+  # compose YAML text — a podman-compose fork bug (or any future regression
+  # of it) silently drops a :ro flag on backoffice's /run/secrets when a :rw
+  # child mount shares its path prefix (Laura, laura-012-rogue-reattack.md).
+  # This is the single highest-value post-up assertion in the whole install:
+  # if it fails, the PKI attestation-pin's un-forgeability guarantee is false
+  # and a compromised backoffice can inject a rogue CA. FATAL, not a warning.
+  _verify_backoffice_secrets_ro_mount
+
   # OLLAMA-INIT-EXIT-001: check ollama-init exit status and warn loudly if it
   # failed. ollama-init is a one-shot container (no restart-unless-stopped) so
   # a failed pull is silent once compose_up returns — the step-12 health check
@@ -10329,6 +10387,80 @@ run_health_check() {
   # agents return 404 "model not found". Non-fatal: the core stack is healthy;
   # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
   _check_ollama_init_exit "${WORK_DIR}/docker"
+}
+
+# _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
+#
+# Runs `podman inspect` / `docker inspect` against the LIVE backoffice
+# container and asserts its /run/secrets mount reports RW=false. This is a
+# runtime assertion, deliberately independent of the compose YAML text (see
+# tests/invariants/test_i10_pki_chain_of_continuity.py for the static/text
+# check) — the whole point of this finding was that the YAML SAID :ro while
+# the runtime behaviour was RW=true on this podman-compose fork. Only the
+# runtime check catches a regression of the underlying bug itself.
+#
+# Only meaningful for compose/vm deployments (K8s's backoffice /run/secrets
+# is, by design, a genuinely writable emptyDir — see backoffice.yaml — so
+# RW=true there is CORRECT, not a regression).
+_verify_backoffice_secrets_ro_mount() {
+  # K8s/helm deploys use a genuinely writable emptyDir at /run/secrets by
+  # design (see backoffice.yaml) — this check only applies to compose/vm
+  # (docker/podman) deploys. Same MODE/YSG_RUNTIME check used at install.sh
+  # lines 4085/9530/14389 for this exact compose-vs-k8s branch decision.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+
+  # Locate the running backoffice container by name pattern via a direct
+  # runtime `ps` call (NOT the vendored podman-compose-ysg fork's `ps`
+  # subcommand — it does not accept `-a`/other docker-compose-standard flags;
+  # see _check_ollama_init_exit above, which has the same latent gap. A
+  # direct runtime call is the same pattern already used elsewhere in this
+  # file for exactly this reason — see e.g. the postgres-container lookup in
+  # _backup_existing_data).
+  local _inspect_cmd="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _inspect_cmd="podman"
+
+  local _ctr_name
+  _ctr_name="$("$_inspect_cmd" ps --format '{{.Names}}' 2>/dev/null | grep -E 'backoffice' | head -1 || true)"
+
+  if [[ -z "$_ctr_name" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not locate the backoffice container to verify /run/secrets RW state — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  local _rw
+  _rw="$("$_inspect_cmd" inspect "$_ctr_name" --format \
+    '{{range .Mounts}}{{if eq .Destination "/run/secrets"}}{{.RW}}{{end}}{{end}}' 2>/dev/null || true)"
+
+  if [[ -z "$_rw" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not read /run/secrets mount state on ${_ctr_name} via '${_inspect_cmd} inspect' — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  if [[ "$_rw" != "false" ]]; then
+    log_error "################################################################"
+    log_error "FATAL: FINDING-V412-RESTART-012 REGRESSION"
+    log_error "  backoffice's /run/secrets mount reports RW=${_rw} (expected"
+    log_error "  RW=false). This means the PKI root-attestation pin's"
+    log_error "  un-forgeability guarantee is FALSE right now — a compromised"
+    log_error "  backoffice process can write ca_root.crt / any file under"
+    log_error "  /run/secrets, enabling rogue-CA injection into the mesh"
+    log_error "  (proven exploit chain: laura-012-rogue-reattack.md)."
+    log_error "  Checked: ${_inspect_cmd} inspect ${_ctr_name} -> /run/secrets RW=${_rw}"
+    log_error "  This is a HARD BLOCK — the install is refusing to proceed"
+    log_error "  with a known-forgeable trust chain. Do not work around this"
+    log_error "  with a manual kubectl/podman patch; investigate the compose"
+    log_error "  mount emission (docker-compose.yml backoffice volumes) and"
+    log_error "  re-run install.sh."
+    log_error "################################################################"
+    exit 1
+  fi
+
+  log_success "FINDING-V412-RESTART-012: backoffice /run/secrets confirmed RW=false at runtime (${_inspect_cmd} inspect)"
 }
 
 # _check_ollama_init_exit — inspect the stopped ollama-init container exit code.
@@ -12964,6 +13096,32 @@ _ensure_caddy_secrets_dir() {
   return 0
 }
 
+# _ensure_pki_attest_dir — FINDING-V412-RESTART-012 (Captain, 2026-07-21).
+#
+# Dedicated, postgres-ONLY directory for the root-attestation pin
+# (ca_root.attested_sha256). Same rationale/pattern as
+# _ensure_caddy_secrets_dir above (YSG-RISK-053), simpler in one respect: this
+# file is never minted at the flat docker/secrets/ path by the PKI issuer, so
+# there is no relocate-and-stub dance needed — only rotate-root ever writes
+# it, and it now writes directly to this dedicated dir. The dir must still
+# exist BEFORE the first `compose up` (Podman rootless bind-mount fails hard
+# on a missing host path — Docker auto-creates, Podman does not; same
+# constraint as docker/secrets-caddy/), so this is called unconditionally
+# from _pki_run_issuer after every mutating PKI action (bootstrap included),
+# guaranteeing it exists before postgres's compose service ever starts.
+_ensure_pki_attest_dir() {
+  local _dir="${WORK_DIR}/docker/secrets-pki-attest"
+  if [[ ! -d "$_dir" ]]; then
+    mkdir -p "$_dir" || { log_error "FINDING-V412-RESTART-012: cannot create ${_dir}"; return 1; }
+  fi
+  # 0700 — owner-only, same rationale as _ensure_caddy_secrets_dir: bind-mount
+  # source resolution is performed by the container runtime; in-container
+  # access is postgres-only via the compose mount (ro), no other UID needs
+  # host-side traversal.
+  chmod 0700 "$_dir" 2>/dev/null || true
+  return 0
+}
+
 # _relocate_caddy_scoped_secrets — move the three Caddy-scoped files out of the
 # flat docker/secrets/ dir and leave an inert mountpoint stub in each one's
 # place. Idempotent (stub detected → no-op; absent → stub only). Preserves
@@ -13707,6 +13865,12 @@ PYHASH
   # caddy (e.g. rotate-leaves --only <agent>). `status` never writes — skip.
   if [[ "$_issuer_rc" -eq 0 && "$subcmd" != "status" ]]; then
     _relocate_caddy_scoped_secrets || return 1
+    # FINDING-V412-RESTART-012: ensure the postgres-only attestation dir
+    # exists before ANY compose service (postgres included) can attempt to
+    # mount it — same idempotent-and-unconditional pattern as the caddy sweep
+    # above, run after every mutating action including the initial bootstrap
+    # so a virgin install always has this directory before the first `up`.
+    _ensure_pki_attest_dir || return 1
   fi
   return "$_issuer_rc"
 }
@@ -16711,18 +16875,41 @@ handle_pki_subcommand() {
       # primitive, now :ro everywhere except the issuer — see
       # docker-compose.yml) but can never produce a matching attestation: it
       # has no host shell (Laura Q3/Q4, LAURA-V412-RESTART-012-TM).
+      #
+      # FINDING-V412-RESTART-012 (2026-07-21): the attestation file is now
+      # written to a DEDICATED, postgres-ONLY directory
+      # (docker/secrets-pki-attest/), not the shared docker/secrets/ tree —
+      # Laura proved backoffice's nominal :ro mount of that shared tree was
+      # not enforced on podman-compose (laura-012-rogue-reattack.md Attack 3:
+      # forged attestation via the same write primitive that overwrites
+      # ca_root.crt). This directory has no other mesh consumer at all, so
+      # even a future regression of SOME OTHER service's RO mount cannot
+      # reach this file. ca_root.crt itself legitimately stays in the shared
+      # tree (every service needs to read it); only the attestation POINTER
+      # is isolated.
       local _new_root="${WORK_DIR}/docker/secrets/ca_root.crt"
       if [[ ! -f "$_new_root" ]]; then
         log_error "rotate-root: issuer reported success but ${_new_root} not found — refusing to write attestation"
         return 1
       fi
+      _ensure_pki_attest_dir || { log_error "rotate-root: could not prepare docker/secrets-pki-attest/ — refusing to write attestation"; return 1; }
       local _new_root_sha
       _new_root_sha="$(sha256sum "$_new_root" | cut -d' ' -f1)"
       local _attest_tmp
-      _attest_tmp="$(mktemp "${WORK_DIR}/docker/secrets/.ca_root_attest.XXXXXX")"
+      _attest_tmp="$(mktemp "${WORK_DIR}/docker/secrets-pki-attest/.ca_root_attest.XXXXXX")"
       printf '%s\n' "$_new_root_sha" > "$_attest_tmp"
       chmod 0644 "$_attest_tmp"
-      mv -f "$_attest_tmp" "${WORK_DIR}/docker/secrets/ca_root.attested_sha256"
+      mv -f "$_attest_tmp" "${WORK_DIR}/docker/secrets-pki-attest/ca_root.attested_sha256"
+      # Best-effort cleanup of any STALE pre-fix attestation file left over
+      # from an upgrade of an install that already ran rotate-root before
+      # this fix shipped — it is dead weight (05-enable-ssl.sh no longer
+      # reads /run/secrets/ca_root.attested_sha256 at all) but leaving stale
+      # attestation material sitting in the flat, widely-mounted secrets dir
+      # is worth tidying up rather than ignoring.
+      if [[ -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" ]]; then
+        rm -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" 2>/dev/null \
+          && log_info "rotate-root: removed stale pre-fix attestation file from docker/secrets/ (relocated to docker/secrets-pki-attest/)"
+      fi
       log_success "rotate-root: wrote operator-attested root pin (sha256=${_new_root_sha:0:12}...)"
       # Propagate + verify, same as rotate-leaves/rotate-intermediate — root
       # rotation used to be the ONE PKI action that never confirmed postgres
