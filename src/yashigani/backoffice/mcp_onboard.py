@@ -20,26 +20,44 @@ Sequence (fail-CLOSED, rolled back LIFO on ANY step failure):
                        wrap snippet, compose override, helm values/netpol,
                        …) under YASHIGANI_MCP_ARTIFACT_ROOT.  Raises
                        CodegenError on any security violation.
-  4. caddy_reload    — POST the monolith Caddyfile to Caddy's admin API
-                       (Content-Type: text/caddyfile; Caddy adapts
-                       server-side, resolving the
-                       ``import /etc/caddy/agents/*.caddy`` sentinel that
-                       picks up the new wrap).  Caddy reloads are atomic and
-                       zero-downtime; a failed load leaves the old config
-                       running.  Transport branches on
-                       YASHIGANI_CONTAINER_RUNTIME (SU-SEAM-1d-04 fix):
-                         docker / podman-*  — shared unix admin socket
-                                              (single-host compose; caddy and
-                                              backoffice share /run/caddy).
+  4. caddy_reload    — FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21)
+                       REWORK: register the route with caddy-config-broker
+                       via narrow, typed DATA (tenant_id, server_id,
+                       mesh_port, shim_port) — NEVER a raw Caddyfile body or
+                       a raw admin ``/load`` call. The broker independently
+                       re-validates every field, renders the MCP-front wrap
+                       from its OWN fixed template (never backoffice-
+                       supplied text), writes it into its OWN
+                       dynamic-agents volume (never bind-mounted into this
+                       container), and triggers the real Caddy reload
+                       itself. See docker/caddy/config_broker.py module
+                       docstring ("NEW CONTRACT") for the full R1+R2
+                       threat-model rework this replaces (the prior
+                       ``POST /load``-of-the-monolith design — Su
+                       5443f11f — FAILED live under the real
+                       no-new-privileges security context; see
+                       laura-final-reattack.md). Registration is atomic and
+                       zero-downtime on the Caddy side; a failed
+                       registration leaves the old config running. Transport
+                       branches on YASHIGANI_CONTAINER_RUNTIME
+                       (SU-SEAM-1d-04 precedent, same branch shape):
+                         docker / podman-*  — dedicated unix socket to
+                                              caddy-config-broker
+                                              (single-host compose; NEVER
+                                              shared with caddy itself).
                          k8s                — Caddy's mesh-mTLS admin relay
-                                              listener (:2019 site block that
-                                              proxies POST /load to the
-                                              caddy-pod-local unix socket).
-                                              backoffice authenticates with
-                                              its mesh ServiceIdentity leaf;
-                                              the relay requires
+                                              listener (:2019 site block)
+                                              now proxies POST/DELETE
+                                              /route to the caddy-config-
+                                              broker SIDECAR co-located in
+                                              the caddy pod (loopback TCP),
+                                              not a raw /load to the local
+                                              admin socket. backoffice
+                                              authenticates with its mesh
+                                              ServiceIdentity leaf; the
+                                              relay requires
                                               require_and_verify + the
-                                              backoffice SPIFFE URI.  Unix
+                                              backoffice SPIFFE URI. Unix
                                               sockets cannot span pods —
                                               caddy and backoffice are
                                               separate pods on K8s.
@@ -74,22 +92,25 @@ mint_agent_leaf is left in place — with the cert files gone it is inert
 a worse failure mode.  A ``MCP_ONBOARD_TRANSACTION_FAILED`` audit event is
 emitted on the tamper-evident chain.
 
-Deployment wiring (Phase-3 stack rebuild — Su/Captain):
+Deployment wiring (Phase-3 stack rebuild — Su/Captain; route-registration
+rework — Captain, FINDING-V412-CADDYADMIN-002):
   * ``YASHIGANI_MCP_ARTIFACT_ROOT`` — writable bind of the install's
-    ``docker/``-rooted tree into the backoffice container (the caddy
-    container reads ``docker/caddy/agents/`` from the same tree).
-  * ``YASHIGANI_CADDY_ADMIN_SOCKET`` (default ``/run/caddy/admin.sock``) —
-    the caddy admin unix socket volume must be shared with backoffice
-    (today it is a caddy-local tmpfs, mode 0700).  Compose runtimes only.
+    ``docker/``-rooted tree into the backoffice container for the NON-Caddy
+    Shape-C artifacts only (compose override, helm values/netpol, OPA
+    bundle, pki ownership fragment, contract test). The Caddy-front wrap is
+    NOT among these — see step 4 above.
+  * ``YASHIGANI_CADDY_BROKER_ROUTE_SOCKET`` (default
+    ``/run/caddy-broker-route/route.sock``) — the dedicated unix socket to
+    caddy-config-broker's POST/DELETE /route contract. Shared ONLY between
+    backoffice and caddy-config-broker (never caddy). Compose runtimes only.
   * ``YASHIGANI_CADDY_ADMIN_URL`` (default
     ``https://yashigani-caddy-admin:2019``) — K8s runtime only: base URL of
-    Caddy's mesh-mTLS admin relay listener
-    (helm configmaps.yaml ``:2019`` site block).  MUST be https on the mesh;
-    the client is ``yashigani.pki.client.internal_httpx_client()`` (the
-    backoffice ServiceIdentity leaf + internal-CA trust) — there is NO
+    Caddy's mesh-mTLS admin relay listener (helm configmaps.yaml ``:2019``
+    site block), which now proxies POST/DELETE /route to the
+    caddy-config-broker sidecar co-located in the caddy pod. MUST be https
+    on the mesh; the client is ``yashigani.pki.client.internal_httpx_client()``
+    (the backoffice ServiceIdentity leaf + internal-CA trust) — there is NO
     identity-less fallback on this path (fail-closed).
-  * ``YASHIGANI_CADDY_CADDYFILE`` (default ``/etc/caddy/Caddyfile``) — the
-    active monolith Caddyfile mounted read-only into backoffice.
   * ``YASHIGANI_CONTAINER_RUNTIME`` — one of codegen.VALID_RUNTIMES
     (default ``docker``); install.sh sets it per selected runtime.
 Until that wiring lands, the transaction fails CLOSED (503/502 + rollback) —
@@ -107,15 +128,19 @@ from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ADMIN_SOCKET = "/run/caddy/admin.sock"
-_DEFAULT_CADDYFILE = "/etc/caddy/Caddyfile"
+# FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) — compose default: the
+# dedicated unix socket to caddy-config-broker's POST/DELETE /route contract.
+# NEVER shared with caddy itself (only backoffice <-> caddy-config-broker).
+_DEFAULT_BROKER_ROUTE_SOCKET = "/run/caddy-broker-route/route.sock"
 # K8s only — Caddy's mesh-mTLS admin relay (helm configmaps.yaml :2019 site
-# block). https is mandatory: the relay is require_and_verify + SPIFFE-gated.
-# yashigani-caddy-admin is the DEDICATED ClusterIP Service (caddy.yaml) — the
-# public yashigani-caddy Service is type LoadBalancer and must never carry
-# the admin relay port. The caddy leaf carries the yashigani-caddy-admin DNS
-# SAN (service_identities.yaml) so hostname verification passes.
-_DEFAULT_ADMIN_API_URL = "https://yashigani-caddy-admin:2019"
+# block), now proxying POST/DELETE /route to the caddy-config-broker sidecar
+# co-located in the caddy pod. https is mandatory: the relay is
+# require_and_verify + SPIFFE-gated. yashigani-caddy-admin is the DEDICATED
+# ClusterIP Service (caddy.yaml) — the public yashigani-caddy Service is type
+# LoadBalancer and must never carry the admin relay port. The caddy leaf
+# carries the yashigani-caddy-admin DNS SAN (service_identities.yaml) so
+# hostname verification passes.
+_DEFAULT_BROKER_RELAY_URL = "https://yashigani-caddy-admin:2019"
 
 
 class McpOnboardError(Exception):
@@ -163,91 +188,136 @@ def _runtime() -> str:
     return runtime
 
 
-def _read_caddyfile_text() -> str:
-    """Read the active monolith Caddyfile (shared by both reload transports)."""
-    caddyfile_path = os.getenv("YASHIGANI_CADDY_CADDYFILE", _DEFAULT_CADDYFILE)
-    try:
-        return Path(caddyfile_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise McpOnboardError(
-            "caddy_reload",
-            f"cannot read Caddyfile at {caddyfile_path!r}: {exc} "
-            "(Phase-3 wiring — mount the active Caddyfile into backoffice)",
-        ) from exc
+def _route_payload(*, tenant_id: str, server_id: str, mesh_port: int, shim_port: int) -> bytes:
+    import json  # noqa: PLC0415 — keep module import light
+    return json.dumps({
+        "tenant_id": tenant_id,
+        "server_id": server_id,
+        "mesh_port": mesh_port,
+        "shim_port": shim_port,
+    }).encode("utf-8")
 
 
-async def _reload_via_admin_socket() -> None:
-    """Compose runtimes (docker / podman-*) — shared unix admin socket.
+async def _register_route_via_broker_socket(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """Compose runtimes (docker / podman-*) — dedicated unix socket to
+    caddy-config-broker.
 
-    POSTs the active monolith Caddyfile with ``Content-Type: text/caddyfile``;
-    Caddy adapts it server-side (parse-time ``{$ENV}`` substitution and the
-    ``import /etc/caddy/agents/*.caddy`` sentinel both resolve inside the
-    caddy container).  A non-2xx response or an unreachable socket raises —
-    the transaction rolls back (fail-closed).
+    FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): POSTs narrow, typed
+    route DATA — NEVER a raw Caddyfile body. caddy-config-broker
+    independently re-validates every field, renders the wrap from its own
+    fixed template, writes it into its own volume, and reloads the real
+    Caddy admin socket itself. A non-2xx response or an unreachable socket
+    raises — the transaction rolls back (fail-closed).
     """
     import httpx  # noqa: PLC0415 — keep module import light
 
-    socket_path = os.getenv("YASHIGANI_CADDY_ADMIN_SOCKET", _DEFAULT_ADMIN_SOCKET)
-    caddyfile_text = _read_caddyfile_text()
+    socket_path = os.getenv(
+        "YASHIGANI_CADDY_BROKER_ROUTE_SOCKET", _DEFAULT_BROKER_ROUTE_SOCKET,
+    )
+    body = _route_payload(
+        tenant_id=tenant_id, server_id=server_id,
+        mesh_port=mesh_port, shim_port=shim_port,
+    )
 
     transport = httpx.AsyncHTTPTransport(uds=socket_path)
     try:
         async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             resp = await client.post(
-                # Host is ignored for unix-socket admin endpoints; Caddy
-                # requires a well-formed origin.
-                "http://localhost/load",
-                content=caddyfile_text.encode("utf-8"),
-                headers={"Content-Type": "text/caddyfile"},
+                "http://localhost/route",
+                content=body,
+                headers={"Content-Type": "application/json"},
             )
     except httpx.HTTPError as exc:
         raise McpOnboardError(
             "caddy_reload",
-            f"caddy admin socket {socket_path!r} unreachable: {exc} "
-            "(Phase-3 wiring — share /run/caddy with backoffice)",
+            f"caddy-config-broker route socket {socket_path!r} unreachable: "
+            f"{exc} (Phase-3 wiring — share caddy_broker_route_sock with "
+            "backoffice)",
         ) from exc
     if resp.status_code // 100 != 2:
         raise McpOnboardError(
             "caddy_reload",
-            "caddy /load rejected the config (HTTP %d): %.300s"
+            "caddy-config-broker /route rejected the request (HTTP %d): %.300s"
             % (resp.status_code, resp.text),
         )
-    logger.info("mcp-onboard: caddy reload OK (admin socket %s)", socket_path)
+    logger.info(
+        "mcp-onboard: route registered OK (broker socket %s, tenant=%s server=%s)",
+        socket_path, tenant_id, server_id,
+    )
 
 
-async def _reload_via_admin_api() -> None:
-    """K8s runtime — Caddy's mesh-mTLS admin relay listener (SU-SEAM-1d-04).
+async def _unregister_route_via_broker_socket(
+    *, tenant_id: str, server_id: str,
+) -> None:
+    """Rollback counterpart of _register_route_via_broker_socket() — best
+    effort (logs, does not raise): rollback must never itself abort a
+    rollback that is already in progress."""
+    import httpx  # noqa: PLC0415 — keep module import light
+    import json  # noqa: PLC0415
 
-    On K8s, caddy and backoffice are separate pods: the unix admin socket
-    cannot be shared (emptyDir is pod-local; same-node co-location / RWX PVC
-    is not the architecture).  Instead the helm Caddyfile exposes a ``:2019``
-    site block that:
+    socket_path = os.getenv(
+        "YASHIGANI_CADDY_BROKER_ROUTE_SOCKET", _DEFAULT_BROKER_ROUTE_SOCKET,
+    )
+    body = json.dumps({"tenant_id": tenant_id, "server_id": server_id}).encode("utf-8")
+    transport = httpx.AsyncHTTPTransport(uds=socket_path)
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
+            resp = await client.request(
+                "DELETE", "http://localhost/route",
+                content=body, headers={"Content-Type": "application/json"},
+            )
+        if resp.status_code // 100 != 2:
+            logger.error(
+                "mcp-onboard: rollback route unregister rejected (HTTP %d): %.300s",
+                resp.status_code, resp.text,
+            )
+    except Exception as exc:  # noqa: BLE001 — rollback is best-effort
+        logger.error("mcp-onboard: rollback route unregister failed: %s", exc)
+
+
+async def _register_route_via_broker_relay(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """K8s runtime — Caddy's mesh-mTLS admin relay listener (SU-SEAM-1d-04),
+    which now proxies POST/DELETE /route to the caddy-config-broker sidecar
+    co-located in the caddy pod (FINDING-V412-CADDYADMIN-002 rework —
+    previously proxied a raw POST /load).
+
+    On K8s, caddy and backoffice are separate pods: the unix socket cannot
+    be shared (emptyDir is pod-local; same-node co-location / RWX PVC is not
+    the architecture). Instead the helm Caddyfile exposes a ``:2019`` site
+    block that:
 
       * terminates mesh mTLS with ``client_auth require_and_verify`` against
         the internal CA bundle (identity-less clients are refused at the
         TLS handshake — the raw admin API is NEVER on the pod network), and
-      * admits ONLY ``POST /load`` from the backoffice SPIFFE URI (CEL
-        expression on the client-cert URI SAN), then proxies to the
-        caddy-pod-local unix admin socket.
+      * admits ONLY POST/DELETE ``/route`` from the backoffice SPIFFE URI
+        (CEL expression on the client-cert URI SAN), then proxies to the
+        caddy-config-broker sidecar's loopback TCP listener.
 
     The client here is ``internal_httpx_client()`` — the backoffice
     ServiceIdentity leaf + internal-CA trust, the SAME factory every other
-    internal mesh call uses (MCP-001 pattern).  There is deliberately NO
-    identity-less fallback: an admin config-mutation surface must fail
-    CLOSED when the mesh identity is unavailable.
+    internal mesh call uses (MCP-001 pattern). There is deliberately NO
+    identity-less fallback: a config-mutation surface must fail CLOSED when
+    the mesh identity is unavailable.
     """
     import httpx  # noqa: PLC0415 — keep module import light
 
-    admin_url = os.getenv(
-        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_ADMIN_API_URL
+    relay_url = os.getenv(
+        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_BROKER_RELAY_URL,
     ).strip().rstrip("/")
-    if not admin_url.startswith("https://"):
+    if not relay_url.startswith("https://"):
         raise McpOnboardError(
             "caddy_reload",
-            f"YASHIGANI_CADDY_ADMIN_URL={admin_url!r} must be https:// — the "
+            f"YASHIGANI_CADDY_ADMIN_URL={relay_url!r} must be https:// — the "
             "K8s admin relay is mesh-mTLS only (fail-closed).",
         )
-    caddyfile_text = _read_caddyfile_text()
+    body = _route_payload(
+        tenant_id=tenant_id, server_id=server_id,
+        mesh_port=mesh_port, shim_port=shim_port,
+    )
 
     try:
         from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
@@ -256,45 +326,93 @@ async def _reload_via_admin_api() -> None:
         raise McpOnboardError(
             "caddy_reload",
             f"mesh ServiceIdentity unavailable for the caddy admin relay "
-            f"({exc}) — the K8s reload path has no identity-less fallback "
-            "(fail-closed; check YASHIGANI_SERVICE_NAME + /run/secrets PKI).",
+            f"({exc}) — the K8s route-registration path has no "
+            "identity-less fallback (fail-closed; check "
+            "YASHIGANI_SERVICE_NAME + /run/secrets PKI).",
         ) from exc
 
     try:
         async with client:
             resp = await client.post(
-                f"{admin_url}/load",
-                content=caddyfile_text.encode("utf-8"),
-                headers={"Content-Type": "text/caddyfile"},
+                f"{relay_url}/route",
+                content=body,
+                headers={"Content-Type": "application/json"},
             )
     except httpx.HTTPError as exc:
         raise McpOnboardError(
             "caddy_reload",
-            f"caddy admin relay {admin_url!r} unreachable: {exc} "
-            "(check the helm :2019 admin-relay listener + NetworkPolicy "
+            f"caddy admin relay {relay_url!r} unreachable: {exc} "
+            "(check the helm :2019 relay listener + NetworkPolicy "
             "backoffice→caddy:2019)",
         ) from exc
     if resp.status_code // 100 != 2:
         raise McpOnboardError(
             "caddy_reload",
-            "caddy /load (admin relay) rejected the config (HTTP %d): %.300s"
+            "caddy admin relay /route rejected the request (HTTP %d): %.300s"
             % (resp.status_code, resp.text),
         )
-    logger.info("mcp-onboard: caddy reload OK (mesh admin relay %s)", admin_url)
+    logger.info(
+        "mcp-onboard: route registered OK (mesh admin relay %s, tenant=%s server=%s)",
+        relay_url, tenant_id, server_id,
+    )
 
 
-async def default_caddy_reloader() -> None:
-    """Reload Caddy — transport selected by YASHIGANI_CONTAINER_RUNTIME.
+async def _unregister_route_via_broker_relay(
+    *, tenant_id: str, server_id: str,
+) -> None:
+    """Rollback counterpart of _register_route_via_broker_relay() — best
+    effort (logs, does not raise)."""
+    import httpx  # noqa: PLC0415 — keep module import light
+    import json  # noqa: PLC0415
 
-    docker / podman-rootful / podman-rootless → shared unix admin socket
-    (single-host compose).  k8s → mesh-mTLS admin relay (separate pods; unix
-    sockets cannot span pods).  Both transports POST the same monolith
-    Caddyfile to Caddy's ``/load`` and fail CLOSED on any error.
-    """
+    relay_url = os.getenv(
+        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_BROKER_RELAY_URL,
+    ).strip().rstrip("/")
+    body = json.dumps({"tenant_id": tenant_id, "server_id": server_id}).encode("utf-8")
+    try:
+        from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
+        client = internal_httpx_client(timeout=15.0)
+        async with client:
+            resp = await client.request(
+                "DELETE", f"{relay_url}/route",
+                content=body, headers={"Content-Type": "application/json"},
+            )
+        if resp.status_code // 100 != 2:
+            logger.error(
+                "mcp-onboard: rollback route unregister (relay) rejected "
+                "(HTTP %d): %.300s", resp.status_code, resp.text,
+            )
+    except Exception as exc:  # noqa: BLE001 — rollback is best-effort
+        logger.error("mcp-onboard: rollback route unregister (relay) failed: %s", exc)
+
+
+async def register_mcp_route(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """Register the MCP-front route with caddy-config-broker — transport
+    selected by YASHIGANI_CONTAINER_RUNTIME. docker / podman-rootful /
+    podman-rootless -> dedicated unix socket (single-host compose). k8s ->
+    mesh-mTLS admin relay (separate pods; unix sockets cannot span pods).
+    Both transports send the SAME narrow typed-DATA contract — NEVER a raw
+    Caddyfile body — and fail CLOSED on any error (FINDING-V412-CADDYADMIN-002)."""
     if _runtime() == "k8s":
-        await _reload_via_admin_api()
+        await _register_route_via_broker_relay(
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=mesh_port, shim_port=shim_port,
+        )
     else:
-        await _reload_via_admin_socket()
+        await _register_route_via_broker_socket(
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=mesh_port, shim_port=shim_port,
+        )
+
+
+async def unregister_mcp_route(*, tenant_id: str, server_id: str) -> None:
+    """Rollback counterpart of register_mcp_route() — best effort."""
+    if _runtime() == "k8s":
+        await _unregister_route_via_broker_relay(tenant_id=tenant_id, server_id=server_id)
+    else:
+        await _unregister_route_via_broker_socket(tenant_id=tenant_id, server_id=server_id)
 
 
 def _leaf_cert_fingerprint(cert_path: Any) -> str:
@@ -394,15 +512,18 @@ async def run_approve_transaction(
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
     """
+    import functools
+
     from yashigani.manifest.codegen import (
         CodegenError,
+        _mcp_mesh_port,
+        _mcp_shim_port,
         approve_mcp_onboard,
         is_artifact_relevant_for_runtime,
     )
     from yashigani.pki.binding import tool_surface_hash
     from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
 
-    reloader = caddy_reloader or default_caddy_reloader
     rollback: list[Callable[[], None]] = []
 
     def _run_rollback() -> None:
@@ -483,6 +604,31 @@ async def run_approve_transaction(
     image_digest = (
         ((parsed.get("spec") or {}).get("image") or {}).get("digest") or ""
     )
+
+    # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): resolve the
+    # route-registration ("reloader") + rollback ("route_unregisterer")
+    # callables now that `parsed` is available. Production default sends
+    # narrow typed DATA to caddy-config-broker (register_mcp_route /
+    # unregister_mcp_route — see module docstring); the injectable
+    # `caddy_reloader` test seam is reused for BOTH forward and rollback
+    # calls (unchanged contract — existing tests assert the injected stub is
+    # called twice on a later-step failure: once to apply, once to restore).
+    # _mcp_mesh_port() is idempotent for a repeat (tenant_id, server_id) pair
+    # in the same codegen session (CodegenEngineShapeC.render(), step 3
+    # below, already resolves+claims it once) — calling it again here
+    # returns the SAME port, never a second claim.
+    if caddy_reloader is not None:
+        reloader: Callable[[], Awaitable[None]] = caddy_reloader
+        route_unregisterer: Callable[[], Awaitable[None]] = caddy_reloader
+    else:
+        reloader = functools.partial(
+            register_mcp_route,
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=_mcp_mesh_port(parsed), shim_port=_mcp_shim_port(parsed),
+        )
+        route_unregisterer = functools.partial(
+            unregister_mcp_route, tenant_id=tenant_id, server_id=server_id,
+        )
 
     # ── Step 2: mint the per-instance leaf (Nico's contract) ────────────────
     instance_id = f"nhi_{uuid.uuid4().hex[:12]}"
@@ -777,10 +923,10 @@ async def run_approve_transaction(
             _run_rollback()
             if reload_applied:
                 try:
-                    await reloader()
+                    await route_unregisterer()
                 except Exception as re_exc:  # noqa: BLE001 — best-effort restore
                     logger.error(
-                        "mcp-onboard: post-rollback caddy re-reload failed: %s",
+                        "mcp-onboard: post-rollback route unregister failed: %s",
                         re_exc,
                     )
             _audit_failure("broker_registry", exc, instance_id, spiffe_id)
@@ -827,16 +973,17 @@ async def run_approve_transaction(
             svid_issued=True,   # the leaf minted in step 2 exists on disk
         )
     except Exception as exc:
-        # Roll back files, then best-effort re-reload so Caddy drops the
-        # now-removed wrap snippet (the old snippet file is gone; a reload
-        # re-adapts without it).
+        # Roll back files, then best-effort unregister so Caddy drops the
+        # now-invalid wrap route (FINDING-V412-CADDYADMIN-002: the broker
+        # owns the route file — unregister asks IT to remove + reload, not
+        # a re-POST of a local artifact that no longer exists here).
         _run_rollback()
         if reload_applied:
             try:
-                await reloader()
+                await route_unregisterer()
             except Exception as re_exc:  # noqa: BLE001 — best-effort restore
                 logger.error(
-                    "mcp-onboard: post-rollback caddy re-reload failed: %s", re_exc,
+                    "mcp-onboard: post-rollback route unregister failed: %s", re_exc,
                 )
         _audit_failure("envelope_mint", exc, instance_id, spiffe_id)
         raise McpOnboardError(
@@ -887,6 +1034,7 @@ async def run_approve_transaction(
 __all__ = [
     "McpOnboardError",
     "McpOnboardResult",
-    "default_caddy_reloader",
+    "register_mcp_route",
+    "unregister_mcp_route",
     "run_approve_transaction",
 ]

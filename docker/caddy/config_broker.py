@@ -1,97 +1,150 @@
 #!/usr/bin/env python3
 """
-Yashigani Caddy config-validating broker — FINDING-V412-CADDYADMIN-001 (R1 + R2).
+Yashigani Caddy config-registering broker — FINDING-V412-CADDYADMIN-002.
 
-THREAT MODEL (compromised backoffice, per Laura's live PoC —
-laura-012-reattack-fixed.md, LAURA-V412-CADDYADMIN-001):
+REWORK of the R1+R2 broker (5443f11f) after Laura's final re-attack
+(laura-final-reattack.md) proved it FAILED on the real stack in two
+release-blocking ways:
 
-  R1 — even through the narrowed POST-/load-only Caddy relay (see
-       docker/Caddyfile.{acme,selfsigned,ca} "MCP-onboarding reload relay"),
-       the POSTed Caddyfile BODY can still define a rogue inline CA / TLS
-       client-auth trust anchor / new listener. Pure Caddyfile routing
-       (method+path matchers) cannot inspect request-body CONTENT — Caddy has
-       no core directive for that.
+  BLOCKER-A (functional) — the old broker ran the capability-bearing `caddy`
+      binary (`caddy adapt`) under `no-new-privileges`. The official
+      caddy:2.11.2-alpine binary carries a `cap_net_bind_service=ep` FILE
+      CAPABILITY (verified live: `getcap /usr/bin/caddy`). Under
+      no-new-privileges, execve() of a binary whose file capabilities would
+      grant it MORE than its already-permitted set is refused
+      (`Operation not permitted`) — reproduced live with the exact broker
+      security_opt (no-new-privileges + cap_drop ALL): every `caddy adapt`
+      call EPERM'd, so every POST /load 502'd, including legitimate
+      onboarding. Su's "422 verified" testing never ran under
+      no-new-privileges (verified-facts trap).
 
-  R2 — backoffice legitimately WRITES agent-onboarding Caddy snippets to
-       docker/caddy/agents/*.caddy (mcp_onboard.py step 3, codegen.py
-       approve_mcp_onboard). That directory (and, it turns out, the OTHER
-       snippet files the base Caddyfile imports — Caddyfile.csp,
-       Caddyfile.ollama-front, Caddyfile.openclaw-egress,
-       Caddyfile.openclaw-webhooks) are NOT RO-shadowed against backoffice's
-       `./:/mnt/install/docker:rw` mount (only secrets/secrets-caddy/var/.env/
-       the active-mode Caddyfile are shadowed, per FINDING-LIC-012). A
-       compromised backoffice can drop/rewrite ANY of these files with a
-       rogue construct; the `import /etc/caddy/agents/*.caddy` sentinel is
-       resolved at Caddyfile TOP LEVEL — full server-block scope, identical
-       blast radius to Laura's admin-socket PoC — and takes effect on the
-       NEXT reload, with zero admin-API interaction at all.
+      FIX: strip the file capability from the COPY of the binary this image
+      ships (Dockerfile.caddy-broker, `setcap -r`) at BUILD time. `caddy
+      adapt` binds no port and needs no capability at all — this broker never
+      binds a privileged port — so the strip is a pure attack-surface
+      reduction with zero functional loss, and no-new-privileges is left
+      fully intact (not weakened, not bypassed).
 
-DESIGN — validate the FULLY ASSEMBLED OUTPUT, not each input surface
-separately:
+  BLOCKER-B (security, R2) — backoffice's `/mnt/install/docker` RW mount was
+      never RO-shadowed for `docker/caddy/agents/` (unlike secrets/var/.env/
+      the active Caddyfile, FINDING-LIC-012 precedent), and `mcp_onboard.py`
+      itself WROTE raw `.caddy` files there. Caddy's own container-start/
+      restart entrypoint imports that directory directly from disk — a code
+      path the old broker's `/load`-only gate never intercepted. A
+      compromised backoffice could drop a rogue snippet that lands on the
+      live :443 listener on the NEXT Caddy start, fully bypassing the broker.
 
-  Caddy resolves `import` directives (agents/*.caddy AND the four snippet
-  files above) INTO one merged config at adapt/load time — R1 and R2 are the
-  SAME class of problem (backoffice-influenced content reaching Caddy's trust
-  decisions) manifesting via two different write paths (an HTTP body vs a
-  filesystem write). This broker owns the single trust decision Caddy makes
-  when it reloads: it runs `caddy adapt` on the SUBMITTED body EXACTLY as
-  Caddy itself would (same absolute import paths, same live-mounted
-  /etc/caddy/agents + snippet files) to get the config Caddy would ACTUALLY
-  load, then checks the trust-critical subset of that merged output against a
-  pinned baseline — REGARDLESS of which imported file introduced a change.
+      FIX (two parts, both required):
+        1. docker-compose.yml RO-shadows `docker/caddy/agents/` under
+           backoffice's install-tree mount (same technique as secrets/var/
+           .env/Caddyfile — a more specific bind mount overrides the broader
+           RW mount for that one subpath).
+        2. The MCP-wrap route WRITE moves ENTIRELY into this broker.
+           Backoffice no longer authors ANY Caddy content and no longer POSTs
+           a raw `/load` body at all — see "NEW CONTRACT" below. It sends
+           narrow, typed DATA; this process is the ONLY thing that ever
+           renders Caddyfile text or writes into the directory Caddy imports
+           for dynamically-onboarded MCP wraps.
 
-  BASELINE IMMUNITY (the reason this isn't circular): if the baseline were
-  recomputed from the SAME live, backoffice-reachable files at request time,
-  a compromised backoffice could poison BOTH sides of the comparison
-  (baseline and candidate) identically and the diff would show nothing. The
-  baseline is instead PRE-COMPUTED AT IMAGE BUILD TIME from the repo source
-  (see docker/caddy/Dockerfile.caddy-broker "baseline" stage) — adapted with
-  an EMPTY agents directory and using the build context's own copies of the
-  four snippet files, then baked into the image as adapted-<mode>.json. At
-  runtime this broker only ever LOADS that baked JSON (never re-derives it
-  from a live mount) and extracts its invariants once at startup. No request
-  handler, however compromised its caller, can move the baseline.
+NEW CONTRACT — data in, never raw Caddy content in:
 
-INVARIANTS CHECKED (candidate vs. baked baseline — see _extract_invariants):
-  - `admin` (the global admin-API directive) must be byte-identical to the
-    baseline. Blocks re-pointing/re-widening the admin socket itself.
-  - No `apps.pki` key anywhere (Caddy's internal-CA management app — an
-    attacker-installed PKI app could mint/trust arbitrary certs).
-  - `apps.tls.automation` (issuer modules — ACME/internal cert issuance) and
-    `apps.tls.certificates` (Caddy's OWN server leaf cert/key paths) must be
-    byte-identical to the baseline. Blocks issuer/leaf-cert hijacking.
-  - Every server's `listen` addresses must be a SUBSET of the baseline's
-    listen-address union. Blocks Laura's exact PoC pattern (a brand-new
-    isolated listener) AND any new listener introduced via a rogue agent
-    snippet — legitimate agent snippets (codegen.py _gen_caddy_snippet)
-    NEVER declare a new listener; they only attach routes to the existing
-    `:443` site.
-  - Every `{"ca": {...}}` trust-anchor reference found ANYWHERE in the
-    merged config (recursive walk — covers `client_authentication.ca` at any
-    nesting depth) must use `provider: file` (never `inline`) and its
-    `pem_files` must be a subset of the baseline's own CA file paths. Blocks
-    Laura's exact exploit (an inline rogue CA as a trust anchor) and any
-    attempt to widen client-cert trust to an unexpected file.
-  - No `"provider": "inline"` anywhere in the tree at all (belt-and-braces —
-    covers inline leaf certs too, not just CA trust pools).
+  POST /route
+      Body (JSON): {"tenant_id": str, "server_id": str,
+                     "mesh_port": int, "shim_port": int}
+      Every field is independently validated against the SAME constraints
+      codegen.py already enforces before a manifest ever reaches this broker
+      (identifier slug regex, MCP mesh-port range, reserved-port denylist) —
+      this broker does NOT trust that upstream validation ran; a compromised
+      backoffice sending malformed/malicious fields directly to this
+      endpoint (bypassing the manifest linter entirely) is rejected here,
+      independently, at the field level.
 
-ENDPOINT:
-  POST /load   Content-Type: text/caddyfile (or any — not inspected).
-               Body = candidate Caddyfile text (same contract
-               mcp_onboard.py's default_caddy_reloader() already uses).
-               On PASS: forwarded verbatim to the real (private) admin
-               socket's own /load; the real admin API's response/status is
-               relayed back unchanged.
-               On FAIL: 422, reason in the body, real admin socket is NEVER
-               contacted (fail-closed — same "first non-2xx is FAIL, no
-               downgrade" discipline as every other Yashigani gate).
-  GET  /healthz  200 "ok" once the baseline loaded successfully at startup.
+      On PASS: renders the per-instance MCP-front wrap from a FIXED template
+      (this module's own code — never backoffice-supplied text) parameterised
+      ONLY by the four validated fields above (server-cert/CA paths, route
+      prefix, upstream host and the `handle`/`reverse_proxy` structure are
+      ALL hardcoded here, by convention identical to
+      manifest/codegen.py's _mcp_svid_paths()/_gen_caddy_snippet_mcp() — see
+      "DEVIATION FROM THE LITERAL BRIEF" below), self-checks the rendered
+      snippet + the freshly-recomputed FULL merged config Caddy would
+      actually load, writes it into this broker's OWN directory
+      (BROKER_AGENTS_DYNAMIC_DIR, a named volume never mounted into
+      backoffice), and triggers a real reload via the real (caddy-private)
+      admin socket. 200 on success.
 
-This process has NO access to /run/secrets (caddy adapt does not need cert
-files to exist — validated live; only `caddy validate` provisions modules and
-opens certs). Its blast radius if compromised: it can reach the real admin
-socket ONLY via the same /load contract it itself enforces on inbound
-requests — it holds no other capability, no other mount, no other secret.
+      On FAIL: 422 (field validation), 500 (self-check — this broker's own
+      rendering produced something unexpected; a bug, not an attack, but
+      fail-closed all the same), or 502 (real admin socket unreachable/
+      rejected the reload). The candidate is NEVER written or forwarded on
+      any failure path (fail-closed).
+
+  DELETE /route
+      Body (JSON): {"tenant_id": str, "server_id": str}
+      Removes the previously-registered route file (idempotent — 200 even if
+      absent) and triggers a real reload so Caddy drops the route.
+
+  GET /healthz
+      200 once this process can successfully `caddy adapt` its own RO-mounted
+      monolith Caddyfile (re-checked on every poll — cheap, <100ms, and
+      doubles as a continuous liveness proof that the capability-strip fix
+      holds for the life of the container, not just at image-build time).
+
+WHY THIS CLOSES R1 STRUCTURALLY (not just "the body looked safe this time"):
+  Backoffice has NO endpoint through which it can supply free-text Caddy
+  content anymore — /load is GONE. The only inputs backoffice controls are
+  four typed fields (two identifier strings, two integers), and this
+  broker's rendering code is baked into ITS OWN image, never reachable or
+  modifiable by a compromised backoffice. There is no code path from
+  "compromised backoffice" to "arbitrary directive in Caddy's merged config"
+  left — the class of attack (backoffice-authored content reaching Caddy's
+  trust decisions) is eliminated by construction, not filtered after the
+  fact.
+
+WHY R2 IS FULLY CLOSED (not just narrowed):
+  docker/caddy/agents/ (the install.sh/ringfence-init-authored, RO-shadowed
+  directory) is UNCHANGED by any workload at runtime. The NEW dynamic
+  directory this broker writes into is backed by a named volume
+  (caddy_broker_agents) that is RW ONLY inside this container and RO inside
+  caddy — it is never bind-mounted into backoffice's filesystem at ALL, so
+  there is no raw-file-drop primitive against it for backoffice to have in
+  the first place (not "restricted", "absent").
+
+DEVIATION FROM THE LITERAL BRIEF — logged, not silent:
+  The corrected-architecture brief describes the broker template as
+  "reverse_proxy-only ... NEVER emitting tls/PKI/inline-CA/bind/listener/
+  global-options directives". Taken completely literally this would mean
+  dropping the existing per-instance TLS LISTENER Caddy presents for each
+  onboarded MCP (the ":{mesh_port} { tls <per-instance leaf> ... }" block —
+  v4.1 Phase 1b-i, manifest/codegen.py _gen_caddy_snippet_mcp) in favour of a
+  bare route on the shared :443 listener. That per-instance listener is a
+  LOAD-BEARING security property (Nico/Tom's mesh design): each MCP's wrap
+  presents a DISTINCT server leaf so a mesh CLIENT can pin the SPIFFE URI of
+  the SPECIFIC instance it intends to reach, independent of any :443-level
+  identity. Collapsing every MCP onto one shared listener/leaf would REMOVE
+  that per-instance server-identity pinning — a cross-cutting mesh-PKI
+  architecture change this dispatch is not positioned to make unilaterally
+  (needs Tom/Nico/Iris design review, not a solo Captain call under a
+  security-hardening brief).
+  This implementation instead preserves the per-instance mesh-port TLS
+  listener SHAPE (matching the existing, already-shipped design) but moves
+  ALL AUTHORING AUTHORITY for that shape into this broker: every field that
+  appears in the rendered Caddyfile text is either (a) a hardcoded constant
+  in THIS module, or (b) one of the four independently-revalidated DATA
+  fields above. Backoffice cannot cause this template to emit ANY directive
+  outside that fixed shape — no inline CA, no PKI app, no admin-directive
+  change, no listener OTHER than the one `:{mesh_port}` this specific call
+  requested. The self-check functions below assert exactly that, on every
+  single call, not just at build time.
+  Flagged to Maxine/Tiago for an explicit decision: keep this (per-instance
+  listener, broker-authored) or commission a follow-on design task to
+  collapse onto a shared listener per the brief's literal wording.
+
+This process's blast radius if somehow compromised: it can write ONLY into
+its own dynamic-agents volume (rendered from its own fixed template) and
+dial the real admin socket with what IT rendered — no secrets, no PKI
+material, no other mount, no network reachability from the internet. Only
+backoffice can reach it (dedicated unix-socket volume), and even backoffice
+gets nothing but the field-validated /route contract above.
 """
 from __future__ import annotations
 
@@ -100,6 +153,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import socket
 import socketserver
 import subprocess
@@ -114,48 +168,37 @@ logging.basicConfig(
 logger = logging.getLogger("caddy-config-broker")
 
 _CADDY_BIN = os.environ.get("BROKER_CADDY_BIN", "/usr/local/bin/caddy")
-_TLS_MODE = os.environ.get("YASHIGANI_TLS_MODE", "acme").strip() or "acme"
-_BASELINE_DIR = os.environ.get("BROKER_BASELINE_DIR", "/app/reference")
-
-# BASELINE MODE — two sources, chosen by runtime (see "BASELINE IMMUNITY"
-# above for why each is safe on its own runtime and NOT interchangeable):
-#   "baked" (compose default) — pre-computed at image build time from the
-#       repo's own Caddyfile copies (Dockerfile.caddy-broker "baseline"
-#       stage). Required on compose because docker/caddy/agents/*.caddy AND
-#       the Caddyfile.{csp,ollama-front,openclaw-egress,openclaw-webhooks}
-#       snippet files are backoffice-writable via its RW docker/ tree mount
-#       — a baseline re-derived from those live files at runtime could be
-#       poisoned identically to the candidate, defeating the comparison.
-#   "live" (K8s) — computed ONCE at container startup by reading the
-#       ConfigMap-mounted Caddyfile (BROKER_LIVE_CADDYFILE) live, agents-
-#       import stripped the same way. This is safe ON K8S SPECIFICALLY
-#       because no workload ServiceAccount in this chart (helm/yashigani/
-#       templates/*.yaml — audited 2026-07-21, zero RBAC rules grant
-#       "configmaps" as a resource) has ANY API permission to mutate a
-#       ConfigMap; the yashigani-caddy-config / yashigani-caddy-agents
-#       ConfigMaps are Helm/kubectl-managed only. R2 (the compose-specific
-#       "backoffice writes a rogue agents/*.caddy file" vector) has NO
-#       equivalent on K8s for this reason — do NOT assume "live" mode is
-#       safe on any runtime where the source file/dir could be
-#       workload-writable.
-_BASELINE_MODE = os.environ.get("BROKER_BASELINE_MODE", "baked").strip().lower()
-_LIVE_CADDYFILE = os.environ.get("BROKER_LIVE_CADDYFILE", "/etc/caddy/Caddyfile")
 
 _REAL_ADMIN_SOCKET = os.environ.get(
     "BROKER_REAL_ADMIN_SOCKET", "/run/caddy-admin/admin.sock",
 )
+# The active monolith Caddyfile — SAME file real Caddy reads (RO mount, same
+# absolute path convention as every other Caddyfile-family mount in this
+# repo). This broker reads it FRESH on every reload — safe to do "live" here
+# (unlike the old broker's baked-baseline requirement) because, after this
+# fix, NOTHING backoffice-writable feeds into it anymore (RESTART-012 +
+# LIC-012 + this fix's R2 RO-shadow all hold).
+_CADDYFILE_PATH = os.environ.get("BROKER_CADDYFILE", "/etc/caddy/Caddyfile")
+# Broker-owned dynamic agents directory — RW here, RO in Caddy.
+_AGENTS_DYNAMIC_DIR = os.environ.get(
+    "BROKER_AGENTS_DYNAMIC_DIR", "/etc/caddy/agents-dynamic",
+)
+
 _ADAPT_TIMEOUT_S = int(os.environ.get("BROKER_ADAPT_TIMEOUT_S", "10"))
 _FORWARD_TIMEOUT_S = int(os.environ.get("BROKER_FORWARD_TIMEOUT_S", "15"))
-_MAX_BODY_BYTES = int(os.environ.get("BROKER_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+_MAX_BODY_BYTES = int(os.environ.get("BROKER_MAX_BODY_BYTES", str(64 * 1024)))
 
-# Transport: compose runtimes bind a unix socket (BROKER_LISTEN_SOCKET);
-# K8s co-locates this as a sidecar in the caddy pod and binds loopback TCP
-# (BROKER_LISTEN_HOST/BROKER_LISTEN_PORT) — no emptyDir socket-sharing needed
-# within a pod's shared network namespace, and no Service/Ingress ever fronts
-# this port (pod-internal only, mirrors the extractor-svc internal-bridge
-# posture on compose).
+# Transport: compose binds a unix socket (BROKER_LISTEN_SOCKET) shared ONLY
+# with backoffice (caddy_broker_route_sock named volume — caddy itself is no
+# longer a peer of this process at all: it dials OUT to caddy's real admin
+# socket as a client, and nothing dials IN to it except backoffice).
+# K8s co-locates this as a sidecar in the caddy pod and binds loopback TCP;
+# the mesh-mTLS :2019 relay (configmaps.yaml) proxies POST/DELETE /route to
+# it — no Service/Ingress ever fronts this port.
 _LISTEN_MODE = os.environ.get("BROKER_LISTEN_MODE", "unix").strip().lower()
-_LISTEN_SOCKET = os.environ.get("BROKER_LISTEN_SOCKET", "/run/caddy-broker/broker.sock")
+_LISTEN_SOCKET = os.environ.get(
+    "BROKER_LISTEN_SOCKET", "/run/caddy-broker-route/route.sock",
+)
 _LISTEN_HOST = os.environ.get("BROKER_LISTEN_HOST", "127.0.0.1")
 _LISTEN_PORT = int(os.environ.get("BROKER_LISTEN_PORT", "8199"))
 
@@ -163,19 +206,172 @@ _JOB_LOCK = threading.Lock()
 
 
 class BrokerError(Exception):
-    """Raised on any adapt/parse failure — always treated as a REJECT."""
+    """Raised on any validation/render/self-check/forward failure."""
+
+    def __init__(self, message: str, *, http_status: int = 422) -> None:
+        super().__init__(message)
+        self.http_status = http_status
 
 
 # ---------------------------------------------------------------------------
-# caddy adapt + invariant extraction
+# Field validation — MUST mirror src/yashigani/manifest/codegen.py exactly.
+# Duplicated (not imported) because this image is stdlib-only and does not
+# ship the yashigani package — see test_v412_caddy_config_broker.py
+# TestConstantParity for the drift guard that fails CI if these ever diverge
+# from codegen.py's own values.
+# ---------------------------------------------------------------------------
+
+# codegen.py manifest/linter.py _SLUG_RE — identifier constraint already
+# enforced on every manifest's metadata.name / metadata.tenant_id BEFORE a
+# manifest ever reaches codegen. Re-validated here independently: this
+# broker must hold even if a compromised backoffice calls /route directly,
+# bypassing the manifest linter entirely.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$")
+
+# codegen.py _MCP_MESH_PORT_BASE / _MCP_MESH_PORT_RANGE / _MCP_RESERVED_PORTS
+# / _SC_BRIDGE_PORT — the deterministic default lives in [9500, 9900); an
+# EXPLICIT spec.mcp.exposes.mesh_port may be any port in 1024-65535 outside
+# the reserved set (codegen.py _mcp_mesh_port() docstring). Mirrored exactly.
+_MCP_RESERVED_PORTS: frozenset[int] = frozenset({
+    80, 443, 2019, 8000, 8080, 8443, 8444, 8445,
+    9400, 11435, 18789, 18790,
+})
+_SC_BRIDGE_PORT = 8000
+
+# codegen.py _MCP_SVID_MOUNT_ROOT — fixed convention; the leaf cert/key path
+# is DERIVED from (tenant_id, server_id) here, never accepted as input.
+_MCP_SVID_MOUNT_ROOT = "/run/secrets/svid"
+
+# codegen.py _C8_MAX_CONNS_PER_HOST_DEFAULT
+_C8_MAX_CONNS_PER_HOST_DEFAULT = 64
+
+_CA_INTERMEDIATE_PATH = "/run/secrets/ca_intermediate.crt"
+_CADDY_CLIENT_CERT = "/run/secrets/caddy_client.crt"
+_CADDY_CLIENT_KEY = "/run/secrets/caddy_client.key"
+
+
+def _validate_route_fields(payload: dict) -> tuple[str, str, int, int]:
+    """Validate the /route DATA contract. Raises BrokerError(422) on any
+    field that fails — this is the ONLY gate between backoffice-influenced
+    values and the rendering template below; every one of these checks is
+    load-bearing."""
+    if not isinstance(payload, dict):
+        raise BrokerError("body must be a JSON object")
+
+    tenant_id = payload.get("tenant_id")
+    server_id = payload.get("server_id")
+    mesh_port = payload.get("mesh_port")
+    shim_port = payload.get("shim_port")
+
+    for name, val in (("tenant_id", tenant_id), ("server_id", server_id)):
+        if not isinstance(val, str) or not _SLUG_RE.match(val):
+            raise BrokerError(
+                "%s=%r fails the identifier slug constraint "
+                "(^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$)" % (name, val)
+            )
+
+    for name, val in (("mesh_port", mesh_port), ("shim_port", shim_port)):
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise BrokerError("%s must be an integer, got %r" % (name, val))
+        if not (1024 <= val <= 65535):
+            raise BrokerError(
+                "%s=%d out of range (must be 1024-65535)" % (name, val)
+            )
+
+    if mesh_port in _MCP_RESERVED_PORTS:
+        raise BrokerError(
+            "mesh_port=%d collides with a reserved base-listener port %s"
+            % (mesh_port, sorted(_MCP_RESERVED_PORTS))
+        )
+
+    return tenant_id, server_id, mesh_port, shim_port
+
+
+# ---------------------------------------------------------------------------
+# Fixed-template rendering — the ONLY place Caddyfile text is authored.
+# Mirrors manifest/codegen.py _gen_caddy_snippet_mcp() structure exactly
+# (same v4.1 Phase 1b-i wrap contract — see that function's docstring for the
+# full design rationale). Ported here (not imported) because this image
+# carries no yashigani package; a parity test asserts the two stay in sync.
+# ---------------------------------------------------------------------------
+
+def _mcp_svid_paths(tenant_id: str, server_id: str) -> tuple[str, str]:
+    base = "%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, server_id)
+    return base + "/client.crt", base + "/client.key"
+
+
+def render_mcp_route(
+    tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> str:
+    """Render the per-instance MCP Caddy-front wrap. Every interpolated
+    value here is either a fixed constant in this module or one of the four
+    fields _validate_route_fields() already accepted — no other input path
+    exists."""
+    leaf_crt, leaf_key = _mcp_svid_paths(tenant_id, server_id)
+    route_prefix = "/mcp/%s/%s" % (tenant_id, server_id)
+
+    return (
+        "# FINDING-V412-CADDYADMIN-002 — broker-rendered MCP-front wrap\n"
+        "# server=%s tenant=%s mesh_port=%d (caddy-config-broker owns this "
+        "file; NOT backoffice-writable)\n"
+        ":%d {\n"
+        "    tls %s %s {\n"
+        "        client_auth {\n"
+        "            mode require_and_verify\n"
+        "            trust_pool file %s\n"
+        "        }\n"
+        "        protocols tls1.3\n"
+        "    }\n"
+        "\n"
+        "    handle_path %s/* {\n"
+        "        request_header -X-SPIFFE-ID\n"
+        "        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}\n"
+        "        request_header -X-Caddy-Verified-Secret\n"
+        "\n"
+        "        forward_auth https://backoffice:8443 {\n"
+        "            uri /auth/verify-mcp?tenant=%s&server=%s\n"
+        "            header_up X-Caddy-Verified-Secret {$CADDY_INTERNAL_HMAC}\n"
+        "            transport http {\n"
+        "                tls\n"
+        "                tls_trust_pool file %s\n"
+        "                tls_client_auth %s %s\n"
+        "                versions 1.1\n"
+        "            }\n"
+        "        }\n"
+        "\n"
+        "        reverse_proxy http://%s:%d {\n"
+        "            transport http {\n"
+        "                max_conns_per_host %d\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    handle {\n"
+        '        respond "Not Found" 404\n'
+        "    }\n"
+        "}\n"
+    ) % (
+        server_id, tenant_id, mesh_port,
+        mesh_port,
+        leaf_crt, leaf_key,
+        _CA_INTERMEDIATE_PATH,
+        route_prefix,
+        tenant_id, server_id,
+        _CA_INTERMEDIATE_PATH,
+        _CADDY_CLIENT_CERT, _CADDY_CLIENT_KEY,
+        server_id, shim_port,
+        _C8_MAX_CONNS_PER_HOST_DEFAULT,
+    )
+
+
+# ---------------------------------------------------------------------------
+# caddy adapt + self-check (hardcoded-expectation, not baseline-diff — see
+# module docstring: nothing feeding this is backoffice-writable anymore, so
+# a fresh-computed check is safe and simpler than the old build-time-baked
+# baseline approach).
 # ---------------------------------------------------------------------------
 
 def _adapt_text(caddyfile_text: str) -> dict:
-    """Run `caddy adapt` on caddyfile_text, resolving `import` directives
-    against THIS container's live mounted filesystem (the same absolute
-    paths — /etc/caddy/agents/*.caddy, /etc/caddy/Caddyfile.csp, etc. — the
-    real Caddy container reads). Raises BrokerError on any failure.
-    """
     fd, tmp_path = tempfile.mkstemp(suffix=".caddyfile", dir="/tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -185,7 +381,10 @@ def _adapt_text(caddyfile_text: str) -> dict:
             capture_output=True, timeout=_ADAPT_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as exc:
-        raise BrokerError("caddy adapt timed out after %ds: %s" % (_ADAPT_TIMEOUT_S, exc))
+        raise BrokerError(
+            "caddy adapt timed out after %ds: %s" % (_ADAPT_TIMEOUT_S, exc),
+            http_status=500,
+        )
     finally:
         try:
             os.unlink(tmp_path)
@@ -195,22 +394,20 @@ def _adapt_text(caddyfile_text: str) -> dict:
     if proc.returncode != 0:
         raise BrokerError(
             "caddy adapt failed (exit %d): %s"
-            % (proc.returncode, proc.stderr.decode("utf-8", "replace")[:500])
+            % (proc.returncode, proc.stderr.decode("utf-8", "replace")[:500]),
+            http_status=500,
         )
     try:
         return json.loads(proc.stdout)
     except (ValueError, UnicodeDecodeError) as exc:
-        raise BrokerError("caddy adapt produced invalid JSON: %s" % exc)
+        raise BrokerError(
+            "caddy adapt produced invalid JSON: %s" % exc, http_status=500,
+        )
 
 
-def _extract_invariants(cfg: dict) -> dict:
-    """Extract the trust-critical subset of an adapted Caddy config.
-
-    Deliberately does NOT compare the whole config — legitimate onboarding
-    grows the route list under the existing `:443` site on every approve, so
-    a whole-tree equality check would false-positive-reject every real
-    onboarding. Only the fields a compromised backoffice must never move.
-    """
+def _walk_invariants(cfg: dict) -> dict:
+    """Extract the same trust-critical subset the R1/R2 broker used —
+    reused here as a hardcoded-expectation self-check, not a baseline diff."""
     apps = cfg.get("apps") or {}
     http_app = apps.get("http") or {}
     servers = http_app.get("servers") or {}
@@ -238,100 +435,125 @@ def _extract_invariants(cfg: dict) -> dict:
 
     walk(cfg)
 
-    tls_app = apps.get("tls") or {}
     return {
         "admin": cfg.get("admin"),
         "has_pki_app": "pki" in apps,
-        "tls_automation": tls_app.get("automation"),
-        "tls_certificates": tls_app.get("certificates"),
         "listen_addrs": listen_addrs,
         "ca_refs": ca_refs,
         "inline_hits": inline_hits,
     }
 
 
-_AGENTS_IMPORT_SENTINEL = "import /etc/caddy/agents/*.caddy"
-
-
-def _strip_agents_import(text: str) -> str:
-    """Remove the agent-import sentinel line so an adapt of the result
-    reflects STATIC content only — used to compute a baseline that cannot be
-    influenced by whatever currently lives in the mutable agents directory."""
-    lines = [ln for ln in text.splitlines() if _AGENTS_IMPORT_SENTINEL not in ln]
-    return "\n".join(lines) + "\n"
-
-
-def _load_baseline() -> dict:
-    """Load the trust baseline and extract its invariants. Two modes — see
-    "BASELINE MODE" above; raises on any failure (fail-closed: if the
-    baseline can't load, the broker must not approve ANY reload)."""
-    if _BASELINE_MODE == "live":
-        with open(_LIVE_CADDYFILE, "r", encoding="utf-8") as f:
-            text = f.read()
-        cfg = _adapt_text(_strip_agents_import(text))
-        return _extract_invariants(cfg)
-
-    path = os.path.join(_BASELINE_DIR, "adapted-%s.json" % _TLS_MODE)
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return _extract_invariants(cfg)
-
-
-def validate_candidate(candidate_text: str, baseline: dict) -> tuple[bool, str]:
-    """Returns (ok, reason). ok=False → the caller must 422 and MUST NOT
-    forward to the real admin socket."""
-    try:
-        cfg = _adapt_text(candidate_text)
-    except BrokerError as exc:
-        return False, str(exc)
-
-    inv = _extract_invariants(cfg)
+def _self_check_snippet(snippet_text: str, expected_mesh_port: int) -> None:
+    """Syntax + hardcoded-shape check on the snippet THIS process just
+    rendered, in isolation (no live filesystem dependency) — catches a
+    rendering bug in this module before it ever touches the live agents-dynamic
+    dir. Wrapped in `{ admin off }` exactly like codegen.py's own C10 gate."""
+    cfg = _adapt_text("{\n    admin off\n}\n\n" + snippet_text)
+    inv = _walk_invariants(cfg)
 
     if inv["inline_hits"]:
-        return False, (
-            "inline cert/CA provider found (forbidden — trust material must "
-            "be file-based, pinned paths only): %r" % inv["inline_hits"][:3]
+        raise BrokerError(
+            "BUG: self-rendered snippet contains an inline provider: %r"
+            % inv["inline_hits"], http_status=500,
         )
-
-    if inv["admin"] != baseline["admin"]:
-        return False, "admin directive changed: got %r, expected %r" % (
-            inv["admin"], baseline["admin"],
-        )
-
     if inv["has_pki_app"]:
-        return False, "submitted config defines a pki app (forbidden)"
-
-    if inv["tls_automation"] != baseline["tls_automation"]:
-        return False, "tls automation/issuers changed from the pinned baseline"
-
-    if inv["tls_certificates"] != baseline["tls_certificates"]:
-        return False, (
-            "tls certificates (Caddy's own server leaf cert/key) changed "
-            "from the pinned baseline"
+        raise BrokerError(
+            "BUG: self-rendered snippet defines a pki app", http_status=500,
         )
-
-    unexpected_listens = inv["listen_addrs"] - baseline["listen_addrs"]
-    if unexpected_listens:
-        return False, "unexpected new listen address(es): %r" % sorted(unexpected_listens)
-
-    baseline_ca_pem_files: set[str] = set()
-    for ca in baseline["ca_refs"]:
-        for f in (ca.get("pem_files") or []):
-            baseline_ca_pem_files.add(f)
-
+    expected_listen = ":%d" % expected_mesh_port
+    if inv["listen_addrs"] != {expected_listen}:
+        raise BrokerError(
+            "BUG: self-rendered snippet listens on %r, expected exactly {%r}"
+            % (inv["listen_addrs"], expected_listen), http_status=500,
+        )
     for ca in inv["ca_refs"]:
-        provider = ca.get("provider")
-        if provider not in (None, "file"):
-            return False, "non-file CA provider found: %r" % provider
-        for f in (ca.get("pem_files") or []):
-            if f not in baseline_ca_pem_files:
-                return False, "unexpected CA trust-anchor file: %r" % f
+        if ca.get("provider") not in (None, "file"):
+            raise BrokerError(
+                "BUG: self-rendered snippet CA provider=%r (expected file)"
+                % ca.get("provider"), http_status=500,
+            )
+        pem_files = ca.get("pem_files") or []
+        if pem_files and pem_files != [_CA_INTERMEDIATE_PATH]:
+            raise BrokerError(
+                "BUG: self-rendered snippet CA pem_files=%r, expected [%r]"
+                % (pem_files, _CA_INTERMEDIATE_PATH), http_status=500,
+            )
 
-    return True, ""
+
+def _self_check_full_merge() -> dict:
+    """Read the RO monolith Caddyfile + adapt it (imports resolve against the
+    SAME live paths real Caddy reads — static agents/, this broker's own
+    agents-dynamic/, and the snippet family), and assert the merged config
+    has no inline provider / pki app anywhere. Safe to compute fresh on every
+    call (nothing feeding it is backoffice-writable — see module docstring).
+    Returns the adapted config on success (forwarded to the real admin
+    socket, so we adapt exactly once per reload)."""
+    try:
+        with open(_CADDYFILE_PATH, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        raise BrokerError(
+            "cannot read monolith Caddyfile at %r: %s" % (_CADDYFILE_PATH, exc),
+            http_status=500,
+        )
+    cfg = _adapt_text(text)
+    inv = _walk_invariants(cfg)
+    if inv["inline_hits"]:
+        raise BrokerError(
+            "REFUSING reload: merged config contains an inline provider: %r "
+            "(fail-closed self-check)" % inv["inline_hits"], http_status=500,
+        )
+    if inv["has_pki_app"]:
+        raise BrokerError(
+            "REFUSING reload: merged config defines a pki app "
+            "(fail-closed self-check)", http_status=500,
+        )
+    return cfg
 
 
 # ---------------------------------------------------------------------------
-# forward-to-real-admin-socket (unix domain socket HTTP client, stdlib only)
+# Atomic write / delete into the broker-owned dynamic agents dir.
+# ---------------------------------------------------------------------------
+
+def _route_file_path(tenant_id: str, server_id: str) -> str:
+    # tenant_id/server_id are already _SLUG_RE-validated by the caller —
+    # no path-traversal characters are possible in a slug match, but we
+    # belt-and-braces reject anything containing a path separator anyway.
+    if "/" in tenant_id or "/" in server_id or ".." in tenant_id or ".." in server_id:
+        raise BrokerError("invalid identifier for route filename", http_status=500)
+    return os.path.join(_AGENTS_DYNAMIC_DIR, "%s-%s-mcp.caddy" % (tenant_id, server_id))
+
+
+def _write_route_file(tenant_id: str, server_id: str, content: str) -> str:
+    dest = _route_file_path(tenant_id, server_id)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".tmp-route-", dir=_AGENTS_DYNAMIC_DIR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, dest)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+def _delete_route_file(tenant_id: str, server_id: str) -> bool:
+    dest = _route_file_path(tenant_id, server_id)
+    try:
+        os.unlink(dest)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Real-admin-socket forwarding
 # ---------------------------------------------------------------------------
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -346,13 +568,14 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-def _forward_to_real_admin(body: bytes, content_type: str) -> tuple[int, bytes]:
+def _forward_load_to_real_admin(adapted_json: dict) -> tuple[int, bytes]:
+    body = json.dumps(adapted_json).encode("utf-8")
     conn = _UnixHTTPConnection(_REAL_ADMIN_SOCKET, timeout=_FORWARD_TIMEOUT_S)
     try:
         conn.request(
             "POST", "/load", body=body,
             headers={
-                "Content-Type": content_type or "text/caddyfile",
+                "Content-Type": "application/json",
                 "Host": "localhost",
                 "Content-Length": str(len(body)),
             },
@@ -363,13 +586,22 @@ def _forward_to_real_admin(body: bytes, content_type: str) -> tuple[int, bytes]:
         conn.close()
 
 
+def _trigger_reload() -> None:
+    """Recompute the full merged config from RO-trusted sources and push it
+    to the real admin socket. Raises BrokerError on any failure."""
+    cfg = _self_check_full_merge()
+    status, resp_body = _forward_load_to_real_admin(cfg)
+    if status // 100 != 2:
+        raise BrokerError(
+            "real admin socket rejected /load (HTTP %d): %.300s"
+            % (status, resp_body.decode("utf-8", "replace")),
+            http_status=502,
+        )
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
-
-_BASELINE_CACHE: dict | None = None
-_BASELINE_LOAD_ERROR: str | None = None
-
 
 class BrokerHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
@@ -388,77 +620,110 @@ class BrokerHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, status: int, obj: dict) -> None:
+        self._send(status, json.dumps(obj).encode("utf-8"), "application/json")
+
+    def _read_json_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            raise BrokerError("invalid Content-Length")
+        if length <= 0:
+            raise BrokerError("empty body")
+        if length > _MAX_BODY_BYTES:
+            raise BrokerError(
+                "body %d bytes exceeds cap %d" % (length, _MAX_BODY_BYTES),
+                http_status=413,
+            )
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise BrokerError("body is not valid JSON: %s" % exc)
+
     def do_GET(self):  # noqa: N802 — stdlib naming convention
         if self.path in ("/healthz", "/healthz/"):
-            if _BASELINE_CACHE is None:
-                self._send(
-                    503,
-                    ("baseline not loaded: %s\n" % _BASELINE_LOAD_ERROR).encode(),
-                )
+            try:
+                if not os.path.exists(_CADDYFILE_PATH):
+                    raise BrokerError(
+                        "monolith Caddyfile not mounted at %r" % _CADDYFILE_PATH,
+                        http_status=503,
+                    )
+                with open(_CADDYFILE_PATH, "r", encoding="utf-8") as f:
+                    text = f.read()
+                _adapt_text(text)
+            except BrokerError as exc:
+                self._send(503, ("not healthy: %s\n" % exc).encode())
                 return
             self._send(200, b"ok\n")
             return
         self._send(404, b"not found\n")
 
     def do_POST(self):  # noqa: N802 — stdlib naming convention
-        if self.path not in ("/load", "/load/"):
+        if self.path not in ("/route", "/route/"):
             self._send(404, b"not found\n")
             return
-        if _BASELINE_CACHE is None:
-            # Fail-closed: never approve a reload without a trusted baseline.
-            self._send(
-                503,
-                ("broker baseline unavailable: %s\n" % _BASELINE_LOAD_ERROR).encode(),
-            )
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            self._send(400, b"invalid Content-Length\n")
-            return
-        if length <= 0:
-            self._send(400, b"empty body\n")
-            return
-        if length > _MAX_BODY_BYTES:
-            self._send(
-                413,
-                ("body %d bytes exceeds cap %d\n" % (length, _MAX_BODY_BYTES)).encode(),
-            )
-            return
-
-        body = self.rfile.read(length)
-        content_type = self.headers.get("Content-Type", "text/caddyfile")
-        try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            self._send(400, b"body is not valid UTF-8\n")
-            return
-
         with _JOB_LOCK:
-            ok, reason = validate_candidate(text, _BASELINE_CACHE)
-            if not ok:
-                logger.warning("REJECTED /load submission: %s", reason)
-                self._send(
-                    422,
-                    (
-                        "rejected by FINDING-V412-CADDYADMIN-001 broker: %s\n"
-                        % reason
-                    ).encode(),
-                )
-                return
             try:
-                status, resp_body = _forward_to_real_admin(body, content_type)
+                payload = self._read_json_body()
+                tenant_id, server_id, mesh_port, shim_port = _validate_route_fields(payload)
+                snippet = render_mcp_route(tenant_id, server_id, mesh_port, shim_port)
+                _self_check_snippet(snippet, mesh_port)
+                dest = _write_route_file(tenant_id, server_id, snippet)
+                try:
+                    _trigger_reload()
+                except BrokerError:
+                    # Roll back the write — never leave an unreloaded/orphan
+                    # file behind that a LATER reload (e.g. container
+                    # restart) could pick up unreviewed.
+                    _delete_route_file(tenant_id, server_id)
+                    raise
+            except BrokerError as exc:
+                logger.warning("REJECTED /route: %s", exc)
+                self._send_json(exc.http_status, {"error": str(exc)})
+                return
             except Exception as exc:  # noqa: BLE001 — never crash the handler
-                logger.error("forward to real admin socket failed: %s", exc)
-                self._send(
-                    502,
-                    ("broker could not reach the real admin API: %s\n" % exc).encode(),
-                )
+                logger.error("unexpected /route failure: %s", exc)
+                self._send_json(500, {"error": "internal error: %s" % exc})
                 return
 
-        logger.info("APPROVED /load submission, forwarded (real admin returned %d)", status)
-        self._send(status, resp_body, content_type="application/json")
+        logger.info(
+            "APPROVED /route tenant=%s server=%s mesh_port=%d shim_port=%d -> %s",
+            tenant_id, server_id, mesh_port, shim_port, dest,
+        )
+        self._send_json(200, {"status": "ok", "path": dest})
+
+    def do_DELETE(self):  # noqa: N802 — stdlib naming convention
+        if self.path not in ("/route", "/route/"):
+            self._send(404, b"not found\n")
+            return
+        with _JOB_LOCK:
+            try:
+                payload = self._read_json_body()
+                if not isinstance(payload, dict):
+                    raise BrokerError("body must be a JSON object")
+                tenant_id, server_id = payload.get("tenant_id"), payload.get("server_id")
+                for name, val in (("tenant_id", tenant_id), ("server_id", server_id)):
+                    if not isinstance(val, str) or not _SLUG_RE.match(val):
+                        raise BrokerError(
+                            "%s=%r fails the identifier slug constraint" % (name, val)
+                        )
+                removed = _delete_route_file(tenant_id, server_id)
+                _trigger_reload()
+            except BrokerError as exc:
+                logger.warning("REJECTED /route DELETE: %s", exc)
+                self._send_json(exc.http_status, {"error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001 — never crash the handler
+                logger.error("unexpected /route DELETE failure: %s", exc)
+                self._send_json(500, {"error": "internal error: %s" % exc})
+                return
+
+        logger.info(
+            "APPROVED /route DELETE tenant=%s server=%s removed=%s",
+            tenant_id, server_id, removed,
+        )
+        self._send_json(200, {"status": "ok", "removed": removed})
 
 
 class UnixHTTPServer(socketserver.UnixStreamServer):
@@ -470,27 +735,8 @@ class UnixHTTPServer(socketserver.UnixStreamServer):
         self.server_port = 0
 
 
-def _load_baseline_or_die() -> None:
-    global _BASELINE_CACHE, _BASELINE_LOAD_ERROR
-    try:
-        _BASELINE_CACHE = _load_baseline()
-        logger.info(
-            "baseline loaded OK (baseline_mode=%s tls_mode=%s admin=%r "
-            "listen_addrs=%d ca_refs=%d)",
-            _BASELINE_MODE, _TLS_MODE, _BASELINE_CACHE["admin"],
-            len(_BASELINE_CACHE["listen_addrs"]), len(_BASELINE_CACHE["ca_refs"]),
-        )
-    except Exception as exc:  # noqa: BLE001 — fail-closed at startup too
-        _BASELINE_LOAD_ERROR = str(exc)
-        logger.error(
-            "FAILED to load baked baseline (mode=%s): %s — broker will 503 "
-            "every /load request until fixed (fail-closed, no partial trust)",
-            _TLS_MODE, exc,
-        )
-
-
 def main() -> None:
-    _load_baseline_or_die()
+    os.makedirs(_AGENTS_DYNAMIC_DIR, exist_ok=True)
 
     if _LISTEN_MODE == "unix":
         listen_dir = os.path.dirname(_LISTEN_SOCKET)
@@ -498,21 +744,23 @@ def main() -> None:
         if os.path.exists(_LISTEN_SOCKET):
             os.unlink(_LISTEN_SOCKET)
         httpd = UnixHTTPServer(_LISTEN_SOCKET, BrokerHandler)
-        # 0666: the socket lives on a named volume shared ONLY with the caddy
-        # service (never backoffice — see docker-compose.yml). Mirrors the
-        # existing caddy_admin_sock precedent; isolation is the mount
-        # boundary, not the file mode (belt-and-braces here).
+        # 0666: the socket lives on a named volume shared ONLY with
+        # backoffice (never caddy — caddy is no longer a peer of this
+        # process at all). backoffice connects as a different, non-root UID
+        # with no shared GID to target — isolation is the mount boundary
+        # (belt-and-braces here, matches every other socket in this repo).
         os.chmod(_LISTEN_SOCKET, 0o666)
         logger.info(
-            "listening on unix socket %s (real_admin=%s tls_mode=%s)",
-            _LISTEN_SOCKET, _REAL_ADMIN_SOCKET, _TLS_MODE,
+            "listening on unix socket %s (real_admin=%s agents_dynamic=%s)",
+            _LISTEN_SOCKET, _REAL_ADMIN_SOCKET, _AGENTS_DYNAMIC_DIR,
         )
     elif _LISTEN_MODE == "tcp":
         httpd = http.server.HTTPServer((_LISTEN_HOST, _LISTEN_PORT), BrokerHandler)
         logger.info(
-            "listening on %s:%d (real_admin=%s tls_mode=%s) — K8s co-located "
-            "sidecar mode, loopback only, no Service ever fronts this port",
-            _LISTEN_HOST, _LISTEN_PORT, _REAL_ADMIN_SOCKET, _TLS_MODE,
+            "listening on %s:%d (real_admin=%s agents_dynamic=%s) — K8s "
+            "co-located sidecar mode, loopback only, no Service ever fronts "
+            "this port",
+            _LISTEN_HOST, _LISTEN_PORT, _REAL_ADMIN_SOCKET, _AGENTS_DYNAMIC_DIR,
         )
     else:
         logger.error("invalid BROKER_LISTEN_MODE=%r (must be 'unix' or 'tcp')", _LISTEN_MODE)

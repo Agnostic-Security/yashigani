@@ -178,6 +178,13 @@ spec:
             - name: caddy-agents
               mountPath: /etc/caddy/agents
               readOnly: true
+            # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): broker-owned
+            # DYNAMIC MCP route directory (see configmaps.yaml S4 sentinel
+            # comment). RO here — the caddy-config-broker sidecar below is
+            # the sole writer.
+            - name: caddy-agents-dynamic
+              mountPath: /etc/caddy/agents-dynamic
+              readOnly: true
             # MUST-4 / v2.24.1: admin unix socket lives here.
             # readOnlyRootFilesystem requires an explicit writable mount for
             # the socket directory — Caddy creates admin.sock at startup.
@@ -208,12 +215,16 @@ spec:
               readOnly: true
             {{- end }}
         {{- if and .Values.caddy.configBroker.enabled .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
-        # FINDING-V412-CADDYADMIN-001 R1 FIX (Su, 2026-07-21): validating
-        # broker for the :2019 admin relay's POST /load body — see
-        # docker/caddy/config_broker.py + values.yaml caddy.configBroker
-        # comment. Co-located in this pod (not a separate Deployment) so it
-        # can reach caddy's pod-local admin socket via the shared
-        # caddy-admin-sock emptyDir — unix sockets cannot span pods.
+        # FINDING-V412-CADDYADMIN-002 REWORK (Captain, 2026-07-21): route-
+        # registering broker for the :2019 admin relay's POST/DELETE /route
+        # DATA contract — see docker/caddy/config_broker.py module docstring
+        # (the R1+R2 rework replacing the old raw-/load-body-validating
+        # design, Su 5443f11f, after Laura's final re-attack proved it FAILED
+        # live under no-new-privileges). Co-located in this pod (not a
+        # separate Deployment) so it can reach caddy's pod-local admin socket
+        # via the shared caddy-admin-sock emptyDir AND write into the shared
+        # caddy-agents-dynamic emptyDir — unix sockets and emptyDirs cannot
+        # span pods.
         - name: caddy-config-broker
           image: "{{ .Values.caddy.configBroker.image.repository }}:{{ .Values.caddy.configBroker.image.tag }}"
           imagePullPolicy: {{ .Values.caddy.configBroker.image.pullPolicy }}
@@ -239,15 +250,17 @@ spec:
               value: "127.0.0.1"
             - name: BROKER_LISTEN_PORT
               value: {{ .Values.caddy.configBroker.port | quote }}
-            # K8s "live" baseline mode (safe here — see config_broker.py
-            # "BASELINE MODE": no chart RBAC grants any workload
-            # ServiceAccount configmaps access, so this ConfigMap-mounted
-            # file is never workload-writable, unlike compose's docker/
-            # tree bind mount).
-            - name: BROKER_BASELINE_MODE
-              value: "live"
-            - name: BROKER_LIVE_CADDYFILE
+            # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): no more
+            # baseline concept — the broker computes its self-checks FRESH
+            # from this RO ConfigMap mount on every reload (safe: no chart
+            # RBAC grants any workload ServiceAccount configmaps access, so
+            # this file is never workload-writable — same safety argument
+            # the old "live" baseline mode already relied on, now the ONLY
+            # mode, on every runtime).
+            - name: BROKER_CADDYFILE
               value: "/etc/caddy/Caddyfile"
+            - name: BROKER_AGENTS_DYNAMIC_DIR
+              value: "/etc/caddy/agents-dynamic"
             - name: BROKER_REAL_ADMIN_SOCKET
               value: "/run/caddy/admin.sock"
           resources:
@@ -263,6 +276,10 @@ spec:
             - name: caddy-agents
               mountPath: /etc/caddy/agents
               readOnly: true
+            # Broker-owned DYNAMIC MCP route directory — RW here (the sole
+            # writer), RO in the caddy container above.
+            - name: caddy-agents-dynamic
+              mountPath: /etc/caddy/agents-dynamic
             # Pod-local admin socket — shared with the caddy container via
             # this emptyDir (same volume, both containers in one pod).
             - name: caddy-admin-sock
@@ -288,6 +305,15 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): broker-owned
+        # DYNAMIC MCP route directory — pod-local, RW ONLY for the
+        # caddy-config-broker sidecar, RO for the caddy container. Memory-
+        # backed + bounded, same posture as caddy-admin-sock above (small,
+        # rendered-text-only content — never secret material).
+        - name: caddy-agents-dynamic
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi
         - name: caddyfile
           configMap:
             name: yashigani-caddy-config
@@ -362,12 +388,13 @@ spec:
 # the admin relay on the external LB IP. This Service is ClusterIP-only, so
 # the relay is reachable exclusively on the pod network. Defence-in-depth:
 # ClusterIP-only → NetworkPolicy (backoffice pods only) → mTLS
-# require_and_verify → backoffice SPIFFE URI pin → POST /load only.
+# require_and_verify → backoffice SPIFFE URI pin → POST/DELETE /route only.
 # The raw admin API remains unix-socket-only inside the caddy pod (MUST-4).
-# backoffice dials https://yashigani-caddy-admin:2019/load
-# (mcp_onboard._reload_via_admin_api); the caddy leaf carries the
-# yashigani-caddy-admin DNS SAN (service_identities.yaml) so hostname
-# verification passes against the internal CA.
+# backoffice dials https://yashigani-caddy-admin:2019/route
+# (mcp_onboard._register_route_via_broker_relay, FINDING-V412-CADDYADMIN-002);
+# the caddy leaf carries the yashigani-caddy-admin DNS SAN
+# (service_identities.yaml) so hostname verification passes against the
+# internal CA.
 apiVersion: v1
 kind: Service
 metadata:

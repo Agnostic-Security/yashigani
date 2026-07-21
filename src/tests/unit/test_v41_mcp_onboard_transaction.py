@@ -189,17 +189,27 @@ class TestApproveTransactionCommit:
         assert (svid_init / "client.key").is_file()
         assert (svid_init / "ca.crt").read_text() == "INTERMEDIATE-CA-PEM"
 
-        # Wrap snippet + compose override written under the artifact root.
-        snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
+        # Compose override written under the artifact root.
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the wrap
+        # snippet ("docker/caddy/agents/<server>-mcp.caddy") is DELIBERATELY
+        # NOT written here anymore — codegen no longer authors Caddy
+        # content at all; the approve transaction instead REGISTERS the
+        # route with caddy-config-broker (the injected `reloader` stub
+        # below stands in for that call — see
+        # test_v412_caddy_config_broker.py for the broker's own render/
+        # self-check coverage of the verify-mcp + X-Caddy-Verified-Secret
+        # content this test used to assert directly from codegen's output).
         override = artifact_root / f"docker/{_SERVER}-compose.override.yml"
-        assert snippet.is_file() and override.is_file()
-        assert f"/auth/verify-mcp?tenant={_TENANT}&server={_SERVER}" in snippet.read_text()
-        # Layer B marker on the forward_auth hop (required for the backoffice
-        # CaddyVerifiedMiddleware + Option C x-spiffe-id preservation).
-        assert "header_up X-Caddy-Verified-Secret" in snippet.read_text()
+        assert override.is_file()
+        snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
+        assert not snippet.exists(), (
+            "BUG: codegen wrote the Caddy-front wrap snippet directly — "
+            "FINDING-V412-CADDYADMIN-002 requires this to go through "
+            "caddy-config-broker's route-registration contract instead."
+        )
 
-        # Reload happened exactly once, and the durable commit carried the
-        # real identity with svid_issued=True.
+        # Route registration happened exactly once, and the durable commit
+        # carried the real identity with svid_issued=True.
         assert reloader.calls == 1
         kwargs = svc.mint_envelope.call_args.kwargs
         assert kwargs["svid_issued"] is True
@@ -207,7 +217,7 @@ class TestApproveTransactionCommit:
         assert kwargs["svid_spiffe_id"] == result.spiffe_id
         assert result.envelope_id == 77
         assert result.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{result.instance_id}")
-        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" in result.artifact_paths
+        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" not in result.artifact_paths
 
     @pytest.mark.asyncio
     async def test_nico_contract_kwargs_passed_to_mint(self, txn_env):

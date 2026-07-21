@@ -990,30 +990,38 @@ caddy:
     enabled: true
     port: 8445
   # v4.1 SU-SEAM-1d-04 — mesh-mTLS caddy admin relay for the K8s MCP
-  # approve-transaction reload path (mcp_onboard._reload_via_admin_api).
+  # approve-transaction route-registration path
+  # (mcp_onboard._register_route_via_broker_relay, FINDING-V412-CADDYADMIN-002).
   # NOT the raw admin API (that stays unix-socket-only per MUST-4): an mTLS
-  # require_and_verify site block admitting ONLY POST /load from the
-  # backoffice SPIFFE URI, proxied to the caddy-pod-local admin socket.
+  # require_and_verify site block admitting ONLY POST/DELETE /route from the
+  # backoffice SPIFFE URI, proxied to the co-located caddy-config-broker
+  # sidecar (never directly to the admin socket).
   # Requires mtls.enabled=true (templates gate on both). NetworkPolicy
   # restricts ingress on this port to backoffice pods.
   adminRelay:
     enabled: true
     port: 2019
-  # FINDING-V412-CADDYADMIN-001 R1 FIX (Su, 2026-07-21): the :2019 relay
-  # above (mTLS + SPIFFE-gated, POST /load only) used to reverse_proxy
-  # DIRECTLY to the pod-local admin socket — narrowed by method+path, but
-  # with no inspection of the POSTed Caddyfile BODY content (a compromised
-  # backoffice could still construct its own rogue Caddyfile — inline CA /
-  # new listener — and POST it through the mTLS-authenticated relay). Now
-  # proxies to this in-pod sidecar instead (docker/caddy/config_broker.py,
-  # same image as compose's caddy-config-broker service, BROKER_LISTEN_MODE
-  # =tcp + BROKER_BASELINE_MODE=live). Loopback-only — no Service/Ingress
-  # ever fronts this port; only reachable from the caddy container in the
-  # SAME pod. R2 (compose's rogue docker/caddy/agents/*.caddy filesystem
-  # vector) has NO K8s equivalent — audited 2026-07-21: zero RBAC rules in
-  # this chart grant any workload ServiceAccount "configmaps" access, so
-  # yashigani-caddy-config / yashigani-caddy-agents are Helm/kubectl-managed
-  # only, never workload-writable (see config_broker.py "BASELINE MODE").
+  # FINDING-V412-CADDYADMIN-002 REWORK (Captain, 2026-07-21): the :2019
+  # relay above (mTLS + SPIFFE-gated) used to proxy a raw POST /load body
+  # (the FINDING-V412-CADDYADMIN-001 R1 fix, Su) — content-VALIDATED by this
+  # sidecar against a startup-computed baseline before forwarding. Laura's
+  # final re-attack proved the compose twin of that design FAILED live under
+  # the real no-new-privileges security context (the broker's own
+  # `caddy adapt` EPERM'd — every legitimate reload 502'd; see
+  # docker/caddy/config_broker.py module docstring). This sidecar now
+  # exposes POST/DELETE /route instead: backoffice sends narrow typed DATA
+  # (tenant_id/server_id/mesh_port/shim_port), the sidecar independently
+  # re-validates every field, renders the wrap from its OWN fixed template,
+  # and writes it into the caddy-agents-dynamic pod-local emptyDir (see
+  # caddy.yaml) — R1 (rogue /load body) is closed by construction, not by
+  # content-filtering a body that no longer exists. Same image as compose's
+  # caddy-config-broker service, BROKER_LISTEN_MODE=tcp. Loopback-only — no
+  # Service/Ingress ever fronts this port; only reachable from the caddy
+  # container in the SAME pod. R2 (compose's rogue docker/caddy/agents/
+  # *.caddy filesystem vector) has NO K8s equivalent — audited 2026-07-21:
+  # zero RBAC rules in this chart grant any workload ServiceAccount
+  # "configmaps" access, so yashigani-caddy-config / yashigani-caddy-agents
+  # are Helm/kubectl-managed only, never workload-writable.
   configBroker:
     enabled: true
     image:

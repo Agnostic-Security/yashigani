@@ -1,13 +1,18 @@
 """
-Unit tests for docker/caddy/config_broker.py — FINDING-V412-CADDYADMIN-001
-(R1 + R2) validating broker.
+Unit tests for docker/caddy/config_broker.py — FINDING-V412-CADDYADMIN-002.
 
-These prove the VALIDATION LOGIC in-process: the live two-container proof
-(real Caddy + real broker, throwaway podman containers, Laura's exact PoC
-shape + a rogue docker/caddy/agents/*.caddy snippet) was run manually during
-the fix and is cited in the commit body; this file is the regression net
-(SOP5 — every fix needs a test that would re-fail on the original bug) run on
-every CI pass without needing a container.
+REWORK of the R1+R2 broker's regression suite (5443f11f) after Laura's final
+re-attack (laura-final-reattack.md) proved the OLD broker FAILED live in two
+release-blocking ways (BLOCKER-A: `caddy adapt` EPERM'd under
+no-new-privileges; BLOCKER-B: R2 filesystem-drop still open). The corrected
+architecture replaces "validate an arbitrary /load body against a baked
+baseline" with "render a fixed template from narrow, independently
+revalidated DATA fields, self-check the result, write it into a
+broker-owned volume, and trigger the reload" — see config_broker.py module
+docstring for the full writeup. This file is the SOP5 regression net for
+that NEW contract (in-process proof; the live two-container proof under the
+REAL no-new-privileges security context was run manually during the fix and
+is cited in the dispatch report).
 
 The broker lives at a non-importable path (it is baked into its own image,
 not the yashigani package), so we load it by file path via importlib — same
@@ -17,19 +22,16 @@ docker/extractor/worker.py.
 Requires a local `caddy` binary (the SAME structural check config_broker.py
 itself performs — `caddy adapt` is the source of truth, never a hand-rolled
 Caddyfile parser). Skipped if absent, matching codegen.py's C10
-`_validate_caddy_snippet` precedent (LAURA-005 — CI/production must set
-YSG_REQUIRE_CADDY_VALIDATE to make an absent binary a hard failure instead).
+`_validate_caddy_snippet` precedent (LAURA-005).
 """
 from __future__ import annotations
 
-import base64
+import http.client
 import importlib.util
 import json
-import os
 import pathlib
 import shutil
 import socket
-import subprocess
 import tempfile
 import threading
 import time
@@ -62,262 +64,242 @@ def broker(monkeypatch):
     return mod
 
 
-# ---------------------------------------------------------------------------
-# Fixtures — small, self-contained Caddyfiles (NOT the real production
-# family — this suite tests the VALIDATION LOGIC in isolation, independent
-# of /etc/caddy staging; the live container proof used the real files).
-# ---------------------------------------------------------------------------
+_VALID = dict(tenant_id="acme-corp", server_id="filesystem", mesh_port=9611, shim_port=8000)
 
-def _rogue_ca_der_b64() -> str:
-    """Ephemeral rogue CA cert, DER-encoded, base64 — same shape Laura used
-    (CN=ROGUE-ATTACKER-CA). Generated fresh per test run via openssl."""
-    proc = subprocess.run(
-        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-         "-keyout", "/dev/null", "-out", "-", "-days", "1",
-         "-subj", "/CN=ROGUE-ATTACKER-CA", "-outform", "DER"],
-        capture_output=True, timeout=15,
-    )
-    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
-    return base64.b64encode(proc.stdout).decode("ascii")
-
-
-_BASE_FIXTURE = """\
+# Minimal Caddyfile fixture the full-merge self-check reads — NOT the real
+# production family (this suite tests the VALIDATION LOGIC in isolation).
+_MONOLITH_FIXTURE = """\
 {
     admin unix//run/caddy-admin/admin.sock|0666
 }
 
 :443 {
     tls internal
+    respond "edge" 200
+}
 
-    handle_path /admin/* {
-        respond "admin ui" 200
-    }
+import /etc/caddy/agents-dynamic/*.caddy
+"""
 
-    handle /mesh/* {
-        reverse_proxy https://backoffice:8443 {
-            transport http {
-                tls
-                tls_trust_pool file /run/secrets/ca_intermediate.crt
-                tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key
-            }
+_MONOLITH_WITH_PKI_APP = """\
+{
+    admin unix//run/caddy-admin/admin.sock|0666
+    pki {
+        ca local {
+            name "rogue"
         }
     }
 }
 
-:8444 {
-    tls internal {
-        client_auth {
-            mode require_and_verify
-            trust_pool file /run/secrets/ca_intermediate.crt
-        }
-    }
-    respond "mesh listener" 200
+:443 {
+    tls internal
+    respond "edge" 200
 }
 """
 
-_LEGIT_GROWTH_FIXTURE = _BASE_FIXTURE.replace(
-    'handle /mesh/* {',
-    'handle_path /agents/default/newagent/* {\n'
-    '        uri strip_prefix /agents/default/newagent\n'
-    '        reverse_proxy {\n'
-    '            to newagent-upstream.internal:9000\n'
-    '            transport http {\n'
-    '                tls\n'
-    '                tls_server_name newagent-upstream.internal\n'
-    '            }\n'
-    '        }\n'
-    '    }\n\n'
-    '    handle /mesh/* {',
-)
+
+# ---------------------------------------------------------------------------
+# Constant parity — must mirror src/yashigani/manifest/codegen.py exactly
+# (config_broker.py duplicates these because its image ships no yashigani
+# package). Drift here silently reopens/narrows the mesh-port allowlist.
+# ---------------------------------------------------------------------------
+
+class TestConstantParity:
+    def test_mesh_port_reserved_set_matches_codegen(self, broker):
+        from yashigani.manifest.codegen import _MCP_RESERVED_PORTS as codegen_reserved
+        from yashigani.manifest.codegen import _SC_BRIDGE_PORT as codegen_bridge_port
+
+        assert broker._MCP_RESERVED_PORTS == frozenset(codegen_reserved)
+        assert broker._SC_BRIDGE_PORT == codegen_bridge_port
+
+    def test_svid_mount_root_matches_codegen(self, broker):
+        from yashigani.manifest.codegen import _MCP_SVID_MOUNT_ROOT as codegen_root
+
+        assert broker._MCP_SVID_MOUNT_ROOT == codegen_root
+
+    def test_c8_max_conns_matches_codegen(self, broker):
+        from yashigani.manifest.codegen import (
+            _C8_MAX_CONNS_PER_HOST_DEFAULT as codegen_c8,
+        )
+
+        assert broker._C8_MAX_CONNS_PER_HOST_DEFAULT == codegen_c8
+
+    def test_slug_regex_matches_linter(self, broker):
+        from yashigani.manifest.linter import _SLUG_RE as linter_slug_re
+
+        assert broker._SLUG_RE.pattern == linter_slug_re.pattern
+
+    def test_svid_paths_match_codegen_convention(self, broker):
+        from yashigani.manifest.codegen import _mcp_svid_paths as codegen_svid_paths
+
+        assert broker._mcp_svid_paths("acme-corp", "filesystem") == \
+            codegen_svid_paths("acme-corp", "filesystem")
 
 
 # ---------------------------------------------------------------------------
-# _extract_invariants
+# Field validation — the ONLY gate between backoffice-influenced input and
+# the fixed rendering template.
 # ---------------------------------------------------------------------------
 
-class TestExtractInvariants:
-    def test_admin_listen_addrs_ca_refs(self, broker):
-        cfg = broker._adapt_text(_BASE_FIXTURE)
-        inv = broker._extract_invariants(cfg)
+class TestValidateRouteFields:
+    def test_valid_fields_pass(self, broker):
+        tenant_id, server_id, mesh_port, shim_port = broker._validate_route_fields(_VALID)
+        assert (tenant_id, server_id, mesh_port, shim_port) == (
+            "acme-corp", "filesystem", 9611, 8000,
+        )
 
-        assert inv["admin"] == {"listen": "unix//run/caddy-admin/admin.sock|0666"}
-        assert ":443" in inv["listen_addrs"]
-        assert ":8444" in inv["listen_addrs"]
-        assert not inv["has_pki_app"]
+    @pytest.mark.parametrize("bad_id", [
+        "", "Acme-Corp", "-leading-dash", "trailing-dash-", "has_underscore",
+        "has space", "..", "../../etc", "a" * 65,
+    ])
+    def test_bad_tenant_id_rejected(self, broker, bad_id):
+        payload = dict(_VALID, tenant_id=bad_id)
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._validate_route_fields(payload)
+        assert exc.value.http_status == 422
+
+    @pytest.mark.parametrize("bad_id", [
+        "", "Filesystem", "has_underscore", "; rm -rf /", "$(whoami)",
+    ])
+    def test_bad_server_id_rejected(self, broker, bad_id):
+        payload = dict(_VALID, server_id=bad_id)
+        with pytest.raises(broker.BrokerError):
+            broker._validate_route_fields(payload)
+
+    @pytest.mark.parametrize("bad_port", [2019, 8000, 8443, 8444, 8445, 9400, 11435])
+    def test_reserved_mesh_port_rejected(self, broker, bad_port):
+        """Reserved ports >= 1024 (below-1024 reserved ports like 80/443 are
+        already caught by the plain range check — see
+        test_out_of_range_or_wrong_type_mesh_port_rejected)."""
+        payload = dict(_VALID, mesh_port=bad_port)
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._validate_route_fields(payload)
+        assert "reserved" in str(exc.value)
+
+    @pytest.mark.parametrize("bad_port", [0, 1023, 70000, -1, "9611", True, 9611.5])
+    def test_out_of_range_or_wrong_type_mesh_port_rejected(self, broker, bad_port):
+        payload = dict(_VALID, mesh_port=bad_port)
+        with pytest.raises(broker.BrokerError):
+            broker._validate_route_fields(payload)
+
+    def test_non_dict_body_rejected(self, broker):
+        with pytest.raises(broker.BrokerError):
+            broker._validate_route_fields(["not", "a", "dict"])
+
+    def test_missing_field_rejected(self, broker):
+        payload = dict(_VALID)
+        del payload["shim_port"]
+        with pytest.raises(broker.BrokerError):
+            broker._validate_route_fields(payload)
+
+
+# ---------------------------------------------------------------------------
+# render_mcp_route — the ONLY place Caddyfile text is authored. Content
+# contract mirrors manifest/codegen.py _gen_caddy_snippet_mcp() (ported, not
+# imported).
+# ---------------------------------------------------------------------------
+
+class TestRenderMcpRoute:
+    def test_snippet_contract(self, broker):
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+
+        assert ":9611 {" in snip
+        assert "handle_path /mcp/acme-corp/filesystem/*" in snip
+        assert ("tls /run/secrets/svid/acme-corp/filesystem/client.crt "
+                "/run/secrets/svid/acme-corp/filesystem/client.key") in snip
+        assert "mode require_and_verify" in snip
+        assert "trust_pool file /run/secrets/ca_intermediate.crt" in snip
+        assert "protocols tls1.3" in snip
+        assert "forward_auth https://backoffice:8443" in snip
+        assert "uri /auth/verify-mcp?tenant=acme-corp&server=filesystem" in snip
+        assert "tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key" in snip
+        assert "reverse_proxy http://filesystem:8000" in snip
+        assert "max_conns_per_host 64" in snip
+        assert "tls_insecure_skip_verify" not in snip
+        assert 'respond "Not Found" 404' in snip
+        # Never emits admin/pki directives — the whole point of moving
+        # rendering authority here.
+        assert "admin " not in snip
+        assert "pki {" not in snip
+
+    def test_adapts_cleanly_with_real_caddy(self, broker):
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+        cfg = broker._adapt_text("{\n    admin off\n}\n\n" + snip)
+        inv = broker._walk_invariants(cfg)
+        assert inv["listen_addrs"] == {":9611"}
         assert not inv["inline_hits"]
-        # Two file-based CA refs (the mesh reverse_proxy transport + the
-        # :8444 client_auth) — both point at the same pinned intermediate.
-        assert len(inv["ca_refs"]) == 2
-        for ca in inv["ca_refs"]:
-            assert ca.get("provider") in (None, "file")
-            assert ca.get("pem_files") == ["/run/secrets/ca_intermediate.crt"]
+        assert not inv["has_pki_app"]
 
-    def test_inline_provider_detected_anywhere_in_tree(self, broker):
-        rogue = _rogue_ca_der_b64()
-        text = _BASE_FIXTURE.replace(
+
+# ---------------------------------------------------------------------------
+# Self-checks — hardcoded-expectation gates (not baseline-diff — see module
+# docstring: nothing feeding these is backoffice-writable anymore).
+# ---------------------------------------------------------------------------
+
+class TestSelfCheckSnippet:
+    def test_correctly_rendered_snippet_passes(self, broker):
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+        broker._self_check_snippet(snip, 9611)  # must not raise
+
+    def test_wrong_listen_port_caught(self, broker):
+        """Simulates a rendering bug: the snippet claims mesh_port=9611 but
+        the caller expected 9612 — self-check must catch the mismatch."""
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._self_check_snippet(snip, 9612)
+        assert exc.value.http_status == 500
+
+    def test_injected_inline_provider_caught(self, broker):
+        """Simulates a template-injection bug (should be structurally
+        impossible given render_mcp_route's fixed template + validated
+        inputs — this proves the self-check would catch it anyway, in
+        depth)."""
+        snip = broker.render_mcp_route("acme-corp", "filesystem", 9611, 8000)
+        tampered = snip.replace(
             "trust_pool file /run/secrets/ca_intermediate.crt",
-            'trust_pool inline {\n                trust_der "%s"\n            }' % rogue,
-            1,
+            'trust_pool inline {\n                trust_der "AAAA"\n            }',
         )
-        cfg = broker._adapt_text(text)
-        inv = broker._extract_invariants(cfg)
-        assert inv["inline_hits"], "inline provider must be detected"
-        assert inv["inline_hits"][0]["provider"] == "inline"
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._self_check_snippet(tampered, 9611)
+        assert "inline" in str(exc.value)
+
+
+class TestSelfCheckFullMerge:
+    def test_clean_monolith_passes(self, broker, tmp_path, monkeypatch):
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text(_MONOLITH_FIXTURE, encoding="utf-8")
+        agents_dynamic = tmp_path / "agents-dynamic"
+        agents_dynamic.mkdir()
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
+        monkeypatch.setattr(broker, "_AGENTS_DYNAMIC_DIR", str(agents_dynamic))
+
+        cfg = broker._self_check_full_merge()
+        assert cfg is not None
+
+    def test_pki_app_refused(self, broker, tmp_path, monkeypatch):
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text(_MONOLITH_WITH_PKI_APP, encoding="utf-8")
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
+
+        with pytest.raises(broker.BrokerError) as exc:
+            broker._self_check_full_merge()
+        assert "pki" in str(exc.value)
+
+    def test_unreadable_caddyfile_fails_closed(self, broker, tmp_path, monkeypatch):
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(tmp_path / "missing"))
+        with pytest.raises(broker.BrokerError):
+            broker._self_check_full_merge()
 
 
 # ---------------------------------------------------------------------------
-# validate_candidate — the actual gate config_broker.py enforces on /load
-# ---------------------------------------------------------------------------
-
-class TestValidateCandidate:
-    @pytest.fixture()
-    def baseline(self, broker):
-        cfg = broker._adapt_text(_BASE_FIXTURE)
-        return broker._extract_invariants(cfg)
-
-    def test_unchanged_reload_passes(self, broker, baseline):
-        """The exact same Caddyfile text re-posted (the real
-        mcp_onboard.py contract — it rereads and reposts the active
-        Caddyfile verbatim) must pass."""
-        ok, reason = broker.validate_candidate(_BASE_FIXTURE, baseline)
-        assert ok, reason
-
-    def test_legitimate_onboarding_growth_passes(self, broker, baseline):
-        """A NEW route attached to the EXISTING :443 site (the shape
-        codegen.py _gen_caddy_snippet always produces — handle_path within
-        the existing site, never a new listener/tls/admin) must NOT be
-        rejected — legitimate onboarding must keep working after this fix."""
-        ok, reason = broker.validate_candidate(_LEGIT_GROWTH_FIXTURE, baseline)
-        assert ok, reason
-
-    def test_new_listener_rejected(self, broker, baseline):
-        """R1 — Laura's exact PoC shape: a brand-new isolated listener
-        (POST /config/apps/http/servers/rogue_poc equivalent, delivered via
-        /load instead of the raw admin API). `tls internal` matches the
-        base fixture's own automation issuer so this is rejected by the
-        LISTEN-SET check specifically, not an unrelated automation-policy
-        parse conflict (Caddy requires matching default issuers across
-        sites sharing a catch-all policy — a real-world detail orthogonal
-        to what this test targets)."""
-        rogue = _BASE_FIXTURE + '\n:19999 {\n    tls internal\n    respond "rogue" 200\n}\n'
-        ok, reason = broker.validate_candidate(rogue, baseline)
-        assert not ok, reason
-        assert "listen" in reason.lower(), reason
-
-    def test_inline_ca_on_existing_listener_rejected(self, broker, baseline):
-        """R1 — inline rogue CA swapped into an EXISTING listener's trust
-        pool (no new port at all) — Laura's actual trust-anchor-injection
-        outcome, minimal-diff shape."""
-        rogue_der = _rogue_ca_der_b64()
-        rogue = _BASE_FIXTURE.replace(
-            "trust_pool file /run/secrets/ca_intermediate.crt",
-            'trust_pool inline {\n                trust_der "%s"\n            }' % rogue_der,
-            1,
-        )
-        ok, reason = broker.validate_candidate(rogue, baseline)
-        assert not ok
-        assert "inline" in reason.lower()
-
-    def test_unexpected_ca_file_path_rejected(self, broker, baseline):
-        """Even a FILE-based (not inline) CA pointed at a path OUTSIDE the
-        baseline's pinned set must be rejected — not just the inline vector."""
-        rogue = _BASE_FIXTURE.replace(
-            "/run/secrets/ca_intermediate.crt",
-            "/run/secrets/attacker_planted_ca.crt",
-            1,
-        )
-        ok, reason = broker.validate_candidate(rogue, baseline)
-        assert not ok
-        assert "trust-anchor" in reason.lower() or "ca" in reason.lower()
-
-    def test_admin_directive_change_rejected(self, broker, baseline):
-        """A resubmitted config that widens/repoints the admin API itself
-        must be rejected — this is exactly what would let a compromised
-        backoffice re-share the admin socket after this fix ships."""
-        rogue = _BASE_FIXTURE.replace(
-            "admin unix//run/caddy-admin/admin.sock|0666",
-            "admin unix//run/caddy/admin.sock|0666",
-            1,
-        )
-        ok, reason = broker.validate_candidate(rogue, baseline)
-        assert not ok
-        assert "admin" in reason.lower()
-
-    def test_pki_app_extract_invariants_flags_it(self, broker, baseline):
-        """A merged config carrying Caddy's internal-CA management app
-        (apps.pki) must be flagged by has_pki_app — regardless of provider
-        shape, minting/trusting arbitrary certs via that app is in scope.
-        Exercised directly on the JSON tree (not round-tripped through
-        Caddyfile syntax, which requires a nontrivial `pki` global-options
-        stanza orthogonal to what this test targets) — this is the same
-        _extract_invariants() call validate_candidate() itself makes on
-        whatever `caddy adapt` returns, so it covers the real code path."""
-        cfg = broker._adapt_text(_BASE_FIXTURE)
-        cfg["apps"]["pki"] = {"certificate_authorities": {"attacker-ca": {}}}
-        inv = broker._extract_invariants(cfg)
-        assert inv["has_pki_app"] is True
-
-    def test_malformed_body_rejected_fail_closed(self, broker, baseline):
-        """A syntactically-broken submission must fail closed (422/adapt
-        error), never silently pass through or crash the handler."""
-        ok, reason = broker.validate_candidate("{ this is not } valid { caddyfile", baseline)
-        assert not ok
-        assert reason  # a reason must always be present
-
-
-# ---------------------------------------------------------------------------
-# K8s "live" baseline mode — see config_broker.py "BASELINE MODE".
-# ---------------------------------------------------------------------------
-
-class TestLiveBaselineMode:
-    def test_live_mode_strips_agents_import_and_matches_baked_equivalent(
-        self, broker, tmp_path, monkeypatch,
-    ):
-        """The K8s sidecar computes its baseline by reading the live
-        ConfigMap-mounted Caddyfile at startup (safe there — see the mode
-        docstring: no chart RBAC grants any workload configmaps access).
-        Its invariants must match what the SAME text would produce via the
-        "baked" path (same _extract_invariants call, different source),
-        proving the two modes are equivalent, not just independently
-        plausible."""
-        caddyfile_with_agents_import = _BASE_FIXTURE + "\n" + broker._AGENTS_IMPORT_SENTINEL + "\n"
-        live_path = tmp_path / "Caddyfile"
-        live_path.write_text(caddyfile_with_agents_import)
-
-        monkeypatch.setattr(broker, "_BASELINE_MODE", "live")
-        monkeypatch.setattr(broker, "_LIVE_CADDYFILE", str(live_path))
-        live_baseline = broker._load_baseline()
-
-        baked_cfg = broker._adapt_text(_BASE_FIXTURE)  # no agents-import at all
-        baked_baseline = broker._extract_invariants(baked_cfg)
-
-        assert live_baseline["admin"] == baked_baseline["admin"]
-        assert live_baseline["listen_addrs"] == baked_baseline["listen_addrs"]
-        assert live_baseline["ca_refs"] == baked_baseline["ca_refs"]
-        assert live_baseline["has_pki_app"] == baked_baseline["has_pki_app"] is False
-
-    def test_strip_agents_import_removes_sentinel_only(self, broker):
-        text = "line one\n" + broker._AGENTS_IMPORT_SENTINEL + "\nline two\n"
-        stripped = broker._strip_agents_import(text)
-        assert broker._AGENTS_IMPORT_SENTINEL not in stripped
-        assert "line one" in stripped
-        assert "line two" in stripped
-
-
-# ---------------------------------------------------------------------------
-# Live HTTP-handler smoke test — the actual server code path (Content-Length
-# parsing, body cap, 404s, the reject-before-forward invariant), not just the
-# pure validate_candidate() function. Runs entirely in-process; the real
-# admin socket is a tiny stub server (also in-process) so no container/caddy
-# instance is required for the FORWARDING half of the contract.
+# HTTP handler — live, in-process proof (real UnixHTTPServer + a stub real-
+# admin socket) that the fail-closed ordering holds end-to-end, not just in
+# the pure functions.
 # ---------------------------------------------------------------------------
 
 class _StubAdminHandler:
-    """Minimal stand-in for the real Caddy admin socket's /load endpoint —
-    always returns 200, and records whether it was ever called."""
-
     def __init__(self):
-        self.called = False
+        self.calls = 0
 
 
 def _run_stub_admin_socket(path: str, state: _StubAdminHandler, stop_event: threading.Event):
@@ -326,7 +308,7 @@ def _run_stub_admin_socket(path: str, state: _StubAdminHandler, stop_event: thre
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
-            state.called = True
+            state.calls += 1
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
             body = b'{"ok":true}'
@@ -349,31 +331,47 @@ def _run_stub_admin_socket(path: str, state: _StubAdminHandler, stop_event: thre
     srv.server_close()
 
 
+def _request_unix(sock_path: str, method: str, path: str, body: bytes) -> tuple[int, bytes]:
+    class _UnixConn(http.client.HTTPConnection):
+        def connect(self):  # noqa: D102
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(sock_path)
+            self.sock = s
+
+    last_exc: Exception | None = None
+    for attempt in range(20):
+        conn = _UnixConn("localhost", timeout=5)
+        try:
+            conn.request(method, path, body=body, headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            })
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+        finally:
+            conn.close()
+    raise AssertionError("could not connect to %s: %s" % (sock_path, last_exc))
+
+
 class TestBrokerHttpServerLive:
-    def test_reject_never_reaches_admin_forward(self, broker, tmp_path, monkeypatch):
-        """A REJECTED candidate must 422 and the stub admin socket must
-        record ZERO calls — proves the fail-closed ordering (validate BEFORE
-        forward) end-to-end through the real handler code, not just the
-        pure function."""
-        # AF_UNIX sockaddr_un.sun_path is ~104 bytes on macOS/BSD — pytest's
-        # tmp_path (nested under /private/var/.../pytest-of-.../pytest-N/...)
-        # routinely exceeds that. Sockets are transient bind()-only test
-        # artifacts (cleaned up in `finally`, never a deliverable), so use a
-        # short-path tempdir purely to satisfy the kernel constraint.
+    @pytest.fixture()
+    def live_env(self, broker, tmp_path, monkeypatch):
         sock_dir = pathlib.Path(tempfile.mkdtemp(prefix="ysgb-"))
         real_admin_sock = str(sock_dir / "admin.sock")
-        broker_sock = str(sock_dir / "broker.sock")
-        baseline_dir = tmp_path / "reference"
-        baseline_dir.mkdir()
+        broker_sock = str(sock_dir / "route.sock")
 
-        cfg = broker._adapt_text(_BASE_FIXTURE)
-        (baseline_dir / "adapted-selfsigned.json").write_text(json.dumps(cfg))
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text(_MONOLITH_FIXTURE, encoding="utf-8")
+        agents_dynamic = tmp_path / "agents-dynamic"
+        agents_dynamic.mkdir()
 
-        monkeypatch.setattr(broker, "_BASELINE_DIR", str(baseline_dir))
-        monkeypatch.setattr(broker, "_TLS_MODE", "selfsigned")
+        monkeypatch.setattr(broker, "_CADDYFILE_PATH", str(caddyfile))
+        monkeypatch.setattr(broker, "_AGENTS_DYNAMIC_DIR", str(agents_dynamic))
         monkeypatch.setattr(broker, "_REAL_ADMIN_SOCKET", real_admin_sock)
-        broker._load_baseline_or_die()
-        assert broker._BASELINE_CACHE is not None, broker._BASELINE_LOAD_ERROR
 
         stop_event = threading.Event()
         stub_state = _StubAdminHandler()
@@ -391,81 +389,64 @@ class TestBrokerHttpServerLive:
         time.sleep(0.1)
 
         try:
-            rogue = _BASE_FIXTURE + '\n:19999 {\n    tls internal\n    respond "rogue" 200\n}\n'
-            status, body = _post_unix(broker_sock, "/load", rogue.encode())
-            assert status == 422, body
-            assert b"listen" in body.lower(), body
-            assert stub_state.called is False, (
-                "REJECTED submission must NEVER reach the real admin socket"
-            )
-
-            status2, body2 = _post_unix(broker_sock, "/load", _BASE_FIXTURE.encode())
-            assert status2 == 200, body2
-            assert stub_state.called is True, (
-                "APPROVED submission must be forwarded to the real admin socket"
-            )
+            yield broker_sock, stub_state, agents_dynamic
         finally:
             httpd.shutdown()
             stop_event.set()
             admin_thread.join(timeout=2)
             server_thread.join(timeout=2)
 
-    def test_wrong_path_404_without_touching_validator(self, broker, tmp_path, monkeypatch):
-        # See test_reject_never_reaches_admin_forward — short path needed
-        # for the AF_UNIX sun_path length limit.
-        sock_dir = pathlib.Path(tempfile.mkdtemp(prefix="ysgb-"))
-        broker_sock = str(sock_dir / "broker.sock")
-        baseline_dir = tmp_path / "reference"
-        baseline_dir.mkdir()
-        cfg = broker._adapt_text(_BASE_FIXTURE)
-        (baseline_dir / "adapted-selfsigned.json").write_text(json.dumps(cfg))
-        monkeypatch.setattr(broker, "_BASELINE_DIR", str(baseline_dir))
-        monkeypatch.setattr(broker, "_TLS_MODE", "selfsigned")
-        broker._load_baseline_or_die()
+    def test_legit_route_registration_writes_file_and_reloads(self, live_env):
+        broker_sock, stub_state, agents_dynamic = live_env
+        status, body = _request_unix(
+            broker_sock, "POST", "/route", json.dumps(_VALID).encode(),
+        )
+        assert status == 200, body
+        assert stub_state.calls == 1, "approved registration must reach the real admin socket"
+        written = list(agents_dynamic.glob("*.caddy"))
+        assert len(written) == 1
+        assert "acme-corp-filesystem-mcp.caddy" in written[0].name
+        assert "handle_path /mcp/acme-corp/filesystem/*" in written[0].read_text()
 
-        httpd = broker.UnixHTTPServer(broker_sock, broker.BrokerHandler)
-        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        server_thread.start()
-        time.sleep(0.1)
-        try:
-            status, _ = _post_unix(broker_sock, "/config/", b"{}")
-            assert status == 404
-            status2, _ = _post_unix(broker_sock, "/stop", b"")
-            assert status2 in (400, 404)  # empty body -> 400 before path check on POST is fine too
-        finally:
-            httpd.shutdown()
-            server_thread.join(timeout=2)
+    def test_malformed_fields_rejected_never_reaches_admin(self, live_env):
+        broker_sock, stub_state, agents_dynamic = live_env
+        payload = dict(_VALID, mesh_port=443)  # reserved port
+        status, body = _request_unix(
+            broker_sock, "POST", "/route", json.dumps(payload).encode(),
+        )
+        assert status == 422, body
+        assert stub_state.calls == 0, (
+            "a REJECTED submission must NEVER reach the real admin socket"
+        )
+        assert not list(agents_dynamic.glob("*.caddy"))
 
+    def test_delete_route_removes_file_and_reloads(self, live_env):
+        broker_sock, stub_state, agents_dynamic = live_env
+        status, _ = _request_unix(broker_sock, "POST", "/route", json.dumps(_VALID).encode())
+        assert status == 200
+        assert len(list(agents_dynamic.glob("*.caddy"))) == 1
 
-def _post_unix(sock_path: str, path: str, body: bytes) -> tuple[int, bytes]:
-    import http.client
+        del_payload = json.dumps({"tenant_id": "acme-corp", "server_id": "filesystem"}).encode()
+        status2, body2 = _request_unix(broker_sock, "DELETE", "/route", del_payload)
+        assert status2 == 200, body2
+        assert not list(agents_dynamic.glob("*.caddy"))
+        assert stub_state.calls == 2, "DELETE must also trigger a real reload"
 
-    class _UnixConn(http.client.HTTPConnection):
-        def connect(self):  # noqa: D102
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect(sock_path)
-            self.sock = s
+    def test_delete_absent_route_is_idempotent(self, live_env):
+        broker_sock, stub_state, agents_dynamic = live_env
+        del_payload = json.dumps({"tenant_id": "acme-corp", "server_id": "never-onboarded"}).encode()
+        status, body = _request_unix(broker_sock, "DELETE", "/route", del_payload)
+        assert status == 200, body
+        assert json.loads(body)["removed"] is False
 
-    # Retry transport-level failures ONLY (connection refused/reset while the
-    # server thread is still starting up under heavy parallel-test load) —
-    # never retry-into-pass on an HTTP status (SOP4: first non-2xx from the
-    # APPLICATION is final; this loop is purely about the listener not being
-    # ready yet, the same class of retry the release-gate probe allows for
-    # curl exit 7/28/35).
-    last_exc: Exception | None = None
-    for attempt in range(20):
-        conn = _UnixConn("localhost", timeout=5)
-        try:
-            conn.request("POST", path, body=body, headers={
-                "Content-Type": "text/caddyfile",
-                "Content-Length": str(len(body)),
-            })
-            resp = conn.getresponse()
-            return resp.status, resp.read()
-        except OSError as exc:
-            last_exc = exc
-            time.sleep(0.05 * (attempt + 1))
-        finally:
-            conn.close()
-    raise AssertionError(f"could not reach {sock_path} after retries: {last_exc}")
+    def test_healthz_ok_when_caddyfile_valid(self, live_env):
+        broker_sock, _stub_state, _agents_dynamic = live_env
+        status, body = _request_unix(broker_sock, "GET", "/healthz", b"")
+        assert status == 200, body
+
+    def test_wrong_path_404(self, live_env):
+        broker_sock, _stub_state, _agents_dynamic = live_env
+        status, _ = _request_unix(broker_sock, "POST", "/load", b"{}")
+        assert status == 404
+        status2, _ = _request_unix(broker_sock, "GET", "/config/", b"")
+        assert status2 == 404

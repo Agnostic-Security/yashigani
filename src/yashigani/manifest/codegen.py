@@ -1813,6 +1813,19 @@ def _mcp_mesh_port(parsed: dict) -> int:
     return port
 
 
+def _mcp_shim_port(parsed: dict) -> int:
+    """Resolve the MCP shim's plain-HTTP port on the ringfence bridge.
+
+    FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): pulled out of
+    _gen_caddy_snippet_mcp() into its own function so mcp_onboard.py's
+    approve transaction can pass this value to caddy-config-broker's
+    POST /route DATA contract without needing to author any Caddy content
+    itself (see that module's docstring).
+    """
+    mcp_exposes = ((parsed.get("spec") or {}).get("mcp") or {}).get("exposes") or {}
+    return mcp_exposes.get("shim_port") or _SC_BRIDGE_PORT
+
+
 # ---------------------------------------------------------------------------
 # C1 (unified-sidecar must-fix #10) — mesh-port registry persistence seed
 # ---------------------------------------------------------------------------
@@ -4746,32 +4759,39 @@ class CodegenEngineShapeC:
         test_compose_content = _gen_contract_test_compose_shape_c(self._parsed, **kwargs)
 
         # v4.1 Phase 1b-i — the wrap: per-MCP Caddy-front snippet.
-        # This is an INGRESS front (Caddy presents the per-instance leaf +
-        # require_and_verify-gates callers), NOT an egress route —
-        # SC-EGRESS-NONE still holds.
-        mcp_caddy_content = _gen_caddy_snippet_mcp(self._parsed, **kwargs)
-        leaf_crt, leaf_key = _mcp_svid_paths(self._tenant_id, agent_name)
-        _validate_caddy_snippet_mcp(
-            mcp_caddy_content,
-            [leaf_crt, "/run/secrets/ca_intermediate.crt",
-             "/run/secrets/caddy_client.crt"],
-            [leaf_key, "/run/secrets/caddy_client.key"],
-            _validator=self._caddy_validator,
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): this codegen
+        # engine NO LONGER renders or writes the Caddy-front wrap snippet.
+        # Laura's final re-attack (laura-final-reattack.md) proved that
+        # backoffice authoring ANY Caddy content — even through this
+        # template-based path — combined with backoffice's writable
+        # docker/caddy/agents/ mount, gave a compromised backoffice a
+        # filesystem-write primitive onto Caddy's live trust surface (R2),
+        # fully bypassing the FINDING-V412-CADDYADMIN-001 admin-socket
+        # broker. The fix moves ALL rendering + writing authority for this
+        # snippet into caddy-config-broker (docker/caddy/config_broker.py
+        # render_mcp_route()) — backoffice's approve transaction now sends
+        # route DATA only (tenant_id, server_id, mesh_port, shim_port) over
+        # a dedicated socket; see mcp_onboard.py
+        # _register_route_via_broker_socket(). `_gen_caddy_snippet_mcp()`/
+        # `_validate_caddy_snippet_mcp()` above are kept (unused by this
+        # engine) only because existing unit tests exercise them directly as
+        # pure functions — the broker's render_mcp_route() is a parity-
+        # tested independent port of this same template, not a caller of it.
+        #
+        # NOTE: No Caddy EGRESS route generated either (SC-EGRESS-NONE).
+        _log.info(
+            "codegen: Shape-C agent %r — Caddy-front (ingress wrap) is now "
+            "registered with caddy-config-broker by the approve transaction "
+            "(FINDING-V412-CADDYADMIN-002), not rendered/written here; no "
+            "egress route either (SC-EGRESS-NONE)",
+            agent_name,
         )
 
         # S6 — validate shell fragment
         _validate_shell_fragment(pki_content, "pki_ownership-%s.sh" % agent_name)
 
-        # NOTE: No Caddy EGRESS route generated (SC-EGRESS-NONE).
-        _log.info(
-            "codegen: Shape-C agent %r — Caddy-front (ingress wrap) snippet "
-            "generated; no egress route (SC-EGRESS-NONE)",
-            agent_name,
-        )
-
         artifacts: dict[str, str] = {
             "docker/%s-compose.override.yml" % agent_name: compose_content,
-            "docker/caddy/agents/%s-mcp.caddy" % agent_name: mcp_caddy_content,
             "helm/yashigani/values-%s.yaml" % agent_name: values_content,
             "helm/yashigani/values-%s-networkpolicy.yaml" % agent_name: netpol_content,
             "helm/yashigani/templates/agents/%s-policy-exception.yaml" % agent_name: kyverno_content,
@@ -4782,16 +4802,19 @@ class CodegenEngineShapeC:
         }
 
         # SC-EGRESS-NONE assertion: no Shape-A-style EGRESS caddy route in the
-        # artifact map ("<agent>.caddy" — LLM egress). The "<agent>-mcp.caddy"
-        # INGRESS front is required to be present (Phase 1b-i wrap).
+        # artifact map ("<agent>.caddy" — LLM egress). FINDING-V412-CADDYADMIN-002:
+        # the "<agent>-mcp.caddy" INGRESS front is ALSO no longer present here
+        # (it is registered with caddy-config-broker instead — see above).
         caddy_key = "docker/caddy/agents/%s.caddy" % agent_name
         assert caddy_key not in artifacts, (
             "BUG: Caddy egress snippet unexpectedly in Shape-C artifact map for %r. "
             "SC-EGRESS-NONE violated." % agent_name
         )
-        assert "docker/caddy/agents/%s-mcp.caddy" % agent_name in artifacts, (
-            "BUG: Phase 1b-i MCP Caddy-front snippet missing for %r — the MCP "
-            "would be onboarded UNWRAPPED." % agent_name
+        assert "docker/caddy/agents/%s-mcp.caddy" % agent_name not in artifacts, (
+            "BUG: Phase 1b-i MCP Caddy-front snippet unexpectedly WRITTEN by "
+            "codegen for %r — FINDING-V412-CADDYADMIN-002 requires this to be "
+            "registered with caddy-config-broker instead, never written into "
+            "a backoffice-writable path." % agent_name
         )
 
         # v4.1 unified-sidecar Phase 2a — capability-keyed, NEVER name- or
@@ -5043,9 +5066,13 @@ def approve_mcp_onboard(
 
     On ``dry_run=False`` (production approve path):
       - Writes all artifacts to ``output_root``.
-      - Caddy picks up ``docker/caddy/agents/<server>-mcp.caddy`` on the next
-        ``caddy reload`` (or SIGUSR1) — the approve transaction is responsible
-        for issuing the reload signal after this function returns.
+      - FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the Caddy-front
+        wrap ("docker/caddy/agents/<server>-mcp.caddy") is NO LONGER among
+        these artifacts — it is registered with caddy-config-broker via a
+        separate DATA-only call (mcp_onboard.py
+        _register_route_via_broker_socket(), using
+        codegen._mcp_mesh_port()/_mcp_shim_port()). The approve transaction
+        is responsible for making that call after this function returns.
 
     Args:
         manifest:        Validated parsed manifest dict (Shape-C / mcp_server).
@@ -5063,9 +5090,9 @@ def approve_mcp_onboard(
         Artifact map ``{relative_path: content}`` — same shape as
         ``CodegenEngineShapeC.render()``.  Load-bearing keys for Phase 1c:
 
-        ``docker/caddy/agents/<server_id>-mcp.caddy``
-            Caddy-front snippet — write to the caddy agents/ directory, then
-            ``caddy reload``.
+        ``docker/caddy/agents/<server_id>-mcp.caddy`` is DELIBERATELY ABSENT
+        (FINDING-V412-CADDYADMIN-002) — the Caddy-front snippet is registered
+        with caddy-config-broker separately, never written to this map.
 
         ``docker/<server_id>-compose.override.yml``
             Compose override — write and run ``docker compose up -d``

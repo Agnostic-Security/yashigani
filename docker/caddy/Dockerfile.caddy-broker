@@ -1,78 +1,47 @@
-# Yashigani Caddy config-validating broker — FINDING-V412-CADDYADMIN-001 (R1+R2)
+# Yashigani Caddy config-registering broker — FINDING-V412-CADDYADMIN-002
 #
-# Multi-stage build:
-#   1. "baseline" — uses the OFFICIAL caddy image + this build's OWN copies of
-#      the Caddyfile family (repo source, NOT any runtime mount) to pre-compute
-#      the adapted JSON config for each TLS mode, with the mutable
-#      docker/caddy/agents/ directory EMPTY. This is the pinned, build-time
-#      trust baseline config_broker.py validates every runtime /load submission
-#      against — see config_broker.py module docstring "BASELINE IMMUNITY" for
-#      why this must be baked at build time and never re-derived from a live
-#      (backoffice-reachable) mount.
-#   2. "caddybin" — isolates the caddy binary so the final runtime image can
+# REWORK of the R1+R2 broker (5443f11f) after Laura's final re-attack proved
+# BLOCKER-A: the broker's copy of the caddy binary carries a
+# `cap_net_bind_service=ep` FILE CAPABILITY (verified live —
+# `getcap /usr/bin/caddy` on the upstream caddy:2.11.2-alpine image). Under
+# this container's `no-new-privileges` security_opt, execve() of that binary
+# is refused (`Operation not permitted`) — reproduced live with the EXACT
+# broker security context (no-new-privileges + cap_drop ALL): every
+# `caddy adapt` EPERM'd, every POST /load 502'd, onboarding was completely
+# broken. See docker/caddy/config_broker.py module docstring for the full
+# root-cause writeup.
+#
+# FIX: strip the file capability from THIS image's copy of the binary at
+# BUILD time (`setcap -r`). `caddy adapt` binds no port and needs no
+# capability at all — this broker never binds a privileged port — so the
+# strip is a pure attack-surface reduction with zero functional loss.
+# no-new-privileges is NOT weakened, NOT bypassed, NOT removed anywhere in
+# this build or in docker-compose.yml.
+#
+# Two-stage build:
+#   1. "caddybin" — isolates the caddy binary so the final runtime image can
 #      COPY --from it without carrying the rest of the caddy:alpine layers.
-#   3. final runtime — python:3.14.5-slim (matches the pin used by
-#      backoffice/gateway/extractor-svc elsewhere in this repo) + the caddy
-#      binary (for validating candidate submissions against the LIVE mounted
-#      Caddyfile family at request time) + config_broker.py. No pip
+#   2. final runtime — python:3.14.5-slim (matches the pin used by
+#      backoffice/gateway/extractor-svc elsewhere in this repo) + the
+#      CAPABILITY-STRIPPED caddy binary + config_broker.py. No pip
 #      dependencies — stdlib only (http.server, json, subprocess).
 #
 # Build context: .. (repo root — docker-compose.yml sets context: .., matching
 # every other Dockerfile in this family). COPY paths are relative to the repo
 # root, NOT to docker/.
+#
+# NOTE: this broker no longer bakes a build-time baseline (the old R1/R2
+# broker's "baseline" stage, adapted-<mode>.json). After this fix, backoffice
+# has NO write path to anything Caddy imports (RO-shadow + the route-write
+# moving entirely into this broker — docker-compose.yml + config_broker.py),
+# so config_broker.py's self-checks are computed FRESH on every call from
+# RO-trusted sources — safe, and simpler than baking+comparing a baseline.
 
-# ── Stage 1: baseline pre-computation (build-time only, discarded from the
-#    final image except for the resulting JSON artifacts) ──────────────────
-FROM docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d AS baseline
-
-WORKDIR /etc/caddy
-
-# Same absolute paths the REAL caddy container mounts these files at
-# (docker-compose.yml caddy service volumes) — Caddy's `import` directives use
-# hardcoded absolute paths (/etc/caddy/Caddyfile.csp etc.), so the baseline
-# adapt must resolve them from the SAME locations to produce a config
-# structurally comparable to what real Caddy would load.
-COPY docker/Caddyfile.acme /etc/caddy/Caddyfile.acme
-COPY docker/Caddyfile.selfsigned /etc/caddy/Caddyfile.selfsigned
-COPY docker/Caddyfile.ca /etc/caddy/Caddyfile.ca
-COPY docker/Caddyfile.csp /etc/caddy/Caddyfile.csp
-COPY docker/Caddyfile.ollama-front /etc/caddy/Caddyfile.ollama-front
-COPY docker/Caddyfile.openclaw-egress /etc/caddy/Caddyfile.openclaw-egress
-COPY docker/Caddyfile.openclaw-webhooks /etc/caddy/Caddyfile.openclaw-webhooks
-
-# Baseline = STATIC content only. docker/caddy/agents/ is deliberately left
-# EMPTY here (no COPY) — that directory (and its 3 committed §2.5 bundled
-# ingress-front snippets) is exactly the mutable, backoffice-reachable
-# surface R2 is about; the broker validates its LIVE content against this
-# baseline at runtime, so the baseline itself must not include it.
-RUN mkdir -p /etc/caddy/agents
-
-# Adapt each TLS mode ONCE, with the agents-import sentinel stripped (mirrors
-# config_broker.py's runtime candidate-adapt exactly, minus live agents
-# content), and persist the resulting JSON. YASHIGANI_TLS_DOMAIN is a
-# parse-time placeholder substitution only (Caddyfile {$VAR} syntax) — any
-# non-empty value produces a structurally valid adapt; the real value is
-# irrelevant to the invariants this broker checks (admin/pki/tls/listen/ca).
-RUN mkdir -p /app/reference \
-    && for mode in acme selfsigned ca; do \
-        sed '/import \/etc\/caddy\/agents\/\*\.caddy/d' "/etc/caddy/Caddyfile.${mode}" \
-            > "/tmp/Caddyfile.${mode}.static" \
-        && YASHIGANI_TLS_DOMAIN=localhost caddy adapt \
-            --config "/tmp/Caddyfile.${mode}.static" --adapter caddyfile \
-            > "/app/reference/adapted-${mode}.json" \
-        || { echo "FATAL: baseline adapt failed for mode=${mode}" >&2; exit 1; }; \
-    done \
-    # Sanity: every baked file must be non-trivial JSON (not empty/truncated).
-    && for mode in acme selfsigned ca; do \
-        [ -s "/app/reference/adapted-${mode}.json" ] \
-            || { echo "FATAL: adapted-${mode}.json is empty" >&2; exit 1; }; \
-    done
-
-# ── Stage 2: caddy binary source (for runtime candidate validation) ────────
+# ── Stage 1: caddy binary source ────────────────────────────────────────────
 FROM docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d AS caddybin
 
-# ── Stage 3: runtime ─────────────────────────────────────────────────────
-# Base image: python:3.14.0-slim@sha256:0aecac02dc3d4c5dbb024b753af084cafe41f5416e02193f1ce345d671ec966e
+# ── Stage 2: runtime ─────────────────────────────────────────────────────
+# Base image: python:3.14.5-slim (parity with the other first-party images).
 FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
 
 ARG HTTP_PROXY
@@ -81,7 +50,7 @@ ARG NO_PROXY
 
 # nonroot numeric UID/GID 65532 (distroless convention — same as
 # docker/Dockerfile.extractor) — this process needs no privileges at all: no
-# secrets, no PKI material, stdlib-only, single-purpose validator+forwarder.
+# secrets, no PKI material, stdlib-only, single-purpose renderer+forwarder.
 RUN groupadd --gid 65532 nonroot \
  && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
 
@@ -94,6 +63,10 @@ RUN apt-get update \
 # CIS Docker 4.8 — strip ALL setuid/setgid bits (parity with
 # docker/Dockerfile.extractor S1 hardening). This is a single non-root Python
 # process; it needs none of python:3.14-slim's setuid utilities.
+# NOTE: this sweep runs BEFORE the caddy binary is copied in below (it only
+# targets PERMISSION bits, 4000/2000 — Linux file CAPABILITIES are a separate
+# xattr this sweep does not see or touch, which is why BLOCKER-A survived
+# this existing hardening step; the dedicated setcap -r below is required).
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true \
  && remaining="$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null)" \
  && if [ -n "$remaining" ]; then \
@@ -103,15 +76,30 @@ RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true \
 
 WORKDIR /app
 
-# The caddy binary — needed at RUNTIME to adapt each candidate /load
-# submission against the LIVE mounted Caddyfile family (what real Caddy would
-# actually load). Copied alone (not the whole caddy:alpine image) to keep
-# this image's own attack surface minimal.
+# The caddy binary — needed at RUNTIME to (a) self-check every rendered MCP
+# snippet and (b) adapt the RO monolith Caddyfile before forwarding a reload
+# to the real admin socket. Copied alone (not the whole caddy:alpine image)
+# to keep this image's own attack surface minimal.
 COPY --from=caddybin /usr/bin/caddy /usr/local/bin/caddy
 
-# Build-time-baked baseline invariants (see Stage 1) — the ONLY thing this
-# broker ever trusts as "known good". Never re-derived from a live mount.
-COPY --from=baseline /app/reference /app/reference
+# FIX FOR BLOCKER-A: strip the file capability the upstream image sets on
+# this binary (cap_net_bind_service — needed by the REAL Caddy container,
+# which binds :80/:443; irrelevant to this broker, which binds no port at
+# all). libcap2-bin (setcap/getcap) is installed, used, VERIFIED, and then
+# fully removed again — this image never carries a capability-manipulation
+# tool in its final layers (CIS-Docker attack-surface-minimisation
+# discipline, same posture as the setuid/setgid sweep above).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && setcap -r /usr/local/bin/caddy \
+    && remaining_caps="$(getcap /usr/local/bin/caddy 2>/dev/null || true)"; \
+       if [ -n "$remaining_caps" ]; then \
+           echo "FATAL: caddy binary retains file capabilities after setcap -r: $remaining_caps" >&2; \
+           exit 1; \
+       fi \
+    && apt-get purge -y --auto-remove libcap2-bin \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY docker/caddy/config_broker.py /app/config_broker.py
 
@@ -119,25 +107,27 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1 \
     BROKER_CADDY_BIN=/usr/local/bin/caddy \
-    BROKER_BASELINE_DIR=/app/reference \
+    BROKER_CADDYFILE=/etc/caddy/Caddyfile \
+    BROKER_AGENTS_DYNAMIC_DIR=/etc/caddy/agents-dynamic \
     BROKER_REAL_ADMIN_SOCKET=/run/caddy-admin/admin.sock \
     BROKER_LISTEN_MODE=unix \
-    BROKER_LISTEN_SOCKET=/run/caddy-broker/broker.sock
+    BROKER_LISTEN_SOCKET=/run/caddy-broker-route/route.sock
 
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 USER 65532:65532
 
-# HEALTHCHECK: confirms the baked baseline loaded successfully at startup
-# (fail-closed — a broker that can't load its baseline must report unhealthy,
-# not silently 503 every request forever without anyone noticing).
+# HEALTHCHECK: confirms this process can still successfully `caddy adapt`
+# its own RO-mounted monolith Caddyfile RIGHT NOW (config_broker.py re-checks
+# on every poll — a continuous liveness proof the capability-strip fix holds
+# for the container's whole lifetime, not just at image-build time).
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=10s \
     CMD python3 -c "\
 import socket,sys; \
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); \
 s.settimeout(4); \
-s.connect('/run/caddy-broker/broker.sock'); \
+s.connect('/run/caddy-broker-route/route.sock'); \
 s.sendall(b'GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n'); \
 data=s.recv(64); \
 sys.exit(0 if data.startswith(b'HTTP/1.0 200') else 1)"

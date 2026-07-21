@@ -221,15 +221,20 @@ class TestArtifactWriteSurvivesNarrowOutputRoot:
         kwargs = svc.mint_envelope.call_args.kwargs
         assert kwargs["svid_issued"] is True
 
-        # The two docker/-prefixed artifacts a compose runtime actually needs
-        # ARE on disk (Ava's evidence: these two DID write successfully
-        # before the 502 hit on the next, non-docker/ key).
+        # The docker/-prefixed compose-override artifact a compose runtime
+        # actually needs IS on disk (Ava's evidence: this DID write
+        # successfully before the 502 hit on the next, non-docker/ key).
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the Caddy-front
+        # wrap snippet is DELIBERATELY absent here — codegen no longer
+        # writes it at all; the approve transaction registers the route
+        # with caddy-config-broker instead (the injected `reloader` stub
+        # stands in for that call — `reloader.calls == 1` above).
         override = artifact_root / f"docker/{_SERVER}-compose.override.yml"
         snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
         assert override.is_file()
-        assert snippet.is_file()
+        assert not snippet.exists()
         assert f"docker/{_SERVER}-compose.override.yml" in result.artifact_paths
-        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" in result.artifact_paths
+        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" not in result.artifact_paths
 
         # The cross-runtime/advisory artifacts were correctly SKIPPED (never
         # attempted under the read-only parent) — not silently swallowed
