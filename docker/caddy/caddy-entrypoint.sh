@@ -491,5 +491,220 @@ else
     log "Slack bot-token pin: secret file absent or empty — CHANNEL 2 enforcement OFF (inert)."
 fi
 
-log "Starting Caddy..."
-exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+# ── FINDING-V412-CADDYADMIN-002 (Ava/Maxine root-cause, 2026-07-21): stale
+#    dynamic-MCP-route boot crash-loop resilience ───────────────────────────
+# Caddy's config load is all-or-nothing: `import /etc/caddy/agents-dynamic/
+# *.caddy` (docker/Caddyfile.<selfsigned|acme|ca>) glob-imports every file the
+# caddy-config-broker has ever written into the broker-owned agents-dynamic
+# volume. ONE bad file in there (references a cert the broker's own atomicity
+# fix didn't manage to clean up, or any other adapt/provision-time failure)
+# fails the WHOLE merged config -> `caddy run` never starts -> compose/K8s
+# restarts the container -> the SAME bad file is still on disk -> permanent
+# crash-loop with no operator recovery path except a manual `rm` + restart
+# (Ava hit exactly this live).
+#
+# FIX: before handing off to the real `caddy run`, validate every file
+# CURRENTLY present in agents-dynamic INDIVIDUALLY (each is a self-contained
+# `:port { ... }` site block — see the "import agents-dynamic" comment in
+# docker/Caddyfile.selfsigned — so it can be tested standalone) against the
+# REAL monolith scaffolding (global options block, every other static
+# import, this container's REAL environment) via `caddy validate`, which
+# provisions TLS file loaders too (proven above: a `tls <missing-cert>`
+# directive fails validate with a clear "no such file or directory", not
+# just a syntax parse). Any file that fails on its own is logged LOUDLY
+# (exact path + adapt/provision error) and EXCLUDED from the config Caddy
+# actually boots from; every other file boots byte-identical, same order.
+#
+# WHY NOT A LITERAL "mv to a quarantine dir" (the finding's suggested
+# wording): `caddy_broker_agents` is mounted `:ro` in THIS container by
+# design — FINDING-V412-CADDYADMIN-002's own R2 fix made it read-only
+# specifically so Caddy (and everything upstream of it) can never write back
+# into the broker-owned volume (see config_broker.py module docstring "WHY
+# R2 IS FULLY CLOSED"). This container's root filesystem is also
+# `read_only: true` (compose + Helm) with only /tmp (tmpfs) writable.
+# Re-opening a write path here to literally `mv` the bad file would undo a
+# real security fix for no functional gain. Instead: build a WRITABLE,
+# tmpfs-backed COPY of the monolith with the bad file(s) excluded from the
+# effective import set, and boot from that copy. The bad file is NEVER
+# deleted (only the broker can do that, via DELETE /route or operator
+# cleanup) but it is deterministically excluded on EVERY boot until it is —
+# same operator-visible "quarantine" signal (loud log line, every restart),
+# without weakening R2. Flagged in this comment, not a silent deviation —
+# see the fix commit body for the full writeup.
+#
+# Known interaction (not a new crash-loop): once a bad file is quarantined
+# this way, a LATER broker reload for a *different* new route still forwards
+# the ORIGINAL (unfiltered) monolith text to Caddy's admin socket (see
+# config_broker.py `_trigger_reload`/`_read_raw_monolith` — it always reads
+# `/etc/caddy/Caddyfile` verbatim, not our synthesized copy). Caddy's admin
+# `POST /load` rejects an invalid candidate WITHOUT dropping the currently
+# running (good) config — so the edge keeps serving, but new-route reloads
+# will keep failing until the stale file is actually removed from the
+# broker's volume. Out of scope for this boot-time fix (that reload path
+# already fails closed, never crashes); tracked as a follow-up below.
+
+_CADDY_CONFIG_SRC="/etc/caddy/Caddyfile"
+_AGENTS_DYNAMIC_DIR="/etc/caddy/agents-dynamic"
+_AGENTS_DYNAMIC_IMPORT_LINE="import /etc/caddy/agents-dynamic/*.caddy"
+_RUNTIME_SCRATCH=""
+_EFFECTIVE_CONFIG_PATH="$_CADDY_CONFIG_SRC"
+
+_cleanup_runtime_scratch() {
+    if [ -n "$_RUNTIME_SCRATCH" ] && [ -d "$_RUNTIME_SCRATCH" ]; then
+        rm -rf "$_RUNTIME_SCRATCH"
+    fi
+}
+trap _cleanup_runtime_scratch EXIT
+
+# Splice a replacement for the agents-dynamic import LINE (exact literal
+# text match via `grep -F` — no sed/regex metachar escaping needed, since the
+# literal itself contains a `*`) into a copy of $_CADDY_CONFIG_SRC, written to
+# $2. $1 may be empty (drop the import entirely) or one-or-more "import ..."
+# lines. Returns 1 (and copies the source untouched) if the sentinel line
+# isn't found — a caddyfile-format drift we must not guess around.
+_splice_agents_dynamic_import() {
+    replacement="$1"
+    out="$2"
+    line_no=$(grep -nF "$_AGENTS_DYNAMIC_IMPORT_LINE" "$_CADDY_CONFIG_SRC" 2>/dev/null | head -n1 | cut -d: -f1)
+    if [ -z "$line_no" ]; then
+        warn "agents-dynamic import sentinel ('$_AGENTS_DYNAMIC_IMPORT_LINE') not found in $_CADDY_CONFIG_SRC"
+        warn "  — cannot isolate dynamic routes; leaving config untouched (Caddyfile-format drift?)."
+        cp "$_CADDY_CONFIG_SRC" "$out"
+        return 1
+    fi
+    {
+        head -n $((line_no - 1)) "$_CADDY_CONFIG_SRC"
+        [ -n "$replacement" ] && printf '%s\n' "$replacement"
+        tail -n +$((line_no + 1)) "$_CADDY_CONFIG_SRC"
+    } > "$out"
+}
+
+# Standalone validity test for ONE dynamic route file: same real global
+# options + every other static import + real container env, only THIS one
+# file glob-... (well, single-path-) imported in place of the full glob.
+# stderr of the failing `caddy validate` is written to $2 for the log.
+_validate_one_dynamic_file() {
+    file="$1"
+    errfile="$2"
+    test_cfg="$_RUNTIME_SCRATCH/test-$(basename "$file").caddyfile"
+    if ! _splice_agents_dynamic_import "import $file" "$test_cfg"; then
+        return 1
+    fi
+    caddy validate --config "$test_cfg" --adapter caddyfile >"$errfile" 2>&1
+}
+
+# Sets $_EFFECTIVE_CONFIG_PATH and returns 0 on success, 1 if no valid config
+# could be assembled (fail loud — never guess past this point). Runs in the
+# CURRENT shell (not a subshell) so the trap + scratch dir persist for the
+# `exec caddy run` that follows.
+resolve_effective_caddy_config() {
+    log "Validating assembled Caddy config (monolith + static + dynamic agent routes)..."
+    # NOTE: the assignment is the if-CONDITION itself (not split across two
+    # statements with a later `$?` check) — under `set -eu`, `ash`/`dash`
+    # abort immediately on a failing command substitution used as a bare
+    # assignment statement; putting it directly in the if-condition is the
+    # POSIX-exempt form (verified: dash + busybox-class shells do NOT abort
+    # here, they take the else branch as expected).
+    if first_pass_err="$(caddy validate --config "$_CADDY_CONFIG_SRC" --adapter caddyfile 2>&1)"; then
+        log "Caddy config validated OK — no dynamic-route quarantine action needed."
+        _EFFECTIVE_CONFIG_PATH="$_CADDY_CONFIG_SRC"
+        return 0
+    fi
+
+    warn "Caddy config validation FAILED on the first pass — inspecting agents-dynamic"
+    warn "  route files individually before giving up (FINDING-V412-CADDYADMIN-002):"
+    printf '%s\n' "$first_pass_err" | while IFS= read -r eline; do warn "    $eline"; done
+
+    _RUNTIME_SCRATCH="$(mktemp -d /tmp/yashigani-caddy-runtime.XXXXXX)"
+
+    dynamic_files=""
+    if [ -d "$_AGENTS_DYNAMIC_DIR" ]; then
+        for f in "$_AGENTS_DYNAMIC_DIR"/*.caddy; do
+            [ -e "$f" ] || continue
+            dynamic_files="${dynamic_files}${f}
+"
+        done
+    fi
+
+    if [ -z "$dynamic_files" ]; then
+        warn "FATAL: Caddy config is invalid and agents-dynamic has NO files to quarantine —"
+        warn "  this is not a stale-dynamic-route problem; refusing to guess further."
+        return 1
+    fi
+
+    good_files=""
+    bad_count=0
+    old_ifs="$IFS"
+    IFS='
+'
+    for f in $dynamic_files; do
+        IFS="$old_ifs"
+        [ -n "$f" ] || continue
+        errfile="$_RUNTIME_SCRATCH/err-$(basename "$f").log"
+        if _validate_one_dynamic_file "$f" "$errfile"; then
+            good_files="${good_files}${f}
+"
+        else
+            bad_count=$((bad_count + 1))
+            warn "QUARANTINED dynamic route file (excluded from this boot): $f"
+            warn "  REASON:"
+            while IFS= read -r eline; do warn "    $eline"; done < "$errfile"
+        fi
+        IFS='
+'
+    done
+    IFS="$old_ifs"
+
+    if [ "$bad_count" -eq 0 ]; then
+        # Every single dynamic file validated fine on its own, yet the FULL
+        # config is still invalid — NOT the single-bad-file class this fix
+        # targets (e.g. two otherwise-valid files collide on the same
+        # mesh_port, or the static monolith itself regressed). Quarantining
+        # nothing here would be guessing; fail loud instead of masking an
+        # unrelated bug.
+        warn "FATAL: no single agents-dynamic file failed standalone validation —"
+        warn "  this is NOT a stale-dynamic-route problem (cross-file collision or a"
+        warn "  static monolith regression). Refusing to drop any file. Original error above."
+        return 1
+    fi
+
+    replacement=""
+    old_ifs="$IFS"
+    IFS='
+'
+    for f in $good_files; do
+        IFS="$old_ifs"
+        [ -n "$f" ] || continue
+        replacement="${replacement}import ${f}
+"
+        IFS='
+'
+    done
+    IFS="$old_ifs"
+
+    effective_cfg="$_RUNTIME_SCRATCH/Caddyfile.effective"
+    _splice_agents_dynamic_import "$replacement" "$effective_cfg" || true
+
+    log "Re-validating effective config with $bad_count bad dynamic-route file(s) excluded..."
+    if second_pass_err="$(caddy validate --config "$effective_cfg" --adapter caddyfile 2>&1)"; then
+        log "Effective config (bad dynamic routes excluded) validated OK — Caddy WILL start."
+        _EFFECTIVE_CONFIG_PATH="$effective_cfg"
+        return 0
+    fi
+
+    warn "FATAL: config is still invalid even after excluding every individually-bad"
+    warn "  dynamic route file — refusing to guess further:"
+    printf '%s\n' "$second_pass_err" | while IFS= read -r eline; do warn "    $eline"; done
+    return 1
+}
+
+if resolve_effective_caddy_config; then
+    log "Starting Caddy (config: $_EFFECTIVE_CONFIG_PATH)..."
+    exec caddy run --config "$_EFFECTIVE_CONFIG_PATH" --adapter caddyfile
+else
+    warn "FATAL: could not assemble a valid Caddy config even after dynamic-route"
+    warn "  quarantine — refusing to start with an unvalidated config. Exiting non-zero"
+    warn "  (compose/K8s will restart; this WILL crash-loop again until the underlying"
+    warn "  cause — not a single stale dynamic route — is fixed by an operator)."
+    exit 1
+fi

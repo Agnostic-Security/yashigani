@@ -485,6 +485,33 @@ class TestBrokerHttpServerLive:
         assert status == 200, body
         assert json.loads(body)["removed"] is False
 
+    def test_reload_transport_failure_rolls_back_dangling_file(
+        self, broker, live_env, monkeypatch,
+    ):
+        """FINDING-V412-CADDYADMIN-002 part 2 regression: before this fix,
+        the POST /route rollback only fired on `except BrokerError`. But
+        `_trigger_reload` -> `_forward_caddyfile_to_real_admin` dials a real
+        unix socket, which can raise a RAW transport exception (here:
+        `FileNotFoundError`/`ConnectionRefusedError` from `socket.connect()`
+        on a nonexistent path) that is NOT a BrokerError instance. That left
+        the just-written route file dangling on disk with no successful
+        reload ever having applied it — exactly the orphan-file class that
+        forces Caddy's own boot-time quarantine logic to work around a
+        registration the broker itself should have rolled back. Proves the
+        fix: even a raw transport failure removes the file before failing."""
+        broker_sock, stub_state, agents_dynamic = live_env
+        monkeypatch.setattr(
+            broker, "_REAL_ADMIN_SOCKET", str(agents_dynamic / "no-such-admin.sock"),
+        )
+        status, body = _request_unix(
+            broker_sock, "POST", "/route", json.dumps(_VALID).encode(),
+        )
+        assert status == 500, body
+        assert not list(agents_dynamic.glob("*.caddy")), (
+            "a reload failure via a raw (non-BrokerError) transport exception "
+            "must still roll back the just-written route file"
+        )
+
     def test_healthz_ok_when_caddyfile_valid(self, live_env):
         broker_sock, _stub_state, _agents_dynamic = live_env
         status, body = _request_unix(broker_sock, "GET", "/healthz", b"")
