@@ -158,6 +158,18 @@ class HttpClient:
         non-empty allowlist; without one every host is denied (fail-closed).
         This flag is set only by ``McpHttpTransport`` — never for general
         outbound HTTP.
+
+    ``expected_spiffe_id`` (FINDING C, v4.1.2 final onboarding e2e):
+        When set, an ``https://`` request made in
+        ``bypass_private_for_allowlisted`` mode is verified by SPIFFE URI SAN
+        (via ``pki.client.internal_httpx_client_verify_spiffe``) instead of
+        DNS hostname — the ring-fenced agent's per-instance Caddy front leaf
+        carries a SPIFFE URI SAN only, no DNS SAN. Chain verification against
+        the internal CA is unchanged either way. When
+        ``bypass_private_for_allowlisted`` + ``https://`` is used WITHOUT an
+        ``expected_spiffe_id``, the request is refused fail-closed (see
+        ``_request``) rather than silently falling back to a hostname check
+        that structurally cannot succeed against this class of upstream.
     """
 
     def __init__(
@@ -168,6 +180,7 @@ class HttpClient:
         allow_http: Optional[bool] = None,
         timeout_s: Optional[float] = None,
         bypass_private_for_allowlisted: bool = False,
+        expected_spiffe_id: Optional[str] = None,
     ):
         self.allowlist = allowlist if allowlist is not None else _env_list("YASHIGANI_OUTBOUND_ALLOWLIST")
         self.blocklist = blocklist if blocklist is not None else _env_list("YASHIGANI_OUTBOUND_BLOCKLIST")
@@ -178,6 +191,7 @@ class HttpClient:
             timeout_s = float(os.getenv("YASHIGANI_OUTBOUND_DEFAULT_TIMEOUT", "30"))
         self.timeout_s = timeout_s
         self.bypass_private_for_allowlisted = bypass_private_for_allowlisted
+        self.expected_spiffe_id = expected_spiffe_id
 
     # ------------------------------------------------------------------
     # Policy check
@@ -313,14 +327,6 @@ class HttpClient:
             # (502 UPSTREAM_UNREACHABLE) even though the agent is reachable
             # and usable via the chat path.
             #
-            # Mirror gateway/orchestrator.py:_execute_mcp_tool, which already
-            # switches to ``pki.client.internal_httpx_client()`` for
-            # ``https://`` MCP upstreams on the chat path. That helper both
-            # trusts the internal CA AND presents this service's own client
-            # cert (required by the per-instance listener's mTLS gate) — it
-            # is never a bare CA-trust-only relaxation, and ``verify=False``
-            # is never used here or anywhere in this module.
-            #
             # This flag is the same one that already gates the RFC-1918
             # private-IP SSRF bypass for this exact class of upstream — it is
             # the existing "this destination is our own ring-fenced mesh"
@@ -330,9 +336,48 @@ class HttpClient:
             # password checks, JWKS fetch, Open WebUI proxy, generic
             # outbound) — those never set this flag and keep using the
             # system CA bundle for genuinely-external hosts, unchanged.
-            from yashigani.pki.client import internal_httpx_client
+            #
+            # ── FINDING C (v4.1.2 final onboarding e2e, Ava/Tom) ────────────
+            # With N1's internal-CA trust in place, the handshake still fails
+            # DNS-hostname verification: the agent's per-instance Caddy front
+            # leaf carries a SPIFFE URI SAN only (no DNS SAN — see
+            # manifest/codegen.py::_gen_caddy_snippet_mcp). We therefore
+            # verify by SPIFFE URI SAN instead of DNS hostname
+            # (``internal_httpx_client_verify_spiffe`` — chain verification
+            # against the internal CA is UNCHANGED; only the identity match
+            # strategy differs, and ``verify=False``/bare
+            # ``check_hostname=False`` is never used without this
+            # compensating SPIFFE check).
+            #
+            # Fail-closed: without an expected_spiffe_id we refuse rather
+            # than fall back to ``internal_httpx_client()``'s DNS-hostname
+            # check, which cannot succeed against this class of upstream
+            # (every https:// bypass-mode caller today is a ring-fenced MCP
+            # agent front — see McpHttpTransport/mcp_router_runtime.py) and
+            # would otherwise mask a caller that forgot to pass the expected
+            # identity as an opaque 502, or (worse) invite a future caller to
+            # "fix" it by disabling hostname checking without a compensating
+            # control.
+            if not self.expected_spiffe_id:
+                logger.error(
+                    "Outbound blocked: bypass_private_for_allowlisted https:// "
+                    "request to %r has no expected_spiffe_id — refusing rather "
+                    "than silently falling back to DNS-hostname verification "
+                    "(FINDING C: ring-fenced agent leaves are SPIFFE-URI-SAN "
+                    "only and cannot pass a DNS-hostname check).",
+                    url,
+                )
+                raise BlockedByPolicy(
+                    f"Host {urlparse(url).hostname!r} requires SPIFFE URI SAN "
+                    "verification (expected_spiffe_id not supplied) — refusing "
+                    "to dial with unverifiable peer identity."
+                )
 
-            async with internal_httpx_client() as client:
+            from yashigani.pki.client import internal_httpx_client_verify_spiffe
+
+            async with internal_httpx_client_verify_spiffe(
+                self.expected_spiffe_id
+            ) as client:
                 return await client.request(method, url, **kwargs)
 
         # Genuinely-external (or non-TLS internal-bridge) traffic — default

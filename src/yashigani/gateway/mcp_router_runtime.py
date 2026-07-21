@@ -655,6 +655,7 @@ async def _handle_mcp_call_inner(
             async with McpHttpTransport(
                 upstream_url=server_cfg.upstream_url,
                 is_relay=False,
+                expected_spiffe_id=server_cfg.spiffe_id,  # FINDING C
             ) as transport:
                 upstream_response = await transport.forward(
                     mcp_request_json=body_str,
@@ -915,6 +916,7 @@ async def _handle_mcp_call_inner(
                 async with McpHttpTransport(
                     upstream_url=server_cfg.upstream_url,
                     is_relay=False,
+                    expected_spiffe_id=server_cfg.spiffe_id,  # FINDING C
                 ) as transport:
                     # For notifications we still use forward() which issues an HTTP
                     # POST — the bridge returns 202 and we mirror that.
@@ -937,6 +939,7 @@ async def _handle_mcp_call_inner(
                 async with McpHttpTransport(
                     upstream_url=server_cfg.upstream_url,
                     is_relay=False,
+                    expected_spiffe_id=server_cfg.spiffe_id,  # FINDING C
                 ) as transport:
                     upstream_response = await transport.forward(
                         mcp_request_json=body_str,
@@ -985,6 +988,7 @@ async def _handle_mcp_call_inner(
             async with McpHttpTransport(
                 upstream_url=server_cfg.upstream_url,
                 is_relay=False,
+                expected_spiffe_id=server_cfg.spiffe_id,  # FINDING C
             ) as transport:
                 upstream_response = await transport.forward(
                     mcp_request_json=body_str,
