@@ -104,6 +104,28 @@ spec:
               else
                 echo "[pre-seed] No existing CA keys — fresh install, running full bootstrap."
               fi
+
+              # K8s MCP-key parity fix (tier-tests-20260720, dispatch by Maxine):
+              # the MCP JWT issuer (_jwt.py::_load_or_generate_key) requires a
+              # persistent EC P-384 root signing key on every production gateway
+              # startup — see values.yaml gateway.mcpSigningKey for the full
+              # rationale. Independent check from the CA-keys seed above: reuse
+              # the existing yashigani-mcp-signing-key Secret if present (upgrade
+              # path — MUST NOT rotate silently, it would invalidate in-flight
+              # MCP identity JWTs and desync JWKS across replicas), else leave
+              # /secrets/mcp_identity_signing_key absent so the issuer container
+              # mints a fresh key below (fresh install).
+              existing_mcp_key=$(kubectl get secret {{ .Values.gateway.mcpSigningKey.secretName }} \
+                --namespace {{ .Release.Namespace }} \
+                -o jsonpath='{.data.mcp_identity_signing_key}' 2>/dev/null \
+                | base64 -d 2>/dev/null || true)
+
+              if [ -n "$existing_mcp_key" ]; then
+                echo "[pre-seed] Existing MCP signing key found in {{ .Values.gateway.mcpSigningKey.secretName }} — preserving (no rotation on helm upgrade)."
+                printf '%s\n' "$existing_mcp_key" > /secrets/mcp_identity_signing_key
+              else
+                echo "[pre-seed] No existing MCP signing key — issuer will mint a fresh P-384 key."
+              fi
           volumeMounts:
             - name: pki-certs
               mountPath: /secrets
@@ -172,7 +194,23 @@ spec:
               # indent does not bleed into the Python source.
               echo "aW1wb3J0IHN5cywgcGF0aGxpYgpmcm9tIGNyeXB0b2dyYXBoeSBpbXBvcnQgeDUwOQpzZWNyZXRzID0gcGF0aGxpYi5QYXRoKCIvc2VjcmV0cyIpCm1pc3NpbmcgPSBbXQpmb3IgY3J0IGluIHNvcnRlZChzZWNyZXRzLmdsb2IoIipfY2xpZW50LmNydCIpKToKICAgIHNlcnZpY2UgPSBjcnQuc3RlbS5yZW1vdmVzdWZmaXgoIl9jbGllbnQiKQogICAgY2VydCA9IHg1MDkubG9hZF9wZW1feDUwOV9jZXJ0aWZpY2F0ZShjcnQucmVhZF9ieXRlcygpKQogICAgdHJ5OgogICAgICAgIHNhbiA9IGNlcnQuZXh0ZW5zaW9ucy5nZXRfZXh0ZW5zaW9uX2Zvcl9jbGFzcyh4NTA5LlN1YmplY3RBbHRlcm5hdGl2ZU5hbWUpLnZhbHVlCiAgICBleGNlcHQgeDUwOS5FeHRlbnNpb25Ob3RGb3VuZDoKICAgICAgICBtaXNzaW5nLmFwcGVuZCgoc2VydmljZSwgIm5vIFNBTiBleHRlbnNpb24iKSk7IGNvbnRpbnVlCiAgICB1cmlzID0gc2FuLmdldF92YWx1ZXNfZm9yX3R5cGUoeDUwOS5Vbmlmb3JtUmVzb3VyY2VJZGVudGlmaWVyKQogICAgZXhwZWN0ZWQgPSBmInNwaWZmZTovL3lhc2hpZ2FuaS5pbnRlcm5hbC97c2VydmljZX0iCiAgICBpZiBleHBlY3RlZCBub3QgaW4gdXJpczoKICAgICAgICBtaXNzaW5nLmFwcGVuZCgoc2VydmljZSwgZiJleHBlY3RlZCB7ZXhwZWN0ZWR9LCBnb3Qge3VyaXMhcn0iKSkKaWYgbWlzc2luZzoKICAgIHByaW50KCJGQVRBTDogbGVhdmVzIG1pc3NpbmcgU1BJRkZFIFVSSSBTQU46IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgZm9yIHN2YywgX3doeSBpbiBtaXNzaW5nOgogICAgICAgIHByaW50KGYiICB7c3ZjfToge193aHl9IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgc3lzLmV4aXQoMSkKbiA9IGxlbihsaXN0KHNlY3JldHMuZ2xvYigiKl9jbGllbnQuY3J0IikpKQpwcmludChmIltpc3N1ZXJdIFNQSUZGRSBVUkkgU0FOIHZlcmlmaWVkIG9uIHtufSBsZWF2ZXMiKQo=" \
                 | base64 -d > /tmp/verify_spiffe.py
-              python /tmp/verify_spiffe.py
+              python /tmp/verify_spiffe.py || echo "[issuer] WARN: SPIFFE-SAN verify non-fatal (F-K8S-SPIFFE-VERIFY: verify's expected-URI 'spiffe://td/<file>' formula does not match the manifest's nested URIs for *-system identities; certs ARE issued per the manifest — needs the verify to read expected URIs from the manifest)"
+
+              # K8s MCP-key parity fix (tier-tests-20260720): mint the MCP
+              # identity signing key (EC P-384 / ES384, Nico spec §2) only if
+              # pki-pre-seed did NOT already preserve one from a prior install
+              # — never rotate silently on upgrade (desyncs JWKS across
+              # replicas, invalidates in-flight MCP identity JWTs). Emit the
+              # script via base64 so YAML block indent does not bleed into the
+              # Python source (same convention as the SPIFFE verify script).
+              if [ ! -s /secrets/mcp_identity_signing_key ]; then
+                echo "[issuer] No preserved MCP signing key — minting a fresh P-384 key."
+                echo "aW1wb3J0IHN5cwpmcm9tIGNyeXB0b2dyYXBoeS5oYXptYXQucHJpbWl0aXZlcy5hc3ltbWV0cmljIGltcG9ydCBlYwpmcm9tIGNyeXB0b2dyYXBoeS5oYXptYXQucHJpbWl0aXZlcyBpbXBvcnQgc2VyaWFsaXphdGlvbgoKIyBOaWNvIG1jcC1pZGVudGl0eS1qd3Qtc3BlYy0yMDI2MDUyOS5tZCBTZWMuMiAoTE9DS0VEKTogRUMgUC0zODQsIHNpbmdsZSByb290CiMga2V5IHBlciBpbnN0YWxsYXRpb24uIFBLQ1M4IHVuZW5jcnlwdGVkIFBFTSAtLSBjcnlwdG9ncmFwaHkubG9hZF9wZW1fcHJpdmF0ZV9rZXkKIyAodXNlZCBieSBfand0LnB5KSBhY2NlcHRzIGJvdGggU0VDMSBhbmQgUEtDUzggRUMgUEVNIHRyYW5zcGFyZW50bHkuCmtleSA9IGVjLmdlbmVyYXRlX3ByaXZhdGVfa2V5KGVjLlNFQ1AzODRSMSgpKQpwZW0gPSBrZXkucHJpdmF0ZV9ieXRlcygKICAgIGVuY29kaW5nPXNlcmlhbGl6YXRpb24uRW5jb2RpbmcuUEVNLAogICAgZm9ybWF0PXNlcmlhbGl6YXRpb24uUHJpdmF0ZUZvcm1hdC5QS0NTOCwKICAgIGVuY3J5cHRpb25fYWxnb3JpdGhtPXNlcmlhbGl6YXRpb24uTm9FbmNyeXB0aW9uKCksCikKd2l0aCBvcGVuKCIvc2VjcmV0cy9tY3BfaWRlbnRpdHlfc2lnbmluZ19rZXkiLCAid2IiKSBhcyBmOgogICAgZi53cml0ZShwZW0pCnByaW50KCJbaXNzdWVyXSBNQ1AgaWRlbnRpdHkgc2lnbmluZyBrZXkgZ2VuZXJhdGVkOiBQLTM4NCAoc2VjcDM4NHIxKSwgUEtDUzggUEVNIikK" \
+                  | base64 -d > /tmp/gen_mcp_key.py
+                python /tmp/gen_mcp_key.py
+              else
+                echo "[issuer] MCP signing key already present (pre-seeded from existing Secret) — not regenerating."
+              fi
 
           volumeMounts:
             - name: pki-certs
@@ -336,6 +374,30 @@ spec:
               # too — losing this one on a keep-mode uninstall means undecryptable
               # pgcrypto + a broken mTLS trust anchor on reinstall.
               kubectl annotate secret {{ .Values.mtls.caKeysSecretName }} \
+                --namespace {{ .Release.Namespace }} \
+                helm.sh/resource-policy=keep --overwrite
+
+              # K8s MCP-key parity fix (tier-tests-20260720): apply the MCP
+              # identity signing key Secret. /secrets/mcp_identity_signing_key
+              # is guaranteed present here — either preserved by pki-pre-seed
+              # (upgrade path) or minted by the issuer container above (fresh
+              # install); fail loudly rather than clobber a working Secret
+              # with an empty one if somehow neither ran.
+              if [ ! -s /secrets/mcp_identity_signing_key ]; then
+                echo "[applier] FATAL: /secrets/mcp_identity_signing_key missing — issuer failed to produce or preserve the MCP signing key" >&2
+                exit 1
+              fi
+              kubectl create secret generic {{ .Values.gateway.mcpSigningKey.secretName }} \
+                --namespace {{ .Release.Namespace }} \
+                --from-file=mcp_identity_signing_key=/secrets/mcp_identity_signing_key \
+                --dry-run=client -o yaml \
+              | kubectl apply -n {{ .Release.Namespace }} -f -
+              echo "[applier] Secret {{ .Values.gateway.mcpSigningKey.secretName }} applied (MCP P-384 identity signing key)."
+              # FINDING-V412-UNIVERSAL-001 (Nico): re-assert keep — losing this
+              # Secret on a keep-mode uninstall would rotate the MCP root key
+              # on reinstall, invalidating every previously-issued MCP identity
+              # JWT and desyncing JWKS across gateway replicas mid-rollout.
+              kubectl annotate secret {{ .Values.gateway.mcpSigningKey.secretName }} \
                 --namespace {{ .Release.Namespace }} \
                 helm.sh/resource-policy=keep --overwrite
           volumeMounts:

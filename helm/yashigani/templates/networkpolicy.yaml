@@ -595,7 +595,15 @@ spec:
 # ollama-init Job egress — allow the init Job pod to reach yashigani-ollama:11434
 # (wait-for-ollama initContainer + ollama pull in main container).
 # Required because default-deny-egress applies to all pods in the namespace.
-{{- if and .Values.ollama.enabled .Values.openWebui.enabled }}
+# F-K8S-OLLAMA-INIT-NETPOL (2026-07-21, caught LIVE): this gate MUST match the
+# ollama-init Job's own gate (ollama.yaml SF-011, 2026-05-19), which was broadened
+# to also fire on any agentBundle. The gate here was left as (ollama && openWebui)
+# only, so when the Job deploys via langflow/letta/openclaw with openWebui disabled
+# (the 4.x default — open-webui replaced by the built-in ui4 SPA), the Job runs but
+# its egress policy is absent → default-deny-egress blocks it → ollama-init hangs
+# forever on "waiting for yashigani-ollama:11434" → helm --atomic times out and
+# rolls back the whole release. Keep this condition identical to the Job's.
+{{- if and .Values.ollama.enabled (or .Values.openWebui.enabled .Values.agentBundles.langflow.enabled .Values.agentBundles.letta.enabled .Values.agentBundles.openclaw.enabled) }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

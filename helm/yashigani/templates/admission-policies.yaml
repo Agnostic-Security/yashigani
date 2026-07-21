@@ -519,23 +519,41 @@ spec:
           FINDING-V412-DNS-001: pods may not bind hostPort 53 or containerPort
           53 — CoreDNS in kube-system is the sole resolver. Pod:
           '{{ "{{" }} request.object.metadata.name {{ "}}" }}'.
-        pattern:
-          spec:
-            # LAURA-CIL HIGH: cover ALL container types — a K8s >=1.28 native
-            # sidecar (initContainer with restartPolicy: Always) or an ephemeral
-            # container could otherwise bind :53 unblocked (same gap class Policy 6
-            # already closes for the CA-keys env check). initContainers/
-            # ephemeralContainers are optional → conditional anchors.
-            containers:
-              - =(ports):
-                  - X(hostPort): "!53"
-                    X(containerPort): "!53"
-            =(initContainers):
-              - =(ports):
-                  - X(hostPort): "!53"
-                    X(containerPort): "!53"
-            =(ephemeralContainers):
-              - =(ports):
-                  - X(hostPort): "!53"
-                    X(containerPort): "!53"
+        # F-K8S-POLICY7-BUG (2026-07-21, caught LIVE): the prior `pattern` form with
+        # X()/"!53" anchors denied EVERY container port (postgres 5432, prometheus 9090,
+        # gateway, …), DoS-ing the whole namespace — static review + helm template both
+        # missed it; only a real deploy surfaced it. Correct form: a foreach that denies
+        # ONLY when a port actually equals 53. Covers containers + native-sidecar
+        # initContainers + ephemeralContainers (LAURA-CIL HIGH).
+        foreach:
+          - list: "request.object.spec.containers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+          - list: "request.object.spec.initContainers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+          - list: "request.object.spec.ephemeralContainers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
 {{- end }}

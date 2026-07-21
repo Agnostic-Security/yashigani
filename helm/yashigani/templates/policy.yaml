@@ -29,12 +29,19 @@
   (c) docker test (openpolicyagent/opa:1.16.1 + openssl) confirming :8282 serves
   TLS when --tls-cert-file is present.
 
-  Fix (this commit): add scheme: HTTPS to readinessProbe and livenessProbe httpGet
-  blocks when mtls.enabled=true. K8s kubelets do NOT verify the server certificate
-  on httpGet scheme: HTTPS probes (no CA bundle is passed; the handshake completes
-  and HTTP status is checked). This is intentional K8s behaviour and acceptable for
-  liveness/readiness; real mTLS verification happens between gateway/backoffice and
-  OPA at runtime via internal_httpx_client.
+  Fix (A3, 2026-05-15 — SUPERSEDED 2026-07-21, see below): added scheme: HTTPS to
+  the httpGet probes when mtls.enabled=true. That analysis was INCOMPLETE: it was
+  validated by a docker test running OPA WITHOUT --authentication=tls, so it never
+  reproduced the client-cert requirement. Live on k3s x86_64 the probe still fails
+  with "remote error: tls: certificate required" because --authentication=tls makes
+  OPA enforce RequireAndVerifyClientCert at the TLS layer on the :8282 diagnostic
+  listener too — a certless kubelet httpGet can never complete the handshake.
+
+  Fix (2026-07-21, F-K8S-POLICY-OPA-PROBE): when mtls.enabled=true, use a tcpSocket
+  probe on :8282 (OPA's image is distroless — no shell/curl for a cert-presenting
+  exec probe). Port-accepting ⇒ OPA is up. Real mTLS verification still happens
+  gateway/backoffice → OPA at runtime via internal_httpx_client. See the inline
+  readinessProbe note for detail.
 
   Note: automountServiceAccountToken disabled — OPA has no K8s API calls.
 */ -}}
@@ -118,23 +125,44 @@ spec:
               containerPort: 8282
               protocol: TCP
           readinessProbe:
+            {{- if .Values.mtls.enabled }}
+            # F-K8S-POLICY-OPA-PROBE (2026-07-21, caught LIVE on k3s x86_64):
+            # with --authentication=tls, OPA enforces RequireAndVerifyClientCert at
+            # the TLS layer on ALL listeners INCLUDING --diagnostic-addr :8282. A
+            # kubelet httpGet (even scheme: HTTPS) presents NO client cert, so the
+            # handshake is rejected: "remote error: tls: certificate required" →
+            # every probe fails → liveness SIGTERMs OPA (graceful exit 0) →
+            # CrashLoop, never Ready → gateway (OPA-dependent) 403s. The earlier
+            # scheme:HTTPS fix (A3, 2026-05-15) was validated by a docker test that
+            # ran OPA WITHOUT --authentication=tls, so it never reproduced the
+            # client-cert requirement. OPA's image is distroless (no shell/curl for a
+            # cert-presenting exec probe), so a tcpSocket check on :8282 is the
+            # correct liveness/readiness signal for an mTLS-only listener:
+            # port-accepting ⇒ OPA is up and serving. Real mTLS verification still
+            # happens gateway/backoffice → OPA at runtime via internal_httpx_client.
+            tcpSocket:
+              port: 8282
+            {{- else }}
             httpGet:
               path: /health
               port: 8282
-              {{- if .Values.mtls.enabled }}
-              scheme: HTTPS
-              {{- end }}
+            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 5
           livenessProbe:
+            {{- if .Values.mtls.enabled }}
+            # See readinessProbe note above (F-K8S-POLICY-OPA-PROBE): tcpSocket on
+            # :8282 because OPA's mTLS-required diagnostic listener rejects certless
+            # kubelet httpGet probes.
+            tcpSocket:
+              port: 8282
+            {{- else }}
             httpGet:
               path: /health
               port: 8282
-              {{- if .Values.mtls.enabled }}
-              scheme: HTTPS
-              {{- end }}
+            {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3

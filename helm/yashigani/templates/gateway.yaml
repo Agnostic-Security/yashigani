@@ -48,6 +48,73 @@ spec:
         fsGroup: 1001
         seccompProfile:
           type: RuntimeDefault
+      {{- if .Values.mtls.enabled }}
+      # YSG-GW-SUBPATH-MOUNT fix (tier-tests-20260720, dispatch by Maxine, traced
+      # by coordinator): the `secrets` volume used to be the mTLS Secret mounted
+      # DIRECTLY (read-only, items-scoped) at /run/secrets. license_key and
+      # mcp_identity_signing_key were then subPath-mounted from SEPARATE Secrets
+      # on top of that same path. kubelet/containerd cannot create a subPath
+      # mountpoint at a path that doesn't already exist as a real file/dir inside
+      # a Secret-projected volume's symlink farm — every gateway pod with a
+      # license configured (i.e. every real deployment) hit RunContainerError:
+      # `error mounting ".../volume-subpaths/license/gateway/4" to rootfs at
+      # "/run/secrets/license_key" ... not a directory`.
+      # Fix: mirror backoffice.yaml's pattern exactly — `secrets` becomes a
+      # writable emptyDir (Memory-backed), seeded by this initContainer copying
+      # the items-scoped PKI Secret (+ license + MCP signing key, when present)
+      # from read-only source mounts. subPath goes away entirely; every file
+      # just lands in /secrets-rw via `cp -L`, so kubelet never needs a subPath
+      # mountpoint inside a Secret volume. Items-scoping (YSG-RISK-053 K8s
+      # parity) is preserved — only the same five PKI keys, plus license_key /
+      # mcp_identity_signing_key when their features are enabled, are ever
+      # projected into the gateway's /run/secrets tree.
+      initContainers:
+        - name: copy-pki-to-writable
+          image: "{{ .Values.mtls.kubectlImage.repository }}:{{ .Values.mtls.kubectlImage.tag }}"
+          imagePullPolicy: {{ .Values.mtls.kubectlImage.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              cp -L /pki-ro/* /secrets-rw/
+              if [ -d /license-ro ]; then
+                cp -L /license-ro/license_key /secrets-rw/
+              fi
+              if [ -d /mcp-signing-key-ro ]; then
+                cp -L /mcp-signing-key-ro/mcp_identity_signing_key /secrets-rw/
+              fi
+              chmod 0400 /secrets-rw/*
+          volumeMounts:
+            - name: pki-ro
+              mountPath: /pki-ro
+              readOnly: true
+            {{- if .Values.licensing.licenseKey }}
+            - name: license-ro
+              mountPath: /license-ro
+              readOnly: true
+            {{- end }}
+            {{- if .Values.mtls.enabled }}
+            # K8s parity fix (tier-tests-20260720): mount unconditionally
+            # whenever the PKI plane is on — NOT gated on
+            # agentBundles.filesystemMcp.enabled. The MCP JWT issuer wires on
+            # every production gateway startup regardless of MCP bundle
+            # config (registry.py build_registry_from_env — shared issuer
+            # built whenever a durable_store is available), so the signing
+            # key is a hard production requirement, not an MCP-bundle extra.
+            - name: mcp-signing-key-ro
+              mountPath: /mcp-signing-key-ro
+              readOnly: true
+            {{- end }}
+            - name: secrets
+              mountPath: /secrets-rw
+      {{- end }}
       containers:
         - name: gateway
           image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.gateway.image.repository "tag" .Values.gateway.image.tag) }}"
@@ -368,30 +435,14 @@ spec:
               mountPath: /etc/yashigani
               readOnly: true
             {{- end }}
-            {{- if .Values.licensing.licenseKey }}
-            # Petra P0-1 (v2.24.4): mount the licence key alongside the PKI material
-            # so loader.py candidate 2 (/run/secrets/license_key) resolves correctly.
-            # subPath keeps the mount scoped to a single file; does not collide with
-            # the PKI Secret already mounted at /run/secrets.
-            - name: license
-              mountPath: /run/secrets/license_key
-              subPath: license_key
-              readOnly: true
-            {{- end }}
-            {{- if .Values.agentBundles.filesystemMcp.enabled }}
-            {{- if .Values.gateway.mcpSigningKey.existingSecretName }}
-            # K8s SB-2 fix: mount MCP identity signing key from a standalone Secret.
-            # Logically separate from mTLS PKI — distinct key-management lifecycle
-            # (JWT signing key rotation is independent of TLS cert rotation).
-            # subPath mount lands at /run/secrets/mcp_identity_signing_key —
-            # the default path expected by _jwt.py (YASHIGANI_MCP_SIGNING_KEY_PATH).
-            # Does NOT interfere with the PKI Secret already at /run/secrets/.
-            - name: mcp-signing-key
-              mountPath: /run/secrets/mcp_identity_signing_key
-              subPath: {{ .Values.gateway.mcpSigningKey.secretKey | quote }}
-              readOnly: true
-            {{- end }}
-            {{- end }}
+            # YSG-GW-SUBPATH-MOUNT fix: license_key and mcp_identity_signing_key
+            # are no longer subPath-mounted here — the copy-pki-to-writable
+            # initContainer above copies both (when enabled) into the writable
+            # `secrets` emptyDir alongside the PKI material, so both land at
+            # /run/secrets/license_key and /run/secrets/mcp_identity_signing_key
+            # (loader.py candidate 2 / _jwt.py YASHIGANI_MCP_SIGNING_KEY_PATH
+            # default) via the single `secrets` volumeMount below — no subPath,
+            # no "not a directory" mount failure.
       volumes:
         - name: tmp
           emptyDir:
@@ -410,6 +461,24 @@ spec:
           {{- end }}
         - name: secrets
           {{- if .Values.mtls.enabled }}
+          # YSG-GW-SUBPATH-MOUNT fix: writable emptyDir now (was a direct Secret
+          # mount) — seeded by the copy-pki-to-writable initContainer from
+          # pki-ro/license-ro/mcp-signing-key-ro below. Memory-backed, matching
+          # backoffice.yaml's equivalent /run/secrets emptyDir. The main
+          # container still mounts this readOnly:true (readOnlyRootFilesystem
+          # posture unchanged — gateway never writes to /run/secrets itself,
+          # unlike backoffice which also writes bootstrap credentials here).
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Mi
+          {{- else }}
+          emptyDir:
+            sizeLimit: 10Mi
+          {{- end }}
+        {{- if .Values.mtls.enabled }}
+        # Read-only source for the initContainer copy — the mTLS Secret,
+        # items-scoped exactly as before (YSG-RISK-053 K8s parity unchanged).
+        - name: pki-ro
           secret:
             secretName: {{ .Values.mtls.existingSecretName | default .Values.mtls.secretName }}
             # 0440 + fsGroup: pod (1001) can read, others blocked.
@@ -431,33 +500,41 @@ spec:
                 path: ca_root.crt
               - key: ca_bundle.crt
                 path: ca_bundle.crt
-          {{- else }}
-          emptyDir:
-            sizeLimit: 10Mi
-          {{- end }}
-        {{- if .Values.mtls.enabled }}
         - name: service-manifest
           configMap:
             name: yashigani-pki-manifest
         {{- end }}
         {{- if .Values.licensing.licenseKey }}
-        # Petra P0-1 (v2.24.4): licence Secret volume.
-        # Mounted via subPath at /run/secrets/license_key (readOnly).
-        - name: license
+        # Petra P0-1 (v2.24.4): licence Secret volume — read-only source for the
+        # initContainer copy (YSG-GW-SUBPATH-MOUNT fix; was subPath-mounted
+        # directly at /run/secrets/license_key, which broke — see initContainer
+        # comment above). items-scoped to the single key actually needed.
+        - name: license-ro
           secret:
             secretName: yashigani-license
             defaultMode: 0440
+            items:
+              - key: license_key
+                path: license_key
         {{- end }}
-        {{- if and .Values.agentBundles.filesystemMcp.enabled .Values.gateway.mcpSigningKey.existingSecretName }}
-        # K8s SB-2 fix: standalone MCP identity signing key volume.
-        # Only rendered when filesystemMcp is enabled AND existingSecretName is set.
-        # The operator must pre-create this Secret before running helm install/upgrade:
-        #   kubectl create secret generic yashigani-mcp-signing-key -n <ns> \
-        #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
-        - name: mcp-signing-key
+        {{- if .Values.mtls.enabled }}
+        # K8s parity fix (tier-tests-20260720, supersedes K8s SB-2): standalone
+        # MCP identity signing key volume — read-only source for the
+        # initContainer copy (YSG-GW-SUBPATH-MOUNT fix; was subPath-mounted
+        # directly, which broke — see initContainer comment above). Rendered
+        # unconditionally whenever mtls.enabled (the PKI plane, which the
+        # bootstrap Job also guards) — NOT gated on
+        # agentBundles.filesystemMcp.enabled; see the initContainer mount
+        # comment above for why. Defaults to the chart-managed Secret minted
+        # by mtls-bootstrap-job.yaml (zero operator pre-creation); set
+        # existingSecretName to override with an operator/KMS-synced Secret.
+        - name: mcp-signing-key-ro
           secret:
-            secretName: {{ .Values.gateway.mcpSigningKey.existingSecretName }}
+            secretName: {{ .Values.gateway.mcpSigningKey.existingSecretName | default .Values.gateway.mcpSigningKey.secretName }}
             defaultMode: 0440
+            items:
+              - key: {{ .Values.gateway.mcpSigningKey.secretKey | quote }}
+                path: mcp_identity_signing_key
         {{- end }}
 ---
 apiVersion: v1

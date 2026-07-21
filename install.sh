@@ -12831,6 +12831,16 @@ _write_helm_values() {
     if [[ -n "${UPSTREAM_URL:-}" ]]; then
       printf "    upstreamUrl: '%s'\n" "${UPSTREAM_URL}"
     fi
+    # F-K8S-OPAURL (2026-07-20): production/staging require gateway.env.opaUrl or
+    # validate-security OPA-URL-001 fail-closes (empty opaUrl => OPA allow:True bypass).
+    printf "    opaUrl: 'https://yashigani-policy:8181'\n"
+
+    # F-K8S-ADMISSION (2026-07-20): production requires admissionPolicies.enabled=true
+    # (validate-security ~line 118). Kyverno is a k8s prereq; enable the chart's
+    # ClusterPolicies (container hardening + PKI trust-plane + rogue-DNS-bind).
+    printf '\n'
+    printf 'admissionPolicies:\n'
+    printf '  enabled: true\n'
 
     printf '\n'
     printf 'backoffice:\n'
@@ -12861,6 +12871,15 @@ _write_helm_values() {
     if [[ -n "${CMVP_CERT:-}" ]]; then
       printf "  cmvpCert: '%s'\n" "${CMVP_CERT//\'/\'\'}"
     fi
+
+    # F-K8S-BEARER (2026-07-20): the k8s path MUST supply internalBearer.value, or the
+    # chart's validate-security.yaml (INTERNAL-BEARER-001) fail-closes in production.
+    # Compose generates YASHIGANI_INTERNAL_BEARER into docker/secrets; mirror it into the
+    # helm values here. secrets.yaml's lookup preserves an existing bearer on upgrade
+    # regardless of this value, so a per-install generated token is upgrade-safe.
+    printf '\n'
+    printf 'internalBearer:\n'
+    printf "  value: '%s'\n" "${YASHIGANI_INTERNAL_BEARER:-$(openssl rand -hex 32)}"
 
     # License key: read from file if operator passed --license-key.
     # Written last — it may be multi-line (YAML literal block scalar).

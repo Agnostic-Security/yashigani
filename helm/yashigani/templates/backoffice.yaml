@@ -72,6 +72,19 @@ spec:
                   cp -L "$f" /secrets-rw/
                 done
               fi
+              # YSG-PGB-SCRAM-x86 fix (tier-tests-20260720): _sync_app_role_password()
+              # (src/yashigani/db/__init__.py) reads ${YASHIGANI_SECRETS_DIR}/postgres_password
+              # as a FILE to replace migration 0001's literal SCRAM placeholder
+              # ('PLACEHOLDER_REPLACED_BY_BOOTSTRAP') on the yashigani_app role. Compose
+              # bind-mounts docker/secrets/postgres_password into /run/secrets — this file
+              # never existed in K8s (postgres_password was env-var-only via secretKeyRef),
+              # so the sync silently no-op'd (caught OSError, logged, returned) and
+              # yashigani_app's real postgres password stayed on the placeholder forever.
+              # Every downstream SCRAM auth (asyncpg/psql -> pgbouncer -> postgres) then
+              # fails "SASL authentication failed" — this is NOT a pgbouncer bug (confirmed
+              # live: identical failure on pgbouncer 1.25.1 AND 1.25.2, auth_query AND
+              # static userlist.txt, direct-to-postgres AND via pgbouncer).
+              cp -L /postgres-secret-ro/postgres_password /secrets-rw/
               chmod 0400 /secrets-rw/*
           securityContext:
             runAsUser: 1001
@@ -89,6 +102,12 @@ spec:
               mountPath: /admin-bootstrap-ro
               readOnly: true
             {{- end }}
+            # YSG-PGB-SCRAM-x86 fix: postgres_password as a file, matching the
+            # compose bind-mount, so _sync_app_role_password() can replace the
+            # migration-0001 SCRAM placeholder on yashigani_app.
+            - name: postgres-secret-ro
+              mountPath: /postgres-secret-ro
+              readOnly: true
             - name: secrets
               mountPath: /secrets-rw
       {{- end }}
@@ -522,6 +541,17 @@ spec:
             defaultMode: 0400
             optional: true
         {{- end }}
+        # YSG-PGB-SCRAM-x86 fix: postgres_password projected as a file (items-
+        # scoped to just this one key — no other postgres secret keys leak into
+        # the backoffice /run/secrets tree) so the initContainer can copy it
+        # alongside the PKI material for _sync_app_role_password() to read.
+        - name: postgres-secret-ro
+          secret:
+            secretName: {{ .Values.postgres.existingSecretName | default "yashigani-postgres-secrets" }}
+            defaultMode: 0440
+            items:
+              - key: postgres_password
+                path: postgres_password
         - name: service-manifest
           configMap:
             name: yashigani-pki-manifest
