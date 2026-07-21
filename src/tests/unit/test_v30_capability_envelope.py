@@ -564,6 +564,42 @@ class TestEnvelopeService:
         latched = await svc.latch_block(PROV)
         assert latched is False
 
+    # ------------------------------------------------------------------
+    # decommission_envelope — FINDING-V412-ONBOARDING-ROBUSTNESS #4
+    # ------------------------------------------------------------------
+
+    async def test_decommission_envelope_transitions_active_row(self):
+        from yashigani.mcp import CapabilityEnvelopeService, STATUS_DECOMMISSIONED
+        pool, conn = _make_mock_pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        svc = CapabilityEnvelopeService(pool=pool)
+        decommissioned = await svc.decommission_envelope(PROV)
+        assert decommissioned is True
+        # The UPDATE targets the new status value, not 'blocked'/'superseded'.
+        sql = conn.execute.call_args.args[0]
+        assert STATUS_DECOMMISSIONED in sql
+        assert "status = 'active'" in sql
+
+    async def test_decommission_envelope_idempotent_no_active(self):
+        from yashigani.mcp import CapabilityEnvelopeService
+        pool, conn = _make_mock_pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")  # no active row
+        svc = CapabilityEnvelopeService(pool=pool)
+        decommissioned = await svc.decommission_envelope(PROV)
+        assert decommissioned is False
+
+    async def test_decommission_then_get_active_returns_none(self):
+        """The exact invariant /auth/verify-mcp and list_active() depend on:
+        after decommission, get_active_envelope() must see no row (same
+        WHERE status='active' clause both already share)."""
+        from yashigani.mcp import CapabilityEnvelopeService
+        pool, conn = _make_mock_pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        conn.fetchrow = AsyncMock(return_value=None)  # post-decommission: no active row
+        svc = CapabilityEnvelopeService(pool=pool)
+        assert await svc.decommission_envelope(PROV) is True
+        assert await svc.get_active_envelope(PROV) is None
+
 
 class TestEnvelopeSerialisation:
     def test_round_trip(self):
