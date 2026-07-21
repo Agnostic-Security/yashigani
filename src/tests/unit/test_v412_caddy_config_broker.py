@@ -29,6 +29,7 @@ from __future__ import annotations
 import http.client
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import socket
@@ -530,3 +531,16 @@ class TestBrokerHttpServerLive:
         assert status == 404
         status2, _ = _request_unix(broker_sock, "GET", "/config/", b"")
         assert status2 == 404
+
+
+class TestRouteFileMode:
+    """FINDING-V412-CADDYADMIN-002-c (Laura): the route file must be world-
+    readable (0644) so Caddy — running cap_drop:[ALL], no CAP_DAC_OVERRIDE, as
+    a different UID than the broker — can `import` it. mkstemp defaults to 0600
+    owned by the broker UID, which caddy cannot read → every /route 502s."""
+
+    def test_written_route_file_is_0644(self, broker, tmp_path, monkeypatch):
+        monkeypatch.setattr(broker, "_AGENTS_DYNAMIC_DIR", str(tmp_path))
+        dest = broker._write_route_file("acme-corp", "filesystem", "# route\n")
+        mode = os.stat(dest).st_mode & 0o777
+        assert mode == 0o644, f"route file mode {oct(mode)} — caddy (cap_drop ALL) cannot import it"

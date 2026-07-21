@@ -605,6 +605,14 @@ def _write_route_file(tenant_id: str, server_id: str, content: str) -> str:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        # mkstemp creates the file 0600 owned by the broker UID (65532). Caddy
+        # imports this file running cap_drop:[ALL] (no CAP_DAC_OVERRIDE) as a
+        # different UID, so 0600 is unreadable → `import` fails with
+        # "permission denied" and every /route registration 502s
+        # (FINDING-V412-CADDYADMIN-002-c, Laura). The file is a non-secret
+        # route config in the broker-owned agents-dynamic volume (RO-mounted
+        # into caddy, never into backoffice); 0644 is the correct mode.
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, dest)
     except Exception:
         try:
