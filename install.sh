@@ -7196,15 +7196,115 @@ PYEOF
 # Idempotent: skips when the key already exists (rotation is a separate concern;
 # the key is long-lived like the wazuh-admin cert — 825 days).  Fail-closed:
 # returns non-zero if the intermediate CA material is missing.
+#
+# _ec_signing_key_is_valid — generic content validation for a PEM EC private
+# key (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21).
+#
+# A NON-EMPTY / `-f` presence check alone is NOT sufficient for a generated
+# EC signing key that a production loader parses strictly: a prior
+# interrupted/killed install can leave a corrupt-but-nonempty key file that
+# some openssl builds parse leniently while the strict loader
+# (`cryptography.load_pem_private_key`, used both by the gateway's MCP JWT
+# issuer AND the backoffice audit-checkpoint signer) rejects — "EC private
+# key is not encoded properly: private key value is too short". Root-caused
+# live 2026-07-21 for mcp_identity_signing_key (Maxine, gateway RestartCount
+# 143): a partial write left a SEC1 key whose private-key OCTET STRING
+# scalar was shorter than required while otherwise well-formed DER.
+#
+# Reproduced with hand-crafted short-scalar fixtures in BOTH formats this
+# function has to accept — SEC1 ("BEGIN EC PRIVATE KEY", the MCP key's
+# format) AND PKCS#8 ("BEGIN PRIVATE KEY", the audit-signing key's format,
+# via `openssl pkcs8 -topk8`) — confirming a bare `openssl ec -noout -text`
+# parse ACCEPTS both corrupted fixtures (reports a plausible "NIST CURVE"
+# line — the exact false-positive that shipped the incident) while
+# `cryptography.load_pem_private_key` correctly rejects both.
+#
+# Validation strategy (in preference order):
+#   1. python3 + `cryptography` (the EXACT production loader) — used
+#      whenever importable.
+#   2. openssl fallback (always available — openssl is a hard prerequisite
+#      for generating these keys at all): normalise via
+#      `openssl ec -outform DER` (accepts SEC1 OR PKCS#8 input, always
+#      re-encodes as SEC1/traditional — this is what makes the SAME
+#      asn1parse check below work for both key formats), then require BOTH
+#      (a) the depth-1 OCTET STRING (the SEC1 private-key scalar) is EXACTLY
+#      the expected byte length for the curve, AND (b) the curve name
+#      matches. The scalar-LENGTH check is what catches the corruption class
+#      above — a bare `-text` parse alone does not (proven during this fix).
+#
+# Podman-rootless-aware: reads via `_safe_read_secret` (same helper
+# `_secret_is_valid` relies on) so a subuid-remapped key file the host
+# installer user cannot `cat` directly is still read via `podman unshare`
+# rather than silently mis-validated.
+#
+# Usage: _ec_signing_key_is_valid <file> <cryptography-curve-class> \
+#          <expected-scalar-bytes> <openssl-curve-name-regex>
+# Returns 0 (valid) / 1 (invalid, corrupt, or absent).
+_ec_signing_key_is_valid() {
+  local _f="$1" _curve_class="$2" _scalar_bytes="$3" _curve_regex="$4"
+  local _pem
+  _pem="$(_safe_read_secret "$_f" "" "")"
+  [[ -n "$_pem" ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    local _py_rc
+    printf '%s\n' "$_pem" | YASHIGANI_EC_CURVE_CLASS="$_curve_class" python3 -c '
+import sys, os
+try:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric import ec
+except ImportError:
+    sys.exit(2)  # cryptography not importable -> fall through to openssl method
+curve_cls = getattr(ec, os.environ["YASHIGANI_EC_CURVE_CLASS"], None)
+try:
+    key = load_pem_private_key(sys.stdin.buffer.read(), password=None)
+    sys.exit(0 if (curve_cls is not None and isinstance(key.curve, curve_cls)) else 1)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
+    _py_rc=$?
+    case "$_py_rc" in
+      0) return 0 ;;   # valid EC key on the expected curve per the exact production loader
+      1) return 1 ;;   # definitively invalid (wrong curve / load failure)
+      *) : ;;          # 2 = cryptography module not importable -> fall through
+    esac
+  fi
+
+  # Fallback: normalise (SEC1 or PKCS#8 -> SEC1 DER) then check scalar length + curve.
+  command -v openssl >/dev/null 2>&1 || return 1
+  local _asn1 _oct_line
+  _asn1="$(printf '%s\n' "$_pem" | openssl ec -outform DER 2>/dev/null | openssl asn1parse -inform DER 2>/dev/null)"
+  [[ -n "$_asn1" ]] || return 1
+  _oct_line="$(printf '%s\n' "$_asn1" | grep -E 'd=1.*prim: OCTET STRING' | head -1)"
+  [[ -n "$_oct_line" ]] || return 1
+  printf '%s\n' "$_oct_line" | grep -Eq "\\bl= *${_scalar_bytes}\\b" || return 1
+  printf '%s\n' "$_pem" | openssl ec -noout -text 2>/dev/null | grep -Eqi "$_curve_regex"
+}
+
+# _audit_signing_key_is_valid — audit_signing.key (PKCS#8, P-256) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 pattern-sweep, Su 2026-07-21):
+# the pre-existing skip-gate below checked `-f` presence ONLY (not even
+# non-emptiness) — the SAME corrupt-key-preserved-across-a-re-run hazard
+# proven for mcp_identity_signing_key applies here: this is another
+# strictly-loaded EC private key (backoffice's audit-checkpoint signer). A
+# partial write from an interrupted install would be silently preserved and
+# only surface as a signing failure at the next daily checkpoint.
+_audit_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP256R1" 32 'P-256|prime256v1|secp256r1'
+}
+
 _provision_audit_signing_key() {
   local secrets="${WORK_DIR}/docker/secrets"
   local asd="${secrets}/audit-signing"
   local keyf="${asd}/audit_signing.key"
   local crtf="${asd}/audit_signing.crt"
 
-  if [[ -f "$keyf" && -f "$crtf" ]]; then
+  if [[ -f "$keyf" && -f "$crtf" ]] && _audit_signing_key_is_valid "$keyf"; then
     log_info "Audit-chain signing key already provisioned — skipping"
     return 0
+  elif [[ -f "$keyf" && -f "$crtf" ]]; then
+    log_warn "audit_signing.key present but FAILED content validation (corrupt/truncated EC key — consistent with a partial write from an interrupted prior install) — regenerating"
   fi
   if [[ ! -f "${secrets}/ca_intermediate.crt" || ! -f "${secrets}/ca_intermediate.key" ]]; then
     log_error "Audit signing-key provisioning: intermediate CA material missing — aborting (fail-closed)"
@@ -11246,6 +11346,23 @@ _secret_is_valid() {
   return 0
 }
 
+# _mcp_signing_key_is_valid — mcp_identity_signing_key (SEC1, P-384) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21). Root-caused
+# live: a NON-EMPTY check alone (`[[ -s ]]`) preserved a corrupt-but-nonempty
+# key across a re-run and the gateway crash-looped at startup (RestartCount
+# 143) with "EC private key is not encoded properly: private key value is
+# too short". See `_ec_signing_key_is_valid` (defined near
+# `_provision_audit_signing_key` above) for the full validation strategy,
+# the reproduced short-scalar fixture, and why a bare `openssl ec -text`
+# parse alone is not a safe substitute for the exact gateway loader
+# (`cryptography.load_pem_private_key` in src/yashigani/mcp/_jwt.py).
+#
+# Returns 0 (valid P-384 EC private key) / 1 (invalid, corrupt, or absent).
+_mcp_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP384R1" 48 'P-384|secp384r1'
+}
+
 # _safe_read_secret — BUG-B+-004: Podman-rootless-aware secret file reader
 #
 # On Podman rootless, secrets are owned by subuid-remapped UIDs that the host
@@ -11680,27 +11797,57 @@ generate_secrets() {
     # BEGIN YSG-P3-MCP-SIGKEY-UPGRADE
     # MCP signing key — generate if absent on upgrade path (same idempotency as caddy_internal_hmac above).
     # This covers upgrades from pre-v2.25.0 where the key did not yet exist.
+    #
+    # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+    # NON-EMPTY check alone preserved a corrupt-but-nonempty key left by a
+    # prior interrupted install, and the gateway crash-looped at startup
+    # (RestartCount 143, measured live). Fix: validate CONTENT
+    # (_mcp_signing_key_is_valid — strict P-384 EC load, see its definition
+    # above _secret_is_valid) not just non-emptiness. UPGRADE PATH policy is
+    # deliberately asymmetric from the fresh-install path below: absent →
+    # generate (unchanged upgrade-from-pre-v2.25.0 behaviour); PRESENT BUT
+    # INVALID → FAIL LOUD, never silently regenerate — an existing file might
+    # be a real key rotated by scripts/rotate-secret.sh that this upgrade run
+    # cannot distinguish from corruption with certainty, so we refuse to
+    # clobber it and force a human to look.
     local _mcp_key_file_up="${secrets_dir}/mcp_identity_signing_key"
     local _env_file_up="${WORK_DIR}/docker/.env"
 
     if [[ ! -s "$_mcp_key_file_up" ]]; then
       log_info "Generating MCP P-384 signing key (upgrade path) → ${_mcp_key_file_up}"
+      local _mcp_key_tmp_up
+      _mcp_key_tmp_up="$(mktemp "${_mcp_key_file_up}.XXXXXX")" || {
+        log_error "MCP P-384 signing key generation (upgrade path): mktemp failed — aborting"
+        return 1
+      }
       (
         umask 077
         if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-             | openssl ec -out "${_mcp_key_file_up}" 2>/dev/null; then
+             | openssl ec -out "${_mcp_key_tmp_up}" 2>/dev/null; then
           printf 'ERROR: Failed to generate MCP P-384 signing key (upgrade path)\n' >&2
-          rm -f "${_mcp_key_file_up}" 2>/dev/null || true
           exit 1
         fi
-        chmod 0600 "${_mcp_key_file_up}"
+        chmod 0600 "${_mcp_key_tmp_up}"
       ) || {
         log_error "MCP P-384 signing key generation failed (upgrade path) — aborting"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
         return 1
       }
+      # Atomic: a kill/interrupt between here and the `mv` leaves either the
+      # (still-absent) target untouched or the temp file — never a
+      # half-written target that a future run would wrongly preserve.
+      if ! _mcp_signing_key_is_valid "${_mcp_key_tmp_up}"; then
+        log_error "Freshly-generated MCP P-384 signing key (upgrade path) failed content validation — this should not happen; aborting rather than installing a bad key"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
+        return 1
+      fi
+      mv -f "${_mcp_key_tmp_up}" "${_mcp_key_file_up}"
       log_info "MCP P-384 signing key generated (mode 0600, upgrade path)"
+    elif ! _mcp_signing_key_is_valid "$_mcp_key_file_up"; then
+      log_error "mcp_identity_signing_key exists (${_mcp_key_file_up}) but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install). Upgrade path refuses to clobber a file that might be a real, deliberately-rotated key. Investigate manually, or rotate via scripts/rotate-secret.sh, then re-run. Aborting."
+      return 1
     else
-      log_info "mcp_identity_signing_key already present — preserving (upgrade path)"
+      log_info "mcp_identity_signing_key already present and valid — preserving (upgrade path)"
     fi
 
     # No .env sync needed — the gateway reads the key from
@@ -12112,36 +12259,67 @@ generate_secrets() {
   # storing the raw private key in .env is wider exposure (docker inspect,
   # backup tools, process env) and is intentionally avoided.
   #
-  # Idempotent: if the key file already exists, preserve it.
+  # Idempotent: if the key file already exists AND validates, preserve it.
   # Rotation: use scripts/rotate-secret.sh (separate documented operation).
   # Backup: the file lands in ${secrets_dir}/ which is captured by
   #   _backup_existing_data → bundle.enc (YSG-RISK-050/051 dual-wrap).
   # Uninstall: wipe of docker/secrets/* in uninstall.sh --remove-volumes covers this.
+  #
+  # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+  # NON-EMPTY check alone (the old `[[ ! -s ]]` gate) preserved a
+  # corrupt-but-nonempty key left by a prior interrupted install, and the
+  # gateway crash-looped at startup (RestartCount 143, measured live) with
+  # "EC private key is not encoded properly: private key value is too
+  # short". Fix: validate CONTENT (_mcp_signing_key_is_valid, defined above
+  # _secret_is_valid — strict P-384 EC load via the same loader class the
+  # gateway uses), not just non-emptiness. FRESH-INSTALL PATH policy:
+  # invalid (whether absent OR corrupt) → regenerate. (Contrast with the
+  # upgrade path above, which FAILS LOUD instead of clobbering an existing
+  # invalid file — a fresh install has no prior "real key" to protect.)
   local _mcp_key_file="${secrets_dir}/mcp_identity_signing_key"
 
-  if [[ ! -s "$_mcp_key_file" ]]; then
+  if ! _mcp_signing_key_is_valid "$_mcp_key_file"; then
+    if [[ -s "$_mcp_key_file" ]]; then
+      log_warn "mcp_identity_signing_key present but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install) — regenerating (fresh-install path)"
+    fi
     log_info "Generating MCP P-384 signing key → ${_mcp_key_file}"
-    umask 077
     # Generate a P-384 (secp384r1) EC private key in unencrypted PEM format.
     # openssl ecparam + openssl ec produces a PKCS#8-compatible PEM that the
     # Python cryptography library reads via load_pem_private_key().
-    # Use a subshell to scope umask 077 tightly to the key file write.
+    #
+    # Atomic write (N3): generate into a mktemp sibling file, validate THAT
+    # file's content, then `mv` it into place. `mv` on the same filesystem
+    # is an atomic rename — an interrupt/kill at any point before the `mv`
+    # leaves either the (untouched or absent) target or an orphan temp file,
+    # NEVER a half-written target that a future run would wrongly preserve
+    # (the exact failure mode this finding closes).
+    local _mcp_key_tmp
+    _mcp_key_tmp="$(mktemp "${_mcp_key_file}.XXXXXX")" || {
+      log_error "MCP P-384 signing key generation: mktemp failed — aborting"
+      return 1
+    }
     (
       umask 077
       if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-           | openssl ec -out "${_mcp_key_file}" 2>/dev/null; then
+           | openssl ec -out "${_mcp_key_tmp}" 2>/dev/null; then
         printf 'ERROR: Failed to generate MCP P-384 signing key\n' >&2
-        rm -f "${_mcp_key_file}" 2>/dev/null || true
         exit 1
       fi
-      chmod 0600 "${_mcp_key_file}"
+      chmod 0600 "${_mcp_key_tmp}"
     ) || {
       log_error "MCP P-384 signing key generation failed — aborting"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
       return 1
     }
+    if ! _mcp_signing_key_is_valid "${_mcp_key_tmp}"; then
+      log_error "Freshly-generated MCP P-384 signing key failed content validation — this should not happen; aborting rather than installing a bad key"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
+      return 1
+    fi
+    mv -f "${_mcp_key_tmp}" "${_mcp_key_file}"
     log_info "MCP P-384 signing key generated (mode 0600)"
   else
-    log_info "mcp_identity_signing_key already present — preserving (use scripts/rotate-secret.sh to rotate)"
+    log_info "mcp_identity_signing_key already present and valid — preserving (use scripts/rotate-secret.sh to rotate)"
   fi
 
   # S1 invariant check: the key file must be 0600 — never world or group readable.
