@@ -320,10 +320,29 @@ services:
       # now carries the NARROW RELOAD RELAY (a regular Caddy site block —
       # see docker/Caddyfile.<mode>, "MCP-onboarding reload relay" — that
       # proxies ONLY POST /load), not the raw Caddy admin API. The raw admin
-      # API moved to a caddy-private tmpfs (/run/caddy-admin, below) that is
-      # NOT bind-mounted here or anywhere else — backoffice has no path to it
-      # at all. Path/env unchanged (mcp_onboard.py needed zero code changes).
+      # API moved off this volume entirely (see caddy_admin_real_sock below)
+      # — backoffice has no path to it at all. Path/env unchanged
+      # (mcp_onboard.py needed zero code changes).
       - caddy_admin_sock:/run/caddy
+      # FINDING-V412-CADDYADMIN-001 R1+R2 FIX (Su, 2026-07-21): the relay's
+      # POST /load now forwards to the caddy-config-broker service (NOT
+      # directly to the real admin socket) — the broker validates the FULLY
+      # ASSEMBLED config against a build-time-baked baseline before ever
+      # touching the real admin API (see docker/caddy/config_broker.py).
+      # Shared ONLY between caddy + caddy-config-broker (caddy_broker_net).
+      - caddy_broker_sock:/run/caddy-broker
+      # The REAL admin API socket. Was a caddy-private tmpfs in the R1-only
+      # fix; promoted to a named volume SHARED WITH caddy-config-broker ONLY
+      # (never backoffice) because the broker must dial out to it as a
+      # client once it approves a submission — see config_broker.py
+      # _forward_to_real_admin(). Isolation is the mount-boundary (only
+      # caddy + caddy-config-broker mount this path — caddy_broker_net).
+      # The admin directive itself is |0666 (not tighter): the broker
+      # connects as a different, non-root UID (65532) with no shared GID to
+      # target — verified live that |0600 (root-only) makes the broker's
+      # forward fail with PermissionError. Matches the ORIGINAL
+      # caddy_admin_sock design this fix is modelled on.
+      - caddy_admin_real_sock:/run/caddy-admin
     healthcheck:
       # MUST-4 / v2.24.1: admin TCP :2019 removed; unix socket is the only
       # admin path. Probes the REAL (caddy-private) admin socket directly —
@@ -339,15 +358,12 @@ services:
       # YSG-RISK-008 (v2.23.4): caddy_data + caddy_config are named volumes
       # (writable). /tmp needed for ACME challenge staging + TLS cert staging.
       - /tmp:size=64m,mode=1777
-      # NOTE: /run/caddy was here as a tmpfs (MUST-4 / v2.24.1). Promoted to
-      # named volume caddy_admin_sock (v4.1 Phase 1d) — see volumes above.
-      # FINDING-V412-CADDYADMIN-001 FIX (Su, 2026-07-21): /run/caddy-admin is
-      # a NEW caddy-only tmpfs holding the REAL admin API socket. mode=0700
-      # on the directory — this path is never bind-mounted into any other
-      # container (compare caddy_admin_sock above, which IS shared with
-      # backoffice), so it is unreachable by any other mesh member regardless
-      # of the socket file's own mode bit.
-      - /run/caddy-admin:size=1m,mode=0700
+      # NOTE: /run/caddy was here as a tmpfs (MUST-4 / v2.24.1), then a
+      # caddy-private tmpfs at /run/caddy-admin (FINDING-V412-CADDYADMIN-001
+      # R1-only fix). Both /run/caddy and /run/caddy-admin are now named
+      # volumes (see volumes: above) — /run/caddy-admin had to become a
+      # shared volume (not tmpfs) once caddy-config-broker needed to reach it
+      # too (R1+R2 fix, same commit series).
     # C6 (P1 W3 Phase 2a): seccomp profile + no-new-privileges hardening.
     # Parity with gateway/backoffice — both use the same yashigani.json profile.
     # yashigani.json extends Docker's default seccomp allowlist by explicitly
@@ -399,6 +415,103 @@ services:
       # (The generated openclaw-egress-forwarder.override.yml also adds this
       # membership — compose merge dedupes.)
       - ringfence_openclaw_in
+      # FINDING-V412-CADDYADMIN-001 FIX (Su, 2026-07-21): caddy <->
+      # caddy-config-broker. Belt-and-braces — the actual data path is the
+      # two shared unix-socket volumes (caddy_broker_sock, above +
+      # caddy_admin_real_sock); this bridge carries no traffic today, but
+      # every other purpose-built pairing in this file gets an explicit
+      # internal bridge (extractor_svc precedent) rather than relying on
+      # implicit default-network attachment.
+      - caddy_broker_net
+
+  # ---------------------------------------------------------------------------
+  # Caddy config-validating broker — FINDING-V412-CADDYADMIN-001 (R1 + R2)
+  # ---------------------------------------------------------------------------
+  # Sits between Caddy's narrow POST-/load-only relay (docker/Caddyfile.<mode>,
+  # "MCP-onboarding reload relay") and the REAL Caddy admin API socket.
+  # Validates the FULLY ASSEMBLED config `caddy adapt` would actually produce
+  # (submitted body + live docker/caddy/agents/*.caddy + live snippet
+  # imports — exactly as real Caddy resolves them) against a baseline BAKED
+  # INTO THE IMAGE AT BUILD TIME (docker/caddy/Dockerfile.caddy-broker
+  # "baseline" stage) — never re-derived from a live, backoffice-reachable
+  # mount. See docker/caddy/config_broker.py module docstring for the full
+  # R1 (rogue /load body) + R2 (rogue docker/caddy/agents/*.caddy snippet)
+  # threat model and why both are the SAME class of problem.
+  #
+  # Blast radius if this process is somehow compromised: it can reach the
+  # real admin socket ONLY via the same /load contract it itself enforces —
+  # no secrets, no PKI material, no other mount, no network reachability
+  # from backoffice or the internet (caddy_broker_net is internal:true and
+  # has no other members). Design precedent: extractor-svc (LAURA-30-001 /
+  # YSG-RISK-080) — a pre-spawned, hardened, single-purpose HTTP service that
+  # replaces a raw privileged API with a narrow, validated contract.
+  caddy-config-broker:
+    build:
+      context: ..
+      dockerfile: docker/caddy/Dockerfile.caddy-broker
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    image: yashigani/caddy-config-broker:${YASHIGANI_VERSION:-4.1.0}
+    restart: unless-stopped
+    mem_limit: ${YASHIGANI_CADDY_BROKER_MEM_LIMIT:-128m}
+    cpus: ${YASHIGANI_CADDY_BROKER_CPU_LIMIT:-0.25}
+    environment:
+      # Selects which build-time-baked baseline (adapted-<mode>.json) this
+      # install's broker validates candidates against. Must match the
+      # Caddyfile variant caddy itself runs (install.sh sets both from the
+      # same YASHIGANI_TLS_MODE selection).
+      YASHIGANI_TLS_MODE: ${YASHIGANI_TLS_MODE:-acme}
+    volumes:
+      # RO — the SAME absolute paths + SAME host source files Caddy itself
+      # mounts, so `caddy adapt` inside the broker resolves a candidate
+      # submission's imports identically to what real Caddy would load.
+      # Deliberately does NOT mount Caddyfile.{acme,selfsigned,ca} — the
+      # candidate text arrives via the POST body (mcp_onboard.py rereads and
+      # reposts the active Caddyfile itself), never read from disk here; the
+      # baseline for those files is the BUILT-IN /app/reference bake instead.
+      - ./Caddyfile.csp:/etc/caddy/Caddyfile.csp:ro
+      - ./Caddyfile.ollama-front:/etc/caddy/Caddyfile.ollama-front:ro
+      - ./Caddyfile.openclaw-egress:/etc/caddy/Caddyfile.openclaw-egress:ro
+      - ./Caddyfile.openclaw-webhooks:/etc/caddy/Caddyfile.openclaw-webhooks:ro
+      # SAME source directory Caddy reads (docker/caddy/agents/*.caddy) — the
+      # R2 threat surface this broker exists to gate. RO here too: the
+      # broker only ever READS this directory to see what Caddy would
+      # actually import; it is never a legitimate writer.
+      - ./caddy/agents:/etc/caddy/agents:ro
+      - caddy_broker_sock:/run/caddy-broker
+      - caddy_admin_real_sock:/run/caddy-admin
+    healthcheck:
+      # Dockerfile HEALTHCHECK already probes GET /healthz over the unix
+      # socket (confirms the baked baseline loaded — fail-closed if not);
+      # redeclared here only for consistent `docker/podman ps` visibility
+      # with every other service in this file.
+      test: ["CMD", "python3", "-c", "import socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.settimeout(4)\ns.connect('/run/caddy-broker/broker.sock')\ns.sendall(b'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n')\nd=s.recv(64)\nsys.exit(0 if d.startswith(b'HTTP/1.0 200') else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      # Broker's own listening-socket directory must be writable by its
+      # non-root UID (65532) — the named volume caddy_broker_sock is mounted
+      # at /run/caddy-broker above; nothing else needed here.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=${YASHIGANI_SECCOMP_PROFILE:-./seccomp/yashigani.json}
+    cap_drop: [ALL]
+    # No cap_add — this process binds a unix socket in an already-writable
+    # mounted directory and makes outbound unix-socket connections; it needs
+    # no Linux capability at all.
+    networks:
+      - caddy_broker_net
+    # No `expose`/`ports` — reachable ONLY via the two shared unix-socket
+    # volumes. caddy_broker_net carries no actual traffic (belt-and-braces,
+    # see the caddy service's networks comment above) and has no other
+    # members — backoffice and the internet cannot reach this service by
+    # any path.
 
   # ---------------------------------------------------------------------------
   # Gateway — MCP reverse proxy (data plane)
@@ -3312,6 +3425,13 @@ volumes:
   # no external access to the path.
   caddy_admin_sock:
     driver: local
+  # FINDING-V412-CADDYADMIN-001 R1+R2 FIX (Su, 2026-07-21): caddy <->
+  # caddy-config-broker only (never backoffice — see caddy service +
+  # caddy-config-broker service comments).
+  caddy_broker_sock:
+    driver: local
+  caddy_admin_real_sock:
+    driver: local
   postgres_data:
     driver: local
   alertmanager_data:
@@ -3517,6 +3637,15 @@ networks:
     internal: true
     # Observability-plane: prometheus, grafana, loki, alertmanager,
     # otel-collector, jaeger. Caddy joins to proxy /admin/grafana etc.
+  # FINDING-V412-CADDYADMIN-001 R1+R2 FIX (Su, 2026-07-21): caddy <->
+  # caddy-config-broker. internal:true, no other members, no internet
+  # egress — the two shared unix-socket volumes carry the actual traffic
+  # (see caddy-config-broker service comment); this bridge is explicit
+  # documentation of the pairing, matching the extractor_svc precedent.
+  caddy_broker_net:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
   # YSG-RISK-055 UA-10: per-agent isolated bridges (v2.24.1).
   # v4.1 three-agent wrap (2026-07-07): AGENTS NO LONGER JOIN these bridges —
   # they live on the §2.6 split ringfences below. The *_isolated definitions

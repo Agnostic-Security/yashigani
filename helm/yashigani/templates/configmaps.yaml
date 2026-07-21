@@ -972,13 +972,23 @@ data:
     #      separately; fail-closed there since != that errors never admits).
     #      Every other method/path/identity gets 403.  No /config, /stop,
     #      /pki or other admin routes are ever proxied.
-    #   3. proxies to the local unix admin socket with Host pinned to
-    #      "localhost" — Caddy's admin host/origin check (DNS-rebinding guard)
-    #      only admits its own listener origins, so the relayed request must
-    #      not carry the external Host (yashigani-caddy:2019).
+    #   3. proxies to the caddy-config-broker sidecar (loopback, same pod —
+    #      FINDING-V412-CADDYADMIN-001 R1 FIX, Su, 2026-07-21), NOT directly
+    #      to the real admin socket. Method+path+SPIFFE narrowing alone
+    #      (steps 1-2, the ORIGINAL SU-SEAM-1d-04 design) still let a
+    #      compromised backoffice POST its own rogue Caddyfile body (inline
+    #      CA / new listener) through this mTLS-authenticated relay — pure
+    #      Caddyfile routing cannot inspect request-BODY content. The
+    #      broker (docker/caddy/config_broker.py, BROKER_BASELINE_MODE=live)
+    #      validates the fully-assembled config `caddy adapt` would
+    #      actually produce against a startup-computed baseline before ever
+    #      forwarding to the real admin socket — see values.yaml
+    #      caddy.configBroker comment + caddy.yaml sidecar for why "live"
+    #      baseline mode is safe on K8s specifically (no chart RBAC grants
+    #      any workload configmaps access).
     # Defence-in-depth stack: NetworkPolicy (backoffice pods only) → mesh mTLS
     # (require_and_verify) → SPIFFE URI pin (backoffice leaf only) → method+
-    # path pin (POST /load only).
+    # path pin (POST /load only) → broker content validation (R1).
     # ─────────────────────────────────────────────────────────────────────────
     :{{ .Values.caddy.adminRelay.port }} {
       tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
@@ -1002,11 +1012,8 @@ data:
         header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/backoffice"
       }
       handle @backoffice_reload {
-        reverse_proxy unix//run/caddy/admin.sock {
-          # Caddy admin origin check admits its own listener origins only;
-          # strip the mesh Host before it reaches the admin endpoint.
-          header_up Host localhost
-          # Don't leak the mesh-identity stamp into the admin endpoint.
+        reverse_proxy 127.0.0.1:{{ .Values.caddy.configBroker.port }} {
+          # Don't leak the mesh-identity stamp into the broker/admin path.
           header_up -X-Yashigani-Verified-Spiffe
         }
       }
