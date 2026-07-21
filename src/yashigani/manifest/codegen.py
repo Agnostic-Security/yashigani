@@ -2518,7 +2518,17 @@ def _gen_egress_forwarder_compose(
         "      - ./caddy/egress/%s-forwarder.caddy:/etc/caddy/egress-forwarder.caddy:ro" % system,
     ] + svid_volume_lines + [
         "    tmpfs:",
-        "      - /tmp:size=16m,mode=0700",
+        "      # mode=1777 (was 0700 — same crash-loop bug class as the svid-sidecar",
+        "      # /run/ringfence finding, 2026-07-21): this forwarder writes",
+        "      # XDG_CONFIG_HOME=/tmp/caddy/config + XDG_DATA_HOME=/tmp/caddy/data",
+        "      # (env above) as its own non-root user (65534:65534 volume mode, or",
+        "      # 1000:1000 transitional mode — see user_line below); a bare tmpfs",
+        "      # with no uid=/gid= is created root:root by both Docker and Podman",
+        "      # regardless of `user:`, so mode=0700 blocked BOTH UIDs from ever",
+        "      # creating /tmp/caddy/* (proven live: `podman run --user 1000:1000",
+        "      # --tmpfs /tmp:...,mode=0700` -> `mkdir: Permission denied`). Same",
+        "      # fix, same reasoning as _gen_svid_sidecar_service's /run/ringfence.",
+        "      - /tmp:size=16m,mode=1777",
         "    networks:",
         "      # Egress ringfence (2-member: %s + this forwarder) + caddy_internal" % system,
         "      # to reach caddy:%d. L1 default-deny (init below) pins caddy:%d as" % (
