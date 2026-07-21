@@ -1722,6 +1722,21 @@ def _demo_mcp_manifest_yaml(tenant_id: str, image_digest: str) -> str:
     + Caddy front + reload + durable registry) — the manifest is the codegen
     input.  metadata.name MUST equal the import server_id and tenant_id MUST
     equal the install tenant (transaction consistency rule).
+
+    FINDING-A fix (2026-07-21): spec.subprocess.command/args now pass
+    "--stdio" — docker/demo-mcp/server.py's stdio JSON-RPC mode, spawned by
+    the first-party bridge (src/yashigani/mcp/_bridge.py) that codegen
+    (_gen_compose_override_shape_c) launches as the container command for
+    every Shape-C ring_fenced import. Without "--stdio" the subprocess would
+    try to bind a TCP socket instead of speaking line-delimited JSON-RPC over
+    stdin/stdout, and the bridge would hang waiting for a response line that
+    never comes. docker/Dockerfile.demo-mcp now also installs the yashigani
+    wheel (brings in fastapi+uvicorn) so the bridge command itself is
+    runnable in this image — previously it was stdlib-only and "uvicorn" was
+    not found at all. spec.mcp.exposes.tools corrected to match the ACTUAL
+    tools this image exposes (echo/reverse/demo_info, docker/demo-mcp/
+    server.py TOOLS) — the previous list (add/uppercase/word_count/
+    current_time) never existed on this upstream.
     """
     return f"""\
 apiVersion: yashigani.io/v1alpha1
@@ -1740,8 +1755,8 @@ spec:
     digest: {image_digest}
   write_posture: readonly
   subprocess:
-    command: ["python3", "server.py"]
-    args: []
+    command: ["python3", "/app/server.py"]
+    args: ["--stdio"]
   network:
     egress_allow: []
   mcp:
@@ -1754,10 +1769,8 @@ spec:
       shim_port: 8000
       tools:
         - {{name: echo, allowed: true, sensitivity_class: PUBLIC}}
-        - {{name: add, allowed: true, sensitivity_class: PUBLIC}}
-        - {{name: uppercase, allowed: true, sensitivity_class: PUBLIC}}
-        - {{name: word_count, allowed: true, sensitivity_class: PUBLIC}}
-        - {{name: current_time, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: reverse, allowed: true, sensitivity_class: PUBLIC}}
+        - {{name: demo_info, allowed: true, sensitivity_class: PUBLIC}}
   audit:
     sensitivity_ceiling: PUBLIC
   storage:
