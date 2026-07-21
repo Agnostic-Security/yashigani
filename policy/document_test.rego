@@ -19,6 +19,11 @@
 #  18. IRIS-DOC-META — row WITHOUT operator fields ⇒ fallback to built-in DOC-ENFORCE-001 + action message
 #  19. IRIS-DOC-META — row with EMPTY strings ⇒ same fallback (not surfaced as override)
 #  20. IRIS-DOC-META — fail-closed BLOCK (no matching row) ⇒ built-in policy_id regardless
+#  22. FINDING-V412 — _winning_policy conflict fix: 2+ policies sharing the
+#      winning action must resolve to exactly ONE deterministic winner + the
+#      correct obligation (no eval_conflict_error), tie-break preserved even
+#      with 3 colliding rows, and the fail-closed-override cases still leave
+#      _winning_policy correctly undefined.
 
 package yashigani.document_test
 
@@ -787,4 +792,139 @@ test_global_policy_still_applies_to_resolved_identity if {
 		"identity": {"identity_id": "idnt_anyresolved01"},
 	}
 		with data.yashigani.document.policies as _policies_log_pii
+}
+
+# ---------------------------------------------------------------------------
+# 22. FINDING-V412-DOCUMENT-REGO-WINNING-POLICY-CONFLICT regression suite.
+#     `_winning_policy` used to be a complete rule (`:= p` with `some p in
+#     _applicable_policies`) that bound EVERY policy sharing the winning
+#     action — 2+ such rows produced `eval_conflict_error` and crashed the
+#     WHOLE decision (not just a field). Ava reproduced this live: a
+#     pre-seeded example policy (id=1, PSEUDONYMIZE) colliding with a test
+#     policy on the same action crashed PSEUDONYMIZE evaluation entirely.
+#     These tests exercise that exact shape and MUST NOT error.
+# ---------------------------------------------------------------------------
+
+# Two PSEUDONYMIZE rows for PII that both match the same detected email —
+# mirrors Ava's live repro (pre-seeded example policy id=1 + a test policy,
+# same action, same class/format/route scope).
+_policies_pseudo_pii_collision_2 := [
+	{
+		"data_class": "PII", "format": "any", "route": "any",
+		"action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false,
+		"policy_id": "DOC-EX-PII-1", "user_message": "example policy message", "code": "DOCUMENT_PII_PSEUDONYMIZED",
+	},
+	{
+		"data_class": "PII", "format": "any", "route": "any",
+		"action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false,
+		"policy_id": "TEST-PII-COLLIDE", "user_message": "test policy message", "code": "DOCUMENT_PII_PSEUDONYMIZED",
+	},
+]
+
+# 22a — 2 policies sharing the winning action must NOT crash the decision:
+# document.decision must evaluate to a single, defined result (pulling
+# `_winning_policy` transitively via policy_id/code/user_message). Any
+# `eval_conflict_error` would make this whole test undefined/error, not just
+# fail an assertion — so a green run here IS the regression proof.
+test_v412_two_colliding_pseudonymize_policies_no_conflict if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii_collision_2
+	d.action == "PSEUDONYMIZE"
+	d.allow == true
+}
+
+# 22b — the deterministic winner is the FIRST applicable row in matrix order
+# (mirrors documents/policy_store.py list_policies(), which sorts ascending by
+# internal numeric id — i.e. earliest-created-first). Confirms the tie-break
+# is not "whichever OPA happens to enumerate" but a stable, predictable pick,
+# and that the operator-supplied self-describing fields resolve off THAT one
+# winning row (never a blend of both).
+test_v412_two_colliding_policies_deterministic_first_winner if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii_collision_2
+	d.policy_id == "DOC-EX-PII-1"
+	d.user_message == "example policy message"
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+}
+
+# 22c — three colliding rows (not just two) — proves the fix scales past a
+# simple pairwise case; still exactly one deterministic winner (the first).
+test_v412_three_colliding_policies_deterministic_first_winner if {
+	policies := [
+		{
+			"data_class": "PII", "format": "any", "route": "any",
+			"action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false,
+			"policy_id": "DOC-EX-PII-2", "user_message": "first row wins", "code": "DOCUMENT_REDACTED",
+		},
+		{
+			"data_class": "PII", "format": "any", "route": "any",
+			"action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false,
+			"policy_id": "TEST-REDACT-B", "user_message": "second row loses", "code": "DOCUMENT_REDACTED",
+		},
+		{
+			"data_class": "PII", "format": "any", "route": "any",
+			"action": "REDACT", "pseudonymize_mode": "A", "small_set_escalation": false,
+			"policy_id": "TEST-REDACT-C", "user_message": "third row loses", "code": "DOCUMENT_REDACTED",
+		},
+	]
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+	d.action == "REDACT"
+	d.policy_id == "DOC-EX-PII-2"
+	d.user_message == "first row wins"
+}
+
+# 22d — colliding rows that BOTH omit the operator-supplied self-describing
+# fields (the common case — most rows carry no policy_id override): must
+# still resolve without conflict, falling back cleanly to the built-in
+# DOC-ENFORCE-001 / action-derived values (proves the fix does not depend on
+# policy_id being present or unique — it can't be, since "" is the default
+# on most rows).
+test_v412_colliding_policies_both_empty_op_fields_fallback_no_conflict if {
+	policies := [
+		{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false},
+		{"data_class": "PII", "format": "any", "route": "any", "action": "PSEUDONYMIZE", "pseudonymize_mode": "A", "small_set_escalation": false},
+	]
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as policies
+	d.action == "PSEUDONYMIZE"
+	d.policy_id == "DOC-ENFORCE-001"
+	d.code == "DOCUMENT_PII_PSEUDONYMIZED"
+}
+
+# 22e — existing single-winner cases still pass unchanged (regression guard:
+# the fix must not alter behaviour when there is exactly one applicable row
+# for the winning action — the ordinary, non-colliding path).
+test_v412_single_winner_unaffected_by_fix if {
+	d := document.decision with input as {"document": _doc([_match_email], true, true)}
+		with data.yashigani.document.policies as _policy_with_op_fields
+	d.policy_id == "DOC-EX-PII-1"
+	d.action == "PSEUDONYMIZE"
+}
+
+# 22f — FAIL-CLOSED override still correctly leaves _winning_policy undefined
+# even when 2+ policies would otherwise collide on the winning action: an
+# incomplete-extraction override forces action to BLOCK while
+# _strongest_configured stays PSEUDONYMIZE, so `action == _strongest_configured`
+# is false and _winning_policy must NOT resolve (built-in policy_id applies) —
+# the presence of a same-action collision among the (never-reached) candidate
+# rows must not leak through or cause a conflict on this path either.
+test_v412_fail_closed_override_undefined_winner_despite_collision if {
+	d := document.decision with input as {"document": _doc([_match_email], false, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii_collision_2
+	d.action == "BLOCK"
+	d.policy_id == "DOC-ENFORCE-001"
+	d.code == "DOCUMENT_BLOCKED"
+}
+
+# 22g — FAIL-CLOSED unpoliced-class override with colliding PII rows present
+# (rows exist and collide on PSEUDONYMIZE, but the detected match is PCI, so
+# NONE of them are applicable at all) — still BLOCKs cleanly with built-in
+# policy_id, no conflict.
+test_v412_fail_closed_unpoliced_undefined_winner_despite_collision if {
+	d := document.decision with input as {"document": _doc([_match_card], true, true)}
+		with data.yashigani.document.policies as _policies_pseudo_pii_collision_2
+	d.action == "BLOCK"
+	d.policy_id == "DOC-ENFORCE-001"
+	d.code == "DOCUMENT_BLOCKED"
 }
