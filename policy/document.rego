@@ -102,9 +102,30 @@ import rego.v1
 # _winning_policy: the applicable policy whose action equals the FINAL action,
 # i.e. the row that *drove* the actual disposition (matrix action AND final
 # action agree — no fail-closed override redirected the outcome).
-# There may be multiple rows with the same action (e.g. two PSEUDONYMIZE rows
-# for different class scopes that both matched); any one will do because they
-# share the same action — the first one found is used.
+#
+# FIX (FINDING-V412-DOCUMENT-REGO-WINNING-POLICY-CONFLICT): there may be
+# multiple rows with the same winning action (e.g. two PSEUDONYMIZE rows for
+# different class scopes that both matched — production WILL have overlapping
+# policies). A complete rule (`:= p` with `some p in ...`) requires the body to
+# bind EXACTLY one `p`; with 2+ same-action rows it binds N candidates and OPA
+# throws `eval_conflict_error: complete rules must not produce multiple
+# outputs`, crashing the whole document decision. `_winning_policy` must
+# resolve to exactly ONE policy under ties, deterministically.
+#
+# Tie-break: the FIRST matching candidate in `_applicable_policies` order.
+# `_applicable_policies` (below) is now an ARRAY built by iterating
+# `data.yashigani.document.policies` (also an array) in source order — and
+# that source order is NOT arbitrary: `DocumentPolicyStore.to_opa_document()`
+# (documents/policy_store.py) serialises `self.list_policies()`, which is
+# explicitly `sorted by numeric id where possible` (ascending, i.e.
+# earliest-created-first). So "first in `_applicable_policies`" == "lowest
+# internal policy id" == the deterministic tie-break the finding calls for.
+# We deliberately do NOT tie-break on the operator-supplied `policy_id` field
+# (IRIS-DOC-META): it is optional and commonly "" for many/most rows (the
+# built-in fallback case), so it is not a reliable — let alone unique —
+# ordering key. The internal store id (mirrored by array order) always exists
+# and is always unique.
+#
 # Undefined when:
 #   - the final action was forced by a fail-closed override (e.g. BLOCK due to
 #     incomplete extraction — _strongest_configured was PSEUDONYMIZE but the
@@ -113,12 +134,18 @@ import rego.v1
 # In those cases _op_* are undefined and built-in values apply cleanly.
 # ---------------------------------------------------------------------------
 _winning_policy := p if {
-	some p in _applicable_policies
-	p.action == _strongest_configured
 	# The final action must equal the matrix action: if a fail-closed override
 	# changed action to BLOCK while _strongest_configured was PSEUDONYMIZE, this
 	# guard fails and _winning_policy is correctly undefined.
 	action == _strongest_configured
+	winners := [w |
+		some w in _applicable_policies
+		w.action == _strongest_configured
+	]
+	count(winners) > 0
+	# Deterministic single pick even when 2+ rows share the winning action —
+	# array indexing always yields exactly one value, never a conflict.
+	p := winners[0]
 }
 
 # Operator field helpers — each is defined only when the field is non-empty.
@@ -232,15 +259,28 @@ _identity_matches(policy_identity_id) if {
 	policy_identity_id == _identity_id
 }
 
-# The set of policies that apply to at least one detected match.
-_applicable_policies contains p if {
+# Whether a policy matches at least one detected match — existence check ONLY
+# (no `m` binding escapes into the caller), so folding this into the
+# `_applicable_policies` comprehension below cannot fan a single policy `p`
+# out into multiple array entries just because several matches independently
+# satisfy it.
+_policy_covers_some_match(p) if {
+	some m in _matches
+	_class_matches(p.data_class, m.data_class)
+}
+
+# The policies that apply to at least one detected match, preserving the
+# SOURCE ORDER of data.yashigani.document.policies (an array — see
+# documents/policy_store.py to_opa_document(), which serialises
+# list_policies() sorted ascending by internal numeric policy id). This order
+# is what `_winning_policy` uses as its deterministic tie-break.
+_applicable_policies := [p |
 	some p in data.yashigani.document.policies
 	_format_matches(p.format)
 	_route_matches(p.route)
 	_identity_matches(object.get(p, "identity_id", ""))
-	some m in _matches
-	_class_matches(p.data_class, m.data_class)
-}
+	_policy_covers_some_match(p)
+]
 
 # Candidate actions contributed by applicable policies.
 _candidate_actions contains a if {
