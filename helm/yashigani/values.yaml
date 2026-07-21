@@ -999,6 +999,40 @@ caddy:
   adminRelay:
     enabled: true
     port: 2019
+  # FINDING-V412-CADDYADMIN-001 R1 FIX (Su, 2026-07-21): the :2019 relay
+  # above (mTLS + SPIFFE-gated, POST /load only) used to reverse_proxy
+  # DIRECTLY to the pod-local admin socket — narrowed by method+path, but
+  # with no inspection of the POSTed Caddyfile BODY content (a compromised
+  # backoffice could still construct its own rogue Caddyfile — inline CA /
+  # new listener — and POST it through the mTLS-authenticated relay). Now
+  # proxies to this in-pod sidecar instead (docker/caddy/config_broker.py,
+  # same image as compose's caddy-config-broker service, BROKER_LISTEN_MODE
+  # =tcp + BROKER_BASELINE_MODE=live). Loopback-only — no Service/Ingress
+  # ever fronts this port; only reachable from the caddy container in the
+  # SAME pod. R2 (compose's rogue docker/caddy/agents/*.caddy filesystem
+  # vector) has NO K8s equivalent — audited 2026-07-21: zero RBAC rules in
+  # this chart grant any workload ServiceAccount "configmaps" access, so
+  # yashigani-caddy-config / yashigani-caddy-agents are Helm/kubectl-managed
+  # only, never workload-writable (see config_broker.py "BASELINE MODE").
+  configBroker:
+    enabled: true
+    image:
+      # Built locally by install.sh / your CI from
+      # docker/caddy/Dockerfile.caddy-broker (same image compose uses).
+      # For K8s deployments: push to your own private registry and update
+      # the repository field accordingly. Pin your post-build digest with
+      # `@sha256:<digest>` for supply-chain attestation (recommended).
+      repository: yashigani-caddy-config-broker
+      tag: "4.1.2"
+      pullPolicy: IfNotPresent
+    port: 8199
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "128Mi"
   # YSG-RISK-061 (v2.24.1): operator ACME / external egress allowlist.
   # Comma-separated list of additional host:port pairs to allow in the
   # caddy-entrypoint.sh iptables OUTPUT rules. Default is empty (only the

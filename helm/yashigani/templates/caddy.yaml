@@ -207,6 +207,67 @@ spec:
               mountPath: {{ $svid.mountPath }}
               readOnly: true
             {{- end }}
+        {{- if and .Values.caddy.configBroker.enabled .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
+        # FINDING-V412-CADDYADMIN-001 R1 FIX (Su, 2026-07-21): validating
+        # broker for the :2019 admin relay's POST /load body — see
+        # docker/caddy/config_broker.py + values.yaml caddy.configBroker
+        # comment. Co-located in this pod (not a separate Deployment) so it
+        # can reach caddy's pod-local admin socket via the shared
+        # caddy-admin-sock emptyDir — unix sockets cannot span pods.
+        - name: caddy-config-broker
+          image: "{{ .Values.caddy.configBroker.image.repository }}:{{ .Values.caddy.configBroker.image.tag }}"
+          imagePullPolicy: {{ .Values.caddy.configBroker.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            # Loopback-only by BROKER_LISTEN_HOST below — no K8s Service or
+            # NetworkPolicy ingress rule ever targets this containerPort;
+            # documentation only (matches the convention in this file).
+            - name: config-broker
+              containerPort: {{ .Values.caddy.configBroker.port }}
+              protocol: TCP
+          env:
+            - name: BROKER_LISTEN_MODE
+              value: "tcp"
+            - name: BROKER_LISTEN_HOST
+              value: "127.0.0.1"
+            - name: BROKER_LISTEN_PORT
+              value: {{ .Values.caddy.configBroker.port | quote }}
+            # K8s "live" baseline mode (safe here — see config_broker.py
+            # "BASELINE MODE": no chart RBAC grants any workload
+            # ServiceAccount configmaps access, so this ConfigMap-mounted
+            # file is never workload-writable, unlike compose's docker/
+            # tree bind mount).
+            - name: BROKER_BASELINE_MODE
+              value: "live"
+            - name: BROKER_LIVE_CADDYFILE
+              value: "/etc/caddy/Caddyfile"
+            - name: BROKER_REAL_ADMIN_SOCKET
+              value: "/run/caddy/admin.sock"
+          resources:
+            {{- toYaml .Values.caddy.configBroker.resources | nindent 12 }}
+          volumeMounts:
+            # SAME ConfigMap mounts as the caddy container — the broker must
+            # resolve `import` directives identically to how real Caddy
+            # resolves them (config_broker.py module docstring).
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+            - name: caddy-agents
+              mountPath: /etc/caddy/agents
+              readOnly: true
+            # Pod-local admin socket — shared with the caddy container via
+            # this emptyDir (same volume, both containers in one pod).
+            - name: caddy-admin-sock
+              mountPath: /run/caddy
+        {{- end }}
       {{- if .Values.mtls.enabled }}
       # /run/secrets PKI mount collides with SA-token at
       # /var/run/secrets/kubernetes.io/serviceaccount (since /var/run→/run).

@@ -35,16 +35,32 @@
     default_sni {$YASHIGANI_TLS_DOMAIN}
     fallback_sni {$YASHIGANI_TLS_DOMAIN}
 
-    # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
-    # TCP :2019 removed. Filesystem permissions are the auth gate.
-    # In-container tooling (healthcheck, reload) uses the socket directly.
-    # No other service on any network can reach this surface.
-    # |0666: socket lives on a named volume mounted ONLY in caddy + backoffice
-    # (caddy_admin_sock). No third container can reach this path, so world-write
-    # on the socket is equivalent to 0660 with a shared group — no external
-    # process can access it. Allows backoffice UID 1001 to POST /load via
-    # default_caddy_reloader() (mcp_onboard.py:135) without requiring group_add.
-    admin unix//run/caddy/admin.sock|0666
+    # ── Admin API — CADDY+BROKER-ONLY unix socket (MUST-4 / v2.24.1
+    #    hardening, tightened by FINDING-V412-CADDYADMIN-001, Su, 2026-07-21)
+    # TCP :2019 removed. The raw admin API socket used to live on the SAME
+    # named volume (caddy_admin_sock) shared RW with backoffice at mode 0666
+    # — giving a compromised backoffice unauthenticated read/write on the
+    # FULL admin surface (GET/POST/PUT/DELETE /config/*, /pki/*, /id/*,
+    # /stop, /adapt). Laura proved this live (LAURA-V412-CADDYADMIN-001):
+    # POST /config/apps/http/servers/rogue_poc installed an inline rogue CA
+    # as an mTLS trust anchor and completed a rogue-cert handshake — zero
+    # filesystem writes, so the RESTART-012 RO-mount fix never touched it.
+    # Fix: the raw admin socket now lives on caddy_admin_real_sock, a named
+    # volume shared ONLY between caddy and caddy-config-broker (never
+    # backoffice — docker-compose.yml) — backoffice has no path to it at
+    # all. |0666: the broker connects as a DIFFERENT, non-root UID (65532,
+    # distinct image/namespace from caddy's own root) — verified live that
+    # |0600 (root-only) makes the broker's forward hit
+    # PermissionError/connection-refused, since there is no shared UID/GID
+    # to target with a tighter mode. Isolation is the mount boundary (only
+    # caddy + caddy-config-broker mount this path — caddy_broker_net), not
+    # the file mode, matching the ORIGINAL caddy_admin_sock design this fix
+    # is modelled on. The narrow reload relay backoffice actually talks to
+    # is the site block below (unix//run/caddy/admin.sock — SAME
+    # path/volume backoffice already mounts, so mcp_onboard.py needed zero
+    # changes); it forwards through caddy-config-broker
+    # (docker/caddy/config_broker.py), never directly to this real socket.
+    admin unix//run/caddy-admin/admin.sock|0666
 
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {
@@ -71,6 +87,100 @@
         # SPIFFE extraction) is unaffected. Mesh listeners :8444/:8445 are
         # single-cert, port-matched, no vhosting — also unaffected.
         strict_sni_host insecure_off
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP-onboarding reload relay (FINDING-V412-CADDYADMIN-001 fix, Su, 2026-07-21)
+# ─────────────────────────────────────────────────────────────────────────────
+# Replaces backoffice's previous DIRECT share of the raw Caddy admin socket.
+# This is an ORDINARY Caddy HTTP site (not the admin API — see the `admin`
+# directive above, now on a caddy-private path) bound on
+# unix//run/caddy/admin.sock — the SAME path/named-volume (caddy_admin_sock)
+# backoffice already mounts, so mcp_onboard.py's default_caddy_reloader()
+# (YASHIGANI_CADDY_ADMIN_SOCKET=/run/caddy/admin.sock, POST /load,
+# Content-Type: text/caddyfile) needed ZERO code changes.
+#
+# It narrows the reachable surface to EXACTLY the one operation onboarding
+# needs — POST /load — and forwards ONLY that to the caddy-config-broker
+# (docker/caddy/config_broker.py). Every other method/path is rejected with
+# 403 before it ever reaches ANY admin surface:
+#   GET  /config/            — recon (Laura confirmed 200 + full live config)
+#   POST/PUT/DELETE /config/* — arbitrary config-tree mutation. Laura's PoC:
+#       POST /config/apps/http/servers/rogue_poc installed an isolated mTLS
+#       listener trusting an inline rogue CA and completed a rogue-cert
+#       handshake — zero filesystem writes.
+#   /pki/*, /id/*, /stop, /adapt — other admin-API surface, also unreachable.
+#
+# request_body max_size bounds the payload (the legitimate Caddyfile is a few
+# tens of KB; 2MB is generous headroom, not a tuned limit).
+#
+# WHY A BROKER (not a direct reverse_proxy to the real admin socket) — closes
+# TWO findings, not one:
+#   R1 — a plain POST-/load-only relay still lets a compromised backoffice
+#        POST its OWN wholesale rogue Caddyfile (inline CA / new listener) —
+#        pure Caddyfile method/path matching cannot inspect BODY CONTENT.
+#   R2 — NEW FINDING found auditing this surface: backoffice mounts the
+#        docker/ install tree RW and docker/caddy/agents/ (imported at
+#        Caddyfile TOP LEVEL by the agent-import sentinel below — full
+#        server-block scope) is NOT RO-shadowed (unlike secrets/var/.env/the
+#        active Caddyfile, post FINDING-LIC-012). A compromised backoffice can
+#        drop a rogue *.caddy snippet there and trigger a legitimate-looking
+#        reload to have Caddy import it — zero admin-API interaction at all.
+# Both are the SAME class (backoffice-influenced content reaching Caddy's
+# trust decisions) via different write paths. The broker validates the FULLY
+# ASSEMBLED config `caddy adapt` would actually produce (submitted body +
+# live agents/*.caddy + live snippet imports, exactly as real Caddy resolves
+# them) against a baseline BAKED INTO THE BROKER'S IMAGE AT BUILD TIME (never
+# re-derived from a live/backoffice-reachable mount — see config_broker.py
+# "BASELINE IMMUNITY"), so it catches a rogue construct regardless of which
+# imported file introduced it. A REJECTED submission never reaches the real
+# admin socket at all (403/422, fail-closed).
+#
+# K8s parity: the mesh-mTLS :2019 admin relay (helm configmaps.yaml) proxies
+# through the SAME broker image, co-located as a sidecar in the caddy pod
+# (loopback TCP — pods share a network namespace, no emptyDir socket-sharing
+# needed) instead of dialing the local admin socket directly.
+#
+# SYNTAX NOTE (verified live via `caddy adapt`, 2026-07-21): Caddy's
+# Caddyfile site-ADDRESS parser does not recognise `unix/` as a listener
+# network scheme — using `unix//run/caddy/admin.sock` directly as the site
+# header silently mis-parses into host="unix" + path="//run/caddy/admin.sock"
+# and gets folded into the WRONG listener (the public :443 site) as an inert
+# path route, so the relay would never actually listen anywhere. `bind` is
+# the Caddy-documented mechanism for pointing a site at a unix socket; the
+# `:9999` header below is an inert placeholder that `bind` fully replaces
+# (confirmed: the adapted JSON `listen` array contains ONLY the unix socket).
+#
+# forward_auth NOTE (verified live, 2026-07-21): forward_auth was tried first
+# as the "check then proxy" mechanism (it's the established pattern for every
+# other auth-gated route in this Caddyfile). Empirically it REWRITES the
+# sub-request to GET and does not forward the original body (confirmed via
+# access log: bytes_read=0) — a content-validating check cannot see the
+# POSTed Caddyfile through it. Plain reverse_proxy to the broker (which
+# forwards the ORIGINAL body, confirmed live) is used instead; the broker
+# itself is what decides whether to forward on to the real admin socket.
+:9999 {
+    bind unix//run/caddy/admin.sock|0666
+
+    request_body {
+        max_size 2MB
+    }
+    @reload {
+        method POST
+        path /load
+    }
+    handle @reload {
+        reverse_proxy unix//run/caddy-broker/broker.sock {
+            # Host is cosmetic here (the broker doesn't origin-check); pinned
+            # for consistency with the broker's own forward to the real
+            # admin socket, which DOES need Host: localhost (Caddy admin
+            # origin check).
+            header_up Host localhost
+        }
+    }
+    handle {
+        respond "Forbidden: only POST /load is proxied to the caddy config broker (FINDING-V412-CADDYADMIN-001)" 403
     }
 }
 
