@@ -96,12 +96,19 @@ class TestC2AdminSocket:
 
     @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
     def test_unix_socket_in_compose_caddyfiles(self, name: str, path: pathlib.Path):
-        """All compose Caddyfiles must use admin unix socket."""
+        """All compose Caddyfiles must use admin unix socket.
+
+        FINDING-V412-CADDYADMIN-001 fix (2026-07-21): the raw admin API now
+        lives on a caddy-PRIVATE path (/run/caddy-admin) that is never
+        bind-mounted into backoffice — see TestCaddyAdmin001ReloadRelay below
+        for the narrow /run/caddy relay backoffice actually talks to.
+        """
         text = _load(path)
-        assert "admin unix//run/caddy/admin.sock" in text, (
-            f"Caddyfile.{name}: admin must use unix socket "
-            f"('admin unix//run/caddy/admin.sock'), not TCP :2019. "
-            f"C2 / MUST-4 / v2.24.1 hardening."
+        assert "admin unix//run/caddy-admin/admin.sock" in text, (
+            f"Caddyfile.{name}: admin must use a CADDY-PRIVATE unix socket "
+            f"('admin unix//run/caddy-admin/admin.sock'), not TCP :2019 and "
+            f"not the backoffice-shared path. C2 / MUST-4 / v2.24.1 hardening "
+            f"+ FINDING-V412-CADDYADMIN-001."
         )
 
     def test_unix_socket_in_helm_caddyfile(self):
@@ -159,6 +166,163 @@ class TestC2AdminSocket:
             "The Caddy admin port must never be exposed as a K8s NetworkPolicy "
             "ingress rule — it is unix-socket-only (C2)."
         )
+
+
+# ---------------------------------------------------------------------------
+# FINDING-V412-CADDYADMIN-001 — narrow reload relay (compose runtimes)
+# ---------------------------------------------------------------------------
+
+class TestCaddyAdmin001ReloadRelay:
+    """FINDING-V412-CADDYADMIN-001 (CRITICAL): backoffice must reach ONLY
+    POST /load through the shared caddy_admin_sock volume — never the raw
+    admin API (/config/*, /pki/*, /id/*, /stop, /adapt). Laura proved live
+    that unrestricted access let a compromised backoffice inject a rogue
+    inline CA as an mTLS trust anchor via POST /config/apps/http/servers/*.
+    """
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_backoffice_shared_path_is_not_the_admin_directive(
+        self, name: str, path: pathlib.Path,
+    ):
+        """The path backoffice mounts (/run/caddy/admin.sock) must NOT be the
+        `admin` directive target — it must only appear as a regular site
+        address (the narrow relay)."""
+        text = _load(path)
+        assert "admin unix//run/caddy/admin.sock" not in text, (
+            f"Caddyfile.{name}: the raw `admin` directive must NOT target "
+            f"/run/caddy/admin.sock — that path is shared (RW) with "
+            f"backoffice. The real admin API must live on a caddy-private "
+            f"path (/run/caddy-admin/admin.sock). FINDING-V412-CADDYADMIN-001."
+        )
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_reload_relay_site_block_present(self, name: str, path: pathlib.Path):
+        """A regular Caddy site block must bind /run/caddy/admin.sock and
+        proxy to the real (private) admin socket."""
+        text = _load(path)
+        assert "bind unix//run/caddy/admin.sock|0666" in text, (
+            f"Caddyfile.{name}: missing the narrow MCP-onboarding reload "
+            f"relay site block (bind unix//run/caddy/admin.sock|0666 inside "
+            f"an inert placeholder site block). FINDING-V412-CADDYADMIN-001."
+        )
+        assert "reverse_proxy unix//run/caddy-admin/admin.sock" in text, (
+            f"Caddyfile.{name}: the reload relay must reverse_proxy to the "
+            f"real, caddy-private admin socket (/run/caddy-admin/admin.sock)."
+        )
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_reload_relay_scoped_to_post_load_only(
+        self, name: str, path: pathlib.Path,
+    ):
+        """The relay's matcher must require BOTH method POST and path /load
+        before proxying — every other request must fall through to a
+        catch-all `handle` that responds without touching the real socket."""
+        text = _load(path)
+        # Isolate the relay block (from its opening address line to its
+        # matching closing brace) so these assertions can't accidentally
+        # match an unrelated part of the file.
+        start = text.index(":9999 {")
+        depth = 0
+        end = start
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        block = text[start:end]
+        assert "method POST" in block, (
+            f"Caddyfile.{name}: reload relay matcher missing 'method POST'."
+        )
+        assert "path /load" in block, (
+            f"Caddyfile.{name}: reload relay matcher missing 'path /load'."
+        )
+        assert "respond " in block and "403" in block, (
+            f"Caddyfile.{name}: reload relay must explicitly reject "
+            f"(403) any request that doesn't match POST /load — "
+            f"fail-closed, not an implicit pass-through."
+        )
+        # The real admin socket must ONLY be dialed inside the @reload-gated
+        # handle, never in the unconditional catch-all.
+        catchall_idx = block.rindex("handle {")
+        assert "reverse_proxy" not in block[catchall_idx:], (
+            f"Caddyfile.{name}: the catch-all handle must not reach the "
+            f"real admin socket — only the POST /load matcher may."
+        )
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_reload_relay_bounds_request_body(self, name: str, path: pathlib.Path):
+        """request_body max_size must be set on the relay to bound the
+        POSTed Caddyfile payload (defence-in-depth, not the primary control)."""
+        text = _load(path)
+        start = text.index(":9999 {")
+        depth = 0
+        end = start
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        block = text[start:end]
+        assert "max_size" in block, (
+            f"Caddyfile.{name}: reload relay must bound request_body max_size."
+        )
+
+    def test_compose_private_admin_socket_tmpfs_present(self):
+        """docker-compose.yml caddy service must mount a caddy-private tmpfs
+        for the real admin socket, separate from the backoffice-shared
+        caddy_admin_sock named volume."""
+        svc = _compose_caddy_svc(_load(_COMPOSE))
+        tmpfs = svc.get("tmpfs", [])
+        has_private_admin_tmpfs = any(
+            "/run/caddy-admin" in str(t) for t in tmpfs
+        )
+        assert has_private_admin_tmpfs, (
+            "docker-compose.yml caddy: missing /run/caddy-admin tmpfs mount "
+            "for the caddy-private admin socket. FINDING-V412-CADDYADMIN-001."
+        )
+
+    def test_compose_healthcheck_targets_private_admin_socket(self):
+        """The caddy healthcheck must probe the real (private) admin socket,
+        not the narrowed /run/caddy relay (which now 403s GET /config/)."""
+        svc = _compose_caddy_svc(_load(_COMPOSE))
+        healthcheck = svc.get("healthcheck", {})
+        test_cmd = " ".join(healthcheck.get("test", []))
+        assert "/run/caddy-admin/admin.sock" in test_cmd, (
+            "docker-compose.yml caddy healthcheck must target "
+            "/run/caddy-admin/admin.sock (the real admin socket), not "
+            "/run/caddy/admin.sock (now a POST-/load-only relay that 403s "
+            "GET /config/). FINDING-V412-CADDYADMIN-001."
+        )
+
+    def test_mutation_relay_matcher_removal_caught(self):
+        """Removing the POST/path matcher scoping must be detected (mutation
+        guard proving the contract actually catches a regression back to
+        unscoped proxying)."""
+        path = CADDYFILES["selfsigned"]
+        text = _load(path)
+        start = text.index(":9999 {")
+        depth = 0
+        end = start
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        block = text[start:end]
+        assert "method POST" in block and "path /load" in block
+
+        mutated_block = block.replace("        method POST\n        path /load\n", "")
+        assert "method POST" not in mutated_block, "Mutation failed"
+        assert "path /load" not in mutated_block, "Mutation failed"
 
 
 # ---------------------------------------------------------------------------
