@@ -548,6 +548,11 @@ _AGENTS_DYNAMIC_DIR="/etc/caddy/agents-dynamic"
 _AGENTS_DYNAMIC_IMPORT_LINE="import /etc/caddy/agents-dynamic/*.caddy"
 _RUNTIME_SCRATCH=""
 _EFFECTIVE_CONFIG_PATH="$_CADDY_CONFIG_SRC"
+# FINDING-V412-CADDY-SIDECAR-RACE: number of dynamic-route files quarantined
+# at boot (set by resolve_effective_caddy_config). 0 = nothing to reconcile,
+# so the background self-heal loop (_reconcile_quarantined_routes, below) is
+# never started — no cost on the common (no-race) path.
+_QUARANTINE_COUNT=0
 
 _cleanup_runtime_scratch() {
     if [ -n "$_RUNTIME_SCRATCH" ] && [ -d "$_RUNTIME_SCRATCH" ]; then
@@ -633,6 +638,7 @@ resolve_effective_caddy_config() {
     fi
 
     good_files=""
+    bad_files=""
     bad_count=0
     old_ifs="$IFS"
     IFS='
@@ -646,6 +652,8 @@ resolve_effective_caddy_config() {
 "
         else
             bad_count=$((bad_count + 1))
+            bad_files="${bad_files}${f}
+"
             warn "QUARANTINED dynamic route file (excluded from this boot): $f"
             warn "  REASON:"
             while IFS= read -r eline; do warn "    $eline"; done < "$errfile"
@@ -689,6 +697,15 @@ resolve_effective_caddy_config() {
     if second_pass_err="$(caddy validate --config "$effective_cfg" --adapter caddyfile 2>&1)"; then
         log "Effective config (bad dynamic routes excluded) validated OK — Caddy WILL start."
         _EFFECTIVE_CONFIG_PATH="$effective_cfg"
+        # FINDING-V412-CADDY-SIDECAR-RACE: persist the boot-time good/bad split
+        # so _reconcile_quarantined_routes (started as a background job just
+        # before `exec caddy run`, below) can re-poll the bad list and hot-
+        # reload it in — without a restart — the moment each file's cert
+        # exists. boot-good is immutable (never rewritten); bad is the
+        # reconcile loop's mutable worklist.
+        printf '%s' "$good_files" > "$_RUNTIME_SCRATCH/quarantine.boot-good"
+        printf '%s' "$bad_files" > "$_RUNTIME_SCRATCH/quarantine.bad"
+        _QUARANTINE_COUNT="$bad_count"
         return 0
     fi
 
@@ -698,8 +715,193 @@ resolve_effective_caddy_config() {
     return 1
 }
 
+# ── FINDING-V412-CADDY-SIDECAR-RACE (Su, 2026-07-21): self-heal quarantined
+#    dynamic routes without a restart ───────────────────────────────────────
+# On a fresh onboard's scoped `up -d <agent> <agent>-svid-sidecar caddy`,
+# Caddy can reach its boot-time config-load step BEFORE the sibling
+# svid-sidecar has written /run/secrets/svid/<tenant>/<server>/client.crt —
+# compose/K8s give no ordering guarantee across the three services on a
+# scoped up (Ava measured ~50% of fresh onboards hitting this). The R2-safe
+# quarantine above (FINDING-V412-CADDYADMIN-002) already keeps Caddy up and
+# every OTHER route live in that case — but until now the quarantined route
+# itself stayed dead until an operator ran `podman restart caddy`.
+#
+# _extract_admin_socket_path() / _reconcile_quarantined_routes() close that
+# gap: a bounded background re-poll that re-validates each quarantined file
+# and, the moment its cert exists, hot-reloads it into the LIVE config via
+# the SAME real admin socket the broker itself uses for every other route
+# change (config_broker.py _trigger_reload/_forward_caddyfile_to_real_admin)
+# — never a container restart, and never a still-invalid file (the rebuilt
+# config is re-validated end-to-end immediately before every POST /load).
+#
+# WHY A HOT ADMIN RELOAD, NOT `depends_on: condition: service_healthy` in
+# the generated compose override (the finding's option (a)): the svid-
+# sidecar IS correctly health-gated already (rotate.sh writes the ready flag
+# only AFTER cert delivery — see docker/svid-sidecar/rotate.sh — so the
+# healthcheck condition would be race-free in principle). But `caddy:` is
+# the SHARED edge for every already-onboarded tenant, not a per-agent
+# service — a depends_on this override adds gets merged into caddy's
+# config on EVERY subsequent onboard (a new, unique per-agent key each
+# time), so compose/podman-compose would detect a config diff on caddy
+# itself and RESTART the shared edge — dropping every other tenant's
+# in-flight connections — on every single onboard after the first, not
+# just the racy one. That is strictly worse than the bug being fixed. The
+# self-heal reload below fixes the SAME race with zero blast radius on any
+# other route (the admin socket's /load API is engineered for exactly this
+# — hot, in-place, all-or-nothing config swaps).
+_extract_admin_socket_path() {
+    # Parses the REAL admin unix-socket path out of the served Caddyfile —
+    # NEVER hardcoded: compose ships /run/caddy-admin/admin.sock
+    # (docker/Caddyfile.{selfsigned,acme,ca}), Helm/K8s ships
+    # /run/caddy/admin.sock (helm/yashigani/templates/configmaps.yaml).
+    # Directive is a single literal line: `admin unix/<path>|<perm>`.
+    # Plain fixed-string grep + POSIX parameter expansion (no sed/grep
+    # regex-dialect dependency — ash/busybox portability, matches
+    # _splice_agents_dynamic_import's grep -F choice above).
+    admin_line="$(grep -F 'admin unix/' "$_CADDY_CONFIG_SRC" 2>/dev/null | head -n1)"
+    [ -n "$admin_line" ] || return 0
+    admin_rest="${admin_line#*admin unix/}"
+    printf '%s\n' "${admin_rest%%|*}"
+}
+
+# Re-polls the boot-time quarantine list (see resolve_effective_caddy_config)
+# on a bounded interval; the moment a previously-bad file individually
+# re-validates, hot-reloads the enlarged good-set via the real admin socket.
+# Started as a background job BEFORE `exec caddy run` below — `exec` replaces
+# THIS shell's program image but does not kill already-started children, so
+# the loop keeps running (now parented under the caddy PID1) for its bounded
+# window, then exits on its own. Runs only when $_QUARANTINE_COUNT > 0 — zero
+# cost on the common (no-race) boot path.
+_reconcile_quarantined_routes() {
+    interval="${YASHIGANI_CADDY_QUARANTINE_REPOLL_INTERVAL_SECONDS:-5}"
+    max_attempts="${YASHIGANI_CADDY_QUARANTINE_REPOLL_MAX_ATTEMPTS:-24}"
+    bad_state="$_RUNTIME_SCRATCH/quarantine.bad"
+    boot_good_state="$_RUNTIME_SCRATCH/quarantine.boot-good"
+    recovered_state="$_RUNTIME_SCRATCH/quarantine.recovered"
+    : > "$recovered_state"
+
+    admin_sock="$(_extract_admin_socket_path)"
+    if [ -z "$admin_sock" ]; then
+        warn "quarantine-reconcile: could not determine the real admin socket path from"
+        warn "  $_CADDY_CONFIG_SRC — self-heal DISABLED for this boot (Caddyfile-format"
+        warn "  drift?). Quarantined route(s) still need a manual restart once fixed."
+        return 0
+    fi
+    log "quarantine-reconcile: started (interval=${interval}s max_attempts=${max_attempts}" \
+        "admin_sock=${admin_sock}) — $_QUARANTINE_COUNT route(s) to watch."
+
+    attempt=0
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        attempt=$((attempt + 1))
+        sleep "$interval"
+
+        if [ ! -s "$bad_state" ]; then
+            log "quarantine-reconcile: no quarantined routes remain — exiting reconcile loop (pass $attempt)."
+            return 0
+        fi
+
+        bad_files_now="$(cat "$bad_state" 2>/dev/null || true)"
+        newly_good=""
+        still_bad=""
+        old_ifs="$IFS"
+        IFS='
+'
+        for f in $bad_files_now; do
+            IFS="$old_ifs"
+            [ -n "$f" ] || continue
+            errfile="$_RUNTIME_SCRATCH/reconcile-err-$(basename "$f").log"
+            if _validate_one_dynamic_file "$f" "$errfile"; then
+                newly_good="${newly_good}${f}
+"
+            else
+                still_bad="${still_bad}${f}
+"
+            fi
+            IFS='
+'
+        done
+        IFS="$old_ifs"
+
+        if [ -z "$newly_good" ]; then
+            # Nothing recovered this pass — state unchanged, just retry later.
+            continue
+        fi
+
+        recovered_count="$(printf '%s\n' "$newly_good" | grep -c .)"
+        log "quarantine-reconcile: cert now present for $recovered_count previously-quarantined" \
+            "route(s) (pass $attempt) — rebuilding + hot-reloading effective config."
+        printf '%s' "$newly_good" >> "$recovered_state"
+
+        # Effective import set = boot-good (immutable) + everything recovered
+        # so far (including this pass) — still-bad files stay excluded.
+        replacement=""
+        recovered_now="$(cat "$boot_good_state" 2>/dev/null || true)
+$(cat "$recovered_state" 2>/dev/null || true)"
+        old_ifs="$IFS"
+        IFS='
+'
+        for f in $recovered_now; do
+            IFS="$old_ifs"
+            [ -n "$f" ] || continue
+            replacement="${replacement}import ${f}
+"
+            IFS='
+'
+        done
+        IFS="$old_ifs"
+
+        reload_cfg="$_RUNTIME_SCRATCH/Caddyfile.reconciled-$attempt"
+        _splice_agents_dynamic_import "$replacement" "$reload_cfg" || true
+
+        # Never load a config we have not JUST re-validated end-to-end —
+        # same fail-closed bar as the boot-time quarantine logic above.
+        if ! reload_err="$(caddy validate --config "$reload_cfg" --adapter caddyfile 2>&1)"; then
+            warn "quarantine-reconcile: rebuilt config FAILED final validate — NOT reloading,"
+            warn "  re-quarantining the recovered file(s) this pass (will retry next interval):"
+            printf '%s\n' "$reload_err" | while IFS= read -r eline; do warn "    $eline"; done
+            { printf '%s' "$newly_good"; printf '%s' "$still_bad"; } > "$bad_state"
+            continue
+        fi
+
+        http_code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+            --unix-socket "$admin_sock" \
+            -X POST -H 'Content-Type: text/caddyfile' \
+            --data-binary "@${reload_cfg}" \
+            http://localhost/load 2>/dev/null)" || http_code="000"
+
+        case "$http_code" in
+            2??)
+                printf '%s\n' "$newly_good" | while IFS= read -r rf; do
+                    [ -n "$rf" ] || continue
+                    log "AUTO-RECOVERED quarantined route (no restart, hot-reloaded): $rf — now LIVE."
+                done
+                printf '%s' "$still_bad" > "$bad_state"
+                ;;
+            *)
+                warn "quarantine-reconcile: admin socket /load rejected the hot-reload"
+                warn "  (HTTP $http_code) even though the rebuilt config validated OK —"
+                warn "  re-quarantining recovered file(s), will retry next interval."
+                { printf '%s' "$newly_good"; printf '%s' "$still_bad"; } > "$bad_state"
+                ;;
+        esac
+    done
+
+    if [ -s "$bad_state" ]; then
+        remaining_count="$(grep -c . "$bad_state" 2>/dev/null || printf '%s' '?')"
+        warn "quarantine-reconcile: window elapsed ($((max_attempts * interval))s) with" \
+            "$remaining_count route(s) still quarantined — self-heal gave up. Manual" \
+            "\`caddy restart\` (or fixing the underlying cert-delivery issue) is required for:"
+        while IFS= read -r rf; do [ -n "$rf" ] && warn "    $rf"; done < "$bad_state"
+    fi
+}
+
 if resolve_effective_caddy_config; then
     log "Starting Caddy (config: $_EFFECTIVE_CONFIG_PATH)..."
+    if [ "$_QUARANTINE_COUNT" -gt 0 ]; then
+        _reconcile_quarantined_routes &
+        log "Started background quarantine-reconcile loop (pid $!) to self-heal" \
+            "$_QUARANTINE_COUNT quarantined route(s) with no restart, once loadable."
+    fi
     exec caddy run --config "$_EFFECTIVE_CONFIG_PATH" --adapter caddyfile
 else
     warn "FATAL: could not assemble a valid Caddy config even after dynamic-route"
