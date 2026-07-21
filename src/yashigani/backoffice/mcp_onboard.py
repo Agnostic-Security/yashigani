@@ -880,6 +880,31 @@ async def run_approve_transaction(
     try:
         if _svid_init_applies:
             _svid_init_dir.mkdir(parents=True, exist_ok=True)
+            # FINDING B (v4.1.2 final onboarding e2e, 2026-07-21): a
+            # re-import of the SAME (tenant, server_id) WITHOUT a prior
+            # decommission previously 403/502'd here with a bare
+            # PermissionError. Root cause: shutil.copy2() opens the
+            # DESTINATION path for writing — but the PRIOR onboarding's
+            # client.key was left behind chmod'd to 0o440 (owner READ-only,
+            # see FINDING-V412-SVID-INIT-KEY-PERM below), so the plain
+            # `open(dst, "wb")` inside copy2() raises PermissionError on the
+            # second import even though backoffice OWNS the file (Linux DAC:
+            # owning a file does not imply write access — only the mode bits
+            # do). Decommission "fixed" this only as a side effect: it
+            # unlinks the whole svid-init dir, and unlink() only needs WRITE
+            # on the PARENT directory (which backoffice always has, having
+            # created it) — never on the target file's own mode bits.
+            # Fix: unlink each of the 3 target basenames BEFORE copying, so
+            # re-import is idempotent regardless of whatever mode a prior
+            # onboarding attempt (successful OR partially-failed) left them
+            # in, and regardless of whether decommission ran first. Every
+            # unlink is best-effort (missing_ok — first-ever import has
+            # nothing to remove) and failures other than "file absent" are
+            # NOT swallowed — they surface as the same fail-closed
+            # McpOnboardError the copy2() calls below already raise on any
+            # other I/O error, via the enclosing try/except.
+            for _stale_name in ("client.crt", "client.key", "ca.crt"):
+                (_svid_init_dir / _stale_name).unlink(missing_ok=True)
             shutil.copy2(cert_path, _svid_init_dir / "client.crt")
             shutil.copy2(key_path, _svid_init_dir / "client.key")
             shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")

@@ -74,6 +74,17 @@ class McpBrokerServerConfig:
     # McpCallContext.target_cert_fingerprint by the runtime router so the OPA
     # input target carries the cert binding.
     cert_fingerprint: str = ""
+    # FINDING C (v4.1.2 final onboarding e2e) — the expected SPIFFE URI SAN
+    # of this instance's per-instance leaf ("spiffe://.../agents/<t>/<s>/<i>").
+    # Populated from the durable registry descriptor's "spiffe_id" field
+    # (mcp/_durable_registry.py) written by the approve transaction, or left
+    # empty for boot-env entries (which are plain-HTTP bridge upstreams and
+    # never take the SPIFFE-verification path). Threaded into
+    # McpHttpTransport(expected_spiffe_id=...) by the runtime router so an
+    # https:// ring-fenced upstream is verified by SPIFFE identity instead of
+    # DNS hostname (net/http_client.py refuses fail-closed if this is empty
+    # for an https:// bypass-mode request).
+    spiffe_id: str = ""
 
 
 class McpBrokerRegistry:
@@ -419,6 +430,9 @@ def build_registry_from_env(
             # the onboard transaction's durable descriptor (empty for
             # boot-env entries without one).
             cert_fingerprint=str(entry.get("cert_fingerprint", "") or ""),
+            # FINDING C (v4.1.2 final onboarding e2e) — expected SPIFFE URI
+            # SAN from the durable descriptor (empty for boot-env entries).
+            spiffe_id=str(entry.get("spiffe_id", "") or ""),
         )
         return broker, server_cfg
 

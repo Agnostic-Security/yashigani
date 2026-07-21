@@ -430,6 +430,96 @@ class TestApproveTransactionFailClosed:
         assert any(e.failed_step == "envelope_mint" for e in events)
 
 
+class TestFindingBReimportIdempotent:
+    """FINDING B (v4.1.2 final onboarding e2e, 2026-07-21): re-importing the
+    SAME (tenant, server_id) WITHOUT a prior decommission must succeed —
+    previously it 502'd (surfaced by Ava as a 403) with a bare
+    PermissionError, because the FIRST onboarding's step 2b leaves
+    svid-init/<t>/<s>/client.key chmod'd to 0o440 (FINDING-V412-SVID-INIT-
+    KEY-PERM, owner READ-only) and the SECOND onboarding's
+    shutil.copy2(..., "client.key") opens that existing path for writing
+    and hits PermissionError. Decommission "fixed" this only as a side
+    effect (unlink() only needs parent-dir write, not target-file mode) —
+    re-import must be idempotent regardless of whether decommission ran."""
+
+    @pytest.mark.asyncio
+    async def test_reimport_without_decommission_succeeds(self, txn_env):
+        """The exact regression: import, then import the SAME server_id
+        again with NO decommission in between. Must NOT raise."""
+        artifact_root, secrets_dir = txn_env
+
+        r1 = await _run(secrets_dir)
+        assert r1.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{r1.instance_id}")
+
+        # Re-import — same tenant/server_id, no decommission call at all.
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()  # mirrors the real per-request codegen session reset
+        r2 = await _run(secrets_dir)
+
+        # A fresh instance_id/spiffe_id was minted — re-import is a full
+        # re-onboard, not a no-op — and it succeeded without any stale-file
+        # error (the bug this regression closes).
+        assert r2.instance_id != r1.instance_id
+        assert r2.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{r2.instance_id}")
+
+    @pytest.mark.asyncio
+    async def test_reimport_overwrites_stale_svid_init_files(self, txn_env):
+        """The svid-init staging files on disk after a re-import reflect
+        the SECOND onboarding's cert — not stale bytes retained from the
+        first (proves 'overwrite', not just 'no crash')."""
+        artifact_root, secrets_dir = txn_env
+        svid_init = secrets_dir / "svid-init" / _TENANT / _SERVER
+
+        def _mint_labelled(label: str):
+            def _mint(paths, tenant_id, agent_name, *, instance_id="", scope_hash="",
+                      image_digest="", approved_by="", audit_writer=None, **kw):
+                cert = paths.agent_cert(tenant_id, agent_name, instance_id)
+                key = paths.agent_key(tenant_id, agent_name, instance_id)
+                cert.write_text(f"CERT-{label}")
+                key.write_text(f"KEY-{label}")
+                return f"spiffe://yashigani.internal/agents/{tenant_id}/{agent_name}/{instance_id}"
+            return _mint
+
+        await _run(secrets_dir, mint=_mint_labelled("first"))
+        assert (svid_init / "client.crt").read_text() == "CERT-first"
+        assert (svid_init / "client.key").read_text() == "KEY-first"
+
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()
+        await _run(secrets_dir, mint=_mint_labelled("second"))
+
+        assert (svid_init / "client.crt").read_text() == "CERT-second"
+        assert (svid_init / "client.key").read_text() == "KEY-second"
+
+    @pytest.mark.asyncio
+    async def test_reimport_permission_denied_regression(self, txn_env):
+        """Direct regression for the ORIGINAL failure mode: without the fix,
+        the second import raised McpOnboardError(step='svid_init') wrapping
+        a bare PermissionError because client.key was chmod'd 0o440 by the
+        first import. Assert the step never fails and the mode is restored
+        to a writable-by-owner state after every import (so a THIRD import
+        would also succeed — not just the second)."""
+        artifact_root, secrets_dir = txn_env
+        svid_init = secrets_dir / "svid-init" / _TENANT / _SERVER
+
+        await _run(secrets_dir)
+        # First-import invariant unchanged: key is still group-readable only
+        # for the sidecar (FINDING-V412-SVID-INIT-KEY-PERM), i.e. NOT
+        # world/owner-writable at rest — the fix must not weaken this.
+        mode_after_first = (svid_init / "client.key").stat().st_mode & 0o777
+        assert mode_after_first == 0o440
+
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()
+        # Must not raise (the regression) — and must succeed a 3rd time too,
+        # proving this isn't a one-shot unlock.
+        await _run(secrets_dir)
+        reset_codegen_registry()
+        await _run(secrets_dir)
+        mode_after_third = (svid_init / "client.key").stat().st_mode & 0o777
+        assert mode_after_third == 0o440
+
+
 class TestMintEnvelopeSvidGuard:
     @pytest.mark.asyncio
     async def test_svid_issued_without_identity_refused(self):
