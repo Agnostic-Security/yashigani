@@ -282,3 +282,49 @@ def _safe_health_check(backend: ClassifierBackend) -> bool:
         return backend.health_check()
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# A1 (5.0) — fail-closed construction fallback.
+# When an entrypoint cannot build its real registry (Redis down, backend
+# import failure, bad config), the inspection pipelines must NOT silently
+# fall back to a fail-open path. They get this registry instead: every
+# classify() exhausts immediately and returns the fail-closed verdict, with
+# the standard unreachable/exhausted audit events.
+# ---------------------------------------------------------------------------
+
+
+class _FailClosedBackend(ClassifierBackend):
+    """Backend that is never available — forces the registry fail-closed path."""
+
+    name = "fail_closed_bootstrap"
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def classify(self, content: str) -> ClassifierResult:
+        raise BackendUnavailableError(
+            f"inspection registry construction failed: {self._reason}"
+        )
+
+    def health_check(self) -> bool:
+        return False
+
+
+def fail_closed_registry(reason: str, audit_writer=None) -> BackendRegistry:
+    """Registry whose every classification fails closed. Used by entrypoints
+    when real registry construction raises — never wire the bare fail-open
+    classifier as the fallback."""
+    logger.critical(
+        "Inspection backend registry could not be constructed (%s) — "
+        "wiring FAIL-CLOSED registry: all inspected traffic will be blocked "
+        "until the registry is repaired.",
+        reason,
+    )
+    backend = _FailClosedBackend(reason)
+    return BackendRegistry(
+        active_backend=backend,
+        fallback_chain=[],
+        all_backends={backend.name: backend},
+        audit_writer=audit_writer,
+    )

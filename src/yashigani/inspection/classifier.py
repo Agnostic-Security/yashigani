@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 LABEL_CLEAN = "CLEAN"
 LABEL_CREDENTIAL_EXFIL = "CREDENTIAL_EXFIL"
 LABEL_PROMPT_INJECTION_ONLY = "PROMPT_INJECTION_ONLY"
+# A1×A10 (5.0): emitted when the classifier itself fails (unreachable model,
+# timeout, malformed/unparseable verdict). Consumers MUST treat this label as
+# fail-closed — it is never a verdict about the content, only about the
+# classifier, and it must never be laundered into CLEAN.
+LABEL_CLASSIFIER_ERROR = "CLASSIFIER_ERROR"
 
 _SYSTEM_PROMPT = """\
 You are a security classifier for an AI gateway. Your sole task is to analyze \
@@ -99,17 +104,20 @@ class PromptInjectionClassifier:
         """
         Classify content for prompt injection. Content must already have
         credentials masked by CHS before this method is called.
-        Returns ClassifierResult — never raises on model error (returns CLEAN
-        with confidence=0.0 and logs the error).
+        Returns ClassifierResult — never raises. On model error it returns
+        LABEL_CLASSIFIER_ERROR (fail-closed): an unreachable or broken
+        classifier must block, not approve. Callers dispose of
+        CLASSIFIER_ERROR as a block with its own audit label so an induced
+        outage is distinguishable from a genuine CLEAN.
         """
         try:
             raw = self._call_model(content)
             return self._parse_response(raw)
         except Exception as exc:
-            logger.error("Classifier error (defaulting to CLEAN/0.0): %s", exc)
+            logger.error("Classifier error — failing closed (CLASSIFIER_ERROR): %s", exc)
             return ClassifierResult(
-                label=LABEL_CLEAN,
-                confidence=0.0,
+                label=LABEL_CLASSIFIER_ERROR,
+                confidence=1.0,
                 exfil_indicators=False,
                 detected_payload_spans=[],
                 raw_response=type(exc).__name__,
@@ -156,8 +164,9 @@ class PromptInjectionClassifier:
 
     def _parse_response(self, raw: str) -> ClassifierResult:
         """
-        Parse model output as strict JSON. Any deviation from schema = CLEAN/0.0.
-        This prevents a jailbroken model from approving a blocked request.
+        Parse model output as strict JSON. Any deviation from schema =
+        CLASSIFIER_ERROR (fail-closed). A jailbroken or malfunctioning model
+        must not be able to approve a request by emitting garbage.
         """
         try:
             # Extract JSON object even if model added surrounding text
@@ -195,8 +204,8 @@ class PromptInjectionClassifier:
         except Exception as exc:
             logger.warning("Failed to parse classifier response: %s. Raw: %.200s", exc, raw)
             return ClassifierResult(
-                label=LABEL_CLEAN,
-                confidence=0.0,
+                label=LABEL_CLASSIFIER_ERROR,
+                confidence=1.0,
                 exfil_indicators=False,
                 detected_payload_spans=[],
                 raw_response=raw,

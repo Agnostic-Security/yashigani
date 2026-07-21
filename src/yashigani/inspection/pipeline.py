@@ -16,8 +16,14 @@ from yashigani.inspection.classifier import (
     LABEL_CLEAN,
     LABEL_CREDENTIAL_EXFIL,
     LABEL_PROMPT_INJECTION_ONLY,
+    LABEL_CLASSIFIER_ERROR,
 )
 from yashigani.inspection.sanitizer import sanitize, SanitizationResult
+
+# A10 (5.0): disposition label for per-identity compute shedding — the request
+# was blocked because the calling identity exhausted its classifier concurrency
+# cap, NOT because of a content verdict.
+LABEL_COMPUTE_SHED = "COMPUTE_SHED"
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +81,14 @@ class InspectionPipeline:
         sanitize_threshold: float = _DEFAULT_SANITIZE_THRESHOLD,
         on_audit: Optional[Callable[[str, dict], None]] = None,
         backend_registry=None,  # Optional[BackendRegistry]
+        concurrency_guard=None,  # Optional[IdentityConcurrencyGuard] — A10
     ) -> None:
         self._classifier = classifier
         self._backend_registry = backend_registry
         self._threshold = sanitize_threshold
         self._masker = CredentialMasker()
         self._on_audit = on_audit or (lambda name, data: None)
+        self._concurrency_guard = concurrency_guard
 
     def process(
         self,
@@ -102,22 +110,34 @@ class InspectionPipeline:
             logger.warning("CHS masker failed (%s) — using raw query for classification", exc)
             masked_query = raw_query
 
-        # Step 2: Classify — use backend_registry if available, else legacy classifier
-        result: Any
-        if self._backend_registry is not None:
-            backend_result = self._backend_registry.classify(masked_query, request_id=request_id)
-            # Adapt BackendRegistry ClassifierResult to the legacy classifier shape
-            # Pipeline disposition only needs .label and .confidence; wrap in a simple object
-            result = _BackendResultAdapter(
-                label=backend_result.label,
-                confidence=backend_result.confidence,
-            )
+        # Step 2: Classify — use backend_registry if available, else legacy classifier.
+        # A10: the classification itself runs inside the per-identity concurrency
+        # slot, so a flooding identity sheds its own requests (fail-closed) instead
+        # of exhausting the shared classifier and inducing errors for everyone.
+        shed_identity = user_id or agent_id
+        if self._concurrency_guard is not None:
+            with self._concurrency_guard.slot(shed_identity) as acquired:
+                if not acquired:
+                    pipeline_result = self._handle_compute_shed(
+                        request_id, session_id, agent_id, user_id,
+                    )
+                    _record_classification(
+                        pipeline_result.classification, pipeline_result.severity
+                    )
+                    return pipeline_result
+                result = self._classify(masked_query, request_id)
         else:
-            result = self._classifier.classify(masked_query)
+            result = self._classify(masked_query, request_id)
 
         # Step 3: Disposition
         if result.label == LABEL_CLEAN:
             pipeline_result = self._pass_through(request_id, raw_query, session_id, agent_id)
+        elif result.label == LABEL_CLASSIFIER_ERROR:
+            # Fail-closed: a broken/unreachable classifier blocks, and the audit
+            # trail distinguishes it from a genuine verdict (A1 council P0).
+            pipeline_result = self._handle_classifier_error(
+                request_id, result, session_id, agent_id, user_id,
+            )
         elif result.label == LABEL_CREDENTIAL_EXFIL:
             pipeline_result = self._handle_credential_exfil(
                 request_id, raw_query, masked_query, result,
@@ -137,6 +157,20 @@ class InspectionPipeline:
         if not 0.70 <= threshold <= 0.99:
             raise ValueError("Threshold must be between 0.70 and 0.99")
         self._threshold = threshold
+
+    def _classify(self, masked_query: str, request_id: str) -> Any:
+        """Run the classifier (registry takes precedence over legacy)."""
+        if self._backend_registry is not None:
+            backend_result = self._backend_registry.classify(
+                masked_query, request_id=request_id
+            )
+            # Adapt BackendRegistry ClassifierResult to the legacy classifier shape
+            # Pipeline disposition only needs .label and .confidence; wrap in a simple object
+            return _BackendResultAdapter(
+                label=backend_result.label,
+                confidence=backend_result.confidence,
+            )
+        return self._classifier.classify(masked_query)
 
     def _dispatch_credential_exfil_alert(
         self,
@@ -314,6 +348,98 @@ class InspectionPipeline:
             audit_fields=audit,
         )
 
+    def _handle_classifier_error(
+        self, request_id: str, classifier_result,
+        session_id: str, agent_id: str, user_id: str,
+    ) -> PipelineResult:
+        """A1 (5.0): classifier failure blocks fail-closed with its own audit
+        label so an induced outage never masquerades as a genuine CLEAN."""
+        admin_alert = {
+            "alert_type": "INSPECTION_CLASSIFIER_ERROR",
+            "severity": "HIGH",
+            "request_id": request_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "action_taken": "DISCARDED",
+            "error_detail": getattr(classifier_result, "raw_response", "") or "",
+        }
+        user_alert = _build_unavailable_alert(request_id)
+
+        audit = {
+            "event_type": "INSPECTION_CLASSIFIER_ERROR",
+            "classification": LABEL_CLASSIFIER_ERROR,
+            "severity": "HIGH",
+            "request_id": request_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "action_taken": "DISCARDED",
+            "sanitized": False,
+            "admin_alerted": True,
+            "user_alerted": True,
+            "raw_query_logged": False,
+        }
+        self._on_audit("INSPECTION_CLASSIFIER_ERROR", audit)
+
+        return PipelineResult(
+            request_id=request_id,
+            action="DISCARDED",
+            clean_query=None,
+            classification=LABEL_CLASSIFIER_ERROR,
+            severity="HIGH",
+            confidence=0.0,
+            admin_alert=admin_alert,
+            user_alert=user_alert,
+            audit_fields=audit,
+        )
+
+    def _handle_compute_shed(
+        self, request_id: str,
+        session_id: str, agent_id: str, user_id: str,
+    ) -> PipelineResult:
+        """A10 (5.0): the calling identity is at its classifier concurrency cap.
+        Shed THIS identity's request fail-closed; other identities are unaffected."""
+        identity = user_id or agent_id
+        admin_alert = {
+            "alert_type": "CLASSIFIER_COMPUTE_SHED",
+            "severity": "HIGH",
+            "request_id": request_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "identity": identity,
+            "action_taken": "DISCARDED",
+        }
+        user_alert = _build_unavailable_alert(request_id)
+
+        audit = {
+            "event_type": "CLASSIFIER_COMPUTE_SHED",
+            "classification": LABEL_COMPUTE_SHED,
+            "severity": "HIGH",
+            "request_id": request_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "identity": identity,
+            "action_taken": "DISCARDED",
+            "sanitized": False,
+            "admin_alerted": True,
+            "user_alerted": True,
+            "raw_query_logged": False,
+        }
+        self._on_audit("CLASSIFIER_COMPUTE_SHED", audit)
+
+        return PipelineResult(
+            request_id=request_id,
+            action="DISCARDED",
+            clean_query=None,
+            classification=LABEL_COMPUTE_SHED,
+            severity="HIGH",
+            confidence=0.0,
+            admin_alert=admin_alert,
+            user_alert=user_alert,
+            audit_fields=audit,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -364,6 +490,26 @@ def _build_user_alert(
     )
     return build_alert(
         act, reason, rule=rule, direction=DIRECTION_FROM_YOU, request_id=request_id
+    )
+
+
+def _build_unavailable_alert(request_id: str) -> dict:
+    """Layman alert for fail-closed blocks that are NOT a content verdict
+    (classifier error / compute shed): honest about unavailability, no
+    accusation of injection."""
+    from yashigani.common.user_alert import (
+        build_alert,
+        ACTION_BLOCKED,
+        DIRECTION_FROM_YOU,
+    )
+
+    return build_alert(
+        ACTION_BLOCKED,
+        "Your message could not be security-checked right now, so it was not "
+        "sent. This is a temporary protection measure — please try again.",
+        rule="Inspection unavailable (fail-closed)",
+        direction=DIRECTION_FROM_YOU,
+        request_id=request_id,
     )
 
 
@@ -478,6 +624,7 @@ class ResponseInspectionPipeline:
         on_audit: Optional[Callable[[str, dict], None]] = None,
         backend_registry=None,  # Optional[BackendRegistry]
         sensitivity_classifier=None,  # Optional[SensitivityClassifier]
+        concurrency_guard=None,  # Optional[IdentityConcurrencyGuard] — A10
     ) -> None:
         self._classifier = classifier
         self._backend_registry = backend_registry
@@ -485,6 +632,7 @@ class ResponseInspectionPipeline:
         self._on_audit = on_audit or (lambda name, data: None)
         # v2.24.1 — GAP-3: optional second classifier for response-content sensitivity
         self._sensitivity_classifier = sensitivity_classifier
+        self._concurrency_guard = concurrency_guard
 
     def inspect(
         self,
@@ -571,18 +719,21 @@ class ResponseInspectionPipeline:
                     request_id, exc,
                 )
 
-        # Classify — backend_registry takes precedence over legacy classifier
+        # Classify — backend_registry takes precedence over legacy classifier.
+        # A10: response-leg classifications count against the same per-identity
+        # cap as the request leg (keyed by agent_id — the response leg has no
+        # end-user identity). Over-cap sheds THIS response fail-closed (BLOCKED).
         classifier_result: Any
-        if self._backend_registry is not None:
-            backend_result = self._backend_registry.classify(
-                response_body, request_id=request_id
-            )
-            classifier_result = _BackendResultAdapter(
-                label=backend_result.label,
-                confidence=backend_result.confidence,
-            )
+        if self._concurrency_guard is not None:
+            with self._concurrency_guard.slot(agent_id) as acquired:
+                if not acquired:
+                    return self._shed_response(
+                        request_id, session_id, agent_id,
+                        content_type, response_sensitivity_value,
+                    )
+                classifier_result = self._classify_response(response_body, request_id)
         else:
-            classifier_result = self._classifier.classify(response_body)
+            classifier_result = self._classify_response(response_body, request_id)
 
         # Disposition
         if classifier_result.label == LABEL_CLEAN:
@@ -635,3 +786,47 @@ class ResponseInspectionPipeline:
     def update_config(self, config: ResponseInspectionConfig) -> None:
         """Replace the active config. Admin-callable."""
         self._config = config
+
+    def _classify_response(self, response_body: str, request_id: str) -> Any:
+        """Run the classifier (registry takes precedence over legacy)."""
+        if self._backend_registry is not None:
+            backend_result = self._backend_registry.classify(
+                response_body, request_id=request_id
+            )
+            return _BackendResultAdapter(
+                label=backend_result.label,
+                confidence=backend_result.confidence,
+            )
+        return self._classifier.classify(response_body)
+
+    def _shed_response(
+        self,
+        request_id: str,
+        session_id: str,
+        agent_id: str,
+        content_type: str,
+        response_sensitivity_value: str,
+    ) -> ResponseInspectionResult:
+        """A10: identity at its classifier cap — block this response fail-closed."""
+        audit = {
+            "event_type": "CLASSIFIER_COMPUTE_SHED",
+            "verdict": RESPONSE_VERDICT_BLOCKED,
+            "request_id": request_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "classification": LABEL_COMPUTE_SHED,
+            "confidence_score": 0.0,
+            "action_taken": "502_returned",
+            "content_type": content_type,
+            "response_sensitivity": response_sensitivity_value,
+        }
+        self._on_audit("CLASSIFIER_COMPUTE_SHED", audit)
+        return ResponseInspectionResult(
+            request_id=request_id,
+            verdict=RESPONSE_VERDICT_BLOCKED,
+            confidence=0.0,
+            skipped=False,
+            skip_reason=None,
+            audit_fields=audit,
+            response_sensitivity=response_sensitivity_value,
+        )

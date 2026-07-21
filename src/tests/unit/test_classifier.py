@@ -6,11 +6,11 @@ Covers:
   - Default model name is qwen2.5:3b (IC-NEW-2 regression)
   - _parse_response happy path: CLEAN, CREDENTIAL_EXFIL, PROMPT_INJECTION_ONLY
   - _parse_response handles surrounding text / extra whitespace
-  - _parse_response on invalid label → CLEAN/0.0 (fail-safe)
-  - _parse_response on empty string → CLEAN/0.0
+  - _parse_response on invalid label → CLASSIFIER_ERROR (fail-closed, 5.0 A1)
+  - _parse_response on empty string → CLASSIFIER_ERROR
   - _parse_response on valid JSON but out-of-range confidence → clamped
   - _parse_response validates span format
-  - classify() error path returns CLEAN/0.0 without raising
+  - classify() error path returns CLASSIFIER_ERROR without raising
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import pytest
 
 from yashigani.inspection.classifier import (
     LABEL_CLEAN,
+    LABEL_CLASSIFIER_ERROR,
     LABEL_CREDENTIAL_EXFIL,
     LABEL_PROMPT_INJECTION_ONLY,
     ClassifierResult,
@@ -118,7 +119,9 @@ class TestParseResponse:
         result = self.clf._parse_response(raw)
         assert result.label == LABEL_CLEAN
 
-    def test_invalid_label_returns_clean(self):
+    def test_invalid_label_fails_closed(self):
+        # 5.0 A1: schema deviation is a classifier failure, never CLEAN —
+        # a jailbroken model must not approve content by emitting garbage.
         raw = json.dumps({
             "label": "JAILBREAK",
             "confidence": 0.99,
@@ -126,13 +129,13 @@ class TestParseResponse:
             "detected_payload_spans": [],
         })
         result = self.clf._parse_response(raw)
-        assert result.label == LABEL_CLEAN
-        assert result.confidence == pytest.approx(0.0)
+        assert result.label == LABEL_CLASSIFIER_ERROR
+        assert result.confidence == pytest.approx(1.0)
 
-    def test_empty_string_returns_clean(self):
+    def test_empty_string_fails_closed(self):
         result = self.clf._parse_response("")
-        assert result.label == LABEL_CLEAN
-        assert result.confidence == pytest.approx(0.0)
+        assert result.label == LABEL_CLASSIFIER_ERROR
+        assert result.confidence == pytest.approx(1.0)
 
     def test_confidence_clamped_above_one(self):
         result = self._parse({
@@ -202,10 +205,13 @@ class TestParseResponse:
 
 
 class TestClassifyErrorPath:
-    def test_classify_model_error_returns_clean(self):
+    def test_classify_model_error_fails_closed(self):
+        # 5.0 A1 (council P0): model error must NEVER become CLEAN — that was
+        # the fail-open the A1×A10 compound Critical exploited.
         clf = PromptInjectionClassifier()
         with patch.object(clf, "_call_model", side_effect=RuntimeError("model unavailable")):
             result = clf.classify("some content")
-        assert result.label == LABEL_CLEAN
-        assert result.confidence == pytest.approx(0.0)
+        assert result.label == LABEL_CLASSIFIER_ERROR
+        assert result.confidence == pytest.approx(1.0)
         assert result.exfil_indicators is False
+        assert result.raw_response == "RuntimeError"

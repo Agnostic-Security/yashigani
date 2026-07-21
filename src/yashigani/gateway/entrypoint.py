@@ -75,16 +75,60 @@ def _build_app(mesh_mode: bool = False):
         logger.warning("OLLAMA_MODEL not set — using default '%s'", model)
     classifier = PromptInjectionClassifier(model=model, ollama_base_url=ollama_url)
 
+    # A1 (5.0): the gateway routes BOTH inspection pipelines through the
+    # fail-closed BackendRegistry — never the bare fail-open classifier.
+    # Registry construction failure wires the fail-closed registry instead.
+    try:
+        from yashigani.inspection.backends.ollama import OllamaBackend
+        from yashigani.inspection.backend_registry import BackendRegistry
+        _chain_raw = os.getenv("YASHIGANI_INSPECTION_FALLBACK_CHAIN", "")
+        _fallback_chain = [b.strip() for b in _chain_raw.split(",") if b.strip()]
+        _ollama_backend = OllamaBackend(base_url=ollama_url, model=model)
+        backend_registry = BackendRegistry(
+            active_backend=_ollama_backend,
+            fallback_chain=_fallback_chain,
+            all_backends={"ollama": _ollama_backend},
+            audit_writer=audit_writer,
+        )
+        logger.info(
+            "Gateway inspection registry initialised: active=ollama, chain=%s",
+            _fallback_chain,
+        )
+    except Exception as exc:
+        from yashigani.inspection.backend_registry import fail_closed_registry
+        backend_registry = fail_closed_registry(str(exc), audit_writer=audit_writer)
+
+    # A10 (5.0): per-identity classifier concurrency cap — a flooding identity
+    # sheds its own requests instead of exhausting the shared classifier.
+    from yashigani.inspection.concurrency_guard import IdentityConcurrencyGuard
+    concurrency_guard = IdentityConcurrencyGuard(
+        max_per_identity=int(
+            os.getenv("YASHIGANI_CLASSIFIER_MAX_CONCURRENT_PER_IDENTITY", "4")
+        )
+    )
+
     pipeline = InspectionPipeline(
         classifier=classifier,
         sanitize_threshold=float(os.getenv("YASHIGANI_INJECT_THRESHOLD", "0.85")),
+        backend_registry=backend_registry,
+        concurrency_guard=concurrency_guard,
     )
 
-    # Response inspection pipeline — v0.9.0 F-01
-    response_pipeline = None
-    if os.getenv("YASHIGANI_INSPECT_RESPONSES", "false").lower() == "true":
-        response_pipeline = ResponseInspectionPipeline(classifier=classifier)
-        logger.info("Response inspection pipeline enabled")
+    # Response inspection pipeline — MANDATORY as of 5.0 (A1 council P0:
+    # response-inspection-off-in-prod). The former YASHIGANI_INSPECT_RESPONSES
+    # opt-in toggle is removed; per-agent tuning stays available through
+    # ResponseInspectionConfig, which is an audited admin path.
+    if "YASHIGANI_INSPECT_RESPONSES" in os.environ:
+        logger.warning(
+            "YASHIGANI_INSPECT_RESPONSES is no longer honoured — response "
+            "inspection is mandatory (5.0 A1). Remove the variable."
+        )
+    response_pipeline = ResponseInspectionPipeline(
+        classifier=classifier,
+        backend_registry=backend_registry,
+        concurrency_guard=concurrency_guard,
+    )
+    logger.info("Response inspection pipeline enabled (mandatory)")
 
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None

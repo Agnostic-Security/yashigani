@@ -161,9 +161,17 @@ def _bootstrap():
     ollama_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     classifier = PromptInjectionClassifier(model=model, ollama_base_url=ollama_url)
+    # A10 (5.0): per-identity classifier concurrency cap (see gateway entrypoint).
+    from yashigani.inspection.concurrency_guard import IdentityConcurrencyGuard
+    inspection_concurrency_guard = IdentityConcurrencyGuard(
+        max_per_identity=int(
+            os.getenv("YASHIGANI_CLASSIFIER_MAX_CONCURRENT_PER_IDENTITY", "4")
+        )
+    )
     inspection_pipeline = InspectionPipeline(
         classifier=classifier,
         sanitize_threshold=float(os.getenv("YASHIGANI_INJECT_THRESHOLD", "0.85")),
+        concurrency_guard=inspection_concurrency_guard,
     )
 
     # ── Rate limiter ─────────────────────────────────────────────────────────
@@ -412,10 +420,13 @@ def _bootstrap():
                 "screen runs on every MCP import"
             )
     except Exception as exc:
-        logger.warning(
-            "Backend registry init failed (%s) — inspection pipeline uses legacy classifier",
-            exc,
-        )
+        # A1 (5.0, council P0): registry-injection failure must fail CLOSED.
+        # The previous fallback ("uses legacy classifier") handed the pipeline
+        # the fail-open bare classifier — backwards. Wire the fail-closed
+        # registry instead: inspection blocks until the registry is repaired.
+        from yashigani.inspection.backend_registry import fail_closed_registry
+        backend_registry = fail_closed_registry(str(exc), audit_writer=audit_writer)
+        inspection_pipeline._backend_registry = backend_registry
 
     # ── Model alias store (Redis db/1, separate key namespace) ─────────────
     model_alias_store = None
