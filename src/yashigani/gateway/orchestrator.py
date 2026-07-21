@@ -542,6 +542,88 @@ async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: 
                           egress_opa="not_reached", inspection_verdict="not_reached",
                           http_status=403, block_source="opa_ingress")
 
+    # 1b) FINDING-V412-RESTART-013 — document enforcement on the OUTBOUND leg
+    # (agent/model -> MCP tool arguments). This is the primary chat->MCP
+    # tool-call path (called from _call_tool_hop at line ~944); before this
+    # fix it had ZERO references to the document-enforcement engine — a
+    # document embedded in `args` was forwarded to the upstream MCP tool
+    # completely unredacted/un-pseudonymized/unblocked. Mirrors the
+    # gateway/mcp_router_runtime.py OUTBOUND-leg wiring closed for the
+    # /mcp/<agent_name> HTTP entrypoint (same bridge, same OPA-decided
+    # REDACT/PSEUDONYMIZE/BLOCK decision, same DOCUMENT_ENFORCEMENT_DECISION
+    # audit event via the pipeline's own on_audit callback — no separate
+    # audit call needed here). Runs AFTER ingress OPA allow (no point
+    # inspecting a call that would be denied anyway) and BEFORE the args are
+    # ever serialized into the JSON-RPC POST below.
+    #
+    # document_pipeline is opt-in (mode-B-proxy flag, entrypoint.py); when
+    # None (default/dark), this block is a complete no-op — zero behaviour
+    # change for every pre-existing orchestration test/deployment.
+    from yashigani.gateway.openai_router import _state as _oa_state
+    _doc_pipeline = getattr(_oa_state, "document_pipeline", None)
+    if _doc_pipeline is not None and isinstance(args, dict) and args:
+        from yashigani.documents.mcp_document_bridge import enforce_mcp_document_payload
+        _doc_identity_id = _principal_id(identity)
+        if _doc_identity_id in ("anonymous", "unknown"):
+            _doc_identity_id = ""
+        try:
+            _doc_outcome = await enforce_mcp_document_payload(
+                _doc_pipeline,
+                opa_url=_oa_state.opa_url,
+                payload=args,
+                request_id=request_id,
+                identity_id=_doc_identity_id,
+                tenant="",
+                surface="mcp-tool-call",
+            )
+        except Exception as exc:
+            # Fail-closed: the bridge itself is designed to never raise (see
+            # its own module docstring), but an unexpected fault here must
+            # still withhold rather than silently forward an uninspected
+            # document to an external MCP server.
+            logger.error(
+                "orchestration: [RESTART-013] document bridge raised on "
+                "tool-call arguments server=%s tool=%s request_id=%s: %s",
+                server, tool, request_id, exc,
+            )
+            notice = (f"[BLOCKED BY YASHIGANI DOCUMENT ENFORCEMENT] The MCP call "
+                      f"{server}.{tool} was held: document enforcement error "
+                      "(fail-closed — a policy decision could not be reached).")
+            _audit(OrchestrationBlockedStepEvent(
+                root_request_id=root_rid, request_id=request_id, identity_id=_principal_id(identity),
+                session_id=_principal_id(identity), agent_id="orchestrator",
+                tool_name=f"mcp__{server}__{tool}", tool_kind="mcp", depth=depth,
+                block_source="document_enforcement", egress_opa_decision="not_reached",
+                inspection_verdict="not_reached", inspection_confidence=0.0,
+            ))
+            return ToolResult(notice, blocked=True, ingress_opa="allow",
+                              egress_opa="not_reached", inspection_verdict="not_reached",
+                              http_status=403, block_source="document_enforcement")
+
+        if _doc_outcome.blocked:
+            notice = (f"[BLOCKED BY YASHIGANI DOCUMENT ENFORCEMENT] A document in the "
+                      f"MCP call {server}.{tool} arguments was held by policy "
+                      f"({_doc_outcome.block_reason}); it was not forwarded.")
+            _audit(OrchestrationBlockedStepEvent(
+                root_request_id=root_rid, request_id=request_id, identity_id=_principal_id(identity),
+                session_id=_principal_id(identity), agent_id="orchestrator",
+                tool_name=f"mcp__{server}__{tool}", tool_kind="mcp", depth=depth,
+                block_source="document_enforcement", egress_opa_decision="not_reached",
+                inspection_verdict="not_reached", inspection_confidence=0.0,
+            ))
+            return ToolResult(notice, blocked=True, ingress_opa="allow",
+                              egress_opa="not_reached", inspection_verdict="not_reached",
+                              http_status=403, block_source="document_enforcement")
+
+        # LOG: no-op. REDACT/PSEUDONYMIZE (mode A): `args` was mutated IN
+        # PLACE by enforce_mcp_document_payload — the SAME dict object step 2
+        # below serializes into the JSON-RPC `rpc["params"]["arguments"]`
+        # body, so the transformed bytes (never the original cleartext) are
+        # what actually reaches the upstream MCP server. No re-serialization
+        # step is needed here (unlike mcp_router_runtime.py, which mutates a
+        # dict nested inside an already-parsed JSON body string) because
+        # `rpc` is built fresh from `args` immediately below.
+
     # 2) Forward to the JSON-RPC MCP upstream (reachable from the gateway netns).
     # F-001 (audit): MCP upstreams can be https://caddy:<port>/mcp/... — build the
     # internal PKI client for https URLs; fall through to plain httpx for http.

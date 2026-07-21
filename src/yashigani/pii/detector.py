@@ -57,6 +57,13 @@ class PiiType(str, Enum):
     # tokenize them and the small-set gate must see them as quasi-identifiers.
     NATIONAL_INSURANCE   = "NATIONAL_INSURANCE"   # UK NINO (AA 10 10 10 A)
     POSTAL_ADDRESS       = "POSTAL_ADDRESS"       # UK postcode / postal address
+    # FINDING-V412-RESTART-013 gap #2: a person's name is PII in its own
+    # right (direct identifier), but was NEVER a detected class — a document
+    # under a "PII" data-class REDACT/PSEUDONYMIZE rule left "Name: Alice
+    # Zhang" in cleartext even though SSN + EMAIL on the same document were
+    # correctly caught. Context-sensitive (label-anchored) — see
+    # patterns.PERSON_NAME_PATTERNS.
+    PERSON_NAME          = "PERSON_NAME"
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +371,21 @@ class PiiDetector:
             patterns = PATTERN_REGISTRY.get(pii_type.value, [])
             for pattern in patterns:
                 for match in pattern.finditer(text):
-                    matched_text = match.group(0)
+                    # RESTART-013 gap #2: context-sensitive patterns (e.g.
+                    # PERSON_NAME's "Name: <value>") wrap the SENSITIVE VALUE
+                    # in capture group 1 so the finding span covers only the
+                    # value — never the label ("Name:" stays cleartext,
+                    # matching the existing SSN/EMAIL redaction shape). Every
+                    # PRE-EXISTING pattern has zero capture groups (all use
+                    # non-capturing `(?:...)` groups), so `pattern.groups == 0`
+                    # for them and this falls through to the original
+                    # whole-match behaviour unchanged.
+                    if pattern.groups > 0 and match.group(1) is not None:
+                        span_start, span_end = match.start(1), match.end(1)
+                        matched_text = match.group(1)
+                    else:
+                        span_start, span_end = match.start(), match.end()
+                        matched_text = match.group(0)
 
                     # Credit card: post-filter with Luhn check.
                     if pii_type == PiiType.CREDIT_CARD:
@@ -373,8 +394,8 @@ class PiiDetector:
 
                     raw_findings.append(PiiFinding(
                         pii_type=pii_type,
-                        start=match.start(),
-                        end=match.end(),
+                        start=span_start,
+                        end=span_end,
                         masked_value=_mask(matched_text),
                     ))
 
