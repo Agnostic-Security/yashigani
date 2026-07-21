@@ -280,6 +280,48 @@ class TestDeployHint:
         assert f"{_SERVER}-compose.override.yml" in hint["commands"][0]
         assert "install.sh --onboard" in hint["note"]  # explicitly disambiguated
 
+    def test_n5_docker_hint_names_exact_services_not_bare_up_d(self):
+        """FINDING-V412-ONBOARDING-ROBUSTNESS N5 (Su, 2026-07-21).
+
+        Regression for: the previous command was a BARE `up -d` (no service
+        name). The vendored podman-compose fork computes one PROJECT-WIDE
+        config hash, not a per-service hash, so a bare `up -d` after any
+        override merge tears down + recreates every existing container
+        (proven live by Ava re-onboarding demo-mcp; reproduced with an
+        isolated 2-service compose fixture during this fix — an untouched
+        service's container ID changed on bare `up -d` and did NOT change
+        when the same command named services explicitly).
+
+        The command must now end with exactly the 3 services the Shape-C
+        override touches (agent, its svid-sidecar, caddy) and must NOT be a
+        bare `up -d` with nothing after it.
+        """
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        cmd = hint["commands"][0]
+        assert cmd.rstrip().endswith(
+            f"up -d {_SERVER} {_SERVER}-svid-sidecar caddy"
+        ), cmd
+        assert not cmd.rstrip().endswith("up -d"), (
+            "N5 regression: bare `up -d` with no service name recreates the "
+            "WHOLE stack on the vendored podman-compose fork (project-wide "
+            "config hash, not per-service) — see docstring."
+        )
+        # No core/other-agent service is ever named.
+        for _untouched in ("postgres", "redis", "backoffice", "gateway"):
+            assert _untouched not in cmd
+
+    def test_n5_docker_hint_note_documents_blast_radius(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        assert f"{_SERVER}-svid-sidecar" in hint["note"]
+        assert "caddy" in hint["note"]
+        assert "N5" in hint["note"]
+
     def test_k8s_hint_uses_helm(self):
         from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
         hint = _agent_container_deploy_hint(

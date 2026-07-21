@@ -550,6 +550,37 @@ def _agent_container_deploy_hint(
     ``handle_onboard_subcommand``). This function closes the documentation
     gap the same way ``_agent_container_teardown_hint`` closes it for
     decommission: return the exact scoped command, never execute it.
+
+    FINDING-V412-ONBOARDING-ROBUSTNESS N5 (Su, 2026-07-21) — blast-radius fix:
+    the command this function returned previously was bare ``up -d`` (no
+    service name), which the note claimed was "scoped to server_id ... only
+    via the -f override file". That claim was FALSE for the vendored
+    podman-compose fork (``vendor/podman-compose-ysg/podman_compose.py``):
+    the fork computes ONE project-wide compose-config hash
+    (``compose.yaml_hash``), not a per-service hash. Merging in the override
+    file changes that global hash, so on the NEXT ``up -d`` every existing
+    container's ``io.podman.compose.config-hash`` label mismatches the new
+    global hash and the fork tears down + recreates the WHOLE STACK — proven
+    live by Ava (demo-mcp re-onboarding) and reproduced with an isolated
+    2-service compose fixture during this fix (an untouched ``db`` service's
+    container ID changed on a bare ``up -d`` after an unrelated override
+    merge; the same fixture with an explicit service list left it
+    untouched). The fork DOES support scoped ``up -d <service...>`` — both
+    create/start AND the hash-mismatch teardown branch respect
+    ``args.services`` (``get_excluded()`` in the fork, used by both
+    ``compose_up`` and ``compose_down``) — the CALL SITE simply never
+    supplied it, so scoping degraded to "all services".
+
+    Fix: name the exact services this override touches. The Shape-C compose
+    override (``_gen_compose_override_shape_c`` in codegen.py) always
+    defines exactly three services: the agent itself (``server_id``), its
+    svid-sidecar (``"%s-svid-sidecar" % server_id``, SEAM-1d-06), and a
+    PATCH onto the existing ``caddy:`` service (adds the new ringfence
+    bridge network + SVID volume mount — caddy legitimately bounces briefly
+    to pick these up). No other service (postgres/redis/backoffice/gateway/
+    any OTHER onboarded agent) is ever named in the override, so naming
+    these three explicitly on the command line makes the fork's own
+    scoping correct instead of accidentally-disabled.
     """
     compose_override = "docker/%s-compose.override.yml" % server_id
     if runtime == "k8s":
@@ -565,21 +596,34 @@ def _agent_container_deploy_hint(
                 "kubeconfig context, scoped to the yashigani namespace only."
             ),
         }
+    svid_sidecar = "%s-svid-sidecar" % server_id
+    # N5: name the services explicitly — see the docstring above. `caddy` IS
+    # named (it reconnects to the new ringfence bridge + SVID volume and
+    # WILL restart briefly) but nothing else in the base stack is.
+    deploy_services = "%s %s caddy" % (server_id, svid_sidecar)
     return {
         "runtime": runtime,
         "commands": [
-            "docker compose -f docker/docker-compose.yml -f %s up -d" % compose_override,
+            "docker compose -f docker/docker-compose.yml -f %s up -d %s"
+            % (compose_override, deploy_services),
         ],
         "note": (
             "backoffice has no docker/podman socket access by design "
             "(LAURA-30-001 / YSG-RISK-080) — this envelope/route registration "
             "does NOT start the container. Run this from the host/operator "
-            "shell, scoped to server_id=%r only via the -f override file; no "
-            "other agent or core service is named in this command. This is "
-            "NOT the same mechanism as `install.sh --onboard` (that CLI uses "
-            "a separate, non-interoperating registry — do not mix the two "
-            "for the same server_id)."
-        ) % server_id,
+            "shell. SCOPED explicitly to the 3 services this override "
+            "touches: %r (the agent), %r (its svid-sidecar), and caddy "
+            "(reconnected to the new ringfence bridge + SVID volume — it "
+            "WILL restart briefly). No OTHER service is named, so "
+            "postgres/redis/backoffice/gateway/other onboarded agents are "
+            "never recreated (FINDING-V412-ONBOARDING-ROBUSTNESS N5 — naming "
+            "no service here previously let the compose engine's own "
+            "project-wide config-hash mismatch recreate the WHOLE stack on "
+            "every add-agent deploy). This is NOT the same mechanism as "
+            "`install.sh --onboard` (that CLI uses a separate, "
+            "non-interoperating registry — do not mix the two for the same "
+            "server_id)."
+        ) % (server_id, svid_sidecar),
     }
 
 
