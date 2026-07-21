@@ -3229,9 +3229,16 @@ def _gen_caddy_snippet_mcp(
         (McpHttpTransport appends /mcp to the base URL).
       - X-SPIFFE-ID strip-before-set from the VERIFIED peer cert URI SAN
         (zero-trust header discipline, EX-231-08).
-      - forward_auth backoffice /auth/verify-mcp: app-layer ingress gate
-        (endpoint lands with Tom's Phase 1b/2 work; the gate fails closed —
-        Caddy 502s the route until the endpoint exists).
+      - forward_auth backoffice /auth/verify-mcp: app-layer ingress gate.
+        Carries its own ``header_up X-SPIFFE-ID`` (FINDING-V412-ONBOARDING-
+        ROBUSTNESS #1, 2026-07-21): forward_auth's auth-subrequest is
+        independent of the surrounding handler chain and does NOT inherit
+        the ``request_header X-SPIFFE-ID`` set above — only header_up
+        entries declared inside the forward_auth block itself reach the
+        auth backend (proven against a live caddy 2.11.4 binary). Without
+        it every caller (agent leaf AND gateway mesh identity) got
+        401 no_spiffe_id even though the TLS handshake + forward_auth hop
+        were both live.
       - reverse_proxy http://<server_id>:<shim_port> over the MCP's ringfence
         bridge.  Plain HTTP on the isolated bridge is intentional (T2): the
         per-instance identity travels via the leaf Caddy presents/verifies +
@@ -3298,6 +3305,19 @@ def _gen_caddy_snippet_mcp(
                     # C10-validated standalone, where named snippets from the
                     # monolith are not defined).
                     header_up X-Caddy-Verified-Secret {{$CADDY_INTERNAL_HMAC}}
+                    # FINDING-V412-ONBOARDING-ROBUSTNESS #1 fix: forward_auth
+                    # builds an INDEPENDENT subrequest to the auth backend — it
+                    # does NOT inherit headers set by the request_header
+                    # directive above (empirically proven: a real caddy 2.11.4
+                    # instance with only `request_header X-SPIFFE-ID ...` and no
+                    # header_up here forwards Host/UA/X-Forwarded-* to the auth
+                    # backend but NEVER X-Spiffe-Id). Only a header_up entry
+                    # declared inside THIS block reaches /auth/verify-mcp. Uses
+                    # the cert SAN placeholder directly (not the request_header-
+                    # set value) — immune to header spoofing since
+                    # require_and_verify already ran. Mirrors the (correct,
+                    # already-proven) _gen_agent_ingress_caddyfile pattern.
+                    header_up X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
                     transport http {{
                         tls
                         tls_trust_pool file /run/secrets/ca_intermediate.crt
