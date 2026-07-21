@@ -905,6 +905,13 @@ services:
       YASHIGANI_ADMIN_MIN_ACTIVE: "2"
       YASHIGANI_ADMIN_SOFT_TARGET: "3"
       YASHIGANI_SECRETS_DIR: /run/secrets
+      # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21) — see the
+      # /run/secrets-rw/agents + /run/secrets-rw/svid-init volume mounts
+      # below for the full rationale. Explicit here (Python default already
+      # matches) so the mapping is visible without cross-referencing
+      # pki/issuer.py / mcp_onboard.py.
+      YASHIGANI_AGENTS_DIR: /run/secrets-rw/agents
+      YASHIGANI_SVID_INIT_DIR: /run/secrets-rw/svid-init
       YASHIGANI_INSPECTION_DEFAULT_BACKEND: ${YASHIGANI_INSPECTION_DEFAULT_BACKEND:-ollama}
       # v2.2: gemini removed from default fallback to prevent unredacted content reaching
       # cloud providers before PII filtering. Admins who explicitly want cloud fallback
@@ -1156,6 +1163,36 @@ services:
       - ./secrets/grafana_admin_password:/run/secrets-rw/grafana_admin_password:rw
       - ./secrets/redis_password:/run/secrets-rw/redis_password:rw
       - ./secrets/license_key:/run/secrets-rw/license_key:rw
+      # FINDING-V412-SVID-WRITE-PATH FIXED (Captain, 2026-07-21): the 012 fix
+      # above correctly made /run/secrets pure :ro, but that also silently
+      # broke the ONE legitimate write backoffice makes into that tree:
+      # pki.issuer.mint_agent_leaf() (agent onboarding — POST
+      # /admin/mcp/servers/import, POST /admin/nhi/{id}/approve, POST
+      # /admin/agents/{id}/cert/rotate) writing the dynamically-issued
+      # agent_<tenant>_<agent>[_<instance>]_client.{crt,key} + the runtime
+      # identity manifest (var/runtime/service_identities.yaml). Onboarding
+      # 502'd with [Errno 30] Read-only file system.
+      #
+      # Fix: two BRAND-NEW host directories (never contain CA material —
+      # ca_root.*/ca_intermediate.*/ca_root.attested_sha256 stay reachable
+      # ONLY via the :ro mount above), shadow-mounted at the SAME
+      # /run/secrets-rw top-level prefix already used for the 4 single-file
+      # mounts (no new nested-mount collision class — see 012 comment above;
+      # these are new dedicated subpaths, not children of /run/secrets):
+      #   agents/    — pki.issuer.IssuerPaths.agents_dir (agent leaf
+      #                cert/key + runtime manifest). Read by backoffice ONLY.
+      #   svid-init/ — mcp_onboard.py step-2b staging dir the svid-sidecar
+      #                reads via ITS OWN separate RO bind of the SAME host
+      #                subdirectory (docker/secrets/svid-init/<tenant>/
+      #                <server>/ — unchanged path; see codegen.py
+      #                _gen_svid_sidecar_service init_dir_host literal).
+      # Host dirs are pre-created + chowned 1001:1001 by install.sh
+      # (_prepare_agent_write_dirs, called alongside _prepare_secrets_dir_for_pki)
+      # so UID 1001 (backoffice's runAsUser) can write through these mounts
+      # AND create the per-tenant/per-server subdirectories mint_agent_leaf /
+      # mcp_onboard.py create at runtime (Path.mkdir(parents=True)).
+      - ./secrets/agents:/run/secrets-rw/agents:rw
+      - ./secrets/svid-init:/run/secrets-rw/svid-init:rw
       # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
       # dir (see caddy service). Single-file remount (ro) at the unchanged
       # in-container path for Layer-B verify + the step-up signer
@@ -1256,7 +1293,25 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (backoffice.yaml:104-105).
     # No cap_add: backoffice binds port 8443 (non-privileged).
     cap_drop: [ALL]
-    # NO group_add: no docker socket mounted; no group membership needed.
+    # FINDING-V412-SVID-INIT-KEY-PERM (Captain, 2026-07-21): backoffice mints
+    # the agent leaf key at 0400 (owner-only, UID 1001) but must stage a
+    # svid-sidecar-readable COPY of it under /run/secrets-rw/svid-init/<t>/<s>/
+    # (mcp_onboard.py step 2b) for the per-instance svid-sidecar (UID 1002)
+    # to pick up — see docker/svid-sidecar/rotate.sh Phase 1 `cp ${INIT_DIR}/
+    # client.key`. Group 2003 (_MCP_SVID_GID, manifest/codegen.py) is the
+    # SAME group already shared between the svid-sidecar (primary GID) and
+    # Caddy (supplemental, dynamically added per-agent by codegen when a
+    # Shape-C MCP is onboarded — see _gen_svid_sidecar_service). Adding it
+    # here lets backoffice chgrp the staged key copy to 2003 + chmod 0440
+    # (mirrors rotate.sh's own least-privilege pattern for the SAME key
+    # material one hop later) instead of the blunter world-readable 0444.
+    # Does NOT grant backoffice anything beyond reading already-minted SVID
+    # material it issued in the first place — a compromised backoffice can
+    # already mint any agent identity via the intermediate CA it signs with;
+    # this is a strictly smaller, derivative read capability, not a new
+    # privilege class.
+    group_add:
+      - "2003"
     # NO docker CLI binary in the backoffice image (removed in Design A rebuild —
     # the docker-cli package is no longer needed since backoffice uses HTTP not CLI).
     healthcheck:

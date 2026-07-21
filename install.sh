@@ -14565,6 +14565,27 @@ _prepare_secrets_dir_for_pki() {
     fi
   fi
   # Docker / non-Podman path: chown was already applied in generate_secrets().
+
+  # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): pre-create + chown
+  # the two NEW writable dirs backoffice's agent-onboarding write path needs
+  # (docker-compose.yml /run/secrets-rw/agents + /run/secrets-rw/svid-init;
+  # pki.issuer.IssuerPaths.agents_dir / mcp_onboard.py YASHIGANI_SVID_INIT_DIR).
+  # Both are BRAND-NEW, always-empty-at-install-time host dirs — never
+  # contain CA material (ca_root.*/ca_intermediate.* stay under secrets_dir
+  # proper, mounted :ro-only into backoffice). Once the DIRECTORY itself is
+  # 1001-owned+writable, backoffice (runAsUser 1001) creates every nested
+  # per-tenant/per-server file/subdirectory itself at runtime
+  # (Path.mkdir(parents=True) in _write_secret / mcp_onboard.py step 2b) —
+  # those inherit UID 1001 automatically because the CREATING process IS
+  # UID 1001, so no recursive host-side chown is needed here, only the two
+  # empty parents. Idempotent (mkdir -p / chown re-run safe) — runs on both
+  # fresh install and upgrade (this function is the single funnel point for
+  # both — see call sites in install() step 9b and handle_pki_subcommand).
+  mkdir -p "${secrets_dir}/agents" "${secrets_dir}/svid-init"
+  _do_chown "1001:1001" "${secrets_dir}/agents" "backoffice agent-cert write dir" \
+    || log_warn "Could not chown ${secrets_dir}/agents to 1001:1001 — agent onboarding (mint SVID) will fail with EACCES until fixed manually"
+  _do_chown "1001:1001" "${secrets_dir}/svid-init" "backoffice svid-init staging dir" \
+    || log_warn "Could not chown ${secrets_dir}/svid-init to 1001:1001 — agent onboarding (svid-init population) will fail with EACCES until fixed manually"
 }
 
 # ---------------------------------------------------------------------------

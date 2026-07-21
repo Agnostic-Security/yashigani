@@ -94,6 +94,23 @@ emitted on the tamper-evident chain.
 
 Deployment wiring (Phase-3 stack rebuild — Su/Captain; route-registration
 rework — Captain, FINDING-V412-CADDYADMIN-002):
+  * ``YASHIGANI_AGENTS_DIR`` (default ``/run/secrets-rw/agents``) — FINDING-
+    V412-SVID-WRITE-PATH (Captain, 2026-07-21): writable mount, SEPARATE from
+    ``YASHIGANI_SECRETS_DIR`` (/run/secrets, RO since RESTART-012), for
+    dynamically-minted agent leaf cert/key + the runtime identity manifest
+    (pki.issuer.IssuerPaths.agents_dir). Never contains CA trust material.
+  * ``YASHIGANI_SVID_INIT_DIR`` (default ``/run/secrets-rw/svid-init``) —
+    same finding: writable staging dir step 2b copies the freshly-minted
+    leaf + ca.crt into (basenames the svid-sidecar's rotate.sh contract
+    expects), read back by the per-instance svid-sidecar via its OWN RO
+    bind of the SAME host directory (docker/secrets/svid-init/<t>/<s>/ —
+    unchanged host path, see codegen._gen_svid_sidecar_service). Compose/
+    podman ONLY — skipped on K8s (Secret+fsGroup delivery instead).
+  * ``YASHIGANI_SVID_GID`` (default ``2003``, matches manifest/codegen.py
+    ``_MCP_SVID_GID``) — FINDING-V412-SVID-INIT-KEY-PERM: GID step 2b
+    chgrps the staged key copy to (0440) so the svid-sidecar (UID 1002)
+    can read it. Requires backoffice's ``group_add: ["2003"]`` in
+    docker-compose.yml.
   * ``YASHIGANI_MCP_ARTIFACT_ROOT`` — writable bind of the install's
     ``docker/``-rooted tree into the backoffice container for the NON-Caddy
     Shape-C artifacts only (compose override, helm values/netpol, OPA
@@ -639,9 +656,21 @@ async def run_approve_transaction(
         "YASHIGANI_SERVICE_MANIFEST_PATH",
         "/etc/yashigani/service_identities.yaml",
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): RESTART-012 made
+    # secrets_dir (/run/secrets) pure :ro on backoffice (CA root/intermediate
+    # + attestation pin must never be writable from this process). The ONE
+    # legitimate write backoffice makes through IssuerPaths — the dynamically
+    # minted agent leaf cert/key + the runtime identity manifest — now goes
+    # to a SEPARATE writable mount instead (default /run/secrets-rw/agents,
+    # backed by a NEW host dir with no path-prefix overlap with ca_root.crt /
+    # ca_intermediate.* / ca_root.attested_sha256). secrets_dir itself is
+    # unchanged here — CA reads (intermediate_cert/intermediate_key below)
+    # still resolve under the RO mount, exactly as before.
+    agents_dir = os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")
     pki_paths = IssuerPaths(
         secrets_dir=Path(secrets_dir),
         manifest_path=Path(manifest_path),
+        agents_dir=Path(agents_dir),
     )
     try:
         spiffe_id = mint_agent_leaf(
@@ -699,16 +728,79 @@ async def run_approve_transaction(
     # _gen_svid_sidecar_service stanza; it copies INIT_DIR → SVID_DIR during its
     # init phase.  Caddy mounts the SVID volume read-only, so the cert must be
     # in place before the caddy reload at step 4 loads the new snippet.
-    _svid_init_dir = Path(secrets_dir) / "svid-init" / tenant_id / server_id
+    #
+    # FINDING-V412-SVID-WRITE-PATH: this directory used to live under
+    # secrets_dir (/run/secrets — now :ro since RESTART-012) and broke the
+    # same way mint_agent_leaf did. It now lives under a dedicated writable
+    # mount (default /run/secrets-rw/svid-init). The HOST-side bind SOURCE
+    # is UNCHANGED — still docker/secrets/svid-init/<tenant>/<server> — so
+    # codegen._gen_svid_sidecar_service's `init_dir_host` literal
+    # ("secrets/svid-init/%s/%s") needs no change; only the container-side
+    # path backoffice writes through changes.
+    #
+    # K8s GATE (Captain, 2026-07-21): this whole step is the filesystem
+    # hand-off to the compose/podman svid-sidecar CONTAINER, which does not
+    # exist on K8s at all — K8s SVID delivery is a Kubernetes Secret +
+    # fsGroup (see helm/yashigani/templates/caddy.yaml SEAM-1d-04 comment).
+    # Before FINDING-V412-SVID-INIT-KEY-PERM this step silently no-op'd on
+    # K8s (wrote a file nobody read, no error). The chgrp-to-2003 fix below
+    # would turn that into a HARD FAILURE on K8s (backoffice's pod has no
+    # supplementalGroup 2003 there — same comment). Skip entirely off
+    # docker/podman so this step stays a true no-op on K8s, matching prior
+    # (harmless) behaviour rather than regressing K8s onboarding.
+    svid_init_root = os.getenv("YASHIGANI_SVID_INIT_DIR", "/run/secrets-rw/svid-init")
+    _svid_init_dir = Path(svid_init_root) / tenant_id / server_id
+    _svid_init_applies = runtime in ("docker", "podman-rootful", "podman-rootless")
     try:
-        _svid_init_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cert_path, _svid_init_dir / "client.crt")
-        shutil.copy2(key_path, _svid_init_dir / "client.key")
-        shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")
-        logger.info(
-            "mcp-onboard: svid-init populated for %s/%s at %s",
-            tenant_id, server_id, _svid_init_dir,
-        )
+        if _svid_init_applies:
+            _svid_init_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cert_path, _svid_init_dir / "client.crt")
+            shutil.copy2(key_path, _svid_init_dir / "client.key")
+            shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")
+            # FINDING-V412-SVID-INIT-KEY-PERM (Captain, 2026-07-21):
+            # shutil.copy2 preserves the SOURCE mode — key_path was written
+            # by mint_agent_leaf at _FILE_MODE_KEY (0o400, owner=backoffice
+            # UID 1001 only). The svid-sidecar reads INIT_DIR as UID 1002
+            # (docker/svid-sidecar/rotate.sh `cp "${INIT_DIR}/client.key"
+            # ...`) — 0400 owner-only denies it (EACCES), so onboarding
+            # would mint successfully but the sidecar's init phase would die
+            # and Caddy would never get a leaf to present. Fix: mirror
+            # rotate.sh's OWN least-privilege pattern for this exact key
+            # (0440 + group _MCP_SVID_GID=2003, the group already shared
+            # between the svid-sidecar and Caddy — see manifest/codegen.py
+            # _MCP_SVID_GID) instead of the blunter world-readable 0444.
+            # Requires backoffice to carry supplementary group 2003
+            # (docker-compose.yml backoffice group_add: ["2003"]).
+            _svid_key_dest = _svid_init_dir / "client.key"
+            os.chmod(_svid_key_dest, 0o440)
+            try:
+                _svid_gid = int(os.getenv("YASHIGANI_SVID_GID", "2003"))
+                os.chown(_svid_key_dest, -1, _svid_gid)
+            except (PermissionError, OSError, KeyError) as _chown_exc:
+                # Fail-closed rather than silently leaving a key the sidecar
+                # cannot read: without supplementary group 2003, backoffice
+                # cannot chgrp to a group it does not belong to (Linux DAC —
+                # not CAP_CHOWN-eligible for a foreign group). Surfaced
+                # loudly; the onboarding transaction still aborts+rolls
+                # back below.
+                raise RuntimeError(
+                    "svid-init key chown to GID %s failed (%s) — backoffice "
+                    "is missing supplementary group %s (docker-compose.yml "
+                    "backoffice group_add). The svid-sidecar (UID 1002) "
+                    "would not be able to read this key."
+                    % (_svid_gid, _chown_exc, _svid_gid)
+                ) from _chown_exc
+            logger.info(
+                "mcp-onboard: svid-init populated for %s/%s at %s (key 0440:%s)",
+                tenant_id, server_id, _svid_init_dir,
+                os.getenv("YASHIGANI_SVID_GID", "2003"),
+            )
+        else:
+            logger.info(
+                "mcp-onboard: svid-init staging skipped for %s/%s — runtime "
+                "%r has no svid-sidecar container (K8s SVID delivery is "
+                "Secret+fsGroup based).", tenant_id, server_id, runtime,
+            )
     except Exception as exc:
         _run_rollback()
         _audit_failure("svid_init", exc, instance_id, spiffe_id)

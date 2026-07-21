@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -610,6 +611,11 @@ def txn_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "YASHIGANI_SERVICE_MANIFEST_PATH", str(tmp_path / "service_identities.yaml"),
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21) — see
+    # test_v41_mcp_onboard_transaction.py txn_env for full rationale.
+    monkeypatch.setenv("YASHIGANI_AGENTS_DIR", str(secrets_dir))
+    monkeypatch.setenv("YASHIGANI_SVID_INIT_DIR", str(secrets_dir / "svid-init"))
+    monkeypatch.setenv("YASHIGANI_SVID_GID", str(os.getgid()))
     monkeypatch.setenv("YASHIGANI_CONTAINER_RUNTIME", "docker")
     monkeypatch.delenv("YSG_REQUIRE_SIGNED_MANIFEST", raising=False)
     monkeypatch.delenv("YSG_REQUIRE_CADDY_VALIDATE", raising=False)

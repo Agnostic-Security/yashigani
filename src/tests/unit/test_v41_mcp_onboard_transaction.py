@@ -21,6 +21,7 @@ Contract under test:
 """
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -118,6 +119,26 @@ def txn_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "YASHIGANI_SERVICE_MANIFEST_PATH", str(tmp_path / "service_identities.yaml"),
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): run_approve_transaction
+    # now builds pki_paths with agents_dir=$YASHIGANI_AGENTS_DIR (default
+    # /run/secrets-rw/agents — a real container path absent under pytest) and
+    # reads $YASHIGANI_SVID_INIT_DIR for the step-2b staging dir (default
+    # /run/secrets-rw/svid-init). Point both at tmp_path so the mint/svid-init
+    # side effects land where this fixture (and the assertions below, which
+    # still expect secrets_dir/"svid-init"/<tenant>/<server>) can see them.
+    # Reuse secrets_dir (already created above) rather than a fresh subdir —
+    # this suite tests transaction ORCHESTRATION, not agents_dir/secrets_dir
+    # path separation (covered by pki/issuer.py unit tests); the mint mock
+    # below (_mint_side_effect) writes via paths.agent_cert()/agent_key()
+    # directly with no mkdir(parents=True), so the target must pre-exist.
+    monkeypatch.setenv("YASHIGANI_AGENTS_DIR", str(secrets_dir))
+    monkeypatch.setenv("YASHIGANI_SVID_INIT_DIR", str(secrets_dir / "svid-init"))
+    # FINDING-V412-SVID-INIT-KEY-PERM: step 2b chgrps the staged key to
+    # $YASHIGANI_SVID_GID (default 2003, the svid-sidecar/Caddy group) — the
+    # test process isn't a member of that real GID. Point it at the test
+    # process's OWN gid (any process may chgrp a file it owns to its own
+    # current gid without needing supplementary group membership).
+    monkeypatch.setenv("YASHIGANI_SVID_GID", str(os.getgid()))
     monkeypatch.setenv("YASHIGANI_CONTAINER_RUNTIME", "docker")
     monkeypatch.delenv("YSG_REQUIRE_SIGNED_MANIFEST", raising=False)
     monkeypatch.delenv("YSG_REQUIRE_CADDY_VALIDATE", raising=False)
