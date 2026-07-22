@@ -1875,13 +1875,100 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
 
-    # ── 2a. Request-leg prompt-injection inspection — LLM defence-in-depth ──
-    # Only content the mechanical layer judged CLEAN reaches the LLM classifier
-    # (novel/subtle patterns). The classifier is itself hardened (input is
-    # JSON-wrapped + treated as fully hostile, structured-output enforced, any
-    # deviation → CLASSIFIER_ERROR fail-closed). Any non-PASS verdict blocks +
-    # audits. The pipeline never raises; a bare-except here still fails closed.
-    if _state.request_inspection_pipeline is not None and prompt_text:
+    # ── 2a-seq. Multi-turn conversational-injection accumulator (5.0) ──
+    # Runs BEFORE the suspicion gate so the gate can use the accumulated score.
+    # Per-message layers are blind to a SLOW-BURN attack that builds over turns
+    # and hides behind benign tangents. This sequence layer accumulates per-turn
+    # risk (decaying, so tangents don't reset it); a sustained trajectory crosses
+    # a threshold and escalates even when no single turn tripped a per-message
+    # layer. Model-free — no exploitable LLM surface of its own.
+    _seq = getattr(_state, "conversation_risk_tracker", None)
+    if _seq is not None and prompt_text:
+        try:
+            from yashigani.inspection.conversation_risk import (
+                extract_turn_signals, ACTION_BLOCK as _SEQ_BLOCK,
+                ACTION_STEP_UP as _SEQ_STEPUP,
+            )
+            _seq_session = identity.get("identity_id", identity_id) if identity else identity_id
+            _seq_verdict = _seq.observe(_seq_session, extract_turn_signals(prompt_text))
+            if _seq_verdict.escalated and _state.audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import ConversationInjectionEscalatedEvent
+                    _state.audit_writer.write(ConversationInjectionEscalatedEvent(
+                        request_id=request_id, identity_id=identity_id,
+                        session_id=_seq_session,
+                        accumulated_score=_seq_verdict.accumulated_score,
+                        turn_count=_seq_verdict.turn_count,
+                        action_taken=_seq_verdict.action,
+                        signal_breakdown=_seq_verdict.signal_breakdown,
+                    ))
+                except Exception:
+                    logger.warning("conversation-risk audit write failed")
+            if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
+                logger.warning(
+                    "CONVERSATION INJECTION %s /v1: identity=%s score=%.3f turns=%d request_id=%s",
+                    _seq_verdict.action.upper(), identity_id,
+                    _seq_verdict.accumulated_score, _seq_verdict.turn_count, request_id,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {
+                        "message": _owui_deny_message("conversation_injection_blocked"),
+                        "type": "conversation_injection_blocked",
+                        "code": _seq_verdict.action,
+                    }},
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Request-Verdict": "blocked",
+                        "X-Yashigani-Conversation-Risk": f"{_seq_verdict.accumulated_score:.3f}",
+                    },
+                )
+        except Exception as _seq_exc:
+            logger.warning("conversation-risk tracker raised: %s", _seq_exc)
+
+    # ── 2a-gate. Suspicion gate — decide WHO gets the LLM (5.0) ──────
+    # We do NOT send every message to the LLM inspector (cost + latency + it
+    # needlessly exposes the LLM to attacker content). The LLM runs ONLY on
+    # SUSPICIOUS prompts. The gate distinguishes suspicious from normal cheaply
+    # and deterministically (markers / forged structure / obfuscation / the
+    # multi-turn accumulator) — normal conversation has none of these signals
+    # and never reaches the LLM.
+    _llm_suspicion = 0.0
+    _run_llm = False
+    if prompt_text and _state.request_inspection_pipeline is not None:
+        try:
+            from yashigani.inspection.suspicion_gate import SuspicionGate as _SG
+            _gate = getattr(_state, "_suspicion_gate_singleton", None)
+            if _gate is None:
+                _gate = _SG()
+                _state._suspicion_gate_singleton = _gate
+            _norm = _mech.safe_text if (_mech is not None and not _mech.rejected) else None
+            _susp = _gate.assess(
+                prompt_text,
+                normalized_text=_norm,
+                conversation_score=(_seq.score_for(
+                    identity.get("identity_id", identity_id) if identity else identity_id
+                ) if _seq is not None else 0.0),
+            )
+            _run_llm = _susp.escalate_to_llm
+            _llm_suspicion = _susp.score
+            if _run_llm:
+                logger.info(
+                    "SUSPICION GATE → LLM review: identity=%s score=%.2f reasons=%s request_id=%s",
+                    _req_identity, _susp.score, _susp.reasons, request_id,
+                )
+        except Exception as _sg_exc:
+            # If the gate errors, escalate to the LLM (conservative — the LLM is
+            # hardened + encapsulates the payload; better a review than a skip).
+            logger.warning("suspicion gate raised (%s) — escalating to LLM", _sg_exc)
+            _run_llm = True
+
+    # ── 2a. Request-leg prompt-injection inspection — LLM (suspicious only) ──
+    # Reached ONLY when the suspicion gate escalated. The classifier is itself
+    # hardened: input is JSON-encoded + delimiter-wrapped (encapsulated as data,
+    # not instructions), structured-output enforced, any deviation →
+    # CLASSIFIER_ERROR fail-closed. Any non-PASS verdict blocks + audits.
+    if _run_llm:
         try:
             _insp = _state.request_inspection_pipeline.process(
                 raw_query=prompt_text,
@@ -1936,59 +2023,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "X-Yashigani-Detection-Layer": "llm",
                 },
             )
-
-    # ── 2a-seq. Multi-turn conversational-injection accumulator (5.0) ──
-    # Per-message layers (mechanical + LLM) above are blind to a SLOW-BURN
-    # attack that builds over turns and hides behind benign tangents. This
-    # sequence layer accumulates per-turn risk (decaying, so tangents don't
-    # reset it); a sustained trajectory crosses a threshold and escalates even
-    # when no single turn tripped the per-message layers. Model-free (consumes
-    # cheap signals), so it adds no exploitable LLM surface of its own.
-    _seq = getattr(_state, "conversation_risk_tracker", None)
-    if _seq is not None and prompt_text:
-        try:
-            from yashigani.inspection.conversation_risk import (
-                extract_turn_signals, ACTION_BLOCK as _SEQ_BLOCK,
-                ACTION_STEP_UP as _SEQ_STEPUP,
-            )
-            _seq_session = identity.get("identity_id", identity_id) if identity else identity_id
-            _seq_verdict = _seq.observe(_seq_session, extract_turn_signals(prompt_text))
-            if _seq_verdict.escalated and _state.audit_writer is not None:
-                try:
-                    from yashigani.audit.schema import ConversationInjectionEscalatedEvent
-                    _state.audit_writer.write(ConversationInjectionEscalatedEvent(
-                        request_id=request_id, identity_id=identity_id,
-                        session_id=_seq_session,
-                        accumulated_score=_seq_verdict.accumulated_score,
-                        turn_count=_seq_verdict.turn_count,
-                        action_taken=_seq_verdict.action,
-                        signal_breakdown=_seq_verdict.signal_breakdown,
-                    ))
-                except Exception:
-                    logger.warning("conversation-risk audit write failed")
-            if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
-                logger.warning(
-                    "CONVERSATION INJECTION %s /v1: identity=%s score=%.3f turns=%d request_id=%s",
-                    _seq_verdict.action.upper(), identity_id,
-                    _seq_verdict.accumulated_score, _seq_verdict.turn_count, request_id,
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": {
-                        "message": _owui_deny_message("conversation_injection_blocked"),
-                        "type": "conversation_injection_blocked",
-                        "code": _seq_verdict.action,
-                    }},
-                    headers={
-                        "X-Yashigani-Request-Id": request_id,
-                        "X-Yashigani-Request-Verdict": "blocked",
-                        "X-Yashigani-Conversation-Risk": f"{_seq_verdict.accumulated_score:.3f}",
-                    },
-                )
-        except Exception as _seq_exc:
-            # The sequence layer is advisory hardening; a failure must not break
-            # the request (the per-message layers already ran fail-closed).
-            logger.warning("conversation-risk tracker raised: %s", _seq_exc)
 
     # ── 2a-mod. Content moderation on the request (5.0 A12) ──────────
     _mod_block = _moderate_content(prompt_text, "request", identity_id, request_id)
