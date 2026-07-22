@@ -1,0 +1,28 @@
+{
+  "_comment": "5.0 A12 demo content-moderation policy. Compliance-team scenario (owned by mia). DEMO tuning only — categories/patterns are illustrative, NOT a production safety line. Point YASHIGANI_CONTENT_MODERATION_POLICY_FILE at this file to activate. Empty/unset = no-op.",
+  "categories": [
+    {
+      "name": "weapons_dangerous",
+      "action": "block",
+      "patterns": [
+        "\\bweaponized\\b",
+        "\\bbuild\\b.{0,30}\\b(bomb|explosive|bioweapon)\\b",
+        "\\bsynthesi[sz]e\\b.{0,30}\\b(nerve agent|sarin|ricin)\\b"
+      ]
+    },
+    {
+      "name": "self_harm",
+      "action": "block",
+      "patterns": [
+        "\\bhow\\b.{0,20}\\b(kill|harm)\\b.{0,10}\\bmyself\\b"
+      ]
+    },
+    {
+      "name": "harassment",
+      "action": "flag",
+      "patterns": [
+        "\\byou('| a)re (an? )?(idiot|moron|worthless)\\b"
+      ]
+    }
+  ]
+}

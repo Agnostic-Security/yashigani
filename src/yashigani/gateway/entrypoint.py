@@ -178,6 +178,22 @@ def _build_app(mesh_mode: bool = False):
             _mi_exc,
         )
 
+    # A12 (5.0): content-moderation guard. Policy loaded from the JSON file named
+    # by YASHIGANI_CONTENT_MODERATION_POLICY_FILE. Unset → empty policy → no-op
+    # (never false-positives out of the box; the operator opts in).
+    from yashigani.inspection.content_moderation import ContentModerationGuard
+    content_moderation_guard = ContentModerationGuard()
+    _cm_file = os.getenv("YASHIGANI_CONTENT_MODERATION_POLICY_FILE", "").strip()
+    if _cm_file:
+        try:
+            _n = content_moderation_guard.load_policy_file(_cm_file)
+            logger.info("A12 content-moderation policy: %d categor(y/ies) from %s", _n, _cm_file)
+        except Exception as _cm_exc:
+            logger.warning(
+                "A12 content-moderation: could not load %s (%s) — guard inactive",
+                _cm_file, _cm_exc,
+            )
+
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None
     try:
@@ -950,6 +966,7 @@ def _build_app(mesh_mode: bool = False):
         request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
         system_prompt_leak_guard=system_prompt_leak_guard,  # 5.0 A4
         model_integrity_verifier=model_integrity_verifier,  # 5.0 A5
+        content_moderation_guard=content_moderation_guard,  # 5.0 A12
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,

@@ -23,6 +23,7 @@ LLM backend is the live-stack piece.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import unicodedata
@@ -91,6 +92,24 @@ class ContentModerationGuard:
     def set_policy(self, rules: list[CategoryRule]) -> None:
         self._rules = {r.name: r.compile() for r in rules}
         logger.info("A12 content-moderation policy set: %d categor(y/ies)", len(self._rules))
+
+    def load_policy_file(self, path: str) -> int:
+        """Load a JSON policy file: {"categories": [{"name","action","patterns"}]}.
+        Returns the number of categories loaded. Raises on unreadable/invalid
+        file so a misconfigured policy fails loudly at startup, not silently open."""
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        cats = doc.get("categories", [])
+        rules = []
+        for c in cats:
+            action = c["action"]
+            if action not in (ACTION_BLOCK, ACTION_FLAG):
+                raise ValueError(f"category {c.get('name')!r}: action must be block|flag")
+            rules.append(CategoryRule(
+                name=c["name"], action=action, patterns=list(c.get("patterns", [])),
+            ))
+        self.set_policy(rules)
+        return len(rules)
 
     def attach_backend(self, backend: ModerationBackend,
                        category_actions: Optional[dict[str, str]] = None) -> None:

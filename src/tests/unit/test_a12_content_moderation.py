@@ -198,3 +198,25 @@ class TestRouterModeration:
         content = payload["choices"][0]["message"]["content"]
         assert "weaponized recipe" not in content
         assert "withheld by the content-safety policy" in content
+
+
+class TestPolicyFileLoader:
+    def test_loads_demo_policy_file(self, tmp_path):
+        import json
+        p = tmp_path / "policy.json"
+        p.write_text(json.dumps({"categories": [
+            {"name": "danger", "action": "block", "patterns": ["\\bboom\\b"]},
+            {"name": "mild", "action": "flag", "patterns": ["\\bmeh\\b"]},
+        ]}))
+        g = ContentModerationGuard()
+        n = g.load_policy_file(str(p))
+        assert n == 2 and g.active is True
+        assert g.moderate("boom").blocked is True
+        assert g.moderate("meh").flagged is True
+
+    def test_invalid_action_rejected(self, tmp_path):
+        import json
+        p = tmp_path / "bad.json"
+        p.write_text(json.dumps({"categories": [{"name": "x", "action": "nuke", "patterns": []}]}))
+        with pytest.raises(ValueError):
+            ContentModerationGuard().load_policy_file(str(p))
