@@ -140,6 +140,11 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
 _OWUI_DENY_MESSAGES: dict[str, str] = {
+    # 5.0 A6-audio — audio present but cannot be transcribed/inspected
+    "audio_not_inspectable":
+        "This request included audio that could not be transcribed and security-"
+        "checked, so it was not processed. Audio is only accepted when voice "
+        "inspection is available. Contact an administrator.",
     # 5.0 A5 — model-integrity pin block
     "model_integrity_mismatch":
         "This request was blocked because the local model failed an integrity "
@@ -823,9 +828,22 @@ class ChatMessage(BaseModel):
     # role:"tool" → which assistant tool_call this message answers
     tool_call_id: Optional[str] = None
 
+    # 5.0 A6-audio: input_audio blocks are preserved here (not silently dropped)
+    # so the handler can transcribe them and run the text controls on the
+    # transcript. Populated in model_post_init; empty for text-only messages.
+    audio_content: Optional[list] = None
+
     def model_post_init(self, __context) -> None:
-        """Flatten list-format content blocks to a plain string."""
+        """Flatten list-format content blocks to a plain string, preserving any
+        input_audio blocks for A6-audio transcription."""
         if isinstance(self.content, list):
+            # Stash audio blocks BEFORE flattening — flattening keeps only text.
+            audio = [
+                b for b in self.content
+                if isinstance(b, dict) and b.get("type") == "input_audio"
+            ]
+            if audio:
+                self.audio_content = list(self.content)  # original, incl. audio
             parts = []
             for block in self.content:
                 if isinstance(block, dict):
@@ -954,6 +972,9 @@ class OpenAIRouterState:
         self.model_integrity_verifier = None
         self.model_observed_digests: dict = {}
         self.model_observed_weights: dict = {}
+        # 5.0 A6-audio: transcriber. When None or unconfigured, a request
+        # carrying audio is BLOCKED (never passed uninspected).
+        self.audio_transcriber = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1154,6 +1175,7 @@ def configure(
     request_inspection_pipeline=None,  # 5.0 A1 — request-leg injection scan
     system_prompt_leak_guard=None,     # 5.0 A4 — response-leg leak scrub
     model_integrity_verifier=None,     # 5.0 A5 — ollama model-pin verifier
+    audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1192,6 +1214,7 @@ def configure(
     _state.request_inspection_pipeline = request_inspection_pipeline
     _state.system_prompt_leak_guard = system_prompt_leak_guard
     _state.model_integrity_verifier = model_integrity_verifier
+    _state.audio_transcriber = audio_transcriber
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -1644,6 +1667,65 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 2. Extract prompt text for classification ─────────────────────
     prompt_text = "\n".join(m.content for m in body.messages if m.content)
+
+    # ── 2-audio. Transcribe audio → fold into prompt_text (5.0 A6-audio) ──
+    # Voice input is transcribed so the SAME text controls (injection, PII,
+    # sensitivity) below run on the transcript. Fail-closed: if a message
+    # carries audio but no transcriber is configured, or transcription errors,
+    # the request is BLOCKED — audio is never forwarded uninspected.
+    _audio_msgs = [m for m in body.messages if getattr(m, "audio_content", None)]
+    if _audio_msgs:
+        from yashigani.inspection.audio_transcription import (
+            extract_audio_blocks, TranscriptionUnavailableError,
+        )
+        transcriber = getattr(_state, "audio_transcriber", None)
+        if transcriber is None or not getattr(transcriber, "configured", False):
+            logger.warning(
+                "A6-audio: request carries audio but no transcriber configured — "
+                "fail-closed block request_id=%s", request_id,
+            )
+            return JSONResponse(
+                status_code=415,
+                content={"error": {
+                    "message": _owui_deny_message("audio_not_inspectable"),
+                    "type": "audio_uninspectable",
+                    "code": "transcription_unavailable",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+        try:
+            _transcripts = []
+            for _m in _audio_msgs:
+                _blocks = extract_audio_blocks(_m.audio_content).blocks
+                if _blocks:
+                    _t = transcriber.transcribe_blocks(_blocks)
+                    if _t:
+                        _transcripts.append(_t)
+                        # Fold the transcript into the message so it also reaches
+                        # the backend as ordinary text (not opaque audio).
+                        _m.content = "\n".join(p for p in (_m.content, _t) if p)
+            if _transcripts:
+                prompt_text = "\n".join(
+                    p for p in ([prompt_text] + _transcripts) if p
+                )
+                logger.info(
+                    "A6-audio: folded %d transcript(s) into prompt for inspection "
+                    "request_id=%s", len(_transcripts), request_id,
+                )
+        except TranscriptionUnavailableError as _tx_exc:
+            logger.warning(
+                "A6-audio: transcription failed (%s) — fail-closed block request_id=%s",
+                _tx_exc, request_id,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={"error": {
+                    "message": _owui_deny_message("audio_not_inspectable"),
+                    "type": "audio_uninspectable",
+                    "code": "transcription_failed",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
 
     # ── 2a. Request-leg prompt-injection inspection (5.0 A1) ──────────
     # The primary /v1 chat surface now runs the SAME injection pipeline the
