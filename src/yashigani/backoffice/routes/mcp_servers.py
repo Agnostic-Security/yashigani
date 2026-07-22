@@ -145,6 +145,15 @@ def _tool_summary(rec) -> dict:
 
 
 # ---------------------------------------------------------------------------
+def _mcp_import_strict_enabled() -> bool:
+    """5.0 tool-poisoning block-half: opt-in strict import gate. Default OFF so
+    the ratified flag-not-block behaviour (DP-Y-003 §3.4) is preserved."""
+    import os
+    return os.getenv("YASHIGANI_MCP_IMPORT_STRICT", "false").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
 # Day-one-poison screen (YSG-RISK-076 / DP-Y-003 §3.4)
 # ---------------------------------------------------------------------------
 
@@ -509,6 +518,57 @@ async def import_mcp_server(
     #    configured, classifier_status="not_configured" is recorded — the import
     #    is NOT silently passed as clean.
     scan_verdict = _screen_tools(body.server_id, raw_tools)
+
+    # 2b. Tool-poisoning block-half (5.0, register §4 #1 / §0 item 9).
+    #
+    # The default (DP-Y-003 §3.4, ratified) is flag-not-block: the operator
+    # holds authority and imports with a sanitised surface. STRICT mode is an
+    # OPT-IN that turns the day-one-poison screen into a hard gate: when the
+    # screen flags suspicious content (rejected/sidecar-escalated/schema
+    # rejections) the import is REJECTED fail-closed rather than passed with a
+    # flag. Enabled per-deployment via YASHIGANI_MCP_IMPORT_STRICT=true; the
+    # default is unchanged so the settled flag-not-block behaviour is preserved.
+    #
+    # Also fail-closed in strict mode when the classifier could not run
+    # (unavailable_error) — a poison scan that did not complete must not wave
+    # the surface through under a strict posture.
+    if _mcp_import_strict_enabled():
+        _strict_reason = None
+        if scan_verdict.get("suspicious_content_flagged"):
+            _strict_reason = "suspicious_content"
+        elif scan_verdict.get("classifier_status") == "unavailable_error":
+            _strict_reason = "poison_scan_unavailable"
+        if _strict_reason is not None:
+            logger.warning(
+                "mcp-import STRICT: rejecting server=%r reason=%s verdict=%s",
+                body.server_id, _strict_reason, scan_verdict,
+            )
+            _audit_writer = getattr(backoffice_state, "audit_writer", None)
+            if _audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import McpImportBlockedEvent
+                    _audit_writer.write(McpImportBlockedEvent(
+                        server_id=body.server_id,
+                        reason=_strict_reason,
+                        rejected_tools=scan_verdict.get("rejected_tools", []),
+                        sidecar_escalations=scan_verdict.get("sidecar_escalations", []),
+                    ))
+                except Exception:  # pragma: no cover — audit must not break the block
+                    logger.exception("mcp-import STRICT: block audit emit failed")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "tool_poisoning_blocked",
+                    "message": (
+                        "This MCP server was rejected because its advertised tool "
+                        "surface failed the day-one tool-poisoning screen and this "
+                        "deployment runs in strict import mode. Review the flagged "
+                        "tools and re-import only after they are cleared."
+                    ),
+                    "reason": _strict_reason,
+                    "sidecar_scan_verdict": scan_verdict,
+                },
+            )
 
     # 3. Project the raw surface into a typed capability envelope.
     tenant = _install_tenant()

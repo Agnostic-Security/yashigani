@@ -143,6 +143,8 @@ class EventType(str, Enum):
     MANIFEST_DELTA_APPROVED = "MANIFEST_DELTA_APPROVED"
     MANIFEST_DELTA_REJECTED = "MANIFEST_DELTA_REJECTED"
     MANIFEST_ACTIVE_BLOCKED = "MANIFEST_ACTIVE_BLOCKED"
+    # 5.0 tool-poisoning block-half — strict-mode import rejection
+    MCP_IMPORT_BLOCKED = "MCP_IMPORT_BLOCKED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1590,6 +1592,24 @@ class ManifestReapprovalEvent(AuditEvent):
     registered_by: str = ""
     approver: str = ""
     action_taken: str = ""  # pending | approved | rejected | blocked
+
+
+@dataclass
+class McpImportBlockedEvent(AuditEvent):
+    """
+    5.0 tool-poisoning block-half: an MCP-server import was REJECTED in strict
+    mode because its advertised tool surface failed the day-one-poison screen
+    (or the screen could not run). Records which tools tripped the gate.
+    """
+
+    event_type: str = EventType.MCP_IMPORT_BLOCKED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    server_id: str = ""
+    reason: str = ""  # suspicious_content | poison_scan_unavailable
+    rejected_tools: list = field(default_factory=list)
+    sidecar_escalations: list = field(default_factory=list)
+    action_taken: str = "blocked"
 
 
 # ---------------------------------------------------------------------------
