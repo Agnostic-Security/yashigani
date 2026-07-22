@@ -204,6 +204,7 @@ def build_registry_from_env(
     org_id: str = "default",                    # 3.1 Phase 4 — org ceiling
     mcp_id_store: Optional[object] = None,      # McpIdStore — 4.0 Item B
     durable_store: Optional[object] = None,     # DurableMcpRegistryStore — 4.1 Ph2a
+    manifest_reapproval_gate: Optional[object] = None,  # 5.0 rug-pull invocation gate
 ) -> tuple[McpBrokerRegistry, object]:  # (registry, jwks_store | None)
     """
     Parse YASHIGANI_MCP_SERVERS and build a McpBrokerRegistry.
@@ -400,6 +401,7 @@ def build_registry_from_env(
             # escalate-only sidecar (over the mesh-mTLS gateway→ollama edge) +
             # the capability-envelope durable store.  None ⇒ triage no-ops.
             semantic_intent_sidecar=semantic_intent_sidecar,
+            manifest_reapproval_gate=manifest_reapproval_gate,  # 5.0 rug-pull gate
             envelope_service=envelope_service,
             # 3.1 Phase 4 — connection allow-list enforcement.
             # When permission_store is None (dev/test), the check is a no-op.

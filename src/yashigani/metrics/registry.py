@@ -121,6 +121,31 @@ inspection_classifications_total = _C(
     ["label", "severity"],
 )
 
+# 5.0 interaction-hardening — every new control's block/flag lands here so the
+# dashboards can chart what Yashigani stopped, by control, layer and leg.
+#   control: injection|model_integrity|content_moderation|conversation|
+#            compute_shed|manifest_pending|audio_uninspectable|rule_promoted
+#   layer:   mechanical|mechanical_promoted|llm|policy|gate|store
+#   leg:     request|response|embeddings|mcp
+interaction_blocks_total = _C(
+    "yashigani_interaction_blocks_total",
+    "5.0 interaction-hardening blocks/flags by control, detection layer and leg.",
+    ["control", "layer", "leg"],
+)
+# LLM-escalation efficiency: how often the suspicion gate sent a message to the
+# LLM vs let it pass. Ratio shows how much LLM exposure the gate saves.
+suspicion_gate_decisions_total = _C(
+    "yashigani_suspicion_gate_decisions_total",
+    "Suspicion-gate decisions: escalated (LLM ran) vs passed (LLM skipped).",
+    ["decision"],
+)
+# Rule-promotion lifecycle (the learning loop).
+rule_promotion_total = _C(
+    "yashigani_rule_promotion_total",
+    "LLM→mechanical rule-promotion lifecycle events.",
+    ["event"],  # proposed|approved|rejected|blocked_by_promoted
+)
+
 # #16 (OPA Phase 2): client-policy aggregate query failures (fail-closed denies).
 # Alert on sustained rate — like the OPA *_CHECK_FAILED audit events.
 client_enforce_failures_total = _C(

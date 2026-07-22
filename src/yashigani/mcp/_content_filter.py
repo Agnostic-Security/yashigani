@@ -401,6 +401,17 @@ class FilterResult:
     semantic_intent_segment: Optional[str] = None
 
 
+def normalize_for_detection(text: str) -> str:
+    """The full obfuscation-defeating normalisation the injection scan runs on:
+    NFKC → strip Unicode Cf format chars → homoglyph-map → leet-digit map. Public
+    so other layers (e.g. the promoted rule-set) match on the SAME normalised
+    form and are not evadable by homoglyph/zero-width/leet tricks."""
+    if not text:
+        return ""
+    prepared = _homoglyph_normalise(_strip_cf_chars(unicodedata.normalize("NFKC", text)))
+    return _leet_normalise(prepared)
+
+
 def filter_description(text: str) -> FilterResult:
     """
     Run the M4 content filter on a single tool description or prompt text.

@@ -57,9 +57,15 @@ def _get_pool():
 
 
 def _get_registry_service():
-    """Return a ManifestRegistryService backed by the shared pool."""
+    """Return a ManifestRegistryService backed by the shared pool, wired with the
+    5.0 rug-pull re-approval gate so a post-approval manifest delta is held
+    pending (and later blocked at invocation) rather than silently taking effect."""
     from yashigani.manifest_registry import ManifestRegistryService
-    return ManifestRegistryService(pool=_get_pool())
+    from yashigani.backoffice.state import backoffice_state
+    return ManifestRegistryService(
+        pool=_get_pool(),
+        reapproval_gate=getattr(backoffice_state, "manifest_reapproval_gate", None),
+    )
 
 
 # ---------------------------------------------------------------------------

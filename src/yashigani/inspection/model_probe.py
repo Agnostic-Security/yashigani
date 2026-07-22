@@ -23,6 +23,7 @@ honest, and the other axis still enforces).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional
@@ -31,8 +32,14 @@ from yashigani.inspection.model_integrity import compute_blob_sha256
 
 logger = logging.getLogger(__name__)
 
-# Default ollama blob store; overridable for non-standard installs.
-_DEFAULT_BLOB_DIR = os.path.expanduser("~/.ollama/models/blobs")
+# Default ollama blob + manifest stores; overridable for non-standard installs.
+_DEFAULT_MODELS_DIR = os.path.expanduser("~/.ollama/models")
+_DEFAULT_BLOB_DIR = os.path.join(_DEFAULT_MODELS_DIR, "blobs")
+_DEFAULT_MANIFEST_DIR = os.path.join(_DEFAULT_MODELS_DIR, "manifests")
+# The ollama media type of the WEIGHTS layer (the model tensors) — the primary
+# trust anchor. Other layers (params, template, license) are not the weights.
+_WEIGHTS_MEDIA_TYPE = "application/vnd.ollama.image.model"
+_DEFAULT_REGISTRY = "registry.ollama.ai"
 
 
 def probe_manifest_digests(base_url: str, timeout: float = 5.0) -> dict[str, str]:
@@ -66,21 +73,73 @@ def blob_path_for_digest(digest: str, blob_dir: str = _DEFAULT_BLOB_DIR) -> Opti
     return candidate if os.path.isfile(candidate) else None
 
 
-def probe_weights_sha256(
-    manifest_digests: dict[str, str], blob_dir: str = _DEFAULT_BLOB_DIR,
-) -> dict[str, str]:
-    """Best-effort: for each model whose manifest digest resolves to a readable
-    blob, compute the weights-blob sha256. Absent/unreadable blobs are skipped.
+def _manifest_path_for_model(
+    model: str, manifest_dir: str, registry: str = _DEFAULT_REGISTRY,
+) -> Optional[str]:
+    """Resolve an ollama model name ('qwen2.5:3b', 'user/model:tag') to its
+    on-disk manifest file. Library models live under <registry>/library/."""
+    name, _, tag = model.partition(":")
+    tag = tag or "latest"
+    ns, _, short = name.rpartition("/")
+    namespace = ns or "library"
+    candidate = os.path.join(manifest_dir, registry, namespace, short, tag)
+    if os.path.isfile(candidate):
+        return candidate
+    # Some installs nest the registry differently; scan for the tag file.
+    for root, _dirs, files in os.walk(manifest_dir):
+        if os.path.basename(root) == short and tag in files:
+            return os.path.join(root, tag)
+    return None
 
-    NOTE: ollama's /api/tags digest is the MANIFEST digest, not the weights
-    blob; a precise weights-blob resolution requires reading the manifest. This
-    computes the hash of whatever blob the digest resolves to when present, which
-    is a real on-disk integrity anchor; a fuller manifest-walk to the exact
-    weights layer is a live-stack refinement.
-    """
+
+def weights_digest_from_manifest(manifest_json: Optional[dict]) -> str:
+    """Given a parsed ollama manifest, return the WEIGHTS layer digest (the
+    layer whose mediaType is the ollama model type). '' if not found. Testable."""
+    if not isinstance(manifest_json, dict):
+        return ""
+    for layer in manifest_json.get("layers", []) or []:
+        if isinstance(layer, dict) and layer.get("mediaType") == _WEIGHTS_MEDIA_TYPE:
+            return str(layer.get("digest") or "")
+    return ""
+
+
+def resolve_weights_blob_path(
+    model: str,
+    manifest_dir: str = _DEFAULT_MANIFEST_DIR,
+    blob_dir: str = _DEFAULT_BLOB_DIR,
+    registry: str = _DEFAULT_REGISTRY,
+) -> Optional[str]:
+    """Walk model → manifest → weights layer → on-disk blob path. None if any
+    step is unreadable."""
+    mpath = _manifest_path_for_model(model, manifest_dir, registry)
+    if mpath is None:
+        return None
+    try:
+        with open(mpath, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.debug("manifest read failed for %s (%s)", model, exc)
+        return None
+    wdigest = weights_digest_from_manifest(manifest)
+    if not wdigest:
+        return None
+    return blob_path_for_digest(wdigest, blob_dir)
+
+
+def probe_weights_sha256(
+    manifest_digests: dict[str, str],
+    blob_dir: str = _DEFAULT_BLOB_DIR,
+    manifest_dir: str = _DEFAULT_MANIFEST_DIR,
+    registry: str = _DEFAULT_REGISTRY,
+) -> dict[str, str]:
+    """For each model, walk its manifest to the WEIGHTS layer blob and stream-
+    hash THAT (the primary trust anchor per the pinning design — ollama does not
+    re-hash the weights at serve time, so an in-place weights swap is invisible
+    to the manifest digest alone). Models whose weights blob is not readable are
+    skipped (manifest fast-path still enforces on that axis)."""
     out: dict[str, str] = {}
-    for name, digest in manifest_digests.items():
-        path = blob_path_for_digest(digest, blob_dir)
+    for name in manifest_digests:
+        path = resolve_weights_blob_path(name, manifest_dir, blob_dir, registry)
         if path is None:
             continue
         try:
@@ -92,7 +151,8 @@ def probe_weights_sha256(
 
 def refresh_into(
     observed_digests: dict, observed_weights: dict,
-    base_url: str, blob_dir: str = _DEFAULT_BLOB_DIR, timeout: float = 5.0,
+    base_url: str, blob_dir: str = _DEFAULT_BLOB_DIR,
+    manifest_dir: str = _DEFAULT_MANIFEST_DIR, timeout: float = 5.0,
 ) -> int:
     """Populate the two observed dicts in place. Returns the model count probed.
     Never raises — a probe failure leaves observed values absent (verifier then
@@ -105,7 +165,7 @@ def refresh_into(
     observed_digests.clear()
     observed_digests.update(digests)
     try:
-        weights = probe_weights_sha256(digests, blob_dir=blob_dir)
+        weights = probe_weights_sha256(digests, blob_dir=blob_dir, manifest_dir=manifest_dir)
         observed_weights.clear()
         observed_weights.update(weights)
     except Exception as exc:  # noqa: BLE001

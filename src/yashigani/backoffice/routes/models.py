@@ -161,10 +161,44 @@ async def list_available_models(session: AdminSession):
             resp = await client.get(f"{base_url}/api/tags")
             if resp.status_code == 200:
                 data = resp.json()
-                return {"models": data.get("models", [])}
+                models = data.get("models", [])
+                return {"models": _annotate_integrity(models)}
     except Exception as exc:
         logger.warning("Failed to list Ollama models: %s", exc)
     return {"models": []}
+
+
+def _annotate_integrity(models: list) -> list:
+    """A5 FIX-3: flag models whose observed manifest digest does not match their
+    pin, so the admin dropdown surfaces a tampered/drifted model instead of
+    silently offering it. Adds integrity_ok=false + integrity_reason to any
+    mismatched entry; unpinned/clean models are annotated integrity_ok=true.
+    Best-effort — never fails the listing."""
+    dc = getattr(backoffice_state, "model_pin_dual_control", None)
+    if dc is None:
+        return models
+    store = getattr(dc, "_store", None)
+    if store is None:
+        return models
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name") or m.get("model") or ""
+        observed = m.get("digest") or ""
+        try:
+            pin = store.get(name)
+        except Exception:
+            continue
+        if pin is None:
+            m["integrity_ok"] = True
+            m["integrity_reason"] = "unpinned"
+        elif pin.manifest_digest and observed and observed != pin.manifest_digest:
+            m["integrity_ok"] = False
+            m["integrity_reason"] = "manifest_mismatch"
+        else:
+            m["integrity_ok"] = True
+            m["integrity_reason"] = "match"
+    return models
 
 
 class PullModelRequest(BaseModel):

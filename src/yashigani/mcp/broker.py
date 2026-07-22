@@ -167,6 +167,10 @@ class McpBrokerConfig:
     # v2.26 / YSG-RISK-057 — content-filter v2 semantic-intent sidecar.
     semantic_intent_sidecar: Optional[Any] = None  # SemanticIntentSidecar
 
+    # 5.0 rug-pull — manifest re-approval gate. When supplied, enforce() blocks a
+    # tools/call to a server whose manifest changed and is pending re-approval.
+    manifest_reapproval_gate: Optional[Any] = None  # ManifestReapprovalGate
+
     # 3.0 / YSG-RISK-060 — imported-MCP capability-envelope service.
     #
     # When supplied, broker.enforce() runs the INVOCATION HARD GATE (Laura
@@ -313,6 +317,7 @@ class McpBroker:
         # (the flag check lives inside the sidecar / filter_description_v2), so
         # wiring a sidecar here without setting the flag is still v1 behaviour.
         self._semantic_intent_sidecar = config.semantic_intent_sidecar
+        self._manifest_reapproval_gate = config.manifest_reapproval_gate
 
         # [3.0 / YSG-RISK-060] Capability-envelope invocation gate.
         self._envelope_service = config.envelope_service
@@ -425,6 +430,34 @@ class McpBroker:
             )
             await self._emit_audit(ctx, tool_decision)
             return tool_decision
+
+        # Step 1c: rug-pull re-approval gate (5.0). Block a tools/call to a
+        # server whose manifest changed after approval and is pending re-approval
+        # — its tool surface is in an unverified state until a 2nd admin clears
+        # it. Keyed by the target server identity (matches the manifest-registry
+        # agent_id). Fail-closed on a store error.
+        _rp_gate = self._manifest_reapproval_gate
+        _target_id = ctx.server_id or ctx.agent_name or ""
+        if _rp_gate is not None and _target_id and _rp_gate.is_blocked(_target_id):
+            rp_elapsed = int((time.monotonic() - t0) * 1000)
+            rp_decision = BrokerDecision(
+                call_id=call_id,
+                allow=False,
+                deny_reason="manifest_pending_reapproval",
+                opa_decision=OpaDecision(
+                    allow=False, deny_reason="manifest_pending_reapproval",
+                    redact_args=set(), audit_capture=True, rate_limit_key=None,
+                ),
+                chain_depth=len(upstream_chain),
+                elapsed_ms=rp_elapsed,
+                error=None,
+            )
+            logger.warning(
+                "mcp-broker: [RUGPULL] blocked call_id=%s server=%s — manifest "
+                "pending re-approval", call_id, _target_id,
+            )
+            await self._emit_audit(ctx, rp_decision)
+            return rp_decision
 
         # Step 2: query OPA (fail-closed).  MI-6 (YSG-RISK-061): build the agent
         # SPIFFE URI in THIS instance's trust domain so OPA adjudicates the

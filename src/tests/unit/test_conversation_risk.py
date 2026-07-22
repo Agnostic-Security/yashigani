@@ -207,3 +207,38 @@ class TestRouterMultiTurn:
                     "summarise this article for me", "thanks that's helpful"]:
             result, captured = await _turn(mod, msg)
             assert result.status_code == 200
+
+
+class TestRedisBackedTracker:
+    """#7 — multi-instance: a shared Redis store makes the accumulator survive
+    across replicas (here: two tracker instances sharing one fake store)."""
+    class _FakeRedis:
+        def __init__(self):
+            self.kv = {}
+        def get(self, k):
+            return self.kv.get(k)
+        def set(self, k, v, ex=None):
+            self.kv[k] = v
+        def delete(self, k):
+            self.kv.pop(k, None)
+
+    def test_two_instances_share_accumulator(self):
+        r = self._FakeRedis()
+        t1 = ConversationRiskTracker(redis_client=r)
+        t2 = ConversationRiskTracker(redis_client=r)
+        # alternate turns across the two "replicas" — a spread-out slow burn
+        seq = [t1, t2, t1, t2, t1, t2]
+        last = None
+        for t in seq:
+            last = t.observe("s1", _attack_turn())
+        assert last.action in (ACTION_STEP_UP, ACTION_BLOCK), \
+            "shared accumulator must escalate even when turns hit different replicas"
+
+    def test_redis_reset(self):
+        r = self._FakeRedis()
+        t = ConversationRiskTracker(redis_client=r)
+        for _ in range(4):
+            t.observe("s1", _attack_turn())
+        assert t.score_for("s1") > 0.0
+        t.reset("s1")
+        assert t.score_for("s1") == 0.0

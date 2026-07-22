@@ -104,6 +104,8 @@ class ConversationRiskTracker:
         step_up_threshold: float = _STEP_UP_THRESHOLD,
         block_threshold: float = _BLOCK_THRESHOLD,
         max_sessions: int = 10000,
+        redis_client=None,
+        session_ttl_s: int = 1800,
     ) -> None:
         if not 0.0 < decay < 1.0:
             raise ValueError("decay must be in (0, 1)")
@@ -113,22 +115,52 @@ class ConversationRiskTracker:
         self._block = block_threshold
         self._sessions: dict[str, _SessionState] = {}
         self._max_sessions = max_sessions
+        # Multi-instance: when a Redis client is supplied the accumulator is
+        # shared across gateway replicas, so an attacker spreading turns over
+        # replicas cannot defeat the slow-burn detection. In-memory otherwise.
+        self._r = redis_client
+        self._ttl = session_ttl_s
+
+    _REDIS_PREFIX = "yashigani:convrisk:"
+
+    def _load(self, key: str) -> _SessionState:
+        if self._r is None:
+            st = self._sessions.get(key)
+            if st is None:
+                if len(self._sessions) >= self._max_sessions:
+                    self._sessions.pop(next(iter(self._sessions)), None)
+                st = _SessionState()
+                self._sessions[key] = st
+            return st
+        try:
+            raw = self._r.get(self._REDIS_PREFIX + key)
+            if raw:
+                import json as _json
+                d = _json.loads(raw if isinstance(raw, str) else raw.decode())
+                return _SessionState(score=float(d.get("s", 0.0)), turns=int(d.get("t", 0)))
+        except Exception as exc:  # noqa: BLE001 — degrade to a fresh accumulator
+            logger.warning("convrisk redis load failed (%s) — fresh state", exc)
+        return _SessionState()
+
+    def _save(self, key: str, st: _SessionState) -> None:
+        if self._r is None:
+            self._sessions[key] = st
+            return
+        try:
+            import json as _json
+            self._r.set(self._REDIS_PREFIX + key,
+                        _json.dumps({"s": st.score, "t": st.turns}), ex=self._ttl)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("convrisk redis save failed (%s)", exc)
 
     def observe(self, session_id: str, signals: TurnSignals) -> ConversationVerdict:
         key = session_id or "anonymous"
-        st = self._sessions.get(key)
-        if st is None:
-            if len(self._sessions) >= self._max_sessions:
-                # Simple bound: drop an arbitrary session. Conversation state is
-                # short-lived; a dropped accumulator just restarts at 0 (safe —
-                # the per-message layers still run every turn).
-                self._sessions.pop(next(iter(self._sessions)), None)
-            st = _SessionState()
-            self._sessions[key] = st
+        st = self._load(key)
 
         contribution, breakdown = signals.contribution()
         st.score = round(self._decay * st.score + contribution, 6)
         st.turns += 1
+        self._save(key, st)
 
         if st.score >= self._block:
             action = ACTION_BLOCK
@@ -154,10 +186,19 @@ class ConversationRiskTracker:
     def reset(self, session_id: str) -> None:
         """Clear a session's accumulator (e.g. after a step-up is satisfied or
         the conversation ends)."""
-        self._sessions.pop(session_id or "anonymous", None)
+        key = session_id or "anonymous"
+        if self._r is not None:
+            try:
+                self._r.delete(self._REDIS_PREFIX + key)
+            except Exception:  # noqa: BLE001
+                pass
+        self._sessions.pop(key, None)
 
     def score_for(self, session_id: str) -> float:
-        st = self._sessions.get(session_id or "anonymous")
+        key = session_id or "anonymous"
+        if self._r is not None:
+            return self._load(key).score
+        st = self._sessions.get(key)
         return st.score if st else 0.0
 
 

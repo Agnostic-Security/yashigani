@@ -118,7 +118,28 @@ class ManifestReapprovalGate:
                        agent_id, rec["new_sha"], approver_id, rec["registered_by"])
         return rec["new_sha"]
 
-    # ── enforcement primitive ───────────────────────────────────────────────
+    # ── enforcement primitives ──────────────────────────────────────────────
+    def is_blocked(self, agent_id: str) -> bool:
+        """Invocation-path enforcement: True if this agent has a manifest delta
+        PENDING re-approval — its tool surface changed and was not re-approved,
+        so calls to it must be blocked until a second admin clears it. A store
+        error returns True (fail-closed). No pending delta → False (allow)."""
+        try:
+            pending = self._r.get(_PENDING_KEY + agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("manifest-gate: store unavailable (%s) — fail-closed block", exc)
+            return True
+        if pending:
+            logger.warning(
+                "MANIFEST_ACTIVE_BLOCKED agent=%s — invocation blocked (delta pending "
+                "re-approval)", agent_id)
+            self._audit_or_raise(
+                "MANIFEST_ACTIVE_BLOCKED", agent_id, "", "",
+                registered_by="", approver="", action="blocked", best_effort=True,
+            )
+            return True
+        return False
+
     def is_active(self, agent_id: str, sha: str) -> bool:
         """True iff `sha` is the approved-active manifest for the agent. A
         pending-but-unapproved delta, or any store error, returns False so the

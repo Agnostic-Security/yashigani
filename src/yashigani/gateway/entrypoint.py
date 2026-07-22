@@ -152,18 +152,21 @@ def _build_app(mesh_mode: bool = False):
                 _sp_file, _sp_exc,
             )
 
-    # T4b: A6-audio transcription backend. When YASHIGANI_AUDIO_TRANSCRIBE_MODEL
-    # is set, wire a local ollama whisper-class transcriber; otherwise audio
-    # requests are blocked (fail-closed, never passed uninspected).
+    # T4b: A6-audio transcription backend. When YASHIGANI_AUDIO_TRANSCRIBE_URL is
+    # set (a LOCAL OpenAI-compatible whisper server — audio never egresses), wire
+    # the transcriber; otherwise audio requests are blocked fail-closed (never
+    # passed uninspected).
     audio_transcriber = None
-    _audio_model = os.getenv("YASHIGANI_AUDIO_TRANSCRIBE_MODEL", "").strip()
-    if _audio_model:
+    _audio_url = os.getenv("YASHIGANI_AUDIO_TRANSCRIBE_URL", "").strip()
+    if _audio_url:
         try:
             from yashigani.inspection.audio_transcription import AudioTranscriber
-            from yashigani.inspection.audio_backends import OllamaTranscriber
-            audio_transcriber = AudioTranscriber(
-                OllamaTranscriber(base_url=ollama_url, model=_audio_model))
-            logger.info("A6-audio transcription enabled (model=%s)", _audio_model)
+            from yashigani.inspection.audio_backends import OpenAITranscriptionBackend
+            audio_transcriber = AudioTranscriber(OpenAITranscriptionBackend(
+                base_url=_audio_url,
+                model=os.getenv("YASHIGANI_AUDIO_TRANSCRIBE_MODEL", "whisper-1"),
+            ))
+            logger.info("A6-audio transcription enabled (url=%s)", _audio_url)
         except Exception as _at_exc:
             logger.warning("A6-audio transcriber unavailable (%s) — audio blocked", _at_exc)
 
@@ -205,6 +208,39 @@ def _build_app(mesh_mode: bool = False):
         except Exception as _mp_exc:
             logger.warning("A5 model probe failed at startup (%s)", _mp_exc)
 
+        # A5 FIX-2 (P0): the injection classifier + sensitivity classifier call
+        # ollama DIRECTLY with fixed startup models (bypassing the request
+        # pipeline). Verify THOSE models against their pins at startup — a
+        # trojaned classifier model would otherwise silently taint every verdict.
+        # Mismatch → CRITICAL + MODEL_INTEGRITY_MISMATCH audit (the verifier
+        # emits it); YASHIGANI_MODEL_PIN_STRICT=true additionally refuses start.
+        _fixed_models = {
+            model,  # OLLAMA_MODEL — the injection classifier's model
+            os.getenv("YASHIGANI_SENSITIVITY_MODEL", model),
+        }
+        _strict_pin = os.getenv("YASHIGANI_MODEL_PIN_STRICT", "false").strip().lower() in (
+            "true", "1", "yes", "on")
+        for _fm in _fixed_models:
+            try:
+                _fmres = model_integrity_verifier.verify(
+                    _fm,
+                    observed_manifest_digest=_model_observed_digests.get(_fm, ""),
+                    observed_weights_sha256=_model_observed_weights.get(_fm, ""),
+                    request_id="startup-classifier-verify",
+                )
+                if not _fmres.ok:
+                    logger.critical(
+                        "A5 FIX-2: classifier startup model %s FAILED integrity "
+                        "(reason=%s) — the inspection classifier may be trojaned", _fm, _fmres.reason)
+                    if _strict_pin:
+                        raise RuntimeError(
+                            f"model-integrity: classifier model {_fm} failed pin "
+                            f"({_fmres.reason}); YASHIGANI_MODEL_PIN_STRICT refuses start")
+            except RuntimeError:
+                raise
+            except Exception as _fmexc:  # noqa: BLE001
+                logger.warning("A5 FIX-2 startup verify errored for %s (%s)", _fm, _fmexc)
+
     # A12 (5.0): content-moderation guard. Policy loaded from the JSON file named
     # by YASHIGANI_CONTENT_MODERATION_POLICY_FILE. Unset → empty policy → no-op
     # (never false-positives out of the box; the operator opts in).
@@ -229,8 +265,23 @@ def _build_app(mesh_mode: bool = False):
         "false", "0", "no", "off",
     ):
         from yashigani.inspection.conversation_risk import ConversationRiskTracker
-        conversation_risk_tracker = ConversationRiskTracker()
-        logger.info("Multi-turn conversation-injection tracker enabled")
+        # Multi-instance: share the accumulator across replicas via Redis so
+        # turns spread over replicas can't defeat the slow-burn detection.
+        _cr_redis = None
+        try:
+            import redis as _redis_cr
+            _cr_redis = _redis_cr.from_url(
+                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
+                decode_responses=False,
+            )
+        except Exception as _cr_exc:
+            logger.warning(
+                "conversation-risk: Redis unavailable (%s) — per-process accumulator "
+                "(multi-replica turns not shared)", _cr_exc)
+        conversation_risk_tracker = ConversationRiskTracker(redis_client=_cr_redis)
+        logger.info(
+            "Multi-turn conversation-injection tracker enabled (%s)",
+            "shared/redis" if _cr_redis is not None else "per-process")
 
     # 5.0 T1: LLM→mechanical rule promotion. Store holds candidate/approved
     # promoted rules; the ruleset is consulted mechanically on the request path.
@@ -1037,6 +1088,7 @@ def _build_app(mesh_mode: bool = False):
         content_moderation_guard=content_moderation_guard,  # 5.0 A12
         audio_transcriber=audio_transcriber,                # 5.0 A6-audio (T4b)
         conversation_risk_tracker=conversation_risk_tracker,  # 5.0 multi-turn
+        sklearn_injection_backend=classifier_backend,       # 5.0 #4 — gate ML signal
         rule_promotion_store=rule_promotion_store,  # 5.0 T1
         promoted_ruleset=promoted_ruleset,          # 5.0 T1
         pii_detector=pii_detector,
@@ -1137,6 +1189,23 @@ def _build_app(mesh_mode: bool = False):
                     _dur_exc,
                 )
 
+        # 5.0 rug-pull: build the manifest re-approval gate so the broker blocks
+        # invocations of a server whose manifest is pending re-approval.
+        _manifest_reapproval_gate = None
+        try:
+            import redis as _redis_rp2
+            from yashigani.mcp.manifest_reapproval import ManifestReapprovalGate
+            _rp2_redis = _redis_rp2.from_url(
+                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
+                decode_responses=False,
+            )
+            _manifest_reapproval_gate = ManifestReapprovalGate(
+                _rp2_redis, audit_writer=audit_writer)
+        except Exception as _rp2_exc:
+            logger.warning(
+                "rug-pull invocation gate unavailable (%s) — MCP calls not gated "
+                "on pending re-approval", _rp2_exc)
+
         _mcp_registry, _mcp_jwks_store = build_registry_from_env(
             opa_url=opa_url,
             audit_writer=audit_writer,
@@ -1148,6 +1217,8 @@ def _build_app(mesh_mode: bool = False):
             mcp_id_store=_mcp_id_store,
             # v4.1 Phase 2a — lazy durable-registry fallback (SEAM-1d-07).
             durable_store=_mcp_durable_store,
+            # 5.0 rug-pull — block invocations of a pending-re-approval manifest.
+            manifest_reapproval_gate=_manifest_reapproval_gate,
         )
         _extra_routers: list = [openai_router, egress_proxy_router]
 

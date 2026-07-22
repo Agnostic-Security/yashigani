@@ -63,7 +63,15 @@ class RuleStoreUnavailableError(Exception):
 
 
 def _normalize(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).casefold()
+    """Match the built-in mechanical filter's obfuscation-defeating normalisation
+    (NFKC + Cf-strip + homoglyph + leet), then casefold — so a promoted rule is
+    no more evadable than a built-in one. Falls back to NFKC+casefold if the
+    filter module is unavailable."""
+    try:
+        from yashigani.mcp._content_filter import normalize_for_detection
+        return normalize_for_detection(text).casefold()
+    except Exception:
+        return unicodedata.normalize("NFKC", text).casefold()
 
 
 def derive_candidate_patterns(content: str) -> list[str]:
@@ -240,6 +248,11 @@ class RulePromotionStore:
 
     def _audit_or_log(self, event_type, cid, pattern, source, initiated_by,
                       approver, action) -> None:
+        try:
+            from yashigani.metrics.registry import rule_promotion_total
+            rule_promotion_total.labels(event=action).inc()
+        except Exception:  # pragma: no cover
+            pass
         if self._audit is None:
             return
         from yashigani.audit.schema import RulePromotionEvent, EventType

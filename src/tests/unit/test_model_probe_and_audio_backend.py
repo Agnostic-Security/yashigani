@@ -11,11 +11,15 @@ import hashlib
 
 import pytest
 
+import json as _json
+
 from yashigani.inspection.model_probe import (
     blob_path_for_digest,
     parse_tags_digests,
     probe_weights_sha256,
     refresh_into,
+    resolve_weights_blob_path,
+    weights_digest_from_manifest,
 )
 from yashigani.inspection.audio_backends import parse_transcription
 from yashigani.inspection.model_integrity import (
@@ -60,10 +64,32 @@ class TestBlobResolve:
         assert blob_path_for_digest("sha256:missing", str(tmp_path)) is None
         assert blob_path_for_digest("", str(tmp_path)) is None
 
-    def test_weights_hash_computed_for_present_blob(self, tmp_path):
-        (tmp_path / "sha256-aa").write_bytes(b"the weights")
-        out = probe_weights_sha256({"m": "sha256:aa"}, blob_dir=str(tmp_path))
-        assert out["m"] == hashlib.sha256(b"the weights").hexdigest()
+    def test_weights_digest_from_manifest(self):
+        manifest = {"layers": [
+            {"mediaType": "application/vnd.ollama.image.template", "digest": "sha256:tpl"},
+            {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:WEIGHTS"},
+        ]}
+        assert weights_digest_from_manifest(manifest) == "sha256:WEIGHTS"
+        assert weights_digest_from_manifest({"layers": []}) == ""
+        assert weights_digest_from_manifest(None) == ""
+
+    def test_manifest_walk_to_weights_blob(self, tmp_path):
+        # Lay out an ollama-style store: manifests/<reg>/library/<model>/<tag>
+        # and blobs/sha256-<weights>. probe must walk manifest → weights layer.
+        blob_dir = tmp_path / "blobs"
+        blob_dir.mkdir()
+        (blob_dir / "sha256-WEIGHTS").write_bytes(b"the actual weights tensors")
+        man_dir = tmp_path / "manifests"
+        model_dir = man_dir / "registry.ollama.ai" / "library" / "qwen2.5"
+        model_dir.mkdir(parents=True)
+        (model_dir / "3b").write_text(_json.dumps({"layers": [
+            {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:WEIGHTS"},
+        ]}))
+        path = resolve_weights_blob_path("qwen2.5:3b", str(man_dir), str(blob_dir))
+        assert path == str(blob_dir / "sha256-WEIGHTS")
+        out = probe_weights_sha256({"qwen2.5:3b": "sha256:manifestdigest"},
+                                   blob_dir=str(blob_dir), manifest_dir=str(man_dir))
+        assert out["qwen2.5:3b"] == hashlib.sha256(b"the actual weights tensors").hexdigest()
 
 
 class TestRefreshAndVerifierLoop:

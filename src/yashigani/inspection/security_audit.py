@@ -38,9 +38,24 @@ def content_hash(text: str) -> str:
 
 def capture_content(text: str) -> str:
     """Return the analysed content for audit when forensic mode is on (bounded),
-    else empty string. Never raises."""
+    else empty string. Credentials/secrets are MASKED before capture so forensic
+    mode records the ATTACK STRUCTURE without writing raw secrets to the audit
+    store (defence for the case where an operator enables it with real traffic).
+    Never raises."""
     if not text or not forensic_capture_enabled():
         return ""
-    if len(text) > _MAX_FORENSIC_CHARS:
-        return text[:_MAX_FORENSIC_CHARS] + f"…[+{len(text) - _MAX_FORENSIC_CHARS} chars]"
-    return text
+    masked = _mask_secrets(text)
+    if len(masked) > _MAX_FORENSIC_CHARS:
+        return masked[:_MAX_FORENSIC_CHARS] + f"…[+{len(masked) - _MAX_FORENSIC_CHARS} chars]"
+    return masked
+
+
+def _mask_secrets(text: str) -> str:
+    """Mask credential-shaped substrings before forensic capture. Best-effort:
+    if the masker is unavailable, fall back to the raw text (forensic mode is an
+    explicit operator opt-in)."""
+    try:
+        from yashigani.audit.masking import CredentialMasker
+        return CredentialMasker().mask_string(text)
+    except Exception:
+        return text

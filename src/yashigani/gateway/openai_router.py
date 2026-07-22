@@ -224,6 +224,15 @@ def _owui_deny_message(reason: str) -> str:
     return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
 
 
+def _metric_block(control: str, layer: str, leg: str) -> None:
+    """Emit the 5.0 interaction-hardening block metric. Never breaks a request."""
+    try:
+        from yashigani.metrics.registry import interaction_blocks_total
+        interaction_blocks_total.labels(control=control, layer=layer, leg=leg).inc()
+    except Exception:  # pragma: no cover — metrics must never fail a request
+        pass
+
+
 def _audit_prompt_injection_block(
     request_id: str, identity_id: str, leg: str, detection_layer: str,
     classification: str, detected_pattern: str, content: str, confidence: float,
@@ -232,6 +241,16 @@ def _audit_prompt_injection_block(
     records who + which layer + the matched rule + a content hash; records the
     raw payload only under forensic mode. Never raises (audit must not break the
     block, but the block itself has already happened)."""
+    # Metric first (independent of the audit writer being present).
+    _mlayer = detection_layer or "llm"
+    _mctrl = "rule_promoted" if _mlayer == "mechanical_promoted" else "injection"
+    _metric_block(_mctrl, _mlayer, leg)
+    if _mlayer == "mechanical_promoted":
+        try:
+            from yashigani.metrics.registry import rule_promotion_total
+            rule_promotion_total.labels(event="blocked_by_promoted").inc()
+        except Exception:
+            pass
     if _state.audit_writer is None:
         return
     try:
@@ -278,6 +297,7 @@ def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
         except Exception:  # pragma: no cover
             logger.warning("A12 moderation audit write failed")
     if result.blocked:
+        _metric_block("content_moderation", "policy", leg)
         logger.warning(
             "A12: content moderation BLOCK leg=%s categories=%s request_id=%s",
             leg, result.categories, request_id,
@@ -321,6 +341,7 @@ def _verify_ollama_pin(model: str, request_id: str):
     )
     if result.ok:
         return None
+    _metric_block("model_integrity", "store", "request")
     logger.warning(
         "A5: model-integrity block model=%s reason=%s request_id=%s",
         model, result.reason, request_id,
@@ -1061,6 +1082,10 @@ class OpenAIRouterState:
         self.audio_transcriber = None
         # 5.0 A12: content-moderation guard. None or empty-policy → no-op.
         self.content_moderation_guard = None
+        # 5.0 #4: cheap sklearn injection classifier used by the suspicion gate
+        # to catch marker-less subtle injections (UNCERTAIN/UNSAFE → escalate to
+        # the LLM). None → gate uses markers/obfuscation/conversation only.
+        self.sklearn_injection_backend = None
         # 5.0: multi-turn conversational-injection risk tracker. None → no-op.
         self.conversation_risk_tracker = None
         # 5.0 T1: LLM→mechanical rule promotion. When the LLM catches a NOVEL
@@ -1273,6 +1298,7 @@ def configure(
     audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
     content_moderation_guard=None,     # 5.0 A12 — unsafe-topic filtering
     conversation_risk_tracker=None,    # 5.0 — multi-turn injection accumulator
+    sklearn_injection_backend=None,    # 5.0 #4 — cheap ML signal for the gate
     rule_promotion_store=None,         # 5.0 T1 — LLM→mechanical promotion store
     promoted_ruleset=None,             # 5.0 T1 — active promoted rules (consulted)
     ddos_protector=None,  # v2.2 — DDoSProtector | None
@@ -1320,6 +1346,7 @@ def configure(
     _state.audio_transcriber = audio_transcriber
     _state.content_moderation_guard = content_moderation_guard
     _state.conversation_risk_tracker = conversation_risk_tracker
+    _state.sklearn_injection_backend = sklearn_injection_backend
     _state.rule_promotion_store = rule_promotion_store
     _state.promoted_ruleset = promoted_ruleset
     _state.ddos_protector = ddos_protector
@@ -1955,6 +1982,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 except Exception:
                     logger.warning("conversation-risk audit write failed")
             if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
+                _metric_block("conversation", "gate", "request")
                 logger.warning(
                     "CONVERSATION INJECTION %s /v1: identity=%s score=%.3f turns=%d request_id=%s",
                     _seq_verdict.action.upper(), identity_id,
@@ -1993,15 +2021,35 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 _gate = _SG()
                 _state._suspicion_gate_singleton = _gate
             _norm = _mech.safe_text if (_mech is not None and not _mech.rejected) else None
+            # #4: cheap sklearn injection signal — UNCERTAIN/UNSAFE escalates a
+            # marker-less subtle injection that the deterministic markers miss.
+            _skl_uncertain = False
+            _skl = getattr(_state, "sklearn_injection_backend", None)
+            if _skl is not None:
+                try:
+                    _skl_res = _skl.classify(prompt_text)
+                    _skl_uncertain = bool(
+                        getattr(_skl_res, "needs_llm_pass", False)
+                        or getattr(_skl_res, "label", "") == "UNSAFE"
+                    )
+                except Exception:
+                    _skl_uncertain = True  # ML error → escalate (conservative)
             _susp = _gate.assess(
                 prompt_text,
                 normalized_text=_norm,
+                sklearn_uncertain=_skl_uncertain,
                 conversation_score=(_seq.score_for(
                     identity.get("identity_id", identity_id) if identity else identity_id
                 ) if _seq is not None else 0.0),
             )
             _run_llm = _susp.escalate_to_llm
             _llm_suspicion = _susp.score
+            try:
+                from yashigani.metrics.registry import suspicion_gate_decisions_total
+                suspicion_gate_decisions_total.labels(
+                    decision="escalated" if _run_llm else "passed").inc()
+            except Exception:
+                pass
             if _run_llm:
                 logger.info(
                     "SUSPICION GATE → LLM review: identity=%s score=%.2f reasons=%s request_id=%s",
@@ -4266,6 +4314,29 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 headers={"X-Yashigani-Request-Id": request_id,
                          "X-Yashigani-Detection-Layer": "mechanical"},
             )
+    # #6 parity: promoted-rule + moderation on the embeddings leg too (the Letta
+    # archival-memory ingress is a HIGHER-stakes A3 surface, not a lower one).
+    _emb_promoted = getattr(_state, "promoted_ruleset", None)
+    if _emb_promoted is not None and classification_text:
+        try:
+            _ephit = _emb_promoted.matches(classification_text)
+        except Exception:
+            _ephit = None
+        if _ephit:
+            logger.warning("EMBEDDINGS INJECTION BLOCKED (PROMOTED rule): identity=%s "
+                           "pattern=%r request_id=%s", _emb_identity, _ephit, request_id)
+            _audit_prompt_injection_block(
+                request_id, _emb_identity, "embeddings", "mechanical_promoted",
+                classification="PROMPT_INJECTION_ONLY", detected_pattern=_ephit,
+                content=classification_text, confidence=1.0)
+            return JSONResponse(status_code=403, content={"error": {
+                "message": _owui_deny_message("prompt_injection_only"),
+                "type": "request_injection_blocked", "code": "prompt_injection_only"}},
+                headers={"X-Yashigani-Request-Id": request_id,
+                         "X-Yashigani-Detection-Layer": "mechanical_promoted"})
+    _emb_mod_block = _moderate_content(classification_text, "embeddings", identity_id, request_id)
+    if _emb_mod_block is not None:
+        return _emb_mod_block
     # T3: suspicion gate on the embeddings leg too — the LLM inspector runs ONLY
     # on suspicious content, not every clean embed (consistency with the chat
     # leg; embeddings is the Letta archival-memory ingress).
