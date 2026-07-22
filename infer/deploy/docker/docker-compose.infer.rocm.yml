@@ -1,0 +1,27 @@
+# Backend-selection overlay — ROCm (AMD). See docker-compose.infer.cuda.yml header for the
+# Iris F4/F5 image-SWAP rationale (identical logic, different backend).
+services:
+  infer-classifier:
+    image: ${YSG_INFER_IMAGE_ROCM:-yashigani/infer-rocm:local}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    environment:
+      YSG_INFER_BACKEND: rocm
+      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CLASSIFIER_N_GPU_LAYERS:-999}
+
+  infer-chat:
+    image: ${YSG_INFER_IMAGE_ROCM:-yashigani/infer-rocm:local}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    environment:
+      YSG_INFER_BACKEND: rocm
+      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CHAT_N_GPU_LAYERS:-999}
+      YSG_INFER_OVERRIDE_TENSOR: ${YSG_INFER_OVERRIDE_TENSOR:-}

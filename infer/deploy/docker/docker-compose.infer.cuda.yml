@@ -1,0 +1,36 @@
+# Backend-selection overlay — CUDA (NVIDIA). Iris F4/F5 corrected image-SWAP logic: this
+# overlay SETS the image for infer-classifier/infer-chat (a genuine swap), it does NOT add a
+# device block onto a shared fat image (platform doc §9 — the R1 premise that per-backend
+# images "drop into the existing GPU overlays" the way ollama's additive-device pattern does
+# was FALSE; per-backend images need real image-selection logic).
+#
+# install.sh detects NVIDIA GPU + Docker/Podman runtime and adds this overlay to
+# compose_files alongside docker-compose.infer.yml (never docker-compose.infer.{rocm,vulkan,cpu}.yml
+# at the same time — mutually exclusive backend selection, operator override supported via
+# YSG_INFER_BACKEND_OVERRIDE).
+#
+# CDI device grant (same mechanism as docker/docker-compose.gpu.yml's ollama CDI wiring —
+# Docker↔Podman parity from one device syntax; docker-compose.infer.podman-override.yml
+# does NOT need a separate device block, only the read_only relaxation CDI hooks require).
+services:
+  infer-classifier:
+    image: ${YSG_INFER_IMAGE_CUDA:-yashigani/infer-cuda:local}
+    devices:
+      - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_INFER_BACKEND: cuda
+      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CLASSIFIER_N_GPU_LAYERS:-999}
+
+  infer-chat:
+    image: ${YSG_INFER_IMAGE_CUDA:-yashigani/infer-cuda:local}
+    devices:
+      - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_INFER_BACKEND: cuda
+      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CHAT_N_GPU_LAYERS:-999}
+      # MoE expert-offload passthrough (platform doc §11.2 differentiator) — empty by
+      # default; operator sets e.g. YSG_INFER_OVERRIDE_TENSOR='\.ffn_.*_exps\.weight=CPU'
+      # for VRAM-limited hosts running a MoE model.
+      YSG_INFER_OVERRIDE_TENSOR: ${YSG_INFER_OVERRIDE_TENSOR:-}

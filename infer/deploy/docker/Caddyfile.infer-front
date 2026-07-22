@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference-engine Caddy front — Yashigani 6.0 first-party engine
+# (inference-engine-platform-requirements-20260722.md §5)
+#
+# SINGLE SOURCE. This file is imported by every Caddyfile variant
+#   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.infer-front
+# and rendered byte-identically into the Helm ConfigMap
+#   helm/yashigani-infer/templates/configmap-caddy-infer-front.yaml
+# via the `.Files.Get` pattern (Iris F5 correction — NOT the ollama-front hand-sync
+# antipattern). The canonical copy lives here; the Helm mirror at
+# helm/yashigani-infer/files/Caddyfile.infer-front is kept in sync ONLY by
+# scripts/sync-caddyfile-infer-front-helm.sh — never hand-edited.
+#
+# Mirrors docker/Caddyfile.ollama-front's proven shape (LAURA-I1-01 close):
+# the engine leaves any shared bridge and joins a dedicated `infer_ringfence`
+# bridge (internal:true) whose ONLY other member is Caddy. The engine has no
+# non-loopback listener reachable except through this front — Caddy IS the
+# auth perimeter (platform doc §13 invariant #1); the engine speaks plain HTTP,
+# no auth of its own (`mtls_capable:false`).
+#
+# Own mesh port :11436 — distinct from ollama-front :11435, the mesh listeners
+# :8444/:8445, and the codegen MCP mesh-port range 9500-9900. Never host-mapped
+# (no compose `ports:` entry).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Caller gate — narrowed to the gateway (+ egress-forwarders), NOT "any valid
+# leaf" (Laura-probe F6 / platform doc §5). Stamped-header pattern (no CEL —
+# Caddy 2.11.x cannot evaluate URI SANs in CEL expressions, LAURA-I1-CEL fix;
+# same proven pattern as docker/Caddyfile.openclaw-egress's llm-egress-caller-gate).
+(infer-front-caller-gate) {
+    request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
+    @caller_not_allowed {
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}"
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_EGRESS_OPENCLAW_SPIFFE_ID:spiffe://yashigani.internal/openclaw}"
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_EGRESS_LANGFLOW_SPIFFE_ID:spiffe://yashigani.internal/langflow}"
+        not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_EGRESS_LETTA_SPIFFE_ID:spiffe://yashigani.internal/letta}"
+    }
+    respond @caller_not_allowed "Forbidden" 403
+}
+
+:11436 {
+    tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /run/secrets/ca_intermediate.crt
+        }
+        protocols tls1.3
+        ciphers TLS_AES_256_GCM_SHA384 TLS_AES_128_GCM_SHA256
+        curves x25519mlkem768 x25519 secp384r1 secp256r1
+    }
+
+    handle_path /infer/pull* {
+        import infer-front-caller-gate
+
+        # /api/pull ADMIN-GATE (Laura F6 / Lu / Red-Council MEDIUM): the puller upstream
+        # is the ONLY container in the topology with blob-store WRITE access AND the only
+        # one wired with a pull_resolver — routing narrows further than the generic
+        # caller-gate above: only requests to THIS path prefix ever reach it, and nothing
+        # else does (infer-puller never receives /infer/chat|generate|embeddings traffic —
+        # see infer/deploy/README.md "classifier/chat/puller container split").
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        rewrite * /api/pull
+
+        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:infer-puller}:8000 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    handle_path /infer/* {
+        import infer-front-caller-gate
+
+        # Zero-trust header discipline (EX-231-08): strip any inbound value, then set
+        # X-SPIFFE-ID from the VERIFIED peer cert's first URI SAN. Only Caddy sets this;
+        # a co-located bridge peer cannot forge it.
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+
+        # Classifier-vs-chat routing (Captain finding #4 MUST-separate-container):
+        # requests explicitly targeting the mandatory sensitivity classifier route to the
+        # dedicated infer-classifier upstream; everything else routes to infer-chat.
+        # The `model` field convention matches the ollama-shim `/api/*` body shape.
+        @classifier_request {
+            path /infer/classifier/*
+        }
+        rewrite @classifier_request /{path.1}
+
+        reverse_proxy @classifier_request http://{$YASHIGANI_INFER_CLASSIFIER_UPSTREAM:infer-classifier}:8000 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            transport http {
+                # Cold model load can exceed the default (WARMUP-001 rationale, ported from
+                # the ollama-front pattern) — long read/write timeouts.
+                read_timeout 120s
+                write_timeout 120s
+            }
+        }
+
+        reverse_proxy http://{$YASHIGANI_INFER_CHAT_UPSTREAM:infer-chat}:8000 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout 120s
+                write_timeout 120s
+            }
+        }
+    }
+
+    # Default-deny: nothing else is served on this listener.
+    handle {
+        respond "Not Found" 404
+    }
+}

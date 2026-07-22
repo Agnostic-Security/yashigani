@@ -1,0 +1,114 @@
+# Yashigani AppArmor profile — infer-{cuda,rocm,vulkan,cpu} serving containers
+# (infer-classifier / infer-chat). Pattern mirrors docker/apparmor/yashigani-gateway.
+#
+# To load this profile on the host before starting the stack:
+#   sudo apparmor_parser -r infer/deploy/docker/apparmor/yashigani-infer-llama-server
+# Verify it loaded:
+#   sudo apparmor_status | grep yashigani-infer-llama-server
+# Enable in compose by uncommenting in docker-compose.infer.yml:
+#   security_opt: ["apparmor=yashigani-infer-llama-server"]
+# AppArmor requires the host kernel module enabled (Ubuntu/Debian default; RHEL/Fedora use
+# SELinux instead — see the SELinux :Z/:z note in infer/deploy/README.md).
+
+#include <tunables/global>
+
+profile yashigani-infer-llama-server flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/python>
+
+  # Shared libraries / runtime (read + mmap-execute for .so files)
+  /etc/ r,
+  /etc/** r,
+  /usr/ r,
+  /usr/** rm,
+  /lib/ r,
+  /lib/** rm,
+  /lib64/ r,
+  /lib64/** rm,
+  /usr/local/lib/** rm,
+  /usr/local/bin/llama-server rix,
+  /usr/local/bin/python* rix,
+  /usr/local/bin/uvicorn ix,
+  /usr/local/bin/infer-entrypoint.sh rix,
+  /usr/local/bin/healthcheck-gpu-engaged.sh rix,
+
+  # Finding #2/#4: blob store is READ-ONLY, no exception — including the classifier's own
+  # container. The ONLY writable data path is the scratch/tmp directory (size-capped tmpfs,
+  # matches the resource-ceiling finding #3).
+  /data/blobs/ r,
+  /data/blobs/** r,
+  /data/scratch/ rw,
+  /data/scratch/** rw,
+
+  # Secrets — none mounted into infer-* (engine has no auth of its own, mtls_capable:false,
+  # platform doc §13 invariant #1). No /run/secrets/ rule at all — deliberate absence, not
+  # an oversight; if a future change mounts a secret here, this profile will deny it by
+  # default (no matching allow rule) until explicitly added and reviewed.
+
+  # GPU device nodes — CDI/KFD/DRI grants (finding #7 CDI is a device grant, not a network
+  # grant). Rule is present but scoped to the device-file class; the actual device node
+  # availability is controlled by the orchestrator's device grant (compose `devices:` / k8s
+  # device-plugin resource), not by this profile alone.
+  /dev/nvidia* rw,
+  /dev/kfd rw,
+  /dev/dri/ r,
+  /dev/dri/renderD* rw,
+
+  # Proc — reads required by Python/llama-server runtime and health checks only.
+  @{PROC}/sys/kernel/ngroups_max r,
+  @{PROC}/sys/kernel/cap_last_cap r,
+  @{PROC}/@{pid}/status r,
+  @{PROC}/@{pid}/maps r,
+  @{PROC}/@{pid}/fd/ r,
+  @{PROC}/@{pid}/task/ r,
+  @{PROC}/sys/net/core/somaxconn r,
+  # oom_score_adj self-raise only (Captain finding #3 entrypoint step) — write to OWN pid's
+  # file, never another process's.
+  @{PROC}/@{pid}/oom_score_adj w,
+
+  # Deny dangerous kernel/hardware access
+  deny @{PROC}/sys/kernel/modules_disabled w,
+  deny /proc/sysrq-trigger w,
+  deny /sys/firmware/** w,
+  deny /sys/kernel/** w,
+  deny /dev/mem r,
+  deny /dev/kmem r,
+  deny /dev/port r,
+
+  # Network — finding #2: seccomp/AppArmor layer stops a parser-RCE foothold from doing
+  # anything with the network path itself (e.g. raw-socket crafting) beyond what the
+  # process already had. tcp/unix only; no udp (llama-server/control-plane use TCP + unix
+  # sockets only), no raw, no packet, no netlink, no bluetooth.
+  network tcp,
+  network unix,
+  deny network udp,
+  deny network raw,
+  deny network packet,
+  deny network bluetooth,
+  deny network netlink,
+
+  # Capabilities — drop ALL is enforced at the compose/k8s securityContext layer
+  # (cap_drop: [ALL], capabilities.drop: [ALL]); this profile denies the escalation-relevant
+  # set again as defense-in-depth.
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_rawio,
+  deny capability sys_ptrace,
+  deny capability sys_boot,
+  deny capability mac_admin,
+  deny capability mac_override,
+  deny capability net_admin,
+  deny capability net_raw,
+  deny capability setpcap,
+
+  # ptrace — deny all (prevents cross-process read of a co-resident model's memory,
+  # finding #4's (a) vector, and generic container-escape-via-process-injection).
+  deny ptrace,
+  deny ptrace peer=**,
+
+  # Mount — deny (enforced by read_only: true / readOnlyRootFilesystem; belt-and-suspenders).
+  deny mount,
+  deny umount,
+  deny pivot_root,
+}

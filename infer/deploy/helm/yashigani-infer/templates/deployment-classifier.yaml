@@ -1,0 +1,132 @@
+{{- /*
+Captain finding #4 (MUST, not "ideally"): the mandatory sensitivity classifier runs in its
+OWN Deployment/pod — never co-scheduled with chat models. Own cgroup (container boundary),
+own PID namespace (k8s default, no hostPID), own seccomp instance. Blob store mounted
+READ-ONLY without exception, including this pod.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-classifier
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-classifier
+    yashigani.infer.managed: "true"
+spec:
+  replicas: {{ .Values.classifier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: infer-classifier
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-infer.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: infer-classifier
+        yashigani.infer.managed: "true"
+    spec:
+      {{- if .Values.gpu.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.gpu.nodeSelector | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1002
+        runAsGroup: 1002
+        fsGroup: 1002
+        seccompProfile:
+          {{- if .Values.seccomp.installViaDaemonSet }}
+          type: Localhost
+          localhostProfile: profiles/infer-llama-server.json
+          {{- else }}
+          type: RuntimeDefault
+          {{- end }}
+      containers:
+        - name: infer-classifier
+          image: {{ include "yashigani-infer.image" . }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: YSG_INFER_ROLE
+              value: "classifier"
+            - name: YSG_INFER_KEEP_ALIVE_PIN
+              value: {{ .Values.classifier.keepAlivePin | quote }}
+            - name: YSG_INFER_MAX_CTX
+              value: {{ .Values.classifier.maxCtx | quote }}
+            - name: YSG_INFER_MAX_CONCURRENCY
+              value: {{ .Values.classifier.maxConcurrency | quote }}
+            - name: YSG_INFER_MAX_TOKENS_PER_REQUEST
+              value: {{ .Values.classifier.maxTokensPerRequest | quote }}
+            - name: YSG_INFER_MAX_RESIDENT_MODELS
+              value: {{ .Values.classifier.maxResidentModels | quote }}
+            - name: YSG_INFER_EXPECT_GPU
+              value: {{ .Values.classifier.expectGpu | quote }}
+            - name: YSG_INFER_EXPECTED_VRAM_MB
+              value: {{ .Values.classifier.expectedVramMb | quote }}
+            {{- if .Values.gpu.resourceName }}
+            - name: YSG_INFER_N_GPU_LAYERS
+              value: "999"
+            {{- else }}
+            - name: YSG_INFER_N_GPU_LAYERS
+              value: "0"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.classifier.resources | nindent 12 }}
+            {{- if .Values.gpu.resourceName }}
+            limits:
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+            {{- end }}
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/blobs
+              readOnly: true
+            - name: scratch
+              mountPath: /data/scratch
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+      volumes:
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: {{ include "yashigani-infer.fullname" . }}-blobs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-classifier
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-classifier
+spec:
+  selector:
+    {{- include "yashigani-infer.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-classifier
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http

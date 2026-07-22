@@ -1,0 +1,31 @@
+# Podman-runtime overrides for the infer engine.
+#
+# ROOTLESS-CDI-004 parity (see docker/docker-compose.gpu-podman.yml): podman's nvidia-cdi-hook
+# is a crun createContainer hook that writes driver-lib symlinks + ld.so.cache INTO the
+# container rootfs at start time — against `read_only: true` it exits 1 and the container
+# never starts. Relax read_only ONLY on the CUDA path under Podman; cap_drop:[ALL] +
+# no-new-privileges + non-privileged are unaffected (same posture as ollama's podman overlay).
+#
+# YSG-RISK-074 (Captain finding #8, `podman compose` v2 wrapper forces seccomp:unconfined):
+# this override re-asserts the explicit seccomp profile path so the infer overlay does not
+# silently lose its custom profile under the v2 wrapper — matches the base file's
+# security_opt (redundant-but-explicit is deliberate; a wrapper that already honours the
+# base file's setting is a harmless no-op here, a wrapper that resets it is caught by
+# scripts/verify-offline.sh's "podman inspect reports the intended profile, not unconfined"
+# release-gate assertion, run live — not offline-verifiable this session).
+# Applied ONLY when YSG_GPU_TYPE=nvidia AND runtime=podman (install.sh selects this overlay
+# in ADDITION to docker-compose.infer.cuda.yml, mirroring docker-compose.gpu-podman.yml's
+# relationship to docker-compose.gpu.yml). The read_only relaxation is scoped to the CUDA
+# path only — Vulkan/CPU/ROCm backends under Podman do not need it (no CDI createContainer
+# hook writing into rootfs on those paths).
+services:
+  infer-classifier:
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
+    read_only: ${YSG_INFER_PODMAN_CUDA_READ_ONLY:-false}
+  infer-chat:
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
+    read_only: ${YSG_INFER_PODMAN_CUDA_READ_ONLY:-false}

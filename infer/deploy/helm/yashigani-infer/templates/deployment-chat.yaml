@@ -1,0 +1,149 @@
+{{- /*
+Captain finding #4: user-facing chat/generate/embeddings models — dedicated Deployment,
+physically separate from infer-classifier (never co-scheduled). Blob store read-only.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-chat
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-chat
+    yashigani.infer.managed: "true"
+spec:
+  replicas: {{ .Values.chat.replicas }}
+  selector:
+    matchLabels:
+      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: infer-chat
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-infer.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: infer-chat
+        yashigani.infer.managed: "true"
+    spec:
+      # Explicit anti-affinity to the classifier component — belt-and-suspenders on top of
+      # the separate-Deployment/separate-pod boundary already enforced above (finding #4
+      # "fail closed rather than silently degrade isolation under a future code change that
+      # simplifies scheduling" — this is the scheduling-layer instance of that principle).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: infer-classifier
+                topologyKey: kubernetes.io/hostname
+      {{- if .Values.gpu.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.gpu.nodeSelector | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1002
+        runAsGroup: 1002
+        fsGroup: 1002
+        seccompProfile:
+          {{- if .Values.seccomp.installViaDaemonSet }}
+          type: Localhost
+          localhostProfile: profiles/infer-llama-server.json
+          {{- else }}
+          type: RuntimeDefault
+          {{- end }}
+      containers:
+        - name: infer-chat
+          image: {{ include "yashigani-infer.image" . }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: YSG_INFER_ROLE
+              value: "chat"
+            - name: YSG_INFER_KEEP_ALIVE_PIN
+              value: "false"
+            - name: YSG_INFER_MAX_CTX
+              value: {{ .Values.chat.maxCtx | quote }}
+            - name: YSG_INFER_MAX_CONCURRENCY
+              value: {{ .Values.chat.maxConcurrency | quote }}
+            - name: YSG_INFER_MAX_TOKENS_PER_REQUEST
+              value: {{ .Values.chat.maxTokensPerRequest | quote }}
+            - name: YSG_INFER_IDLE_UNLOAD_SECONDS
+              value: {{ .Values.chat.idleUnloadSeconds | quote }}
+            - name: YSG_INFER_MAX_RESIDENT_MODELS
+              value: {{ .Values.chat.maxResidentModels | quote }}
+            - name: YSG_INFER_EXPECT_GPU
+              value: {{ .Values.chat.expectGpu | quote }}
+            - name: YSG_INFER_EXPECTED_VRAM_MB
+              value: {{ .Values.chat.expectedVramMb | quote }}
+            {{- if .Values.chat.overrideTensor }}
+            - name: YSG_INFER_OVERRIDE_TENSOR
+              value: {{ .Values.chat.overrideTensor | quote }}
+            {{- end }}
+            {{- if .Values.gpu.resourceName }}
+            - name: YSG_INFER_N_GPU_LAYERS
+              value: "999"
+            {{- else }}
+            - name: YSG_INFER_N_GPU_LAYERS
+              value: "0"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.chat.resources | nindent 12 }}
+            {{- if .Values.gpu.resourceName }}
+            limits:
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+            {{- end }}
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/blobs
+              readOnly: true
+            - name: scratch
+              mountPath: /data/scratch
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+      volumes:
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: {{ include "yashigani-infer.fullname" . }}-blobs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-chat
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-chat
+spec:
+  selector:
+    {{- include "yashigani-infer.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-chat
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http

@@ -1,0 +1,140 @@
+# Yashigani 6.0 inference engine — Helm values.
+# Pre-integration standalone chart (see Chart.yaml). Mirrors the compose overlay's numeric
+# resource ceilings and topology 1:1 so operators moving from compose to k8s get the same
+# posture without re-deriving numbers (Captain findings #3/#4).
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace: yashigani
+
+# Backend selection (Iris F4/F5 corrected image-SWAP logic) — exactly one of
+# cuda | rocm | vulkan | cpu. Node GPU labels/selectors narrow scheduling per platform doc §9.
+backend: cpu
+
+images:
+  cuda:
+    repository: yashigani/infer-cuda
+    tag: local
+  rocm:
+    repository: yashigani/infer-rocm
+    tag: local
+  vulkan:
+    repository: yashigani/infer-vulkan
+    tag: local
+  cpu:
+    repository: yashigani/infer-cpu
+    tag: local
+  puller:
+    repository: yashigani/infer-puller
+    tag: local
+  firstParseJail:
+    repository: yashigani/infer-first-parse-jail
+    tag: local
+
+# GPU node scheduling (device-plugin resource requests, platform doc §4).
+gpu:
+  nodeSelector: {}
+  # e.g. cuda: {"nvidia.com/gpu.present": "true"}; rocm: {"amd.com/gpu.present": "true"}
+  resourceName: ""
+  # e.g. cuda: "nvidia.com/gpu"; rocm: "amd.com/gpu"; vulkan/cpu: "" (no device-plugin resource)
+  count: 1
+
+classifier:
+  replicas: 1
+  keepAlivePin: true
+  maxCtx: 2048
+  maxConcurrency: 8
+  maxTokensPerRequest: 512
+  maxResidentModels: 1
+  expectGpu: true
+  expectedVramMb: 256
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # Guaranteed QoS reference point: set requests==limits to make this pod harder to evict
+  # under node memory pressure relative to chat pods (finding #3 OOM-victim-selection —
+  # k8s-native mechanism is QoS class via requests/limits ratio, not a manual procfs write).
+
+chat:
+  replicas: 1
+  maxCtx: 8192
+  maxConcurrency: 4
+  maxTokensPerRequest: 4096
+  idleUnloadSeconds: 600
+  maxResidentModels: 3
+  expectGpu: true
+  expectedVramMb: 1024
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      cpu: "4"
+      memory: 16Gi
+  overrideTensor: ""
+
+puller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+firstParseJail:
+  # Ephemeral Job, TTL-cleaned — see templates/job-first-parse-jail.yaml. Not a resident
+  # Deployment; this block only configures the Job template's resource ceiling.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi
+  ttlSecondsAfterFinished: 300
+
+# C3 supervisor scoped privilege (Captain finding #1/#3). v1's subprocess-based supervisor
+# does NOT use this RBAC yet — provisioned and scoped ready for a future
+# ContainerOrchestrationHook implementation. Disabled by default; enabling without a real
+# consumer just adds an unused, tightly-scoped ServiceAccount (harmless but also pointless —
+# leave false until the dynamic per-model orchestration seam is actually wired).
+supervisorRbac:
+  enabled: false
+  serviceAccountName: infer-supervisor
+
+admissionPolicies:
+  enabled: false
+  validationFailureAction: Enforce
+
+networkPolicies:
+  enabled: true
+
+# Caddy front upstream service names this chart's NetworkPolicy expects to peer with —
+# override if the main helm/yashigani release name differs from the default fullname.
+caddy:
+  serviceName: yashigani-caddy
+  frontPort: 11436
+
+blobStore:
+  size: 100Gi
+  storageClassName: ""
+
+mtls:
+  enabled: true
+
+# Custom Localhost seccomp profile provisioning (k8s cannot push files to node filesystems
+# via a Pod spec alone). true = install via the DaemonSet in
+# templates/daemonset-seccomp-profile-installer.yaml; false = Deployments use
+# seccompProfile.type: RuntimeDefault instead (cluster-portable, less strict than the
+# enumerated infer-llama-server.json deny-list — RuntimeDefault is still a real, non-trivial
+# profile, not Unconfined).
+seccomp:
+  installViaDaemonSet: false
+  kubeletSeccompRoot: /var/lib/kubelet/seccomp/profiles

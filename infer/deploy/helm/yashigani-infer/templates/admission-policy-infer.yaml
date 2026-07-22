@@ -1,0 +1,114 @@
+{{- /*
+Captain finding #1: "Every supervisor-created pod spec is admission-checked by a
+Kyverno/Gatekeeper policy (same family as the existing restrict-pki-trust-plane) that
+INDEPENDENTLY denies hostPath, hostNetwork, hostPID, privileged: true, capability adds, and
+assumption of the yashigani-pki ServiceAccount — enforced by policy, not trusted from
+supervisor code, because the threat model here is precisely 'the supervisor itself gets
+compromised.'"
+
+Pattern/naming mirrors helm/yashigani/templates/admission-policies.yaml's Kyverno
+convention (same fail-fast CRD-presence guard). Scope: pods carrying label
+yashigani.infer.managed=true (the label every supervisor-created pod MUST carry — a pod
+without the label is not this policy's concern, but also then isn't a legitimate
+supervisor-managed pod either; the ServiceAccount-subject rule below catches that case
+independently of the label).
+*/ -}}
+{{- if .Values.admissionPolicies.enabled }}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "clusterpolicies.kyverno.io" }}
+{{- if not $crd }}
+{{- fail "admissionPolicies.enabled=true but the Kyverno ClusterPolicy CRD is not installed in this cluster.\n\nInstall Kyverno first:\n  helm repo add kyverno https://kyverno.github.io/kyverno/\n  helm install kyverno kyverno/kyverno -n kyverno --create-namespace\nThen re-run helm install/upgrade, or set admissionPolicies.enabled=false." }}
+{{- end }}
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ .Release.Name }}-restrict-infer-supervisor-pod-spec
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    policies.kyverno.io/title: "Restrict infer-supervisor-managed pod spec"
+    policies.kyverno.io/category: "Pod Security"
+    policies.kyverno.io/severity: "critical"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Captain finding #1: denies hostPath/hostNetwork/hostPID/privileged/capability-adds
+      and assumption of the yashigani-pki ServiceAccount for any pod created via the
+      {{ .Values.supervisorRbac.serviceAccountName }} ServiceAccount or carrying the
+      yashigani.infer.managed=true label. Enforced independently of supervisor code —
+      the threat model is "the supervisor itself gets compromised."
+spec:
+  validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
+  background: true
+  rules:
+    - name: deny-hostpath-hostnetwork-hostpid
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["{{ .Values.namespace }}"]
+              selector:
+                matchLabels:
+                  yashigani.infer.managed: "true"
+      validate:
+        message: >-
+          Infer-supervisor-managed pods must not set hostPath volumes, hostNetwork, or
+          hostPID.
+        deny:
+          conditions:
+            any:
+              - key: "{{ "{{" }} request.object.spec.hostNetwork || false {{ "}}" }}"
+                operator: Equals
+                value: true
+              - key: "{{ "{{" }} request.object.spec.hostPID || false {{ "}}" }}"
+                operator: Equals
+                value: true
+              - key: "{{ "{{" }} length(request.object.spec.volumes[?hostPath]) || `0` {{ "}}" }}"
+                operator: GreaterThan
+                value: 0
+    - name: deny-privileged-and-capability-add
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["{{ .Values.namespace }}"]
+              selector:
+                matchLabels:
+                  yashigani.infer.managed: "true"
+      validate:
+        message: >-
+          Infer-supervisor-managed containers must not set privileged: true or add any
+          capability.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.securityContext.privileged || false {{ "}}" }}"
+                    operator: Equals
+                    value: true
+                  - key: "{{ "{{" }} length(element.securityContext.capabilities.add[]) || `0` {{ "}}" }}"
+                    operator: GreaterThan
+                    value: 0
+    - name: deny-pki-serviceaccount-assumption
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["{{ .Values.namespace }}"]
+      validate:
+        message: >-
+          Pods created by the {{ .Values.supervisorRbac.serviceAccountName }} identity (or
+          carrying yashigani.infer.managed=true) must not assume the yashigani-pki
+          ServiceAccount — closes the class this finding names: a compromised supervisor
+          escalating via the PKI trust plane's own SA.
+        deny:
+          conditions:
+            all:
+              - key: "{{ "{{" }} request.object.spec.serviceAccountName || '' {{ "}}" }}"
+                operator: Equals
+                value: "yashigani-pki"
+              - key: "{{ "{{" }} request.object.metadata.labels.\"yashigani.infer.managed\" || '' {{ "}}" }}"
+                operator: Equals
+                value: "true"
+{{- end }}
