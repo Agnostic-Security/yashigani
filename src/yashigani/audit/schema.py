@@ -147,6 +147,8 @@ class EventType(str, Enum):
     MCP_IMPORT_BLOCKED = "MCP_IMPORT_BLOCKED"
     # 5.0 A12 — content moderation / unsafe-topic filtering
     CONTENT_MODERATION_FLAGGED = "CONTENT_MODERATION_FLAGGED"
+    # 5.0 — multi-turn / slow-burn conversational injection escalation
+    CONVERSATION_INJECTION_ESCALATED = "CONVERSATION_INJECTION_ESCALATED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1641,6 +1643,27 @@ class ContentModerationEvent(AuditEvent):
     categories: list = field(default_factory=list)
     action_taken: str = ""  # block | flag
     content_hash: str = ""
+
+
+@dataclass
+class ConversationInjectionEscalatedEvent(AuditEvent):
+    """
+    5.0: a multi-turn / slow-burn injection attempt crossed the per-conversation
+    risk threshold. Single turns may each look benign (tangents); the ACCUMULATED
+    trajectory is the signal. Records the session, the accumulated score, the
+    turn count, and the contributing signal breakdown — never raw content.
+    """
+
+    event_type: str = EventType.CONVERSATION_INJECTION_ESCALATED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    session_id: str = ""
+    accumulated_score: float = 0.0
+    turn_count: int = 0
+    action_taken: str = ""  # flag | step_up | block
+    signal_breakdown: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

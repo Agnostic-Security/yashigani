@@ -194,6 +194,17 @@ def _build_app(mesh_mode: bool = False):
                 _cm_file, _cm_exc,
             )
 
+    # 5.0: multi-turn conversational-injection tracker. On by default (cheap,
+    # model-free); disable with YASHIGANI_CONVERSATION_RISK=false. Thresholds
+    # are conservative so a normal conversation never escalates.
+    conversation_risk_tracker = None
+    if os.getenv("YASHIGANI_CONVERSATION_RISK", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    ):
+        from yashigani.inspection.conversation_risk import ConversationRiskTracker
+        conversation_risk_tracker = ConversationRiskTracker()
+        logger.info("Multi-turn conversation-injection tracker enabled")
+
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None
     try:
@@ -967,6 +978,7 @@ def _build_app(mesh_mode: bool = False):
         system_prompt_leak_guard=system_prompt_leak_guard,  # 5.0 A4
         model_integrity_verifier=model_integrity_verifier,  # 5.0 A5
         content_moderation_guard=content_moderation_guard,  # 5.0 A12
+        conversation_risk_tracker=conversation_risk_tracker,  # 5.0 multi-turn
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,

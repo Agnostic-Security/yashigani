@@ -140,6 +140,11 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
 _OWUI_DENY_MESSAGES: dict[str, str] = {
+    # 5.0 — multi-turn conversational injection escalation
+    "conversation_injection_blocked":
+        "This conversation was flagged as a sustained attempt to manipulate the "
+        "assistant across multiple turns and was blocked. Contact an "
+        "administrator if you believe this is an error.",
     # 5.0 A12 — content moderation / unsafe-topic block
     "content_moderation_blocked":
         "This request was blocked by the content-safety policy. Contact an "
@@ -1056,6 +1061,8 @@ class OpenAIRouterState:
         self.audio_transcriber = None
         # 5.0 A12: content-moderation guard. None or empty-policy → no-op.
         self.content_moderation_guard = None
+        # 5.0: multi-turn conversational-injection risk tracker. None → no-op.
+        self.conversation_risk_tracker = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1258,6 +1265,7 @@ def configure(
     model_integrity_verifier=None,     # 5.0 A5 — ollama model-pin verifier
     audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
     content_moderation_guard=None,     # 5.0 A12 — unsafe-topic filtering
+    conversation_risk_tracker=None,    # 5.0 — multi-turn injection accumulator
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1298,6 +1306,7 @@ def configure(
     _state.model_integrity_verifier = model_integrity_verifier
     _state.audio_transcriber = audio_transcriber
     _state.content_moderation_guard = content_moderation_guard
+    _state.conversation_risk_tracker = conversation_risk_tracker
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -1927,6 +1936,59 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "X-Yashigani-Detection-Layer": "llm",
                 },
             )
+
+    # ── 2a-seq. Multi-turn conversational-injection accumulator (5.0) ──
+    # Per-message layers (mechanical + LLM) above are blind to a SLOW-BURN
+    # attack that builds over turns and hides behind benign tangents. This
+    # sequence layer accumulates per-turn risk (decaying, so tangents don't
+    # reset it); a sustained trajectory crosses a threshold and escalates even
+    # when no single turn tripped the per-message layers. Model-free (consumes
+    # cheap signals), so it adds no exploitable LLM surface of its own.
+    _seq = getattr(_state, "conversation_risk_tracker", None)
+    if _seq is not None and prompt_text:
+        try:
+            from yashigani.inspection.conversation_risk import (
+                extract_turn_signals, ACTION_BLOCK as _SEQ_BLOCK,
+                ACTION_STEP_UP as _SEQ_STEPUP,
+            )
+            _seq_session = identity.get("identity_id", identity_id) if identity else identity_id
+            _seq_verdict = _seq.observe(_seq_session, extract_turn_signals(prompt_text))
+            if _seq_verdict.escalated and _state.audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import ConversationInjectionEscalatedEvent
+                    _state.audit_writer.write(ConversationInjectionEscalatedEvent(
+                        request_id=request_id, identity_id=identity_id,
+                        session_id=_seq_session,
+                        accumulated_score=_seq_verdict.accumulated_score,
+                        turn_count=_seq_verdict.turn_count,
+                        action_taken=_seq_verdict.action,
+                        signal_breakdown=_seq_verdict.signal_breakdown,
+                    ))
+                except Exception:
+                    logger.warning("conversation-risk audit write failed")
+            if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
+                logger.warning(
+                    "CONVERSATION INJECTION %s /v1: identity=%s score=%.3f turns=%d request_id=%s",
+                    _seq_verdict.action.upper(), identity_id,
+                    _seq_verdict.accumulated_score, _seq_verdict.turn_count, request_id,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {
+                        "message": _owui_deny_message("conversation_injection_blocked"),
+                        "type": "conversation_injection_blocked",
+                        "code": _seq_verdict.action,
+                    }},
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Request-Verdict": "blocked",
+                        "X-Yashigani-Conversation-Risk": f"{_seq_verdict.accumulated_score:.3f}",
+                    },
+                )
+        except Exception as _seq_exc:
+            # The sequence layer is advisory hardening; a failure must not break
+            # the request (the per-message layers already ran fail-closed).
+            logger.warning("conversation-risk tracker raised: %s", _seq_exc)
 
     # ── 2a-mod. Content moderation on the request (5.0 A12) ──────────
     _mod_block = _moderate_content(prompt_text, "request", identity_id, request_id)
