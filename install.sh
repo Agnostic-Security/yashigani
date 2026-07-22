@@ -10975,6 +10975,26 @@ _do_chown() {
     _chown_mode="direct"
   fi
 
+  # FINDING-V412-DOCKER-MAC-VIRTIOFS-CHOWN — Docker Desktop for Mac (VirtioFS).
+  # On Docker Desktop macOS the secrets dir is a VirtioFS bind mount, which
+  # presents bind-mounted files to a container as ITS OWN uid regardless of the
+  # host-side owner/mode (verified live: a UID-1001 container reads a 0400
+  # host-max-owned token with NO chown). So host-side chown here:
+  #   1. is COSMETIC — it does NOT isolate; on Mac the real secret isolation is
+  #      which containers MOUNT which secrets (compose), not the file uid →
+  #      skipping it loses no security; and
+  #   2. is IMPOSSIBLE on read-only-mode files (0400/0444): VirtioFS rejects any
+  #      metadata syscall on a no-owner-write file → "Permission denied" → the
+  #      install aborts on a genuinely-unnecessary op.
+  # Per-runtime correctness (docker+Darwin only), NOT a band-aid — the op is
+  # skipped because it is unnecessary on THIS runtime. Linux docker (native fs,
+  # host uid DOES gate access) and podman are unaffected; file modes are set by
+  # the writers (PKI issuer etc.).
+  if [[ "$_chown_mode" == "docker_run" && "$(uname 2>/dev/null)" == "Darwin" ]]; then
+    log_info "_do_chown: Docker Desktop macOS (VirtioFS) — host-side chown is cosmetic + unrunnable on 0400; isolation is via compose mount scoping. Skipping for ${_label}."
+    return 0
+  fi
+
   local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
