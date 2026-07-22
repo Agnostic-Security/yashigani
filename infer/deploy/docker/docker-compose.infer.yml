@@ -24,18 +24,28 @@
 # Resource ceilings (Captain finding #3 — numeric, not "supervisor enforces bounds"):
 # mem_limit / pids_limit / mem_swappiness=0 / memswap_limit=mem_limit per service below.
 # n_ctx / max_concurrency / max_tokens are supervisor-level ceilings passed via the
-# YSG_INFER_MAX_* env vars documented in infer/deploy/README.md — wiring them into
-# EngineConfig/ResourceLimits construction is a Tom follow-up (no ASGI entrypoint module
-# exists yet in yashigani_infer; see docker/entrypoint/infer-entrypoint.sh's fail-closed
-# EX_CONFIG exit).
+# YSG_INFER_MAX_* env vars documented in infer/deploy/README.md — Tom's
+# yashigani_infer.entrypoint module (landed after this file's first commit; see
+# infer/deploy/README.md "Coordination gap — RESOLVED") now consumes them.
+#
+# Blob-store mount path (Tom's integration-seam fix, addressed here): `BlobStore.__init__`
+# (infer/src/yashigani_infer/blobstore/store.py) creates `<YSG_INFER_BLOB_STORE_ROOT>/blobs/`
+# AND `<YSG_INFER_BLOB_STORE_ROOT>/meta/` under the configured root — it is NOT itself a
+# "blobs" directory. Mounting the persistent volume at `/data/blobs` (the earlier shape)
+# would put the `blobs/` subdir on the volume but leave `meta/` (per-model provenance/
+# metadata JSON, read on every /api/tags, /api/show, /api/ps, find_by_name call) on the
+# container's own ephemeral/read-only rootfs — silently losing metadata every restart even
+# with the blob bytes themselves persisted. Fix: mount the WHOLE root at `/data/model-store`
+# and set `YSG_INFER_BLOB_STORE_ROOT=/data/model-store` — both `blobs/` and `meta/` then
+# live on the one mounted volume.
 
 networks:
   infer_ringfence:
     internal: true
 
 volumes:
-  infer_blobs:
-  # Puller-only scratch for in-flight downloads before atomic promote into infer_blobs
+  infer_model_store:
+  # Puller-only scratch for in-flight downloads before atomic promote into infer_model_store
   # (Su C4/C5 lane — download atomicity, symlink/allowlist containment — not built here).
   infer_puller_scratch:
 
@@ -58,10 +68,11 @@ services:
       - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-infer-llama-server}
     cap_drop: [ALL]
     volumes:
-      - infer_blobs:/data/blobs:ro
-      - ../deploy/docker/seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - infer_model_store:/data/model-store:ro
+      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
     environment:
       YSG_INFER_ROLE: classifier
+      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
       YSG_INFER_KEEP_ALIVE_PIN: "true"
       YSG_INFER_MAX_CTX: ${YSG_INFER_CLASSIFIER_MAX_CTX:-2048}
       YSG_INFER_MAX_CONCURRENCY: ${YSG_INFER_CLASSIFIER_MAX_CONCURRENCY:-8}
@@ -72,6 +83,14 @@ services:
       YSG_INFER_EXPECTED_VRAM_MB: ${YSG_INFER_CLASSIFIER_EXPECTED_VRAM_MB:-256}
     networks:
       - infer_ringfence
+    depends_on:
+      # infer-puller's BlobStore.__init__ mkdir's `blobs/` + `meta/` under the shared volume
+      # at process startup (Tom's entrypoint.py factory runs at uvicorn `--factory` load, not
+      # lazily) — waiting for it healthy avoids a cold-start race where this READ-ONLY mount
+      # tries to create those directories itself on a fresh, empty volume and fails closed
+      # (EROFS) before any model has ever been pulled.
+      infer-puller:
+        condition: service_healthy
 
   infer-chat:
     # image: set by the backend overlay
@@ -91,10 +110,11 @@ services:
       - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-infer-llama-server}
     cap_drop: [ALL]
     volumes:
-      - infer_blobs:/data/blobs:ro
-      - ../deploy/docker/seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - infer_model_store:/data/model-store:ro
+      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
     environment:
       YSG_INFER_ROLE: chat
+      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
       YSG_INFER_KEEP_ALIVE_PIN: "false"
       YSG_INFER_MAX_CTX: ${YSG_INFER_CHAT_MAX_CTX:-8192}
       YSG_INFER_MAX_CONCURRENCY: ${YSG_INFER_CHAT_MAX_CONCURRENCY:-4}
@@ -105,6 +125,10 @@ services:
       YSG_INFER_EXPECTED_VRAM_MB: ${YSG_INFER_CHAT_EXPECTED_VRAM_MB:-1024}
     networks:
       - infer_ringfence
+    depends_on:
+      # Same cold-start-race rationale as infer-classifier above.
+      infer-puller:
+        condition: service_healthy
 
   infer-puller:
     build:
@@ -125,11 +149,12 @@ services:
       - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
     cap_drop: [ALL]
     volumes:
-      - infer_blobs:/data/blobs:rw
+      - infer_model_store:/data/model-store:rw
       - infer_puller_scratch:/data/scratch:rw
-      - ../deploy/docker/seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
     environment:
       YSG_INFER_ROLE: puller
+      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
       # HF token, if configured, is secret-mounted (never an inline env value) — Su/Nico lane.
     networks:
       - infer_ringfence
@@ -158,7 +183,7 @@ services:
       - seccomp=/etc/yashigani/seccomp/infer-first-parse-jail.json
     cap_drop: [ALL]
     volumes:
-      - ../deploy/docker/seccomp/infer-first-parse-jail.json:/etc/yashigani/seccomp/infer-first-parse-jail.json:ro
+      - ./seccomp/infer-first-parse-jail.json:/etc/yashigani/seccomp/infer-first-parse-jail.json:ro
     # stdin piped in by the invoking caller; stdout captured; container removed (--rm) by
     # the caller immediately after — never left resident.
 

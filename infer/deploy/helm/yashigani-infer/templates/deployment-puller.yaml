@@ -44,6 +44,8 @@ spec:
           env:
             - name: YSG_INFER_ROLE
               value: "puller"
+            - name: YSG_INFER_BLOB_STORE_ROOT
+              value: "/data/model-store"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -53,7 +55,7 @@ spec:
             {{- toYaml .Values.puller.resources | nindent 12 }}
           volumeMounts:
             - name: blobs
-              mountPath: /data/blobs
+              mountPath: /data/model-store
               readOnly: false
             - name: scratch
               mountPath: /tmp

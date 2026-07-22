@@ -124,17 +124,58 @@ Both the socket-proxy and the Helm RBAC/admission-policy are shipped **disabled 
 supervisor doesn't consume them yet — enabling either without a real caller just adds an
 unused privileged surface.
 
-## Coordination gap — no ASGI entrypoint module exists yet
+## Coordination gap — ASGI entrypoint module — RESOLVED
 
-`infer/src/yashigani_infer/app.py`'s `create_app()` takes constructor keyword arguments
-(`blob_store`, `supervisor`, `upstream`, `pull_resolver`, `output_inspection_hook`) — it is not
-a bare `uvicorn --factory` target. Every Dockerfile's `ENTRYPOINT` (`docker/entrypoint/infer-
-entrypoint.sh`) execs `uvicorn yashigani_infer.entrypoint:create_asgi_app --factory`, a module
-that **does not exist in the package today**. The entrypoint script checks for it and **fails
-closed with exit 78 (EX_CONFIG)** and a clear message rather than guessing a wiring invocation.
-The exact env-var contract that module needs to honour is documented inline in
-`infer-entrypoint.sh` (`YSG_INFER_ROLE`, `YSG_INFER_MAX_CTX`, `YSG_INFER_MAX_CONCURRENCY`,
-etc.) — this is a named, build-blocking coordination item for Tom, not a deploy-layer bug.
+Tom landed `infer/src/yashigani_infer/entrypoint.py` (`b61b494b`, "add ASGI wiring entrypoint
+closing Captain's coordination gap") — `create_asgi_app` is now a real `uvicorn --factory`
+target that parses the documented env-var contract and constructs the real `BlobStore`/
+`Supervisor`/`HttpxUpstreamClient` graph, failing closed (`EntrypointConfigError`) on any
+missing/invalid required value. The entrypoint scripts' fail-closed exit-78 path is now dead
+code in practice (module exists) but left in place — it degrades gracefully to the same
+fail-closed behaviour if the module is ever removed/renamed.
+
+## Blob-store mount path — RESOLVED (2026-07-22, follow-up fix)
+
+Tom's entrypoint module surfaced a real gap in this tree: `docker-compose.infer.yml` and the
+three Helm Deployments never set `YSG_INFER_BLOB_STORE_ROOT`, so `BlobStore` defaulted to
+`$HOME/.yashigani/infer/blobs` **inside the container** — pulled models would not survive a
+restart, because that path is on the container's own (ephemeral/read-only) rootfs, not the
+mounted volume.
+
+**Root cause, checked against the actual code (not guessed):** `BlobStore.__init__`
+(`blobstore/store.py`) creates `<root>/blobs/` **and** `<root>/meta/` under whatever root it's
+given — the root itself is not a "blobs" directory. The original mount shape
+(`infer_blobs:/data/blobs`) put the `blobs/` subdir on the named volume but left `meta/`
+(the per-model provenance/metadata JSON read by `/api/tags`, `/api/show`, `/api/ps`,
+`find_by_name`) on the container's own filesystem — losing metadata every restart even with
+blob bytes persisted.
+
+**Fix — value chosen and the mount it maps to:**
+
+| | Compose | Helm |
+|---|---|---|
+| `YSG_INFER_BLOB_STORE_ROOT` | `/data/model-store` | `/data/model-store` |
+| Mount | named volume `infer_model_store` (renamed from `infer_blobs`) → `/data/model-store` (classifier/chat `:ro`, puller `:rw`) | PVC `{{ fullname }}-blobs` → `/data/model-store` (classifier/chat `readOnly: true`, puller `readOnly: false`) |
+
+Set identically on all three compose services and all three Helm Deployments (classifier,
+chat, puller) — verified by `docker compose config` and `helm template` (see updated Offline-
+verify table below). `docker/apparmor/yashigani-infer-llama-server` and every Dockerfile's
+`mkdir -p` were updated from `/data/blobs` to `/data/model-store` to match.
+
+**Cold-start ordering, closed too (not left as a landmine):** classifier/chat mount the volume
+**read-only** (finding #4, no exception) — on a brand-new, empty volume, `BlobStore.__init__`'s
+`mkdir(parents=True, exist_ok=True)` would try to create `blobs/`/`meta/` itself and fail
+closed (`EROFS`) before any model is ever pulled. Compose: `depends_on: infer-puller:
+condition: service_healthy` (puller mounts read-write and its own `BlobStore()` construction at
+process startup creates both subdirs first). Helm: an `initContainer` on classifier/chat
+mounts the same PVC read-write just to `mkdir -p` both subdirs before the main (read-only)
+container starts — standard k8s per-container mount-mode pattern, no extra privilege.
+
+**Also caught and fixed while verifying this (pre-existing, not introduced by this fix):**
+`docker-compose.infer.yml`'s seccomp bind-mount source was `../deploy/docker/seccomp/...`,
+which resolves relative to the compose file's own directory (`infer/deploy/docker/`) to a
+nonexistent `infer/deploy/deploy/docker/seccomp/...` path. Fixed to `./seccomp/...`; confirmed
+via `docker compose config` that the resolved `source:` now points at the real file.
 
 ## Offline-verify results (this session, `scripts/verify-offline.sh`)
 
@@ -150,6 +191,8 @@ etc.) — this is a named, build-blocking coordination item for Tom, not a deplo
 | seccomp JSON validity (`jq`) | **PASS** — both profiles + the helm mirror parse and have `defaultAction: SCMP_ACT_ERRNO`. |
 | Helm-mirror byte-parity (`sync-infer-deploy-artifacts-to-helm.sh --check`) | **PASS** — Caddyfile + seccomp JSON mirrors byte-identical to canonical. |
 | Portability fix (this session) | `sync-infer-deploy-artifacts-to-helm.sh` originally used `declare -A` (bash 4+ associative arrays) — **fails on macOS's default bash 3.2**. Rewrote with parallel indexed arrays before first run; verified working on this Mac's actual `/bin/bash 3.2.57`. |
+| `YSG_INFER_BLOB_STORE_ROOT` present on all 3 compose services | **PASS** — `docker compose -f docker-compose.infer.yml -f docker-compose.infer.cpu.yml config` shows `YSG_INFER_BLOB_STORE_ROOT: /data/model-store` on `infer-classifier`, `infer-chat`, `infer-puller`; mount `target: /data/model-store` matches on all three. |
+| `YSG_INFER_BLOB_STORE_ROOT` present on all 3 Helm Deployments | **PASS** — `helm template` (cuda variant) shows `value: "/data/model-store"` on `infer-classifier`, `infer-chat`, `infer-puller` containers; `volumeMounts[].mountPath: /data/model-store` matches on all three. |
 
 ## Explicitly deferred to a live GPU build (nothing guessed)
 

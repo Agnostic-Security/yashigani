@@ -43,6 +43,30 @@ spec:
           {{- else }}
           type: RuntimeDefault
           {{- end }}
+      # Tom's integration-seam fix: `BlobStore.__init__` creates `<root>/blobs/` AND
+      # `<root>/meta/` under YSG_INFER_BLOB_STORE_ROOT. This container mounts the PVC
+      # READ-ONLY (finding #4 — no exception, including the classifier) — on a brand-new,
+      # empty PVC that mkdir would fail closed (EROFS) before any model has ever been
+      # pulled. This initContainer mounts the SAME PVC read-write (fsGroup 1002 makes it
+      # group-writable to the same non-root UID the main container runs as) and pre-creates
+      # both subdirectories once, so the main container's own BlobStore(root) construction
+      # (mkdir(..., exist_ok=True)) is a no-op against already-existing directories.
+      initContainers:
+        - name: init-model-store-dirs
+          image: busybox:1.36@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME
+          command: ["sh", "-c", "mkdir -p /data/model-store/blobs /data/model-store/meta"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1002
+            runAsGroup: 1002
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/model-store
+              readOnly: false
       containers:
         - name: infer-classifier
           image: {{ include "yashigani-infer.image" . }}
@@ -53,6 +77,8 @@ spec:
           env:
             - name: YSG_INFER_ROLE
               value: "classifier"
+            - name: YSG_INFER_BLOB_STORE_ROOT
+              value: "/data/model-store"
             - name: YSG_INFER_KEEP_ALIVE_PIN
               value: {{ .Values.classifier.keepAlivePin | quote }}
             - name: YSG_INFER_MAX_CTX
@@ -87,7 +113,7 @@ spec:
             {{- end }}
           volumeMounts:
             - name: blobs
-              mountPath: /data/blobs
+              mountPath: /data/model-store
               readOnly: true
             - name: scratch
               mountPath: /data/scratch

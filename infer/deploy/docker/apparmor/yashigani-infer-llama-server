@@ -36,8 +36,8 @@ profile yashigani-infer-llama-server flags=(attach_disconnected,mediate_deleted)
   # Finding #2/#4: blob store is READ-ONLY, no exception — including the classifier's own
   # container. The ONLY writable data path is the scratch/tmp directory (size-capped tmpfs,
   # matches the resource-ceiling finding #3).
-  /data/blobs/ r,
-  /data/blobs/** r,
+  /data/model-store/ r,
+  /data/model-store/** r,
   /data/scratch/ rw,
   /data/scratch/** rw,
 

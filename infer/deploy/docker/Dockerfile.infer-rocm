@@ -74,7 +74,7 @@ RUN pip3 install --no-cache-dir --break-system-packages /tmp/*.whl \
 COPY infer/deploy/docker/entrypoint/infer-entrypoint.sh /usr/local/bin/infer-entrypoint.sh
 COPY infer/deploy/gpu/healthcheck-gpu-engaged.sh /usr/local/bin/healthcheck-gpu-engaged.sh
 RUN chmod 0555 /usr/local/bin/infer-entrypoint.sh /usr/local/bin/llama-server /usr/local/bin/healthcheck-gpu-engaged.sh \
-    && mkdir -p /data/blobs /data/scratch \
+    && mkdir -p /data/model-store /data/scratch \
     && chown -R yashigani-infer:yashigani-infer /data
 
 USER yashigani-infer
