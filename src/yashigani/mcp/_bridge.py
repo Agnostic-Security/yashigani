@@ -42,7 +42,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -89,11 +89,16 @@ class _BridgeProcess:
         env: Optional[dict] = None,
         read_timeout: float = _DEFAULT_SUBPROCESS_READ_TIMEOUT,
         restart_on_crash: bool = True,
+        audit_hook: "Optional[Callable[[dict], None]]" = None,
     ) -> None:
         self._command = command
         self._extra_env = env or {}
         self._read_timeout = read_timeout
         self._restart_on_crash = restart_on_crash
+        # A2 (5.0): called with a structured event dict on every G8 server-
+        # initiated-primitive denial so the reject is AUDITED, not just logged
+        # (register acceptance gate). None → audit falls back to the logger.
+        self._audit_hook = audit_hook
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._restart_count = 0
@@ -264,15 +269,27 @@ class _BridgeProcess:
                             logger.warning(
                                 "mcp-bridge: DENIED server frame hijacking pending "
                                 "id=%r method=%r (default-deny G8)", hijacked_id, method)
+                            self._emit_deny_audit(
+                                reason="id_hijack", method=method,
+                                frame_id=hijacked_id, frame_kind=frame_kind,
+                            )
                             continue
                     if _frame_shape.is_reverse_primitive(msg):
                         logger.warning(
                             "mcp-bridge: DENIED server-initiated primitive method=%r "
                             "(default-deny G8)", method)
+                        self._emit_deny_audit(
+                            reason="reverse_primitive", method=method,
+                            frame_id=msg.get("id"), frame_kind=frame_kind,
+                        )
                     else:
                         logger.debug(
                             "mcp-bridge: discarded non-response frame kind=%s method=%r",
                             frame_kind, method)
+                        self._emit_deny_audit(
+                            reason="malformed_frame", method=method,
+                            frame_id=msg.get("id"), frame_kind=frame_kind,
+                        )
                     continue
 
                 # Deliver to the matching waiter by id (genuine response only)
@@ -298,6 +315,31 @@ class _BridgeProcess:
                 if not fut.done():
                     fut.set_exception(RuntimeError("mcp-bridge: reader loop exited"))
             self._pending.clear()
+
+    def _emit_deny_audit(
+        self, reason: str, method, frame_id, frame_kind: str,
+    ) -> None:
+        """A2 (5.0): audit a G8 server-initiated-primitive denial.
+
+        Best-effort and never raises — an audit failure must not break the
+        reader loop. Falls back to a structured warning log when no hook is
+        wired so the deny is still on a durable channel.
+        """
+        event = {
+            "event_type": "MCP_SERVER_PRIMITIVE_DENIED",
+            "reason": reason,                       # id_hijack | reverse_primitive | malformed_frame
+            "method": method if isinstance(method, str) else None,
+            "frame_id": str(frame_id) if frame_id is not None else None,
+            "frame_kind": frame_kind,
+            "action_taken": "denied",
+        }
+        try:
+            if self._audit_hook is not None:
+                self._audit_hook(event)
+            else:
+                logger.warning("mcp-bridge AUDIT %s", json.dumps(event, sort_keys=True))
+        except Exception as exc:  # pragma: no cover — audit must never break the loop
+            logger.error("mcp-bridge: deny-audit emit failed: %s", exc)
 
     @property
     def is_running(self) -> bool:
@@ -394,11 +436,23 @@ class _BridgeProcess:
             await self._proc.stdin.drain()
 
 
+# A2 (5.0): dedicated audit logger for the standalone bridge container. G8
+# deny events land here as structured JSON so the SIEM/Wazuh pipeline routes
+# them to the audit sink even though the bridge is a separate process from the
+# gateway's in-process AuditLogWriter.
+_bridge_audit_logger = logging.getLogger("yashigani.audit.mcp_bridge")
+
+
+def _default_bridge_audit_hook(event: dict) -> None:
+    _bridge_audit_logger.warning("%s", json.dumps(event, sort_keys=True))
+
+
 def create_bridge_app(
     command: Optional[list[str]] = None,
     env: Optional[dict] = None,
     read_timeout: float = _DEFAULT_SUBPROCESS_READ_TIMEOUT,
     restart_on_crash: bool = True,
+    audit_hook: "Optional[Callable[[dict], None]]" = None,
 ) -> FastAPI:
     """
     Create the bridge ASGI application.
@@ -441,6 +495,7 @@ def create_bridge_app(
         env=env,
         read_timeout=read_timeout,
         restart_on_crash=restart_on_crash,
+        audit_hook=audit_hook or _default_bridge_audit_hook,
     )
 
     @asynccontextmanager
