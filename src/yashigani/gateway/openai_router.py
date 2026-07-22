@@ -140,6 +140,10 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
 _OWUI_DENY_MESSAGES: dict[str, str] = {
+    # 5.0 A12 — content moderation / unsafe-topic block
+    "content_moderation_blocked":
+        "This request was blocked by the content-safety policy. Contact an "
+        "administrator if you believe this is an error.",
     # 5.0 A6-audio — audio present but cannot be transcribed/inspected
     "audio_not_inspectable":
         "This request included audio that could not be transcribed and security-"
@@ -213,6 +217,48 @@ def _owui_deny_message(reason: str) -> str:
     Never leaks the raw reason code into the returned string.
     """
     return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+
+
+def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
+    """5.0 A12: run the content-moderation guard on `text`. Returns a 403
+    JSONResponse when a block-category matches, else None (allow/flag). A flag
+    is audited but not blocked. No-op when no guard/policy is configured."""
+    guard = getattr(_state, "content_moderation_guard", None)
+    if guard is None or not getattr(guard, "active", False) or not text:
+        return None
+    result = guard.moderate(text)
+    if not result.flagged:
+        return None
+    if _state.audit_writer is not None:
+        try:
+            from yashigani.audit.schema import ContentModerationEvent
+            _state.audit_writer.write(ContentModerationEvent(
+                request_id=request_id, identity_id=identity_id, leg=leg,
+                categories=result.categories, action_taken=result.action,
+                content_hash=result.content_hash,
+            ))
+        except Exception:  # pragma: no cover
+            logger.warning("A12 moderation audit write failed")
+    if result.blocked:
+        logger.warning(
+            "A12: content moderation BLOCK leg=%s categories=%s request_id=%s",
+            leg, result.categories, request_id,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={"error": {
+                "message": _owui_deny_message("content_moderation_blocked"),
+                "type": "content_moderation_blocked",
+                "code": ",".join(result.categories),
+            }},
+            headers={
+                "X-Yashigani-Request-Id": request_id,
+                "X-Yashigani-Moderation": ",".join(result.categories),
+            },
+        )
+    logger.info("A12: content moderation FLAG leg=%s categories=%s request_id=%s",
+                leg, result.categories, request_id)
+    return None
 
 
 def _verify_ollama_pin(model: str, request_id: str):
@@ -975,6 +1021,8 @@ class OpenAIRouterState:
         # 5.0 A6-audio: transcriber. When None or unconfigured, a request
         # carrying audio is BLOCKED (never passed uninspected).
         self.audio_transcriber = None
+        # 5.0 A12: content-moderation guard. None or empty-policy → no-op.
+        self.content_moderation_guard = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1176,6 +1224,7 @@ def configure(
     system_prompt_leak_guard=None,     # 5.0 A4 — response-leg leak scrub
     model_integrity_verifier=None,     # 5.0 A5 — ollama model-pin verifier
     audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
+    content_moderation_guard=None,     # 5.0 A12 — unsafe-topic filtering
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1215,6 +1264,7 @@ def configure(
     _state.system_prompt_leak_guard = system_prompt_leak_guard
     _state.model_integrity_verifier = model_integrity_verifier
     _state.audio_transcriber = audio_transcriber
+    _state.content_moderation_guard = content_moderation_guard
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -1783,6 +1833,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "X-Yashigani-Request-Classification": _insp.classification,
                 },
             )
+
+    # ── 2a-mod. Content moderation on the request (5.0 A12) ──────────
+    _mod_block = _moderate_content(prompt_text, "request", identity_id, request_id)
+    if _mod_block is not None:
+        return _mod_block
 
     # ── 2b. Content relay detection (agent-to-agent laundering) ──────
     if _state.content_relay_detector and prompt_text:
@@ -3525,6 +3580,39 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # Redaction is best-effort; a guard crash must not fail the request,
             # but log it loudly so the gap is visible.
             logger.error("A4: system-prompt leak scan raised %s", _leak_exc)
+
+    # ── 7b-iv. Content moderation on the response (5.0 A12) ──────────
+    # A block withholds the content (consistent with A4 / response inspection);
+    # a flag is audited but delivered. No-op when no policy is configured.
+    _mod_guard = getattr(_state, "content_moderation_guard", None)
+    if (
+        _mod_guard is not None and getattr(_mod_guard, "active", False)
+        and assistant_content and response_verdict == "clean"
+    ):
+        try:
+            _mod_res = _mod_guard.moderate(assistant_content)
+            if _mod_res.flagged and _state.audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import ContentModerationEvent
+                    _state.audit_writer.write(ContentModerationEvent(
+                        request_id=request_id, identity_id=identity_id, leg="response",
+                        categories=_mod_res.categories, action_taken=_mod_res.action,
+                        content_hash=_mod_res.content_hash,
+                    ))
+                except Exception:
+                    logger.warning("A12 response moderation audit write failed")
+            if _mod_res.blocked:
+                logger.warning(
+                    "A12: response content moderation BLOCK categories=%s request_id=%s",
+                    _mod_res.categories, request_id,
+                )
+                response_verdict = "blocked"
+                assistant_content = (
+                    "This response was withheld by the content-safety policy. "
+                    "Contact an administrator if you believe this is an error."
+                )
+        except Exception as _mod_exc:
+            logger.error("A12: response moderation raised %s", _mod_exc)
 
     # ── 7c. PII detection on response (buffered path only) ────────────
     #

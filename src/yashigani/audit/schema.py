@@ -145,6 +145,8 @@ class EventType(str, Enum):
     MANIFEST_ACTIVE_BLOCKED = "MANIFEST_ACTIVE_BLOCKED"
     # 5.0 tool-poisoning block-half — strict-mode import rejection
     MCP_IMPORT_BLOCKED = "MCP_IMPORT_BLOCKED"
+    # 5.0 A12 — content moderation / unsafe-topic filtering
+    CONTENT_MODERATION_FLAGGED = "CONTENT_MODERATION_FLAGGED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1610,6 +1612,25 @@ class McpImportBlockedEvent(AuditEvent):
     rejected_tools: list = field(default_factory=list)
     sidecar_escalations: list = field(default_factory=list)
     action_taken: str = "blocked"
+
+
+@dataclass
+class ContentModerationEvent(AuditEvent):
+    """
+    5.0 A12: content-moderation / unsafe-topic filter flagged prompt or response
+    content. Records the matched categories and the leg, never the content
+    (a hash only). action = block | flag per the category policy.
+    """
+
+    event_type: str = EventType.CONTENT_MODERATION_FLAGGED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    leg: str = ""  # request | response
+    categories: list = field(default_factory=list)
+    action_taken: str = ""  # block | flag
+    content_hash: str = ""
 
 
 # ---------------------------------------------------------------------------
