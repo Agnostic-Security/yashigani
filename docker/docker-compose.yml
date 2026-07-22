@@ -320,6 +320,14 @@ services:
       - ./secrets-caddy/caddy_client.crt:/run/secrets/caddy_client.crt:ro
       - ./secrets-caddy/caddy_client.key:/run/secrets/caddy_client.key:ro
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): CA PRIVATE keys mask. Caddy only
+      # ever needs ca_root.crt (verify) — it never signs. Shadow-mount the
+      # empty placeholder over both CA private-key paths so a compromised
+      # Caddy process cannot read either key (see docker/pki-key-mask/README.md).
+      # Only the ephemeral install.sh issuer container and backoffice's OWN
+      # /run/secrets/ca_intermediate.key (mint_agent_leaf) keep the real files.
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
       # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: the OLD
       # caddy_admin_sock (backoffice-shared reload relay, "MCP-onboarding
@@ -780,6 +788,11 @@ services:
       # (auth/caddy_verified.py Layer B) — CADDY_INTERNAL_HMAC env var first,
       # file fallback at this unchanged in-container path.
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): gateway never signs — only
+      # verifies (YASHIGANI_CA_CERT=ca_root.crt above). Mask both CA private
+      # keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       # Demo/free: writable cloud-keys volume for runtime-set cloud LLM API keys.
       # DockerSecretsProvider reads this dir first (before /run/secrets) when
       # resolving cloud keys set via the admin UI.  Mode 0600 per-file (set by
@@ -1181,6 +1194,14 @@ services:
       # bootstrap.py now catches the resulting PermissionError per-field
       # instead of crashing the entrypoint (see auth/bootstrap.py diff).
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): backoffice DOES sign — it mints
+      # per-agent leaves at onboard time (mcp_onboard.py mint_agent_leaf, via
+      # IssuerPaths(secrets_dir=$YASHIGANI_SECRETS_DIR) reading
+      # /run/secrets/ca_intermediate.key) — that file is left un-masked below.
+      # ca_root.key is NEVER read by any running service (only install.sh's
+      # ephemeral one-shot issuer container touches it, outside compose) — mask
+      # it even here (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
       - ./secrets/admin_initial_password:/run/secrets-rw/admin_initial_password:rw
       - ./secrets/grafana_admin_password:/run/secrets-rw/grafana_admin_password:rw
       - ./secrets/redis_password:/run/secrets-rw/redis_password:rw
@@ -1264,6 +1285,15 @@ services:
       #     independent of and in addition to the Python-level guard.
       - ./:/mnt/install/docker:rw
       - ./secrets:/mnt/install/docker/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): this artifact-writing mount is
+      # a SECOND, independent path to docker/secrets/ (same file, different
+      # in-container location) — nothing that reads codegen artifacts here
+      # needs either CA private key (mint_agent_leaf reads them ONLY via
+      # /run/secrets above, never via /mnt/install/...). Mask both so a
+      # compromised backoffice cannot read ca_root.key/ca_intermediate.key
+      # through this second path either (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/mnt/install/docker/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/mnt/install/docker/secrets/ca_intermediate.key:ro
       - ./secrets-caddy:/mnt/install/docker/secrets-caddy:ro
       - ./var:/mnt/install/docker/var:ro
       - ./.env:/mnt/install/docker/.env:ro
@@ -1508,6 +1538,10 @@ services:
       # material (certs/keys). redis_password additionally mounted per-file so
       # budget-redis cannot read postgres_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): budget-redis never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./secrets/redis_password:/run/secrets/redis_password:ro
     healthcheck:
       # trust anchor: ca_root.crt — libssl strict-mode (error:0A000086 with intermediate)
@@ -1591,6 +1625,10 @@ services:
       - ../policy:/policies:ro
       - ../policy/data:/policies/data:ro
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): policy never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     healthcheck:
       # OPA image is scratch-based: only /opa binary, no shell, no curl, no wget.
       # podman-compose 1.0.6 translates CMD form to /bin/sh -c which fails on
@@ -1650,6 +1688,10 @@ services:
       # material (certs/keys). redis_password additionally mounted per-file so
       # redis cannot read postgres_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): redis never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./secrets/redis_password:/run/secrets/redis_password:ro
     healthcheck:
       # redis-cli over TLS with our client cert.
@@ -1958,6 +2000,10 @@ services:
       # → Prometheus datasource calls use mutual TLS (Pattern B).
       - ../config/prometheus-web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): prometheus never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     healthcheck:
       # v2.23.3 RETRO-V233-001: prometheus enables RequireAndVerifyClientCert
       # (prometheus-web-config.yml). wget --no-check-certificate skips server
@@ -2039,6 +2085,10 @@ services:
       - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../config/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): grafana never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     healthcheck:
       # retro #83: Grafana now serves HTTPS on 3443. wget --no-check-certificate
       # skips CA verification for localhost-only healthcheck (no SPIFFE needed).
@@ -2107,6 +2157,10 @@ services:
       # material (certs/keys). postgres_password additionally mounted per-file so
       # postgres cannot read redis_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): postgres never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./secrets/postgres_password:/run/secrets/postgres_password:ro
       # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21) — defence-in-depth
       # on top of the /run/secrets RO fix above (backoffice volumes, this file):
@@ -2220,6 +2274,10 @@ services:
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): pgbouncer never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       # YSG-RISK-073 cycle 7: pgbouncer_authenticator_password redundant mount removed.
       # ./secrets:/run/secrets:ro bulk mount above provides all needed certs.
@@ -2275,6 +2333,10 @@ services:
       - ../config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager_data:/alertmanager
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): alertmanager never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     depends_on:
       prometheus:
         condition: service_healthy
@@ -2319,6 +2381,10 @@ services:
       # loki is mtls_capable:true in service_identities.yaml so the bootstrap
       # issues loki_client.crt/key. /run/secrets is read-only (RO bind-mount).
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): loki never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     healthcheck:
       # v2.23.3 RETRO-V233-001 (extended): Loki 3.7.1 is fully distroless — the
       # image contains only the /bin/loki binary. No shell, no wget, and no nc.
@@ -2366,6 +2432,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # PKI certs: promtail client cert for mTLS push to Loki.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): promtail never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       # B8: persist positions file so re-tails from last offset on restart rather
       # than from the start (which causes duplicate log ingestion into Loki).
       # /tmp/positions.yaml was lost on every container restart. Named volume
@@ -2421,6 +2491,10 @@ services:
       # PKI certs: collector presents otel-collector leaf cert to clients;
       # trusts ca_intermediate.crt as the client-cert verification CA.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): otel-collector never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     healthcheck:
       test: ["CMD", "/otelcol-contrib", "components"]
       interval: 30s
@@ -2468,6 +2542,10 @@ services:
     command: ["--config=/etc/jaeger/jaeger.yml"]
     volumes:
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): jaeger never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ../config/jaeger/jaeger.yml:/etc/jaeger/jaeger.yml:ro
     healthcheck:
       # v2.23.3 RETRO-V233-001: Jaeger v2 all-in-one image is distroless — no
@@ -2566,6 +2644,10 @@ services:
       VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
     volumes:
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): vault never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     read_only: true
     tmpfs:
       # YSG-RISK-008 (v2.23.4): vault dev-mode stores data in-memory only.
@@ -2941,6 +3023,10 @@ services:
       #           postgres_password (PGPASSWORD).
       # No write access required — the job only reads secrets and runs psql.
       - ./secrets:/run/secrets:ro
+      # FINDING-V412-F1 (Captain, 2026-07-22): agent-db-init never signs — mask
+      # both CA private keys (see docker/pki-key-mask/README.md).
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]

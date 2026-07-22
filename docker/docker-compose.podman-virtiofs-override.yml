@@ -130,6 +130,11 @@ services:
       # (same statfs-EPERM rationale as the dir mount). No clobber risk: the
       # hmac file is shared only by gateway + backoffice, both UID 1001.
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
+      # FINDING-V412-F1 (Captain, 2026-07-22): mask both CA private keys — see
+      # docker-compose.yml gateway service comment + docker/pki-key-mask/README.md.
+      # denied.mask never contains secret material, so no :U ownership concern.
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
       - ./cloud-keys:/run/cloud-keys:rw
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
       # NO /var/run/docker.sock entry here — see header comment. Pool Manager
@@ -158,22 +163,34 @@ services:
       - ./secrets:/run/secrets:ro,U
       # YSG-RISK-053: see gateway note above.
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
+      # FINDING-V412-F1 (Captain, 2026-07-22): mask ca_root.key ONLY — backoffice
+      # keeps the real ca_intermediate.key (mint_agent_leaf onboarding signer).
+      # See docker-compose.yml backoffice service comment.
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
 
   policy:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   redis:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   prometheus:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   grafana:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   caddy:
     volumes:
@@ -187,6 +204,9 @@ services:
       # never the file, so the base ro mount is sufficient.
       - ./secrets-caddy/caddy_client.crt:/run/secrets/caddy_client.crt:ro,U
       - ./secrets-caddy/caddy_client.key:/run/secrets/caddy_client.key:ro,U
+      # FINDING-V412-F1 (Captain, 2026-07-22): mask both CA private keys.
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   postgres:
     volumes:
@@ -195,34 +215,50 @@ services:
       # :U rationale as /run/secrets above (directory-level bind mount needs
       # it on macOS virtiofs; no other service mounts this path at all).
       - ./secrets-pki-attest:/run/secrets-pki-attest:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   pgbouncer:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   alertmanager:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   loki:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   otel-collector:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   jaeger:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   vault:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   budget-redis:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
+      - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
 
   # langflow — third-party image, cannot bake OPENSSL_armcap into Dockerfile.
   # Root cause: cryptography >=46.0.0 ships a Rust/OpenSSL arm64 binary
