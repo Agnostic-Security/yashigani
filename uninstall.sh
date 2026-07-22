@@ -44,6 +44,17 @@ YES="false"
 # state file's PROJECT field (which falls back to "docker" for legacy installs).
 PROJECT_FLAG="${PROJECT_FLAG:-}"
 
+# K8S-PROJECT-FLAG-2026-07-22 (Finding 3, P1): explicit k8s-native selectors.
+# --project=NAME alone was silently ignored by _teardown_k8s() (it only reads
+# YASHIGANI_NAMESPACE/YASHIGANI_HELM_RELEASE env vars, falling back to the LOCAL
+# tree's state file) — a wrong-target risk on a shared multi-org k8s cluster.
+# --namespace=/--release= give an unambiguous, documented, k8s-specific override;
+# --project= is additionally wired below (after runtime resolution) as a
+# lower-precedence namespace fallback so the existing multi-instance flag keeps
+# working for k8s installs where PROJECT == NAMESPACE (install.sh's own convention).
+NAMESPACE_FLAG="${NAMESPACE_FLAG:-}"
+RELEASE_FLAG="${RELEASE_FLAG:-}"
+
 # MI-4 (step-up on destructive lifecycle ops / YSG-RISK-061): proof that a fresh
 # step-up TOTP verification was performed before this privileged mutation. May be
 # supplied via --stepup-token=<value> or the YASHIGANI_STEPUP_TOKEN env var; the
@@ -263,6 +274,29 @@ _list_project_containers() {
 # prefix anchor) — so both sweeps see the identical set regardless of
 # whether "ringfence_" is the start of the name or an infix after the
 # project prefix.
+#
+# CROSS-ORG-RINGFENCE-SWEEP-2026-07-22 (P0, Tiago gap-map finding 1): the
+# bare pattern above is safe ONLY as an in-process `grep -v` EXCLUSION inside
+# _list_project_networks(), because that function's own base enumeration is
+# ALREADY project-scoped (label match OR `^${_pfx}_` name anchor) before the
+# exclusion ever runs — so nothing outside this project's networks reaches
+# the exclusion filter to begin with.
+#
+# It is NOT safe used directly as a `network ls --filter name=...` query
+# against the runtime, because Docker/Podman's `--filter name=` is a
+# substring match against EVERY network on the daemon, with no project
+# scoping applied at all. On a shared multi-org host, `network ls --filter
+# name=ringfence_` returns every org's `<project>_ringfence_<agent>`
+# network, and the J12 removal sweep below then `network rm`'d all of them —
+# a single org's `uninstall.sh --project=orgA --remove-volumes` deleted
+# orgB's active ringfence networks. CONFIRMED via local podman regression
+# test (testing_runs/yashigani/wt-su-lifecycle/, 2026-07-22).
+#
+# Fix: the REMOVAL sweep must anchor to THIS project's prefix
+# (${_PROJECT_PREFIX}_ringfence_ — see _PROJECT_RINGFENCE_PATTERN below,
+# derived once _PROJECT_PREFIX is resolved). The bare pattern here stays as
+# the exclusion-only building block; never pass it unanchored to a runtime
+# `--filter name=` query again.
 # ---------------------------------------------------------------------------
 _RINGFENCE_NAME_PATTERN="ringfence_"
 
@@ -652,6 +686,31 @@ _teardown_k8s() {
   echo "  Namespace: ${_ns}"
   echo "  Helm release: ${_release}"
 
+  # ---------------------------------------------------------------------------
+  # CROSS-ORG-COREDNS-WARN-2026-07-22 (Finding 4, P2): if THIS install patched
+  # the SHARED kube-system CoreDNS ConfigMap (install.sh --apply-coredns-
+  # hardening), warn the operator — never auto-revert. It is a cluster-wide
+  # resource outside this namespace/Helm release; other orgs/namespaces on the
+  # same cluster may depend on the hardened Corefile still being in place.
+  # ---------------------------------------------------------------------------
+  if [ "${YASHIGANI_COREDNS_HARDENING_APPLIED:-false}" = "true" ]; then
+    echo "" >&2
+    echo "  [WARN] This install applied CoreDNS DNSSEC/DoT hardening to the SHARED" >&2
+    echo "  [WARN] kube-system 'coredns' ConfigMap (install.sh --apply-coredns-hardening)." >&2
+    echo "  [WARN] That patch is NOT part of this Helm release/namespace and is NOT being" >&2
+    echo "  [WARN] reverted by this uninstall — it is a cluster-wide resource other" >&2
+    echo "  [WARN] namespaces/orgs on this cluster may still depend on." >&2
+    echo "  [WARN] Pre-patch Corefile backup: ${YASHIGANI_COREDNS_BACKUP_DIR:-/var/lib/yashigani/coredns-backups}" >&2
+    echo "  [WARN] Before manually reverting, confirm no OTHER yashigani namespace still" >&2
+    echo "  [WARN] relies on this hardening: kubectl get ns -l yashigani.io/tenant" >&2
+    echo "  [WARN] Manual revert (only once no other tenant depends on it):" >&2
+    echo "  [WARN]   kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' > /tmp/current-corefile" >&2
+    echo "  [WARN]   # restore from the backup above, then:" >&2
+    echo "  [WARN]   kubectl -n kube-system create configmap coredns --from-file=Corefile=<restored-file> -o yaml --dry-run=client | kubectl apply -f -" >&2
+    echo "  [WARN]   kubectl -n kube-system rollout restart deployment coredns" >&2
+    echo "" >&2
+  fi
+
   # Step 1: helm uninstall (removes Deployment, Service, ConfigMap, Secrets, etc.)
   if command -v helm >/dev/null 2>&1; then
     if helm status "$_release" -n "$_ns" >/dev/null 2>&1; then
@@ -780,6 +839,8 @@ for arg in "$@"; do
         --remove-volumes) REMOVE_VOLUMES="true" ;;
         --runtime=*)      RUNTIME="${arg#*=}" ;;
         --project=*)      PROJECT_FLAG="${arg#*=}" ;;
+        --namespace=*)    NAMESPACE_FLAG="${arg#*=}" ;;
+        --release=*)      RELEASE_FLAG="${arg#*=}" ;;
         --yes|-y)         YES="true" ;;
         # MI-4 (step-up on destructive lifecycle ops): operator proof that a fresh
         # step-up TOTP verification was performed for this privileged mutation. The
@@ -802,6 +863,18 @@ Options:
   --project=NAME      Target a specific named instance (multi-instance hosts).
                       Normally read from the install state file's PROJECT field;
                       use this to uninstall one of several side-by-side instances.
+                      Applies to docker/podman (compose project name) AND k8s
+                      (used as the target namespace when --namespace is not
+                      also given — see below).
+  --namespace=NAME    k8s ONLY. Explicit target namespace for a multi-org k8s
+                      cluster. Takes precedence over --project and over the
+                      YASHIGANI_NAMESPACE env var. Use this (or --project) to
+                      make certain a k8s partial-nuke targets the intended
+                      org's namespace rather than the local tree's install-
+                      state default.
+  --release=NAME      k8s ONLY. Explicit target Helm release name. Takes
+                      precedence over the YASHIGANI_HELM_RELEASE env var.
+                      Defaults to "yashigani" (the install.sh convention).
   --yes, -y           Skip confirmation prompts (for unattended/CI use).
                       Safety note: when combined with --remove-volumes this
                       will DELETE ALL DATA without prompting. Pass both flags
@@ -877,6 +950,12 @@ if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
     # no-op for compose runtimes (correct behaviour).
     _state_namespace="$(grep -E '^NAMESPACE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]' || true)"
     _state_helm_release="$(grep -E '^HELM_RELEASE=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]' || true)"
+    # CROSS-ORG-COREDNS-WARN-2026-07-22 (Finding 4): whether THIS install
+    # patched the shared kube-system CoreDNS ConfigMap (install.sh
+    # --apply-coredns-hardening), so _teardown_k8s() can WARN — never
+    # auto-revert a cluster-shared resource other orgs/namespaces may rely on.
+    _state_coredns_applied="$(grep -E '^COREDNS_HARDENING_APPLIED=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\r\n[:space:]' || true)"
+    _state_coredns_backup_dir="$(grep -E '^COREDNS_BACKUP_DIR=' "$_STATE_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n[:space:]' || true)"
     if [ -z "$RUNTIME" ] && { [ "$_state_runtime" = "docker" ] || [ "$_state_runtime" = "podman" ] || [ "$_state_runtime" = "k8s" ]; }; then
         RUNTIME="$_state_runtime"
         log_info "Using runtime from install state file: $RUNTIME"
@@ -893,7 +972,23 @@ if [ -f "$_STATE_FILE" ] && [ -r "$_STATE_FILE" ]; then
             YASHIGANI_HELM_RELEASE="$_state_helm_release"
             log_info "Using Helm release from install state file: $YASHIGANI_HELM_RELEASE"
         fi
+        if [ -n "$_state_coredns_applied" ] && [ -z "${YASHIGANI_COREDNS_HARDENING_APPLIED:-}" ]; then
+            YASHIGANI_COREDNS_HARDENING_APPLIED="$_state_coredns_applied"
+        fi
+        if [ -n "$_state_coredns_backup_dir" ] && [ -z "${YASHIGANI_COREDNS_BACKUP_DIR:-}" ]; then
+            YASHIGANI_COREDNS_BACKUP_DIR="$_state_coredns_backup_dir"
+        fi
     fi
+fi
+
+# K8S-PROJECT-FLAG-2026-07-22 (Finding 3): an explicit --namespace= or --release=
+# flag is an unambiguous k8s-native signal — infer RUNTIME=k8s from it when the
+# operator has not already given --runtime= explicitly, rather than falling
+# through to podman/docker auto-detect (Source 3) and silently ignoring a k8s
+# selector the operator clearly intended to use.
+if [ -z "$RUNTIME" ] && { [ -n "$NAMESPACE_FLAG" ] || [ -n "$RELEASE_FLAG" ]; }; then
+    RUNTIME="k8s"
+    log_info "Inferred --runtime=k8s from --namespace/--release flag."
 fi
 
 # Source 3: auto-detect (only when RUNTIME is still empty after state-file check).
@@ -917,6 +1012,59 @@ case "$RUNTIME" in
     exit 1
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# K8S-PROJECT-FLAG-2026-07-22 (Finding 3, P1): final k8s namespace/release
+# selector resolution, now that RUNTIME is fully known.
+#
+# Precedence (highest to lowest):
+#   1. --namespace=/--release=  — most explicit, always wins, overrides any
+#      pre-set env var or state-file value.
+#   2. Pre-set YASHIGANI_NAMESPACE/YASHIGANI_HELM_RELEASE env vars — existing
+#      ambient-override behaviour (unchanged; already applied above at the
+#      state-file propagation step).
+#   3. --project=NAME — k8s fallback. install.sh's own convention is
+#      PROJECT == NAMESPACE for k8s installs (install.sh:18098), so a bare
+#      --project (the existing multi-instance flag, previously silently
+#      ignored for k8s) now maps to the target namespace when nothing more
+#      explicit was given.
+#   4. State file NAMESPACE=/HELM_RELEASE= (already applied above).
+#   5. Hardcoded default "yashigani" (applied inside _teardown_k8s()).
+#
+# Safety: if --project is given ALONGSIDE an already-resolved YASHIGANI_NAMESPACE
+# (from a pre-set env var or the state file) that DISAGREES with --project, this
+# is exactly the wrong-target risk the finding describes — hard-fail rather than
+# silently pick one. --namespace= is the documented way to disambiguate.
+# ---------------------------------------------------------------------------
+if [ "$RUNTIME" = "k8s" ]; then
+    if [ -n "$NAMESPACE_FLAG" ]; then
+        if [ -n "${YASHIGANI_NAMESPACE:-}" ] && [ "$YASHIGANI_NAMESPACE" != "$NAMESPACE_FLAG" ]; then
+            log_info "--namespace=${NAMESPACE_FLAG} overrides previously-resolved namespace '${YASHIGANI_NAMESPACE}'."
+        fi
+        YASHIGANI_NAMESPACE="$NAMESPACE_FLAG"
+        log_info "Using namespace from --namespace flag: ${YASHIGANI_NAMESPACE}"
+    elif [ -n "$PROJECT_FLAG" ]; then
+        if [ -n "${YASHIGANI_NAMESPACE:-}" ] && [ "$YASHIGANI_NAMESPACE" != "$PROJECT_FLAG" ]; then
+            log_error "Ambiguous k8s target: --project=${PROJECT_FLAG} conflicts with the" >&2
+            log_error "namespace already resolved from an env var or the install state file" >&2
+            log_error "('${YASHIGANI_NAMESPACE}'). Refusing to guess which namespace to tear down." >&2
+            log_error "Use --namespace=${PROJECT_FLAG} (or the correct target namespace) to disambiguate." >&2
+            exit 1
+        fi
+        YASHIGANI_NAMESPACE="$PROJECT_FLAG"
+        log_info "Using namespace from --project flag (k8s fallback): ${YASHIGANI_NAMESPACE}"
+    fi
+
+    if [ -n "$RELEASE_FLAG" ]; then
+        if [ -n "${YASHIGANI_HELM_RELEASE:-}" ] && [ "$YASHIGANI_HELM_RELEASE" != "$RELEASE_FLAG" ]; then
+            log_info "--release=${RELEASE_FLAG} overrides previously-resolved release '${YASHIGANI_HELM_RELEASE}'."
+        fi
+        YASHIGANI_HELM_RELEASE="$RELEASE_FLAG"
+        log_info "Using Helm release from --release flag: ${YASHIGANI_HELM_RELEASE}"
+    fi
+
+    log_info "k8s target resolved: namespace=${YASHIGANI_NAMESPACE:-yashigani} release=${YASHIGANI_HELM_RELEASE:-yashigani}"
+fi
 
 # ---------------------------------------------------------------------------
 # RUNTIME_SUBTYPE detection
@@ -1403,6 +1551,12 @@ fi
 # ---------------------------------------------------------------------------
 _PROJECT_PREFIX="${_PROJECT_PREFIX:-docker}"
 
+# CROSS-ORG-RINGFENCE-SWEEP-2026-07-22 (P0): project-anchored ringfence
+# pattern for the J12 removal sweep further down — see the
+# _RINGFENCE_NAME_PATTERN comment above for why the bare pattern must never
+# be passed directly to a runtime `--filter name=` query.
+_PROJECT_RINGFENCE_PATTERN="${_PROJECT_PREFIX}_${_RINGFENCE_NAME_PATTERN}"
+
 echo "=== Canonical network cleanup ==="
 _net_removed=0
 _net_failed=0
@@ -1483,10 +1637,14 @@ fi
 # onboard container.
 #
 # Discovery: `docker/podman network ls --filter name=<pattern>` lists all
-# networks whose name CONTAINS the pattern (substring, not anchored) — this
-# is why _RINGFENCE_NAME_PATTERN itself has no anchor: it must match both
-# the never-actually-occurring bare form and the real, always-project-
-# prefixed on-disk form (<project>_ringfence_<agent>).
+# networks whose name CONTAINS the pattern (substring match against the
+# WHOLE DAEMON, no project scoping applied by the runtime itself). The real
+# on-disk name is always project-prefixed (<project>_ringfence_<agent>), so
+# this sweep MUST anchor the filter to THIS project's prefix
+# (_PROJECT_RINGFENCE_PATTERN = "${_PROJECT_PREFIX}_ringfence_") — never the
+# bare _RINGFENCE_NAME_PATTERN — or a single org's uninstall on a shared
+# multi-org host removes every OTHER org's ringfence networks too
+# (CROSS-ORG-RINGFENCE-SWEEP-2026-07-22, P0).
 #
 # The assertion below logs residuals as WARN (not exit-1): a ringfence network
 # may survive removal if a non-yashigani container joined it.  The operator
@@ -1508,18 +1666,18 @@ while IFS= read -r _rfnet; do
         echo "  [WARN] ringfence network rm failed: $_rfnet (may be in use)" >&2
         _ringfence_failed=$(( _ringfence_failed + 1 ))
     fi
-done < <("$RUNTIME" network ls --filter "name=${_RINGFENCE_NAME_PATTERN}" --format "{{.Name}}" 2>/dev/null || true)
+done < <("$RUNTIME" network ls --filter "name=${_PROJECT_RINGFENCE_PATTERN}" --format "{{.Name}}" 2>/dev/null || true)
 
 if [ "$_ringfence_removed" -gt 0 ] || [ "$_ringfence_failed" -gt 0 ]; then
     echo "Ringfence network cleanup: ${_ringfence_removed} removed, ${_ringfence_failed} failed."
     if [ "$_ringfence_failed" -gt 0 ]; then
         echo "  [WARN] Some ringfence networks could not be removed (in use by a foreign container?)." >&2
         echo "  Manual remediation:" >&2
-        echo "    ${RUNTIME} network ls --filter name=${_RINGFENCE_NAME_PATTERN}   # list survivors" >&2
+        echo "    ${RUNTIME} network ls --filter name=${_PROJECT_RINGFENCE_PATTERN}   # list survivors (THIS project only)" >&2
         echo "    ${RUNTIME} network rm <name>                     # after detaching foreign containers" >&2
     fi
 else
-    echo "  [ok] No ringfence networks found."
+    echo "  [ok] No ringfence networks found for project ${_PROJECT_PREFIX}."
 fi
 
 # ---------------------------------------------------------------------------
@@ -1731,6 +1889,19 @@ fi
 # declared in an opt-in compose override like docker-compose.wazuh.yml that
 # were not started via the primary compose file). These have SHA-like names
 # and are NOT cleaned up by the named-volume loop above.
+#
+# CROSS-ORG-DANGLING-VOL-2026-07-22 (P0 audit-sweep, found alongside the J12
+# ringfence bug): the ORIGINAL podman fallback below, when the project-label
+# filter matched nothing, fell through to `volume ls --filter dangling=true`
+# with NO project scoping at all and removed EVERY dangling volume on the
+# shared daemon — including anonymous volumes belonging to other orgs on a
+# multi-org host. Compose labels its own anonymous volumes the same as named
+# ones, so the label filter is the correct and sufficient signal; an
+# unlabeled dangling volume cannot be safely attributed to this project by
+# name (anonymous volumes have no project-prefixed name to anchor on) and
+# must NEVER be blind-removed. Fix: WARN + skip instead of blind-removing —
+# same posture as the CNI "foreign config" handling above (list, never nuke
+# what cannot be positively attributed to this project).
 # ---------------------------------------------------------------------------
 if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     echo "=== Dangling volume prune (ANON-VOL-LEAK) ==="
@@ -1740,8 +1911,15 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true \
             --filter "label=io.podman.compose.project=${_PROJECT_PREFIX}" 2>/dev/null || true)"
         if [ -z "$_dangling_ids" ]; then
-            _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
+            _unattributed_dangling="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
                 | grep -E "^[0-9a-f]{64}$" || true)"
+            if [ -n "$_unattributed_dangling" ]; then
+                _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || echo 0)"
+                echo "  [WARN] ${_unattributed_count} unlabeled dangling volume(s) found on this daemon —" >&2
+                echo "  [WARN] cannot attribute to project '${_PROJECT_PREFIX}' (no project label) — NOT removing" >&2
+                echo "  [WARN] (may belong to another org on a shared host). Review manually:" >&2
+                echo "  [WARN]   ${RUNTIME} volume ls --filter dangling=true" >&2
+            fi
         fi
         if [ -n "$_dangling_ids" ]; then
             while IFS= read -r _vid; do

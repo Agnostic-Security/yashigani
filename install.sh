@@ -18103,6 +18103,12 @@ main() {
         printf 'INSTALL_USER=%s\n'       "$(id -un)"
         printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
+        # CROSS-ORG-COREDNS-WARN-2026-07-22 (gap-map Finding 4, P2): record
+        # whether this install patched the SHARED kube-system CoreDNS
+        # ConfigMap so uninstall.sh can WARN (never auto-revert — it's a
+        # cluster-wide resource other namespaces/orgs may depend on).
+        printf 'COREDNS_HARDENING_APPLIED=%s\n' "${APPLY_COREDNS_HARDENING:-false}"
+        printf 'COREDNS_BACKUP_DIR=%s\n'  "${COREDNS_BACKUP_DIR:-/var/lib/yashigani/coredns-backups}"
       } > "$_k8s_state_path"
       chmod 0644 "$_k8s_state_path"
       log_info "Install state written: ${_k8s_state_path}"
