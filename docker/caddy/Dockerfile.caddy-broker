@@ -125,6 +125,36 @@ RUN mkdir -p /etc/caddy/agents-dynamic \
     && chown 65532:65532 /etc/caddy/agents-dynamic \
     && chmod 0755 /etc/caddy/agents-dynamic
 
+# FINDING-V412-DOCKER-VOL-001 (Su, 2026-07-22): SAME CLASS as the
+# agents-dynamic fix above, applied to the OTHER broker-owned named volume —
+# caddy_broker_route_sock, mounted at /run/caddy-broker-route by THIS
+# container (binds route.sock, the sole writer) and by backoffice (client
+# only — connects out, never creates anything here; see
+# docker-compose.yml backoffice volumes). This directory was NOT pre-created
+# in this image, so on Docker Desktop macOS (and any Docker Engine host — the
+# behaviour is Docker-generic, not VirtioFS-specific) the fresh named volume
+# inits root:root 0755 (Docker's default for a path absent from BOTH
+# mounters' images) and this nonroot broker cannot create route.sock inside
+# a directory it cannot write to — confirmed live:
+# "PermissionError: [Errno 13] Permission denied" at
+# socket.bind('/run/caddy-broker-route/route.sock'), crash-looping the
+# broker and blocking convergence (Maxine, 2026-07-22). Podman rootless
+# masked this because userns remapping makes the volume writable by the
+# unprivileged caller regardless of on-disk UID — Docker Engine has no such
+# remap. FIX: pre-own the directory here (this container is the actual
+# writer) AND identically in Dockerfile.backoffice (compose gives no
+# depends_on ordering between caddy-config-broker and backoffice, so either
+# container's image may initialise the volume first — owning it in BOTH
+# images makes the outcome correct regardless of start order, same pattern
+# as agents-dynamic above). 0755: backoffice (UID 1001, no shared group)
+# only needs traverse (x) to reach the socket file — config_broker.py's
+# server_bind() already chmods the socket file itself to 0666 after bind()
+# (see config_broker.py), so backoffice's connect() does not need directory
+# write access at all.
+RUN mkdir -p /run/caddy-broker-route \
+    && chown 65532:65532 /run/caddy-broker-route \
+    && chmod 0755 /run/caddy-broker-route
+
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
