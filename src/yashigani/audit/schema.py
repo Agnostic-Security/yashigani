@@ -132,6 +132,12 @@ class EventType(str, Enum):
     RESPONSE_INJECTION_DETECTED = "RESPONSE_INJECTION_DETECTED"
     # 5.0 A4 — system-prompt leakage scrubbed in a response (LLM07)
     SYSTEM_PROMPT_LEAK_DETECTED = "SYSTEM_PROMPT_LEAK_DETECTED"
+    # 5.0 A5 — model-integrity pinning + dual-control (LLM03 runtime slice)
+    MODEL_PIN_BOOTSTRAPPED = "MODEL_PIN_BOOTSTRAPPED"
+    MODEL_PIN_PROPOSED = "MODEL_PIN_PROPOSED"
+    MODEL_PIN_APPROVED = "MODEL_PIN_APPROVED"
+    MODEL_PIN_REJECTED = "MODEL_PIN_REJECTED"
+    MODEL_INTEGRITY_MISMATCH = "MODEL_INTEGRITY_MISMATCH"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1536,6 +1542,30 @@ class SystemPromptLeakDetectedEvent(AuditEvent):
     matched_shingles: int = 0
     overlap_ratio: float = 0.0
     action_taken: str = "scrubbed"
+
+
+@dataclass
+class ModelPinEvent(AuditEvent):
+    """
+    5.0 A5: model-integrity pin lifecycle (bootstrap / propose / approve /
+    reject) and runtime integrity mismatch. Non-repudiation: APPROVED echoes
+    the confirming digest the approver reviewed. Digests are safe to store
+    (they are hashes, not secrets).
+    """
+
+    event_type: str = EventType.MODEL_PIN_PROPOSED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    request_id: str = ""
+    model: str = ""
+    # old→new for PROPOSED/APPROVED; observed vs expected for MISMATCH
+    old_weights_sha256: str = ""
+    new_weights_sha256: str = ""
+    old_manifest_digest: str = ""
+    new_manifest_digest: str = ""
+    initiated_by: str = ""
+    approver: str = ""
+    action_taken: str = ""  # bootstrapped | proposed | approved | rejected | block
 
 
 # ---------------------------------------------------------------------------

@@ -152,6 +152,32 @@ def _build_app(mesh_mode: bool = False):
                 _sp_file, _sp_exc,
             )
 
+    # A5 (5.0): ollama model-integrity verifier. Reads pins from the shared
+    # store; verify() fails closed on a store error. Enabled by default; the
+    # observed-digest cache is populated by the startup/periodic /api/tags probe
+    # (wired separately). When the store can't be built the verifier is left
+    # None (unpinned deployments are unaffected; pinned ones would fail closed
+    # once the probe runs).
+    model_integrity_verifier = None
+    try:
+        import redis as _redis_mi
+        from yashigani.inspection.model_integrity import (
+            ModelPinStore, ModelIntegrityVerifier,
+        )
+        _mi_redis = _redis_mi.from_url(
+            os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
+            decode_responses=False,
+        )
+        model_integrity_verifier = ModelIntegrityVerifier(
+            ModelPinStore(_mi_redis), audit_writer=audit_writer,
+        )
+        logger.info("A5 model-integrity verifier initialised")
+    except Exception as _mi_exc:
+        logger.warning(
+            "A5 model-integrity verifier unavailable (%s) — model pinning inactive",
+            _mi_exc,
+        )
+
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None
     try:
@@ -923,6 +949,7 @@ def _build_app(mesh_mode: bool = False):
         response_inspection_pipeline=response_pipeline,
         request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
         system_prompt_leak_guard=system_prompt_leak_guard,  # 5.0 A4
+        model_integrity_verifier=model_integrity_verifier,  # 5.0 A5
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,

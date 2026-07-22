@@ -236,3 +236,84 @@ class TestA4ResponseLeakScrub:
         payload = _json.loads(bytes(result.body).decode())
         content = payload["choices"][0]["message"]["content"]
         assert content == "The capital of France is Paris."
+
+
+@pytest.mark.skipif(not _fastapi_available, reason="fastapi not installed")
+class TestA5ModelIntegrityEnforcement:
+    """5.0 A5 — chat path blocks on a model-integrity mismatch, passes unpinned."""
+
+    class _StubVerifier:
+        def __init__(self, result):
+            self._r = result
+            self.calls = 0
+
+        def verify(self, model, observed_manifest_digest="", observed_weights_sha256="", request_id=""):
+            self.calls += 1
+            return self._r
+
+    async def _drive_ok_backend(self, mod):
+        captured = []
+
+        async def _fake_post(url, json=None, **kwargs):
+            captured.append(json)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "message": {"content": "reply"},
+                "prompt_eval_count": 3,
+                "eval_count": 5,
+            }
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = _fake_post
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            body = mod.ChatCompletionRequest(
+                model="test-model",
+                messages=[mod.ChatMessage(role="user", content="hello")],
+                stream=False,
+            )
+            result = await mod.chat_completions(body, _mock_request(mod))
+        return result, captured
+
+    @pytest.mark.asyncio
+    async def test_weights_mismatch_blocks_before_dispatch(self):
+        from yashigani.inspection.model_integrity import VerifyResult
+        mod = _import_router_fresh("a5block")
+        mod._state.model_integrity_verifier = self._StubVerifier(
+            VerifyResult(ok=False, model="test-model", reason="weights_mismatch")
+        )
+        result, captured = await self._drive_ok_backend(mod)
+        assert result.status_code == 403
+        assert captured == [], "no backend dispatch on an integrity block"
+
+    @pytest.mark.asyncio
+    async def test_store_unavailable_fails_closed(self):
+        from yashigani.inspection.model_integrity import VerifyResult
+        mod = _import_router_fresh("a5store")
+        mod._state.model_integrity_verifier = self._StubVerifier(
+            VerifyResult(ok=False, model="test-model", reason="store_unavailable")
+        )
+        result, captured = await self._drive_ok_backend(mod)
+        assert result.status_code == 403
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_match_passes_to_backend(self):
+        from yashigani.inspection.model_integrity import VerifyResult
+        mod = _import_router_fresh("a5ok")
+        v = self._StubVerifier(VerifyResult(ok=True, model="test-model", reason="match"))
+        mod._state.model_integrity_verifier = v
+        result, captured = await self._drive_ok_backend(mod)
+        assert v.calls == 1
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_verifier_is_noop(self):
+        mod = _import_router_fresh("a5none")
+        mod._state.model_integrity_verifier = None
+        result, captured = await self._drive_ok_backend(mod)
+        assert len(captured) == 1

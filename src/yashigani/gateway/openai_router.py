@@ -140,6 +140,11 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
 _OWUI_DENY_MESSAGES: dict[str, str] = {
+    # 5.0 A5 — model-integrity pin block
+    "model_integrity_mismatch":
+        "This request was blocked because the local model failed an integrity "
+        "check (its signature does not match the approved pin). Contact an "
+        "administrator — the model may have been changed or tampered with.",
     # v1 ingress (OPA v1_routing.rego `reason`)
     "identity_not_active":
         "Your account is not active. Contact an administrator to restore access.",
@@ -203,6 +208,46 @@ def _owui_deny_message(reason: str) -> str:
     Never leaks the raw reason code into the returned string.
     """
     return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+
+
+def _verify_ollama_pin(model: str, request_id: str):
+    """5.0 A5: verify an ollama model against its integrity pin before dispatch.
+
+    Returns a 403 JSONResponse to block, or None to allow. Fail-closed: a store
+    error or a weights/manifest mismatch blocks; an unpinned model or an absent
+    verifier passes. Observed digests come from the startup/periodic probe
+    cache — when absent the manifest fast-path simply has nothing to compare and
+    only a populated weights anchor can mismatch (both-empty ⇒ pass, honest).
+    """
+    verifier = getattr(_state, "model_integrity_verifier", None)
+    if verifier is None:
+        return None
+    observed_manifest = _state.model_observed_digests.get(model, "")
+    observed_weights = _state.model_observed_weights.get(model, "")
+    result = verifier.verify(
+        model,
+        observed_manifest_digest=observed_manifest,
+        observed_weights_sha256=observed_weights,
+        request_id=request_id,
+    )
+    if result.ok:
+        return None
+    logger.warning(
+        "A5: model-integrity block model=%s reason=%s request_id=%s",
+        model, result.reason, request_id,
+    )
+    return JSONResponse(
+        status_code=403,
+        content={"error": {
+            "message": _owui_deny_message("model_integrity_mismatch"),
+            "type": "model_integrity_block",
+            "code": result.reason,
+        }},
+        headers={
+            "X-Yashigani-Request-Id": request_id,
+            "X-Yashigani-Model-Integrity": result.reason,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +947,13 @@ class OpenAIRouterState:
         self.request_inspection_pipeline = None
         # 5.0 A4: response-leg system-prompt leakage guard (LLM07). None = no-op.
         self.system_prompt_leak_guard = None
+        # 5.0 A5: model-integrity verifier + observed-digest cache (LLM03). The
+        # verifier fails closed on a store error; when None, or the model is
+        # unpinned, verification is a pass. observed digests are refreshed by a
+        # startup/periodic /api/tags probe (model → manifest digest).
+        self.model_integrity_verifier = None
+        self.model_observed_digests: dict = {}
+        self.model_observed_weights: dict = {}
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1101,6 +1153,7 @@ def configure(
     response_inspection_pipeline=None,
     request_inspection_pipeline=None,  # 5.0 A1 — request-leg injection scan
     system_prompt_leak_guard=None,     # 5.0 A4 — response-leg leak scrub
+    model_integrity_verifier=None,     # 5.0 A5 — ollama model-pin verifier
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1138,6 +1191,7 @@ def configure(
     _state.response_inspection_pipeline = response_inspection_pipeline
     _state.request_inspection_pipeline = request_inspection_pipeline
     _state.system_prompt_leak_guard = system_prompt_leak_guard
+    _state.model_integrity_verifier = model_integrity_verifier
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -2629,6 +2683,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     pii_detected_on_request = False
     destination = "local" if selected_provider == "ollama" else "cloud"
 
+    # ── 6b. Model-integrity pin verification (5.0 A5, ollama only) ────
+    # After OPA ingress, before dispatch. Fail-closed: a store error or a
+    # weights/manifest mismatch blocks (403); unpinned models pass.
+    if destination == "local":
+        _pin_block = _verify_ollama_pin(selected_model, request_id)
+        if _pin_block is not None:
+            return _pin_block
+
     if _state.pii_detector is not None and prompt_text:
         _run_pii = True
         if destination == "cloud" and _state.pii_cloud_bypass:
@@ -3894,6 +3956,12 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             },
             headers={"X-Yashigani-OPA-Reason": opa_reason},
         )
+
+    # ── 5b. Model-integrity pin verification (5.0 A5, ollama only) ────
+    if selected_provider == "ollama":
+        _epin_block = _verify_ollama_pin(selected_model, request_id)
+        if _epin_block is not None:
+            return _epin_block
 
     # ── 6. Sensitive-to-cloud gate (belt-and-braces, independent of OPA) ─
     # OPA's routing_safe rule already covers this via v1_routing.rego, but we
