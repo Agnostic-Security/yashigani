@@ -81,6 +81,7 @@ import ipaddress
 import logging
 import os
 import re
+import socket
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -510,6 +511,185 @@ _PURE_DECIMAL_RE = re.compile(r"^\d+$")
 # _HEX_IP_RE: 0x-prefixed hex strings are also alternative IP encodings.
 _HEX_IP_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
 
+# F2 (CRITICAL — Laura, FINDING-V412-DOCKER-CLEANROUND-BATCH):
+# _PURE_DECIMAL_RE / _HEX_IP_RE only catch a WHOLE-STRING decimal or hex
+# integer (no dots).  They miss the *dotted, per-octet* alternate encodings
+# that inet_aton()/getaddrinfo() on Linux/BSD/macOS also resolve:
+#   "0251.0376.0251.0376"  (octal per octet)  -> 169.254.169.254 (IMDS)
+#   "0xA9.0xFE.0xA9.0xFE"  (hex per octet)    -> 169.254.169.254 (IMDS)
+# ipaddress.ip_address() raises ValueError on BOTH forms (it deliberately
+# rejects octal/hex octets to avoid this exact ambiguity — CVE-class
+# "leading zero" IP parsing bugs), so the OLD code fell through the
+# ``except ValueError: return False`` branch and treated them as ordinary
+# hostnames.  At codegen/runtime time, though, the OS resolver DOES parse
+# them as literal IPs — so the SSRF/private-address guard was silently
+# bypassable for every consumer of _is_private_address (linter C1 AND
+# codegen._assert_not_private).
+#
+# _NUMERIC_IPV4_PART matches a single dot-separated component that is
+# decimal ("8", "254" — no leading zero), leading-zero ("0", "0376",
+# "0192" — see fallback note below), or hex ("0xA9").
+# _NUMERIC_IPV4_CANDIDATE_RE matches 1-4 such components (the classic BSD
+# inet_aton "a" / "a.b" / "a.b.c" / "a.b.c.d" forms).  A string that
+# matches this shape can NEVER be a legitimate DNS hostname (no real TLD
+# is all-digits/hex), so folding it and failing closed on any ambiguity
+# is always safe.
+#
+# Ground-truthed live (SOP-0 §4 — never assume library/libc behaviour):
+# different resolvers DISAGREE on a leading-zero component that contains a
+# non-octal digit (8 or 9), e.g. "078" or "0192":
+#   socket.inet_aton("078.1.1.1")       -> raises "illegal IP address"
+#   socket.getaddrinfo("078.1.1.1", ..) -> resolves to 78.1.1.1 (silent
+#                                          decimal fallback for that part)
+# Since the real runtime egress path (Caddy/Go net, Python socket, libc
+# inet_aton) may resolve the SAME literal to a DIFFERENT concrete address
+# depending on which resolver is consulted, there is no single "correct"
+# fold for this ambiguous shape — so `_parse_ipv4_numeric_part` FAILS
+# CLOSED (raises) rather than guessing a value, and `_fold_ipv4_numeric_literal`
+# propagates that as "cannot fold" -> `_is_private_address` blocks the
+# whole string (see the "shape matched but folding failed" branch below).
+# A leading-zero component whose remaining digits are ALL valid octal
+# (0-7) is unambiguous across resolvers and is folded normally as octal.
+_NUMERIC_IPV4_PART = r"(?:0[xX][0-9a-fA-F]+|0[0-9]*|[1-9][0-9]*)"
+_NUMERIC_IPV4_CANDIDATE_RE = re.compile(
+    r"^%s(?:\.%s){0,3}$" % (_NUMERIC_IPV4_PART, _NUMERIC_IPV4_PART)
+)
+_IPV4_HEX_PART_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
+_IPV4_LEADING_ZERO_PART_RE = re.compile(r"^0[0-9]*$")
+_IPV4_ALL_OCTAL_DIGITS_RE = re.compile(r"^[0-7]*$")
+
+
+def _parse_ipv4_numeric_part(part: str) -> int:
+    """Parse one dot-separated component as hex (0x-prefixed), octal
+    (leading zero, all-octal-digit remainder), or plain decimal.
+
+    Raises ValueError for a leading-zero component containing a non-octal
+    digit (8/9) — real resolvers disagree on how to interpret it (see
+    module note above), so the caller fails closed rather than folding to
+    a value that might not match what the actual egress connection does.
+    """
+    if _IPV4_HEX_PART_RE.match(part):
+        return int(part, 16)
+    if _IPV4_LEADING_ZERO_PART_RE.match(part):
+        rest = part[1:]
+        if _IPV4_ALL_OCTAL_DIGITS_RE.match(rest):
+            return int(part, 8) if part != "0" else 0
+        raise ValueError(
+            "ambiguous leading-zero IPv4 octet %r — resolvers disagree "
+            "on interpretation" % part
+        )
+    return int(part, 10)
+
+
+def _fold_ipv4_numeric_literal(host: str) -> Optional["ipaddress.IPv4Address"]:
+    """
+    F2 (CRITICAL): fold a numeric IPv4 literal expressed with octal
+    (leading-zero), hex (0x-prefixed), or plain-decimal dot-separated
+    components into the concrete ``ipaddress.IPv4Address`` it names — the
+    same way inet_aton()/getaddrinfo() do on Linux/BSD/macOS.
+
+    Supports the classic BSD 1-4 part forms ("a", "a.b", "a.b.c",
+    "a.b.c.d"), each component independently decimal/octal/hex, e.g.:
+        "0251.0376.0251.0376"  (octal)      -> 169.254.169.254
+        "0xA9.0xFE.0xA9.0xFE"  (hex)        -> 169.254.169.254
+        "2852039166"           (32-bit int) -> 169.254.169.254
+
+    Returns None if ``host`` is not shaped like a numeric IPv4 literal at
+    all (i.e. it is a genuine hostname), or if folding overflows a 32-bit
+    address (which is never a valid IP either — the caller fails closed
+    on that case since the shape match already ruled out a real hostname).
+    """
+    if not _NUMERIC_IPV4_CANDIDATE_RE.match(host):
+        return None
+    parts = host.split(".")
+    try:
+        values = [_parse_ipv4_numeric_part(p) for p in parts]
+    except ValueError:
+        return None
+
+    if len(values) == 1:
+        total = values[0]
+    elif len(values) == 2:
+        if values[0] > 0xFF or values[1] > 0xFFFFFF:
+            return None
+        total = (values[0] << 24) | values[1]
+    elif len(values) == 3:
+        if values[0] > 0xFF or values[1] > 0xFF or values[2] > 0xFFFF:
+            return None
+        total = (values[0] << 24) | (values[1] << 16) | values[2]
+    else:  # 4 parts
+        if any(v > 0xFF for v in values):
+            return None
+        total = (values[0] << 24) | (values[1] << 16) | (values[2] << 8) | values[3]
+
+    if total > 0xFFFFFFFF or total < 0:
+        return None
+    return ipaddress.IPv4Address(total)
+
+
+def _resolves_to_private_via_getaddrinfo(host: str) -> Optional[bool]:
+    """
+    F2 (CRITICAL): resolve ``host`` via ``socket.getaddrinfo`` (all address
+    families — AF_UNSPEC by default) and report whether ANY resolved
+    address is private/loopback/link-local/reserved/multicast.
+
+    Used ONLY as a defence-in-depth cross-check for strings that already
+    match ``_NUMERIC_IPV4_CANDIDATE_RE`` (i.e. never a legitimate DNS
+    hostname) — this never adds a live-network dependency for genuine
+    hostnames such as "api.openai.com".  For a numeric-host string,
+    ``getaddrinfo`` resolves purely locally (no DNS query is issued for a
+    literal numeric address per POSIX getaddrinfo(3) semantics), so this
+    is safe to call even in air-gapped test/build environments.
+
+    Returns:
+        True  — resolution succeeded and at least one address is private.
+        False — resolution succeeded and every address is public.
+        None  — resolution failed; caller fails closed (a numeric-shaped
+                string is never a legitimate public hostname, so an
+                unresolvable one is inherently suspicious, not benign).
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, socket.herror, UnicodeError, OverflowError):
+        return None
+
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = str(sockaddr[0]).split("%", 1)[0]  # strip IPv6 zone id if present
+        try:
+            resolved = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if isinstance(resolved, ipaddress.IPv4Address):
+            if (
+                resolved in _LOOPBACK_V4
+                or resolved in _LINK_LOCAL_V4
+                or resolved in _ZERO_V4
+                or any(resolved in net for net in _RFC1918)
+                or resolved.is_multicast
+                or resolved.is_reserved
+            ):
+                return True
+        elif isinstance(resolved, ipaddress.IPv6Address):
+            mapped = resolved.ipv4_mapped
+            if mapped is not None:
+                if (
+                    mapped in _LOOPBACK_V4
+                    or mapped in _LINK_LOCAL_V4
+                    or mapped in _ZERO_V4
+                    or any(mapped in net for net in _RFC1918)
+                ):
+                    return True
+            elif (
+                resolved in _LOOPBACK_V6
+                or resolved in _LINK_LOCAL_V6
+                or resolved in _ULA_V6
+                or resolved in _IPV4_MAPPED_V6
+                or resolved.is_multicast
+            ):
+                return True
+    return False
+
 
 def _is_private_address(host: str) -> bool:
     """
@@ -527,8 +707,21 @@ def _is_private_address(host: str) -> bool:
     - For IPv6Address, unwrap ipv4_mapped and re-run check on the IPv4.
     - Add ::ffff:0:0/96 (IPv4-mapped) to IPv6 blocklist.
 
-    Hostnames (non-IP strings) are NOT resolved — that is the codegen's job.
-    Only literal IP addresses are checked here.
+    F2 hardening (v4.1.2, FINDING-V412-DOCKER-CLEANROUND-BATCH — bypasses
+    the codescan SSRF fix db20ff30):
+    - Fold DOTTED octal/hex/decimal IPv4 literal encodings
+      ("0251.0376.0251.0376", "0xA9.0xFE.0xA9.0xFE") that ipaddress
+      rejects with ValueError but the platform resolver (and therefore
+      Caddy/Python socket code at actual connect time) DOES resolve.
+    - Cross-check any numeric-shaped literal against socket.getaddrinfo
+      (all families) as defence-in-depth; fail closed (block) on
+      resolution error OR on any resolved private/reserved/multicast
+      address — a numeric-shaped string is never a legitimate hostname.
+
+    Hostnames (non-numeric-literal strings) are NOT DNS-resolved here —
+    that full resolve+block is the runtime egress guard's job (Caddy /
+    codegen); this static check only fails closed on ambiguous IP-literal
+    ENCODINGS, never on genuine unresolvable hostnames.
     """
     # --- normalise ---
     # Strip trailing dot (C1-E bypass: "169.254.169.254.")
@@ -547,18 +740,41 @@ def _is_private_address(host: str) -> bool:
         # private to fail closed (getaddrinfo may resolve them to private).
         return True
 
+    is_numeric_ipv4_literal = bool(_NUMERIC_IPV4_CANDIDATE_RE.match(host))
+
     try:
-        addr = ipaddress.ip_address(host)
+        addr: Any = ipaddress.ip_address(host)
     except ValueError:
-        return False  # genuine hostname — not a literal IP
+        addr = None
+
+    if addr is None:
+        if not is_numeric_ipv4_literal:
+            return False  # genuine hostname — not a literal IP at all
+
+        # F2: dotted octal/hex/mixed IPv4 literal — fold it the way the
+        # platform resolver would.
+        folded = _fold_ipv4_numeric_literal(host)
+        if folded is None:
+            # Shape matched (digits/0x/dots only) but folding overflowed —
+            # never a valid hostname either; fail closed.
+            return True
+        addr = folded
 
     if isinstance(addr, ipaddress.IPv4Address):
-        return (
+        blocked = (
             addr in _LOOPBACK_V4
             or addr in _LINK_LOCAL_V4
             or addr in _ZERO_V4        # LAURA-001: 0.0.0.0/8
             or any(addr in net for net in _RFC1918)
         )
+        if not blocked and is_numeric_ipv4_literal:
+            # F2 defence-in-depth: a numeric-shaped literal is NEVER a
+            # legitimate hostname — cross-check the OS resolver too, and
+            # fail closed on any disagreement or resolution failure.
+            resolved_private = _resolves_to_private_via_getaddrinfo(host)
+            if resolved_private is None or resolved_private:
+                blocked = True
+        return blocked
     if isinstance(addr, ipaddress.IPv6Address):
         # LAURA-001: unwrap IPv4-mapped IPv6 and re-run IPv4 check (C1-A)
         mapped = addr.ipv4_mapped
