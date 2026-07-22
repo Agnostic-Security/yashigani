@@ -1063,6 +1063,11 @@ class OpenAIRouterState:
         self.content_moderation_guard = None
         # 5.0: multi-turn conversational-injection risk tracker. None → no-op.
         self.conversation_risk_tracker = None
+        # 5.0 T1: LLM→mechanical rule promotion. When the LLM catches a NOVEL
+        # injection the mechanical layer missed, propose a candidate rule; the
+        # approved promoted ruleset is consulted mechanically on later requests.
+        self.rule_promotion_store = None
+        self.promoted_ruleset = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1266,6 +1271,8 @@ def configure(
     audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
     content_moderation_guard=None,     # 5.0 A12 — unsafe-topic filtering
     conversation_risk_tracker=None,    # 5.0 — multi-turn injection accumulator
+    rule_promotion_store=None,         # 5.0 T1 — LLM→mechanical promotion store
+    promoted_ruleset=None,             # 5.0 T1 — active promoted rules (consulted)
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1307,6 +1314,8 @@ def configure(
     _state.audio_transcriber = audio_transcriber
     _state.content_moderation_guard = content_moderation_guard
     _state.conversation_risk_tracker = conversation_risk_tracker
+    _state.rule_promotion_store = rule_promotion_store
+    _state.promoted_ruleset = promoted_ruleset
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -1875,6 +1884,41 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
 
+    # ── 2a-promo. Consult the PROMOTED ruleset (5.0 T1) ─────────────
+    # Rules the LLM taught us (novel injections distilled + admin-approved) are
+    # enforced here mechanically — cheaply, without touching the LLM. This is
+    # the payoff of the learning loop: yesterday's novel attack is today's
+    # deterministic block.
+    _promoted = getattr(_state, "promoted_ruleset", None)
+    if _promoted is not None and prompt_text:
+        try:
+            _phit = _promoted.matches(prompt_text)
+        except Exception:
+            _phit = None
+        if _phit:
+            logger.warning(
+                "REQUEST INJECTION BLOCKED /v1 (PROMOTED rule, no LLM): identity=%s "
+                "pattern=%r request_id=%s", _req_identity, _phit, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, "request", "mechanical_promoted",
+                classification="PROMPT_INJECTION_ONLY", detected_pattern=_phit,
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message("prompt_injection_only"),
+                    "type": "request_injection_blocked",
+                    "code": "prompt_injection_only",
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Detection-Layer": "mechanical_promoted",
+                },
+            )
+
     # ── 2a-seq. Multi-turn conversational-injection accumulator (5.0) ──
     # Runs BEFORE the suspicion gate so the gate can use the accumulated score.
     # Per-message layers are blind to a SLOW-BURN attack that builds over turns
@@ -2008,6 +2052,17 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 classification=_insp.classification, detected_pattern="",
                 content=prompt_text, confidence=_insp.confidence,
             )
+            # T1 learning loop: the LLM caught what the mechanical layer missed —
+            # distil a candidate mechanical rule (dual-control-gated) so the next
+            # instance is blocked mechanically without the LLM.
+            _promo = getattr(_state, "rule_promotion_store", None)
+            if _promo is not None and _insp.classification in (
+                "PROMPT_INJECTION_ONLY", "CREDENTIAL_EXFIL",
+            ):
+                try:
+                    _promo.propose_from_detection(prompt_text, initiated_by="gateway:llm-detector")
+                except Exception as _promo_exc:
+                    logger.warning("rule-promotion propose failed: %s", _promo_exc)
             _reason_code = _insp.classification.lower()
             return JSONResponse(
                 status_code=403,
@@ -4205,7 +4260,23 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 headers={"X-Yashigani-Request-Id": request_id,
                          "X-Yashigani-Detection-Layer": "mechanical"},
             )
-    if _state.request_inspection_pipeline is not None and classification_text:
+    # T3: suspicion gate on the embeddings leg too — the LLM inspector runs ONLY
+    # on suspicious content, not every clean embed (consistency with the chat
+    # leg; embeddings is the Letta archival-memory ingress).
+    _emb_run_llm = False
+    if classification_text and _state.request_inspection_pipeline is not None:
+        try:
+            from yashigani.inspection.suspicion_gate import SuspicionGate as _ESG
+            _egate = getattr(_state, "_suspicion_gate_singleton", None)
+            if _egate is None:
+                _egate = _ESG()
+                _state._suspicion_gate_singleton = _egate
+            _enorm = _emech.safe_text if (_emech is not None and not _emech.rejected) else None
+            _esusp = _egate.assess(classification_text, normalized_text=_enorm)
+            _emb_run_llm = _esusp.escalate_to_llm
+        except Exception:
+            _emb_run_llm = True  # conservative — review on gate error
+    if _emb_run_llm:
         try:
             _einsp = _state.request_inspection_pipeline.process(
                 raw_query=classification_text,

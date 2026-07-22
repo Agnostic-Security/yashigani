@@ -205,6 +205,34 @@ def _build_app(mesh_mode: bool = False):
         conversation_risk_tracker = ConversationRiskTracker()
         logger.info("Multi-turn conversation-injection tracker enabled")
 
+    # 5.0 T1: LLM→mechanical rule promotion. Store holds candidate/approved
+    # promoted rules; the ruleset is consulted mechanically on the request path.
+    # On by default (cheap); YASHIGANI_RULE_PROMOTION=false to disable.
+    rule_promotion_store = None
+    promoted_ruleset = None
+    if os.getenv("YASHIGANI_RULE_PROMOTION", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    ):
+        try:
+            import redis as _redis_rp
+            from yashigani.inspection.rule_promotion import (
+                RulePromotionStore, PromotedRuleset,
+            )
+            _rp_redis = _redis_rp.from_url(
+                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
+                decode_responses=False,
+            )
+            rule_promotion_store = RulePromotionStore(_rp_redis, audit_writer=audit_writer)
+            promoted_ruleset = PromotedRuleset(rule_promotion_store)
+            promoted_ruleset.refresh()
+            logger.info(
+                "T1 rule promotion enabled (%d active promoted rule(s))",
+                promoted_ruleset.size,
+            )
+        except Exception as _rp_exc:
+            logger.warning(
+                "T1 rule promotion unavailable (%s) — learning loop inactive", _rp_exc)
+
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None
     try:
@@ -979,6 +1007,8 @@ def _build_app(mesh_mode: bool = False):
         model_integrity_verifier=model_integrity_verifier,  # 5.0 A5
         content_moderation_guard=content_moderation_guard,  # 5.0 A12
         conversation_risk_tracker=conversation_risk_tracker,  # 5.0 multi-turn
+        rule_promotion_store=rule_promotion_store,  # 5.0 T1
+        promoted_ruleset=promoted_ruleset,          # 5.0 T1
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,

@@ -149,6 +149,10 @@ class EventType(str, Enum):
     CONTENT_MODERATION_FLAGGED = "CONTENT_MODERATION_FLAGGED"
     # 5.0 — multi-turn / slow-burn conversational injection escalation
     CONVERSATION_INJECTION_ESCALATED = "CONVERSATION_INJECTION_ESCALATED"
+    # 5.0 — LLM→mechanical rule promotion (novel detection distilled to a rule)
+    RULE_PROMOTION_PROPOSED = "RULE_PROMOTION_PROPOSED"
+    RULE_PROMOTION_APPROVED = "RULE_PROMOTION_APPROVED"
+    RULE_PROMOTION_REJECTED = "RULE_PROMOTION_REJECTED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1664,6 +1668,28 @@ class ConversationInjectionEscalatedEvent(AuditEvent):
     turn_count: int = 0
     action_taken: str = ""  # flag | step_up | block
     signal_breakdown: dict = field(default_factory=dict)
+
+
+@dataclass
+class RulePromotionEvent(AuditEvent):
+    """
+    5.0: an injection the hardened LLM caught but the deterministic mechanical
+    filter MISSED is distilled into a candidate mechanical rule and (after
+    dual-control approval) promoted to the active ruleset — so the next instance
+    is blocked mechanically, cheaply, without touching the LLM. Records the
+    candidate pattern (a hash + the pattern itself — patterns are not secrets),
+    never the raw payload.
+    """
+
+    event_type: str = EventType.RULE_PROMOTION_PROPOSED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    candidate_id: str = ""
+    pattern: str = ""
+    source: str = ""  # llm_novel_detection
+    initiated_by: str = ""
+    approver: str = ""
+    action_taken: str = ""  # proposed | approved | rejected
 
 
 # ---------------------------------------------------------------------------
