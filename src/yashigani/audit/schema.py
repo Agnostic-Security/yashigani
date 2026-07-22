@@ -599,14 +599,24 @@ class PromptInjectionDetectedEvent(AuditEvent):
     masking_applied: bool = True
     session_id: str = ""
     agent_id: str = ""
-    classification: str = ""  # CREDENTIAL_EXFIL | PROMPT_INJECTION_ONLY
+    classification: str = ""  # CREDENTIAL_EXFIL | PROMPT_INJECTION_ONLY | CLASSIFIER_ERROR | COMPUTE_SHED
     severity: str = ""  # CRITICAL | HIGH
     confidence_score: float = 0.0
     action_taken: str = ""  # sanitized | discarded
     sanitized: bool = False
     admin_alerted: bool = True  # always True — both paths alert admin
     user_alerted: bool = True
-    raw_query_logged: bool = False  # always False — invariant
+    # 5.0 forensic fields (Tiago: blocks must be attributable + reviewable):
+    request_id: str = ""
+    identity_id: str = ""           # WHO attempted it (user / agent / MCP server)
+    leg: str = ""                   # request | embeddings
+    detection_layer: str = ""       # mechanical | llm — mechanical never touches the LLM
+    detected_pattern: str = ""      # the deterministic rule that fired (not sensitive)
+    content_hash: str = ""          # ALWAYS recorded (attribution/non-repudiation)
+    # raw_query_logged stays False by default (ASVS V7 hash-only invariant);
+    # analyzed_content is populated ONLY under YASHIGANI_SECURITY_FORENSIC_CAPTURE.
+    raw_query_logged: bool = False
+    analyzed_content: str = ""      # the payload — forensic mode only, else ""
 
 
 @dataclass

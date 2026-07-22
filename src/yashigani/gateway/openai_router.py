@@ -219,6 +219,39 @@ def _owui_deny_message(reason: str) -> str:
     return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
 
 
+def _audit_prompt_injection_block(
+    request_id: str, identity_id: str, leg: str, detection_layer: str,
+    classification: str, detected_pattern: str, content: str, confidence: float,
+) -> None:
+    """5.0: durable audit for a request/embeddings-leg injection block. ALWAYS
+    records who + which layer + the matched rule + a content hash; records the
+    raw payload only under forensic mode. Never raises (audit must not break the
+    block, but the block itself has already happened)."""
+    if _state.audit_writer is None:
+        return
+    try:
+        from yashigani.inspection.security_audit import capture_content, content_hash
+        from yashigani.audit.schema import PromptInjectionDetectedEvent
+        _forensic = capture_content(content)
+        _state.audit_writer.write(PromptInjectionDetectedEvent(
+            request_id=request_id,
+            identity_id=identity_id,
+            agent_id=identity_id,
+            leg=leg,
+            detection_layer=detection_layer,
+            classification=classification,
+            severity="HIGH",
+            confidence_score=confidence,
+            action_taken="discarded",
+            detected_pattern=detected_pattern or "",
+            content_hash=content_hash(content),
+            analyzed_content=_forensic,
+            raw_query_logged=bool(_forensic),
+        ))
+    except Exception as _aud_exc:  # pragma: no cover
+        logger.warning("injection-block audit write failed: %s", _aud_exc)
+
+
 def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
     """5.0 A12: run the content-moderation guard on `text`. Returns a 403
     JSONResponse when a block-category matches, else None (allow/flag). A flag
@@ -1777,18 +1810,68 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 headers={"X-Yashigani-Request-Id": request_id},
             )
 
-    # ── 2a. Request-leg prompt-injection inspection (5.0 A1) ──────────
-    # The primary /v1 chat surface now runs the SAME injection pipeline the
-    # MCP/proxy path uses — closing the headline A1 gap. Fail-closed: any
-    # non-PASS verdict returns 403 and the request never reaches a backend.
-    #
-    # Why block (not sanitize-and-forward) here: the dispatched body is built
-    # from body.messages, while the pipeline operates on the joined prompt_text.
-    # Mapping a sanitizer's cleaned span back onto individual messages is not
-    # reliable for the multi-message case, and forwarding the ORIGINAL messages
-    # after logging SANITIZED would be a silent bypass. Blocking is the honest,
-    # safe disposition; per-message sanitize reconstruction is a tracked follow-up.
-    # The pipeline itself never raises; a bare-except here still fails closed.
+    # ── 2a-mech. MECHANICAL request-leg injection scan (5.0 A1, LLM-protecting) ──
+    # Deterministic FIRST, and authoritative. The mechanical filter
+    # (homoglyph/leet/decode-normalised regex) catches injection WITHOUT calling
+    # the LLM — so an obvious injection payload is blocked before the LLM
+    # inspector ever reads it. This is the mitigation for A4' (the inspection LLM
+    # is itself an attack surface: a payload crafted to flip the inspector's
+    # verdict never reaches it). Everything blocked here lands in the audit log
+    # with attribution + the matched rule (+ the payload in forensic mode).
+    _req_identity = identity_id or (identity.get("slug", "openai-router") if identity else "anonymous")
+    if prompt_text:
+        try:
+            from yashigani.mcp._content_filter import filter_description as _mech_filter
+            _mech = _mech_filter(prompt_text)
+        except Exception as _mech_exc:
+            logger.error("mechanical injection scan raised (%s) — fail-closed request_id=%s",
+                         _mech_exc, request_id)
+            _mech = None
+            _audit_prompt_injection_block(
+                request_id, _req_identity, "request", "mechanical",
+                classification="MECHANICAL_SCAN_ERROR", detected_pattern="",
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"message": _owui_deny_message("request_inspection_error"),
+                                   "type": "request_inspection_error",
+                                   "code": "request_inspection_error"}},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+        if _mech is not None and _mech.rejected:
+            logger.warning(
+                "REQUEST INJECTION BLOCKED /v1 (MECHANICAL, no LLM): identity=%s "
+                "matched=%r reason=%s request_id=%s",
+                _req_identity, _mech.matched_pattern, _mech.reject_reason, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, "request", "mechanical",
+                classification="PROMPT_INJECTION_ONLY",
+                detected_pattern=_mech.matched_pattern or _mech.reject_reason,
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message("prompt_injection_only"),
+                    "type": "request_injection_blocked",
+                    "code": "prompt_injection_only",
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Request-Classification": "PROMPT_INJECTION_ONLY",
+                    "X-Yashigani-Detection-Layer": "mechanical",
+                },
+            )
+
+    # ── 2a. Request-leg prompt-injection inspection — LLM defence-in-depth ──
+    # Only content the mechanical layer judged CLEAN reaches the LLM classifier
+    # (novel/subtle patterns). The classifier is itself hardened (input is
+    # JSON-wrapped + treated as fully hostile, structured-output enforced, any
+    # deviation → CLASSIFIER_ERROR fail-closed). Any non-PASS verdict blocks +
+    # audits. The pipeline never raises; a bare-except here still fails closed.
     if _state.request_inspection_pipeline is not None and prompt_text:
         try:
             _insp = _state.request_inspection_pipeline.process(
@@ -1802,6 +1885,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "Request inspection raised (%s) — fail-closed block request_id=%s",
                 _insp_exc, request_id,
             )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, "request", "llm",
+                classification="INSPECTION_ERROR", detected_pattern="",
+                content=prompt_text, confidence=0.0,
+            )
             return JSONResponse(
                 status_code=403,
                 content={"error": {
@@ -1814,10 +1902,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         if _insp.action != "PASS":
             logger.warning(
-                "REQUEST INSPECTION BLOCKED /v1: identity=%s action=%s "
+                "REQUEST INJECTION BLOCKED /v1 (LLM): identity=%s action=%s "
                 "classification=%s confidence=%.2f request_id=%s",
-                identity_id, _insp.action, _insp.classification,
+                _req_identity, _insp.action, _insp.classification,
                 _insp.confidence, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, "request", "llm",
+                classification=_insp.classification, detected_pattern="",
+                content=prompt_text, confidence=_insp.confidence,
             )
             _reason_code = _insp.classification.lower()
             return JSONResponse(
@@ -1831,6 +1924,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "X-Yashigani-Request-Id": request_id,
                     "X-Yashigani-Request-Verdict": "blocked",
                     "X-Yashigani-Request-Classification": _insp.classification,
+                    "X-Yashigani-Detection-Layer": "llm",
                 },
             )
 
@@ -3984,7 +4078,37 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
     # The embeddings endpoint is the Letta archival-memory ingress: content
     # embedded here becomes persistent agent memory (A3 poisoning surface), so
     # it MUST run the same injection scan as chat and MUST NOT be omitted.
-    # Fail-closed: any non-PASS verdict → 403, nothing is embedded or stored.
+    # MECHANICAL-first (protects the LLM inspector, audits with attribution);
+    # LLM is defence-in-depth on mechanically-clean content. Fail-closed.
+    _emb_identity = identity_id or (identity.get("slug", "embeddings") if identity else "anonymous")
+    if classification_text:
+        try:
+            from yashigani.mcp._content_filter import filter_description as _emech_filter
+            _emech = _emech_filter(classification_text)
+        except Exception:
+            _emech = None
+        if _emech is not None and _emech.rejected:
+            logger.warning(
+                "EMBEDDINGS INJECTION BLOCKED (MECHANICAL, no LLM): identity=%s "
+                "matched=%r request_id=%s",
+                _emb_identity, _emech.matched_pattern, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _emb_identity, "embeddings", "mechanical",
+                classification="PROMPT_INJECTION_ONLY",
+                detected_pattern=_emech.matched_pattern or _emech.reject_reason,
+                content=classification_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message("prompt_injection_only"),
+                    "type": "request_injection_blocked",
+                    "code": "prompt_injection_only",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id,
+                         "X-Yashigani-Detection-Layer": "mechanical"},
+            )
     if _state.request_inspection_pipeline is not None and classification_text:
         try:
             _einsp = _state.request_inspection_pipeline.process(
@@ -3998,6 +4122,11 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 "Embeddings inspection raised (%s) — fail-closed block request_id=%s",
                 _einsp_exc, request_id,
             )
+            _audit_prompt_injection_block(
+                request_id, _emb_identity, "embeddings", "llm",
+                classification="INSPECTION_ERROR", detected_pattern="",
+                content=classification_text, confidence=0.0,
+            )
             return JSONResponse(
                 status_code=403,
                 content={"error": {
@@ -4009,9 +4138,14 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             )
         if _einsp.action != "PASS":
             logger.warning(
-                "EMBEDDINGS INSPECTION BLOCKED: identity=%s action=%s "
+                "EMBEDDINGS INJECTION BLOCKED (LLM): identity=%s action=%s "
                 "classification=%s request_id=%s",
-                identity_id, _einsp.action, _einsp.classification, request_id,
+                _emb_identity, _einsp.action, _einsp.classification, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _emb_identity, "embeddings", "llm",
+                classification=_einsp.classification, detected_pattern="",
+                content=classification_text, confidence=_einsp.confidence,
             )
             _ereason = _einsp.classification.lower()
             return JSONResponse(
@@ -4025,6 +4159,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                     "X-Yashigani-Request-Id": request_id,
                     "X-Yashigani-Request-Verdict": "blocked",
                     "X-Yashigani-Request-Classification": _einsp.classification,
+                    "X-Yashigani-Detection-Layer": "llm",
                 },
             )
 
