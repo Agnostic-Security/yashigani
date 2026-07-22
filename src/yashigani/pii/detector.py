@@ -18,6 +18,7 @@ Modes:
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -140,6 +141,67 @@ def _luhn_valid(number: str) -> bool:
     return total % 10 == 0
 
 
+# F4 (CRITICAL — Laura, FINDING-V412-DOCKER-CLEANROUND-BATCH): inserting a
+# Unicode "format" character (category Cf — U+200B ZERO WIDTH SPACE,
+# U+200C ZERO WIDTH NON-JOINER, U+200D ZERO WIDTH JOINER, U+FEFF
+# ZERO-WIDTH-NO-BREAK-SPACE/BOM, and others) INSIDE an SSN/credit-card/etc.
+# token splits the contiguous digit run so every pattern in patterns.py
+# (all plain `\d`/literal-anchored regexes, no format-char tolerance)
+# finds ZERO matches — the value passed through completely unredacted.
+# These characters render with zero visual width, so an operator/reviewer
+# staring at the rendered text sees the exact same SSN/card number a human
+# would recognise as sensitive, while the detector sees nothing.
+#
+# Fix: normalize text BEFORE matching —
+#   1. Drop every category-"Cf" (format) character entirely (they carry no
+#      visual width and no semantic content of their own).
+#   2. Apply NFKC per-character (never across characters, so the mapping
+#      stays simple and order-preserving) to also close compatibility-form
+#      evasions (e.g. FULLWIDTH DIGIT ZERO U+FF10 -> ASCII "0").
+# The index_map lets a match span in the NORMALIZED text be translated
+# back to the correct span in the ORIGINAL text, so redaction/
+# pseudonymisation still splices the right characters out of the real
+# payload (never the normalized copy).
+def _normalize_with_span_map(text: str) -> tuple[str, list[int]]:
+    """
+    Build a normalized view of ``text`` for PII pattern matching, plus a
+    parallel index map so a match span found in the NORMALIZED text can be
+    translated back to the corresponding span in the ORIGINAL text.
+
+    Returns:
+        (normalized_text, index_map) where index_map[i] is the original-text
+        index that normalized_text[i] was derived from.  A normalized span
+        [ns, ne) maps back to the original span
+        [index_map[ns], index_map[ne - 1] + 1) via
+        :func:`_map_normalized_span_to_original`.
+    """
+    out_chars: list[str] = []
+    index_map: list[int] = []
+    for i, ch in enumerate(text):
+        if unicodedata.category(ch) == "Cf":
+            # Zero-width / format character — drop entirely.  No output
+            # emitted, so it contributes nothing to the matched span and
+            # cannot be used to split an otherwise-contiguous PII token.
+            continue
+        for out_ch in unicodedata.normalize("NFKC", ch):
+            out_chars.append(out_ch)
+            index_map.append(i)
+    return "".join(out_chars), index_map
+
+
+def _map_normalized_span_to_original(
+    norm_start: int, norm_end: int, index_map: list[int], orig_len: int,
+) -> tuple[int, int]:
+    """Translate a [norm_start, norm_end) span in normalized text back to
+    the corresponding [orig_start, orig_end) span in the original text."""
+    if norm_end <= norm_start:
+        pos = index_map[norm_start] if norm_start < len(index_map) else orig_len
+        return pos, pos
+    orig_start = index_map[norm_start]
+    orig_end = index_map[norm_end - 1] + 1
+    return orig_start, orig_end
+
+
 def _deduplicate_findings(findings: list[PiiFinding]) -> list[PiiFinding]:
     """Remove overlapping findings, keeping the one with the wider span.
 
@@ -258,6 +320,12 @@ class PiiDetector:
           ``action_taken`` to "blocked" for encoded-only hits — the caller MUST
           drop or refuse the payload rather than forward an un-redactable
           encoded secret.  ``detected`` is always set when any view matched.
+
+        F4 (CRITICAL — Laura): ``action_taken`` is "redacted"/"pseudonymized"
+        ONLY when at least one raw-view finding was actually spliced out of
+        the text.  A genuinely clean payload (``raw_findings`` empty and not
+        ``encoded_only``) reports action_taken="logged" — never falsely
+        claims a transform that never happened (false compliance).
         """
         result = self.detect_decoded(text)
 
@@ -272,7 +340,14 @@ class PiiDetector:
             encoded_only = result.detected and not raw_findings
             # If PII was found only in a decoded view, we cannot redact it in
             # place — escalate to blocked so the caller refuses the payload.
-            action = "blocked" if encoded_only else "redacted"
+            # F4: only claim "redacted" when a raw-view finding was actually
+            # spliced out — never on a payload with nothing to redact.
+            if encoded_only:
+                action = "blocked"
+            elif raw_findings:
+                action = "redacted"
+            else:
+                action = "logged"
             return redacted, PiiResult(
                 detected=result.detected,
                 findings=result.findings,
@@ -289,7 +364,13 @@ class PiiDetector:
             encoded_only = result.detected and not raw_findings
             # Same escalation as REDACT: encoded-only PII cannot be pseudonymised
             # in-place — caller must block the payload.
-            action = "blocked" if encoded_only else "pseudonymized"
+            # F4: only claim "pseudonymized" when something was actually applied.
+            if encoded_only:
+                action = "blocked"
+            elif raw_findings:
+                action = "pseudonymized"
+            else:
+                action = "logged"
             return pseudonymized, PiiResult(
                 detected=result.detected,
                 findings=result.findings,
@@ -317,6 +398,10 @@ class PiiDetector:
         Returns the redacted text and a :class:`PiiResult` describing the
         replacements.  Replacements are applied right-to-left so that
         start/end offsets of earlier findings stay valid.
+
+        F4 (CRITICAL — Laura): ``action_taken`` is "redacted" only when a
+        finding was actually spliced out; a clean payload (no findings)
+        reports "logged" — never a false "redacted" claim on unchanged text.
         """
         findings = self._scan(text)
         redacted = self._apply_redactions(text, findings)
@@ -324,7 +409,7 @@ class PiiDetector:
             detected=bool(findings),
             findings=findings,
             mode=self.mode,
-            action_taken="redacted",
+            action_taken="redacted" if findings else "logged",
         )
         return redacted, result
 
@@ -364,13 +449,24 @@ class PiiDetector:
     # ------------------------------------------------------------------
 
     def _scan(self, text: str) -> list[PiiFinding]:
-        """Run all enabled patterns and return deduplicated findings."""
+        """Run all enabled patterns and return deduplicated findings.
+
+        F4 (CRITICAL — Laura): patterns are matched against a NORMALIZED
+        view of ``text`` (Cf/zero-width chars stripped + per-character
+        NFKC) so a zero-width Unicode character inserted mid-token cannot
+        split an otherwise-contiguous SSN/credit-card/etc. run and evade
+        every pattern.  Match spans are translated back to the ORIGINAL
+        text via the index map before being stored, so redaction /
+        pseudonymisation still splices the correct span out of the real
+        payload (including any zero-width characters embedded within it).
+        """
         raw_findings: list[PiiFinding] = []
+        norm_text, index_map = _normalize_with_span_map(text)
 
         for pii_type in self.enabled_types:
             patterns = PATTERN_REGISTRY.get(pii_type.value, [])
             for pattern in patterns:
-                for match in pattern.finditer(text):
+                for match in pattern.finditer(norm_text):
                     # RESTART-013 gap #2: context-sensitive patterns (e.g.
                     # PERSON_NAME's "Name: <value>") wrap the SENSITIVE VALUE
                     # in capture group 1 so the finding span covers only the
@@ -381,16 +477,24 @@ class PiiDetector:
                     # for them and this falls through to the original
                     # whole-match behaviour unchanged.
                     if pattern.groups > 0 and match.group(1) is not None:
-                        span_start, span_end = match.start(1), match.end(1)
+                        norm_start, norm_end = match.start(1), match.end(1)
                         matched_text = match.group(1)
                     else:
-                        span_start, span_end = match.start(), match.end()
+                        norm_start, norm_end = match.start(), match.end()
                         matched_text = match.group(0)
 
-                    # Credit card: post-filter with Luhn check.
+                    # Credit card: post-filter with Luhn check (against the
+                    # NORMALIZED — clean, zero-width-free — matched text).
                     if pii_type == PiiType.CREDIT_CARD:
                         if not _luhn_valid(matched_text):
                             continue
+
+                    # F4: map the span back to the ORIGINAL text so
+                    # redaction/pseudonymisation excises the full original
+                    # span (including any embedded zero-width characters).
+                    span_start, span_end = _map_normalized_span_to_original(
+                        norm_start, norm_end, index_map, len(text),
+                    )
 
                     raw_findings.append(PiiFinding(
                         pii_type=pii_type,
@@ -407,6 +511,9 @@ class PiiDetector:
         Non-reversible at this layer.  Full reversible pseudonymisation
         (reversible via pointer file) is at the doc-OPA document pipeline.
         Returns the pseudonymised text and a PiiResult.
+
+        F4 (CRITICAL — Laura): ``action_taken`` is "pseudonymized" only when
+        a finding was actually applied; a clean payload reports "logged".
         """
         findings = self._scan(text)
         pseudonymized = self._apply_pseudonymization(text, findings)
@@ -414,7 +521,7 @@ class PiiDetector:
             detected=bool(findings),
             findings=findings,
             mode=self.mode,
-            action_taken="pseudonymized",
+            action_taken="pseudonymized" if findings else "logged",
         )
 
     def _apply_redactions(self, text: str, findings: list[PiiFinding]) -> str:
