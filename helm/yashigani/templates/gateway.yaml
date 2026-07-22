@@ -132,6 +132,36 @@ spec:
               value: {{ $gwEnv.orchDeadlineS | quote }}
             - name: YASHIGANI_ORCH_MAX_FANOUT
               value: {{ $gwEnv.orchMaxFanout | quote }}
+            # 5.0 interaction-hardening (compose parity). Unset keys fall back to
+            # the in-code defaults; set here to tune per deployment.
+            {{- if $gwEnv.classifierMaxConcurrentPerIdentity }}
+            - name: YASHIGANI_CLASSIFIER_MAX_CONCURRENT_PER_IDENTITY
+              value: {{ $gwEnv.classifierMaxConcurrentPerIdentity | quote }}
+            {{- end }}
+            {{- if $gwEnv.securityForensicCapture }}
+            - name: YASHIGANI_SECURITY_FORENSIC_CAPTURE
+              value: {{ $gwEnv.securityForensicCapture | quote }}
+            {{- end }}
+            {{- if $gwEnv.conversationRisk }}
+            - name: YASHIGANI_CONVERSATION_RISK
+              value: {{ $gwEnv.conversationRisk | quote }}
+            {{- end }}
+            {{- if $gwEnv.rulePromotion }}
+            - name: YASHIGANI_RULE_PROMOTION
+              value: {{ $gwEnv.rulePromotion | quote }}
+            {{- end }}
+            {{- if $gwEnv.protectedSystemPromptsFile }}
+            - name: YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE
+              value: {{ $gwEnv.protectedSystemPromptsFile | quote }}
+            {{- end }}
+            {{- if $gwEnv.contentModerationPolicyFile }}
+            - name: YASHIGANI_CONTENT_MODERATION_POLICY_FILE
+              value: {{ $gwEnv.contentModerationPolicyFile | quote }}
+            {{- end }}
+            {{- if $gwEnv.audioTranscribeModel }}
+            - name: YASHIGANI_AUDIO_TRANSCRIBE_MODEL
+              value: {{ $gwEnv.audioTranscribeModel | quote }}
+            {{- end }}
             # LAURA-ORCH-001(b): strict low budget for injection-originated
             # (tool-result justified) hops; over-budget result-steered hops are
             # refused (fail-closed).

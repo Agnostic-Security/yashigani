@@ -387,6 +387,22 @@ gateway:
     orchMaxIters: "9"
     orchDeadlineS: "300"
     orchMaxFanout: "4"
+    # 5.0 interaction-hardening security controls (compose parity). Blank = use
+    # the in-code default. See docs/compose x-common-env for the same keys.
+    #   classifierMaxConcurrentPerIdentity — A10 per-identity classifier cap (default 4)
+    #   securityForensicCapture — log the analysed payload in security audit events (default false)
+    #   conversationRisk — multi-turn injection accumulator (default true)
+    #   rulePromotion — LLM→mechanical learning loop (default true)
+    #   protectedSystemPromptsFile — A4 leak-scrub corpus path (default unset = off)
+    #   contentModerationPolicyFile — A12 policy path (default unset = off)
+    #   audioTranscribeModel — A6 whisper-class model (default unset = audio blocked)
+    classifierMaxConcurrentPerIdentity: ""
+    securityForensicCapture: ""
+    conversationRisk: ""
+    rulePromotion: ""
+    protectedSystemPromptsFile: ""
+    contentModerationPolicyFile: ""
+    audioTranscribeModel: ""
     # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
     # derives from prior tool-RESULT content (injection-originated hops). An
     # over-budget result-steered hop is REFUSED so a result-steering injection

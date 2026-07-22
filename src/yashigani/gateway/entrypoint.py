@@ -152,6 +152,21 @@ def _build_app(mesh_mode: bool = False):
                 _sp_file, _sp_exc,
             )
 
+    # T4b: A6-audio transcription backend. When YASHIGANI_AUDIO_TRANSCRIBE_MODEL
+    # is set, wire a local ollama whisper-class transcriber; otherwise audio
+    # requests are blocked (fail-closed, never passed uninspected).
+    audio_transcriber = None
+    _audio_model = os.getenv("YASHIGANI_AUDIO_TRANSCRIBE_MODEL", "").strip()
+    if _audio_model:
+        try:
+            from yashigani.inspection.audio_transcription import AudioTranscriber
+            from yashigani.inspection.audio_backends import OllamaTranscriber
+            audio_transcriber = AudioTranscriber(
+                OllamaTranscriber(base_url=ollama_url, model=_audio_model))
+            logger.info("A6-audio transcription enabled (model=%s)", _audio_model)
+        except Exception as _at_exc:
+            logger.warning("A6-audio transcriber unavailable (%s) — audio blocked", _at_exc)
+
     # A5 (5.0): ollama model-integrity verifier. Reads pins from the shared
     # store; verify() fails closed on a store error. Enabled by default; the
     # observed-digest cache is populated by the startup/periodic /api/tags probe
@@ -177,6 +192,18 @@ def _build_app(mesh_mode: bool = False):
             "A5 model-integrity verifier unavailable (%s) — model pinning inactive",
             _mi_exc,
         )
+
+    # T4a: A5 observed-digest probe — populate the observed digest/weights the
+    # verifier compares against, from a live /api/tags + on-disk blob hash. Runs
+    # once at startup; a periodic refresh is a launchd/cron concern. Best-effort.
+    _model_observed_digests: dict = {}
+    _model_observed_weights: dict = {}
+    if model_integrity_verifier is not None:
+        try:
+            from yashigani.inspection.model_probe import refresh_into
+            refresh_into(_model_observed_digests, _model_observed_weights, ollama_url)
+        except Exception as _mp_exc:
+            logger.warning("A5 model probe failed at startup (%s)", _mp_exc)
 
     # A12 (5.0): content-moderation guard. Policy loaded from the JSON file named
     # by YASHIGANI_CONTENT_MODERATION_POLICY_FILE. Unset → empty policy → no-op
@@ -1005,7 +1032,10 @@ def _build_app(mesh_mode: bool = False):
         request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
         system_prompt_leak_guard=system_prompt_leak_guard,  # 5.0 A4
         model_integrity_verifier=model_integrity_verifier,  # 5.0 A5
+        model_observed_digests=_model_observed_digests,     # 5.0 T4a
+        model_observed_weights=_model_observed_weights,     # 5.0 T4a
         content_moderation_guard=content_moderation_guard,  # 5.0 A12
+        audio_transcriber=audio_transcriber,                # 5.0 A6-audio (T4b)
         conversation_risk_tracker=conversation_risk_tracker,  # 5.0 multi-turn
         rule_promotion_store=rule_promotion_store,  # 5.0 T1
         promoted_ruleset=promoted_ruleset,          # 5.0 T1

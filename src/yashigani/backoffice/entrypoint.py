@@ -344,6 +344,24 @@ def _bootstrap():
             # Expose for the erasure route (POST /admin/privacy/erase).
             backoffice_state.crypto_shredder = _cs_shredder
             logger.info("Backoffice: crypto-shred Shredder attached (Redis DB 7)")
+
+            # 5.0 T5 — dual-control operators for the admin model-security routes,
+            # over the shared Redis (db/1). Best-effort; the routes 503 if absent.
+            try:
+                import redis as _redis_ms
+                _ms_redis = _redis_ms.from_url(_backoffice_redis_url(1), decode_responses=False)
+                from yashigani.inspection.model_integrity import ModelPinStore, ModelPinDualControl
+                from yashigani.mcp.manifest_reapproval import ManifestReapprovalGate
+                from yashigani.inspection.rule_promotion import RulePromotionStore
+                backoffice_state.model_pin_dual_control = ModelPinDualControl(
+                    ModelPinStore(_ms_redis), _ms_redis, audit_writer=audit_writer)
+                backoffice_state.manifest_reapproval_gate = ManifestReapprovalGate(
+                    _ms_redis, audit_writer=audit_writer)
+                backoffice_state.rule_promotion_store = RulePromotionStore(
+                    _ms_redis, audit_writer=audit_writer)
+                logger.info("Backoffice: T5 model-security dual-controls wired")
+            except Exception as _ms_exc:
+                logger.warning("Backoffice: T5 model-security controls unavailable (%s)", _ms_exc)
         except Exception as exc:
             logger.error(
                 "Backoffice: crypto-shred UNAVAILABLE (%s) — data-subject fields "

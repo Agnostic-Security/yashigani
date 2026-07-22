@@ -83,6 +83,11 @@ class BackofficeState:
     # disabled (YASHIGANI_AUDIT_DB_SINK=false) or no DB is configured.
     db_audit_sink: Optional[Any] = None              # PostgresSink instance
     audit_checkpoint_scheduler: Optional[Any] = None  # AuditCheckpointScheduler
+    # 5.0 T5 — dual-control operators for the new security controls. Wired in the
+    # backoffice bootstrap over the shared Redis; the admin routes drive them.
+    model_pin_dual_control: Optional[Any] = None      # ModelPinDualControl (A5)
+    manifest_reapproval_gate: Optional[Any] = None    # ManifestReapprovalGate (rug-pull)
+    rule_promotion_store: Optional[Any] = None        # RulePromotionStore (T1 learning loop)
     # SIEM sink runtime config (updated via /admin/audit/siem/config)
     siem_backend: str = "none"
     siem_endpoint: Optional[str] = None

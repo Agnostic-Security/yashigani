@@ -1268,6 +1268,8 @@ def configure(
     request_inspection_pipeline=None,  # 5.0 A1 — request-leg injection scan
     system_prompt_leak_guard=None,     # 5.0 A4 — response-leg leak scrub
     model_integrity_verifier=None,     # 5.0 A5 — ollama model-pin verifier
+    model_observed_digests=None,       # 5.0 T4a — observed manifest digests
+    model_observed_weights=None,       # 5.0 T4a — observed weights hashes
     audio_transcriber=None,            # 5.0 A6-audio — transcribe→text controls
     content_moderation_guard=None,     # 5.0 A12 — unsafe-topic filtering
     conversation_risk_tracker=None,    # 5.0 — multi-turn injection accumulator
@@ -1311,6 +1313,10 @@ def configure(
     _state.request_inspection_pipeline = request_inspection_pipeline
     _state.system_prompt_leak_guard = system_prompt_leak_guard
     _state.model_integrity_verifier = model_integrity_verifier
+    if model_observed_digests is not None:
+        _state.model_observed_digests = model_observed_digests
+    if model_observed_weights is not None:
+        _state.model_observed_weights = model_observed_weights
     _state.audio_transcriber = audio_transcriber
     _state.content_moderation_guard = content_moderation_guard
     _state.conversation_risk_tracker = conversation_risk_tracker

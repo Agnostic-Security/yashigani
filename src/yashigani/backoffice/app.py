@@ -1492,6 +1492,9 @@ def create_backoffice_app() -> FastAPI:
     # #25 — dual-admin cloud-LLM risk-accepted override (propose/approve/revoke/status)
     from yashigani.backoffice.routes.cloud_override import router as cloud_override_router
     app.include_router(cloud_override_router, prefix="/admin/cloud-override", tags=["cloud-override"])
+    # 5.0 T5 — model-security dual-control admin routes (A5 pin, rug-pull, promotion)
+    from yashigani.backoffice.routes.model_security import router as model_security_router
+    app.include_router(model_security_router, prefix="/admin/model-security", tags=["model-security"])
     app.include_router(alerts_router, prefix="/admin/alerts", tags=["alerts"])
     app.include_router(agent_bundles_router, prefix="/admin/agent-bundles", tags=["agent-bundles"])
     # v1.0 — Budget admin API
