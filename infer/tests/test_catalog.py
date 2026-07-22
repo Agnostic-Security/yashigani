@@ -2,9 +2,13 @@
 # Copyright 2026 Agnostic Security Ltd
 """Unit tests for the signed-catalog verify-side (ECDSA). No network, no key-mgmt infra —
 this test mints an ephemeral P-256 keypair locally purely to exercise the verify path;
-production signing/key distribution is a separate component (Nico), not exercised here."""
+production signing/key distribution is a separate component (`scripts/manifest_signer.py`,
+Yashigani signing infra only), not exercised here."""
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -15,19 +19,30 @@ from yashigani_infer.catalog import (
     CatalogVerifier,
     SignedCatalog,
     SignedCatalogEntry,
+    StaticRevocationSource,
 )
 
 REVISION = "b" * 40
 GOOD_SHA256 = "c" * 64
+GOOD_LFS_OBJECT_ID = "f" * 64
+ISSUED_AT = "2026-07-22T00:00:00Z"
 
 
 def _make_signed_entry(private_key, **overrides) -> SignedCatalogEntry:
-    fields = {
+    fields: dict[str, Any] = {
         "repo_id": "acme/tiny-model",
         "revision": REVISION,
         "filename": "tiny-model.Q4_K_M.gguf",
+        "quant": "Q4_K_M",
         "sha256": GOOD_SHA256,
+        "lfs_object_id": GOOD_LFS_OBJECT_ID,
         "provenance_tier": "vetted",
+        "issued_at": ISSUED_AT,
+        # Large enough that tests calling require() without an explicit `now=`
+        # (i.e. real wall-clock time) never spuriously expire relative to the
+        # fixed ISSUED_AT constant above, while still comfortably under the
+        # no-eternal-trust ceiling enforced by SignedCatalogEntry.
+        "max_trust_age_seconds": 90 * 24 * 3600,
         "signer_key_id": "key-2026-07",
     }
     fields.update(overrides)
@@ -55,8 +70,34 @@ def test_verifier_rejects_tampered_payload(keypair) -> None:
         repo_id=entry.repo_id,
         revision=entry.revision,
         filename=entry.filename,
+        quant=entry.quant,
         sha256="d" * 64,  # digest swapped after signing
+        lfs_object_id=entry.lfs_object_id,
         provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
+        signature=entry.signature,
+        signer_key_id=entry.signer_key_id,
+    )
+    with pytest.raises(CatalogVerificationError):
+        CatalogVerifier(public_key).verify(tampered)
+
+
+def test_verifier_rejects_tampered_provenance_tier(keypair) -> None:
+    """Finding #5: provenance_tier is inside the signature — editing it independently
+    of the signature (e.g. laundering 'community' -> 'vetted') must invalidate the sig."""
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key, provenance_tier="community")
+    tampered = SignedCatalogEntry(
+        repo_id=entry.repo_id,
+        revision=entry.revision,
+        filename=entry.filename,
+        quant=entry.quant,
+        sha256=entry.sha256,
+        lfs_object_id=entry.lfs_object_id,
+        provenance_tier="vetted",  # promoted after signing, without a new signature
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
         signature=entry.signature,
         signer_key_id=entry.signer_key_id,
     )
@@ -78,8 +119,100 @@ def test_entry_rejects_malformed_sha256() -> None:
             repo_id="acme/tiny-model",
             revision=REVISION,
             filename="tiny-model.gguf",
+            quant="Q4_K_M",
             sha256="not-a-hex-digest",
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
             provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=3600,
+            signature=b"",
+            signer_key_id="key-1",
+        )
+
+
+def test_entry_rejects_malformed_lfs_object_id() -> None:
+    with pytest.raises(ValueError, match="lfs_object_id"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision=REVISION,
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id="sha256:not-stripped",
+            provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=3600,
+            signature=b"",
+            signer_key_id="key-1",
+        )
+
+
+def test_entry_rejects_floating_revision() -> None:
+    """A manifest signed against a floating branch (e.g. 'main') is refused at the
+    dataclass level, not only by the adapter's own allowlist (finding #3)."""
+    with pytest.raises(ValueError, match="revision"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision="main",
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
+            provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=3600,
+            signature=b"",
+            signer_key_id="key-1",
+        )
+
+
+def test_entry_rejects_naive_issued_at() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision=REVISION,
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
+            provenance_tier="vetted",
+            issued_at="2026-07-22T00:00:00",  # no tz
+            max_trust_age_seconds=3600,
+            signature=b"",
+            signer_key_id="key-1",
+        )
+
+
+@pytest.mark.parametrize("bad_ttl", [0, -1])
+def test_entry_rejects_non_positive_max_trust_age(bad_ttl: int) -> None:
+    with pytest.raises(ValueError, match="max_trust_age_seconds"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision=REVISION,
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
+            provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=bad_ttl,
+            signature=b"",
+            signer_key_id="key-1",
+        )
+
+
+def test_entry_rejects_eternal_trust_window() -> None:
+    with pytest.raises(ValueError, match="ceiling"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision=REVISION,
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
+            provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=999_999_999,
             signature=b"",
             signer_key_id="key-1",
         )
@@ -94,6 +227,8 @@ def test_signed_catalog_load_and_require_roundtrip(keypair) -> None:
     fetched = catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf")
     assert fetched.sha256 == GOOD_SHA256
     assert fetched.provenance_tier == "vetted"
+    assert fetched.quant == "Q4_K_M"
+    assert fetched.lfs_object_id == GOOD_LFS_OBJECT_ID
 
 
 def test_signed_catalog_refuses_to_load_a_badly_signed_entry(keypair) -> None:
@@ -103,8 +238,12 @@ def test_signed_catalog_refuses_to_load_a_badly_signed_entry(keypair) -> None:
         repo_id=entry.repo_id,
         revision=entry.revision,
         filename=entry.filename,
+        quant=entry.quant,
         sha256="e" * 64,
+        lfs_object_id=entry.lfs_object_id,
         provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
         signature=entry.signature,
         signer_key_id=entry.signer_key_id,
     )
@@ -122,3 +261,79 @@ def test_signed_catalog_require_raises_when_absent_no_override(keypair) -> None:
     catalog = SignedCatalog(CatalogVerifier(public_key))
     with pytest.raises(CatalogVerificationError, match="no override"):
         catalog.require("acme/unlisted-model", REVISION, "model.gguf")
+
+
+# --- Nico provenance red-team 2026-07-22: TTL + revocation (findings #2/#6) ---
+
+
+def test_require_rejects_expired_manifest_no_override(keypair) -> None:
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key, max_trust_age_seconds=60)
+    catalog = SignedCatalog(CatalogVerifier(public_key))
+    catalog.load_entries([entry])
+
+    issued = datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
+    past_ttl = issued + timedelta(seconds=61)
+    with pytest.raises(CatalogVerificationError, match="max trust age"):
+        catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf", now=past_ttl)
+
+
+def test_require_accepts_manifest_still_within_ttl(keypair) -> None:
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key, max_trust_age_seconds=60)
+    catalog = SignedCatalog(CatalogVerifier(public_key))
+    catalog.load_entries([entry])
+
+    issued = datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
+    within_ttl = issued + timedelta(seconds=59)
+    fetched = catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf", now=within_ttl)
+    assert fetched.sha256 == GOOD_SHA256
+
+
+def test_require_rejects_manifest_that_was_admitted_before_it_expired(keypair) -> None:
+    """finding #2: TTL must be re-checked at USE time, not only at load time — an
+    entry that verified fine at load_entries() can still be too old by the time a
+    later pull actually calls require()."""
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key, max_trust_age_seconds=60)
+    catalog = SignedCatalog(CatalogVerifier(public_key))
+    catalog.load_entries([entry])  # admitted fine — signature is valid regardless of age
+
+    issued = datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
+    long_after = issued + timedelta(days=30)
+    with pytest.raises(CatalogVerificationError, match="max trust age"):
+        catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf", now=long_after)
+
+
+def test_require_rejects_revoked_manifest_no_override(keypair) -> None:
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key)
+    revocation = StaticRevocationSource(denied=[("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf")])
+    catalog = SignedCatalog(CatalogVerifier(public_key), revocation_source=revocation)
+    catalog.load_entries([entry])  # a valid signature does not bypass the deny-list
+
+    with pytest.raises(CatalogVerificationError, match="deny-list"):
+        catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf")
+
+
+def test_require_accepts_when_not_on_deny_list(keypair) -> None:
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key)
+    revocation = StaticRevocationSource(denied=[("acme/some-other-model", REVISION, "other.gguf")])
+    catalog = SignedCatalog(CatalogVerifier(public_key), revocation_source=revocation)
+    catalog.load_entries([entry])
+
+    fetched = catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf")
+    assert fetched.sha256 == GOOD_SHA256
+
+
+def test_default_revocation_source_denies_nothing(keypair) -> None:
+    """The offline/air-gapped default: no revocation source wired means no deny-list,
+    NOT a fail-closed 'nothing is ever admitted' state (documented explicitly in
+    StaticRevocationSource's own docstring)."""
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key)
+    catalog = SignedCatalog(CatalogVerifier(public_key))  # no revocation_source passed
+    catalog.load_entries([entry])
+    fetched = catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf")
+    assert fetched.sha256 == GOOD_SHA256

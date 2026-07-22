@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -125,12 +127,18 @@ def test_resolve_propagates_download_failure(tmp_blob_store: BlobStore) -> None:
 
 
 def _signed_catalog_with(private_key, public_key, *, sha256: str) -> SignedCatalog:
-    fields = {
+    fields: dict[str, Any] = {
         "repo_id": "acme/tiny-model",
         "revision": PINNED_REVISION,
         "filename": "tiny-model.gguf",
+        "quant": "Q4_K_M",
         "sha256": sha256,
+        "lfs_object_id": "b" * 64,
         "provenance_tier": "vetted",
+        "issued_at": "2026-07-22T00:00:00Z",
+        # generous window so this fixed timestamp never spuriously expires
+        # against real wall-clock time in these tests (no explicit `now=`).
+        "max_trust_age_seconds": 90 * 24 * 3600,
         "signer_key_id": "test-key",
     }
     unsigned = SignedCatalogEntry(**fields, signature=b"")

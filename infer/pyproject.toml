@@ -1,4 +1,4 @@
-# Last updated: 2026-07-22T00:00:00+00:00 (feat: 6.0 inference-engine foundation — commodity control plane skeleton)
+# Last updated: 2026-07-22T23:00:00+00:00 (feat: model-manifest signing/mint side + counter-signed format hardening — Nico provenance red-team)
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -49,6 +49,13 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# `scripts/` holds the mint-side (private-key) signing tooling
+# (`keygen_manifest.py`, `manifest_signer.py`) — deliberately kept OUT of
+# `src/yashigani_infer/` so it never ships in the runtime wheel (see
+# `scripts/manifest_signer.py`'s module docstring). This path is added only
+# so pytest can import it directly for round-trip tests; it does not change
+# what gets built/installed.
+pythonpath = ["scripts"]
 
 [tool.coverage.run]
 source = ["yashigani_infer"]
