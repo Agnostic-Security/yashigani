@@ -85,13 +85,17 @@ class ManifestRegistryService:
         ok, msg = await svc.verify(record_id=1)
     """
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, reapproval_gate: Any = None) -> None:
         if pool is None:
             raise RuntimeError(
                 "ManifestRegistryService requires a non-None asyncpg pool. "
                 "Ensure create_pool() has been called before constructing this service."
             )
         self._pool = pool
+        # 5.0 rug-pull: when set, a manifest delta is held PENDING_REAPPROVAL in
+        # the gate and is NOT active until a second admin approves. The ledger
+        # itself stays append-only (history of truth); the gate governs "active".
+        self._reapproval_gate = reapproval_gate
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -220,6 +224,25 @@ class ManifestRegistryService:
             record_id,
             prev_sha[:12] if prev_sha else "null",
         )
+
+        # 5.0 rug-pull gate: a post-approval manifest change is held pending
+        # re-approval (NOT active) so the invocation path can fail closed on it.
+        # The ledger append above always succeeds (history is the source of
+        # truth); gating "active" is a separate concern and must not fail the
+        # registration, so this is best-effort with a loud log.
+        if self._reapproval_gate is not None:
+            try:
+                note = self._reapproval_gate.note_registration(
+                    agent_id, sha, registered_by=operator_identity,
+                )
+                if not note.active:
+                    _log.warning(
+                        "ManifestRegistry: agent=%s new manifest is PENDING RE-APPROVAL "
+                        "(rug-pull gate) — not active until a 2nd admin approves", agent_id,
+                    )
+            except Exception:  # noqa: BLE001 — never fail the append on the gate
+                _log.exception(
+                    "ManifestRegistry: reapproval-gate note failed for agent=%s", agent_id)
         return record_id
 
     # ------------------------------------------------------------------

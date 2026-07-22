@@ -138,6 +138,11 @@ class EventType(str, Enum):
     MODEL_PIN_APPROVED = "MODEL_PIN_APPROVED"
     MODEL_PIN_REJECTED = "MODEL_PIN_REJECTED"
     MODEL_INTEGRITY_MISMATCH = "MODEL_INTEGRITY_MISMATCH"
+    # 5.0 rug-pull — manifest delta must be re-approved before it goes active
+    MANIFEST_DELTA_PENDING = "MANIFEST_DELTA_PENDING"
+    MANIFEST_DELTA_APPROVED = "MANIFEST_DELTA_APPROVED"
+    MANIFEST_DELTA_REJECTED = "MANIFEST_DELTA_REJECTED"
+    MANIFEST_ACTIVE_BLOCKED = "MANIFEST_ACTIVE_BLOCKED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1566,6 +1571,25 @@ class ModelPinEvent(AuditEvent):
     initiated_by: str = ""
     approver: str = ""
     action_taken: str = ""  # bootstrapped | proposed | approved | rejected | block
+
+
+@dataclass
+class ManifestReapprovalEvent(AuditEvent):
+    """
+    5.0 rug-pull: an MCP-server/agent manifest changed after approval. The delta
+    is held PENDING_REAPPROVAL and blocked from going active until a second
+    admin approves — a silent post-approval mutation cannot take effect.
+    """
+
+    event_type: str = EventType.MANIFEST_DELTA_PENDING
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False
+    agent_id: str = ""
+    old_manifest_sha256: str = ""
+    new_manifest_sha256: str = ""
+    registered_by: str = ""
+    approver: str = ""
+    action_taken: str = ""  # pending | approved | rejected | blocked
 
 
 # ---------------------------------------------------------------------------
