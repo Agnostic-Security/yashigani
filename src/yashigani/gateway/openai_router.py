@@ -900,6 +900,8 @@ class OpenAIRouterState:
         # path (previously only the MCP/proxy path ran it). Fail-closed:
         # DISCARDED → 403, SANITIZED → forward the cleaned prompt.
         self.request_inspection_pipeline = None
+        # 5.0 A4: response-leg system-prompt leakage guard (LLM07). None = no-op.
+        self.system_prompt_leak_guard = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
@@ -1098,6 +1100,7 @@ def configure(
     agent_registry=None,
     response_inspection_pipeline=None,
     request_inspection_pipeline=None,  # 5.0 A1 — request-leg injection scan
+    system_prompt_leak_guard=None,     # 5.0 A4 — response-leg leak scrub
     ddos_protector=None,  # v2.2 — DDoSProtector | None
     pii_detector=None,    # v2.2 — PiiDetector | None
     pii_cloud_bypass: bool = False,  # v2.2 — True = skip PII for cloud-routed requests
@@ -1134,6 +1137,7 @@ def configure(
     _state.agent_registry = agent_registry
     _state.response_inspection_pipeline = response_inspection_pipeline
     _state.request_inspection_pipeline = request_inspection_pipeline
+    _state.system_prompt_leak_guard = system_prompt_leak_guard
     _state.ddos_protector = ddos_protector
     _state.pii_detector = pii_detector
     _state.pii_cloud_bypass = pii_cloud_bypass
@@ -3341,6 +3345,43 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 "Please contact your administrator."
             )
 
+    # ── 7b-iii. System-prompt leakage scrub (5.0 A4 / LLM07) ──────────
+    # Output-side defence: even if the request-leg classifier missed an
+    # extraction attempt, a model that echoes its system prompt must not leak
+    # it. Corpus-based, model-free; no-op when no guard/corpus is registered.
+    # Redact-and-forward (not block) — the rest of the answer may be useful and
+    # the sensitive span is already removed. The leak is always audited.
+    if (
+        _state.system_prompt_leak_guard is not None
+        and getattr(_state.system_prompt_leak_guard, "has_corpus", False)
+        and assistant_content
+        and response_verdict == "clean"
+    ):
+        try:
+            _leak = _state.system_prompt_leak_guard.scan(assistant_content)
+            if _leak.leaked:
+                assistant_content = _leak.scrubbed_text
+                logger.warning(
+                    "A4: system-prompt leak scrubbed in response request_id=%s "
+                    "matched=%d overlap=%.3f",
+                    request_id, _leak.matched_shingles, _leak.overlap_ratio,
+                )
+                if _state.audit_writer:
+                    try:
+                        from yashigani.audit.schema import SystemPromptLeakDetectedEvent
+                        _state.audit_writer.write(SystemPromptLeakDetectedEvent(
+                            request_id=request_id,
+                            identity_id=identity_id,
+                            matched_shingles=_leak.matched_shingles,
+                            overlap_ratio=_leak.overlap_ratio,
+                        ))
+                    except Exception as _la_exc:
+                        logger.warning("A4 audit write failed: %s", _la_exc)
+        except Exception as _leak_exc:
+            # Redaction is best-effort; a guard crash must not fail the request,
+            # but log it loudly so the gap is visible.
+            logger.error("A4: system-prompt leak scan raised %s", _leak_exc)
+
     # ── 7c. PII detection on response (buffered path only) ────────────
     #
     # Runs AFTER response inspection so any injection-flagged content is
@@ -3706,6 +3747,54 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
     else:
         input_texts = [raw_input] if raw_input else []
         classification_text = raw_input or ""
+
+    # ── 2a. Request-leg injection inspection (5.0 A1 / FIX-1) ─────────
+    # The embeddings endpoint is the Letta archival-memory ingress: content
+    # embedded here becomes persistent agent memory (A3 poisoning surface), so
+    # it MUST run the same injection scan as chat and MUST NOT be omitted.
+    # Fail-closed: any non-PASS verdict → 403, nothing is embedded or stored.
+    if _state.request_inspection_pipeline is not None and classification_text:
+        try:
+            _einsp = _state.request_inspection_pipeline.process(
+                raw_query=classification_text,
+                session_id=identity.get("identity_id", request_id) if identity else request_id,
+                agent_id=identity.get("slug", "embeddings") if identity else "embeddings",
+                user_id=identity_id,
+            )
+        except Exception as _einsp_exc:
+            logger.error(
+                "Embeddings inspection raised (%s) — fail-closed block request_id=%s",
+                _einsp_exc, request_id,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message("request_inspection_error"),
+                    "type": "request_inspection_error",
+                    "code": "request_inspection_error",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+        if _einsp.action != "PASS":
+            logger.warning(
+                "EMBEDDINGS INSPECTION BLOCKED: identity=%s action=%s "
+                "classification=%s request_id=%s",
+                identity_id, _einsp.action, _einsp.classification, request_id,
+            )
+            _ereason = _einsp.classification.lower()
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _owui_deny_message(_ereason),
+                    "type": "request_injection_blocked",
+                    "code": _ereason,
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Request-Classification": _einsp.classification,
+                },
+            )
 
     # ── 3. Sensitivity classification ─────────────────────────────────
     sensitivity_level = "PUBLIC"

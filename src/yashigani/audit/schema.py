@@ -130,6 +130,8 @@ class EventType(str, Enum):
     OPA_ASSISTANT_REGO_REJECTED = "OPA_ASSISTANT_REGO_REJECTED"
     # v0.9.0 — Response-path inspection
     RESPONSE_INJECTION_DETECTED = "RESPONSE_INJECTION_DETECTED"
+    # 5.0 A4 — system-prompt leakage scrubbed in a response (LLM07)
+    SYSTEM_PROMPT_LEAK_DETECTED = "SYSTEM_PROMPT_LEAK_DETECTED"
     # v2.25.4 — Agent/tool orchestration (build sheet §7.6, OPA-every-hop)
     ORCHESTRATION_STEP = "ORCHESTRATION_STEP"
     ORCHESTRATION_CAP = "ORCHESTRATION_CAP"
@@ -1516,6 +1518,24 @@ class ResponseInjectionDetectedEvent(AuditEvent):
     content_type: str = ""  # Content-Type of the upstream response
     response_content_hash: str = ""  # SHA-256 of the raw response body
     classifier_only_mode: bool = False  # True when LLM fallback was skipped
+
+
+@dataclass
+class SystemPromptLeakDetectedEvent(AuditEvent):
+    """
+    5.0 A4 (LLM07): written when the response-leg guard detects and scrubs
+    registered system-prompt content echoed back in a model response. The
+    leaked text itself is never stored — only overlap metrics.
+    """
+
+    event_type: str = EventType.SYSTEM_PROMPT_LEAK_DETECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    matched_shingles: int = 0
+    overlap_ratio: float = 0.0
+    action_taken: str = "scrubbed"
 
 
 # ---------------------------------------------------------------------------

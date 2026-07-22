@@ -130,6 +130,28 @@ def _build_app(mesh_mode: bool = False):
     )
     logger.info("Response inspection pipeline enabled (mandatory)")
 
+    # A4 (5.0): response-leg system-prompt leakage guard. Corpus = the
+    # operator's protected system-prompt(s), one per line in the file named by
+    # YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE. Unset/empty → guard is a no-op
+    # (honest: it only protects what the operator registers).
+    from yashigani.inspection.system_prompt_guard import SystemPromptLeakGuard
+    system_prompt_leak_guard = SystemPromptLeakGuard()
+    _sp_file = os.getenv("YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE", "").strip()
+    if _sp_file:
+        try:
+            with open(_sp_file, "r", encoding="utf-8") as _spf:
+                _prompts = [ln.strip() for ln in _spf if ln.strip()]
+            system_prompt_leak_guard.set_corpus(_prompts)
+            logger.info(
+                "A4 system-prompt leak guard: %d protected prompt(s) loaded from %s",
+                len(_prompts), _sp_file,
+            )
+        except Exception as _sp_exc:
+            logger.warning(
+                "A4 system-prompt guard: could not load %s (%s) — guard inactive",
+                _sp_file, _sp_exc,
+            )
+
     # sklearn first-pass classifier — v2.23.3 (replaces fasttext-wheel)
     classifier_backend = None
     try:
@@ -900,6 +922,7 @@ def _build_app(mesh_mode: bool = False):
         agent_registry=agent_registry,
         response_inspection_pipeline=response_pipeline,
         request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
+        system_prompt_leak_guard=system_prompt_leak_guard,  # 5.0 A4
         pii_detector=pii_detector,
         pii_cloud_bypass=pii_cloud_bypass,
         opa_url=opa_url,
