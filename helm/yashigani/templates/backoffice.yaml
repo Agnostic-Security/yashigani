@@ -207,6 +207,18 @@ spec:
               value: "https://yashigani-policy:8181"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
+            # FINDING-V412-RESTART-012: on docker/podman-compose, /run/secrets
+            # is now a pure :ro mount and the 4 dev-mode-fallback credential
+            # writes (admin_initial_password etc.) + the license-key write go
+            # to a SEPARATE /run/secrets-rw mount instead (see docker-compose.yml
+            # + auth/bootstrap.py write_docker_secrets()). On K8s, /run/secrets
+            # is ALREADY a genuinely writable emptyDir (seeded by the
+            # copy-pki-to-writable initContainer above) — there is no nested
+            # bind-mount to regress, so writes stay at the SAME path here.
+            # Without this override the Python default (/run/secrets-rw) would
+            # resolve to a path that doesn't exist in this pod.
+            - name: YASHIGANI_SECRETS_RW_DIR
+              value: "/run/secrets"
             - name: YASHIGANI_DEPLOYMENT_STREAM
               value: {{ (.Values.gateway.env | default dict).deploymentStream | quote }}
             {{- if .Values.mtls.enabled }}
@@ -293,17 +305,31 @@ spec:
             # ollama:11434 directly. Default ON; set "false" to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document
+            # enforcement admin routes (routes/documents.py, dp_weaken.py,
+            # user_ui.py) read is_document_enforcement_enabled() directly.
+            # Compose parity: docker-compose.yml backoffice env
+            # YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED. Backoffice does NOT read
+            # the mode-B-proxy flag (gateway-only hot-path gate) — see
+            # gateway.yaml for that entry.
+            - name: YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED
+              value: {{ .Values.documentEnforcement.enabled | default false | quote }}
             # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
             # MCP approve-transaction env vars.
             # v4.1 SU-SEAM-1d-04 RESOLVED: the unix-socket admin path cannot
             # span pods (emptyDir is pod-local), so on K8s
-            # default_caddy_reloader() branches on
-            # YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs the Caddyfile to
-            # Caddy's mesh-mTLS admin relay (:2019 site block, configmaps.yaml)
-            # via YASHIGANI_CADDY_ADMIN_URL, authenticating with the
-            # backoffice ServiceIdentity leaf (internal_httpx_client — no
-            # identity-less fallback, fail-closed). YASHIGANI_CADDY_ADMIN_SOCKET
-            # is intentionally NOT set here: it is the compose-only transport.
+            # register_mcp_route() branches on YASHIGANI_CONTAINER_RUNTIME=k8s
+            # and POSTs route DATA to Caddy's mesh-mTLS admin relay (:2019
+            # site block, configmaps.yaml) via YASHIGANI_CADDY_ADMIN_URL,
+            # authenticating with the backoffice ServiceIdentity leaf
+            # (internal_httpx_client — no identity-less fallback, fail-closed).
+            # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): backoffice no
+            # longer reads or reposts the monolith Caddyfile at all — it sends
+            # narrow typed DATA (tenant_id/server_id/mesh_port/shim_port) and
+            # the caddy-config-broker sidecar (co-located in the caddy pod)
+            # renders + writes + reloads. YASHIGANI_CADDY_BROKER_ROUTE_SOCKET
+            # is intentionally NOT set here: it is the compose-only transport
+            # (unix sockets cannot span pods).
             - name: YASHIGANI_MCP_ARTIFACT_ROOT
               value: {{ .Values.backoffice.mcpArtifactRoot | default "/mnt/install" | quote }}
             - name: YASHIGANI_CONTAINER_RUNTIME
@@ -312,8 +338,6 @@ spec:
             - name: YASHIGANI_CADDY_ADMIN_URL
               value: "https://yashigani-caddy-admin:{{ .Values.caddy.adminRelay.port }}"
             {{- end }}
-            - name: YASHIGANI_CADDY_CADDYFILE
-              value: "/etc/caddy/Caddyfile"
             # YSG-COMPOSE-ENV-001 Helm parity: backoffice reads YASHIGANI_INTERNAL_BEARER
             # from env (os.environ.get) — must be injected via secretKeyRef, not only
             # present in yashigani-agent-bearer for agent-bundle shims.
@@ -438,17 +462,12 @@ spec:
               mountPath: /run/audit-signing
               readOnly: true
             {{- end }}
-            {{- if .Values.caddy.enabled }}
-            # v4.1 SU-SEAM-1d-04: the K8s reload path reads the monolith
-            # Caddyfile (YASHIGANI_CADDY_CADDYFILE) and POSTs it to the caddy
-            # admin relay. Same ConfigMap the caddy pod mounts — one source,
-            # no drift. Read-only: backoffice never renders the monolith
-            # (agent routes live in snippets; see caddy-agents design note).
-            - name: caddyfile
-              mountPath: /etc/caddy/Caddyfile
-              subPath: Caddyfile
-              readOnly: true
-            {{- end }}
+            # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the old
+            # caddyfile ConfigMap mount is REMOVED — backoffice no longer
+            # reads or reposts the monolith Caddyfile on K8s (the SU-SEAM-
+            # 1d-04 route-DATA registration call needs no Caddy content at
+            # all; caddy-config-broker renders it server-side from the SAME
+            # ConfigMap, mounted only in the caddy pod).
       volumes:
         - name: tmp
           emptyDir:
@@ -527,12 +546,9 @@ spec:
             secretName: yashigani-license
             defaultMode: 0440
         {{- end }}
-        {{- if .Values.caddy.enabled }}
-        # v4.1 SU-SEAM-1d-04: monolith Caddyfile for the K8s reload path.
-        - name: caddyfile
-          configMap:
-            name: yashigani-caddy-config
-        {{- end }}
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the caddyfile
+        # ConfigMap volume is REMOVED — backoffice no longer reads the
+        # monolith Caddyfile at all (see the env/volumeMounts comment above).
         {{- if .Values.audit.signingKey.enabled }}
         # v2.25.2 (Lu wire-sink-gate P2 — irrevocable signed chain): audit-chain
         # checkpoint signing key Secret. Mounted RO into backoffice ONLY (the

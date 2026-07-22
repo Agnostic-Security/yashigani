@@ -35,16 +35,32 @@
     default_sni {$YASHIGANI_TLS_DOMAIN}
     fallback_sni {$YASHIGANI_TLS_DOMAIN}
 
-    # ── Admin API — unix socket only (MUST-4 / v2.24.1 hardening) ───────────
-    # TCP :2019 removed. Filesystem permissions are the auth gate.
-    # In-container tooling (healthcheck, reload) uses the socket directly.
-    # No other service on any network can reach this surface.
-    # |0666: socket lives on a named volume mounted ONLY in caddy + backoffice
-    # (caddy_admin_sock). No third container can reach this path, so world-write
-    # on the socket is equivalent to 0660 with a shared group — no external
-    # process can access it. Allows backoffice UID 1001 to POST /load via
-    # default_caddy_reloader() (mcp_onboard.py:135) without requiring group_add.
-    admin unix//run/caddy/admin.sock|0666
+    # ── Admin API — CADDY+BROKER-ONLY unix socket (MUST-4 / v2.24.1
+    #    hardening, tightened by FINDING-V412-CADDYADMIN-001, Su, 2026-07-21)
+    # TCP :2019 removed. The raw admin API socket used to live on the SAME
+    # named volume (caddy_admin_sock) shared RW with backoffice at mode 0666
+    # — giving a compromised backoffice unauthenticated read/write on the
+    # FULL admin surface (GET/POST/PUT/DELETE /config/*, /pki/*, /id/*,
+    # /stop, /adapt). Laura proved this live (LAURA-V412-CADDYADMIN-001):
+    # POST /config/apps/http/servers/rogue_poc installed an inline rogue CA
+    # as an mTLS trust anchor and completed a rogue-cert handshake — zero
+    # filesystem writes, so the RESTART-012 RO-mount fix never touched it.
+    # Fix: the raw admin socket now lives on caddy_admin_real_sock, a named
+    # volume shared ONLY between caddy and caddy-config-broker (never
+    # backoffice — docker-compose.yml) — backoffice has no path to it at
+    # all. |0666: the broker connects as a DIFFERENT, non-root UID (65532,
+    # distinct image/namespace from caddy's own root) — verified live that
+    # |0600 (root-only) makes the broker's forward hit
+    # PermissionError/connection-refused, since there is no shared UID/GID
+    # to target with a tighter mode. Isolation is the mount boundary (only
+    # caddy + caddy-config-broker mount this path — caddy_broker_net), not
+    # the file mode, matching the ORIGINAL caddy_admin_sock design this fix
+    # is modelled on. The narrow reload relay backoffice actually talks to
+    # is the site block below (unix//run/caddy/admin.sock — SAME
+    # path/volume backoffice already mounts, so mcp_onboard.py needed zero
+    # changes); it forwards through caddy-config-broker
+    # (docker/caddy/config_broker.py), never directly to this real socket.
+    admin unix//run/caddy-admin/admin.sock|0666
 
     # ── Connection timeouts (DoS/slow-loris mitigation) ─────────────────────
     servers {
@@ -73,6 +89,7 @@
         strict_sni_host insecure_off
     }
 }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSP policy snippet — defines the four path matchers and their Content-Security-
@@ -870,3 +887,16 @@ import /etc/caddy/Caddyfile.ollama-front
 import /etc/caddy/Caddyfile.openclaw-egress
 
 import /etc/caddy/agents/*.caddy
+
+# FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) — broker-owned DYNAMIC MCP
+# route directory. docker/caddy/agents/ above (S4) is install.sh/ringfence-init
+# authored and RO-shadowed in backoffice (LIC-012-style). MCP wrap routes
+# registered by the live approve-transaction (mcp_onboard.py) are RENDERED and
+# WRITTEN EXCLUSIVELY by caddy-config-broker (docker/caddy/config_broker.py) —
+# backoffice sends narrow validated DATA (tenant_id/server_id/mesh_port/
+# shim_port) over a dedicated unix socket, never raw Caddy content or a raw
+# admin /load body (closes FINDING-V412-CADDYADMIN-001 R1+R2 — see
+# config_broker.py module docstring). This directory (caddy_broker_agents
+# named volume) is never bind-mounted into backoffice at all — RO here,
+# RW only inside caddy-config-broker.
+import /etc/caddy/agents-dynamic/*.caddy

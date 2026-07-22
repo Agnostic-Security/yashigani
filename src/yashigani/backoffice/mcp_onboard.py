@@ -20,26 +20,44 @@ Sequence (fail-CLOSED, rolled back LIFO on ANY step failure):
                        wrap snippet, compose override, helm values/netpol,
                        …) under YASHIGANI_MCP_ARTIFACT_ROOT.  Raises
                        CodegenError on any security violation.
-  4. caddy_reload    — POST the monolith Caddyfile to Caddy's admin API
-                       (Content-Type: text/caddyfile; Caddy adapts
-                       server-side, resolving the
-                       ``import /etc/caddy/agents/*.caddy`` sentinel that
-                       picks up the new wrap).  Caddy reloads are atomic and
-                       zero-downtime; a failed load leaves the old config
-                       running.  Transport branches on
-                       YASHIGANI_CONTAINER_RUNTIME (SU-SEAM-1d-04 fix):
-                         docker / podman-*  — shared unix admin socket
-                                              (single-host compose; caddy and
-                                              backoffice share /run/caddy).
+  4. caddy_reload    — FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21)
+                       REWORK: register the route with caddy-config-broker
+                       via narrow, typed DATA (tenant_id, server_id,
+                       mesh_port, shim_port) — NEVER a raw Caddyfile body or
+                       a raw admin ``/load`` call. The broker independently
+                       re-validates every field, renders the MCP-front wrap
+                       from its OWN fixed template (never backoffice-
+                       supplied text), writes it into its OWN
+                       dynamic-agents volume (never bind-mounted into this
+                       container), and triggers the real Caddy reload
+                       itself. See docker/caddy/config_broker.py module
+                       docstring ("NEW CONTRACT") for the full R1+R2
+                       threat-model rework this replaces (the prior
+                       ``POST /load``-of-the-monolith design — Su
+                       5443f11f — FAILED live under the real
+                       no-new-privileges security context; see
+                       laura-final-reattack.md). Registration is atomic and
+                       zero-downtime on the Caddy side; a failed
+                       registration leaves the old config running. Transport
+                       branches on YASHIGANI_CONTAINER_RUNTIME
+                       (SU-SEAM-1d-04 precedent, same branch shape):
+                         docker / podman-*  — dedicated unix socket to
+                                              caddy-config-broker
+                                              (single-host compose; NEVER
+                                              shared with caddy itself).
                          k8s                — Caddy's mesh-mTLS admin relay
-                                              listener (:2019 site block that
-                                              proxies POST /load to the
-                                              caddy-pod-local unix socket).
-                                              backoffice authenticates with
-                                              its mesh ServiceIdentity leaf;
-                                              the relay requires
+                                              listener (:2019 site block)
+                                              now proxies POST/DELETE
+                                              /route to the caddy-config-
+                                              broker SIDECAR co-located in
+                                              the caddy pod (loopback TCP),
+                                              not a raw /load to the local
+                                              admin socket. backoffice
+                                              authenticates with its mesh
+                                              ServiceIdentity leaf; the
+                                              relay requires
                                               require_and_verify + the
-                                              backoffice SPIFFE URI.  Unix
+                                              backoffice SPIFFE URI. Unix
                                               sockets cannot span pods —
                                               caddy and backoffice are
                                               separate pods on K8s.
@@ -74,22 +92,42 @@ mint_agent_leaf is left in place — with the cert files gone it is inert
 a worse failure mode.  A ``MCP_ONBOARD_TRANSACTION_FAILED`` audit event is
 emitted on the tamper-evident chain.
 
-Deployment wiring (Phase-3 stack rebuild — Su/Captain):
+Deployment wiring (Phase-3 stack rebuild — Su/Captain; route-registration
+rework — Captain, FINDING-V412-CADDYADMIN-002):
+  * ``YASHIGANI_AGENTS_DIR`` (default ``/run/secrets-rw/agents``) — FINDING-
+    V412-SVID-WRITE-PATH (Captain, 2026-07-21): writable mount, SEPARATE from
+    ``YASHIGANI_SECRETS_DIR`` (/run/secrets, RO since RESTART-012), for
+    dynamically-minted agent leaf cert/key + the runtime identity manifest
+    (pki.issuer.IssuerPaths.agents_dir). Never contains CA trust material.
+  * ``YASHIGANI_SVID_INIT_DIR`` (default ``/run/secrets-rw/svid-init``) —
+    same finding: writable staging dir step 2b copies the freshly-minted
+    leaf + ca.crt into (basenames the svid-sidecar's rotate.sh contract
+    expects), read back by the per-instance svid-sidecar via its OWN RO
+    bind of the SAME host directory (docker/secrets/svid-init/<t>/<s>/ —
+    unchanged host path, see codegen._gen_svid_sidecar_service). Compose/
+    podman ONLY — skipped on K8s (Secret+fsGroup delivery instead).
+  * ``YASHIGANI_SVID_GID`` (default ``2003``, matches manifest/codegen.py
+    ``_MCP_SVID_GID``) — FINDING-V412-SVID-INIT-KEY-PERM: GID step 2b
+    chgrps the staged key copy to (0440) so the svid-sidecar (UID 1002)
+    can read it. Requires backoffice's ``group_add: ["2003"]`` in
+    docker-compose.yml.
   * ``YASHIGANI_MCP_ARTIFACT_ROOT`` — writable bind of the install's
-    ``docker/``-rooted tree into the backoffice container (the caddy
-    container reads ``docker/caddy/agents/`` from the same tree).
-  * ``YASHIGANI_CADDY_ADMIN_SOCKET`` (default ``/run/caddy/admin.sock``) —
-    the caddy admin unix socket volume must be shared with backoffice
-    (today it is a caddy-local tmpfs, mode 0700).  Compose runtimes only.
+    ``docker/``-rooted tree into the backoffice container for the NON-Caddy
+    Shape-C artifacts only (compose override, helm values/netpol, OPA
+    bundle, pki ownership fragment, contract test). The Caddy-front wrap is
+    NOT among these — see step 4 above.
+  * ``YASHIGANI_CADDY_BROKER_ROUTE_SOCKET`` (default
+    ``/run/caddy-broker-route/route.sock``) — the dedicated unix socket to
+    caddy-config-broker's POST/DELETE /route contract. Shared ONLY between
+    backoffice and caddy-config-broker (never caddy). Compose runtimes only.
   * ``YASHIGANI_CADDY_ADMIN_URL`` (default
     ``https://yashigani-caddy-admin:2019``) — K8s runtime only: base URL of
-    Caddy's mesh-mTLS admin relay listener
-    (helm configmaps.yaml ``:2019`` site block).  MUST be https on the mesh;
-    the client is ``yashigani.pki.client.internal_httpx_client()`` (the
-    backoffice ServiceIdentity leaf + internal-CA trust) — there is NO
+    Caddy's mesh-mTLS admin relay listener (helm configmaps.yaml ``:2019``
+    site block), which now proxies POST/DELETE /route to the
+    caddy-config-broker sidecar co-located in the caddy pod. MUST be https
+    on the mesh; the client is ``yashigani.pki.client.internal_httpx_client()``
+    (the backoffice ServiceIdentity leaf + internal-CA trust) — there is NO
     identity-less fallback on this path (fail-closed).
-  * ``YASHIGANI_CADDY_CADDYFILE`` (default ``/etc/caddy/Caddyfile``) — the
-    active monolith Caddyfile mounted read-only into backoffice.
   * ``YASHIGANI_CONTAINER_RUNTIME`` — one of codegen.VALID_RUNTIMES
     (default ``docker``); install.sh sets it per selected runtime.
 Until that wiring lands, the transaction fails CLOSED (503/502 + rollback) —
@@ -107,15 +145,19 @@ from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ADMIN_SOCKET = "/run/caddy/admin.sock"
-_DEFAULT_CADDYFILE = "/etc/caddy/Caddyfile"
+# FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) — compose default: the
+# dedicated unix socket to caddy-config-broker's POST/DELETE /route contract.
+# NEVER shared with caddy itself (only backoffice <-> caddy-config-broker).
+_DEFAULT_BROKER_ROUTE_SOCKET = "/run/caddy-broker-route/route.sock"
 # K8s only — Caddy's mesh-mTLS admin relay (helm configmaps.yaml :2019 site
-# block). https is mandatory: the relay is require_and_verify + SPIFFE-gated.
-# yashigani-caddy-admin is the DEDICATED ClusterIP Service (caddy.yaml) — the
-# public yashigani-caddy Service is type LoadBalancer and must never carry
-# the admin relay port. The caddy leaf carries the yashigani-caddy-admin DNS
-# SAN (service_identities.yaml) so hostname verification passes.
-_DEFAULT_ADMIN_API_URL = "https://yashigani-caddy-admin:2019"
+# block), now proxying POST/DELETE /route to the caddy-config-broker sidecar
+# co-located in the caddy pod. https is mandatory: the relay is
+# require_and_verify + SPIFFE-gated. yashigani-caddy-admin is the DEDICATED
+# ClusterIP Service (caddy.yaml) — the public yashigani-caddy Service is type
+# LoadBalancer and must never carry the admin relay port. The caddy leaf
+# carries the yashigani-caddy-admin DNS SAN (service_identities.yaml) so
+# hostname verification passes.
+_DEFAULT_BROKER_RELAY_URL = "https://yashigani-caddy-admin:2019"
 
 
 class McpOnboardError(Exception):
@@ -135,6 +177,24 @@ class McpOnboardResult:
     instance_id: str
     spiffe_id: str
     artifact_paths: list[str] = field(default_factory=list)
+    deploy_hint: dict = field(default_factory=dict)
+
+
+@dataclass
+class McpDecommissionResult:
+    """Outcome of a decommission transaction (FINDING-V412-ONBOARDING-
+    ROBUSTNESS #4). ``steps`` records the per-step outcome so a partial
+    failure is fully visible to the caller — see run_decommission_transaction
+    docstring for why decommission does not roll back on partial failure."""
+
+    server_id: str
+    tenant_id: str
+    already_decommissioned: bool
+    instance_id: str = ""
+    spiffe_id: str = ""
+    artifact_paths_removed: list[str] = field(default_factory=list)
+    steps: dict[str, str] = field(default_factory=dict)
+    container_teardown: dict[str, Any] = field(default_factory=dict)
 
 
 def _artifact_root() -> Path:
@@ -163,91 +223,136 @@ def _runtime() -> str:
     return runtime
 
 
-def _read_caddyfile_text() -> str:
-    """Read the active monolith Caddyfile (shared by both reload transports)."""
-    caddyfile_path = os.getenv("YASHIGANI_CADDY_CADDYFILE", _DEFAULT_CADDYFILE)
-    try:
-        return Path(caddyfile_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise McpOnboardError(
-            "caddy_reload",
-            f"cannot read Caddyfile at {caddyfile_path!r}: {exc} "
-            "(Phase-3 wiring — mount the active Caddyfile into backoffice)",
-        ) from exc
+def _route_payload(*, tenant_id: str, server_id: str, mesh_port: int, shim_port: int) -> bytes:
+    import json  # noqa: PLC0415 — keep module import light
+    return json.dumps({
+        "tenant_id": tenant_id,
+        "server_id": server_id,
+        "mesh_port": mesh_port,
+        "shim_port": shim_port,
+    }).encode("utf-8")
 
 
-async def _reload_via_admin_socket() -> None:
-    """Compose runtimes (docker / podman-*) — shared unix admin socket.
+async def _register_route_via_broker_socket(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """Compose runtimes (docker / podman-*) — dedicated unix socket to
+    caddy-config-broker.
 
-    POSTs the active monolith Caddyfile with ``Content-Type: text/caddyfile``;
-    Caddy adapts it server-side (parse-time ``{$ENV}`` substitution and the
-    ``import /etc/caddy/agents/*.caddy`` sentinel both resolve inside the
-    caddy container).  A non-2xx response or an unreachable socket raises —
-    the transaction rolls back (fail-closed).
+    FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): POSTs narrow, typed
+    route DATA — NEVER a raw Caddyfile body. caddy-config-broker
+    independently re-validates every field, renders the wrap from its own
+    fixed template, writes it into its own volume, and reloads the real
+    Caddy admin socket itself. A non-2xx response or an unreachable socket
+    raises — the transaction rolls back (fail-closed).
     """
     import httpx  # noqa: PLC0415 — keep module import light
 
-    socket_path = os.getenv("YASHIGANI_CADDY_ADMIN_SOCKET", _DEFAULT_ADMIN_SOCKET)
-    caddyfile_text = _read_caddyfile_text()
+    socket_path = os.getenv(
+        "YASHIGANI_CADDY_BROKER_ROUTE_SOCKET", _DEFAULT_BROKER_ROUTE_SOCKET,
+    )
+    body = _route_payload(
+        tenant_id=tenant_id, server_id=server_id,
+        mesh_port=mesh_port, shim_port=shim_port,
+    )
 
     transport = httpx.AsyncHTTPTransport(uds=socket_path)
     try:
         async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             resp = await client.post(
-                # Host is ignored for unix-socket admin endpoints; Caddy
-                # requires a well-formed origin.
-                "http://localhost/load",
-                content=caddyfile_text.encode("utf-8"),
-                headers={"Content-Type": "text/caddyfile"},
+                "http://localhost/route",
+                content=body,
+                headers={"Content-Type": "application/json"},
             )
     except httpx.HTTPError as exc:
         raise McpOnboardError(
             "caddy_reload",
-            f"caddy admin socket {socket_path!r} unreachable: {exc} "
-            "(Phase-3 wiring — share /run/caddy with backoffice)",
+            f"caddy-config-broker route socket {socket_path!r} unreachable: "
+            f"{exc} (Phase-3 wiring — share caddy_broker_route_sock with "
+            "backoffice)",
         ) from exc
     if resp.status_code // 100 != 2:
         raise McpOnboardError(
             "caddy_reload",
-            "caddy /load rejected the config (HTTP %d): %.300s"
+            "caddy-config-broker /route rejected the request (HTTP %d): %.300s"
             % (resp.status_code, resp.text),
         )
-    logger.info("mcp-onboard: caddy reload OK (admin socket %s)", socket_path)
+    logger.info(
+        "mcp-onboard: route registered OK (broker socket %s, tenant=%s server=%s)",
+        socket_path, tenant_id, server_id,
+    )
 
 
-async def _reload_via_admin_api() -> None:
-    """K8s runtime — Caddy's mesh-mTLS admin relay listener (SU-SEAM-1d-04).
+async def _unregister_route_via_broker_socket(
+    *, tenant_id: str, server_id: str,
+) -> None:
+    """Rollback counterpart of _register_route_via_broker_socket() — best
+    effort (logs, does not raise): rollback must never itself abort a
+    rollback that is already in progress."""
+    import httpx  # noqa: PLC0415 — keep module import light
+    import json  # noqa: PLC0415
 
-    On K8s, caddy and backoffice are separate pods: the unix admin socket
-    cannot be shared (emptyDir is pod-local; same-node co-location / RWX PVC
-    is not the architecture).  Instead the helm Caddyfile exposes a ``:2019``
-    site block that:
+    socket_path = os.getenv(
+        "YASHIGANI_CADDY_BROKER_ROUTE_SOCKET", _DEFAULT_BROKER_ROUTE_SOCKET,
+    )
+    body = json.dumps({"tenant_id": tenant_id, "server_id": server_id}).encode("utf-8")
+    transport = httpx.AsyncHTTPTransport(uds=socket_path)
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
+            resp = await client.request(
+                "DELETE", "http://localhost/route",
+                content=body, headers={"Content-Type": "application/json"},
+            )
+        if resp.status_code // 100 != 2:
+            logger.error(
+                "mcp-onboard: rollback route unregister rejected (HTTP %d): %.300s",
+                resp.status_code, resp.text,
+            )
+    except Exception as exc:  # noqa: BLE001 — rollback is best-effort
+        logger.error("mcp-onboard: rollback route unregister failed: %s", exc)
+
+
+async def _register_route_via_broker_relay(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """K8s runtime — Caddy's mesh-mTLS admin relay listener (SU-SEAM-1d-04),
+    which now proxies POST/DELETE /route to the caddy-config-broker sidecar
+    co-located in the caddy pod (FINDING-V412-CADDYADMIN-002 rework —
+    previously proxied a raw POST /load).
+
+    On K8s, caddy and backoffice are separate pods: the unix socket cannot
+    be shared (emptyDir is pod-local; same-node co-location / RWX PVC is not
+    the architecture). Instead the helm Caddyfile exposes a ``:2019`` site
+    block that:
 
       * terminates mesh mTLS with ``client_auth require_and_verify`` against
         the internal CA bundle (identity-less clients are refused at the
         TLS handshake — the raw admin API is NEVER on the pod network), and
-      * admits ONLY ``POST /load`` from the backoffice SPIFFE URI (CEL
-        expression on the client-cert URI SAN), then proxies to the
-        caddy-pod-local unix admin socket.
+      * admits ONLY POST/DELETE ``/route`` from the backoffice SPIFFE URI
+        (CEL expression on the client-cert URI SAN), then proxies to the
+        caddy-config-broker sidecar's loopback TCP listener.
 
     The client here is ``internal_httpx_client()`` — the backoffice
     ServiceIdentity leaf + internal-CA trust, the SAME factory every other
-    internal mesh call uses (MCP-001 pattern).  There is deliberately NO
-    identity-less fallback: an admin config-mutation surface must fail
-    CLOSED when the mesh identity is unavailable.
+    internal mesh call uses (MCP-001 pattern). There is deliberately NO
+    identity-less fallback: a config-mutation surface must fail CLOSED when
+    the mesh identity is unavailable.
     """
     import httpx  # noqa: PLC0415 — keep module import light
 
-    admin_url = os.getenv(
-        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_ADMIN_API_URL
+    relay_url = os.getenv(
+        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_BROKER_RELAY_URL,
     ).strip().rstrip("/")
-    if not admin_url.startswith("https://"):
+    if not relay_url.startswith("https://"):
         raise McpOnboardError(
             "caddy_reload",
-            f"YASHIGANI_CADDY_ADMIN_URL={admin_url!r} must be https:// — the "
+            f"YASHIGANI_CADDY_ADMIN_URL={relay_url!r} must be https:// — the "
             "K8s admin relay is mesh-mTLS only (fail-closed).",
         )
-    caddyfile_text = _read_caddyfile_text()
+    body = _route_payload(
+        tenant_id=tenant_id, server_id=server_id,
+        mesh_port=mesh_port, shim_port=shim_port,
+    )
 
     try:
         from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
@@ -256,45 +361,93 @@ async def _reload_via_admin_api() -> None:
         raise McpOnboardError(
             "caddy_reload",
             f"mesh ServiceIdentity unavailable for the caddy admin relay "
-            f"({exc}) — the K8s reload path has no identity-less fallback "
-            "(fail-closed; check YASHIGANI_SERVICE_NAME + /run/secrets PKI).",
+            f"({exc}) — the K8s route-registration path has no "
+            "identity-less fallback (fail-closed; check "
+            "YASHIGANI_SERVICE_NAME + /run/secrets PKI).",
         ) from exc
 
     try:
         async with client:
             resp = await client.post(
-                f"{admin_url}/load",
-                content=caddyfile_text.encode("utf-8"),
-                headers={"Content-Type": "text/caddyfile"},
+                f"{relay_url}/route",
+                content=body,
+                headers={"Content-Type": "application/json"},
             )
     except httpx.HTTPError as exc:
         raise McpOnboardError(
             "caddy_reload",
-            f"caddy admin relay {admin_url!r} unreachable: {exc} "
-            "(check the helm :2019 admin-relay listener + NetworkPolicy "
+            f"caddy admin relay {relay_url!r} unreachable: {exc} "
+            "(check the helm :2019 relay listener + NetworkPolicy "
             "backoffice→caddy:2019)",
         ) from exc
     if resp.status_code // 100 != 2:
         raise McpOnboardError(
             "caddy_reload",
-            "caddy /load (admin relay) rejected the config (HTTP %d): %.300s"
+            "caddy admin relay /route rejected the request (HTTP %d): %.300s"
             % (resp.status_code, resp.text),
         )
-    logger.info("mcp-onboard: caddy reload OK (mesh admin relay %s)", admin_url)
+    logger.info(
+        "mcp-onboard: route registered OK (mesh admin relay %s, tenant=%s server=%s)",
+        relay_url, tenant_id, server_id,
+    )
 
 
-async def default_caddy_reloader() -> None:
-    """Reload Caddy — transport selected by YASHIGANI_CONTAINER_RUNTIME.
+async def _unregister_route_via_broker_relay(
+    *, tenant_id: str, server_id: str,
+) -> None:
+    """Rollback counterpart of _register_route_via_broker_relay() — best
+    effort (logs, does not raise)."""
+    import httpx  # noqa: PLC0415 — keep module import light
+    import json  # noqa: PLC0415
 
-    docker / podman-rootful / podman-rootless → shared unix admin socket
-    (single-host compose).  k8s → mesh-mTLS admin relay (separate pods; unix
-    sockets cannot span pods).  Both transports POST the same monolith
-    Caddyfile to Caddy's ``/load`` and fail CLOSED on any error.
-    """
+    relay_url = os.getenv(
+        "YASHIGANI_CADDY_ADMIN_URL", _DEFAULT_BROKER_RELAY_URL,
+    ).strip().rstrip("/")
+    body = json.dumps({"tenant_id": tenant_id, "server_id": server_id}).encode("utf-8")
+    try:
+        from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
+        client = internal_httpx_client(timeout=15.0)
+        async with client:
+            resp = await client.request(
+                "DELETE", f"{relay_url}/route",
+                content=body, headers={"Content-Type": "application/json"},
+            )
+        if resp.status_code // 100 != 2:
+            logger.error(
+                "mcp-onboard: rollback route unregister (relay) rejected "
+                "(HTTP %d): %.300s", resp.status_code, resp.text,
+            )
+    except Exception as exc:  # noqa: BLE001 — rollback is best-effort
+        logger.error("mcp-onboard: rollback route unregister (relay) failed: %s", exc)
+
+
+async def register_mcp_route(
+    *, tenant_id: str, server_id: str, mesh_port: int, shim_port: int,
+) -> None:
+    """Register the MCP-front route with caddy-config-broker — transport
+    selected by YASHIGANI_CONTAINER_RUNTIME. docker / podman-rootful /
+    podman-rootless -> dedicated unix socket (single-host compose). k8s ->
+    mesh-mTLS admin relay (separate pods; unix sockets cannot span pods).
+    Both transports send the SAME narrow typed-DATA contract — NEVER a raw
+    Caddyfile body — and fail CLOSED on any error (FINDING-V412-CADDYADMIN-002)."""
     if _runtime() == "k8s":
-        await _reload_via_admin_api()
+        await _register_route_via_broker_relay(
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=mesh_port, shim_port=shim_port,
+        )
     else:
-        await _reload_via_admin_socket()
+        await _register_route_via_broker_socket(
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=mesh_port, shim_port=shim_port,
+        )
+
+
+async def unregister_mcp_route(*, tenant_id: str, server_id: str) -> None:
+    """Rollback counterpart of register_mcp_route() — best effort."""
+    if _runtime() == "k8s":
+        await _unregister_route_via_broker_relay(tenant_id=tenant_id, server_id=server_id)
+    else:
+        await _unregister_route_via_broker_socket(tenant_id=tenant_id, server_id=server_id)
 
 
 def _leaf_cert_fingerprint(cert_path: Any) -> str:
@@ -366,6 +519,114 @@ def _validate_manifest_or_raise(
     return parsed
 
 
+def _agent_container_deploy_hint(
+    *, tenant_id: str, server_id: str, runtime: str,
+) -> dict:
+    """Deterministic, component-isolated compose/helm command guidance for
+    deploying the newly-approved agent's CONTAINER (FINDING-V412-ONBOARDING-
+    ROBUSTNESS #5, Tom, 2026-07-21 — "is onboard-without-deploy by design or
+    a gap?").
+
+    DETERMINATION (see the finding writeup for the full analysis): the
+    separation between "register the capability envelope + broker route"
+    (this transaction — an app-tier action) and "start the container" (a
+    host-tier action) IS deliberate — backoffice has no docker/podman socket
+    access (LAURA-30-001 / YSG-RISK-080, the SAME boundary
+    ``_agent_container_teardown_hint`` documents for decommission). That
+    separation is not the gap.
+
+    The GAP is the absence of any discoverable, actionable guidance for the
+    operator once ``POST /import`` returns. The pre-existing
+    ``install.sh --onboard <manifest>`` CLI is NOT that guidance: it is a
+    wholly separate, non-interoperating onboarding mechanism (its own
+    boot-env-only ``YASHIGANI_MCP_SERVERS`` registry, no capability-envelope
+    row, no caddy-config-broker route registration — it manipulates a Caddy
+    include line directly, pre-dating FINDING-V412-CADDYADMIN-002's broker
+    rework) — pointing an API-onboarded operator at it would either do
+    nothing useful or double-register the agent under two different
+    registries. Nor does ``install.sh --onboard`` itself deploy the new
+    agent's own container (it only recreates ``gateway`` — verified by
+    inspection; no ``compose up`` for the new service exists anywhere in
+    ``handle_onboard_subcommand``). This function closes the documentation
+    gap the same way ``_agent_container_teardown_hint`` closes it for
+    decommission: return the exact scoped command, never execute it.
+
+    FINDING-V412-ONBOARDING-ROBUSTNESS N5 (Su, 2026-07-21) — blast-radius fix:
+    the command this function returned previously was bare ``up -d`` (no
+    service name), which the note claimed was "scoped to server_id ... only
+    via the -f override file". That claim was FALSE for the vendored
+    podman-compose fork (``vendor/podman-compose-ysg/podman_compose.py``):
+    the fork computes ONE project-wide compose-config hash
+    (``compose.yaml_hash``), not a per-service hash. Merging in the override
+    file changes that global hash, so on the NEXT ``up -d`` every existing
+    container's ``io.podman.compose.config-hash`` label mismatches the new
+    global hash and the fork tears down + recreates the WHOLE STACK — proven
+    live by Ava (demo-mcp re-onboarding) and reproduced with an isolated
+    2-service compose fixture during this fix (an untouched ``db`` service's
+    container ID changed on a bare ``up -d`` after an unrelated override
+    merge; the same fixture with an explicit service list left it
+    untouched). The fork DOES support scoped ``up -d <service...>`` — both
+    create/start AND the hash-mismatch teardown branch respect
+    ``args.services`` (``get_excluded()`` in the fork, used by both
+    ``compose_up`` and ``compose_down``) — the CALL SITE simply never
+    supplied it, so scoping degraded to "all services".
+
+    Fix: name the exact services this override touches. The Shape-C compose
+    override (``_gen_compose_override_shape_c`` in codegen.py) always
+    defines exactly three services: the agent itself (``server_id``), its
+    svid-sidecar (``"%s-svid-sidecar" % server_id``, SEAM-1d-06), and a
+    PATCH onto the existing ``caddy:`` service (adds the new ringfence
+    bridge network + SVID volume mount — caddy legitimately bounces briefly
+    to pick these up). No other service (postgres/redis/backoffice/gateway/
+    any OTHER onboarded agent) is ever named in the override, so naming
+    these three explicitly on the command line makes the fork's own
+    scoping correct instead of accidentally-disabled.
+    """
+    compose_override = "docker/%s-compose.override.yml" % server_id
+    if runtime == "k8s":
+        return {
+            "runtime": "k8s",
+            "commands": [
+                "helm upgrade --install %s-mcp yashigani/yashigani-mcp-agent "
+                "-n yashigani -f helm/yashigani/values-%s.yaml" % (server_id, server_id),
+            ],
+            "note": (
+                "backoffice has no cluster-admin credentials by design "
+                "(LAURA-30-001 analogue) — run this from an operator "
+                "kubeconfig context, scoped to the yashigani namespace only."
+            ),
+        }
+    svid_sidecar = "%s-svid-sidecar" % server_id
+    # N5: name the services explicitly — see the docstring above. `caddy` IS
+    # named (it reconnects to the new ringfence bridge + SVID volume and
+    # WILL restart briefly) but nothing else in the base stack is.
+    deploy_services = "%s %s caddy" % (server_id, svid_sidecar)
+    return {
+        "runtime": runtime,
+        "commands": [
+            "docker compose -f docker/docker-compose.yml -f %s up -d %s"
+            % (compose_override, deploy_services),
+        ],
+        "note": (
+            "backoffice has no docker/podman socket access by design "
+            "(LAURA-30-001 / YSG-RISK-080) — this envelope/route registration "
+            "does NOT start the container. Run this from the host/operator "
+            "shell. SCOPED explicitly to the 3 services this override "
+            "touches: %r (the agent), %r (its svid-sidecar), and caddy "
+            "(reconnected to the new ringfence bridge + SVID volume — it "
+            "WILL restart briefly). No OTHER service is named, so "
+            "postgres/redis/backoffice/gateway/other onboarded agents are "
+            "never recreated (FINDING-V412-ONBOARDING-ROBUSTNESS N5 — naming "
+            "no service here previously let the compose engine's own "
+            "project-wide config-hash mismatch recreate the WHOLE stack on "
+            "every add-agent deploy). This is NOT the same mechanism as "
+            "`install.sh --onboard` (that CLI uses a separate, "
+            "non-interoperating registry — do not mix the two for the same "
+            "server_id)."
+        ) % (server_id, svid_sidecar),
+    }
+
+
 async def run_approve_transaction(
     *,
     manifest_yaml: str,
@@ -394,11 +655,18 @@ async def run_approve_transaction(
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
     """
-    from yashigani.manifest.codegen import CodegenError, approve_mcp_onboard
+    import functools
+
+    from yashigani.manifest.codegen import (
+        CodegenError,
+        _mcp_mesh_port,
+        _mcp_shim_port,
+        approve_mcp_onboard,
+        is_artifact_relevant_for_runtime,
+    )
     from yashigani.pki.binding import tool_surface_hash
     from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
 
-    reloader = caddy_reloader or default_caddy_reloader
     rollback: list[Callable[[], None]] = []
 
     def _run_rollback() -> None:
@@ -480,6 +748,31 @@ async def run_approve_transaction(
         ((parsed.get("spec") or {}).get("image") or {}).get("digest") or ""
     )
 
+    # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): resolve the
+    # route-registration ("reloader") + rollback ("route_unregisterer")
+    # callables now that `parsed` is available. Production default sends
+    # narrow typed DATA to caddy-config-broker (register_mcp_route /
+    # unregister_mcp_route — see module docstring); the injectable
+    # `caddy_reloader` test seam is reused for BOTH forward and rollback
+    # calls (unchanged contract — existing tests assert the injected stub is
+    # called twice on a later-step failure: once to apply, once to restore).
+    # _mcp_mesh_port() is idempotent for a repeat (tenant_id, server_id) pair
+    # in the same codegen session (CodegenEngineShapeC.render(), step 3
+    # below, already resolves+claims it once) — calling it again here
+    # returns the SAME port, never a second claim.
+    if caddy_reloader is not None:
+        reloader: Callable[[], Awaitable[None]] = caddy_reloader
+        route_unregisterer: Callable[[], Awaitable[None]] = caddy_reloader
+    else:
+        reloader = functools.partial(
+            register_mcp_route,
+            tenant_id=tenant_id, server_id=server_id,
+            mesh_port=_mcp_mesh_port(parsed), shim_port=_mcp_shim_port(parsed),
+        )
+        route_unregisterer = functools.partial(
+            unregister_mcp_route, tenant_id=tenant_id, server_id=server_id,
+        )
+
     # ── Step 2: mint the per-instance leaf (Nico's contract) ────────────────
     instance_id = f"nhi_{uuid.uuid4().hex[:12]}"
     spiffe_id = ""
@@ -489,9 +782,21 @@ async def run_approve_transaction(
         "YASHIGANI_SERVICE_MANIFEST_PATH",
         "/etc/yashigani/service_identities.yaml",
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): RESTART-012 made
+    # secrets_dir (/run/secrets) pure :ro on backoffice (CA root/intermediate
+    # + attestation pin must never be writable from this process). The ONE
+    # legitimate write backoffice makes through IssuerPaths — the dynamically
+    # minted agent leaf cert/key + the runtime identity manifest — now goes
+    # to a SEPARATE writable mount instead (default /run/secrets-rw/agents,
+    # backed by a NEW host dir with no path-prefix overlap with ca_root.crt /
+    # ca_intermediate.* / ca_root.attested_sha256). secrets_dir itself is
+    # unchanged here — CA reads (intermediate_cert/intermediate_key below)
+    # still resolve under the RO mount, exactly as before.
+    agents_dir = os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")
     pki_paths = IssuerPaths(
         secrets_dir=Path(secrets_dir),
         manifest_path=Path(manifest_path),
+        agents_dir=Path(agents_dir),
     )
     try:
         spiffe_id = mint_agent_leaf(
@@ -549,16 +854,104 @@ async def run_approve_transaction(
     # _gen_svid_sidecar_service stanza; it copies INIT_DIR → SVID_DIR during its
     # init phase.  Caddy mounts the SVID volume read-only, so the cert must be
     # in place before the caddy reload at step 4 loads the new snippet.
-    _svid_init_dir = Path(secrets_dir) / "svid-init" / tenant_id / server_id
+    #
+    # FINDING-V412-SVID-WRITE-PATH: this directory used to live under
+    # secrets_dir (/run/secrets — now :ro since RESTART-012) and broke the
+    # same way mint_agent_leaf did. It now lives under a dedicated writable
+    # mount (default /run/secrets-rw/svid-init). The HOST-side bind SOURCE
+    # is UNCHANGED — still docker/secrets/svid-init/<tenant>/<server> — so
+    # codegen._gen_svid_sidecar_service's `init_dir_host` literal
+    # ("secrets/svid-init/%s/%s") needs no change; only the container-side
+    # path backoffice writes through changes.
+    #
+    # K8s GATE (Captain, 2026-07-21): this whole step is the filesystem
+    # hand-off to the compose/podman svid-sidecar CONTAINER, which does not
+    # exist on K8s at all — K8s SVID delivery is a Kubernetes Secret +
+    # fsGroup (see helm/yashigani/templates/caddy.yaml SEAM-1d-04 comment).
+    # Before FINDING-V412-SVID-INIT-KEY-PERM this step silently no-op'd on
+    # K8s (wrote a file nobody read, no error). The chgrp-to-2003 fix below
+    # would turn that into a HARD FAILURE on K8s (backoffice's pod has no
+    # supplementalGroup 2003 there — same comment). Skip entirely off
+    # docker/podman so this step stays a true no-op on K8s, matching prior
+    # (harmless) behaviour rather than regressing K8s onboarding.
+    svid_init_root = os.getenv("YASHIGANI_SVID_INIT_DIR", "/run/secrets-rw/svid-init")
+    _svid_init_dir = Path(svid_init_root) / tenant_id / server_id
+    _svid_init_applies = runtime in ("docker", "podman-rootful", "podman-rootless")
     try:
-        _svid_init_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cert_path, _svid_init_dir / "client.crt")
-        shutil.copy2(key_path, _svid_init_dir / "client.key")
-        shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")
-        logger.info(
-            "mcp-onboard: svid-init populated for %s/%s at %s",
-            tenant_id, server_id, _svid_init_dir,
-        )
+        if _svid_init_applies:
+            _svid_init_dir.mkdir(parents=True, exist_ok=True)
+            # FINDING B (v4.1.2 final onboarding e2e, 2026-07-21): a
+            # re-import of the SAME (tenant, server_id) WITHOUT a prior
+            # decommission previously 403/502'd here with a bare
+            # PermissionError. Root cause: shutil.copy2() opens the
+            # DESTINATION path for writing — but the PRIOR onboarding's
+            # client.key was left behind chmod'd to 0o440 (owner READ-only,
+            # see FINDING-V412-SVID-INIT-KEY-PERM below), so the plain
+            # `open(dst, "wb")` inside copy2() raises PermissionError on the
+            # second import even though backoffice OWNS the file (Linux DAC:
+            # owning a file does not imply write access — only the mode bits
+            # do). Decommission "fixed" this only as a side effect: it
+            # unlinks the whole svid-init dir, and unlink() only needs WRITE
+            # on the PARENT directory (which backoffice always has, having
+            # created it) — never on the target file's own mode bits.
+            # Fix: unlink each of the 3 target basenames BEFORE copying, so
+            # re-import is idempotent regardless of whatever mode a prior
+            # onboarding attempt (successful OR partially-failed) left them
+            # in, and regardless of whether decommission ran first. Every
+            # unlink is best-effort (missing_ok — first-ever import has
+            # nothing to remove) and failures other than "file absent" are
+            # NOT swallowed — they surface as the same fail-closed
+            # McpOnboardError the copy2() calls below already raise on any
+            # other I/O error, via the enclosing try/except.
+            for _stale_name in ("client.crt", "client.key", "ca.crt"):
+                (_svid_init_dir / _stale_name).unlink(missing_ok=True)
+            shutil.copy2(cert_path, _svid_init_dir / "client.crt")
+            shutil.copy2(key_path, _svid_init_dir / "client.key")
+            shutil.copy2(pki_paths.intermediate_cert, _svid_init_dir / "ca.crt")
+            # FINDING-V412-SVID-INIT-KEY-PERM (Captain, 2026-07-21):
+            # shutil.copy2 preserves the SOURCE mode — key_path was written
+            # by mint_agent_leaf at _FILE_MODE_KEY (0o400, owner=backoffice
+            # UID 1001 only). The svid-sidecar reads INIT_DIR as UID 1002
+            # (docker/svid-sidecar/rotate.sh `cp "${INIT_DIR}/client.key"
+            # ...`) — 0400 owner-only denies it (EACCES), so onboarding
+            # would mint successfully but the sidecar's init phase would die
+            # and Caddy would never get a leaf to present. Fix: mirror
+            # rotate.sh's OWN least-privilege pattern for this exact key
+            # (0440 + group _MCP_SVID_GID=2003, the group already shared
+            # between the svid-sidecar and Caddy — see manifest/codegen.py
+            # _MCP_SVID_GID) instead of the blunter world-readable 0444.
+            # Requires backoffice to carry supplementary group 2003
+            # (docker-compose.yml backoffice group_add: ["2003"]).
+            _svid_key_dest = _svid_init_dir / "client.key"
+            os.chmod(_svid_key_dest, 0o440)
+            try:
+                _svid_gid = int(os.getenv("YASHIGANI_SVID_GID", "2003"))
+                os.chown(_svid_key_dest, -1, _svid_gid)
+            except (PermissionError, OSError, KeyError) as _chown_exc:
+                # Fail-closed rather than silently leaving a key the sidecar
+                # cannot read: without supplementary group 2003, backoffice
+                # cannot chgrp to a group it does not belong to (Linux DAC —
+                # not CAP_CHOWN-eligible for a foreign group). Surfaced
+                # loudly; the onboarding transaction still aborts+rolls
+                # back below.
+                raise RuntimeError(
+                    "svid-init key chown to GID %s failed (%s) — backoffice "
+                    "is missing supplementary group %s (docker-compose.yml "
+                    "backoffice group_add). The svid-sidecar (UID 1002) "
+                    "would not be able to read this key."
+                    % (_svid_gid, _chown_exc, _svid_gid)
+                ) from _chown_exc
+            logger.info(
+                "mcp-onboard: svid-init populated for %s/%s at %s (key 0440:%s)",
+                tenant_id, server_id, _svid_init_dir,
+                os.getenv("YASHIGANI_SVID_GID", "2003"),
+            )
+        else:
+            logger.info(
+                "mcp-onboard: svid-init staging skipped for %s/%s — runtime "
+                "%r has no svid-sidecar container (K8s SVID delivery is "
+                "Secret+fsGroup based).", tenant_id, server_id, runtime,
+            )
     except Exception as exc:
         _run_rollback()
         _audit_failure("svid_init", exc, instance_id, spiffe_id)
@@ -605,7 +998,18 @@ async def run_approve_transaction(
             "artifact write failed — onboarding aborted and rolled back.",
         ) from exc
 
-    artifact_paths = sorted(artifacts.keys())
+    # v4.1.2 fix (RESTART-013 MCP leg, Gap B): approve_mcp_onboard() returns
+    # the FULL rendered artifact map (unchanged contract, every runtime), but
+    # render()'s disk-write step now only PERSISTS the subset relevant to
+    # `runtime` (codegen.is_artifact_relevant_for_runtime — the
+    # artifact_write 502 root-cause fix). artifact_paths must reflect what is
+    # actually on disk — both for the rollback below (unlinking a key that
+    # was never written is harmless but wrong bookkeeping) and for the
+    # response's "svid_issued=True is backed by the cert on disk" evidentiary
+    # principle: report only what is actually there.
+    artifact_paths = sorted(
+        rel for rel in artifacts if is_artifact_relevant_for_runtime(rel, runtime)
+    )
 
     def _undo_artifacts() -> None:
         for rel in artifact_paths:
@@ -762,10 +1166,10 @@ async def run_approve_transaction(
             _run_rollback()
             if reload_applied:
                 try:
-                    await reloader()
+                    await route_unregisterer()
                 except Exception as re_exc:  # noqa: BLE001 — best-effort restore
                     logger.error(
-                        "mcp-onboard: post-rollback caddy re-reload failed: %s",
+                        "mcp-onboard: post-rollback route unregister failed: %s",
                         re_exc,
                     )
             _audit_failure("broker_registry", exc, instance_id, spiffe_id)
@@ -812,16 +1216,17 @@ async def run_approve_transaction(
             svid_issued=True,   # the leaf minted in step 2 exists on disk
         )
     except Exception as exc:
-        # Roll back files, then best-effort re-reload so Caddy drops the
-        # now-removed wrap snippet (the old snippet file is gone; a reload
-        # re-adapts without it).
+        # Roll back files, then best-effort unregister so Caddy drops the
+        # now-invalid wrap route (FINDING-V412-CADDYADMIN-002: the broker
+        # owns the route file — unregister asks IT to remove + reload, not
+        # a re-POST of a local artifact that no longer exists here).
         _run_rollback()
         if reload_applied:
             try:
-                await reloader()
+                await route_unregisterer()
             except Exception as re_exc:  # noqa: BLE001 — best-effort restore
                 logger.error(
-                    "mcp-onboard: post-rollback caddy re-reload failed: %s", re_exc,
+                    "mcp-onboard: post-rollback route unregister failed: %s", re_exc,
                 )
         _audit_failure("envelope_mint", exc, instance_id, spiffe_id)
         raise McpOnboardError(
@@ -866,12 +1271,385 @@ async def run_approve_transaction(
         instance_id=instance_id,
         spiffe_id=spiffe_id,
         artifact_paths=artifact_paths,
+        deploy_hint=_agent_container_deploy_hint(
+            tenant_id=tenant_id, server_id=server_id, runtime=runtime,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decommission — the mirror-image of run_approve_transaction()
+# FINDING-V412-ONBOARDING-ROBUSTNESS #4 (Tom, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+def _agent_container_teardown_hint(
+    *, tenant_id: str, server_id: str, runtime: str, mode: str,
+) -> dict:
+    """Deterministic, component-isolated compose/helm command guidance for
+    the container+volume layer.
+
+    Backoffice deliberately has NO docker/podman socket access
+    (LAURA-30-001 / YSG-RISK-080 — the container-API surface was a proven
+    privilege-escalation vector; see docker-compose.yml's backoffice service
+    comment). This function therefore never executes anything — it returns
+    command GUIDANCE (the operator's real invocation combines this override
+    with the install's base docker-compose.yml, exactly as install.sh's own
+    ``COMPOSE_CMD`` array does) scoped ONLY to (tenant_id, server_id) via the
+    override filename / network name / helm release name, so it can never
+    accidentally target another agent or a core service.
+
+    mode="keep": stop the container, keep its volumes (re-onboardable later
+                 without losing state).
+    mode="nuke": remove container + the agent's dedicated ringfence network +
+                 named volumes (full teardown; matches uninstall.sh's own
+                 --remove-volumes convention for the same keep-vs-nuke split).
+    """
+    compose_override = "docker/%s-compose.override.yml" % server_id
+    network = "ringfence_%s" % server_id
+    if runtime == "k8s":
+        return {
+            "runtime": "k8s",
+            "mode": mode,
+            "commands": [
+                "helm uninstall %s-mcp -n yashigani" % server_id
+                if mode == "nuke" else
+                "kubectl scale deployment/%s-mcp -n yashigani --replicas=0" % server_id,
+            ],
+            "note": (
+                "backoffice has no cluster-admin credentials by design "
+                "(LAURA-30-001 analogue) — run this from an operator "
+                "kubeconfig context, scoped to the yashigani namespace only."
+            ),
+        }
+    down_cmd = "docker compose -f %s down" % compose_override
+    if mode == "nuke":
+        down_cmd += " --volumes --rmi local"
+    return {
+        "runtime": runtime,
+        "mode": mode,
+        "commands": [
+            down_cmd,
+            "docker network rm %s" % network if mode == "nuke" else
+            "# network %s left in place (mode=keep)" % network,
+        ],
+        "note": (
+            "backoffice has no docker/podman socket access by design "
+            "(LAURA-30-001 / YSG-RISK-080) — run this from the host/operator "
+            "shell (or install.sh's remove-agent op), scoped to server_id=%r "
+            "only via the -f override file and network name; no other "
+            "agent or core service is named in these commands."
+        ) % server_id,
+    }
+
+
+async def run_decommission_transaction(
+    *,
+    tenant_id: str,
+    server_id: str,
+    operator_identity: str,
+    envelope_service: Any,       # CapabilityEnvelopeService
+    audit_writer: Any = None,
+    registry_store: Any = None,  # DurableMcpRegistryStore — same store onboarding uses
+    container_teardown_mode: str = "keep",  # "keep" | "nuke" — informational only
+) -> McpDecommissionResult:
+    """Cleanly reverse a ring_fenced MCP agent's onboarding — component-
+    isolated (only this (tenant_id, server_id) pair's resources are ever
+    touched) and idempotent (safe to call repeatedly, including on a
+    server_id that was never onboarded).
+
+    Steps, in DENY-FIRST order (the opposite ordering rule from
+    run_approve_transaction's GRANT-LAST commit point — see that function's
+    module docstring "INVARIANT (Iris SEAM-1d-03)"): the goal there was
+    "never grant before everything is ready"; the goal here is "never leave
+    a live access path open a moment longer than necessary while cleanup
+    proceeds":
+
+      1. envelope_decommission — transition the ACTIVE envelope (if any) to
+         'decommissioned' FIRST. The instant this commits, /auth/verify-mcp
+         (get_active_envelope() -> None -> 403 server_not_onboarded) denies
+         every subsequent call, and GET /admin/mcp/servers/ stops listing
+         the server. This is the SECURITY-CRITICAL step.
+      2. registry — delete the durable broker descriptor + OPA grant +
+         baseline + egress grant (Redis db/3), then re-push the egress-
+         grants document so revocation (grant absence = kill switch, Nico
+         Q3) is live immediately, not just on the next gateway restart.
+      2b. codegen_dedup — release the (tenant_id, server_id) entry from the
+         in-process codegen C3 duplicate-agent registry (FINDING N2, v4.1.2
+         finalized onboarding e2e, Ava, 2026-07-21). approve_mcp_onboard()
+         registers this pair on onboard via
+         codegen._assert_unique_agent_pair() so a second onboard within the
+         SAME backoffice process is rejected; without releasing it here,
+         re-onboarding the SAME server_id after a legitimate decommission
+         fails C3_duplicate_agent until the process restarts. Best-effort,
+         non-fail-closed (pure in-process bookkeeping, no access-control
+         effect) — symmetric with where onboarding adds it.
+      3. route — DELETE the broker route (unregister_mcp_route): Caddy
+         drops the per-instance :mesh_port wrap and reloads. Best-effort:
+         even if this fails, step 1 already denies every request at the
+         application layer.
+      4. svid — remove the per-instance leaf cert/key from
+         YASHIGANI_AGENTS_DIR and the svid-init staging files, using the
+         instance_id recorded on the envelope row (migration 0026 columns) —
+         no manifest is needed at decommission time.
+      5. artifacts — unlink the runtime-relevant codegen artifacts (compose
+         override / helm values — the SAME deterministic filenames
+         approve_mcp_onboard() writes, predictable from server_id alone).
+
+    UNLIKE the approve transaction, a failure partway through does NOT roll
+    back the steps already completed: every step here only TIGHTENS the
+    deny posture (removes a grant/route/cert), so a partial reversal is
+    strictly SAFER than the pre-decommission state, never worse. Each step's
+    outcome is recorded in the returned ``steps`` dict; the caller (the
+    DELETE /admin/mcp/servers/{server_id} route) surfaces the full picture
+    rather than an opaque single failure — the whole transaction is safe to
+    retry (every step is independently idempotent).
+
+    Container/volume teardown is INTENTIONALLY NOT performed here —
+    backoffice has no docker/podman socket (LAURA-30-001 / YSG-RISK-080).
+    ``container_teardown_mode`` only selects which scoped command guidance
+    ``_agent_container_teardown_hint()`` returns for the operator to run.
+    """
+    from yashigani.manifest.codegen import is_artifact_relevant_for_runtime, release_agent_pair
+    from yashigani.pki.issuer import IssuerPaths
+
+    provenance_id = "%s:%s" % (tenant_id, server_id)
+    runtime = _runtime()
+    steps: dict[str, str] = {}
+    instance_id = ""
+    spiffe_id = ""
+
+    def _audit_failure(step: str, exc: Exception) -> None:
+        if audit_writer is None:
+            return
+        try:
+            from yashigani.audit.schema import McpDecommissionTransactionFailedEvent
+            audit_writer.write(McpDecommissionTransactionFailedEvent(
+                approver_account=operator_identity,
+                tenant_id=tenant_id,
+                server_id=server_id,
+                instance_id=instance_id,
+                spiffe_id=spiffe_id,
+                failed_step=step,
+                error_type=type(exc).__name__,
+            ))
+        except Exception as audit_exc:  # noqa: BLE001 — audit never masks the abort
+            logger.error(
+                "mcp-decommission: MCP_DECOMMISSION_TRANSACTION_FAILED audit "
+                "write failed: %s", audit_exc,
+            )
+
+    # ── Step 1: envelope_decommission (SECURITY-CRITICAL, deny-first) ───────
+    try:
+        record = await envelope_service.get_active_envelope(provenance_id)
+        if record is not None:
+            instance_id = record.svid_instance_id or ""
+            spiffe_id = record.svid_spiffe_id or ""
+            decommissioned = await envelope_service.decommission_envelope(provenance_id)
+            steps["envelope"] = "decommissioned" if decommissioned else "already_inactive"
+        else:
+            steps["envelope"] = "already_inactive"
+    except Exception as exc:
+        _audit_failure("envelope_decommission", exc)
+        logger.error(
+            "mcp-decommission: envelope_decommission FAILED for %s (%s) — "
+            "aborting decommission (fail-closed: could not confirm the "
+            "server is no longer active, so no further reversal is safe to "
+            "attempt)", provenance_id, exc,
+        )
+        raise McpOnboardError(
+            "envelope_decommission",
+            "capability-envelope deactivation failed — decommission "
+            "aborted. The server may still be onboarded; retry.",
+        ) from exc
+
+    already_decommissioned = steps["envelope"] == "already_inactive" and not instance_id
+
+    # ── Step 2: registry (durable broker descriptor + OPA grant/baseline/egress) ─
+    if registry_store is not None:
+        try:
+            registry_store.delete(tenant_id, server_id)
+            registry_store.delete_grant(tenant_id, server_id)
+            registry_store.delete_baseline(tenant_id, server_id)
+            registry_store.delete_egress_grant(tenant_id, server_id)
+            steps["registry"] = "removed"
+        except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+            _audit_failure("registry", exc)
+            steps["registry"] = "error: %s" % type(exc).__name__
+            logger.error(
+                "mcp-decommission: registry cleanup failed for %s (%s) — "
+                "continuing (envelope already decommissioned; this is a "
+                "residual-cleanup failure, not an access-control failure)",
+                provenance_id, exc,
+            )
+        else:
+            try:
+                from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
+                from yashigani.mcp._opa_push import push_egress_grants  # noqa: PLC0415
+                _opa_url = os.environ.get(
+                    "YASHIGANI_OPA_URL", "https://policy:8181",
+                ).strip() or "https://policy:8181"
+                push_egress_grants(_opa_url, build_egress_grants_doc(registry_store))
+            except Exception as push_exc:  # noqa: BLE001 — revocation-by-absence still holds
+                logger.error(
+                    "mcp-decommission: post-decommission egress-grant OPA "
+                    "push failed (%s) — revocation is still recorded (grant "
+                    "absence = kill switch); the next gateway startup push "
+                    "or approve re-pushes data.yashigani.mcp.egress_grants",
+                    push_exc,
+                )
+    else:
+        steps["registry"] = "skipped_no_store"
+
+    # ── Step 2b: codegen dedup registry (FINDING N2) ─────────────────────────
+    # Symmetric release of the in-process C3 duplicate-agent guard that
+    # approve_mcp_onboard() sets via codegen._assert_unique_agent_pair().
+    # Without this, re-onboarding the SAME (tenant_id, server_id) pair in the
+    # SAME backoffice process fails C3_duplicate_agent until restart, even
+    # though the durable registry (step 2, above) and the envelope (step 1)
+    # have already been cleared.
+    try:
+        _released = release_agent_pair(tenant_id, server_id)
+        steps["codegen_dedup"] = "released" if _released else "not_registered"
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("codegen_dedup", exc)
+        steps["codegen_dedup"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: codegen dedup-registry release failed for %s "
+            "(%s) — continuing (envelope already decommissioned; a stuck C3 "
+            "entry only blocks a FUTURE re-onboard of this server_id, it does "
+            "not affect current access control)",
+            provenance_id, exc,
+        )
+
+    # ── Step 3: route (broker DELETE /route) ─────────────────────────────────
+    try:
+        await unregister_mcp_route(tenant_id=tenant_id, server_id=server_id)
+        steps["route"] = "removed"
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("route_unregister", exc)
+        steps["route"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: broker route unregister failed for %s (%s) — "
+            "continuing (envelope already decommissioned so /auth/verify-mcp "
+            "denies regardless; Caddy may still 404/serve a stale wrap until "
+            "this is retried)", provenance_id, exc,
+        )
+
+    # ── Step 4: svid (per-instance leaf + svid-init staging) ────────────────
+    if instance_id:
+        try:
+            secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+            manifest_path = os.getenv(
+                "YASHIGANI_SERVICE_MANIFEST_PATH",
+                "/etc/yashigani/service_identities.yaml",
+            )
+            agents_dir = os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")
+            pki_paths = IssuerPaths(
+                secrets_dir=Path(secrets_dir),
+                manifest_path=Path(manifest_path),
+                agents_dir=Path(agents_dir),
+            )
+            cert_path = pki_paths.agent_cert(tenant_id, server_id, instance_id)
+            key_path = pki_paths.agent_key(tenant_id, server_id, instance_id)
+            for p in (cert_path, key_path):
+                Path(p).unlink(missing_ok=True)
+
+            if runtime in ("docker", "podman-rootful", "podman-rootless"):
+                svid_init_root = os.getenv(
+                    "YASHIGANI_SVID_INIT_DIR", "/run/secrets-rw/svid-init",
+                )
+                svid_init_dir = Path(svid_init_root) / tenant_id / server_id
+                for fname in ("client.crt", "client.key", "ca.crt"):
+                    (svid_init_dir / fname).unlink(missing_ok=True)
+            steps["svid"] = "removed"
+        except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+            _audit_failure("svid_revoke", exc)
+            steps["svid"] = "error: %s" % type(exc).__name__
+            logger.error(
+                "mcp-decommission: svid leaf removal failed for %s/%s "
+                "instance=%s (%s) — continuing (envelope already "
+                "decommissioned so the leaf is now orphaned/inert even if "
+                "the file removal itself failed)",
+                tenant_id, server_id, instance_id, exc,
+            )
+    else:
+        steps["svid"] = "skipped_no_instance" if already_decommissioned else "skipped_no_svid_on_record"
+
+    # ── Step 5: artifacts (compose override / helm values — deterministic) ──
+    artifact_paths_removed: list[str] = []
+    try:
+        output_root = _artifact_root()
+        candidates = [
+            "docker/%s-compose.override.yml" % server_id,
+            "helm/yashigani/values-%s.yaml" % server_id,
+            "helm/yashigani/values-%s-networkpolicy.yaml" % server_id,
+            "helm/yashigani/templates/agents/%s-policy-exception.yaml" % server_id,
+        ]
+        for rel in candidates:
+            if not is_artifact_relevant_for_runtime(rel, runtime):
+                continue
+            p = output_root / rel
+            if p.exists():
+                p.unlink(missing_ok=True)
+                artifact_paths_removed.append(rel)
+        steps["artifacts"] = "removed_%d" % len(artifact_paths_removed)
+    except McpOnboardError as exc:
+        # _artifact_root() not configured — dev/test only; not fatal.
+        steps["artifacts"] = "skipped: %s" % exc
+    except Exception as exc:  # noqa: BLE001 — best-effort, does not abort
+        _audit_failure("artifacts", exc)
+        steps["artifacts"] = "error: %s" % type(exc).__name__
+        logger.error(
+            "mcp-decommission: artifact cleanup failed for %s (%s) — "
+            "continuing (cosmetic — a stray compose-override file does not "
+            "grant access; the envelope is already decommissioned)",
+            provenance_id, exc,
+        )
+
+    if audit_writer is not None:
+        try:
+            from yashigani.audit.schema import McpDecommissionedEvent
+            audit_writer.write(McpDecommissionedEvent(
+                approver_account=operator_identity,
+                tenant_id=tenant_id,
+                server_id=server_id,
+                instance_id=instance_id,
+                spiffe_id=spiffe_id,
+                container_teardown_mode=container_teardown_mode,
+            ))
+        except Exception as audit_exc:  # noqa: BLE001 — audit never masks success
+            logger.error(
+                "mcp-decommission: MCP_DECOMMISSIONED audit write failed: %s",
+                audit_exc,
+            )
+
+    logger.info(
+        "mcp-decommission: %s for %s (instance=%s steps=%s)",
+        "ALREADY-DECOMMISSIONED" if already_decommissioned else "COMPLETE",
+        provenance_id, instance_id or "n/a", steps,
+    )
+
+    return McpDecommissionResult(
+        server_id=server_id,
+        tenant_id=tenant_id,
+        already_decommissioned=already_decommissioned,
+        instance_id=instance_id,
+        spiffe_id=spiffe_id,
+        artifact_paths_removed=artifact_paths_removed,
+        steps=steps,
+        container_teardown=_agent_container_teardown_hint(
+            tenant_id=tenant_id, server_id=server_id, runtime=runtime,
+            mode=container_teardown_mode,
+        ),
     )
 
 
 __all__ = [
     "McpOnboardError",
     "McpOnboardResult",
-    "default_caddy_reloader",
+    "McpDecommissionResult",
+    "register_mcp_route",
+    "unregister_mcp_route",
     "run_approve_transaction",
+    "run_decommission_transaction",
 ]

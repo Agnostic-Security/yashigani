@@ -20,7 +20,8 @@ Entry points:
   CodegenEngine(parsed, runtime)       — W3 Shape A artifact generator
   CodegenEngineShapeC(parsed, runtime) — P3 Shape C (stdio MCP-server) artifact generator
   CodegenError                         — codegen failure type
-  reset_codegen_registry()             — C3 duplicate-pair registry reset
+  reset_codegen_registry()             — C3 duplicate-pair registry reset (ALL pairs)
+  release_agent_pair(t, a)             — C3 single-pair release (decommission -> re-onboard)
   seed_mesh_ports_from_descriptors(d)  — C1 mesh-port registry seed from durable state
   resolve_egress_forwarder_port(p)     — C2 fixed egress-forwarder port (9400, overridable)
   MCP_EGRESS_FORWARDER_PORT            — C2 forwarder port constant (outside 9500-9899)
@@ -47,6 +48,7 @@ from yashigani.manifest.codegen import (
     CodegenEngine,
     CodegenEngineShapeC,
     CodegenError,
+    release_agent_pair,
     render_agent_ingress_artifacts,
     render_egress_forwarder_artifacts,
     reset_codegen_registry,
@@ -73,6 +75,7 @@ __all__ = [
     "CodegenEngineShapeC",
     "CodegenError",
     "reset_codegen_registry",
+    "release_agent_pair",
     "seed_mesh_ports_from_descriptors",
     "resolve_egress_forwarder_port",
     "MCP_EGRESS_FORWARDER_PORT",

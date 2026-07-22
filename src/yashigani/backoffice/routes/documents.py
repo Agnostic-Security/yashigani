@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -206,6 +207,20 @@ class PolicyRequest(BaseModel):
             "Uppercase letters, digits, underscores only."
         ),
     )
+    # RESTART-013 gap #4 — per-user/identity policy dimension. "" (default) =
+    # applies to any caller (global — every pre-existing policy is unaffected).
+    # Non-empty = scoped to exactly the caller whose resolved identity_id
+    # matches (policy/document.rego `_identity_matches`).
+    identity_id: str = Field(
+        default="",
+        max_length=80,
+        pattern=r"^$|^idnt_[0-9a-f]+$",
+        description=(
+            "Optional: scope this policy to ONE caller by their canonical "
+            "Yashigani identity_id ('idnt_' + hex). Empty (default) = applies "
+            "to any caller."
+        ),
+    )
 
 
 class InspectRequest(BaseModel):
@@ -230,6 +245,12 @@ class InspectRequest(BaseModel):
     # Empty (default) = per-file isolation.  The salt itself is NEVER supplied by
     # the client — the route looks it up from the operator's set store by id.
     set_id: str = Field(default="", max_length=64)
+    # RESTART-013 gap #4 — lets an admin PREVIEW how an identity-scoped policy
+    # will evaluate for a given caller from the sample-document playground,
+    # without needing a live session as that user. Empty (default) = evaluate
+    # as an unresolved caller (only global policies can match — pre-existing
+    # behaviour, unaffected).
+    identity_id: str = Field(default="", max_length=80, pattern=r"^$|^idnt_[0-9a-f]+$")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -264,17 +285,22 @@ def _require_enabled() -> None:
         )
 
 
-def _build_pipeline() -> DocumentInspectionPipeline:
-    """Construct a pipeline honouring the configured caps + the existing audit
-    sink.  The pipeline calls the EXISTING PII detector internally."""
+def _build_pipeline(audit_context: Optional[dict] = None) -> DocumentInspectionPipeline:
+    """Construct a pipeline honouring the configured caps + the REAL audit
+    chain (RESTART-013 gap #5).  The pipeline calls the EXISTING PII detector
+    internally.
+
+    ``audit_context`` is the mutable dict passed straight through to
+    :func:`make_document_audit_callback` — the caller updates
+    ``audit_context["obligations"]`` after the OPA decision is known (see
+    ``documents/audit_bridge.py`` for the two-pass rationale)."""
+    from yashigani.documents.audit_bridge import make_document_audit_callback
+
     cfg = DocumentEnforcementConfig.from_env()
     registry = cfg.build_registry()
-
-    def _audit(event_name: str, fields: dict) -> None:
-        # Reuse the gateway audit sink shape; tolerate a missing writer in
-        # dev/test (the pipeline still returns the verdict).
-        logger.info("document audit event: %s", event_name)
-
+    _audit = make_document_audit_callback(
+        backoffice_state.audit_writer, surface="admin-inspect", context=audit_context,
+    )
     return DocumentInspectionPipeline(registry=registry, on_audit=_audit)
 
 
@@ -563,6 +589,7 @@ async def create_policy(body: PolicyRequest, session: StepUpAdminSession):
             policy_id=body.policy_id,
             user_message=body.user_message,
             code=body.code,
+            identity_id=body.identity_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "invalid_policy", "message": str(exc)})
@@ -600,7 +627,11 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
     viewer rows + the self-describing user alert carried from the OPA decision.
     Never returns raw values or the replacer-map handle."""
     _require_enabled()
-    pipeline = _build_pipeline()
+    # RESTART-013 gap #5 — mutable context the audit callback reads at write
+    # time; gap #4 seeds identity_id up front (known before the OPA call),
+    # obligations is filled in after the decision below.
+    _audit_ctx: dict = {"identity_id": body.identity_id, "tenant": _install_tenant()}
+    pipeline = _build_pipeline(audit_context=_audit_ctx)
     request_id = f"doc-{len(_results) + 1}-{body.filename}"
     data_bytes = body.content.encode("utf-8", errors="replace")
 
@@ -665,7 +696,12 @@ async def inspect_document(body: InspectRequest, session: AdminSession):
             opa_input,
             route=body.route,
             pseudonymize_mode=body.pseudonymize_mode,
+            identity_id=body.identity_id,
         )
+
+    # RESTART-013 gap #5 — obligations are now known; the SECOND pipeline.inspect()
+    # call below (if any) writes its audit event carrying them via _audit_ctx.
+    _audit_ctx["obligations"] = decision.get("obligations", [])
 
     opa_action = decision.get("action", DISPOSITION_BLOCK)
 

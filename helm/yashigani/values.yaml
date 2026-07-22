@@ -990,15 +990,57 @@ caddy:
     enabled: true
     port: 8445
   # v4.1 SU-SEAM-1d-04 — mesh-mTLS caddy admin relay for the K8s MCP
-  # approve-transaction reload path (mcp_onboard._reload_via_admin_api).
+  # approve-transaction route-registration path
+  # (mcp_onboard._register_route_via_broker_relay, FINDING-V412-CADDYADMIN-002).
   # NOT the raw admin API (that stays unix-socket-only per MUST-4): an mTLS
-  # require_and_verify site block admitting ONLY POST /load from the
-  # backoffice SPIFFE URI, proxied to the caddy-pod-local admin socket.
+  # require_and_verify site block admitting ONLY POST/DELETE /route from the
+  # backoffice SPIFFE URI, proxied to the co-located caddy-config-broker
+  # sidecar (never directly to the admin socket).
   # Requires mtls.enabled=true (templates gate on both). NetworkPolicy
   # restricts ingress on this port to backoffice pods.
   adminRelay:
     enabled: true
     port: 2019
+  # FINDING-V412-CADDYADMIN-002 REWORK (Captain, 2026-07-21): the :2019
+  # relay above (mTLS + SPIFFE-gated) used to proxy a raw POST /load body
+  # (the FINDING-V412-CADDYADMIN-001 R1 fix, Su) — content-VALIDATED by this
+  # sidecar against a startup-computed baseline before forwarding. Laura's
+  # final re-attack proved the compose twin of that design FAILED live under
+  # the real no-new-privileges security context (the broker's own
+  # `caddy adapt` EPERM'd — every legitimate reload 502'd; see
+  # docker/caddy/config_broker.py module docstring). This sidecar now
+  # exposes POST/DELETE /route instead: backoffice sends narrow typed DATA
+  # (tenant_id/server_id/mesh_port/shim_port), the sidecar independently
+  # re-validates every field, renders the wrap from its OWN fixed template,
+  # and writes it into the caddy-agents-dynamic pod-local emptyDir (see
+  # caddy.yaml) — R1 (rogue /load body) is closed by construction, not by
+  # content-filtering a body that no longer exists. Same image as compose's
+  # caddy-config-broker service, BROKER_LISTEN_MODE=tcp. Loopback-only — no
+  # Service/Ingress ever fronts this port; only reachable from the caddy
+  # container in the SAME pod. R2 (compose's rogue docker/caddy/agents/
+  # *.caddy filesystem vector) has NO K8s equivalent — audited 2026-07-21:
+  # zero RBAC rules in this chart grant any workload ServiceAccount
+  # "configmaps" access, so yashigani-caddy-config / yashigani-caddy-agents
+  # are Helm/kubectl-managed only, never workload-writable.
+  configBroker:
+    enabled: true
+    image:
+      # Built locally by install.sh / your CI from
+      # docker/caddy/Dockerfile.caddy-broker (same image compose uses).
+      # For K8s deployments: push to your own private registry and update
+      # the repository field accordingly. Pin your post-build digest with
+      # `@sha256:<digest>` for supply-chain attestation (recommended).
+      repository: yashigani-caddy-config-broker
+      tag: "4.1.2"
+      pullPolicy: IfNotPresent
+    port: 8199
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "128Mi"
   # YSG-RISK-061 (v2.24.1): operator ACME / external egress allowlist.
   # Comma-separated list of additional host:port pairs to allow in the
   # caddy-entrypoint.sh iptables OUTPUT rules. Default is empty (only the
@@ -1934,6 +1976,17 @@ licensing:
 # ---------------------------------------------------------------------------
 documentEnforcement:
   enabled: false
+  # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — DELIBERATE double
+  # opt-in, mirroring docker-compose.yml: documents/proxy_modeb.py's
+  # is_modeb_proxy_active() requires BOTH `enabled` above AND this flag before
+  # the gateway's hot egress path (MCP tool-call document bridge) engages
+  # ("Untouched unless opted in AND document-shaped" — proxy_modeb.py module
+  # docstring, discipline #2). Do NOT default this to `enabled`'s value — the
+  # two flags are intentionally independent so an operator can enable
+  # ingress-upload document enforcement (/user/documents) WITHOUT also
+  # activating the mode-B proxy/MCP-egress interception. Set true only when
+  # you also want MCP tool-call document enforcement.
+  modeBProxyEnabled: false
   # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
   # Pin a digest in production (Verification Protocol §7).
   image:

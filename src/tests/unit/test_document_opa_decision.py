@@ -83,3 +83,58 @@ async def test_valid_decision_passes_through(monkeypatch):
     )
     assert d["action"] == "PSEUDONYMIZE"
     assert d["obligations"] == ["apply_pseudonymize_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_identity_id_threaded_into_opa_payload(monkeypatch):
+    """RESTART-013 gap #4: identity_id is carried as input.identity.identity_id
+    in the payload POSTed to OPA — the per-user policy dimension actually
+    reaches the policy engine, not just the Python signature."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"result": {"action": "LOG", "allow": True, "deny": [], "obligations": []}}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, json=None, **k):
+            captured["payload"] = json
+            return _Resp()
+
+    monkeypatch.setattr(opa_decision, "internal_httpx_client", lambda **k: _Client())
+    await opa_decision.evaluate_document_decision(
+        "https://policy:8181", {"format": "txt"}, identity_id="idnt_userredact01",
+    )
+    assert captured["payload"]["input"]["identity"] == {"identity_id": "idnt_userredact01"}
+
+
+@pytest.mark.asyncio
+async def test_identity_id_defaults_empty_string(monkeypatch):
+    """Callers that never pass identity_id still POST a well-formed (empty)
+    identity object — never omit the key OPA's rego reads with object.get."""
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"result": {"action": "LOG", "allow": True, "deny": [], "obligations": []}}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, json=None, **k):
+            captured["payload"] = json
+            return _Resp()
+
+    monkeypatch.setattr(opa_decision, "internal_httpx_client", lambda **k: _Client())
+    await opa_decision.evaluate_document_decision("https://policy:8181", {"format": "txt"})
+    assert captured["payload"]["input"]["identity"] == {"identity_id": ""}

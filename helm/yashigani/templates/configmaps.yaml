@@ -947,20 +947,23 @@ data:
     {{- if and .Values.caddy.adminRelay.enabled .Values.mtls.enabled }}
     # ─────────────────────────────────────────────────────────────────────────
     # v4.1 SU-SEAM-1d-04 (Su, ebe5f141) — mesh-mTLS caddy admin relay (:2019).
-    # K8s-only reload path for the MCP approve transaction
-    # (mcp_onboard._reload_via_admin_api).  On compose runtimes backoffice
-    # reloads Caddy over the shared /run/caddy/admin.sock unix socket; on K8s
-    # caddy and backoffice are SEPARATE PODS — a unix socket cannot span pods
-    # (emptyDir is pod-local; same-node co-location / RWX PVC is not the arch).
+    # K8s-only route-registration path for the MCP approve transaction
+    # (mcp_onboard.register_mcp_route / _register_route_via_broker_relay).
+    # On compose runtimes backoffice reaches caddy-config-broker over a
+    # dedicated unix socket; on K8s caddy and backoffice are SEPARATE PODS —
+    # a unix socket cannot span pods (emptyDir is pod-local; same-node
+    # co-location / RWX PVC is not the arch).
     #
     # MUST-4 compatibility: this does NOT re-expose the raw admin TCP endpoint.
     # The admin API itself stays bound to the caddy-pod-local unix socket
-    # (global options above).  This is an ordinary Caddy HTTPS site block that:
+    # (global options above), reachable ONLY by the co-located
+    # caddy-config-broker sidecar. This is an ordinary Caddy HTTPS site block
+    # that:
     #   1. terminates mesh mTLS — client_auth require_and_verify against the
     #      internal CA bundle.  Identity-less clients are refused at the TLS
     #      handshake, before any HTTP surface exists.
-    #   2. admits ONLY POST /load AND ONLY the backoffice SPIFFE URI.  The
-    #      verified client-cert URI SAN is stamped into
+    #   2. admits ONLY POST/DELETE /route AND ONLY the backoffice SPIFFE URI.
+    #      The verified client-cert URI SAN is stamped into
     #      X-Yashigani-Verified-Spiffe (bare SET — replaces any client-sent
     #      value; same discipline as the :8444/:8445 X-SPIFFE-ID stamp) and
     #      matched with an exact `header` matcher.  Deliberately NOT a CEL
@@ -971,14 +974,29 @@ data:
     #      @caller_not_openclaw expression shares this defect — flagged
     #      separately; fail-closed there since != that errors never admits).
     #      Every other method/path/identity gets 403.  No /config, /stop,
-    #      /pki or other admin routes are ever proxied.
-    #   3. proxies to the local unix admin socket with Host pinned to
-    #      "localhost" — Caddy's admin host/origin check (DNS-rebinding guard)
-    #      only admits its own listener origins, so the relayed request must
-    #      not carry the external Host (yashigani-caddy:2019).
+    #      /pki, /load, or other raw admin routes are ever proxied — /route
+    #      is the ONLY surface backoffice can reach.
+    #   3. proxies to the caddy-config-broker sidecar (loopback, same pod).
+    # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: this relay
+    # used to proxy a raw POST /load body (the entire monolith Caddyfile,
+    # backoffice-reread-and-reposted) to the broker for CONTENT validation
+    # against a startup-computed baseline (FINDING-V412-CADDYADMIN-001 R1
+    # fix). Laura's final re-attack proved the compose twin of that design
+    # FAILED live under the real no-new-privileges security context
+    # (BLOCKER-A: the broker's own `caddy adapt` EPERM'd — every legitimate
+    # reload 502'd; see docker/caddy/config_broker.py module docstring). The
+    # corrected contract eliminates the raw-body path entirely: backoffice
+    # now sends narrow typed DATA (tenant_id/server_id/mesh_port/shim_port)
+    # to POST/DELETE /route; the broker independently re-validates every
+    # field, renders the MCP-front wrap from its OWN fixed template (never
+    # backoffice-supplied text), and writes it into a pod-local emptyDir
+    # Caddy imports (see caddy.yaml caddy-agents-dynamic volume) — R1 is
+    # closed by construction (no code path from backoffice-controlled input
+    # to arbitrary Caddy directives), not by content-filtering a body that
+    # no longer exists.
     # Defence-in-depth stack: NetworkPolicy (backoffice pods only) → mesh mTLS
     # (require_and_verify) → SPIFFE URI pin (backoffice leaf only) → method+
-    # path pin (POST /load only).
+    # path pin (POST/DELETE /route only) → broker field-level validation.
     # ─────────────────────────────────────────────────────────────────────────
     :{{ .Values.caddy.adminRelay.port }} {
       tls /run/secrets/caddy_client.crt /run/secrets/caddy_client.key {
@@ -996,17 +1014,14 @@ data:
       # request_header runs before handle in Caddy's directive order, so the
       # header matcher below sees the stamped value.
       request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
-      @backoffice_reload {
-        method POST
-        path /load
+      @backoffice_route {
+        method POST DELETE
+        path /route
         header X-Yashigani-Verified-Spiffe "spiffe://{{ .Values.global.spiffeTrustDomain | default "yashigani.internal" }}/backoffice"
       }
-      handle @backoffice_reload {
-        reverse_proxy unix//run/caddy/admin.sock {
-          # Caddy admin origin check admits its own listener origins only;
-          # strip the mesh Host before it reaches the admin endpoint.
-          header_up Host localhost
-          # Don't leak the mesh-identity stamp into the admin endpoint.
+      handle @backoffice_route {
+        reverse_proxy 127.0.0.1:{{ .Values.caddy.configBroker.port }} {
+          # Don't leak the mesh-identity stamp into the broker path.
           header_up -X-Yashigani-Verified-Spiffe
         }
       }
@@ -1132,6 +1147,18 @@ data:
     # NEVER regenerate the Caddyfile monolith — agent routes live in snippets.
     # ─────────────────────────────────────────────────────────────────────────
     import /etc/caddy/agents/*.caddy
+
+    # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) — broker-owned
+    # DYNAMIC MCP route directory. The static agents/ import above is
+    # ConfigMap-mounted (Helm/kubectl-managed only — R2 has NO K8s equivalent,
+    # zero chart RBAC rules grant any workload ServiceAccount configmaps
+    # access). MCP wrap routes registered by the live approve-transaction
+    # (mcp_onboard.py, via the :2019 relay above) are rendered and written
+    # EXCLUSIVELY by the caddy-config-broker sidecar into a pod-local emptyDir
+    # (caddy.yaml caddy-agents-dynamic volume) — RW only for the broker
+    # sidecar, RO for the caddy container, never reachable from any other pod
+    # (backoffice included).
+    import /etc/caddy/agents-dynamic/*.caddy
 {{- end }}
 
 {{/*

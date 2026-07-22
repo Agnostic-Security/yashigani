@@ -98,6 +98,31 @@ _FILE_MODE_TOKEN = 0o400
 class IssuerPaths:
     secrets_dir: Path
     manifest_path: Path
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): RESTART-012 made
+    # backoffice's ``/run/secrets`` mount pure :ro (CA root/intermediate +
+    # attestation pin must never be writable from a compromised backoffice
+    # process). That RO also silently broke the ONE legitimate write backoffice
+    # is supposed to make from that dataclass: dynamically-issued agent leaf
+    # certs/keys + the runtime identity manifest (mint_agent_leaf,
+    # approve_nhi_svid, rotate_agent_cert). Those three are backoffice's
+    # designed onboarding authority (mint a leaf under the existing
+    # intermediate) and must stay writable WITHOUT reopening any path to the
+    # CA trust material.
+    #
+    # ``agents_dir`` is an OPTIONAL, SEPARATE writable base for exactly those
+    # three artefact classes (agent_cert/agent_key/runtime_manifest). When
+    # unset (the default — CLI / install.sh host-side ephemeral issuer, which
+    # already has full RW on secrets_dir and predates this split), those
+    # properties fall back to secrets_dir unchanged — byte-identical legacy
+    # behaviour. When set (backoffice's runtime construction —
+    # mcp_onboard.py / routes/agents.py — passes
+    # YASHIGANI_AGENTS_DIR, default /run/secrets-rw/agents), the three
+    # properties resolve under agents_dir instead. root_cert/root_key/
+    # intermediate_cert/intermediate_key/leaf_cert/leaf_key/bootstrap_token
+    # are NEVER affected by agents_dir — they stay under secrets_dir always,
+    # so this split cannot be used to reach CA material even if agents_dir
+    # and secrets_dir happen to alias.
+    agents_dir: Optional[Path] = None
 
     # Derived
     @property
@@ -119,6 +144,11 @@ class IssuerPaths:
         return self.secrets_dir / f"{service}_bootstrap_token"
 
     @property
+    def _agents_base(self) -> Path:
+        """Writable base for dynamic per-agent artefacts (see agents_dir doc above)."""
+        return self.agents_dir if self.agents_dir is not None else self.secrets_dir
+
+    @property
     def runtime_manifest(self) -> Path:
         """Path to the runtime-writable agent identity manifest.
 
@@ -127,11 +157,13 @@ class IssuerPaths:
         identities are appended to this separate runtime manifest. The backoffice
         lifespan loader merges both into the live ServiceIdentityManifest object.
 
-        Layout: <secrets_dir>/var/runtime/service_identities.yaml
-        Created by install.sh (empty agents: [] stub) on first install.
-        Written by mint_agent_leaf() at runtime.
+        Layout: <_agents_base>/var/runtime/service_identities.yaml
+        Created by install.sh (empty agents: [] stub) on first install
+        (legacy secrets_dir layout) or by mint_agent_leaf() itself on first
+        write under the dedicated agents_dir (parents=True mkdir in
+        _write_secret).
         """
-        return self.secrets_dir / "var" / "runtime" / "service_identities.yaml"
+        return self._agents_base / "var" / "runtime" / "service_identities.yaml"
 
     @staticmethod
     def agent_entry_name(tenant_id: str, agent_name: str, instance_id: str = "") -> str:
@@ -148,12 +180,12 @@ class IssuerPaths:
         return stem
 
     def agent_cert(self, tenant_id: str, agent_name: str, instance_id: str = "") -> Path:
-        """Leaf cert path for a dynamically-issued agent identity."""
-        return self.secrets_dir / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.crt"
+        """Leaf cert path for a dynamically-issued agent identity (writable base)."""
+        return self._agents_base / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.crt"
 
     def agent_key(self, tenant_id: str, agent_name: str, instance_id: str = "") -> Path:
-        """Leaf key path for a dynamically-issued agent identity."""
-        return self.secrets_dir / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.key"
+        """Leaf key path for a dynamically-issued agent identity (writable base)."""
+        return self._agents_base / f"{self.agent_entry_name(tenant_id, agent_name, instance_id)}_client.key"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

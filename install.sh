@@ -4031,6 +4031,32 @@ _backup_existing_data() {
     fi
   fi
 
+  # FINDING-V412-RESTART-012: back up the postgres-only root-attestation dir
+  # (ca_root.attested_sha256, if present — most installs never run rotate-root
+  # so this is frequently empty) alongside docker/secrets — same pattern as
+  # secrets-caddy above. restore.sh restores it into docker/secrets-pki-attest/.
+  if [[ -d "${WORK_DIR}/docker/secrets-pki-attest" ]]; then
+    local _attest_src="${WORK_DIR}/docker/secrets-pki-attest"
+    local _attest_dest="${backup_dir}/secrets-pki-attest"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+      mkdir -p "$_attest_dest"
+      if podman unshare bash -c "tar -cf - -C '${_attest_src}' ." \
+           | tar -xpf - -C "$_attest_dest" 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up via podman unshare tar (FINDING-V412-RESTART-012)"
+      else
+        log_warn "  secrets-pki-attest/ backup via podman unshare failed — skipping (non-fatal; regenerated on next rotate-root)"
+        rm -rf "$_attest_dest"
+      fi
+    else
+      mkdir -p "$_attest_dest"
+      if cp -rp "$_attest_src"/. "$_attest_dest"/ 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets-pki-attest/ partial copy — non-fatal."
+      fi
+    fi
+  fi
+
   # Backup .env (contains passwords as env vars)
   if [[ -f "${WORK_DIR}/docker/.env" ]]; then
     cp "${WORK_DIR}/docker/.env" "${backup_dir}/.env"
@@ -6700,6 +6726,7 @@ _fix_config_perms() {
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
     -not \( -path "${work_dir}/docker/secrets-caddy" -prune \) \
+    -not \( -path "${work_dir}/docker/secrets-pki-attest" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
@@ -6715,8 +6742,15 @@ _fix_config_perms() {
   # Note: *.crt files are intentionally 0644 (public material — CA and client certs
   # must be readable by all container UIDs for mTLS peer verification). Only private
   # keys and password/token files are checked here.
-  # YSG-RISK-053: sweep BOTH secret dirs — the flat docker/secrets/ and the
-  # Caddy-scoped docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # YSG-RISK-053: sweep the flat docker/secrets/ and the Caddy-scoped
+  # docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # NOTE: docker/secrets-pki-attest/ (FINDING-V412-RESTART-012) is
+  # deliberately NOT swept here — ca_root.attested_sha256 holds a SHA-256
+  # digest, not key material; like *.crt below, its VALUE is public
+  # (disclosure confers no capability), only its ISOLATION matters (no other
+  # mesh container may mount the directory it lives in — see
+  # docker-compose.yml + test_i10_pki_chain_of_continuity.py). It is 0644 by
+  # design (install.sh rotate-root case); see the directory-level check below.
   local _sweep_dir
   for _sweep_dir in "${work_dir}/docker/secrets" "${work_dir}/docker/secrets-caddy"; do
     if [[ -d "$_sweep_dir" ]]; then
@@ -6738,6 +6772,20 @@ _fix_config_perms() {
       fi
     fi
   done
+
+  # FINDING-V412-RESTART-012: docker/secrets-pki-attest/ (postgres-only
+  # attestation dir) is not subject to the world-readable file sweep above
+  # (its one file's VALUE is non-sensitive — see comment above), but the
+  # DIRECTORY itself must never be world-writable/world-searchable-for-write
+  # — self-heal + assert, same fail-closed pattern as the loop above.
+  local _attest_dir="${work_dir}/docker/secrets-pki-attest"
+  if [[ -d "$_attest_dir" ]]; then
+    chmod o-w "$_attest_dir" 2>/dev/null || true
+    if find "$_attest_dir" -maxdepth 0 -perm -002 2>/dev/null | grep -q .; then
+      log_error "FINDING-V412-RESTART-012: ${_attest_dir} is world-writable after self-heal — investigate." >&2
+      exit 1
+    fi
+  fi
 
   log_success "Bind-mounted config permissions verified"
 }
@@ -7148,15 +7196,115 @@ PYEOF
 # Idempotent: skips when the key already exists (rotation is a separate concern;
 # the key is long-lived like the wazuh-admin cert — 825 days).  Fail-closed:
 # returns non-zero if the intermediate CA material is missing.
+#
+# _ec_signing_key_is_valid — generic content validation for a PEM EC private
+# key (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21).
+#
+# A NON-EMPTY / `-f` presence check alone is NOT sufficient for a generated
+# EC signing key that a production loader parses strictly: a prior
+# interrupted/killed install can leave a corrupt-but-nonempty key file that
+# some openssl builds parse leniently while the strict loader
+# (`cryptography.load_pem_private_key`, used both by the gateway's MCP JWT
+# issuer AND the backoffice audit-checkpoint signer) rejects — "EC private
+# key is not encoded properly: private key value is too short". Root-caused
+# live 2026-07-21 for mcp_identity_signing_key (Maxine, gateway RestartCount
+# 143): a partial write left a SEC1 key whose private-key OCTET STRING
+# scalar was shorter than required while otherwise well-formed DER.
+#
+# Reproduced with hand-crafted short-scalar fixtures in BOTH formats this
+# function has to accept — SEC1 ("BEGIN EC PRIVATE KEY", the MCP key's
+# format) AND PKCS#8 ("BEGIN PRIVATE KEY", the audit-signing key's format,
+# via `openssl pkcs8 -topk8`) — confirming a bare `openssl ec -noout -text`
+# parse ACCEPTS both corrupted fixtures (reports a plausible "NIST CURVE"
+# line — the exact false-positive that shipped the incident) while
+# `cryptography.load_pem_private_key` correctly rejects both.
+#
+# Validation strategy (in preference order):
+#   1. python3 + `cryptography` (the EXACT production loader) — used
+#      whenever importable.
+#   2. openssl fallback (always available — openssl is a hard prerequisite
+#      for generating these keys at all): normalise via
+#      `openssl ec -outform DER` (accepts SEC1 OR PKCS#8 input, always
+#      re-encodes as SEC1/traditional — this is what makes the SAME
+#      asn1parse check below work for both key formats), then require BOTH
+#      (a) the depth-1 OCTET STRING (the SEC1 private-key scalar) is EXACTLY
+#      the expected byte length for the curve, AND (b) the curve name
+#      matches. The scalar-LENGTH check is what catches the corruption class
+#      above — a bare `-text` parse alone does not (proven during this fix).
+#
+# Podman-rootless-aware: reads via `_safe_read_secret` (same helper
+# `_secret_is_valid` relies on) so a subuid-remapped key file the host
+# installer user cannot `cat` directly is still read via `podman unshare`
+# rather than silently mis-validated.
+#
+# Usage: _ec_signing_key_is_valid <file> <cryptography-curve-class> \
+#          <expected-scalar-bytes> <openssl-curve-name-regex>
+# Returns 0 (valid) / 1 (invalid, corrupt, or absent).
+_ec_signing_key_is_valid() {
+  local _f="$1" _curve_class="$2" _scalar_bytes="$3" _curve_regex="$4"
+  local _pem
+  _pem="$(_safe_read_secret "$_f" "" "")"
+  [[ -n "$_pem" ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    local _py_rc
+    printf '%s\n' "$_pem" | YASHIGANI_EC_CURVE_CLASS="$_curve_class" python3 -c '
+import sys, os
+try:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric import ec
+except ImportError:
+    sys.exit(2)  # cryptography not importable -> fall through to openssl method
+curve_cls = getattr(ec, os.environ["YASHIGANI_EC_CURVE_CLASS"], None)
+try:
+    key = load_pem_private_key(sys.stdin.buffer.read(), password=None)
+    sys.exit(0 if (curve_cls is not None and isinstance(key.curve, curve_cls)) else 1)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
+    _py_rc=$?
+    case "$_py_rc" in
+      0) return 0 ;;   # valid EC key on the expected curve per the exact production loader
+      1) return 1 ;;   # definitively invalid (wrong curve / load failure)
+      *) : ;;          # 2 = cryptography module not importable -> fall through
+    esac
+  fi
+
+  # Fallback: normalise (SEC1 or PKCS#8 -> SEC1 DER) then check scalar length + curve.
+  command -v openssl >/dev/null 2>&1 || return 1
+  local _asn1 _oct_line
+  _asn1="$(printf '%s\n' "$_pem" | openssl ec -outform DER 2>/dev/null | openssl asn1parse -inform DER 2>/dev/null)"
+  [[ -n "$_asn1" ]] || return 1
+  _oct_line="$(printf '%s\n' "$_asn1" | grep -E 'd=1.*prim: OCTET STRING' | head -1)"
+  [[ -n "$_oct_line" ]] || return 1
+  printf '%s\n' "$_oct_line" | grep -Eq "\\bl= *${_scalar_bytes}\\b" || return 1
+  printf '%s\n' "$_pem" | openssl ec -noout -text 2>/dev/null | grep -Eqi "$_curve_regex"
+}
+
+# _audit_signing_key_is_valid — audit_signing.key (PKCS#8, P-256) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 pattern-sweep, Su 2026-07-21):
+# the pre-existing skip-gate below checked `-f` presence ONLY (not even
+# non-emptiness) — the SAME corrupt-key-preserved-across-a-re-run hazard
+# proven for mcp_identity_signing_key applies here: this is another
+# strictly-loaded EC private key (backoffice's audit-checkpoint signer). A
+# partial write from an interrupted install would be silently preserved and
+# only surface as a signing failure at the next daily checkpoint.
+_audit_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP256R1" 32 'P-256|prime256v1|secp256r1'
+}
+
 _provision_audit_signing_key() {
   local secrets="${WORK_DIR}/docker/secrets"
   local asd="${secrets}/audit-signing"
   local keyf="${asd}/audit_signing.key"
   local crtf="${asd}/audit_signing.crt"
 
-  if [[ -f "$keyf" && -f "$crtf" ]]; then
+  if [[ -f "$keyf" && -f "$crtf" ]] && _audit_signing_key_is_valid "$keyf"; then
     log_info "Audit-chain signing key already provisioned — skipping"
     return 0
+  elif [[ -f "$keyf" && -f "$crtf" ]]; then
+    log_warn "audit_signing.key present but FAILED content validation (corrupt/truncated EC key — consistent with a partial write from an interrupted prior install) — regenerating"
   fi
   if [[ ! -f "${secrets}/ca_intermediate.crt" || ! -f "${secrets}/ca_intermediate.key" ]]; then
     log_error "Audit signing-key provisioning: intermediate CA material missing — aborting (fail-closed)"
@@ -10321,6 +10469,16 @@ run_health_check() {
   bash "$health_script"
   log_success "Health checks passed"
 
+  # FINDING-V412-RESTART-012 (Captain, 2026-07-21): fail-loud, hard-block
+  # assertion that the RO-mount fix actually took at RUNTIME, not just in the
+  # compose YAML text — a podman-compose fork bug (or any future regression
+  # of it) silently drops a :ro flag on backoffice's /run/secrets when a :rw
+  # child mount shares its path prefix (Laura, laura-012-rogue-reattack.md).
+  # This is the single highest-value post-up assertion in the whole install:
+  # if it fails, the PKI attestation-pin's un-forgeability guarantee is false
+  # and a compromised backoffice can inject a rogue CA. FATAL, not a warning.
+  _verify_backoffice_secrets_ro_mount
+
   # OLLAMA-INIT-EXIT-001: check ollama-init exit status and warn loudly if it
   # failed. ollama-init is a one-shot container (no restart-unless-stopped) so
   # a failed pull is silent once compose_up returns — the step-12 health check
@@ -10329,6 +10487,80 @@ run_health_check() {
   # agents return 404 "model not found". Non-fatal: the core stack is healthy;
   # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
   _check_ollama_init_exit "${WORK_DIR}/docker"
+}
+
+# _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
+#
+# Runs `podman inspect` / `docker inspect` against the LIVE backoffice
+# container and asserts its /run/secrets mount reports RW=false. This is a
+# runtime assertion, deliberately independent of the compose YAML text (see
+# tests/invariants/test_i10_pki_chain_of_continuity.py for the static/text
+# check) — the whole point of this finding was that the YAML SAID :ro while
+# the runtime behaviour was RW=true on this podman-compose fork. Only the
+# runtime check catches a regression of the underlying bug itself.
+#
+# Only meaningful for compose/vm deployments (K8s's backoffice /run/secrets
+# is, by design, a genuinely writable emptyDir — see backoffice.yaml — so
+# RW=true there is CORRECT, not a regression).
+_verify_backoffice_secrets_ro_mount() {
+  # K8s/helm deploys use a genuinely writable emptyDir at /run/secrets by
+  # design (see backoffice.yaml) — this check only applies to compose/vm
+  # (docker/podman) deploys. Same MODE/YSG_RUNTIME check used at install.sh
+  # lines 4085/9530/14389 for this exact compose-vs-k8s branch decision.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+
+  # Locate the running backoffice container by name pattern via a direct
+  # runtime `ps` call (NOT the vendored podman-compose-ysg fork's `ps`
+  # subcommand — it does not accept `-a`/other docker-compose-standard flags;
+  # see _check_ollama_init_exit above, which has the same latent gap. A
+  # direct runtime call is the same pattern already used elsewhere in this
+  # file for exactly this reason — see e.g. the postgres-container lookup in
+  # _backup_existing_data).
+  local _inspect_cmd="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _inspect_cmd="podman"
+
+  local _ctr_name
+  _ctr_name="$("$_inspect_cmd" ps --format '{{.Names}}' 2>/dev/null | grep -E 'backoffice' | head -1 || true)"
+
+  if [[ -z "$_ctr_name" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not locate the backoffice container to verify /run/secrets RW state — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  local _rw
+  _rw="$("$_inspect_cmd" inspect "$_ctr_name" --format \
+    '{{range .Mounts}}{{if eq .Destination "/run/secrets"}}{{.RW}}{{end}}{{end}}' 2>/dev/null || true)"
+
+  if [[ -z "$_rw" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not read /run/secrets mount state on ${_ctr_name} via '${_inspect_cmd} inspect' — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  if [[ "$_rw" != "false" ]]; then
+    log_error "################################################################"
+    log_error "FATAL: FINDING-V412-RESTART-012 REGRESSION"
+    log_error "  backoffice's /run/secrets mount reports RW=${_rw} (expected"
+    log_error "  RW=false). This means the PKI root-attestation pin's"
+    log_error "  un-forgeability guarantee is FALSE right now — a compromised"
+    log_error "  backoffice process can write ca_root.crt / any file under"
+    log_error "  /run/secrets, enabling rogue-CA injection into the mesh"
+    log_error "  (proven exploit chain: laura-012-rogue-reattack.md)."
+    log_error "  Checked: ${_inspect_cmd} inspect ${_ctr_name} -> /run/secrets RW=${_rw}"
+    log_error "  This is a HARD BLOCK — the install is refusing to proceed"
+    log_error "  with a known-forgeable trust chain. Do not work around this"
+    log_error "  with a manual kubectl/podman patch; investigate the compose"
+    log_error "  mount emission (docker-compose.yml backoffice volumes) and"
+    log_error "  re-run install.sh."
+    log_error "################################################################"
+    exit 1
+  fi
+
+  log_success "FINDING-V412-RESTART-012: backoffice /run/secrets confirmed RW=false at runtime (${_inspect_cmd} inspect)"
 }
 
 # _check_ollama_init_exit — inspect the stopped ollama-init container exit code.
@@ -11114,6 +11346,23 @@ _secret_is_valid() {
   return 0
 }
 
+# _mcp_signing_key_is_valid — mcp_identity_signing_key (SEC1, P-384) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21). Root-caused
+# live: a NON-EMPTY check alone (`[[ -s ]]`) preserved a corrupt-but-nonempty
+# key across a re-run and the gateway crash-looped at startup (RestartCount
+# 143) with "EC private key is not encoded properly: private key value is
+# too short". See `_ec_signing_key_is_valid` (defined near
+# `_provision_audit_signing_key` above) for the full validation strategy,
+# the reproduced short-scalar fixture, and why a bare `openssl ec -text`
+# parse alone is not a safe substitute for the exact gateway loader
+# (`cryptography.load_pem_private_key` in src/yashigani/mcp/_jwt.py).
+#
+# Returns 0 (valid P-384 EC private key) / 1 (invalid, corrupt, or absent).
+_mcp_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP384R1" 48 'P-384|secp384r1'
+}
+
 # _safe_read_secret — BUG-B+-004: Podman-rootless-aware secret file reader
 #
 # On Podman rootless, secrets are owned by subuid-remapped UIDs that the host
@@ -11548,27 +11797,57 @@ generate_secrets() {
     # BEGIN YSG-P3-MCP-SIGKEY-UPGRADE
     # MCP signing key — generate if absent on upgrade path (same idempotency as caddy_internal_hmac above).
     # This covers upgrades from pre-v2.25.0 where the key did not yet exist.
+    #
+    # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+    # NON-EMPTY check alone preserved a corrupt-but-nonempty key left by a
+    # prior interrupted install, and the gateway crash-looped at startup
+    # (RestartCount 143, measured live). Fix: validate CONTENT
+    # (_mcp_signing_key_is_valid — strict P-384 EC load, see its definition
+    # above _secret_is_valid) not just non-emptiness. UPGRADE PATH policy is
+    # deliberately asymmetric from the fresh-install path below: absent →
+    # generate (unchanged upgrade-from-pre-v2.25.0 behaviour); PRESENT BUT
+    # INVALID → FAIL LOUD, never silently regenerate — an existing file might
+    # be a real key rotated by scripts/rotate-secret.sh that this upgrade run
+    # cannot distinguish from corruption with certainty, so we refuse to
+    # clobber it and force a human to look.
     local _mcp_key_file_up="${secrets_dir}/mcp_identity_signing_key"
     local _env_file_up="${WORK_DIR}/docker/.env"
 
     if [[ ! -s "$_mcp_key_file_up" ]]; then
       log_info "Generating MCP P-384 signing key (upgrade path) → ${_mcp_key_file_up}"
+      local _mcp_key_tmp_up
+      _mcp_key_tmp_up="$(mktemp "${_mcp_key_file_up}.XXXXXX")" || {
+        log_error "MCP P-384 signing key generation (upgrade path): mktemp failed — aborting"
+        return 1
+      }
       (
         umask 077
         if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-             | openssl ec -out "${_mcp_key_file_up}" 2>/dev/null; then
+             | openssl ec -out "${_mcp_key_tmp_up}" 2>/dev/null; then
           printf 'ERROR: Failed to generate MCP P-384 signing key (upgrade path)\n' >&2
-          rm -f "${_mcp_key_file_up}" 2>/dev/null || true
           exit 1
         fi
-        chmod 0600 "${_mcp_key_file_up}"
+        chmod 0600 "${_mcp_key_tmp_up}"
       ) || {
         log_error "MCP P-384 signing key generation failed (upgrade path) — aborting"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
         return 1
       }
+      # Atomic: a kill/interrupt between here and the `mv` leaves either the
+      # (still-absent) target untouched or the temp file — never a
+      # half-written target that a future run would wrongly preserve.
+      if ! _mcp_signing_key_is_valid "${_mcp_key_tmp_up}"; then
+        log_error "Freshly-generated MCP P-384 signing key (upgrade path) failed content validation — this should not happen; aborting rather than installing a bad key"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
+        return 1
+      fi
+      mv -f "${_mcp_key_tmp_up}" "${_mcp_key_file_up}"
       log_info "MCP P-384 signing key generated (mode 0600, upgrade path)"
+    elif ! _mcp_signing_key_is_valid "$_mcp_key_file_up"; then
+      log_error "mcp_identity_signing_key exists (${_mcp_key_file_up}) but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install). Upgrade path refuses to clobber a file that might be a real, deliberately-rotated key. Investigate manually, or rotate via scripts/rotate-secret.sh, then re-run. Aborting."
+      return 1
     else
-      log_info "mcp_identity_signing_key already present — preserving (upgrade path)"
+      log_info "mcp_identity_signing_key already present and valid — preserving (upgrade path)"
     fi
 
     # No .env sync needed — the gateway reads the key from
@@ -11980,36 +12259,67 @@ generate_secrets() {
   # storing the raw private key in .env is wider exposure (docker inspect,
   # backup tools, process env) and is intentionally avoided.
   #
-  # Idempotent: if the key file already exists, preserve it.
+  # Idempotent: if the key file already exists AND validates, preserve it.
   # Rotation: use scripts/rotate-secret.sh (separate documented operation).
   # Backup: the file lands in ${secrets_dir}/ which is captured by
   #   _backup_existing_data → bundle.enc (YSG-RISK-050/051 dual-wrap).
   # Uninstall: wipe of docker/secrets/* in uninstall.sh --remove-volumes covers this.
+  #
+  # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+  # NON-EMPTY check alone (the old `[[ ! -s ]]` gate) preserved a
+  # corrupt-but-nonempty key left by a prior interrupted install, and the
+  # gateway crash-looped at startup (RestartCount 143, measured live) with
+  # "EC private key is not encoded properly: private key value is too
+  # short". Fix: validate CONTENT (_mcp_signing_key_is_valid, defined above
+  # _secret_is_valid — strict P-384 EC load via the same loader class the
+  # gateway uses), not just non-emptiness. FRESH-INSTALL PATH policy:
+  # invalid (whether absent OR corrupt) → regenerate. (Contrast with the
+  # upgrade path above, which FAILS LOUD instead of clobbering an existing
+  # invalid file — a fresh install has no prior "real key" to protect.)
   local _mcp_key_file="${secrets_dir}/mcp_identity_signing_key"
 
-  if [[ ! -s "$_mcp_key_file" ]]; then
+  if ! _mcp_signing_key_is_valid "$_mcp_key_file"; then
+    if [[ -s "$_mcp_key_file" ]]; then
+      log_warn "mcp_identity_signing_key present but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install) — regenerating (fresh-install path)"
+    fi
     log_info "Generating MCP P-384 signing key → ${_mcp_key_file}"
-    umask 077
     # Generate a P-384 (secp384r1) EC private key in unencrypted PEM format.
     # openssl ecparam + openssl ec produces a PKCS#8-compatible PEM that the
     # Python cryptography library reads via load_pem_private_key().
-    # Use a subshell to scope umask 077 tightly to the key file write.
+    #
+    # Atomic write (N3): generate into a mktemp sibling file, validate THAT
+    # file's content, then `mv` it into place. `mv` on the same filesystem
+    # is an atomic rename — an interrupt/kill at any point before the `mv`
+    # leaves either the (untouched or absent) target or an orphan temp file,
+    # NEVER a half-written target that a future run would wrongly preserve
+    # (the exact failure mode this finding closes).
+    local _mcp_key_tmp
+    _mcp_key_tmp="$(mktemp "${_mcp_key_file}.XXXXXX")" || {
+      log_error "MCP P-384 signing key generation: mktemp failed — aborting"
+      return 1
+    }
     (
       umask 077
       if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-           | openssl ec -out "${_mcp_key_file}" 2>/dev/null; then
+           | openssl ec -out "${_mcp_key_tmp}" 2>/dev/null; then
         printf 'ERROR: Failed to generate MCP P-384 signing key\n' >&2
-        rm -f "${_mcp_key_file}" 2>/dev/null || true
         exit 1
       fi
-      chmod 0600 "${_mcp_key_file}"
+      chmod 0600 "${_mcp_key_tmp}"
     ) || {
       log_error "MCP P-384 signing key generation failed — aborting"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
       return 1
     }
+    if ! _mcp_signing_key_is_valid "${_mcp_key_tmp}"; then
+      log_error "Freshly-generated MCP P-384 signing key failed content validation — this should not happen; aborting rather than installing a bad key"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
+      return 1
+    fi
+    mv -f "${_mcp_key_tmp}" "${_mcp_key_file}"
     log_info "MCP P-384 signing key generated (mode 0600)"
   else
-    log_info "mcp_identity_signing_key already present — preserving (use scripts/rotate-secret.sh to rotate)"
+    log_info "mcp_identity_signing_key already present and valid — preserving (use scripts/rotate-secret.sh to rotate)"
   fi
 
   # S1 invariant check: the key file must be 0600 — never world or group readable.
@@ -12964,6 +13274,32 @@ _ensure_caddy_secrets_dir() {
   return 0
 }
 
+# _ensure_pki_attest_dir — FINDING-V412-RESTART-012 (Captain, 2026-07-21).
+#
+# Dedicated, postgres-ONLY directory for the root-attestation pin
+# (ca_root.attested_sha256). Same rationale/pattern as
+# _ensure_caddy_secrets_dir above (YSG-RISK-053), simpler in one respect: this
+# file is never minted at the flat docker/secrets/ path by the PKI issuer, so
+# there is no relocate-and-stub dance needed — only rotate-root ever writes
+# it, and it now writes directly to this dedicated dir. The dir must still
+# exist BEFORE the first `compose up` (Podman rootless bind-mount fails hard
+# on a missing host path — Docker auto-creates, Podman does not; same
+# constraint as docker/secrets-caddy/), so this is called unconditionally
+# from _pki_run_issuer after every mutating PKI action (bootstrap included),
+# guaranteeing it exists before postgres's compose service ever starts.
+_ensure_pki_attest_dir() {
+  local _dir="${WORK_DIR}/docker/secrets-pki-attest"
+  if [[ ! -d "$_dir" ]]; then
+    mkdir -p "$_dir" || { log_error "FINDING-V412-RESTART-012: cannot create ${_dir}"; return 1; }
+  fi
+  # 0700 — owner-only, same rationale as _ensure_caddy_secrets_dir: bind-mount
+  # source resolution is performed by the container runtime; in-container
+  # access is postgres-only via the compose mount (ro), no other UID needs
+  # host-side traversal.
+  chmod 0700 "$_dir" 2>/dev/null || true
+  return 0
+}
+
 # _relocate_caddy_scoped_secrets — move the three Caddy-scoped files out of the
 # flat docker/secrets/ dir and leave an inert mountpoint stub in each one's
 # place. Idempotent (stub detected → no-op; absent → stub only). Preserves
@@ -13707,6 +14043,12 @@ PYHASH
   # caddy (e.g. rotate-leaves --only <agent>). `status` never writes — skip.
   if [[ "$_issuer_rc" -eq 0 && "$subcmd" != "status" ]]; then
     _relocate_caddy_scoped_secrets || return 1
+    # FINDING-V412-RESTART-012: ensure the postgres-only attestation dir
+    # exists before ANY compose service (postgres included) can attempt to
+    # mount it — same idempotent-and-unconditional pattern as the caddy sweep
+    # above, run after every mutating action including the initial bootstrap
+    # so a virgin install always has this directory before the first `up`.
+    _ensure_pki_attest_dir || return 1
   fi
   return "$_issuer_rc"
 }
@@ -14401,6 +14743,27 @@ _prepare_secrets_dir_for_pki() {
     fi
   fi
   # Docker / non-Podman path: chown was already applied in generate_secrets().
+
+  # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): pre-create + chown
+  # the two NEW writable dirs backoffice's agent-onboarding write path needs
+  # (docker-compose.yml /run/secrets-rw/agents + /run/secrets-rw/svid-init;
+  # pki.issuer.IssuerPaths.agents_dir / mcp_onboard.py YASHIGANI_SVID_INIT_DIR).
+  # Both are BRAND-NEW, always-empty-at-install-time host dirs — never
+  # contain CA material (ca_root.*/ca_intermediate.* stay under secrets_dir
+  # proper, mounted :ro-only into backoffice). Once the DIRECTORY itself is
+  # 1001-owned+writable, backoffice (runAsUser 1001) creates every nested
+  # per-tenant/per-server file/subdirectory itself at runtime
+  # (Path.mkdir(parents=True) in _write_secret / mcp_onboard.py step 2b) —
+  # those inherit UID 1001 automatically because the CREATING process IS
+  # UID 1001, so no recursive host-side chown is needed here, only the two
+  # empty parents. Idempotent (mkdir -p / chown re-run safe) — runs on both
+  # fresh install and upgrade (this function is the single funnel point for
+  # both — see call sites in install() step 9b and handle_pki_subcommand).
+  mkdir -p "${secrets_dir}/agents" "${secrets_dir}/svid-init"
+  _do_chown "1001:1001" "${secrets_dir}/agents" "backoffice agent-cert write dir" \
+    || log_warn "Could not chown ${secrets_dir}/agents to 1001:1001 — agent onboarding (mint SVID) will fail with EACCES until fixed manually"
+  _do_chown "1001:1001" "${secrets_dir}/svid-init" "backoffice svid-init staging dir" \
+    || log_warn "Could not chown ${secrets_dir}/svid-init to 1001:1001 — agent onboarding (svid-init population) will fail with EACCES until fixed manually"
 }
 
 # ---------------------------------------------------------------------------
@@ -14612,6 +14975,30 @@ bootstrap_internal_pki() {
       # Lu wire-sink-gate P2 (v2.25.2): ensure the audit signing key exists after
       # rotation (idempotent — does not rotate the long-lived signing leaf).
       _provision_audit_signing_key || return 1
+      # FINDING-V412-RESTART-012: propagate rotated leaves to ANY ALREADY-RUNNING
+      # mesh member. On a fresh install this is a no-op (nothing is running yet
+      # — compose_up hasn't happened). On a stack that lives long enough to hit
+      # time-based renewal / URI-SAN-drift and gets install.sh re-run against
+      # it, every mesh member was previously left serving/trusting whatever
+      # material it loaded at its own last (re)start while docker/secrets/
+      # moved on — the exact drift Laura (r6) and Tom (r3) reproduced against
+      # backoffice, and independently full-stack reproduced+fixed live here
+      # (2026-07-20): redis, budget-redis, pgbouncer AND caddy all needed a
+      # restart too, not just postgres — Caddy specifically was found still
+      # rejecting backoffice's rotated leaf ("x509: certificate signed by
+      # unknown authority") until restarted. Fail loud (return 1) rather than
+      # let a silent miss here become a certificate-verify crash loop
+      # discovered only at runtime.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "Leaf rotation: could not confirm the running postgres picked up the rotated trust material."
+        log_error "  Refusing to continue with a possibly-stale postgres server leaf — see remediation above."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "Leaf rotation: could not confirm every mesh service picked up the rotated material."
+        log_error "  Refusing to continue with possibly-stale trust state — see remediation above."
+        return 1
+      fi
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
@@ -14805,6 +15192,101 @@ _postgres_byo_ca_trust_sync() {
       return 1
     fi
   fi
+
+  return 0
+}
+
+# =============================================================================
+# _pki_restart_mesh_services — propagate a rotation to any ALREADY-RUNNING
+# services that read their PKI material once at process start
+# =============================================================================
+# FINDING-V412-RESTART-012 (full live reproduction, 2026-07-20): forcing a
+# rotation and then walking the mesh one service at a time (redis,
+# budget-redis, pgbouncer, caddy, gateway, backoffice) proved EVERY one of
+# them keeps serving/trusting whatever material it read at its OWN last
+# process start — none of them re-read cert/key/CA files from the
+# bind-mounted secrets dir on their own. A plain restart (not a full
+# recreate) IS sufficient for all of them — each was confirmed to pick up
+# the rotated files correctly after `podman restart` — but the restart must
+# actually happen. The pre-fix behaviour only ever PRINTED a restart hint
+# (and that hint omitted caddy entirely, and separately told the operator to
+# "restart postgres", which is FALSE — see _postgres_byo_ca_trust_sync,
+# postgres needs the exec-based init-script re-run, not a bare restart,
+# because a restart does not re-execute docker-entrypoint-initdb.d/* against
+# an already-initialized PGDATA).
+#
+# Safe to restart: redis/budget-redis persist via AOF to a named volume (see
+# the B1 AOF-enablement note at the top of docker-compose.yml); pgbouncer,
+# caddy, gateway and backoffice are stateless proxies/app servers.
+#
+# Same honesty contract as _postgres_byo_ca_trust_sync: "not running" is only
+# ever concluded from a runtime query that itself succeeded. A runtime that
+# fails to answer is NOT the same as "service is down" — fail loud instead of
+# silently leaving stale trust material in place.
+#
+# Args: one or more compose service names to restart if currently running.
+# =============================================================================
+_pki_restart_mesh_services() {
+  local _services=("$@")
+  log_info "Leaf/intermediate rotation: propagating to running mesh services: ${_services[*]}"
+
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  local _exec_tools=()
+  command -v docker >/dev/null 2>&1 && _exec_tools+=("docker")
+  command -v podman >/dev/null 2>&1 && _exec_tools+=("podman")
+
+  if [[ ${#_exec_tools[@]} -eq 0 ]]; then
+    log_warn "Rotation propagation: no container runtime found (docker/podman) — skipping restarts"
+    log_warn "  Manual remediation: docker compose restart ${_services[*]}"
+    return 0
+  fi
+
+  local _runtime_reachable=false
+  local _svc
+  for _svc in "${_services[@]}"; do
+    local _restarted=false
+    local _tool
+    for _tool in "${_exec_tools[@]}"; do
+      local _cname
+      _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "${_svc}" 2>/dev/null)" || true
+      if [[ -n "$_cname" ]]; then
+        _runtime_reachable=true
+        log_info "  Found running ${_svc} container: ${_cname} (via ${_tool}) — restarting to pick up rotated material"
+        # FINDING-V412-RESTART-012 live-verify: podman's `restart` subcommand
+        # can refuse with "dependencies ... container state improper" when a
+        # one-shot init container (e.g. ollama-init) it depends on has
+        # already exited 0 (its correct terminal state) — a podman-compose
+        # dependency-tracking quirk, unrelated to PKI. Fall back to
+        # stop+start (proven live to work identically) rather than fail the
+        # whole rotation over an orchestration quirk.
+        if "${_tool}" restart "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} restarted (${_cname}) — rotated material now in effect"
+          _restarted=true
+        elif "${_tool}" stop "${_cname}" >/dev/null 2>&1 && "${_tool}" start "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} stopped+started (${_cname}) — rotated material now in effect (restart fallback)"
+          _restarted=true
+        else
+          log_error "Rotation propagation: both '${_tool} restart' and stop+start failed for ${_svc} (${_cname})"
+          return 1
+        fi
+        break
+      fi
+      if "${_tool}" ps -a --filter "label=com.docker.compose.project=${_proj}" --format '{{.Names}}' >/dev/null 2>&1; then
+        _runtime_reachable=true
+      fi
+    done
+    if [[ "$_restarted" == "false" ]]; then
+      if [[ "$_runtime_reachable" == "true" ]]; then
+        log_info "  ${_svc} container not running — rotated material will be used at next start (no action needed now)"
+      else
+        log_error "Rotation propagation: could not determine ${_svc} container state"
+        log_error "  Every available runtime (${_exec_tools[*]}) failed to respond to 'ps' for project '${_proj}'."
+        log_error "  This is NOT the same as '${_svc} is not running' — do not assume the rotated material is safe."
+        log_error "  Manual remediation: verify the runtime is reachable, then restart ${_svc} manually."
+        return 1
+      fi
+    fi
+  done
 
   return 0
 }
@@ -15172,7 +15654,7 @@ _ysg_onboard_stepup_gate() {
   read -rs _password </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read password from tty"; return 1; }
   printf "\n" >/dev/tty
 
-  printf "  TOTP code for login (6 digits): " >/dev/tty
+  printf "  TOTP code for login (6 or 8 digits per your tier): " >/dev/tty
   read -rs _totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read TOTP from tty"; return 1; }
   printf "\n" >/dev/tty
 
@@ -15182,7 +15664,7 @@ _ysg_onboard_stepup_gate() {
   # their authenticator (a fresh 30-second window).
   log_info "  Wait for the NEXT code in your authenticator (new 30-second window),"
   log_info "  then enter it below for the step-up verification."
-  printf "  TOTP code for step-up (6 digits, NEXT window): " >/dev/tty
+  printf "  TOTP code for step-up (6 or 8 digits per your tier, NEXT window): " >/dev/tty
   read -rs _stepup_totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read step-up TOTP from tty"; _username=""; _password=""; _totp=""; _stepup_totp=""; return 1; }
   printf "\n" >/dev/tty
 
@@ -15192,13 +15674,23 @@ _ysg_onboard_stepup_gate() {
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: login TOTP must be exactly 6 digits."
+  # FINDING-V412-STEPUP-TOTP-8DIGIT-REJECTED: admin-tier accounts are minted
+  # HMAC-SHA-512/8-digit (install.sh _gen_totp_uri, ~line 10500); user-tier
+  # accounts are HMAC-SHA-256/6-digit. This shell-side gate cannot know which
+  # tier the operator belongs to (it never sees the account record), so it
+  # must accept BOTH tiered lengths here. The server is the actual authority:
+  # /auth/login and /auth/stepup (src/yashigani/backoffice/routes/auth.py)
+  # already validate the exact digit count against the account's enrolled
+  # algorithm/digits after resolving the account tier — this regex is only a
+  # cheap pre-flight to avoid a wasted network round-trip on an obviously
+  # malformed code.
+  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: login TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: step-up TOTP must be exactly 6 digits."
+  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: step-up TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
@@ -16478,6 +16970,17 @@ handle_offboard_subcommand() {
 
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
+  # FINDING-V412-RESTART-012: this maintenance entrypoint runs standalone (no
+  # full install(), no prior resolve_compose_cmd()/COMPOSE_PROJECT_NAME
+  # resolution). The rotate-leaves/rotate-intermediate branches below need
+  # both to actually propagate a rotation into a RUNNING stack instead of
+  # just printing a hint. Resolve them here, defensively, if not already set.
+  if [[ -z "${COMPOSE_PROJECT_NAME:-}" && -f "${WORK_DIR}/docker/.env" ]]; then
+    COMPOSE_PROJECT_NAME="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2-)"
+    [[ -n "$COMPOSE_PROJECT_NAME" ]] && export COMPOSE_PROJECT_NAME
+  fi
+  resolve_compose_cmd 2>/dev/null || true
+
   case "$PKI_ACTION" in
     bootstrap)
       _prepare_secrets_dir_for_pki
@@ -16503,15 +17006,42 @@ handle_pki_subcommand() {
       # offboard-triggered path (install.sh --pki-action rotate-leaves) therefore
       # left keys unreadable by their owning containers.
       _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-leaves — keys may be unreadable by containers"; return 1; }
-      log_success "Leaf certs rotated — restart services to pick up new certs"
-      log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
+      # FINDING-V412-RESTART-012 (full live reproduction + fix, 2026-07-20):
+      # this used to be a printed hint only ("restart these services
+      # yourself") — and the hint itself was wrong (told the operator to
+      # "restart postgres", which does not resync PGDATA; a bare restart
+      # does not re-run docker-entrypoint-initdb.d/* against an
+      # already-initialized data dir) and incomplete (omitted caddy, which
+      # live-testing proved ALSO needs a restart — it independently caches
+      # its upstream mTLS trust and was found rejecting backoffice's rotated
+      # leaf with "x509: certificate signed by unknown authority" until
+      # restarted). Now automated + fail-loud instead of a hope-the-operator-
+      # reads-the-log hint.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-leaves: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-leaves: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Leaf certs rotated and propagated to every running mesh service"
       ;;
     rotate-intermediate)
       log_step "-" "Rotating intermediate + leaf certs"
       _pki_run_issuer rotate-intermediate \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Intermediate + leaves rotated — restart the stack"
+      _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-intermediate — keys may be unreadable by containers"; return 1; }
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-intermediate: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-intermediate: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Intermediate + leaves rotated and propagated to every running mesh service"
       ;;
     rotate-root)
       log_warn "Root CA rotation is DESTRUCTIVE — every service's trust bundle"
@@ -16527,7 +17057,72 @@ handle_pki_subcommand() {
         --root-lifetime-years "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Full PKI rotated — restart all services"
+      local _rr_rc=$?
+      if [[ $_rr_rc -ne 0 ]]; then
+        log_error "rotate-root: issuer failed (exit ${_rr_rc}) — attestation NOT written, prior root remains pinned everywhere"
+        return 1
+      fi
+      # FINDING-LAURA-V412-PKI-PIN: root CAs are self-signed — there is no
+      # prior root to openssl-verify a NEW root against. The trust anchor for
+      # "is this an operator-sanctioned root swap, not a rogue in-mesh
+      # container write" is THIS ceremony itself: host shell access + the
+      # typed-YES confirmation above. Stamp the sha256 of the freshly-rotated
+      # root as an explicit, host-written attestation. 05-enable-ssl.sh (and
+      # any future trust-sync) requires this to match before accepting a root
+      # change — see docker/postgres/05-enable-ssl.sh. A compromised mesh
+      # service can overwrite ca_root.crt (pre-existing LIC-012 write
+      # primitive, now :ro everywhere except the issuer — see
+      # docker-compose.yml) but can never produce a matching attestation: it
+      # has no host shell (Laura Q3/Q4, LAURA-V412-RESTART-012-TM).
+      #
+      # FINDING-V412-RESTART-012 (2026-07-21): the attestation file is now
+      # written to a DEDICATED, postgres-ONLY directory
+      # (docker/secrets-pki-attest/), not the shared docker/secrets/ tree —
+      # Laura proved backoffice's nominal :ro mount of that shared tree was
+      # not enforced on podman-compose (laura-012-rogue-reattack.md Attack 3:
+      # forged attestation via the same write primitive that overwrites
+      # ca_root.crt). This directory has no other mesh consumer at all, so
+      # even a future regression of SOME OTHER service's RO mount cannot
+      # reach this file. ca_root.crt itself legitimately stays in the shared
+      # tree (every service needs to read it); only the attestation POINTER
+      # is isolated.
+      local _new_root="${WORK_DIR}/docker/secrets/ca_root.crt"
+      if [[ ! -f "$_new_root" ]]; then
+        log_error "rotate-root: issuer reported success but ${_new_root} not found — refusing to write attestation"
+        return 1
+      fi
+      _ensure_pki_attest_dir || { log_error "rotate-root: could not prepare docker/secrets-pki-attest/ — refusing to write attestation"; return 1; }
+      local _new_root_sha
+      _new_root_sha="$(sha256sum "$_new_root" | cut -d' ' -f1)"
+      local _attest_tmp
+      _attest_tmp="$(mktemp "${WORK_DIR}/docker/secrets-pki-attest/.ca_root_attest.XXXXXX")"
+      printf '%s\n' "$_new_root_sha" > "$_attest_tmp"
+      chmod 0644 "$_attest_tmp"
+      mv -f "$_attest_tmp" "${WORK_DIR}/docker/secrets-pki-attest/ca_root.attested_sha256"
+      # Best-effort cleanup of any STALE pre-fix attestation file left over
+      # from an upgrade of an install that already ran rotate-root before
+      # this fix shipped — it is dead weight (05-enable-ssl.sh no longer
+      # reads /run/secrets/ca_root.attested_sha256 at all) but leaving stale
+      # attestation material sitting in the flat, widely-mounted secrets dir
+      # is worth tidying up rather than ignoring.
+      if [[ -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" ]]; then
+        rm -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" 2>/dev/null \
+          && log_info "rotate-root: removed stale pre-fix attestation file from docker/secrets/ (relocated to docker/secrets-pki-attest/)"
+      fi
+      log_success "rotate-root: wrote operator-attested root pin (sha256=${_new_root_sha:0:12}...)"
+      # Propagate + verify, same as rotate-leaves/rotate-intermediate — root
+      # rotation used to be the ONE PKI action that never confirmed postgres
+      # (or the rest of the mesh) actually picked up the new material; it
+      # only printed a hint. Now fail-loud like its siblings.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-root: could not confirm the running postgres picked up the rotated root (chain-of-continuity check may have rejected it — see postgres logs)."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-root: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Full PKI rotated, attested, and propagated to every running mesh service"
       ;;
     status)
       _pki_run_issuer status

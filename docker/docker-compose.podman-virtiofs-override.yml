@@ -137,8 +137,25 @@ services:
       # whether a docker.sock happens to exist on the host.
 
   backoffice:
+    # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21): this entry was
+    # ":rw,U" — the ONLY service in this whole file whose /run/secrets is
+    # anything but ro,U. Laura proved (laura-012-rogue-reattack.md) that a
+    # compromised backoffice could use this to overwrite ca_root.crt and
+    # forge the root-attestation pin, enabling full rogue-CA injection. This
+    # override REPLACES (not merges) the base file's /run/secrets entry by
+    # matching in-container target (podman-compose dedup-by-target — see
+    # header comment), so ":rw,U" here was silently overriding the base
+    # file's already-correct ":ro" — this is the ACTUAL live root cause on
+    # macOS Podman (confirmed via `podman inspect` showing RW=true even
+    # after the base docker-compose.yml's nested-mount fix). Fixed to
+    # ro,U, matching every other service in this file. The 4 legitimately
+    # writable secrets now live at /run/secrets-rw/<name> (base
+    # docker-compose.yml) — plain file bind-mounts of already
+    # correctly-owned host files, which (unlike the directory-level mount)
+    # do not need :U on this virtiofs setup (verified live: unqualified
+    # inherited entries work — see docker/docker-compose.yml).
     volumes:
-      - ./secrets:/run/secrets:rw,U
+      - ./secrets:/run/secrets:ro,U
       # YSG-RISK-053: see gateway note above.
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro,U
 
@@ -174,6 +191,10 @@ services:
   postgres:
     volumes:
       - ./secrets:/run/secrets:ro,U
+      # FINDING-V412-RESTART-012: postgres-only root-attestation dir — same
+      # :U rationale as /run/secrets above (directory-level bind mount needs
+      # it on macOS virtiofs; no other service mounts this path at all).
+      - ./secrets-pki-attest:/run/secrets-pki-attest:ro,U
 
   pgbouncer:
     volumes:

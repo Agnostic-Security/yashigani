@@ -42,4 +42,17 @@ RUN apk add --no-cache \
 COPY docker/caddy/caddy-entrypoint.sh /usr/local/bin/caddy-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/caddy-entrypoint.sh
 
+# The caddy_broker_agents named volume is mounted here (RO) by THIS caddy
+# container and RW by the caddy-config-broker. Caddy starts FIRST (no
+# depends_on — see docker-compose.yml), so it is the container that INITIALISES
+# the fresh volume, and a fresh named volume inherits ownership from the
+# first-mounting image's directory. This dir MUST therefore be owned by the
+# broker's UID (65532) here — otherwise the volume inits root-owned and the
+# nonroot broker cannot write route files → every /route 500s
+# (FINDING-V412-CADDYADMIN-002-d, Laura). 0755 so caddy (root, cap_drop:[ALL],
+# no CAP_DAC_OVERRIDE) can still traverse it to import the broker's 0644 files.
+RUN mkdir -p /etc/caddy/agents-dynamic \
+    && chown 65532:65532 /etc/caddy/agents-dynamic \
+    && chmod 0755 /etc/caddy/agents-dynamic
+
 ENTRYPOINT ["/usr/local/bin/caddy-entrypoint.sh"]

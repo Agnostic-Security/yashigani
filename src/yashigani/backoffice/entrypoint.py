@@ -53,6 +53,12 @@ def _bootstrap():
     # ── First-run credential generation ────────────────────────────────────
     admin_username = os.getenv("YASHIGANI_ADMIN_USERNAME", "admin@yashigani.local")
     secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    # FINDING-V412-RESTART-012: writes for the 4 dev-mode-fallback credentials
+    # go to a SEPARATE writable mount (default /run/secrets-rw) — /run/secrets
+    # is now a pure :ro mount on backoffice (see docker-compose.yml + auth/
+    # bootstrap.py write_docker_secrets() docstring). Reads are unaffected —
+    # both mountpoints bind the same underlying host file.
+    secrets_write_dir = os.getenv("YASHIGANI_SECRETS_RW_DIR", "/run/secrets-rw")
 
     creds = load_or_generate(admin_username=admin_username, secrets_dir=secrets_dir)
     if creds is not None:
@@ -65,7 +71,7 @@ def _bootstrap():
         if os.path.exists(grafana_pwd_file):
             creds.grafana_admin_password = open(grafana_pwd_file).read().strip()
         print_credentials(creds)
-        write_docker_secrets(creds, secrets_dir=secrets_dir)
+        write_docker_secrets(creds, secrets_dir=secrets_dir, write_dir=secrets_write_dir)
         mark_bootstrapped()
         initial_admin_password = creds.admin_password
         _redis_password = creds.redis_password

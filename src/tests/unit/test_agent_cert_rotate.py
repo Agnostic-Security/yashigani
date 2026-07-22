@@ -95,9 +95,19 @@ def paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> IssuerPaths:
     manifest = tmp_path / "service_identities.yaml"
     manifest.write_text(_MANIFEST)
     secrets = tmp_path / "secrets"
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): rotate_agent_cert()
+    # now builds its IssuerPaths via _rotate_pki_paths(), which reads
+    # YASHIGANI_AGENTS_DIR for agent cert/key/runtime-manifest writes
+    # (defaults to /run/secrets-rw/agents in production — a real container
+    # path that doesn't exist under pytest). Point it at a tmp_path dir so
+    # the endpoint under test resolves the SAME agents_dir this fixture
+    # mints into, mirroring the existing YASHIGANI_SECRETS_DIR/
+    # YASHIGANI_SERVICE_MANIFEST_PATH env wiring above.
+    agents = tmp_path / "agents"
     monkeypatch.setenv("YASHIGANI_SECRETS_DIR", str(secrets))
     monkeypatch.setenv("YASHIGANI_SERVICE_MANIFEST_PATH", str(manifest))
-    p = IssuerPaths(secrets_dir=secrets, manifest_path=manifest)
+    monkeypatch.setenv("YASHIGANI_AGENTS_DIR", str(agents))
+    p = IssuerPaths(secrets_dir=secrets, manifest_path=manifest, agents_dir=agents)
     bootstrap(p)
     return p
 

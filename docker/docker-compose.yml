@@ -293,6 +293,13 @@ services:
       # Read-only: snippets are written by install.sh/ringfence-init only.
       # Empty at base install (no agents onboarded); Caddy continues normally.
       - ./caddy/agents:/etc/caddy/agents:ro
+      # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): broker-owned
+      # DYNAMIC MCP-route directory (`import /etc/caddy/agents-dynamic/*.caddy`
+      # sentinel, docker/Caddyfile.<mode>). RW ONLY inside caddy-config-broker
+      # (see that service's volumes below); RO here; NEVER mounted into
+      # backoffice at all — see docker/caddy/config_broker.py module
+      # docstring for the full R1+R2 rework rationale.
+      - caddy_broker_agents:/etc/caddy/agents-dynamic:ro
       # Internal mesh CA — Caddy calls backoffice /auth/verify via forward_auth
       # (mTLS client). The runtime manifest (with per-install
       # bootstrap_token_sha256 values) is mounted read-only.
@@ -314,15 +321,35 @@ services:
       - ./secrets-caddy/caddy_client.key:/run/secrets/caddy_client.key:ro
       - ./secrets-caddy/caddy_internal_hmac:/run/secrets/caddy_internal_hmac:ro
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
-      # v4.1 Phase 1d (SEAM Phase-3 wiring): Caddy admin unix socket shared
-      # with backoffice for caddy /load (MCP approve). Socket mode 0666 per
-      # Caddyfile admin |0666 — contained to caddy + backoffice mounts only.
-      - caddy_admin_sock:/run/caddy
+      # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: the OLD
+      # caddy_admin_sock (backoffice-shared reload relay, "MCP-onboarding
+      # reload relay" site block) and caddy_broker_sock (caddy-dials-broker)
+      # are REMOVED entirely. Backoffice no longer shares ANY socket with
+      # Caddy at all — it registers MCP routes with caddy-config-broker
+      # directly (caddy_broker_route_sock, see that service). Caddy's ONLY
+      # remaining role in this subsystem is presenting the real admin socket
+      # for the broker to dial OUT to as a client (below) and importing the
+      # broker-rendered agents-dynamic directory (above).
+      # The REAL admin API socket. Was a caddy-private tmpfs in the R1-only
+      # fix; promoted to a named volume SHARED WITH caddy-config-broker ONLY
+      # (never backoffice) because the broker must dial out to it as a
+      # client once it approves a submission — see config_broker.py
+      # _forward_to_real_admin(). Isolation is the mount-boundary (only
+      # caddy + caddy-config-broker mount this path — caddy_broker_net).
+      # The admin directive itself is |0666 (not tighter): the broker
+      # connects as a different, non-root UID (65532) with no shared GID to
+      # target — verified live that |0600 (root-only) makes the broker's
+      # forward fail with PermissionError. Matches the ORIGINAL
+      # caddy_admin_sock design this fix is modelled on.
+      - caddy_admin_real_sock:/run/caddy-admin
     healthcheck:
       # MUST-4 / v2.24.1: admin TCP :2019 removed; unix socket is the only
-      # admin path. curl --unix-socket targets the socket from inside the
-      # container — no TCP listener exposed to any network.
-      test: ["CMD", "curl", "-fsS", "--unix-socket", "/run/caddy/admin.sock", "http://localhost/config/"]
+      # admin path. Probes the REAL (caddy-private) admin socket directly.
+      # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the old backoffice-
+      # shared /run/caddy relay is gone entirely (see caddy_broker_route_sock
+      # on caddy-config-broker) — this healthcheck was always the real
+      # socket, unaffected by the rework.
+      test: ["CMD", "curl", "-fsS", "--unix-socket", "/run/caddy-admin/admin.sock", "http://localhost/config/"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -331,8 +358,12 @@ services:
       # YSG-RISK-008 (v2.23.4): caddy_data + caddy_config are named volumes
       # (writable). /tmp needed for ACME challenge staging + TLS cert staging.
       - /tmp:size=64m,mode=1777
-      # NOTE: /run/caddy was here as a tmpfs (MUST-4 / v2.24.1). Promoted to
-      # named volume caddy_admin_sock (v4.1 Phase 1d) — see volumes above.
+      # NOTE: /run/caddy was here as a tmpfs (MUST-4 / v2.24.1), then a
+      # caddy-private tmpfs at /run/caddy-admin (FINDING-V412-CADDYADMIN-001
+      # R1-only fix). Both /run/caddy and /run/caddy-admin are now named
+      # volumes (see volumes: above) — /run/caddy-admin had to become a
+      # shared volume (not tmpfs) once caddy-config-broker needed to reach it
+      # too (R1+R2 fix, same commit series).
     # C6 (P1 W3 Phase 2a): seccomp profile + no-new-privileges hardening.
     # Parity with gateway/backoffice — both use the same yashigani.json profile.
     # yashigani.json extends Docker's default seccomp allowlist by explicitly
@@ -351,6 +382,28 @@ services:
     cap_add:
       - NET_BIND_SERVICE
       - NET_ADMIN
+    # FINDING-V412-CADDYADMIN-002-e / onboarding-robustness batch #3 (Su,
+    # 2026-07-21): GID 2003 (_MCP_SVID_MOUNT_ROOT's group, manifest/
+    # codegen.py _MCP_SVID_GID) lets Caddy read the per-instance MCP SVID
+    # leaf a svid-sidecar writes at 0440 (see manifest/codegen.py
+    # _gen_svid_sidecar_service). This USED TO be re-declared identically in
+    # EVERY Shape-C MCP agent's docker-compose.override.yml — a fixed
+    # constant, not agent-specific — so onboarding 2+ Shape-C MCPs together
+    # (`docker compose -f base -f agent1-override -f agent2-override ...`)
+    # fed Docker Compose the SAME group_add value twice for this SAME
+    # service, which Compose v2 hard-rejects: "services.caddy.group_add
+    # items at 0 and 1 are equal" — refuses to start ANYTHING (confirmed
+    # live, Docker Compose v5.1.3; podman-compose silently tolerates the
+    # duplicate, so this was a Docker-only outage). Fix: GID 2003 is now a
+    # STATIC, always-present group_add here instead of being re-emitted per
+    # agent. Harmless no-op before any Shape-C MCP is onboarded (the GID
+    # reads nothing until an SVID volume exists). Per-agent overrides keep
+    # adding their OWN unique `networks:`/`volumes:` entries to this same
+    # `caddy:` stanza — those are safe to concatenate across files because
+    # each agent's value (ringfence bridge name / SVID volume name) is
+    # distinct, unlike this fixed GID.
+    group_add:
+      - "2003"
     # v2.23.1: Caddy is the FIRST container to start — no depends_on.
     # It tolerates 502s on upstreams until gateway/backoffice come up;
     # external traffic still reaches it immediately for health checks.
@@ -384,6 +437,120 @@ services:
       # (The generated openclaw-egress-forwarder.override.yml also adds this
       # membership — compose merge dedupes.)
       - ringfence_openclaw_in
+      # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: caddy is no
+      # longer a member of caddy_broker_net — it never talks to the broker
+      # over network in either direction post-rework (only the shared
+      # caddy_admin_real_sock unix-socket volume, where the BROKER dials OUT
+      # as a client). caddy_broker_net now pairs {backoffice,
+      # caddy-config-broker} instead — see that network's top-level comment.
+
+  # ---------------------------------------------------------------------------
+  # Caddy config-REGISTERING broker — FINDING-V412-CADDYADMIN-002
+  # ---------------------------------------------------------------------------
+  # REWORK of the R1+R2 validating broker (5443f11f) after Laura's final
+  # re-attack proved it FAILED on the real stack — BLOCKER-A (broker's own
+  # `caddy adapt` EPERM'd under no-new-privileges — the binary carried a
+  # `cap_net_bind_service` FILE CAPABILITY; fixed by stripping it at build
+  # time, Dockerfile.caddy-broker) and BLOCKER-B (R2 still open — backoffice
+  # could drop a rogue docker/caddy/agents/*.caddy file, bypassing the broker
+  # entirely via Caddy's own container-start/restart import). See
+  # docker/caddy/config_broker.py module docstring for the full writeup.
+  #
+  # NEW CONTRACT: backoffice sends narrow, typed DATA (tenant_id, server_id,
+  # mesh_port, shim_port) to POST/DELETE /route — it can no longer author ANY
+  # Caddy content or POST a raw /load body at all (that endpoint is GONE).
+  # This broker independently re-validates every field, renders the MCP-front
+  # wrap from its OWN fixed template (never backoffice-supplied text), writes
+  # it into its OWN dynamic-agents volume (never bind-mounted into
+  # backoffice), and triggers the real reload itself.
+  #
+  # Blast radius if this process is somehow compromised: it can write ONLY
+  # into its own dynamic-agents volume (its own fixed template) and dial the
+  # real admin socket with what it itself rendered — no secrets, no PKI
+  # material, no other mount. Only backoffice can reach it at all
+  # (caddy_broker_route_sock — caddy is NOT a peer). Design precedent:
+  # extractor-svc (LAURA-30-001 / YSG-RISK-080) — a pre-spawned, hardened,
+  # single-purpose HTTP service that replaces a raw privileged API with a
+  # narrow, validated contract.
+  caddy-config-broker:
+    build:
+      context: ..
+      dockerfile: docker/caddy/Dockerfile.caddy-broker
+      args:
+        GIT_SHA: ${YASHIGANI_GIT_SHA:-dev}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    image: yashigani/caddy-config-broker:${YASHIGANI_VERSION:-4.1.0}
+    restart: unless-stopped
+    mem_limit: ${YASHIGANI_CADDY_BROKER_MEM_LIMIT:-128m}
+    cpus: ${YASHIGANI_CADDY_BROKER_CPU_LIMIT:-0.25}
+    volumes:
+      # RO — the active monolith Caddyfile (SAME source Caddy itself reads).
+      # FINDING-V412-CADDYADMIN-002-b (Captain, 2026-07-21): this broker
+      # NEVER adapts this file itself anymore (see config_broker.py
+      # "ENV-VAR-FREE SELF-CHECKS" — the real monolith references ~12
+      # `{$VAR}` placeholders only real Caddy's own environment carries;
+      # adapting it here without those vars hard-fails `caddy adapt`,
+      # which broke /healthz + every reload on the real install). It is
+      # read as RAW BYTES and forwarded verbatim to the real admin socket
+      # — real Caddy (which HAS the real environment) does the actual
+      # adapt server-side, exactly as it already does at container start.
+      - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
+      # FINDING-V412-CADDYADMIN-002-b: the Caddyfile.{csp,ollama-front,
+      # openclaw-egress,openclaw-webhooks} snippet-family mounts and the
+      # static docker/caddy/agents/ mount are REMOVED — this broker no
+      # longer resolves any `import` itself (it forwards the monolith
+      # unadapted; self-checks run against self-contained candidates only
+      # — see config_broker.py). Smaller mount surface, smaller blast
+      # radius, not a workaround.
+      # RW — broker-owned DYNAMIC MCP-route directory. The ONLY thing this
+      # process ever writes to disk. RO in caddy (see caddy service); NEVER
+      # mounted into backoffice at all (closes R2 by construction).
+      - caddy_broker_agents:/etc/caddy/agents-dynamic:rw
+      # The REAL admin API socket — dialed OUT as a client once a reload is
+      # approved. Shared ONLY with caddy (caddy binds it; this process
+      # never does).
+      - caddy_admin_real_sock:/run/caddy-admin
+      # NEW — the ONLY socket backoffice can reach. This process binds it;
+      # backoffice connects as a client. Never shared with caddy.
+      - caddy_broker_route_sock:/run/caddy-broker-route
+    healthcheck:
+      # Dockerfile HEALTHCHECK already probes GET /healthz over the unix
+      # socket (confirms the render+adapt+self-check pipeline still works
+      # against a FIXED internal probe candidate under no-new-privileges —
+      # continuous proof the capability-strip fix holds, not just at image-
+      # build time; see config_broker.py "ENV-VAR-FREE SELF-CHECKS" for why
+      # this no longer touches the real monolith's env-var placeholders);
+      # redeclared here only for consistent `docker/podman ps` visibility
+      # with every other service in this file.
+      test: ["CMD", "python3", "-c", "import socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.settimeout(4)\ns.connect('/run/caddy-broker-route/route.sock')\ns.sendall(b'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n')\nd=s.recv(64)\nsys.exit(0 if d.startswith(b'HTTP/1.0 200') else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      # Broker's own listening-socket directory is writable via the named
+      # volume caddy_broker_route_sock mounted at /run/caddy-broker-route
+      # above; nothing else needed here.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=${YASHIGANI_SECCOMP_PROFILE:-./seccomp/yashigani.json}
+    cap_drop: [ALL]
+    # No cap_add — this process binds a unix socket in an already-writable
+    # mounted directory and makes outbound unix-socket connections; it needs
+    # no Linux capability at all. `caddy adapt` (self-checks only, never
+    # binds a port) needs none either post capability-strip — see
+    # Dockerfile.caddy-broker.
+    networks:
+      - caddy_broker_net
+    # No `expose`/`ports` — reachable ONLY via the caddy_broker_route_sock
+    # shared unix-socket volume. caddy_broker_net carries no actual traffic
+    # (belt-and-braces, see the caddy service's networks comment above) and
+    # has no other members — the internet cannot reach this service by any
+    # path, and only backoffice (never caddy, post-rework) can reach it at
+    # all.
 
   # ---------------------------------------------------------------------------
   # Gateway — MCP reverse proxy (data plane)
@@ -501,15 +668,47 @@ services:
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       # Opt-in flag; production deployments default false.  Set true in .env for demo.
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # v4.1.2 fix (RESTART-013 MCP leg, Gap A) — documents/proxy_modeb.py's
+      # is_modeb_proxy_active() is a DELIBERATE double opt-in gate: "Both the
+      # document-enforcement flag AND the dedicated mode-B-proxy flag must be
+      # on ... before any pipeline work runs" on the hot gateway egress path
+      # (see proxy_modeb.py module docstring, discipline #2). This second
+      # flag was defined in documents/config.py (ENV_MODEB_PROXY) and read via
+      # plain os.environ, but was NEVER added to this environment: block — no
+      # env_file, no key, nothing. An operator setting it in docker/.env had
+      # zero path into the gateway container (confirmed live via `podman exec
+      # gateway env | grep DOCUMENT`: only ENFORCEMENT_ENABLED reached the
+      # process). document_pipeline therefore stayed None even with
+      # YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true, making the whole
+      # RESTART-013 MCP-document-bridge wiring in proxy.py / mcp_router_runtime.py
+      # dead code via the standard compose install path. Default is false —
+      # this does NOT weaken or auto-link the double opt-in: an operator who
+      # wants the MCP tool-call document path enforced must still explicitly
+      # set BOTH flags true in docker/.env (documented in the ENFORCEMENT_ENABLED
+      # comment above; demo installs set both, per Ava's 2026-07-20 byte-proof).
+      YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED: ${YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
       # Default ON: every MCP tool import is screened by the LLM semantic-intent
       # classifier before approval (tool-poisoning / day-one-poison close).
       # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
       # Backend: same OLLAMA_BASE_URL (http://ollama:11434) as the PII classifier.
       YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
-      # Extractor sandbox: gateway does NOT spawn containers — only backoffice does.
-      # These knobs are kept here only for completeness (MAX_OUTPUT_BYTES is read by
-      # the proxy_modeb pipeline in the gateway). The sandbox runtime vars live in backoffice.
+      # Extractor sandbox — Design A (RESTART-013 gap #2 fix, 2026-07-20).
+      # Gateway does NOT spawn containers (no docker socket / container API —
+      # unchanged), but it DOES now reach the pre-spawned extractor-svc over
+      # plain HTTP, exactly like backoffice does (see backoffice's own
+      # "Extractor sandbox — Design A" block below for the full rationale).
+      # Before this fix, YASHIGANI_EXTRACTOR_WORKER_URL was absent here, so
+      # create_extractor_backend() had nothing to select and every
+      # REDACT/PSEUDONYMIZE re-render from the gateway process (proxy egress
+      # step 4d + the MCP tool-call document path) fail-closed to BLOCK,
+      # unconditionally, regardless of policy (proven live —
+      # FINDING-V412-RESTART-013 gap #3/#2). A compromised gateway can still
+      # only POST document bytes to extractor-svc:8090 — no host-escape
+      # primitive is introduced (same Design A blast radius as backoffice).
+      YASHIGANI_EXTRACTOR_WORKER_URL: "http://extractor-svc:8090"
+      YASHIGANI_EXTRACTOR_RUNTIME: "http"
+      YASHIGANI_EXTRACTOR_TIMEOUT_S: "20"
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
       # P3 MCP broker — JSON array of registered MCP server descriptors.
       # Written by install.sh --onboard (Shape C) and cleared by install.sh --offboard.
@@ -637,6 +836,14 @@ services:
         condition: service_healthy
       pgbouncer:
         condition: service_started
+      # RESTART-013 gap #2 fix — mirrors backoffice's existing hard dependency.
+      # extractor-svc has no profile gate (it always starts as part of the
+      # default topology, dark unless YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED is
+      # flipped); waiting for service_healthy avoids a startup race where the
+      # gateway's document_pipeline (when the mode-B-proxy flag is on) probes
+      # extractor-svc before it is ready.
+      extractor-svc:
+        condition: service_healthy
     healthcheck:
       # mTLS port now used — healthcheck uses the client cert inside the
       # container. Pattern A for Python ssl: trust anchor is the public ca_root.crt
@@ -666,6 +873,17 @@ services:
       # demo-mcp upstream dispatch path (demo opt-in). Harmless when the
       # demo-mcp profile is not active: the bridge exists, the service does not.
       - demo_mcp_isolated
+      # RESTART-013 gap #2 fix (2026-07-20): gateway → extractor-svc:8090 for
+      # document REDACT/PSEUDONYMIZE re-render (Design A — mirrors backoffice's
+      # existing extractor_svc membership below). Before this fix, gateway had
+      # NO route to extractor-svc at all, so its own document_pipeline
+      # (proxy egress step 4d + the MCP tool-call document path) fail-closed
+      # to BLOCK unconditionally, live-proven in
+      # FINDING-V412-RESTART-013 gap #3. internal:true (extractor_svc has no
+      # internet egress) — same isolation posture as backoffice's membership;
+      # a compromised gateway process can still only POST document bytes to
+      # extractor-svc:8090, nothing more.
+      - extractor_svc
 
   # ---------------------------------------------------------------------------
   # Backoffice — Admin control plane (generates first-run credentials)
@@ -709,6 +927,13 @@ services:
       YASHIGANI_ADMIN_MIN_ACTIVE: "2"
       YASHIGANI_ADMIN_SOFT_TARGET: "3"
       YASHIGANI_SECRETS_DIR: /run/secrets
+      # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21) — see the
+      # /run/secrets-rw/agents + /run/secrets-rw/svid-init volume mounts
+      # below for the full rationale. Explicit here (Python default already
+      # matches) so the mapping is visible without cross-referencing
+      # pki/issuer.py / mcp_onboard.py.
+      YASHIGANI_AGENTS_DIR: /run/secrets-rw/agents
+      YASHIGANI_SVID_INIT_DIR: /run/secrets-rw/svid-init
       YASHIGANI_INSPECTION_DEFAULT_BACKEND: ${YASHIGANI_INSPECTION_DEFAULT_BACKEND:-ollama}
       # v2.2: gemini removed from default fallback to prevent unredacted content reaching
       # cloud providers before PII filtering. Admins who explicitly want cloud fallback
@@ -863,34 +1088,41 @@ services:
       YASHIGANI_EXTRACTOR_MAX_OUTPUT_BYTES: "33554432"
       # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
       # MCP approve-transaction env vars. _artifact_root(), _runtime(), and
-      # default_caddy_reloader() all raise McpOnboardError (503) if unset.
-      # The transaction fails CLOSED without these — no partial onboarding.
+      # the route-registration reloader all raise McpOnboardError (503) if
+      # unset. The transaction fails CLOSED without these — no partial
+      # onboarding.
       #
-      # YASHIGANI_MCP_ARTIFACT_ROOT: output_root for codegen; artifacts written
-      #   as  output_root / "docker/caddy/agents/<s>-mcp.caddy". The mount
-      #   ./:/mnt/install/docker (below) places the docker/ tree at
-      #   /mnt/install/docker inside backoffice, so output_root=/mnt/install
-      #   resolves to the correct host path ${INSTALL_DIR}/docker/caddy/agents/.
-      #   Caddy reads the same host path via ./caddy/agents:/etc/caddy/agents:ro.
+      # YASHIGANI_MCP_ARTIFACT_ROOT: output_root for codegen's non-Caddy
+      #   Shape-C artifacts (compose override, helm values/netpol, OPA bundle,
+      #   pki ownership fragment, contract test). FINDING-V412-CADDYADMIN-002
+      #   (Captain, 2026-07-21): the Caddy-front wrap snippet
+      #   ("docker/caddy/agents/<s>-mcp.caddy") is NO LONGER among these —
+      #   codegen.py no longer renders or writes it at all. Backoffice sends
+      #   route DATA to caddy-config-broker instead (see
+      #   YASHIGANI_CADDY_BROKER_ROUTE_SOCKET below); the broker renders +
+      #   writes it into its OWN volume, never this one.
       YASHIGANI_MCP_ARTIFACT_ROOT: /mnt/install
       # YASHIGANI_CONTAINER_RUNTIME: selects the correct codegen render path.
       #   install.sh writes this to docker/.env at bootstrap time. The ?:-docker
       #   default covers pre-3.0 .env files that predate this variable.
       YASHIGANI_CONTAINER_RUNTIME: ${YASHIGANI_CONTAINER_RUNTIME:-docker}
-      # YASHIGANI_CADDY_ADMIN_SOCKET: default_caddy_reloader() POSTs the
-      #   Caddyfile to the caddy admin unix socket via httpx AsyncHTTPTransport.
-      #   Promoted from caddy-local tmpfs to caddy_admin_sock named volume so
-      #   backoffice can reach it (see volumes: caddy_admin_sock:/run/caddy).
-      #   v4.1 SU-SEAM-1d-04: compose-only transport. On K8s (separate pods —
-      #   no shared unix socket) the reloader branches on
-      #   YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs to Caddy's mesh-mTLS admin
-      #   relay instead (YASHIGANI_CADDY_ADMIN_URL; see helm backoffice.yaml +
-      #   configmaps.yaml :2019 admin-relay site block).
-      YASHIGANI_CADDY_ADMIN_SOCKET: /run/caddy/admin.sock
-      # YASHIGANI_CADDY_CADDYFILE: default_caddy_reloader() reads the active
-      #   Caddyfile and POSTs it to /load; Caddy adapts server-side (env subs +
-      #   import /etc/caddy/agents/*.caddy sentinel). Mount: see volumes below.
-      YASHIGANI_CADDY_CADDYFILE: /etc/caddy/Caddyfile
+      # YASHIGANI_CADDY_BROKER_ROUTE_SOCKET: FINDING-V412-CADDYADMIN-002
+      #   (Captain, 2026-07-21) REWORK — replaces the old
+      #   YASHIGANI_CADDY_ADMIN_SOCKET / YASHIGANI_CADDY_CADDYFILE pair
+      #   entirely. Backoffice no longer shares ANY socket with Caddy, reads
+      #   no Caddyfile, and POSTs no raw /load body — it sends narrow typed
+      #   DATA (tenant_id/server_id/mesh_port/shim_port) to
+      #   caddy-config-broker's POST/DELETE /route contract over THIS
+      #   dedicated unix socket (caddy_broker_route_sock named volume, shared
+      #   ONLY with caddy-config-broker — never caddy). v4.1 SU-SEAM-1d-04
+      #   compose-only transport, unchanged in spirit: on K8s (separate pods —
+      #   no shared unix socket) the registrar branches on
+      #   YASHIGANI_CONTAINER_RUNTIME=k8s and POSTs to the SAME /route
+      #   contract via Caddy's mesh-mTLS admin relay instead
+      #   (YASHIGANI_CADDY_ADMIN_URL; see helm backoffice.yaml + configmaps.yaml
+      #   :2019 relay, now proxying to the caddy-config-broker sidecar's
+      #   /route, not a raw /load).
+      YASHIGANI_CADDY_BROKER_ROUTE_SOCKET: /run/caddy-broker-route/route.sock
     volumes:
       - audit_data:/data/audit
       - bootstrap_data:/data/bootstrap
@@ -898,14 +1130,91 @@ services:
       # rw so the admin "Create backup" button can write on-demand DB snapshots
       # (pg_dump) here; the installer also writes its backups to the same host dir.
       - ${INSTALL_DIR:-..}/backups:/data/backups:rw
-      # LIC-007 / LIC-012 (v2.24.0 DEFERRED): This mount is writable because
-      # write_docker_secrets() writes admin credentials + license_key here during
-      # bootstrap. After bootstrap, license_key should be chmod 0400. The trivial
-      # fix (chmod in write_docker_secrets() post-write) is Tom Group 5.1.
-      # Schema-split (separate :ro PKI mount + writable bootstrap mount) = LIC-012
-      # for v2.24.0. K8s is already protected: backoffice.yaml initContainer runs
-      # chmod 0400 on all /secrets-rw/* files including license_key.
-      - ./secrets:/run/secrets
+      # FINDING-LIC-012 FIXED (Laura V412-PKI re-attack, 2026-07-20): this mount
+      # was flat-RW, so a compromised backoffice could overwrite ca_root.crt /
+      # ca_intermediate.crt / any *_client.{crt,key} — material EVERY other
+      # mesh member reads from this same host directory (proven live PoC,
+      # LAURA-V412-RESTART-012-TM Q1). Schema-split per the original LIC-012
+      # plan: the directory mount is now :ro (backoffice reads PKI material
+      # like every other service — see mount-audit table in commit body); the
+      # four filenames backoffice legitimately writes are individually
+      # shadow-mounted RW on top (same nesting technique already used for
+      # caddy_internal_hmac/redis_password elsewhere in this file — a more
+      # specific bind mount overrides the broader one for that one path).
+      # Only the in-namespace PKI issuer (ephemeral container spawned
+      # host-side by install.sh's _pki_run_issuer_*, NOT this long-running
+      # service) ever writes CA/intermediate/leaf trust material.
+      #
+      # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21): the four
+      # single-file :rw shadow-mounts previously lived UNDER /run/secrets
+      # itself (e.g. ./secrets/admin_initial_password:/run/secrets/admin_
+      # initial_password:rw). Laura proved (laura-012-rogue-reattack.md) that
+      # on this podman-compose fork, a :rw child mount sharing a path prefix
+      # with a :ro parent silently drops the PARENT's ro flag — podman inspect
+      # showed /run/secrets RW=true, opts=[rbind], no "ro" — letting backoffice
+      # write ANYTHING under /run/secrets, including ca_root.crt and the
+      # attestation-pin file, defeating the whole PKI trust chain (rogue-CA
+      # injection, full chain proven live: forge attestation → poison
+      # .ysg_pinned_root_sha256 → pg_ctl reload of an attacker CA → rogue mTLS
+      # leaf accepted). Fix: the 4 writable secrets are now shadow-mounted at a
+      # SEPARATE top-level path (/run/secrets-rw/<name>) that shares no prefix
+      # with /run/secrets, so there is no nested-mount collision for the fork's
+      # -v emission to mishandle — /run/secrets is now a PURE :ro mount with
+      # zero nested children. Both mountpoints bind the SAME host file
+      # (./secrets/<name>), so a write via /run/secrets-rw/<name> is
+      # immediately visible to every reader still using /run/secrets/<name>
+      # (licensing/loader.py, DockerSecretsProvider, etc. — unchanged).
+      # write_docker_secrets()/license.py now write via YASHIGANI_SECRETS_RW_DIR
+      # (default /run/secrets-rw) — see src/yashigani/auth/bootstrap.py and
+      # src/yashigani/backoffice/routes/license.py.
+      #
+      # Source files are pre-created by install.sh before compose up in the
+      # supported install flow (generate_secrets(): admin_initial_password,
+      # grafana_admin_password, redis_password; handle_license() step 7:
+      # license_key) so the bind source always exists at container start.
+      # write_docker_secrets() (src/yashigani/auth/bootstrap.py) is a dev-mode
+      # fallback only — in the production install.sh flow admin_initial_password
+      # already exists, so load_or_generate() short-circuits and this path
+      # never executes. prometheus_password (also in that mapping) is NOT
+      # given an RW override: nothing in the codebase reads
+      # /run/secrets/prometheus_password (vestigial field — see bootstrap.py);
+      # bootstrap.py now catches the resulting PermissionError per-field
+      # instead of crashing the entrypoint (see auth/bootstrap.py diff).
+      - ./secrets:/run/secrets:ro
+      - ./secrets/admin_initial_password:/run/secrets-rw/admin_initial_password:rw
+      - ./secrets/grafana_admin_password:/run/secrets-rw/grafana_admin_password:rw
+      - ./secrets/redis_password:/run/secrets-rw/redis_password:rw
+      - ./secrets/license_key:/run/secrets-rw/license_key:rw
+      # FINDING-V412-SVID-WRITE-PATH FIXED (Captain, 2026-07-21): the 012 fix
+      # above correctly made /run/secrets pure :ro, but that also silently
+      # broke the ONE legitimate write backoffice makes into that tree:
+      # pki.issuer.mint_agent_leaf() (agent onboarding — POST
+      # /admin/mcp/servers/import, POST /admin/nhi/{id}/approve, POST
+      # /admin/agents/{id}/cert/rotate) writing the dynamically-issued
+      # agent_<tenant>_<agent>[_<instance>]_client.{crt,key} + the runtime
+      # identity manifest (var/runtime/service_identities.yaml). Onboarding
+      # 502'd with [Errno 30] Read-only file system.
+      #
+      # Fix: two BRAND-NEW host directories (never contain CA material —
+      # ca_root.*/ca_intermediate.*/ca_root.attested_sha256 stay reachable
+      # ONLY via the :ro mount above), shadow-mounted at the SAME
+      # /run/secrets-rw top-level prefix already used for the 4 single-file
+      # mounts (no new nested-mount collision class — see 012 comment above;
+      # these are new dedicated subpaths, not children of /run/secrets):
+      #   agents/    — pki.issuer.IssuerPaths.agents_dir (agent leaf
+      #                cert/key + runtime manifest). Read by backoffice ONLY.
+      #   svid-init/ — mcp_onboard.py step-2b staging dir the svid-sidecar
+      #                reads via ITS OWN separate RO bind of the SAME host
+      #                subdirectory (docker/secrets/svid-init/<tenant>/
+      #                <server>/ — unchanged path; see codegen.py
+      #                _gen_svid_sidecar_service init_dir_host literal).
+      # Host dirs are pre-created + chowned 1001:1001 by install.sh
+      # (_prepare_agent_write_dirs, called alongside _prepare_secrets_dir_for_pki)
+      # so UID 1001 (backoffice's runAsUser) can write through these mounts
+      # AND create the per-tenant/per-server subdirectories mint_agent_leaf /
+      # mcp_onboard.py create at runtime (Path.mkdir(parents=True)).
+      - ./secrets/agents:/run/secrets-rw/agents:rw
+      - ./secrets/svid-init:/run/secrets-rw/svid-init:rw
       # YSG-RISK-053: caddy_internal_hmac is scoped out of the flat ./secrets
       # dir (see caddy service). Single-file remount (ro) at the unchanged
       # in-container path for Layer-B verify + the step-up signer
@@ -934,22 +1243,63 @@ services:
       # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-B):
       # Three mounts required for the MCP approve transaction.
       #
-      # (a) Artifact root — docker/ tree (writable). Codegen writes
-      #     docker/caddy/agents/<s>-mcp.caddy relative to YASHIGANI_MCP_ARTIFACT_ROOT
-      #     (/mnt/install). Mounting ./  at /mnt/install/docker exposes ONLY the
-      #     docker/ directory subtree (same blast radius as ./secrets:/run/secrets
-      #     which already exists). codegen._safe_write() rejects traversals outside
-      #     output_root. Caddy reads the same host path via ./caddy/agents:ro (above).
+      # (a) Artifact root — docker/ tree (writable). Codegen writes artifacts at
+      #     THREE distinct depths under this root — docker/<agent>-compose.override.yml
+      #     and docker/<agent>-egress-forwarder.override.yml at the top level,
+      #     docker/caddy/agents/*.caddy, and docker/caddy/egress/*.caddy (see
+      #     src/yashigani/manifest/codegen.py artifact-key literals) — so the
+      #     mount cannot be narrowed to a single subdirectory without breaking
+      #     compose-override generation. codegen._safe_write() rejects traversals
+      #     outside output_root at the PYTHON level only.
+      #
+      #     FINDING-LIC-012 FIXED (Laura V412-PKI re-attack, 2026-07-20): a
+      #     compromised backoffice process bypasses that Python-level check
+      #     entirely via the raw OS bind mount and reaches docker/secrets/ a
+      #     SECOND, independent way (proven live PoC, LAURA-V412-RESTART-012-TM
+      #     Q1 — this was flagged explicitly as the second write path). Nested
+      #     bind mounts shadow the broader mount for their subpath (same
+      #     technique used for /run/secrets above and caddy_internal_hmac
+      #     elsewhere in this file) — every trust-critical subtree reachable
+      #     under this mount is shadow-remounted :ro immediately below,
+      #     independent of and in addition to the Python-level guard.
       - ./:/mnt/install/docker:rw
-      # (b) Caddy admin socket — shared named volume caddy_admin_sock. Caddy creates
-      #     admin.sock with mode 0666 (Caddyfile |0666, compose variant). backoffice
-      #     UID 1001 connects via httpx AsyncHTTPTransport(uds=...) to POST /load.
-      #     No network exposure — the socket is inside this named volume only.
-      - caddy_admin_sock:/run/caddy
-      # (c) Active Caddyfile (ro) — default_caddy_reloader() reads it to POST to
-      #     /load. YASHIGANI_CADDY_CADDYFILE=/etc/caddy/Caddyfile maps here.
-      #     Same source file as caddy's own mount (host path ./Caddyfile.<mode>).
-      - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/etc/caddy/Caddyfile:ro
+      - ./secrets:/mnt/install/docker/secrets:ro
+      - ./secrets-caddy:/mnt/install/docker/secrets-caddy:ro
+      - ./var:/mnt/install/docker/var:ro
+      - ./.env:/mnt/install/docker/.env:ro
+      - ./Caddyfile.${YASHIGANI_TLS_MODE:-acme}:/mnt/install/docker/Caddyfile.${YASHIGANI_TLS_MODE:-acme}:ro
+      # FINDING-V412-CADDYADMIN-002 BLOCKER-B FIX (Captain, 2026-07-21):
+      # `docker/caddy/agents/` RO-shadowed here — same technique as
+      # secrets/var/.env/Caddyfile above (a more specific bind mount
+      # overrides the broader RW mount for that one subpath). Flagged by Su
+      # 2026-07-21 (NEW FINDING, routed to Maxine) and confirmed live by
+      # Laura's final re-attack (NEW FINDING #2): a compromised backoffice
+      # could write a rogue `docker/caddy/agents/<name>.caddy` snippet via
+      # the RW mount, imported at Caddyfile TOP LEVEL — full server-block
+      # scope, bypassing the config broker entirely via Caddy's own
+      # container-start/restart import (which never calls the broker at
+      # all). install.sh/ringfence-init (host-side, outside any container
+      # mount) is unaffected — it writes this directory directly on the
+      # host, not through this bind mount, so this RO-shadow does not
+      # regress the legitimate host-side write path.
+      # codegen.py no longer writes ANYTHING into this directory from
+      # inside backoffice (FINDING-V412-CADDYADMIN-002 — the MCP-wrap
+      # snippet moved to caddy-config-broker's OWN volume, see below), so
+      # this mount going RO removes a write path with no remaining
+      # legitimate backoffice writer to break.
+      - ./caddy/agents:/mnt/install/docker/caddy/agents:ro
+      # (b) MCP-onboarding ROUTE REGISTRATION — shared named volume
+      #     caddy_broker_route_sock. FINDING-V412-CADDYADMIN-002 REWORK
+      #     (Captain, 2026-07-21): replaces the old caddy_admin_sock reload
+      #     relay + Caddyfile-read mount ENTIRELY. Backoffice no longer
+      #     shares any socket with Caddy and reads no Caddyfile — it POSTs/
+      #     DELETEs narrow typed route DATA to caddy-config-broker's /route
+      #     contract over THIS socket (see mcp_onboard.py
+      #     _register_route_via_broker_socket() +
+      #     docker/caddy/config_broker.py "NEW CONTRACT"). No network
+      #     exposure — the socket is inside this named volume only, shared
+      #     ONLY with caddy-config-broker (never caddy itself).
+      - caddy_broker_route_sock:/run/caddy-broker-route
     read_only: true
     tmpfs:
       - /tmp:size=100M
@@ -965,7 +1315,29 @@ services:
     # V232-CSCAN-01k-RES-01: align cap_drop with Helm (backoffice.yaml:104-105).
     # No cap_add: backoffice binds port 8443 (non-privileged).
     cap_drop: [ALL]
-    # NO group_add: no docker socket mounted; no group membership needed.
+    # FINDING-V412-SVID-INIT-KEY-PERM (Captain, 2026-07-21): backoffice mints
+    # the agent leaf key at 0400 (owner-only, UID 1001) but must stage a
+    # svid-sidecar-readable COPY of it under /run/secrets-rw/svid-init/<t>/<s>/
+    # (mcp_onboard.py step 2b) for the per-instance svid-sidecar (UID 1002)
+    # to pick up — see docker/svid-sidecar/rotate.sh Phase 1 `cp ${INIT_DIR}/
+    # client.key`. Group 2003 (_MCP_SVID_GID, manifest/codegen.py) is the
+    # SAME group already shared between the svid-sidecar (primary GID) and
+    # Caddy (supplemental — STATICALLY present on the base caddy: service
+    # above since batch-finding #3 / FINDING-V412-CADDYADMIN-002-e; it was
+    # previously added per-agent by codegen, which duplicated the value
+    # across every Shape-C override and hard-failed Docker Compose's merge
+    # once 2+ Shape-C MCPs were onboarded together — see the caddy: service's
+    # group_add comment above and manifest/codegen.py _gen_svid_sidecar_service).
+    # Adding it here lets backoffice chgrp the staged key copy to 2003 + chmod 0440
+    # (mirrors rotate.sh's own least-privilege pattern for the SAME key
+    # material one hop later) instead of the blunter world-readable 0444.
+    # Does NOT grant backoffice anything beyond reading already-minted SVID
+    # material it issued in the first place — a compromised backoffice can
+    # already mint any agent identity via the intermediate CA it signs with;
+    # this is a strictly smaller, derivative read capability, not a new
+    # privilege class.
+    group_add:
+      - "2003"
     # NO docker CLI binary in the backoffice image (removed in Design A rebuild —
     # the docker-cli package is no longer needed since backoffice uses HTTP not CLI).
     healthcheck:
@@ -1008,6 +1380,13 @@ services:
       - extractor_svc
       - demo_mcp_isolated
       - langflow_isolated
+      # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): backoffice <->
+      # caddy-config-broker (MCP route registration). Belt-and-braces — the
+      # actual data path is the caddy_broker_route_sock shared unix-socket
+      # volume; every other purpose-built pairing in this file gets an
+      # explicit internal bridge (extractor_svc precedent) rather than
+      # relying on implicit default-network attachment.
+      - caddy_broker_net
 
   # ---------------------------------------------------------------------------
   # Extractor Service — pre-spawned hardened document extraction worker
@@ -1729,6 +2108,21 @@ services:
       # postgres cannot read redis_password or yashigani_internal_bearer.
       - ./secrets:/run/secrets:ro
       - ./secrets/postgres_password:/run/secrets/postgres_password:ro
+      # FINDING-V412-RESTART-012 FIXED (Captain, 2026-07-21) — defence-in-depth
+      # on top of the /run/secrets RO fix above (backoffice volumes, this file):
+      # the root-attestation pin (ca_root.attested_sha256) is now written by
+      # install.sh's --pki-action=rotate-root ceremony to a SEPARATE,
+      # postgres-ONLY host directory (docker/secrets-pki-attest/), never into
+      # the shared docker/secrets/ tree that backoffice/gateway/redis/etc also
+      # mount. No other compose service mounts this path — Laura's proven
+      # attack (forge ca_root.attested_sha256 via the RO-bypass write
+      # primitive, poison the pin, trigger pg_ctl reload of a rogue CA) is now
+      # structurally unreachable even if a FUTURE fork regression re-drops a
+      # :ro flag on some other service's /run/secrets mount: the attestation
+      # file simply isn't reachable from any container but this one.
+      # See docker/postgres/05-enable-ssl.sh (_ATTEST_DIR) + install.sh
+      # (_ensure_pki_attest_dir, rotate-root case).
+      - ./secrets-pki-attest:/run/secrets-pki-attest:ro
       # Init scripts run in alphabetical order — 05 must come before 10/11.
       # 05: TLS + client-cert verification on first initdb.
       # 10: pgbouncer_authenticator role + ysg_pgbouncer_get_auth function (YSG-RISK-049 close).
@@ -3143,12 +3537,28 @@ volumes:
     driver: local
   caddy_config:
     driver: local
-  # v4.1 Phase 1d (SEAM Phase-3 wiring): Caddy admin unix socket shared
-  # between caddy and backoffice so default_caddy_reloader() can POST /load.
-  # Promoted from caddy-local tmpfs (MUST-4 / v2.24.1). Socket mode 0666
-  # (Caddyfile admin |0666) — volume is mounted ONLY in caddy + backoffice,
-  # no external access to the path.
-  caddy_admin_sock:
+  # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: the OLD
+  # caddy_admin_sock (shared caddy<->backoffice reload relay) and
+  # caddy_broker_sock (caddy<->caddy-config-broker) volumes are REMOVED.
+  # Backoffice no longer talks to Caddy or the broker's old /load path at
+  # all — see caddy_broker_route_sock + caddy_broker_agents below and
+  # docker/caddy/config_broker.py module docstring ("NEW CONTRACT").
+  caddy_admin_real_sock:
+    driver: local
+  # NEW — the ONLY socket backoffice can reach for MCP-onboarding route
+  # registration (POST/DELETE /route, narrow typed-DATA contract — never
+  # raw Caddy content, never a raw admin /load body). Shared ONLY between
+  # backoffice (client) and caddy-config-broker (server); caddy is NOT a
+  # member — caddy never needs to reach this process, only the reverse.
+  caddy_broker_route_sock:
+    driver: local
+  # NEW — broker-owned DYNAMIC MCP-route directory (see
+  # docker/Caddyfile.<mode> "FINDING-V412-CADDYADMIN-002" comment + S4
+  # agent-import-sentinel section). RW ONLY inside caddy-config-broker; RO
+  # in caddy; NEVER bind-mounted into backoffice — this closes R2 by
+  # construction (no raw-file-drop primitive exists against this path for
+  # backoffice to have in the first place).
+  caddy_broker_agents:
     driver: local
   postgres_data:
     driver: local
@@ -3355,6 +3765,19 @@ networks:
     internal: true
     # Observability-plane: prometheus, grafana, loki, alertmanager,
     # otel-collector, jaeger. Caddy joins to proxy /admin/grafana etc.
+  # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21) REWORK: repointed from
+  # {caddy, caddy-config-broker} to {backoffice, caddy-config-broker} — caddy
+  # is no longer a peer of the broker over network at all (it only dials the
+  # real admin socket OUT as a client via a shared unix-socket volume; caddy
+  # itself never talks to the broker in either direction post-rework).
+  # internal:true, no other members, no internet egress — the actual traffic
+  # is the caddy_broker_route_sock shared unix-socket volume; this bridge is
+  # explicit documentation of the pairing, matching the extractor_svc
+  # precedent (belt-and-braces, not load-bearing for isolation).
+  caddy_broker_net:
+    driver: bridge
+    enable_ipv6: false
+    internal: true
   # YSG-RISK-055 UA-10: per-agent isolated bridges (v2.24.1).
   # v4.1 three-agent wrap (2026-07-07): AGENTS NO LONGER JOIN these bridges —
   # they live on the §2.6 split ringfences below. The *_isolated definitions

@@ -828,6 +828,10 @@ async def deactivate_agent(
                     "YASHIGANI_SERVICE_MANIFEST_PATH",
                     "/etc/yashigani/service_identities.yaml",
                 )),
+                # FINDING-V412-SVID-WRITE-PATH: revoke flips runtime_manifest
+                # (a write) — same breakage class as mint_agent_leaf under
+                # RESTART-012's RO /run/secrets. See _rotate_pki_paths() below.
+                agents_dir=_Path(os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")),
             )
             revoke_agent_identity(
                 _pki_paths,
@@ -933,7 +937,15 @@ _CERT_ROTATE_ACL_PATH = "/admin/agents/*/cert/rotate"
 
 
 def _rotate_pki_paths():
-    """IssuerPaths from the live env (same wiring as approve/deactivate)."""
+    """IssuerPaths from the live env (same wiring as approve/deactivate).
+
+    FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): agents_dir points at
+    the dedicated writable mount (default /run/secrets-rw/agents, backed by
+    a NEW host dir that shares no prefix with ca_root.crt/ca_intermediate.*)
+    so mint_agent_leaf's cert/key/runtime-manifest writes succeed WITHOUT
+    reopening RESTART-012's /run/secrets :ro (CA trust material stays
+    strictly read-only — secrets_dir is unchanged and untouched by this).
+    """
     from pathlib import Path as _Path
     from yashigani.pki.issuer import IssuerPaths
 
@@ -943,6 +955,7 @@ def _rotate_pki_paths():
             "YASHIGANI_SERVICE_MANIFEST_PATH",
             "/etc/yashigani/service_identities.yaml",
         )),
+        agents_dir=_Path(os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")),
     )
 
 
@@ -1392,6 +1405,8 @@ async def approve_nhi_svid(
         pki_paths = IssuerPaths(
             secrets_dir=Path(_secrets_dir),
             manifest_path=Path(_manifest_path),
+            # FINDING-V412-SVID-WRITE-PATH — see _rotate_pki_paths() above.
+            agents_dir=Path(os.getenv("YASHIGANI_AGENTS_DIR", "/run/secrets-rw/agents")),
         )
         tenant_id = nhi.get("owner_identity_id", "tenant")
         agent_name = nhi.get("name", nhi_id)
