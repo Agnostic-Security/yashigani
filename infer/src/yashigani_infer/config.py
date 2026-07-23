@@ -13,15 +13,33 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
+
+#: The single override var this default honours — also the source of truth
+#: `entrypoint.py`'s env-var contract docstring documents (Iris integration-
+#: seam audit F4: this used to be a second, independently-maintained copy of
+#: the same var name in `entrypoint._resolve_blob_store_root`).
+BLOB_STORE_ROOT_ENV = "YSG_INFER_BLOB_STORE_ROOT"
 
 
-def _default_blob_store_root() -> Path:
+def _default_blob_store_root(env: Mapping[str, str] | None = None) -> Path:
     """Resolve the blob-store root, honouring an operator override.
 
     Defaults under the user's home so unit tests never need root/sudo and
     the same code works identically on macOS and Linux.
+
+    Args:
+        env: the mapping to read the override from. Defaults to the real
+            `os.environ` (production / `EngineConfig()`'s own default-factory
+            use). `entrypoint.py` passes its own injected env mapping here
+            instead of touching `os.environ` directly, so its env-parsing
+            stays independently unit-testable with a plain `dict` — this is
+            the ONE source for "what does an unset
+            `YSG_INFER_BLOB_STORE_ROOT` default to," per Iris F4 (previously
+            duplicated, independently, in `entrypoint._resolve_blob_store_root`).
     """
-    override = os.environ.get("YSG_INFER_BLOB_STORE_ROOT")
+    active_env: Mapping[str, str] = os.environ if env is None else env
+    override = active_env.get(BLOB_STORE_ROOT_ENV)
     if override:
         return Path(override)
     return Path.home() / ".yashigani" / "infer" / "blobs"

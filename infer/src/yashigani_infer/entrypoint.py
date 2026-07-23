@@ -84,7 +84,7 @@ from fastapi import FastAPI
 
 from yashigani_infer.app import create_app
 from yashigani_infer.blobstore.store import BlobStore
-from yashigani_infer.config import EngineConfig
+from yashigani_infer.config import EngineConfig, _default_blob_store_root
 from yashigani_infer.supervisor.process import SubprocessProcessRunner
 from yashigani_infer.supervisor.supervisor import LoadConfig, ResourceLimits, Supervisor
 from yashigani_infer.upstream import HttpxUpstreamClient
@@ -178,14 +178,14 @@ def _parse_override_tensor(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def _resolve_blob_store_root(env: Mapping[str, str]) -> Path:
-    """Mirror `config._default_blob_store_root`'s override-or-home-default logic, but
-    against the injected `env` mapping rather than `os.environ` directly — so tests can
-    fully control this via a fake mapping without touching the real process environment
+    """Delegate to `config._default_blob_store_root`, the single source of truth for
+    "what does an unset `YSG_INFER_BLOB_STORE_ROOT` default to" (Iris integration-seam
+    audit F4 — this used to be a second, independently-maintained copy of the same
+    override-or-home-default logic). Passing the injected `env` mapping through (rather
+    than letting the default read `os.environ` directly) keeps this module's env-parsing
+    fully unit-testable via a plain `dict`, without touching the real process environment
     or the real home directory."""
-    override = env.get(_BLOB_STORE_ROOT_ENV)
-    if override:
-        return Path(override)
-    return Path.home() / ".yashigani" / "infer" / "blobs"
+    return _default_blob_store_root(env)
 
 
 def load_role_config(env: Mapping[str, str]) -> RoleConfig:
