@@ -12670,7 +12670,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-512, 8-digit (admin tier — SHA-1 apps NOT compatible)"
   if [[ -n "$GEN_ADMIN1_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN1_TOTP_URI}"
@@ -12680,7 +12680,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-512, 8-digit (admin tier — SHA-1 apps NOT compatible)"
   if [[ -n "$GEN_ADMIN2_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN2_TOTP_URI}"
@@ -12753,7 +12753,7 @@ print_completion_summary() {
   # --- Next steps ---
   printf "  ${C_BOLD}Next steps:${C_RESET}\n"
   printf "    1. Save ALL credentials above in a password manager\n"
-  printf "    2. Scan the TOTP QR URIs into any authenticator app (Google Authenticator, Authy, Aegis,\n       1Password, Microsoft Authenticator, etc.) — Yashigani uses standard HMAC-SHA-1 TOTP\n       (RFC 6238 default), compatible with all authenticator apps.\n"
+  printf "    2. Scan the TOTP QR URIs using an authenticator app that supports SHA-256/SHA-512\n       (e.g. agnosticOTP or Aegis) — admin accounts use HMAC-SHA-512/8-digit, user accounts\n       use HMAC-SHA-256/6-digit. Classic SHA-1-only apps (e.g. Google Authenticator, Authy)\n       are NOT compatible and will generate codes the server rejects. The QR/URI carries the\n       correct algorithm=/digits= parameters, so a compliant app auto-configures.\n"
   printf "    3. Log in to the backoffice as '%s' and change the default password\n" "${GEN_ADMIN1_USERNAME}"
   printf "    4. Store '%s' credentials in a safe/vault (break-glass backup)\n" "${GEN_ADMIN2_USERNAME}"
   printf "    5. Register your first AI agent\n"
