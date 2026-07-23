@@ -650,6 +650,10 @@ async def create_declaration(
         declared_by=body.declared_by,
         justification=body.justification,
         declared_at=_now_iso(),
+        # v4.1.2 bug 3: capture the SERVER-SIDE session identity of the
+        # declaring admin (never trust the client-supplied declared_by
+        # string for the maker-checker check — see approve_declaration()).
+        declaring_account_id=session.account_id,
     )
 
     return {
@@ -681,6 +685,14 @@ async def approve_declaration(
     Enforces INV-2: cloud_model allow=True MUST carry opa_policy_ref.
     Requires step-up (fresh TOTP within YASHIGANI_STEPUP_TTL_SECONDS).
 
+    v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 3) DISTINCT-APPROVER ENFORCED:
+    a pending declaration must exist for (resource_type, resource_id), and the
+    approving admin must be a DIFFERENT admin from the one who declared it —
+    mirrors the maker≠checker separation-of-duties enforced by
+    dp_weaken.py's approve_weaken_request() and cloud_override.py's
+    cloud_override_approve(). Before this fix, the same admin could declare
+    and approve their own grant with no distinct-approver check at all.
+
     EU AI Act Art.14: AI recommends (via declaration), human decides (this endpoint).
     The admin's identity is the logged accountable act in the audit chain.
     """
@@ -693,6 +705,37 @@ async def approve_declaration(
             detail={
                 "error": "browser_capability_not_supported_here",
                 "message": "browser_capability approvals are managed via /admin/api/capability-policy.",
+            },
+        )
+
+    # DISTINCT-APPROVER CHECK — server-side; must not trust any client input.
+    # Mirrors dp_weaken.py's approve_weaken_request() / cloud_override.py's
+    # cloud_override_approve(): a pending declaration must exist, and the
+    # declaring admin (captured server-side at POST /declarations time,
+    # NOT the free-form declared_by field) must differ from the approver.
+    pending = store.get_pending_declaration(rt, resource_id)
+    if pending is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "declaration_not_found",
+                "message": (
+                    "No pending declaration found for this resource "
+                    "(may have expired, already been approved, or never been declared). "
+                    "Submit POST /declarations first."
+                ),
+            },
+        )
+    declaring_account_id = pending.get("declaring_account_id")
+    if declaring_account_id and declaring_account_id == session.account_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "self_approval_forbidden",
+                "message": (
+                    "The declaring admin cannot approve their own declaration. "
+                    "A DIFFERENT admin must perform the approval."
+                ),
             },
         )
 
