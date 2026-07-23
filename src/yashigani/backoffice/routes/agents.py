@@ -394,27 +394,65 @@ def _to_response(agent: dict) -> AgentResponse:
 
 
 def _build_quick_start(agent_id: str, token: str) -> dict:
-    """Build copy-paste integration snippets shown once on agent registration / token rotation."""
+    """Build copy-paste integration snippets shown once on agent registration / token rotation.
+
+    FIX (v4.1.2 onboarding blocker, Captain live-verify on podman @ ebaa1797):
+    The token minted here is an opaque 256-bit PSK, verified ONLY by
+    AgentAuthMiddleware (gateway/agent_auth.py) on the agent-to-agent
+    orchestration path -- POST /agents/{target_agent_id}/{path}. It is NOT a
+    JWT and CANNOT be presented at /mcp/{agent_name}: that route belongs to
+    the separate MCP tool-server broker subsystem (McpBrokerRegistry),
+    onboarded exclusively by an administrator via
+    POST /admin/mcp/servers/import, and gated by an external-IdP JWT
+    (JWKS-validated, gateway/proxy.py step "0d JWT introspection") or
+    internal-mesh mTLS proof -- neither of which this PSK can satisfy
+    (gateway/jwt_inspector.py rejects it at header-parse: it has no dots,
+    so it is not a 3-segment JWT at all).
+
+    The previous snippet told operators to POST {gw}/mcp and GET {gw}/health
+    -- both 404 (the real routes are /agents/{target_agent_id}/... and
+    /healthz) and, independent of the path typo, /mcp/* was never wired to
+    accept this credential type in the first place. This snippet documents
+    the REAL, reachable, self-service path this token actually authenticates.
+    """
     gw = "<your-gateway-url>"
+    target_placeholder = "<target-agent-id>"
     return {
         "curl": (
-            f"curl -X POST https://{gw}/mcp \\\n"
+            f"curl -X POST https://{gw}/agents/{target_placeholder}/v1/chat/completions \\\n"
             f"  -H 'Authorization: Bearer {token}' \\\n"
+            f"  -H 'X-Yashigani-Caller-Agent-Id: {agent_id}' \\\n"
             f"  -H 'Content-Type: application/json' \\\n"
-            f'  -d \'{{"jsonrpc":"2.0","method":"tools/list","id":1}}\''
+            f'  -d \'{{"model":"<model>","messages":[{{"role":"user","content":"hello"}}]}}\''
         ),
         "python_httpx": (
             f"import httpx\n"
             f"client = httpx.Client(\n"
             f"    base_url='https://{gw}',\n"
-            f"    headers={{'Authorization': 'Bearer {token}'}}\n"
+            f"    headers={{\n"
+            f"        'Authorization': 'Bearer {token}',\n"
+            f"        'X-Yashigani-Caller-Agent-Id': '{agent_id}',\n"
+            f"    }},\n"
             f")\n"
-            f'resp = client.post(\'/mcp\', json={{"jsonrpc":"2.0","method":"tools/list","id":1}})\n'
+            f"resp = client.post(\n"
+            f"    '/agents/{target_placeholder}/v1/chat/completions',\n"
+            f'    json={{"model": "<model>", "messages": [{{"role": "user", "content": "hello"}}]}},\n'
+            f")\n"
             f"print(resp.json())"
         ),
-        "health_check": (f"curl https://{gw}/health -H 'Authorization: Bearer {token}'"),
+        "health_check": f"curl https://{gw}/healthz",
         "note": (
-            f"Replace '{gw}' with your actual gateway URL. Token shown once — store it securely. Agent ID: {agent_id}"
+            f"This token authenticates AGENT-TO-AGENT calls at "
+            f"POST {gw}/agents/{{target_agent_id}}/... (gateway/agent_auth.py) -- "
+            f"it is NOT accepted at /mcp/{{agent_name}}. MCP tool-server access is "
+            f"a separate subsystem onboarded by an administrator via "
+            f"POST /admin/mcp/servers/import and requires an external JWT or "
+            f"mesh mTLS, not this PSK. Replace '{gw}' with your actual gateway "
+            f"URL and '{target_placeholder}' with the agent_id you want to call "
+            f"-- every call MUST also include the header "
+            f"'X-Yashigani-Caller-Agent-Id: {agent_id}' alongside the Bearer "
+            f"token, or AgentAuthMiddleware rejects it (missing_caller_agent_id_header). "
+            f"Token shown once — store it securely. Agent ID: {agent_id}"
         ),
     }
 
