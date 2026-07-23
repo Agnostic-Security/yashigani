@@ -190,11 +190,25 @@ class TestRetryAfterStructural:
         )
 
     def test_retry_after_value_is_delay_seconds(self):
-        fn = _parse_fn("_apply_auth_throttle")
-        fn_src = ast.unparse(fn)
-        assert "delay" in fn_src, (
-            "_apply_auth_throttle must compute 'delay' from _throttle_delay_for_level "
-            "and use it as the Retry-After value"
+        """
+        AVA-412-DOS (2026-07-23) extracted the log/audit/raise-429 sequence
+        (including the 'delay' computation) out of _apply_auth_throttle
+        into a shared _reject_with_throttle helper — called from both the
+        no-mutation fast-reject path and the post-admit path — so the
+        'delay' computation now lives there rather than inline in
+        _apply_auth_throttle itself. Check both functions' combined source.
+        """
+        apply_fn_src = ast.unparse(_parse_fn("_apply_auth_throttle"))
+        reject_fn_src = ast.unparse(_parse_fn("_reject_with_throttle"))
+        assert "delay" in apply_fn_src or "delay" in reject_fn_src, (
+            "_apply_auth_throttle (or its _reject_with_throttle helper) must "
+            "compute 'delay' from _throttle_delay_for_level and use it as "
+            "the Retry-After value"
+        )
+        assert "_reject_with_throttle(" in apply_fn_src, (
+            "_apply_auth_throttle must delegate the 429 raise to "
+            "_reject_with_throttle so both the fast-reject and post-admit "
+            "paths share identical Retry-After/banner/audit logic"
         )
 
     def test_apply_auth_throttle_is_account_gated(self):
@@ -300,9 +314,32 @@ class TestRetryAfterBehaviour:
 
     def _make_mock_redis(self, ip_fails: int, ip_level_before: int,
                           acct_fails: int, acct_level_before: int) -> MagicMock:
-        """Mock the atomic admit's eval() return value directly."""
+        """Mock the atomic admit's eval() return value directly.
+
+        AVA-412-DOS (2026-07-23): _apply_auth_throttle now does a read-only
+        GET pre-check of the SAME throttle keys BEFORE deciding whether to
+        call the mutating atomic admit (eval) at all. That GET must observe
+        the identical "before this call" level these tests already encode
+        via ip_level_before/acct_level_before for the eval mock — an
+        unconfigured MagicMock().get() would otherwise return a truthy
+        MagicMock whose int() coerces to 1, making every case look
+        "already gated" regardless of the intended level. Wiring .get()
+        to the same before-state keeps this mock an accurate stand-in for
+        real Redis (where GET and the Lua's internal GET would of course
+        agree, since they read the same key at the same instant).
+        """
         r = MagicMock()
         r.eval.return_value = [ip_fails, ip_level_before, acct_fails, acct_level_before]
+
+        def _fake_get(key):
+            key_str = key.decode() if isinstance(key, bytes) else key
+            if key_str.startswith("auth:throttle:ip:"):
+                return str(ip_level_before).encode() if ip_level_before else None
+            if key_str.startswith("auth:throttle:acct:"):
+                return str(acct_level_before).encode() if acct_level_before else None
+            return None
+
+        r.get.side_effect = _fake_get
         return r
 
     def _make_mock_response(self) -> MagicMock:
