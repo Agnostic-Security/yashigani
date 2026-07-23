@@ -15,6 +15,7 @@ from yashigani_infer.adapters.ollama_store import (
     parse_model_ref,
 )
 from yashigani_infer.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
+from yashigani_infer.containment.hooks import default_first_parse_jail_hook
 from yashigani_infer.models import ProvenanceKind
 
 
@@ -146,3 +147,31 @@ def test_resolve_raises_when_manifest_has_no_model_layer(tmp_blob_store: BlobSto
     adapter = OllamaStoreAdapter(tmp_blob_store)
     with pytest.raises(OllamaStoreAdapterError, match="no model"):
         adapter.resolve(model_ref="empty:latest", ollama_dir=ollama_dir)
+
+
+# ── first-parse jail wiring (Iris integration-seam audit F3) ────────────────
+
+
+def test_hook_fires_on_first_load_from_ollama_store(
+    tmp_blob_store: BlobStore, tmp_path: Path, minimal_gguf_bytes: bytes
+) -> None:
+    ollama_dir = _write_ollama_store(tmp_path / "dot-ollama", model_bytes=minimal_gguf_bytes)
+    calls: list[bytes] = []
+
+    def _spy_hook(header_bytes: bytes) -> bytes:
+        calls.append(header_bytes)
+        return default_first_parse_jail_hook(header_bytes)
+
+    adapter = OllamaStoreAdapter(tmp_blob_store, first_parse_jail_hook=_spy_hook)
+    resolved = adapter.resolve(model_ref="llama3:8b", ollama_dir=ollama_dir)
+
+    assert len(calls) == 1
+    assert calls[0].startswith(b"GGUF")
+    assert resolved.sha256 == sha256_bytes(minimal_gguf_bytes)
+
+
+def test_hook_fails_closed_on_a_malformed_blob(tmp_blob_store: BlobStore, tmp_path: Path) -> None:
+    ollama_dir = _write_ollama_store(tmp_path / "dot-ollama", model_bytes=b"this is not a gguf file at all")
+    adapter = OllamaStoreAdapter(tmp_blob_store)
+    with pytest.raises(OllamaStoreAdapterError, match="not a valid GGUF"):
+        adapter.resolve(model_ref="llama3:8b", ollama_dir=ollama_dir)

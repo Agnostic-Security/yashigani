@@ -37,7 +37,7 @@ from typing import Any
 
 from yashigani_infer.adapters.base import SourceAdapter
 from yashigani_infer.blobstore.store import DigestMismatchError, sha256_stream
-from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+from yashigani_infer.gguf.header import GGUFParseError
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
 from yashigani_infer.pathsafety import (
     canonicalize_and_contain,
@@ -167,9 +167,8 @@ class OllamaStoreAdapter(SourceAdapter):
                     f"Ollama blob {blob_path} digest is {actual_digest}, manifest claims {hex_digest}"
                 )
 
-            blob_fh.seek(0)
             try:
-                header = parse_gguf_header(blob_fh)
+                header = self._first_parse_gguf_header(blob_fh)
             except GGUFParseError as exc:
                 raise OllamaStoreAdapterError(f"blob {blob_path} is not a valid GGUF file: {exc}") from exc
 

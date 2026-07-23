@@ -44,7 +44,8 @@ from yashigani_infer.adapters.base import SourceAdapter
 from yashigani_infer.adapters.downloader import Downloader
 from yashigani_infer.blobstore.store import DigestMismatchError, sha256_file
 from yashigani_infer.catalog import SignedCatalog
-from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+from yashigani_infer.containment.hooks import FirstParseJailHook
+from yashigani_infer.gguf.header import GGUFParseError
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
 from yashigani_infer.pathsafety import PathTraversalError, reject_dotdot_segments
 
@@ -75,8 +76,9 @@ class HuggingFaceAdapter(SourceAdapter):
         *,
         scratch_dir: Path | None = None,
         catalog: SignedCatalog | None = None,
+        first_parse_jail_hook: FirstParseJailHook | None = None,
     ) -> None:
-        super().__init__(blob_store)
+        super().__init__(blob_store, first_parse_jail_hook=first_parse_jail_hook)
         self._downloader = downloader
         self._scratch_dir = Path(scratch_dir) if scratch_dir is not None else blob_store.root / "scratch"
         self._catalog = catalog
@@ -155,7 +157,7 @@ class HuggingFaceAdapter(SourceAdapter):
             final_sha256 = required_sha256 or digest
 
             try:
-                header = parse_gguf_header(scratch_path)
+                header = self._first_parse_gguf_header(scratch_path)
             except GGUFParseError as exc:
                 raise InvalidRepoReferenceError(
                     f"downloaded file from {repo_id}@{revision}/{filename} is not a valid GGUF: {exc}"

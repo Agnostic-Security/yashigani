@@ -24,7 +24,7 @@ from typing import Any
 
 from yashigani_infer.adapters.base import SourceAdapter
 from yashigani_infer.blobstore.store import sha256_stream
-from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+from yashigani_infer.gguf.header import GGUFParseError
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
 from yashigani_infer.pathsafety import (
     PathTraversalError,
@@ -83,9 +83,8 @@ class LMStudioStoreAdapter(SourceAdapter):
         fd = open_no_follow_symlink(resolved_target)
         with os.fdopen(fd, "rb") as fh:
             digest = sha256_stream(fh)
-            fh.seek(0)
             try:
-                header = parse_gguf_header(fh)
+                header = self._first_parse_gguf_header(fh)
             except GGUFParseError as exc:
                 raise LMStudioStoreAdapterError(f"{resolved_target} is not a valid GGUF file: {exc}") from exc
 

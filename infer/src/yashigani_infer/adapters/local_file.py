@@ -9,7 +9,7 @@ from typing import Any
 
 from yashigani_infer.adapters.base import SourceAdapter
 from yashigani_infer.blobstore.store import sha256_file
-from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+from yashigani_infer.gguf.header import GGUFParseError
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
 
 
@@ -32,10 +32,12 @@ class LocalFileAdapter(SourceAdapter):
             raise LocalFileAdapterError(f"not a file: {path}")
 
         # Parse the header first (cheap — reads only the metadata section,
-        # never the whole file) to both validate this is really a GGUF and
-        # to build normalized metadata for the ollama shim.
+        # never the whole file), routed through the first-parse jail hook
+        # (Iris audit F3 — see `SourceAdapter._first_parse_gguf_header`), to
+        # both validate this is really a GGUF and to build normalized
+        # metadata for the ollama shim.
         try:
-            header = parse_gguf_header(path)
+            header = self._first_parse_gguf_header(path)
         except GGUFParseError as exc:
             raise LocalFileAdapterError(f"{path} is not a valid GGUF file: {exc}") from exc
 

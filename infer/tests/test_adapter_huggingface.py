@@ -18,6 +18,7 @@ from yashigani_infer.adapters.huggingface import (
 )
 from yashigani_infer.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
 from yashigani_infer.catalog import CatalogVerificationError, CatalogVerifier, SignedCatalog, SignedCatalogEntry
+from yashigani_infer.containment.hooks import default_first_parse_jail_hook
 from yashigani_infer.models import ProvenanceKind
 
 PINNED_REVISION = "a" * 40
@@ -180,6 +181,24 @@ def test_resolve_with_catalog_refuses_when_download_does_not_match_signed_digest
         adapter.resolve(
             repo_id="acme/tiny-model", revision=PINNED_REVISION, filename="tiny-model.gguf", licence_accepted=True
         )
+
+
+def test_hook_fires_on_first_load_from_huggingface(tmp_blob_store: BlobStore, minimal_gguf_bytes: bytes) -> None:
+    downloader = FakeDownloader(minimal_gguf_bytes)
+    calls: list[bytes] = []
+
+    def _spy_hook(header_bytes: bytes) -> bytes:
+        calls.append(header_bytes)
+        return default_first_parse_jail_hook(header_bytes)
+
+    adapter = HuggingFaceAdapter(tmp_blob_store, downloader, first_parse_jail_hook=_spy_hook)
+    resolved = adapter.resolve(
+        repo_id="acme/tiny-model", revision=PINNED_REVISION, filename="tiny-model.gguf", licence_accepted=True
+    )
+
+    assert len(calls) == 1
+    assert calls[0].startswith(b"GGUF")
+    assert resolved.sha256 == sha256_bytes(minimal_gguf_bytes)
 
 
 def test_resolve_with_catalog_refuses_unlisted_model_no_override(
