@@ -18,14 +18,20 @@
 # not relicense any part of this work. The Yashigani proprietary EULA does
 # NOT apply to this file or this directory; see NOTICE.md.
 #
-# Three upstream defects are patched below, each root-caused from this exact
+# Four upstream defects are patched below, each root-caused from this exact
 # source (not assumed from behaviour). Full rationale + dates:
 # see ./CHANGES.agnostic.md. Patch sites are individually marked
-# "# AS-FIX-<n> (2026-07-18):" at the point of change:
+# "# AS-FIX-<n> (<date>):" at the point of change:
 #   AS-FIX-1: security_opt path normalization (container_to_args, ~line 1118)
 #   AS-FIX-2: dependency-ordering topological sort (2 call sites)
 #   AS-FIX-3: depends_on `required: false` threaded through the dependency
 #             graph and honored in check_dep_conditions()
+#   AS-FIX-4 (2026-07-23): exclude service_completed_successfully
+#             (one-shot-job) deps from --requires= (container_to_args,
+#             ~line 1138) — podman's --requires means "must be running" and
+#             has no equivalent for "ran to completion once"; walking it
+#             through an exited one-shot whose own dep is already running
+#             hits a podman dependency-graph-construction bug.
 # AS-FIX-2 and AS-FIX-3 ship together and are tested together — a bare
 # except-KeyError guard for AS-FIX-3 without AS-FIX-2's real topological sort
 # would silently mask genuine required-dependency ordering failures.
@@ -1136,7 +1142,43 @@ async def container_to_args(
     if pod:
         podman_args.append(f"--pod={pod}")
     deps = []
+    # AS-FIX-4 (2026-07-23): exclude `service_completed_successfully`
+    # (ServiceDependencyCondition.STOPPED) dependencies from `--requires=`.
+    # Root cause (source-verified, Captain live-repro, byte-identical across
+    # 3 from-scratch podman installs — YSG-PODMAN-LETTA-001): `--requires=`
+    # is podman-engine-level and means "must be RUNNING" — when the engine
+    # resolves a `podman start <dependent>` call, any --requires member that
+    # is not currently running (including a one-shot job that already
+    # EXITED 0, e.g. agent-db-init) is itself queued for a restart as part of
+    # satisfying the dependent's start. compose's service_completed_successfully
+    # semantics ("ran to completion once") has no podman --requires equivalent
+    # — podman has no "was previously satisfied, stay stopped" state. Walking
+    # a --requires chain that re-enters an exited one-shot whose own
+    # dependency (postgres) is already running then hits a podman
+    # dependency-graph-construction bug: "container agent-db-init depends on
+    # container postgres not found in input list" — because postgres, already
+    # running, is excluded from the graph's "to start" input set that the
+    # one-shot's own resolution still needs to reference. This is NOT a race
+    # (deterministic every run) and is NOT fixable by retry/backoff — the
+    # one-shot dependency must never be walked via --requires in the first
+    # place. Confirmed failure: letta-pgbouncer and letta both stick in
+    # `Created` (never reach `Up`) on every from-scratch podman install.
+    #
+    # Fix: drop STOPPED-condition deps from the --requires list entirely.
+    # This does NOT weaken dependency correctness — check_dep_conditions()
+    # (below, ~line 3174) already independently enforces
+    # service_completed_successfully via `podman wait --condition=stopped
+    # <dep>` BEFORE this fork ever issues `podman start <dependent>`. That
+    # app-level wait is authoritative for one-shot completion (it is a
+    # state-reached check, not a must-stay-running check) and was already
+    # running in parallel with --requires; --requires was pure redundant
+    # (and, for this condition class, actively harmful) belt-and-suspenders.
+    # service_started / service_healthy deps are UNCHANGED — they stay in
+    # --requires as before, since "must be running" is the correct semantic
+    # for those and they do not pass through an exited container.
     for dep_srv in cnt.get("_deps", []):
+        if dep_srv.condition == ServiceDependencyCondition.STOPPED:
+            continue
         deps.extend(compose.container_names_by_service.get(dep_srv.name, []))
     if deps and not no_deps:
         deps_csv = ",".join(deps)

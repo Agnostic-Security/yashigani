@@ -137,6 +137,59 @@ swallow a genuinely-missing required dependency.
 upstream podman-compose 1.5.0 with `KeyError: 'ollama-init'`) — zero crash,
 all containers created successfully.
 
+## 2026-07-23 — AS-FIX-4: exclude one-shot (`service_completed_successfully`) deps from `--requires=`
+
+**File:** `podman_compose.py`, `container_to_args()`, ~line 1138.
+
+**Root cause (source-verified, Captain live-repro, byte-identical across 3
+from-scratch podman installs — YSG-PODMAN-LETTA-001; deterministic, NOT a
+race):** `container_to_args()` translated every entry in a service's
+transitively-flattened `_deps` set into `podman create --requires=<name>`,
+regardless of the dependency's declared condition. `--requires=` is a
+podman-engine-level primitive meaning "must be RUNNING" — when the engine
+resolves `podman start <dependent>`, any `--requires` member that is not
+currently running (including a one-shot init job that already **exited 0**,
+e.g. `agent-db-init`, or `ollama-init`) is itself queued for a restart as
+part of satisfying the dependent's start. Compose's
+`service_completed_successfully` condition ("ran to completion once") has
+**no equivalent state** in podman's `--requires` model. Walking a
+`--requires` chain that re-enters an exited one-shot whose own dependency
+(`postgres`) is already running then hits a podman dependency-graph
+construction bug: `Error: ... container agent-db-init depends on container
+postgres not found in input list: no such container`. Confirmed failure:
+`letta` and `letta-pgbouncer` both stuck in `Created` (never reach `Up`) on
+every from-scratch podman install with the `letta` profile active.
+
+**Fix:** in `container_to_args()`, skip any `_deps` entry whose
+`ServiceDependencyCondition` is `STOPPED` (the internal enum value
+`docker_to_podman_cond` maps `service_completed_successfully` to) when
+building the `--requires=` list. `service_started` / `service_healthy`
+dependencies are unchanged. This does **not** weaken dependency
+correctness: `check_dep_conditions()` (same file, ~line 3174) already
+independently enforces `service_completed_successfully` via `podman wait
+--condition=stopped <dep>` **before** this fork ever issues `podman start
+<dependent>` — that application-level, state-reached wait is authoritative
+for one-shot completion and was already running in parallel with
+`--requires`; the engine-level `--requires` was pure redundant (and, for
+this specific condition class, actively harmful) belt-and-suspenders.
+
+**Live-verified 2026-07-23** on the live `wt-integrated` podman stack
+(`/Users/max/Documents/Claude/testing_runs/yashigani/wt-integrated/ysg`):
+recreated `letta-pgbouncer` and `letta` with the corrected `--requires=`
+(`localhost_postgres_1` only, and the full non-one-shot chain respectively —
+both drop `localhost_agent-db-init_1`; `letta` additionally drops
+`localhost_ollama-init_1`, also a `service_completed_successfully` dep
+inherited transitively via `gateway`→`ollama`→`ollama-init`). Both
+containers reached `Up (healthy)` with zero dependency-graph errors
+(`.State.Error` empty on both); the other 25 containers in the stack were
+untouched.
+
+**Pairs with defect 2 (install.sh `_podman_compose_letta_waitloop`
+false-positive-success fix, same date, YSG-PODMAN-LETTA-001):** that
+wait-loop was a install.sh-level workaround for the identical class of
+failure; it now verifies real container state instead of assuming success
+from a non-checked `podman start` return code.
+
 ## Version string
 
 `__version__` changed from `"1.5.0"` to `"1.5.0+ysg.1"` (GPL-2.0 fork-naming

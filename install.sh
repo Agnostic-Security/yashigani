@@ -8107,6 +8107,17 @@ _podman_compose_letta_waitloop() {
   local _timeout_s="${YSG_LETTA_WAITLOOP_TIMEOUT_S:-300}"
   local _deadline=$(( $(date +%s) + _timeout_s ))
 
+  # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): false-positive-success
+  # tracker. Pre-fix, every stage past postgres logged only a WARNING on
+  # failure and the function always fell through to an unconditional
+  # `log_success "... letta started"` at the end regardless of whether
+  # `podman start` actually succeeded or the container ever reached a real
+  # Running/healthy state — a silent lie. `_wl_failed` is set non-zero the
+  # instant any stage fails to reach its ACTUAL verified state (not merely
+  # "the start command returned 0"); the function's own return code and the
+  # final log line are both driven off this, never off command-issued-ness.
+  local _wl_failed=0
+
   # Container names follow podman-compose convention: ${project}_${service}_1
   local _pg_ctr="${_proj}_postgres_1"
   local _gw_ctr="${_proj}_gateway_1"
@@ -8157,12 +8168,15 @@ _podman_compose_letta_waitloop() {
 
   # ── Step 2: start agent-db-init; wait for exit 0 ──────────────────────────
   if [[ "$(_letta_wl_state "$_adb_ctr")" == "absent" ]]; then
-    log_warn "Letta wait-loop [2/4]: agent-db-init container absent — letta DB may be missing"
+    log_error "Letta wait-loop [2/4]: agent-db-init container absent — letta DB may be missing"
+    _wl_failed=1
   else
     log_info "Letta wait-loop [2/4]: starting agent-db-init..."
     # `podman start` on an already-running container is a no-op exit-0; safe to call.
+    # The start-command return code is NOT the success signal here — a one-shot
+    # job's actual outcome is its exit code, checked below. Both are logged.
     podman start "$_adb_ctr" 2>/dev/null \
-      || log_warn "Letta wait-loop: podman start agent-db-init returned non-zero — proceeding"
+      || log_warn "Letta wait-loop: podman start agent-db-init returned non-zero — will still poll actual state"
     log_info "Letta wait-loop [2/4]: waiting for agent-db-init to exit 0..."
     local _adb_ok=0
     while [[ $(date +%s) -lt $_deadline ]]; do
@@ -8181,17 +8195,19 @@ _podman_compose_letta_waitloop() {
     else
       local _final_x
       _final_x="$(_letta_wl_exitcode "$_adb_ctr")"
-      log_warn "Letta wait-loop [2/4]: agent-db-init did not exit 0 (exit=${_final_x}) — letta may crash on missing DB"
+      log_error "Letta wait-loop [2/4]: agent-db-init did NOT exit 0 (state=$(_letta_wl_state "$_adb_ctr") exit=${_final_x}) — letta DB is not confirmed to exist"
+      _wl_failed=1
     fi
   fi
 
-  # ── Step 3: start letta-pgbouncer; wait for healthy ───────────────────────
+  # ── Step 3: start letta-pgbouncer; wait for healthy (verified, not assumed) ─
   if [[ "$(_letta_wl_state "$_lpgb_ctr")" == "absent" ]]; then
-    log_warn "Letta wait-loop [3/4]: letta-pgbouncer container absent"
+    log_error "Letta wait-loop [3/4]: letta-pgbouncer container absent"
+    _wl_failed=1
   else
     log_info "Letta wait-loop [3/4]: starting letta-pgbouncer..."
     podman start "$_lpgb_ctr" 2>/dev/null \
-      || log_warn "Letta wait-loop: podman start letta-pgbouncer returned non-zero — proceeding"
+      || log_warn "Letta wait-loop: podman start letta-pgbouncer returned non-zero — will still poll actual state"
     log_info "Letta wait-loop [3/4]: waiting for letta-pgbouncer healthy..."
     local _lpgb_ok=0
     while [[ $(date +%s) -lt $_deadline ]]; do
@@ -8201,11 +8217,12 @@ _podman_compose_letta_waitloop() {
     if [[ "$_lpgb_ok" -eq 1 ]]; then
       log_success "Letta wait-loop [3/4]: letta-pgbouncer healthy"
     else
-      log_warn "Letta wait-loop [3/4]: letta-pgbouncer not healthy before timeout — letta may fail DB connect"
+      log_error "Letta wait-loop [3/4]: letta-pgbouncer NOT healthy before timeout (state=$(_letta_wl_state "$_lpgb_ctr") health=$(_letta_wl_health "$_lpgb_ctr")) — letta will fail DB connect"
+      _wl_failed=1
     fi
   fi
 
-  # ── Step 4: wait for gateway healthy; start letta ─────────────────────────
+  # ── Step 4: wait for gateway healthy; start letta; VERIFY it actually runs ──
   # gateway has no service_healthy depends_on so podman-compose starts it
   # unconditionally, but it may still be converging. letta depends on it.
   if [[ "$(_letta_wl_health "$_gw_ctr")" != "healthy" ]]; then
@@ -8220,12 +8237,54 @@ _podman_compose_letta_waitloop() {
   fi
 
   if [[ "$(_letta_wl_state "$_letta_ctr")" == "absent" ]]; then
-    log_warn "Letta wait-loop [4/4]: letta container absent — cannot start"
+    log_error "Letta wait-loop [4/4]: letta container absent — cannot start"
+    _wl_failed=1
   else
     log_info "Letta wait-loop [4/4]: starting letta..."
+    # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): pre-fix, this block
+    # logged `ok Letta wait-loop [4/4]: letta started` unconditionally right
+    # after issuing `podman start`, regardless of its return code AND
+    # regardless of whether the container ever reached Running — a
+    # false-positive success. `podman start` returning 0 only means the
+    # engine accepted the request; on the exact YSG-PODMAN-LETTA-001 bug this
+    # fix addresses, `podman start` on letta previously returned non-zero
+    # (dependency-graph-construction error) while this code path still
+    # printed success. Fix: poll `_letta_wl_state` for the container to
+    # actually reach "running" (the literal, verifiable fact asked for — not
+    # "the command that asks it to run returned 0"), then additionally wait
+    # for "healthy" within the remaining budget as a stronger, non-blocking
+    # bonus signal. FAIL LOUDLY (log_error + _wl_failed=1) if letta never
+    # reaches Running before the deadline — no downgrade to a warning.
     podman start "$_letta_ctr" 2>/dev/null \
-      || log_warn "Letta wait-loop: podman start letta returned non-zero — proceeding"
-    log_success "Letta wait-loop [4/4]: letta started"
+      || log_warn "Letta wait-loop: podman start letta returned non-zero — will still poll actual state"
+    local _letta_running=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_state "$_letta_ctr")" == "running" ]] && { _letta_running=1; break; }
+      sleep 3
+    done
+    if [[ "$_letta_running" -ne 1 ]]; then
+      log_error "Letta wait-loop [4/4]: letta did NOT reach Running before timeout (state=$(_letta_wl_state "$_letta_ctr")) — letta tier FAILED to start"
+      _wl_failed=1
+    else
+      # Bonus: wait for healthy within whatever budget remains, but Running
+      # (already confirmed) is the pass/fail gate this defect fix targets.
+      local _letta_healthy=0
+      while [[ $(date +%s) -lt $_deadline ]]; do
+        [[ "$(_letta_wl_health "$_letta_ctr")" == "healthy" ]] && { _letta_healthy=1; break; }
+        [[ "$(_letta_wl_state "$_letta_ctr")" != "running" ]] && break
+        sleep 3
+      done
+      if [[ "$_letta_healthy" -eq 1 ]]; then
+        log_success "Letta wait-loop [4/4]: letta started and healthy"
+      else
+        log_success "Letta wait-loop [4/4]: letta started (running; health=$(_letta_wl_health "$_letta_ctr") — did not confirm healthy before timeout)"
+      fi
+    fi
+  fi
+
+  if [[ "$_wl_failed" -ne 0 ]]; then
+    log_error "Letta wait-loop: one or more letta-tier stages FAILED — letta tier is NOT fully up (core gateway/backoffice services are unaffected and remain usable)"
+    return 1
   fi
 }
 
@@ -9332,7 +9391,26 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   # detects that case and explicitly sequences them on their dep health.
   # NO-OP for all other providers (podman compose, docker) and lean installs.
   # See _podman_compose_letta_waitloop() definition above for full rationale.
-  _podman_compose_letta_waitloop
+  #
+  # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): the call used to be
+  # bare — under `set -euo pipefail` a real non-zero return here would abort
+  # the ENTIRE install (including core gateway/backoffice, already up and
+  # healthy at this point), which contradicts this function's own documented
+  # design ("Warn-and-continue on letta-pgbouncer / agent-db-init failures —
+  # core gateway/backoffice are unaffected — non-fatal", see function docblock
+  # above). The bug was never "the whole install aborts" — it was the
+  # opposite: the function's own false-positive `log_success` meant it never
+  # actually returned non-zero in practice. Now that the function honestly
+  # returns 1 on a real letta-tier failure, `|| true` is REQUIRED to preserve
+  # the pre-existing "core install succeeds regardless" contract while still
+  # surfacing the failure loudly and distinctly (never silently) below.
+  local _letta_waitloop_rc=0
+  _podman_compose_letta_waitloop || _letta_waitloop_rc=$?
+
+  if [[ "$_letta_waitloop_rc" -ne 0 ]]; then
+    log_error "LETTA TIER FAILED TO START — see 'Letta wait-loop' errors above for the exact stage that failed"
+    log_error "Core services (gateway/backoffice/postgres/etc.) are unaffected; re-run with --letta or retry 'podman start ${COMPOSE_PROJECT_NAME:-docker}_letta_1' after investigating"
+  fi
 
   log_success "Services started"
 

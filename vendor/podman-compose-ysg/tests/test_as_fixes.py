@@ -1,5 +1,5 @@
 """
-Regression tests for the 3 Agnostic Security patches (AS-FIX-1/2/3) applied
+Regression tests for the 4 Agnostic Security patches (AS-FIX-1/2/3/4) applied
 to vendored podman-compose 1.5.0 -> podman-compose-ysg 1.5.0+ysg.1.
 
 Scope note (GPL-2.0 boundary hygiene, Petra memo §2.3): these tests import
@@ -253,6 +253,107 @@ class TestSeccompPathResolution:
         args = asyncio.run(pc.container_to_args(compose, cnt))
         idx = args.index("--security-opt")
         assert args[idx + 1] == f"seccomp={os.path.realpath(str(profile))}"
+
+
+# ---------------------------------------------------------------------------
+# AS-FIX-4: exclude service_completed_successfully (one-shot) deps from
+# --requires= (YSG-PODMAN-LETTA-001)
+# ---------------------------------------------------------------------------
+
+
+class _FakeComposeForDeps:
+    def __init__(self, container_names_by_service: dict[str, list[str]]):
+        self.dirname = "/tmp"
+        self.container_names_by_service = container_names_by_service
+        self.environ: dict[str, str] = {}
+
+
+class TestOneShotDepsExcludedFromRequires:
+    def test_stopped_condition_dep_excluded_from_requires(self):
+        """
+        Reproduces YSG-PODMAN-LETTA-001 exactly: a dependency declared with
+        service_completed_successfully (-> ServiceDependencyCondition.STOPPED)
+        must NOT appear in the baked --requires= list. podman's --requires
+        means "must be running" and has no equivalent for "ran to completion
+        once" — including a one-shot job there caused podman's own engine to
+        try to restart the already-exited job as part of resolving
+        --requires, which then hit a dependency-graph-construction bug when
+        the one-shot's own dependency (postgres) was already running
+        ("... not found in input list"). letta-pgbouncer and letta both
+        stuck in Created on every from-scratch podman install before this
+        fix.
+        """
+        compose = _FakeComposeForDeps(container_names_by_service={
+            "postgres": ["proj_postgres_1"],
+            "agent-db-init": ["proj_agent-db-init_1"],
+        })
+        cnt = {
+            "name": "letta-pgbouncer",
+            "service_name": "letta-pgbouncer",
+            "image": "x",
+            "network_mode": "none",
+            "_deps": [
+                pc.ServiceDependency("postgres", "service_healthy"),
+                pc.ServiceDependency("agent-db-init", "service_completed_successfully"),
+            ],
+        }
+        args = asyncio.run(pc.container_to_args(compose, cnt, detached=False))
+        requires = [a for a in args if a.startswith("--requires=")]
+        assert len(requires) == 1, "expected exactly one --requires= flag"
+        requires_names = requires[0][len("--requires="):].split(",")
+        assert "proj_postgres_1" in requires_names
+        assert "proj_agent-db-init_1" not in requires_names, (
+            "a service_completed_successfully (one-shot) dependency must "
+            "never be walked via podman's engine-level --requires="
+        )
+
+    def test_only_stopped_deps_excluded_running_deps_unaffected(self):
+        """service_started / service_healthy deps are UNCHANGED by this fix —
+        only the STOPPED-condition class is excluded. If ALL deps happen to
+        be STOPPED, no --requires= flag should be emitted at all (empty list,
+        not --requires= with a trailing/empty value)."""
+        compose = _FakeComposeForDeps(container_names_by_service={
+            "one-shot": ["proj_one-shot_1"],
+        })
+        cnt = {
+            "name": "dependent",
+            "service_name": "dependent",
+            "image": "x",
+            "network_mode": "none",
+            "_deps": [
+                pc.ServiceDependency("one-shot", "service_completed_successfully"),
+            ],
+        }
+        args = asyncio.run(pc.container_to_args(compose, cnt, detached=False))
+        requires = [a for a in args if a.startswith("--requires=")]
+        assert requires == [], (
+            "a service with ONLY one-shot (STOPPED) deps must produce no "
+            "--requires= flag at all, not an empty/malformed one"
+        )
+
+    def test_healthy_and_started_deps_still_in_requires(self):
+        """Sanity: this fix must not regress the non-one-shot case at all —
+        service_healthy / service_started deps still translate to
+        --requires= exactly as before AS-FIX-4."""
+        compose = _FakeComposeForDeps(container_names_by_service={
+            "postgres": ["proj_postgres_1"],
+            "gateway": ["proj_gateway_1"],
+        })
+        cnt = {
+            "name": "letta",
+            "service_name": "letta",
+            "image": "x",
+            "network_mode": "none",
+            "_deps": [
+                pc.ServiceDependency("postgres", "service_healthy"),
+                pc.ServiceDependency("gateway", "service_healthy"),
+            ],
+        }
+        args = asyncio.run(pc.container_to_args(compose, cnt, detached=False))
+        requires = [a for a in args if a.startswith("--requires=")]
+        assert len(requires) == 1
+        requires_names = set(requires[0][len("--requires="):].split(","))
+        assert requires_names == {"proj_postgres_1", "proj_gateway_1"}
 
 
 if __name__ == "__main__":
