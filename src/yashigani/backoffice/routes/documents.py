@@ -393,12 +393,22 @@ async def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
 
     Matches on group ``id`` OR ``display_name`` so an operator can name the
     detokenize role either way.  Fail-closed: any store error / missing store /
-    unknown account → False (deny).  This is the proof-bearing gate the brief
-    mandates: an unauthorised user must NOT receive the table.
+    unknown account / unresolvable identity → False (deny).  This is the
+    proof-bearing gate the brief mandates: an unauthorised user must NOT
+    receive the table.
 
-    LAURA-30-003: ``account_id`` is a UUID; ``RBACStore.get_user_groups`` keys on
-    email.  Resolve the email via ``auth_service.get_account_by_id`` before the
-    RBAC lookup so the gate actually fires instead of always-denying.
+    LAURA-30-003: ``account_id`` is a UUID; resolve it to an email via
+    ``auth_service.get_account_by_id`` first.
+
+    v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 2): after the 4.1 UID
+    migration, ``RBACStore.get_user_groups()`` is keyed by ``identity_id``
+    (``idnt_{12hex}``), NOT email (see rbac/store.py get_user_groups()
+    docstring — passing email now silently returns ``[]``, which is
+    fail-closed but denies every legitimate admin, making the document
+    control unusable). Resolve email → identity_id via the identity
+    registry before the RBAC lookup, mirroring the same resolution
+    ``backoffice/routes/rbac.py``'s ``get_user_groups()`` route handler
+    already performs.
     """
     store = backoffice_state.rbac_store
     if store is None:
@@ -417,8 +427,22 @@ async def _admin_in_detokenize_role(account_id: str, role: str) -> bool:
     email = getattr(record, "email", None) or getattr(record, "username", None)
     if not email:
         return False
+    # Resolve email → identity_id (fail-closed on missing registry/identity).
+    registry = backoffice_state.identity_registry
+    if registry is None:
+        return False
+    identity = registry.get_by_email(email)
+    if identity is None:
+        return False
+    identity_id = (
+        identity.get("identity_id")
+        if isinstance(identity, dict)
+        else getattr(identity, "identity_id", None)
+    )
+    if not identity_id:
+        return False
     try:
-        groups = store.get_user_groups(email)
+        groups = store.get_user_groups(identity_id)
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("RBAC lookup failed for detokenize gate: %s", exc)
         return False
