@@ -347,19 +347,71 @@ def second_user_client(bo_app, session_store):
 
 @pytest.fixture
 def gw_app_factory():
-    """Returns a callable that builds the gateway FastAPI app. The gateway
-    entrypoint module docstring/pattern must be inspected by the owning group
-    (gateway/entrypoint.py) — its lifespan has its own DB/Redis/OPA
-    dependencies, same no-op-lifespan technique applies. Provided here as a
-    stub factory location so the GATEWAY-MCP group has one canonical place to
-    land it (avoids a second, divergent gateway-app fixture appearing in a
-    group test file)."""
+    """Returns a callable that builds a FRESH gateway FastAPI app.
 
-    def _build() -> FastAPI:
-        from yashigani.gateway.entrypoint import app as gw_app  # type: ignore[attr-defined]
+    GATEWAY-MCP FIX (2026-07-23): the original stub imported
+    ``yashigani.gateway.entrypoint.app`` — a MODULE-LEVEL SINGLETON built
+    exactly once, at first import, by ``entrypoint._build_app()``. That is not
+    an app *factory* the way ``create_backoffice_app()`` is: ``_build_app()``
+    (a) hard-requires ``YASHIGANI_UPSTREAM_URL`` via ``os.environ[...]`` (no
+    default — raises ``KeyError`` at import time if unset), (b) attempts ~15
+    real ``redis.from_url(...).ping()`` connections (RBAC, rate-limit, DDoS,
+    JWT inspector, model stores, workflow scheduler, egress limiter — each
+    individually try/excepted to degrade to ``None`` on failure, so it doesn't
+    crash offline, but it is slow and non-deterministic across environments),
+    and (c) starts several background daemon threads (MetricsCollector,
+    PoolHealthMonitor, a Redis pub/sub settings-subscriber thread) as an
+    IMPORT-TIME side effect. Swapping ``.router.lifespan_context`` on that
+    singleton afterwards does NOT rebuild it, and calling the stub's ``_build``
+    again just re-returns the SAME already-built app object — there is no
+    per-test (or even per-session) isolation, unlike every other fixture in
+    this file.
 
-        gw_app.router.lifespan_context = _noop_lifespan
-        return gw_app
+    Verified fix: build the gateway app the same way this exact codebase's
+    OWN unit-test suite already does — see
+    ``src/tests/unit/test_openapi_exposure.py::_make_gateway_client`` — by
+    calling ``create_gateway_app()`` (the real FastAPI app *factory* in
+    ``gateway/proxy.py``) directly, mirroring how ``bo_app_factory`` above
+    calls ``create_backoffice_app()``. ``create_gateway_app()`` takes plain
+    keyword arguments (no Redis/DB I/O at construction time) and its
+    ``_lifespan`` only does two things offline-relevant: (1) load the Layer B
+    Caddy secret (cheap, env-var read — same pattern as
+    ``load_caddy_secret()`` in ``bo_app_factory``), and (2) construct an
+    ``httpx.AsyncClient`` (no network I/O at construction). Postgres/workflow-
+    scheduler startup are gated behind env vars this suite deliberately leaves
+    unset. The no-op lifespan swap below is applied anyway, for the same
+    defence-in-depth reason ``bo_app_factory`` applies it, and because tests
+    that never reach the catch-all's upstream-forward step never touch
+    ``state["http_client"]`` regardless.
+
+    NOTE: unlike ``bo_app_factory``, this factory does NOT add
+    ``CaddyVerifiedMiddleware`` / ``SpiffePeerCertMiddleware`` /
+    ``LicenseEnforcementMiddleware`` / ``AgentAuthMiddleware`` — those are
+    wired by ``entrypoint._build_app()`` AROUND the object ``create_gateway_app()``
+    returns, not by ``create_gateway_app()`` itself, and this exact codebase's
+    own ``test_openapi_exposure.py::_make_gateway_client`` does not add them
+    either. Route-level auth (Bearer/API-key resolution + OPA) IS exercised;
+    the outer Caddy/Spiffe/License/Agent middleware chain is NOT — see the
+    GATEWAY-MCP group's test module for the explicit scope note.
+    """
+
+    def _build(*, config=None, extra_routers=None, **create_gateway_app_kwargs) -> FastAPI:
+        from yashigani.auth.caddy_verified import load_caddy_secret
+
+        load_caddy_secret()
+        from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
+
+        cfg = config or GatewayConfig(
+            upstream_base_url="http://upstream.invalid:9",
+            opa_url="https://policy.invalid:8181",
+        )
+        app = create_gateway_app(
+            config=cfg,
+            extra_routers=extra_routers or [],
+            **create_gateway_app_kwargs,
+        )
+        app.router.lifespan_context = _noop_lifespan
+        return app
 
     return _build
 
@@ -372,7 +424,22 @@ def gw_app_factory():
 
 
 class MockOPATransport(httpx.MockTransport):
+    """
+    FIX (2026-07-23, found independently by the GATEWAY-MCP fan-out group):
+    the original version of this class overrode `__init__` WITHOUT calling
+    `httpx.MockTransport.__init__(self, self.handle_request)` — this works
+    fine under `httpx.Client` (sync dispatch resolves `self.handle_request`
+    directly), but silently breaks under `httpx.AsyncClient` (async
+    dispatch), because `MockTransport.__init__` is what actually wires the
+    handler callable into the base transport's dispatch machinery. Several
+    fan-out groups worked around this locally by wrapping
+    `httpx.MockTransport(mock_opa.handle_request)` themselves instead of
+    using this class directly — fixed here so `mock_opa` is a correct,
+    directly-usable transport for BOTH sync and async httpx clients.
+    """
+
     def __init__(self, allow: bool = True):
+        super().__init__(self.handle_request)
         self._allow = allow
 
     def set_decision(self, decision: str) -> None:
