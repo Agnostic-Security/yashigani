@@ -112,24 +112,39 @@ def test_keygen_cli_refuses_to_overwrite_without_force(tmp_path: Path, monkeypat
 # --- manifest_signer.py: pull-manifest (SignedCatalogEntry) round-trip ---
 
 
-def _mint_pull_entry(signer: ManifestSigner, **overrides):
-    fields = {
-        "repo_id": "acme/tiny-model",
-        "revision": REVISION,
-        "filename": "tiny-model.Q4_K_M.gguf",
-        "quant": "Q4_K_M",
-        "sha256": "c" * 64,
-        "lfs_object_id": "d" * 64,
-        "provenance_tier": "counter-signed",
-        "signer_key_id": "test-signing-key-2026-07",
-        # Large enough that tests calling require() without an explicit
-        # `now=` (real wall-clock time) never spuriously expire relative to
-        # the fixed issued_at below.
-        "max_trust_age_seconds": 90 * 24 * 3600,
-        "issued_at": "2026-07-22T00:00:00Z",
-    }
-    fields.update(overrides)
-    return signer.mint(**fields)
+def _mint_pull_entry(
+    signer: ManifestSigner,
+    *,
+    repo_id: str = "acme/tiny-model",
+    revision: str = REVISION,
+    filename: str = "tiny-model.Q4_K_M.gguf",
+    quant: str = "Q4_K_M",
+    sha256: str = "c" * 64,
+    lfs_object_id: str = "d" * 64,
+    provenance_tier: str = "counter-signed",
+    signer_key_id: str = "test-signing-key-2026-07",
+    # Large enough that tests calling require() without an explicit `now=`
+    # (real wall-clock time) never spuriously expire relative to the fixed
+    # issued_at below.
+    max_trust_age_seconds: int = 90 * 24 * 3600,
+    issued_at: str = "2026-07-22T00:00:00Z",
+) -> SignedCatalogEntry:
+    # Explicit typed kwargs (not a **dict-unpack) mirroring ManifestSigner.mint's
+    # own signature — mypy cannot verify a `dict[str, object]` unpack against
+    # typed keyword parameters (was the standing arg-type error at this call
+    # site); named parameters give it exact per-field types instead.
+    return signer.mint(
+        repo_id=repo_id,
+        revision=revision,
+        filename=filename,
+        quant=quant,
+        sha256=sha256,
+        lfs_object_id=lfs_object_id,
+        provenance_tier=provenance_tier,
+        signer_key_id=signer_key_id,
+        max_trust_age_seconds=max_trust_age_seconds,
+        issued_at=issued_at,
+    )
 
 
 def test_sign_then_verify_round_trip(signing_keypair) -> None:
