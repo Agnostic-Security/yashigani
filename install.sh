@@ -14772,11 +14772,22 @@ PYHASH
     fi
     rm -f "$_hashpy"
     # fail-closed verification — the explicit ISSUE-009 action-item gate
+    #
+    # BUG-GREP-C-DOUBLE-PRINT-2026-07-23 (found via uninstall.sh P3a pattern-
+    # sweep): `grep -c ... || echo 0` double-prints "0\n0" when the count is
+    # genuinely zero (grep -c already emits "0" on no-match AND exits 1, so
+    # the `|| echo 0` fallback ALSO fires). That two-line value fed into
+    # `[[ "$_pop" -lt 1 ]]` throws a bash arithmetic syntax error which
+    # evaluates the condition FALSE — silently DEFEATING this fail-closed
+    # gate exactly when it matters most (0 populated tokens). Fixed by
+    # dropping the redundant `|| echo 0` (grep -c's own stdout already
+    # covers the zero case; `|| true` only guards set -e from the no-match
+    # exit code).
     local _pop
     if [[ "$_use_unshare2" == "true" ]]; then
-      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || true)"
     else
-      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || true)"
     fi
     if [[ "${_pop:-0}" -lt 1 ]]; then
       log_error "_pki_run_issuer: runtime manifest has 0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009) — aborting fail-closed"

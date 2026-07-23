@@ -547,6 +547,43 @@ restart_services() {
 # the pull+restart+health-check+auto-rollback steps are already one atomic
 # unit at the helm level. Do NOT reimplement any of that logic here.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _k8s_current_helm_revision — the release's latest Helm revision number, or
+# "0" if the release does not exist, or "" (empty) if it could not be
+# determined (helm missing / query failed) — callers must treat "" as
+# UNKNOWN, not as "0".
+#
+# Used by k8s_delegate_upgrade() (BUG-UPDATE-FALSE-ROLLBACK-CLAIM-2026-07-23,
+# P3b) to tell apart two very different failure shapes after a delegated
+# `install.sh --upgrade --mode k8s` call fails:
+#   - install.sh reached STEP 8 (helm upgrade --atomic) and it failed →
+#     revision number ADVANCES (an atomic rollback is itself a new revision
+#     in Helm's history) → "already rolled back cluster-side" is TRUE.
+#   - install.sh aborted at an EARLY preflight (missing helm/kubectl, cluster
+#     connectivity, kernel/CRD gate, etc.) BEFORE STEP 8 ever ran → revision
+#     number is UNCHANGED → nothing was rolled back because nothing was
+#     changed cluster-side; claiming otherwise is actively misleading.
+# ---------------------------------------------------------------------------
+_k8s_current_helm_revision() {
+  if ! command -v helm >/dev/null 2>&1; then
+    printf ''
+    return 0
+  fi
+  local _json _rev
+  _json="$(helm history "$K8S_HELM_RELEASE" -n "$K8S_NAMESPACE" --max 1 -o json 2>/dev/null || true)"
+  if [[ -z "$_json" ]]; then
+    # No history (release does not exist) is a valid "0", distinguishable
+    # from "helm history command itself errored" only by exit code, which
+    # `|| true` above already discarded — but an empty release is the
+    # overwhelmingly common no-history case, so treat empty-but-helm-present
+    # as revision 0 rather than unknown.
+    printf '0'
+    return 0
+  fi
+  _rev="$(printf '%s' "$_json" | grep -o '"revision"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$' || true)"
+  printf '%s' "${_rev:-}"
+}
+
 k8s_delegate_upgrade() {
   log_step "6-8/8" "Delegating to install.sh --upgrade --mode k8s (helm upgrade --atomic)..."
 
@@ -570,18 +607,47 @@ k8s_delegate_upgrade() {
     return 0
   fi
 
+  # BUG-UPDATE-FALSE-ROLLBACK-CLAIM-2026-07-23 (P3b): snapshot the Helm
+  # revision BEFORE delegating, so a failure can be attributed accurately.
+  local _rev_before
+  _rev_before="$(_k8s_current_helm_revision)"
+
   log_info "Running: ${install_sh} ${args[*]}"
   if "$install_sh" "${args[@]}"; then
     log_success "Helm release '${K8S_HELM_RELEASE}' upgraded in namespace '${K8S_NAMESPACE}' (v${TARGET_VERSION})."
     return 0
   fi
 
+  local _rev_after
+  _rev_after="$(_k8s_current_helm_revision)"
+
   log_error "k8s upgrade FAILED."
-  log_error "Because k8s_helm_install() always runs 'helm upgrade --atomic', the"
-  log_error "release has ALREADY been rolled back cluster-side to its previous"
-  log_error "revision — no further action from update.sh is needed or safe to take."
   log_error "Namespace: ${K8S_NAMESPACE}   Release: ${K8S_HELM_RELEASE}"
-  log_error "Inspect with: helm history ${K8S_HELM_RELEASE} -n ${K8S_NAMESPACE}"
+  if [[ -n "$_rev_before" && -n "$_rev_after" && "$_rev_before" != "$_rev_after" ]]; then
+    # Revision advanced — install.sh reached STEP 8 and helm's own --atomic
+    # gate rolled it back. This claim is now evidence-backed, not assumed.
+    log_error "Because k8s_helm_install() always runs 'helm upgrade --atomic', the"
+    log_error "release has ALREADY been rolled back cluster-side to its previous"
+    log_error "revision (history: ${_rev_before} -> ${_rev_after}) — no further action"
+    log_error "from update.sh is needed or safe to take."
+    log_error "Inspect with: helm history ${K8S_HELM_RELEASE} -n ${K8S_NAMESPACE}"
+  elif [[ -n "$_rev_before" && -n "$_rev_after" ]]; then
+    # Revision unchanged — install.sh aborted BEFORE the helm upgrade began.
+    # Nothing was rolled back because nothing was changed cluster-side.
+    log_error "install.sh aborted BEFORE the Helm upgrade began (revision unchanged"
+    log_error "at ${_rev_before}) — most likely an early preflight failure (missing"
+    log_error "helm/kubectl, cluster connectivity, kernel/CRD gate, etc.), NOT a"
+    log_error "helm --atomic rollback. Nothing was rolled back because nothing was"
+    log_error "changed cluster-side."
+    log_error "Re-run directly to see the exact preflight error:"
+    log_error "  ${install_sh} ${args[*]}"
+  else
+    # Could not determine either revision (helm unavailable / query failed) —
+    # do NOT assert either way.
+    log_error "Could not determine whether the Helm upgrade began before failing"
+    log_error "(helm unavailable or revision query failed) — inspect manually:"
+    log_error "  helm history ${K8S_HELM_RELEASE} -n ${K8S_NAMESPACE}"
+  fi
   exit 1
 }
 
@@ -824,10 +890,12 @@ main() {
   if [[ "$RUNTIME_MODE" == "k8s" ]]; then
     # K8S-UPDATE-2026-07-22: single delegated call — pull+restart+health-gate
     # +atomic-rollback-on-failure are ALL handled inside install.sh's own
-    # k8s_helm_install(). k8s_delegate_upgrade() exits non-zero (and the
-    # release has already been rolled back cluster-side by --atomic) or
-    # exits 0 (fully healthy) — there is no separate verify_health/do_rollback
-    # step to run afterward for k8s.
+    # k8s_helm_install(). k8s_delegate_upgrade() exits 0 (fully healthy) or
+    # non-zero — on failure it now checks the Helm revision before/after to
+    # report ACCURATELY whether --atomic actually rolled back a started
+    # upgrade, or install.sh aborted at an early preflight before any change
+    # was made (BUG-UPDATE-FALSE-ROLLBACK-CLAIM-2026-07-23, P3b) — there is
+    # no separate verify_health/do_rollback step to run afterward for k8s.
     k8s_delegate_upgrade
   else
     pull_images

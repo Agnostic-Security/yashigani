@@ -10,8 +10,24 @@
 # Last updated: 2026-05-15T10:00:00+00:00 (fix(uninstall): stub docker/.env for compose-down in DR scenario — BUG-UNINSTALL-NO-ENV)
 # Last updated: 2026-05-15T00:00:00+00:00 (fix(uninstall): drop privileged-linger shortcut from disable-linger, copy-pasteable remediation — Q2 / lint-sudo-pattern fix)
 # Last updated: 2026-05-14T23:00:00+00:00 (fix: gate linger-disable on --remove-volumes — Q3 asymmetry)
+# Last updated: 2026-07-23T00:00:00+00:00 (fix(uninstall): _resolve_tool_bin + fail-closed k8s tool
+#   preflight — BUG-UNINSTALL-PATH-MISSING-HELM-NONROOT-2026-07-23, P0. Same class as
+#   BUG-UNINSTALL-PATH-MISSING-PODMAN-MAC-2026-05-27 below, never extended to helm: the hardened
+#   PATH omits ~/.local/bin (pipx / get_helm.sh --no-sudo, the common non-root helm install
+#   location), so `command -v helm` silently failed and the k8s teardown proceeded kubectl-only,
+#   leaving Helm-owned Deployments/StatefulSets alive to re-spawn force-deleted pods.)
 
 set -euo pipefail
+
+# BUG-UNINSTALL-PATH-MISSING-HELM-NONROOT-2026-07-23: capture the operator's
+# inherited PATH BEFORE the hardened PATH below replaces it. _resolve_tool_bin()
+# uses this as a bounded LAST-RESORT search space so a tool installed to a
+# legitimate-but-unlisted location (rootless helm via `get_helm.sh --no-sudo`,
+# pipx, asdf, krew, etc.) can still be found. This does NOT widen the PATH
+# actually used to execute anything: resolution and execution are kept separate
+# — we resolve an absolute path once via search, then invoke that absolute path,
+# so the hardened-PATH hijack-safety intent is preserved.
+_ORIG_PATH="${PATH:-}"
 
 # Hardened PATH — never trust inherited PATH for privileged scripts.
 # BUG-UNINSTALL-PATH-MISSING-PODMAN-MAC-2026-05-27: prior PATH excluded
@@ -33,6 +49,116 @@ log_info() { printf "    --> %s\n" "$1"; }
 log_warn() { printf "    !!  %s\n" "$1" >&2; }
 log_error() { printf "    XX  %s\n" "$1" >&2; }
 log_success() { printf "    ok  %s\n" "$1"; }
+
+# ---------------------------------------------------------------------------
+# _resolve_tool_bin NAME — resolve an absolute path to a required binary
+# without trusting a single narrow PATH.
+#
+# Search order (first hit wins):
+#   1. Hardened PATH above (trusted system + Homebrew + Podman dirs).
+#   2. Well-known non-root install locations NOT on the hardened PATH
+#      (pipx/get_helm.sh --no-sudo default $HOME/.local/bin, $HOME/bin,
+#      krew's $HOME/.krew/bin, MacPorts, Linux snap).
+#   3. The operator's ORIGINAL inherited PATH (captured in $_ORIG_PATH
+#      before hardening, above) — last resort, for install locations we
+#      don't enumerate explicitly.
+#
+# Resolving to an absolute path (rather than relying on a mutated PATH at
+# call time) means the caller invokes the exact binary found here — no
+# re-resolution, no PATH-hijack window between preflight and execution.
+# Prints the absolute path on stdout and returns 0 on success; returns 1
+# (prints nothing) if the binary cannot be found anywhere.
+# BUG-UNINSTALL-PATH-MISSING-HELM-NONROOT-2026-07-23.
+# ---------------------------------------------------------------------------
+_resolve_tool_bin() {
+  local _name="${1:?_resolve_tool_bin: tool name required}"
+  local _dir _p _found
+
+  # 1) hardened PATH (already includes system + homebrew + podman dirs).
+  if _found="$(command -v "$_name" 2>/dev/null)"; then
+    printf '%s\n' "$_found"
+    return 0
+  fi
+
+  # 2) well-known non-root / user-scoped install locations.
+  for _dir in \
+    "${HOME:-}/.local/bin" \
+    "${HOME:-}/bin" \
+    "${HOME:-}/.krew/bin" \
+    "/opt/local/bin" \
+    "/snap/bin"
+  do
+    [ -n "$_dir" ] || continue
+    if [ -x "${_dir}/${_name}" ]; then
+      printf '%s/%s\n' "$_dir" "$_name"
+      return 0
+    fi
+  done
+
+  # 3) operator's original inherited PATH (captured before hardening) — last
+  # resort so an unusual-but-legitimate install location still resolves.
+  if [ -n "$_ORIG_PATH" ]; then
+    local _oldifs="$IFS"
+    IFS=:
+    for _p in $_ORIG_PATH; do
+      IFS="$_oldifs"
+      if [ -n "$_p" ] && [ -x "${_p}/${_name}" ]; then
+        printf '%s/%s\n' "$_p" "$_name"
+        return 0
+      fi
+    done
+    IFS="$_oldifs"
+  fi
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# _require_k8s_tools — fail-closed preflight for the k8s teardown path.
+#
+# CRITICAL INVARIANT: a destructive lifecycle step (helm uninstall, kubectl
+# delete) must NEVER be silently skipped because its tool wasn't found. Prior
+# behaviour: _teardown_k8s()'s `if command -v helm` guard fell through to a
+# `[WARN] helm not found — skipping helm uninstall` else-branch and CONTINUED
+# — the k8s teardown proceeded kubectl-only while Helm-owned Deployments/
+# StatefulSets stayed alive, re-spawning force-deleted pods and hanging the
+# subsequent `kubectl delete pvc --wait`. BUG-UNINSTALL-PATH-MISSING-HELM-
+# NONROOT-2026-07-23 (P0).
+#
+# Resolves HELM_BIN and KUBECTL_BIN via _resolve_tool_bin() (operator-supplied
+# HELM_BIN/KUBECTL_BIN env vars take precedence, for an explicit override when
+# a binary lives somewhere genuinely unexpected). If either tool cannot be
+# resolved, ABORTS with exit 1 BEFORE any delete runs — fail-closed, not
+# skip-and-proceed.
+# ---------------------------------------------------------------------------
+_require_k8s_tools() {
+  local _missing=()
+
+  if [ -z "${HELM_BIN:-}" ]; then
+    HELM_BIN="$(_resolve_tool_bin helm || true)"
+  fi
+  if [ -z "${KUBECTL_BIN:-}" ]; then
+    KUBECTL_BIN="$(_resolve_tool_bin kubectl || true)"
+  fi
+
+  [ -n "$HELM_BIN" ] || _missing+=("helm")
+  [ -n "$KUBECTL_BIN" ] || _missing+=("kubectl")
+
+  if [ "${#_missing[@]}" -gt 0 ]; then
+    log_error "k8s teardown requires: ${_missing[*]} — not found in the hardened PATH,"
+    log_error "common non-root install locations (\$HOME/.local/bin, \$HOME/bin, ...), or"
+    log_error "your original shell PATH."
+    log_error "ABORTING before any delete — a k8s teardown that proceeds kubectl-only"
+    log_error "while helm-owned resources survive is WORSE than not tearing down at all"
+    log_error "(force-deleted pods get recreated by the surviving Deployment/StatefulSet,"
+    log_error "re-mounting PVCs the operator believes were deleted)."
+    log_error "Install/locate the missing tool(s) and re-run, or pass an explicit path:"
+    log_error "  HELM_BIN=/path/to/helm KUBECTL_BIN=/path/to/kubectl $0 ..."
+    exit 1
+  fi
+
+  export HELM_BIN KUBECTL_BIN
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
@@ -376,7 +502,7 @@ _remove_containers() {
   [ -z "$_ids" ] && return 0
 
   local _count
-  _count="$(printf '%s\n' "$_ids" | grep -c '.' || echo 0)"
+  _count="$(printf '%s\n' "$_ids" | grep -c '.' || true)"
   echo "  [stop] Stopping ${_count} container(s)..."
   while IFS= read -r _cid; do
     [ -z "$_cid" ] && continue
@@ -420,7 +546,7 @@ _assert_no_containers_remain() {
   _residual="$(_list_project_containers "$_rt" "$_pfx")"
   if [ -n "$_residual" ]; then
     local _cnt
-    _cnt="$(printf '%s\n' "$_residual" | grep -c '.' || echo 0)"
+    _cnt="$(printf '%s\n' "$_residual" | grep -c '.' || true)"
     printf '\n' >&2
     printf 'ERROR: uninstall.sh FAILED — %d project container(s) remain after all removal passes.\n' "$_cnt" >&2
     printf 'Runtime: %s\n' "$_label" >&2
@@ -682,9 +808,16 @@ _teardown_k8s() {
   local _ns="${YASHIGANI_NAMESPACE:-yashigani}"
   local _release="${YASHIGANI_HELM_RELEASE:-yashigani}"
 
+  # BUG-UNINSTALL-PATH-MISSING-HELM-NONROOT-2026-07-23 (P0): resolve helm +
+  # kubectl BEFORE any delete runs. Aborts (exit 1) if either is missing —
+  # fail-closed, never skip-and-proceed. Sets HELM_BIN / KUBECTL_BIN.
+  _require_k8s_tools
+
   echo "=== Kubernetes (Helm) teardown ==="
   echo "  Namespace: ${_ns}"
   echo "  Helm release: ${_release}"
+  echo "  helm:    ${HELM_BIN}"
+  echo "  kubectl: ${KUBECTL_BIN}"
 
   # ---------------------------------------------------------------------------
   # CROSS-ORG-COREDNS-WARN-2026-07-22 (Finding 4, P2): if THIS install patched
@@ -712,123 +845,118 @@ _teardown_k8s() {
   fi
 
   # Step 1: helm uninstall (removes Deployment, Service, ConfigMap, Secrets, etc.)
-  if command -v helm >/dev/null 2>&1; then
-    if helm status "$_release" -n "$_ns" >/dev/null 2>&1; then
-      echo "  [helm] Uninstalling release ${_release}..."
-      helm uninstall "$_release" -n "$_ns" --wait --timeout 120s 2>&1 || true
-    else
-      echo "  [skip] Helm release ${_release} not found in namespace ${_ns}"
-    fi
+  # _require_k8s_tools above guarantees HELM_BIN resolves — no command -v guard
+  # needed here, and no skip-branch: absence already aborted the whole function.
+  if "$HELM_BIN" status "$_release" -n "$_ns" >/dev/null 2>&1; then
+    echo "  [helm] Uninstalling release ${_release}..."
+    "$HELM_BIN" uninstall "$_release" -n "$_ns" --wait --timeout 120s 2>&1 || true
   else
-    echo "  [WARN] helm not found — skipping helm uninstall" >&2
+    echo "  [skip] Helm release ${_release} not found in namespace ${_ns}"
   fi
 
   # Step 2: drain any residual pods via kubectl.
-  if command -v kubectl >/dev/null 2>&1; then
-    local _pod_count
-    _pod_count="$(kubectl get pods -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
-    if [ "$_pod_count" -gt 0 ]; then
-      echo "  [kubectl] Force-deleting ${_pod_count} residual pod(s)..."
-      kubectl delete pods --all -n "$_ns" --force --grace-period=0 2>&1 || true
+  # KUBECTL_BIN is guaranteed resolved by _require_k8s_tools — same reasoning.
+  local _pod_count
+  _pod_count="$("$KUBECTL_BIN" get pods -n "$_ns" --no-headers 2>/dev/null | grep -c . || true)"
+  if [ "$_pod_count" -gt 0 ]; then
+    echo "  [kubectl] Force-deleting ${_pod_count} residual pod(s)..."
+    "$KUBECTL_BIN" delete pods --all -n "$_ns" --force --grace-period=0 2>&1 || true
+  else
+    echo "  [ok] No residual pods in namespace ${_ns}."
+  fi
+
+  # FINDING-V412-UNIVERSAL-001 — keep-vs-nuke Secret contract on k8s.
+  #
+  # The chart's credential/PKI/licence Secrets now carry
+  # helm.sh/resource-policy: keep (secrets.yaml, licensing-secret.yaml,
+  # mtls-rbac.yaml + re-asserted by the bootstrap Job). So `helm uninstall`
+  # (Step 1 above) LEAVES them — matching the compose contract: plain uninstall
+  # preserves secrets/PKI for reinstall/upgrade; only --remove-volumes nukes.
+  local _kept
+  _kept="$("$KUBECTL_BIN" get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+            --no-headers 2>/dev/null | grep -c . || true)"
+
+  if [ "$REMOVE_VOLUMES" != "true" ]; then
+    # Step 3 (keep-mode): PRESERVE secrets/PKI/PVCs/namespace.
+    echo "  [keep] Preserving ${_kept} yashigani Secret(s) + PKI + PVCs for reinstall/upgrade."
+    echo "  [keep] Run 'uninstall.sh --remove-volumes' to purge secrets/PVCs/namespace."
+  else
+    # Step 3 (NUKE): purge kept Secrets, PVCs, then namespace. Delete the kept
+    # Secrets explicitly and BEFORE the namespace so a namespace-delete timeout
+    # can never leave credential material behind reporting a false-clean.
+    echo "  [nuke] --remove-volumes set — purging ${_kept} Secret(s), PVCs, namespace."
+
+    # 3a: Secrets. Instance-labelled selector covers the 12 app Secrets +
+    # licensing + PKI placeholders. The two PKI Secrets are re-applied
+    # imperatively by the bootstrap Job and may not retain the instance label,
+    # so also delete them (and licensing) by well-known name (idempotent).
+    "$KUBECTL_BIN" delete secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+      --wait=true --timeout=60s 2>&1 || true
+    local _s
+    for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
+              "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
+              "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
+      "$KUBECTL_BIN" delete secret "$_s" -n "$_ns" --ignore-not-found=true \
+        --wait=true --timeout=30s 2>&1 || true
+    done
+
+    # 3b: PVCs.
+    local _pvc_count
+    _pvc_count="$("$KUBECTL_BIN" get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || true)"
+    if [ "$_pvc_count" -gt 0 ]; then
+      echo "  [kubectl] Deleting ${_pvc_count} PersistentVolumeClaim(s)..."
+      "$KUBECTL_BIN" delete pvc --all -n "$_ns" --wait=true --timeout=60s 2>&1 || true
     else
-      echo "  [ok] No residual pods in namespace ${_ns}."
+      echo "  [ok] No PVCs found in namespace ${_ns}."
     fi
 
-    # FINDING-V412-UNIVERSAL-001 — keep-vs-nuke Secret contract on k8s.
-    #
-    # The chart's credential/PKI/licence Secrets now carry
-    # helm.sh/resource-policy: keep (secrets.yaml, licensing-secret.yaml,
-    # mtls-rbac.yaml + re-asserted by the bootstrap Job). So `helm uninstall`
-    # (Step 1 above) LEAVES them — matching the compose contract: plain uninstall
-    # preserves secrets/PKI for reinstall/upgrade; only --remove-volumes nukes.
-    local _kept
-    _kept="$(kubectl get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
-              --no-headers 2>/dev/null | grep -c . || echo 0)"
-
-    if [ "$REMOVE_VOLUMES" != "true" ]; then
-      # Step 3 (keep-mode): PRESERVE secrets/PKI/PVCs/namespace.
-      echo "  [keep] Preserving ${_kept} yashigani Secret(s) + PKI + PVCs for reinstall/upgrade."
-      echo "  [keep] Run 'uninstall.sh --remove-volumes' to purge secrets/PVCs/namespace."
-    else
-      # Step 3 (NUKE): purge kept Secrets, PVCs, then namespace. Delete the kept
-      # Secrets explicitly and BEFORE the namespace so a namespace-delete timeout
-      # can never leave credential material behind reporting a false-clean.
-      echo "  [nuke] --remove-volumes set — purging ${_kept} Secret(s), PVCs, namespace."
-
-      # 3a: Secrets. Instance-labelled selector covers the 12 app Secrets +
-      # licensing + PKI placeholders. The two PKI Secrets are re-applied
-      # imperatively by the bootstrap Job and may not retain the instance label,
-      # so also delete them (and licensing) by well-known name (idempotent).
-      kubectl delete secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
-        --wait=true --timeout=60s 2>&1 || true
-      local _s
-      for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
-                "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
-                "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
-        kubectl delete secret "$_s" -n "$_ns" --ignore-not-found=true \
-          --wait=true --timeout=30s 2>&1 || true
-      done
-
-      # 3b: PVCs.
-      local _pvc_count
-      _pvc_count="$(kubectl get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
-      if [ "$_pvc_count" -gt 0 ]; then
-        echo "  [kubectl] Deleting ${_pvc_count} PersistentVolumeClaim(s)..."
-        kubectl delete pvc --all -n "$_ns" --wait=true --timeout=60s 2>&1 || true
-      else
-        echo "  [ok] No PVCs found in namespace ${_ns}."
+    # 3c: positive post-delete assertion — kept Secrets and PVCs MUST be gone.
+    # A nuke that leaves credential material is a FAILED nuke — do not swallow.
+    local _sec_remaining _pvc_remaining
+    _sec_remaining="$("$KUBECTL_BIN" get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
+                        --no-headers 2>/dev/null | grep -c . || true)"
+    for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
+              "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
+              "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
+      if "$KUBECTL_BIN" get secret "$_s" -n "$_ns" >/dev/null 2>&1; then
+        _sec_remaining=$((_sec_remaining + 1))
       fi
-
-      # 3c: positive post-delete assertion — kept Secrets and PVCs MUST be gone.
-      # A nuke that leaves credential material is a FAILED nuke — do not swallow.
-      local _sec_remaining _pvc_remaining
-      _sec_remaining="$(kubectl get secret -n "$_ns" -l app.kubernetes.io/instance="$_release" \
-                          --no-headers 2>/dev/null | grep -c . || echo 0)"
-      for _s in "${YASHIGANI_PKI_SECRET:-yashigani-pki-certs}" \
-                "${YASHIGANI_PKI_CA_KEYS_SECRET:-yashigani-pki-ca-keys}" \
-                "${YASHIGANI_LICENSE_SECRET:-yashigani-license}"; do
-        if kubectl get secret "$_s" -n "$_ns" >/dev/null 2>&1; then
-          _sec_remaining=$((_sec_remaining + 1))
-        fi
-      done
-      _pvc_remaining="$(kubectl get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || echo 0)"
-      if [ "$_sec_remaining" -gt 0 ] || [ "$_pvc_remaining" -gt 0 ]; then
-        printf '\n' >&2
-        printf 'ERROR: uninstall.sh --remove-volumes FAILED to purge state in %s: %d Secret(s), %d PVC(s) remain\n' \
-               "$_ns" "$_sec_remaining" "$_pvc_remaining" >&2
-        kubectl get secret,pvc -n "$_ns" >&2 || true
-        printf '\nManual remediation:\n' >&2
-        printf '  kubectl delete secret,pvc --all -n %s\n' "$_ns" >&2
-        printf '\n' >&2
-        exit 1
-      fi
-      echo "  [ok] NUKE verified — 0 yashigani Secrets, 0 PVCs remain in ${_ns}."
-
-      # Step 4: delete the namespace itself.
-      if kubectl get namespace "$_ns" >/dev/null 2>&1; then
-        echo "  [kubectl] Deleting namespace ${_ns}..."
-        kubectl delete namespace "$_ns" --wait=true --timeout=60s 2>&1 || true
-      fi
-    fi
-
-    # Step 5: final assertion — no pods should remain.
-    local _remaining_pods
-    _remaining_pods="$(kubectl get pods -n "$_ns" --no-headers 2>/dev/null | grep -v Terminating | grep -c . || echo 0)"
-    if [ "$_remaining_pods" -gt 0 ]; then
+    done
+    _pvc_remaining="$("$KUBECTL_BIN" get pvc -n "$_ns" --no-headers 2>/dev/null | grep -c . || true)"
+    if [ "$_sec_remaining" -gt 0 ] || [ "$_pvc_remaining" -gt 0 ]; then
       printf '\n' >&2
-      printf 'ERROR: uninstall.sh FAILED — %d pod(s) remain in namespace %s\n' \
-             "$_remaining_pods" "$_ns" >&2
-      kubectl get pods -n "$_ns" >&2 || true
+      printf 'ERROR: uninstall.sh --remove-volumes FAILED to purge state in %s: %d Secret(s), %d PVC(s) remain\n' \
+             "$_ns" "$_sec_remaining" "$_pvc_remaining" >&2
+      "$KUBECTL_BIN" get secret,pvc -n "$_ns" >&2 || true
       printf '\nManual remediation:\n' >&2
-      printf '  kubectl delete pods --all -n %s --force --grace-period=0\n' "$_ns" >&2
-      printf '  kubectl delete namespace %s\n' "$_ns" >&2
+      printf '  kubectl delete secret,pvc --all -n %s\n' "$_ns" >&2
       printf '\n' >&2
       exit 1
     fi
-    echo "  [ok] All pods removed."
-  else
-    echo "  [WARN] kubectl not found — cannot verify pod drain" >&2
+    echo "  [ok] NUKE verified — 0 yashigani Secrets, 0 PVCs remain in ${_ns}."
+
+    # Step 4: delete the namespace itself.
+    if "$KUBECTL_BIN" get namespace "$_ns" >/dev/null 2>&1; then
+      echo "  [kubectl] Deleting namespace ${_ns}..."
+      "$KUBECTL_BIN" delete namespace "$_ns" --wait=true --timeout=60s 2>&1 || true
+    fi
   fi
+
+  # Step 5: final assertion — no pods should remain.
+  local _remaining_pods
+  _remaining_pods="$("$KUBECTL_BIN" get pods -n "$_ns" --no-headers 2>/dev/null | grep -v Terminating | grep -c . || true)"
+  if [ "$_remaining_pods" -gt 0 ]; then
+    printf '\n' >&2
+    printf 'ERROR: uninstall.sh FAILED — %d pod(s) remain in namespace %s\n' \
+           "$_remaining_pods" "$_ns" >&2
+    "$KUBECTL_BIN" get pods -n "$_ns" >&2 || true
+    printf '\nManual remediation:\n' >&2
+    printf '  kubectl delete pods --all -n %s --force --grace-period=0\n' "$_ns" >&2
+    printf '  kubectl delete namespace %s\n' "$_ns" >&2
+    printf '\n' >&2
+    exit 1
+  fi
+  echo "  [ok] All pods removed."
 }
 
 # ===========================================================================
@@ -1582,7 +1710,7 @@ echo "Network cleanup: ${_net_removed} removed, ${_net_failed} failed."
 # outside a static list's coverage (FINDING-V412-RESTART-004a).
 _residual_networks="$(_list_project_networks "$RUNTIME" "$_PROJECT_PREFIX")"
 if [ -n "$_residual_networks" ]; then
-    _residual_count="$(printf '%s\n' "$_residual_networks" | grep -c '.' || echo 0)"
+    _residual_count="$(printf '%s\n' "$_residual_networks" | grep -c '.' || true)"
     echo "" >&2
     echo "ERROR: ${_residual_count} project network(s) survived removal:" >&2
     printf '%s\n' "$_residual_networks" | sed 's/^/      /' >&2
@@ -1914,7 +2042,7 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
             _unattributed_dangling="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
                 | grep -E "^[0-9a-f]{64}$" || true)"
             if [ -n "$_unattributed_dangling" ]; then
-                _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || echo 0)"
+                _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || true)"
                 echo "  [WARN] ${_unattributed_count} unlabeled dangling volume(s) found on this daemon —" >&2
                 echo "  [WARN] cannot attribute to project '${_PROJECT_PREFIX}' (no project label) — NOT removing" >&2
                 echo "  [WARN] (may belong to another org on a shared host). Review manually:" >&2
