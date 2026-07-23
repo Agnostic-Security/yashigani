@@ -1,0 +1,225 @@
+{{- /*
+infer-init — day-one default model auto-pull (Iris cutover-prep map Seam 2, line 34: "an
+engine deploy ships with zero models, so first-inference is broken out of the box"). Engine-
+side SF-011 analog: release/5.0's `ollama-init` Job auto-pulls a default model on install so
+any AI workload has a backend from first deploy; this engine had no equivalent.
+
+Mechanism differs from `ollama-init` because the topology differs: `infer-puller` (see
+deployment-puller.yaml) is already a long-running Deployment with a wired `/api/pull` route
+(app.py) — unlike `ollama-init`'s self-contained temporary `ollama serve`, this Job is a thin
+HTTP client waiting on an already-healthy peer, not a second server process. Reuses the
+`images.puller` image (python3 stdlib `urllib` only) for both the wait initContainer and the
+pull container — no new image to build/pin, no busybox/curl dependency for the HTTP+JSON step
+(busybox `wget`/`--post-data` cannot reliably distinguish HTTP status codes for the graceful-
+501 case below without extra parsing fragility; python's `urllib.error.HTTPError.code` is exact).
+
+CRITICAL — model intentionally defaults EMPTY (values.yaml `inferInit.model`). Do NOT hardcode
+a default GGUF: which model ships as day-one default, and its signed provenance manifest, is
+Tiago's provenance/signing decision (see infer/deploy/README.md "day-one models" +
+adapters/huggingface.py's own supply-chain-provenance council findings — an unsigned,
+client-chosen default here would be exactly the "resolve a sha256 live from the repo you're
+trusting" anti-pattern those findings closed). Empty = this Job does NOT render at all — the
+`if` guard below, not a Job that starts and no-ops. `helm template` must show zero resources
+for this file when `inferInit.model` is empty.
+
+F1 convergence note (Iris Seam 3, line 48): install.sh's healthcheck-exemption / one-shot-job
+handling for `ollama-init` needs a sibling entry for `infer-init` in `_exempt_patterns` at
+convergence time — that is release/5.0-side wiring, explicitly OUT OF SCOPE for this
+engine-only dispatch (HARD CONSTRAINT: only files under infer/). Documented here AND in
+infer/deploy/README.md so it isn't silently dropped at convergence.
+*/ -}}
+{{- if and .Values.inferInit.enabled (ne .Values.inferInit.model "") }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    app.kubernetes.io/component: infer-init
+  annotations:
+    helm.sh/chart-version: {{ .Chart.Version | quote }}
+    yashigani.infer.init-model: {{ .Values.inferInit.model | quote }}
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: {{ .Values.inferInit.timeoutSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-infer.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: infer-init
+        # Deliberately NOT yashigani.infer.managed=true — that label denotes a
+        # supervisor-CREATED serving pod (admission-policy-infer.yaml's own definition); this
+        # is a static Helm-authored day-one bootstrap Job, not one. Dedicated NetworkPolicy
+        # rules below (not the shared default-deny-egress selector) scope its network access
+        # explicitly instead.
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-puller
+          image: "{{ .Values.images.puller.repository }}:{{ .Values.images.puller.tag }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: YSG_INFER_PULLER_URL
+              value: "http://{{ include "yashigani-infer.fullname" . }}-puller:8000"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, sys, time, urllib.request
+
+              url = os.environ["YSG_INFER_PULLER_URL"] + "/healthz"
+              deadline = time.time() + 120
+              while time.time() < deadline:
+                  try:
+                      with urllib.request.urlopen(url, timeout=5) as r:
+                          if r.status == 200:
+                              print("infer-puller is ready")
+                              sys.exit(0)
+                          print(f"infer-puller reported status {r.status}, retrying...")
+                  except Exception as exc:
+                      print(f"waiting for infer-puller: {exc}")
+                  time.sleep(5)
+              print("ERROR: infer-puller did not become ready within 120s", file=sys.stderr)
+              sys.exit(1)
+          resources:
+            {{- toYaml .Values.inferInit.resources | nindent 12 }}
+      containers:
+        - name: infer-init
+          image: "{{ .Values.images.puller.repository }}:{{ .Values.images.puller.tag }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: YSG_INFER_PULLER_URL
+              value: "http://{{ include "yashigani-infer.fullname" . }}-puller:8000"
+            - name: YSG_INFER_INIT_MODEL
+              value: {{ .Values.inferInit.model | quote }}
+            - name: YSG_INFER_INIT_MODEL_DIGEST
+              value: {{ .Values.inferInit.modelDigest | quote }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json, os, sys, urllib.error, urllib.request
+
+              model = os.environ["YSG_INFER_INIT_MODEL"]
+              digest = os.environ.get("YSG_INFER_INIT_MODEL_DIGEST", "skip")
+              url = os.environ["YSG_INFER_PULLER_URL"] + "/api/pull"
+              body = json.dumps({"model": model, "name": model}).encode()
+              print(f"infer-init: requesting pull of '{model}' from {url} "
+                    f"(modelDigest={digest} -- informational only, see infer/deploy/README.md)")
+              req = urllib.request.Request(
+                  url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=570) as r:
+                      for line in r:
+                          sys.stdout.write(line.decode(errors="replace"))
+                      print(f"\ninfer-init: pull request for '{model}' completed (HTTP {r.status})")
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode(errors="replace")
+                  if exc.code == 501:
+                      # Known v1-foundation limitation (infer/deploy/README.md "day-one
+                      # models"): entrypoint.py hardwires pull_resolver=None regardless of
+                      # role until a source-adapter wiring lands (separate Python work, not
+                      # this dispatch) -- /api/pull always 501s until then. Retrying will
+                      # never help, so warn loudly and exit 0 rather than spend backoffLimit
+                      # retrying a guaranteed failure.
+                      print(f"WARNING: infer-puller has no pull source adapter wired yet "
+                            f"(HTTP 501): {detail}", file=sys.stderr)
+                      print("WARNING: day-one model pull skipped -- deploy ships model-less "
+                            "until adapter wiring lands", file=sys.stderr)
+                      sys.exit(0)
+                  print(f"ERROR: pull failed HTTP {exc.code}: {detail}", file=sys.stderr)
+                  sys.exit(1)
+              except Exception as exc:
+                  print(f"ERROR: pull request failed: {exc}", file=sys.stderr)
+                  sys.exit(1)
+          resources:
+            {{- toYaml .Values.inferInit.resources | nindent 12 }}
+---
+# infer-init egress -- least privilege: reach the puller Service (+ DNS) only. Explicit,
+# dedicated policy rather than relying on the shared default-deny-egress selector, since this
+# pod is deliberately not labeled yashigani.infer.managed=true (see pod template comment
+# above).
+{{- if .Values.networkPolicies.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-infer-init-egress
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: infer-init
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "yashigani-infer.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: infer-puller
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# Puller ingress -- add infer-init as an additional allowed source alongside Caddy
+# (networkpolicy-infer.yaml's allow-puller-ingress rule covers Caddy only).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "yashigani-infer.fullname" . }}-allow-puller-ingress-from-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-infer.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: infer-puller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "yashigani-infer.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: infer-init
+      ports:
+        - protocol: TCP
+          port: 8000
+{{- end }}
+{{- end }}

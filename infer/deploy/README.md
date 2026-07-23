@@ -177,6 +177,74 @@ which resolves relative to the compose file's own directory (`infer/deploy/docke
 nonexistent `infer/deploy/deploy/docker/seccomp/...` path. Fixed to `./seccomp/...`; confirmed
 via `docker compose config` that the resolved `source:` now points at the real file.
 
+## Day-one models — `infer-init` (2026-07-23, Captain, engine-side only)
+
+Iris's cutover-prep map (`internal-docs/yashigani/iris-infer-6.0-to-5.0-cutover-prep-map-
+20260723.md`, Seam 2, line 34) found this engine deploy shipped with **zero models** — no
+equivalent of `release/5.0`'s `ollama-init` Job (the `SF-011` fix), so first-inference was
+broken out of the box on a clean deploy. Closed via `templates/job-infer-init.yaml` (Helm) and
+`docker-compose.infer.yml`'s `infer-init` service (compose, `profiles: ["init"]`).
+
+**Mechanism differs from `ollama-init`.** `infer-puller` (see `deployment-puller.yaml` /
+`docker-compose.infer.yml`) is already a long-running peer with a wired `/api/pull` route
+(`app.py`) — unlike `ollama-init`'s self-contained temporary `ollama serve` process,
+`infer-init` is a thin HTTP client: wait for `infer-puller` healthy, then `POST /api/pull` with
+the configured model name. Both the Helm Job and the compose service reuse the `infer-puller`
+image itself (python3 stdlib `urllib` only) — no new image to build or pin.
+
+**CRITICAL — no hardcoded default model.** `inferInit.model` (Helm) / `YSG_INFER_INIT_MODEL`
+(compose) default **EMPTY**. Which GGUF ships as the day-one default, and its signed
+provenance manifest, is **Tiago's provenance/signing decision** — the same class of council
+finding (Laura F2/F3, Nico #1, Lu SUPPLY-1) that shaped `adapters/huggingface.py`'s pinned-
+revision + signed-catalog admission gate applies here too: choosing an unsigned default
+ourselves would be exactly the "resolve a sha256 live from the repo you're trusting"
+anti-pattern those findings closed. With the value empty:
+  - **Helm:** the Job (and its two dedicated NetworkPolicy rules) are **not rendered at all**
+    — `{{- if and .Values.inferInit.enabled (ne .Values.inferInit.model "") }}` — verified via
+    `helm template` both ways (see Offline-verify table below).
+  - **Compose:** the `infer-init` service always renders in `docker compose config` (compose
+    has no Helm-style conditional resource omission), but its own script detects the empty
+    model at runtime and exits 0 immediately as a no-op before attempting any HTTP call.
+
+Before enabling day-one auto-pull in a real deploy: choose a default model, produce its signed
+provenance manifest (Nico/catalog.py's `SignedCatalog` admission gate), THEN set
+`inferInit.model` / `YSG_INFER_INIT_MODEL` to that model's name.
+
+**Known v1-foundation limitation, not hidden:** `entrypoint.py` hardwires `pull_resolver=None`
+regardless of role (see "Coordination gap" above) — no source adapter is wired into any deploy
+yet. `/api/pull` therefore always responds `501` until that separate Python wiring lands. Both
+`infer-init` scripts treat HTTP 501 specifically as a non-fatal, loudly-logged `WARNING` and
+`exit 0` (retrying would never help — this is a permanent condition until the code changes,
+not a transient one), rather than spending the Job's `backoffLimit` retrying a guaranteed
+failure. Verified live this session (see below) against a stub server exercising exactly the
+`/healthz` + `/api/pull` contract `app.py` implements, in all three states (`200` success,
+`501` no-adapter, empty-model no-op) plus wait-for-ready.
+
+**F1 convergence note (Iris Seam 3, line 48) — deliberately NOT built here:** `install.sh`'s
+healthcheck-exemption / one-shot-job handling for `ollama-init` will need a sibling entry for
+`infer-init` in `_exempt_patterns` at convergence time. That is `release/5.0`-side wiring —
+out of scope for this engine-only dispatch (HARD CONSTRAINT: only files under `infer/`).
+Flagged here so it isn't silently dropped when this tree merges into `helm/yashigani`.
+
+**NetworkPolicy note (k8s only):** `infer-init`'s pod is deliberately **not** labeled
+`yashigani.infer.managed=true` (that label denotes a supervisor-*created* serving pod per
+`admission-policy-infer.yaml`'s own definition, not a static Helm-authored bootstrap Job).
+`job-infer-init.yaml` ships its own dedicated egress rule (puller:8000 + DNS only) and a
+companion ingress rule on `infer-puller` (alongside the existing Caddy-only allow), rather than
+piggybacking on the shared `default-deny-egress` selector.
+
+**Live verification this session (Docker, own scratch harness — no product image touched
+beyond extracting its rendered scripts verbatim):**
+
+| Scenario | Result |
+|---|---|
+| `wait-for-puller` initContainer script vs. a stub `/healthz` returning 200 | **PASS** — detects ready, exits 0 |
+| `infer-init` container script, stub `/api/pull` returns 200 NDJSON | **PASS** — streams progress, exits 0 |
+| `infer-init` container script, stub `/api/pull` returns 501 (no adapter wired) | **PASS** — logs WARNING, exits 0 (non-fatal, matches design) |
+| compose `infer-init` service script, `YSG_INFER_INIT_MODEL` empty | **PASS** — no-op, exits 0, no HTTP call made |
+| compose `infer-init` service script, model set, stub returns 200 | **PASS** — same as Helm case |
+| Same pull script under full hardening (`--read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true --user 1000:1000`) | **PASS** — no permission errors |
+
 ## Offline-verify results (this session, `scripts/verify-offline.sh`)
 
 | Gate | Result |
@@ -193,6 +261,19 @@ via `docker compose config` that the resolved `source:` now points at the real f
 | Portability fix (this session) | `sync-infer-deploy-artifacts-to-helm.sh` originally used `declare -A` (bash 4+ associative arrays) — **fails on macOS's default bash 3.2**. Rewrote with parallel indexed arrays before first run; verified working on this Mac's actual `/bin/bash 3.2.57`. |
 | `YSG_INFER_BLOB_STORE_ROOT` present on all 3 compose services | **PASS** — `docker compose -f docker-compose.infer.yml -f docker-compose.infer.cpu.yml config` shows `YSG_INFER_BLOB_STORE_ROOT: /data/model-store` on `infer-classifier`, `infer-chat`, `infer-puller`; mount `target: /data/model-store` matches on all three. |
 | `YSG_INFER_BLOB_STORE_ROOT` present on all 3 Helm Deployments | **PASS** — `helm template` (cuda variant) shows `value: "/data/model-store"` on `infer-classifier`, `infer-chat`, `infer-puller` containers; `volumeMounts[].mountPath: /data/model-store` matches on all three. |
+
+### `infer-init` gates (2026-07-23 session — this Mac has live `helm`/`docker`/`kubectl`, used them)
+
+| Gate | Result |
+|---|---|
+| `helm lint` | **PASS**, `inferInit.model` empty (default) and set to a test value. |
+| `helm template` — `inferInit.model=""` (default) | **PASS** — zero `infer-init` resources rendered (no Job, no NetworkPolicy); confirmed by grepping the full render for `infer-init`/`allow-puller-ingress-from-init` — no matches. |
+| `helm template --set inferInit.model=qwen2.5-3b-instruct-q4_k_m` | **PASS** — Job + both NetworkPolicy rules render, hardened (`runAsNonRoot`, `runAsUser: 1000`, cap-drop ALL, `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, `automountServiceAccountToken: false`). Also confirmed with `networkPolicies.enabled=false` — Job renders, zero NetworkPolicy resources. |
+| `kubectl apply --dry-run=server` (Docker Desktop's local cluster, `namespace=default` override) | **PASS** — all 18 rendered resources, including `job.batch/test-yashigani-infer-init` and the two new NetworkPolicy rules, accepted by a real API server. |
+| Both inline Python scripts (`wait-for-puller` initContainer + `infer-init` container + compose equivalent) | **`compile()`-checked, zero SyntaxError** — extracted verbatim from the rendered/`docker compose config` output, not hand-retyped. |
+| `docker compose -f docker-compose.infer.yml -f docker-compose.infer.cpu.yml --profile init config` — `YSG_INFER_INIT_MODEL` unset and set | **PASS** both ways. |
+| Live functional test — own scratch Docker harness, stub server implementing exactly `app.py`'s `/healthz` + `/api/pull` contract (200-success / 501-no-adapter / unhealthy) | **PASS** all scenarios — see table above. Script extracted verbatim from the rendered Helm Job / `docker compose config` output before running (no hand-retyped copy), matching Verification Protocol #8's "full command must succeed against a running peer" discipline. |
+| Same pull script under full container hardening (`--read-only --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges:true --user 1000:1000`) | **PASS** — matches the Job/compose service's actual runtime security context; no permission errors. |
 
 ## Explicitly deferred to a live GPU build (nothing guessed)
 

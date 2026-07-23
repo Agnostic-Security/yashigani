@@ -88,6 +88,35 @@ puller:
       cpu: "1"
       memory: 2Gi
 
+# infer-init — day-one default model auto-pull (Iris cutover-prep map Seam 2, engine-side
+# SF-011 analog — see templates/job-infer-init.yaml + infer/deploy/README.md "day-one
+# models"). Gate mirrors release/5.0's ollama-init dual-AND condition (ollama.enabled AND an
+# AI-workload flag): here, `enabled` AND a non-empty `model` must BOTH hold before the Job
+# renders at all.
+#
+# CRITICAL — model intentionally defaults EMPTY. Do NOT hardcode a default GGUF here: which
+# model ships as day-one default, and its signed provenance manifest, is Tiago's provenance/
+# signing decision (Laura F2/F3, Nico #1, Lu SUPPLY-1 council findings on the HF adapter apply
+# here too — an unsigned client-chosen default would be exactly the "resolve a sha256 live
+# from the same repo you're trusting" anti-pattern). Empty = the Job is NOT rendered at all
+# (see the `{{- if and .Values.inferInit.enabled (ne .Values.inferInit.model "") }}` guard) —
+# deploy ships model-less by design, not a broken/crash-looping Job.
+inferInit:
+  enabled: true
+  model: ""
+  # modelDigest: informational only client-side (echoed into the Job's log for operator
+  # visibility) — actual digest enforcement is a server-side SignedCatalog concern
+  # (catalog.py) when a catalog is wired; this Job does not verify it itself.
+  modelDigest: "skip"
+  timeoutSeconds: 600
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi
+
 firstParseJail:
   # Ephemeral Job, TTL-cleaned — see templates/job-first-parse-jail.yaml. Not a resident
   # Deployment; this block only configures the Job template's resource ceiling.

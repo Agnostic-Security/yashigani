@@ -12,6 +12,14 @@ Topology deployed:
   {{ include "yashigani-infer.fullname" . }}-classifier   (mandatory sensitivity classifier, own pod)
   {{ include "yashigani-infer.fullname" . }}-chat          (user-facing models, own pod)
   {{ include "yashigani-infer.fullname" . }}-puller        (blob-store write path only, no llama-server binary)
+{{- if and .Values.inferInit.enabled (ne .Values.inferInit.model "") }}
+  {{ include "yashigani-infer.fullname" . }}-init          (one-shot day-one model pull: {{ .Values.inferInit.model }})
+{{- else }}
+
+NOTE: inferInit.model is empty — this deploy ships MODEL-LESS by design (no day-one auto-pull
+Job rendered). Set inferInit.model (and choose/sign a default model's provenance manifest
+first — see infer/deploy/README.md "day-one models") to enable it.
+{{- end }}
 
 Ring-fence: default-deny egress on every yashigani.infer.managed=true pod except the puller's
 scoped HF/OCI-mirror egress rule. Ingress restricted to {{ .Values.caddy.serviceName }} only.

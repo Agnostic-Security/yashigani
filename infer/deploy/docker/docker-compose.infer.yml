@@ -159,6 +159,97 @@ services:
     networks:
       - infer_ringfence
 
+  # ── infer-init — day-one default model auto-pull (Iris cutover-prep map Seam 2 / engine-
+  # side SF-011 analog — see infer/deploy/README.md "day-one models") ───────────────────────
+  # `profiles: ["init"]` matches this file's own established one-shot-service convention
+  # (`invoke-first-parse-jail`/`infer-docker-socket-proxy` below) rather than a separate
+  # override file — one-shot/optional services are gated in-file here, not via overlay.
+  # Invoke with: `docker compose -f docker-compose.infer.yml -f docker-compose.infer.<backend>.yml
+  # --profile init up infer-init`.
+  #
+  # Mechanism differs from `docker-compose.yml`'s `ollama-init`: `infer-puller` is already a
+  # long-running service with a wired `/api/pull` route (app.py), unlike ollama-init's
+  # self-contained temporary `ollama serve` — this is a thin HTTP client waiting on an
+  # already-healthy peer (`depends_on: condition: service_healthy`, same pattern as
+  # infer-classifier/infer-chat above), not a second server process. Reuses the infer-puller
+  # image (python3 stdlib `urllib` only) — no new image to build/pin.
+  #
+  # CRITICAL — no hardcoded default model. YSG_INFER_INIT_MODEL defaults EMPTY: which GGUF
+  # ships as day-one default, and its signed provenance manifest, is Tiago's provenance/
+  # signing decision, not something to forge here. Compose has no Helm-style conditional
+  # resource omission, so this service definition always renders in `docker compose config`
+  # regardless of the env var — but when YSG_INFER_INIT_MODEL is empty the script below
+  # detects that and exits 0 immediately as a no-op before attempting any pull; the deploy
+  # ships model-less by design either way.
+  infer-init:
+    profiles: ["init"]
+    image: ${YSG_INFER_PULLER_IMAGE:-yashigani/infer-puller:local}
+    user: "1000:1000"
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 256m
+    mem_swappiness: 0
+    memswap_limit: 256m
+    pids_limit: 32
+    environment:
+      YSG_INFER_PULLER_URL: "http://infer-puller:8000"
+      YSG_INFER_INIT_MODEL: ${YSG_INFER_INIT_MODEL:-}
+      YSG_INFER_INIT_MODEL_DIGEST: ${YSG_INFER_INIT_MODEL_DIGEST:-skip}
+    networks:
+      - infer_ringfence
+    depends_on:
+      infer-puller:
+        condition: service_healthy
+    entrypoint: ["python3", "-c"]
+    command:
+      - |
+        import json, os, sys, urllib.error, urllib.request
+
+        model = os.environ.get("YSG_INFER_INIT_MODEL", "").strip()
+        if not model:
+            print("infer-init: YSG_INFER_INIT_MODEL is empty -- no-op by design (day-one "
+                  "default model + signed provenance manifest is a Tiago provenance/signing "
+                  "decision; see infer/deploy/README.md 'day-one models'). "
+                  "Deploy ships model-less.")
+            sys.exit(0)
+
+        digest = os.environ.get("YSG_INFER_INIT_MODEL_DIGEST", "skip")
+        url = os.environ["YSG_INFER_PULLER_URL"] + "/api/pull"
+        body = json.dumps({"model": model, "name": model}).encode()
+        print(f"infer-init: requesting pull of '{model}' from {url} "
+              f"(modelDigest={digest} -- informational only, see infer/deploy/README.md)")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=570) as r:
+                for line in r:
+                    sys.stdout.write(line.decode(errors="replace"))
+                print(f"\ninfer-init: pull request for '{model}' completed (HTTP {r.status})")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            if exc.code == 501:
+                # Known v1-foundation limitation (see infer/deploy/README.md "day-one
+                # models"): entrypoint.py hardwires pull_resolver=None regardless of role
+                # until a source-adapter wiring lands (separate Python work, not this
+                # dispatch) -- /api/pull always 501s until then. Retrying will never help,
+                # so warn loudly and exit 0 rather than loop on a guaranteed failure.
+                print(f"WARNING: infer-puller has no pull source adapter wired yet "
+                      f"(HTTP 501): {detail}", file=sys.stderr)
+                print("WARNING: day-one model pull skipped -- deploy ships model-less "
+                      "until adapter wiring lands", file=sys.stderr)
+                sys.exit(0)
+            print(f"ERROR: pull failed HTTP {exc.code}: {detail}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"ERROR: pull request failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
   # ── C1 first-parse jail (Red-Council / Captain finding #1's sibling) ──────────────────
   # Ephemeral, profile-gated, invoked ONE-SHOT per untrusted model's first parse — never a
   # resident service. `docker compose --profile parse-jail run --rm invoke-first-parse-jail`
