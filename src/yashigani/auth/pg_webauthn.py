@@ -38,7 +38,8 @@ from yashigani.auth.webauthn import (
     _import_webauthn,
     _map_uv,
     _map_attestation,
-    _to_json_str,
+    _build_authenticator_selection,
+    _build_credential_descriptors,
 )
 from yashigani.db.pgcrypto import PGP_SYM_ENCRYPT_OPTIONS
 from yashigani.db.postgres import tenant_transaction
@@ -297,10 +298,9 @@ class PgWebAuthnService:
         challenge = self._challenges.issue(user_id)
 
         existing = await self._pg.list_for_user(user_id)
-        exclude_credentials = [
-            {"id": c.credential_id, "type": "public-key"}
-            for c in existing
-        ]
+        exclude_credentials = _build_credential_descriptors(
+            [c.credential_id for c in existing]
+        )
 
         options = webauthn.generate_registration_options(
             rp_id=effective_rp_id,
@@ -309,10 +309,7 @@ class PgWebAuthnService:
             user_name=user_name,
             challenge=challenge,
             exclude_credentials=exclude_credentials,
-            authenticator_selection=webauthn.AuthenticatorSelectionCriteria(
-                require_resident_key=cfg.require_resident_key,
-                user_verification=_map_uv(cfg.user_verification, webauthn),
-            ),
+            authenticator_selection=_build_authenticator_selection(cfg, webauthn),
             attestation=_map_attestation(cfg.attestation, webauthn),
         )
 
@@ -338,13 +335,14 @@ class PgWebAuthnService:
             raise ValueError("No pending registration challenge for this user.")
 
         try:
-            credential_json = _to_json_str(credential_response)
-            try:
-                cred = webauthn.RegistrationCredential.parse_raw(credential_json.encode())
-            except (TypeError, AttributeError):
-                cred = webauthn.RegistrationCredential.parse_raw(credential_json)
+            # py-webauthn >=2.x: verify_registration_response accepts the raw
+            # dict/JSON directly (parse_registration_credential_json()
+            # internally). RegistrationCredential.parse_raw() does not exist
+            # on the current dataclass-based RegistrationCredential — see
+            # yashigani/auth/webauthn.py complete_registration() for the same
+            # fix and full rationale (production 500 root cause).
             verification = webauthn.verify_registration_response(
-                credential=cred,
+                credential=credential_response,
                 expected_challenge=challenge,
                 expected_rp_id=cfg.rp_id,
                 expected_origin=expected_origin,
@@ -353,14 +351,16 @@ class PgWebAuthnService:
         except Exception as exc:
             raise ValueError(f"WebAuthn registration verification failed: {exc}") from exc
 
-        # Extract transport hints if available (py-webauthn ≥ 2.0)
+        # Extract transport hints if the client reported them. Read directly
+        # from the raw credential_response dict — verify_registration_response
+        # is now called with the dict (not a parsed RegistrationCredential
+        # object), and VerifiedRegistration carries no `response`/`transports`
+        # field, so there is nothing to introspect off `verification` either.
         transports: list[str] = []
         try:
-            raw_transports = getattr(cred, "response", None)
+            raw_transports = (credential_response.get("response") or {}).get("transports")
             if raw_transports:
-                t = getattr(raw_transports, "transports", None)
-                if t:
-                    transports = [str(x.value) if hasattr(x, "value") else str(x) for x in t]
+                transports = [str(t) for t in raw_transports]
         except Exception:
             pass
 
@@ -401,10 +401,9 @@ class PgWebAuthnService:
         challenge = self._challenges.issue(user_id)
 
         allowed = await self._pg.list_for_user(user_id)
-        allow_credentials = [
-            {"id": c.credential_id, "type": "public-key"}
-            for c in allowed
-        ]
+        allow_credentials = _build_credential_descriptors(
+            [c.credential_id for c in allowed]
+        )
 
         if not allow_credentials:
             raise ValueError("No registered WebAuthn credentials for this user.")
@@ -450,13 +449,12 @@ class PgWebAuthnService:
             raise ValueError("Credential not found or does not belong to this user.")
 
         try:
-            auth_json = _to_json_str(credential_response)
-            try:
-                auth_cred = webauthn.AuthenticationCredential.parse_raw(auth_json.encode())
-            except (TypeError, AttributeError):
-                auth_cred = webauthn.AuthenticationCredential.parse_raw(auth_json)
+            # py-webauthn >=2.x: verify_authentication_response accepts the
+            # raw dict/JSON directly (parse_authentication_credential_json()
+            # internally) — see complete_registration() above for the same
+            # fix and full rationale.
             verification = webauthn.verify_authentication_response(
-                credential=auth_cred,
+                credential=credential_response,
                 expected_challenge=challenge,
                 expected_rp_id=cfg.rp_id,
                 expected_origin=expected_origin,
