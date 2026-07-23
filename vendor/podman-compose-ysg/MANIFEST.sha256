@@ -1,15 +1,15 @@
 # MANIFEST.sha256 — podman-compose-ysg 1.5.0+ysg.1 vendored-fork integrity manifest
-# Generated: 2026-07-18T21:57:54Z by generate-manifest.sh
+# Generated: 2026-07-23T06:42:42Z by generate-manifest.sh
 # Format: standard sha256sum(1) output — verify with:
 #   (cd vendor/podman-compose-ysg && sha256sum -c MANIFEST.sha256)
 # or use verify-manifest.sh for the fail-closed wrapper with clear errors.
-3885ed31c099f5fe5d401cbd3a9479d0282411f6f99b8905a01c49dc0ccc9331  podman_compose.py
+5773b2e0d21a90d95ce6fe05a907b21f71d00d046fe94e5e213079168c9bbe94  podman_compose.py
 8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  LICENSE
-a67224cc6b960cb94002f3bd3b52325bc3612aa9b6fa51ae6acbb3928d875bf8  CHANGES.agnostic.md
+d936bdea85ee280e4dc2cacbf6701441f5921f02b49791f66077482fba780b75  CHANGES.agnostic.md
 c191881b5375d041573b29bdde017fec004431964610afb8d3ff36a62350d1f5  NOTICE.md
 0ff0040aade11f9980c91ba9d88fc363da04bbf94cd86eebad452345a6d4e979  README.md
 64cb1559f7f5580ec3e56f1db23e91a781356c09973681524558d8efcef0cc34  vendor-integrity.md
 e385835e6248dc86906dfaf3e4d8ac3048992b7b0bff437f3c132d821bf0ddfb  generate-manifest.sh
 1d05495460b27464aed40c797b859146072437be0af8e6f73a9a06e60118551c  verify-manifest.sh
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/__init__.py
-3b6b08362616414cbd79481845733f0fff5fbe4ec71f5c94c26a14b93c527329  tests/test_as_fixes.py
+7b5683d863fd890baa9292aed219960f85b8e514bc34397fc67799db6526f51c  tests/test_as_fixes.py
