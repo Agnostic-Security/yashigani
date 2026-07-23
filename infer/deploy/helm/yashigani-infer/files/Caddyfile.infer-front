@@ -72,6 +72,32 @@
         }
     }
 
+    handle_path /infer/api/pull* {
+        import infer-front-caller-gate
+
+        # URL-convention shim (Iris Seam 5, F1 cutover-prep map, her recommended
+        # option (b)): a gateway/backoffice caller using the ollama convention
+        # `base + "/api/pull"` resolves to `/infer/api/pull`, which the literal
+        # `/infer/pull*` route above does NOT match (no `/api` segment) — without
+        # this route it would fall through to the generic `/infer/*` catch-all
+        # below and silently 501 against infer-chat (no pull_resolver on that
+        # role). This route rewrites to `/api/pull` and reaches the SAME puller
+        # upstream as `/infer/pull*`, so `_ollama_base()`-shaped caller code stays
+        # engine-agnostic regardless of which URL convention it uses.
+        request_header -X-SPIFFE-ID
+        request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
+        rewrite * /api/pull
+
+        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:infer-puller}:8000 {
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
     handle_path /infer/* {
         import infer-front-caller-gate
 
