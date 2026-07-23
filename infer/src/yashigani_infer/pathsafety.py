@@ -37,6 +37,26 @@ class SymlinkEscapeError(OSError):
     """Raised when the final open() would follow a symlink (TOCTOU guard)."""
 
 
+_MAX_REFLECTED_COMPONENT_LEN = 64
+
+
+def _bounded_component(component: str, limit: int = _MAX_REFLECTED_COMPONENT_LEN) -> str:
+    """Bound an attacker-controlled path fragment before it reaches an exception message.
+
+    Laura's adversarial re-attack (2026-07-22, probe A1f) found that an
+    overlong single path component causes the OSError raised by
+    `Path.is_symlink()`/`Path.resolve()` (`ENAMETOOLONG` / "File name too
+    long") to reflect the FULL attacker-controlled string verbatim —
+    confirmed O(1)/linear, not itself a resource-exhaustion vector, but
+    worth truncating before it can inflate structured logs once this path
+    becomes network-reachable (Info-only, non-blocking). Fixed length, not a
+    ratio, so behaviour doesn't vary by input size.
+    """
+    if len(component) <= limit:
+        return component
+    return f"{component[:limit]}…[truncated, {len(component)} chars total]"
+
+
 def reject_dotdot_segments(relative: str) -> None:
     """Gate 1: reject any `..`/`.` path segment before any join/resolve.
 
@@ -78,9 +98,27 @@ def canonicalize_and_contain(root: Path, relative: str) -> Path:
     """
     root_real = root.resolve(strict=False)
     candidate = root / relative
-    if candidate.is_symlink():
+
+    # `is_symlink()`/`resolve()` below do real lstat/realpath syscalls — an
+    # overlong `relative` component (or overlong resulting path) surfaces a
+    # native OSError (ENAMETOOLONG) whose message embeds the full path
+    # verbatim. Catch and re-raise the SAME exception type (still fails
+    # closed, no control-flow change) with the reflected component bounded
+    # (Laura A1f, log-hygiene hardening).
+    try:
+        candidate_is_symlink = candidate.is_symlink()
+    except OSError as exc:
+        raise OSError(
+            exc.errno, f"cannot stat path component {_bounded_component(relative)!r}: {exc.strerror or exc}"
+        ) from None
+    if candidate_is_symlink:
         raise PathTraversalError(f"{relative!r} is a symlink — refusing to follow it (leaf must be a regular file)")
-    candidate_real = candidate.resolve(strict=False)
+    try:
+        candidate_real = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise OSError(
+            exc.errno, f"cannot resolve path component {_bounded_component(relative)!r}: {exc.strerror or exc}"
+        ) from None
     try:
         candidate_real.relative_to(root_real)
     except ValueError:

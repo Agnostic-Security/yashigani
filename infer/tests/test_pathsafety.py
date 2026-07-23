@@ -101,3 +101,37 @@ def test_open_no_follow_symlink_refuses_a_symlink_leaf(tmp_path) -> None:
 
     with pytest.raises(SymlinkEscapeError):
         open_no_follow_symlink(link)
+
+
+def test_canonicalize_and_contain_bounds_overlong_component_in_exception_message(tmp_path) -> None:
+    """Laura A1f (log-hygiene, info-only): an overlong single path component
+    causes a native OSError (ENAMETOOLONG) whose message must NOT reflect
+    the full attacker string — it must be bounded, and the exception type
+    must still be OSError (fail-closed, no control-flow change)."""
+    root = tmp_path / "store"
+    root.mkdir()
+    overlong = "a" * 5000
+
+    with pytest.raises(OSError) as excinfo:
+        canonicalize_and_contain(root, overlong)
+
+    message = str(excinfo.value)
+    assert overlong not in message, "full attacker-controlled component was reflected verbatim"
+    assert len(message) < 300, f"exception message not bounded: {len(message)} chars"
+    assert "…[truncated" in message
+
+
+def test_canonicalize_and_contain_bounds_overlong_component_regardless_of_input_size(tmp_path) -> None:
+    """Bounding must be O(1) in the reflected message regardless of how
+    large the attacker's input actually is (5000 vs 20000 chars)."""
+    root = tmp_path / "store"
+    root.mkdir()
+
+    with pytest.raises(OSError) as excinfo_small:
+        canonicalize_and_contain(root, "a" * 5000)
+    with pytest.raises(OSError) as excinfo_large:
+        canonicalize_and_contain(root, "a" * 20000)
+
+    # Both messages are bounded to roughly the same (small) length, not
+    # scaling with the attacker's input size.
+    assert abs(len(str(excinfo_small.value)) - len(str(excinfo_large.value))) < 20
