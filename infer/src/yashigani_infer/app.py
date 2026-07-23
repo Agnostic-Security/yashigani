@@ -114,9 +114,30 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     @app.get("/healthz")
-    def healthz() -> dict[str, Any]:
-        resident = supervisor.resident_shas
-        return {"status": "ok", "resident_models": [supervisor.healthz(sha) for sha in resident]}
+    def healthz() -> JSONResponse:
+        """GPU-engaged health contract (Iris integration-seam audit F2 /
+        platform-requirements §4.5 / Captain #3 / Red-Council #6).
+
+        `supervisor.healthz()` already computes per-model `gpu_engaged` /
+        `unhealthy` correctly (see `supervisor/supervisor.py`) — the gap was
+        purely here: this route used to always return HTTP 200 with
+        `{"status": "ok", ...}` regardless of what those nested per-model
+        healths said, so a GPU-tagged deployment that silently fell back to
+        CPU (0 offloaded layers) would report Ready forever to any probe
+        that only checks the status code (a plain k8s `httpGet` probe,
+        Docker/Podman `HEALTHCHECK`, etc).
+
+        Fix: aggregate across every resident model. If ANY resident is
+        GPU-expected but reports zero offloaded layers (or is simply not
+        alive), the whole container reports unhealthy via a non-200 status
+        — a single-source contract a plain `httpGet` probe can consume with
+        no `exec` needed, and the existing compose `HEALTHCHECK` script can
+        also key off directly.
+        """
+        resident_health = [supervisor.healthz(sha) for sha in supervisor.resident_shas]
+        unhealthy = any(health.get("status") == "unhealthy" for health in resident_health)
+        body: dict[str, Any] = {"status": "unhealthy" if unhealthy else "ok", "resident_models": resident_health}
+        return JSONResponse(content=body, status_code=503 if unhealthy else 200)
 
     @app.get("/api/tags")
     def api_tags() -> dict[str, Any]:

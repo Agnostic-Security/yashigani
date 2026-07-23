@@ -16,7 +16,7 @@ from yashigani_infer.app import create_app
 from yashigani_infer.blobstore.store import BlobStore
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
 from yashigani_infer.shim.framing import format_sse_event
-from yashigani_infer.supervisor.supervisor import ResourceLimits, Supervisor
+from yashigani_infer.supervisor.supervisor import LoadConfig, ResourceLimits, Supervisor
 
 
 @pytest.fixture()
@@ -42,6 +42,57 @@ def test_healthz_reports_ok_with_no_residents(tmp_blob_store: BlobStore) -> None
     resp = client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "resident_models": []}
+
+
+def test_healthz_returns_200_when_gpu_expected_and_engaged(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    """Iris integration-seam audit F2: a GPU-tagged deployment that really
+    offloaded layers must still report Ready — the fix must not turn every
+    GPU deployment unhealthy, only a silent CPU fallback."""
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    supervisor.load(ingested_model, LoadConfig(n_gpu_layers=32, expect_gpu=True))
+    client = TestClient(app)
+
+    resp = client.get("/healthz")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["resident_models"][0]["gpu_engaged"] is True
+
+
+def test_healthz_returns_non_200_when_gpu_expected_but_zero_layers_offloaded(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    """Iris integration-seam audit F2 / Red-Council #6: `/healthz` used to
+    always return HTTP 200 regardless of the nested per-model health, so a
+    GPU-tagged deployment silently falling back to CPU (0 offloaded layers)
+    reported Ready forever to any probe that only checks the status code.
+    This must now hard-fail the whole container, not just nest a warning."""
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    supervisor.load(ingested_model, LoadConfig(n_gpu_layers=0, expect_gpu=True))
+    client = TestClient(app)
+
+    resp = client.get("/healthz")
+
+    assert resp.status_code != 200
+    body = resp.json()
+    assert body["status"] == "unhealthy"
+    assert body["resident_models"][0]["gpu_engaged"] is False
+
+
+def test_healthz_stays_200_for_a_cpu_only_deployment_without_gpu_expectation(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    supervisor.load(ingested_model, LoadConfig(n_gpu_layers=0, expect_gpu=False))
+    client = TestClient(app)
+
+    resp = client.get("/healthz")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
 
 
 def test_api_tags_lists_ingested_models(tmp_blob_store: BlobStore, ingested_model: ResolvedModel) -> None:
