@@ -1,4 +1,4 @@
-# Last updated: 2026-05-28T00:00:00+00:00 (feat: v2.25.0 P1 W0a+W1 — ring-fence onboarding audit types + manifest parser/linter)
+# Last updated: 2026-07-23T00:00:00+00:00 (fix: v4.1.2 SCA dep bumps — pillow 12.3.0, pyasn1 0.6.4)
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -22,7 +22,9 @@ dependencies = [
     "argon2-cffi>=25.1",
     "pyotp>=2.9",
     "qrcode[pil]>=7.4",
+    "pillow>=12.3.0",   # transitive via qrcode[pil]; floor pinned for 10 HIGH + 3 MED CVEs fixed in 12.3.0 (Lu trivy fs, v4.1.2 SCA sweep 20260723).
     "webauthn>=2.1",
+    "pyasn1>=0.6.4",   # transitive via webauthn + google-auth->pyasn1-modules; floor pinned for CVE-2026-59884/59885 (2 HIGH, quadratic-time + oversized-tag DoS in BER/OID decoder).
     "redis>=5.0",
     # Inspection / AI
     # (Ollama is accessed via local HTTP — no SDK required)
