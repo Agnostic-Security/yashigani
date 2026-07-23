@@ -17,6 +17,31 @@ The chart does not bundle Kyverno.
 NOTE: ClusterPolicy is a cluster-scoped CRD — it does not live inside the
 yashigani namespace but it is owned by this Helm release (release name in labels).
 Helm will delete these policies on helm uninstall.
+
+MULTI-ORG NAMING (fix/v412-k8s-clusterpolicy-multiorg-naming, CAPTAIN LIVE FIND
+2026-07-23): install.sh's k8s convention pins the Helm RELEASE NAME to the
+literal "yashigani" for every org — only --namespace varies per org (e.g.
+org-a ns=yashigani, org-b ns=yashigani-orgb; confirmed install.sh:13672-13674
+`helm upgrade --install yashigani "$chart_dir" --namespace "$NAMESPACE"`).
+These policies are PER-ORG (each org's install owns and governs only its own
+namespace's Pods — see each rule's `match.any[].resources.namespaces:
+{{ "{{" }} .Release.Namespace {{ "}}" }}` scoping below, unchanged by this
+fix). Cluster-scoped CRD names must therefore embed the per-org discriminator
+too, or a 2nd org's `helm install` collides on "invalid ownership metadata"
+against the 1st org's identically-named ClusterPolicy (reproduced live:
+testing_runs/yashigani/wt-fix-clusterpolicy-multiorg/evidence/before-org{a,b}.yaml
+— both rendered `yashigani-require-run-as-non-root` etc. before this fix).
+Fix: every ClusterPolicy name below embeds {{ .Release.Namespace }} (not
+multiTenant.tenantId — that value is optional/gated behind the separate
+multiTenant.enabled flag and defaults to "" independent of
+admissionPolicies.enabled, so keying on it here would either collide again
+on unset installs or force a new required value on every existing
+admissionPolicies.enabled=true deployment; Release.Namespace is always
+present, already the operative per-org boundary per install.sh, and mirrors
+cilium-clusterwide-networkpolicy.yaml's per-tenant-naming PATTERN — a
+different discriminator VALUE, same per-org naming PRINCIPLE). Namespace
+names are already RFC1123-DNS-label-constrained by Kubernetes itself, so no
+additional sanitization is needed for use in a ClusterPolicy resource name.
 */ -}}
 {{- if .Values.admissionPolicies.enabled }}
 {{- /*
@@ -40,7 +65,7 @@ lookup always returns empty in that context (correct: no cluster connection).
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-run-as-non-root
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-run-as-non-root
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -82,7 +107,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-no-privilege-escalation
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-no-privilege-escalation
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -124,7 +149,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-seccomp-profile
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-seccomp-profile
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -166,7 +191,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-drop-all-capabilities
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-drop-all-capabilities
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -207,7 +232,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-restrict-root-user
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-restrict-root-user
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -296,7 +321,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-restrict-pki-trust-plane
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-restrict-pki-trust-plane
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -488,7 +513,7 @@ spec:
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-deny-rogue-dns-bind
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-deny-rogue-dns-bind
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
