@@ -12934,12 +12934,20 @@ k8s_ensure_fresh_local_images() {
   #    can prove provenance without a registry round-trip too.
   #    bash-3.2-safe (macOS system bash — see scripts/test-installer.sh
   #    portability gate): plain pipe-delimited list, not an associative array.
+  # YSG-RISK-123b: extractor renamed yashigani/extractor -> yashigani-extractor
+  # (hyphen) to match helm/yashigani/values.yaml documentEnforcement.image.repository
+  # and the yashigani.ownImage naming convention shared by gateway/backoffice/
+  # caddy-config-broker. This is the K8s-only image list — the docker-compose
+  # path (_build_extractor_image, docker-compose.extractor.yml) is untouched and
+  # still builds/tags the slash name "yashigani/extractor", which is correct
+  # there (compose's single dockerd store does not hit the kubelet-separate-
+  # containerd-store bug this whole function exists to defeat).
   local _k8s_images
   _k8s_images="$(cat <<'IMGLIST'
 yashigani-gateway|docker/Dockerfile.gateway
 yashigani-backoffice|docker/Dockerfile.backoffice
 yashigani-caddy-config-broker|docker/caddy/Dockerfile.caddy-broker
-yashigani/extractor|docker/Dockerfile.extractor
+yashigani-extractor|docker/Dockerfile.extractor
 IMGLIST
 )"
   local _repo _dockerfile _local_tag _remote_tag _pushed_digest
@@ -12974,6 +12982,15 @@ IMGLIST
     case "$_repo" in
       yashigani-gateway)    export _YSG_K8S_EXPECTED_DIGEST_GATEWAY="${_pushed_digest}" ;;
       yashigani-backoffice) export _YSG_K8S_EXPECTED_DIGEST_BACKOFFICE="${_pushed_digest}" ;;
+      # YSG-RISK-123b: recorded for operator audit trail / k8s_verify_image_provenance's
+      # log-only note below. Unlike gateway/backoffice there is no long-running
+      # extractor Deployment/pod at install time to diff a running imageID
+      # against (extractor pods are per-job ephemeral, created on-demand by
+      # KubernetesBackend.run_extractor_job) — the provenance guarantee for
+      # extractor is the registry-aware image wiring itself (gateway.yaml /
+      # backoffice.yaml YASHIGANI_EXTRACTOR_IMAGE -> yashigani.ownImage ->
+      # this exact just-pushed tag), not a post-hoc running-pod digest check.
+      yashigani-extractor)  export _YSG_K8S_EXPECTED_DIGEST_EXTRACTOR="${_pushed_digest}" ;;
     esac
   done <<< "$_k8s_images"
 
@@ -14112,6 +14129,26 @@ k8s_verify_image_provenance() {
     log_error "node-local image cache, and whether ${NAMESPACE} pods were scheduled onto"
     log_error "a node that already had a same-tag image cached before this install ran."
     exit 1
+  fi
+
+  # YSG-RISK-123b: the extractor is a per-job EPHEMERAL pod (no long-running
+  # Deployment), so there is no running pod to diff an imageID against at
+  # install time the way gateway/backoffice are checked above. Its provenance
+  # guarantee is the registry-aware config wiring itself: gateway.yaml /
+  # backoffice.yaml set YASHIGANI_EXTRACTOR_IMAGE from the same
+  # yashigani.ownImage(global.imageRegistry, global.imageOwner,
+  # documentEnforcement.image.repository, .tag) expression used to build+push
+  # in step 7b, so KubernetesBackend.run_extractor_job (backend.py) can only
+  # ever reference this exact just-pushed tag — never the stale hardcoded
+  # DEFAULT_IMAGE fallback in documents/sandbox.py. This is a config-time
+  # guarantee, not a runtime-verified one. Flagged for a LIVE check as part of
+  # the x8x k3s smoke run: trigger one document-enforcement job with
+  # documentEnforcement.enabled=true and diff the spawned pod's
+  # status.containerStatuses[0].imageID against the digest below.
+  if [[ -n "${_YSG_K8S_EXPECTED_DIGEST_EXTRACTOR:-}" ]]; then
+    log_info "Extractor image built+pushed, digest ${_YSG_K8S_EXPECTED_DIGEST_EXTRACTOR}"
+    log_info "  (config-verified via YASHIGANI_EXTRACTOR_IMAGE wiring — ephemeral per-job"
+    log_info "   pods have nothing running yet to runtime-verify; see YSG-RISK-123b note)"
   fi
 }
 

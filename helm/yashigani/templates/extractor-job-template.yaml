@@ -102,7 +102,12 @@ data:
       activeDeadlineSeconds: {{ .Values.documentEnforcement.timeoutSeconds | default 20 }}  # wall-clock kill
       containers:
         - name: extractor
-          image: "{{ .Values.documentEnforcement.image.repository | default "yashigani/extractor" }}:{{ .Values.documentEnforcement.image.tag | default .Chart.AppVersion }}"
+          # YSG-RISK-123b: registry-aware, same yashigani.ownImage helper the
+          # gateway/backoffice/caddy-config-broker templates use, so this
+          # documented spec cannot drift from what KubernetesBackend.run_extractor_job
+          # (src/yashigani/pool/backend.py) actually creates via
+          # YASHIGANI_EXTRACTOR_IMAGE (wired in gateway.yaml / backoffice.yaml).
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" (.Values.documentEnforcement.image.repository | default "yashigani-extractor") "tag" (.Values.documentEnforcement.image.tag | default .Chart.AppVersion)) }}"
           stdin: true
           stdinOnce: true
           securityContext:
