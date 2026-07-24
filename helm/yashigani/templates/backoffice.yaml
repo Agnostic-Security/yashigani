@@ -226,18 +226,40 @@ spec:
               value: "https://yashigani-policy:8181"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
-            # FINDING-V412-RESTART-012: on docker/podman-compose, /run/secrets
-            # is now a pure :ro mount and the 4 dev-mode-fallback credential
-            # writes (admin_initial_password etc.) + the license-key write go
-            # to a SEPARATE /run/secrets-rw mount instead (see docker-compose.yml
-            # + auth/bootstrap.py write_docker_secrets()). On K8s, /run/secrets
-            # is ALREADY a genuinely writable emptyDir (seeded by the
-            # copy-pki-to-writable initContainer above) — there is no nested
-            # bind-mount to regress, so writes stay at the SAME path here.
-            # Without this override the Python default (/run/secrets-rw) would
-            # resolve to a path that doesn't exist in this pod.
+            # YSG-RISK-120 fix (k8s parity with compose FINDING-V412-RESTART-012):
+            # previously /run/secrets was a SINGLE writable emptyDir holding
+            # BOTH the CA trust anchors (ca_root.crt/ca_bundle.crt, seeded by
+            # the copy-pki-to-writable initContainer) AND the writable
+            # bootstrap-credential writes (admin_initial_password etc. via
+            # write_docker_secrets(), license_key via /admin/license/activate).
+            # A backoffice file-write primitive could rm+rewrite ca_root.crt
+            # to an attacker-controlled CA, poisoning every outbound mTLS
+            # verify backoffice performs (postgres sslrootcert, redis
+            # ssl_ca_certs, healthcheck, OTel). Fixed the same way compose
+            # was fixed: when mTLS is enabled, /run/secrets is now mounted
+            # readOnly in the main container (see volumeMounts below) and the
+            # genuinely-writable files go to a SEPARATE emptyDir at
+            # /run/secrets-rw instead. When mTLS is disabled, no PKI
+            # initContainer ever runs and no CA material is ever seeded into
+            # /run/secrets, so there is nothing to protect — writes stay at
+            # the single /run/secrets path as before (Python default
+            # /run/secrets-rw would otherwise resolve to a path that doesn't
+            # exist in that pod).
             - name: YASHIGANI_SECRETS_RW_DIR
-              value: "/run/secrets"
+              value: {{ if .Values.mtls.enabled }}"/run/secrets-rw"{{ else }}"/run/secrets"{{ end }}
+            {{- if .Values.mtls.enabled }}
+            # YSG-RISK-120 fix: loader.py checks YASHIGANI_LICENSE_FILE (candidate
+            # 1) before the hardcoded /run/secrets/license_key (candidate 2). A
+            # runtime-activated license (POST /admin/license/activate) is written
+            # to the writable /run/secrets-rw volume, not the now-readOnly
+            # /run/secrets volume that holds the install-time licensing.licenseKey
+            # Secret mount — without this override an activated license would be
+            # lost on pod restart (fell through to the community-tier default).
+            # Fresh installs with no runtime activation yet: this candidate file
+            # doesn't exist, loader.py falls through to candidate 2 unchanged.
+            - name: YASHIGANI_LICENSE_FILE
+              value: "/run/secrets-rw/license_key"
+            {{- end }}
             - name: YASHIGANI_DEPLOYMENT_STREAM
               value: {{ (.Values.gateway.env | default dict).deploymentStream | quote }}
             {{- if .Values.mtls.enabled }}
@@ -450,9 +472,33 @@ spec:
               mountPath: /var/log/yashigani
             - name: secrets
               mountPath: /run/secrets
-              # writable: initContainer seeds PKI, bootstrap writes
-              # admin_initial_password + friends alongside them.
+              {{- if .Values.mtls.enabled }}
+              readOnly: true
+              # YSG-RISK-120 fix: this volume holds the CA trust anchors
+              # (ca_root.crt/ca_bundle.crt) + own leaf/key + bootstrap token +
+              # postgres_password, seeded by the copy-pki-to-writable
+              # initContainer above (which mounts it RW). The main container
+              # only ever READS these files — mounting readOnly here means a
+              # backoffice file-write primitive can no longer rm/rewrite the
+              # CA trust anchor it verifies its own outbound mTLS against.
+              # Genuinely-writable bootstrap files now live on the separate
+              # secrets-rw volume below.
+              {{- else }}
+              # mTLS disabled: no PKI initContainer runs, no CA material is
+              # ever seeded here — stays writable for write_docker_secrets()
+              # dev-mode fallback (YASHIGANI_SECRETS_RW_DIR=/run/secrets above).
+              {{- end }}
             {{- if .Values.mtls.enabled }}
+            - name: secrets-rw
+              mountPath: /run/secrets-rw
+              # YSG-RISK-120 fix: separate writable emptyDir for the
+              # genuinely-writable bootstrap files — write_docker_secrets()
+              # dev-mode-fallback credentials (admin_initial_password,
+              # grafana_admin_password, redis_password, prometheus_password)
+              # and the runtime license-activation write (routes/license.py).
+              # Deliberately never seeded with CA/trust material. Mirrors
+              # docker-compose.yml's /run/secrets-rw shadow-mount
+              # (FINDING-V412-RESTART-012).
             - name: service-manifest
               mountPath: /etc/yashigani
               readOnly: true
@@ -466,8 +512,9 @@ spec:
             {{- if .Values.licensing.licenseKey }}
             # Petra P0-1 (v2.24.4): mount the licence key so loader.py candidate 2
             # (/run/secrets/license_key) resolves. subPath keeps the mount scoped to
-            # a single file; coexists with the writable emptyDir at /run/secrets
-            # (initContainer seeds PKI there; this adds the licence file separately).
+            # a single file; coexists with the (now readOnly, YSG-RISK-120 fix)
+            # /run/secrets emptyDir (initContainer seeds PKI there; this adds the
+            # licence file separately — both are read-only from the main container).
             - name: license
               mountPath: /run/secrets/license_key
               subPath: license_key
@@ -504,11 +551,24 @@ spec:
             sizeLimit: 50Mi
           {{- end }}
         {{- if .Values.mtls.enabled }}
-        # Writable /run/secrets seeded by initContainer.
+        # Writable FROM THE INITCONTAINER'S PERSPECTIVE ONLY: seeded by
+        # copy-pki-to-writable, then mounted readOnly in the main backoffice
+        # container (YSG-RISK-120 fix — see volumeMounts above). Holds CA
+        # trust anchors + own leaf/key + bootstrap token + postgres_password.
         - name: secrets
           emptyDir:
             medium: Memory
             sizeLimit: 10Mi
+        # YSG-RISK-120 fix: separate writable emptyDir for the bootstrap
+        # credential writes (admin_initial_password + friends, license_key)
+        # that must stay writable by the main container. Never touched by
+        # the copy-pki-to-writable initContainer — no CA/trust material is
+        # ever seeded here, so this volume being writable carries none of the
+        # CA-tamper risk the /run/secrets split above closes.
+        - name: secrets-rw
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         # Read-only mount of the PKI Secret — the initContainer reads from
         # this and copies into the writable /run/secrets emptyDir.
         - name: pki-ro
