@@ -240,6 +240,15 @@ SKIP_PULL=false
 # cluster CNI does not enforce NetworkPolicy. Skipping records a risk-register
 # exception (operator accepts an unverified ring-fence).
 SKIP_NETWORKPOLICY_PROBE=false
+# YSG-RISK-123: skip the k8s local-image freshness build/push/verify sequence
+# (k8s_ensure_fresh_local_images + k8s_verify_image_provenance). Default off —
+# by default install.sh k8s path builds gateway/backoffice/caddy-config-broker/
+# extractor from CURRENT source, pushes to an ephemeral local registry, and
+# verifies the deployed pod's imageID digest matches what was just pushed
+# before declaring success. Intended escape hatch for operators who supply
+# their OWN pre-built, registry-hosted, immutable-digest images via
+# --set global.imageRegistry=... (real CI/CD pipeline owns freshness there).
+SKIP_K8S_IMAGE_BUILD=false
 # Cilium ratified as the k8s CNI standard (2026-07-19 design). These two gates
 # are cheap/fast, static-ish checks that fail fast BEFORE the wizard runs.
 # Kernel check is skippable (soft heuristic, node kernels can legitimately
@@ -520,6 +529,14 @@ OPTIONS
                                           is not forwarding over tls:// with tls_servername
                                           pinned, or if live external resolution fails.
                                           Skipping records a risk-register exception.
+  --skip-k8s-image-build                   (k8s) Skip the local-image build/push/provenance
+                                          sequence (YSG-RISK-123). By default install.sh builds
+                                          gateway/backoffice/caddy-config-broker/extractor from
+                                          CURRENT source, pushes to an ephemeral local registry,
+                                          and verifies the deployed pod's image digest matches
+                                          what was just built. Use this flag only when you supply
+                                          your own pre-built, registry-hosted images via
+                                          --set global.imageRegistry=... .
   --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
                                           Corefile with the DNSSEC-delegated/DoT forward block
                                           (scripts/coredns-hardening-apply.sh) before the
@@ -769,6 +786,7 @@ parse_args() {
       --skip-kernel-ebpf-probe)   SKIP_KERNEL_EBPF_PROBE=true;   shift ;;
       --skip-coredns-dnssec-probe) SKIP_COREDNS_DNSSEC_PROBE=true; shift ;;
       --apply-coredns-hardening)  APPLY_COREDNS_HARDENING=true;  shift ;;
+      --skip-k8s-image-build)    SKIP_K8S_IMAGE_BUILD=true;      shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
@@ -12810,6 +12828,171 @@ print_completion_summary() {
 # Kubernetes flow steps
 # =============================================================================
 
+# STEP 7b (k8s): ensure fresh, provenance-verifiable local images
+# -----------------------------------------------------------------------------
+# YSG-RISK-123 (2026-07-24): Ava live-diagnosed a k8s-deployed backoffice pod
+# executing PRE-d48a65df code (webauthn_v1._expected_origin still read the raw
+# Host header) while the source at HEAD already carried the fix, causing
+# register/finish 400 origin-mismatch. Root cause — static analysis + LIVE
+# verification against docker-desktop k8s same day
+# (testing_runs/yashigani/v412-final3-k8s-image-123/):
+#
+#   1. Docker Desktop's embedded "Kubernetes" runs kubelet against a SEPARATE
+#      containerd store inside a kind-style node (kubectl get nodes shows
+#      `desktop-control-plane`, CONTAINER-RUNTIME containerd://2.2.1) — NOT
+#      the top-level dockerd store `docker build` populates. LIVE-PROVEN: a
+#      throwaway image built via plain `docker build` stayed
+#      `ErrImageNeverPull` under a Pod referencing it with
+#      imagePullPolicy: Never for 60s+ (no auto-sync). The SAME image pushed
+#      to a registry at localhost:5000 and referenced as
+#      localhost:5000/<repo>:<tag> pulled successfully in 94ms — the registry
+#      round-trip is the only proven bridge on this topology.
+#   2. helm/yashigani/values.yaml ships gateway/backoffice/caddy-config-broker
+#      with HYPHEN repository names (yashigani-gateway, yashigani-backoffice,
+#      yashigani-caddy-config-broker) and global.imageRegistry="" by default —
+#      the `yashigani.ownImage` helper then renders a bare "<repo>:<tag>"
+#      local-store lookup. docker-compose.yml (the only automated build path
+#      in install.sh before this fix) builds and tags first-party images with
+#      SLASH names instead (yashigani/gateway, yashigani/backoffice) — a
+#      DIFFERENT local image. Nothing in install.sh, scripts/k8s-install.sh,
+#      or the manual rebuild steps previously documented in
+#      docs/kubernetes_deployment.md (which itself used the wrong slash name)
+#      ever built, tagged, or pushed an image under the chart's hyphenated
+#      name. Whatever image already happened to exist locally under that
+#      name — however old — is what imagePullPolicy: IfNotPresent serves,
+#      silently, forever.
+#   3. LIVE CONFIRMATION: `yashigani-backoffice:4.1.2` and
+#      `yashigani-gateway:4.1.2` were both found cached with image Created
+#      12:21:23+01:00 — three minutes BEFORE commit d48a65df (12:24:27+01:00,
+#      the WebAuthn _expected_origin fix) landed. That is precisely the stale
+#      image Ava's live probe caught.
+#
+# Fix: build first-party images fresh from CURRENT source under the EXACT
+# repository names the chart expects (closing the naming mismatch), push them
+# to an ephemeral local registry, and point the chart at that registry via
+# global.imageRegistry/imageOwner. A registry pull is a supported CRI path on
+# every runtime regardless of whether kubelet's containerd shares storage
+# with `docker build` — this defeats the store-separation problem
+# categorically rather than papering over this one symptom.
+#
+# Skippable with --skip-k8s-image-build / SKIP_K8S_IMAGE_BUILD=1 for operators
+# supplying their own pre-built, registry-hosted, immutable-digest images via
+# --set global.imageRegistry=... (their own CI/CD owns freshness there).
+k8s_ensure_fresh_local_images() {
+  set_step "7b" "k8s local image freshness (YSG-RISK-123)"
+
+  if [[ "${SKIP_K8S_IMAGE_BUILD:-false}" == "true" ]]; then
+    log_warn "Skipping k8s local image build/push/provenance (--skip-k8s-image-build)."
+    log_warn "Ensure your own images use an IMMUTABLE tag/digest and that"
+    log_warn "global.imageRegistry is set — install.sh cannot verify freshness otherwise."
+    return 0
+  fi
+
+  # Operator already pointed the chart at a real registry (their own CI/CD
+  # owns image freshness there) — do not build or push anything local.
+  local _operator_registry=""
+  _operator_registry="$(grep -E '^\s*imageRegistry:' "${WORK_DIR}/.env.helm" 2>/dev/null \
+    | tail -1 | sed -E 's/^[[:space:]]*imageRegistry:[[:space:]]*"?([^"[:space:]]*)"?.*/\1/' || true)"
+  if [[ -n "${_operator_registry}" ]]; then
+    log_info "global.imageRegistry already set to '${_operator_registry}' — skipping local build/push (operator-managed registry)."
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "k8s_ensure_fresh_local_images: build gateway/backoffice/caddy-config-broker/extractor from source, push to ${YASHIGANI_K8S_LOCAL_REGISTRY:-localhost:5000}, set global.imageRegistry"
+    return 0
+  fi
+
+  log_step "7b/${TOTAL_STEPS}" "Building + pushing first-party k8s images (YSG-RISK-123)..."
+  require_cmd "docker"   # k8s path is Docker-only today (no podman-k8s support upstream)
+
+  local _reg="${YASHIGANI_K8S_LOCAL_REGISTRY:-localhost:5000}"
+  local _owner="local"
+  local _reg_port="${_reg##*:}"
+
+  # 1) Ensure a local registry is reachable at $_reg — start an ephemeral one
+  #    (named so re-runs are idempotent) if nothing is listening there yet.
+  if ! docker ps --filter "name=^yashigani-k8s-local-registry$" --filter "status=running" \
+       --format '{{.Names}}' | grep -q .; then
+    if docker ps -a --filter "name=^yashigani-k8s-local-registry$" --format '{{.Names}}' | grep -q .; then
+      docker start yashigani-k8s-local-registry >/dev/null
+    else
+      docker run -d --name yashigani-k8s-local-registry \
+        --restart unless-stopped \
+        -p "${_reg_port}:5000" \
+        registry:2 >/dev/null
+    fi
+    log_success "Ephemeral local registry running at ${_reg}"
+  else
+    log_info "Reusing existing local registry at ${_reg}"
+  fi
+
+  # 2) Build + push each first-party image under the EXACT name the chart's
+  #    default values.yaml expects. --build-arg GIT_SHA + LABEL
+  #    org.opencontainers.image.revision mirror the existing compose-path
+  #    cache-busting pattern (_local_images_cached above) so `docker inspect`
+  #    can prove provenance without a registry round-trip too.
+  #    bash-3.2-safe (macOS system bash — see scripts/test-installer.sh
+  #    portability gate): plain pipe-delimited list, not an associative array.
+  local _k8s_images
+  _k8s_images="$(cat <<'IMGLIST'
+yashigani-gateway|docker/Dockerfile.gateway
+yashigani-backoffice|docker/Dockerfile.backoffice
+yashigani-caddy-config-broker|docker/caddy/Dockerfile.caddy-broker
+yashigani/extractor|docker/Dockerfile.extractor
+IMGLIST
+)"
+  local _repo _dockerfile _local_tag _remote_tag _pushed_digest
+  while IFS='|' read -r _repo _dockerfile; do
+    [[ -z "$_repo" ]] && continue
+    _local_tag="${_repo}:${YASHIGANI_VERSION}"
+    _remote_tag="${_reg}/${_owner}/${_repo}:${YASHIGANI_VERSION}"
+
+    log_info "Building ${_local_tag} (SHA ${YASHIGANI_GIT_SHA}) from ${_dockerfile}..."
+    docker build \
+      -f "${WORK_DIR}/${_dockerfile}" \
+      -t "${_local_tag}" \
+      --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+      --label "org.opencontainers.image.revision=${YASHIGANI_GIT_SHA}" \
+      "${WORK_DIR}" || {
+        log_error "Failed to build ${_local_tag} — cannot continue k8s install"
+        exit 1
+      }
+
+    docker tag "${_local_tag}" "${_remote_tag}"
+    docker push "${_remote_tag}" >/dev/null || {
+      log_error "Failed to push ${_remote_tag} to local registry ${_reg}"
+      exit 1
+    }
+    log_success "Pushed ${_remote_tag}"
+
+    # Capture the just-pushed content digest for gateway/backoffice so
+    # k8s_verify_image_provenance can prove the DEPLOYED pod runs THIS exact
+    # content, not merely a same-tag image (YSG-RISK-123 — the whole point).
+    _pushed_digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${_remote_tag}" 2>/dev/null \
+      | awk -F@ '{print $2}' || true)"
+    case "$_repo" in
+      yashigani-gateway)    export _YSG_K8S_EXPECTED_DIGEST_GATEWAY="${_pushed_digest}" ;;
+      yashigani-backoffice) export _YSG_K8S_EXPECTED_DIGEST_BACKOFFICE="${_pushed_digest}" ;;
+    esac
+  done <<< "$_k8s_images"
+
+  # 3) Point the chart at the local registry. Appended to .env.helm so
+  #    k8s_helm_install's `-f .env.helm` picks it up; an operator's own --set
+  #    still wins per normal helm precedence.
+  {
+    printf '\nglobal:\n'
+    printf '  imageRegistry: "%s"\n' "${_reg}"
+    printf '  imageOwner: "%s"\n' "${_owner}"
+  } >> "${WORK_DIR}/.env.helm"
+
+  # Remembered for the post-deploy provenance check (k8s_verify_image_provenance).
+  export _YSG_K8S_IMAGE_REGISTRY="${_reg}"
+  export _YSG_K8S_IMAGE_OWNER="${_owner}"
+
+  log_success "First-party k8s images fresh, pushed, and wired into helm values (YSG-RISK-123)"
+}
+
 # STEP 7 (k8s): helm dependency update
 k8s_helm_dep_update() {
   set_step "7" "helm dependency update"
@@ -13856,6 +14039,80 @@ k8s_rollout_status() {
     --timeout=300s
 
   log_success "Gateway deployment is ready"
+}
+
+# STEP 9b (k8s): verify deployed image provenance
+# -----------------------------------------------------------------------------
+# YSG-RISK-123: a green `kubectl rollout status` only proves the pod is
+# Ready — it says nothing about WHICH code is inside it (SOP 2, healthcheck
+# semantic discipline, applies equally to rollout-status). Ava's live
+# WebAuthn diagnosis is exactly this failure mode: rollout reported healthy,
+# but the running backoffice was serving pre-d48a65df code.
+#
+# When k8s_ensure_fresh_local_images ran (the default path — see that
+# function's header for full root-cause + LIVE evidence), it recorded the
+# content digest of the image it JUST built and pushed. This step reads back
+# the ACTUAL running pod's image digest and fails the install loud if they
+# don't match, instead of letting a stale-image silently declare success.
+#
+# Skipped when k8s_ensure_fresh_local_images itself skipped (operator-managed
+# registry / --skip-k8s-image-build) — install.sh has no "expected" digest to
+# compare against in that case; the operator's own CI/CD owns that guarantee.
+k8s_verify_image_provenance() {
+  set_step "9b" "verify deployed image provenance (YSG-RISK-123)"
+
+  if [[ -z "${_YSG_K8S_EXPECTED_DIGEST_GATEWAY:-}" && -z "${_YSG_K8S_EXPECTED_DIGEST_BACKOFFICE:-}" ]]; then
+    log_info "No expected image digest recorded (--skip-k8s-image-build or operator registry) — skipping provenance check."
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "k8s_verify_image_provenance: compare running pod imageID digests to just-pushed digests"
+    return 0
+  fi
+
+  require_cmd "kubectl"
+  log_step "9b/${TOTAL_STEPS}" "Verifying deployed pods run the image just built (YSG-RISK-123)..."
+
+  local _fail=0
+  local _svc _label _expected _actual _actual_digest
+
+  for _svc in gateway backoffice; do
+    _label="app.kubernetes.io/name=yashigani-${_svc}"
+    case "$_svc" in
+      gateway)    _expected="${_YSG_K8S_EXPECTED_DIGEST_GATEWAY:-}" ;;
+      backoffice) _expected="${_YSG_K8S_EXPECTED_DIGEST_BACKOFFICE:-}" ;;
+    esac
+    [[ -z "$_expected" ]] && continue
+
+    _actual="$(kubectl get pods -n "$NAMESPACE" -l "$_label" \
+      -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null || true)"
+    if [[ -z "$_actual" ]]; then
+      log_error "Could not read imageID for ${_svc} pod (label ${_label}) — cannot verify provenance"
+      _fail=1
+      continue
+    fi
+    _actual_digest="${_actual#*@}"   # strip "<repo>@" prefix if present
+
+    if [[ "$_actual_digest" != "sha256:${_expected#sha256:}" && "$_actual_digest" != "$_expected" ]]; then
+      log_error "PROVENANCE MISMATCH: ${_svc} pod is running a DIFFERENT image than was just built/pushed."
+      log_error "  Expected digest: ${_expected}"
+      log_error "  Running imageID: ${_actual}"
+      log_error "  This is the exact stale-serve pattern from YSG-RISK-123 — the cluster"
+      log_error "  reused a cached image instead of pulling the freshly-pushed one."
+      _fail=1
+    else
+      log_success "${_svc} pod provenance verified — running image matches source SHA ${YASHIGANI_GIT_SHA}"
+    fi
+  done
+
+  if [[ "$_fail" -ne 0 ]]; then
+    log_error "Aborting: deployed image provenance could not be verified (YSG-RISK-123)."
+    log_error "Do not treat this install as successful. Investigate imagePullPolicy,"
+    log_error "node-local image cache, and whether ${NAMESPACE} pods were scheduled onto"
+    log_error "a node that already had a same-tag image cached before this install ran."
+    exit 1
+  fi
 }
 
 # STEP 10 (k8s): Access instructions
@@ -18135,6 +18392,12 @@ main() {
     # AES key pre-seed happens before helm installs the backoffice Secret.
     _write_helm_values
 
+    # Step 7b: build/push first-party images + wire local registry into
+    # helm values (YSG-RISK-123). Must run AFTER _write_helm_values (appends
+    # global.imageRegistry to .env.helm) and BEFORE k8s_helm_dep_update /
+    # k8s_helm_install so the release picks up the freshly-pushed images.
+    k8s_ensure_fresh_local_images
+
     # Step 7: Helm dependency update
     k8s_helm_dep_update
 
@@ -18143,6 +18406,9 @@ main() {
 
     # Step 9: Rollout status
     k8s_rollout_status
+
+    # Step 9b: verify the deployed pods run the image just built (YSG-RISK-123)
+    k8s_verify_image_provenance
 
     # Step 10: Access instructions
     k8s_print_access
