@@ -459,6 +459,12 @@ spec:
             # gateway.yaml for that entry.
             - name: YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED
               value: {{ .Values.documentEnforcement.enabled | default false | quote }}
+            # YSG-RISK-123b fix: same extractor-image wiring as gateway.yaml —
+            # backoffice's /user/documents ingress path also spawns per-job
+            # extractor pods via KubernetesBackend.run_extractor_job (backend.py),
+            # so it needs the SAME registry-aware, freshly-built image reference.
+            - name: YASHIGANI_EXTRACTOR_IMAGE
+              value: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" (.Values.documentEnforcement.image.repository | default "yashigani-extractor") "tag" (.Values.documentEnforcement.image.tag | default .Chart.AppVersion)) }}"
             # v4.1 Phase 1d (SEAM Phase-3 wiring, iris-phase1d-audit §5-A):
             # MCP approve-transaction env vars.
             # v4.1 SU-SEAM-1d-04 RESOLVED: the unix-socket admin path cannot

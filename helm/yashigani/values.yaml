@@ -2143,8 +2143,20 @@ documentEnforcement:
   modeBProxyEnabled: false
   # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
   # Pin a digest in production (Verification Protocol §7).
+  #
+  # YSG-RISK-123b fix (2026-07-24): repository renamed from slash-form
+  # "yashigani/extractor" (the docker-compose build tag) to HYPHEN form,
+  # matching gateway/backoffice/caddy-config-broker's K8s naming convention
+  # so `yashigani.ownImage` (registry/owner/repo/tag) resolves consistently
+  # and install.sh's k8s_ensure_fresh_local_images (step 7b) builds+pushes
+  # under the EXACT name the chart references — closing the same
+  # stale-image-provenance gap Captain fixed for gateway/backoffice/
+  # caddy-config-broker. The docker-compose path is UNCHANGED (it still
+  # builds/tags "yashigani/extractor" — see docker-compose.extractor.yml —
+  # because compose's single dockerd store is not affected by the k8s
+  # kubelet-separate-containerd-store bug this fixes).
   image:
-    repository: yashigani/extractor
+    repository: yashigani-extractor
     tag: ""            # defaults to .Chart.AppVersion when empty
   # Per-job resource caps for the ephemeral extractor pods (fail-closed defaults).
   timeoutSeconds: 20   # activeDeadlineSeconds — wall-clock kill

@@ -274,6 +274,19 @@ spec:
               value: {{ .Values.documentEnforcement.enabled | default false | quote }}
             - name: YASHIGANI_DOCUMENT_MODEB_PROXY_ENABLED
               value: {{ .Values.documentEnforcement.modeBProxyEnabled | default false | quote }}
+            # YSG-RISK-123b fix: wire the per-job extractor pod's image through
+            # the SAME yashigani.ownImage helper (registry/owner/repo/tag) that
+            # gateway/backoffice/caddy-config-broker use, so KubernetesBackend.
+            # run_extractor_job (src/yashigani/pool/backend.py, called via
+            # SandboxConfig.from_env() in documents/sandbox.py) spawns the
+            # freshly-built+pushed image from install.sh step 7b
+            # (k8s_ensure_fresh_local_images) instead of falling back to the
+            # stale hardcoded DEFAULT_IMAGE ("yashigani/extractor:2.26.0") that
+            # was never registry-aware and was never wired into any K8s pod
+            # spec — the residual gap in YSG-RISK-123 (Captain's fix covered
+            # gateway/backoffice/adminBootstrap/caddy-config-broker only).
+            - name: YASHIGANI_EXTRACTOR_IMAGE
+              value: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" (.Values.documentEnforcement.image.repository | default "yashigani-extractor") "tag" (.Values.documentEnforcement.image.tag | default .Chart.AppVersion)) }}"
             # FLAG-3 fix: per-instance /egress/eval LLM rate cap (EgressLimitEnforcer).
             # Compose parity: docker-compose.yml gateway env YASHIGANI_EGRESS_LIMIT_*.
             # mode: "cap" (default) deny+fail-closed; "monitor" meter-only, never deny.
