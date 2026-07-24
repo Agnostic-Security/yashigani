@@ -3345,7 +3345,7 @@ Setting `FIPS_MODE=1` activates code paths that call `openssl dgst` and `openssl
 | Image | FIPS Provider included |
 |-------|------------------------|
 | `python:3.14.0-slim` (gateway, backoffice) | No |
-| `caddy:2.11.2-alpine` (caddy) | No |
+| `caddy:2.11.4-alpine` (caddy) | No |
 
 Setting `fips.mode=true` or `YSG_FIPS_MODE=1` with the default images makes Yashigani **FIPS-capable** (the code path is active) but does **not** make it **FIPS-validated** (CMVP module not loaded; crypto operations use the default non-validated OpenSSL).
 

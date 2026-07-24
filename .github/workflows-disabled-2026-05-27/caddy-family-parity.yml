@@ -59,10 +59,10 @@ jobs:
   caddy-adapt:
     name: caddy adapt (compose + helm)
     runs-on: ubuntu-latest
-    # Pinned to the project caddy version: docker.io/library/caddy:2.11.2-alpine
+    # Pinned to the project caddy version: docker.io/library/caddy:2.11.4-alpine
     # Same digest as docker/docker-compose.yml line 92.
     container:
-      image: caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+      image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 

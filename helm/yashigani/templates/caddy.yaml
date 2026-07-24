@@ -111,7 +111,7 @@ spec:
             # Nico N-001 (v2.24.4): FIPS_MODE propagation.
             # Routes openssl dgst calls through the OpenSSL FIPS Provider.
             # REQUIRES a FIPS-configured base image (CMVP #4985) — default
-            # caddy:2.11.2-alpine does NOT contain the FIPS Provider. Do NOT
+            # caddy:2.11.4-alpine does NOT contain the FIPS Provider. Do NOT
             # set fips.mode=true without swapping to a FIPS-configured image.
             - name: FIPS_MODE
               value: "1"

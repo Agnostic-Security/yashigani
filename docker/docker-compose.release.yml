@@ -27,7 +27,7 @@
 #
 # Digest inventory (verified 2026-05-07 via crane digest — INDEX-level multi-arch digest):
 #
-#   caddy:2.11.2-alpine                         sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+#   caddy:2.11.4-alpine                         sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 #   redis:7.4.9-alpine                          sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
 #   openpolicyagent/opa:1.16.1                  sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02
 #   ollama/ollama:0.23.1                        sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
@@ -69,7 +69,7 @@
 services:
 
   caddy:
-    image: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    image: docker.io/library/caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
   budget-redis:
     image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
