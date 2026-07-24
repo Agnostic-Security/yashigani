@@ -86,6 +86,32 @@
 # rationale.
 #
 # "root.crt" is postgres's hardcoded ssl_ca_file name; the content is the bundle.
+#
+# Last updated: 2026-07-24 (fix(k8s): FINDING-V412-K8S-PG-SSL — remove every
+#   `chown postgres:postgres` / `install -o/-g postgres` in this K8s copy.
+#   templates/postgres.yaml now pins runAsUser/runAsGroup/fsGroup to 999,
+#   matching this image's real postgres UID/GID exactly (see that file's
+#   comment) — every file this script creates is already owned uid999:gid999
+#   at creation time (the process never runs as any other UID, ever; there
+#   is no root moment to drop from). An explicit chown was therefore always
+#   redundant here, AND is exactly the failure mode that broke this path
+#   before (a chown to a MISMATCHED "postgres" UID resolved from
+#   /etc/passwd needs CAP_CHOWN, which capabilities.drop:[ALL] removes).
+#   Dropped outright as defense-in-depth against any future image/UID drift
+#   regressing this class of bug again — chmod alone is sufficient since
+#   ownership is already correct by construction.
+#
+#   NOTE — deliberate divergence from docker/postgres/05-enable-ssl.sh: the
+#   compose copy of this script is UNCHANGED and keeps its chown calls.
+#   Compose pins `user: "999:999"` on the container (docker-compose.yml,
+#   "gate V232-SMOKE-018") which ALSO exactly matches this image's real
+#   postgres UID/GID, so chown there is already a same-UID no-op requiring
+#   no capability — it isn't broken, so it isn't touched (per-runtime
+#   optimisation: docker/podman/k8s are independent streams, see
+#   feedback_optimize_per_runtime_not_flimsy_shared.md). This is the ONLY
+#   functional delta between the two copies; keep it that way if you edit
+#   either file — do not silently reintroduce chown here or silently drop it
+#   there without updating this note.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -197,10 +223,13 @@ _pinned_root_sha=""
 [[ -f "$_PINNED_ROOT_FILE" ]] && _pinned_root_sha="$(cat "$_PINNED_ROOT_FILE" 2>/dev/null || true)"
 
 _write_pinned_root() {
-  # Usage: _write_pinned_root <sha256>. Atomic write, postgres-owned, 0600.
+  # Usage: _write_pinned_root <sha256>. Atomic write, 0600.
+  # No chown: this process runs as uid999:gid999 (postgres) for its entire
+  # lifetime (templates/postgres.yaml runAsUser/runAsGroup: 999) — the file
+  # this function just created is already owned uid999:gid999 by
+  # construction. See the FINDING-V412-K8S-PG-SSL note at the top of this file.
   local _tmp="${_PINNED_ROOT_FILE}.new.$$"
   printf '%s\n' "$1" > "${_tmp}"
-  chown postgres:postgres "${_tmp}"
   chmod 0600 "${_tmp}"
   mv "${_tmp}" "${_PINNED_ROOT_FILE}"
 }
@@ -262,9 +291,9 @@ if [[ "$_src_sha" != "$_dst_sha" ]]; then
 
   # Write atomically: temp file → chmod/chown → mv.
   # Using a temp path inside PGDATA so mv is on the same filesystem (atomic rename).
+  # No chown — already owned uid999:gid999 by construction (see top-of-file note).
   _trust_tmp="${PGDATA}/root.crt.new.$$"
   _assemble_trust_bundle > "${_trust_tmp}"
-  chown postgres:postgres "${_trust_tmp}"
   chmod 0640 "${_trust_tmp}"
   mv "${_trust_tmp}" "${PGDATA}/root.crt"
 
@@ -324,10 +353,15 @@ if [[ -n "$_leaf_src_sha" && "$_leaf_src_sha" != "$_leaf_dst_sha" ]]; then
 
   echo "[05-enable-ssl] Server leaf verified (chains to trust bundle, key pair matches) — updating server.crt/server.key"
 
+  # No -o/-g on install — the destination is created by this process
+  # (uid999:gid999) and is already owned correctly by construction (see
+  # top-of-file note). -o/-g postgres would resolve via /etc/passwd, which is
+  # only safe as long as that resolves to the SAME uid/gid the process is
+  # already running as; dropped outright so this can never regress silently.
   _leaf_crt_tmp="${PGDATA}/server.crt.new.$$"
   _leaf_key_tmp="${PGDATA}/server.key.new.$$"
-  install -m 0644 -o postgres -g postgres "${_SECRETS_DIR}/postgres_client.crt" "${_leaf_crt_tmp}"
-  install -m 0600 -o postgres -g postgres "${_SECRETS_DIR}/postgres_client.key" "${_leaf_key_tmp}"
+  install -m 0644 "${_SECRETS_DIR}/postgres_client.crt" "${_leaf_crt_tmp}"
+  install -m 0600 "${_SECRETS_DIR}/postgres_client.key" "${_leaf_key_tmp}"
   mv "${_leaf_crt_tmp}" "${PGDATA}/server.crt"
   mv "${_leaf_key_tmp}" "${PGDATA}/server.key"
 
@@ -361,9 +395,9 @@ fi
 echo "[05-enable-ssl] First-init path — configuring postgresql.conf + pg_hba.conf"
 
 # Server cert + trust bundle are already installed above (unconditional sync
-# blocks run before this guard). Ensure ownership is correct in case the sync
-# blocks ran before PGDATA ownership was otherwise settled.
-chown postgres:postgres "${PGDATA}/root.crt" "${PGDATA}/server.crt" "${PGDATA}/server.key"
+# blocks run before this guard), already owned uid999:gid999 by construction
+# (see top-of-file note) — no chown needed. Ensure mode bits are correct in
+# case the sync blocks ran before this guard on first-init.
 chmod 0640 "${PGDATA}/root.crt"
 chmod 0644 "${PGDATA}/server.crt"
 chmod 0600 "${PGDATA}/server.key"
@@ -411,7 +445,7 @@ hostnossl all     all            0.0.0.0/0      reject
 hostnossl all     all            ::/0           reject
 HBA
 
-chown postgres:postgres "${PGDATA}/pg_hba.conf"
+# No chown — already owned uid999:gid999 by construction (see top-of-file note).
 chmod 0600 "${PGDATA}/pg_hba.conf"
 
 echo "[05-enable-ssl] Done. Postgres will require TLS + client cert for network connections."

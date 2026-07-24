@@ -1815,12 +1815,27 @@ wazuh:
 
 # ---------------------------------------------------------------------------
 # PostgreSQL 16 — primary durable store
+#
+# FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): the default postgres:16-alpine
+# image has NO openssl CLI, so files/postgres-05-enable-ssl.sh's fail-closed
+# chain-of-continuity check (FINDING-LAURA-V412-PKI-PIN) aborts with "openssl
+# not found" — ssl=on never gets written, gateway/backoffice sslmode=verify-ca
+# then hit "server does not support SSL" and CrashLoop. Standardised on the
+# SAME pgvector/pgvector:0.8.2-pg16 image already used by
+# docker-compose.yml/docker/docker-compose.release.yml (Debian bookworm base,
+# HAS /usr/bin/openssl) for full runtime parity across compose and K8s. This
+# image's postgres user is UID/GID 999 (Debian convention, NOT Alpine's 70) —
+# templates/postgres.yaml securityContext.runAsUser/runAsGroup/fsGroup are set
+# to 999 to match (see that file's comment for the chown-EPERM history this
+# fixes). Digest verified live via `docker buildx imagetools inspect` 2026-07-24
+# (the tag has been republished since compose's original pin — the digest here
+# is the current, live-verified one, not carried over stale).
 # ---------------------------------------------------------------------------
 postgres:
   enabled: true
   image:
-    repository: postgres
-    tag: "16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50"
+    repository: docker.io/pgvector/pgvector
+    tag: "0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
