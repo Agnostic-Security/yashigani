@@ -226,7 +226,15 @@ spec:
         # caddy-agents-dynamic emptyDir — unix sockets and emptyDirs cannot
         # span pods.
         - name: caddy-config-broker
-          image: "{{ .Values.caddy.configBroker.image.repository }}:{{ .Values.caddy.configBroker.image.tag }}"
+          # YSG-RISK-123: previously hardcoded "<repo>:<tag>" with no registry
+          # prefix, unlike gateway/backoffice/adminBootstrap. That meant
+          # --set global.imageRegistry=... (the documented arm64/registry
+          # workaround, docs/operations/upgrade.md) silently had NO EFFECT on
+          # this image — it stayed pinned to whatever bare-name image
+          # happened to be cached locally regardless of operator config. Now
+          # routed through the same yashigani.ownImage helper as gateway/
+          # backoffice for consistent registry-prefix behaviour.
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.caddy.configBroker.image.repository "tag" .Values.caddy.configBroker.image.tag) }}"
           imagePullPolicy: {{ .Values.caddy.configBroker.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
