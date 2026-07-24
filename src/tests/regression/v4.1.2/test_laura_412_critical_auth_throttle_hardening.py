@@ -853,10 +853,41 @@ class TestThrottleAdmitFailsClosedOn503:
     """
 
     def test_apply_auth_throttle_returns_503_on_redis_error(self):
+        """
+        AVA-412-DOS (2026-07-23) split the single Redis round-trip into a
+        read-only pre-check (``GET``) followed, only when not already
+        gated, by the mutating atomic admit (``EVAL``) — a real Redis
+        outage can surface at either call, so both are faulted here to
+        prove the 503 fail-closed path holds regardless of which one a
+        live outage happens to hit first.
+        """
         from fastapi import HTTPException, Response
 
         mod = _import_auth_mod()
         broken_redis = MagicMock()
+        broken_redis.get.side_effect = ConnectionError("redis unreachable")
+        broken_redis.eval.side_effect = ConnectionError("redis unreachable")
+        resp = Response()
+
+        with patch.object(mod, "_get_throttle_redis", return_value=broken_redis):
+            with pytest.raises(HTTPException) as exc_info:
+                mod._apply_auth_throttle("1.2.3.4", "someone", "uuid-someone", resp)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail.get("error") == "auth_throttle_unavailable"
+
+    def test_apply_auth_throttle_returns_503_when_only_atomic_admit_fails(self):
+        """
+        Companion case: the read-only pre-check succeeds (fakeredis-style
+        real GET on an empty/not-yet-gated key), but the mutating atomic
+        admit itself fails — must still 503, not fall through to a 500 or
+        silently admit the request.
+        """
+        from fastapi import HTTPException, Response
+
+        mod = _import_auth_mod()
+        broken_redis = MagicMock()
+        broken_redis.get.return_value = None  # not gated — phase 1 passes
         broken_redis.eval.side_effect = ConnectionError("redis unreachable")
         resp = Response()
 

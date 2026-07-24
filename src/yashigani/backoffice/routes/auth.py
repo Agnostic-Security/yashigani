@@ -95,7 +95,37 @@ round 2 — Laura re-attack, testing_runs/yashigani/v412r5-podman-throttlefix-20
     nonexistent usernames, which cannot collide with any real account_id.
   - See testing_runs/yashigani/v412r5-podman-throttlefix-20260719/laura/laura-reattack-throttle.md.
 
-Last updated: 2026-07-19T00:00:00+00:00
+AVA-412-DOS fix (2026-07-23, fix/v412-auth-throttle-dos):
+  - CRITICAL — self-extending perpetual lockout (OWASP API4:2023, ASVS
+    V2.2). LAURA-412-HIGH (above) deliberately moved the atomic INCR/EXPIRE
+    admit to BEFORE authenticate() runs, "for every attempt (not just
+    confirmed failures)" — correct for closing the TOCTOU race, but this
+    meant _throttle_admit() ran unconditionally on every /auth/login POST,
+    including ones _apply_auth_throttle() was about to reject at 429
+    because the account was ALREADY gated. Each such blocked, zero-
+    credential probe still re-EXPIRE'd the account's throttle key to the
+    full 900s window (and re-escalated its level toward the 900s ceiling)
+    — an unauthenticated caller who merely knew a valid admin USERNAME
+    could hold that account locked out indefinitely by sending one POST
+    per window, forever, without ever supplying a password.
+  - Fixed by splitting the gate into a read-only pre-check
+    (_throttle_current_level(), a bare Redis GET) BEFORE the mutating
+    atomic admit. If the account's throttle key is ALREADY set (a PRIOR
+    genuine attempt gated it), the request is rejected immediately with NO
+    Redis mutation at all — no INCR, no (re)EXPIRE, no re-escalation. Only
+    a request that is NOT currently gated proceeds to the atomic
+    _throttle_admit() Lua call, preserving the LAURA-412-HIGH concurrency
+    guarantee unchanged for the attempts that actually matter (the ones
+    still racing to cross the threshold for the first time). Net effect:
+    the lockout window now always expires _THROTTLE_WINDOW_SECONDS after
+    the LAST GENUINE attempt that reached (or was admitted toward)
+    authenticate() — never after the last blocked probe — so a legitimate
+    user (or a spammed victim) always recovers automatically, while
+    sustained genuine wrong-password brute-forcing still throttles with
+    the same bounded exponential backoff as before.
+  - See testing_runs/yashigani/wt-fix-throttle-dos-20260723/.
+
+Last updated: 2026-07-23T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -399,6 +429,19 @@ def _throttle_admit(
     return (int(result[0]), int(result[1]), int(result[2]), int(result[3]))
 
 
+def _throttle_current_level(r, throttle_key: str) -> int:
+    """Read-only current escalation level of a throttle key (0 if absent/expired).
+
+    AVA-412-DOS fix (2026-07-23): a bare Redis ``GET`` never touches the
+    key's TTL or value — calling this repeatedly can NEVER itself extend
+    or re-arm a lockout window. Used by ``_apply_auth_throttle()`` to
+    distinguish "already gated by a prior genuine attempt" (reject with no
+    mutation) from "not yet gated" (proceed to the mutating atomic admit).
+    """
+    raw = r.get(throttle_key)
+    return int(raw) if raw is not None else 0
+
+
 def _hash_account(username: str) -> str:
     """SHA-256 hex digest (first 16 chars) of a normalised username.
 
@@ -563,72 +606,18 @@ async def _resolve_account_id_for_bucket(username: str) -> Optional[str]:
         return None
 
 
-def _apply_auth_throttle(
+def _reject_with_throttle(
+    response: Response,
+    bucket_key: str,
     client_ip: str,
     username: str,
-    account_id: Optional[str],
-    response: Response,
+    acct_level: int,
+    ip_level: int,
 ) -> None:
-    """
-    Account-gated brute-force throttle.  Raises HTTP 429 with a ``Retry-After``
-    header (RFC 6585) and a user-facing banner ONLY when the specific account
-    being logged into already has recorded attempts of its own past the
-    threshold.  An implicated IP alone — with zero attempts recorded against
-    THIS account's bucket — is never sufficient to block the request; see
-    the module docstring above for the full rationale (NAT/proxy IP-collapse
-    cannot be allowed to lock out clean accounts).  The caller never
-    proceeds past this point while its account is gated.
-
-    Every call to this function ATOMICALLY claims a slot in both bucket
-    dimensions via ``_throttle_admit`` (LAURA-412-HIGH fix, r5 2026-07-19) —
-    this must run before any credential verification, not after, or the
-    TOCTOU race Laura proved (25 concurrent requests all observing the
-    pre-increment state) reopens.  ``account_id`` — resolved by the caller
-    via ``_resolve_account_id_for_bucket`` (both the password route and, as
-    of the Captain merge-review fix, the WebAuthn routes — never the
-    admin-tier-only ``_resolve_admin_id``, which would leave disabled/user-
-    tier accounts keyed on the ``unk:`` fallback) — selects the identity-
-    stable bucket key (LAURA-412-MEDIUM fix); see ``_account_bucket_key``
-    for the full rationale.
-
-    ASVS 6.3.5: brute-force mitigation via rate-limiting and account lockout.
-
-    Fail-closed (Captain merge-review, 2026-07-19): if Redis is unavailable,
-    ``_throttle_admit`` propagates the underlying error — caught here and
-    converted to an explicit HTTP 503, matching this module's established
-    fail-closed pattern (see ``_totp_incr_failure`` call sites) rather than
-    falling through to FastAPI's generic 500 handler.
-    """
-    r = _get_throttle_redis()
-    bucket_key = _account_bucket_key(username, account_id)
-
-    ip_fail_key = f"auth:fail:ip:{client_ip}"
-    ip_throttle_key = f"auth:throttle:ip:{client_ip}"
-    acct_fail_key = f"auth:fail:acct:{bucket_key}"
-    acct_throttle_key = f"auth:throttle:acct:{bucket_key}"
-
-    try:
-        ip_fails, ip_level, acct_fails, acct_level = _throttle_admit(
-            r, ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key,
-        )
-    except Exception as exc:
-        # Fail-closed per SOP 1: Redis unavailable must not silently allow
-        # (nor silently deny with an opaque 500) — an explicit 503 tells the
-        # caller and any monitoring exactly what happened.
-        _log.error("Auth throttle: Redis unavailable during atomic admit: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "error": "auth_throttle_unavailable",
-                "message": "Authentication service temporarily unavailable.",
-            },
-        )
-
-    # Account-gated: an implicated IP with no attempts recorded against THIS
-    # account's bucket must never block the request on its own.
-    if acct_level <= 0:
-        return
-
+    """Log, audit, and raise the 429 for a gated account.  Pure — performs
+    no Redis I/O of its own — so it is safe to call from either the
+    no-mutation fast-reject path or the post-admit path in
+    ``_apply_auth_throttle`` (AVA-412-DOS fix, 2026-07-23)."""
     effective_level = max(acct_level, ip_level)
     delay = _throttle_delay_for_level(effective_level)
     _log.warning(
@@ -671,6 +660,132 @@ def _apply_auth_throttle(
             ),
         },
     )
+
+
+def _apply_auth_throttle(
+    client_ip: str,
+    username: str,
+    account_id: Optional[str],
+    response: Response,
+) -> None:
+    """
+    Account-gated brute-force throttle.  Raises HTTP 429 with a ``Retry-After``
+    header (RFC 6585) and a user-facing banner ONLY when the specific account
+    being logged into already has recorded attempts of its own past the
+    threshold.  An implicated IP alone — with zero attempts recorded against
+    THIS account's bucket — is never sufficient to block the request; see
+    the module docstring above for the full rationale (NAT/proxy IP-collapse
+    cannot be allowed to lock out clean accounts).  The caller never
+    proceeds past this point while its account is gated.
+
+    Two-phase check (AVA-412-DOS fix, 2026-07-23):
+
+    1. A READ-ONLY pre-check (``_throttle_current_level``, a bare Redis
+       ``GET`` — no INCR, no EXPIRE, no SET) asks whether the account is
+       ALREADY gated by a prior genuine attempt. If so, this request is
+       rejected immediately with NO Redis mutation whatsoever — the
+       lockout's TTL is left exactly as it was. This is what stops an
+       unauthenticated caller who sends nothing but blocked probes (no
+       correct — or even attempted — credentials) from holding an account
+       locked out forever: the window can only ever be armed/re-armed by a
+       request that actually reaches phase 2.
+    2. Only when NOT already gated does this function perform the mutating
+       atomic admit (``_throttle_admit``, LAURA-412-HIGH fix, r5
+       2026-07-19) — this still runs before any credential verification,
+       preserving the TOCTOU-race closure Laura proved (25 concurrent
+       requests all observing the pre-increment state) for the attempts
+       that are actually racing to cross the threshold for the first time.
+       A narrow race is possible where a concurrent sibling gates the
+       account between this request's phase-1 GET and its own phase-2 call
+       — that sibling's own atomic admit still correctly reports the
+       already-escalated level, so this request is still rejected, just
+       via one bounded extra round-trip rather than an unbounded, repeated
+       self-refresh.
+
+    ``account_id`` — resolved by the caller via
+    ``_resolve_account_id_for_bucket`` (both the password route and, as of
+    the Captain merge-review fix, the WebAuthn routes — never the
+    admin-tier-only ``_resolve_admin_id``, which would leave disabled/user-
+    tier accounts keyed on the ``unk:`` fallback) — selects the identity-
+    stable bucket key (LAURA-412-MEDIUM fix); see ``_account_bucket_key``
+    for the full rationale.
+
+    ASVS 6.3.5 / OWASP API4:2023: brute-force mitigation via rate-limiting
+    and account lockout that itself must not become an unauthenticated DoS
+    primitive (AVA-412-DOS).
+
+    Fail-closed (Captain merge-review, 2026-07-19; extended AVA-412-DOS): if
+    Redis is unavailable at EITHER phase, the underlying error is caught and
+    converted to an explicit HTTP 503, matching this module's established
+    fail-closed pattern (see ``_totp_incr_failure`` call sites) rather than
+    falling through to FastAPI's generic 500 handler or silently admitting
+    the request.
+    """
+    r = _get_throttle_redis()
+    bucket_key = _account_bucket_key(username, account_id)
+
+    ip_fail_key = f"auth:fail:ip:{client_ip}"
+    ip_throttle_key = f"auth:throttle:ip:{client_ip}"
+    acct_fail_key = f"auth:fail:acct:{bucket_key}"
+    acct_throttle_key = f"auth:throttle:acct:{bucket_key}"
+
+    try:
+        # Phase 1: read-only gate check. See docstring — this MUST NOT
+        # mutate anything, or the self-extension bug reopens.
+        already_gated_level = _throttle_current_level(r, acct_throttle_key)
+    except Exception as exc:
+        # Fail-closed per SOP 1: Redis unavailable must not silently allow
+        # (nor silently deny with an opaque 500) — an explicit 503 tells the
+        # caller and any monitoring exactly what happened.
+        _log.error("Auth throttle: Redis unavailable during gate pre-check: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "auth_throttle_unavailable",
+                "message": "Authentication service temporarily unavailable.",
+            },
+        )
+
+    if already_gated_level > 0:
+        # Already gated by a prior GENUINE attempt — reject without ever
+        # touching Redis state (ip severity is also read-only here).
+        try:
+            ip_level = _throttle_current_level(r, ip_throttle_key)
+        except Exception as exc:
+            _log.error("Auth throttle: Redis unavailable reading IP severity: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "auth_throttle_unavailable",
+                    "message": "Authentication service temporarily unavailable.",
+                },
+            )
+        _reject_with_throttle(response, bucket_key, client_ip, username, already_gated_level, ip_level)
+        return  # unreachable — _reject_with_throttle always raises
+
+    # Phase 2: not currently gated — admit this attempt atomically. This is
+    # the only path that ever mutates the throttle keys.
+    try:
+        ip_fails, ip_level, acct_fails, acct_level = _throttle_admit(
+            r, ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key,
+        )
+    except Exception as exc:
+        _log.error("Auth throttle: Redis unavailable during atomic admit: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "auth_throttle_unavailable",
+                "message": "Authentication service temporarily unavailable.",
+            },
+        )
+
+    # Account-gated: an implicated IP with no attempts recorded against THIS
+    # account's bucket must never block the request on its own.
+    if acct_level <= 0:
+        return
+
+    # Reached only via the narrow phase-1/phase-2 race described above.
+    _reject_with_throttle(response, bucket_key, client_ip, username, acct_level, ip_level)
 
 
 def _reset_auth_failures(client_ip: str, username: str, account_id: Optional[str]) -> None:
