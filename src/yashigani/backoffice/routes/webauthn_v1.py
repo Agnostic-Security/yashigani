@@ -33,6 +33,7 @@ Last updated: 2026-05-08T00:00:00+00:00
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -176,7 +177,24 @@ async def register_finish(
     Audit event: WEBAUTHN_CREDENTIAL_REGISTERED.
     """
     svc = _get_pg_service()
-    origin = _expected_origin(request)
+    try:
+        origin = _expected_origin(request)
+    except ValueError as exc:
+        logger.warning(
+            "WebAuthn register/finish rejected for admin %s — invalid origin host: %s",
+            session.account_id,
+            exc,
+        )
+        _write_audit(
+            session.account_id,
+            "WEBAUTHN_CREDENTIAL_REGISTERED",
+            outcome="failure",
+            detail="invalid_origin_host",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "webauthn_origin_not_allowed"},
+        )
 
     try:
         credential = await svc.complete_registration(
@@ -332,7 +350,24 @@ async def login_finish(body: LoginFinishRequest, request: Request, response: Res
         )
 
     svc = _get_pg_service()
-    origin = _expected_origin(request)
+    try:
+        origin = _expected_origin(request)
+    except ValueError as exc:
+        logger.warning(
+            "WebAuthn login/finish rejected for %s — invalid origin host: %s",
+            body.username,
+            exc,
+        )
+        _write_audit(
+            admin_id,
+            "WEBAUTHN_LOGIN_FAILURE",
+            outcome="failure",
+            detail="invalid_origin_host",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "webauthn_login_failed"},
+        )
 
     try:
         verified_user_id = await svc.complete_authentication(
@@ -482,11 +517,72 @@ def _get_pg_service():
     return svc
 
 
+def _configured_public_hosts() -> frozenset[str]:
+    """
+    Return the set of hostnames (lowercased, no port) this deployment is
+    permitted to present as the WebAuthn expected_origin host.
+
+    YASHIGANI_TLS_DOMAIN is the operator's configured public domain — set
+    by ``install.sh --domain``, wired into the backoffice container in both
+    docker/docker-compose.yml and helm/yashigani/templates/backoffice.yaml
+    (default "localhost" for the self-signed dev/demo install; see
+    docker/Caddyfile.selfsigned's `default_sni {$YASHIGANI_TLS_DOMAIN}`).
+    "localhost" is always permitted in addition, since Caddyfile.selfsigned
+    serves its local_certs cert under that name regardless of whether an
+    operator has also configured a real domain.
+    """
+    domain = os.getenv("YASHIGANI_TLS_DOMAIN", "localhost").strip().lower()
+    hosts = {"localhost"}
+    if domain:
+        hosts.add(domain)
+    return frozenset(hosts)
+
+
 def _expected_origin(request: Request) -> str:
-    """Derive expected WebAuthn origin from the incoming request."""
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", request.url.netloc)
-    return f"{scheme}://{host}"
+    """
+    Derive the EXTERNAL WebAuthn origin the browser actually navigated to
+    and signed into clientDataJSON — never the internal Caddy->backoffice
+    upstream Host.
+
+    LAURA/AVA-412 (2026-07-24): register/finish 400'd with
+    InvalidRegistrationResponse for EVERY admin — clientDataJSON.origin was
+    "https://localhost:8443" (what the browser actually signed) but this
+    function previously read the raw `Host` header the backoffice PROCESS
+    sees, which on the Caddy->backoffice reverse_proxy leg is the upstream
+    dial address ("backoffice:8443"), not the address the browser used.
+
+    Fix: prefer X-Forwarded-Host / X-Forwarded-Proto — headers Caddy now
+    sets explicitly via `header_up X-Forwarded-Host {host}` ("set"
+    semantics, which unconditionally overwrite any client-supplied
+    X-Forwarded-Host before the request reaches backoffice — see
+    docker/Caddyfile.{selfsigned,acme,ca} and
+    helm/yashigani/templates/configmaps.yaml backoffice reverse_proxy
+    blocks) to carry the EXTERNAL host+scheme the browser actually used
+    across the proxy hop. Falls back to the raw Host header only for
+    direct-to-backoffice access with no Caddy in front (local dev/tests).
+
+    Security: Caddy's public edge is path-routed, not host-vhosted (see
+    the "Public-edge SNI defaulting" comment in Caddyfile.selfsigned —
+    "single path-routed edge, no host-based vhosting"), so a client can
+    present an arbitrary Host value on the wire. We therefore validate the
+    derived hostname against an allowlist built from the operator's
+    configured public domain (YASHIGANI_TLS_DOMAIN) plus "localhost", and
+    raise (surfaced as 400/401 by the caller) rather than silently trusting
+    an out-of-allowlist value as the expected_origin.
+    """
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get(
+        "host", request.url.netloc
+    )
+
+    hostname = host.split(":", 1)[0].lower()
+    allowed = _configured_public_hosts()
+    if hostname not in allowed:
+        raise ValueError(
+            f"webauthn origin host {hostname!r} not in configured allowlist {sorted(allowed)!r}"
+        )
+
+    return f"{proto}://{host}"
 
 
 def _client_ip(request: Request) -> str:

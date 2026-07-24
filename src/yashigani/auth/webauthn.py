@@ -29,7 +29,13 @@ def _import_webauthn():
 
 @dataclass
 class WebAuthnConfig:
-    rp_id: str = os.getenv("YASHIGANI_WEBAUTHN_RP_ID", "localhost")
+    # LAURA/AVA-412 (2026-07-24): default to the operator's configured
+    # public domain (YASHIGANI_TLS_DOMAIN), not a hardcoded "localhost" —
+    # see build_pg_webauthn_service() in pg_webauthn.py for the full
+    # rationale. YASHIGANI_WEBAUTHN_RP_ID remains an explicit override.
+    rp_id: str = os.getenv(
+        "YASHIGANI_WEBAUTHN_RP_ID", os.getenv("YASHIGANI_TLS_DOMAIN", "localhost")
+    )
     rp_name: str = "Yashigani Backoffice"
     require_resident_key: bool = False
     user_verification: str = "preferred"   # "required" for high-assurance

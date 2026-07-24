@@ -400,8 +400,16 @@ class TestW18OriginDeprecation:
             "origin is derived from X-Forwarded-Proto + Host headers."
         )
 
-    def test_expected_origin_uses_headers(self):
-        """_expected_origin() must derive origin from request headers, not env."""
+    def test_expected_origin_uses_headers(self, monkeypatch):
+        """_expected_origin() must derive origin from request headers, not env.
+
+        LAURA/AVA-412 (2026-07-24): "host" here must be an entry in the
+        configured public-host allowlist (YASHIGANI_TLS_DOMAIN + "localhost")
+        — Caddy's public edge is path-routed, not host-vhosted, so an
+        UNCONFIGURED Host is now rejected rather than blindly trusted (see
+        TestExpectedOriginAllowlist below for the rejection-path coverage).
+        """
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "admin.example.com")
         from unittest.mock import MagicMock
         from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
 
@@ -414,6 +422,28 @@ class TestW18OriginDeprecation:
         assert origin == "https://admin.example.com"
         # Must NOT fall back to env var
         assert "WEBAUTHN_ORIGIN" not in origin
+
+
+# ---------------------------------------------------------------------------
+# LAURA/AVA-412 regression: origin allowlist (Caddy path-routing, not
+# host-vhosted, means an unconfigured Host must be rejected — see
+# src/tests/regression/v4.1.2/test_tom_webauthn_origin_mismatch_fix.py for
+# the fuller X-Forwarded-Host preference + full-ceremony coverage).
+# ---------------------------------------------------------------------------
+
+class TestExpectedOriginAllowlist:
+    def test_unconfigured_host_rejected(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "yashigani.example.com")
+        mock_request = MagicMock()
+        mock_request.headers = {"x-forwarded-proto": "https", "host": "admin.example.com"}
+        mock_request.url.scheme = "http"
+        mock_request.url.netloc = "localhost:8443"
+
+        with pytest.raises(ValueError, match="not in configured allowlist"):
+            _expected_origin(mock_request)
 
 
 # ---------------------------------------------------------------------------
