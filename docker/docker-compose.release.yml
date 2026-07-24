@@ -28,13 +28,13 @@
 # Digest inventory (verified 2026-05-07 via crane digest — INDEX-level multi-arch digest):
 #
 #   caddy:2.11.4-alpine                         sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
-#   redis:7.4.9-alpine                          sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+#   redis:7.4.9-alpine                          sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
 #   openpolicyagent/opa:1.16.1                  sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02
 #   ollama/ollama:0.23.1                        sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f
 #   prom/prometheus:v3.11.3                     sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3
 #   grafana/grafana:13.0.1                      sha256:0f86bada30d65ef9d0183b90c1e2682ac92d53d95da8bed322b984ea78a4a73a
 #   pgvector/pgvector:0.8.2-pg16                sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
-#   edoburu/pgbouncer:v1.25.1-p0                sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
+#   edoburu/pgbouncer:v1.25.1-p0                sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
 #   prom/alertmanager:v0.32.1                   sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286
 #   grafana/loki:3.7.1                          sha256:73e905b51a7f917f7a1075e4be68759df30226e03dcb3cd2213b989cc0dc8eb4
 #   grafana/promtail:3.6.10                     sha256:2a0f5e3e160ee5d549c585f6cc4f4e1c566ff783324a424bd75bc16503fc660e
@@ -45,10 +45,10 @@
 #   langflowai/langflow:1.9.2                   sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14
 #   letta/letta:0.16.7                          sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c
 #   ghcr.io/openclaw/openclaw:2026.5.6          sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc
-#   wazuh/wazuh-manager:4.14.5                  sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109
-#   wazuh/wazuh-indexer:4.14.5                  sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
-#   wazuh/wazuh-dashboard:4.14.5                sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af
-#   quay.io/keycloak/keycloak:26.6.1            sha256:26ae26445475f7fac5f90ee138b1bdb64324f5815fb16133ffdbdb122d97c4d8
+#   wazuh/wazuh-manager:4.14.5                  sha256:824ff13d446682cd3bd5960479ce0d1d6a9fed8fdbc0ce31a4f0f3b9a97a7734
+#   wazuh/wazuh-indexer:4.14.5                  sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0
+#   wazuh/wazuh-dashboard:4.14.5                sha256:9f592de5abe1b0d543a1896b7d83ce058fa165452906b20c0576f6c86f3c2d65
+#   quay.io/keycloak/keycloak:26.6.1            sha256:dea26401d06341095cc4ea9d66896200b55de5ca1daa1d2fcbe58493afa6e0ad
 #
 # NOTE: yashigani/gateway and yashigani/backoffice are our own images (built
 # from this repo). They are pinned to digest at push time when mirrored to
@@ -72,7 +72,7 @@ services:
     image: docker.io/library/caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
   budget-redis:
-    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
 
   policy:
     image: docker.io/openpolicyagent/opa:1.16.1@sha256:c6f9910d5e982df13fa4c65f02cfa7f65f9cfdbef9fbaf80d6547f840294aa02
@@ -93,7 +93,7 @@ services:
     image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
 
   pgbouncer:
-    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
+    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
 
   alertmanager:
     image: docker.io/prom/alertmanager:v0.32.1@sha256:51a825c2a40acc3e338fdd00d622e01ec090f72be2b3ea46be0839cd47a4d286
@@ -117,7 +117,7 @@ services:
     image: docker.io/smallstep/step-ca:0.30.2@sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270
 
   redis:
-    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
 
   langflow:
     image: docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14
@@ -129,13 +129,13 @@ services:
     image: ghcr.io/openclaw/openclaw:2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc
 
   wazuh-manager:
-    image: docker.io/wazuh/wazuh-manager:4.14.5@sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109
+    image: docker.io/wazuh/wazuh-manager:4.14.5@sha256:824ff13d446682cd3bd5960479ce0d1d6a9fed8fdbc0ce31a4f0f3b9a97a7734
 
   wazuh-indexer:
-    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
+    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0
 
   wazuh-dashboard:
-    image: docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af
+    image: docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:9f592de5abe1b0d543a1896b7d83ce058fa165452906b20c0576f6c86f3c2d65
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.6.1@sha256:26ae26445475f7fac5f90ee138b1bdb64324f5815fb16133ffdbdb122d97c4d8
+    image: quay.io/keycloak/keycloak:26.6.1@sha256:dea26401d06341095cc4ea9d66896200b55de5ca1daa1d2fcbe58493afa6e0ad

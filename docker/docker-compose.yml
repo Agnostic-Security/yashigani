@@ -1506,7 +1506,7 @@ services:
   # ---------------------------------------------------------------------------
   budget-redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     # gate V232-SMOKE-018: redis:7-alpine has no USER directive (defaults to root).
     # With cap_drop: [ALL], root has no DAC_OVERRIDE → cannot read TLS keys
     # chowned to 999:999 by `_pki_chown_client_keys`. Pin to UID 999:999 (the
@@ -1659,7 +1659,7 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     dns_search: ["."]
-    image: docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    image: docker.io/library/redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     # gate V232-SMOKE-018 — see budget-redis above for rationale.
     user: "999:999"
     restart: unless-stopped
@@ -2236,7 +2236,7 @@ services:
   # PgBouncer — transaction-mode connection pooler
   # ---------------------------------------------------------------------------
   pgbouncer:
-    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
+    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
     # gate V232-SMOKE-018: edoburu/pgbouncer has USER pgbouncer (UID 70) but
     # the same cap_drop ALL constraint applies on init scripts. Pin
     # explicitly so the chowned client keys (70:70 by `_pki_chown_client_keys`)
@@ -2586,7 +2586,7 @@ services:
   # ---------------------------------------------------------------------------
   keycloak:
     dns_search: ["."]
-    image: quay.io/keycloak/keycloak:26.6.1@sha256:26ae26445475f7fac5f90ee138b1bdb64324f5815fb16133ffdbdb122d97c4d8
+    image: quay.io/keycloak/keycloak:26.6.1@sha256:dea26401d06341095cc4ea9d66896200b55de5ca1daa1d2fcbe58493afa6e0ad
     restart: unless-stopped
     mem_limit: ${YASHIGANI_KEYCLOAK_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_KEYCLOAK_CPU_LIMIT:-1.0}
@@ -2824,7 +2824,7 @@ services:
   # YSG-RISK-048 CLOSED 2026-05-20 via pgbouncer session-mode sidecar.
   letta-pgbouncer:
     dns_search: ["."]
-    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
+    image: docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
     user: "70:70"
     restart: unless-stopped
     mem_limit: 64m
@@ -3429,7 +3429,7 @@ services:
   # ---------------------------------------------------------------------------
   wazuh-manager:
     dns_search: ["."]
-    image: docker.io/wazuh/wazuh-manager:4.14.5@sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109
+    image: docker.io/wazuh/wazuh-manager:4.14.5@sha256:824ff13d446682cd3bd5960479ce0d1d6a9fed8fdbc0ce31a4f0f3b9a97a7734
     restart: unless-stopped
     mem_limit: ${YASHIGANI_WAZUH_MANAGER_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_WAZUH_MANAGER_CPU_LIMIT:-1.0}
@@ -3483,7 +3483,7 @@ services:
 
   wazuh-indexer:
     dns_search: ["."]
-    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
+    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0
     restart: unless-stopped
     mem_limit: ${YASHIGANI_WAZUH_INDEXER_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_WAZUH_INDEXER_CPU_LIMIT:-1.0}
@@ -3514,7 +3514,7 @@ services:
 
   wazuh-dashboard:
     dns_search: ["."]
-    image: docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af
+    image: docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:9f592de5abe1b0d543a1896b7d83ce058fa165452906b20c0576f6c86f3c2d65
     restart: unless-stopped
     mem_limit: ${YASHIGANI_WAZUH_DASHBOARD_MEM_LIMIT:-1024m}
     cpus: ${YASHIGANI_WAZUH_DASHBOARD_CPU_LIMIT:-1.0}
