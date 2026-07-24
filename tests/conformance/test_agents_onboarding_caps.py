@@ -989,27 +989,26 @@ class TestPermissionsDeclarations:
         r = unauth_client.delete("/admin/api/permissions/declarations/mcp_server/srv2")
         assert r.status_code == 401
 
-    def test_MAKER_CHECKER_FINDING_same_admin_session_declares_and_approves(
+    def test_MAKER_CHECKER_FIX_VERIFIED_same_admin_session_cannot_self_approve(
         self, admin_client, stepup_admin_client, capability_policy_state, mock_audit_writer,
     ):
-        """FINDING (maker-checker gap, permissions.py:39,627-744): approve_
-        declaration is StepUpAdminSession-gated (a fresh TOTP re-verification)
-        but there is NO distinct-approver check anywhere in create_declaration
-        or approve_declaration — declared_by is a free-form string with no
-        binding to any session/account_id, and approve_declaration never
-        compares session.account_id against the declaration's declared_by nor
-        requires a DIFFERENT admin account than the one that declared it.
+        """FIX VERIFIED (maker-checker gap CLOSED, permissions.py:673-739,
+        v4.1.2 YCS-20260723-v4.1.2-CONFORMANCE bug 3, fix/v412-conformance-
+        divergences @ 8692b494): create_declaration now captures the
+        declaring admin's session.account_id server-side as
+        `declaring_account_id` (never trusting the client-supplied free-form
+        `declared_by` field), and approve_declaration compares it against the
+        approving session's account_id — a DIFFERENT admin from the one who
+        declared it is now required, mirroring dp_weaken.py's
+        approve_weaken_request() / cloud_override.py's
+        cloud_override_approve() two-person separation of duties.
 
         This test proves the SAME admin account (conformance-admin-stepup,
         via the stepup_admin_client fixture) can submit a declaration on its
-        own behalf ('declared_by': its own account id) and then, in the very
-        next call with the same session, approve it — a true one-person
-        declare-then-approve round trip with no maker-checker separation.
-        Contrast with the dp_weaken-style two-person control referenced in
-        the dispatch brief: no equivalent distinct-approver enforcement
-        exists here. This is DIFFERENT from the tenant-scope check in
-        agent_policies.py (which IS enforced) — reported here as a genuine,
-        unmitigated gap, not softened to a passing assertion."""
+        own behalf ('declared_by': its own account id) but is now REJECTED
+        (403 self_approval_forbidden) when it tries to approve that same
+        declaration with the same session — was a genuine maker-checker gap
+        (200 + approved:true), now closed."""
         own_account = "conformance-admin-stepup"
         r_declare = stepup_admin_client.post(
             "/admin/api/permissions/declarations",
@@ -1020,22 +1019,19 @@ class TestPermissionsDeclarations:
         )
         assert r_declare.status_code == 201
 
-        # Same session approves its own declaration — no distinct-approver
-        # check anywhere in the code path rejects this.
+        # Same session attempts to approve its own declaration — distinct-
+        # approver check now rejects this server-side.
         r_approve = stepup_admin_client.post(
             "/admin/api/permissions/declarations/external_api/api.example.com/approve",
             json={"allow": True},
         )
-        assert r_approve.status_code == 200, (
-            "MAKER-CHECKER GAP CONFIRMED: the same admin session that declared "
-            "the resource was able to approve its own declaration — approve_"
-            "declaration only requires StepUpAdminSession (fresh TOTP), never "
-            "a distinct approver identity. If this assertion ever starts "
-            "failing because a distinct-approver check was added, update this "
-            "test to assert the (now fixed) 403 instead."
+        assert r_approve.status_code == 403, (
+            "MAKER-CHECKER FIX REGRESSED: the same admin session that "
+            "declared the resource must NOT be able to approve its own "
+            "declaration — approve_declaration must compare the server-"
+            "captured declaring_account_id against session.account_id."
         )
-        assert r_approve.json()["approved"] is True
-        assert r_approve.json()["actor"] == own_account
+        assert r_approve.json()["detail"]["error"] == "self_approval_forbidden"
 
 
 # ---------------------------------------------------------------------------

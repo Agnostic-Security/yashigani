@@ -245,6 +245,37 @@ def rbac_state(fake_redis_client, monkeypatch):
     return store
 
 
+@pytest.fixture
+def identity_registry_state(fake_redis_client, monkeypatch):
+    """Wires the REAL IdentityRegistry against fakeredis (constructor takes
+    redis_client directly — src/yashigani/identity/registry.py:152).
+
+    v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 2 FIX): documents.py's
+    ``_admin_in_detokenize_role`` now resolves the caller's email to an
+    identity_id via ``backoffice_state.identity_registry`` before the RBAC
+    group lookup (mirroring rbac.py's existing resolution). Without this
+    fixture wired, ``registry is None`` → fail-closed 403 for the WRONG
+    reason (missing registry, not an email/identity_id key mismatch)."""
+    from yashigani.backoffice.state import backoffice_state
+    from yashigani.identity.registry import IdentityRegistry
+
+    registry = IdentityRegistry(redis_client=fake_redis_client)
+    monkeypatch.setattr(backoffice_state, "identity_registry", registry, raising=False)
+    return registry
+
+
+def _register_human(registry, email: str) -> str:
+    """Register a HUMAN identity for `email` via the REAL IdentityRegistry and
+    return its identity_id — mirrors test_identity_rbac.py's helper of the
+    same name (`_register_human`, test_identity_rbac.py:302)."""
+    from yashigani.identity.registry import IdentityKind
+    from yashigani.identity.slug import email_to_slug
+
+    slug = email_to_slug(email)
+    identity_id, _plaintext_key = registry.register(kind=IdentityKind.HUMAN, name=email, slug=slug)
+    return identity_id
+
+
 def _seed_pseudonymize_result(request_id: str, *, owner_identity: str, tenant: str,
                                detokenize_rbac_role: str, rows: dict[str, str] | None = None):
     """Construct a REAL DocumentInspectionResult + REAL CorrespondenceTable
@@ -899,47 +930,50 @@ class TestDocumentsDetokenize:
         r = stepup_admin_client.get("/admin/documents/results/doc-2/table")
         assert r.status_code == 403
 
-    def test_table_rbac_gate_denies_real_identity_id_group_member_REAL_FINDING(
-        self, stepup_admin_client, rbac_state, dp_weaken_state,
+    def test_table_rbac_gate_grants_real_identity_id_group_member_FIX_VERIFIED(
+        self, stepup_admin_client, rbac_state, dp_weaken_state, identity_registry_state,
     ):
-        """REAL FINDING — documents.py:411-421 (_admin_in_detokenize_role).
+        """FIX VERIFIED — documents.py:390-452 (_admin_in_detokenize_role).
+
+        v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 2 FIX,
+        fix/v412-conformance-divergences @ 8692b494): the gate now resolves
+        the caller's email → identity_id via `backoffice_state.identity_registry`
+        (`registry.get_by_email(email)`) BEFORE calling
+        `RBACStore.get_user_groups(identity_id)`, mirroring
+        routes/rbac.py's existing `_email_to_identity_id()`-equivalent
+        resolution. This test wires the identity_registry fixture (the
+        REAL, missing piece — without it, `registry is None` fail-closes
+        403 for the WRONG reason) and proves a genuinely-authorised group
+        member now receives the table.
 
         Setup mirrors a genuinely-authorised production admin:
-          - RBACStore group "docteam" has member "idnt_5f9e3aa1b2c3" (realistic
-            identity_id format, added via RBACStore.add_member exactly as
-            production RBAC group membership works).
+          - A REAL HUMAN identity is registered for "admin-stepup@acme.com"
+            via IdentityRegistry.register() (returns the real identity_id).
+          - RBACStore group "docteam" has that SAME identity_id as a member
+            (added via RBACStore.add_member exactly as production RBAC group
+            membership works).
           - The session's account resolves (via auth_service.get_account_by_id)
-            to email "admin-stepup@acme.com" — a realistic, DIFFERENT string
-            from the identity_id above (exactly as it would be in production:
-            emails and identity_ids are never the same string).
+            to that same email.
           - The correspondence table names the required role as "docteam" AND
             the table's owner_identity is bound to THIS session's account_id
             (so identity+tenant binding passes) — isolating the RBAC role gate
             as the ONLY thing under test.
 
-        Expected (if the gate worked as documented): 200, table rows returned.
-        Actual (real RBACStore, real code, no mocks): 403 detokenize_forbidden
-        — the gate NEVER matches, because documents.py:421 calls
-        `store.get_user_groups(email)` and RBACStore.get_user_groups()
-        (src/yashigani/rbac/store.py:157-167) indexes membership by
-        identity_id, not email; its own docstring says so explicitly:
-        "Passing an email or slug will return [] — use the identity registry
-        to resolve to identity_id first." documents.py never performs that
-        resolution (contrast with routes/rbac.py's `_email_to_identity_id()`
-        helper, which exists for exactly this purpose and is NOT used here).
-
-        Net effect: fail-closed (never grants unauthorised access), but the
-        RBAC-gated correspondence-table retrieval feature is completely
-        broken for every legitimately-authorised admin. Flagged loudly per
-        dispatch brief.
+        Expected (fix verified): 200, table rows returned. Was 403
+        detokenize_forbidden before the fix (see regression test
+        `test_tom_permissions_...` / v4.1.2 divergence branch for the
+        original REAL FINDING that documented the bug being fixed here).
         """
         from yashigani.rbac.model import RBACGroup
 
+        email = "admin-stepup@acme.com"
+        identity_id = _register_human(identity_registry_state, email)
+
         rbac_state.add_group(RBACGroup(id="docteam", display_name="Doc Team"))
-        rbac_state.add_member("docteam", "idnt_5f9e3aa1b2c3")  # realistic identity_id
+        rbac_state.add_member("docteam", identity_id)
 
         _store, auth = dp_weaken_state
-        auth.set_account("conformance-admin-stepup", email="admin-stepup@acme.com")
+        auth.set_account("conformance-admin-stepup", email=email)
 
         _seed_pseudonymize_result(
             "doc-3", owner_identity="conformance-admin-stepup", tenant="default",
@@ -947,12 +981,38 @@ class TestDocumentsDetokenize:
         )
 
         r = stepup_admin_client.get("/admin/documents/results/doc-3/table")
-        assert r.status_code == 403, (
-            "REAL FINDING confirmed: a genuinely group-member admin is denied "
-            "the correspondence table because documents.py:421 passes an "
-            "email into RBACStore.get_user_groups(), which indexes by "
-            "identity_id post-4.1 UID migration (rbac/store.py:157-167)."
+        assert r.status_code == 200, (
+            "FIX regressed: a genuinely group-member admin (registered by "
+            "identity_id, resolved from email via identity_registry) must "
+            "be GRANTED the correspondence table — documents.py:421 now "
+            "resolves email -> identity_id before RBACStore.get_user_groups()."
         )
+
+    def test_table_rbac_gate_denies_non_member_identity(
+        self, stepup_admin_client, rbac_state, dp_weaken_state, identity_registry_state,
+    ):
+        """Companion to the FIX_VERIFIED test above: a genuinely-registered
+        identity that is NOT a member of the required RBAC group must still
+        be denied — proves the fix is not a blanket bypass, only a correct
+        email -> identity_id resolution."""
+        from yashigani.rbac.model import RBACGroup
+
+        email = "admin-stepup@acme.com"
+        _register_human(identity_registry_state, email)  # registered, but never added to "docteam"
+
+        rbac_state.add_group(RBACGroup(id="docteam", display_name="Doc Team"))
+        # deliberately no add_member() call — this identity is not in the group
+
+        _store, auth = dp_weaken_state
+        auth.set_account("conformance-admin-stepup", email=email)
+
+        _seed_pseudonymize_result(
+            "doc-4", owner_identity="conformance-admin-stepup", tenant="default",
+            detokenize_rbac_role="docteam",
+        )
+
+        r = stepup_admin_client.get("/admin/documents/results/doc-4/table")
+        assert r.status_code == 403
         assert r.json()["detail"]["error"] == "detokenize_forbidden"
 
     def test_table_csv_unauth_401(self, unauth_client):

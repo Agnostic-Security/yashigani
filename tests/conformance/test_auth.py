@@ -1431,24 +1431,23 @@ class TestWebauthnRegisterBegin:
         assert r.status_code == 503
         assert r.json()["detail"]["error"] == "webauthn_not_configured"
 
-    def test_with_legacy_service_wired_500_dependency_break(self, admin_client, legacy_webauthn_service):
-        """FINDING (dependency version break, NOT this test's fault):
-        `pyproject.toml` pins `webauthn>=2.1` with no upper bound. The
-        installed `webauthn==3.0.0` moved `AuthenticatorSelectionCriteria` /
-        `UserVerificationRequirement` / `AttestationConveyancePreference`
-        from the top-level `webauthn` module to `webauthn.helpers.structs`.
+    def test_with_legacy_service_wired_200(self, admin_client, legacy_webauthn_service):
+        """FIX VERIFIED (v4.1.2 YCS-20260723-v4.1.2-CONFORMANCE bug 1):
+        `pyproject.toml` now pins `webauthn>=2.1,<3` (resolves to 2.7.1) and
         `src/yashigani/auth/webauthn.py` `_map_uv()`/`_map_attestation()`/
-        `begin_registration()` (lines 185-189, 362-377) still reference the
-        old top-level path, so even with the service correctly wired this
-        call genuinely 500s today. Asserted here as the REAL current
-        behaviour (regression guard), not papered over — see this file's
-        module docstring and the final report for the full citation. The
-        SAME bug is shared by `pg_webauthn.py` (the PRODUCTION v1 API path,
-        see TestWebauthnV1RegisterStart) since it imports these same two
+        `begin_registration()` now import `AuthenticatorSelectionCriteria` /
+        `UserVerificationRequirement` / `AttestationConveyancePreference`
+        from `webauthn.helpers.structs` (the correct path for the
+        practically-installable 2.x range). With the service correctly
+        wired this call now succeeds — was a genuine 500 dependency break,
+        fixed by fix/v412-conformance-divergences. The SAME fix is shared by
+        `pg_webauthn.py` (the PRODUCTION v1 API path, see
+        TestWebauthnV1RegisterStart) since it imports these same two
         helpers."""
         r = admin_client.post("/auth/webauthn/register/begin", json={"user_name": "alice"})
-        assert r.status_code == 500
-        assert r.json()["detail"]["error"] == "webauthn_register_begin_failed"
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert "options" in r.json()
 
 
 class TestWebauthnRegisterComplete:
@@ -1479,13 +1478,14 @@ class TestWebauthnAuthenticateBegin:
     def test_default_503(self, admin_client):
         assert admin_client.post("/auth/webauthn/authenticate/begin").status_code == 503
 
-    def test_with_legacy_service_wired_500_dependency_break(self, admin_client, legacy_webauthn_service):
-        """FINDING — same webauthn==3.0.0 top-level-attribute break as
-        TestWebauthnRegisterBegin (webauthn.py:270, `_map_uv`). Asserts the
-        REAL current 500, not the intended 200."""
+    def test_with_legacy_service_wired_200(self, admin_client, legacy_webauthn_service):
+        """FIX VERIFIED — same `webauthn.helpers.structs` import-path fix
+        + `webauthn>=2.1,<3` pin as TestWebauthnRegisterBegin
+        (webauthn.py:265, `_map_uv`). Asserts the fixed 200, was 500."""
         r = admin_client.post("/auth/webauthn/authenticate/begin")
-        assert r.status_code == 500
-        assert r.json()["detail"]["error"] == "webauthn_authenticate_begin_failed"
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert "options" in r.json()
 
 
 class TestWebauthnAuthenticateComplete:
@@ -1591,21 +1591,20 @@ class TestWebauthnV1RegisterStart:
         assert r.status_code == 503
         assert r.json()["detail"]["error"] == "webauthn_not_configured"
 
-    def test_with_service_wired_500_dependency_break(self, admin_client, pg_webauthn_service_fake):
-        """FINDING (production-affecting, see module docstring): the REAL
-        `pg_webauthn.py` (production PgWebAuthnService) imports the SAME
-        `_map_uv`/`_map_attestation` helpers from `auth/webauthn.py`
-        (pg_webauthn.py:39-40) that break under the installed
-        `webauthn==3.0.0` (top-level `AuthenticatorSelectionCriteria` /
-        `UserVerificationRequirement` moved to `webauthn.helpers.structs`;
-        `pyproject.toml` pins `webauthn>=2.1` with no upper bound). This
-        means `POST /api/v1/admin/webauthn/register/start` — the PRODUCTION
-        FIDO2 registration entrypoint, not dead code — genuinely 500s today
-        even when pg_webauthn_service is fully wired with live Postgres.
-        Asserted here as the REAL current behaviour, not the intended 200."""
+    def test_with_service_wired_200(self, admin_client, pg_webauthn_service_fake):
+        """FIX VERIFIED (production-affecting): the REAL `pg_webauthn.py`
+        (production PgWebAuthnService) imports the SAME `_map_uv`/
+        `_map_attestation` helpers from `auth/webauthn.py`
+        (pg_webauthn.py:39-40), now importing from
+        `webauthn.helpers.structs` under the pinned `webauthn>=2.1,<3`
+        (resolves 2.7.1). `POST /api/v1/admin/webauthn/register/start` — the
+        PRODUCTION FIDO2 registration entrypoint — now succeeds when
+        pg_webauthn_service is wired. Was a genuine 500 dependency break,
+        fixed by fix/v412-conformance-divergences."""
         r = admin_client.post("/api/v1/admin/webauthn/register/start", json={"credential_name": "YubiKey"})
-        assert r.status_code == 500
-        assert r.json()["detail"]["error"] == "webauthn_register_start_failed"
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert "options" in r.json()
 
 
 class TestWebauthnV1RegisterFinish:
