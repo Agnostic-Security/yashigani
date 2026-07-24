@@ -487,6 +487,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -497,6 +498,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -507,6 +509,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -517,6 +520,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -527,6 +531,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -550,6 +555,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -689,6 +695,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -700,6 +707,7 @@ Hiring: https://agnosticsec.com/careers
         import internal-mtls
         import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }
@@ -744,6 +752,7 @@ Hiring: https://agnosticsec.com/careers
             import internal-mtls
             import inject-caddy-verified
                 header_up X-Forwarded-Proto https
+                header_up X-Forwarded-Host {host}
                 header_up X-Real-IP {remote_host}
             }
         }
@@ -844,6 +853,7 @@ http://{$YASHIGANI_TLS_DOMAIN}:80 {
             import internal-mtls
             import inject-caddy-verified
             header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
         }
     }

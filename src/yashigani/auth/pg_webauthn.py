@@ -502,8 +502,19 @@ def build_pg_webauthn_service(redis_client) -> PgWebAuthnService:
     Called once from the entrypoint after create_pool() completes.
     """
     import os
+    # LAURA/AVA-412 (2026-07-24): rp_id must be equal to (or a registrable
+    # domain suffix of) the origin's effective domain, or the browser itself
+    # rejects credential creation with a SecurityError before any signature
+    # is produced. YASHIGANI_TLS_DOMAIN is the operator's configured public
+    # domain (install.sh --domain; already wired into this container via
+    # docker-compose.yml / helm backoffice.yaml) so it is the correct
+    # default here — "localhost" only applies to the self-signed default
+    # install. YASHIGANI_WEBAUTHN_RP_ID remains an explicit override for
+    # deployments that need a different (e.g. narrower-scoped) rp_id.
     config = WebAuthnConfig(
-        rp_id=os.getenv("YASHIGANI_WEBAUTHN_RP_ID", "localhost"),
+        rp_id=os.getenv(
+            "YASHIGANI_WEBAUTHN_RP_ID", os.getenv("YASHIGANI_TLS_DOMAIN", "localhost")
+        ),
         rp_name=os.getenv("YASHIGANI_WEBAUTHN_RP_NAME", "Yashigani Backoffice"),
         require_resident_key=os.getenv("YASHIGANI_WEBAUTHN_REQUIRE_RESIDENT_KEY", "false").lower() == "true",
         user_verification=os.getenv("YASHIGANI_WEBAUTHN_USER_VERIFICATION", "preferred"),
