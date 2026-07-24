@@ -39,14 +39,106 @@ spec:
         fsGroup: 1001
         seccompProfile:
           type: RuntimeDefault
-      {{- if .Values.mtls.enabled }}
-      # Backoffice bootstrap writes admin_initial_password + redis_password
-      # + grafana_admin_password into YASHIGANI_SECRETS_DIR (default
-      # /run/secrets). In docker-compose, /run/secrets is a tmpfs overlay
-      # populated by docker secrets — writable. Under K8s a Secret mount is
-      # readOnly at the kernel level, breaking write_docker_secrets(). Copy
-      # the PKI cert material into a writable emptyDir at startup.
+      # YSG-RISK-122 (Ava, live k8s @ ca720724): yashigani-backoffice was
+      # observed scheduled 7s before yashigani-redis-0 — headless-Service DNS
+      # for a StatefulSet pod is only resolvable once kube-dns registers the
+      # pod IP, which can exceed backoffice's own in-process retry budget
+      # (entrypoint.py: 5 attempts, 1/2/4/8/16s backoff, ~31s). When that
+      # budget is exhausted, backoffice previously left RBAC / the agent
+      # registry / the permission store / budget enforcement disabled for the
+      # pod's entire lifetime (fixed at the Python layer in
+      # backoffice/redis_selfheal.py — this initContainer is defense-in-depth
+      # only, making the race far less likely rather than depending solely on
+      # the runtime self-heal). docker/podman compose ordering
+      # (`depends_on: service_healthy`) already prevents this; k8s Deployments
+      # have no equivalent construct, hence this initContainer. Reuses the
+      # already-pulled backoffice image (has python3) — no new image surface.
+      #
+      # Unconditional (NOT gated on mtls.enabled) because the boot race exists
+      # regardless of whether mTLS is on — DNS propagation timing is the same
+      # either way; only the copy-pki-to-writable initContainer below is
+      # mTLS-specific.
       initContainers:
+        {{- if (.Values.backoffice.waitForRedis).enabled | default true }}
+        - name: wait-for-redis
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.backoffice.image.repository "tag" .Values.backoffice.image.tag) }}"
+          imagePullPolicy: {{ .Values.backoffice.image.pullPolicy }}
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, socket, sys, time
+              host = os.environ["WAIT_REDIS_HOST"]
+              port = int(os.environ["WAIT_REDIS_PORT"])
+              interval = float(os.environ.get("WAIT_REDIS_INTERVAL_S", "2"))
+              attempt = 0
+              while True:
+                  attempt += 1
+                  try:
+                      with socket.create_connection((host, port), timeout=3):
+                          print(f"wait-for-redis: {host}:{port} reachable after {attempt} attempt(s)", flush=True)
+                          sys.exit(0)
+                  except OSError as exc:
+                      if attempt % 5 == 1:
+                          print(f"wait-for-redis: {host}:{port} not yet reachable (attempt {attempt}): {exc}", flush=True)
+                      time.sleep(interval)
+          env:
+            - name: WAIT_REDIS_HOST
+              value: "yashigani-redis"
+            - name: WAIT_REDIS_PORT
+              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}"6379"{{ end }}
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        - name: wait-for-budget-redis
+          image: "{{ include "yashigani.ownImage" (dict "registry" .Values.global.imageRegistry "owner" .Values.global.imageOwner "repo" .Values.backoffice.image.repository "tag" .Values.backoffice.image.tag) }}"
+          imagePullPolicy: {{ .Values.backoffice.image.pullPolicy }}
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, socket, sys, time
+              host = os.environ["WAIT_REDIS_HOST"]
+              port = int(os.environ["WAIT_REDIS_PORT"])
+              interval = float(os.environ.get("WAIT_REDIS_INTERVAL_S", "2"))
+              attempt = 0
+              while True:
+                  attempt += 1
+                  try:
+                      with socket.create_connection((host, port), timeout=3):
+                          print(f"wait-for-budget-redis: {host}:{port} reachable after {attempt} attempt(s)", flush=True)
+                          sys.exit(0)
+                  except OSError as exc:
+                      if attempt % 5 == 1:
+                          print(f"wait-for-budget-redis: {host}:{port} not yet reachable (attempt {attempt}): {exc}", flush=True)
+                      time.sleep(interval)
+          env:
+            # Mirrors the BUDGET_REDIS_HOST/PORT override added to the main
+            # container's env block below (YSG-RISK-122 finding: this override
+            # was previously MISSING on backoffice — the code default
+            # "budget-redis" does not resolve in-cluster, service is
+            # yashigani-budget-redis. gateway.yaml already had this override).
+            - name: WAIT_REDIS_HOST
+              value: "yashigani-budget-redis"
+            - name: WAIT_REDIS_PORT
+              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}"6379"{{ end }}
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        {{- end }}
+      {{- if .Values.mtls.enabled }}
+        # Backoffice bootstrap writes admin_initial_password + redis_password
+        # + grafana_admin_password into YASHIGANI_SECRETS_DIR (default
+        # /run/secrets). In docker-compose, /run/secrets is a tmpfs overlay
+        # populated by docker secrets — writable. Under K8s a Secret mount is
+        # readOnly at the kernel level, breaking write_docker_secrets(). Copy
+        # the PKI cert material into a writable emptyDir at startup.
         - name: copy-pki-to-writable
           # alpine/k8s is already cached on the node (used by pki-bootstrap
           # Job). Reusing it avoids another image pull + keeps the chart's
@@ -160,6 +252,18 @@ spec:
             - name: REDIS_HOST
               value: "yashigani-redis"
             - name: REDIS_PORT
+              value: {{ if .Values.mtls.enabled }}"6380"{{ else }}"6379"{{ end }}
+            # YSG-RISK-122 finding: this override was MISSING on backoffice —
+            # entrypoint.py's budget_enforcer init defaults BUDGET_REDIS_HOST
+            # to "budget-redis" (correct for compose, where the service is
+            # literally named budget-redis), which does NOT resolve in-cluster
+            # (k8s Service is yashigani-budget-redis). Without this override,
+            # backoffice's /admin/budget/usage/* was 503 unconditionally under
+            # k8s, independent of the boot-race timing — gateway.yaml already
+            # carried this exact override; backoffice did not.
+            - name: BUDGET_REDIS_HOST
+              value: "yashigani-budget-redis"
+            - name: BUDGET_REDIS_PORT
               value: {{ if .Values.mtls.enabled }}"6380"{{ else }}"6379"{{ end }}
             {{- if .Values.mtls.enabled }}
             - name: REDIS_USE_TLS

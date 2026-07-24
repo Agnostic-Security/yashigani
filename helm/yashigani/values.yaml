@@ -537,6 +537,15 @@ backoffice:
     repository: yashigani-backoffice
     tag: "4.1.2"
     pullPolicy: IfNotPresent
+  # YSG-RISK-122 (Ava, live k8s @ ca720724): defense-in-depth initContainers
+  # that block backoffice's main container from starting until
+  # yashigani-redis and yashigani-budget-redis are DNS-resolvable + accepting
+  # TCP connections. The primary fix is the runtime self-heal in
+  # backoffice/redis_selfheal.py (bounded lazy reconnect); this toggle exists
+  # so operators can disable the initContainers independently if their own
+  # dependency-ordering tooling already handles it. Default: enabled.
+  waitForRedis:
+    enabled: true
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
   resources:

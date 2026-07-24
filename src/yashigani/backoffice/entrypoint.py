@@ -39,8 +39,6 @@ from yashigani.kms.factory import create_provider
 from yashigani.kms.rotation import KSMRotationScheduler
 from yashigani.ratelimit.config import RateLimitConfig
 from yashigani.ratelimit.limiter import RateLimiter
-from yashigani.rbac.store import RBACStore
-from yashigani.agents.registry import AgentRegistry
 from yashigani.metrics.collectors import MetricsCollector
 from yashigani.backoffice.app import create_backoffice_app
 from yashigani.backoffice.state import backoffice_state
@@ -186,7 +184,7 @@ def _bootstrap():
     except Exception as exc:
         logger.warning("Rate limiter Redis unavailable (%s) — rate limiting disabled", exc)
 
-    # ── RBAC store + Agent registry (Redis db/3) ─────────────────────────────
+    # ── RBAC store + Agent registry (Redis db/3) ───────────────────────────────
     # F3 / v2.23.4: retry-with-backoff on RBAC+Agent Redis init.
     # K8s DNS for headless Services (ClusterIP: None) may not resolve at
     # container startup — the backing Endpoints object is populated by kube-dns
@@ -195,6 +193,18 @@ def _bootstrap():
     # agent_registry=None for the entire pod lifetime → every /admin/agents
     # call returns 503.  Five attempts with 1/2/4/8/16 s backoff covers the
     # typical kube-dns propagation window without blocking readiness probes.
+    #
+    # YSG-RISK-122 (Ava, live k8s @ ca720724): that ~31s budget is not always
+    # enough — backoffice was scheduled 7s before yashigani-redis-0, and the
+    # DNS-propagation window can exceed the retry budget. Previously, once
+    # these 5 attempts were exhausted, RBAC/agent-registry/permission-store/
+    # document stores stayed None for the pod's ENTIRE lifetime even after
+    # Redis became reachable, because nothing at request time ever tried
+    # again. The construction logic now lives in
+    # rbac_stack.build_rbac_agent_stack() so backoffice/redis_selfheal.py can
+    # call the SAME code lazily, at request time, bounded by a cooldown,
+    # after this startup loop gives up — see that module's docstring for the
+    # full self-heal design.
     rbac_store = None
     agent_registry = None
     binding_store = None    # #16 — client-policy BindingStore (Redis db/3)
@@ -207,111 +217,17 @@ def _bootstrap():
     _rbac_backoff = 1.0
     for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
         try:
-            import redis as _redis
+            from yashigani.backoffice.rbac_stack import build_rbac_agent_stack
             redis_rbac_url = _backoffice_redis_url(3)
-            redis_rbac_client = _redis.from_url(redis_rbac_url, decode_responses=False)
-            rbac_store = RBACStore(redis_client=redis_rbac_client)
-            logger.info(
-                "RBAC store initialised: %d group(s) loaded from Redis",
-                len(rbac_store.list_groups()),
-            )
-            # Agent registry shares the same Redis db/3 instance (different key namespace)
-            # ISSUE-AGENT-REG-DURABILITY (Iris, 2026-06-10): wire the durable
-            # Postgres mirror so register/update/deactivate dual-write to
-            # agent_registry. Redis db/3 has no persistence (appendonly no /
-            # save ""), so a redis recreate wipes the registry; the durable store
-            # + startup reconciler (lifespan) restore it. Constructed only when a
-            # usable (non-templated) DSN is present; otherwise the registry stays
-            # Redis-only as before. The store uses its own sync psycopg2 conn at
-            # write time, so it does not depend on the asyncpg pool being open yet.
-            _durable_agent_store = None
-            try:
-                from yashigani.agents.durable_store import AgentDurableStore, _direct_dsn
-                if _direct_dsn() and "${POSTGRES_PASSWORD}" not in _direct_dsn():
-                    _durable_agent_store = AgentDurableStore()
-                    logger.info("Agent durable store (Postgres mirror) wired")
-                else:
-                    logger.warning(
-                        "Agent durable store NOT wired — no usable Postgres DSN; "
-                        "agent registrations will NOT survive a redis recreate"
-                    )
-            except Exception as _ds_exc:
-                logger.warning("Agent durable store init skipped (%s)", _ds_exc)
-            agent_registry = AgentRegistry(
-                redis_client=redis_rbac_client,
-                durable_store=_durable_agent_store,
-            )
-            logger.info(
-                "Agent registry initialised: %d agent(s) in index",
-                agent_registry.count("all"),
-            )
-            # #16 — client-policy BindingStore shares the same Redis db/3 instance
-            # (key prefix ysgbind:*, disjoint from rbac:* and the agent registry).
-            from yashigani.policy_bindings.store import BindingStore as _BindingStore
-            binding_store = _BindingStore(redis_client=redis_rbac_client)
-            logger.info(
-                "Binding store initialised: %d client-policy binding(s) loaded",
-                len(binding_store.list()),
-            )
-            # Document-enforcement policy store (2.26) shares Redis db/3
-            # (key namespace "document:"); same persistence + startup-OPA-re-push
-            # pattern as the RBAC store. Seed the demo matrix on first boot only.
-            from yashigani.documents.policy_store import DocumentPolicyStore
-            document_policy_store = DocumentPolicyStore(redis_client=redis_rbac_client)
-            document_policy_store.seed_defaults()
-            logger.info(
-                "Document policy store initialised: %d policy(ies) loaded from Redis",
-                len(document_policy_store.list_policies()),
-            )
-            # Document-SET store (2.26 set-scoped-salt) shares Redis db/3
-            # (key namespace "document:set:"); holds the opaque per-set salt for
-            # operator-defined cross-file correlation sets.  No seeding — sets are
-            # operator-created (default stays per-file isolation).
-            from yashigani.documents.set_store import DocumentSetStore
-            document_set_store = DocumentSetStore(redis_client=redis_rbac_client)
-            logger.info(
-                "Document set store initialised: %d set(s) loaded from Redis",
-                len(document_set_store.list_sets()),
-            )
-            # Capability-envelope PENDING re-approval store (3.0 / YSG-RISK-060)
-            # shares Redis db/3 (key namespace "mcp_envelope_pending:"). Holds the
-            # candidate (refreshed) tool surface for every BLOCKED imported-MCP
-            # refresh so the re-approval admin SPA can show the diff vs the
-            # ORIGINAL baseline and mint it on step-up approve. No seeding —
-            # entries are created by the broker when it latches a block.
-            from yashigani.mcp.envelope_pending_store import EnvelopePendingStore
-            envelope_pending_store = EnvelopePendingStore(redis_client=redis_rbac_client)
-            logger.info(
-                "Capability-envelope pending store initialised: %d pending re-approval(s)",
-                len(envelope_pending_store.list_for_tenant(
-                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
-                )),
-            )
-            # 4.0 — Data-protection weaken pending store (LAURA-V400-R2-001).
-            # Shares Redis db/3 (key namespace "dp_weaken:").  Holds pending
-            # maker-checker weaken requests for pii_config, pii_cloud_bypass,
-            # and doc_enforcement until a second admin approves or rejects.
-            # No seeding — entries are created on-demand via the admin API.
-            from yashigani.protection.weaken_pending_store import DpWeakenPendingStore as _DpWeakenStore
-            _dp_weaken_store = _DpWeakenStore(redis_client=redis_rbac_client)
-            logger.info(
-                "Data-protection weaken store initialised (dual-admin maker-checker, 4.0): "
-                "%d pending request(s)",
-                _dp_weaken_store.count_for_tenant(
-                    os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
-                ),
-            )
-            # 3.0 — browser Permissions-Policy store (Redis db/3, prefix cap_policy:*)
-            from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
-            _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
-            _cap_policy_store = _CapPolStore(
-                redis_client=redis_rbac_client,
-                default_org_id=_cap_pol_org_id,
-            )
-            logger.info(
-                "Capability policy store initialised (browser Permissions-Policy, 3.0, org=%s)",
-                _cap_pol_org_id,
-            )
+            _rbac_stack = build_rbac_agent_stack(redis_rbac_url)
+            rbac_store = _rbac_stack.rbac_store
+            agent_registry = _rbac_stack.agent_registry
+            binding_store = _rbac_stack.binding_store
+            document_policy_store = _rbac_stack.document_policy_store
+            document_set_store = _rbac_stack.document_set_store
+            envelope_pending_store = _rbac_stack.envelope_pending_store
+            _dp_weaken_store = _rbac_stack.dp_weaken_store
+            _cap_policy_store = _rbac_stack.capability_policy_store
             break  # success
         except Exception as exc:
             if _rbac_attempt < _RBAC_MAX_ATTEMPTS:
@@ -324,7 +240,9 @@ def _bootstrap():
             else:
                 logger.warning(
                     "RBAC/Agent Redis unavailable after %d attempts (%s) — "
-                    "RBAC and agent registry disabled",
+                    "RBAC and agent registry disabled at startup; a bounded "
+                    "lazy reconnect will keep retrying at request time "
+                    "(YSG-RISK-122 self-heal, backoffice/redis_selfheal.py)",
                     _RBAC_MAX_ATTEMPTS, exc,
                 )
 
@@ -459,21 +377,23 @@ def _bootstrap():
     # values don't satisfy. A Redis db/3 config store (same durable admin store
     # as allocations/bindings) persists + reads back correctly with no route or
     # UI changes. configure() wires it into the budget router below.
+    # YSG-RISK-122: this was a SINGLE-attempt, no-retry try/except (unlike the
+    # RBAC stack's 5x backoff loop above) — if anything MORE exposed to the
+    # same k8s boot-order race. build_budget_config_store() is now shared with
+    # redis_selfheal.ensure_budget_config_store(), which retries this lazily
+    # at request time, bounded by a cooldown, if this startup attempt fails.
     budget_config_store = None
     try:
-        import redis as _redis
-        from yashigani.billing.budget_config_store import BudgetConfigStore
+        from yashigani.backoffice.budget_stack import build_budget_config_store
         from yashigani.backoffice.routes import budget as _budget_routes
-        redis_budget_client = _redis.from_url(
-            _backoffice_redis_url(3),
-            decode_responses=False,
-        )
-        budget_config_store = BudgetConfigStore(redis_client=redis_budget_client)
+        budget_config_store = build_budget_config_store(_backoffice_redis_url(3))
         _budget_routes.configure(budget_store=budget_config_store)
-        logger.info("Budget config store initialised (Redis db/3) and wired to /admin/budget/*")
+        logger.info("Budget config store wired to /admin/budget/*")
     except Exception as exc:
         logger.warning(
-            "Budget config store init failed (%s) — budget caps will not persist",
+            "Budget config store init failed (%s) — budget caps will not persist "
+            "at startup; a bounded lazy reconnect will keep retrying at request "
+            "time (YSG-RISK-122 self-heal, backoffice/redis_selfheal.py)",
             exc,
         )
 
@@ -489,35 +409,34 @@ def _bootstrap():
     # backoffice container.  We reuse build_redis_url() with an explicit host
     # override (BUDGET_REDIS_HOST, default "budget-redis") and the backoffice
     # client cert (same TLS CA, accepted by budget-redis --tls-auth-clients yes).
+    # YSG-RISK-122: same single-attempt exposure as the config store above.
+    # build_budget_enforcer() / budget_enforcer_redis_url() are shared with
+    # redis_selfheal.ensure_budget_enforcer() for the lazy request-time retry.
     try:
-        import redis as _redis_br
-        from yashigani.billing.budget_enforcer import BudgetEnforcer as _BudgetEnforcer
+        from yashigani.backoffice.budget_stack import (
+            build_budget_enforcer,
+            budget_enforcer_redis_url,
+        )
         from yashigani.backoffice.routes import budget as _budget_routes_be
-        _budget_redis_host = os.getenv("BUDGET_REDIS_HOST", "budget-redis")
-        _budget_redis_port = os.getenv("BUDGET_REDIS_PORT", "6380")
-        _budget_redis_url = build_redis_url(
-            0,
-            host=_budget_redis_host,
-            port=_budget_redis_port,
+        _budget_redis_url = budget_enforcer_redis_url(
             password=_redis_password,
             use_tls=redis_use_tls,
             secrets_dir=_secrets_dir,
-            client_cert_name="backoffice_client",
         )
-        _budget_redis_client = _redis_br.from_url(_budget_redis_url, decode_responses=False)
-        _budget_redis_client.ping()
-        _budget_enforcer = _BudgetEnforcer(redis_client=_budget_redis_client)
+        _budget_enforcer = build_budget_enforcer(_budget_redis_url)
         _budget_routes_be.configure(
             budget_enforcer=_budget_enforcer,
             budget_store=budget_config_store,
         )
         logger.info(
-            "Budget enforcer wired to /admin/budget/usage/* (budget-redis at %s:%s)",
-            _budget_redis_host, _budget_redis_port,
+            "Budget enforcer wired to /admin/budget/usage/* (host=%s)",
+            os.getenv("BUDGET_REDIS_HOST", "budget-redis"),
         )
     except Exception as exc:
         logger.warning(
-            "Budget enforcer init failed (%s) — /admin/budget/usage/* will return 503",
+            "Budget enforcer init failed (%s) — /admin/budget/usage/* will return "
+            "503 at startup; a bounded lazy reconnect will keep retrying at "
+            "request time (YSG-RISK-122 self-heal, backoffice/redis_selfheal.py)",
             exc,
         )
 
