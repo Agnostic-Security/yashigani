@@ -1214,6 +1214,24 @@ def create_backoffice_app() -> FastAPI:
                     )
         return await call_next(request)
 
+    # YSG-RISK-122 self-heal: bounded lazy reconnect for RBAC/agent-registry/
+    # permission-store/budget Redis clients that failed to connect at startup
+    # (e.g. k8s boot-order race — yashigani-backoffice scheduled before
+    # yashigani-redis-0, see backoffice/redis_selfheal.py docstring for full
+    # context). Runs before every /admin/* request, ahead of routing (every
+    # `@app.middleware("http")` function here runs before call_next() reaches
+    # the router, regardless of registration order relative to its siblings)
+    # — so a successful reconnect is visible to the route handler on the SAME
+    # request that triggered it. No-ops (pure None-checks, zero Redis
+    # round-trips) once the stack is healthy, and is bounded by a per-stack
+    # cooldown while unhealthy so an outage cannot turn into a reconnect storm.
+    @app.middleware("http")
+    async def redis_selfheal_middleware(request: Request, call_next):
+        if request.url.path.startswith("/admin"):
+            from yashigani.backoffice.redis_selfheal import maybe_selfheal
+            await maybe_selfheal()
+        return await call_next(request)
+
     # Uniform 401 for unauthenticated /admin/* requests (QA Wave 2 Issue 10).
     # Before this middleware, some admin endpoints returned 401 (route exists,
     # auth dep failed) while others returned 404 (no root route under that
