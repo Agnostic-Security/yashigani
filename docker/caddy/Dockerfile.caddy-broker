@@ -38,7 +38,14 @@
 # RO-trusted sources — safe, and simpler than baking+comparing a baseline.
 
 # ── Stage 1: caddy binary source ────────────────────────────────────────────
-FROM docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d AS caddybin
+# YSG-CVE-V412-028: bumped 2.11.2-alpine -> 2.11.4-alpine in lockstep with
+# docker/caddy/Dockerfile.caddy (2026-07-23, Captain) — this stage's ONLY
+# purpose is to donate the caddy binary itself (COPY --from below), so it
+# must track the same upstream release to clear the same golang.org/x/crypto
+# + Go stdlib + caddy/v2 CVEs from Lu's scan
+# (testing_runs/yashigani/v412-controls-20260723/image-{trivy,grype}-
+# caddy-config-broker.json, "usr/local/bin/caddy" gobinary target).
+FROM docker.io/library/caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 AS caddybin
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────
 # Base image: python:3.14.5-slim (parity with the other first-party images).

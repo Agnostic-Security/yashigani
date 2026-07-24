@@ -128,7 +128,7 @@ x-common-env: &common-env
   #
   # IMPORTANT: FIPS_MODE=1 activates the FIPS code path only if the container's
   # OpenSSL installation includes the CMVP #4985-validated FIPS Provider.
-  # The default python:3.14.0-slim and caddy:2.11.2-alpine images do NOT
+  # The default python:3.14.0-slim and caddy:2.11.4-alpine images do NOT
   # include the FIPS Provider. Operators requiring FIPS-validated crypto MUST
   # use a FIPS-configured base image (e.g. UBI + openssl-fips or AWS BoringCrypto).
   FIPS_MODE: ${YSG_FIPS_MODE:-0}
@@ -167,7 +167,7 @@ services:
     dns_search: ["."]
     # YSG-RISK-061 (v2.24.1): use hardened build (caddy/Dockerfile.caddy) which
     # adds iptables + iproute2-minimal and installs caddy-entrypoint.sh.
-    # The base image is the same digest-pinned caddy:2.11.2-alpine upstream.
+    # The base image is the same digest-pinned caddy:2.11.4-alpine upstream.
     build:
       context: ..
       dockerfile: docker/caddy/Dockerfile.caddy

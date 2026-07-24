@@ -1,7 +1,18 @@
 # Yashigani Caddy — hardened TLS edge with egress restriction support
 #
-# Base: official caddy:2.11.2-alpine (digest-pinned in docker-compose.yml).
+# Base: official caddy:2.11.4-alpine (digest-pinned in docker-compose.yml).
 # Adds: iptables (baked in at build time — not installed at runtime).
+#
+# YSG-CVE-V412-028: bumped from 2.11.2-alpine -> 2.11.4-alpine (2026-07-23,
+# Captain) to clear the 28-CVE fixable subset from Lu's trivy+grype image
+# scan (testing_runs/yashigani/v412-controls-20260723/image-{trivy,grype}-
+# caddy.json): golang.org/x/crypto (9 CVEs), Go stdlib (multiple), and the
+# caddy/v2 binary's own CVEs are only fixable by consuming an upstream Caddy
+# release built against a newer Go toolchain — this repo does NOT build Caddy
+# from source (no xcaddy/go.mod here), so the fix path is the upstream image
+# tag bump, not a local `go get`. `apk upgrade` (below) clears the remaining
+# Alpine-layer curl/openssl/nghttp2/c-ares CVEs. See re-scan diff in
+# testing_runs/yashigani/fix-v412-image-cve-rebuild-20260723/.
 #
 # YSG-RISK-061: iptables is required by caddy-entrypoint.sh to enforce the
 # OUTPUT egress allowlist. The package adds ~2MB and requires no extra
@@ -18,7 +29,7 @@
 # Build command (automated via docker-compose.yml build block):
 #   docker compose build caddy
 
-FROM docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+FROM docker.io/library/caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
 # Proxy passthrough — enterprise/proxied/airgapped builds.
 # ARG declarations expose the build-args as env vars so apk respects them.
@@ -27,8 +38,21 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 
+# YSG-CVE-V412-028: upgrade the base image's pre-installed packages (curl,
+# libcurl, libssl3, libcrypto3, nghttp2-libs, c-ares — all shipped by the
+# upstream caddy:alpine image, not by us) to the current alpine 3.23 repo
+# versions BEFORE adding our own packages. Verified live against the
+# alpine:3.23 apk index (2026-07-23): curl/libcurl -> 8.20.0-r0,
+# libssl3/libcrypto3 -> 3.5.7-r0, nghttp2-libs -> 1.69.0-r0,
+# c-ares -> 1.34.8-r0 — clears CVE-2026-5773/6276/3805 (curl/libcurl),
+# CVE-2026-45447/42764/34180..34183/7383/45445/9076 (libssl3/libcrypto3),
+# CVE-2026-27135 (nghttp2-libs), CVE-2026-33630 (c-ares).
+RUN apk upgrade --no-cache
+
 # Add iptables (and getent/nss_dns for hostname resolution in the entrypoint).
 # iproute2-minimal provides `ip route` for bridge subnet enumeration.
+# iptables=1.8.11-r1 confirmed still current in alpine 3.23 main (unchanged
+# by the base bump above).
 RUN apk add --no-cache \
     iptables=1.8.11-r1 \
     iproute2-minimal \
