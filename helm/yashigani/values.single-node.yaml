@@ -194,8 +194,18 @@ otelCollector:
 
 # ---------------------------------------------------------------------------
 # Caddy — halve CPU
+#
+# FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): base values.yaml default is
+# service.type: LoadBalancer, correct for real cloud clusters (values.release.yaml
+# production profile inherits it unchanged). Single-node/default clusters
+# (docker-desktop, kind, k3s without MetalLB) have no LB controller — a
+# Service stuck Pending with a LoadBalancer finalizer hangs `helm uninstall`
+# and namespace deletion indefinitely. Override to ClusterIP here; reach the
+# stack via `kubectl port-forward` (as documented for single-node installs).
 # ---------------------------------------------------------------------------
 caddy:
+  service:
+    type: ClusterIP
   resources:
     requests:
       cpu: "100m"

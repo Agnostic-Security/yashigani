@@ -74,8 +74,13 @@ grafana:
 postgres:
   image:
     repository: docker.io/pgvector/pgvector
-    tag: "0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
-    digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+    # FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): digest re-verified live via
+    # `docker buildx imagetools inspect` — the previously pinned digest
+    # (7d400e340e...) no longer resolves (upstream republished the tag);
+    # `docker manifest inspect` on the old pin returned "manifest verification
+    # failed". Re-pinned to the current, live-verified index digest.
+    tag: "0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
+    digest: "sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
 
 pgbouncer:
   image:
