@@ -125,7 +125,42 @@ AVA-412-DOS fix (2026-07-23, fix/v412-auth-throttle-dos):
     the same bounded exponential backoff as before.
   - See testing_runs/yashigani/wt-fix-throttle-dos-20260723/.
 
-Last updated: 2026-07-23T00:00:00+00:00
+AVA-RETRYAFTER fix (2026-07-24, fix/v412-throttle-retryafter):
+  - RFC 6585 §4 contract violation — Retry-After lied about the actual
+    lockout duration (Ava, live Redis inspection db1). _reject_with_throttle()
+    reports the documented ESCALATING schedule via
+    _throttle_delay_for_level() (30/60/180/450/900 by level, _THROTTLE_DELAYS)
+    but _THROTTLE_ADMIT_LUA set every escalation-level key's (auth:throttle:
+    ip:*/auth:throttle:acct:*) actual Redis EXPIRE to the flat rolling
+    `window` (900s) regardless of level — the key whose mere PRESENCE is
+    what _apply_auth_throttle()'s gate check (_throttle_current_level) reads
+    to decide whether to reject. A level-1 client (3 consecutive failures)
+    was told "Retry-After: 30" but the key that actually released the gate
+    did not expire for 900s — a ~30x mismatch between advertised and actual
+    wait.
+  - Design determination: the module's own comments and pre-existing test
+    suite (test_v2232_login_throttle_retry_after.py::TestThrottleDelaySchedule)
+    already document and pin an ESCALATING-backoff design (level 1=30s ...
+    level 5=900s ceiling), not a fixed 900s window with a single Retry-After.
+    Fixed by making _THROTTLE_ADMIT_LUA's EXPIRE for each escalation-level
+    key equal to THAT level's own _THROTTLE_DELAYS entry (passed in as
+    trailing ARGV) instead of the flat window — the gating key's real TTL
+    now always equals what _throttle_delay_for_level() reports for the same
+    level. The rolling FAIL-COUNT keys (auth:fail:ip:*/auth:fail:acct:*) are
+    unrelated to Retry-After and unchanged (still flat `window` — they are
+    never read by the gate check).
+  - YSG-RISK-098 (AVA-412-DOS self-extend fix, above) is untouched: the
+    phase-1 read-only pre-check / phase-2 mutating-admit split is unchanged;
+    this fix only changes what TTL is written when a level actually
+    escalates, never who gets to write it.  See
+    src/tests/regression/v4.1.2/test_ava_412_dos_auth_throttle_self_extend.py
+    (assertion at the freshly-set TTL updated from ">800" to the correct
+    per-level ~30s to match, since it previously encoded the flat-900 bug as
+    expected behaviour) and the new
+    src/tests/regression/v4.1.2/test_ava_retryafter_ttl_matches_header.py.
+  - See testing_runs/yashigani/fix-v412-throttle-retryafter-20260724/.
+
+Last updated: 2026-07-24T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -326,12 +361,33 @@ _THROTTLE_DELAYS = [30, 60, 180, 450, 900]
 # single, non-interleaved unit — concurrent callers are strictly serialised
 # by Redis itself, so no window exists for two-phase "read, decide later,
 # increment" races.  KEYS: 1=ip_fail 2=ip_throttle 3=acct_fail 4=acct_throttle.
-# ARGV: 1=ip_threshold 2=acct_threshold 3=window_seconds 4=max_level.
+# ARGV: 1=ip_threshold 2=acct_threshold 3=window_seconds 4=max_level,
+# 5..(4+max_level)=the escalation delay (seconds) for level 1..max_level
+# (mirrors _THROTTLE_DELAYS — see AVA-RETRYAFTER fix below).
 # Returns {ip_fails, ip_level_before, acct_fails, acct_level_before} — the
 # "_before" values reflect whether the bucket was ALREADY escalated prior
 # to this specific attempt (so attempt 1/2/3 still proceed to real auth,
 # matching the pre-existing "3 genuine attempts before throttling" contract
 # — see _throttle_admit() docstring for the full reasoning).
+#
+# AVA-RETRYAFTER fix (2026-07-24, fix/v412-throttle-retryafter): the
+# ESCALATION-LEVEL keys (KEYS[2] ip_throttle, KEYS[4] acct_throttle) — the
+# keys whose mere PRESENCE is what actually gates a request in
+# _apply_auth_throttle() — previously had their EXPIRE set to the flat
+# rolling `window` (900s) on EVERY escalation, regardless of level. But the
+# Retry-After header (_reject_with_throttle -> _throttle_delay_for_level)
+# reports the documented ESCALATING schedule (30/60/180/450/900,
+# _THROTTLE_DELAYS) for that same level. Net effect (live, Ava, Redis
+# inspection db1): a level-1 client was told "Retry-After: 30" but the key
+# that actually released the gate did not expire for 900s — a ~30x RFC 6585
+# contract violation. Fixed by giving each escalation-level key an EXPIRE
+# equal to THAT level's own delay (so level 1 -> 30s, ..., level 5 -> 900s
+# ceiling) instead of the flat window — the gating key's real TTL now always
+# equals the value _throttle_delay_for_level() reports for the same level.
+# The separate rolling FAIL-COUNT keys (KEYS[1] ip_fail, KEYS[3] acct_fail)
+# are unrelated to Retry-After (they are never read for the gate check, only
+# for threshold-crossing) and correctly keep the flat `window` — no client-
+# visible duration is derived from them.
 # ---------------------------------------------------------------------------
 _THROTTLE_ADMIT_LUA = """
 local ip_threshold   = tonumber(ARGV[1])
@@ -339,14 +395,34 @@ local acct_threshold = tonumber(ARGV[2])
 local window         = tonumber(ARGV[3])
 local max_level      = tonumber(ARGV[4])
 
+-- ARGV[5 .. 4+max_level] = per-level escalation delay (seconds), 1-indexed
+-- (level 1 = ARGV[5], level 2 = ARGV[6], ...). Mirrors _THROTTLE_DELAYS so
+-- the escalation-level key's actual TTL always matches what
+-- _throttle_delay_for_level() reports in the Retry-After header.
+local delays = {}
+for i = 1, max_level do
+    delays[i] = tonumber(ARGV[4 + i])
+end
+
+local function ttl_for_level(level)
+    if level < 1 then
+        return delays[1]
+    end
+    if level > max_level then
+        return delays[max_level]
+    end
+    return delays[level]
+end
+
 local ip_fails = redis.call('INCR', KEYS[1])
 redis.call('EXPIRE', KEYS[1], window)
 local ip_level_before = tonumber(redis.call('GET', KEYS[2]) or '0')
 if ip_fails >= ip_threshold then
     if ip_level_before < max_level then
-        redis.call('SET', KEYS[2], ip_level_before + 1, 'EX', window)
+        local ip_new_level = ip_level_before + 1
+        redis.call('SET', KEYS[2], ip_new_level, 'EX', ttl_for_level(ip_new_level))
     else
-        redis.call('EXPIRE', KEYS[2], window)
+        redis.call('EXPIRE', KEYS[2], ttl_for_level(max_level))
     end
 end
 
@@ -355,9 +431,10 @@ redis.call('EXPIRE', KEYS[3], window)
 local acct_level_before = tonumber(redis.call('GET', KEYS[4]) or '0')
 if acct_fails >= acct_threshold then
     if acct_level_before < max_level then
-        redis.call('SET', KEYS[4], acct_level_before + 1, 'EX', window)
+        local acct_new_level = acct_level_before + 1
+        redis.call('SET', KEYS[4], acct_new_level, 'EX', ttl_for_level(acct_new_level))
     else
-        redis.call('EXPIRE', KEYS[4], window)
+        redis.call('EXPIRE', KEYS[4], ttl_for_level(max_level))
     end
 end
 
@@ -413,6 +490,11 @@ def _throttle_admit(
     bucket).
 
     Returns (ip_fails, ip_level_before, acct_fails, acct_level_before).
+
+    AVA-RETRYAFTER fix (2026-07-24): the escalation-level keys' actual Redis
+    TTL is now the per-level ``_THROTTLE_DELAYS`` value (passed here as
+    trailing ARGV entries), not the flat ``_THROTTLE_WINDOW_SECONDS`` — see
+    ``_THROTTLE_ADMIT_LUA`` docstring/comment above for the full rationale.
     """
     result = r.eval(
         _THROTTLE_ADMIT_LUA,
@@ -425,6 +507,7 @@ def _throttle_admit(
         _THROTTLE_ACCOUNT_THRESHOLD,
         _THROTTLE_WINDOW_SECONDS,
         len(_THROTTLE_DELAYS),
+        *_THROTTLE_DELAYS,
     )
     return (int(result[0]), int(result[1]), int(result[2]), int(result[3]))
 
