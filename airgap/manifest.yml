@@ -63,8 +63,8 @@ profiles:
 
       - name: "docker.io/pgvector/pgvector"
         tag: "0.8.2-pg16"
-        digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
-        ref: "docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+        digest: "sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
+        ref: "docker.io/pgvector/pgvector:0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
         note: "PostgreSQL 16 + pgvector — primary datastore"
 
       - name: "docker.io/edoburu/pgbouncer"
