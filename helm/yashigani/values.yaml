@@ -1504,6 +1504,21 @@ agentBundles:
       # secretKeyRef env var in K8s. supplementalGroups: [2002] was vestigial.
       # Removed per Laura A1 amendment — GID 2002 narrowed to langflow-only on
       # Compose path; K8s never needed it.
+      # YSG-RISK-121 CLOSED: fsGroup: 70 — mirrors the working yashigani-pgbouncer
+      # pod pattern (pgbouncer.yaml podSecurityContext). This pod is mixed-UID:
+      # the letta app container runs runAsUser:0 (root — unaffected by fsGroup,
+      # root reads regardless of file ownership), while the letta-pgbouncer
+      # sidecar runs runAsUser/Group:70. Without fsGroup, the letta-pgbouncer-pki
+      # Secret volume below is owned root:root and the non-root sidecar gets
+      # EACCES ("failed to load certificate file ... (null)") trying to read
+      # its own leaf. fsGroup:70 makes K8s own the Secret volume files as
+      # group 70, matching the sidecar's runAsGroup so it can read (with
+      # defaultMode 0440 below). Scoped to this bundle's pod only — does NOT
+      # touch the CA-material posture (YSG-RISK-120): CA private keys are
+      # never mounted here, the letta-pgbouncer-pki mount stays readOnly:true,
+      # and this only widens group-read on the leaf/trust-anchor files this
+      # pod already legitimately receives.
+      fsGroup: 70
     containerSecurityContext:
       allowPrivilegeEscalation: false
       # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
@@ -1556,7 +1571,13 @@ agentBundles:
       - name: letta-pgbouncer-pki
         secret:
           secretName: "yashigani-pki-certs"
-          defaultMode: 0400
+          # YSG-RISK-121 CLOSED: 0400 (owner-only) → 0440 (owner+group read),
+          # matching the main yashigani-pgbouncer pki-certs volume exactly
+          # (pgbouncer.yaml). Paired with fsGroup:70 above, this lets the
+          # runAsUser/Group:70 letta-pgbouncer sidecar read its own leaf.
+          # Mount stays readOnly:true; no write access is granted; no CA
+          # private key material is projected here (items: below is unchanged).
+          defaultMode: 0440
           items:
             - key: letta-pgbouncer_client.crt
               path: letta-pgbouncer_client.crt
