@@ -551,15 +551,39 @@ def _expected_origin(request: Request) -> str:
     sees, which on the Caddy->backoffice reverse_proxy leg is the upstream
     dial address ("backoffice:8443"), not the address the browser used.
 
-    Fix: prefer X-Forwarded-Host / X-Forwarded-Proto — headers Caddy now
-    sets explicitly via `header_up X-Forwarded-Host {host}` ("set"
-    semantics, which unconditionally overwrite any client-supplied
-    X-Forwarded-Host before the request reaches backoffice — see
-    docker/Caddyfile.{selfsigned,acme,ca} and
-    helm/yashigani/templates/configmaps.yaml backoffice reverse_proxy
-    blocks) to carry the EXTERNAL host+scheme the browser actually used
-    across the proxy hop. Falls back to the raw Host header only for
-    direct-to-backoffice access with no Caddy in front (local dev/tests).
+    Fix (v2, 2026-07-24 — 3rd iteration): prefer X-Forwarded-Host /
+    X-Forwarded-Proto — headers Caddy now sets explicitly via `header_up
+    X-Forwarded-Host {http.request.hostport}` ("set" semantics, which
+    unconditionally overwrite any client-supplied X-Forwarded-Host before
+    the request reaches backoffice — see docker/Caddyfile.{selfsigned,acme,
+    ca} and helm/yashigani/templates/configmaps.yaml backoffice
+    reverse_proxy blocks) to carry the EXTERNAL host+scheme the browser
+    actually used across the proxy hop. Falls back to the raw Host header
+    only for direct-to-backoffice access with no Caddy in front (local
+    dev/tests).
+
+    IMPORTANT — `{http.request.hostport}` vs `{host}`: the previous (2nd
+    iteration) fix used Caddy's `{host}` placeholder, which silently STRIPS
+    the port (`{host}` == `{http.request.host}`) — confirmed live: Caddy
+    forwarded `X-Forwarded-Host: localhost` (no `:8443`) while the browser
+    signed `origin: "https://localhost:8443"`, so the mismatch just moved
+    rather than closed. `{http.request.hostport}` preserves whatever
+    host:port the client actually dialled (verified against caddy v2.11.4:
+    `{http.request.hostport}` always includes the port, even when it's the
+    scheme's default — e.g. a client Host of "example.com:443" adapts to
+    hostport "example.com:443", NOT "example.com").
+
+    That "always includes the port, even the default one" behaviour is why
+    this function does its OWN default-port normalisation below, rather
+    than trusting the port verbatim: on a standard ACME install (public
+    :443/:80), the BROWSER's origin string omits the default port
+    (`https://example.com`, per the URL/Origin spec — browsers never
+    include the scheme's default port in `location.origin`), so passing
+    "https://example.com:443" straight through as expected_origin would
+    reintroduce this exact bug class for every standard-port install. Only
+    the self-signed dev default (:8443, a NON-default port) happens to need
+    the port preserved verbatim — that case is unaffected by the
+    normalisation (8443 != 443, so it's kept).
 
     Security: Caddy's public edge is path-routed, not host-vhosted (see
     the "Public-edge SNI defaulting" comment in Caddyfile.selfsigned —
@@ -575,14 +599,23 @@ def _expected_origin(request: Request) -> str:
         "host", request.url.netloc
     )
 
-    hostname = host.split(":", 1)[0].lower()
+    raw_hostname, _, port = host.partition(":")
+    hostname = raw_hostname.lower()
     allowed = _configured_public_hosts()
     if hostname not in allowed:
         raise ValueError(
             f"webauthn origin host {hostname!r} not in configured allowlist {sorted(allowed)!r}"
         )
 
-    return f"{proto}://{host}"
+    # Browsers never include the scheme's default port in
+    # `location.origin` (443 for https, 80 for http) — strip it here too,
+    # so an explicit-but-default port (e.g. Caddy's {http.request.hostport}
+    # yielding "example.com:443") still matches what clientDataJSON.origin
+    # actually contains. Non-default ports (e.g. ":8443") are kept verbatim.
+    default_port = "443" if proto == "https" else "80"
+    origin_host = hostname if (not port or port == default_port) else f"{hostname}:{port}"
+
+    return f"{proto}://{origin_host}"
 
 
 def _client_ip(request: Request) -> str:

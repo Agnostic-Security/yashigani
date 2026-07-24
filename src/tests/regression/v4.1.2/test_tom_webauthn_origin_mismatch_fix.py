@@ -13,12 +13,26 @@ clientDataJSON.origin. Every register/authenticate ceremony failed 100% of
 the time as a result.
 
 Fix (this commit):
-  - Caddy now forwards `X-Forwarded-Host {host}` (the ORIGINAL inbound
-    Host -- i.e. what the browser sent) on every backoffice reverse_proxy
-    block, in docker/Caddyfile.{selfsigned,acme,ca} AND the Helm-rendered
-    equivalent in helm/yashigani/templates/configmaps.yaml. `header_up ...
-    {host}` uses Caddy's "set" semantics, which unconditionally overwrites
-    any client-supplied X-Forwarded-Host before it reaches backoffice.
+  - Caddy now forwards `X-Forwarded-Host {http.request.hostport}` (the
+    ORIGINAL inbound host:port -- i.e. what the browser sent) on every
+    backoffice reverse_proxy block, in docker/Caddyfile.{selfsigned,acme,
+    ca} AND the Helm-rendered equivalent in
+    helm/yashigani/templates/configmaps.yaml. `header_up ...
+    {http.request.hostport}` uses Caddy's "set" semantics, which
+    unconditionally overwrites any client-supplied X-Forwarded-Host before
+    it reaches backoffice.
+
+    3RD-ITERATION NOTE (2026-07-24, Ava live-diagnosed): the PREVIOUS fix
+    (this test file's original version) used Caddy's `{host}` placeholder
+    instead. `{host}` == `{http.request.host}`, which Caddy documents (and
+    we confirmed empirically against caddy v2.11.4 with `caddy adapt` +
+    a live probe server) as HOST-ONLY -- it silently strips the port.
+    Caddy therefore forwarded `X-Forwarded-Host: localhost` (no `:8443`),
+    `_expected_origin()` computed `https://localhost`, but the browser
+    signed `clientDataJSON.origin = "https://localhost:8443"` -- the
+    mismatch moved (from the internal upstream Host to a port-stripped
+    external Host) but never closed. `{http.request.hostport}` is the
+    correct placeholder for host:port.
   - `_expected_origin()` now prefers X-Forwarded-Host over the raw Host
     header, and validates the derived hostname against an allowlist built
     from YASHIGANI_TLS_DOMAIN (the operator's configured public domain)
@@ -26,6 +40,16 @@ Fix (this commit):
     host-vhosted, so an arbitrary client-supplied Host must not be
     silently trusted as the expected_origin (that would defeat WebAuthn's
     anti-phishing origin check entirely).
+  - `_expected_origin()` ALSO now strips the scheme's default port (443
+    for https, 80 for http) from the returned origin when present, since
+    `{http.request.hostport}` (unlike `{host}`) preserves an EXPLICIT
+    default port verbatim (e.g. a client Host of "example.com:443" adapts
+    to hostport "example.com:443", not "example.com") -- but browsers
+    never include the scheme's default port in `location.origin`, so a
+    standard ACME install on public :443 would otherwise reintroduce this
+    exact bug class. Non-default ports (e.g. the self-signed dev :8443)
+    are kept verbatim -- see TestExpectedOriginDefaultPortNormalisation
+    below.
   - `WebAuthnConfig.rp_id` (auth/webauthn.py + build_pg_webauthn_service()
     in auth/pg_webauthn.py) now defaults to YASHIGANI_TLS_DOMAIN instead of
     a hardcoded "localhost", so a real configured --domain also satisfies
@@ -47,6 +71,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import pathlib
 import secrets
 
 import cbor2
@@ -143,6 +168,114 @@ class TestExpectedOriginPrefersForwardedHost:
         )
         with pytest.raises(ValueError, match="not in configured allowlist"):
             _expected_origin(request)
+
+
+class TestExpectedOriginDefaultPortNormalisation:
+    """3rd-iteration regression coverage: `{http.request.hostport}` (unlike
+    `{host}`) preserves an EXPLICIT default port verbatim, but a browser's
+    `location.origin` never includes the scheme's default port. Without
+    this normalisation, a standard ACME install on public :443 would 400
+    with the exact same origin-mismatch class this bug already caused
+    once via `{host}` stripping ALL ports (default or not)."""
+
+    def test_https_443_strips_to_no_port(self, monkeypatch):
+        """ACME install on standard :443 -- Caddy's {http.request.hostport}
+        yields 'example.com:443', but the browser signs
+        'https://example.com' (no port). Must normalise to match."""
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "example.com")
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        request = _fake_request(
+            {
+                "host": "backoffice:8443",
+                "x-forwarded-host": "example.com:443",
+                "x-forwarded-proto": "https",
+            }
+        )
+        origin = _expected_origin(request)
+        assert origin == "https://example.com"
+
+    def test_http_80_strips_to_no_port(self, monkeypatch):
+        """Same normalisation for plain-http default port 80."""
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "example.com")
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        request = _fake_request(
+            {
+                "host": "backoffice:8443",
+                "x-forwarded-host": "example.com:80",
+                "x-forwarded-proto": "http",
+            }
+        )
+        origin = _expected_origin(request)
+        assert origin == "http://example.com"
+
+    def test_https_8443_non_default_port_kept(self, monkeypatch):
+        """The self-signed dev default (:8443) is NOT the https default
+        port -- must be preserved verbatim, exactly like the pre-existing
+        TestExpectedOriginPrefersForwardedHost coverage above."""
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "localhost")
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        request = _fake_request(
+            {
+                "host": "backoffice:8443",
+                "x-forwarded-host": "localhost:8443",
+                "x-forwarded-proto": "https",
+            }
+        )
+        origin = _expected_origin(request)
+        assert origin == "https://localhost:8443"
+
+    def test_http_8080_non_default_port_kept(self, monkeypatch):
+        """A non-default http port must also be preserved verbatim."""
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "example.com")
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+
+        request = _fake_request(
+            {
+                "host": "backoffice:8443",
+                "x-forwarded-host": "example.com:8080",
+                "x-forwarded-proto": "http",
+            }
+        )
+        origin = _expected_origin(request)
+        assert origin == "http://example.com:8080"
+
+
+class TestCaddyfileForwardsHostportNotHost:
+    """Static regression guard: asserts the actual Caddyfile source (not
+    just the Python unit) uses `{http.request.hostport}`, and never
+    regresses to the bare `{host}` placeholder that caused this bug's 2nd
+    iteration. Re-fails immediately if anyone reintroduces `header_up
+    X-Forwarded-Host {host}` in any of the three Caddyfile variants or the
+    Helm-rendered equivalent."""
+
+    _REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
+    _CADDY_FILES = (
+        "docker/Caddyfile.selfsigned",
+        "docker/Caddyfile.acme",
+        "docker/Caddyfile.ca",
+        "helm/yashigani/templates/configmaps.yaml",
+    )
+
+    @pytest.mark.parametrize("relpath", _CADDY_FILES)
+    def test_no_bare_host_placeholder_for_x_forwarded_host(self, relpath):
+        text = (self._REPO_ROOT / relpath).read_text()
+        assert "X-Forwarded-Host {host}" not in text, (
+            f"{relpath} forwards X-Forwarded-Host via the bare {{host}} "
+            "placeholder, which STRIPS the port (Caddy v2.11.4, confirmed "
+            "empirically) -- this is the exact 2nd-iteration WebAuthn "
+            "origin bug. Use {http.request.hostport} instead."
+        )
+
+    @pytest.mark.parametrize("relpath", _CADDY_FILES)
+    def test_hostport_placeholder_present_in_backoffice_blocks(self, relpath):
+        text = (self._REPO_ROOT / relpath).read_text()
+        assert "X-Forwarded-Host {http.request.hostport}" in text, (
+            f"{relpath} does not forward X-Forwarded-Host with "
+            "{http.request.hostport} in any backoffice reverse_proxy block."
+        )
 
 
 # ---------------------------------------------------------------------------

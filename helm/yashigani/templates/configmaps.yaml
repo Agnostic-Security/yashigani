@@ -735,7 +735,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       # ── Admin API — /api/v1/admin/* (PKI, HIBP, secrets, WebAuthn) ─────────
@@ -756,7 +756,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       handle /auth/* {
@@ -765,7 +765,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       handle /me/* {
@@ -774,7 +774,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       handle /static/* {
@@ -783,7 +783,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       handle /login {
@@ -792,7 +792,7 @@ data:
           import internal-mtls-backoffice
           {{- end }}
           import inject-caddy-verified
-          header_up X-Forwarded-Host {host}
+          header_up X-Forwarded-Host {http.request.hostport}
         }
       }
       {{- if .Values.agentBundles.openclaw.enabled }}
@@ -866,7 +866,7 @@ data:
             {{- end }}
             import inject-caddy-verified
             header_up X-Forwarded-Proto https
-            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Host {http.request.hostport}
             header_up X-Real-IP {remote_host}
           }
         }
