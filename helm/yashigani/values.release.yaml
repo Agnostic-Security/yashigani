@@ -44,14 +44,14 @@ policy:
 redis:
   image:
     repository: docker.io/library/redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
-    digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+    digest: "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 
 budgetRedis:
   image:
     repository: docker.io/library/redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
-    digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+    digest: "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 
 ollama:
   image:
@@ -74,8 +74,8 @@ grafana:
 postgres:
   image:
     repository: docker.io/pgvector/pgvector
-    tag: "0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
-    digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+    tag: "0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
+    digest: "sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
 
 pgbouncer:
   image:

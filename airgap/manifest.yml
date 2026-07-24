@@ -51,8 +51,8 @@ profiles:
 
       - name: "docker.io/library/redis"
         tag: "7.4.9-alpine"
-        digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
-        ref: "docker.io/library/redis:7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+        digest: "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+        ref: "docker.io/library/redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
         note: "Rate-limit and session store (redis + budget-redis — same image)"
 
       - name: "docker.io/openpolicyagent/opa"
@@ -69,8 +69,8 @@ profiles:
 
       - name: "docker.io/edoburu/pgbouncer"
         tag: "v1.25.1-p0"
-        digest: "sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
-        ref: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        digest: "sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
+        ref: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
         note: "Connection pooler"
 
       - name: "docker.io/ollama/ollama"
@@ -180,20 +180,20 @@ profiles:
     images:
       - name: "docker.io/wazuh/wazuh-manager"
         tag: "4.14.5"
-        digest: "sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109"
-        ref: "docker.io/wazuh/wazuh-manager:4.14.5@sha256:3b2b7aae2daf696071ecc8b32a5d1e65e5c2a625291afc434bd20171a9d41109"
+        digest: "sha256:824ff13d446682cd3bd5960479ce0d1d6a9fed8fdbc0ce31a4f0f3b9a97a7734"
+        ref: "docker.io/wazuh/wazuh-manager:4.14.5@sha256:824ff13d446682cd3bd5960479ce0d1d6a9fed8fdbc0ce31a4f0f3b9a97a7734"
         note: "Wazuh Manager"
 
       - name: "docker.io/wazuh/wazuh-indexer"
         tag: "4.14.5"
-        digest: "sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c"
-        ref: "docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c"
+        digest: "sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0"
+        ref: "docker.io/wazuh/wazuh-indexer:4.14.5@sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0"
         note: "Wazuh Indexer (OpenSearch)"
 
       - name: "docker.io/wazuh/wazuh-dashboard"
         tag: "4.14.5"
-        digest: "sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af"
-        ref: "docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:75437f4fb347db2d040863801f9eb73b0ca16c8b3fb4d93a07df34b7313b16af"
+        digest: "sha256:9f592de5abe1b0d543a1896b7d83ce058fa165452906b20c0576f6c86f3c2d65"
+        ref: "docker.io/wazuh/wazuh-dashboard:4.14.5@sha256:9f592de5abe1b0d543a1896b7d83ce058fa165452906b20c0576f6c86f3c2d65"
         note: "Wazuh Dashboard"
 
   spire:

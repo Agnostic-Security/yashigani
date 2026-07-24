@@ -770,7 +770,7 @@ redis:
   enabled: true
   image:
     repository: redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1587,7 +1587,7 @@ agentBundles:
     # Same image as existing yashigani-pgbouncer Deployment. No new registry dependency.
     extraContainers:
       - name: letta-pgbouncer
-        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
         imagePullPolicy: IfNotPresent
         securityContext:
           # pgbouncer runs as UID 70 (edoburu image USER pgbouncer). runAsNonRoot:true
@@ -1770,7 +1770,7 @@ budgetRedis:
   enabled: true
   image:
     repository: redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1847,7 +1847,7 @@ pgbouncer:
   enabled: true
   image:
     repository: edoburu/pgbouncer
-    tag: "v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+    tag: "v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.

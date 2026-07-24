@@ -42,7 +42,7 @@ services:
   # One-shot OpenSearch security-index initialiser (securityadmin) using the internal-CA
   # admin cert. Manager/dashboard gate on its successful completion.
   wazuh-security-init:
-    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:bcba58b3fe756114249b8834bcae8f852d277ffc6b9695d3de5989f5fe94d36c
+    image: docker.io/wazuh/wazuh-indexer:4.14.5@sha256:9a1d21950af0d8cf49ee3ee3aceaa4d295550634ab15412dea5b50cb66214dd0
     restart: "no"
     depends_on:
       wazuh-indexer:
