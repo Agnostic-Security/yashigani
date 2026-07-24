@@ -46,13 +46,21 @@ class _FakeGroup:
 
 
 class _FakeRBACStore:
-    """Minimal get_user_groups(email) -> [group] for the detokenize gate."""
+    """Minimal get_user_groups(identity_id) -> [group] for the detokenize
+    gate. v4.1.2 bug 2: RBACStore.get_user_groups() is identity_id-keyed
+    post-4.1 UID migration, not email-keyed -- see
+    yashigani/rbac/store.py:157-167. This fake's ``membership`` dict is keyed
+    by whatever ``_FakeIdentityRegistry`` resolves an email to (in this test
+    file, identity_id == email string, for fixture simplicity -- the
+    production code path is exercised in
+    src/tests/unit/test_laura_30_003_detokenize_rbac.py with a genuinely
+    different identity_id/email pair)."""
 
     def __init__(self, membership: dict[str, list[_FakeGroup]]):
         self._membership = membership
 
-    def get_user_groups(self, email: str):
-        return self._membership.get(email, [])
+    def get_user_groups(self, identity_id: str):
+        return self._membership.get(identity_id, [])
 
 
 class _FakeAccountRecord:
@@ -74,6 +82,19 @@ class _FakeAuthService:
 
     async def get_account_by_id(self, account_id: str):  # noqa: D401
         return _FakeAccountRecord(email=account_id)
+
+
+class _FakeIdentityRegistry:
+    """v4.1.2 bug 2: the detokenize gate now resolves email -> identity_id
+    via backoffice_state.identity_registry before the RBAC lookup. This fake
+    maps every email to an identity_id equal to the email string itself, so
+    _FakeRBACStore's existing email-keyed ``membership`` dicts continue to
+    work unchanged as identity_id-keyed dicts."""
+
+    def get_by_email(self, email: str) -> dict | None:
+        if not email:
+            return None
+        return {"identity_id": email}
 
 
 def _session(account_id: str) -> Session:
@@ -120,6 +141,10 @@ def client(monkeypatch):
     # account_id → email.  In these tests account_id IS the email, so the fake
     # returns an AccountRecord with email == account_id.
     backoffice_state.auth_service = _FakeAuthService()
+    # v4.1.2 bug 2: wire a fake identity_registry so the gate can resolve
+    # email → identity_id (RBACStore.get_user_groups() is identity_id-keyed
+    # post-4.1 UID migration; without this, every lookup denies).
+    backoffice_state.identity_registry = _FakeIdentityRegistry()
 
     # Default to the authorised admin; tests override per-call where needed.
     app.dependency_overrides[require_admin_session] = lambda: _session(AUTHORISED_ADMIN)
@@ -132,6 +157,7 @@ def client(monkeypatch):
 
     backoffice_state.rbac_store = None
     backoffice_state.auth_service = None
+    backoffice_state.identity_registry = None
     docroutes._results.clear()
 
 

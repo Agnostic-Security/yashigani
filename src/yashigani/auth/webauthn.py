@@ -170,10 +170,9 @@ class WebAuthnService:
 
         # Build exclude list — prevent re-registering existing credentials
         existing = self._credential_store.list_for_user(user_id)
-        exclude_credentials = [
-            {"id": c.credential_id, "type": "public-key"}
-            for c in existing
-        ]
+        exclude_credentials = _build_credential_descriptors(
+            [c.credential_id for c in existing]
+        )
 
         options = webauthn.generate_registration_options(
             rp_id=effective_rp_id,
@@ -182,10 +181,7 @@ class WebAuthnService:
             user_name=user_name,
             challenge=challenge,
             exclude_credentials=exclude_credentials,
-            authenticator_selection=webauthn.AuthenticatorSelectionCriteria(
-                require_resident_key=cfg.require_resident_key,
-                user_verification=_map_uv(cfg.user_verification, webauthn),
-            ),
+            authenticator_selection=_build_authenticator_selection(cfg, webauthn),
             attestation=_map_attestation(cfg.attestation, webauthn),
         )
 
@@ -211,14 +207,14 @@ class WebAuthnService:
             raise ValueError("No pending registration challenge for this user.")
 
         try:
-            credential_json = _to_json_str(credential_response)
-            # py-webauthn v2.1+: parse_raw expects bytes; v1.x: expects str
-            try:
-                cred = webauthn.RegistrationCredential.parse_raw(credential_json.encode())
-            except (TypeError, AttributeError):
-                cred = webauthn.RegistrationCredential.parse_raw(credential_json)
+            # py-webauthn >=2.x: verify_registration_response accepts the raw
+            # dict/JSON directly and parses it internally via
+            # parse_registration_credential_json(). `RegistrationCredential
+            # .parse_raw()` is a Pydantic-v1-style classmethod that does not
+            # exist on the current (plain-dataclass) RegistrationCredential —
+            # constructing it by hand is both unnecessary and broken.
             verification = webauthn.verify_registration_response(
-                credential=cred,
+                credential=credential_response,
                 expected_challenge=challenge,
                 expected_rp_id=cfg.rp_id,
                 expected_origin=expected_origin,
@@ -258,10 +254,9 @@ class WebAuthnService:
 
         # Allow any registered credential for this user
         allowed = self._credential_store.list_for_user(user_id)
-        allow_credentials = [
-            {"id": c.credential_id, "type": "public-key"}
-            for c in allowed
-        ]
+        allow_credentials = _build_credential_descriptors(
+            [c.credential_id for c in allowed]
+        )
 
         options = webauthn.generate_authentication_options(
             rp_id=effective_rp_id,
@@ -307,13 +302,12 @@ class WebAuthnService:
             raise ValueError("Credential not found or does not belong to this user.")
 
         try:
-            auth_json = _to_json_str(credential_response)
-            try:
-                auth_cred = webauthn.AuthenticationCredential.parse_raw(auth_json.encode())
-            except (TypeError, AttributeError):
-                auth_cred = webauthn.AuthenticationCredential.parse_raw(auth_json)
+            # py-webauthn >=2.x: verify_authentication_response accepts the
+            # raw dict/JSON directly (parse_authentication_credential_json()
+            # internally). See complete_registration() for why manual
+            # AuthenticationCredential.parse_raw() construction was removed.
             verification = webauthn.verify_authentication_response(
-                credential=auth_cred,
+                credential=credential_response,
                 expected_challenge=challenge,
                 expected_rp_id=cfg.rp_id,
                 expected_origin=expected_origin,
@@ -355,28 +349,79 @@ class WebAuthnService:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+#
+# py-webauthn (installed range: >=2.1,<3 — see pyproject.toml) does NOT expose
+# AuthenticatorSelectionCriteria / UserVerificationRequirement /
+# AttestationConveyancePreference / RegistrationCredential /
+# AuthenticationCredential at the top-level `webauthn` module across the
+# entire practically-installable 2.x range (verified: 2.1.0 through 2.7.1,
+# the current uv.lock pin, all lack these at top level). They live under
+# `webauthn.helpers.structs`. The `webauthn` module argument is still threaded
+# through these helpers (rather than importing structs at module scope) so
+# `_import_webauthn()` remains the single choke point that raises the
+# friendly "pip install py-webauthn" error when the package is entirely
+# absent — these submodule imports only run once that import has already
+# succeeded.
 
 def _map_uv(user_verification: str, webauthn):
     """Map string to py_webauthn UserVerificationRequirement enum."""
+    from webauthn.helpers.structs import UserVerificationRequirement
+
     mapping = {
-        "required": webauthn.UserVerificationRequirement.REQUIRED,
-        "preferred": webauthn.UserVerificationRequirement.PREFERRED,
-        "discouraged": webauthn.UserVerificationRequirement.DISCOURAGED,
+        "required": UserVerificationRequirement.REQUIRED,
+        "preferred": UserVerificationRequirement.PREFERRED,
+        "discouraged": UserVerificationRequirement.DISCOURAGED,
     }
-    return mapping.get(user_verification, webauthn.UserVerificationRequirement.PREFERRED)
+    return mapping.get(user_verification, UserVerificationRequirement.PREFERRED)
 
 
 def _map_attestation(attestation: str, webauthn):
     """Map string to py_webauthn AttestationConveyancePreference enum."""
+    from webauthn.helpers.structs import AttestationConveyancePreference
+
     mapping = {
-        "none": webauthn.AttestationConveyancePreference.NONE,
-        "indirect": webauthn.AttestationConveyancePreference.INDIRECT,
-        "direct": webauthn.AttestationConveyancePreference.DIRECT,
-        "enterprise": webauthn.AttestationConveyancePreference.ENTERPRISE,
+        "none": AttestationConveyancePreference.NONE,
+        "indirect": AttestationConveyancePreference.INDIRECT,
+        "direct": AttestationConveyancePreference.DIRECT,
+        "enterprise": AttestationConveyancePreference.ENTERPRISE,
     }
-    return mapping.get(attestation, webauthn.AttestationConveyancePreference.NONE)
+    return mapping.get(attestation, AttestationConveyancePreference.NONE)
 
 
-def _to_json_str(obj: dict) -> str:
-    import json
-    return json.dumps(obj)
+def _build_authenticator_selection(cfg: "WebAuthnConfig", webauthn):
+    """Build an AuthenticatorSelectionCriteria from WebAuthnConfig.
+
+    Shared by webauthn.py's WebAuthnService.begin_registration and
+    pg_webauthn.py's PgWebAuthnService.begin_registration so both paths stay
+    in lockstep on the correct import location.
+    """
+    from webauthn.helpers.structs import AuthenticatorSelectionCriteria
+
+    return AuthenticatorSelectionCriteria(
+        require_resident_key=cfg.require_resident_key,
+        user_verification=_map_uv(cfg.user_verification, webauthn),
+    )
+
+
+def _build_credential_descriptors(credential_ids: "list[bytes]"):
+    """Build PublicKeyCredentialDescriptor objects for exclude_credentials /
+    allow_credentials.
+
+    `generate_registration_options()`/`generate_authentication_options()`
+    type-check these as `List[PublicKeyCredentialDescriptor]` and iterate
+    attribute access (`cred.id`, `cred.type`) internally
+    (webauthn/helpers/options_to_json_dict.py) -- passing plain `{"id":
+    ..., "type": "public-key"}` dicts (the old code, both here and in
+    pg_webauthn.py) raises `AttributeError: 'dict' object has no attribute
+    'id'` the moment a user has ANY existing credential (i.e. on every real
+    re-registration and every real authentication attempt with a previously
+    enrolled credential -- the normal case, not an edge case). Same API-shape
+    bug class as the AuthenticatorSelectionCriteria/UserVerificationRequirement
+    break; found via the regression test in
+    src/tests/regression/v4.1.2/test_tom_webauthn_pywebauthn_api_break.py
+    while proving begin_authentication against the real library with a
+    seeded credential.
+    """
+    from webauthn.helpers.structs import PublicKeyCredentialDescriptor
+
+    return [PublicKeyCredentialDescriptor(id=cid) for cid in credential_ids]
