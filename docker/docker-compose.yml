@@ -2124,7 +2124,13 @@ services:
   # ---------------------------------------------------------------------------
   postgres:
     dns_search: ["."]
-    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    # FRESH-INSTALL-BLOCKER fix (Su, 2026-07-24): the prior pin (sha256:7d400e340e...)
+    # was stale — upstream republished the 0.8.2-pg16 tag, so the old digest no
+    # longer matched what `docker.io/pgvector/pgvector:0.8.2-pg16` resolves to on
+    # a virgin machine with no image cache, breaking install.sh from-scratch.
+    # Re-verified live via `docker buildx imagetools inspect` 2026-07-24; same
+    # digest independently confirmed by Captain's k8s fix (helm/yashigani/values.yaml).
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
     # gate V232-SMOKE-018: pgvector/pgvector has no USER directive (defaults to
     # root). The postgres entrypoint then runs gosu/setpriv to switch from root
     # → postgres user, but `cap_drop: [ALL]` strips CAP_SETUID/SETGID/FOWNER —
@@ -2961,7 +2967,7 @@ services:
   #   0640) are readable as file owner. ca_root.crt is world-readable (0644).
   agent-db-init:
     dns_search: ["."]
-    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: docker.io/pgvector/pgvector:0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
     # UID 1001:1001 — same UID as gateway/backoffice Python apps.
     # backoffice_client.crt/key are chowned to 1001:1001 0600 by install.sh
     # (pki_ownership.sh: "backoffice:1001:0600"). postgres_password is 1001:999 0640
