@@ -241,7 +241,15 @@ class TestBlockedProbesDoNotSelfExtend:
                 mod._apply_auth_throttle(ip, username, account_id, resp)
 
             assert int(r.get(acct_throttle_key)) == 1
-            assert r.ttl(acct_throttle_key) > 800  # freshly set to ~900s
+            # AVA-RETRYAFTER fix (2026-07-24): level 1's escalation-level key
+            # is now given the level-1 TTL (30s, matching the Retry-After
+            # header) rather than the flat 900s window this assertion used
+            # to expect — that flat-900 behaviour WAS the RFC 6585 bug (see
+            # fix/v412-throttle-retryafter). AVA-412-DOS's self-extend
+            # invariant (proven below) is orthogonal to which TTL value is
+            # used at set-time — it only requires the TTL never jumps back
+            # UP once set.
+            assert 0 < r.ttl(acct_throttle_key) <= 30  # freshly set to ~30s (level 1)
 
             # Simulate the window having nearly elapsed (5s left) — stands
             # in for ~895s of real elapsed wall-clock time.
