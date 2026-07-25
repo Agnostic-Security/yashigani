@@ -36,6 +36,29 @@ _REDACTION = "[REDACTED: system prompt]"
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
+def load_corpus_lines(path: str) -> list[str]:
+    """Read a protected-system-prompts file: one prompt per line.
+
+    TD-2026-07-25-05: blank lines AND `#`-prefixed comment lines are skipped
+    — they are not prompts. Without this, a demo/operator asset with a
+    header comment block (see scripts/demo-assets/protected-system-prompts.txt)
+    silently loads the comment lines as if they were protected prompts,
+    inflating the reported corpus count and contributing over-broad,
+    unrelated shingles to the leak-detection window — which could cause a
+    spurious scrub match against ordinary output. This is a hygiene fix
+    (over-counting), not a security bypass: it cannot cause a real leak to
+    go undetected, only (at most) a false-positive scrub of innocent text.
+    """
+    prompts: list[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            prompts.append(line)
+    return prompts
+
+
 def _normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold()
 

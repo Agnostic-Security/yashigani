@@ -1,4 +1,6 @@
-# 5.0 A4 demo — protected system prompts (one per line, blank lines ignored).
+# 5.0 A4 demo — protected system prompts (one per line, blank lines ignored,
+# and lines starting with '#' are comments and are also ignored — see
+# yashigani.inspection.system_prompt_guard.load_corpus_lines).
 # Point YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE at this file. If a model echoes
 # any of these back in a response, the leaked run is scrubbed + audited.
 # These match the demo persona prompts seeded by populate-demo.py (Mimi/PaulBot).

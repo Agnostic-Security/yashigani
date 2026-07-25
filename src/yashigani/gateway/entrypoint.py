@@ -157,13 +157,18 @@ def _build_app(mesh_mode: bool = False):
     # operator's protected system-prompt(s), one per line in the file named by
     # YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE. Unset/empty → guard is a no-op
     # (honest: it only protects what the operator registers).
-    from yashigani.inspection.system_prompt_guard import SystemPromptLeakGuard
+    from yashigani.inspection.system_prompt_guard import (
+        SystemPromptLeakGuard,
+        load_corpus_lines,
+    )
     system_prompt_leak_guard = SystemPromptLeakGuard()
     _sp_file = os.getenv("YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE", "").strip()
     if _sp_file:
         try:
-            with open(_sp_file, "r", encoding="utf-8") as _spf:
-                _prompts = [ln.strip() for ln in _spf if ln.strip()]
+            # TD-2026-07-25-05: load_corpus_lines() skips blank lines AND
+            # `#`-comment lines — a header comment block in the file is not
+            # a protected prompt.
+            _prompts = load_corpus_lines(_sp_file)
             system_prompt_leak_guard.set_corpus(_prompts)
             logger.info(
                 "A4 system-prompt leak guard: %d protected prompt(s) loaded from %s",
