@@ -290,6 +290,15 @@ async def record_ceremony(
         )
 
     # -- Write to manifest_registrations
+    #
+    # LAURA-V50-005: body.operator_identity is client-supplied free text (a
+    # JWT-sub string, or "unknown") and is stored verbatim as audit
+    # provenance ONLY. The rug-pull re-approval gate's SoD comparison key
+    # MUST be the calling admin's server-verified session identity
+    # (StepUpAdminSession.account_id) — the same identity namespace
+    # POST /admin/model-security/manifest/approve compares approver_id
+    # against — so a single admin can never register-then-self-approve a
+    # manifest delta.
     svc = _get_registry_service()
     try:
         record_id = await svc.register(
@@ -298,6 +307,7 @@ async def record_ceremony(
             manifest_yaml=body.manifest_yaml,
             operator_identity=body.operator_identity,
             signature_provenance=body.signature_provenance,
+            registrant_account_id=session.account_id,
         )
     except ValueError as exc:
         raise HTTPException(
