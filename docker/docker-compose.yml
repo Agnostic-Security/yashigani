@@ -255,6 +255,26 @@ services:
       # admitted IDs from the per-instance trust domain.
       YASHIGANI_LANGFLOW_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/langflow
       YASHIGANI_LETTA_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/letta
+      # YSG-RISK/TD-2026-07-25-05: the :18790 gateway-egress-deliver-gate
+      # (Caddyfile.openclaw-egress) admits ONLY the gateway's own mesh leaf on
+      # /deliver/llm|slack|slack-hooks/telegram/*. Unlike its three siblings
+      # above, this var was NEVER composed from the per-instance trust domain —
+      # the snippet's inline default (`spiffe://yashigani.internal/gateway`)
+      # silently took over on every install, permanently mismatching the REAL
+      # gateway leaf SAN (`spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN}/gateway`,
+      # per service_identities.yaml + install.sh cert issuance) on any
+      # multi-instance / per-install trust domain (i.e. every real deployment,
+      # since the legacy bare "yashigani.internal" default only matches a
+      # single hardcoded legacy value). Root cause of the @letta / @langflow
+      # /v1/models 403 loop (egress-eval logs ALLOW, but upstream_status=403 —
+      # the Caddy static caller-gate denies the /deliver hop BEFORE the
+      # request ever reaches the gateway's Python OPA-backed models_list
+      # check). K8s/Helm is unaffected: templates/configmaps.yaml rewrites the
+      # literal "spiffe://yashigani.internal/" substring (including this
+      # snippet's inline default) to the real trust domain at render time —
+      # compose has no equivalent substitution, so the env var is load-bearing
+      # here. Fixed by composing it the SAME way as its three siblings.
+      YASHIGANI_GATEWAY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/gateway
       # v4.1 Phase 1c (LAURA-I1-03): when "1" (install.sh sets it iff the
       # openclaw profile is enabled), caddy-entrypoint.sh appends
       # slack.com:443 hooks.slack.com:443 api.telegram.org:443 to the iptables
