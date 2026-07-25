@@ -174,12 +174,15 @@ class _StubAuthService:
         return None
 
 
-def _make_registry_stub(plaintext_key="yk_test_plaintext_key_1234"):
+def _make_registry_stub(plaintext_key="yk_test_plaintext_key_1234", key_exists=True):
     """
     MagicMock IdentityRegistry with:
       - get_by_slug → returns a HUMAN identity dict
       - rotate_key  → returns the given plaintext_key
       - get         → returns registry data with metadata fields
+      - has_key / revoke_key — LAURA-4.1.2-010: backs the self-service
+        list/revoke routes. Defaults to key_exists=True so existing tests
+        that assume a pre-seeded key keep passing.
     """
     registry = MagicMock()
     identity = {
@@ -196,6 +199,8 @@ def _make_registry_stub(plaintext_key="yk_test_plaintext_key_1234"):
     registry.get = MagicMock(return_value=identity)
     registry.rotate_key = MagicMock(return_value=plaintext_key)
     registry.register = MagicMock(return_value=("idnt_abc123", plaintext_key))
+    registry.has_key = MagicMock(return_value=key_exists)
+    registry.revoke_key = MagicMock(return_value=key_exists)
     return registry
 
 
@@ -707,7 +712,16 @@ class TestDeleteMeApiKeyRevokes:
         finally:
             _teardown(originals)
 
-    def test_delete_removes_redis_key(self):
+    def test_delete_routes_through_registry_not_session_store_redis(self):
+        """
+        LAURA-4.1.2-010: identity:key:{identity_id} is owned by the
+        IdentityRegistry (Redis db/3) — NOT session_store._redis (db/1).
+
+        Regression: if the route reverts to deleting via
+        session_store._redis, this test fails because registry.revoke_key
+        is never called with the caller's identity_id — the exact silent
+        no-op that made "revoked" keys stay valid forever.
+        """
         from fastapi.testclient import TestClient
 
         record = _StubRecord(
@@ -717,18 +731,33 @@ class TestDeleteMeApiKeyRevokes:
         registry = _make_registry_stub()
         app, ss, audit, redis, originals = _build_me_app(record, registry=registry)
         try:
-            # Verify key exists before delete
-            assert redis.get("identity:key:idnt_abc123") is not None, (
-                "Test setup error: expected key in Redis before delete"
-            )
-
             client = TestClient(app, raise_server_exceptions=True)
             resp = client.delete("/me/api-keys/idnt_abc123")
             assert resp.status_code == 204
 
-            # Key must be gone after delete
-            assert redis.get("identity:key:idnt_abc123") is None, (
-                "REGRESSION: identity:key not deleted after revocation"
+            registry.revoke_key.assert_called_once_with("idnt_abc123")
+        finally:
+            _teardown(originals)
+
+    def test_delete_returns_404_when_registry_has_no_key(self):
+        """
+        registry.revoke_key() returning False (nothing to revoke) must 404 —
+        proves the route trusts the registry's return value, not a
+        different Redis client's state.
+        """
+        from fastapi.testclient import TestClient
+
+        record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        registry = _make_registry_stub(key_exists=False)
+        app, ss, audit, redis, originals = _build_me_app(record, registry=registry)
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.delete("/me/api-keys/idnt_abc123")
+            assert resp.status_code == 404, (
+                f"Expected 404 when registry has no key, got {resp.status_code}: {resp.text}"
             )
         finally:
             _teardown(originals)
@@ -1143,5 +1172,160 @@ class TestAuditEventsNeverLogPlaintext:
             assert len(events_with_plaintext) == 0, (
                 f"REGRESSION: audit event contains plaintext token: {events_with_plaintext}"
             )
+        finally:
+            _teardown(originals)
+
+
+# ---------------------------------------------------------------------------
+# LAURA-4.1.2-010 — real IdentityRegistry (fakeredis db/3) wired alongside a
+# SEPARATE DB/1-like stub for session_store, proving list/revoke go through
+# the registry and not the wrong Redis client.
+#
+# This deliberately does NOT use the MagicMock registry stub above: a mocked
+# registry cannot expose the "revoke deleted the wrong DB" bug, because a
+# mock has no real backing store to get out of sync. Wiring a real
+# IdentityRegistry(fakeredis) + a genuinely separate session-store Redis stub
+# reproduces the production topology (registry db/3 vs session_store db/1)
+# closely enough that the original bug (silent no-op revoke, ghost key
+# staying valid) would have failed this test.
+# ---------------------------------------------------------------------------
+
+class TestLaura412010FullRoundTripThroughRealRegistry:
+    """
+    issue -> list (shows it) -> revoke -> verify old key now rejected via
+    registry.verify_key() (401-equivalent) AND list shows [].
+
+    Regression: pre-fix, list_api_keys/revoke_api_key read/deleted
+    identity:key:{identity_id} via session_store._redis (db/1) while the key
+    actually lives in registry._r (db/3, the same client rotate_key/verify_key
+    use). GET always returned [] and DELETE always 404'd, but the key kept
+    verifying successfully forever -- a silent revoke no-op.
+    """
+
+    def _build_real_app(self, record):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("fakeredis")
+        import fakeredis
+        from fastapi import FastAPI
+        from yashigani.backoffice import state as state_mod
+        from yashigani.backoffice.routes import me as me_mod
+        from yashigani.backoffice import middleware as mw_mod
+        from yashigani.identity import IdentityRegistry, IdentityKind
+
+        orig_auth = state_mod.backoffice_state.auth_service
+        orig_session = state_mod.backoffice_state.session_store
+        orig_audit = state_mod.backoffice_state.audit_writer
+        orig_registry = state_mod.backoffice_state.identity_registry
+
+        # db/3 equivalent: the REAL registry, backed by fakeredis.
+        registry_redis = fakeredis.FakeRedis()
+        registry = IdentityRegistry(registry_redis)
+        identity_id, _initial_key = registry.register(
+            kind=IdentityKind.HUMAN,
+            name=record.username,
+            slug="alice-example-com",
+        )
+
+        # db/1 equivalent: a totally separate Redis stub for the session store.
+        # This must NEVER be touched by list/revoke — if it is, the fix has
+        # regressed back to reading/deleting the wrong DB.
+        session_redis = _StubRedis()
+        stub_session_store = _StubSessionStore(redis=session_redis)
+        stub_audit = _StubAuditWriter()
+        stub_auth = _StubAuthService(record)
+
+        state_mod.backoffice_state.auth_service = stub_auth
+        state_mod.backoffice_state.session_store = stub_session_store
+        state_mod.backoffice_state.audit_writer = stub_audit
+        state_mod.backoffice_state.identity_registry = registry
+
+        app = FastAPI()
+        app.include_router(me_mod.router)
+
+        user_session = _make_session(record.account_id, record.account_tier, stepup_age=60.0)
+
+        async def _override_any_session():
+            return user_session
+
+        app.dependency_overrides[mw_mod.require_any_session] = _override_any_session
+
+        originals = (orig_auth, orig_session, orig_audit, orig_registry)
+        return app, registry, identity_id, session_redis, originals
+
+    def test_issue_list_revoke_round_trip(self):
+        from fastapi.testclient import TestClient
+
+        record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        app, registry, identity_id, session_redis, originals = self._build_real_app(record)
+        try:
+            client = TestClient(app, raise_server_exceptions=True)
+
+            # 1. Issue a key
+            resp = client.post("/me/api-key")
+            assert resp.status_code == 200, f"Issue failed: {resp.text}"
+            token = resp.json()["plaintext_token"]
+
+            # Sanity: the real registry (db/3) verifies the freshly issued token.
+            assert registry.verify_key(identity_id, token) is True, (
+                "Test setup error: freshly issued token does not verify"
+            )
+
+            # 2. List — must show exactly one key
+            resp = client.get("/me/api-keys")
+            assert resp.status_code == 200
+            keys = resp.json()["api_keys"]
+            assert len(keys) == 1, f"Expected 1 key after issuance, got: {keys}"
+            key_id = keys[0]["key_id"]
+            assert key_id == identity_id
+
+            # 3. Revoke
+            resp = client.delete(f"/me/api-keys/{key_id}")
+            assert resp.status_code == 204, f"Revoke failed: {resp.text}"
+
+            # 4. The revoked token must NO LONGER verify against the real
+            # registry -- this is the actual authentication path used by
+            # every other route (proves revoke is not a silent no-op).
+            assert registry.verify_key(identity_id, token) is False, (
+                "REGRESSION (LAURA-4.1.2-010): revoked API key still "
+                "verifies successfully against the IdentityRegistry -- "
+                "revoke was a silent no-op."
+            )
+
+            # 5. List must now show empty.
+            resp = client.get("/me/api-keys")
+            assert resp.status_code == 200
+            assert resp.json()["api_keys"] == [], (
+                "REGRESSION (LAURA-4.1.2-010): list still shows a key after revoke."
+            )
+
+            # 6. The session-store's Redis (db/1 stand-in) must never have
+            # been touched by list/revoke -- it should remain completely
+            # empty of identity:key:* entries.
+            assert session_redis.get(f"identity:key:{identity_id}") is None
+            assert session_redis.get(f"identity:key:grace:{identity_id}") is None
+        finally:
+            _teardown(originals)
+
+    def test_list_before_any_issuance_is_empty(self):
+        """No key ever issued -> GET returns [] via the real registry path."""
+        from fastapi.testclient import TestClient
+
+        record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        app, registry, identity_id, session_redis, originals = self._build_real_app(record)
+        try:
+            # register() issues an initial key as part of HUMAN registration;
+            # explicitly revoke it first so we start from "no key" state.
+            registry.revoke_key(identity_id)
+
+            client = TestClient(app, raise_server_exceptions=True)
+            resp = client.get("/me/api-keys")
+            assert resp.status_code == 200
+            assert resp.json()["api_keys"] == []
         finally:
             _teardown(originals)
