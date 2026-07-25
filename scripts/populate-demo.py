@@ -59,17 +59,66 @@ DEFAULT_LOCAL_MODEL = os.environ.get("YASHIGANI_DEMO_LOCAL_MODEL", "qwen2.5:3b")
 # ORCHID_* == primary admin, ASPEN_* == backup/break-glass admin (names kept so
 # the rest of the script is unchanged).
 import re as _re
+def _read_secrets_dir_creds():
+    """Primary source: the compose/docker secrets directory the installer writes
+    (install.sh writes adminN_username / adminN_password / adminN_totp_secret;
+    the server bootstrap seeds admin1's login pw as admin_initial_password, which
+    equals admin1_password). This is the current source of truth for a docker/
+    podman deploy — the human-readable completion box is NOT in the install log on
+    a non-interactive install, which is why log-scraping went stale.
+
+    Honours YASHIGANI_DEMO_SECRETS_DIR; otherwise probes the conventional
+    docker/secrets locations relative to the script + CWD. Returns the two
+    (user, initial_pw, totp) triples, or None if the layout isn't present."""
+    candidates = []
+    env_dir = os.environ.get("YASHIGANI_DEMO_SECRETS_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    _here = Path(__file__).resolve().parent
+    candidates += [
+        _here.parent / "docker" / "secrets",   # <repo>/docker/secrets
+        DEMO_DIR / "docker" / "secrets",
+        Path.cwd() / "docker" / "secrets",
+    ]
+    for d in candidates:
+        try:
+            if not (d / "admin1_username").exists():
+                continue
+            def _rd(name):
+                return (d / name).read_text().strip()
+            # admin1 initial login pw: prefer admin_initial_password (what the
+            # server bootstrap seeds); fall back to admin1_password (same value).
+            a1_pw = (d / "admin_initial_password")
+            a1_pw = a1_pw.read_text().strip() if a1_pw.exists() else _rd("admin1_password")
+            primary = (_rd("admin1_username"), a1_pw, _rd("admin1_totp_secret"))
+            backup = (_rd("admin2_username"), _rd("admin2_password"), _rd("admin2_totp_secret"))
+            if all(primary) and all(backup):
+                print(f"  [creds] source=secrets-dir ({d})")
+                return primary, backup
+        except Exception as _e:
+            print(f"  [creds] secrets-dir {d} unreadable ({_e}) — trying next source")
+    return None
+
+
 def _parse_admin_creds():
+    # Preferred: the installer's secrets directory (docker/podman deploy).
+    from_secrets = _read_secrets_dir_creds()
+    if from_secrets is not None:
+        return from_secrets
+    # Fallback: scrape the human-readable completion box from the install log
+    # (interactive/VM path where the box is captured to the log).
     lp = DEMO_DIR / ".last-install-log"
     log = Path(lp.read_text().strip()) if lp.exists() else None
     if not log or not log.exists():
-        sys.exit("FATAL: cannot find install log via .last-install-log")
+        sys.exit("FATAL: cannot find admin creds — no secrets dir "
+                 "(set YASHIGANI_DEMO_SECRETS_DIR) and no install log via .last-install-log")
     txt = log.read_text(errors="ignore")
     users = _re.findall(r"Username:\s+(\S+)", txt)
     pws = _re.findall(r"Password:\s+(\S+)", txt)
     totps = _re.findall(r"TOTP secret:\s+(\S+)", txt)
     if len(users) < 2 or len(pws) < 2 or len(totps) < 2:
         sys.exit(f"FATAL: parse failed users={len(users)} pws={len(pws)} totps={len(totps)}")
+    print("  [creds] source=install-log")
     return (users[0], pws[0], totps[0]), (users[1], pws[1], totps[1])
 (_PU, _PP, _PT), (_BU, _BP, _BT) = _parse_admin_creds()
 ORCHID_USER = _PU
@@ -92,8 +141,28 @@ S.verify = False
 # TOTP helpers
 # ---------------------------------------------------------------------------
 
+def _totp_code(secret: str, algorithm: str, digits: int) -> str:
+    """RFC 6238 TOTP for an explicit algorithm + digit count. The server is
+    role-tiered (auth/totp.py): admins = HMAC-SHA-512/8-digit, users =
+    HMAC-SHA-256/6-digit. pyotp's default (SHA-1/6) does NOT match either tier,
+    so we compute the HOTP directly with the correct digest."""
+    import base64 as _b64
+    import hashlib as _hl
+    import hmac as _hmac
+    import struct as _struct
+    _digest = {"SHA1": _hl.sha1, "SHA256": _hl.sha256, "SHA512": _hl.sha512}[algorithm.upper()]
+    pad = (8 - len(secret) % 8) % 8
+    raw_secret = _b64.b32decode(secret.upper() + "=" * pad)
+    counter = int(time.time()) // 30
+    h = _hmac.new(raw_secret, _struct.pack(">Q", counter), _digest).digest()
+    offset = h[-1] & 0x0F
+    code = _struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % 10 ** digits).zfill(digits)
+
+
 def _totp(secret: str) -> str:
-    return pyotp.TOTP(secret).now()
+    """Admin-tier code — HMAC-SHA-512, 8 digits (auth/totp.py ROLE_TOTP_ALGO)."""
+    return _totp_code(secret, "SHA512", 8)
 
 
 def _fresh_totp(secret: str, label: str) -> str:
@@ -1317,20 +1386,8 @@ def step13b_cloud9_demo_wire() -> None:
 # ---------------------------------------------------------------------------
 
 def _user_totp_sha256(secret: str) -> str:
-    """Compute SHA256/6-digit TOTP (standard user-tier algo)."""
-    import base64 as _b64
-    import hashlib as _hl
-    import hmac as _hmac
-    import struct as _struct
-    import time as _time
-    pad = (8 - len(secret) % 8) % 8
-    raw_secret = _b64.b32decode(secret.upper() + "=" * pad)
-    t = int(_time.time()) // 30
-    msg = _struct.pack(">Q", t)
-    h = _hmac.new(raw_secret, msg, _hl.sha256).digest()
-    offset = h[-1] & 0x0F
-    code = _struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
-    return str(code % 10 ** 6).zfill(6)
+    """User-tier code — HMAC-SHA-256, 6 digits (auth/totp.py ROLE_TOTP_ALGO)."""
+    return _totp_code(secret, "SHA256", 6)
 
 
 def _user_login_session(email: str, username: str, password: str, totp_secret: str) -> requests.Session:
@@ -1960,7 +2017,7 @@ def step14_verify_aspen() -> None:
     aspen_session.verify = False
 
     _wait_next_totp_window("aspen-verify")
-    code = pyotp.TOTP(ASPEN_TOTP_SECRET).now()
+    code = _totp(ASPEN_TOTP_SECRET)  # backup admin — also SHA-512/8-digit
     r = aspen_session.post(f"{BASE_URL}/auth/login", json={
         "username": ASPEN_USER,
         "password": aspen_pw,
