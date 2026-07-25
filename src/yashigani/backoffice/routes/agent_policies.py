@@ -345,18 +345,32 @@ def _registry_store():
     # In the backoffice, we access it via the gateway's durable store if available,
     # or instantiate one from the shared Redis connection.
     # Pattern: check backoffice_state for a wired store (future integration),
-    # then fall back to constructing one from the YASHIGANI_REDIS_URL env.
+    # then fall back to constructing one via the TLS-aware build_redis_url()
+    # helper — same Redis db/3 the gateway uses.
     store = getattr(backoffice_state, "mcp_registry_store", None)
     if store is not None:
         return store
-    # Construct from env — same Redis db/3 the gateway uses.
+    # LAURA-V50-002: this previously fell back to a hardcoded plaintext
+    # redis://redis:6379/3 URL if YASHIGANI_REDIS_URL was unset — unreachable
+    # against this deployment's TLS-only Redis (6380). docker-compose.yml
+    # DOES set YASHIGANI_REDIS_URL correctly for the backoffice service today
+    # (rediss://...:6380/3 with backoffice_client cert), so this exact path
+    # was not observed broken live — but the plaintext fallback was a latent
+    # trap for any deploy that omits the env var. Route through the same
+    # TLS-aware builder every other backoffice Redis client uses instead of
+    # keeping a parallel non-TLS code path alive.
     try:
         import redis as _redis  # noqa: PLC0415
+        from yashigani.gateway._redis_url import build_redis_url  # noqa: PLC0415
         from yashigani.mcp._durable_registry import DurableMcpRegistryStore  # noqa: PLC0415
-        redis_url = os.environ.get("YASHIGANI_REDIS_URL", "redis://redis:6379/3")
-        # Force db/3 if not in URL
-        if "/3" not in redis_url.split("?")[0]:
-            redis_url = redis_url.rstrip("/0123456789") + "/3"
+        redis_use_tls = os.getenv("REDIS_USE_TLS", "true").lower() == "true"
+        secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+        redis_url = build_redis_url(
+            3,
+            use_tls=redis_use_tls,
+            secrets_dir=secrets_dir,
+            client_cert_name="backoffice_client",
+        )
         r = _redis.Redis.from_url(redis_url)
         return DurableMcpRegistryStore(r)
     except Exception as exc:

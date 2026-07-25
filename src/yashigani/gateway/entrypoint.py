@@ -69,6 +69,28 @@ def _build_app(mesh_mode: bool = False):
         on_audit=cast(Callable[..., object], audit_writer),  # AuditLogWriter is callable at runtime
     )
 
+    # Redis URL helper — all DB-specific URLs are built by build_redis_url().
+    # v2.23.1: TLS-only (rediss://) with client cert authentication. Redis
+    # rejects plaintext connections (port 0 in redis.conf).
+    # See gateway/_redis_url.py for cert-path and DB-ordering rationale.
+    # LAURA-V50-002: hoisted above the A5/conversation-risk/rule-promotion
+    # blocks below (previously those blocks pre-dated this helper's
+    # definition and used a hardcoded plaintext redis://redis:6379 fallback
+    # that never matches the TLS-only deployment — 100%-reproducible outage).
+    from yashigani.gateway._redis_url import build_redis_url
+    secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    redis_use_tls = os.getenv("REDIS_USE_TLS", "true").lower() == "true"
+
+    def _gw_redis_url(db: int, host: str | None = None, port: str | None = None) -> str:
+        return build_redis_url(
+            db,
+            host=host,
+            port=port,
+            use_tls=redis_use_tls,
+            secrets_dir=secrets_dir,
+            client_cert_name="gateway_client",
+        )
+
     # Inspection pipeline
     ollama_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
@@ -183,10 +205,14 @@ def _build_app(mesh_mode: bool = False):
         from yashigani.inspection.model_integrity import (
             ModelPinStore, ModelIntegrityVerifier,
         )
-        _mi_redis = _redis_mi.from_url(
-            os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
-            decode_responses=False,
-        )
+        # LAURA-V50-002: was a hardcoded plaintext redis://redis:6379/1
+        # fallback — never reachable against this deployment's TLS-only
+        # Redis (6380), causing a 100%-reproducible A5 fail-closed block of
+        # every local-model completion. Routed through the same TLS-aware
+        # builder every other gateway Redis client uses (DB 1, shared with
+        # the JWT inspector / settings pubsub / model-alias store — distinct
+        # key namespace "yashigani:model:pin:", no collision).
+        _mi_redis = _redis_mi.from_url(_gw_redis_url(1), decode_responses=False)
         model_integrity_verifier = ModelIntegrityVerifier(
             ModelPinStore(_mi_redis), audit_writer=audit_writer,
         )
@@ -271,10 +297,11 @@ def _build_app(mesh_mode: bool = False):
         _cr_redis = None
         try:
             import redis as _redis_cr
-            _cr_redis = _redis_cr.from_url(
-                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
-                decode_responses=False,
-            )
+            # LAURA-V50-002: was the same hardcoded plaintext 6379/1 fallback
+            # as the A5 client above — fails OPEN here (per-process fallback
+            # below), which silently defeated the multi-turn slow-burn
+            # detector across replicas. DB 1, key namespace "yashigani:convrisk:".
+            _cr_redis = _redis_cr.from_url(_gw_redis_url(1), decode_responses=False)
         except Exception as _cr_exc:
             logger.warning(
                 "conversation-risk: Redis unavailable (%s) — per-process accumulator "
@@ -297,10 +324,9 @@ def _build_app(mesh_mode: bool = False):
             from yashigani.inspection.rule_promotion import (
                 RulePromotionStore, PromotedRuleset,
             )
-            _rp_redis = _redis_rp.from_url(
-                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
-                decode_responses=False,
-            )
+            # LAURA-V50-002: was the same hardcoded plaintext 6379/1 fallback.
+            # DB 1, key namespace "yashigani:rulepromo:".
+            _rp_redis = _redis_rp.from_url(_gw_redis_url(1), decode_responses=False)
             rule_promotion_store = RulePromotionStore(_rp_redis, audit_writer=audit_writer)
             promoted_ruleset = PromotedRuleset(rule_promotion_store)
             promoted_ruleset.refresh()
@@ -330,23 +356,8 @@ def _build_app(mesh_mode: bool = False):
         opa_url=opa_url,
     )
 
-    # Redis URL helper — all DB-specific URLs are built by build_redis_url().
-    # v2.23.1: TLS-only (rediss://) with client cert authentication. Redis
-    # rejects plaintext connections (port 0 in redis.conf).
-    # See gateway/_redis_url.py for cert-path and DB-ordering rationale.
-    from yashigani.gateway._redis_url import build_redis_url
-    secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
-    redis_use_tls = os.getenv("REDIS_USE_TLS", "true").lower() == "true"
-
-    def _gw_redis_url(db: int, host: str | None = None, port: str | None = None) -> str:
-        return build_redis_url(
-            db,
-            host=host,
-            port=port,
-            use_tls=redis_use_tls,
-            secrets_dir=secrets_dir,
-            client_cert_name="gateway_client",
-        )
+    # Redis URL helper (_gw_redis_url) is defined above, hoisted ahead of the
+    # A5/conversation-risk/rule-promotion blocks — see LAURA-V50-002 comment there.
 
     # Rate limiter — Redis DB 2
     _rl_fail_mode = cast(Literal["open", "closed"], resolve_rate_limit_fail_mode())
@@ -1226,10 +1237,9 @@ def _build_app(mesh_mode: bool = False):
         try:
             import redis as _redis_rp2
             from yashigani.mcp.manifest_reapproval import ManifestReapprovalGate
-            _rp2_redis = _redis_rp2.from_url(
-                os.getenv("YASHIGANI_REDIS_URL", "redis://redis:6379/1"),
-                decode_responses=False,
-            )
+            # LAURA-V50-002: was the same hardcoded plaintext 6379/1 fallback.
+            # DB 1, key namespace "yashigani:manifest:".
+            _rp2_redis = _redis_rp2.from_url(_gw_redis_url(1), decode_responses=False)
             _manifest_reapproval_gate = ManifestReapprovalGate(
                 _rp2_redis, audit_writer=audit_writer)
         except Exception as _rp2_exc:
