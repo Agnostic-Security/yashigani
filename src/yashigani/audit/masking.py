@@ -46,6 +46,39 @@ AUDIT_INTEGRITY_EVENTS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Hash/digest field names — NEVER masked, regardless of event type
+#
+# LAURA-V50-003(b): the generic 32-64 char hex pattern below exists to catch
+# unlabelled secrets, but a SHA-256 hexdigest IS a 32-64 char hex string by
+# definition — so the pattern was matching the schema's own integrity/
+# attribution fields (content_hash, response_content_hash, manifest_digest,
+# weights_sha256, etc.) and rewriting them to the literal string
+# "[REDACTED:api_key]" on every masked event, destroying the
+# non-repudiation guarantee those fields exist to provide.
+#
+# Field-name suffix denylist rather than an explicit field list: any field
+# documented as "SHA-256/SHA-384 of X" or "hash of X" in schema.py follows
+# one of these naming conventions, and a suffix denylist keeps new hash/
+# digest fields safe by construction instead of requiring every future
+# field to remember to opt out of masking individually.
+# ---------------------------------------------------------------------------
+
+_HASH_FIELD_SUFFIXES: tuple[str, ...] = (
+    "_hash",
+    "_hash_tail",   # e.g. old_hash_tail / new_hash_tail (Argon2id hash tail)
+    "_digest",
+    "_sha256",
+    "_sha384",
+    "_sha512",
+)
+
+
+def _is_hash_field(field_name: str) -> bool:
+    """True if `field_name` holds a hash/digest value that must never be masked."""
+    return field_name.endswith(_HASH_FIELD_SUFFIXES)
+
+
+# ---------------------------------------------------------------------------
 # Regex patterns — compiled once at module import
 # ---------------------------------------------------------------------------
 
@@ -56,6 +89,13 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     # Bearer token in header/string
     (re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', re.IGNORECASE),
      "[REDACTED:bearer]"),
+    # LAURA-V50-003(a): labelled plain-password disclosure — "password is X",
+    # "password: X", "pwd=X". Plain passwords don't match any vendor-format
+    # pattern below (not hex, no known key prefix), so they previously leaked
+    # in cleartext into forensically-captured audit content. Keeps the label
+    # (attack structure) but drops the value.
+    (re.compile(r'(?i)\b(password|passwd|pwd)\b\s*(?:is\s+|[:=]\s*)[\'"]?[^\s\'",;]+'),
+     r'\1: [REDACTED:password]'),
     # OpenAI / Anthropic / generic sk- keys
     (re.compile(r'sk-[A-Za-z0-9]{20,}'),
      "[REDACTED:api_key]"),
@@ -110,10 +150,17 @@ class CredentialMasker:
         """
         Return a shallow-copied event with all string fields masked.
         Non-string fields are left unchanged.
+        Hash/digest fields (content_hash, response_content_hash,
+        manifest_digest, weights_sha256, etc. — see _is_hash_field) are
+        NEVER masked: they carry a computed integrity value, not free-form
+        content, and the generic hex-secret pattern would otherwise rewrite
+        every SHA-256 hexdigest to a static placeholder (LAURA-V50-003(b)).
         raw_query_logged is always forced to False.
         """
         cloned = copy.copy(event)
         for f in dataclasses.fields(cloned):
+            if _is_hash_field(f.name):
+                continue
             val = getattr(cloned, f.name)
             if isinstance(val, str):
                 setattr(cloned, f.name, self.mask_string(val))
