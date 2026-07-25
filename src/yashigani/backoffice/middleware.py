@@ -6,7 +6,9 @@ Last updated: 2026-06-27T00:00:00+01:00
 """
 from __future__ import annotations
 
+import os
 from typing import Annotated, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, status, Request
 
@@ -15,6 +17,92 @@ from yashigani.auth.stepup import assert_fresh_stepup
 
 _SESSION_COOKIE = "__Host-yashigani_admin_session"
 _USER_SESSION_COOKIE = "__Host-yashigani_session"
+
+# TD-2026-07-25-04 (Ava): CSRF Origin/Referer not server-validated.
+#
+# State-changing methods where a forged cross-site Origin gets a
+# defense-in-depth reject. GET/HEAD/OPTIONS/TRACE are read-only by HTTP
+# semantics and are intentionally excluded (a cross-site GET has no
+# mutating effect and browsers routinely omit Origin on top-level GET
+# navigations).
+_CSRF_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _configured_public_hosts() -> frozenset[str]:
+    """Hostnames this backoffice deployment is reachable at, for CSRF Origin
+    validation.
+
+    Deliberately duplicates routes/webauthn_v1.py::_configured_public_hosts
+    (same YASHIGANI_TLS_DOMAIN + "localhost" allowlist) rather than importing
+    it — routes/ imports FROM backoffice/middleware.py, so the reverse import
+    would be a backwards layering dependency. Same rationale as the
+    pki/ssl_context.py::_extract_spiffe_uris duplication elsewhere in this
+    codebase.
+    """
+    domain = os.getenv("YASHIGANI_TLS_DOMAIN", "localhost").strip().lower()
+    hosts = {"localhost"}
+    if domain:
+        hosts.add(domain)
+    return frozenset(hosts)
+
+
+def _origin_is_same_site(origin: str) -> bool:
+    """True if the Origin header's hostname matches this deployment's
+    configured public-host allowlist (YASHIGANI_TLS_DOMAIN + "localhost").
+
+    Deliberately hostname-only (not scheme/port): the browser's Origin
+    header is only ever attacker-controlled by navigating to a DIFFERENT
+    site, never by picking a different port on OUR site, so a same-hostname
+    check is sufficient to reject cross-site senders without also rejecting
+    legitimate same-site requests that arrive on a non-default port (e.g.
+    the self-signed dev default https://localhost:8443).
+    """
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    return hostname in _configured_public_hosts()
+
+
+def _enforce_csrf_origin(request: Request) -> None:
+    """ASVS V4.2.2 / CWE-352 defense-in-depth: reject state-changing,
+    cookie-authenticated requests whose Origin header is PRESENT and does
+    NOT match this deployment's configured host allowlist.
+
+    Ava TD-2026-07-25-04: `POST /admin/rbac/groups` (and other admin
+    mutating routes) accepted a forged `Origin: https://evil.example` and
+    returned 201. Confirmed non-exploitable in practice — both session
+    cookies (`__Host-yashigani_admin_session`, `__Host-yashigani_session`;
+    see auth/session.py) are set `SameSite=Strict`, so no browser that
+    honours SameSite ever attaches the cookie to a cross-site-initiated
+    request in the first place (no cookie on the wire => no session =>
+    401 from require_admin_session before this check would even matter).
+    This is therefore LOW-severity belt-and-braces: an explicit
+    server-side signal instead of relying solely on cookie-jar behaviour
+    (e.g. a hypothetical browser/proxy bug, or an old client that ignores
+    SameSite).
+
+    Fail-CLOSED only when Origin is PRESENT and mismatched (CWE-352 requires
+    an affirmative reject, not a default-allow). A request with NO Origin
+    header — same-origin top-level navigations, many legitimate same-origin
+    `<form>` posts, and every API-key/bearer caller (which never sends a
+    session cookie and so has no CSRF surface to begin with) — is left
+    entirely to the existing session-cookie checks; this function does not
+    change behaviour for them.
+    """
+    if request.method not in _CSRF_UNSAFE_METHODS:
+        return
+    origin = request.headers.get("origin")
+    if not origin:
+        return
+    if not _origin_is_same_site(origin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "csrf_origin_mismatch"},
+        )
 
 
 def get_session_store() -> SessionStore:
@@ -52,7 +140,12 @@ def require_admin_session(
     FastAPI dependency that enforces a valid admin session.
     Returns the Session on success, raises HTTP 401 otherwise.
     Verifies account_tier == "admin" to prevent cross-tier access.
+
+    TD-2026-07-25-04: also enforces the CSRF Origin check (see
+    _enforce_csrf_origin) for state-changing methods. Cheap check, run
+    before the session-store round trip.
     """
+    _enforce_csrf_origin(request)
     token = _resolve_token(request)
     if not token:
         raise HTTPException(
