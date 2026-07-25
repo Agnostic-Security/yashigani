@@ -132,6 +132,14 @@ docker/openclaw/openclaw.runtime.json
 # NEVER commit real API keys — this glob ensures they stay out of VCS.
 docker/cloud-keys/*
 !docker/cloud-keys/.gitkeep
+
+# YSG-GATE-V50-C: runtime-minted per-tenant crypto-shred KEKs
+# (audit/crypto_shred.py). Written atomically (0600) by
+# DockerSecretsProvider.set_secret the first time a tenant's admin mutations
+# get sealed. Directory tracked via .gitkeep (same Podman rootless rationale
+# as docker/cloud-keys/ above). NEVER commit real KEK material.
+docker/cryptoshred-keys/*
+!docker/cryptoshred-keys/.gitkeep
 install-progress.bar
 install-podman-run.log
 _relaunch.sh

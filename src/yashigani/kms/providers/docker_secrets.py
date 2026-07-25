@@ -22,6 +22,41 @@ Cloud-key write support (DEMO/FREE tier — Tiago directive):
     filesystem access — the cloud-key namespace filter is enforced before the
     file write, and _safe_filename rejects any key whose basename contains
     ".." / "/" / "\\".
+
+Crypto-shred KEK write support (YSG-GATE-V50-C, Tom 2026-07-25):
+  ``audit/crypto_shred.py`` mints a per-tenant Data-Encryption-Key-wrapping
+  KEK on first use (``cryptoshred:kek:<tenant>``) via ``get_secret`` /
+  ``set_secret``.  crypto_shred_enabled defaults True in EVERY deployment
+  mode (audit/config.py — a privacy control, unlike db_sink_enabled) and
+  docker-compose.yml/Helm both default YASHIGANI_KMS_PROVIDER=docker, so this
+  is a hard runtime requirement of the docker-secrets provider, not an
+  optional extra. Before this fix, KEK keys fell through to the generic
+  "not in the cloud-key namespace" rejection and sealing failed on every
+  admin mutation (ERROR-spam finding).
+
+  KEKs get their OWN writable directory (cryptoshred_keys_dir), physically
+  separate from cloud_keys_dir:
+  - Different security posture: cloud_keys_dir backs an admin-UI-listed,
+    human-supplied LLM provider credential; cryptoshred_keys_dir backs a
+    machine-generated wrapping key that must never appear in any "list your
+    stored keys" inventory (list_secrets still enumerates it as a bare key
+    name for operator/health visibility — no key MATERIAL is ever returned
+    by list_secrets for either namespace).
+  - Different write trigger: cloud keys are written on an explicit admin PUT;
+    KEKs are minted lazily and silently the first time ANY admin mutation is
+    audited, with no user-facing endpoint.
+  - Keeping them separate means a future change to the cloud-key allowlist
+    or its admin routes can never accidentally expose/rotate a crypto-shred
+    KEK, and vice versa.
+
+  Matches the cloud-key mechanism exactly: atomic mktemp→chmod 0600→rename
+  write, prefix-gated (``cryptoshred:kek:``) rather than an exact-name
+  allowlist (KEK keys are per-tenant: ``cryptoshred:kek:default``,
+  ``cryptoshred:kek:<tenant-id>``, ...), same path-traversal guard via
+  _safe_filename(). KEKs MUST persist across container restarts (losing a
+  KEK renders every already-sealed subject field for that tenant permanently
+  undecipherable — an unintended mass-shred) — cryptoshred_keys_dir must be
+  backed by a durable volume, never emptyDir/tmpfs.
 """
 from __future__ import annotations
 
@@ -50,6 +85,12 @@ _CLOUD_KEY_NAMES: frozenset[str] = frozenset({
     "anthropic_api_key",
 })
 
+# Prefix identifying a crypto-shred per-tenant KEK key
+# (audit/crypto_shred.py CryptoShredKeyStore._KEK_KMS_KEY =
+# "cryptoshred:kek:{tenant}"). Prefix-matched rather than an exact-name
+# allowlist because the tenant id is dynamic.
+_CRYPTOSHRED_KEK_PREFIX = "cryptoshred:kek:"
+
 
 class DockerSecretsProvider(KSMProvider):
     """
@@ -57,11 +98,14 @@ class DockerSecretsProvider(KSMProvider):
 
     Cloud API keys (openai_api_key, anthropic_api_key) can be stored at
     runtime via set_secret when cloud_keys_dir is provided (demo/free tier).
-    All other keys are read-only; set_secret on them raises ProviderError.
+    Crypto-shred per-tenant KEKs (cryptoshred:kek:<tenant>) can be stored at
+    runtime via set_secret when cryptoshred_keys_dir is provided. All other
+    keys are read-only; set_secret on them raises ProviderError.
 
-    get_secret resolution order:
-      1. cloud_keys_dir/<key>  — runtime-set key (writable volume)
-      2. secrets_dir/<key>     — install-provisioned key (read-only mount)
+    get_secret resolution order (per matching namespace):
+      1. cloud_keys_dir/<key>         — runtime-set cloud key (writable volume)
+      2. cryptoshred_keys_dir/<key>   — runtime-set KEK (writable volume)
+      3. secrets_dir/<key>            — install-provisioned key (read-only mount)
     """
 
     def __init__(
@@ -69,10 +113,12 @@ class DockerSecretsProvider(KSMProvider):
         environment_scope: str,
         secrets_dir: Path = _SECRETS_DIR,
         cloud_keys_dir: Optional[Path] = None,
+        cryptoshred_keys_dir: Optional[Path] = None,
     ) -> None:
         self._environment_scope = environment_scope
         self._secrets_dir = secrets_dir
         self._cloud_keys_dir = cloud_keys_dir
+        self._cryptoshred_keys_dir = cryptoshred_keys_dir
 
     # -- KSMProvider ---------------------------------------------------------
 
@@ -91,6 +137,17 @@ class DockerSecretsProvider(KSMProvider):
                         f"Failed to read cloud key '{key}' from {cloud_path}: {exc}"
                     ) from exc
 
+        # Crypto-shred KEKs: check writable dir first (runtime-minted key).
+        if safe_key.startswith(_CRYPTOSHRED_KEK_PREFIX) and self._cryptoshred_keys_dir is not None:
+            kek_path = self._cryptoshred_keys_dir / safe_key
+            if kek_path.exists():
+                try:
+                    return kek_path.read_text(encoding="utf-8").rstrip("\n")
+                except OSError as exc:
+                    raise ProviderError(
+                        f"Failed to read crypto-shred KEK '{key}' from {kek_path}: {exc}"
+                    ) from exc
+
         # Fall back to read-only Docker-secrets mount (pre-seeded or install-managed).
         secret_path = self._secrets_dir / safe_key
         if not secret_path.exists():
@@ -102,51 +159,77 @@ class DockerSecretsProvider(KSMProvider):
 
     def set_secret(self, key: str, value: str) -> None:
         """
-        Write a cloud API key atomically to the writable cloud-keys directory.
+        Write a cloud API key or a crypto-shred KEK atomically to its writable
+        namespace directory.
 
-        Only keys in _CLOUD_KEY_NAMES are accepted (openai_api_key,
-        anthropic_api_key).  All other keys raise ProviderError — this keeps
+        Only keys in _CLOUD_KEY_NAMES (openai_api_key, anthropic_api_key) or
+        prefixed _CRYPTOSHRED_KEK_PREFIX (cryptoshred:kek:<tenant>) are
+        accepted. All other keys raise ProviderError — this keeps
         install-managed secrets (postgres_password, internal_bearer, PKI
         material) permanently read-only even in demo/free deployments.
 
-        The write is atomic on POSIX: mktemp in cloud_keys_dir → write content
+        The write is atomic on POSIX: mktemp in the target dir → write content
         → chmod 0600 → os.rename() to final name.  A reader can never see a
         partial write.
         """
         self._check_scope(key)
         safe_key = self._safe_filename(key)
 
-        if safe_key not in _CLOUD_KEY_NAMES:
-            raise ProviderError(
-                f"Docker Secrets provider: key '{key}' is not in the cloud-key "
-                "namespace and cannot be set programmatically. "
-                "Install-managed secrets (PKI, passwords, tokens) are read-only."
-            )
-
-        if self._cloud_keys_dir is None:
-            raise ProviderError(
+        if safe_key in _CLOUD_KEY_NAMES:
+            target_dir = self._cloud_keys_dir
+            namespace_label = "cloud key"
+            not_configured_msg = (
                 "Docker Secrets provider: cloud-keys directory is not configured. "
                 "Set YASHIGANI_CLOUD_KEYS_DIR or mount a writable volume and "
                 "pass cloud_keys_dir to DockerSecretsProvider."
             )
-
-        cloud_dir = self._cloud_keys_dir
-        if not cloud_dir.exists():
-            raise ProviderError(
-                f"Cloud-keys directory '{cloud_dir}' does not exist. "
+            not_exist_msg = (
+                f"Cloud-keys directory '{{dir}}' does not exist. "
                 "Ensure the host directory is created and mounted (rw) before "
                 "storing cloud API keys."
             )
-        if not os.access(cloud_dir, os.W_OK):
-            raise ProviderError(
-                f"Cloud-keys directory '{cloud_dir}' is not writable by the "
+            not_writable_msg = (
+                f"Cloud-keys directory '{{dir}}' is not writable by the "
                 "container process. Check volume mount mode and UID/GID mapping."
             )
+        elif safe_key.startswith(_CRYPTOSHRED_KEK_PREFIX):
+            target_dir = self._cryptoshred_keys_dir
+            namespace_label = "crypto-shred KEK"
+            not_configured_msg = (
+                "Docker Secrets provider: crypto-shred-keys directory is not "
+                "configured. Set YASHIGANI_CRYPTO_SHRED_KEKS_DIR or mount a "
+                "writable volume and pass cryptoshred_keys_dir to "
+                "DockerSecretsProvider."
+            )
+            not_exist_msg = (
+                f"Crypto-shred-keys directory '{{dir}}' does not exist. "
+                "Ensure the host directory is created and mounted (rw) before "
+                "crypto-shred can mint per-tenant KEKs."
+            )
+            not_writable_msg = (
+                f"Crypto-shred-keys directory '{{dir}}' is not writable by the "
+                "container process. Check volume mount mode and UID/GID mapping."
+            )
+        else:
+            raise ProviderError(
+                f"Docker Secrets provider: key '{key}' is not in the cloud-key "
+                "or crypto-shred-KEK namespace and cannot be set "
+                "programmatically. Install-managed secrets (PKI, passwords, "
+                "tokens) are read-only."
+            )
+
+        if target_dir is None:
+            raise ProviderError(not_configured_msg)
+
+        if not target_dir.exists():
+            raise ProviderError(not_exist_msg.format(dir=target_dir))
+        if not os.access(target_dir, os.W_OK):
+            raise ProviderError(not_writable_msg.format(dir=target_dir))
 
         # Atomic write: temp file in the same directory → rename (same device).
         try:
             fd, tmp_path_str = tempfile.mkstemp(
-                dir=cloud_dir,
+                dir=target_dir,
                 prefix=f".{safe_key}.",
                 suffix=".tmp",
             )
@@ -162,12 +245,12 @@ class DockerSecretsProvider(KSMProvider):
                 tmp_path.unlink(missing_ok=True)
                 raise
             # Rename is atomic on POSIX (same device guaranteed by mkstemp dir).
-            tmp_path.rename(cloud_dir / safe_key)
+            tmp_path.rename(target_dir / safe_key)
         except ProviderError:
             raise
         except OSError as exc:
             raise ProviderError(
-                f"Failed to write cloud key '{key}' to {cloud_dir}: {exc}"
+                f"Failed to write {namespace_label} '{key}' to {target_dir}: {exc}"
             ) from exc
 
     def rotate_secret(self, key: str, new_value: str) -> str:
@@ -199,20 +282,27 @@ class DockerSecretsProvider(KSMProvider):
                         last_rotated_at=None,
                         expires_at=None,
                     ))
-            # Also list runtime-set cloud keys (from cloud_keys_dir).
-            if self._cloud_keys_dir is not None and self._cloud_keys_dir.exists():
+            # Also list runtime-set cloud keys (from cloud_keys_dir) and
+            # runtime-minted crypto-shred KEKs (from cryptoshred_keys_dir).
+            # Names only — no key material is ever included in list_secrets().
+            for rw_dir, version_label in (
+                (self._cloud_keys_dir, "docker-runtime"),
+                (self._cryptoshred_keys_dir, "docker-runtime-cryptoshred"),
+            ):
+                if rw_dir is None or not rw_dir.exists():
+                    continue
                 existing_names = {e.key for e in entries}
-                for path in self._cloud_keys_dir.iterdir():
+                for path in rw_dir.iterdir():
                     if path.is_file() and not path.name.startswith("."):
                         name = path.name
                         if name in existing_names:
-                            continue  # already listed from secrets_dir
+                            continue  # already listed
                         if prefix and not name.startswith(prefix):
                             continue
                         stat_info = path.stat()
                         entries.append(SecretMetadata(
                             key=name,
-                            version="docker-runtime",
+                            version=version_label,
                             created_at=_format_ts(stat_info.st_ctime),
                             last_rotated_at=_format_ts(stat_info.st_mtime),
                             expires_at=None,
@@ -230,13 +320,14 @@ class DockerSecretsProvider(KSMProvider):
     def health_check(self) -> bool:
         try:
             ro_ok = self._secrets_dir.exists() and os.access(self._secrets_dir, os.R_OK)
-            if self._cloud_keys_dir is not None:
-                rw_ok = (
-                    self._cloud_keys_dir.exists()
-                    and os.access(self._cloud_keys_dir, os.R_OK | os.W_OK)
-                )
-                return ro_ok and rw_ok
-            return ro_ok
+            if not ro_ok:
+                return False
+            for rw_dir in (self._cloud_keys_dir, self._cryptoshred_keys_dir):
+                if rw_dir is not None:
+                    rw_ok = rw_dir.exists() and os.access(rw_dir, os.R_OK | os.W_OK)
+                    if not rw_ok:
+                        return False
+            return True
         except Exception:
             return False
 

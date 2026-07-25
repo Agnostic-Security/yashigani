@@ -117,17 +117,28 @@ def create_provider() -> KSMProvider:
 
     cls = _load_class(_PROVIDER_MAP[provider_name])
 
-    # DockerSecretsProvider supports an optional writable cloud-keys directory
-    # (demo/free tier only — Tiago directive).  When YASHIGANI_CLOUD_KEYS_DIR is
-    # set, pass it so the provider can store/read runtime-set cloud API keys.
-    # Production KMS providers (keeper, aws, azure, gcp, vault) ignore this arg.
+    # DockerSecretsProvider supports optional writable namespace directories:
+    #   - cloud-keys (demo/free tier only — Tiago directive): YASHIGANI_CLOUD_KEYS_DIR
+    #   - crypto-shred KEKs (YSG-GATE-V50-C): YASHIGANI_CRYPTO_SHRED_KEKS_DIR
+    # crypto_shred_enabled defaults True EVERYWHERE (audit/config.py — a privacy
+    # control, not an opt-in), so the KEK directory is a hard runtime requirement
+    # of the docker-secrets provider whenever crypto-shred is on, not an extra.
+    # Production KMS providers (keeper, aws, azure, gcp, vault) ignore both args
+    # — they mint/store the KEK natively via set_secret in their own backend.
     if provider_name == "docker":
         from pathlib import Path
         cloud_keys_dir_str = os.environ.get("YASHIGANI_CLOUD_KEYS_DIR", "").strip()
         cloud_keys_dir = Path(cloud_keys_dir_str) if cloud_keys_dir_str else None
+        cryptoshred_keys_dir_str = os.environ.get(
+            "YASHIGANI_CRYPTO_SHRED_KEKS_DIR", ""
+        ).strip()
+        cryptoshred_keys_dir = (
+            Path(cryptoshred_keys_dir_str) if cryptoshred_keys_dir_str else None
+        )
         instance: KSMProvider = cls(
             environment_scope=env_scope,
             cloud_keys_dir=cloud_keys_dir,
+            cryptoshred_keys_dir=cryptoshred_keys_dir,
         )
     else:
         instance = cls(environment_scope=env_scope)

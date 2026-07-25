@@ -136,6 +136,11 @@ services:
       - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro,U
       - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro,U
       - ./cloud-keys:/run/cloud-keys:rw
+      # YSG-GATE-V50-C fix: this !override block is a full-list replace, so
+      # the writable crypto-shred KEK mount (docker-compose.yml gateway
+      # service) must be re-declared here too — same rationale/no-:U as
+      # ./cloud-keys immediately above.
+      - ./cryptoshred-keys:/run/cryptoshred-keys:rw
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
       # NO /var/run/docker.sock entry here — see header comment. Pool Manager
       # runs in stub mode on macOS Podman, unconditionally, regardless of
