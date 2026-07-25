@@ -63,6 +63,13 @@ def _letta_brain_model() -> str:
     P1.5 (fix/medlow-findings): consolidate model resolution here and in
     letta_client.py so both use YASHIGANI_LETTA_BRAIN_MODEL; this lets the
     installer set a single env var to swap the brain model for all letta paths.
+
+    v5.0-fix/letta-brain-handle-prefix (2026-07-25): "openai-proxy/" is the
+    HANDLE prefix Letta's own OpenAIProvider computes for any base_url that
+    is not the real OpenAI endpoint — it is NOT a provider name we register.
+    See letta_client.py's module docstring + _letta_brain_model() for the
+    full ground-truthed citation (letta==0.16.7 source). Do not change this
+    default to "openai/..." — that does not match what Letta computes.
     """
     return os.environ.get("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
 
@@ -352,9 +359,11 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
         if resp.status_code not in (200, 201):
             # P1.5: include the model name for fast diagnostics (404 on model
             # means the model name is wrong or not configured in Letta's proxy).
+            from yashigani.gateway.letta_client import _handle_not_found_hint
             raise RuntimeError(
                 f"letta brain-agent creation failed (model={brain_model!r}): "
                 f"HTTP {resp.status_code} {resp.text[:300]}"
+                f"{_handle_not_found_hint(resp.status_code, resp.text)}"
             )
         return resp.json()["id"]
 

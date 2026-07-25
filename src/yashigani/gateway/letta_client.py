@@ -12,6 +12,29 @@ now configurable via YASHIGANI_LETTA_BRAIN_MODEL (falls back to
 "openai-proxy/qwen2.5:3b"). This is the model Letta uses for its OWN reasoning —
 it must be reachable via Letta's OPENAI_API_BASE (which points to the gateway).
 
+v5.0-fix/letta-brain-handle-prefix (2026-07-25) — GROUND-TRUTHED against the
+ACTUAL letta==0.16.7 wheel (pinned digest above), NOT assumption:
+  * Letta does NOT need (and we must NOT register) a provider literally named
+    "openai-proxy".  ``letta/server/server.py`` auto-registers exactly ONE
+    OpenAIProvider, ALWAYS named ``"openai"``, whenever ``OPENAI_API_KEY`` is
+    set — the name is hardcoded, not derived from any env var.
+  * The HANDLE PREFIX we resolve against is a SEPARATE thing: Letta's own
+    ``OpenAIProvider._list_llm_models`` (letta/schemas/providers/openai.py)
+    computes ``handle = self.get_handle(model_name, base_name="openai-proxy")``
+    for EVERY model whenever ``self.base_url != "https://api.openai.com/v1"``
+    (get_handle() returns ``f"{base_name}/{model_name}"``).  Since our
+    OPENAI_API_BASE is the internal egress mesh path (never real OpenAI), the
+    computed handle for our qwen2.5:3b model IS "openai-proxy/qwen2.5:3b" —
+    exactly the hardcoded default below.  Do NOT "fix" this to "openai/..." —
+    that would break the (verified-correct) handle Letta itself computes.
+  * The handle only becomes RESOLVABLE once Letta's periodic
+    ``_sync_provider_models_async()`` successfully calls
+    ``GET {OPENAI_API_BASE}/models`` and persists the result — if that call
+    fails (e.g. egress 403), the provider has ZERO synced models and ANY
+    handle 404s with "must be one of []", regardless of prefix naming. See
+    the model-list egress path (Caddyfile.openclaw-egress /llm/*) for that
+    failure mode; it is orthogonal to the prefix chosen here.
+
 SC-AGENT-003 (3.1): Replace the "letta/letta-free" cloud embedding handle with an
 explicit embedding_config that points at the gateway's /v1/embeddings endpoint
 (http://gateway:8081/v1).  The original handle resolves to embeddings.letta.com
@@ -53,6 +76,34 @@ _LETTA_IMAGE = (
     "@sha256:fb7bd2c94a8bb7badbcfdb78a334abe3c1a75b5ea59e177aeba2e6356f54f92c"
 )
 _LETTA_PORT = 8283
+
+def _handle_not_found_hint(status_code: int, response_text: str) -> str:
+    """Return a diagnostic hint when a create-agent failure looks like Letta's
+    HandleNotFoundError ("Handle X not found, must be one of [...]").
+
+    v5.0-fix/letta-brain-handle-prefix (2026-07-25): the naive read of this
+    error ("the handle/prefix must be wrong") is WRONG — see the module
+    docstring + _letta_brain_model() ground-truth citation.  The real
+    culprit, ~100% of the time this specific shape appears, is that Letta's
+    per-provider model-list sync (_sync_provider_models_async, called at
+    Letta startup and periodically) never populated ANY models for the
+    "openai" provider — usually because GET {OPENAI_API_BASE}/models failed
+    (egress 403/timeout/unreachable), leaving the provider's synced model
+    set empty.  Point whoever reads this log line at the egress path, not
+    at the handle string.
+    """
+    if status_code == 404 and "not found, must be one of" in response_text:
+        return (
+            " HINT: this is Letta's HandleNotFoundError shape, NOT a "
+            "prefix-naming bug (see letta_client.py module docstring) — it "
+            "means Letta's 'openai' provider has ZERO synced models. Check "
+            "whether GET {OPENAI_API_BASE}/models (the egress model-list "
+            "call, e.g. egress-letta:9400/llm/v1/models) is succeeding; a "
+            "403/timeout there empties the provider's model list and every "
+            "handle 404s regardless of prefix."
+        )
+    return ""
+
 
 # Cache the default agent ID after first creation.
 # DEPRECATED (4.0 — use LettaClientPool). Retained for backward-compat with any
@@ -257,6 +308,7 @@ class LettaClientPool:
                 raise RuntimeError(
                     f"LettaClientPool: agent creation failed for user {user_id[:8]} "
                     f"(model={brain_model!r}): HTTP {resp.status_code} {resp.text[:300]}"
+                    f"{_handle_not_found_hint(resp.status_code, resp.text)}"
                 )
             agent_id = resp.json()["id"]
             self._agent_ids[user_id] = agent_id
@@ -403,9 +455,16 @@ _GATEWAY_EMBED_ENDPOINT = "http://gateway:8081/v1"
 def _letta_brain_model() -> str:
     """Return the model Letta uses for its own reasoning (configurable at deploy time).
 
-    Letta resolves this through its ``openai-proxy/`` provider prefix, which maps to
-    the gateway's /v1 endpoint.  The concrete model name after the slash must exist in
-    Ollama (pulled by the installer).  Installer default: qwen2.5:3b.
+    The "openai-proxy/" prefix is NOT a registered provider name — it is the
+    HANDLE base_name Letta's own OpenAIProvider computes (get_handle(...,
+    base_name="openai-proxy")) whenever its base_url differs from the real
+    "https://api.openai.com/v1" (see letta/schemas/providers/openai.py,
+    verified against the pinned letta==0.16.7 wheel — module docstring above
+    has the full citation).  The provider Letta auto-registers from
+    OPENAI_API_KEY/OPENAI_API_BASE is always literally named "openai"; the
+    handle prefix is independent of that name.  The concrete model name after
+    the slash must exist in Ollama (pulled by the installer).  Installer
+    default: qwen2.5:3b.
     """
     return os.getenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
 
@@ -545,6 +604,7 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
         raise RuntimeError(
             f"Letta agent creation failed (model={brain_model!r}): "
             f"HTTP {resp.status_code} {resp.text[:300]}"
+            f"{_handle_not_found_hint(resp.status_code, resp.text)}"
         )
 
     agent_data = resp.json()
