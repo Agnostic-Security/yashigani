@@ -450,6 +450,14 @@ spec:
             # ollama:11434 directly. Default ON; set "false" to disable.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # DP-Y-003 §3.4 — tool-poisoning strict-import gate. Default "" →
+            # code default "false" (flag-not-block, ratified). DEPLOY-WIRING
+            # FIX (Captain, 2026-07-25) — was entirely missing from the chart;
+            # mirrors docker-compose.yml YASHIGANI_MCP_IMPORT_STRICT.
+            {{- if .Values.backoffice.mcpImportStrict }}
+            - name: YASHIGANI_MCP_IMPORT_STRICT
+              value: {{ .Values.backoffice.mcpImportStrict | quote }}
+            {{- end }}
             # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document
             # enforcement admin routes (routes/documents.py, dp_weaken.py,
             # user_ui.py) read is_document_enforcement_enabled() directly.
