@@ -45,6 +45,16 @@ _MAX_MARKER_WINDOW_WORDS = 8
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
+# YSG-RISK-131: the sole machine proposer identity used by the LLM-seeded
+# learning loop (gateway/openai_router.py). The self-approval check in
+# RulePromotionStore.approve() compares `initiated_by` against `approver_id`
+# (a human admin's session account_id) — TODAY that can never match because
+# the ONLY propose route is this fixed machine marker, so the check is
+# safe-but-vacuous. See the docstrings on propose_from_detection() and
+# approve() below for the invariant that keeps it a REAL SoD gate the moment
+# a human propose route is ever added.
+MACHINE_INITIATED_BY = "gateway:llm-detector"
+
 # Markers that make a window worth promoting (an anchor of injection intent).
 _ANCHOR_MARKERS = (
     "ignore", "disregard", "forget", "override", "bypass", "system prompt",
@@ -133,7 +143,28 @@ class RulePromotionStore:
     ) -> list[str]:
         """Derive candidate patterns from a flagged payload and store each
         PENDING. Returns the candidate ids created. Idempotent on pattern:
-        a pattern already pending or active is skipped."""
+        a pattern already pending or active is skipped.
+
+        YSG-RISK-131 defense-in-depth: `initiated_by` MUST be a canonical,
+        server-known proposer identity. TODAY that is always
+        `MACHINE_INITIATED_BY` ("gateway:llm-detector") — there is no human
+        propose route, only approve/reject
+        (backoffice/routes/model_security.py). IF a human propose route is
+        EVER added, it MUST pass the proposing admin's canonical
+        `session.account_id` as `initiated_by` — never a free-text label —
+        the same canonical-identity-namespace requirement
+        manifest_reapproval.py's `registered_by`/`approver_id` pair enforces
+        (LAURA-V50-005). Otherwise the self-approval check in approve()
+        stays vacuous for that path too. Fail closed on an unnormalizable
+        initiator rather than silently accept one.
+        """
+        if not initiated_by or not isinstance(initiated_by, str):
+            raise RulePromotionError(
+                "initiated_by must be a non-empty, canonical proposer "
+                "identity string (the machine marker for LLM-seeded "
+                "proposals, or a human admin's session account_id for any "
+                "future propose route)."
+            )
         patterns = derive_candidate_patterns(content)
         if not patterns:
             return []
@@ -163,11 +194,29 @@ class RulePromotionStore:
 
     # ── dual-control approval ───────────────────────────────────────────────
     def approve(self, candidate_id: str, approver_id: str, confirming_pattern: str) -> str:
+        # YSG-RISK-131 defense-in-depth: approver_id must be the same
+        # canonical identity namespace propose_from_detection() requires for
+        # initiated_by (see its docstring). Fail closed on an
+        # unnormalizable approver rather than let it vacuously never-match
+        # a future human-tier initiated_by and sail through the SoD check
+        # below — mirrors manifest_reapproval.ManifestReapprovalGate.approve()
+        # (LAURA-V50-005).
+        if not approver_id or not isinstance(approver_id, str):
+            raise RulePromotionError(
+                "approver_id must be a non-empty, canonical admin identity "
+                "string (e.g. the approving admin's session account_id)."
+            )
         raw = self._get(_PENDING_PREFIX + candidate_id)
         if not raw:
             raise RulePromotionError("No pending rule-promotion candidate with that id.")
         rec = json.loads(raw)
         if rec["initiated_by"] == approver_id:
+            # Real SoD gate for any current/future propose route: whether
+            # initiated_by is the fixed machine marker (today, always a
+            # miss) or — once a human propose route exists — a human
+            # admin's session account_id (a real self-approval attempt),
+            # this comparison is what blocks it. See module-level comment
+            # on MACHINE_INITIATED_BY.
             raise RulePromotionError("The approver must differ from the proposer.")
         if confirming_pattern != rec["pattern"]:
             self._audit_or_log("RULE_PROMOTION_REJECTED", candidate_id,

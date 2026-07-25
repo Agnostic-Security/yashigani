@@ -809,7 +809,8 @@ async def _run_request_leg_inspection(
                 "PROMPT_INJECTION_ONLY", "CREDENTIAL_EXFIL",
             ):
                 try:
-                    _promo.propose_from_detection(prompt_text, initiated_by="gateway:llm-detector")
+                    from yashigani.inspection.rule_promotion import MACHINE_INITIATED_BY
+                    _promo.propose_from_detection(prompt_text, initiated_by=MACHINE_INITIATED_BY)
                 except Exception as _promo_exc:
                     logger.warning("rule-promotion propose failed: %s", _promo_exc)
             _reason_code = _insp.classification.lower()
