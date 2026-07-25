@@ -509,6 +509,13 @@ async def test_qwen_final_regated_unconditionally(monkeypatch):
         sensitivity_classifier = None
         pii_detector = None
         response_inspection_pipeline = None
+        # LAURA-V50-001 fix: run_orchestration now runs the interaction-hardening
+        # gate chain (_run_request_leg_inspection) on the seed prompt before the
+        # M1 seed adjudication this test exercises — these two attributes are
+        # accessed directly (not via getattr) by that chain, matching production
+        # OpenAIRouterState's always-defined defaults.
+        request_inspection_pipeline = None
+        audit_writer = None
     monkeypatch.setattr(openai_router, "_state", _LoopState())
     monkeypatch.setattr(orchestrator, "_audit", lambda e: None)
     monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda t: "PUBLIC")

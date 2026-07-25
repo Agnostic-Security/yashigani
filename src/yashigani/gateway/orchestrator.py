@@ -1549,7 +1549,9 @@ async def run_orchestration(*, body, identity, request, request_id: str,
     Both brains share this function's setup (catalog projection, seed adjudication,
     nonce, caps) so the §0.1 invariant holds identically regardless of brain.
     """
-    from yashigani.gateway.openai_router import _state, _sse_from_completion
+    from yashigani.gateway.openai_router import (
+        _state, _sse_from_completion, _run_request_leg_inspection,
+    )
     from yashigani.gateway.tool_catalog import build_tool_catalog
     from yashigani.audit.schema import (
         OrchestrationCapEvent, OrchestrationDepthCeilingEvent,
@@ -1610,6 +1612,29 @@ async def run_orchestration(*, body, identity, request, request_id: str,
                                 "to try again later — the block is a policy decision, not a transient error. "
                                 "If they need access, suggest they contact an administrator.\n\n"
                                 + _QUARANTINE_SYSTEM)})
+
+    # ── FIX LAURA-V50-001 (CRITICAL, live-pentest-proven): interaction-hardening
+    # gate chain on the SEED PROMPT, BEFORE the brain is ever called ─────────────
+    # The orchestration entry point `return`ed into this function BEFORE the /v1
+    # handler's request-leg gate chain (mechanical injection filter -> promoted
+    # ruleset -> multi-turn conversation accumulator -> suspicion gate -> LLM
+    # injection classifier -> A12 content moderation) ever ran — proven live:
+    # identical injection payload, same identity, direct chat -> 403 mechanical
+    # block + audit; orchestration (model=cloud9-orchestrate) -> 200 OK, zero
+    # audit entries. `_run_request_leg_inspection` is the SAME helper the direct
+    # /v1 path calls (openai_router.chat_completions, leg="request"); calling it
+    # here with leg="orchestration_seed" closes the bypass while keeping every
+    # block on this leg attributable + distinguishable in audit/metrics from a
+    # direct-chat block. Runs BEFORE the M1 sensitivity/RBAC/OPA/PII seed
+    # adjudication below, mirroring the direct path's ordering (2a interaction
+    # gates run before the §3 sensitivity scan in chat_completions).
+    _seed_prompt_text = "\n".join(m.content for m in body.messages if m.content)
+    seed_inspection_block = await _run_request_leg_inspection(
+        _seed_prompt_text, identity, _principal_id(identity), request_id,
+        leg="orchestration_seed",
+    )
+    if seed_inspection_block is not None:
+        return seed_inspection_block
 
     # ── FIX M1 (§0.1.1 H→A ingress): adjudicate the SEED PROMPT before the brain ──
     # The brain inference (_call_orchestrator → Ollama) is the un-gated edge: the

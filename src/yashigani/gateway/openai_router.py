@@ -527,6 +527,315 @@ def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
     return None
 
 
+async def _run_request_leg_inspection(
+    prompt_text: str, identity: dict | None, identity_id: str, request_id: str,
+    leg: str = "request",
+) -> Optional[JSONResponse]:
+    """5.0 interaction-hardening request-leg gate chain (LAURA-V50-001 fix).
+
+    Runs the FULL mechanical -> promoted-ruleset -> conversation-accumulator ->
+    suspicion-gate/LLM-classifier -> content-moderation chain on `prompt_text`.
+    This is the single source of truth for request-leg inspection: BOTH the
+    direct /v1 chat path (`chat_completions`) and the orchestration seed prompt
+    (`orchestrator.run_orchestration`) call this helper, so "gated on path A,
+    not path B" (LAURA-V50-001 — orchestration bypassed this entire chain by
+    returning into `run_orchestration()` before it ever ran) cannot recur.
+
+    `leg` labels every audit event and every `_metric_block` call so a block
+    raised from the orchestration seed is attributable and distinguishable
+    from a direct-chat block (e.g. "request" vs "orchestration_seed") without
+    changing the direct path's existing behaviour: the default leg="request"
+    reproduces byte-identical status codes / headers / audit / metrics to the
+    pre-fix inline block.
+
+    Fail-closed parity: a mechanical-scan exception or LLM-classifier error
+    BLOCKS (never falls through to model dispatch) on every leg identically.
+
+    Returns a 403 JSONResponse to block, or None to allow the caller through
+    to the next stage (sensitivity scan / seed adjudication / model dispatch).
+    """
+    _req_identity = identity_id or (identity.get("slug", "openai-router") if identity else "anonymous")
+
+    # ── mech. MECHANICAL request-leg injection scan (5.0 A1, LLM-protecting) ──
+    # Deterministic FIRST, and authoritative. The mechanical filter
+    # (homoglyph/leet/decode-normalised regex) catches injection WITHOUT calling
+    # the LLM — so an obvious injection payload is blocked before the LLM
+    # inspector ever reads it. This is the mitigation for A4' (the inspection LLM
+    # is itself an attack surface: a payload crafted to flip the inspector's
+    # verdict never reaches it). Everything blocked here lands in the audit log
+    # with attribution + the matched rule (+ the payload in forensic mode).
+    _mech = None
+    if prompt_text:
+        try:
+            from yashigani.mcp._content_filter import filter_description as _mech_filter
+            _mech = _mech_filter(prompt_text)
+        except Exception as _mech_exc:
+            logger.error("mechanical injection scan raised (%s) — fail-closed leg=%s request_id=%s",
+                         _mech_exc, leg, request_id)
+            _mech = None
+            _audit_prompt_injection_block(
+                request_id, _req_identity, leg, "mechanical",
+                classification="MECHANICAL_SCAN_ERROR", detected_pattern="",
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"message": _deny_message("request_inspection_error"),
+                                   "type": "request_inspection_error",
+                                   "code": "request_inspection_error"}},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+        if _mech is not None and _mech.rejected:
+            logger.warning(
+                "REQUEST INJECTION BLOCKED leg=%s (MECHANICAL, no LLM): identity=%s "
+                "matched=%r reason=%s request_id=%s",
+                leg, _req_identity, _mech.matched_pattern, _mech.reject_reason, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, leg, "mechanical",
+                classification="PROMPT_INJECTION_ONLY",
+                detected_pattern=_mech.matched_pattern or _mech.reject_reason,
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _deny_message("prompt_injection_only"),
+                    "type": "request_injection_blocked",
+                    "code": "prompt_injection_only",
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Request-Classification": "PROMPT_INJECTION_ONLY",
+                    "X-Yashigani-Detection-Layer": "mechanical",
+                },
+            )
+
+    # ── promo. Consult the PROMOTED ruleset (5.0 T1) ─────────────
+    # Rules the LLM taught us (novel injections distilled + admin-approved) are
+    # enforced here mechanically — cheaply, without touching the LLM. This is
+    # the payoff of the learning loop: yesterday's novel attack is today's
+    # deterministic block.
+    _promoted = getattr(_state, "promoted_ruleset", None)
+    if _promoted is not None and prompt_text:
+        try:
+            _phit = _promoted.matches(prompt_text)
+        except Exception:
+            _phit = None
+        if _phit:
+            logger.warning(
+                "REQUEST INJECTION BLOCKED leg=%s (PROMOTED rule, no LLM): identity=%s "
+                "pattern=%r request_id=%s", leg, _req_identity, _phit, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, leg, "mechanical_promoted",
+                classification="PROMPT_INJECTION_ONLY", detected_pattern=_phit,
+                content=prompt_text, confidence=1.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _deny_message("prompt_injection_only"),
+                    "type": "request_injection_blocked",
+                    "code": "prompt_injection_only",
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Detection-Layer": "mechanical_promoted",
+                },
+            )
+
+    # ── seq. Multi-turn conversational-injection accumulator (5.0) ──
+    # Runs BEFORE the suspicion gate so the gate can use the accumulated score.
+    # Per-message layers are blind to a SLOW-BURN attack that builds over turns
+    # and hides behind benign tangents. This sequence layer accumulates per-turn
+    # risk (decaying, so tangents don't reset it); a sustained trajectory crosses
+    # a threshold and escalates even when no single turn tripped a per-message
+    # layer. Model-free — no exploitable LLM surface of its own.
+    _seq = getattr(_state, "conversation_risk_tracker", None)
+    if _seq is not None and prompt_text:
+        try:
+            from yashigani.inspection.conversation_risk import (
+                extract_turn_signals, ACTION_BLOCK as _SEQ_BLOCK,
+                ACTION_STEP_UP as _SEQ_STEPUP,
+            )
+            _seq_session = identity.get("identity_id", identity_id) if identity else identity_id
+            _seq_verdict = _seq.observe(_seq_session, extract_turn_signals(prompt_text))
+            if _seq_verdict.escalated and _state.audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import ConversationInjectionEscalatedEvent
+                    _state.audit_writer.write(ConversationInjectionEscalatedEvent(
+                        request_id=request_id, identity_id=identity_id,
+                        session_id=_seq_session,
+                        accumulated_score=_seq_verdict.accumulated_score,
+                        turn_count=_seq_verdict.turn_count,
+                        action_taken=_seq_verdict.action,
+                        signal_breakdown=_seq_verdict.signal_breakdown,
+                    ))
+                except Exception:
+                    logger.warning("conversation-risk audit write failed")
+            if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
+                _metric_block("conversation", "gate", leg)
+                logger.warning(
+                    "CONVERSATION INJECTION %s leg=%s: identity=%s score=%.3f turns=%d request_id=%s",
+                    _seq_verdict.action.upper(), leg, identity_id,
+                    _seq_verdict.accumulated_score, _seq_verdict.turn_count, request_id,
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {
+                        "message": _deny_message("conversation_injection_blocked"),
+                        "type": "conversation_injection_blocked",
+                        "code": _seq_verdict.action,
+                    }},
+                    headers={
+                        "X-Yashigani-Request-Id": request_id,
+                        "X-Yashigani-Request-Verdict": "blocked",
+                        "X-Yashigani-Conversation-Risk": f"{_seq_verdict.accumulated_score:.3f}",
+                    },
+                )
+        except Exception as _seq_exc:
+            logger.warning("conversation-risk tracker raised: %s", _seq_exc)
+
+    # ── gate. Suspicion gate — decide WHO gets the LLM (5.0) ──────────
+    # We do NOT send every message to the LLM inspector (cost + latency + it
+    # needlessly exposes the LLM to attacker content). The LLM runs ONLY on
+    # SUSPICIOUS prompts. The gate distinguishes suspicious from normal cheaply
+    # and deterministically (markers / forged structure / obfuscation / the
+    # multi-turn accumulator) — normal conversation has none of these signals
+    # and never reaches the LLM.
+    _llm_suspicion = 0.0
+    _run_llm = False
+    if prompt_text and _state.request_inspection_pipeline is not None:
+        try:
+            from yashigani.inspection.suspicion_gate import SuspicionGate as _SG
+            _gate = getattr(_state, "_suspicion_gate_singleton", None)
+            if _gate is None:
+                _gate = _SG()
+                _state._suspicion_gate_singleton = _gate
+            _norm = _mech.safe_text if (_mech is not None and not _mech.rejected) else None
+            # #4: cheap sklearn injection signal — UNCERTAIN/UNSAFE escalates a
+            # marker-less subtle injection that the deterministic markers miss.
+            _skl_uncertain = False
+            _skl = getattr(_state, "sklearn_injection_backend", None)
+            if _skl is not None:
+                try:
+                    _skl_res = _skl.classify(prompt_text)
+                    _skl_uncertain = bool(
+                        getattr(_skl_res, "needs_llm_pass", False)
+                        or getattr(_skl_res, "label", "") == "UNSAFE"
+                    )
+                except Exception:
+                    _skl_uncertain = True  # ML error → escalate (conservative)
+            _susp = _gate.assess(
+                prompt_text,
+                normalized_text=_norm,
+                sklearn_uncertain=_skl_uncertain,
+                conversation_score=(_seq.score_for(
+                    identity.get("identity_id", identity_id) if identity else identity_id
+                ) if _seq is not None else 0.0),
+            )
+            _run_llm = _susp.escalate_to_llm
+            _llm_suspicion = _susp.score
+            try:
+                from yashigani.metrics.registry import suspicion_gate_decisions_total
+                suspicion_gate_decisions_total.labels(
+                    decision="escalated" if _run_llm else "passed").inc()
+            except Exception:
+                pass
+            if _run_llm:
+                logger.info(
+                    "SUSPICION GATE → LLM review leg=%s: identity=%s score=%.2f reasons=%s request_id=%s",
+                    leg, _req_identity, _susp.score, _susp.reasons, request_id,
+                )
+        except Exception as _sg_exc:
+            # If the gate errors, escalate to the LLM (conservative — the LLM is
+            # hardened + encapsulates the payload; better a review than a skip).
+            logger.warning("suspicion gate raised (%s) — escalating to LLM", _sg_exc)
+            _run_llm = True
+
+    # ── LLM. Request-leg prompt-injection inspection — LLM (suspicious only) ──
+    # Reached ONLY when the suspicion gate escalated. The classifier is itself
+    # hardened: input is JSON-encoded + delimiter-wrapped (encapsulated as data,
+    # not instructions), structured-output enforced, any deviation →
+    # CLASSIFIER_ERROR fail-closed. Any non-PASS verdict blocks + audits.
+    if _run_llm:
+        try:
+            _insp = _state.request_inspection_pipeline.process(
+                raw_query=prompt_text,
+                session_id=identity.get("identity_id", request_id) if identity else request_id,
+                agent_id=identity.get("slug", "openai-router") if identity else "openai-router",
+                user_id=identity_id,
+            )
+        except Exception as _insp_exc:
+            logger.error(
+                "Request inspection raised (%s) — fail-closed leg=%s request_id=%s",
+                _insp_exc, leg, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, leg, "llm",
+                classification="INSPECTION_ERROR", detected_pattern="",
+                content=prompt_text, confidence=0.0,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _deny_message("request_inspection_error"),
+                    "type": "request_inspection_error",
+                    "code": "request_inspection_error",
+                }},
+                headers={"X-Yashigani-Request-Id": request_id},
+            )
+
+        if _insp.action != "PASS":
+            logger.warning(
+                "REQUEST INJECTION BLOCKED leg=%s (LLM): identity=%s action=%s "
+                "classification=%s confidence=%.2f request_id=%s",
+                leg, _req_identity, _insp.action, _insp.classification,
+                _insp.confidence, request_id,
+            )
+            _audit_prompt_injection_block(
+                request_id, _req_identity, leg, "llm",
+                classification=_insp.classification, detected_pattern="",
+                content=prompt_text, confidence=_insp.confidence,
+            )
+            # T1 learning loop: the LLM caught what the mechanical layer missed —
+            # distil a candidate mechanical rule (dual-control-gated) so the next
+            # instance is blocked mechanically without the LLM.
+            _promo = getattr(_state, "rule_promotion_store", None)
+            if _promo is not None and _insp.classification in (
+                "PROMPT_INJECTION_ONLY", "CREDENTIAL_EXFIL",
+            ):
+                try:
+                    _promo.propose_from_detection(prompt_text, initiated_by="gateway:llm-detector")
+                except Exception as _promo_exc:
+                    logger.warning("rule-promotion propose failed: %s", _promo_exc)
+            _reason_code = _insp.classification.lower()
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": _deny_message(_reason_code),
+                    "type": "request_injection_blocked",
+                    "code": _reason_code,
+                }},
+                headers={
+                    "X-Yashigani-Request-Id": request_id,
+                    "X-Yashigani-Request-Verdict": "blocked",
+                    "X-Yashigani-Request-Classification": _insp.classification,
+                    "X-Yashigani-Detection-Layer": "llm",
+                },
+            )
+
+    # ── mod. Content moderation on the request (5.0 A12) ──────────
+    _mod_block = _moderate_content(prompt_text, leg, identity_id, request_id)
+    if _mod_block is not None:
+        return _mod_block
+
+    return None
+
+
 def _verify_ollama_pin(model: str, request_id: str):
     """5.0 A5: verify an ollama model against its integrity pin before dispatch.
 
@@ -1993,282 +2302,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 headers={"X-Yashigani-Request-Id": request_id},
             )
 
-    # ── 2a-mech. MECHANICAL request-leg injection scan (5.0 A1, LLM-protecting) ──
-    # Deterministic FIRST, and authoritative. The mechanical filter
-    # (homoglyph/leet/decode-normalised regex) catches injection WITHOUT calling
-    # the LLM — so an obvious injection payload is blocked before the LLM
-    # inspector ever reads it. This is the mitigation for A4' (the inspection LLM
-    # is itself an attack surface: a payload crafted to flip the inspector's
-    # verdict never reaches it). Everything blocked here lands in the audit log
-    # with attribution + the matched rule (+ the payload in forensic mode).
-    _req_identity = identity_id or (identity.get("slug", "openai-router") if identity else "anonymous")
-    if prompt_text:
-        try:
-            from yashigani.mcp._content_filter import filter_description as _mech_filter
-            _mech = _mech_filter(prompt_text)
-        except Exception as _mech_exc:
-            logger.error("mechanical injection scan raised (%s) — fail-closed request_id=%s",
-                         _mech_exc, request_id)
-            _mech = None
-            _audit_prompt_injection_block(
-                request_id, _req_identity, "request", "mechanical",
-                classification="MECHANICAL_SCAN_ERROR", detected_pattern="",
-                content=prompt_text, confidence=1.0,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={"error": {"message": _deny_message("request_inspection_error"),
-                                   "type": "request_inspection_error",
-                                   "code": "request_inspection_error"}},
-                headers={"X-Yashigani-Request-Id": request_id},
-            )
-        if _mech is not None and _mech.rejected:
-            logger.warning(
-                "REQUEST INJECTION BLOCKED /v1 (MECHANICAL, no LLM): identity=%s "
-                "matched=%r reason=%s request_id=%s",
-                _req_identity, _mech.matched_pattern, _mech.reject_reason, request_id,
-            )
-            _audit_prompt_injection_block(
-                request_id, _req_identity, "request", "mechanical",
-                classification="PROMPT_INJECTION_ONLY",
-                detected_pattern=_mech.matched_pattern or _mech.reject_reason,
-                content=prompt_text, confidence=1.0,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={"error": {
-                    "message": _deny_message("prompt_injection_only"),
-                    "type": "request_injection_blocked",
-                    "code": "prompt_injection_only",
-                }},
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-Request-Verdict": "blocked",
-                    "X-Yashigani-Request-Classification": "PROMPT_INJECTION_ONLY",
-                    "X-Yashigani-Detection-Layer": "mechanical",
-                },
-            )
-
-    # ── 2a-promo. Consult the PROMOTED ruleset (5.0 T1) ─────────────
-    # Rules the LLM taught us (novel injections distilled + admin-approved) are
-    # enforced here mechanically — cheaply, without touching the LLM. This is
-    # the payoff of the learning loop: yesterday's novel attack is today's
-    # deterministic block.
-    _promoted = getattr(_state, "promoted_ruleset", None)
-    if _promoted is not None and prompt_text:
-        try:
-            _phit = _promoted.matches(prompt_text)
-        except Exception:
-            _phit = None
-        if _phit:
-            logger.warning(
-                "REQUEST INJECTION BLOCKED /v1 (PROMOTED rule, no LLM): identity=%s "
-                "pattern=%r request_id=%s", _req_identity, _phit, request_id,
-            )
-            _audit_prompt_injection_block(
-                request_id, _req_identity, "request", "mechanical_promoted",
-                classification="PROMPT_INJECTION_ONLY", detected_pattern=_phit,
-                content=prompt_text, confidence=1.0,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={"error": {
-                    "message": _deny_message("prompt_injection_only"),
-                    "type": "request_injection_blocked",
-                    "code": "prompt_injection_only",
-                }},
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-Request-Verdict": "blocked",
-                    "X-Yashigani-Detection-Layer": "mechanical_promoted",
-                },
-            )
-
-    # ── 2a-seq. Multi-turn conversational-injection accumulator (5.0) ──
-    # Runs BEFORE the suspicion gate so the gate can use the accumulated score.
-    # Per-message layers are blind to a SLOW-BURN attack that builds over turns
-    # and hides behind benign tangents. This sequence layer accumulates per-turn
-    # risk (decaying, so tangents don't reset it); a sustained trajectory crosses
-    # a threshold and escalates even when no single turn tripped a per-message
-    # layer. Model-free — no exploitable LLM surface of its own.
-    _seq = getattr(_state, "conversation_risk_tracker", None)
-    if _seq is not None and prompt_text:
-        try:
-            from yashigani.inspection.conversation_risk import (
-                extract_turn_signals, ACTION_BLOCK as _SEQ_BLOCK,
-                ACTION_STEP_UP as _SEQ_STEPUP,
-            )
-            _seq_session = identity.get("identity_id", identity_id) if identity else identity_id
-            _seq_verdict = _seq.observe(_seq_session, extract_turn_signals(prompt_text))
-            if _seq_verdict.escalated and _state.audit_writer is not None:
-                try:
-                    from yashigani.audit.schema import ConversationInjectionEscalatedEvent
-                    _state.audit_writer.write(ConversationInjectionEscalatedEvent(
-                        request_id=request_id, identity_id=identity_id,
-                        session_id=_seq_session,
-                        accumulated_score=_seq_verdict.accumulated_score,
-                        turn_count=_seq_verdict.turn_count,
-                        action_taken=_seq_verdict.action,
-                        signal_breakdown=_seq_verdict.signal_breakdown,
-                    ))
-                except Exception:
-                    logger.warning("conversation-risk audit write failed")
-            if _seq_verdict.action in (_SEQ_BLOCK, _SEQ_STEPUP):
-                _metric_block("conversation", "gate", "request")
-                logger.warning(
-                    "CONVERSATION INJECTION %s /v1: identity=%s score=%.3f turns=%d request_id=%s",
-                    _seq_verdict.action.upper(), identity_id,
-                    _seq_verdict.accumulated_score, _seq_verdict.turn_count, request_id,
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": {
-                        "message": _deny_message("conversation_injection_blocked"),
-                        "type": "conversation_injection_blocked",
-                        "code": _seq_verdict.action,
-                    }},
-                    headers={
-                        "X-Yashigani-Request-Id": request_id,
-                        "X-Yashigani-Request-Verdict": "blocked",
-                        "X-Yashigani-Conversation-Risk": f"{_seq_verdict.accumulated_score:.3f}",
-                    },
-                )
-        except Exception as _seq_exc:
-            logger.warning("conversation-risk tracker raised: %s", _seq_exc)
-
-    # ── 2a-gate. Suspicion gate — decide WHO gets the LLM (5.0) ──────
-    # We do NOT send every message to the LLM inspector (cost + latency + it
-    # needlessly exposes the LLM to attacker content). The LLM runs ONLY on
-    # SUSPICIOUS prompts. The gate distinguishes suspicious from normal cheaply
-    # and deterministically (markers / forged structure / obfuscation / the
-    # multi-turn accumulator) — normal conversation has none of these signals
-    # and never reaches the LLM.
-    _llm_suspicion = 0.0
-    _run_llm = False
-    if prompt_text and _state.request_inspection_pipeline is not None:
-        try:
-            from yashigani.inspection.suspicion_gate import SuspicionGate as _SG
-            _gate = getattr(_state, "_suspicion_gate_singleton", None)
-            if _gate is None:
-                _gate = _SG()
-                _state._suspicion_gate_singleton = _gate
-            _norm = _mech.safe_text if (_mech is not None and not _mech.rejected) else None
-            # #4: cheap sklearn injection signal — UNCERTAIN/UNSAFE escalates a
-            # marker-less subtle injection that the deterministic markers miss.
-            _skl_uncertain = False
-            _skl = getattr(_state, "sklearn_injection_backend", None)
-            if _skl is not None:
-                try:
-                    _skl_res = _skl.classify(prompt_text)
-                    _skl_uncertain = bool(
-                        getattr(_skl_res, "needs_llm_pass", False)
-                        or getattr(_skl_res, "label", "") == "UNSAFE"
-                    )
-                except Exception:
-                    _skl_uncertain = True  # ML error → escalate (conservative)
-            _susp = _gate.assess(
-                prompt_text,
-                normalized_text=_norm,
-                sklearn_uncertain=_skl_uncertain,
-                conversation_score=(_seq.score_for(
-                    identity.get("identity_id", identity_id) if identity else identity_id
-                ) if _seq is not None else 0.0),
-            )
-            _run_llm = _susp.escalate_to_llm
-            _llm_suspicion = _susp.score
-            try:
-                from yashigani.metrics.registry import suspicion_gate_decisions_total
-                suspicion_gate_decisions_total.labels(
-                    decision="escalated" if _run_llm else "passed").inc()
-            except Exception:
-                pass
-            if _run_llm:
-                logger.info(
-                    "SUSPICION GATE → LLM review: identity=%s score=%.2f reasons=%s request_id=%s",
-                    _req_identity, _susp.score, _susp.reasons, request_id,
-                )
-        except Exception as _sg_exc:
-            # If the gate errors, escalate to the LLM (conservative — the LLM is
-            # hardened + encapsulates the payload; better a review than a skip).
-            logger.warning("suspicion gate raised (%s) — escalating to LLM", _sg_exc)
-            _run_llm = True
-
-    # ── 2a. Request-leg prompt-injection inspection — LLM (suspicious only) ──
-    # Reached ONLY when the suspicion gate escalated. The classifier is itself
-    # hardened: input is JSON-encoded + delimiter-wrapped (encapsulated as data,
-    # not instructions), structured-output enforced, any deviation →
-    # CLASSIFIER_ERROR fail-closed. Any non-PASS verdict blocks + audits.
-    if _run_llm:
-        try:
-            _insp = _state.request_inspection_pipeline.process(
-                raw_query=prompt_text,
-                session_id=identity.get("identity_id", request_id) if identity else request_id,
-                agent_id=identity.get("slug", "openai-router") if identity else "openai-router",
-                user_id=identity_id,
-            )
-        except Exception as _insp_exc:
-            logger.error(
-                "Request inspection raised (%s) — fail-closed block request_id=%s",
-                _insp_exc, request_id,
-            )
-            _audit_prompt_injection_block(
-                request_id, _req_identity, "request", "llm",
-                classification="INSPECTION_ERROR", detected_pattern="",
-                content=prompt_text, confidence=0.0,
-            )
-            return JSONResponse(
-                status_code=403,
-                content={"error": {
-                    "message": _deny_message("request_inspection_error"),
-                    "type": "request_inspection_error",
-                    "code": "request_inspection_error",
-                }},
-                headers={"X-Yashigani-Request-Id": request_id},
-            )
-
-        if _insp.action != "PASS":
-            logger.warning(
-                "REQUEST INJECTION BLOCKED /v1 (LLM): identity=%s action=%s "
-                "classification=%s confidence=%.2f request_id=%s",
-                _req_identity, _insp.action, _insp.classification,
-                _insp.confidence, request_id,
-            )
-            _audit_prompt_injection_block(
-                request_id, _req_identity, "request", "llm",
-                classification=_insp.classification, detected_pattern="",
-                content=prompt_text, confidence=_insp.confidence,
-            )
-            # T1 learning loop: the LLM caught what the mechanical layer missed —
-            # distil a candidate mechanical rule (dual-control-gated) so the next
-            # instance is blocked mechanically without the LLM.
-            _promo = getattr(_state, "rule_promotion_store", None)
-            if _promo is not None and _insp.classification in (
-                "PROMPT_INJECTION_ONLY", "CREDENTIAL_EXFIL",
-            ):
-                try:
-                    _promo.propose_from_detection(prompt_text, initiated_by="gateway:llm-detector")
-                except Exception as _promo_exc:
-                    logger.warning("rule-promotion propose failed: %s", _promo_exc)
-            _reason_code = _insp.classification.lower()
-            return JSONResponse(
-                status_code=403,
-                content={"error": {
-                    "message": _deny_message(_reason_code),
-                    "type": "request_injection_blocked",
-                    "code": _reason_code,
-                }},
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-Request-Verdict": "blocked",
-                    "X-Yashigani-Request-Classification": _insp.classification,
-                    "X-Yashigani-Detection-Layer": "llm",
-                },
-            )
-
-    # ── 2a-mod. Content moderation on the request (5.0 A12) ──────────
-    _mod_block = _moderate_content(prompt_text, "request", identity_id, request_id)
-    if _mod_block is not None:
-        return _mod_block
+    # ── 2a. Request-leg interaction-hardening gate chain (5.0) ───────────
+    # Mechanical injection filter -> promoted ruleset -> conversation
+    # accumulator -> suspicion gate/LLM classifier -> content moderation.
+    # LAURA-V50-001: this is now a SHARED helper (_run_request_leg_inspection)
+    # so the orchestration seed prompt (orchestrator.run_orchestration) runs
+    # the IDENTICAL chain before the brain is ever called — see that module
+    # for the mirrored call site. leg="request" reproduces this path's
+    # pre-fix behaviour byte-for-byte (same status codes/headers/audit/metrics).
+    _leg_block = await _run_request_leg_inspection(
+        prompt_text, identity, identity_id, request_id, leg="request",
+    )
+    if _leg_block is not None:
+        return _leg_block
 
     # ── 2b. Content relay detection (agent-to-agent laundering) ──────
     if _state.content_relay_detector and prompt_text:
