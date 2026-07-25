@@ -178,6 +178,81 @@ test_models_service_full_with_operator_override if {
     with data.yashigani.v1.models_list_policy.service_account_filter as "full"
 }
 
+# ── YSG-RISK/TD-2026-07-25-02 — @letta bundled-agent /v1/models 403 ──────
+# Bundled P1 wrapped systems (Letta, Langflow, OpenClaw) resolve via
+# _resolve_identity's p1_agent branch (kind="agent") or p1_nhi branch
+# (kind="nhi") — both are mesh/PSK-authenticated service-tier principals
+# running the SAME per-instance model-list SYNC "service"/"unknown" callers
+# do. They were omitted from the original GAP-001 kind-set, hard-denying
+# their own provider model-sync regardless of active status.
+
+test_models_agent_kind_allowed_restricted if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "active", "kind": "agent"},
+    }
+    d.allow == true
+    d.filter == "restricted"
+    d.reason == "ok"
+}
+
+test_models_nhi_kind_allowed_restricted if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "active", "kind": "nhi"},
+    }
+    d.allow == true
+    d.filter == "restricted"
+    d.reason == "ok"
+}
+
+# Least-privilege proof: adding "agent"/"nhi" to the service-tier set does
+# NOT relax the active-status gate — a non-active agent/nhi is still denied,
+# identically to a non-active "service"/"unknown" identity.
+test_models_deny_inactive_agent if {
+    not data.yashigani.v1.models_list_allowed with input as {
+        "identity": {"status": "suspended", "kind": "agent"},
+    }
+}
+
+test_models_deny_inactive_nhi if {
+    not data.yashigani.v1.models_list_allowed with input as {
+        "identity": {"status": "", "kind": "nhi"},
+    }
+}
+
+# Least-privilege proof: agent/nhi never gets "full" — only the SAME
+# operator-gated override that "service"/"unknown" already requires, and
+# a plain agent/nhi caller (no override) stays restricted, never full.
+test_models_agent_full_requires_operator_override if {
+    data.yashigani.v1.models_list_filter == "restricted" with input as {
+        "identity": {"status": "active", "kind": "agent"},
+    }
+    # no data override set — must NOT be "full"
+}
+
+test_models_agent_full_with_operator_override if {
+    data.yashigani.v1.models_list_filter == "full" with input as {
+        "identity": {"status": "active", "kind": "agent"},
+    }
+    with data.yashigani.v1.models_list_policy.service_account_filter as "full"
+}
+
+# Least-privilege proof: human/anonymous/unauthorized callers are wholly
+# unaffected by the agent/nhi addition — still exactly the pre-existing
+# GAP-001 behaviour.
+test_models_deny_anonymous_unaffected_by_agent_nhi_fix if {
+    d := data.yashigani.v1.models_list_decision with input as {
+        "identity": {"status": "anonymous", "kind": "unknown"},
+    }
+    d.allow == false
+    d.filter == "denied"
+}
+
+test_models_deny_inactive_human_unaffected_by_agent_nhi_fix if {
+    not data.yashigani.v1.models_list_allowed with input as {
+        "identity": {"status": "suspended", "kind": "human"},
+    }
+}
+
 # ── sensitivity_allowed ───────────────────────────────────────────────────
 
 test_sensitivity_deny_absent_ceiling if {
