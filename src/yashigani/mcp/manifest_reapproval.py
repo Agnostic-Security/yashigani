@@ -123,6 +123,16 @@ class ManifestReapprovalGate:
         rec = json.loads(raw if isinstance(raw, str) else raw.decode())
 
         if rec["registered_by"] == approver_id:
+            # TD-2026-07-25-03: the block holds (we raise below either way),
+            # but until now this rejected same-admin self-approval attempt
+            # left no attributable audit record — only provable indirectly
+            # via gate state. Emit the audit event BEFORE raising, same
+            # write-ahead pattern as the other manifest-reapproval audits.
+            self._audit_or_raise(
+                "MANIFEST_DELTA_REJECTED", agent_id, rec["old_sha"], rec["new_sha"],
+                registered_by=rec["registered_by"], approver=approver_id,
+                action="rejected_self_approval",
+            )
             raise ManifestReapprovalError(
                 "The approver must be a DIFFERENT admin from the registrant.")
         if confirming_sha != rec["new_sha"]:

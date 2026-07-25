@@ -99,6 +99,24 @@ class TestApproval:
         with pytest.raises(ManifestReapprovalError, match="DIFFERENT admin"):
             self.g.approve("agentA", approver_id="alice", confirming_sha="SHA2")
 
+    def test_self_approval_rejection_emits_audit_event(self):
+        # TD-2026-07-25-03: the rejected same-admin self-approval attempt
+        # must itself be an attributable audit record, not just provable
+        # indirectly via gate state (the delta stays not-active either way).
+        with pytest.raises(ManifestReapprovalError, match="DIFFERENT admin"):
+            self.g.approve("agentA", approver_id="alice", confirming_sha="SHA2")
+        rejected = [e for e in self.audit.events
+                    if e.event_type.value == "MANIFEST_DELTA_REJECTED"
+                    and e.action_taken == "rejected_self_approval"]
+        assert rejected, "no audit event emitted for the rejected self-approval attempt"
+        ev = rejected[0]
+        assert ev.registered_by == "alice"
+        assert ev.approver == "alice"
+        assert ev.agent_id == "agentA"
+        assert ev.new_manifest_sha256 == "SHA2"
+        # Gate state still correct: not active.
+        assert self.g.is_active("agentA", "SHA2") is False
+
     def test_confirming_sha_must_match(self):
         with pytest.raises(ManifestReapprovalError, match="does not match"):
             self.g.approve("agentA", approver_id="bob", confirming_sha="SHA_WRONG")
