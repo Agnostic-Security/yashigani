@@ -3419,8 +3419,34 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if env_token:
                     agent_headers["Authorization"] = f"Bearer {env_token}"
 
+                # TD-2026-07-25-01 / YSG-GATE-V50-A (mirrored from 5.0 line
+                # commit ee820113 — kept identical so 4.1.2 and 5.0 don't
+                # diverge): bundled/mesh-fronted "openai"-protocol agents
+                # (currently openclaw; langflow when mis-registered) dispatch
+                # through this generic branch too. Their registered upstream
+                # is the Caddy INGRESS front (https://caddy:<port>/agents/...),
+                # which terminates mTLS require_and_verify against the
+                # internal mesh CA (_dispatch_client.py). A bare
+                # httpx.AsyncClient() presents no client leaf and trusts only
+                # system roots, so it fails CERTIFICATE_VERIFY_FAILED against
+                # that front. Admin-registered EXTERNAL agents (arbitrary
+                # https://agent.example.com upstreams) are NOT behind our
+                # mesh CA and must keep using the bare client — mirrors the
+                # closed-allowlist shape in
+                # backoffice/bundled_envelopes.py::_FRONT_UPSTREAM_RE
+                # (duplicated here rather than imported, same layering
+                # rationale as pki/ssl_context.py::_extract_spiffe_uris).
+                _mesh_front_re = re.compile(
+                    r"^https://caddy:\d{4,5}/agents/[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}"
+                    r"/[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}/?$"
+                )
                 try:
-                    async with httpx.AsyncClient(timeout=120.0) as client:
+                    if _mesh_front_re.match(agent_upstream or ""):
+                        from yashigani.gateway._dispatch_client import agent_dispatch_client
+                        _agent_client_cm = agent_dispatch_client(timeout=120.0)
+                    else:
+                        _agent_client_cm = httpx.AsyncClient(timeout=120.0)
+                    async with _agent_client_cm as client:
                         resp = await client.post(
                             f"{agent_upstream}/v1/chat/completions",
                             json=agent_body,
