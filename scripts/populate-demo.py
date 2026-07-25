@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """
-populate-2255-protocol2.py — Yashigani 2.25.5 PROTOCOL2 seed script.
+populate-demo.py — Yashigani 4.1.2 demo seed script.
 
 GUARDRAILS (enforced in code):
   1. Uses ONLY orchid. Forced pw-change -> new pw saved full -> re-login to prove round-trip.
   2. aspen is NEVER touched except a single login-verify at the END.
   3. /auth/totp/provision/start is NEVER called (would rotate TOTP secret, LAURA-2255-008).
   4. Step-up TOTP is called after re-login; all step-up-gated ops happen within 5-min window.
+  5. CONFIG-ONLY (Tiago hard constraint): every mutation goes through the admin API.
+     If a config step fails, that is a real product bug — this script FAILS LOUD
+     (sys.exit) rather than papering over it with a hardcoded fallback value.
+  6. Bundled agents (langflow/letta/openclaw) are NEVER created here — install.sh's
+     register_agent_bundles() already registers them with the correct caddy-front
+     mesh upstream_url. This script only DISCOVERS them (GET /admin/agents) and
+     PUTs demo-specific groups/allowed_caller_groups/allowed_paths. Sending
+     upstream_url here reintroduced a duplicate-agent-with-wrong-upstream bug
+     that broke chat (LAURA-4.1.2-related finding) — see step8_register_agents().
 
 What this script creates:
   Groups  : data-team, finance-team, compliance-team
-  Users   : ana@agnosticsec.local / paul@agnosticsec.local / mia@agnosticsec.local
+  Users   : ana@agnosticsec.com / paul@agnosticsec.com / mia@agnosticsec.com / noah / sara
             each in a different group
-  Agents  : langflow, letta, openclaw  (groups: [owui-users, users])
-  Policies: 8 self-describing client OPA policies (saved + bound)
+  Agents  : configures (never creates) the install.sh-bundled langflow/letta/openclaw
+            agents (groups: [owui-users, users])
+  Policies: 10 self-describing client OPA policies (saved + bound)
   Probes  : one allow + one deny via /admin/inspection/simulate (if available)
   MCP     : demo-mcp reachability probe
 
 Usage:
-  python3 populate-2255-protocol2.py
+  python3 populate-demo.py
 
-All credential output -> CREDENTIALS-2255-PROTOCOL2-20260619.txt (updated in-place).
-Scratch state saved to populate-2255-protocol2-state.json (same dir).
+All credential output -> CREDENTIALS-4.1.2-CLEAN.txt (updated in-place).
+Scratch state saved to populate-4.1.2-clean-state.json (same dir).
 """
 
 from __future__ import annotations
@@ -29,16 +39,34 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import pyotp
 import requests
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# Product TOTP core — single source of truth for algorithm/digits (LAURA-4.1.2
+# populate-demo fix). Admins are SHA512/8-digit, users SHA256/6-digit
+# (src/yashigani/auth/totp.py ROLE_TOTP_ALGO / ROLE_TOTP_DIGITS) — hand-rolling
+# pyotp.TOTP(secret).now() silently falls back to pyotp's SHA1/6-digit default,
+# which never matches an admin account's real algorithm and always 401s.
+# ---------------------------------------------------------------------------
+try:
+    from yashigani.auth.totp import ROLE_TOTP_ALGO, ROLE_TOTP_DIGITS, _totp_at
+except ImportError:
+    # Script may be invoked as `python3 scripts/populate-demo.py` outside an
+    # installed/editable yashigani environment — fall back to the repo's src/
+    # layout (scripts/ is a direct child of the repo root).
+    _repo_src = Path(__file__).resolve().parent.parent / "src"
+    if _repo_src.is_dir():
+        sys.path.insert(0, str(_repo_src))
+    from yashigani.auth.totp import ROLE_TOTP_ALGO, ROLE_TOTP_DIGITS, _totp_at
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -47,8 +75,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # script is portable; defaults to the current working directory. The install log
 # to parse admin creds from is DEMO_DIR/.last-install-log (a pointer file).
 DEMO_DIR = Path(os.environ.get("YASHIGANI_DEMO_OUT_DIR", ".")).resolve()
-CREDS_FILE = DEMO_DIR / "CREDENTIALS-3.0.0-CLEAN.txt"
-STATE_FILE = DEMO_DIR / "populate-3.0.0-clean-state.json"
+CREDS_FILE = DEMO_DIR / "CREDENTIALS-4.1.2-CLEAN.txt"
+STATE_FILE = DEMO_DIR / "populate-4.1.2-clean-state.json"
 
 BASE_URL = os.environ.get("YASHIGANI_BASE_URL", "https://localhost").rstrip("/")
 
@@ -88,9 +116,22 @@ S.verify = False
 # ---------------------------------------------------------------------------
 # TOTP helpers
 # ---------------------------------------------------------------------------
+# Admins are role-tiered SHA512/8-digit (ROLE_TOTP_ALGO["admin"] /
+# ROLE_TOTP_DIGITS["admin"]) — sourced from the product's own TOTP core
+# (_totp_at), never hand-rolled or defaulted to pyotp's SHA1/6.
+
+def _role_totp(secret: str, tier: str = "admin") -> str:
+    """Compute a role-tiered TOTP code via the product's TOTP core (single
+    source of truth — src/yashigani/auth/totp.py _totp_at / ROLE_TOTP_ALGO /
+    ROLE_TOTP_DIGITS). tier is "admin" (SHA512/8) or "user" (SHA256/6)."""
+    algorithm = ROLE_TOTP_ALGO[tier]
+    digits = ROLE_TOTP_DIGITS[tier]
+    return _totp_at(secret, int(time.time()), algorithm, digits)
+
 
 def _totp(secret: str) -> str:
-    return pyotp.TOTP(secret).now()
+    """Admin-tier TOTP (SHA512/8). Orchid/aspen are always admin accounts."""
+    return _role_totp(secret, "admin")
 
 
 def _fresh_totp(secret: str, label: str) -> str:
@@ -138,6 +179,50 @@ def _check(r: requests.Response, label: str, expected: int) -> dict:
         return r.json()
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Compose-project-prefix-agnostic container name resolution.
+#
+# LAURA-4.1.2 populate-demo fix: the compose project prefix is NOT a constant
+# ("docker-" was hardcoded here but this stack's ACTUAL prefix is "localhost-"
+# — see testing_runs/yashigani/4.1.2-e2e/ACCESS-BRIEF.md). Never hardcode
+# "<prefix>-<service>-1"; resolve it from the running container set (Docker +
+# Podman parity), falling back to COMPOSE_PROJECT_NAME if set.
+# ---------------------------------------------------------------------------
+
+def _container_name(service: str) -> str:
+    """
+    Resolve the actual running container name for a compose *service*
+    (e.g. "demo-mcp", "backoffice", "gateway") under whichever compose
+    project prefix is in effect — never assume "docker-" or "localhost-".
+
+    Tries `docker ps` then `podman ps` (runtime parity), matching an
+    exact "-<service>-1" suffix over a broader substring hit. Falls back to
+    COMPOSE_PROJECT_NAME + "-<service>-1" if neither runtime is reachable.
+    Returns "" if the container cannot be resolved — callers must treat
+    these lookups as best-effort diagnostics, not config mutations.
+    """
+    for runtime in ("docker", "podman"):
+        try:
+            result = subprocess.run(
+                [runtime, "ps", "--filter", f"name={service}", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            names = [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]
+            exact = [n for n in names if n.endswith(f"-{service}-1")]
+            if exact:
+                return exact[0]
+            if names:
+                return names[0]
+
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "").strip()
+    if project:
+        return f"{project}-{service}-1"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +484,8 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
 
 def step7b_save_user_creds(user_creds: dict[str, dict]) -> None:
     """Append user credentials to a separate demo-user creds file."""
-    out = DEMO_DIR / f"demo-user-creds-protocol2-{datetime.utcnow().strftime('%Y%m%d')}.txt"
-    lines = [f"# Demo user credentials — populate-2255-protocol2 run {datetime.utcnow().isoformat()}Z\n"]
+    out = DEMO_DIR / f"demo-user-creds-4.1.2-{datetime.utcnow().strftime('%Y%m%d')}.txt"
+    lines = [f"# Demo user credentials — populate-demo (4.1.2) run {datetime.utcnow().isoformat()}Z\n"]
     for email, creds in user_creds.items():
         username = creds.get("username", "")
         # FIND-DEMO-CREDS: step7c rotates the temp password on forced first-login,
@@ -417,33 +502,39 @@ def step7b_save_user_creds(user_creds: dict[str, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# STEP 8 — Register agents
+# STEP 8 — Discover + configure bundled agents (NEVER create/register)
 # ---------------------------------------------------------------------------
-
-AGENT_HOSTNAMES_ENV = "langflow,letta,openclaw"  # matches YASHIGANI_AGENT_UPSTREAM_HOSTNAMES
-
+# install.sh's register_agent_bundles() (install.sh:10278) already registers
+# the bundled agents via a direct Postgres+Redis write with the CORRECT
+# caddy-front mesh upstream_url (e.g. https://caddy:9671/agents/default/openclaw).
+# Real registered names (install.sh:10343 case statement):
+#   langflow -> "agent__langflow" (P1-only callee — distinct from the local key)
+#   letta    -> "letta"
+#   openclaw -> "openclaw"
+# This script must NEVER POST a new agent (that reintroduced a duplicate agent
+# with a bare-hostname upstream_url — e.g. http://openclaw:18789 — bypassing the
+# caddy-front mesh entirely, which is exactly what broke chat) and must NEVER
+# send upstream_url on PUT. It only discovers the real agent_id by name and
+# PUTs the demo-specific groups/allowed_caller_groups/allowed_paths.
 
 AGENTS = [
     {
-        "name": "langflow",
-        "upstream_url": "http://langflow:7860",
-        "protocol": "openai",
+        "local_key": "langflow",
+        "real_names": ("agent__langflow",),
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["data-team", "owui-users", "users"],
         "allowed_paths": [],
     },
     {
-        "name": "letta",
-        "upstream_url": "http://letta:8283",
-        "protocol": "openai",
+        "local_key": "letta",
+        "real_names": ("letta",),
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["finance-team", "owui-users", "users"],
         "allowed_paths": [],
     },
     {
-        "name": "openclaw",
-        "upstream_url": "http://openclaw:18789",
-        "protocol": "openai",
+        "local_key": "openclaw",
+        "real_names": ("openclaw",),
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["compliance-team", "owui-users", "users"],
         "allowed_paths": [],
@@ -507,46 +598,78 @@ def step7c_onboard_users(user_creds: dict) -> dict:
 
 
 def step8_register_agents() -> dict[str, dict]:
-    """Register agents (step-up gated). Return name -> {agent_id, token}."""
-    print("\n=== STEP 8: Register agents (step-up gated) ===")
+    """
+    Discover the install.sh-bundled agents (real names differ from our local
+    demo keys for langflow — see AGENTS comment above) and PUT only the
+    demo-specific groups/allowed_caller_groups/allowed_paths onto them.
 
-    # List existing agents
+    CONFIG-ONLY / FAIL LOUD (Tiago hard constraint): if a bundled agent is
+    missing from GET /admin/agents, that means install.sh's
+    register_agent_bundles() did not run or did not complete for this
+    deployment — a real product/deploy issue. This script does NOT paper
+    over that with a hardcoded upstream_url fallback; it exits non-zero.
+
+    Returns local_key -> {agent_id, name, token}.
+    """
+    print("\n=== STEP 8: Discover + configure bundled agents (step-up gated) ===")
+
     r = S.get(f"{BASE_URL}/admin/agents")
     existing = _ok(r, "list-agents")
-    existing_by_name = {a["name"]: a["agent_id"] for a in existing}
+    by_name = {a["name"]: a for a in existing}
 
     agent_info: dict[str, dict] = {}
+    missing: list[str] = []
     for adef in AGENTS:
-        name = adef["name"]
-        if name in existing_by_name:
-            print(f"  agent '{name}' already registered: {existing_by_name[name]}")
-            agent_info[name] = {"agent_id": existing_by_name[name], "token": "(already existed)"}
+        local_key = adef["local_key"]
+        match = next((by_name[n] for n in adef["real_names"] if n in by_name), None)
+        if match is None:
+            missing.append(f"{local_key} (expected real name in {adef['real_names']})")
             continue
+        agent_info[local_key] = {
+            "agent_id": match["agent_id"],
+            "name": match["name"],
+            # No plaintext PSK is available here — install.sh's
+            # register_agent_bundles() writes it directly to
+            # /run/secrets/<profile>_token inside the containers, never
+            # through the admin API (SEC-001, install.sh:10375).
+            "token": "(pre-registered by install.sh register_agent_bundles; "
+                     "token lives in /run/secrets/<profile>_token)",
+        }
 
-        r = S.post(f"{BASE_URL}/admin/agents", json={
-            "name": name,
-            "upstream_url": adef["upstream_url"],
-            "protocol": adef["protocol"],
+    if missing:
+        print(
+            f"  FATAL: bundled agent(s) not found via GET /admin/agents: {missing}\n"
+            f"  This means install.sh's register_agent_bundles() did not run or did "
+            f"not complete for this deployment (real product/deploy issue) — not "
+            f"something this script papers over with a hardcoded upstream_url.\n"
+            f"  Currently registered agent names: {sorted(by_name.keys())}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for adef in AGENTS:
+        local_key = adef["local_key"]
+        info = agent_info[local_key]
+        agent_id = info["agent_id"]
+        # upstream_url is deliberately OMITTED — install.sh owns the caddy-front
+        # mesh URL for this agent; sending it here reintroduces the
+        # duplicate-agent-wrong-upstream bug this fix closes.
+        payload = {
             "groups": adef["groups"],
             "allowed_caller_groups": adef["allowed_caller_groups"],
             "allowed_paths": adef["allowed_paths"],
-        })
+        }
+        r = S.put(f"{BASE_URL}/admin/agents/{agent_id}", json=payload)
         if r.status_code == 403 and "step_up_required" in r.text:
             print("  Step-up expired — re-doing step-up and retrying...")
             _do_stepup_inline()
-            r = S.post(f"{BASE_URL}/admin/agents", json={
-                "name": name,
-                "upstream_url": adef["upstream_url"],
-                "protocol": adef["protocol"],
-                "groups": adef["groups"],
-                "allowed_caller_groups": adef["allowed_caller_groups"],
-                "allowed_paths": adef["allowed_paths"],
-            })
-        body = _ok(r, f"register-agent-{name}", allow=(201,))
-        agent_id = body.get("agent_id", "")
-        token = body.get("token", "")
-        print(f"  registered agent '{name}': agent_id={agent_id}")
-        agent_info[name] = {"agent_id": agent_id, "token": token}
+            r = S.put(f"{BASE_URL}/admin/agents/{agent_id}", json=payload)
+        body = _ok(r, f"configure-agent-{local_key}")
+        print(
+            f"  configured agent '{local_key}' (real name={info['name']}, "
+            f"agent_id={agent_id}): groups={body.get('groups')} "
+            f"allowed_caller_groups={body.get('allowed_caller_groups')}"
+        )
 
     return agent_info
 
@@ -672,18 +795,26 @@ def _do_stepup_inline() -> None:
 
 
 def step8b_save_agent_tokens(agent_info: dict[str, dict]) -> None:
-    out = DEMO_DIR / f"agent-tokens-protocol2-{datetime.utcnow().strftime('%Y%m%d')}.txt"
-    lines = [f"# Agent tokens — populate-2255-protocol2 run {datetime.utcnow().isoformat()}Z\n",
-             "# Tokens are show-once. Store securely.\n"]
-    for name, info in agent_info.items():
-        lines.append(f"{name}  agent_id={info['agent_id']}  token={info['token']}\n")
+    out = DEMO_DIR / f"agent-tokens-4.1.2-{datetime.utcnow().strftime('%Y%m%d')}.txt"
+    lines = [
+        f"# Agent config — populate-demo (4.1.2) run {datetime.utcnow().isoformat()}Z\n",
+        (
+            "# Bundled agents are registered by install.sh (not this script); no plaintext\n"
+            "# PSK is available here — see install.sh register_agent_bundles().\n"
+        ),
+    ]
+    for local_key, info in agent_info.items():
+        lines.append(
+            f"{local_key}  real_name={info.get('name', '')}  agent_id={info['agent_id']}  "
+            f"token={info['token']}\n"
+        )
     out.write_text("".join(lines))
     out.chmod(0o600)
-    print(f"  Agent tokens saved to {out}")
+    print(f"  Agent config saved to {out}")
 
 
 # ---------------------------------------------------------------------------
-# STEP 9 — Save + activate 8 OPA client policies
+# STEP 9 — Save + activate 10 OPA client policies
 # ---------------------------------------------------------------------------
 
 # Self-describing policies following the decision contract:
@@ -952,7 +1083,7 @@ obligations contains "audit_high_risk_decision" if {
 
 def step9_save_policies() -> list[str]:
     """Save 8 policies to OPA. Returns list of names successfully saved."""
-    print("\n=== STEP 9: Save 8 OPA client policies (step-up gated) ===")
+    print(f"\n=== STEP 9: Save {len(POLICIES)} OPA client policies (step-up gated) ===")
     saved: list[str] = []
     for pol in POLICIES:
         name = pol["name"]
@@ -1004,6 +1135,13 @@ def step9_save_policies() -> list[str]:
 # Valid scope_kinds: human | service | api_client | mcp_server | agent
 # Valid directions:  ingress | egress | both
 # scope_id="" = wildcard (all subjects of scope_kind)
+#
+# LAURA-4.1.2 populate-demo fix: for scope_kind == "agent", scope_id below is a
+# LOCAL KEY (matching AGENTS[*]["local_key"] above), NOT the real registered
+# agent name. step10_bind_policies() resolves it to the real discovered name
+# (e.g. "langflow" -> "agent__langflow") via agent_info from step8 before
+# binding — hardcoding "langflow" here would bind to a non-existent agent
+# identity, since the real registered name is "agent__langflow".
 
 BINDINGS = [
     # POL-001: data access control -> all human callers, ingress
@@ -1029,7 +1167,17 @@ BINDINGS = [
 ]
 
 
-def step10_bind_policies() -> None:
+def step10_bind_policies(agent_info: dict[str, dict]) -> None:
+    """
+    Bind policies (step-up gated).
+
+    agent_info comes from step8_register_agents() — {local_key: {agent_id,
+    name, token}}. Any BINDINGS entry with scope_kind == "agent" has its
+    scope_id (a local_key, e.g. "langflow") resolved to the REAL registered
+    agent name (e.g. "agent__langflow") before binding. Hardcoding the local
+    key as the scope_id would silently bind to a non-existent agent identity
+    for langflow (LAURA-4.1.2 populate-demo fix, POL-005/006/007).
+    """
     print("\n=== STEP 10: Bind policies (step-up gated) ===")
     # List existing bindings to avoid duplicates
     r = S.get(f"{BASE_URL}/admin/policies/bindings")
@@ -1040,7 +1188,20 @@ def step10_bind_policies() -> None:
         for b in existing_bindings_raw
     }
 
-    for bdef in BINDINGS:
+    for raw_bdef in BINDINGS:
+        bdef = dict(raw_bdef)
+        if bdef["scope_kind"] == "agent" and bdef["scope_id"]:
+            local_key = bdef["scope_id"]
+            info = agent_info.get(local_key)
+            if not info or not info.get("name"):
+                print(
+                    f"  FATAL: cannot bind '{bdef['policy_name']}' — agent local_key "
+                    f"'{local_key}' was not discovered in STEP 8 (see FATAL above).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            bdef["scope_id"] = info["name"]
+
         key = (bdef["policy_name"], bdef["scope_kind"], bdef["scope_id"], bdef["direction"])
         if key in existing_keys:
             print(f"  binding {key} already exists — skipping")
@@ -1069,7 +1230,7 @@ def step10_bind_policies() -> None:
 def step11_allow_deny_probe() -> None:
     """
     Fire one allow and one deny probe via /admin/inspection/simulate.
-    If the endpoint doesn't exist (2.25.5 subset), skip gracefully.
+    If the endpoint doesn't exist on this deployment tier, skip gracefully.
     """
     print("\n=== STEP 11: Allow/deny OPA probe ===")
 
@@ -1096,14 +1257,14 @@ def step11_allow_deny_probe() -> None:
     for label, payload in [("allow-probe", allow_input), ("deny-probe", deny_input)]:
         r = S.post(f"{BASE_URL}/admin/inspection/simulate", json={"input": payload})
         if r.status_code == 404:
-            print(f"  {label}: /admin/inspection/simulate not available on 2.25.5 (expected 404, not a failure)")
+            print(f"  {label}: /admin/inspection/simulate not available on this deployment tier (expected 404, not a failure)")
             continue
         if r.status_code == 405:
             print(f"  {label}: 405 Method Not Allowed — endpoint may be GET-only, skipping")
             continue
         body = _ok(r, label, allow=(200, 201, 422, 503))
         if r.status_code in (422, 503):
-            print(f"  {label}: HTTP {r.status_code} (OPA unavailable or bad input schema — expected on 2.25.5 subset)")
+            print(f"  {label}: HTTP {r.status_code} (OPA unavailable or bad input schema — expected on this deployment tier)")
         else:
             decision = body.get("decision") or body.get("result") or body
             print(f"  {label}: {json.dumps(decision, default=str)[:200]}")
@@ -1145,30 +1306,34 @@ def step13_demo_mcp() -> None:
     """
     print("\n=== STEP 13: demo-mcp reachability check ===")
 
-    # Check container health via docker inspect
-    import subprocess
-    result = subprocess.run(
-        ["docker", "inspect", "--format", "{{.State.Health.Status}}", "docker-demo-mcp-1"],
-        capture_output=True, text=True
-    )
-    health = result.stdout.strip()
-    print(f"  docker-demo-mcp-1 health: {health}")
-    if health == "healthy":
-        print("  demo-mcp container is healthy")
+    container = _container_name("demo-mcp")
+    if not container:
+        print("  WARN: could not resolve demo-mcp container name via docker/podman ps "
+              "or COMPOSE_PROJECT_NAME — skipping health/self-probe checks")
     else:
-        print(f"  WARN: demo-mcp health={health} (may still be starting)")
+        # Check container health via docker inspect
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Health.Status}}", container],
+            capture_output=True, text=True
+        )
+        health = result.stdout.strip()
+        print(f"  {container} health: {health}")
+        if health == "healthy":
+            print("  demo-mcp container is healthy")
+        else:
+            print(f"  WARN: demo-mcp health={health} (may still be starting)")
 
-    # Probe from within docker network via exec
-    result2 = subprocess.run(
-        ["docker", "exec", "docker-demo-mcp-1", "python3", "-c",
-         "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2); "
-         "print('HTTP', r.status)"],
-        capture_output=True, text=True
-    )
-    if result2.returncode == 0:
-        print(f"  demo-mcp self-probe: {result2.stdout.strip()}")
-    else:
-        print(f"  demo-mcp self-probe: FAILED: {result2.stderr.strip()[:200]}")
+        # Probe from within docker network via exec
+        result2 = subprocess.run(
+            ["docker", "exec", container, "python3", "-c",
+             "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2); "
+             "print('HTTP', r.status)"],
+            capture_output=True, text=True
+        )
+        if result2.returncode == 0:
+            print(f"  demo-mcp self-probe: {result2.stdout.strip()}")
+        else:
+            print(f"  demo-mcp self-probe: FAILED: {result2.stderr.strip()[:200]}")
 
     # The MCP gateway endpoint /mcp requires agent Bearer token — check the
     # endpoint is at least reachable (401 = gateway is up, not 404/502)
@@ -1314,20 +1479,12 @@ def step13b_cloud9_demo_wire() -> None:
 # ---------------------------------------------------------------------------
 
 def _user_totp_sha256(secret: str) -> str:
-    """Compute SHA256/6-digit TOTP (standard user-tier algo)."""
-    import base64 as _b64
-    import hashlib as _hl
-    import hmac as _hmac
-    import struct as _struct
-    import time as _time
-    pad = (8 - len(secret) % 8) % 8
-    raw_secret = _b64.b32decode(secret.upper() + "=" * pad)
-    t = int(_time.time()) // 30
-    msg = _struct.pack(">Q", t)
-    h = _hmac.new(raw_secret, msg, _hl.sha256).digest()
-    offset = h[-1] & 0x0F
-    code = _struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
-    return str(code % 10 ** 6).zfill(6)
+    """User-tier TOTP (SHA256/6-digit). Thin delegator onto the product's own
+    TOTP core (_role_totp -> yashigani.auth.totp._totp_at) — collapses the
+    previous hand-rolled HMAC/base32 implementation onto the single source of
+    truth also used for admin TOTP (ROLE_TOTP_ALGO["user"] / ROLE_TOTP_DIGITS["user"]
+    == SHA256/6, matching src/yashigani/auth/totp.py exactly)."""
+    return _role_totp(secret, "user")
 
 
 def _user_login_session(email: str, username: str, password: str, totp_secret: str) -> requests.Session:
@@ -1602,10 +1759,19 @@ def _inject_workflow_via_redis(
       - backoffice Redis db/3 (wf:meta:{wf_id}, wf:workflows:{account_id})
       - gateway Redis db/6 (wf:spec:{wf_id}, wf:sched:index)
     """
-    import subprocess
     import json as _json
     import uuid as _uuid
     import time as _t
+
+    backoffice_container = _container_name("backoffice")
+    gateway_container = _container_name("gateway")
+    if not backoffice_container or not gateway_container:
+        print(
+            "  WARN: could not resolve backoffice/gateway container names via "
+            "docker/podman ps or COMPOSE_PROJECT_NAME — skipping Redis-injection "
+            f"fallback (backoffice={backoffice_container!r} gateway={gateway_container!r})"
+        )
+        return None
 
     wf_id = "wf_demo_" + _uuid.uuid4().hex[:12]
     now = _t.strftime("%Y-%m-%dT%H:%M:%S+00:00", _t.gmtime())
@@ -1657,7 +1823,7 @@ print('GATEWAY-REDIS-OK', wf_id)
 
     # Execute in backoffice container (db/3).
     r1 = subprocess.run(
-        ["docker", "exec", "localhost-backoffice-1", "python3", "-c", backoffice_code],
+        ["docker", "exec", backoffice_container, "python3", "-c", backoffice_code],
         capture_output=True, text=True, timeout=30,
     )
     if r1.returncode != 0 or "BACKOFFICE-REDIS-OK" not in r1.stdout:
@@ -1667,7 +1833,7 @@ print('GATEWAY-REDIS-OK', wf_id)
 
     # Execute in gateway container (db/6).
     r2 = subprocess.run(
-        ["docker", "exec", "localhost-gateway-1", "python3", "-c", gateway_code],
+        ["docker", "exec", gateway_container, "python3", "-c", gateway_code],
         capture_output=True, text=True, timeout=30,
     )
     if r2.returncode != 0 or "GATEWAY-REDIS-OK" not in r2.stdout:
@@ -1678,7 +1844,7 @@ print('GATEWAY-REDIS-OK', wf_id)
             f"'{json.dumps({'workflow_id': wf_id, 'owner_identity_id': account_id, 'enabled': True, 'steps': steps, 'schedule': schedule})}'"
         )
         r3 = subprocess.run(
-            ["docker", "exec", "localhost-gateway-1", "sh", "-c", redis_cli_cmd],
+            ["docker", "exec", gateway_container, "sh", "-c", redis_cli_cmd],
             capture_output=True, text=True, timeout=10,
         )
         print(f"  gateway redis-cli fallback: {r3.stdout.strip()} {r3.stderr.strip()[:100]}")
@@ -1887,7 +2053,7 @@ def step14_verify_aspen() -> None:
     aspen_session.verify = False
 
     _wait_next_totp_window("aspen-verify")
-    code = pyotp.TOTP(ASPEN_TOTP_SECRET).now()
+    code = _role_totp(ASPEN_TOTP_SECRET, "admin")  # aspen is admin-tier (SHA512/8)
     r = aspen_session.post(f"{BASE_URL}/auth/login", json={
         "username": ASPEN_USER,
         "password": aspen_pw,
@@ -1916,7 +2082,7 @@ def step15_summary(
     agent_info: dict[str, dict],
 ) -> None:
     print("\n" + "=" * 70)
-    print("POPULATE 2.25.5 PROTOCOL2 — COMPLETE")
+    print("POPULATE-DEMO (4.1.2) — COMPLETE")
     print("=" * 70)
 
     print(f"\nOrchid new password ({len(ORCHID_NEW_PW)} chars, round-trip verified):")
@@ -1952,7 +2118,7 @@ def step15_summary(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print(f"populate-2255-protocol2.py starting at {datetime.utcnow().isoformat()}Z")
+    print(f"populate-demo.py (4.1.2) starting at {datetime.utcnow().isoformat()}Z")
     print(f"BASE_URL: {BASE_URL}")
     print(f"CREDS_FILE: {CREDS_FILE}")
 
@@ -1990,11 +2156,11 @@ def main() -> None:
     agent_info = step8_register_agents()
     step8b_save_agent_tokens(agent_info)
 
-    # Step 9: save 8 OPA policies (step-up gated)
+    # Step 9: save OPA policies (step-up gated)
     step9_save_policies()
 
-    # Step 10: bind policies (step-up gated)
-    step10_bind_policies()
+    # Step 10: bind policies (step-up gated) — resolves agent local_key -> real name
+    step10_bind_policies(agent_info)
 
     # Step 11: allow/deny probe
     step11_allow_deny_probe()
