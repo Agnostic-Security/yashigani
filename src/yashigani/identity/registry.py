@@ -632,6 +632,38 @@ return 1
             logger.error("IdentityRegistry.verify_key error for %s: %s", identity_id, exc)
             return False
 
+    def has_key(self, identity_id: str) -> bool:
+        """
+        Return True if a current (non-grace) API key exists for this identity.
+
+        LAURA-4.1.2-010: this is the canonical way for callers (e.g. the
+        self-service /me/api-keys routes) to check key existence without
+        reaching into a *different* Redis client/DB than the one the key
+        actually lives in (identity:key:{identity_id} lives in db/3, owned
+        by this registry — never db/1, which is the session store's DB).
+        """
+        return bool(self._r.exists(f"identity:key:{identity_id}"))
+
+    def revoke_key(self, identity_id: str) -> bool:
+        """
+        Revoke (delete) the current API key + any grace key for this identity.
+
+        Returns True if a current key existed and was deleted, False if
+        there was nothing to revoke (caller should treat this as "not found").
+
+        Does NOT deactivate or delete the identity itself — only the key
+        material. Use deactivate() to remove the identity entirely.
+
+        LAURA-4.1.2-010: this must be the ONLY code path used to revoke a
+        self-service API key. Deleting identity:key:{identity_id} via any
+        other Redis client (e.g. session_store._redis, which is a different
+        DB) is a no-op against the real key and leaves the key usable.
+        """
+        existed = bool(self._r.exists(f"identity:key:{identity_id}"))
+        self._r.delete(f"identity:key:{identity_id}", f"identity:key:grace:{identity_id}")
+        logger.info("IdentityRegistry: key revoked for %s (existed=%s)", identity_id, existed)
+        return existed
+
     def rotate_key(self, identity_id: str, grace_seconds: int = 7 * 86400) -> str:
         """
         Rotate API key. Returns new plaintext key.

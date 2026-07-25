@@ -229,11 +229,13 @@ async def issue_api_key(request: Request, session: AnySession):
     identity = _get_identity_for_account(registry, record)
     identity_id = identity["identity_id"]
 
-    # 7. Check for existing key (to determine if this is a rotation)
-    existing_key = backoffice_state.session_store._redis.get(
-        f"identity:key:{identity_id}"
-    ) if backoffice_state.session_store else None
-    is_rotation = existing_key is not None
+    # 7. Check for existing key (to determine if this is a rotation).
+    # LAURA-4.1.2-010: identity:key:{identity_id} lives in the IdentityRegistry's
+    # Redis DB (db/3) — the SAME store issue/rotate/verify use. It is NOT owned
+    # by session_store._redis (db/1, session tokens only). Route through the
+    # registry so this check is never checking a different DB than the one the
+    # key actually lives in.
+    is_rotation = registry.has_key(identity_id)
 
     # 8. Rotate key — grace_seconds=0 means prior token is immediately invalidated.
     plaintext_token = registry.rotate_key(identity_id, grace_seconds=0)
@@ -298,11 +300,11 @@ async def list_api_keys(session: AnySession):
 
     identity_id = identity["identity_id"]
 
-    # 5. Check whether a key exists for this identity
-    r = backoffice_state.session_store._redis if backoffice_state.session_store else None
-    key_hash = r.get(f"identity:key:{identity_id}") if r is not None else None
-
-    if key_hash is None:
+    # 5. Check whether a key exists for this identity.
+    # LAURA-4.1.2-010: identity:key:{identity_id} is owned by the IdentityRegistry
+    # (db/3) — the same store issue/rotate/verify use. Route through registry.has_key,
+    # NOT session_store._redis (db/1), which never held this key in the first place.
+    if not registry.has_key(identity_id):
         return {"api_keys": []}
 
     # 6. Build metadata response — NO plaintext
@@ -364,15 +366,14 @@ async def revoke_api_key(key_id: str, session: AnySession):
             },
         )
 
-    # 5. Check key exists
-    r = backoffice_state.session_store._redis if backoffice_state.session_store else None
-    key_hash = r.get(f"identity:key:{identity_id}") if r is not None else None
-    if key_hash is None:
+    # 5 & 6. Revoke — delete current key + any grace key via the IdentityRegistry.
+    # LAURA-4.1.2-010: identity:key:{identity_id} is owned by the IdentityRegistry
+    # (db/3) — the same store issue/rotate/verify use. registry.revoke_key() is the
+    # ONLY correct code path; deleting via session_store._redis (db/1) is a no-op
+    # against the real key and left "revoked" keys fully usable (silent no-op bug).
+    existed = registry.revoke_key(identity_id)
+    if not existed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "key_not_found"})
-
-    # 6. Revoke — delete current key + any grace key
-    if r is not None:
-        r.delete(f"identity:key:{identity_id}", f"identity:key:grace:{identity_id}")
 
     # 7. Audit
     state = backoffice_state
