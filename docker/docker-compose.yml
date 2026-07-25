@@ -83,6 +83,19 @@ x-common-env: &common-env
   # Scoped to cloud keys only (openai_api_key, anthropic_api_key) — install-managed
   # secrets remain read-only.  Production KMS (keeper/aws/vault) ignores this var.
   YASHIGANI_CLOUD_KEYS_DIR: /run/cloud-keys
+  # YSG-GATE-V50-C fix: writable path for the per-tenant crypto-shred KEK
+  # (audit/crypto_shred.py CryptoShredKeyStore._get_or_create_kek). Sealed
+  # subject fields exist because crypto_shred_enabled defaults True in EVERY
+  # deployment mode (audit/config.py — a privacy control), so this directory
+  # is a hard runtime requirement whenever YASHIGANI_KMS_PROVIDER=docker, not
+  # a demo-tier extra like cloud-keys.  Kept physically separate from
+  # /run/cloud-keys — a machine-minted KEK must never share a directory (or
+  # the admin-UI key inventory) with human-supplied LLM provider credentials.
+  # DockerSecretsProvider.set_secret writes atomically (0600) here the first
+  # time a tenant KEK is minted; get_secret checks this dir first, then
+  # /run/secrets. MUST be a durable volume — never emptyDir/tmpfs — losing a
+  # KEK permanently un-decrypts every already-sealed field for that tenant.
+  YASHIGANI_CRYPTO_SHRED_KEKS_DIR: /run/cryptoshred-keys
   YASHIGANI_AUDIT_LOG_PATH: /data/audit/audit.log
   YASHIGANI_AUDIT_MAX_FILE_SIZE_MB: ${YASHIGANI_AUDIT_MAX_FILE_SIZE_MB:-100}
   YASHIGANI_AUDIT_RETENTION_DAYS: ${YASHIGANI_AUDIT_RETENTION_DAYS:-90}
@@ -836,6 +849,11 @@ services:
       # Never place install-managed secrets here — the provider enforces the
       # cloud-key namespace at write time.
       - ./cloud-keys:/run/cloud-keys:rw
+      # YSG-GATE-V50-C fix: writable per-tenant crypto-shred KEK volume,
+      # physically separate from ./cloud-keys (see YASHIGANI_CRYPTO_SHRED_KEKS_DIR
+      # note above). Same UID 1001 write requirement, same atomic-write provider
+      # code path (docker_secrets.py set_secret).
+      - ./cryptoshred-keys:/run/cryptoshred-keys:rw
       # 5.0 DEPLOY-WIRING FIX (Captain, 2026-07-25): demo config assets for the
       # A4 (system-prompt leak scrub) + A12 (content-moderation) controls —
       # same bind-mount-from-repo-root pattern as OPA's `../policy:/policies:ro`
@@ -1301,6 +1319,13 @@ services:
       # here when an admin stores a key via the UI.  Gateway reads back from this
       # same host path via its own cloud-keys mount.  Scoped to cloud keys only.
       - ./cloud-keys:/run/cloud-keys:rw
+      # YSG-GATE-V50-C fix: writable per-tenant crypto-shred KEK volume.
+      # Backoffice mints the tenant KEK on the FIRST sealed admin-account
+      # mutation (CryptoShredKeyStore._get_or_create_kek); gateway reads it
+      # back from this same host path via its own mount below.  Physically
+      # separate from ./cloud-keys — see YASHIGANI_CRYPTO_SHRED_KEKS_DIR note
+      # in the shared env block above.
+      - ./cryptoshred-keys:/run/cryptoshred-keys:rw
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro

@@ -514,7 +514,7 @@ class TestDockerSecretsProviderCloudKeys:
         rw_dir.mkdir()
 
         provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
-        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+        with pytest.raises(ProviderError, match="not in the cloud-key or crypto-shred-KEK namespace"):
             provider.set_secret("postgres_password", "newpw")
 
     def test_set_secret_refuses_internal_bearer(self, tmp_path):
@@ -525,7 +525,7 @@ class TestDockerSecretsProviderCloudKeys:
         rw_dir.mkdir()
 
         provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
-        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+        with pytest.raises(ProviderError, match="not in the cloud-key or crypto-shred-KEK namespace"):
             provider.set_secret("yashigani_internal_bearer", "fake-bearer")
 
     def test_set_secret_refuses_ca_root(self, tmp_path):
@@ -536,7 +536,7 @@ class TestDockerSecretsProviderCloudKeys:
         rw_dir.mkdir()
 
         provider = self._make_provider(ro_dir, cloud_keys_dir=rw_dir)
-        with pytest.raises(ProviderError, match="not in the cloud-key namespace"):
+        with pytest.raises(ProviderError, match="not in the cloud-key or crypto-shred-KEK namespace"):
             provider.set_secret("ca_root.crt", "fake-cert")
 
     # --- error conditions ---------------------------------------------------
