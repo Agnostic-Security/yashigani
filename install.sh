@@ -10340,7 +10340,18 @@ register_agent_bundles() {
     # until that lands, dispatch through the front fails CLOSED at the TLS
     # handshake (no regression — the direct path had no L3 route at all).
     case "$_profile" in
-      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="openai"
+      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="langflow"
+                 # YSG-GATE-V50-A: was "openai" — routed langflow through the
+                 # generic OpenAI-compat branch in openai_router.py, which (a)
+                 # posts directly to /v1/chat/completions (langflow doesn't
+                 # implement that path; it needs the auto_login + flow-run
+                 # dance) and (b) historically used a bare httpx client with
+                 # no mesh client leaf against the mTLS-only Caddy front,
+                 # 502 agent_unreachable / CERTIFICATE_VERIFY_FAILED. "langflow"
+                 # routes through gateway/langflow_client.py::langflow_chat,
+                 # which already presents the mesh leaf via
+                 # _dispatch_client.agent_dispatch_client() — same pattern as
+                 # letta's _proto="letta" below.
                  # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
                  # agent__langflow is a P1-only callee: only the gateway can be its upstream
                  # (OPENAI_API_BASE=http://egress-langflow:9400/llm/v1 — enforced in compose/helm).
