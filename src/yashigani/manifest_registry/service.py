@@ -136,6 +136,7 @@ class ManifestRegistryService:
         manifest_yaml: str,
         operator_identity: str,
         signature_provenance: Optional[dict] = None,
+        registrant_account_id: Optional[str] = None,
     ) -> int:
         """
         Append a manifest registration record.
@@ -153,8 +154,22 @@ class ManifestRegistryService:
             Full YAML text of the manifest being registered.
         operator_identity:
             sub claim from the operator token, or "unknown" for weak-identity.
+            Free-text provenance/audit annotation ONLY — stored verbatim in
+            registered_by_operator_identity for cross-referencing the CLI's
+            JWT-derived human identity. LAURA-V50-005: this field is
+            client-supplied and MUST NOT be used as a two-person-integrity
+            comparison key (see registrant_account_id below).
         signature_provenance:
             Ceremony JSON dict (alg, signer, sig, ack fields), or None.
+        registrant_account_id:
+            LAURA-V50-005: the calling admin's server-verified session
+            identity (StepUpAdminSession.account_id) — the SAME identity
+            namespace `ManifestReapprovalGate.approve()` compares
+            `approver_id` against. Required whenever a reapproval_gate is
+            wired (fail-closed: raises ValueError if omitted) so the rug-pull
+            dual-control SoD check always compares two directly-comparable,
+            server-verified identities instead of a free-text label against
+            a session UUID.
 
         Returns
         -------
@@ -169,6 +184,17 @@ class ManifestRegistryService:
             raise ValueError("manifest_yaml is required")
         if not operator_identity:
             raise ValueError("operator_identity is required")
+        if self._reapproval_gate is not None and not registrant_account_id:
+            # LAURA-V50-005 defense-in-depth: never silently fall back to the
+            # free-text operator_identity for the SoD comparison key. If the
+            # caller didn't supply a server-verified account_id, fail closed
+            # here rather than let the gate later compare mismatched
+            # identity namespaces (which is exactly how the bypass worked).
+            raise ValueError(
+                "registrant_account_id is required when a manifest reapproval "
+                "gate is wired — refusing to register a rug-pull-gated delta "
+                "without a server-verified registrant identity."
+            )
 
         self._check_blob_size(manifest_yaml)
         sha = self._compute_sha256(manifest_yaml)
@@ -233,7 +259,7 @@ class ManifestRegistryService:
         if self._reapproval_gate is not None:
             try:
                 note = self._reapproval_gate.note_registration(
-                    agent_id, sha, registered_by=operator_identity,
+                    agent_id, sha, registered_by=registrant_account_id,
                 )
                 if not note.active:
                     _log.warning(

@@ -46,7 +46,7 @@ AUDIT_INTEGRITY_EVENTS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Hash/digest field names — NEVER masked, regardless of event type
+# Structured fields — NEVER value-masked, regardless of event type
 #
 # LAURA-V50-003(b): the generic 32-64 char hex pattern below exists to catch
 # unlabelled secrets, but a SHA-256 hexdigest IS a 32-64 char hex string by
@@ -56,11 +56,25 @@ AUDIT_INTEGRITY_EVENTS: frozenset[str] = frozenset({
 # "[REDACTED:api_key]" on every masked event, destroying the
 # non-repudiation guarantee those fields exist to provide.
 #
-# Field-name suffix denylist rather than an explicit field list: any field
-# documented as "SHA-256/SHA-384 of X" or "hash of X" in schema.py follows
-# one of these naming conventions, and a suffix denylist keeps new hash/
-# digest fields safe by construction instead of requiring every future
-# field to remember to opt out of masking individually.
+# LAURA-V50-006: the same collision hits any OTHER hex-shaped structured
+# identifier that isn't a hash/digest — e.g. candidate_id
+# (uuid.uuid4().hex, 32 lowercase hex chars). The V50-003(b) fix was a
+# field-*name* denylist scoped to hash/digest suffixes only, so it did not
+# cover this case; extending it one field at a time ("also exempt
+# candidate_id") is whack-a-mole — the schema has ~150 more `_id` fields
+# following the same naming convention (request_id, session_id, agent_id,
+# tenant_id, rule_id, workflow_id, key_id, spiffe_id, ...), all of which are
+# server-generated/server-verified correlation identifiers, never free-form
+# text a caller could paste a credential into.
+#
+# Fix, generalized by NAMING CONVENTION rather than by field list: any field
+# whose name ends in a structured-identifier or hash/digest suffix is,
+# by construction across this schema, a correlation identifier or a
+# computed integrity anchor — never a place a credential could be pasted —
+# so it is exempt from value-masking. Free-form/captured-payload fields
+# (analyzed_content, justification, ack_text_shown, error, previous_value/
+# new_value, etc.) do NOT end in these suffixes and remain fully masked, so
+# LAURA-V50-003(a)'s plain-password-in-content coverage is unchanged.
 # ---------------------------------------------------------------------------
 
 _HASH_FIELD_SUFFIXES: tuple[str, ...] = (
@@ -72,10 +86,34 @@ _HASH_FIELD_SUFFIXES: tuple[str, ...] = (
     "_sha512",
 )
 
+# LAURA-V50-006: structured correlation-identifier suffix. Every identifier
+# field in schema.py follows this naming convention (agent_id, session_id,
+# candidate_id, tenant_id, rule_id, spiffe_id, key_id, ...) — server-
+# generated or server-verified IDs, never free-form content.
+_STRUCTURAL_ID_SUFFIXES: tuple[str, ...] = (
+    "_id",
+)
+
+_NEVER_MASKED_FIELD_SUFFIXES: tuple[str, ...] = (
+    _HASH_FIELD_SUFFIXES + _STRUCTURAL_ID_SUFFIXES
+)
+
 
 def _is_hash_field(field_name: str) -> bool:
-    """True if `field_name` holds a hash/digest value that must never be masked."""
+    """True if `field_name` holds a hash/digest value that must never be masked.
+
+    Kept name for backward compatibility (LAURA-V50-003(b) call sites/tests
+    reference `_is_hash_field`); it now also covers LAURA-V50-006's
+    structured-identifier generalization via `_is_never_masked_field`.
+    """
     return field_name.endswith(_HASH_FIELD_SUFFIXES)
+
+
+def _is_never_masked_field(field_name: str) -> bool:
+    """True if `field_name` holds a hash/digest OR a structured correlation
+    identifier — either way, a value that must never be handed to
+    mask_string() (LAURA-V50-003(b) + LAURA-V50-006)."""
+    return field_name.endswith(_NEVER_MASKED_FIELD_SUFFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +189,18 @@ class CredentialMasker:
         Return a shallow-copied event with all string fields masked.
         Non-string fields are left unchanged.
         Hash/digest fields (content_hash, response_content_hash,
-        manifest_digest, weights_sha256, etc. — see _is_hash_field) are
-        NEVER masked: they carry a computed integrity value, not free-form
-        content, and the generic hex-secret pattern would otherwise rewrite
-        every SHA-256 hexdigest to a static placeholder (LAURA-V50-003(b)).
+        manifest_digest, weights_sha256, etc.) and structured correlation-
+        identifier fields (candidate_id, session_id, agent_id, tenant_id,
+        etc. — see _is_never_masked_field) are NEVER masked: they carry a
+        computed integrity value or a server-verified identifier, not
+        free-form content, and the generic hex-secret pattern would
+        otherwise rewrite any hex-shaped one to a static placeholder
+        (LAURA-V50-003(b), LAURA-V50-006).
         raw_query_logged is always forced to False.
         """
         cloned = copy.copy(event)
         for f in dataclasses.fields(cloned):
-            if _is_hash_field(f.name):
+            if _is_never_masked_field(f.name):
                 continue
             val = getattr(cloned, f.name)
             if isinstance(val, str):

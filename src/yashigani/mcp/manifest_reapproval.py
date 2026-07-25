@@ -57,7 +57,23 @@ class ManifestReapprovalGate:
     ) -> NoteResult:
         """Call on every manifest registration. Returns whether the new sha is
         active. First registration (no active sha) is TOFU-active; an unchanged
-        sha stays active; a delta is held pending re-approval (NOT active)."""
+        sha stays active; a delta is held pending re-approval (NOT active).
+
+        LAURA-V50-005 defense-in-depth: `registered_by` MUST be the same
+        canonical, server-verified admin identity namespace `approve()`
+        compares `approver_id` against (e.g. the admin's session
+        account_id) — never a client-supplied free-text label. If the
+        caller passes an empty/non-string identity, fail closed (raise)
+        rather than silently record an unnormalizable registrant that
+        could later vacuously fail to collide with a real approver_id.
+        """
+        if not registered_by or not isinstance(registered_by, str):
+            raise ManifestReapprovalError(
+                "registered_by must be a non-empty, canonical admin identity "
+                "string (e.g. the registering admin's session account_id) — "
+                "refusing to hold a rug-pull-gated delta with an "
+                "unnormalizable registrant identity."
+            )
         try:
             active_raw = self._r.get(_ACTIVE_KEY + agent_id)
         except Exception as exc:  # noqa: BLE001
@@ -90,6 +106,16 @@ class ManifestReapprovalGate:
 
     # ── dual-control approval ───────────────────────────────────────────────
     def approve(self, agent_id: str, approver_id: str, confirming_sha: str) -> str:
+        # LAURA-V50-005 defense-in-depth: approver_id must be the same
+        # canonical, server-verified identity namespace as registered_by
+        # (see note_registration). Fail closed on an unnormalizable
+        # approver identity rather than let it vacuously never-match
+        # registered_by and sail through the SoD check.
+        if not approver_id or not isinstance(approver_id, str):
+            raise ManifestReapprovalError(
+                "approver_id must be a non-empty, canonical admin identity "
+                "string (e.g. the approving admin's session account_id)."
+            )
         raw = self._r.get(_PENDING_KEY + agent_id)
         if not raw:
             raise ManifestReapprovalError(
