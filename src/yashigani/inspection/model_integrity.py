@@ -34,7 +34,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,15 @@ class Pin:
 class VerifyResult:
     ok: bool
     model: str
-    reason: str  # "match" | "no_pin" | "weights_mismatch" | "manifest_mismatch" | "store_unavailable"
+    # "match" | "no_pin" | "weights_mismatch" | "manifest_mismatch"
+    # | "store_unavailable" | "pin_unverifiable"
+    #
+    # "pin_unverifiable" (LAURA-V50-004): a pin EXISTS but nothing was actually
+    # compared on either axis — pin.weights_sha256/manifest_digest were empty,
+    # or the observed side was empty, on BOTH axes. This must never be reported
+    # as "match" (a vacuous pin is not a verified pin). ok reflects the caller's
+    # strict-mode choice (see ModelIntegrityVerifier.verify).
+    reason: str
     expected_weights: str = ""
     observed_weights: str = ""
     expected_manifest: str = ""
@@ -151,8 +159,27 @@ class ModelIntegrityVerifier:
         observed_manifest_digest: str = "",
         observed_weights_sha256: str = "",
         request_id: str = "",
+        strict: bool = False,
     ) -> VerifyResult:
-        """Fail-closed: a store error returns ok=False (store_unavailable)."""
+        """Fail-closed: a store error returns ok=False (store_unavailable).
+
+        LAURA-V50-004: a pin that COMPARES NOTHING must never report "match".
+        Each axis (weights, manifest) is only "comparable" when BOTH the pin
+        field and the observed field are non-empty. If a pin exists but NEITHER
+        axis is comparable (empty pin fields, or the observed side is
+        unavailable on both axes — e.g. weights unprobeable on this host
+        topology AND an empty manifest_digest), the pin is vacuous: the dual-
+        control ceremony may show "approved" but it enforces nothing. That
+        state is reported as reason="pin_unverifiable", never "match".
+
+        `strict` (caller passes YASHIGANI_MODEL_PIN_STRICT): when True, an
+        unverifiable pin BLOCKS (ok=False) — the fail-safe default is to trust
+        the operator's explicit opt-in over uptime. When False (default), it
+        does not block (ok=True) so a legitimately-unprobeable platform (Mac
+        host-native ollama; see model_probe.py) does not cause an outage — but
+        it is never silent: a WARNING is logged and an audit event is written
+        either way, so the vacuous state is always operator-visible.
+        """
         try:
             pin = self._store.get(model)
         except PinStoreUnavailableError:
@@ -166,11 +193,10 @@ class ModelIntegrityVerifier:
             # Policy decision (caller): unpinned models pass unless strict mode.
             return VerifyResult(ok=True, model=model, reason="no_pin")
 
-        if (
-            pin.weights_sha256
-            and observed_weights_sha256
-            and observed_weights_sha256 != pin.weights_sha256
-        ):
+        weights_comparable = bool(pin.weights_sha256 and observed_weights_sha256)
+        manifest_comparable = bool(pin.manifest_digest and observed_manifest_digest)
+
+        if weights_comparable and observed_weights_sha256 != pin.weights_sha256:
             self._emit_mismatch(model, pin.weights_sha256, observed_weights_sha256,
                                 pin.manifest_digest, observed_manifest_digest, request_id)
             return VerifyResult(
@@ -178,15 +204,20 @@ class ModelIntegrityVerifier:
                 expected_weights=pin.weights_sha256, observed_weights=observed_weights_sha256,
             )
 
-        if (
-            pin.manifest_digest
-            and observed_manifest_digest
-            and observed_manifest_digest != pin.manifest_digest
-        ):
+        if manifest_comparable and observed_manifest_digest != pin.manifest_digest:
             self._emit_mismatch(model, pin.weights_sha256, observed_weights_sha256,
                                 pin.manifest_digest, observed_manifest_digest, request_id)
             return VerifyResult(
                 ok=False, model=model, reason="manifest_mismatch",
+                expected_manifest=pin.manifest_digest, observed_manifest=observed_manifest_digest,
+            )
+
+        if not weights_comparable and not manifest_comparable:
+            self._emit_unverifiable(model, pin, observed_weights_sha256,
+                                    observed_manifest_digest, request_id, strict)
+            return VerifyResult(
+                ok=not strict, model=model, reason="pin_unverifiable",
+                expected_weights=pin.weights_sha256, observed_weights=observed_weights_sha256,
                 expected_manifest=pin.manifest_digest, observed_manifest=observed_manifest_digest,
             )
 
@@ -212,6 +243,34 @@ class ModelIntegrityVerifier:
         except Exception:  # pragma: no cover
             logger.exception("model-integrity: mismatch audit emit failed")
 
+    def _emit_unverifiable(self, model: str, pin: Pin, obs_w: str, obs_m: str,
+                           request_id: str, strict: bool) -> None:
+        """LAURA-V50-004: a pin exists but compared nothing on either axis.
+        Always loud (WARNING + audit) — this state must never be silent,
+        strict or not."""
+        logger.warning(
+            "MODEL_PIN_UNVERIFIABLE model=%s pin_weights=%r pin_manifest=%r "
+            "observed_weights=%r observed_manifest=%r strict=%s action=%s — "
+            "the pin exists but enforces nothing: it was not compared on "
+            "either axis (empty pin field, or the observed side is "
+            "unavailable, on BOTH axes)",
+            model, pin.weights_sha256, pin.manifest_digest, obs_w, obs_m,
+            strict, "block" if strict else "warn",
+        )
+        if self._audit is None:
+            return
+        try:
+            from yashigani.audit.schema import ModelPinEvent, EventType
+            self._audit.write(ModelPinEvent(
+                event_type=EventType.MODEL_PIN_UNVERIFIABLE,
+                request_id=request_id, model=model,
+                old_weights_sha256=pin.weights_sha256, new_weights_sha256=obs_w,
+                old_manifest_digest=pin.manifest_digest, new_manifest_digest=obs_m,
+                action_taken="block" if strict else "warn",
+            ))
+        except Exception:  # pragma: no cover
+            logger.exception("model-integrity: unverifiable audit emit failed")
+
 
 # ── Dual-control pin changes (corrected SOD-1/SOD-2 pattern) ────────────────
 
@@ -220,15 +279,61 @@ class ModelPinDualControl:
     by a DIFFERENT admin B who re-supplies the confirming digest. The pending
     record is immutable while PENDING (a second propose is rejected)."""
 
-    def __init__(self, store: ModelPinStore, redis_client, audit_writer=None) -> None:
+    def __init__(self, store: ModelPinStore, redis_client, audit_writer=None,
+                probe_manifest_digest_fn: Optional[Callable[[str], str]] = None) -> None:
         self._store = store
         self._r = redis_client
         self._audit = audit_writer
+        # LAURA-V50-004 rec #2: best-effort live-probe callback the caller can
+        # wire (backoffice: model_probe.probe_manifest_digests against ollama)
+        # to auto-populate manifest_digest when the admin didn't supply one —
+        # so the dual-control ceremony records a REAL, comparable anchor
+        # instead of silently accepting an empty one. Optional/DI so this
+        # module stays network-free and unit-testable.
+        self._probe_manifest_digest_fn = probe_manifest_digest_fn
+
+    def _autofill_manifest_digest(self, model: str, weights_sha256: str,
+                                  manifest_digest: str) -> str:
+        """If manifest_digest was not supplied and a probe callback is wired,
+        best-effort fetch the model's CURRENT observed manifest digest so the
+        pin commits to a real anchor. Never raises — probe failure just leaves
+        manifest_digest as supplied (empty), and the caller's own
+        both-empty check then rejects the vacuous pin."""
+        if manifest_digest or self._probe_manifest_digest_fn is None:
+            return manifest_digest
+        try:
+            observed = self._probe_manifest_digest_fn(model)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never block on probe errors
+            logger.warning(
+                "model-integrity: live manifest-digest probe failed for model=%s (%s) — "
+                "pin will proceed with the digest as supplied", model, exc,
+            )
+            return manifest_digest
+        if observed:
+            logger.info(
+                "model-integrity: auto-populated manifest_digest for model=%s from live probe "
+                "(admin did not supply one)", model,
+            )
+            return observed
+        return manifest_digest
 
     def bootstrap(self, model: str, weights_sha256: str, manifest_digest: str,
                   actor_id: str) -> Pin:
         """TOFU: capture the first pin for a model under single installer
-        authority. Write-ahead audit — fails closed if the audit write fails."""
+        authority. Write-ahead audit — fails closed if the audit write fails.
+
+        LAURA-V50-004: reject a pin with NO usable anchor (both digests empty
+        after best-effort live-probe autofill) — a pin must commit to at
+        least one real, comparable anchor. This is what let the live
+        qwen2.5:3b pin ship with an empty manifest_digest and an unprobeable
+        weights anchor, enforcing nothing while showing "approved"."""
+        manifest_digest = self._autofill_manifest_digest(model, weights_sha256, manifest_digest)
+        if not weights_sha256 and not manifest_digest:
+            raise DualControlError(
+                "A pin requires at least one non-empty anchor (weights_sha256 or "
+                "manifest_digest); none was supplied and none could be observed "
+                "from a live probe for this model."
+            )
         pin = Pin(model=model, weights_sha256=weights_sha256, manifest_digest=manifest_digest)
         self._audit_or_raise(
             "MODEL_PIN_BOOTSTRAPPED", model,
@@ -244,8 +349,13 @@ class ModelPinDualControl:
         just = (justification or "").strip()
         if len(just) < 4:
             raise DualControlError("A justification is required for a pin change.")
+        new_manifest_digest = self._autofill_manifest_digest(
+            model, new_weights_sha256, new_manifest_digest)
         if not new_weights_sha256 and not new_manifest_digest:
-            raise DualControlError("At least one of weights/manifest digest is required.")
+            raise DualControlError(
+                "At least one of weights/manifest digest is required (none was "
+                "supplied and none could be observed from a live probe)."
+            )
 
         key = _PENDING_KEY_PREFIX + model
         # Immutable while PENDING: reject a second proposal for the same model.

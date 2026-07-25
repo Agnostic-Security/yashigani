@@ -90,7 +90,8 @@ class _RecModeration:
         R.categories = []; R.action = "allow"; R.content_hash = ""; return R
 
 class _RecVerifier:
-    def verify(self, model, observed_manifest_digest="", observed_weights_sha256="", request_id=""):
+    def verify(self, model, observed_manifest_digest="", observed_weights_sha256="",
+              request_id="", strict=False):
         CALLS.append("pin")
         R = MagicMock(); R.ok = True; R.reason = "match"; return R
 
@@ -189,7 +190,8 @@ class TestEachLayerBlocksAtItsPoint:
     async def test_pin_mismatch_blocks_before_dispatch(self):
         mod = _import_router_fresh("blkpin"); _wire_all(mod)
         v = _RecVerifier()
-        def _v(model, observed_manifest_digest="", observed_weights_sha256="", request_id=""):
+        def _v(model, observed_manifest_digest="", observed_weights_sha256="",
+              request_id="", strict=False):
             CALLS.append("pin"); R = MagicMock(); R.ok = False; R.reason = "weights_mismatch"; return R
         v.verify = _v
         mod._state.model_integrity_verifier = v

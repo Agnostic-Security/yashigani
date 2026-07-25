@@ -145,6 +145,9 @@ class EventType(str, Enum):
     MODEL_PIN_APPROVED = "MODEL_PIN_APPROVED"
     MODEL_PIN_REJECTED = "MODEL_PIN_REJECTED"
     MODEL_INTEGRITY_MISMATCH = "MODEL_INTEGRITY_MISMATCH"
+    # LAURA-V50-004 — a pin exists but compared nothing on either axis (empty
+    # digest(s) and/or unavailable observed side); never reported as "match"
+    MODEL_PIN_UNVERIFIABLE = "MODEL_PIN_UNVERIFIABLE"
     # 5.0 rug-pull — manifest delta must be re-approved before it goes active
     MANIFEST_DELTA_PENDING = "MANIFEST_DELTA_PENDING"
     MANIFEST_DELTA_APPROVED = "MANIFEST_DELTA_APPROVED"

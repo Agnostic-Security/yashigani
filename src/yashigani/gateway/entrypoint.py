@@ -254,6 +254,10 @@ def _build_app(mesh_mode: bool = False):
                     observed_manifest_digest=_model_observed_digests.get(_fm, ""),
                     observed_weights_sha256=_model_observed_weights.get(_fm, ""),
                     request_id="startup-classifier-verify",
+                    # LAURA-V50-004: a vacuous pin (reason=pin_unverifiable) must
+                    # refuse start here too when strict mode is on, not just
+                    # silently pass — same flag that gates the per-request path.
+                    strict=_strict_pin,
                 )
                 if not _fmres.ok:
                     logger.critical(

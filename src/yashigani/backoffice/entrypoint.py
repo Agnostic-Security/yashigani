@@ -277,8 +277,21 @@ def _bootstrap():
                 from yashigani.inspection.model_integrity import ModelPinStore, ModelPinDualControl
                 from yashigani.mcp.manifest_reapproval import ManifestReapprovalGate
                 from yashigani.inspection.rule_promotion import RulePromotionStore
+
+                # LAURA-V50-004: best-effort live-probe callback so bootstrap()/
+                # propose() can auto-populate manifest_digest from the model's
+                # CURRENT observed manifest digest when an admin doesn't supply
+                # one — the manifest anchor is real and comparable rather than
+                # silently accepted empty. Each call is a fresh /api/tags GET
+                # (admin-rate action, not hot-path); any failure is caught
+                # inside _autofill_manifest_digest, never blocks the ceremony.
+                def _probe_manifest_digest(model_name: str) -> str:
+                    from yashigani.inspection.model_probe import probe_manifest_digests
+                    return probe_manifest_digests(ollama_url).get(model_name, "")
+
                 backoffice_state.model_pin_dual_control = ModelPinDualControl(
-                    ModelPinStore(_ms_redis), _ms_redis, audit_writer=audit_writer)
+                    ModelPinStore(_ms_redis), _ms_redis, audit_writer=audit_writer,
+                    probe_manifest_digest_fn=_probe_manifest_digest)
                 backoffice_state.manifest_reapproval_gate = ManifestReapprovalGate(
                     _ms_redis, audit_writer=audit_writer)
                 backoffice_state.rule_promotion_store = RulePromotionStore(

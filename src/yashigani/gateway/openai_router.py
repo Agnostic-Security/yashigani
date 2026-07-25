@@ -843,7 +843,16 @@ def _verify_ollama_pin(model: str, request_id: str):
     error or a weights/manifest mismatch blocks; an unpinned model or an absent
     verifier passes. Observed digests come from the startup/periodic probe
     cache — when absent the manifest fast-path simply has nothing to compare and
-    only a populated weights anchor can mismatch (both-empty ⇒ pass, honest).
+    only a populated weights anchor can mismatch.
+
+    LAURA-V50-004: a pin that compares NOTHING on either axis (empty pin
+    digest(s), or the observed side unavailable on both axes) is never
+    reported as a silent pass-through "match" — verify() returns
+    reason="pin_unverifiable" and always emits a WARNING + audit event.
+    Under YASHIGANI_MODEL_PIN_STRICT=true it blocks (403) here like any other
+    mismatch; otherwise it does not block (avoids an outage on a platform
+    where an anchor is legitimately unprobeable — see model_probe.py) but is
+    never silent.
     """
     verifier = getattr(_state, "model_integrity_verifier", None)
     if verifier is None:
@@ -855,6 +864,7 @@ def _verify_ollama_pin(model: str, request_id: str):
         observed_manifest_digest=observed_manifest,
         observed_weights_sha256=observed_weights,
         request_id=request_id,
+        strict=_state.model_pin_strict,
     )
     if result.ok:
         return None
@@ -1442,6 +1452,10 @@ class OpenAIRouterState:
         self.model_integrity_verifier = None
         self.model_observed_digests: dict = {}
         self.model_observed_weights: dict = {}
+        # LAURA-V50-004: YASHIGANI_MODEL_PIN_STRICT — when True, a pin that
+        # compares nothing on either axis (reason="pin_unverifiable") BLOCKS
+        # like a mismatch instead of warn-and-continue. Set in configure().
+        self.model_pin_strict: bool = False
         # 5.0 A6-audio: transcriber. When None or unconfigured, a request
         # carrying audio is BLOCKED (never passed uninspected).
         self.audio_transcriber = None
@@ -1725,6 +1739,11 @@ def configure(
     _state.request_inspection_pipeline = request_inspection_pipeline
     _state.system_prompt_leak_guard = system_prompt_leak_guard
     _state.model_integrity_verifier = model_integrity_verifier
+    # LAURA-V50-004: threaded into every verify() call (startup + per-request)
+    # so a pin that compares nothing on either axis blocks under strict mode
+    # instead of silently reporting "match".
+    _state.model_pin_strict = os.getenv("YASHIGANI_MODEL_PIN_STRICT", "false").strip().lower() in (
+        "true", "1", "yes", "on")
     if model_observed_digests is not None:
         _state.model_observed_digests = model_observed_digests
     if model_observed_weights is not None:

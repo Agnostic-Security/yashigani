@@ -252,7 +252,8 @@ class TestA5ModelIntegrityEnforcement:
             self._r = result
             self.calls = 0
 
-        def verify(self, model, observed_manifest_digest="", observed_weights_sha256="", request_id=""):
+        def verify(self, model, observed_manifest_digest="", observed_weights_sha256="",
+                  request_id="", strict=False):
             self.calls += 1
             return self._r
 
