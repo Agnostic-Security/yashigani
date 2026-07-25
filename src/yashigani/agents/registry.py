@@ -710,7 +710,16 @@ return 1
             "name": _b(b"name"),
             "upstream_url": upstream_url,
             "protocol": _b(b"protocol") or "openai",
-            "status": _b(b"status"),
+            # YSG-RISK/TD-2026-07-25-02: every OTHER field with real semantic
+            # weight here (kind, protocol) already falls back with `or` when
+            # the Redis hash field is empty/absent — "status" was the one
+            # exception, decoding to "" (never "active") for any record whose
+            # status field was never explicitly HSET. An agent/nhi identity
+            # is active by construction unless explicitly deactivated (which
+            # DOES write status=b"inactive" — see deactivate()); "" is not a
+            # real state and must not be distinguishable from "active" by any
+            # downstream status=="active" gate (ASVS V4.1.3 default-secure).
+            "status": _b(b"status") or "active",
             "kind": kind,
             "created_at": _b(b"created_at"),
             "last_seen_at": _b(b"last_seen_at"),

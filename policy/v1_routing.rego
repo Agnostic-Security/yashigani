@@ -349,13 +349,13 @@ reason := "sensitivity_ceiling_exceeded" if {
 #
 # Controls whether a caller may enumerate the model list and what subset
 # they receive.  Human principals with non-anonymous identity get the full
-# list.  Service-account principals (internal_bearer, SPIFFE workloads) see
-# only models they are authorised to call — the full topology must not be
-# enumerable by compromised internal-mesh containers.
+# list.  Service-tier principals (internal_bearer, SPIFFE/PSK-authenticated
+# mesh workloads) see only models they are authorised to call — the full
+# topology must not be enumerable by compromised internal-mesh containers.
 #
 # Input schema:
 #   input.identity.status         — active | suspended | anonymous
-#   input.identity.kind           — human | service | admin | unknown
+#   input.identity.kind           — human | service | admin | unknown | agent | nhi
 #   input.identity.sensitivity_ceiling — PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
 #
 # Decision document:
@@ -365,6 +365,25 @@ reason := "sensitivity_ceiling_exceeded" if {
 # Operator override: push a data bundle with
 #   data.yashigani.v1.models_list_policy.service_account_filter = "full"
 # to grant service accounts the full list (opt-in, explicit, auditable).
+#
+# YSG-RISK/TD-2026-07-25-02 (4.1.2): "agent" (bundled P1 wrapped systems —
+# Letta, Langflow, OpenClaw — resolved via their per-instance PSK/SVID token
+# through _resolve_identity's p1_agent branch) and "nhi" (non-human identities,
+# p1_nhi branch) are BOTH mesh/PSK-authenticated service-tier principals,
+# structurally identical in trust level to "service"/"unknown" — they run the
+# SAME per-instance model-list SYNC that "service" callers do (a bundled
+# agent's OpenAI-compatible client calls GET /v1/models on startup to populate
+# its provider's model catalogue).  They were omitted from the original
+# GAP-001 kind-set, so any bundled agent whose identity resolves with
+# kind=="agent" or kind=="nhi" was hard-denied on /v1/models regardless of
+# active status — breaking its own provider model-sync (letta:
+# `_sync_provider_models_async` silently catches the 403 → zero synced models
+# → every `openai-proxy/...` brain handle 404s "must be one of []").  Adding
+# them to the SAME restricted-filter branch below closes the parity gap
+# WITHOUT widening privilege: they get exactly the "service" treatment
+# (restricted filter, allowed_models-gated, empty-by-default) — never "full",
+# never bypassing the active-status gate, never touched for anonymous/human.
+_service_tier_kinds := {"service", "unknown", "agent", "nhi"}
 
 default models_list_allowed := false
 
@@ -374,16 +393,16 @@ models_list_allowed if {
     input.identity.kind in {"human", "admin"}
 }
 
-# Service-account principals get RESTRICTED listing by default.
+# Service-tier principals get RESTRICTED listing by default.
 # Operator can grant full listing via data bundle override (see above).
 models_list_allowed if {
     input.identity.status == "active"
-    input.identity.kind in {"service", "unknown"}
+    input.identity.kind in _service_tier_kinds
 }
 
 # Filter level:
 #   human / admin → full list
-#   service / unknown → restricted (their allowed_models only, or all if allowed_models is empty and operator grants)
+#   service-tier → restricted (their allowed_models only, or all if allowed_models is empty and operator grants)
 #   denied → should not reach this branch (models_list_allowed = false guards above)
 default models_list_filter := "denied"
 
@@ -394,13 +413,13 @@ models_list_filter := "full" if {
 
 models_list_filter := "restricted" if {
     models_list_allowed
-    input.identity.kind in {"service", "unknown"}
+    input.identity.kind in _service_tier_kinds
     not _service_full_override
 }
 
 models_list_filter := "full" if {
     models_list_allowed
-    input.identity.kind in {"service", "unknown"}
+    input.identity.kind in _service_tier_kinds
     _service_full_override
 }
 

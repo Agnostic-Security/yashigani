@@ -5737,7 +5737,12 @@ def _resolve_nhi_identity(nhi_id: str) -> Optional[dict]:
         return {
             "identity_id": nhi_id,
             "kind": "nhi",
-            "status": nhi.get("status", "active"),
+            # YSG-RISK/TD-2026-07-25-02: `.get(key, default)` only defaults when
+            # the key is ABSENT — a registry record whose "status" field was
+            # never explicitly written decodes to "" (see agents/registry.py
+            # _decode_agent), which would silently bypass this default and
+            # deny an otherwise-active NHI on every status=="active" gate.
+            "status": nhi.get("status") or "active",
             "groups": [],
             "allowed_models": nhi.get("allowed_models", []),
             "allowed_paths": nhi.get("allowed_paths", []),
@@ -5861,7 +5866,12 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                             return {
                                 "identity_id": token_identity_id,
                                 "kind": "agent",
-                                "status": agent.get("status", "active"),
+                                # YSG-RISK/TD-2026-07-25-02: `.get(key, default)`
+                                # only defaults when the key is ABSENT — see
+                                # agents/registry.py _decode_agent, which can
+                                # decode "status" to "" for a record whose
+                                # status field was never explicitly HSET.
+                                "status": agent.get("status") or "active",
                                 "groups": agent.get("groups", []),
                                 "allowed_models": [],
                                 "allowed_paths": agent.get("allowed_paths", []),
@@ -6102,10 +6112,14 @@ async def _opa_cloud_model_policy_check(
         )
         return {"allow": False, "reason": "invalid_policy_ref"}
 
+    # YSG-RISK/TD-2026-07-25-02: `.get(key, default)` only defaults when the
+    # key is ABSENT — an identity dict carrying an EXPLICIT falsy status/kind
+    # (e.g. a registry record whose field was never written) would silently
+    # bypass the default here too. Same fix as _opa_models_check.
     opa_input = {
         "identity": {
-            "status": identity.get("status", "active") if identity else "anonymous",
-            "kind": identity.get("kind", "unknown") if identity else "unknown",
+            "status": (identity.get("status") or "active") if identity else "anonymous",
+            "kind": (identity.get("kind") or "unknown") if identity else "unknown",
             "groups": identity.get("groups", []) if identity else [],
             "sensitivity_ceiling": (
                 identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "RESTRICTED"
@@ -6211,9 +6225,13 @@ async def _opa_v1_check(
     else:
         _allowed_models_doc = identity.get("allowed_models", []) if identity else []
 
+    # YSG-RISK/TD-2026-07-25-02: same `.get(key, default)` gotcha fix as
+    # _opa_models_check — this identity_doc feeds allow_v1 (v1_routing.rego)
+    # directly, so an explicit falsy status/kind here denies /v1/chat and
+    # /v1/embeddings for an otherwise-active caller exactly the same way.
     identity_doc = {
-        "status": identity.get("status", "active") if identity else "anonymous",
-        "kind": identity.get("kind", "unknown") if identity else "unknown",
+        "status": (identity.get("status") or "active") if identity else "anonymous",
+        "kind": (identity.get("kind") or "unknown") if identity else "unknown",
         "groups": identity.get("groups", []) if identity else [],
         "allowed_models": _allowed_models_doc,
         "sensitivity_ceiling": identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC",
@@ -6524,9 +6542,13 @@ async def _opa_response_check(
                 logger.warning("Audit write failed for OPA not-configured event: %s", _aw_exc)
         return {"allow": False, "reason": "opa_not_configured"}
 
+    # YSG-RISK/TD-2026-07-25-02: same `.get(key, default)` gotcha fix as
+    # _opa_models_check / _opa_v1_check — this identity_doc feeds
+    # response_allowed (v1_routing.rego), so an explicit falsy status/kind
+    # would deny response delivery to an otherwise-active caller.
     identity_doc = {
-        "status": identity.get("status", "active") if identity else "anonymous",
-        "kind": identity.get("kind", "unknown") if identity else "unknown",
+        "status": (identity.get("status") or "active") if identity else "anonymous",
+        "kind": (identity.get("kind") or "unknown") if identity else "unknown",
         "sensitivity_ceiling": identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC",
     }
 
@@ -6631,9 +6653,19 @@ async def _opa_models_check(identity: dict | None) -> dict:
         ).inc()
         return {"allow": False, "filter": "denied", "reason": "opa_not_configured"}
 
+    # YSG-RISK/TD-2026-07-25-02: dict.get(key, default) only applies the
+    # default when the KEY IS ABSENT — an identity dict that carries an
+    # EXPLICIT falsy value ("" / None) for "status" (e.g. a registry-backed
+    # record whose status field was never written) silently bypasses the
+    # "active" default and reaches OPA as status="" / status=None, which
+    # never equals "active" — a legitimate active service/agent/nhi identity
+    # is then denied.  `or` treats any falsy value (missing OR empty OR None)
+    # the same way, matching the safe pattern already used elsewhere in this
+    # codebase (identity/registry.py IdentityRecord default, agents/registry.py
+    # restore_from_durable).  Same fix applied to "kind" for consistency.
     identity_doc = {
-        "status": identity.get("status", "active") if identity else "anonymous",
-        "kind": identity.get("kind", "unknown") if identity else "unknown",
+        "status": (identity.get("status") or "active") if identity else "anonymous",
+        "kind": (identity.get("kind") or "unknown") if identity else "unknown",
         "sensitivity_ceiling": (
             identity.get("sensitivity_ceiling", "RESTRICTED") if identity else "PUBLIC"
         ),

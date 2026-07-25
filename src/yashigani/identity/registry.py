@@ -711,7 +711,14 @@ return 1
             "allowed_cidrs": _j("allowed_cidrs"),
             "org_id": _s("org_id"),
             "bound_spiffe_uri": _s("bound_spiffe_uri"),
-            "status": _s("status"),
+            # YSG-RISK/TD-2026-07-25-02: register() always HSETs status="active"
+            # explicitly, but a record whose status field was somehow never
+            # written (partial write, manual Redis manipulation, restore path)
+            # must not decode to "" — every downstream status=="active" gate
+            # (v1_routing.rego allow_v1 / models_list_allowed) treats "" as a
+            # hard deny for what is, by construction, an active identity.
+            # Matches the same fix applied to agents/registry.py _decode_agent.
+            "status": _s("status") or "active",
             "created_at": _s("created_at"),
             "updated_at": _s("updated_at"),
             "last_seen_at": _s("last_seen_at"),
