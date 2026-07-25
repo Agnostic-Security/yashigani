@@ -225,9 +225,17 @@ spec:
             - name: YASHIGANI_CONTENT_MODERATION_POLICY_FILE
               value: {{ $gwEnv.contentModerationPolicyFile | quote }}
             {{- end }}
+            {{- if $gwEnv.audioTranscribeUrl }}
+            - name: YASHIGANI_AUDIO_TRANSCRIBE_URL
+              value: {{ $gwEnv.audioTranscribeUrl | quote }}
+            {{- end }}
             {{- if $gwEnv.audioTranscribeModel }}
             - name: YASHIGANI_AUDIO_TRANSCRIBE_MODEL
               value: {{ $gwEnv.audioTranscribeModel | quote }}
+            {{- end }}
+            {{- if $gwEnv.modelPinStrict }}
+            - name: YASHIGANI_MODEL_PIN_STRICT
+              value: {{ $gwEnv.modelPinStrict | quote }}
             {{- end }}
             # LAURA-ORCH-001(b): strict low budget for injection-originated
             # (tool-result justified) hops; over-budget result-steered hops are

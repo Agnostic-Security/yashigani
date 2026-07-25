@@ -494,14 +494,22 @@ gateway:
     #   rulePromotion — LLM→mechanical learning loop (default true)
     #   protectedSystemPromptsFile — A4 leak-scrub corpus path (default unset = off)
     #   contentModerationPolicyFile — A12 policy path (default unset = off)
+    #   audioTranscribeUrl — A6 local whisper-class transcriber URL (default unset =
+    #     audio BLOCKED fail-closed; DEPLOY-WIRING FIX, Captain 2026-07-25 — this is
+    #     the actual enable switch; audioTranscribeModel alone never activated A6-audio)
     #   audioTranscribeModel — A6 whisper-class model (default unset = audio blocked)
+    #   modelPinStrict — A5 refuse gateway start on classifier startup-model pin
+    #     mismatch (default unset = false = warn+continue; DEPLOY-WIRING FIX,
+    #     Captain 2026-07-25 — was entirely missing from the chart)
     classifierMaxConcurrentPerIdentity: ""
     securityForensicCapture: ""
     conversationRisk: ""
     rulePromotion: ""
     protectedSystemPromptsFile: ""
     contentModerationPolicyFile: ""
+    audioTranscribeUrl: ""
     audioTranscribeModel: ""
+    modelPinStrict: ""
     # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
     # derives from prior tool-RESULT content (injection-originated hops). An
     # over-budget result-steered hop is REFUSED so a result-steering injection
@@ -596,6 +604,14 @@ backoffice:
   # Default "true". Set to "false" to disable across both gateway and backoffice.
   # Mirrors docker-compose.yml YASHIGANI_SEMANTIC_INTENT_SIDECAR on the backoffice service.
   semanticIntentSidecar: "true"
+  # DP-Y-003 §3.4 — tool-poisoning strict-import gate (backoffice
+  # mcp_servers.py:_mcp_import_strict_enabled). Default "" (false) = ratified
+  # flag-not-block behaviour: a poisoned import is flagged in
+  # sidecar_scan_verdict, not rejected. Set "true" to reject outright.
+  # DEPLOY-WIRING FIX (Captain, 2026-07-25) — was entirely missing from the
+  # chart (compose parity gap); mirrors docker-compose.yml
+  # YASHIGANI_MCP_IMPORT_STRICT on the backoffice service.
+  mcpImportStrict: ""
   # v2.23.3 (#59): the backoffice K8s Secret (existingSecretName / default
   # "yashigani-backoffice-secrets") must contain the following keys:
   #   db_aes_key  — 64-char hex (32 bytes) or 44-char base64; used by

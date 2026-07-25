@@ -701,6 +701,42 @@ services:
       # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
       # Backend: same OLLAMA_BASE_URL (http://ollama:11434) as the PII classifier.
       YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
+      # ----------------------------------------------------------------------
+      # 5.0 interaction-hardening — DEPLOY-WIRING FIX (Captain, 2026-07-25).
+      # docs/security/interaction-hardening-5.0.md is the source of truth for
+      # every default below; entrypoint.py / security_audit.py are the
+      # code read-sites. Ava's e2e + Laura's pentest found these controls
+      # loaded ONLY under manual env override — never wired into compose —
+      # so a plain `docker compose up` shipped them dark (no-op). Defaults
+      # here match the doc + code defaults exactly (no behaviour change for
+      # deployments that already override; every unset var now resolves to
+      # the SAME value the code already defaulted to).
+      #
+      # A4 — system-prompt leak scrub. Empty = no-op (doc default: off).
+      # Point at the in-container demo asset to activate the demo corpus:
+      #   YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE=/app/demo-assets/protected-system-prompts.txt
+      YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE: ${YASHIGANI_PROTECTED_SYSTEM_PROMPTS_FILE:-}
+      # A12 — content-moderation policy. Empty = no-op (doc default: off).
+      # Point at the in-container demo asset to activate the demo policy:
+      #   YASHIGANI_CONTENT_MODERATION_POLICY_FILE=/app/demo-assets/content-moderation-policy.json
+      YASHIGANI_CONTENT_MODERATION_POLICY_FILE: ${YASHIGANI_CONTENT_MODERATION_POLICY_FILE:-}
+      # A6-audio — local whisper-class transcriber URL. Empty = audio BLOCKED
+      # (fail-closed; never passed uninspected). Doc default: off.
+      YASHIGANI_AUDIO_TRANSCRIBE_URL: ${YASHIGANI_AUDIO_TRANSCRIBE_URL:-}
+      YASHIGANI_AUDIO_TRANSCRIBE_MODEL: ${YASHIGANI_AUDIO_TRANSCRIBE_MODEL:-whisper-1}
+      # A5 — refuse gateway start on a classifier startup-model pin mismatch.
+      # Doc default: pin off until bootstrapped (false = warn+continue, log
+      # CRITICAL + MODEL_INTEGRITY_MISMATCH audit; does not block start).
+      YASHIGANI_MODEL_PIN_STRICT: ${YASHIGANI_MODEL_PIN_STRICT:-false}
+      # Multi-turn conversational-injection accumulator. Doc default: on.
+      YASHIGANI_CONVERSATION_RISK: ${YASHIGANI_CONVERSATION_RISK:-true}
+      # LLM→mechanical rule-promotion learning loop. Doc default: on.
+      YASHIGANI_RULE_PROMOTION: ${YASHIGANI_RULE_PROMOTION:-true}
+      # Forensic content capture on security-audit events (raw payload,
+      # credentials masked, bounded 4096 chars). Doc default: off — hash-only
+      # in production; a demo/forensic stack opts in explicitly.
+      YASHIGANI_SECURITY_FORENSIC_CAPTURE: ${YASHIGANI_SECURITY_FORENSIC_CAPTURE:-false}
+      # ----------------------------------------------------------------------
       # Extractor sandbox — Design A (RESTART-013 gap #2 fix, 2026-07-20).
       # Gateway does NOT spawn containers (no docker socket / container API —
       # unchanged), but it DOES now reach the pre-spawned extractor-svc over
@@ -800,6 +836,17 @@ services:
       # Never place install-managed secrets here — the provider enforces the
       # cloud-key namespace at write time.
       - ./cloud-keys:/run/cloud-keys:rw
+      # 5.0 DEPLOY-WIRING FIX (Captain, 2026-07-25): demo config assets for the
+      # A4 (system-prompt leak scrub) + A12 (content-moderation) controls —
+      # same bind-mount-from-repo-root pattern as OPA's `../policy:/policies:ro`
+      # below. RO: gateway only ever reads these. Mounted unconditionally
+      # (cheap, no-op unless the matching env var above points at a file in
+      # here); scripts/demo-assets/ ships content-moderation-policy.json +
+      # protected-system-prompts.txt (Ava e2e / Laura pentest finding — the
+      # assets existed in the repo but were never reachable inside the
+      # container, so the demo path could not be exercised even with the env
+      # vars manually set).
+      - ../scripts/demo-assets:/app/demo-assets:ro
       # Internal mTLS — runtime manifest (with per-install bootstrap_token_sha256 values).
       # Source: docker/var/runtime/service_identities.yaml (gitignored, populated by install.sh).
       - ./var/runtime/service_identities.yaml:/etc/yashigani/service_identities.yaml:ro
@@ -1077,6 +1124,14 @@ services:
       YASHIGANI_LANGFLOW_INTERNAL_URL: https://caddy:9705/agents/default/langflow
       # Document-content enforcement (doc-OPA data protection, task 5 / 3.0 demo).
       YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED: ${YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED:-false}
+      # 5.0 DEPLOY-WIRING FIX (Captain, 2026-07-25): tool-poisoning strict-import
+      # gate (mcp_servers.py:_mcp_import_strict_enabled). Ratified default is
+      # flag-not-block (DP-Y-003 §3.4) — screened-but-poisoned imports are
+      # flagged in sidecar_scan_verdict, NOT rejected, unless the operator opts
+      # into strict rejection. Was never wired into compose (Ava e2e /
+      # Laura pentest finding) — the flag existed only in code + Helm was
+      # itself missing this var too (fixed in the same pass, backoffice.yaml).
+      YASHIGANI_MCP_IMPORT_STRICT: ${YASHIGANI_MCP_IMPORT_STRICT:-false}
       # DP-Y-003 §3.4 — semantic-intent import classifier sidecar (YSG-RISK-076).
       # Backoffice MCP import screening uses the same Ollama-backed semantic-intent
       # classifier as the gateway. Default ON.
