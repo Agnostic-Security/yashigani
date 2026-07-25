@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — Yashigani v4.1.2
+# update.sh — Yashigani v5.0.0
 # last-updated: 2026-07-15T00:00:00+00:00 (v4.1.2 release: bump header)
 # last-updated: 2026-05-04T00:00:00+01:00 (feat: verify_health + auto-rollback wiring — retro #59)
 # Updates an existing Yashigani installation to the latest version.
@@ -19,7 +19,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CURRENT_VERSION="4.1.2"
+CURRENT_VERSION="5.0.0"
 REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
 RELEASES_API="https://api.github.com/repos/agnosticsec-com/yashigani/releases/latest"
 
