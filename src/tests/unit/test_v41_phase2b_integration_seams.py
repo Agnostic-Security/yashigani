@@ -32,6 +32,7 @@ Unit tests — v4.1 Phase 2b integration seams (coordinator brief):
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -414,9 +415,17 @@ class TestSvidInitPopulation:
                 "YASHIGANI_SECRETS_DIR": str(tmp_path / "secrets"),
                 "YASHIGANI_SERVICE_MANIFEST_PATH": str(tmp_path / "svc.yaml"),
             }.get(k, d)),
+            # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): step 2b now
+            # resolves the staging dir via $YASHIGANI_SVID_INIT_DIR (default
+            # /run/secrets-rw/svid-init — not writable under pytest). Point
+            # it under tmp_path so the CA-missing failure this test exercises
+            # is reached via the intended shutil.copy2(intermediate_cert, ...)
+            # FileNotFoundError, not an unrelated mkdir permission error.
             patch("os.getenv", side_effect=lambda k, d="": {
                 "YASHIGANI_SECRETS_DIR": str(tmp_path / "secrets"),
                 "YASHIGANI_SERVICE_MANIFEST_PATH": str(tmp_path / "svc.yaml"),
+                "YASHIGANI_SVID_INIT_DIR": str(tmp_path / "secrets" / "svid-init"),
+                "YASHIGANI_SVID_GID": str(os.getgid()),
             }.get(k, d)),
         ):
             with pytest.raises(McpOnboardError) as exc_info:
@@ -683,9 +692,13 @@ class TestApproveTransactionGrantBaseline:
             patch("os.environ.get", side_effect=lambda k, d="": {
                 "YASHIGANI_ENV": "dev",
             }.get(k, d)),
+            # FINDING-V412-SVID-WRITE-PATH — see S2-b test above for full
+            # rationale (same fixture shape, same fix).
             patch("os.getenv", side_effect=lambda k, d="": {
                 "YASHIGANI_SECRETS_DIR": str(secrets_dir),
                 "YASHIGANI_SERVICE_MANIFEST_PATH": str(tmp_path / "svc.yaml"),
+                "YASHIGANI_SVID_INIT_DIR": str(secrets_dir / "svid-init"),
+                "YASHIGANI_SVID_GID": str(os.getgid()),
             }.get(k, d)),
         ):
             await run_approve_transaction(

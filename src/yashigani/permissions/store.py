@@ -391,14 +391,30 @@ class PermissionStore:
         declared_by: str,
         justification: str,
         declared_at: str,
+        declaring_account_id: Optional[str] = None,
     ) -> None:
         """
         Record a pending declaration for (resource_type, resource_id).
 
-        declared_by:   identity that submitted the declaration
-                       (e.g. "agent:my-agent" or admin account_id)
+        declared_by:   free-form identity label the caller supplied
+                       (e.g. "agent:my-agent" or an admin account_id) —
+                       documentary only, never trusted for authorisation.
         justification: short human-readable reason
         declared_at:   ISO-8601 UTC timestamp
+        declaring_account_id: v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 3)
+                       the SERVER-CAPTURED session.account_id of the admin who
+                       called POST /declarations. Distinct from declared_by
+                       (which is client-supplied and cannot be trusted for a
+                       maker-checker check — an admin could set declared_by to
+                       any string and still approve their own declaration).
+                       approve_declaration() compares the approving admin's
+                       session.account_id against THIS field, mirroring the
+                       distinct-admin enforcement in dp_weaken.py/
+                       cloud_override.py. Optional (None) for callers that
+                       invoke this method directly without an HTTP session
+                       (pre-4.1.2 call sites / tests) — approve_declaration()
+                       treats a missing value as "no maker identity recorded",
+                       not as "same admin".
         """
         key = "perm:pending:{}:{}".format(resource_type.value, resource_id)
         idx = "perm:pending_idx:{}".format(resource_type.value)
@@ -408,8 +424,35 @@ class PermissionStore:
             "declared_by": declared_by,
             "justification": justification,
             "declared_at": declared_at,
+            "declaring_account_id": declaring_account_id,
         }))
         self._redis.sadd(idx, resource_id)
+
+    def get_pending_declaration(
+        self,
+        resource_type: ResourceType,
+        resource_id: str,
+    ) -> Optional[dict]:
+        """
+        Return the single pending declaration for (resource_type, resource_id),
+        or None if no declaration is pending.
+
+        v4.1.2 (YCS-20260723-v4.1.2-CONFORMANCE bug 3): added so
+        approve_declaration() can fetch the declaring admin's identity for
+        the distinct-approver check without scanning the whole pending index.
+        """
+        key = "perm:pending:{}:{}".format(resource_type.value, resource_id)
+        raw = self._redis.get(key)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            logger.error(
+                "perm: get_pending_declaration failed to deserialise %s/%s: %s",
+                resource_type.value, resource_id, exc,
+            )
+            return None
 
     def get_pending_declarations(
         self,

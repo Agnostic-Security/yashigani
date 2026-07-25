@@ -16,19 +16,17 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.4 (2026-05-21) — cleanup-system architectural close (state file + container-fallback rm + cross-UID handlers across install/uninstall), `letta-pgbouncer` mTLS sidecar closing YSG-RISK-048, KMS-architectural posture documented for credentials, Open WebUI in-mesh path through gateway, `/me/api-key` self-service Bearer issuance, OPA fail-closed posture; see `CHANGELOG.md` for the release entry.
+**Latest Stable Version:** v4.1.2 (2026-07-15) — Deny/RBAC hardening: positive-validation model-string gate (LAURA-412-002), alias→cloud RBAC bypass closed (W3-007), RBAC group-membership backfill (W3-008); complete logout / session invalidation (WA-10) with `__Host-` cookie clearance; carried 4.1.1-pentest fixes (model-ID normalisation, force-password-change scoping, routing-telemetry header gating, cloud_override SOD hardening); podman 6.x compose bifurcation fix; inference-backend operator guide; see `CHANGELOG.md` for the release entry.
 
-> **Upgrade notice:** v2.23.4 carries a behavioural change — OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
-
-> **Notable behaviour changes in v2.23.4:**
-> - **OPA fails closed** on every exception path (was prior `allow:True` in some paths). New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}`.
-> - **letta postgres** now routes through dedicated `letta-pgbouncer` mTLS sidecar — clean pg_hba `clientcert=verify-ca` catch-all, no carveouts.
-> - **Cleanup system** — `docker/.yashigani-install-state` file written at install completion; uninstall reads it for cross-UID runtime selection. Required for correct dual-runtime / multi-user host behaviour.
+> **Notable behaviour changes in v4.1.2:**
+> - **Logout revokes all sessions** for the authenticated identity (not only the current session). `__Host-` cookie cleared with `Secure; HttpOnly; SameSite=Strict; Max-Age=0`.
+> - **Model strings validated** against an allowlist before routing — unknown or malformed identifiers return 422 (LAURA-412-002).
+> - **RBAC group membership** now backfilled at first authenticated request for identities missing group records (W3-008).
 
 ---
 **Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-05-07
+**Document Date:** 2026-07-15
 ---
 **Classification:** ***Public — Product Overview***
 ---
@@ -177,7 +175,21 @@ For a more detailed explanation, see the [Compliance Reports](docs/compliance/RE
 
 ## 7. Current Release Highlights
 
-The v2.23 line currently ships five releases. v2.23.0 is the single-branch / API-first / strict-CSP foundation; v2.23.1 adds core-plane mTLS and the two-tier PKI; v2.23.2 delivers the security hardening batch, supply-chain controls, and N-1 upgrade validation; v2.23.3 adds DNS-rebinding defence, PKI admin UI + BYO-CA driver, air-gap deployment, API3 BOPLA, backup encryption, and password-history reuse rejection; v2.23.4 closes the cleanup-system architectural class, ships the pgbouncer mTLS sidecar (`letta-pgbouncer`), documents the KMS-architectural posture for credentials, adds Open WebUI in-mesh routing, `/me/api-key` self-service issuance, HUMAN identity registration on local-auth login, and OPA fail-closed posture. For the full per-version history (v0.1.0 → v2.22.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+v4.1.2 is the current release. For the full per-version history (v0.1.0 → v4.1.x), see [Architecture.md §4 Security Features by Version](Architecture.md#4-security-features-by-version).
+
+### v4.1.2 — Deny/RBAC hardening, complete logout, and podman 6.x
+
+v4.1.2 is a security and tech-debt patch on top of v4.1.1. It closes RBAC bypass and group-membership gaps found during the 4.1.1 pentest round, delivers complete session invalidation on logout with `__Host-` cookie clearance, and resolves the podman 6.x compose bifurcation. Carries all earlier 4.1.1-pentest fixes (model-ID normalisation, force-password-change scoping, routing-telemetry header gating, cloud_override SOD dual-control hardening). Tag SSH-signed.
+
+**Deny/RBAC Hardening** -- Positive-validation model-string gate (LAURA-412-002): model strings are validated against an explicit allowlist before routing, rejecting unknown or malformed identifiers with 422. Alias→cloud RBAC bypass (W3-007): model aliases now carry the source identity's RBAC group membership through the resolution chain, closing a path where aliased requests bypassed group-level cloud-model restrictions. RBAC group-membership backfill (W3-008): existing sessions and identities missing group-membership records are backfilled at first authenticated request, eliminating the gap where pre-backfill identities could access ungated model tiers.
+
+**Complete Logout / Session Invalidation (WA-10)** -- Logout now revokes all active sessions for the authenticated identity (not only the current session). The response clears the `__Host-session` cookie with `Secure; HttpOnly; Path=/; SameSite=Strict` and issues a `Set-Cookie: __Host-session=; Max-Age=0` clearance header, preventing session resurrection from client-side replays.
+
+**Carried 4.1.1-pentest fixes** -- Model-ID normalisation + unknown-model 422 (411-002): model identifiers are normalised to a canonical form before lookup; unrecognised identifiers return 422 rather than being forwarded upstream. Force-password-change scoping (411-003): the force-change flow is correctly scoped to the authenticating user, closing a privilege-escalation edge case. Routing-telemetry header gating (411-004): routing-decision telemetry headers are suppressed for non-admin identities. `cloud_override` SOD dual-control hardening: `cloud_override` flag changes require a second admin approval, enforcing separation of duties on the highest-privilege routing bypass.
+
+**Docs** -- New operator guide `docs/security/securing-inference-backend.md` covering inference-backend isolation, network segmentation for the Ollama/llama.cpp socket, and recommended firewall rules for production deployments.
+
+**Tech debt** -- Podman 6.x compose bifurcation (item D): `install.sh` and `docker-compose-podman.yml` updated to handle the `podman compose` / `podman-compose` command-resolution change introduced in Podman 6.x. Optional consent-gated inference-backend firewall (item B): `_setup_inference_firewall` helper added to `install.sh` with operator opt-in via `--inference-firewall`; disabled by default pending broader testing.
 
 ### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe
 

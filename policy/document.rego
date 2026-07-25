@@ -59,16 +59,25 @@
 #   input.routing_decision.route          "ingress-upload"|"egress-mcp-result"|
 #                                         "json-attachment"|... (matched against policy.route)
 #   input.request.pseudonymize_mode       "A" (give-the-user-the-table, DEFAULT) | "B"
+#   input.identity.identity_id            RESTART-013 gap #4 — the caller's canonical
+#                                         Yashigani identity_id ("idnt_{12hex}"), when
+#                                         resolved. "" when unresolved/unauthenticated —
+#                                         only identity-SCOPED policies (below) require a
+#                                         match; global (identity_id == "") policies are
+#                                         unaffected and keep applying to every caller.
 #
 # === DATA (documents/policy_store.py → push_document_data) ===
 #   data.yashigani.document.policies[]    the operator's action matrix, each:
 #                                           { data_class, format, route, action,
 #                                             pseudonymize_mode, small_set_escalation,
-#                                             policy_id, user_message, code }
-#                                         The last three are the operator-supplied
-#                                         self-describing fields (may be "").  When
-#                                         non-empty they override the built-in values
-#                                         in the decision (IRIS-DOC-META).
+#                                             policy_id, user_message, code, identity_id }
+#                                         The last four are optional operator-supplied
+#                                         fields (may be "").  policy_id/user_message/code
+#                                         override the built-in values in the decision
+#                                         (IRIS-DOC-META) when non-empty. identity_id scopes
+#                                         the policy to ONE caller (RESTART-013 gap #4) when
+#                                         non-empty; "" (default) = applies to any caller,
+#                                         preserving every pre-existing global policy.
 #   data.yashigani.document.config.detokenize_role       RBAC role for de-tokenize / table
 #   data.yashigani.document.config.map_ttl_seconds       fail-closed TTL for the replacer map
 #   data.yashigani.document.config.small_set_threshold   record_count at/under which QI gate fires
@@ -93,9 +102,30 @@ import rego.v1
 # _winning_policy: the applicable policy whose action equals the FINAL action,
 # i.e. the row that *drove* the actual disposition (matrix action AND final
 # action agree — no fail-closed override redirected the outcome).
-# There may be multiple rows with the same action (e.g. two PSEUDONYMIZE rows
-# for different class scopes that both matched); any one will do because they
-# share the same action — the first one found is used.
+#
+# FIX (FINDING-V412-DOCUMENT-REGO-WINNING-POLICY-CONFLICT): there may be
+# multiple rows with the same winning action (e.g. two PSEUDONYMIZE rows for
+# different class scopes that both matched — production WILL have overlapping
+# policies). A complete rule (`:= p` with `some p in ...`) requires the body to
+# bind EXACTLY one `p`; with 2+ same-action rows it binds N candidates and OPA
+# throws `eval_conflict_error: complete rules must not produce multiple
+# outputs`, crashing the whole document decision. `_winning_policy` must
+# resolve to exactly ONE policy under ties, deterministically.
+#
+# Tie-break: the FIRST matching candidate in `_applicable_policies` order.
+# `_applicable_policies` (below) is now an ARRAY built by iterating
+# `data.yashigani.document.policies` (also an array) in source order — and
+# that source order is NOT arbitrary: `DocumentPolicyStore.to_opa_document()`
+# (documents/policy_store.py) serialises `self.list_policies()`, which is
+# explicitly `sorted by numeric id where possible` (ascending, i.e.
+# earliest-created-first). So "first in `_applicable_policies`" == "lowest
+# internal policy id" == the deterministic tie-break the finding calls for.
+# We deliberately do NOT tie-break on the operator-supplied `policy_id` field
+# (IRIS-DOC-META): it is optional and commonly "" for many/most rows (the
+# built-in fallback case), so it is not a reliable — let alone unique —
+# ordering key. The internal store id (mirrored by array order) always exists
+# and is always unique.
+#
 # Undefined when:
 #   - the final action was forced by a fail-closed override (e.g. BLOCK due to
 #     incomplete extraction — _strongest_configured was PSEUDONYMIZE but the
@@ -104,12 +134,18 @@ import rego.v1
 # In those cases _op_* are undefined and built-in values apply cleanly.
 # ---------------------------------------------------------------------------
 _winning_policy := p if {
-	some p in _applicable_policies
-	p.action == _strongest_configured
 	# The final action must equal the matrix action: if a fail-closed override
 	# changed action to BLOCK while _strongest_configured was PSEUDONYMIZE, this
 	# guard fails and _winning_policy is correctly undefined.
 	action == _strongest_configured
+	winners := [w |
+		some w in _applicable_policies
+		w.action == _strongest_configured
+	]
+	count(winners) > 0
+	# Deterministic single pick even when 2+ rows share the winning action —
+	# array indexing always yields exactly one value, never a conflict.
+	p := winners[0]
 }
 
 # Operator field helpers — each is defined only when the field is non-empty.
@@ -167,6 +203,15 @@ _format := object.get(object.get(input, "document", {}), "format", "")
 
 _route := object.get(object.get(input, "routing_decision", {}), "route", "any")
 
+# RESTART-013 gap #4 — per-user/identity policy dimension.
+# The caller's Yashigani identity_id (canonical "idnt_{12hex}" key from the
+# identity registry — see gateway/mcp_router_runtime.py user_id resolution and
+# backoffice user_ui.py id_registry.get_by_account_id()). Empty string when no
+# identity was resolved (unauthenticated / registry-unavailable path, or a
+# caller that intentionally supplies none) — policies scoped to "any identity"
+# still apply; only identity-SCOPED policies require a match.
+_identity_id := object.get(object.get(input, "identity", {}), "identity_id", "")
+
 _matches := object.get(object.get(input, "document", {}), "matches", [])
 
 _record_count := object.get(object.get(input, "document", {}), "record_count", 0)
@@ -200,14 +245,42 @@ _route_matches(policy_route) if policy_route == "any"
 
 _route_matches(policy_route) if policy_route == _route
 
-# The set of policies that apply to at least one detected match.
-_applicable_policies contains p if {
-	some p in data.yashigani.document.policies
-	_format_matches(p.format)
-	_route_matches(p.route)
+# RESTART-013 gap #4 — identity match.  A policy with NO identity_id (the
+# default — "" — every built-in/example policy) applies to ANY caller, exactly
+# as before this change (global policies keep working, identity is opt-in).
+# A policy with a non-empty identity_id ONLY applies when the caller's resolved
+# identity_id equals it (an unresolved caller — _identity_id == "" — never
+# matches a scoped policy; it falls through to whatever global policy applies,
+# or to the fail-closed "no applicable policy" BLOCK if none does).
+_identity_matches(policy_identity_id) if policy_identity_id == ""
+
+_identity_matches(policy_identity_id) if {
+	policy_identity_id != ""
+	policy_identity_id == _identity_id
+}
+
+# Whether a policy matches at least one detected match — existence check ONLY
+# (no `m` binding escapes into the caller), so folding this into the
+# `_applicable_policies` comprehension below cannot fan a single policy `p`
+# out into multiple array entries just because several matches independently
+# satisfy it.
+_policy_covers_some_match(p) if {
 	some m in _matches
 	_class_matches(p.data_class, m.data_class)
 }
+
+# The policies that apply to at least one detected match, preserving the
+# SOURCE ORDER of data.yashigani.document.policies (an array — see
+# documents/policy_store.py to_opa_document(), which serialises
+# list_policies() sorted ascending by internal numeric policy id). This order
+# is what `_winning_policy` uses as its deterministic tie-break.
+_applicable_policies := [p |
+	some p in data.yashigani.document.policies
+	_format_matches(p.format)
+	_route_matches(p.route)
+	_identity_matches(object.get(p, "identity_id", ""))
+	_policy_covers_some_match(p)
+]
 
 # Candidate actions contributed by applicable policies.
 _candidate_actions contains a if {

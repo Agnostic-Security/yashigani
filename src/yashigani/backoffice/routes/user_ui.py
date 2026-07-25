@@ -245,18 +245,45 @@ def _resolve_declared_mime(upload: UploadFile, safe_filename: str) -> str:
     return _check_allowed_mime(declared, safe_filename)
 
 
-def _build_pipeline():
-    """Construct a DocumentInspectionPipeline using the existing config."""
+def _build_pipeline(audit_context: Optional[dict] = None):
+    """Construct a DocumentInspectionPipeline using the existing config.
+
+    RESTART-013 gap #5: wires the REAL tamper-evident audit chain
+    (``backoffice_state.audit_writer``) instead of a bare ``logger.info`` —
+    executes the rego's ever-present ``audit_document_decision`` obligation.
+    ``audit_context`` is the mutable dict the caller updates with
+    ``identity_id``/``tenant``/``obligations`` (see documents/audit_bridge.py)."""
+    from yashigani.documents.audit_bridge import make_document_audit_callback
     from yashigani.documents.config import DocumentEnforcementConfig
 
     cfg = DocumentEnforcementConfig.from_env()
     registry = cfg.build_registry()
-
-    def _audit(event_name: str, fields: dict) -> None:
-        logger.info("user document audit event: %s fields=%s", event_name, fields)
+    _audit = make_document_audit_callback(
+        backoffice_state.audit_writer, surface="user-upload", context=audit_context,
+    )
 
     from yashigani.documents.pipeline import DocumentInspectionPipeline
     return DocumentInspectionPipeline(registry=registry, on_audit=_audit)
+
+
+def _resolve_caller_identity_id(session) -> str:
+    """Resolve the caller's canonical Yashigani identity_id ("idnt_...") for the
+    RESTART-013 gap #4 per-user document-policy dimension.
+
+    Best-effort: mirrors the resolution already used by ``user_chat_proxy``
+    (``id_registry.get_by_account_id``). Returns "" when the registry is
+    absent or no identity is linked — the caller then only matches GLOBAL
+    (identity_id == "") policies, exactly as before this feature existed."""
+    id_registry = backoffice_state.identity_registry
+    if id_registry is None:
+        return ""
+    try:
+        identity = id_registry.get_by_account_id(session.account_id)
+        if identity:
+            return str(identity.get("identity_id", "") or "")
+    except Exception as exc:
+        logger.debug("_resolve_caller_identity_id: lookup failed: %s", exc)
+    return ""
 
 
 def _install_tenant() -> str:
@@ -605,6 +632,8 @@ async def user_upload_document(
     from yashigani.documents.pipeline import (
         DISPOSITION_BLOCK,
         DISPOSITION_LOG,
+        DISPOSITION_PSEUDONYMIZE,
+        DISPOSITION_REDACT,
     )
     from yashigani.documents.opa_decision import evaluate_document_decision
 
@@ -680,8 +709,15 @@ async def user_upload_document(
     import uuid as _uuid
     request_id = f"user-doc-{session.account_id[:8]}-{_uuid.uuid4().hex[:8]}-{safe_filename}"
 
+    # RESTART-013 gap #4 — resolve the caller's canonical identity_id so a
+    # per-user REDACT/PSEUDONYMIZE policy can bind to THIS caller specifically.
+    # "" (unresolved) still works — only global policies match, unchanged.
+    caller_identity_id = _resolve_caller_identity_id(session)
+    # RESTART-013 gap #5 — mutable audit context (see documents/audit_bridge.py).
+    _audit_ctx: dict = {"identity_id": caller_identity_id, "tenant": _install_tenant()}
+
     try:
-        pipeline = _build_pipeline()
+        pipeline = _build_pipeline(audit_context=_audit_ctx)
     except Exception as exc:
         logger.error("user_upload_document: pipeline init failed: %s", exc)
         raise HTTPException(
@@ -725,7 +761,12 @@ async def user_upload_document(
             opa_input,
             route=route,
             pseudonymize_mode=pseudonymize_mode,
+            identity_id=caller_identity_id,
         )
+
+    # RESTART-013 gap #5 — obligations now known; the second pipeline.inspect()
+    # call below (if any) records them in its audit event via _audit_ctx.
+    _audit_ctx["obligations"] = decision.get("obligations", [])
 
     opa_action = decision.get("action", DISPOSITION_BLOCK)
 
@@ -781,10 +822,22 @@ async def user_upload_document(
             "policy_id": decision.get("policy_id"),
             "code": decision.get("code"),
         },
-        # processed_content: populated by the pipeline when action is
-        # 'redact' / 'pseudonymize' and the pipeline rewrites the document.
-        # Currently None (pipeline returns raw matches, not rewritten content).
-        "processed_content": None,
+        # processed_content: RESTART-013 gap #3 fix. The pipeline's second pass
+        # (REDACT/PSEUDONYMIZE) rewrites the document into
+        # ``result.forward_bytes`` — previously computed and then discarded
+        # (hardcoded None). Base64-encoded (this is a JSON body, matching the
+        # request's own content_base64 convention) so the caller can actually
+        # receive the transformed file instead of only its verdict metadata.
+        # None for BLOCK (nothing to forward) and for LOG (the disposition
+        # carries the ORIGINAL bytes unchanged — no transform occurred, so
+        # there is nothing new to hand back beyond what the caller already
+        # has).
+        "processed_content": (
+            base64.b64encode(result.forward_bytes).decode("ascii")
+            if opa_action in (DISPOSITION_REDACT, DISPOSITION_PSEUDONYMIZE)
+            and result.forward_bytes is not None
+            else None
+        ),
     }
 
 

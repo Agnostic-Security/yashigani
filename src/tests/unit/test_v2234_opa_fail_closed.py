@@ -380,7 +380,10 @@ class TestAnonymousCallerRejected:
         )
         assert response.status_code == 401
         body = response.json()
-        assert body["detail"]["error"] == "AUTHENTICATION_REQUIRED"
+        # LAURA-411-004: 401 body now uses generic OpenAI format (no internal header names)
+        assert body["detail"]["error"]["type"] == "authentication_error"
+        assert body["detail"]["error"]["code"] == "unauthorized"
+        assert "Authentication required" in body["detail"]["error"]["message"]
 
     def test_p2_internal_bearer_passes_auth_gate(self, monkeypatch):
         """T15: yashigani-internal Bearer resolves as service identity (not anonymous)."""

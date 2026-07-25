@@ -1,5 +1,5 @@
 # Podman Deployment Guide
-<!-- Last updated: 2026-05-08T13:00:00+01:00 -->
+<!-- Last updated: 2026-07-13 (rootless is the supported macOS mode; removed stale rootful-machine requirement -- podman is always rootless, no root access needed) -->
 
 Yashigani supports Podman as a drop-in Docker replacement. The Pool Manager
 (container-per-identity isolation, required for CIAA compliance) needs access
@@ -10,32 +10,33 @@ to the Podman socket to create per-user agent containers.
 Podman on macOS runs a Linux VM. The Pool Manager needs the VM's libpod
 socket bridged to the macOS host.
 
-### Required: rootful machine
+### Setup: rootless machine
 
 ```bash
-podman machine stop 2>/dev/null || true
-podman machine rm -f 2>/dev/null || true
-podman machine init --rootful
+podman machine init
 podman machine start
 ```
 
-This exposes a Docker-compatible socket at `/var/run/docker.sock` on the
-macOS host. The compose override bind-mounts it into the gateway container
-at `/var/run/container.sock` (read-only).
+Podman on macOS is **always rootless** -- no root access is required. The
+default machine exposes the rootless libpod socket, which the compose override
+bind-mounts into the gateway container at `/var/run/container.sock` (read-only)
+for the Pool Manager.
 
-### Why rootful?
+### Why rootless?
 
-Rootless Podman Machine cannot create containers that join the Yashigani
-internal network from outside the VM's user namespace. Rootful mode is
-required for full Pool Manager isolation. This is a trust boundary on your
-developer workstation only -- production deployments use Linux rootful
-podman or Kubernetes.
+Rootless Podman is the supported mode on every platform -- macOS, Linux, and
+production. There is **no rootful requirement and no need for root access**: the
+Pool Manager creates per-identity agent containers over the rootless podman
+socket. (Earlier releases documented a rootful machine for internal-network
+joining; that limitation has been resolved -- the rootful step is no longer
+needed, and this section is kept so operators following older guides know to
+skip it.)
 
 ### Verify
 
 ```bash
-ls -l /var/run/docker.sock   # should be a socket
-podman --remote info          # should succeed
+podman machine info           # a running rootless machine
+podman info                   # should succeed
 ```
 
 ## Linux (systemd user socket)
@@ -52,7 +53,8 @@ No rootful requirement on Linux -- user namespaces handle isolation.
 
 - **"Pool Manager: no Docker or Podman SDK available -- running in STUB MODE"**:
   the gateway container cannot reach any container socket. On macOS,
-  re-run the rootful machine init above. On Linux, check the podman socket
+  restart the rootless machine (`podman machine stop && podman machine start`)
+  and confirm the socket is exposed. On Linux, check the podman socket
   unit is active: `systemctl --user status podman.socket`.
 
 - **Stub mode is NEVER acceptable in production** -- it disables container-per-

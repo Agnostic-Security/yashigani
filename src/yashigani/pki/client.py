@@ -24,7 +24,7 @@ from typing import Any, Optional
 import httpx
 
 from yashigani.pki.identity import ServiceIdentity
-from yashigani.pki.ssl_context import client_ssl_context
+from yashigani.pki.ssl_context import client_ssl_context, client_ssl_context_verify_spiffe
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,39 @@ def internal_httpx_client(
             "if you need custom TLS config."
         )
     ctx = client_ssl_context(identity)
+    return httpx.AsyncClient(verify=ctx, timeout=timeout, **kwargs)
+
+
+def internal_httpx_client_verify_spiffe(
+    expected_spiffe_id: str,
+    *,
+    identity: Optional[ServiceIdentity] = None,
+    timeout: float = 10.0,
+    **kwargs: Any,
+) -> httpx.AsyncClient:
+    """Return an ``httpx.AsyncClient`` for a ring-fenced-agent peer verified
+    by SPIFFE URI SAN instead of DNS hostname (FINDING C, v4.1.2 final
+    onboarding e2e).
+
+    Use this — never a bare ``internal_httpx_client()`` — when dialling a
+    per-instance MCP agent Caddy front (``https://caddy:<mesh_port>/mcp/...``):
+    those leaves carry a SPIFFE URI SAN only (no DNS SAN), so the default
+    hostname check in :func:`internal_httpx_client` always fails against
+    them. Chain verification against the internal CA is unchanged; only the
+    identity-matching strategy differs. See
+    :func:`yashigani.pki.ssl_context.client_ssl_context_verify_spiffe` for
+    the full rationale and threat-model note.
+
+    ``verify``/``cert`` cannot be overridden, same contract as
+    :func:`internal_httpx_client`.
+    """
+    if "verify" in kwargs or "cert" in kwargs:
+        raise TypeError(
+            "internal_httpx_client_verify_spiffe: verify/cert are controlled "
+            "by internal PKI policy and cannot be overridden. Use "
+            "httpx.AsyncClient directly if you need custom TLS config."
+        )
+    ctx = client_ssl_context_verify_spiffe(expected_spiffe_id, identity)
     return httpx.AsyncClient(verify=ctx, timeout=timeout, **kwargs)
 
 

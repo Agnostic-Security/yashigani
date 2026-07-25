@@ -1095,8 +1095,10 @@ def create_backoffice_app() -> FastAPI:
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+        # X-Frame-Options: DENY — emitted by Caddy (header @not_embed); removed
+        # here to prevent duplicate headers (LAURA-411-006).
+        # X-XSS-Protection removed — deprecated, removed from modern browsers, can
+        # introduce vulns; CSP (below) is the correct control (LAURA-411-005).
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Referrer-Policy"] = "no-referrer"
         # ZAP 10015/10049: Authenticated/sensitive dynamic responses must not be
@@ -1210,6 +1212,24 @@ def create_backoffice_app() -> FastAPI:
                             "received_bytes": length,
                         },
                     )
+        return await call_next(request)
+
+    # YSG-RISK-122 self-heal: bounded lazy reconnect for RBAC/agent-registry/
+    # permission-store/budget Redis clients that failed to connect at startup
+    # (e.g. k8s boot-order race — yashigani-backoffice scheduled before
+    # yashigani-redis-0, see backoffice/redis_selfheal.py docstring for full
+    # context). Runs before every /admin/* request, ahead of routing (every
+    # `@app.middleware("http")` function here runs before call_next() reaches
+    # the router, regardless of registration order relative to its siblings)
+    # — so a successful reconnect is visible to the route handler on the SAME
+    # request that triggered it. No-ops (pure None-checks, zero Redis
+    # round-trips) once the stack is healthy, and is bounded by a per-stack
+    # cooldown while unhealthy so an outage cannot turn into a reconnect storm.
+    @app.middleware("http")
+    async def redis_selfheal_middleware(request: Request, call_next):
+        if request.url.path.startswith("/admin"):
+            from yashigani.backoffice.redis_selfheal import maybe_selfheal
+            await maybe_selfheal()
         return await call_next(request)
 
     # Uniform 401 for unauthenticated /admin/* requests (QA Wave 2 Issue 10).

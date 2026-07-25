@@ -90,16 +90,73 @@ _REDOS_NESTED_RE = _re.compile(
 # no surrounding context) — useless for DLP and cause performance issues.
 _OVERBROAD_RE = _re.compile(r"^\.\*$|^\.\+$|^\(\.\*\)$|^\(\.\+\)$")
 
+# F3 (HIGH — Laura, FINDING-V412-DOCKER-CLEANROUND-BATCH): _REDOS_NESTED_RE
+# above only fires when the nested quantifier is inside a `(...)` GROUP —
+# e.g. "(a+)+".  It does NOT fire on an UNPARENTHESIZED chain of adjacent
+# broad-wildcard quantifiers with no grouping at all, e.g.:
+#     .*.*.*.*.*.*x
+# Laura's PoC: this pattern PASSED _validate_regex_safety unchanged (no
+# parens anywhere in the string) and then hung the regex engine for
+# minutes against a short adversarial input with no trailing "x" — classic
+# catastrophic backtracking (measured live: n=100 chars already ~24s,
+# n=120 ~74s on stdlib re; the exact hang time scales with input length
+# and interpreter, but the underlying vulnerability class is identical to
+# the parenthesized nested-quantifier case _REDOS_NESTED_RE already
+# blocks).  A string that is entirely all-numeric TLD-shaped never occurs
+# in real hostnames, but here the analogous invariant is: two or more
+# quantified "broad" atoms (., \w, \W, \s, \S, \d, \D, or any bracket
+# expression) placed DIRECTLY adjacent to each other (no literal/anchor
+# separating them) is inherently ambiguous for the backtracking engine —
+# there is no reason a legitimate DLP pattern needs this shape, and it is
+# the textbook catastrophic-backtracking construction.
+#
+# _REDOS_ADJACENT_WILDCARD_RE requires >= 2 such atom+quantifier units in
+# an unbroken row.  Verified NOT to false-positive on any of the 5 seeded
+# built-in patterns (credit card / API key / SSN / phone / email) — each
+# either uses a bounded {n} / {n,} quantifier (not bare * or +) or has a
+# literal/anchor between quantified atoms, so none of them chain adjacent
+# unbounded wildcards.
+_REDOS_WILDCARD_ATOM = r"(?:(?<!\\)\.|\\[wWsSdD]|\[\^?[^\]]*\])"
+_REDOS_ADJACENT_WILDCARD_RE = _re.compile(
+    r"(?:%s[*+]){2,}" % _REDOS_WILDCARD_ATOM
+)
+
+
+_MAX_REGEX_PATTERN_LEN = 512
+
 
 def _validate_regex_safety(pattern: str) -> None:
     """Validate a pattern string for ReDoS risk and compilability.
 
     Raises HTTPException 422 on:
+      - Patterns longer than _MAX_REGEX_PATTERN_LEN (#1900: hard cap enforced
+        HERE, first, so every caller is covered regardless of whether the
+        pattern came through a length-constrained Pydantic field (create_pattern,
+        PatternRequest.pattern max_length=512) or an unbounded source (the
+        LLM-generated `generated_regex` in generate_pattern, which has no field
+        constraint of its own) — the ReDoS heuristic below must never see input
+        longer than this cap.
       - Patterns that fail to compile (invalid regex).
       - Patterns with nested quantifiers on variable-length groups
         (catastrophic backtracking risk).
       - Trivially-overbroad patterns (bare .* / .+) with no context.
     """
+    # 0. Hard length cap — FIRST check, before any regex engine touches the
+    #    string. This is caller-independent: it covers both the length-capped
+    #    PatternRequest.pattern field AND the unbounded LLM-generated regex
+    #    fed in by generate_pattern() before this function is ever reached.
+    if len(pattern) > _MAX_REGEX_PATTERN_LEN:
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "pattern_too_long",
+                "message": (
+                    f"Pattern exceeds the maximum allowed length of "
+                    f"{_MAX_REGEX_PATTERN_LEN} characters."
+                ),
+            },
+        )
+
     # 1. Compilability guard — reject syntactically invalid regexes.
     try:
         _re.compile(pattern)
@@ -136,6 +193,27 @@ def _validate_regex_safety(pattern: str) -> None:
                     "Pattern contains nested quantifiers on a variable-length group "
                     "(e.g. (a+)+) which can cause catastrophic backtracking.  "
                     "Rewrite without nesting quantifiers, e.g. use 'a+' instead of '(a+)+'."
+                ),
+            },
+        )
+
+    # 4. F3 (HIGH — Laura): unparenthesized adjacent-quantifier heuristic.
+    #    Catches ".*.*.*.*.*.*x" and similar chains of directly-adjacent
+    #    broad-wildcard quantifiers that _REDOS_NESTED_RE (parens-only)
+    #    does not see at all.
+    if _REDOS_ADJACENT_WILDCARD_RE.search(pattern):
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "redos_risk_adjacent_wildcard",
+                "message": (
+                    "Pattern contains two or more adjacent quantified broad-wildcard "
+                    "tokens (e.g. '.*.*', '\\w+\\w+', '[^,]*[^,]*') with no literal or "
+                    "anchor between them.  This is ambiguous for the backtracking regex "
+                    "engine and can cause catastrophic (exponential-time) backtracking "
+                    "even without any parentheses (F3 / CWE-1333).  Rewrite the pattern "
+                    "so at most one broad wildcard is quantified in any unbroken run, "
+                    "e.g. add a literal separator or anchor between the wildcard groups."
                 ),
             },
         )

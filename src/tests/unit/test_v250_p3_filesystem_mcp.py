@@ -800,6 +800,67 @@ class TestCodegenShapeCMountName:
 
 
 # ===========================================================================
+# E2. onboarding-robustness batch finding #3 (Su, 2026-07-21): the shared
+# `caddy:` service's group_add MUST NOT be re-declared per-agent anymore —
+# it moved to a STATIC addition on the base caddy: service in
+# docker/docker-compose.yml. Live-proven root cause: Docker Compose v2
+# hard-rejects a group_add value repeated across 2+ `-f` override files for
+# the SAME service ("services.caddy.group_add items at 0 and 1 are equal"),
+# which fired whenever 2+ Shape-C MCP agents were onboarded together (each
+# agent's override used to add the SAME fixed GID 2003 to `caddy:`).
+# ===========================================================================
+
+class TestCaddyGroupAddNotPerAgent:
+    def test_shape_c_override_caddy_stanza_has_no_group_add(self) -> None:
+        """The per-agent override's caddy: stanza must not emit group_add —
+        GID 2003 is a fixed constant now owned solely by the base compose
+        file, never re-declared per agent (would duplicate across N agents'
+        override files and hard-fail Docker Compose's merge)."""
+        import yaml
+        artifacts = _sc_engine().render(dry_run=True)
+        compose_key = [k for k in artifacts if "compose.override" in k][0]
+        doc = yaml.safe_load(artifacts[compose_key])
+        caddy_stanza = doc["services"]["caddy"]
+        assert "group_add" not in caddy_stanza, (
+            "caddy: stanza in the per-agent override must not declare "
+            "group_add — batch finding #3 regression"
+        )
+        # networks:/volumes: are legitimately per-agent (unique values —
+        # distinct ringfence bridge / SVID volume names per agent) and must
+        # still be present.
+        assert "networks" in caddy_stanza
+        assert "volumes" in caddy_stanza
+
+    def test_two_shape_c_agents_dont_duplicate_group_add_across_overrides(
+        self,
+    ) -> None:
+        """Two DIFFERENT Shape-C agents' overrides, both merged with the
+        base compose file (the real multi-agent deploy scenario), must not
+        produce a duplicate group_add value for the shared caddy: service."""
+        import copy as _copy
+        import yaml
+        from yashigani.manifest.codegen import (
+            CodegenEngineShapeC, reset_codegen_registry,
+        )
+
+        reset_codegen_registry()
+        p1 = _copy.deepcopy(_SC_PARSED_BASE)
+        p1["metadata"]["name"] = "filesystem-a"
+        artifacts_a = CodegenEngineShapeC(p1, runtime="docker").render(dry_run=True)
+
+        reset_codegen_registry()
+        p2 = _copy.deepcopy(_SC_PARSED_BASE)
+        p2["metadata"]["name"] = "filesystem-b"
+        p2["spec"]["storage"]["mounts"][0]["name"] = "ysg_fs_acme_filesystem_b_workspace"
+        artifacts_b = CodegenEngineShapeC(p2, runtime="docker").render(dry_run=True)
+
+        compose_a = artifacts_a[[k for k in artifacts_a if "compose.override" in k][0]]
+        compose_b = artifacts_b[[k for k in artifacts_b if "compose.override" in k][0]]
+        assert "group_add" not in yaml.safe_load(compose_a)["services"]["caddy"]
+        assert "group_add" not in yaml.safe_load(compose_b)["services"]["caddy"]
+
+
+# ===========================================================================
 # F. Nico-002: CertMount(spiffe_identity=resolve_spiffe_uri(fs_manifest))
 # ===========================================================================
 

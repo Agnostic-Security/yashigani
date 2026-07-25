@@ -1043,6 +1043,16 @@ restore_backup() {
   # gateway/backoffice single-file mounts serve → total auth outage).
   _restore_caddy_scoped_secrets "${backup_dir}" || return 1
 
+  # 1c. FINDING-V412-RESTART-012: restore the postgres-only root-attestation
+  # dir (ca_root.attested_sha256) into docker/secrets-pki-attest/. Unlike the
+  # caddy-scoped secrets above, this file has no legacy flat-path layout to
+  # migrate (it never existed on any backup taken before this fix shipped —
+  # rotate-root now writes it straight to the dedicated dir) and no
+  # container-UID ownership dance (plain installer-owned 0644 hash pointer,
+  # not key material — see docker-compose.yml comment). Most backups simply
+  # won't have this dir (rotate-root is rare) — that is expected, not an error.
+  _restore_pki_attest_dir "${backup_dir}" || return 1
+
   # 2. Restore .env
   if [[ -f "${backup_dir}/.env" ]]; then
     log_info "Restoring .env..."
@@ -1270,6 +1280,40 @@ _restore_caddy_scoped_secrets() {
   _apply_caddy_scoped_perms "1001:1001" "${_live_dir}/caddy_internal_hmac" "0640"
 
   log_success "Caddy-scoped secrets restored (${_restored} file(s)) → docker/secrets-caddy/ (YSG-RISK-053)"
+  return 0
+}
+
+# _restore_pki_attest_dir — FINDING-V412-RESTART-012 (Captain, 2026-07-21).
+#
+# Restores docker/secrets-pki-attest/ (ca_root.attested_sha256, the
+# root-rotation operator-attestation pin) from a backup, if present. No stub
+# mechanism needed (unlike _restore_caddy_scoped_secrets): no other compose
+# service has ever mounted a path under docker/secrets/ for this filename, so
+# there is nothing to shadow/relocate — the file simply didn't exist before
+# this fix, or already lives at the dedicated path in any backup taken after.
+_restore_pki_attest_dir() {
+  local _backup_dir="$1"
+  local _live_dir="${WORK_DIR}/docker/secrets-pki-attest"
+
+  mkdir -p "$_live_dir" 2>/dev/null || true
+  chmod 0700 "$_live_dir" 2>/dev/null || true
+
+  if [[ ! -d "${_backup_dir}/secrets-pki-attest" ]]; then
+    log_info "No secrets-pki-attest/ in backup — skipping (expected unless rotate-root was ever run)"
+    return 0
+  fi
+
+  local _f="ca_root.attested_sha256"
+  if [[ -f "${_backup_dir}/secrets-pki-attest/${_f}" ]]; then
+    chmod u+w "${_live_dir}/${_f}" 2>/dev/null || true
+    if cp -p "${_backup_dir}/secrets-pki-attest/${_f}" "${_live_dir}/${_f}" 2>/dev/null; then
+      chmod 0644 "${_live_dir}/${_f}" 2>/dev/null || true
+      log_success "Root-attestation pin restored → docker/secrets-pki-attest/ (FINDING-V412-RESTART-012)"
+    else
+      log_error "FINDING-V412-RESTART-012: failed to restore secrets-pki-attest/${_f} from backup"
+      return 1
+    fi
+  fi
   return 0
 }
 

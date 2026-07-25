@@ -70,6 +70,50 @@ yashigani
 {{- end }}
 
 {{/*
+yashigani.multiTenantAntiAffinity — node-per-tenant hard anti-affinity
+(Enterprise/shared-cluster multi-tenant only).
+
+Design authority: yashigani-k8s-dns-hardening-design-20260719.md §4
+("Same-node hostile-neighbor" / node-per-tenant anti-affinity spec).
+
+Emits a hard (requiredDuringSchedulingIgnoredDuringExecution — NOT
+`preferred`, per §4: "a soft preference is not a segregation guarantee")
+podAntiAffinity term that repels pods carrying a DIFFERENT tenant label from
+the same node, keyed on multiTenant.tenantLabel/multiTenant.tenantId.
+Renders nothing unless multiTenant.enabled=true AND multiTenant.tenantId is
+set.
+
+NOT YET WIRED into any Deployment/StatefulSet pod spec in this chart — this
+is the reusable primitive only. Two dependencies must land before this can
+be safely wired in:
+  1. Per-tenant node-pool capacity planning (§4: "capacity planning is
+     Lior/Captain's remit, not this design's") — a hard anti-affinity
+     constraint that cannot be satisfied leaves pods Pending forever.
+  2. Every wired pod template must ALSO carry
+     `{{ .Values.multiTenant.tenantLabel }}: {{ .Values.multiTenant.tenantId }}`
+     as an actual POD label (podAntiAffinity labelSelector matches pod
+     labels, not namespace labels) — not added by this chart today, flagged
+     as a cross-team dependency (coordinate with Lior on multi-tenant
+     values-schema ownership, per the design doc's own note).
+
+Usage once both dependencies are satisfied, under a Deployment/StatefulSet's
+spec.template.spec.affinity.podAntiAffinity:
+  {{ include "yashigani.multiTenantAntiAffinity" . | nindent N }}
+*/}}
+{{- define "yashigani.multiTenantAntiAffinity" -}}
+{{- if and .Values.multiTenant.enabled .Values.multiTenant.tenantId }}
+requiredDuringSchedulingIgnoredDuringExecution:
+  - labelSelector:
+      matchExpressions:
+        - key: {{ .Values.multiTenant.tenantLabel }}
+          operator: NotIn
+          values:
+            - {{ .Values.multiTenant.tenantId | quote }}
+    topologyKey: kubernetes.io/hostname
+{{- end }}
+{{- end }}
+
+{{/*
 yashigani.ownImage — render an image ref for a customer-built image
 (gateway, backoffice, adminBootstrap).
 

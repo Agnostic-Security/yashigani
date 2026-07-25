@@ -220,6 +220,50 @@ class TestC3DuplicateAgentAborts:
 
 
 # ---------------------------------------------------------------------------
+# C3-b — reserved base-compose-service-name collision guard
+# (onboarding-robustness batch finding #3, Su, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+class TestC3bReservedServiceName:
+    """C3-b (HIGH): metadata.name colliding with an existing base compose
+    service (e.g. the bundled "demo-mcp" opt-in demo upstream) must abort
+    codegen — proven live: Docker Compose v5.1.3 hard-rejects the resulting
+    duplicate security_opt/cap_drop merge ("services.demo-mcp.security_opt
+    items at 0 and 1 are equal"), refusing to start the whole stack."""
+
+    def test_reserved_name_aborts_shape_a(self) -> None:
+        from yashigani.manifest.codegen import CodegenEngine, CodegenError, reset_codegen_registry
+        reset_codegen_registry()
+        p = copy.deepcopy(_BASE_PARSED)
+        p["metadata"]["name"] = "demo-mcp"
+        with pytest.raises(CodegenError) as exc_info:
+            CodegenEngine(p, "docker").render(dry_run=True)
+        assert exc_info.value.code == "C3b_reserved_service_name"
+
+    def test_reserved_name_aborts_for_every_base_service(self) -> None:
+        """Every enumerated base-compose service name is rejected, not just
+        the one live-reproduced example (SOP-0 — audited, not guessed)."""
+        from yashigani.manifest.codegen import (
+            CodegenEngine, CodegenError, reset_codegen_registry,
+        )
+        from yashigani.manifest.linter import _RESERVED_BASE_SERVICE_NAMES
+        for reserved in sorted(_RESERVED_BASE_SERVICE_NAMES):
+            reset_codegen_registry()
+            p = copy.deepcopy(_BASE_PARSED)
+            p["metadata"]["name"] = reserved
+            with pytest.raises(CodegenError) as exc_info:
+                CodegenEngine(p, "docker").render(dry_run=True)
+            assert exc_info.value.code == "C3b_reserved_service_name", reserved
+
+    def test_non_reserved_name_passes(self) -> None:
+        from yashigani.manifest.codegen import CodegenEngine, reset_codegen_registry
+        reset_codegen_registry()
+        p = copy.deepcopy(_BASE_PARSED)
+        p["metadata"]["name"] = "hermes-agent"
+        CodegenEngine(p, "docker").render(dry_run=True)  # no exception
+
+
+# ---------------------------------------------------------------------------
 # C10 — Caddy validator injectable (HIGH ship-gate)
 # ---------------------------------------------------------------------------
 
@@ -330,16 +374,73 @@ class TestM9SymlinkWriteRefused:
         assert written == [], "dry_run wrote files: %s" % written
         assert len(artifacts) > 0
 
-    def test_real_run_writes_files(self, tmp_path) -> None:
-        """Real run writes files under output_root."""
-        from yashigani.manifest.codegen import reset_codegen_registry
+    def test_real_run_writes_only_runtime_relevant_files(self, tmp_path) -> None:
+        """Real run persists only the artifacts relevant to `runtime` (v4.1.2
+        fix, RESTART-013 MCP leg Gap B / artifact_write 502 root cause).
+
+        The FULL artifact map is still returned (unchanged introspection
+        contract), but for a compose runtime ("docker") only "docker/"-
+        prefixed keys are written to disk — "helm/"-prefixed and other
+        cross-runtime/advisory keys (service_identities.yaml.fragment,
+        pki_ownership-*.sh, opa/*.rego, tests/contracts/*) are NOT, because
+        a real compose install's output_root is scoped to only the docker/
+        subtree (docker-compose.yml backoffice bind mount) and nothing reads
+        those other keys back at approve-time for a compose deployment. This
+        is what makes the approve-ceremony survive a narrowly-mounted
+        output_root — see is_artifact_relevant_for_runtime()'s module
+        docstring in codegen.py.
+        """
+        from yashigani.manifest.codegen import (
+            is_artifact_relevant_for_runtime,
+            reset_codegen_registry,
+        )
         reset_codegen_registry()
-        engine = _fresh_engine()
+        engine = _fresh_engine(runtime="docker")
         artifacts = engine.render(output_root=tmp_path, dry_run=False)
+        assert len(artifacts) > 0
+        wrote_any_docker = False
         for rel_path in artifacts:
             dest = tmp_path / rel_path
-            assert dest.is_file(), "Expected file not found: %s" % dest
-            assert dest.read_text() == artifacts[rel_path]
+            if is_artifact_relevant_for_runtime(rel_path, "docker"):
+                assert dest.is_file(), "Expected file not found: %s" % dest
+                assert dest.read_text() == artifacts[rel_path]
+                assert rel_path.startswith("docker/")
+                wrote_any_docker = True
+            else:
+                assert not dest.exists(), (
+                    "runtime=docker must NOT persist %r (not docker/-prefixed) "
+                    "— artifact_write 502 regression" % rel_path
+                )
+        assert wrote_any_docker, "no docker/-prefixed artifact was written at all"
+        # Sanity: the map DOES contain non-docker keys that were correctly skipped.
+        assert any(not k.startswith("docker/") for k in artifacts), (
+            "test fixture no longer produces cross-runtime artifacts — "
+            "update the fixture, this assertion is meant to prove the skip path fired"
+        )
+
+    def test_real_run_k8s_writes_only_helm_files(self, tmp_path) -> None:
+        """Real run on runtime="k8s" persists only "helm/"-prefixed artifacts —
+        the docker/-prefixed compose override and Caddy egress snippet must
+        NOT be written (no docker-compose exists on K8s)."""
+        from yashigani.manifest.codegen import (
+            is_artifact_relevant_for_runtime,
+            reset_codegen_registry,
+        )
+        reset_codegen_registry()
+        engine = _fresh_engine(runtime="k8s")
+        artifacts = engine.render(output_root=tmp_path, dry_run=False)
+        wrote_any_helm = False
+        for rel_path in artifacts:
+            dest = tmp_path / rel_path
+            if is_artifact_relevant_for_runtime(rel_path, "k8s"):
+                assert dest.is_file(), "Expected file not found: %s" % dest
+                assert rel_path.startswith("helm/")
+                wrote_any_helm = True
+            else:
+                assert not dest.exists(), (
+                    "runtime=k8s must NOT persist %r" % rel_path
+                )
+        assert wrote_any_helm, "no helm/-prefixed artifact was written at all"
 
 
 # ---------------------------------------------------------------------------

@@ -7,26 +7,146 @@
 # ResponseInspection (G-ORCH-OPA-1), so the injected result is BLOCKED at egress
 # and the user sees a neutral notice instead. Benign input echoes normally.
 #
-# Stdlib only (no third-party deps) → minimal attack surface. Runs non-root
-# (USER 10001), binds non-privileged :8000, compatible with the compose
-# read_only rootfs + cap_drop:[ALL] + no-new-privileges hardening.
+# TWO DEPLOYMENT SHAPES — this ONE image serves both (FINDING-A fix, 2026-07-21:
+# "bundled demo-mcp reference manifest not real-deployable as Shape-C"):
+#
+#   1. mcp-a direct-upstream — base `demo-mcp` compose service (docker-compose.yml,
+#      profile demo-mcp), the "cloud-9" chat-injection demo
+#      (UPSTREAM_MCP_URL=http://demo-mcp:8000). Container CMD =
+#      `python3 /app/server.py` (default, UNCHANGED from before this fix):
+#      server.py binds MCP_HOST:MCP_PORT and speaks plain-HTTP JSON-RPC
+#      directly — no bridge involved. Proven working (Ava chat-MCP byte-proof);
+#      this shape is not touched by the fix below.
+#
+#   2. Shape-C ring_fenced import (POST /admin/mcp/servers/import,
+#      topology: ring_fenced) — the reference onboarding demo (scripts/
+#      populate-demo.py step13c_mcp_import_ceremony, manifest transport: stdio).
+#      codegen (_gen_compose_override_shape_c, src/yashigani/manifest/codegen.py)
+#      UNCONDITIONALLY overrides the container command to
+#        uvicorn yashigani.mcp._bridge:get_app --factory --host 0.0.0.0 --port 8000
+#      and sets YASHIGANI_MCP_SUBPROCESS_COMMAND to spec.subprocess.command
+#      (now `python3 /app/server.py --stdio`). The first-party bridge
+#      (src/yashigani/mcp/_bridge.py) then spawns server.py in --stdio mode as
+#      its stdio-transport subprocess (line-delimited JSON-RPC over stdin/
+#      stdout — see server.py's _stdio_main() docstring for the exact framing
+#      contract).  PREVIOUSLY this image was stdlib-only and had neither
+#      uvicorn/fastapi nor the yashigani wheel installed, so the codegen
+#      command failed at "uvicorn: not found" — onboarding the reference demo
+#      needed a manual workaround (FINDING-A). This Dockerfile now installs
+#      the yashigani wheel (pulls in fastapi+uvicorn, the bridge's own deps
+#      per pyproject.toml) so that command actually runs.
+#
+# Both modes execute the SAME tool logic (TOOLS table + _call_tool() in
+# server.py) — no behavioural drift between the two deployment shapes.
+#
+# Non-root (UID 10001 — matches codegen._SC_RUN_AS_USER for Shape-C AND the
+# pre-existing Path-A USER), binds non-privileged :8000, compatible with the
+# compose read_only rootfs + cap_drop:[ALL] + no-new-privileges hardening in
+# BOTH deployment shapes.
 #
 # Built by scripts/build-demo-mcp.sh and by `docker compose` via the build:
-# directive on the demo-mcp service (profile: demo-mcp).
+# directive on the demo-mcp service (profile: demo-mcp) — same build for both
+# deployment shapes (identical image; only the runtime `command:` differs).
 #
-# Context: repo root. Source: docker/demo-mcp/server.py.
-FROM python:3.12-slim
+# Digest pinning (CIS Docker Benchmark 4.6): python:3.12-slim, verified
+# 2026-07-21 via `podman manifest inspect docker.io/library/python:3.12-slim`.
+#
+# Context: repo root (needs pyproject.toml + src/ for the wheel build, and
+# docker/demo-mcp/server.py). Source of the tool logic: docker/demo-mcp/server.py.
+
+# ── Multi-arch python selector — mirrors docker/Dockerfile.git-mcp ───────────
+# BuildKit / podman build inject TARGETARCH automatically to match the host
+# (or --platform) target; the ARG default below only matters for engines that
+# don't auto-populate it.
+ARG TARGETARCH=amd64
+
+FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS python-amd64
+FROM python:3.12-slim@sha256:55842c72c6b3584d06ec84c731fc516b30b8a53ad262ebd085e47ab568b3bfc1 AS python-arm64
+
+FROM python-${TARGETARCH} AS python-base
+
+
+# ── Stage 1: wheel builder (Yashigani bridge) ─────────────────────────────────
+FROM python-base AS builder
+
+# Proxy passthrough — enterprise/proxied/airgapped builds.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+WORKDIR /build
+
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
+    pip install --no-cache-dir build
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+RUN python -m build --wheel --outdir /dist
+
+
+# ── Stage 2: runtime — minimal final image ────────────────────────────────────
+# python-slim + the yashigani wheel (fastapi/uvicorn deps for Shape-C mode).
+# No pip in the final image (removed after install — CIS 4.x, matches
+# Dockerfile.gateway/git-mcp/filesystem-mcp).
+FROM python-base AS runtime
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+# UID 10001 matches codegen._SC_RUN_AS_USER (Shape-C run-as-user) AND the
+# pre-existing Path-A `USER 10001` — one UID satisfies both deployment shapes.
+RUN groupadd --gid 10001 demo-mcp \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /bin/false demo-mcp
+
+# Install the Yashigani wheel — brings in fastapi+uvicorn (pyproject.toml
+# core deps) needed for Shape-C mode's bridge command.
+COPY --from=builder /dist/*.whl /tmp/
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" && \
+    pip install --no-cache-dir "/tmp/$(ls /tmp/*.whl | xargs -n1 basename)" && \
+    rm /tmp/*.whl && \
+    pip uninstall -y pip
 
 COPY docker/demo-mcp/server.py /app/server.py
 
+WORKDIR /app
 USER 10001
+
 EXPOSE 8000
 ENV MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    # GHSA-537c-gmf6-5ccf / applehv SVE2/HWCAP: clear SVE bit in OpenSSL armcap;
+    # 0x8fd keeps NEON/AES/SHA hardware accel on Linux, fixes SIGILL on macOS
+    # Podman applehv (arm64). Matches Dockerfile.git-mcp / Dockerfile.filesystem-mcp
+    # — the yashigani wheel (installed above) imports cryptography at runtime,
+    # same as those bundles, in the Shape-C bridge command.
+    OPENSSL_armcap=0x8fd
 
-# GET / returns 200 — liveness page used by the compose healthcheck too.
+# Bridge-compatible probe (POST /mcp, JSON-RPC initialize) — matches the
+# bridge's actual route surface (POST-only: src/yashigani/mcp/_bridge.py
+# registers "/mcp" and "/", no GET route) so this HEALTHCHECK is correct when
+# the Shape-C override command (uvicorn bridge) is running — codegen emits no
+# healthcheck override for Shape-C, so the image default governs there.
+# server.py's do_POST() doesn't gate on path either, so this probe also passes
+# in default (Path-A HTTP) mode — though the base `demo-mcp` compose service
+# declares its own explicit `healthcheck:` (GET /, docker-compose.yml) which
+# takes priority there regardless.
 HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
-  CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/',timeout=2).status==200 else 1)"
+  CMD python3 -c "\
+import sys, urllib.request, json; \
+req = urllib.request.Request(\
+  'http://127.0.0.1:8000/mcp', \
+  data=json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize', \
+    'params':{'protocolVersion':'2024-11-05', \
+      'capabilities':{},'clientInfo':{'name':'healthcheck','version':'1'}}}).encode(), \
+  headers={'Content-Type':'application/json'}); \
+r = urllib.request.urlopen(req, timeout=4); \
+sys.exit(0 if r.status == 200 else 1)"
 
+# Default CMD: mcp-a direct-upstream HTTP mode (Path A, UNCHANGED). The
+# Shape-C ring_fenced deployment overrides this at the compose-override layer
+# (codegen._gen_compose_override_shape_c) to the uvicorn bridge command —
+# both commands are runnable from this same image.
 CMD ["python3", "/app/server.py"]

@@ -1,6 +1,6 @@
-# Yashigani v2.25.0 — Umbrella Chart Top-Level Values
+# Yashigani v4.1.2 — Umbrella Chart Top-Level Values
 # All sub-chart values are namespaced under their service name.
-# Last updated: 2026-05-27 (v2.25.0 P2 wave 2 — B10/B11/B12/B13/B14-captain/A6 + Iris coord)
+# Last updated: 2026-07-15 (v4.1.2: version bump — Deny/RBAC hardening + complete logout + podman 6.x)
 
 global:
   # imageRegistry and imageOwner are used only for gateway / backoffice /
@@ -84,8 +84,29 @@ global:
 # network-layer absent; application-layer mTLS + SPIFFE gate remain active.
 # Document any disablement in the risk register with maintainer sign-off.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DNS (FINDING-V412-DNS-001 / IRIS-CIL-001): allow-dns-egress scopes :53 egress
+# to the cluster DNS pod only (closes the open DNS-exfil channel). These
+# selectors default to CoreDNS on k3s/kubeadm; OVERRIDE if your distro labels
+# CoreDNS differently — otherwise pod DNS resolution is blocked.
+# ---------------------------------------------------------------------------
+dns:
+  corednsNamespace: kube-system
+  corednsPodLabels:
+    k8s-app: kube-dns
+
 networkPolicies:
   enabled: true
+  # FINDING-V412-UNIVERSAL-004: NetworkPolicy enforcement is CNI-dependent —
+  # Calico/Cilium enforce at the datapath; flannel (k3s default) and kindnet
+  # (kind default) silently NO-OP NetworkPolicy, so a green `helm install` could
+  # ship with NO ring-fence (egress bypassing Caddy->OPA), making Enterprise/k8s
+  # weaker than Professional/compose. Enforcement is VERIFIED by the INSTALLER,
+  # not by a chart value (a chart cannot probe the datapath): install.sh runs a
+  # positive enforcement probe (throwaway ns + default-deny + allow->deny->allow
+  # reachability test) and FAILS the k8s install if the CNI does not enforce.
+  # Override only with risk-register sign-off:
+  #   install.sh --skip-networkpolicy-probe   (or NETPOL_REQUIRE_ENFORCEMENT=false)
 
 # ---------------------------------------------------------------------------
 # Admission Control (YSG-RISK-008 — v2.23.2 P1)
@@ -145,6 +166,66 @@ admissionPolicies:
   # Kyverno policy action: Enforce (hard reject) or Audit (log only).
   # Must be Enforce in production. Audit only during rollout evaluation.
   validationFailureAction: Enforce
+
+# ---------------------------------------------------------------------------
+# Multi-Tenant / Cilium additive layer (Enterprise install profile)
+# ---------------------------------------------------------------------------
+# tom-chart.md (2026-07-19 REISSUED verdict) + yashigani-k8s-dns-hardening-
+# design-20260719.md. ADDITIVE ONLY — the 45-resource standard NetworkPolicy
+# baseline (networkpolicy.yaml) remains the CNI-portable source of truth for
+# the intra-tenant-stack ring-fence, unchanged, on every profile. This block
+# gates a SEPARATE Cilium-only layer:
+#   - CiliumClusterwideNetworkPolicy cross-tenant default-deny
+#     (templates/cilium-clusterwide-networkpolicy.yaml)
+#   - 3 targeted CiliumNetworkPolicy toFQDNs egress rules narrowing the
+#     ollama-registry / Caddy-ACME / openclaw-Slack-Telegram ipBlock-CIDR-
+#     guess gaps already flagged inline in networkpolicy.yaml /
+#     networkpolicy-caddy-egress.yaml (templates/cilium-networkpolicy-fqdn.yaml)
+#
+# DEFAULT: OFF on every profile shipped by this chart today. Per the reissued
+# verdict this is intended to be DEFAULT-ON for the Enterprise/shared-cluster
+# multi-tenant install profile specifically (NOT Professional Plus, which is
+# namespace-per-release with no cross-tenant boundary to protect and stays
+# CNI-portable on Calico or any enforcing CNI). This chart does not yet
+# encode a Professional-Plus/Enterprise profile switch — flagged for
+# Maxine/Iris: an Enterprise values overlay (e.g. values-enterprise.yaml, not
+# present in this chart today) must set multiTenant.enabled=true AND
+# multiTenant.cilium.enabled=true; Professional Plus installs leave both false
+# (this file's defaults) and render byte-identical to today.
+#
+# HARD DEPENDENCY when enabled: Cilium must be installed cluster-wide BEFORE
+# helm install/upgrade (CiliumClusterwideNetworkPolicy + CiliumNetworkPolicy
+# CRDs). Both new templates fail closed with a remediation message if the CRD
+# is absent — same pattern as admissionPolicies' Kyverno guard.
+multiTenant:
+  enabled: false
+  # Namespace-boundary label KEY. install.sh's k8s_helm_install() namespace
+  # pre-creation step is the LOAD-BEARING side of this contract — it must
+  # stamp this label onto the Namespace (value = tenantId below) BEFORE helm
+  # install runs, or the tenant boundary this block documents has no
+  # namespace-level record. This chart's own Cilium templates do NOT depend
+  # on that stamp today (they key on the reserved namespace-NAME identity
+  # instead — see cilium-clusterwide-networkpolicy.yaml's "MECHANISM NOTE");
+  # the namespace label is still required for discoverability/audit and any
+  # future namespace-label-based selector. Su's lane, not this chart —
+  # flagged as a cross-team dependency (tom-chart.md item 5).
+  tenantLabel: "yashigani.io/tenant"
+  # This release's tenant identifier. REQUIRED (fail-closed in
+  # cilium-clusterwide-networkpolicy.yaml) when multiTenant.enabled=true.
+  # Distinct from agentBundles/agentIngressFronts tenantId (an
+  # agent-upstream routing key, not a k8s isolation boundary —
+  # tom-chart.md grounding).
+  tenantId: ""
+  cilium:
+    enabled: false
+    # Namespaces (beyond this release's own namespace + kube-system, which
+    # are always implicitly allowed by the cross-tenant CCNP for DNS) that
+    # cross-tenant traffic is permitted to/from — e.g. a shared ingress-nginx
+    # namespace (auto-added when global.tlsMode=nginx) or cert-manager.
+    # Empty by default; operators on a shared platform-services cluster with
+    # additional platform namespaces must add them here — this chart does
+    # not guess a cluster's platform-namespace layout.
+    additionalAllowedNamespaces: []
 
 mtls:
   # Hard-off switch. When false the chart renders the pre-v2.23.1 plaintext
@@ -246,7 +327,7 @@ adminBootstrap:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -289,7 +370,7 @@ gateway:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-gateway
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit (scheduler sizing).
@@ -331,33 +412,51 @@ gateway:
   # ---------------------------------------------------------------------------
   mcpServers: []
   # ---------------------------------------------------------------------------
-  # K8s SB-2 fix: MCP identity signing key delivery for Kubernetes deployments.
+  # K8s parity fix (tier-tests-20260720, supersedes K8s SB-2): MCP identity
+  # signing key delivery for Kubernetes deployments.
   #
-  # Choice: Option B (separate Secret, separate mount — logically distinct from mTLS PKI).
-  # Rationale: mcp_identity_signing_key is a JWT signing secret, not a TLS certificate.
-  # Mixing it into the mTLS PKI Secret (Option A) couples two distinct key-management
-  # lifecycles (TLS cert rotation vs JWT key rotation) and risks conflating their
-  # security properties. A standalone Secret follows least-privilege and allows
-  # independent rotation without touching the mTLS bundle.
+  # WHY THIS IS REQUIRED (not optional): the MCP JWT issuer
+  # (src/yashigani/mcp/_jwt.py::_load_or_generate_key) is wired on EVERY
+  # gateway startup where Redis is configured — build_registry_from_env()
+  # (src/yashigani/mcp/registry.py ~line 267/337) builds the shared issuer
+  # whenever a durable_store is available, NOT only when
+  # agentBundles.filesystemMcp.enabled or YASHIGANI_MCP_SERVERS is set. With
+  # YASHIGANI_ENV=production (hardcoded by gateway.yaml, LIC-001 anti-tamper)
+  # an ephemeral key is refused, so a persistent key MUST exist at
+  # /run/secrets/mcp_identity_signing_key or the gateway fail-closes at
+  # startup ("MCP broker wiring failed — gateway cannot start safely").
   #
-  # In Docker/Compose: install.sh writes the key to a host path and bind-mounts it.
-  # In Kubernetes: the operator must pre-create a K8s Secret containing the key, then
-  # reference it here via mcpSigningKey.existingSecretName + mcpSigningKey.secretKey.
-  # The gateway pod mounts the key via subPath to /run/secrets/mcp_identity_signing_key.
+  # Key spec (Nico mcp-identity-jwt-spec-20260529.md §2, LOCKED): EC P-384,
+  # single root key per installation, per-tenant keys HKDF-derived at runtime
+  # (YSG-RISK-109) — never generate per-tenant Secrets. Non-KMS default
+  # storage = PEM file, gateway UID only. Default rotation cadence 90 days,
+  # via an explicit operator-triggered rotation — NEVER silently on
+  # helm upgrade/reinstall (would desync JWKS across replicas and invalidate
+  # in-flight MCP identity JWTs).
   #
-  # Pre-create the Secret:
-  #   kubectl create secret generic yashigani-mcp-signing-key \
-  #     -n <namespace> \
-  #     --from-literal=mcp_identity_signing_key="$(openssl rand -hex 32)"
-  # Then set:
-  #   --set gateway.mcpSigningKey.existingSecretName=yashigani-mcp-signing-key
+  # Choice: separate Secret, separate mount — logically distinct from mTLS PKI
+  # (JWT signing key rotation lifecycle != TLS cert rotation lifecycle).
   #
-  # Only required when agentBundles.filesystemMcp.enabled=true.
-  # Leave existingSecretName empty if not using MCP bundles.
+  # Generation mechanism: Sprig's `genPrivateKey "ecdsa"` only emits P-256
+  # (hardcoded), so Helm templating alone CANNOT mint the required P-384
+  # curve. The chart's mtls-bootstrap-job.yaml (pre-install/pre-upgrade Job,
+  # already running python `cryptography` for PKI issuance) mints this key
+  # in-cluster instead — idempotently: pki-pre-seed preserves an existing key
+  # from a prior install (no rotation on upgrade), the issuer initContainer
+  # generates a fresh key only when none was preserved, and the applier
+  # container writes/keeps the Secret (helm.sh/resource-policy: keep, same as
+  # the two PKI Secrets). Zero operator pre-creation required — `helm install`
+  # alone is sufficient (CLAUDE.md: reproduce from committed code).
+  #
+  # existingSecretName: set to point the gateway at an operator/KMS-synced
+  # Secret instead (e.g. Vault Agent Injector, external-secrets-operator) —
+  # the chart-managed Secret named `secretName` below is then not consulted.
+  # Mirrors the mtls.existingSecretName override pattern exactly.
   # ---------------------------------------------------------------------------
   mcpSigningKey:
-    existingSecretName: ""   # name of the pre-created K8s Secret
-    secretKey: "mcp_identity_signing_key"  # key inside the Secret
+    existingSecretName: ""                     # operator/KMS override (optional)
+    secretName: "yashigani-mcp-signing-key"     # chart-managed Secret (mtls-bootstrap-job)
+    secretKey: "mcp_identity_signing_key"       # key inside the Secret
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
@@ -452,8 +551,17 @@ backoffice:
     # the repository field accordingly. Pin your post-build digest with
     # `@sha256:<digest>` for supply-chain attestation (recommended).
     repository: yashigani-backoffice
-    tag: "4.1.0"
+    tag: "4.1.2"
     pullPolicy: IfNotPresent
+  # YSG-RISK-122 (Ava, live k8s @ ca720724): defense-in-depth initContainers
+  # that block backoffice's main container from starting until
+  # yashigani-redis and yashigani-budget-redis are DNS-resolvable + accepting
+  # TCP connections. The primary fix is the runtime self-heal in
+  # backoffice/redis_selfheal.py (bounded lazy reconnect); this toggle exists
+  # so operators can disable the initContainers independently if their own
+  # dependency-ordering tooling already handles it. Default: enabled.
+  waitForRedis:
+    enabled: true
   replicaCount: 2
   # YSG-RISK-005 #3av: requests = 50% of limit.
   resources:
@@ -687,7 +795,7 @@ redis:
   enabled: true
   image:
     repository: redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -975,7 +1083,7 @@ caddy:
   enabled: true
   image:
     repository: caddy
-    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
+    tag: "2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1006,15 +1114,57 @@ caddy:
     enabled: true
     port: 8445
   # v4.1 SU-SEAM-1d-04 — mesh-mTLS caddy admin relay for the K8s MCP
-  # approve-transaction reload path (mcp_onboard._reload_via_admin_api).
+  # approve-transaction route-registration path
+  # (mcp_onboard._register_route_via_broker_relay, FINDING-V412-CADDYADMIN-002).
   # NOT the raw admin API (that stays unix-socket-only per MUST-4): an mTLS
-  # require_and_verify site block admitting ONLY POST /load from the
-  # backoffice SPIFFE URI, proxied to the caddy-pod-local admin socket.
+  # require_and_verify site block admitting ONLY POST/DELETE /route from the
+  # backoffice SPIFFE URI, proxied to the co-located caddy-config-broker
+  # sidecar (never directly to the admin socket).
   # Requires mtls.enabled=true (templates gate on both). NetworkPolicy
   # restricts ingress on this port to backoffice pods.
   adminRelay:
     enabled: true
     port: 2019
+  # FINDING-V412-CADDYADMIN-002 REWORK (Captain, 2026-07-21): the :2019
+  # relay above (mTLS + SPIFFE-gated) used to proxy a raw POST /load body
+  # (the FINDING-V412-CADDYADMIN-001 R1 fix, Su) — content-VALIDATED by this
+  # sidecar against a startup-computed baseline before forwarding. Laura's
+  # final re-attack proved the compose twin of that design FAILED live under
+  # the real no-new-privileges security context (the broker's own
+  # `caddy adapt` EPERM'd — every legitimate reload 502'd; see
+  # docker/caddy/config_broker.py module docstring). This sidecar now
+  # exposes POST/DELETE /route instead: backoffice sends narrow typed DATA
+  # (tenant_id/server_id/mesh_port/shim_port), the sidecar independently
+  # re-validates every field, renders the wrap from its OWN fixed template,
+  # and writes it into the caddy-agents-dynamic pod-local emptyDir (see
+  # caddy.yaml) — R1 (rogue /load body) is closed by construction, not by
+  # content-filtering a body that no longer exists. Same image as compose's
+  # caddy-config-broker service, BROKER_LISTEN_MODE=tcp. Loopback-only — no
+  # Service/Ingress ever fronts this port; only reachable from the caddy
+  # container in the SAME pod. R2 (compose's rogue docker/caddy/agents/
+  # *.caddy filesystem vector) has NO K8s equivalent — audited 2026-07-21:
+  # zero RBAC rules in this chart grant any workload ServiceAccount
+  # "configmaps" access, so yashigani-caddy-config / yashigani-caddy-agents
+  # are Helm/kubectl-managed only, never workload-writable.
+  configBroker:
+    enabled: true
+    image:
+      # Built locally by install.sh / your CI from
+      # docker/caddy/Dockerfile.caddy-broker (same image compose uses).
+      # For K8s deployments: push to your own private registry and update
+      # the repository field accordingly. Pin your post-build digest with
+      # `@sha256:<digest>` for supply-chain attestation (recommended).
+      repository: yashigani-caddy-config-broker
+      tag: "4.1.2"
+      pullPolicy: IfNotPresent
+    port: 8199
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "128Mi"
   # YSG-RISK-061 (v2.24.1): operator ACME / external egress allowlist.
   # Comma-separated list of additional host:port pairs to allow in the
   # caddy-entrypoint.sh iptables OUTPUT rules. Default is empty (only the
@@ -1213,6 +1363,16 @@ agentBundles:
       LANGFLOW_DEFAULT_MODEL: "qwen2.5:3b"
       DO_NOT_TRACK: "true"
       LANGFLOW_AUTO_LOGIN: "true"
+      # COMPOSE PARITY FIX (2026-07-21): persistence.mountPath (/app/langflow, PVC
+      # below) and extraVolumeMounts/RO-rootfs were already wired, but langflow was
+      # never TOLD to use that mount — it defaulted to sqlite/config paths under
+      # the read-only image rootfs (/app/.venv/.../langflow.db,
+      # /app/data/.cache/langflow), so initialize_database() raised
+      # sqlite3.OperationalError: unable to open database file → CrashLoopBackOff.
+      # Mirrors docker-compose.yml:2255-2256 (langflow_data:/app/langflow named
+      # volume + these same two env vars). Same fix Compose already carries.
+      LANGFLOW_DATABASE_URL: "sqlite:////app/langflow/langflow.db"
+      LANGFLOW_CONFIG_DIR: "/app/langflow/config"
       # FAIL-002 parity (v2.23.4): langflow 1.9.2 writes alembic migration log to
       # /app/.venv/lib/python3.12/site-packages/langflow/alembic/alembic.log — inside
       # the image rootfs. readOnlyRootFilesystem:false already prevents EROFS in K8s,
@@ -1369,6 +1529,21 @@ agentBundles:
       # secretKeyRef env var in K8s. supplementalGroups: [2002] was vestigial.
       # Removed per Laura A1 amendment — GID 2002 narrowed to langflow-only on
       # Compose path; K8s never needed it.
+      # YSG-RISK-121 CLOSED: fsGroup: 70 — mirrors the working yashigani-pgbouncer
+      # pod pattern (pgbouncer.yaml podSecurityContext). This pod is mixed-UID:
+      # the letta app container runs runAsUser:0 (root — unaffected by fsGroup,
+      # root reads regardless of file ownership), while the letta-pgbouncer
+      # sidecar runs runAsUser/Group:70. Without fsGroup, the letta-pgbouncer-pki
+      # Secret volume below is owned root:root and the non-root sidecar gets
+      # EACCES ("failed to load certificate file ... (null)") trying to read
+      # its own leaf. fsGroup:70 makes K8s own the Secret volume files as
+      # group 70, matching the sidecar's runAsGroup so it can read (with
+      # defaultMode 0440 below). Scoped to this bundle's pod only — does NOT
+      # touch the CA-material posture (YSG-RISK-120): CA private keys are
+      # never mounted here, the letta-pgbouncer-pki mount stays readOnly:true,
+      # and this only widens group-read on the leaf/trust-anchor files this
+      # pod already legitimately receives.
+      fsGroup: 70
     containerSecurityContext:
       allowPrivilegeEscalation: false
       # readOnlyRootFilesystem: true — restored (was incorrectly false since v2.23.x).
@@ -1421,7 +1596,13 @@ agentBundles:
       - name: letta-pgbouncer-pki
         secret:
           secretName: "yashigani-pki-certs"
-          defaultMode: 0400
+          # YSG-RISK-121 CLOSED: 0400 (owner-only) → 0440 (owner+group read),
+          # matching the main yashigani-pgbouncer pki-certs volume exactly
+          # (pgbouncer.yaml). Paired with fsGroup:70 above, this lets the
+          # runAsUser/Group:70 letta-pgbouncer sidecar read its own leaf.
+          # Mount stays readOnly:true; no write access is granted; no CA
+          # private key material is projected here (items: below is unchanged).
+          defaultMode: 0440
           items:
             - key: letta-pgbouncer_client.crt
               path: letta-pgbouncer_client.crt
@@ -1452,7 +1633,7 @@ agentBundles:
     # Same image as existing yashigani-pgbouncer Deployment. No new registry dependency.
     extraContainers:
       - name: letta-pgbouncer
-        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+        image: "docker.io/edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
         imagePullPolicy: IfNotPresent
         securityContext:
           # pgbouncer runs as UID 70 (edoburu image USER pgbouncer). runAsNonRoot:true
@@ -1635,7 +1816,7 @@ budgetRedis:
   enabled: true
   image:
     repository: redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1680,12 +1861,27 @@ wazuh:
 
 # ---------------------------------------------------------------------------
 # PostgreSQL 16 — primary durable store
+#
+# FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): the default postgres:16-alpine
+# image has NO openssl CLI, so files/postgres-05-enable-ssl.sh's fail-closed
+# chain-of-continuity check (FINDING-LAURA-V412-PKI-PIN) aborts with "openssl
+# not found" — ssl=on never gets written, gateway/backoffice sslmode=verify-ca
+# then hit "server does not support SSL" and CrashLoop. Standardised on the
+# SAME pgvector/pgvector:0.8.2-pg16 image already used by
+# docker-compose.yml/docker/docker-compose.release.yml (Debian bookworm base,
+# HAS /usr/bin/openssl) for full runtime parity across compose and K8s. This
+# image's postgres user is UID/GID 999 (Debian convention, NOT Alpine's 70) —
+# templates/postgres.yaml securityContext.runAsUser/runAsGroup/fsGroup are set
+# to 999 to match (see that file's comment for the chown-EPERM history this
+# fixes). Digest verified live via `docker buildx imagetools inspect` 2026-07-24
+# (the tag has been republished since compose's original pin — the digest here
+# is the current, live-verified one, not carried over stale).
 # ---------------------------------------------------------------------------
 postgres:
   enabled: true
   image:
-    repository: postgres
-    tag: "16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50"
+    repository: docker.io/pgvector/pgvector
+    tag: "0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1712,7 +1908,7 @@ pgbouncer:
   enabled: true
   image:
     repository: edoburu/pgbouncer
-    tag: "v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4"
+    tag: "v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
     pullPolicy: IfNotPresent
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
@@ -1950,10 +2146,33 @@ licensing:
 # ---------------------------------------------------------------------------
 documentEnforcement:
   enabled: false
+  # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — DELIBERATE double
+  # opt-in, mirroring docker-compose.yml: documents/proxy_modeb.py's
+  # is_modeb_proxy_active() requires BOTH `enabled` above AND this flag before
+  # the gateway's hot egress path (MCP tool-call document bridge) engages
+  # ("Untouched unless opted in AND document-shaped" — proxy_modeb.py module
+  # docstring, discipline #2). Do NOT default this to `enabled`'s value — the
+  # two flags are intentionally independent so an operator can enable
+  # ingress-upload document enforcement (/user/documents) WITHOUT also
+  # activating the mode-B proxy/MCP-egress interception. Set true only when
+  # you also want MCP tool-call document enforcement.
+  modeBProxyEnabled: false
   # Per-job hardened extractor image (built from docker/Dockerfile.extractor).
   # Pin a digest in production (Verification Protocol §7).
+  #
+  # YSG-RISK-123b fix (2026-07-24): repository renamed from slash-form
+  # "yashigani/extractor" (the docker-compose build tag) to HYPHEN form,
+  # matching gateway/backoffice/caddy-config-broker's K8s naming convention
+  # so `yashigani.ownImage` (registry/owner/repo/tag) resolves consistently
+  # and install.sh's k8s_ensure_fresh_local_images (step 7b) builds+pushes
+  # under the EXACT name the chart references — closing the same
+  # stale-image-provenance gap Captain fixed for gateway/backoffice/
+  # caddy-config-broker. The docker-compose path is UNCHANGED (it still
+  # builds/tags "yashigani/extractor" — see docker-compose.extractor.yml —
+  # because compose's single dockerd store is not affected by the k8s
+  # kubelet-separate-containerd-store bug this fixes).
   image:
-    repository: yashigani/extractor
+    repository: yashigani-extractor
     tag: ""            # defaults to .Chart.AppVersion when empty
   # Per-job resource caps for the ephemeral extractor pods (fail-closed defaults).
   timeoutSeconds: 20   # activeDeadlineSeconds — wall-clock kill

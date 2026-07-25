@@ -18,7 +18,7 @@ This attribution is provided in good faith to satisfy the notice obligations of 
 
 | Component | Version (pinned) | SPDX | Upstream source | Notes |
 |---|---|---|---|---|
-| **Caddy** | `2.11.2-alpine` | `Apache-2.0` | https://github.com/caddyserver/caddy | Reverse proxy / auth perimeter (`docker/Caddyfile.*`). |
+| **Caddy** | `2.11.4-alpine` | `Apache-2.0` | https://github.com/caddyserver/caddy | Reverse proxy / auth perimeter (`docker/Caddyfile.*`). |
 | **Open Policy Agent (OPA)** | `1.16.1` | `Apache-2.0` | https://github.com/open-policy-agent/opa | Policy decision point for routing + agent-to-agent calls. |
 | **PostgreSQL (pgvector image)** | `0.8.2-pg16` | `PostgreSQL` | https://github.com/pgvector/pgvector ; https://www.postgresql.org/about/licence/ | Primary database. pgvector extension under the PostgreSQL License. |
 | **Redis** | `7.4.9-alpine` | `RSALv2 OR SSPLv1` | https://github.com/redis/redis | Redis Inc. dual-licensed starting Redis 7.4 (RSALv2 / SSPLv1). Operators with redistribution use cases should review the dual-license terms upstream. |

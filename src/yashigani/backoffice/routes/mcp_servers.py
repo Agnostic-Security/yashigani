@@ -5,8 +5,15 @@ Admin surface for the MCP server registry: listing registered servers and
 importing (seeding) new ones through the governed capability-envelope ceremony.
 
 Endpoints (prefix /admin/mcp/servers):
-  GET  /               — list active registered MCP servers (with tool summary)
-  POST /import         — import/seed a new MCP server (step-up gated)
+  GET    /                    — list active registered MCP servers (with tool summary)
+  POST   /import              — import/seed a new MCP server (step-up gated)
+  DELETE /{server_id}         — decommission a ring_fenced MCP server (step-up
+                                 gated) — FINDING-V412-ONBOARDING-ROBUSTNESS #4.
+                                 See mcp_onboard.py run_decommission_transaction
+                                 for the full reversal (envelope deactivation,
+                                 broker-route removal, durable-registry
+                                 cleanup, SVID leaf revocation). Idempotent;
+                                 component-isolated to this server_id only.
 
 Import ceremony (POST /import):
   1. Receives server_id + upstream_url (+ optional topology/egress_posture).
@@ -28,13 +35,23 @@ Security properties:
   * POST /import requires StepUpAdminSession (fresh TOTP) — mutating.
   * server_id and upstream_url are validated (length, scheme) before use.
   * The tools/list HTTP call is made BY THE BACKOFFICE PROCESS (not the client).
-    The operator supplies the server URL; the backoffice fetches from it.  This
-    is operator-controlled egress (admin must already own the network), not SSRF.
-    Allowed schemes: http/https only; localhost/internal URLs are accepted in demo
-    mode (the demo MCP runs inside the compose network).
+    The operator supplies the server URL; the backoffice fetches from it. This
+    is operator-controlled egress by design (an operator-chosen internal MCP
+    server on the compose/mesh network is a legitimate target — e.g. demo mode
+    imports 'http://demo-mcp:8000'), so upstream_url is NOT allowlisted and
+    RFC-1918/private-mesh hosts are accepted. It is NOT blanket-exempt from
+    SSRF, though: codescan #1 (mustui triage 2026-07-20) proved the pre-fix
+    code let upstream_url reach cloud-metadata (IMDS) and loopback targets —
+    a blind-SSRF/internal-recon primitive. upstream_url is now gated by
+    assert_no_imds_or_loopback_url() (yashigani.alerts._url_guard) at both
+    the Pydantic field-validator (config-write time, fail 422 before any
+    fetch) and again immediately before the httpx call (defence-in-depth) —
+    same two-checkpoint pattern as the Slack/Teams webhook guard
+    (V232-CSCAN-01b), narrowed to IMDS/loopback only (no vendor allowlist, no
+    blanket private-range block) so internal MCP deployments keep working.
   * The envelope is operator-signed with the admin's account_id.
 
-Last updated: 2026-06-30T00:00:00+00:00
+Last updated: 2026-07-20T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -48,6 +65,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
+from yashigani.alerts._url_guard import WebhookUrlForbidden, assert_no_imds_or_loopback_url
 from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
@@ -389,6 +407,14 @@ class ImportMcpServerRequest(BaseModel):
             raise ValueError("upstream_url must start with http:// or https://")
         if len(v) > 2048:
             raise ValueError("upstream_url too long (max 2048 chars)")
+        # codescan #1 (mustui triage 2026-07-20): block IMDS/loopback SSRF
+        # targets at config-write time, before any fetch is attempted. Does
+        # NOT block RFC-1918/private-mesh hosts — internal MCP servers are a
+        # legitimate, by-design target for this field.
+        try:
+            assert_no_imds_or_loopback_url(v)
+        except WebhookUrlForbidden as exc:
+            raise ValueError(f"upstream_url rejected: {exc.reason}") from exc
         return v
 
     @field_validator("topology")
@@ -461,7 +487,22 @@ async def import_mcp_server(
     """
     from yashigani.mcp._envelope import project_surface, surface_set_hash
 
-    # 1. Fetch tools/list from the upstream.
+    # 1a. codescan #1 (mustui triage 2026-07-20): re-validate upstream_url
+    #     immediately before the outbound fetch — last-line-of-defence in
+    #     case the config-write-time field_validator was somehow bypassed
+    #     (same two-checkpoint pattern as slack_sink.py/teams_sink.py).
+    try:
+        assert_no_imds_or_loopback_url(body.upstream_url)
+    except WebhookUrlForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "upstream_url_forbidden",
+                "message": f"upstream_url rejected: {exc.reason}",
+            },
+        )
+
+    # 1b. Fetch tools/list from the upstream.
     rpc = {
         "jsonrpc": "2.0",
         "id": "import-ceremony",
@@ -691,4 +732,117 @@ async def import_mcp_server(
             "svid_issued": True,
         }
         response["artifacts"] = onboard_result.artifact_paths
+        # FINDING-V412-ONBOARDING-ROBUSTNESS #5 (Tom, 2026-07-21): this
+        # ceremony registers the capability envelope + broker route but does
+        # NOT start the agent's container — backoffice has no docker/podman
+        # socket access by design (LAURA-30-001 / YSG-RISK-080, the same
+        # boundary #4's decommission `container_teardown` field documents).
+        # `deploy` surfaces the exact scoped command the operator runs next,
+        # closing the "what do I do now" documentation gap without backoffice
+        # ever touching the container layer itself.
+        response["deploy"] = onboard_result.deploy_hint
     return response
+
+
+# ---------------------------------------------------------------------------
+# Decommission — FINDING-V412-ONBOARDING-ROBUSTNESS #4
+# ---------------------------------------------------------------------------
+
+_VALID_TEARDOWN_MODES = frozenset({"keep", "nuke"})
+
+
+@router.delete("/{server_id}")
+async def decommission_mcp_server(
+    server_id: str,
+    session: StepUpAdminSession,
+    mode: str = "keep",
+):
+    """Decommission (cleanly remove) a ring_fenced MCP server.
+
+    Step-up gated (destructive, matching POST /import's own gate): the admin
+    must have a fresh TOTP stamp in their session.
+
+    Reverses the approve transaction end to end (see mcp_onboard.py
+    run_decommission_transaction docstring for the full step sequence and
+    ordering rationale):
+      * the capability envelope is transitioned active -> decommissioned
+        (deny-first: /auth/verify-mcp starts denying immediately, before any
+        other cleanup runs);
+      * the durable broker-registry descriptor + OPA grant/baseline/egress
+        grant are deleted (Redis db/3) and the egress-grants revocation is
+        pushed live;
+      * the broker route is unregistered (Caddy drops the per-instance wrap);
+      * the per-instance SVID leaf cert/key and svid-init staging files are
+        removed;
+      * the runtime-relevant codegen artifacts (compose override / helm
+        values) are unlinked.
+
+    Component-isolated: every step above is keyed on (tenant_id, server_id)
+    ONLY — no other agent or core service is ever touched. Idempotent: safe
+    to call repeatedly, including for a server_id that was never onboarded
+    or was already decommissioned (returns 200 with
+    ``already_decommissioned: true`` rather than 404/409).
+
+    ``mode`` ("keep" | "nuke", default "keep") selects which command
+    guidance the response's ``container_teardown`` field carries for the
+    CONTAINER + VOLUME layer. Backoffice performs NO container-level action
+    itself — it has no docker/podman socket access by design (LAURA-30-001 /
+    YSG-RISK-080; see docker-compose.yml's backoffice service comment). The
+    operator (or install.sh) runs the returned scoped compose/helm command.
+
+    Returns: {server_id, tenant_id, already_decommissioned, steps,
+    artifacts_removed, svid, container_teardown}
+    """
+    if mode not in _VALID_TEARDOWN_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_mode",
+                "message": "mode must be one of %s" % sorted(_VALID_TEARDOWN_MODES),
+            },
+        )
+
+    from yashigani.backoffice.mcp_onboard import McpOnboardError, run_decommission_transaction
+
+    svc = _envelope_service()
+    tenant = _install_tenant()
+
+    try:
+        result = await run_decommission_transaction(
+            tenant_id=tenant,
+            server_id=server_id,
+            operator_identity=session.account_id,
+            envelope_service=svc,
+            audit_writer=backoffice_state.audit_writer,
+            registry_store=_durable_registry_store(),
+            container_teardown_mode=mode,
+        )
+    except McpOnboardError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={
+                "error": "decommission_transaction_failed",
+                "failed_step": exc.step,
+                "message": str(exc),
+            },
+        )
+
+    logger.info(
+        "mcp-servers: decommissioned server_id=%r tenant=%r by admin=%s "
+        "mode=%s already_decommissioned=%s steps=%s",
+        server_id, tenant, session.account_id, mode,
+        result.already_decommissioned, result.steps,
+    )
+
+    return {
+        "server_id": result.server_id,
+        "tenant_id": result.tenant_id,
+        "already_decommissioned": result.already_decommissioned,
+        "steps": result.steps,
+        "artifacts_removed": result.artifact_paths_removed,
+        "svid": {
+            "instance_id": result.instance_id,
+            "spiffe_id": result.spiffe_id,
+        },
+        "container_teardown": result.container_teardown,
+    }

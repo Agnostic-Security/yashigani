@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 license_router = APIRouter(tags=["license"])
 
 _LICENSE_SECRET_PATH = "/run/secrets/license_key"
+# FINDING-V412-RESTART-012 (2026-07-21): /run/secrets is now a pure :ro mount
+# on backoffice (docker-compose.yml) — writes/deletes of the license key go
+# via a SEPARATE writable mount (default /run/secrets-rw) that binds the SAME
+# underlying host file, so existence/read checks against _LICENSE_SECRET_PATH
+# above stay accurate (see auth/bootstrap.py write_docker_secrets() docstring
+# for the full rationale).
+_LICENSE_SECRET_WRITE_PATH = os.path.join(
+    os.getenv("YASHIGANI_SECRETS_RW_DIR", "/run/secrets-rw"), "license_key"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +498,13 @@ async def activate_license(
     set_license(new_lic)
 
     try:
-        with open(_LICENSE_SECRET_PATH, "w") as fh:
+        with open(_LICENSE_SECRET_WRITE_PATH, "w") as fh:
             fh.write(content)
     except OSError:
-        logger.debug("License key secret path not writable (%s) — skipping persist", _LICENSE_SECRET_PATH)
+        logger.debug(
+            "License key secret path not writable (%s) — skipping persist",
+            _LICENSE_SECRET_WRITE_PATH,
+        )
 
     expires_at = new_lic.expires_at.isoformat() if new_lic.expires_at is not None else None
 
@@ -534,7 +546,7 @@ async def revert_license(body: RevertRequest, session=Depends(require_stepup_adm
 
     try:
         if os.path.exists(_LICENSE_SECRET_PATH):
-            os.remove(_LICENSE_SECRET_PATH)
+            os.remove(_LICENSE_SECRET_WRITE_PATH)
     except OSError as exc:
         logger.warning("Could not remove license key secret file: %s", exc)
 

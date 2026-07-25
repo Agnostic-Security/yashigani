@@ -42,9 +42,11 @@ metadata:
     "helm.sh/hook-weight": "-10"
     "helm.sh/hook-delete-policy": before-hook-creation
 rules:
-  # Single rule — get/update/patch on the two PKI Secrets only.
-  # Retro #3aj: leaves and CA private keys are split into two Secrets;
-  # both are pre-seeded as empty placeholders by the -9-weighted hooks
+  # get/update/patch on the PKI Secrets, plus the MCP identity signing-key
+  # Secret (K8s parity fix, tier-tests-20260720 — the bootstrap Job also
+  # mints/preserves the MCP JWT root key here; see values.yaml
+  # gateway.mcpSigningKey + mtls-bootstrap-job.yaml pki-pre-seed/issuer/applier).
+  # All three are pre-seeded as empty placeholders by the -9-weighted hooks
   # below so the applier never needs the unrestricted `create` verb on
   # the secrets resource.
   - apiGroups: [""]
@@ -52,6 +54,7 @@ rules:
     resourceNames:
       - {{ .Values.mtls.secretName | quote }}
       - {{ .Values.mtls.caKeysSecretName | quote }}
+      - {{ .Values.gateway.mcpSigningKey.secretName | quote }}
     verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -80,6 +83,17 @@ roleRef:
 # overwritten by the bootstrap Job at weight -5. This lets us drop the
 # over-broad `create` verb from the RBAC Role above. resource-policy: keep
 # means it survives between helm upgrades, preserving live certs.
+{{- /* FINDING-V412-UNIVERSAL-001 (Nico/Captain): only seed the empty placeholder
+     on a FRESH install. On a keep-mode uninstall the populated Secret survives
+     (resource-policy: keep); a reinstall must NOT re-run this pre-install-hook
+     Create against the already-existing Secret — Helm's hook Create path has no
+     "AlreadyExists -> adopt" fallback (unlike the main manifest apply used by the
+     app Secrets), so the hook would fail and abort `helm install`, funnelling the
+     operator toward `--remove-volumes` = CA loss (the exact scenario -001 exists
+     to prevent). When the Secret already exists, skip the placeholder; the
+     bootstrap Job applier updates it in place (get/update/patch RBAC, no create).
+     Same lookup-preserve technique used in secrets.yaml / licensing-secret.yaml. */ -}}
+{{- if not (lookup "v1" "Secret" .Release.Namespace .Values.mtls.secretName) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -98,11 +112,17 @@ metadata:
     "helm.sh/resource-policy": keep
 type: Opaque
 data: {}
+{{- end }}
 ---
 # Retro #3aj — placeholder Secret for the CA private keys. Same pattern as
 # the leaves Secret (pre-install, keep), but workload pods MUST NOT be able
 # to project this volume. Only the bootstrap Job and rotation CronJob
 # (running under ServiceAccount yashigani-pki) reference it.
+{{- /* FINDING-V412-UNIVERSAL-001 (Nico/Captain): CA-keys placeholder — same
+     fresh-install-only guard as the leaves Secret above. Losing this one on a
+     failed reinstall is the worst case (undecryptable pgcrypto + broken mTLS
+     trust anchor), so it MUST survive keep-mode uninstall -> reinstall. */ -}}
+{{- if not (lookup "v1" "Secret" .Release.Namespace .Values.mtls.caKeysSecretName) }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -118,4 +138,31 @@ metadata:
     "helm.sh/resource-policy": keep
 type: Opaque
 data: {}
+{{- end }}
+---
+# K8s MCP-key parity fix (tier-tests-20260720): placeholder Secret for the
+# MCP identity signing key, same fresh-install-only / keep-mode guard as the
+# two PKI placeholders above. Populated by the bootstrap Job's applier
+# container (mtls-bootstrap-job.yaml) with an EC P-384 key minted by the
+# issuer initContainer (or preserved from a prior install by pki-pre-seed —
+# never rotated by a re-run of this Job). Referenced by gateway.yaml's
+# mcp-signing-key-ro volume via gateway.mcpSigningKey.existingSecretName |
+# default gateway.mcpSigningKey.secretName.
+{{- if not (lookup "v1" "Secret" .Release.Namespace .Values.gateway.mcpSigningKey.secretName) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.gateway.mcpSigningKey.secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: yashigani-pki
+    app.kubernetes.io/component: pki
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/resource-policy": keep
+type: Opaque
+data: {}
+{{- end }}
 {{- end }}

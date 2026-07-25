@@ -26,7 +26,141 @@ Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
     OWUI's WEBUI_AUTH_SIGNOUT_REDIRECT_URL points here so its logout button clears
     the Yashigani session cookie.  See Phase 2 notes.
 
-Last updated: 2026-06-13T00:00:00+00:00
+WA-10 fix (2026-07-15, fix/v412-wa10-logout):
+  - Both logout() and logout_redirect() now enumerate ALL cookie slots and
+    revoke every distinct session token present in the request — not just the
+    single token resolved by the AnySession/cookie-priority logic.  Holding
+    both __Host-yashigani_admin_session and __Host-yashigani_session (dual-
+    session browser state) previously left one session live after logout.
+  - Every __Host- cookie clearance now emits Secure; HttpOnly; SameSite=Strict;
+    Path=/ — symmetric with the SET path (_set_session_cookie).  Starlette's
+    bare delete_cookie() omits Secure, so the browser silently ignores the
+    Max-Age=0 directive, leaving the original token in place.
+  - change_password() clearance extended: previously only cleared the admin
+    cookie; now clears both cookies with the correct attributes.
+  - _clear_session_cookie() helper added adjacent to _set_session_cookie() so
+    the two paths can never drift independently.  (WA-10 / ASVS V3.4.1)
+
+LAURA-412-CRITICAL fix (2026-07-19, fix/v412-auth-throttle-hardening):
+  - Auth-throttle redesigned: a per-ACCOUNT bucket (username-keyed, IP-
+    independent) is now the sole pre-auth GATE; the per-IP bucket becomes a
+    severity modifier only, never an independent gate.  A clean account can
+    no longer be locked out by unrelated noise sharing its apparent IP
+    (podman-pasta NAT, CGNAT, corporate proxy/LB — Laura proved a stranger's
+    4 garbage-credential requests 429'd an uninvolved, credential-correct
+    admin, podman r4, 2026-07-19).
+  - The GLOBAL (any-IP) bucket is REMOVED — on a self-hosted single-tenant
+    gateway it had no upside that offset letting any unauthenticated caller
+    contribute to blocking every other caller.
+  - Escalation is bounded at 900s (15 min); the old permanent-block tail
+    (`auth:blocked:{ip}` set with no TTL) is removed — no unrecoverable
+    state is ever reached without an explicit admin action.
+  - Self-heal: a successful login now clears both the account gate and the
+    IP severity bucket.  Previously the pre-auth block could prevent a
+    legitimate, credential-correct login from ever reaching the success
+    path that would have triggered the reset.
+  - See AgnosticSecurity memory project_v412_design_conflict_xrealip_podman_nat.md
+    and testing_runs/yashigani/v412r4-podman-20260719/laura/laura-podman-pentest.md.
+
+LAURA-412-HIGH / LAURA-412-MEDIUM fix (2026-07-19, fix/v412-auth-throttle-hardening,
+round 2 — Laura re-attack, testing_runs/yashigani/v412r5-podman-throttlefix-20260719/):
+  - HIGH — TOCTOU race: the round-1 design read the current fail-count/level
+    in _apply_auth_throttle() and only incremented it LATER in
+    _record_auth_failure(), after authenticate() resolved.  25 concurrent
+    wrong-password requests against one real account all read the
+    pre-increment state and all passed the gate (none of their own
+    siblings' failures had been recorded yet).  Fixed by collapsing the
+    check-and-increment into ONE atomic Redis Lua script
+    (_THROTTLE_ADMIT_LUA / _throttle_admit()) executed BEFORE
+    authenticate() runs, for every attempt (not just confirmed failures).
+    Redis executes Lua scripts as a single atomic, non-interleaved unit, so
+    concurrent callers are strictly serialised by Redis itself — the
+    threshold can no longer be "outrun" by concurrency.  _record_auth_failure()
+    is removed; counting now happens unconditionally in the atomic
+    admission step, with self-heal (_reset_auth_failures) deleting the
+    whole bucket on success regardless of how it was populated.
+  - MEDIUM — casefold-collision: round 1's `_hash_account()` casefolded the
+    username before hashing, but this system's actual identity model is
+    CASE-SENSITIVE (admin_accounts.username is a case-sensitive UNIQUE TEXT
+    column; _fetch_by_username does an exact `= $1` match; neither
+    create_admin() nor create_user() perform any case-insensitive collision
+    check) — so "collision-probe-a" and "COLLISION-PROBE-A" are two real,
+    independent accounts that casefolding collapsed into one shared bucket,
+    reintroducing the same cross-account-lockout failure class. Fixed by
+    keying the account bucket on the account's stable, opaque account_id
+    (resolved via _resolve_account_id_for_bucket()) whenever the account
+    exists — immune to ANY normalisation choice (case, unicode, whitespace)
+    by construction, since account_id never derives from the display
+    username. Falls back to a hashed, casefolded username ONLY for
+    nonexistent usernames, which cannot collide with any real account_id.
+  - See testing_runs/yashigani/v412r5-podman-throttlefix-20260719/laura/laura-reattack-throttle.md.
+
+AVA-412-DOS fix (2026-07-23, fix/v412-auth-throttle-dos):
+  - CRITICAL — self-extending perpetual lockout (OWASP API4:2023, ASVS
+    V2.2). LAURA-412-HIGH (above) deliberately moved the atomic INCR/EXPIRE
+    admit to BEFORE authenticate() runs, "for every attempt (not just
+    confirmed failures)" — correct for closing the TOCTOU race, but this
+    meant _throttle_admit() ran unconditionally on every /auth/login POST,
+    including ones _apply_auth_throttle() was about to reject at 429
+    because the account was ALREADY gated. Each such blocked, zero-
+    credential probe still re-EXPIRE'd the account's throttle key to the
+    full 900s window (and re-escalated its level toward the 900s ceiling)
+    — an unauthenticated caller who merely knew a valid admin USERNAME
+    could hold that account locked out indefinitely by sending one POST
+    per window, forever, without ever supplying a password.
+  - Fixed by splitting the gate into a read-only pre-check
+    (_throttle_current_level(), a bare Redis GET) BEFORE the mutating
+    atomic admit. If the account's throttle key is ALREADY set (a PRIOR
+    genuine attempt gated it), the request is rejected immediately with NO
+    Redis mutation at all — no INCR, no (re)EXPIRE, no re-escalation. Only
+    a request that is NOT currently gated proceeds to the atomic
+    _throttle_admit() Lua call, preserving the LAURA-412-HIGH concurrency
+    guarantee unchanged for the attempts that actually matter (the ones
+    still racing to cross the threshold for the first time). Net effect:
+    the lockout window now always expires _THROTTLE_WINDOW_SECONDS after
+    the LAST GENUINE attempt that reached (or was admitted toward)
+    authenticate() — never after the last blocked probe — so a legitimate
+    user (or a spammed victim) always recovers automatically, while
+    sustained genuine wrong-password brute-forcing still throttles with
+    the same bounded exponential backoff as before.
+  - See testing_runs/yashigani/wt-fix-throttle-dos-20260723/.
+
+AVA-RETRYAFTER fix (2026-07-24, fix/v412-throttle-retryafter):
+  - RFC 6585 §4 contract violation — Retry-After lied about the actual
+    lockout duration (Ava, live Redis inspection db1). _reject_with_throttle()
+    reports the documented ESCALATING schedule via
+    _throttle_delay_for_level() (30/60/180/450/900 by level, _THROTTLE_DELAYS)
+    but _THROTTLE_ADMIT_LUA set every escalation-level key's (auth:throttle:
+    ip:*/auth:throttle:acct:*) actual Redis EXPIRE to the flat rolling
+    `window` (900s) regardless of level — the key whose mere PRESENCE is
+    what _apply_auth_throttle()'s gate check (_throttle_current_level) reads
+    to decide whether to reject. A level-1 client (3 consecutive failures)
+    was told "Retry-After: 30" but the key that actually released the gate
+    did not expire for 900s — a ~30x mismatch between advertised and actual
+    wait.
+  - Design determination: the module's own comments and pre-existing test
+    suite (test_v2232_login_throttle_retry_after.py::TestThrottleDelaySchedule)
+    already document and pin an ESCALATING-backoff design (level 1=30s ...
+    level 5=900s ceiling), not a fixed 900s window with a single Retry-After.
+    Fixed by making _THROTTLE_ADMIT_LUA's EXPIRE for each escalation-level
+    key equal to THAT level's own _THROTTLE_DELAYS entry (passed in as
+    trailing ARGV) instead of the flat window — the gating key's real TTL
+    now always equals what _throttle_delay_for_level() reports for the same
+    level. The rolling FAIL-COUNT keys (auth:fail:ip:*/auth:fail:acct:*) are
+    unrelated to Retry-After and unchanged (still flat `window` — they are
+    never read by the gate check).
+  - YSG-RISK-098 (AVA-412-DOS self-extend fix, above) is untouched: the
+    phase-1 read-only pre-check / phase-2 mutating-admit split is unchanged;
+    this fix only changes what TTL is written when a level actually
+    escalates, never who gets to write it.  See
+    src/tests/regression/v4.1.2/test_ava_412_dos_auth_throttle_self_extend.py
+    (assertion at the freshly-set TTL updated from ">800" to the correct
+    per-level ~30s to match, since it previously encoded the flat-900 bug as
+    expected behaviour) and the new
+    src/tests/regression/v4.1.2/test_ava_retryafter_ttl_matches_header.py.
+  - See testing_runs/yashigani/fix-v412-throttle-retryafter-20260724/.
+
+Last updated: 2026-07-24T00:00:00+00:00
 """
 
 from __future__ import annotations
@@ -36,6 +170,7 @@ import logging
 import os
 import re
 import time
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse as _RedirectResponse
@@ -111,35 +246,335 @@ def _totp_reset(session_prefix: str) -> None:
     r.delete(_totp_fail_key(session_prefix))
 
 # ---------------------------------------------------------------------------
-# Auth brute-force throttle (ASVS 6.3.5)
+# Auth brute-force throttle (ASVS 6.3.5) — LAURA-412-CRITICAL redesign
 #
-# Per-IP tracking:  3 consecutive failures from the same IP → throttle.
-# Global tracking:  5 failures from ANY IP(s) within a 15-min window → throttle.
-# Delay escalation: ×5 multiplier — 30s, 60s, 300s, 1500s, 7500s, cap 37500s.
+# Dual-bucket, ACCOUNT-GATED design (2026-07-19):
+#
+#   * Per-ACCOUNT bucket (username-keyed, IP-independent) is the sole GATE.
+#     A login attempt is only ever pre-auth-throttled if the SPECIFIC
+#     account being logged into already has its own recorded failures.
+#     A clean account can never be blocked by another account's — or
+#     another caller's — noise, even when they share an apparent IP.
+#   * Per-IP bucket is retained as a SEVERITY MODIFIER only, never an
+#     independent gate: once an account is implicated, the effective delay
+#     also reflects how hot its source IP looks, but the IP bucket alone
+#     can never trigger a 429.  This is what makes the design correct
+#     regardless of whether client-IP attribution is trustworthy — see
+#     project_v412_design_conflict_xrealip_podman_nat.md.  Under a NAT/
+#     proxy/CGNAT/podman-pasta topology many distinct legitimate callers
+#     collapse onto one apparent address; treating that shared bucket as a
+#     gate let one attacker's garbage credentials lock out every other
+#     account behind it (Laura, podman r4, 2026-07-19 — an uninvolved,
+#     credential-correct admin got 429'd by a stranger's 4 failed attempts).
+#   * The GLOBAL (any-IP) bucket is REMOVED.  On a self-hosted single-
+#     tenant gateway a global-failure bucket has no upside that offsets
+#     letting ANY unauthenticated caller, anywhere, contribute to blocking
+#     EVERY other caller — exactly the DoS primitive Laura proved.
+#   * Escalation is BOUNDED at 900s (15 min) — see _THROTTLE_DELAYS below.
+#     There is no permanent-block tail: the old design set
+#     `auth:blocked:{ip}` with no TTL once escalation exhausted the delay
+#     table, recoverable only by manual Redis surgery.  That branch is
+#     removed entirely.  900s is long enough to meaningfully slow a
+#     scripted brute-force loop (~96 guesses/day at sustained max delay vs
+#     ~2 880/day unthrottled) and short enough that a legitimately-
+#     throttled admin recovers automatically, with no operator action,
+#     well inside a working session.  It is deliberately SHORTER than the
+#     Postgres-backed per-account hard lockout (`_LOCKOUT_SECONDS` = 1800s,
+#     auth/local_auth.py / auth/pg_auth.py) so this Redis layer stays the
+#     "soft" first line of friction and the DB layer remains the
+#     authoritative "hard" backstop for a confirmed real-account attack —
+#     the two layers reinforce rather than fight each other.  The DB layer
+#     already self-heals (failed_attempts reset to 0 on success) and is
+#     already bounded (30 min, not permanent) — it needed no change here.
+#   * Self-heal: a SUCCESSFUL login clears both the account gate and the
+#     IP severity bucket immediately (`_reset_auth_failures`).  Under the
+#     old design the IP bucket was reset on success too, but a legitimate
+#     caller could never REACH success in the first place — the pre-auth
+#     block fired before authenticate() ever ran.  Gating on the account
+#     bucket (which starts clean for every account) is what makes the
+#     success path reachable again for anyone not actually implicated.
+#
+# Round 2 (Laura re-attack, 2026-07-19, see module docstring for full detail):
+#
+#   * ATOMIC admission (LAURA-412-HIGH).  Checking the current count and
+#     incrementing it later (after authenticate() resolves) is a TOCTOU
+#     race under concurrency: N simultaneous requests can all observe the
+#     pre-increment state and all pass the gate.  _throttle_admit() runs a
+#     single Redis Lua script that increments BOTH bucket dimensions and
+#     reads their PRIOR level in one atomic round-trip, BEFORE
+#     authenticate() is ever called.  Redis executes Lua scripts
+#     non-interleaved, so concurrent callers are strictly serialised by
+#     Redis itself — the Nth-ordered request to cross the threshold is the
+#     only one that (as a side-effect of its own atomic call) escalates the
+#     level, and every subsequent request correctly observes that
+#     already-escalated state.  There is no longer a separate
+#     "record failure after the fact" step — every ATTEMPT (not just a
+#     confirmed failure) claims a slot; a real success immediately deletes
+#     the whole bucket via self-heal regardless of how it was populated,
+#     so this has no visible effect on normal sequential use.
+#   * ID-KEYED account bucket (LAURA-412-MEDIUM).  This system's identity
+#     model is CASE-SENSITIVE (admin_accounts.username is a case-sensitive
+#     UNIQUE TEXT column; every lookup is an exact match; account creation
+#     performs no case-insensitive collision check) — so "alice" and
+#     "ALICE" can be two REAL, independent accounts.  Casefolding the
+#     username before hashing (round 1) collapsed such pairs into one
+#     bucket, reintroducing cross-account lockout for a narrower
+#     prerequisite (account-creation privilege or SSO/SCIM case variance).
+#     _account_bucket_key() keys on the account's stable, opaque
+#     account_id whenever the account exists — immune to ANY
+#     normalisation choice by construction — and only falls back to a
+#     hashed, casefolded username for a NONEXISTENT username (which cannot
+#     collide with any real account_id).
+#
 # Redis keys:
-#   auth:fail:ip:{ip}        — INCR on failure, EXPIRE 900
-#   auth:fail:global          — INCR on failure, EXPIRE 900
-#   auth:throttle:ip:{ip}    — current delay level for this IP
-#   auth:throttle:global      — current delay level globally
+#   auth:fail:ip:{ip}        — INCR on every attempt, EXPIRE 900s (severity signal)
+#   auth:throttle:ip:{ip}    — current delay level for this IP     (severity signal)
+#   auth:fail:acct:{b}       — INCR on every attempt, EXPIRE 900s (gating signal)
+#   auth:throttle:acct:{b}   — current delay level for this account (gating signal)
+#   auth:blocked:{ip}        — admin-managed manual block (GET/DELETE
+#                              /blocked-ips below); no longer auto-populated
+#                              by escalation.
+#   b = "id:{account_id}" when the account exists (stable, opaque —
+#       immune to case/unicode/whitespace normalisation tricks), else
+#       "unk:{sha256(username.strip().casefold())[:16]}" for a nonexistent
+#       username (cannot collide with any real account_id — different
+#       key namespace entirely).  The raw username is never stored as a
+#       Redis key either way (no plaintext identity leakage from a
+#       `redis-cli KEYS` dump; mirrors the _hash_ip() style used elsewhere
+#       in this module for the same reason).
 # ---------------------------------------------------------------------------
 
-_THROTTLE_IP_THRESHOLD = 3  # per-IP consecutive failures before throttle
-_THROTTLE_GLOBAL_THRESHOLD = 5  # global failures (any IP) in 15-min window
-_THROTTLE_WINDOW_SECONDS = 900  # 15-minute window for counters
-_THROTTLE_BASE_DELAY = 30  # Level 1: 30 seconds
-_THROTTLE_MULTIPLIER = 5  # Each level multiplies by 5  (sic — see spec)
-_THROTTLE_MAX_DELAY = 37500  # Cap at 625 minutes
+_THROTTLE_IP_THRESHOLD = 3       # per-IP consecutive failures before it adds severity
+_THROTTLE_ACCOUNT_THRESHOLD = 3  # per-account consecutive failures before the account is gated
+_THROTTLE_WINDOW_SECONDS = 900   # 15-minute rolling window for counters
 
-# Delay schedule (pre-computed for clarity):
-# Level 1:     30s
-# Level 2:     60s   (but spec says ×5 from 30 → 150 would be naive; spec lists
-#              explicit values, so we use the explicit table)
-_THROTTLE_DELAYS = [30, 60, 300, 1500, 7500, 37500]
+# Bounded escalation schedule — capped at 900s (15 min).  Index = level-1.
+# The last entry is a CEILING: further failures within the window refresh
+# the TTL (holding the account/IP at the max delay) but never escalate
+# past it and never convert into a separate unrecoverable state.
+_THROTTLE_DELAYS = [30, 60, 180, 450, 900]
+
+# ---------------------------------------------------------------------------
+# LAURA-412-HIGH (r5, 2026-07-19): atomic admit — a single Redis Lua script
+# that increments BOTH bucket dimensions and reads their PRIOR (pre-this-
+# call) level in one atomic round-trip.  Redis executes Lua scripts as a
+# single, non-interleaved unit — concurrent callers are strictly serialised
+# by Redis itself, so no window exists for two-phase "read, decide later,
+# increment" races.  KEYS: 1=ip_fail 2=ip_throttle 3=acct_fail 4=acct_throttle.
+# ARGV: 1=ip_threshold 2=acct_threshold 3=window_seconds 4=max_level,
+# 5..(4+max_level)=the escalation delay (seconds) for level 1..max_level
+# (mirrors _THROTTLE_DELAYS — see AVA-RETRYAFTER fix below).
+# Returns {ip_fails, ip_level_before, acct_fails, acct_level_before} — the
+# "_before" values reflect whether the bucket was ALREADY escalated prior
+# to this specific attempt (so attempt 1/2/3 still proceed to real auth,
+# matching the pre-existing "3 genuine attempts before throttling" contract
+# — see _throttle_admit() docstring for the full reasoning).
+#
+# AVA-RETRYAFTER fix (2026-07-24, fix/v412-throttle-retryafter): the
+# ESCALATION-LEVEL keys (KEYS[2] ip_throttle, KEYS[4] acct_throttle) — the
+# keys whose mere PRESENCE is what actually gates a request in
+# _apply_auth_throttle() — previously had their EXPIRE set to the flat
+# rolling `window` (900s) on EVERY escalation, regardless of level. But the
+# Retry-After header (_reject_with_throttle -> _throttle_delay_for_level)
+# reports the documented ESCALATING schedule (30/60/180/450/900,
+# _THROTTLE_DELAYS) for that same level. Net effect (live, Ava, Redis
+# inspection db1): a level-1 client was told "Retry-After: 30" but the key
+# that actually released the gate did not expire for 900s — a ~30x RFC 6585
+# contract violation. Fixed by giving each escalation-level key an EXPIRE
+# equal to THAT level's own delay (so level 1 -> 30s, ..., level 5 -> 900s
+# ceiling) instead of the flat window — the gating key's real TTL now always
+# equals the value _throttle_delay_for_level() reports for the same level.
+# The separate rolling FAIL-COUNT keys (KEYS[1] ip_fail, KEYS[3] acct_fail)
+# are unrelated to Retry-After (they are never read for the gate check, only
+# for threshold-crossing) and correctly keep the flat `window` — no client-
+# visible duration is derived from them.
+# ---------------------------------------------------------------------------
+_THROTTLE_ADMIT_LUA = """
+local ip_threshold   = tonumber(ARGV[1])
+local acct_threshold = tonumber(ARGV[2])
+local window         = tonumber(ARGV[3])
+local max_level      = tonumber(ARGV[4])
+
+-- ARGV[5 .. 4+max_level] = per-level escalation delay (seconds), 1-indexed
+-- (level 1 = ARGV[5], level 2 = ARGV[6], ...). Mirrors _THROTTLE_DELAYS so
+-- the escalation-level key's actual TTL always matches what
+-- _throttle_delay_for_level() reports in the Retry-After header.
+local delays = {}
+for i = 1, max_level do
+    delays[i] = tonumber(ARGV[4 + i])
+end
+
+local function ttl_for_level(level)
+    if level < 1 then
+        return delays[1]
+    end
+    if level > max_level then
+        return delays[max_level]
+    end
+    return delays[level]
+end
+
+local ip_fails = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], window)
+local ip_level_before = tonumber(redis.call('GET', KEYS[2]) or '0')
+if ip_fails >= ip_threshold then
+    if ip_level_before < max_level then
+        local ip_new_level = ip_level_before + 1
+        redis.call('SET', KEYS[2], ip_new_level, 'EX', ttl_for_level(ip_new_level))
+    else
+        redis.call('EXPIRE', KEYS[2], ttl_for_level(max_level))
+    end
+end
+
+local acct_fails = redis.call('INCR', KEYS[3])
+redis.call('EXPIRE', KEYS[3], window)
+local acct_level_before = tonumber(redis.call('GET', KEYS[4]) or '0')
+if acct_fails >= acct_threshold then
+    if acct_level_before < max_level then
+        local acct_new_level = acct_level_before + 1
+        redis.call('SET', KEYS[4], acct_new_level, 'EX', ttl_for_level(acct_new_level))
+    else
+        redis.call('EXPIRE', KEYS[4], ttl_for_level(max_level))
+    end
+end
+
+return {ip_fails, ip_level_before, acct_fails, acct_level_before}
+"""
 
 
 def _get_throttle_redis():
     """Return the Redis client used by the session store (reuse existing connection)."""
     return backoffice_state.session_store._redis
+
+
+def _throttle_admit(
+    r,
+    ip_fail_key: str,
+    ip_throttle_key: str,
+    acct_fail_key: str,
+    acct_throttle_key: str,
+) -> tuple[int, int, int, int]:
+    """
+    Atomically admit one login attempt against both the IP severity bucket
+    and the account gate bucket, in a single Redis round-trip.
+
+    LAURA-412-HIGH fix (r5, 2026-07-19): the round-1 design read the
+    current fail-count/level in _apply_auth_throttle(), then incremented
+    it SEPARATELY, later, in _record_auth_failure() — only after
+    authenticate() had resolved.  Laura proved 25 concurrent wrong-password
+    requests against one real account all observed the pre-increment state
+    (0 failures) and ALL passed the gate, because none of their own
+    siblings' failures had been recorded yet at the moment each one
+    checked — a textbook TOCTOU/CWE-362 window.  No amount of reordering
+    two separate Python-level round-trips can close this; the read and the
+    write must be ONE atomic operation.
+
+    A Redis Lua script is exactly that: Redis executes it as a single,
+    non-interleaved unit (Redis is single-threaded for script execution),
+    so N concurrent callers are strictly SERIALISED into some strict order
+    by Redis itself, with no possibility of two of them observing the same
+    "pre-increment" state.  Whichever request happens to be the Nth to
+    cross the threshold is the only one whose own atomic call performs the
+    escalation; every request ordered after it correctly observes the
+    already-escalated level — regardless of how "concurrent" the arrival
+    was at the network layer.
+
+    Every attempt (not just a confirmed failure) claims a slot here, ahead
+    of the expensive authenticate() call — this is what makes the fix
+    correct: counting can only be made concurrency-safe by moving it before
+    the point where its outcome is still unknown.  A genuine success
+    deletes the whole bucket via self-heal (_reset_auth_failures)
+    regardless of how many slots were claimed on the way there, so this has
+    no visible effect on normal sequential use (a user who fails twice
+    then succeeds sees exactly the same end state as before: an absent
+    bucket).
+
+    Returns (ip_fails, ip_level_before, acct_fails, acct_level_before).
+
+    AVA-RETRYAFTER fix (2026-07-24): the escalation-level keys' actual Redis
+    TTL is now the per-level ``_THROTTLE_DELAYS`` value (passed here as
+    trailing ARGV entries), not the flat ``_THROTTLE_WINDOW_SECONDS`` — see
+    ``_THROTTLE_ADMIT_LUA`` docstring/comment above for the full rationale.
+    """
+    result = r.eval(
+        _THROTTLE_ADMIT_LUA,
+        4,
+        ip_fail_key,
+        ip_throttle_key,
+        acct_fail_key,
+        acct_throttle_key,
+        _THROTTLE_IP_THRESHOLD,
+        _THROTTLE_ACCOUNT_THRESHOLD,
+        _THROTTLE_WINDOW_SECONDS,
+        len(_THROTTLE_DELAYS),
+        *_THROTTLE_DELAYS,
+    )
+    return (int(result[0]), int(result[1]), int(result[2]), int(result[3]))
+
+
+def _throttle_current_level(r, throttle_key: str) -> int:
+    """Read-only current escalation level of a throttle key (0 if absent/expired).
+
+    AVA-412-DOS fix (2026-07-23): a bare Redis ``GET`` never touches the
+    key's TTL or value — calling this repeatedly can NEVER itself extend
+    or re-arm a lockout window. Used by ``_apply_auth_throttle()`` to
+    distinguish "already gated by a prior genuine attempt" (reject with no
+    mutation) from "not yet gated" (proceed to the mutating atomic admit).
+    """
+    raw = r.get(throttle_key)
+    return int(raw) if raw is not None else 0
+
+
+def _hash_account(username: str) -> str:
+    """SHA-256 hex digest (first 16 chars) of a normalised username.
+
+    Used ONLY as the fallback bucket component for a NONEXISTENT username
+    (see _account_bucket_key()) — a real account is keyed on its stable
+    account_id instead (LAURA-412-MEDIUM, r5 2026-07-19).  Normalisation
+    (strip + casefold) is safe here specifically because a bogus username
+    can never collide with any real account's "id:{account_id}" bucket —
+    different key namespace entirely.  Mirrors _hash_ip()'s style further
+    down this module: never store the raw identity as a Redis key or in a
+    log line.
+    """
+    return hashlib.sha256(username.strip().casefold().encode()).hexdigest()[:16]
+
+
+def _account_bucket_key(username: str, account_id: Optional[str]) -> str:
+    """
+    Stable per-identity throttle bucket key (LAURA-412-MEDIUM fix, r5,
+    2026-07-19).
+
+    Account-identity model confirmed in code before choosing this fix:
+    usernames in this system are CASE-SENSITIVE, mutually distinct
+    identities — ``admin_accounts.username`` is a case-sensitive
+    ``UNIQUE TEXT`` column (db/migrations/versions/0006_admin_accounts.py),
+    every username lookup (``_fetch_by_username``) is an exact ``= $1``
+    match, and neither ``create_admin()`` nor ``create_user()`` perform any
+    case-insensitive collision check (only ``get_account_by_email()``
+    case-folds, and only for admin/user cross-tier SoD — not same-tier
+    username collisions).  So "collision-probe-a" and "COLLISION-PROBE-A"
+    are two REAL, independent, simultaneously-valid accounts in this model
+    — Laura proved exactly this live (r5, 2026-07-19): casefolding the
+    username for the throttle key (the r4 design) collapsed them into one
+    shared bucket, reintroducing the same cross-account-lockout failure
+    class the r4 fix was meant to close, just with a narrower prerequisite.
+
+    Keying on ``account_id`` sidesteps the whole class of normalisation
+    questions (case, unicode, whitespace, homoglyphs) rather than chasing
+    an ever-more-precise string-canonicalisation rule — it is immune by
+    construction, since ``account_id`` is assigned once at creation and
+    never derived from the display username.
+
+    A nonexistent username has no ``account_id`` to key on; falling back
+    to a hash of the normalised username is safe in that case because a
+    bogus username can never collide with any REAL account's
+    ``"id:..."``-prefixed key (different key namespace entirely, via the
+    ``"unk:"`` prefix).
+    """
+    if account_id:
+        return f"id:{account_id}"
+    return f"unk:{_hash_account(username)}"
 
 
 def _throttle_delay_for_level(level: int) -> int:
@@ -155,18 +590,25 @@ def _check_ip_access(client_ip: str) -> None:
     Check IP allowlist and blocklist BEFORE any auth processing.
     Order: allowlist (if non-empty, reject unlisted) → blocklist → proceed.
     Supports IPv4, IPv6, and CIDR ranges.
+
+    LAURA-412-CRITICAL (2026-07-19): `auth:blocked:{ip}` is no longer
+    auto-populated by escalating login failures (see _throttle_admit) —
+    the old design's unbounded permanent-block tail is removed.  This check
+    still exists to enforce a DELIBERATE, admin-managed block (an operator
+    with a threat-intel-driven reason to hard-block a specific address); it
+    is populated/cleared via the GET/DELETE /blocked-ips endpoints below.
     """
     import ipaddress
 
     r = _get_throttle_redis()
 
-    # 1. Check blocklist first (permanent bans)
+    # 1. Check blocklist first (admin-managed manual bans — see docstring)
     if r.exists(f"auth:blocked:{client_ip}"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "error": "ip_blocked",
-                "message": "This IP has been blocked due to excessive failed authentication attempts. Contact your administrator.",
+                "message": "This IP has been blocked. Contact your administrator.",
             },
         )
 
@@ -216,113 +658,240 @@ def _real_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _apply_auth_throttle(client_ip: str, response: Response) -> None:
+async def _resolve_account_id_for_bucket(username: str) -> Optional[str]:
     """
-    Check per-IP and global failure counters.  If either exceeds its threshold,
-    raise HTTP 429 with a ``Retry-After`` header (RFC 6585) and a user-facing
-    banner message.  The caller never proceeds past this point while throttled.
+    Resolve ``username`` to its stable ``account_id`` for throttle-bucket
+    keying (LAURA-412-MEDIUM fix, r5 2026-07-19).  Looked up
+    UNCONDITIONALLY — any tier, disabled or not — because bucket IDENTITY
+    correctness does not depend on login ELIGIBILITY; a disabled account is
+    still a real, distinct identity that must not share a bucket with an
+    unrelated one.
 
-    ASVS 6.3.5: brute-force mitigation via rate-limiting and account lockout.
+    Fails open to ``None`` (falls back to the safe username-hash bucket,
+    see ``_account_bucket_key``) on any DB error — the account-existence
+    LOOKUP failing does not weaken authentication itself (``authenticate()``
+    still hits the DB directly and fails closed there); it only means this
+    one request's throttle bucket temporarily can't be identity-precise.
+    Mirrors the same fail-open posture the pre-existing
+    ``webauthn_v1._resolve_admin_id()`` helper already takes.
+    """
+    from yashigani.db.postgres import tenant_transaction
+
+    try:
+        async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
+            row = await conn.fetchrow(
+                "SELECT account_id FROM admin_accounts WHERE username = $1",
+                username,
+            )
+        return str(row["account_id"]) if row else None
+    except Exception:
+        _log.exception("Failed to resolve account_id for throttle bucket keying")
+        return None
+
+
+def _reject_with_throttle(
+    response: Response,
+    bucket_key: str,
+    client_ip: str,
+    username: str,
+    acct_level: int,
+    ip_level: int,
+) -> None:
+    """Log, audit, and raise the 429 for a gated account.  Pure — performs
+    no Redis I/O of its own — so it is safe to call from either the
+    no-mutation fast-reject path or the post-admit path in
+    ``_apply_auth_throttle`` (AVA-412-DOS fix, 2026-07-23)."""
+    effective_level = max(acct_level, ip_level)
+    delay = _throttle_delay_for_level(effective_level)
+    _log.warning(
+        "Auth throttle: account=%s ip=%s acct_level=%d ip_level=%d delay=%ds",
+        bucket_key,
+        client_ip,
+        acct_level,
+        ip_level,
+        delay,
+    )
+
+    state = backoffice_state
+    if state.audit_writer is not None:
+        from yashigani.audit.schema import AuthThrottleTriggeredEvent
+        from yashigani.auth.session import _mask_ip
+
+        state.audit_writer.write(
+            AuthThrottleTriggeredEvent(
+                admin_account=username,
+                client_ip_prefix=_mask_ip(client_ip),
+                account_throttle_level=acct_level,
+                ip_throttle_level=ip_level,
+                delay_seconds=delay,
+            )
+        )
+
+    # RFC 6585 §4 — Retry-After header on 429.
+    # Set on the response object so the header is present on the HTTPException
+    # response (FastAPI propagates headers set before raise).
+    response.headers["Retry-After"] = str(delay)
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        headers={"Retry-After": str(delay)},
+        detail={
+            "error": "too_many_requests",
+            "retry_after_seconds": delay,
+            "banner": (
+                f"Too many failed login attempts. "
+                f"Please wait {delay} second{'s' if delay != 1 else ''} before trying again."
+            ),
+        },
+    )
+
+
+def _apply_auth_throttle(
+    client_ip: str,
+    username: str,
+    account_id: Optional[str],
+    response: Response,
+) -> None:
+    """
+    Account-gated brute-force throttle.  Raises HTTP 429 with a ``Retry-After``
+    header (RFC 6585) and a user-facing banner ONLY when the specific account
+    being logged into already has recorded attempts of its own past the
+    threshold.  An implicated IP alone — with zero attempts recorded against
+    THIS account's bucket — is never sufficient to block the request; see
+    the module docstring above for the full rationale (NAT/proxy IP-collapse
+    cannot be allowed to lock out clean accounts).  The caller never
+    proceeds past this point while its account is gated.
+
+    Two-phase check (AVA-412-DOS fix, 2026-07-23):
+
+    1. A READ-ONLY pre-check (``_throttle_current_level``, a bare Redis
+       ``GET`` — no INCR, no EXPIRE, no SET) asks whether the account is
+       ALREADY gated by a prior genuine attempt. If so, this request is
+       rejected immediately with NO Redis mutation whatsoever — the
+       lockout's TTL is left exactly as it was. This is what stops an
+       unauthenticated caller who sends nothing but blocked probes (no
+       correct — or even attempted — credentials) from holding an account
+       locked out forever: the window can only ever be armed/re-armed by a
+       request that actually reaches phase 2.
+    2. Only when NOT already gated does this function perform the mutating
+       atomic admit (``_throttle_admit``, LAURA-412-HIGH fix, r5
+       2026-07-19) — this still runs before any credential verification,
+       preserving the TOCTOU-race closure Laura proved (25 concurrent
+       requests all observing the pre-increment state) for the attempts
+       that are actually racing to cross the threshold for the first time.
+       A narrow race is possible where a concurrent sibling gates the
+       account between this request's phase-1 GET and its own phase-2 call
+       — that sibling's own atomic admit still correctly reports the
+       already-escalated level, so this request is still rejected, just
+       via one bounded extra round-trip rather than an unbounded, repeated
+       self-refresh.
+
+    ``account_id`` — resolved by the caller via
+    ``_resolve_account_id_for_bucket`` (both the password route and, as of
+    the Captain merge-review fix, the WebAuthn routes — never the
+    admin-tier-only ``_resolve_admin_id``, which would leave disabled/user-
+    tier accounts keyed on the ``unk:`` fallback) — selects the identity-
+    stable bucket key (LAURA-412-MEDIUM fix); see ``_account_bucket_key``
+    for the full rationale.
+
+    ASVS 6.3.5 / OWASP API4:2023: brute-force mitigation via rate-limiting
+    and account lockout that itself must not become an unauthenticated DoS
+    primitive (AVA-412-DOS).
+
+    Fail-closed (Captain merge-review, 2026-07-19; extended AVA-412-DOS): if
+    Redis is unavailable at EITHER phase, the underlying error is caught and
+    converted to an explicit HTTP 503, matching this module's established
+    fail-closed pattern (see ``_totp_incr_failure`` call sites) rather than
+    falling through to FastAPI's generic 500 handler or silently admitting
+    the request.
     """
     r = _get_throttle_redis()
-    ip_key = f"auth:throttle:ip:{client_ip}"
-    global_key = "auth:throttle:global"
+    bucket_key = _account_bucket_key(username, account_id)
+
     ip_fail_key = f"auth:fail:ip:{client_ip}"
-    global_fail_key = "auth:fail:global"
+    ip_throttle_key = f"auth:throttle:ip:{client_ip}"
+    acct_fail_key = f"auth:fail:acct:{bucket_key}"
+    acct_throttle_key = f"auth:throttle:acct:{bucket_key}"
 
-    # Read current failure counts and throttle levels
-    pipe = r.pipeline()
-    pipe.get(ip_fail_key)
-    pipe.get(global_fail_key)
-    pipe.get(ip_key)
-    pipe.get(global_key)
-    ip_fails, global_fails, ip_level, global_level = pipe.execute()
-
-    ip_fails = int(ip_fails or 0)
-    global_fails = int(global_fails or 0)
-    ip_level = int(ip_level or 0)
-    global_level = int(global_level or 0)
-
-    # Determine the effective level (use the higher of ip/global)
-    effective_level = max(ip_level, global_level)
-
-    if effective_level > 0:
-        delay = _throttle_delay_for_level(effective_level)
-        _log.warning(
-            "Auth throttle: ip=%s level=%d delay=%ds",
-            client_ip,
-            effective_level,
-            delay,
-        )
-        # RFC 6585 §4 — Retry-After header on 429.
-        # Set on the response object so the header is present on the HTTPException
-        # response (FastAPI propagates headers set before raise).
-        response.headers["Retry-After"] = str(delay)
+    try:
+        # Phase 1: read-only gate check. See docstring — this MUST NOT
+        # mutate anything, or the self-extension bug reopens.
+        already_gated_level = _throttle_current_level(r, acct_throttle_key)
+    except Exception as exc:
+        # Fail-closed per SOP 1: Redis unavailable must not silently allow
+        # (nor silently deny with an opaque 500) — an explicit 503 tells the
+        # caller and any monitoring exactly what happened.
+        _log.error("Auth throttle: Redis unavailable during gate pre-check: %s", exc)
         raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": str(delay)},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
-                "error": "too_many_requests",
-                "retry_after_seconds": delay,
-                "banner": (
-                    f"Too many failed login attempts. "
-                    f"Please wait {delay} second{'s' if delay != 1 else ''} before trying again."
-                ),
+                "error": "auth_throttle_unavailable",
+                "message": "Authentication service temporarily unavailable.",
             },
         )
 
+    if already_gated_level > 0:
+        # Already gated by a prior GENUINE attempt — reject without ever
+        # touching Redis state (ip severity is also read-only here).
+        try:
+            ip_level = _throttle_current_level(r, ip_throttle_key)
+        except Exception as exc:
+            _log.error("Auth throttle: Redis unavailable reading IP severity: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "auth_throttle_unavailable",
+                    "message": "Authentication service temporarily unavailable.",
+                },
+            )
+        _reject_with_throttle(response, bucket_key, client_ip, username, already_gated_level, ip_level)
+        return  # unreachable — _reject_with_throttle always raises
 
-def _record_auth_failure(client_ip: str) -> None:
-    """Increment failure counters and escalate throttle level if thresholds are exceeded.
-    After exhausting the delay escalation (level > max), permanently block the IP."""
+    # Phase 2: not currently gated — admit this attempt atomically. This is
+    # the only path that ever mutates the throttle keys.
+    try:
+        ip_fails, ip_level, acct_fails, acct_level = _throttle_admit(
+            r, ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key,
+        )
+    except Exception as exc:
+        _log.error("Auth throttle: Redis unavailable during atomic admit: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "auth_throttle_unavailable",
+                "message": "Authentication service temporarily unavailable.",
+            },
+        )
+
+    # Account-gated: an implicated IP with no attempts recorded against THIS
+    # account's bucket must never block the request on its own.
+    if acct_level <= 0:
+        return
+
+    # Reached only via the narrow phase-1/phase-2 race described above.
+    _reject_with_throttle(response, bucket_key, client_ip, username, acct_level, ip_level)
+
+
+def _reset_auth_failures(client_ip: str, username: str, account_id: Optional[str]) -> None:
+    """On successful login, clear both the account gate and the IP severity
+    bucket.  A successful login proves the specific account is not currently
+    under active compromise; clearing the shared IP bucket too means the
+    NEXT (possibly different, legitimate) caller behind the same collapsed
+    address is not held back by stale severity from an unrelated attacker.
+
+    ``account_id`` must resolve to the SAME bucket key used by
+    ``_apply_auth_throttle`` for this login (LAURA-412-MEDIUM, r5
+    2026-07-19) — pass the authoritative ``record.account_id`` returned by
+    a successful ``authenticate()``/WebAuthn completion, not a stale
+    pre-lookup value, so the reset always targets the bucket that was
+    actually gated."""
     r = _get_throttle_redis()
-    ip_fail_key = f"auth:fail:ip:{client_ip}"
-    global_fail_key = "auth:fail:global"
-    ip_throttle_key = f"auth:throttle:ip:{client_ip}"
-    global_throttle_key = "auth:throttle:global"
-
-    pipe = r.pipeline()
-    pipe.incr(ip_fail_key)
-    pipe.expire(ip_fail_key, _THROTTLE_WINDOW_SECONDS)
-    pipe.incr(global_fail_key)
-    pipe.expire(global_fail_key, _THROTTLE_WINDOW_SECONDS)
-    results = pipe.execute()
-    ip_fails = results[0]
-    global_fails = results[2]
-
-    # Escalate per-IP throttle if threshold exceeded
-    if ip_fails >= _THROTTLE_IP_THRESHOLD:
-        current = int(r.get(ip_throttle_key) or 0)
-        new_level = current + 1
-        # After max delay level → permanent block
-        if new_level > len(_THROTTLE_DELAYS):
-            import json
-
-            r.set(
-                f"auth:blocked:{client_ip}",
-                json.dumps(
-                    {
-                        "blocked_at": time.time(),
-                        "reason": f"Exceeded max throttle level ({len(_THROTTLE_DELAYS)}) — permanent block",
-                        "ip_failures": ip_fails,
-                    }
-                ),
-            )  # No TTL = permanent
-            _log.critical("AUTH IP BLOCKED PERMANENTLY: ip=%s failures=%d", client_ip, ip_fails)
-        else:
-            r.set(ip_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
-
-    # Escalate global throttle if threshold exceeded
-    if global_fails >= _THROTTLE_GLOBAL_THRESHOLD:
-        current = int(r.get(global_throttle_key) or 0)
-        new_level = current + 1
-        r.set(global_throttle_key, new_level, ex=_THROTTLE_WINDOW_SECONDS)
-
-
-def _reset_ip_auth_failures(client_ip: str) -> None:
-    """On successful login, reset the per-IP counter (global decays via TTL)."""
-    r = _get_throttle_redis()
-    r.delete(f"auth:fail:ip:{client_ip}", f"auth:throttle:ip:{client_ip}")
+    bucket_key = _account_bucket_key(username, account_id)
+    r.delete(
+        f"auth:fail:ip:{client_ip}",
+        f"auth:throttle:ip:{client_ip}",
+        f"auth:fail:acct:{bucket_key}",
+        f"auth:throttle:acct:{bucket_key}",
+    )
 
 
 class LoginRequest(BaseModel):
@@ -361,9 +930,15 @@ async def login(body: LoginRequest, request: Request, response: Response):
     """
     client_ip = _real_client_ip(request)  # LAURA-3X-001: real peer, not Caddy IP
 
-    # Check order: allowlist → blocklist → throttle → auth
+    # Check order: allowlist → blocklist → throttle (account-gated, atomic) → auth
     _check_ip_access(client_ip)
-    _apply_auth_throttle(client_ip, response)
+    # LAURA-412-MEDIUM: resolve the identity-stable bucket key BEFORE the
+    # throttle check so the gate never keys on a normalised display string.
+    account_id = await _resolve_account_id_for_bucket(body.username)
+    # LAURA-412-HIGH: this atomically claims a slot in both bucket
+    # dimensions BEFORE any credential verification runs — see
+    # _apply_auth_throttle / _throttle_admit docstrings.
+    _apply_auth_throttle(client_ip, body.username, account_id, response)
 
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
@@ -383,14 +958,15 @@ async def login(body: LoginRequest, request: Request, response: Response):
             audit_writer=state.audit_writer,  # ACS gap #95: propagate for ACCOUNT_LOCKOUT
         )
     except (ValueError, TypeError):
-        _record_auth_failure(client_ip)
+        # LAURA-412-HIGH: no separate _record_auth_failure call — the
+        # attempt was already atomically counted by _apply_auth_throttle
+        # above, before this exception could even occur.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "invalid_credentials_format"},
         )
 
     if not success:
-        _record_auth_failure(client_ip)
         state.audit_writer.write(_make_login_event(body.username, "failure", reason))
         try:
             from yashigani.metrics.registry import auth_login_attempts_total
@@ -409,8 +985,11 @@ async def login(body: LoginRequest, request: Request, response: Response):
             },
         )
 
-    # Success — reset per-IP failure counter (global decays via TTL)
-    _reset_ip_auth_failures(client_ip)
+    # Success — self-heal: clear both the account gate and the IP severity
+    # bucket.  Use record.account_id (authoritative, just-confirmed) rather
+    # than the earlier pre-auth lookup, so the reset always targets the
+    # bucket that was actually gated (LAURA-412-MEDIUM).
+    _reset_auth_failures(client_ip, body.username, record.account_id)
 
     # LAURA-V232-003: when force_totp_provision=True, authenticate() returns
     # reason="totp_provision_required" meaning the account has NOT yet set up
@@ -489,9 +1068,45 @@ async def login(body: LoginRequest, request: Request, response: Response):
     #     are invalidated (ASVS V2.1.4); the user must log in again to get a full
     #     session.
     #
-    # Admin accounts with force_password_change=True are NOT restricted here —
-    # they already go through the totp_provisioning path if applicable, and the
-    # admin plane has separate controls. This fix targets user-plane bypass only.
+    # LAURA-411-003 (ASVS V2.1.7): enforce force_password_change for ADMIN accounts.
+    # A session issued with force_password_change=True is a restricted
+    # account_tier="admin_password_change_required" — accepted by require_any_session
+    # (so /auth/password/change and /auth/logout remain reachable) but REJECTED by
+    # require_admin_session (so all /admin/* GET/POST endpoints are blocked until
+    # the password is changed and the admin re-authenticates for a full session).
+    # Mirrors the totp_provisioning pattern at lines 428-450 above.
+    if record.force_password_change and record.account_tier == "admin":
+        restricted_session = state.session_store.create(
+            account_id=record.account_id,
+            account_tier="admin_password_change_required",
+            client_ip=client_ip,
+        )
+        state.audit_writer.write(
+            _make_login_event(
+                body.username,
+                "admin_password_change_restricted",
+                None,
+                account_tier=record.account_tier,
+            )
+        )
+        _log.info(
+            "LAURA-411-003: admin_password_change_required session issued for %s "
+            "(force_password_change=True). All /admin/* endpoints blocked until "
+            "password is changed via /auth/password/change.",
+            body.username,
+        )
+        _set_session_cookie(response, restricted_session.token, "admin_password_change_required")
+        return {
+            "status": "admin_password_change_required",
+            "force_password_change": True,
+            "force_totp_provision": record.force_totp_provision,
+            "message": (
+                "Your password must be changed before you can access admin functions. "
+                "POST to /auth/password/change to set a new password."
+            ),
+        }
+
+    # User-tier force-password-change restriction (LAURA-V400-NEW-002).
     if record.force_password_change and record.account_tier == "user":
         restricted_session = state.session_store.create(
             account_id=record.account_id,
@@ -568,27 +1183,54 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 @router.post("/logout")
 async def logout(
+    request: Request,  # WA-10: enumerate ALL cookie slots for full revocation
     session: AnySession,  # Phase 1 fix: was AdminSession — user-tier sessions were trapped (no end-user logout bug)
     response: Response,
     store=Depends(get_session_store),
 ):
     """
-    Single-logout endpoint.  Clears the session regardless of tier (admin or user).
+    Single-logout endpoint.  Clears ALL sessions regardless of tier (admin or user).
 
     Phase 1 / 2.25.5-auth-ingress: changed from AdminSession → AnySession so
     user-tier accounts can reach this endpoint.  Previously a user-tier session
     received HTTP 403 from require_admin_session and was permanently trapped
     (no working end-user logout).
 
-    Security: the session token is invalidated in Redis and BOTH cookies
-    (__Host-yashigani_admin_session and __Host-yashigani_session) are cleared.
-    An expired/invalidated session calling this endpoint returns HTTP 401 from
-    require_any_session before reaching this handler — no unauthenticated
-    session-clearing is possible.
+    WA-10 fix: when a browser holds BOTH an admin cookie (__Host-yashigani_admin_session)
+    and a user cookie (__Host-yashigani_session), the AnySession dependency resolves
+    only the FIRST matching token (admin-cookie preferred by _resolve_token).  The
+    other session would remain live in Redis after the first token is invalidated,
+    and a follow-up request using that cookie would pass /auth/verify-admin with HTTP
+    200.  This handler now enumerates every cookie slot and revokes each distinct
+    token independently.
+
+    Security: all distinct session tokens present in the request are invalidated in
+    Redis.  BOTH __Host- cookies are cleared with Secure; HttpOnly; Path=/ (symmetric
+    with _set_session_cookie — bare delete_cookie() omits Secure, causing browsers to
+    ignore the Max-Age=0 clearance for __Host- cookies).  An expired/invalidated
+    session calling this endpoint returns HTTP 401 from require_any_session before
+    reaching this handler — no unauthenticated session-clearing is possible.
     """
-    store.invalidate(session.token)
-    response.delete_cookie(_SESSION_COOKIE, path="/")
-    response.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    # WA-10: collect every distinct session token present in the request.
+    # _resolve_token (used by AnySession) picks admin-cookie first; if the
+    # browser also holds a user-cookie backed by a DIFFERENT session, that
+    # second session must also be revoked.
+    tokens_to_revoke: set[str] = {session.token}
+    for _cookie_name in (_SESSION_COOKIE, _USER_SESSION_COOKIE):
+        _raw = request.cookies.get(_cookie_name)
+        if _raw and _raw not in tokens_to_revoke:
+            tokens_to_revoke.add(_raw)
+
+    for _tok in tokens_to_revoke:
+        try:
+            store.invalidate(_tok)
+        except Exception:
+            pass  # already expired / gone — cookie clearance still proceeds
+
+    # WA-10: use _clear_session_cookie (not delete_cookie) so the clearance
+    # directive carries Secure; HttpOnly; Path=/ — required for __Host- cookies.
+    _clear_session_cookie(response, _SESSION_COOKIE)
+    _clear_session_cookie(response, _USER_SESSION_COOKIE)
     # AU.L2-3.3.1 / OWASP A09: emit audit event for every auth lifecycle action.
     state = backoffice_state
     if state.audit_writer is not None:
@@ -624,31 +1266,40 @@ async def logout_redirect(
       2. OWUI does NOT support submitting a POST form redirect via WEBUI_AUTH_SIGNOUT_REDIRECT_URL;
          it only performs a browser navigation (window.location).
       3. The action is idempotent — a forged logout just forces a re-login.
+
+    WA-10 fix: previously only one token was resolved (user-cookie preferred) and
+    only that one session was revoked.  Now BOTH cookie slots are checked and every
+    distinct token is independently invalidated server-side.
     """
-    # Try to read the session token from either cookie name.
-    token = (
-        request.cookies.get(_USER_SESSION_COOKIE)
-        or request.cookies.get(_SESSION_COOKIE)
-    )
+    # WA-10: collect every distinct session token present in the request.
+    # The original code used user-cookie-first priority, leaving the admin session
+    # live when both cookies were present.  Enumerate ALL slots.
+    tokens_to_revoke: set[str] = set()
+    for _cookie_name in (_USER_SESSION_COOKIE, _SESSION_COOKIE):
+        _raw = request.cookies.get(_cookie_name)
+        if _raw:
+            tokens_to_revoke.add(_raw)
 
     state = backoffice_state
-    if token:
+    for _tok in tokens_to_revoke:
         try:
-            store.invalidate(token)
+            # Resolve account_id BEFORE invalidation (store.get returns None after).
+            _session_data = store.get(_tok)
+            _account_id = _session_data.account_id if _session_data else "unknown"
+            store.invalidate(_tok)
             if state.audit_writer is not None:
-                # Resolve the account_id from the session if it is still valid.
-                session_data = store.get(token)
-                account_id = session_data.account_id if session_data else "unknown"
                 state.audit_writer.write(
-                    _make_login_event(account_id, "logout", None)
+                    _make_login_event(_account_id, "logout", None)
                 )
         except Exception:
             # Session already expired / gone — still clear the cookies.
             pass
 
     redirect = _RedirectResponse(url="/login", status_code=302)
-    redirect.delete_cookie(_SESSION_COOKIE, path="/")
-    redirect.delete_cookie(_USER_SESSION_COOKIE, path="/")
+    # WA-10: use _clear_session_cookie (not delete_cookie) so the clearance
+    # directive carries Secure; HttpOnly; Path=/ — required for __Host- cookies.
+    _clear_session_cookie(redirect, _SESSION_COOKIE)
+    _clear_session_cookie(redirect, _USER_SESSION_COOKIE)
     return redirect
 
 
@@ -1599,7 +2250,10 @@ async def change_password(
 
     # Invalidate ALL sessions including current (ASVS V2.1.4)
     store.invalidate_all_for_account(session.account_id)
-    response.delete_cookie(_SESSION_COOKIE)
+    # WA-10: clear BOTH cookie slots with proper __Host- attributes.
+    # The previous call only cleared the admin cookie and omitted Secure.
+    _clear_session_cookie(response, _SESSION_COOKIE)
+    _clear_session_cookie(response, _USER_SESSION_COOKIE)
 
     # ACS gap #95 (auth_log): dedicated PASSWORD_CHANGED event replaces the
     # generic ConfigChangedEvent, providing cleaner forensic queries.
@@ -1959,6 +2613,35 @@ def _set_session_cookie(response: Response, token: str, account_tier: str = "adm
         secure=True,
         samesite="strict",
         max_age=14400,
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response, name: str) -> None:
+    """Clear a __Host- prefixed session cookie, symmetric with _set_session_cookie.
+
+    The __Host- cookie prefix mandates that EVERY Set-Cookie directive for that
+    cookie — including clearance (Max-Age=0) — carries Secure=True and Path=/.
+    Starlette/FastAPI's Response.delete_cookie() does NOT include Secure by
+    default, so a bare delete_cookie() call produces:
+
+        Set-Cookie: __Host-yashigani_admin_session=""; Max-Age=0; Path=/; SameSite=lax
+
+    Browsers validate the __Host- prefix constraints on the clearance response
+    exactly as they do on the original Set-Cookie, and silently ignore the
+    Max-Age=0 when Secure is absent — leaving the original valid token in place.
+
+    This helper mirrors the exact attribute set used by _set_session_cookie so
+    the two paths are always in lockstep and cannot drift independently.
+    (WA-10 / ASVS V3.4.1 / RFC 6265bis §4.1.3)
+    """
+    response.set_cookie(
+        key=name,
+        value="",
+        max_age=0,
+        httponly=True,
+        secure=True,
+        samesite="strict",
         path="/",
     )
 

@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -139,7 +140,7 @@ def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result
 #   • Keep messages under ~120 chars so they fit the OWUI error pill.
 #   • Always explain WHAT was blocked and WHO to ask for help.
 # ---------------------------------------------------------------------------
-_OWUI_DENY_MESSAGES: dict[str, str] = {
+_DENY_MESSAGES: dict[str, str] = {
     # 5.0 — multi-turn conversational injection escalation
     "conversation_injection_blocked":
         "This conversation was flagged as a sustained attempt to manipulate the "
@@ -212,16 +213,223 @@ _OWUI_DENY_MESSAGES: dict[str, str] = {
         "The data-protection policy for this cloud model is not configured. Contact an administrator.",
 }
 
-_OWUI_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
+_GENERIC_DENY = "Your request was denied by policy. Contact an administrator for details."
 
 
-def _owui_deny_message(reason: str) -> str:
-    """Return a human-readable deny message for OWUI chat display.
+def _deny_message(reason: str) -> str:
+    """Return a human-readable deny message for chat display.
 
     Falls back to the generic message for any reason code not in the table.
     Never leaks the raw reason code into the returned string.
     """
-    return _OWUI_DENY_MESSAGES.get(reason, _OWUI_GENERIC_DENY)
+    return _DENY_MESSAGES.get(reason, _GENERIC_DENY)
+
+
+# ---------------------------------------------------------------------------
+# LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
+# ---------------------------------------------------------------------------
+
+# LAURA-412-002 (layer 1): compiled ASCII-only positive allowlist for model strings.
+# Any char outside [a-zA-Z0-9._:/@-] is rejected, closing the ENTIRE class of
+# bypass vectors regardless of position:
+#   • Printable non-set chars: |#!~<\ and any other symbol not listed
+#   • All Unicode Cf/whitespace/control chars: ZWSP (U+200B), ZWNJ (U+200C),
+#     ZWJ (U+200D), BOM (U+FEFF), Word-Joiner (U+2060), Invisible-Sep (U+2063),
+#     NUL (\x00), embedded newlines (\n, \r)
+# re.ASCII ensures the char-class [a-zA-Z0-9] is strictly 7-bit ASCII; no
+# Unicode letter/digit will match.  \Z (not $) anchors the end to prevent
+# a trailing \n from slipping through (Python's $ matches before a terminal \n).
+# Callers with @-prefix (agent calls) are exempted BEFORE _validate_model_string
+# is invoked, so @ appears in the allowlist only for digest formats (model@sha256:…).
+_MODEL_VALID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
+
+
+def _validate_model_string(model: str) -> Optional[str]:
+    """Return an error-reason string if *model* is an invalid input, else None.
+
+    LAURA-412-002: POSITIVE VALIDATION replaces the prior denylist as the
+    primary gate.  Any model string that does not match the strict ASCII
+    allowlist ``^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\\Z`` is rejected with
+    ``invalid_model``.  This closes the ENTIRE class of bypass vectors at once:
+      • Printable non-set chars (|#!~<\\)
+      • All Unicode Cf/whitespace/control chars (ZWSP, ZWNJ, ZWJ, BOM,
+        Word-Joiner, Invisible-Sep, NUL \\x00, embedded \\n/\\r)
+      • Any combination thereof, regardless of position in the string
+
+    Legacy explicit checks are kept AHEAD of positive validation so that
+    existing tests retain their specific error codes and for clarity when
+    the permission store is absent (the explicit-deny gate cannot fire):
+      • URL-scheme forms (http://, https://, //, ftp://, any ://)
+      • Path-traversal patterns (../, ..\\\\)
+      • Null-sentinel literals (``"null"``, ``"none"``, ``"undefined"``)
+      • Empty strings (after strip)
+
+    Called before RBAC deny and optimisation so that no bypass variant can
+    reach the silent local-default fallback.
+    """
+    s = (model or "").strip()
+    if not s:
+        return "empty_model"
+    s_lower = s.lower()
+    # Explicit URL-scheme rejection (kept for backward-compat error code +
+    # for deployments where permission_store is None and layer 2 cannot fire).
+    for prefix in ("http://", "https://", "//", "ftp://"):
+        if s_lower.startswith(prefix):
+            return "url_not_allowed"
+    # LAURA-412-001: reject ANY ://-scheme form (e.g. openai://gpt-4o).
+    if "://" in s_lower:
+        return "url_not_allowed"
+    if "../" in s or "..\\" in s or s.startswith("/") or s.startswith(".."):
+        return "path_traversal_not_allowed"
+    if s_lower in ("null", "none", "undefined"):
+        return "null_not_allowed"
+    # LAURA-412-002 (layer 1): positive allowlist — reject anything outside
+    # the ASCII-safe model-name charset.
+    if not _MODEL_VALID_RE.match(s):
+        return "invalid_model"
+    return None
+
+
+def _fetch_ollama_models_sync(
+    ollama_url: str,
+    timeout: float = 3.0,
+) -> list[dict] | None:
+    """Fetch the installed model list from Ollama /api/tags (synchronous).
+
+    Called once at gateway startup (via the entrypoint) before
+    configure_openai_router() so that _is_known_model() can gate genuinely-
+    unknown models with HTTP 422 while recognising every model that Ollama
+    actually has installed.
+
+    Returns:
+        list[dict]: raw model dicts from the API response on success.
+        None: on ANY error (connection refused, timeout, JSON parse failure).
+              None signals _is_known_model() to be *permissive* — the backend
+              itself will reject a genuinely unknown model, so the gateway must
+              never brick itself because its model list is temporarily unavailable.
+    """
+    # F-001 class: use the internal mesh mTLS transport for https ollama fronts
+    # (Mac Metal / mTLS installs), NOT bare httpx. ollama_get_json() presents this
+    # service's leaf + trusts the internal CA and returns None on any error, which
+    # is exactly the permissive-fallback contract this function needs.
+    from yashigani.inspection._ollama_transport import ollama_get_json
+    data = ollama_get_json(ollama_url, "/api/tags", timeout=timeout)
+    if data is None:
+        logger.warning(
+            "gateway: could not fetch ollama model list from %s/api/tags — "
+            "available_models=None; _is_known_model will be permissive until a "
+            "gateway reload populates the list",
+            ollama_url,
+        )
+        return None
+    models: list[dict] = data.get("models") or []
+    logger.info(
+        "gateway: ollama model list fetched — %d model(s) from %s/api/tags",
+        len(models), ollama_url,
+    )
+    return models
+
+
+def _is_known_model(
+    model: str,
+    alias_store,
+    available_models: list | None,
+) -> bool:
+    """True if *model* is a known alias, installed local model, or cloud-provider-
+    qualified model (``openai:X`` / ``anthropic:X``).
+
+    LAURA-411-002 / Ava FINDING-1 (part b): an unresolvable model must return
+    HTTP 422 rather than silently falling back to the local default (qwen2.5:3b).
+
+    ``available_models`` semantics:
+      - ``None`` : startup fetch of /api/tags failed (backend unreachable at boot).
+                   Treat as "unknown list" → permissive; let the backend arbitrate.
+      - ``[]``   : fetched successfully; ollama reported no installed models.
+                   Strict gate applies (or minimally-configured path if alias_store
+                   is also absent).
+      - ``[...]``: populated list; strict gate applies.
+
+    Permissive (True) when alias_store is also absent (minimally-configured /
+    test deployments) so those environments do not receive false 422s.
+    """
+    if not model:
+        return False
+    # LAURA-412-001: canonicalize via normalize_model_for_deny so that the
+    # cloud-provider prefix check and the local-model equality check both
+    # operate on the same canonical form that the DENY lookup uses.  This
+    # prevents a model being "known" under one form (e.g. "openai::gpt-4o")
+    # while the DENY lookup misses it because the stored grant key is the
+    # canonical "openai:gpt-4o".
+    from yashigani.models.effective import normalize_model_for_deny as _norm_for_known
+    norm = _norm_for_known(model)
+    if not norm:
+        return False
+
+    # 1. Cloud provider-qualified: ``provider:model`` where provider is known.
+    #    We trust the cloud provider to reject an unrecognised model name.
+    #    Operating on the canonical norm ensures openai::gpt-4o and
+    #    openai:gpt-4o. both canonicalize to openai:gpt-4o before this check.
+    if ":" in norm:
+        provider_prefix = norm.split(":", 1)[0]
+        if provider_prefix in _CLOUD_PROVIDER_CONFIG:
+            return True
+
+    # 2. Alias store (configured aliases: "smart", "fast", "gpt-4o", …).
+    #    Try the original case first then the normalized canonical form.
+    if alias_store is not None:
+        try:
+            if (
+                alias_store.get(model) is not None
+                or (norm != model and alias_store.get(norm) is not None)
+            ):
+                return True
+        except Exception:
+            # Store blip → assume known to avoid false 422 on transient errors.
+            return True
+
+    # 3. Available (installed Ollama) models.
+    # BUG-B FIX (4.1.2): _state.available_models stores dicts keyed "id"
+    # (populated via the Ollama /api/tags response); "name" is absent, so
+    # all local models wrongly missed this check → 422 model_not_found.
+    for m in available_models or []:
+        name = (m.get("name") or m.get("id") or "").lower()
+        if name and name == norm:
+            return True
+
+    # 4. Permissive fallback rules (checked after the list scan so a loaded list
+    #    always gates correctly).
+    #
+    #    a) available_models is None → startup fetch of /api/tags failed.
+    #       We cannot distinguish "model exists" from "model unknown" so we permit
+    #       and let the backend (Ollama) return its own 404.  This prevents the
+    #       gateway from bricking itself when the inference backend is slow to start.
+    if available_models is None:
+        return True
+
+    #    b) No alias_store AND empty available_models → minimally-configured or
+    #       test deployment; skip the gate to avoid false 422s.
+    if alias_store is None and not available_models:
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# LAURA-411-004 (Info): routing-telemetry headers gate
+# ---------------------------------------------------------------------------
+
+def _routing_telemetry_enabled() -> bool:
+    """True when routing-telemetry headers should be included in /v1/* responses.
+
+    LAURA-411-004: ``x-yashigani-route-reason``, ``x-yashigani-routed-via``,
+    ``x-yashigani-sensitivity``, and ``x-yashigani-complexity`` expose internal
+    routing decisions to every caller.  These are now gated behind
+    ``YASHIGANI_ROUTING_TELEMETRY=true`` (default OFF).
+
+    ``x-yashigani-model`` and ``x-yashigani-generated-content`` are always
+    present — the UI depends on them.
+    """
+    return os.getenv("YASHIGANI_ROUTING_TELEMETRY", "false").strip().lower() == "true"
 
 
 def _metric_block(control: str, layer: str, leg: str) -> None:
@@ -305,7 +513,7 @@ def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
         return JSONResponse(
             status_code=403,
             content={"error": {
-                "message": _owui_deny_message("content_moderation_blocked"),
+                "message": _deny_message("content_moderation_blocked"),
                 "type": "content_moderation_blocked",
                 "code": ",".join(result.categories),
             }},
@@ -349,7 +557,7 @@ def _verify_ollama_pin(model: str, request_id: str):
     return JSONResponse(
         status_code=403,
         content={"error": {
-            "message": _owui_deny_message("model_integrity_mismatch"),
+            "message": _deny_message("model_integrity_mismatch"),
             "type": "model_integrity_block",
             "code": result.reason,
         }},
@@ -408,50 +616,14 @@ _INTERNAL_BEARER: str = _load_internal_bearer()
 
 
 # ---------------------------------------------------------------------------
-# Track C (F-B) — per-user identity through Open WebUI.
+# 4.1 SEC-GAP-1: Track C (F-B) — per-user identity via X-Yashigani-Identity-Id.
 #
-# THE GAP: Open WebUI (OWUI) authenticates to the gateway's internal mesh port
-# (8081) with the shared `yashigani_internal_bearer`. Historically the resolver
-# mapped that bearer to a flat `internal` service identity (RESTRICTED, empty
-# allowed_models) BEFORE any per-user path, so every OWUI user shared one
-# identity and per-user/group/org RBAC (models, agents, sensitivity ceiling)
-# NEVER applied to OWUI traffic.
-#
-# THE FIX (trusted-forwarder model): the internal bearer establishes OWUI as a
-# TRUSTED FORWARDER — exactly the same trust anchor already used for the
-# orchestration-principal header. When (and ONLY when) a request carries the
-# internal bearer, the gateway honours OWUI's forwarded-user headers
-# (X-OpenWebUI-User-Email etc., emitted when ENABLE_FORWARD_USER_INFO_HEADERS=
-# true on the OWUI service) and resolves the ACTUAL per-user Yashigani identity.
-#
-# MAPPING (email -> Yashigani identity), in priority order:
-#   1. The forwarded email's local-part is matched as an identity SLUG
-#      (alice@corp.example -> slug "alice"); if a registered identity exists,
-#      that identity (with its own groups/allowed_models/sensitivity_ceiling)
-#      is used. Operators provision OWUI users by creating a Yashigani identity
-#      whose slug equals the user's email local-part.
-#   2. Optionally, an explicit slug override map (YASHIGANI_OWUI_SLUG_MAP, JSON
-#      object "email": "slug") lets an operator pin specific emails to slugs.
-#   3. No match / missing / malformed email -> the configurable baseline
-#      OWUI-users default identity (YASHIGANI_OWUI_DEFAULT_SLUG, default
-#      "owui-users"). If that slug is not registered either, fall back to a
-#      synthetic baseline-RESTRICTED identity (NEVER a higher privilege).
-#
-# SPOOFING DEFENSE (load-bearing): the forwarded-user header is honoured ONLY
-# under the internal bearer. A direct/external caller WITHOUT the bearer can set
-# X-OpenWebUI-User-* freely and it is IGNORED — the resolver never consults it
-# off the internal-bearer path. Caddy also strips inbound X-OpenWebUI-User-* /
-# X-Forwarded-User on the public path (defence in depth). Fail-closed: under the
-# bearer, an unmatched/missing/malformed forwarded user resolves to the
-# baseline-restricted default, NEVER to elevated privilege.
+# The 3.x X-OpenWebUI-User-Email forwarding path has been removed.  Identity on
+# the internal-bearer path is now resolved ONLY from X-Yashigani-Identity-Id
+# (idnt_ PK).  X-Forwarded-User / email / slug derivation paths are gone.
+# Fail-closed: no valid UID header on the forwarder path → service "internal"
+# identity (RESTRICTED).  No phantom owui-users default identity.
 # ---------------------------------------------------------------------------
-_OWUI_FORWARD_ENABLED: bool = (
-    os.environ.get("YASHIGANI_OWUI_FORWARD_USER", "true").strip().lower() == "true"
-)
-_OWUI_DEFAULT_SLUG: str = os.environ.get(
-    "YASHIGANI_OWUI_DEFAULT_SLUG", "owui-users"
-).strip()
-_OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
 
 # ---------------------------------------------------------------------------
 # 4.0 native WebUI trusted-forwarder header (LAURA-4.0-S1-001 close / identity_id contract)
@@ -463,10 +635,10 @@ _OWUI_USER_EMAIL_HEADER = "x-openwebui-user-email"
 # Contract:
 #   - Value: idnt_ PK string (e.g. "idnt_abc123")
 #   - Trust boundary: honoured ONLY on the internal-bearer path (p2_forwarder
-#     or _INTERNAL_BEARER) — same trust gate as X-OpenWebUI-User-Email.
+#     or _INTERNAL_BEARER).  4.1 SEC-GAP-1: X-OpenWebUI-User-Email path removed.
 #   - Caddy MUST strip this header at the public edge (Su's Caddyfile task).
 #   - If the header is present but the identity cannot be resolved: fail-closed
-#     (HTTP 403), do NOT fall back to the email path or an unauthenticated principal.
+#     (HTTP 403), do NOT fall back to a default/unauthenticated principal.
 # ---------------------------------------------------------------------------
 _YASHIGANI_IDENTITY_ID_HEADER = "x-yashigani-identity-id"
 
@@ -569,125 +741,9 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
     return identity
 
 
-def _load_owui_slug_map() -> dict[str, str]:
-    """Parse YASHIGANI_OWUI_SLUG_MAP (JSON object email->slug). Fail-safe: {}."""
-    raw = os.environ.get("YASHIGANI_OWUI_SLUG_MAP", "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return {str(k).strip().lower(): str(v).strip() for k, v in parsed.items() if v}
-    except Exception as exc:  # malformed map must not break startup
-        logger.warning("YASHIGANI_OWUI_SLUG_MAP is not valid JSON (%s) — ignoring", exc)
-    return {}
-
-
-_OWUI_SLUG_MAP: dict[str, str] = _load_owui_slug_map()
-
-
-def _baseline_owui_identity() -> dict:
-    """Synthetic fail-closed baseline for OWUI users with no registered identity.
-
-    RESTRICTED ceiling, empty allowed_models — strictly the LOWEST privilege.
-    Used only when neither the per-user slug NOR the configured default slug
-    resolves to a registered identity. kind="service" keeps it out of the
-    end-user seat count while still being subject to OPA RBAC. It is NEVER the
-    `internal` identity_id, so the brain-reasoning marker cannot be tripped by
-    an OWUI user (that marker keys on identity_id == "internal").
-    """
-    return {
-        "identity_id": _OWUI_DEFAULT_SLUG or "owui-users",
-        "status": "active",
-        "kind": "service",
-        "groups": ["owui-users"],
-        "allowed_models": [],
-        "sensitivity_ceiling": "RESTRICTED",
-        "_owui_forwarded": True,
-        "_owui_baseline": True,
-    }
-
-
-def _resolve_owui_forwarded_user(request: Request) -> Optional[dict]:
-    """Resolve the ACTUAL OWUI user identity from forwarded headers.
-
-    CALLED ONLY from the internal-bearer fast-path — i.e. the request is already
-    proven to come from the trusted forwarder (OWUI). The forwarded-user header
-    is therefore trustworthy at this point and never consulted elsewhere, which
-    is the whole spoofing defence.
-
-    Returns a registered identity dict (per-user RBAC applies) when the email
-    maps to one; otherwise the configured default-slug identity; otherwise the
-    synthetic baseline-RESTRICTED identity. NEVER returns None and NEVER returns
-    a privilege higher than the matched identity — fail-closed by construction.
-    Returns None only to signal "no forwarded user present" so the caller can
-    fall through to the flat `internal` service identity (preserves the
-    orchestration / brain path, which carries NO forwarded-user header).
-    """
-    if not _OWUI_FORWARD_ENABLED:
-        return None
-    email = request.headers.get(_OWUI_USER_EMAIL_HEADER, "").strip()
-    if not email:
-        # No forwarded user -> not an OWUI per-user call (e.g. brain self-call,
-        # in-mesh agent). Caller falls back to flat `internal`.
-        return None
-    email_l = email.lower()
-
-    # Registry unavailable -> fail-closed to baseline (NEVER internal/elevated).
-    if _state.identity_registry is None:
-        logger.warning(
-            "OWUI forwarded user %r present but identity_registry unavailable — "
-            "baseline-RESTRICTED", email,
-        )
-        return _baseline_owui_identity()
-
-    # Resolve candidate slug: explicit map override first, else canonical email slug.
-    # B5 fix (2.25.5): previously used the email local-part with dots/underscores
-    # kept (e.g. "dana.lee"), which never matched the identity registered at login
-    # by _auth_email_to_slug ("dana-lee-example-com").  Now use the SAME canonical
-    # derivation (yashigani.identity.slug.email_to_slug) so both sides agree.
-    slug = _OWUI_SLUG_MAP.get(email_l)
-    if not slug:
-        try:
-            from yashigani.identity.slug import email_to_slug as _email_to_slug
-            slug = _email_to_slug(email_l)
-        except (ValueError, Exception) as _exc:
-            logger.warning("OWUI slug derivation failed for %r (%s) — baseline", email, _exc)
-            slug = ""
-
-    identity = None
-    if slug:
-        try:
-            identity = _state.identity_registry.get_by_slug(slug)
-        except Exception as exc:  # registry blip — fail-closed to baseline
-            logger.warning("OWUI slug lookup failed for %r (%s) — baseline", slug, exc)
-            identity = None
-
-    if identity:
-        identity = dict(identity)
-        identity["_owui_forwarded"] = True
-        identity["_owui_email"] = email
-        return identity
-
-    # No per-user match -> configured default-slug identity if registered.
-    if _OWUI_DEFAULT_SLUG:
-        try:
-            default_ident = _state.identity_registry.get_by_slug(_OWUI_DEFAULT_SLUG)
-        except Exception:
-            default_ident = None
-        if default_ident:
-            default_ident = dict(default_ident)
-            default_ident["_owui_forwarded"] = True
-            default_ident["_owui_email"] = email
-            default_ident["_owui_default"] = True
-            return default_ident
-
-    # Nothing registered -> synthetic baseline-RESTRICTED.
-    logger.info(
-        "OWUI user %r mapped to baseline (no identity for slug %r, no default %r)",
-        email, slug, _OWUI_DEFAULT_SLUG,
-    )
-    return _baseline_owui_identity()
+# (4.1 SEC-GAP-1: _load_owui_slug_map, _OWUI_SLUG_MAP, _baseline_owui_identity,
+#  and _resolve_owui_forwarded_user removed.  Identity resolved from
+#  X-Yashigani-Identity-Id only; no email/slug derivation in the authz path.)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1113,7 @@ class OpenAIRouterState:
         self.optimization_engine = None
         self.ollama_url: str = "http://ollama:11434"
         self.default_model: str = "qwen2.5:3b"
-        self.available_models: list[dict] = []
+        self.available_models: list[dict] | None = None  # None=fetch-failed/permissive; []=fetched-empty; [...]= populated
         self.agent_registry = None
         # Track B1 (model-RBAC): durable allocation store + alias store, read on
         # the request path to compute effective-allowed-models for the caller.
@@ -1094,6 +1150,18 @@ class OpenAIRouterState:
         self.rule_promotion_store = None
         self.promoted_ruleset = None
         self.ddos_protector = None  # v2.2 — DDoSProtector | None
+        # FINDING-V412-RESTART-013 gap #6: DocumentInspectionPipeline | None.
+        # Same singleton instance entrypoint.py builds and hands to
+        # create_gateway_app()'s state["document_pipeline"] (proxy egress +
+        # gateway/mcp_router_runtime.py's /mcp/<agent_name> HTTP entrypoint).
+        # Mirrored here so the chat->MCP tool-dispatch path
+        # (gateway/orchestrator.py:_execute_mcp_tool) — which has NO access to
+        # proxy.py's per-request `state` dict, only this module-level
+        # singleton — can also invoke document REDACT/PSEUDONYMIZE/BLOCK
+        # enforcement on tool-call arguments before they leave the ring-fence.
+        # None (default/dark, mode-B-proxy opt-in flag off) preserves the
+        # exact pre-fix behaviour: MCP chat-tool-call traffic is untouched.
+        self.document_pipeline = None
         # v2.2 — streaming
         self.streaming_enabled: bool = True
         self.streaming_inspect_interval: int = 200
@@ -1111,7 +1179,7 @@ class OpenAIRouterState:
         # fast hmac.compare_digest on every request.
         #
         # Role classes:
-        #   "p2_forwarder"   — OWUI trusted forwarder; may set X-OpenWebUI-User-Email
+        #   "p2_forwarder"   — backoffice/chat trusted forwarder; sets X-Yashigani-Identity-Id
         #   "p2_orchestrator"— Gateway orchestrator self-call; may set X-Yashigani-
         #                      Orchestration-Principal
         #   "p1_agent"       — Bundled agent (Letta, Langflow, OpenClaw); resolves as
@@ -1148,6 +1216,13 @@ class OpenAIRouterState:
         self.permission_strict: bool = (
             os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
         )
+        # W3-008: RBAC store for group membership backfill.
+        # The identity registry stores groups only as set at REGISTRATION time.
+        # Memberships granted later via RBAC add_member live solely in
+        # rbac:user:{identity_id} in the RBAC store and are never written back to
+        # the registry record.  Wired here so chat_completions can call
+        # get_user_groups() to union the complete set before any group-tier check.
+        self.rbac_store = None   # RBACStore | None
         # F-T10-001: low-confidence step-up threshold.  When response-inspection
         # confidence falls below this value AND sensitivity >= CONFIDENTIAL,
         # X-Yashigani-Low-Confidence-Stepup: required is added to the response.
@@ -1311,6 +1386,8 @@ def configure(
     model_alias_store=None,       # Track B1 — ModelAliasStore | None
     kms_provider=None,            # KSMProvider | None — for cloud API key resolution
     permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
+    rbac_store=None,              # W3-008 — RBACStore | None (group membership backfill)
+    document_pipeline=None,       # FINDING-V412-RESTART-013 gap #6 — DocumentInspectionPipeline | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -1333,7 +1410,7 @@ def configure(
     _state.audit_writer = audit_writer
     _state.ollama_url = ollama_url
     _state.default_model = default_model
-    _state.available_models = available_models or []
+    _state.available_models = available_models  # preserve None (fetch-failed) vs [] (fetched-empty) vs [...] (populated)
     _state.agent_registry = agent_registry
     _state.response_inspection_pipeline = response_inspection_pipeline
     _state.request_inspection_pipeline = request_inspection_pipeline
@@ -1363,6 +1440,8 @@ def configure(
     _state.permission_strict = (
         os.environ.get("YASHIGANI_PERMISSION_STRICT", "false").strip().lower() == "true"
     )
+    _state.rbac_store = rbac_store                         # W3-008 — group backfill
+    _state.document_pipeline = document_pipeline           # RESTART-013 gap #6
 
     # ── 4.0 Phase 3 — P1/P2 token role map (RISK-108) ──────────────────────
     # Populate from YASHIGANI_TOKEN_ROLE_MAP env var (JSON dict for dev/test):
@@ -1720,18 +1799,71 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             "zero-trust fail-closed (Path 2)",
             request_id,
         )
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "POST /v1/chat/completions requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Forwarded-User header from Caddy)."
-                ),
-                "request_id": request_id,
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
+
+    # ── 1b-2. W3-008: RBAC group membership backfill ─────────────────────────
+    # The identity registry persists `groups` only at REGISTRATION time.  Group
+    # memberships added later via RBAC add_member are stored exclusively in
+    # `rbac:user:{identity_id}` (Redis SADD) and are NEVER written back into
+    # `identity:reg:{identity_id}`.  Without backfill every group-tier check in
+    # this function (Layer 2 cloud gate, W3-007, LAURA-411-001 deny probe, perm
+    # gate) iterates an empty list — silently over-blocking group-grantees
+    # (power_user → 422) AND silently failing-open on group-deny grants.
+    #
+    # Backfill logic (human/user principals only):
+    #   1. Call rbac_store.get_user_groups(identity_id) — reads rbac:user:{id}
+    #      in Redis, which is authoritative for post-registration membership.
+    #   2. Union the RBAC set with the reg-record set (preserves reg-record
+    #      groups; dedupes; does not drop any existing membership).
+    #   3. Shallow-copy the identity dict before mutating so the registry's
+    #      cached dict is never modified in place.
+    #
+    # Fail-safe: if the rbac store is unavailable (None or raises), keep the
+    # reg-record groups and log a warning.  This is intentionally NOT fail-
+    # closed (a store blip must not hard-block ALL users); the group-tier gates
+    # below already have their own fail-closed behaviour for missing grants.
+    #
+    # Service/agent/internal identities (kind ∉ {"human","user"}) legitimately
+    # have groups=[] and are NOT backfilled — their access is controlled via
+    # org-level grants, not group membership.
+    if _state.rbac_store is not None and identity is not None:
+        _w3008_kind = identity.get("kind", "")
+        if _w3008_kind in ("human", "user"):
+            _w3008_iid = identity.get("identity_id")
+            if _w3008_iid:
+                try:
+                    _w3008_rbac_groups = _state.rbac_store.get_user_groups(_w3008_iid)
+                    _w3008_rbac_gids: set[str] = {g.id for g in _w3008_rbac_groups}
+                    _w3008_reg_gids: set[str] = set(identity.get("groups") or [])
+                    _w3008_all_gids = _w3008_reg_gids | _w3008_rbac_gids
+                    if _w3008_all_gids != _w3008_reg_gids:
+                        # New memberships found — shallow-copy identity before mutating
+                        identity = dict(identity)
+                        identity["groups"] = list(_w3008_all_gids)
+                        logger.debug(
+                            "W3-008: backfilled groups for %s: reg=%s rbac=%s final=%s",
+                            _w3008_iid,
+                            sorted(_w3008_reg_gids),
+                            sorted(_w3008_rbac_gids),
+                            sorted(_w3008_all_gids),
+                        )
+                except Exception as _w3008_exc:
+                    logger.warning(
+                        "W3-008: RBAC group backfill failed for %s: %s — "
+                        "keeping reg-record groups (fail-safe, not fail-closed)",
+                        _w3008_iid, _w3008_exc,
+                    )
 
     # ── 1c. Orchestration delegation (2.25.4, build sheet §3.1/§3.5) ──────
     # When the caller supplies `tools` (or opts in via `orchestrate=true`), the
@@ -1821,7 +1953,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=415,
                 content={"error": {
-                    "message": _owui_deny_message("audio_not_inspectable"),
+                    "message": _deny_message("audio_not_inspectable"),
                     "type": "audio_uninspectable",
                     "code": "transcription_unavailable",
                 }},
@@ -1854,7 +1986,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=422,
                 content={"error": {
-                    "message": _owui_deny_message("audio_not_inspectable"),
+                    "message": _deny_message("audio_not_inspectable"),
                     "type": "audio_uninspectable",
                     "code": "transcription_failed",
                 }},
@@ -1885,7 +2017,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             )
             return JSONResponse(
                 status_code=403,
-                content={"error": {"message": _owui_deny_message("request_inspection_error"),
+                content={"error": {"message": _deny_message("request_inspection_error"),
                                    "type": "request_inspection_error",
                                    "code": "request_inspection_error"}},
                 headers={"X-Yashigani-Request-Id": request_id},
@@ -1905,7 +2037,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message("prompt_injection_only"),
+                    "message": _deny_message("prompt_injection_only"),
                     "type": "request_injection_blocked",
                     "code": "prompt_injection_only",
                 }},
@@ -1941,7 +2073,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message("prompt_injection_only"),
+                    "message": _deny_message("prompt_injection_only"),
                     "type": "request_injection_blocked",
                     "code": "prompt_injection_only",
                 }},
@@ -1991,7 +2123,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 return JSONResponse(
                     status_code=403,
                     content={"error": {
-                        "message": _owui_deny_message("conversation_injection_blocked"),
+                        "message": _deny_message("conversation_injection_blocked"),
                         "type": "conversation_injection_blocked",
                         "code": _seq_verdict.action,
                     }},
@@ -2087,7 +2219,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message("request_inspection_error"),
+                    "message": _deny_message("request_inspection_error"),
                     "type": "request_inspection_error",
                     "code": "request_inspection_error",
                 }},
@@ -2121,7 +2253,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message(_reason_code),
+                    "message": _deny_message(_reason_code),
                     "type": "request_injection_blocked",
                     "code": _reason_code,
                 }},
@@ -2208,9 +2340,280 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 6. Route decision ──────────────────────────────────────────────
     selected_model = body.model or _state.default_model
+    # W3-007 (LAURA-V250-W3-007): resolved cloud target from alias pre-resolution.
+    # Set inside the body.model validation block below; consumed by the Layer 2
+    # extension and the LAURA-411-001 extension later in this function.
+    _w3007_resolved_cloud_target: str | None = None
 
     # Agent routing: if model starts with @, forward to the agent's upstream
     is_agent_call = selected_model.startswith("@")
+
+    # ── LAURA-411-002 / Ava FINDING-1: model input validation + normalization ──
+    # Runs BEFORE RBAC deny and optimisation so URL/path/null variants cannot
+    # bypass the deny check by triggering the silent local-default fallback.
+    # Exempt: agent calls (start with @), brain-reasoning leg (server-minted,
+    # no alloc), and calls where body.model is absent (explicit default-model
+    # path — preserved per brief).
+    if body.model and not is_agent_call and not brain_reasoning_leg:
+        _mv_err = _validate_model_string(body.model)
+        if _mv_err is not None:
+            logger.warning(
+                "LAURA-411-002: invalid model string %r from identity=%s (%s) → 422",
+                body.model, identity_id, _mv_err,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "message": f"The model name is invalid ({_mv_err}).",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
+        # Normalize: lowercase + provider/model → provider:model.
+        # The normalized form flows through optimisation and RBAC;
+        # body.model (original) is retained for audit/logging.
+        from yashigani.models.effective import normalize_model_for_deny as _norm_model_fn
+        _norm = _norm_model_fn(body.model)
+        if _norm and _norm != selected_model:
+            logger.debug(
+                "LAURA-411-002: model normalized %r → %r",
+                body.model, _norm,
+            )
+            selected_model = _norm
+
+        # Part (b): reject models that resolve to no known alias or installed
+        # model → HTTP 422 model_not_found instead of silent fallback to
+        # qwen2.5:3b.  Skipped when alias_store and available_models are both
+        # absent (minimally-configured / test deployments).
+        if not _is_known_model(
+            selected_model,
+            _state.model_alias_store,
+            _state.available_models,
+        ):
+            logger.warning(
+                "LAURA-411-002: unknown model %r (normalized: %r) from identity=%s → 422",
+                body.model, selected_model, identity_id,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "message": (
+                            f"The model '{body.model}' is not available. "
+                            "Contact an administrator to check the model name."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                },
+            )
+
+        # W3-007 (LAURA-V250-W3-007): Pre-resolve alias to its canonical cloud target.
+        # Layer 2 (below) gates on ":" in selected_model — a plain alias name has no
+        # colon and is therefore skipped, allowing an alias that resolves to a cloud
+        # model to bypass the cloud RBAC gate entirely (PoC: model="smart" resolves to
+        # "anthropic:claude-sonnet-4-6"; no Anthropic API key → local fallback;
+        # _perm_is_cloud=False → cloud gate never fires → LAURA-411-001 checks "smart"
+        # literal — no deny grant for that name → 200 with qwen content).
+        #
+        # Fix: resolve the alias here so _w3007_resolved_cloud_target carries the
+        # resolved cloud canonical.  Both the Layer 2 extension and the LAURA-411-001
+        # extension below then enforce the RESOLVED model's permission requirements
+        # regardless of whether the caller supplied an alias name or a direct string.
+        if _state.model_alias_store is not None:
+            try:
+                _w3007_alias_cfg = _state.model_alias_store.get(selected_model)
+                if _w3007_alias_cfg is not None:
+                    _w3007_alias_canonical = (
+                        f"{_w3007_alias_cfg.provider}:{_w3007_alias_cfg.model}"
+                    )
+                    # Defence-in-depth: validate the resolved canonical through Layer 1.
+                    # Admin-stored aliases are trusted, but any alias whose resolved
+                    # provider:model fails validation is rejected rather than silently
+                    # smuggled through the cloud RBAC gate.
+                    if _validate_model_string(_w3007_alias_canonical) is None:
+                        if _w3007_alias_cfg.provider in _CLOUD_PROVIDER_CONFIG:
+                            _w3007_resolved_cloud_target = _w3007_alias_canonical
+            except Exception:  # noqa: BLE001 — store blip; treat as no cloud alias
+                pass
+
+        # LAURA-412-002 (layer 2): No silent local fallback for cloud-prefixed
+        # models that are not recognized/granted.
+        #
+        # ROOT CAUSE closed: _is_known_model() returns True for ANY model whose
+        # canonical prefix is in _CLOUD_PROVIDER_CONFIG (e.g. "openai:anything").
+        # After _resolve_alias, a cloud-prefixed string with no "/" falls through
+        # as ("ollama", model, False) → selected_provider="ollama" → the 6a-perm
+        # cloud gate (_perm_is_cloud=False) never fires → LAURA-411-001's
+        # explicit-deny lookup uses the CANONICAL key so a junk suffix
+        # ("openai:gpt-4oAAAA") never matches the stored grant ("openai:gpt-4o")
+        # → no deny → silent qwen2.5:3b fallback → 200.
+        #
+        # FIX: if the canonical model has a known cloud provider prefix, it MUST
+        # have either (a) an alias-store entry (resolves to a real provider/model)
+        # OR (b) a permission grant (allow or deny — any grant proves the admin
+        # configured this model) at org/user/group level.  If neither → 422.
+        #
+        # PRESERVE: power_user with a GRANTED openai:gpt-4o on a keyless demo
+        # stack still gets a 200 via local-fallback because a grant EXISTS for the
+        # exact canonical model → _412_has_grant=True → gate passes → 6a-perm and
+        # LAURA-411-001 handle allow/deny correctly.
+        #
+        # SKIPPED when permission_store is None (no grant system configured) —
+        # consistent with 6a-perm and LAURA-411-001 gates that also require it.
+        if ":" in selected_model and _state.permission_store is not None:
+            _412_prefix = selected_model.split(":", 1)[0]
+            if _412_prefix in _CLOUD_PROVIDER_CONFIG:
+                # Check for a known alias (resolves this exact canonical string)
+                _412_alias_known = False
+                if _state.model_alias_store is not None:
+                    try:
+                        _412_alias_known = _state.model_alias_store.get(selected_model) is not None
+                    except Exception:  # noqa: BLE001 — store blip; treat as unknown
+                        _412_alias_known = False
+                _412_has_grant = _412_alias_known
+                if not _412_has_grant:
+                    from yashigani.permissions import ResourceType as _RT_412
+                    from yashigani.permissions import DEFAULT_ORG_ID as _ORG_412
+                    try:
+                        # Org level — primary tier for cloud_model grants
+                        if _state.permission_store.get_boolean_grant(
+                            _RT_412.CLOUD_MODEL, "org", _ORG_412, selected_model
+                        ) is not None:
+                            _412_has_grant = True
+                        # User level
+                        if not _412_has_grant and identity:
+                            _412_kind = identity.get("kind", "")
+                            _412_uid = (
+                                identity.get("identity_id")
+                                if _412_kind in ("human", "user") else None
+                            )
+                            if _412_uid and _state.permission_store.get_boolean_grant(
+                                _RT_412.CLOUD_MODEL, "user", _412_uid, selected_model
+                            ) is not None:
+                                _412_has_grant = True
+                        # Group level
+                        if not _412_has_grant and identity:
+                            for _412_gid in (identity.get("groups") or []):
+                                if _state.permission_store.get_boolean_grant(
+                                    _RT_412.CLOUD_MODEL, "group", str(_412_gid), selected_model
+                                ) is not None:
+                                    _412_has_grant = True
+                                    break
+                    except Exception as _412_exc:  # noqa: BLE001
+                        # Fail-closed: grant-check failure → unknown grant → 422
+                        logger.warning(
+                            "LAURA-412-002: permission store check failed (%s) — "
+                            "fail-closed, treating cloud-prefixed model %r as ungranted",
+                            _412_exc, selected_model,
+                        )
+                        _412_has_grant = False
+                if not _412_has_grant:
+                    logger.warning(
+                        "LAURA-412-002: cloud-prefixed model %r (canonical: %r, "
+                        "provider: %s) has no alias or permission grant — "
+                        "422 (no silent local fallback). LAURA-412.",
+                        body.model, selected_model, _412_prefix,
+                    )
+                    return JSONResponse(
+                        status_code=422,
+                        content={
+                            "error": {
+                                "message": (
+                                    f"The model '{body.model}' is not available. "
+                                    "Contact an administrator to check the model name."
+                                ),
+                                "type": "invalid_request_error",
+                                "code": "model_not_found",
+                            }
+                        },
+                    )
+
+        # W3-007 (Layer 2 extension — LAURA-V250-W3-007): alias→cloud RBAC gate.
+        # Fires when selected_model is an alias resolving to a cloud model (e.g.
+        # "smart" → "anthropic:claude-sonnet-4-6").  The Layer 2 block above only
+        # fires when ":" is in selected_model; a bare alias name has no colon →
+        # the existing check was skipped → resolved cloud target never checked →
+        # bypass (PoC: 200 with local fallback content).
+        #
+        # Logic mirrors Layer 2: ANY grant (allow OR deny) for the resolved cloud
+        # target proves the admin configured this model → gate passes and LAURA-411-001
+        # below handles explicit-deny.  NO grant → 422 (no silent local fallback).
+        # PRESERVE: a user granted the resolved cloud model still gets the by-design
+        # local-fallback 200 on a keyless demo stack (grant found → gate passes).
+        # Local-target aliases (e.g. fast→qwen2.5:3b, provider=ollama) have
+        # _w3007_resolved_cloud_target=None → this block is skipped entirely.
+        if _w3007_resolved_cloud_target is not None and _state.permission_store is not None:
+            _w3007_target = _w3007_resolved_cloud_target
+            _w3007_prefix = _w3007_target.split(":", 1)[0]
+            _w3007_alias_known = False
+            if _state.model_alias_store is not None:
+                try:
+                    _w3007_alias_known = (
+                        _state.model_alias_store.get(_w3007_target) is not None
+                    )
+                except Exception:  # noqa: BLE001 — store blip; treat as unknown
+                    _w3007_alias_known = False
+            _w3007_has_grant = _w3007_alias_known
+            if not _w3007_has_grant:
+                from yashigani.permissions import ResourceType as _RT_W3007
+                from yashigani.permissions import DEFAULT_ORG_ID as _ORG_W3007
+                try:
+                    # Org level
+                    if _state.permission_store.get_boolean_grant(
+                        _RT_W3007.CLOUD_MODEL, "org", _ORG_W3007, _w3007_target
+                    ) is not None:
+                        _w3007_has_grant = True
+                    # User level
+                    if not _w3007_has_grant and identity:
+                        _w3007_kind = identity.get("kind", "")
+                        _w3007_uid = (
+                            identity.get("identity_id")
+                            if _w3007_kind in ("human", "user") else None
+                        )
+                        if _w3007_uid and _state.permission_store.get_boolean_grant(
+                            _RT_W3007.CLOUD_MODEL, "user", _w3007_uid, _w3007_target
+                        ) is not None:
+                            _w3007_has_grant = True
+                    # Group level
+                    if not _w3007_has_grant and identity:
+                        for _w3007_gid in (identity.get("groups") or []):
+                            if _state.permission_store.get_boolean_grant(
+                                _RT_W3007.CLOUD_MODEL, "group", str(_w3007_gid), _w3007_target
+                            ) is not None:
+                                _w3007_has_grant = True
+                                break
+                except Exception as _w3007_exc:  # noqa: BLE001
+                    # Fail-closed: permission check failure → treat as ungranted → 422
+                    logger.warning(
+                        "W3-007: alias→cloud permission check failed (%s) for "
+                        "alias=%r → resolved=%r — fail-closed (422)",
+                        _w3007_exc, body.model, _w3007_target,
+                    )
+                    _w3007_has_grant = False
+            if not _w3007_has_grant:
+                logger.warning(
+                    "W3-007 DENIED (Layer 2 ext): alias=%r → resolved=%r "
+                    "(provider=%s) has no permission grant for identity=%s — "
+                    "422. LAURA-V250-W3-007.",
+                    body.model, _w3007_target, _w3007_prefix, identity_id,
+                )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": {
+                            "message": (
+                                f"The model '{body.model}' is not available. "
+                                "Contact an administrator to check the model name."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    },
+                )
+
     agent_upstream = None
     agent_protocol = "openai"
     if is_agent_call and _state.agent_registry:
@@ -2765,7 +3168,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 content={
                     "error": {
                         # R2: human-readable message so OWUI displays it in chat.
-                        "message": _owui_deny_message("model_not_allocated"),
+                        "message": _deny_message("model_not_allocated"),
                         "type": "policy_denied",
                         "code": "model_not_allocated",
                     }
@@ -2885,7 +3288,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 status_code=403,
                 content={
                     "error": {
-                        "message": _owui_deny_message(_perm_deny_reason),
+                        "message": _deny_message(_perm_deny_reason),
                         "type": "policy_denied",
                         "code": _perm_deny_reason,
                     }
@@ -2915,7 +3318,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": _owui_deny_message(_perm_deny_reason),
+                            "message": _deny_message(_perm_deny_reason),
                             "type": "policy_denied",
                             "code": _perm_deny_reason,
                         }
@@ -2943,13 +3346,115 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     status_code=403,
                     content={
                         "error": {
-                            "message": _owui_deny_message(_perm_deny_reason),
+                            "message": _deny_message(_perm_deny_reason),
                             "type": "policy_denied",
                             "code": _perm_deny_reason,
                         }
                     },
                     headers={"X-Yashigani-Permission-Reason": _perm_deny_reason},
                 )
+
+    # ── LAURA-411-001: explicit DENY on requested model — routing-independent ──────
+    # The gate above (6a-perm) only fires when selected_provider is a configured cloud
+    # provider (openai/anthropic) or permission_strict is on.  When no cloud key is
+    # configured, selected_provider becomes "ollama" → _perm_is_cloud=False →
+    # _perm_needs_check=False → an explicit user/group DENY grant on the originally-
+    # requested model name (e.g. perm:grant:cloud_model:user:{uid}:openai:gpt-4o =
+    # {allow:false}) is silently skipped and the request is served via Ollama.
+    #
+    # This gate checks ONLY the user/group tiers for an explicit allow=False on
+    # body.model.  It deliberately does NOT consult the org-level ceiling: a missing
+    # org grant for a cloud model on a local-only stack is expected and MUST NOT block
+    # local fallback (that would break every non-cloud Ollama deployment).  Only an
+    # explicit per-user or per-group DENY triggers this path.
+    #
+    # MUST NOT fire when: agent call, brain-reasoning leg, perm_needs_check already ran
+    # (cloud or strict path already handled it), no permission_store, or body.model empty.
+    if (
+        body.model
+        and not is_agent_call
+        and not brain_reasoning_leg
+        and not _perm_needs_check          # cloud gate already ran — don't double-check
+        and _state.permission_store is not None
+    ):
+        from yashigani.permissions import ResourceType as _RT_411
+        _411_kind = identity.get("kind", "") if identity else ""
+        _411_uid: Optional[str] = (
+            identity.get("identity_id")
+            if _411_kind in ("human", "user") else None
+        ) if identity else None
+        _411_groups: list = identity.get("groups", []) if identity else []
+        _411_explicit_deny = False
+        # BUG-A FIX (4.1.2): normalize body.model before deny-grant lookup so
+        # that "openai/gpt-4o", "OPENAI/GPT-4O", and "openai:gpt-4o" all
+        # resolve to the canonical key used when the grant was stored.
+        # normalize_model_for_deny already imported inline at ~1634 for routing;
+        # import again locally to keep the fix self-contained.
+        from yashigani.models.effective import normalize_model_for_deny as _norm_deny_fn
+        _411_model_key = _norm_deny_fn(body.model) or body.model
+        try:
+            if _411_uid:
+                _411_ug = _state.permission_store.get_boolean_grant(
+                    _RT_411.CLOUD_MODEL, "user", _411_uid, _411_model_key
+                )
+                if _411_ug is not None and not _411_ug.allow:
+                    _411_explicit_deny = True
+            if not _411_explicit_deny:
+                for _411_gid in _411_groups:
+                    _411_gg = _state.permission_store.get_boolean_grant(
+                        _RT_411.CLOUD_MODEL, "group", _411_gid, _411_model_key
+                    )
+                    if _411_gg is not None and not _411_gg.allow:
+                        _411_explicit_deny = True
+                        break
+            # W3-007 (LAURA-411-001 extension): also probe the RESOLVED cloud target.
+            # If body.model is an alias pointing to a cloud model, a DENY grant on the
+            # resolved canonical (e.g. deny on anthropic:claude-sonnet-4-6) must block
+            # the alias too — deny follows the resolved target, not just the alias name.
+            # Without this, a caller denied the resolved cloud model could still use its
+            # alias to route through (the alias name has no matching deny grant).
+            if not _411_explicit_deny and _w3007_resolved_cloud_target:
+                _w3007_deny_key = _w3007_resolved_cloud_target
+                if _411_uid:
+                    _w3007_ug = _state.permission_store.get_boolean_grant(
+                        _RT_411.CLOUD_MODEL, "user", _411_uid, _w3007_deny_key
+                    )
+                    if _w3007_ug is not None and not _w3007_ug.allow:
+                        _411_explicit_deny = True
+                if not _411_explicit_deny:
+                    for _w3007_gid in _411_groups:
+                        _w3007_gg = _state.permission_store.get_boolean_grant(
+                            _RT_411.CLOUD_MODEL, "group", _w3007_gid, _w3007_deny_key
+                        )
+                        if _w3007_gg is not None and not _w3007_gg.allow:
+                            _411_explicit_deny = True
+                            break
+        except Exception as _411_exc:
+            logger.error(
+                "PERM (LAURA-411-001) requested-model DENY probe failed: %s — "
+                "fail-closed (denying request)", _411_exc,
+            )
+            _411_explicit_deny = True  # fail-closed per SOP 1
+
+        if _411_explicit_deny:
+            _411_deny_reason = "cloud_model_not_granted"
+            logger.warning(
+                "PERM DENIED (LAURA-411-001): provider=%s routed-model=%s "
+                "requested=%s identity=%s — explicit DENY on requested model "
+                "blocks Ollama fallback",
+                selected_provider, selected_model, body.model, identity_id,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": _deny_message(_411_deny_reason),
+                        "type": "policy_denied",
+                        "code": _411_deny_reason,
+                    }
+                },
+                headers={"X-Yashigani-Permission-Reason": _411_deny_reason},
+            )
 
     # ── Track B1: BIND the FINALLY-SELECTED model to the allocation ──────
     # Runs on the model that will ACTUALLY be served (after optimisation OR the
@@ -3002,7 +3507,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message("model_not_allocated"),
+                    "message": _deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -3035,7 +3540,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message(opa_reason),
+                    "message": _deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -3075,7 +3580,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             content={
                 "error": {
                     # R2: human-readable message so OWUI displays it in chat.
-                    "message": _owui_deny_message("model_not_allocated"),
+                    "message": _deny_message("model_not_allocated"),
                     "type": "policy_denied",
                     "code": "model_not_allocated",
                 }
@@ -3103,7 +3608,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # R2: human-readable message so OWUI displays it in chat.
             # _ce_reason is a comma-joined set of machine deny codes; it is kept
             # in `code` for operator tooling but never shown to the end user.
-            content={"error": {"message": _owui_deny_message("client_policy_denied"),
+            content={"error": {"message": _deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_reason}},
             headers={"X-Yashigani-Client-Policy-Reason": _ce_reason},
         )
@@ -3178,7 +3683,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             status_code=status.HTTP_403_FORBIDDEN,
                             content={
                                 "error": {
-                                    "message": _owui_deny_message("pii_detected"),
+                                    "message": _deny_message("pii_detected"),
                                     "type": "pii_blocked",
                                     "code": "pii_detected",
                                     # Operator/diagnostic fields — not shown in OWUI chat.
@@ -3207,7 +3712,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                         status_code=status.HTTP_403_FORBIDDEN,
                                         content={
                                             "error": {
-                                                "message": _owui_deny_message("pii_detected_encoded"),
+                                                "message": _deny_message("pii_detected_encoded"),
                                                 "type": "pii_blocked",
                                                 "code": "pii_detected_encoded",
                                                 "matched_views": sorted(_msg_res.matched_views),
@@ -3304,7 +3809,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             # stay alive for the duration of the generator, so we wrap the
             # response in a local async generator that owns the client lifetime.
             async def _sse_generator():
-                async with httpx.AsyncClient(timeout=120.0) as _client:
+                # F-001 (chat-stream seam): bare httpx.AsyncClient has no SSL
+                # context → CERTIFICATE_VERIFY_FAILED when ollama_url is
+                # https://caddy:11435/ollama (Mac Metal / mTLS-Ollama front).
+                # Route through ollama_async_client (same fix as model-list).
+                from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                    ollama_async_client as _ollama_ac_sse,
+                )
+                async with _ollama_ac_sse(_state.ollama_url, timeout=120.0) as _client:
                     try:
                         async with _client.stream(
                             "POST",
@@ -3345,28 +3857,36 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         )
                         yield "data: [DONE]\n\n"
 
+            # LAURA-411-004: routing-telemetry headers gated behind flag.
+            # Always present: Request-Id, Model, Generated-Content, PII, Confidence.
+            # Debug-only (YASHIGANI_ROUTING_TELEMETRY=true): Route-Reason, Routed-Via,
+            # Sensitivity, Complexity.
+            _stream_headers: dict[str, str] = {
+                "X-Yashigani-Request-Id": request_id,
+                "X-Yashigani-Model": selected_model,
+                # Budget headers intentionally omitted — see module docstring.
+                # PII header reflects request-path scan only (response is streamed).
+                "X-Yashigani-PII-Detected": "true" if pii_detected_on_request else "false",
+                # F-T10-001: generated-content disclaimer always present.
+                # Confidence defaults to 1.0 on streaming (response body not
+                # yet available when headers are committed); StreamingInspector
+                # flags anomalies in-band via SSE event field, not via header.
+                "X-Yashigani-Generated-Content": "true",
+                "X-Yashigani-Response-Inspection-Confidence": "1.0000",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+            }
+            if _routing_telemetry_enabled():
+                _stream_headers["X-Yashigani-Routed-Via"] = selected_provider
+                _stream_headers["X-Yashigani-Route-Reason"] = (
+                    route_reason.encode("ascii", "replace").decode("ascii")
+                )
+                _stream_headers["X-Yashigani-Sensitivity"] = sensitivity_level
+                _stream_headers["X-Yashigani-Complexity"] = complexity_level
             return StreamingResponse(
                 _sse_generator(),
                 media_type="text/event-stream",
-                headers={
-                    "X-Yashigani-Request-Id": request_id,
-                    "X-Yashigani-Routed-Via": selected_provider,
-                    "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
-                    "X-Yashigani-Model": selected_model,
-                    "X-Yashigani-Sensitivity": sensitivity_level,
-                    "X-Yashigani-Complexity": complexity_level,
-                    # Budget headers intentionally omitted — see module docstring.
-                    # PII header reflects request-path scan only (response is streamed).
-                    "X-Yashigani-PII-Detected": "true" if pii_detected_on_request else "false",
-                    # F-T10-001: generated-content disclaimer always present.
-                    # Confidence defaults to 1.0 on streaming (response body not
-                    # yet available when headers are committed); StreamingInspector
-                    # flags anomalies in-band via SSE event field, not via header.
-                    "X-Yashigani-Generated-Content": "true",
-                    "X-Yashigani-Response-Inspection-Confidence": "1.0000",
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
-                },
+                headers=_stream_headers,
             )
 
         # ── 7b. Buffered path (agent calls + stream=False + streaming disabled) ──
@@ -3664,7 +4184,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if body.temperature is not None:
                     ollama_body["temperature"] = body.temperature
 
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                # F-001 (chat-nonstream seam): bare httpx.AsyncClient has no
+                # SSL context → fails when ollama_url is https:// (Mac Metal /
+                # mTLS-Ollama).  Route through ollama_async_client.
+                from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                    ollama_async_client as _ollama_ac_chat,
+                )
+                async with _ollama_ac_chat(_state.ollama_url, timeout=120.0) as client:
                     resp = await client.post(
                         f"{_state.ollama_url}/api/chat",
                         json=ollama_body,
@@ -4063,7 +4589,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     content={
                         "error": {
                             # R2: human-readable message so OWUI displays it in chat.
-                            "message": _owui_deny_message(resp_opa_reason),
+                            "message": _deny_message(resp_opa_reason),
                             "type": "response_policy_denied",
                             "code": resp_opa_reason,
                         }
@@ -4089,7 +4615,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         return JSONResponse(
             status_code=403,
             # R2: human-readable message so OWUI displays it in chat.
-            content={"error": {"message": _owui_deny_message("client_policy_denied"),
+            content={"error": {"message": _deny_message("client_policy_denied"),
                                "type": "client_policy_denied", "code": _ce_eg_reason}},
             headers={"X-Yashigani-Request-Id": request_id,
                      "X-Yashigani-Client-Policy-Reason": _ce_eg_reason},
@@ -4115,14 +4641,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     )
 
     # ── 10. Return with budget + PII headers ─────────────────────────
+    # LAURA-411-004: routing-telemetry headers gated behind flag (default OFF).
+    # Always present: Request-Id, Model, Elapsed-Ms, Verdict, PII, Generated-Content,
+    # Inspection-Confidence.
+    # Debug-only (YASHIGANI_ROUTING_TELEMETRY=true): Routed-Via, Route-Reason,
+    # Sensitivity, Complexity.
     _pii_detected_any = pii_detected_on_request or pii_detected_on_response
     headers = {
         "X-Yashigani-Request-Id": request_id,
-        "X-Yashigani-Routed-Via": selected_provider,
-        "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
         "X-Yashigani-Model": selected_model,
-        "X-Yashigani-Sensitivity": sensitivity_level,
-        "X-Yashigani-Complexity": complexity_level,
         "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
         "X-Yashigani-Response-Verdict": response_verdict,
         "X-Yashigani-PII-Detected": "true" if _pii_detected_any else "false",
@@ -4132,6 +4659,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         "X-Yashigani-Generated-Content": "true",
         "X-Yashigani-Response-Inspection-Confidence": f"{response_inspection_confidence:.4f}",
     }
+    if _routing_telemetry_enabled():
+        headers["X-Yashigani-Routed-Via"] = selected_provider
+        headers["X-Yashigani-Route-Reason"] = (
+            route_reason.encode("ascii", "replace").decode("ascii")
+        )
+        headers["X-Yashigani-Sensitivity"] = sensitivity_level
+        headers["X-Yashigani-Complexity"] = complexity_level
     # G-ORCH-OPA-3: signal a relaxed brain-reasoning turn so the orchestration
     # loop routes any relaxed final/prose answer through the NON-relaxed egress
     # gate (the load-bearing leak guard, condition 4).  Present ONLY on a leg
@@ -4253,16 +4787,16 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             "zero-trust fail-closed",
             request_id,
         )
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "POST /v1/embeddings requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate via "
-                    "the SSO flow (X-Forwarded-User header from Caddy)."
-                ),
-                "request_id": request_id,
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
 
@@ -4307,7 +4841,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message("prompt_injection_only"),
+                    "message": _deny_message("prompt_injection_only"),
                     "type": "request_injection_blocked",
                     "code": "prompt_injection_only",
                 }},
@@ -4330,7 +4864,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 classification="PROMPT_INJECTION_ONLY", detected_pattern=_ephit,
                 content=classification_text, confidence=1.0)
             return JSONResponse(status_code=403, content={"error": {
-                "message": _owui_deny_message("prompt_injection_only"),
+                "message": _deny_message("prompt_injection_only"),
                 "type": "request_injection_blocked", "code": "prompt_injection_only"}},
                 headers={"X-Yashigani-Request-Id": request_id,
                          "X-Yashigani-Detection-Layer": "mechanical_promoted"})
@@ -4374,7 +4908,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message("request_inspection_error"),
+                    "message": _deny_message("request_inspection_error"),
                     "type": "request_inspection_error",
                     "code": "request_inspection_error",
                 }},
@@ -4395,7 +4929,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             return JSONResponse(
                 status_code=403,
                 content={"error": {
-                    "message": _owui_deny_message(_ereason),
+                    "message": _deny_message(_ereason),
                     "type": "request_injection_blocked",
                     "code": _ereason,
                 }},
@@ -4498,7 +5032,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message(opa_reason),
+                    "message": _deny_message(opa_reason),
                     "type": "policy_denied",
                     "code": opa_reason,
                 }
@@ -4545,7 +5079,7 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": _owui_deny_message("routing_unsafe_sensitive_to_cloud"),
+                    "message": _deny_message("routing_unsafe_sensitive_to_cloud"),
                     "type": "policy_denied",
                     "code": "routing_unsafe_sensitive_to_cloud",
                 }
@@ -4656,7 +5190,13 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
                 "model": selected_model,
                 "input": raw_input,  # Ollama /api/embed accepts str or list[str]
             }
-            async with _httpx.AsyncClient(timeout=60.0) as _client:
+            # F-001 (embed seam): bare httpx.AsyncClient has no SSL context →
+            # fails when ollama_url is https:// (Mac Metal / mTLS-Ollama front).
+            # Route through ollama_async_client (same fix as model-list / chat).
+            from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+                ollama_async_client as _ollama_ac_embed,
+            )
+            async with _ollama_ac_embed(_state.ollama_url, timeout=60.0) as _client:
                 resp = await _client.post(
                     f"{_state.ollama_url}/api/embed",
                     json=ollama_body,
@@ -4736,16 +5276,21 @@ async def create_embeddings(body: EmbeddingRequest, request: Request):
         except Exception as _ae:
             logger.warning("Embeddings audit write failed: %s", _ae)
 
+    # LAURA-411-004: routing-telemetry headers gated (same gate as /v1/chat/completions).
+    _emb_headers: dict[str, str] = {
+        "X-Yashigani-Request-Id": request_id,
+        "X-Yashigani-Model": actual_model,
+        "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
+    }
+    if _routing_telemetry_enabled():
+        _emb_headers["X-Yashigani-Routed-Via"] = selected_provider
+        _emb_headers["X-Yashigani-Route-Reason"] = (
+            route_reason.encode("ascii", "replace").decode("ascii")
+        )
+        _emb_headers["X-Yashigani-Sensitivity"] = sensitivity_level
     return JSONResponse(
         content=response.model_dump(),
-        headers={
-            "X-Yashigani-Request-Id": request_id,
-            "X-Yashigani-Routed-Via": selected_provider,
-            "X-Yashigani-Route-Reason": route_reason.encode("ascii", "replace").decode("ascii"),
-            "X-Yashigani-Model": actual_model,
-            "X-Yashigani-Sensitivity": sensitivity_level,
-            "X-Yashigani-Elapsed-Ms": str(elapsed_ms),
-        },
+        headers=_emb_headers,
     )
 
 
@@ -4761,7 +5306,7 @@ async def list_models(request: Request):
     Open WebUI carries the admin session cookie (it lives at /chat/* behind
     the same Caddy auth) so the picker still populates after login. MCP
     clients that hit `/v1/models` directly must present a valid Bearer
-    token or X-Forwarded-User header to enumerate.
+    token or X-Yashigani-Identity-Id (SSO via Caddy) to enumerate.
 
     v2.24.1 — GAP-001 (Iris audit): OPA evaluation added after identity
     resolution.  Human/admin principals receive full list; service-account
@@ -4774,15 +5319,16 @@ async def list_models(request: Request):
 
     identity = _resolve_identity(request)
     if not identity:
+        # LAURA-411-004: generic OpenAI-format 401 — no internal header names or
+        # auth-architecture details in the response body. Full reason in server log only.
         raise HTTPException(
             status_code=401,
             detail={
-                "error": "AUTHENTICATION_REQUIRED",
-                "detail": (
-                    "GET /v1/models requires an authenticated identity. "
-                    "Provide Authorization: Bearer <api_key> or authenticate "
-                    "via the admin SSO flow."
-                ),
+                "error": {
+                    "message": "Authentication required",
+                    "type": "authentication_error",
+                    "code": "unauthorized",
+                },
             },
         )
 
@@ -4848,9 +5394,16 @@ async def list_models(request: Request):
     # Add local Ollama models — exposed on full filter; for restricted filter,
     # only models in allowed_models_set (if set is non-empty).
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{_state.ollama_url}/api/tags")
+        # F-001 (model-list seam): bare httpx.AsyncClient has no SSL context and
+        # fails CERTIFICATE_VERIFY_FAILED when ollama_url is
+        # https://caddy:11435/ollama (Mac Metal / any mTLS-Ollama front).
+        # Route through ollama_async_client so the internal PKI context is loaded
+        # for https URLs; plain http://ollama:11434 falls through unchanged.
+        from yashigani.inspection._ollama_transport import (  # noqa: PLC0415
+            ollama_async_client as _ollama_async_client,
+        )
+        async with _ollama_async_client(_state.ollama_url, timeout=5.0) as client:
+            resp = await client.get(f"{_state.ollama_url.rstrip('/')}/api/tags")
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
                     model_name = m.get("name", "")
@@ -4890,7 +5443,7 @@ async def list_models(request: Request):
             logger.warning("Failed to list agents for models: %s", exc)
 
     # Add any statically configured models
-    for m in _state.available_models:
+    for m in (_state.available_models or []):
         model_id = m.get("id", "")
         if opa_filter == "full" or (allowed_models_set is not None and model_id in allowed_models_set):
             models.append(ModelInfo(
@@ -5115,13 +5668,18 @@ def _resolve_identity(request: Request) -> Optional[dict]:
     """
     Resolve identity from request.
 
-    Priority:
+    Priority (4.1 SEC-GAP-1):
     1. yashigani-internal Bearer token (mesh-port internal service calls)
-    2. X-Forwarded-User header (SSO via Caddy)
+       → X-Yashigani-Identity-Id for per-user on forwarder path
+    2. request.state.ysg_principal (pre-resolved by proxy.py boundary block
+       from X-Yashigani-Identity-Id for SSO/browser-session path via Caddy)
     3. Authorization: Bearer <api_key> (registry lookup)
 
+    X-Forwarded-User / X-OpenWebUI-User-Email paths REMOVED in 4.1.
+    Fail-closed: no bearer + no pre-resolved UID + no api-key → returns None → 401.
+
     The yashigani-internal check is intentionally placed BEFORE the
-    identity_registry null-guard so that Open WebUI's hardcoded internal
+    identity_registry null-guard so that the hardcoded internal
     token resolves even when the identity registry is temporarily
     unavailable (e.g. Redis not yet reachable at startup).  Network
     isolation on the data bridge / K8s NetworkPolicy is the transport-
@@ -5167,33 +5725,27 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
                     )
-                # 4.0: prefer X-Yashigani-Identity-Id (idnt_ PK) over the email header.
+                # 4.1 SEC-GAP-1: X-Yashigani-Identity-Id only — no email/slug path.
                 # _resolve_yashigani_identity_id_header raises 403/503 on failure so
-                # control NEVER falls through to the email path when the idnt_ header
-                # is present (fail-closed per LAURA-4.0-S1-001).
+                # control NEVER falls through when the idnt_ header is present
+                # (fail-closed per LAURA-4.0-S1-001).
                 yashigani_identity = _resolve_yashigani_identity_id_header(request)
                 if yashigani_identity is not None:
                     return yashigani_identity
-                # Backward compat: 3.x OWUI forwarder sends X-OpenWebUI-User-Email.
-                owui_identity = _resolve_owui_forwarded_user(request)
-                if owui_identity is not None:
-                    return owui_identity
+                # No UID header → service internal (RESTRICTED), no phantom default.
                 return {"identity_id": "internal", "status": "active", "kind": "service",
                         "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED"}
 
             elif role_class in ("p1_agent", "p1_nhi"):
                 # P1 agent/NHI: resolve as OWN identity only.
                 # Strip any P2 impersonation headers and emit security event.
+                # 4.1 SEC-GAP-1: X-OpenWebUI-User-Email check removed; strip
+                # X-Yashigani-Identity-Id + orchestration-principal only.
                 orch_hdr = request.headers.get("x-yashigani-orchestration-principal", "")
-                owui_hdr = request.headers.get(_OWUI_USER_EMAIL_HEADER, "")
                 identity_id_hdr = request.headers.get(_YASHIGANI_IDENTITY_ID_HEADER, "")
                 if orch_hdr:
                     _emit_agent_header_stripped(
                         "x-yashigani-orchestration-principal", role_class, token_identity_id
-                    )
-                if owui_hdr:
-                    _emit_agent_header_stripped(
-                        _OWUI_USER_EMAIL_HEADER, role_class, token_identity_id
                     )
                 if identity_id_hdr:
                     _emit_agent_header_stripped(
@@ -5262,26 +5814,16 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     return real
 
             # ── Track C (F-B): trusted-forwarder per-user resolution ──
-            # Priority 1 (4.0 native WebUI): X-Yashigani-Identity-Id (idnt_ PK).
-            #   The 4.0 backoffice chat proxy resolves identity_id from the session's
-            #   account_id and forwards the idnt_ PK directly.  No slug/email
-            #   derivation needed — the PK is looked up directly in the registry.
-            #   Fail-closed: if header present but identity not found → 403 (no fallback).
-            #
-            # Priority 2 (3.x OWUI backward compat): X-OpenWebUI-User-Email.
-            #   OWUI (3.x) sets this to the user's email; the gateway derives a slug.
-            #   Preserved so existing 3.x deployments are unaffected.
-            #
+            # 4.1 SEC-GAP-1: X-Yashigani-Identity-Id ONLY (idnt_ PK).
+            #   The backoffice chat proxy forwards the idnt_ PK directly.
+            #   Fail-closed: header present but not in registry → 403 (no fallback).
+            #   X-OpenWebUI-User-Email / X-Forwarded-User paths removed.
             # ORDERING: runs AFTER orchestration-principal check. Brain/in-mesh agent
-            # self-calls carry NEITHER header; they fall through to `internal`.
-            # SPOOFING DEFENSE: only inside the proven-internal-bearer branch; an
-            # external caller without the bearer never reaches this code.
+            # self-calls carry neither header; they fall through to `internal`.
+            # SPOOFING DEFENSE: only inside the proven-internal-bearer branch.
             yashigani_identity = _resolve_yashigani_identity_id_header(request)
             if yashigani_identity is not None:
                 return yashigani_identity
-            owui_identity = _resolve_owui_forwarded_user(request)
-            if owui_identity is not None:
-                return owui_identity
 
             return {"identity_id": "internal", "status": "active", "kind": "service",
                     "groups": [], "allowed_models": [], "sensitivity_ceiling": "RESTRICTED",
@@ -5310,37 +5852,14 @@ def _resolve_identity(request: Request) -> Optional[dict]:
         if _oir_identity is not None:
             return _oir_identity
         # principal was pre-resolved but registry blip prevented dict fetch —
-        # fall through to legacy paths rather than fail-open with partial data
+        # fall through to API-key auth rather than fail-open with partial data
 
-    # ── SSO headers (from Caddy) ── LAURA-OBS-B: trust-gate X-Forwarded-User ──
-    # X-Forwarded-User is the 3.x SSO identity Caddy's forward_auth re-injects.
-    # In 4.x the canonical header is X-Yashigani-Identity-Id (above); this path
-    # is preserved for backward-compat with 3.x Caddyfile deployments only.
-    #
-    # ASYMMETRY CLOSED: X-OpenWebUI-User-* is honoured ONLY inside the proven
-    # internal-bearer branch above, but X-Forwarded-User was previously honoured
-    # here UNCONDITIONALLY.  On the mesh listener (8081) CaddyVerifiedMiddleware is
-    # NOT active (mesh_entrypoint: "N/A for direct mesh calls"), so a raw in-mesh
-    # caller (e.g. OWUI's own network) could set `X-Forwarded-User: coderuser` and
-    # be served coderuser's identity — an in-mesh identity-reassignment primitive.
-    # Caddy strips it at the public edge so it is not edge-exploitable today, but
-    # the latent asymmetry is closed here.
-    #
-    # FIX: honour X-Forwarded-User ONLY when the request carries a VALID
-    # X-Caddy-Verified-Secret — the SAME cryptographic trust proof that anchors the
-    # legitimate Caddy forward_auth/SSO path.  A genuine SSO request (proxied
-    # through Caddy 8080) always carries it, so the per-user API/SSO path is
-    # preserved byte-for-byte.  A raw mesh caller without the secret is IGNORED
-    # (falls through to API-key auth below).  validate_caddy_secret fail-closes
-    # when the secret is unloaded (returns False), so this never fail-opens.
-    from yashigani.auth.caddy_verified import validate_caddy_secret
-    forwarded_user = request.headers.get("X-Forwarded-User")
-    if forwarded_user and validate_caddy_secret(
-        request.headers.get("X-Caddy-Verified-Secret", "")
-    ):
-        identity = _state.identity_registry.get_by_slug(forwarded_user)
-        if identity:
-            return identity
+    # 4.1 SEC-GAP-1: X-Forwarded-User / slug-based SSO path removed.
+    # SSO identity now flows exclusively via X-Yashigani-Identity-Id (idnt_ PK),
+    # pre-resolved by proxy.py 0b boundary block into request.state.ysg_principal
+    # (handled above).  No X-Forwarded-User / get_by_slug() on this path.
+    # Fail-closed: no valid UID pre-resolution → falls through to API-key auth
+    # below; no bearer + no api-key → returns None → 401.
 
     # API key (registry lookup)
     if auth.startswith("Bearer "):

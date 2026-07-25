@@ -149,6 +149,29 @@ RUN mkdir -p /data/audit /data/bootstrap /var/log/yashigani && \
     chown -R yashigani:yashigani /data /var/log/yashigani /app 2>/dev/null || true && \
     chmod -R a+rX /usr/local/lib/python3.14/site-packages/yashigani/ 2>/dev/null || true
 
+# FINDING-V412-DOCKER-VOL-001 (Su, 2026-07-22): backoffice is the CLIENT side
+# of the caddy_broker_route_sock named volume, mounted at
+# /run/caddy-broker-route (see docker-compose.yml backoffice volumes — it
+# connects OUT to caddy-config-broker's /route contract; it never creates
+# anything in this directory itself). caddy-config-broker (UID 65532) is the
+# actual writer/binder of route.sock inside this directory (see
+# docker/caddy/Dockerfile.caddy-broker for the matching fix + full
+# root-cause writeup). Docker Compose gives no depends_on ordering between
+# backoffice and caddy-config-broker, so EITHER container's image may
+# initialise this fresh named volume first — a plain named volume inherits
+# ownership from whichever image directory mounts it first. Owning this
+# directory identically (65532:65532, 0755) in BOTH images means the
+# broker can always create route.sock here regardless of start order,
+# even though backoffice itself runs as UID 1001 (yashigani) — this chown
+# targets the OTHER container's UID by design, mirroring the existing
+# caddy_broker_agents pattern (docker/caddy/Dockerfile.caddy chowns that
+# volume's directory to the broker's UID too, for the identical reason).
+# 0755 is sufficient for backoffice (traverse only — connect() needs no
+# directory write; config_broker.py chmods route.sock itself to 0666).
+RUN mkdir -p /run/caddy-broker-route && \
+    chown 65532:65532 /run/caddy-broker-route && \
+    chmod 0755 /run/caddy-broker-route
+
 # umask 0077 wrapper — sets file-creation mask before uvicorn starts so
 # every runtime-written file (audit logs, alembic state, Python open())
 # defaults to 0600 (owner-only), not 0644. Defence-in-depth; closes the

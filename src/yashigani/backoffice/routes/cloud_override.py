@@ -35,6 +35,15 @@ class ProposeRequest(BaseModel):
     ttl_hours: int = Field(default=4, ge=1, le=72)
 
 
+class ApproveRequest(BaseModel):
+    """BUG-C FIX (4.1.2): SOD-1 fix (fc7edfb2) added confirming_fingerprint to
+    CloudOverrideManager.approve(), but the route still called approve(account_id)
+    with one arg → TypeError → 500.  Callers must now supply the fingerprint
+    returned by /propose (proposal_fingerprint field).
+    """
+    confirming_fingerprint: str = Field(min_length=1, max_length=256)
+
+
 def _mgr():
     m = backoffice_state.cloud_override_manager
     if m is None:
@@ -64,10 +73,15 @@ async def cloud_override_propose(body: ProposeRequest, session: StepUpAdminSessi
 
 
 @router.post("/approve")
-async def cloud_override_approve(session: StepUpAdminSession):
-    """Admin 2 approves -> ACTIVE. Must be a different admin from the proposer."""
+async def cloud_override_approve(body: ApproveRequest, session: StepUpAdminSession):
+    """Admin 2 approves -> ACTIVE. Must be a different admin from the proposer.
+
+    ``confirming_fingerprint`` must match the SHA-256 fingerprint returned as
+    ``proposal_fingerprint`` by /propose (SOD-1 swap-attack prevention).
+    Mismatch → 409; missing field → 422 (Pydantic validation).
+    """
     try:
-        state = _mgr().approve(session.account_id)
+        state = _mgr().approve(session.account_id, body.confirming_fingerprint)
     except ApprovalError as exc:
         raise HTTPException(status_code=409, detail={"error": "approval_failed", "message": str(exc)})
     _log.warning("Admin %s APPROVED cloud override (now ACTIVE)", session.account_id)

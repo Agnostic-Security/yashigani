@@ -47,6 +47,8 @@ import os
 import sys
 import unittest.mock as mock
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,6 +124,11 @@ AUTH = {"Authorization": f"Bearer {BEARER}"}
 def test_t1_bearer_plus_email_resolves_registered_user():
     """B5 fix: slug is now canonical email_to_slug("alice@corp.example")
     = "alice-corp-example", not the local-part "alice"."""
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "superseded by X-Yashigani-Identity-Id tests in "
+        "test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env({})
     # Register under the canonical slug, as the login handler does.
     alice = _mk_identity("alice-corp-example", groups=["engineering"],
@@ -138,6 +145,11 @@ def test_t1_bearer_plus_email_resolves_registered_user():
 
 def test_t2_two_users_get_two_different_rbac():
     """B5 fix: slugs are canonical email_to_slug values, not local-parts."""
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "superseded by X-Yashigani-Identity-Id tests in "
+        "test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env({})
     alice = _mk_identity("alice-corp-example", groups=["eng"], allowed_models=["gpt-4o"])
     bob = _mk_identity("bob-corp-example", groups=["sales"], allowed_models=["qwen2.5:3b"])
@@ -157,6 +169,12 @@ def test_t2_two_users_get_two_different_rbac():
 
 
 def test_t3_no_match_uses_registered_default_slug():
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "YASHIGANI_OWUI_DEFAULT_SLUG env var no longer has any effect; "
+        "superseded by X-Yashigani-Identity-Id tests in "
+        "test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env({"YASHIGANI_OWUI_DEFAULT_SLUG": "owui-users"})
     default = _mk_identity("owui-users", kind="service",
                            groups=["owui-users"], allowed_models=["qwen2.5:3b"],
@@ -170,6 +188,12 @@ def test_t3_no_match_uses_registered_default_slug():
 
 
 def test_t4_no_match_no_default_falls_to_baseline_restricted():
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "_owui_baseline marker no longer emitted; fail-closed 403 via "
+        "_resolve_yashigani_identity_id_header when idnt_ key absent from registry; "
+        "superseded by test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env({"YASHIGANI_OWUI_DEFAULT_SLUG": "owui-users"})
     # Empty registry — neither user slug nor default slug registered.
     mod._state.identity_registry = _FakeRegistry({})
@@ -231,6 +255,12 @@ def test_t7_no_bearer_spoofed_email_no_apikey_is_none():
 
 
 def test_t8_slug_map_override():
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "YASHIGANI_OWUI_SLUG_MAP env var no longer has any effect; "
+        "superseded by X-Yashigani-Identity-Id tests in "
+        "test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env(
         {"YASHIGANI_OWUI_SLUG_MAP": '{"weird.login@corp.example": "alice"}'})
     alice = _mk_identity("alice", allowed_models=["gpt-4o"])
@@ -251,6 +281,12 @@ def test_t9_malformed_empty_email_is_flat_internal_not_elevated():
 
 
 def test_t10_registry_unavailable_under_bearer_fails_closed_to_baseline():
+    pytest.skip(
+        "OWUI X-OpenWebUI-User-Email forwarding path removed in 4.1 SEC-GAP-1 — "
+        "_owui_baseline marker no longer emitted; registry-unavailable on the "
+        "X-Yashigani-Identity-Id path now raises 503 (fail-closed HTTPException); "
+        "superseded by test_secgap1_uid_unification.py::TestOpenAIRouterResolveIdentity"
+    )
     mod = _load_router_with_env({})
     mod._state.identity_registry = None
     req = _FakeRequest({**AUTH, "X-OpenWebUI-User-Email": "alice@corp.example"})

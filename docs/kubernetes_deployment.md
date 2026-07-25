@@ -19,21 +19,50 @@ Optional but recommended:
 
 ### Docker Desktop Kubernetes — Image Preflight
 
-If you are testing on **Docker Desktop's built-in Kubernetes** (single-node, local development): a Docker Desktop restart, K8s reset, or Docker Engine upgrade evicts all images from the embedded containerd runtime. After any of these events, the gateway/backoffice images that Helm references will not be present locally and pods will hang in `ImagePullBackOff` (since `imagePullPolicy: IfNotPresent` is the chart default and no remote pull is configured for locally-built images).
+**SUPERSEDED 2026-07-24 (YSG-RISK-123) — do not follow the old manual steps below by hand.**
+`install.sh --mode k8s` now runs `k8s_ensure_fresh_local_images` automatically before every
+Helm install/upgrade: it builds gateway/backoffice/caddy-config-broker/extractor fresh from
+current source, pushes them to an ephemeral local registry, points the chart at that registry
+(`global.imageRegistry`/`imageOwner`), and — after rollout — verifies the DEPLOYED pod's image
+digest matches what was just pushed (`k8s_verify_image_provenance`), failing the install loud
+on mismatch. Use `scripts/k8s-install.sh` / `install.sh --mode k8s` as the entry point; only
+reach for the manual commands below if you deliberately passed `--skip-k8s-image-build`.
 
-Run this preflight before `helm install` / `helm upgrade` whenever Docker Desktop K8s has restarted:
+**Root cause of the old guidance being wrong:** Docker Desktop's embedded Kubernetes runs
+kubelet against a SEPARATE containerd store inside a kind-style node (`kubectl get nodes`
+shows `desktop-control-plane`), not the top-level dockerd store `docker build` populates.
+Live-verified 2026-07-24: a plain `docker build`-ed image stayed `ErrImageNeverPull` under a
+Pod with `imagePullPolicy: Never` for 60s+ (no auto-sync); the SAME image pushed to a registry
+at `localhost:5000` and referenced as `localhost:5000/<repo>:<tag>` pulled in 94ms. The manual
+commands previously documented here (a) never pushed anywhere, so they could silently leave a
+STALE image in place with no error at all, and (b) built the images under the compose-path
+SLASH name (`yashigani/gateway`) while the chart's default `values.yaml` expects the HYPHEN
+name (`yashigani-gateway`) — a different local image entirely. See
+`FINDING-V412-K8S-STALE-BACKOFFICE-IMAGE.md` for full root-cause detail and live evidence.
+
+<details>
+<summary>Manual fallback (only with --skip-k8s-image-build)</summary>
 
 ```bash
-# Rebuild local images
-docker build -f docker/Dockerfile.gateway -t yashigani/gateway:2.23.2 .
-docker build -f docker/Dockerfile.backoffice -t yashigani/backoffice:2.23.2 .
+# Rebuild local images under the EXACT names the chart's values.yaml expects
+# (hyphen, not slash) and push to a registry the cluster can actually reach —
+# a bare `docker build` is NOT visible to Docker Desktop's k8s kubelet.
+docker build -f docker/Dockerfile.gateway    -t localhost:5000/local/yashigani-gateway:4.1.2    .
+docker build -f docker/Dockerfile.backoffice -t localhost:5000/local/yashigani-backoffice:4.1.2 .
+docker run -d --name yashigani-k8s-local-registry -p 5000:5000 registry:2  # if not already running
+docker push localhost:5000/local/yashigani-gateway:4.1.2
+docker push localhost:5000/local/yashigani-backoffice:4.1.2
+helm upgrade yashigani ./helm/yashigani -n yashigani \
+  --set global.imageRegistry=localhost:5000 --set global.imageOwner=local
 
 # Re-pull base images that DD K8s evicted alongside
 docker pull redis:7-alpine
 docker pull postgres:16-alpine
 ```
 
-This step is **not required** on managed K8s (EKS/GKE/AKS/k3s/k8s-on-VMs) where the container runtime persists images across cluster restarts.
+</details>
+
+This step is **not required** on managed K8s (EKS/GKE/AKS/k3s/k8s-on-VMs) where the container runtime persists images across cluster restarts, or where images are pulled from a real registry with an immutable per-release tag/digest.
 
 ---
 

@@ -46,6 +46,13 @@ class EventType(str, Enum):
     # ACCOUNT_LOCKOUT: emitted when an account is locked out due to failed
     # password or TOTP attempts (ASVS V2.1.5 / NIST 800-63B §5.2.2).
     ACCOUNT_LOCKOUT = "ACCOUNT_LOCKOUT"
+    # v4.1.2 LAURA-412-CRITICAL: AUTH_THROTTLE_TRIGGERED — emitted whenever
+    # /auth/login or the WebAuthn login flow is rejected with HTTP 429 by the
+    # pre-auth throttle gate, as opposed to a 401 credential failure. Gives a
+    # dedicated forensic trail distinguishing "denied for exceeding the
+    # throttle" from "denied for bad credentials" (previously only a
+    # logger.warning line existed). ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+    AUTH_THROTTLE_TRIGGERED = "AUTH_THROTTLE_TRIGGERED"
     # PASSWORD_CHANGED: distinct from CONFIG_CHANGED — dedicated event for
     # self-service and forced password changes with audit-trail clarity.
     PASSWORD_CHANGED = "PASSWORD_CHANGED"
@@ -424,6 +431,12 @@ class EventType(str, Enum):
     # v4.1 unified-sidecar Phase 1 (Lu M1) — a (caller SPIFFE, egress prefixes)
     # grant was written inside the step-up-gated approve transaction.
     MCP_EGRESS_GRANT_WRITTEN = "MCP_EGRESS_GRANT_WRITTEN"
+    # FINDING-V412-ONBOARDING-ROBUSTNESS #4 (Tom, 2026-07-21) — the per-agent
+    # decommission transaction (mirror-image of the approve transaction):
+    # broker route removed, SVID leaf revoked, durable-registry entries
+    # deleted, capability envelope transitioned active->decommissioned.
+    MCP_DECOMMISSION_TRANSACTION_FAILED = "MCP_DECOMMISSION_TRANSACTION_FAILED"
+    MCP_DECOMMISSIONED = "MCP_DECOMMISSIONED"
     # P1/P2 header isolation — SECURITY event (HIGH severity)
     # Emitted when a P1 (agent-only) caller presents a P2 (user-assertion) header.
     # The header is silently stripped; this event is the regression canary.
@@ -526,6 +539,16 @@ class EventType(str, Enum):
     # An INERT pending registry record was written (no leaf, no grant, no envelope).
     # Surfaces in nhi-approvals.js as "discovered — pending admin approval".
     LANGFLOW_FLOW_DISCOVERED = "LANGFLOW_FLOW_DISCOVERED"
+    # ---------------------------------------------------------------------------
+    # RESTART-013 gap #5 — document enforcement decision + audit obligation
+    # execution.  policy/document.rego ALWAYS carries "audit_document_decision"
+    # in its obligations list; before this event existed nothing dispatched that
+    # obligation into the tamper-evident chain (both backoffice document routes
+    # + the gateway's own mode-B pipeline construction only ever logged to
+    # stdout, or nowhere at all).  Every DocumentInspectionPipeline decision
+    # (LOG/REDACT/PSEUDONYMIZE/BLOCK/ROUTE_LOCAL) now writes one of these.
+    # ASVS V7.3.4 (sensitive-data audit) / CMMC AU.L2-3.3.1.
+    DOCUMENT_ENFORCEMENT_DECISION = "DOCUMENT_ENFORCEMENT_DECISION"
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +750,34 @@ class AccountLockoutEvent(AuditEvent):
     lockout_type: str = ""  # "password" | "totp"
     failed_attempts: int = 0
     lockout_duration_seconds: int = 0
+
+
+@dataclass
+class AuthThrottleTriggeredEvent(AuditEvent):
+    """
+    Written whenever a login attempt is rejected with HTTP 429 by the
+    account-gated pre-auth throttle (auth.py::_apply_auth_throttle /
+    webauthn_v1.py), as distinct from a 401 credential failure.
+
+    v4.1.2 LAURA-412-CRITICAL fix: the throttle previously had no audit
+    trail of its own — only logger.warning lines — making it impossible to
+    forensically distinguish "denied by the throttle" from "denied for bad
+    credentials" after the fact. ASVS V7.2.1 / CMMC AU.L2-3.3.1.
+
+    account_throttle_level / ip_throttle_level: the two bucket levels read
+    at decision time (see auth.py module docstring — the account level is
+    the sole gate, the IP level is a severity modifier only).
+    delay_seconds: the Retry-After value actually returned to the caller.
+    """
+
+    event_type: str = EventType.AUTH_THROTTLE_TRIGGERED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    admin_account: str = ""
+    client_ip_prefix: str = ""
+    account_throttle_level: int = 0
+    ip_throttle_level: int = 0
+    delay_seconds: int = 0
 
 
 @dataclass
@@ -2529,6 +2580,10 @@ class CloudOverrideEvent(AuditEvent):
     initiated_by: str = ""
     approver: str = ""
     expires_at: str = ""
+    # SOD-1 (YCS-20260705-v4.1.2-SOD-1): the SHA-256 fingerprint the approver supplied
+    # to bind their approval to the exact proposal they reviewed.  Present on
+    # CLOUD_OVERRIDE_ACTIVATED; empty string on PROPOSED/REVOKED.
+    confirming_fingerprint: str = ""
 
 
 @dataclass
@@ -3841,6 +3896,67 @@ class McpEgressGrantWrittenEvent(AuditEvent):
 
 
 @dataclass
+class McpDecommissionTransactionFailedEvent(AuditEvent):
+    """The MCP decommission transaction ABORTED partway through (best-effort
+    reversal — see mcp_onboard.py run_decommission_transaction docstring).
+
+    Unlike the approve transaction, decommission does NOT roll back what it
+    already undid: a partially-reversed onboarding is strictly SAFER than the
+    original state (every reversed step tightens, never loosens, the deny
+    posture — e.g. the broker route or the active envelope, once removed,
+    stays removed even if a later step fails). This event records exactly
+    which step raised so the operator can finish the remaining steps by hand
+    or retry (the whole transaction is idempotent).
+
+    failed_step: which reversal step raised (route_unregister / registry /
+                 envelope_decommission / svid_revoke).
+    error_type:  exception class name only (paths/messages stay in app logs).
+    """
+
+    event_type: str = EventType.MCP_DECOMMISSION_TRANSACTION_FAILED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    failed_step: str = ""
+    error_type: str = ""
+
+
+@dataclass
+class McpDecommissionedEvent(AuditEvent):
+    """A ring_fenced MCP agent was cleanly decommissioned (FINDING-V412-
+    ONBOARDING-ROBUSTNESS #4): broker route removed, SVID leaf revoked,
+    durable-registry entries deleted, capability envelope transitioned
+    active->decommissioned. Component-isolated — only this (tenant_id,
+    server_id) pair's resources are touched; no other agent or core service
+    is affected.
+
+    container_teardown_mode: "keep" (container/volumes preserved for a future
+                              re-onboard) or "nuke" (operator intends full
+                              removal) — informational only; backoffice has
+                              NO docker/podman socket access (LAURA-30-001 /
+                              YSG-RISK-080) and therefore performs the
+                              application-layer reversal only. The response
+                              carries the exact scoped compose/helm commands
+                              for the operator (or install.sh) to run for the
+                              container+volume layer.
+    """
+
+    event_type: str = EventType.MCP_DECOMMISSIONED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    approver_account: str = ""
+    tenant_id: str = ""
+    server_id: str = ""
+    instance_id: str = ""
+    spiffe_id: str = ""
+    container_teardown_mode: str = ""
+
+
+@dataclass
 class NhiInvocationAllowedEvent(AuditEvent):
     """OPA allowed an NHI-originated hop (RISK-097 invariant pass)."""
 
@@ -4585,3 +4701,53 @@ class LangflowFlowDiscoveredEvent(AuditEvent):
         "All flows under this instance share the union egress grant. "
         "Per-flow isolation requires per-instance containers (Track 3+)."
     )
+
+
+# ---------------------------------------------------------------------------
+# RESTART-013 gap #5 — document enforcement decision audit event
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DocumentEnforcementDecisionEvent(AuditEvent):
+    """Executes the "audit_document_decision" OPA obligation
+    (policy/document.rego) — the tamper-evident record of ONE
+    DocumentInspectionPipeline decision (LOG/REDACT/PSEUDONYMIZE/BLOCK/
+    ROUTE_LOCAL), replacing the pre-RESTART-013 state where every call site
+    either logged to stdout only (``logger.info``) or nowhere at all (the
+    gateway's own mode-B pipeline construction passed no ``on_audit`` at all).
+
+    Security invariants (immutable floors, mirrors PIIDetectedEvent):
+      - Raw document bytes / raw match values are NEVER stored — only
+        data_class labels + counts (the pipeline's own audit dict already
+        enforces this; this event just carries it through to the chain).
+      - masking_applied is always True.
+      - identity_id is the caller's canonical Yashigani identity ("idnt_...")
+        when resolved, else "" — the RESTART-013 gap #4 per-user dimension the
+        decision was evaluated under.
+
+    ASVS V7.3.4 (sensitive-data audit) / CMMC AU.L2-3.3.1.
+    """
+
+    event_type: str = EventType.DOCUMENT_ENFORCEMENT_DECISION
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    surface: str = ""              # "admin-inspect" | "user-upload" | "proxy-egress" | "mcp-tool-call" | ...
+    disposition: str = ""          # LOG | REDACT | PSEUDONYMIZE | BLOCK | ROUTE_LOCAL
+    detected_format: str = ""
+    match_count: int = 0
+    identity_id: str = ""          # RESTART-013 gap #4 — "" when unresolved
+    tenant: str = ""
+    obligations: list = None       # type: ignore[assignment]
+    # The pipeline's own per-decision audit fields (event_type/disposition/
+    # detected_format/segment_count/match_count/matches[masked]/etc — see
+    # documents/pipeline.py _log/_redact/_pseudonymize/_block). Never raw values.
+    pipeline_event_type: str = ""
+    pipeline_audit_fields: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.obligations is None:
+            self.obligations = []
+        if self.pipeline_audit_fields is None:
+            self.pipeline_audit_fields = {}

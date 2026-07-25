@@ -365,9 +365,11 @@ def test_apply_with_mode_b_template_returns_422(monkeypatch):
         patch.object(ap, "backoffice_state", mock_state),
     ):
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.get_event_loop().run_until_complete(
-                ap._run_apply("acme", "langflow", body, session)
-            )
+            # asyncio.get_event_loop() is deprecated (3.10+) and raises
+            # RuntimeError when called after a prior async test closes the loop
+            # (Python 3.12 behaviour).  Use asyncio.run() which always creates
+            # a fresh event loop — no ordering dependency.
+            asyncio.run(ap._run_apply("acme", "langflow", body, session))
 
     assert exc_info.value.status_code == 422
     assert "mode_b_not_available" in str(exc_info.value.detail)
@@ -508,9 +510,13 @@ def test_reconciler_caps_flow_count():
     The cap lives inside _fetch_flows (which slices the API response to MAX_FLOWS).
     We test by giving _fetch_flows a mock HTTP response with MAX_FLOWS+10 entries and
     verifying it returns exactly MAX_FLOWS after slicing.
+
+    Updated for cefde5cf (F-G fix): _fetch_flows now takes only langflow_url (no
+    bearer arg) and uses internal_httpx_sync_client + get_langflow_api_headers for
+    mTLS x-api-key auth rather than a caller-supplied bearer token.  The new auth
+    mechanism is more secure; the test patches the new transport + auth helpers.
     """
     import json as _json
-    import httpx
 
     # Build a list with more than MAX_FLOWS entries
     oversized_list = [
@@ -521,7 +527,8 @@ def test_reconciler_caps_flow_count():
 
     from yashigani.backoffice.langflow_reconciler import _fetch_flows
 
-    # Mock httpx.Client so _fetch_flows runs its own cap logic
+    # Mock internal_httpx_sync_client (context manager) + get_langflow_api_headers
+    # so _fetch_flows can run its cap logic without a real PKI / langflow instance.
     mock_response = MagicMock()
     mock_response.content = body_bytes
     mock_response.raise_for_status = MagicMock()
@@ -531,8 +538,21 @@ def test_reconciler_caps_flow_count():
     mock_client.__exit__ = MagicMock(return_value=False)
     mock_client.get = MagicMock(return_value=mock_response)
 
-    with patch("httpx.Client", return_value=mock_client):
-        result = _fetch_flows("http://langflow:7860", "test-bearer")
+    # _fetch_flows uses local imports (PLC0415 guard) inside the function body:
+    #   from yashigani.pki.client import internal_httpx_sync_client
+    #   from yashigani.backoffice.langflow_auth import get_langflow_api_headers
+    # Patch the SOURCE modules so the lazy import picks up the mocks.
+    with (
+        patch(
+            "yashigani.pki.client.internal_httpx_sync_client",
+            return_value=mock_client,
+        ),
+        patch(
+            "yashigani.backoffice.langflow_auth.get_langflow_api_headers",
+            return_value={"x-api-key": "test-key"},
+        ),
+    ):
+        result = _fetch_flows("http://langflow:7860")
 
     assert len(result) == MAX_FLOWS, (
         f"_fetch_flows must cap at MAX_FLOWS={MAX_FLOWS}; got {len(result)}"

@@ -28,7 +28,7 @@ from yashigani.metrics.collectors import MetricsCollector
 from yashigani.metrics.middleware import PrometheusMiddleware
 from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
 from yashigani.gateway.agent_auth import AgentAuthMiddleware
-from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router
+from yashigani.gateway.openai_router import router as openai_router, configure as configure_openai_router, _fetch_ollama_models_sync
 from yashigani.gateway.egress_proxy import router as egress_proxy_router, configure as configure_egress_proxy
 from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 from yashigani.gateway._ratelimit_env import resolve_rate_limit_fail_mode
@@ -38,6 +38,7 @@ from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def _build_app(mesh_mode: bool = False):
     # ── OTEL tracing — initialise before anything else ─────────────────────
@@ -700,11 +701,23 @@ def _build_app(mesh_mode: bool = False):
     try:
         from yashigani.documents.proxy_modeb import is_modeb_proxy_active
         if is_modeb_proxy_active():
+            from yashigani.documents.audit_bridge import make_shared_document_audit_callback
             from yashigani.documents.config import DocumentEnforcementConfig
             from yashigani.documents.pipeline import DocumentInspectionPipeline
             _doc_cfg = DocumentEnforcementConfig.from_env()
+            # RESTART-013 gap #5: this pipeline is a SINGLETON reused by every
+            # concurrent request (state["document_pipeline"]), so it gets the
+            # contextvars-based shared callback (asyncio-task-safe), NOT the
+            # closure-dict variant documents.py/user_ui.py use (those build a
+            # fresh pipeline per request). Previously this construction passed
+            # NO on_audit at all — the pipeline default is a silent no-op, so
+            # every proxy-egress + MCP-tool-call document decision produced
+            # ZERO audit trail. See documents/audit_bridge.py.
             document_pipeline = DocumentInspectionPipeline(
                 registry=_doc_cfg.build_registry(),
+                on_audit=make_shared_document_audit_callback(
+                    audit_writer, surface="proxy-egress",
+                ),
             )
             logger.info(
                 "Document mode-B egress pipeline ready (max_bytes=%d, max_segments=%d)",
@@ -1066,6 +1079,13 @@ def _build_app(mesh_mode: bool = False):
             "WorkflowScheduler unavailable (%s) — scheduled workflows disabled", exc
         )
 
+    # ── Bug B (LAURA-411-002 wiring gap) — fetch installed Ollama models so
+    # _is_known_model() can recognise local model IDs (qwen2.5:3b, qwen2.5:7b …).
+    # Failure (backend unreachable at startup) → None → permissive fallback in
+    # _is_known_model: let Ollama itself arbitrate unknown names.  Gateway never
+    # bricks due to a slow-starting inference backend.
+    _available_models = _fetch_ollama_models_sync(ollama_url, timeout=3.0)
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -1078,6 +1098,7 @@ def _build_app(mesh_mode: bool = False):
         audit_writer=audit_writer,
         ollama_url=ollama_url,
         default_model=model,
+        available_models=_available_models,
         agent_registry=agent_registry,
         response_inspection_pipeline=response_pipeline,
         request_inspection_pipeline=pipeline,  # 5.0 A1 — request-leg injection scan on /v1
@@ -1101,6 +1122,16 @@ def _build_app(mesh_mode: bool = False):
         model_alias_store=model_alias_store,
         kms_provider=kms_provider,
         permission_store=permission_store,   # 3.1 Phase 6 — cloud-model deny-by-default gate
+        rbac_store=rbac_store,               # W3-008 — RBAC group membership backfill
+        # FINDING-V412-RESTART-013 gap #6 — the SAME document_pipeline singleton
+        # passed to create_gateway_app() below (proxy egress + mcp_router_runtime's
+        # /mcp/<agent_name> HTTP entrypoint) is mirrored onto the openai_router
+        # module-level _state so gateway/orchestrator.py:_execute_mcp_tool (the
+        # chat->MCP tool-dispatch path, which has no access to proxy.py's
+        # per-request state dict) can also enforce document REDACT/PSEUDONYMIZE/
+        # BLOCK on outbound tool-call arguments. None when mode-B-proxy is not
+        # opted in (dark) — unchanged pre-fix behaviour.
+        document_pipeline=document_pipeline,
     )
 
     # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────

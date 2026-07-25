@@ -43,7 +43,7 @@ test_rbac_denial_self_described if {
     d := decision with input as {
         "path": "/v1/chat", "method": "GET",
         "session_id": "sess-123", "agent_id": "agent-x",
-        "session": {"email": "nobody@example.com"},
+        "session": {"identity_id": "idnt_nobody00001"},
     }
     with data.yashigani.rbac.groups as {"admins": {"members": ["boss@example.com"], "allow": ["/v1/chat"]}}
     d.allow == false

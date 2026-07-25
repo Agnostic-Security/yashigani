@@ -12,9 +12,27 @@ _mcp_tools_from_upstream + orchestrator._extract_mcp_text):
                tools/call  -> {"result": {"content": [{"type":"text","text": ...}]}}
 
 Stdlib only (read_only rootfs, non-root USER 10001, no egress — matches compose hardening).
+
+TWO RUN MODES (FINDING-A fix, 2026-07-21 — bundled demo-mcp reference manifest not
+real-deployable as Shape-C):
+  1. Default (no args) — plain-HTTP JSON-RPC daemon on MCP_HOST:MCP_PORT, as above.
+     Used by the base `demo-mcp` compose service (docker-compose.yml, profile
+     `demo-mcp`), the direct-upstream "cloud-9" chat-injection demo (mcp-a
+     topology, UPSTREAM_MCP_URL=http://demo-mcp:8000). UNCHANGED by this fix.
+  2. `--stdio` — line-delimited JSON-RPC over stdin/stdout, one JSON object per
+     line; replies only to messages that carry an "id" (JSON-RPC 2.0 requests),
+     never to notifications (e.g. "notifications/initialized") — this is the
+     exact framing contract src/yashigani/mcp/_bridge.py's _BridgeProcess reader
+     loop expects when it spawns this script as the YASHIGANI_MCP_SUBPROCESS_COMMAND
+     subprocess for a Shape-C ring_fenced deployment (docker/Dockerfile.demo-mcp
+     now also installs the yashigani wheel + uvicorn so the bridge itself can run
+     in the same image). Both modes share the same TOOLS table + _call_tool()
+     dispatch — single source of truth, no behavioural drift between the two
+     deployment shapes.
 """
 import json
 import os
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -147,5 +165,73 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def _stdio_main() -> None:
+    """Shape-C bridge subprocess mode — line-delimited JSON-RPC over stdio.
+
+    Contract (mirrors src/yashigani/mcp/_bridge.py exactly):
+      - One JSON-RPC message per input line on stdin.
+      - A REQUEST (message with an "id" key, per JSON-RPC 2.0) gets exactly one
+        JSON-RPC response line written to stdout, then flushed immediately —
+        the bridge's reader loop does readline() per response and would hang
+        forever on unflushed output.
+      - A NOTIFICATION (no "id" key, e.g. "notifications/initialized") gets NO
+        reply — the bridge never waits for one; replying would desync response
+        correlation on the next real request.
+      - Malformed JSON on a line still gets a JSON-RPC parse-error response
+        (id=None) so the bridge doesn't stall waiting on a request the
+        subprocess never acknowledged.
+    """
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        try:
+            rpc = json.loads(raw_line)
+        except json.JSONDecodeError:
+            sys.stdout.write(json.dumps(_error(None, -32700, "parse error")) + "\n")
+            sys.stdout.flush()
+            continue
+
+        is_notification = "id" not in rpc
+        req_id = rpc.get("id")
+        method = rpc.get("method", "")
+        params = rpc.get("params") or {}
+
+        if method in ("notifications/initialized", "initialized"):
+            continue  # notification — never reply
+
+        if method == "initialize":
+            response = _result(req_id, {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "demo-mcp", "version": "3.0.0-stdio"},
+            })
+        elif method == "tools/list":
+            response = _result(req_id, {"tools": TOOLS})
+        elif method == "tools/call":
+            name = params.get("name", "")
+            try:
+                text = _call_tool(name, params.get("arguments"))
+            except KeyError:
+                response = _error(req_id, -32602, f"unknown tool: {name}")
+            else:
+                response = _result(req_id, {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": False,
+                })
+        else:
+            response = _error(req_id, -32601, f"method not found: {method}")
+
+        if is_notification:
+            continue  # belt-and-suspenders: never reply to a notification
+
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    if "--stdio" in sys.argv[1:]:
+        _stdio_main()
+    else:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

@@ -32,27 +32,45 @@ spec:
       # /run/secrets mount collision — see redis.yaml note.
       automountServiceAccountToken: false
       securityContext:
-        # Internal K8s integration evidence: postgres:16-alpine runs as
-        # UID/GID 70 (Alpine convention). The previous fsGroup: 999 was
-        # carried over from when the image was the Debian-based postgres
-        # (UID/GID 999). With Alpine, mounted Secret volumes (default mode
-        # 0440 root:fsGroup) ended up as `r--r----- root:ping(999)`, and
-        # postgres dropped to UID 70 GID 70 before initdb scripts ran —
-        # neither in root(0) nor in ping(999), so /run/secrets/* read as
-        # `Permission denied`, 05-enable-ssl.sh exited non-zero, postgres
-        # restarted, second start saw partial PGDATA → init scripts skipped
-        # → ssl=off → pgbouncer→postgres handshake failed.
-        # fsGroup: 70 chowns Secret + PVC volumes to GID 70 (postgres),
+        # FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): the postgres image is
+        # now pgvector/pgvector:0.8.2-pg16 (Debian bookworm, HAS the openssl
+        # CLI that 05-enable-ssl.sh's fail-closed chain-of-continuity check
+        # requires — postgres:16-alpine does not ship openssl at all). This
+        # image's postgres user is UID/GID 999 (Debian convention), NOT
+        # Alpine's UID/GID 70. Compose already standardised on this same
+        # image + digest (docker-compose.yml, "gate V232-SMOKE-018" comment)
+        # with `user: "999:999"` for the identical reason: pgvector has no
+        # USER directive (defaults to root at PID1), and cap_drop:[ALL]
+        # strips CAP_SETUID/SETGID/FOWNER so the entrypoint's own gosu/setpriv
+        # root→postgres privilege-drop dance fails ("Operation not
+        # permitted"). Pinning runAsUser/runAsGroup/fsGroup to 999 here starts
+        # the container AS uid 999 directly (K8s enforces this at container
+        # creation, not via an in-container setuid step), matching compose.
+        #
+        # HISTORICAL (pre-2026-07-24, postgres:16-alpine/UID 70): mounted
+        # Secret volumes (default mode 0440 root:fsGroup) combined with a
+        # UID that didn't match the image's real "postgres" user caused
+        # either Permission denied reads OR (when the values.release.yaml
+        # override swapped in pgvector while this securityContext still said
+        # 70) a real cross-UID chown attempt in 05-enable-ssl.sh
+        # ("chown postgres:postgres" resolving to UID 999 while the running
+        # process was UID 70) — requires CAP_CHOWN, which is dropped, so it
+        # failed "Operation not permitted". Matching UID/GID exactly (this
+        # fix) makes every chown in the script a same-UID no-op that needs no
+        # capability at all; 05-enable-ssl.sh additionally removes the
+        # explicit chown calls outright (see that file) as defense-in-depth
+        # against any future image/UID drift regressing this class of bug.
+        #
+        # fsGroup: 999 chowns Secret + PVC volumes to GID 999 (postgres),
         # giving the postgres user read access via group membership without
         # broadening permissions beyond the pod.
-        # YSG-RISK-008: runAsNonRoot enforced at K8s level. postgres:16-alpine
-        # drops to UID/GID 70 (postgres) after init. readOnlyRootFilesystem is
-        # NOT set — postgres writes PGDATA (PVC), /var/run/postgresql (socket),
-        # /tmp. Full ROFS would break initdb. Documented exception.
+        # YSG-RISK-008: runAsNonRoot enforced at K8s level. readOnlyRootFilesystem
+        # is NOT set — postgres writes PGDATA (PVC), /var/run/postgresql
+        # (socket), /tmp. Full ROFS would break initdb. Documented exception.
         runAsNonRoot: true
-        runAsUser: 70
-        runAsGroup: 70
-        fsGroup: 70
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
         # YSG-SECRETS-DIST-002 CLOSED: postgres_password delivered via secretKeyRef
         # env var in K8s. supplementalGroups: [2002] was vestigial (no file-read
         # path in K8s). Removed per Laura A1 amendment — GID 2002 narrowed to
@@ -205,6 +223,18 @@ spec:
                 path: ca_root.crt
               - key: ca_intermediate.crt
                 path: ca_intermediate.crt
+              # FINDING-V412-RESTART-012 note: ca_root.attested_sha256 is
+              # deliberately NOT in this items list. K8s has no equivalent of
+              # install.sh's --pki-action=rotate-root ceremony yet, so root
+              # rotation on K8s is unimplemented and 05-enable-ssl.sh's
+              # YASHIGANI_PG_ATTEST_DIR (default /run/secrets-pki-attest) will
+              # never resolve here — any future root-CHANGE on K8s fails
+              # closed exactly as it did before this fix (REJECTED: no
+              # attestation found), which is correct. If K8s root rotation is
+              # ever built, mirror the docker/podman isolation: a dedicated
+              # Secret/volume mounted ONLY into the postgres pod, never into
+              # this pki-certs Secret (which backoffice/gateway also consume)
+              # — do NOT add ca_root.attested_sha256 to a shared items list.
         # YSG-RISK-049: pgbouncer_authenticator_password for 10-pgbouncer-auth.sh init script.
         # Same secret as pgbouncer pod — auto-generated by secrets.yaml on first install,
         # preserved on upgrade via helm lookup. Operator-overridable via pgbouncer.authSecretName.

@@ -528,13 +528,30 @@ def _write_secret_file(
     """
     tmp_path = path.parent / (path.name + ".tmp")
     try:
-        tmp_path.write_text(value, encoding="utf-8")
-        # Apply explicit GID before chmod so the correct group sees group-read.
-        # chown(-1, gid) leaves UID unchanged and only sets GID.
+        # A leftover .tmp from a prior interrupted rotation (crash/kill between
+        # create and rename) would collide with O_EXCL below. Safe to remove —
+        # it is our own scratch file, never the live secret at `path`.
+        tmp_path.unlink(missing_ok=True)
+        # #1874 (py/clear-text-storage TOCTOU): create the temp file already
+        # restricted to `mode`, atomically, via O_CREAT|O_EXCL — never via
+        # write_text() + chmod() after the fact. write_text() creates the file
+        # at the process umask (e.g. 0o644 under umask 0o022) and there is a
+        # window between that create and the later chmod() during which the
+        # plaintext secret is group/world-readable. os.open() with the mode
+        # argument sets the permission bits at creation time in the same
+        # syscall — no window exists. Same pattern scripts/keygen.py uses.
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value)
+        # Apply explicit GID before final chmod so the correct group sees
+        # group-read. chown(-1, gid) leaves UID unchanged and only sets GID.
         if gid != -1:
             os.chown(tmp_path, -1, gid)
-        # chmod after chown — sets the final mode on the inode before rename.
-        tmp_path.chmod(mode)
+            # os.chown() does not alter mode bits, but re-assert mode anyway
+            # in case any OS-specific chown side effect (e.g. setgid clearing)
+            # changed it — belt-and-braces, still no plaintext-exposure window
+            # since the file was created at `mode` from the first syscall.
+            tmp_path.chmod(mode)
         tmp_path.rename(path)
     except OSError:
         # Clean up the temp file if any step failed before rename.

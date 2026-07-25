@@ -388,9 +388,12 @@ class DocumentInspectionPipeline:
     #: A QI match on a small record set escalates the disposition (§5.3c).
     #: Broadened (L-01): DOB, phone, IP, National Insurance and postal address
     #: all re-identify a small structured set when they co-occur per row.
+    #: RESTART-013 gap #2: PERSON_NAME added — a name is the most direct
+    #: re-identifying field of all; it must escalate the small-set gate at
+    #: least as readily as DOB/phone/postcode do.
     _QI_TYPES = frozenset({
         "DATE_OF_BIRTH", "PHONE", "IP_ADDRESS",
-        "NATIONAL_INSURANCE", "POSTAL_ADDRESS",
+        "NATIONAL_INSURANCE", "POSTAL_ADDRESS", "PERSON_NAME",
     })
 
     def _enumerate(

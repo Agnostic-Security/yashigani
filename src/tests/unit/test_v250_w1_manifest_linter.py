@@ -491,6 +491,43 @@ class TestC3NamePresence:
 
 
 # ---------------------------------------------------------------------------
+# C3-b — reserved base-compose-service-name collision guard
+# (onboarding-robustness batch finding #3, Su, 2026-07-21)
+# ---------------------------------------------------------------------------
+
+class TestC3bReservedServiceName:
+    """metadata.name colliding with a service already defined in
+    docker/docker-compose.yml (e.g. "demo-mcp", the bundled opt-in demo
+    upstream) must be rejected at lint time — before codegen ever renders a
+    compose override that would merge-collide with the existing service.
+    Live-proven root cause of onboarding-robustness batch finding #3:
+    Docker Compose v5.1.3 hard-fails with "services.demo-mcp.security_opt
+    items at 0 and 1 are equal" when both the base service and a per-agent
+    override declare the SAME service name with the SAME security_opt."""
+
+    def test_demo_mcp_name_rejected(self) -> None:
+        from yashigani.manifest import validate_manifest
+        import copy
+        os.environ["YSG_REQUIRE_SIGNED_MANIFEST"] = "skip"
+        try:
+            parsed = copy.deepcopy(_BASE_PARSED)
+            parsed["metadata"]["name"] = "demo-mcp"
+            result = validate_manifest(parsed)
+            rules = [e.rule for e in result.errors]
+            assert "C3b_reserved_service_name" in rules, rules
+        finally:
+            del os.environ["YSG_REQUIRE_SIGNED_MANIFEST"]
+
+    def test_non_reserved_name_not_flagged(self) -> None:
+        from yashigani.manifest import validate_manifest
+        from yashigani.manifest.linter import _lint_reserved_service_name
+        import copy
+        parsed = copy.deepcopy(_BASE_PARSED)
+        parsed["metadata"]["name"] = "my-filesystem-mcp"
+        assert _lint_reserved_service_name(parsed) == []
+
+
+# ---------------------------------------------------------------------------
 # Human-quality error messages (K3)
 # ---------------------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 # Yashigani — Installation and Configuration Guide
 
-**Version:** 2.24.0
-**Last updated:** 2026-05-23T00:00:00+00:00
+**Version:** 4.1.2
+**Last updated:** 2026-07-15T00:00:00+00:00
 **Applies to:** Docker Compose and Kubernetes (Helm) deployments
 
 ---
@@ -104,7 +104,7 @@ Before starting, confirm the following network conditions are met:
 - **Ports 80 and 443** must be open and reachable from the internet if using ACME (Let's Encrypt) TLS mode. Port 80 is used for the ACME HTTP-01 challenge; port 443 is your application traffic. If your load balancer or upstream firewall handles 80→443 redirect externally, port 80 must still reach the host for the initial certificate issuance.
 - **DNS A record** (or AAAA for IPv6) pointing your fully qualified domain name (FQDN) to the server's public IP address. This is mandatory for ACME mode. Allow up to 5 minutes for DNS propagation before starting the stack.
 - **Outbound HTTPS** (port 443) must be permitted from the host for Let's Encrypt ACME endpoints and for Ollama model pulls from `ollama.ai` and Hugging Face registries.
-- **Internal Docker networking** is isolated by default via a four-network topology (EX-231-10, v2.23.1): `edge` (Caddy + public ports 80/443), `caddy_internal` (Caddy + gateway + backoffice — the only network where :8443/:8080 are reachable), `data` (gateway + backoffice outbound + postgres/pgbouncer/redis/OPA/ollama), and `obs` (prometheus/grafana/loki/alertmanager/otel-collector/jaeger). Caddy is the SOLE ingress to backoffice and gateway — no other service has a route to `caddy_internal`. Ollama and OpenClaw additionally join `edge` for outbound internet access. In Kubernetes, K8s NetworkPolicy enforces the same posture at the kernel level.
+- **Internal Docker networking** is isolated by default via a four-network topology (EX-231-10, v2.23.1): `edge` (Caddy + public ports 80/443), `caddy_internal` (Caddy + gateway + backoffice — the only network where :8443/:8080 are reachable), `data` (gateway + backoffice outbound + postgres/pgbouncer/redis/OPA/ollama), and `obs` (prometheus/grafana/loki/alertmanager/otel-collector/jaeger). Caddy is the SOLE ingress to backoffice and gateway — no other service has a route to `caddy_internal`. Ollama and OpenClaw additionally join `edge` for outbound internet access. In Kubernetes, the same posture is expressed as `NetworkPolicy` resources. **NetworkPolicy enforcement is CNI-dependent** (FINDING-V412-UNIVERSAL-004): policy-enforcing CNIs (Calico, Cilium) apply them at the datapath, whereas non-enforcing CNIs (flannel — the k3s default; kindnet — the kind default) silently ignore NetworkPolicy, which would leave the ring-fence absent. The installer therefore runs a positive NetworkPolicy-enforcement probe at install time (on by default; override with `install.sh --skip-networkpolicy-probe`, which records a risk-register exception) and **fails the install if the cluster CNI does not enforce** — so the ring-fence is never silently missing. Use an enforcing CNI (Calico/Cilium) on release-gate and production clusters.
 
 > **Warning:** Do not expose Redis (6379), budget-redis (6380), Postgres (5432), or Prometheus (9090) ports to the host in production. These services are intentionally not bound to host interfaces in the default `docker-compose.yml`.
 
@@ -1064,6 +1064,8 @@ docker compose up -d ollama
 **Apple Silicon (M-series):** GPU acceleration for Ollama is automatic when using Docker Desktop 4.x+ on macOS. No additional configuration is needed. Increase Docker Desktop memory allocation to match your model size (see preflight_check.md Section 4a for recommendations).
 
 **AMD (ROCm):** Requires ROCm-compatible driver and runtime. Contact support for ROCm-specific Compose configuration.
+
+**Step 4 — Secure a self-run backend (important).** Ollama (and LM Studio, llama.cpp, vLLM, …) have **no built-in authentication** on their API. If you run the inference server yourself — especially host-native on macOS (Metal GPU) — an open port lets any local process call it directly, bypassing Yashigani's auth, RBAC, OPA, budget, audit, and PII inspection. Lock it down per **[Securing Your Self-Run Inference Backend](security/securing-inference-backend.md)** — bind to loopback, apply the copy-paste firewall rules for your OS (`pf` / `iptables` / `nftables` / `ufw` / `firewalld`), and route its egress through Caddy.
 
 ### 7.2 Cloud Backends (Anthropic, Gemini, Azure OpenAI)
 
@@ -3343,7 +3345,7 @@ Setting `FIPS_MODE=1` activates code paths that call `openssl dgst` and `openssl
 | Image | FIPS Provider included |
 |-------|------------------------|
 | `python:3.14.0-slim` (gateway, backoffice) | No |
-| `caddy:2.11.2-alpine` (caddy) | No |
+| `caddy:2.11.4-alpine` (caddy) | No |
 
 Setting `fips.mode=true` or `YSG_FIPS_MODE=1` with the default images makes Yashigani **FIPS-capable** (the code path is active) but does **not** make it **FIPS-validated** (CMVP module not loaded; crypto operations use the default non-validated OpenSSL).
 

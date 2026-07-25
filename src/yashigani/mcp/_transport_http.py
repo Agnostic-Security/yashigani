@@ -115,6 +115,7 @@ class McpHttpTransport:
         http_client: Optional[httpx.AsyncClient] = None,
         timeout_seconds: float = _DEFAULT_UPSTREAM_TIMEOUT,
         trusted_upstream_urls: Optional[list[str]] = None,
+        expected_spiffe_id: Optional[str] = None,
     ) -> None:
         self._upstream_url = upstream_url.rstrip("/")
         self._is_relay = is_relay
@@ -126,6 +127,15 @@ class McpHttpTransport:
         # to [upstream_url] so every transport instance is auto-guarded to only
         # reach its own registered upstream.
         self._trusted_upstream_urls = trusted_upstream_urls
+        # FINDING C (v4.1.2 final onboarding e2e): the expected SPIFFE URI SAN
+        # of the ring-fenced agent's per-instance Caddy front leaf. Threaded
+        # through to net.HttpClient so an https:// upstream is verified by
+        # SPIFFE identity instead of DNS hostname (the leaf carries no DNS
+        # SAN). None for plain-HTTP bridge upstreams (unused there) and for
+        # legacy/pre-Phase-2a boot-env https entries — see http_client.py's
+        # fail-closed refusal when an https:// bypass-mode request has no
+        # expected_spiffe_id.
+        self._expected_spiffe_id = expected_spiffe_id
         # Shared client (caller owns lifetime if provided; we create one if not).
         # When http_client is injected (tests / pooling), SSRF guard is bypassed
         # at this layer — the injected client is fully caller-controlled.
@@ -157,6 +167,7 @@ class McpHttpTransport:
                 allow_http=True,                     # Docker bridge uses HTTP
                 bypass_private_for_allowlisted=True, # allow RFC-1918 MCP hosts
                 timeout_s=self._timeout,
+                expected_spiffe_id=self._expected_spiffe_id,  # FINDING C
             )
             logger.debug(
                 "mcp-transport: SSRF guard active upstream=%r allowlist=%r",

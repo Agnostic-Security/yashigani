@@ -1,23 +1,42 @@
 """
-Regression test — LAURA-30-003: detokenize RBAC gate resolves email from account_id.
+Regression test — LAURA-30-003 + v4.1.2 bug 2 (YCS-20260723-v4.1.2-CONFORMANCE):
+detokenize RBAC gate identity resolution.
 
-Before the fix, ``_admin_in_detokenize_role(account_id, role)`` passed the UUID
-directly to ``RBACStore.get_user_groups``, which keys on email — so every lookup
-returned an empty list and the gate always denied.
+History:
+  - LAURA-30-003 (pre-4.1.2): ``_admin_in_detokenize_role(account_id, role)``
+    passed the raw account UUID directly to ``RBACStore.get_user_groups``,
+    which keys on email — every lookup returned an empty list and the gate
+    always denied. Fixed by resolving UUID -> email via
+    ``auth_service.get_account_by_id`` first.
+  - v4.1.2 bug 2 (this fix, found by the conformance suite): the LAURA-30-003
+    fix became stale after the 4.1 UID migration. ``RBACStore.get_user_groups``
+    is now keyed by ``identity_id`` (``idnt_{12hex}``), NOT email (see
+    ``rbac/store.py`` ``get_user_groups()`` docstring). Passing email
+    silently returns ``[]`` — fail-closed, but denies every legitimate admin,
+    making the document correspondence-table control unusable. Fixed by
+    resolving email -> identity_id via ``backoffice_state.identity_registry``
+    before the RBAC lookup, mirroring ``backoffice/routes/rbac.py``'s
+    ``get_user_groups()`` route handler.
 
-After the fix, the function is async, looks up the email via
-``auth_service.get_account_by_id(account_id)``, and then passes the email to
-``store.get_user_groups``.
+IMPORTANT: unlike the original version of this file (which re-implemented
+``_admin_in_detokenize_role``'s logic inline as a shadow copy), these tests
+import and call the REAL function from
+``yashigani.backoffice.routes.documents``. The shadow-copy approach is
+exactly how the v4.1.2 regression went undetected by this file for as long
+as it did: the inline copy kept testing OLD logic while the real function
+was fixed and re-broken underneath it. Testing the genuine call path removes
+that drift risk permanently.
 
-Closes: LAURA-30-003.
+Closes: LAURA-30-003, YCS-20260723-v4.1.2-CONFORMANCE bug 2.
+Last updated: 2026-07-23T00:00:00+00:00
 """
 from __future__ import annotations
 
 import asyncio
-import types
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-import pytest
+from yashigani.backoffice.routes.documents import _admin_in_detokenize_role
+from yashigani.backoffice.state import backoffice_state
 
 # ---------------------------------------------------------------------------
 # Minimal fakes
@@ -31,163 +50,191 @@ class _FakeGroup:
 
 
 class _FakeAccountRecord:
-    def __init__(self, email: str, username: str):
+    def __init__(self, email: str | None, username: str | None):
         self.email = email
         self.username = username
 
 
-# ---------------------------------------------------------------------------
-# Helpers that mirror the async call chain
-# ---------------------------------------------------------------------------
+class _FakeIdentityRegistry:
+    """Minimal stand-in for yashigani.identity.registry.IdentityRegistry —
+    only the get_by_email() surface _admin_in_detokenize_role touches."""
+
+    def __init__(self, email_to_identity_id: dict[str, str]):
+        self._map = email_to_identity_id
+
+    def get_by_email(self, email: str) -> dict | None:
+        iid = self._map.get(email)
+        return {"identity_id": iid} if iid else None
 
 
-async def _call_gate(account_id: str, role: str, *, account_record, groups):
-    """
-    Replicate ``_admin_in_detokenize_role`` post-fix logic inline so the test
-    is decoupled from import-time side-effects while still verifying the
-    algorithm is correct.
-
-    Returns ``(allowed: bool, email_used: str | None)``.  ``email_used`` is
-    the email passed to ``get_user_groups``; ``None`` when the lookup was never
-    reached (account missing, no email, etc.).
-    """
-    email_used: str | None = None
-
-    # Simulate fake auth_service
+def _wire(monkeypatch, *, account_record, groups_by_identity_id, email_to_identity_id, registry=True):
     auth_service = MagicMock()
     auth_service.get_account_by_id = AsyncMock(return_value=account_record)
+    monkeypatch.setattr(backoffice_state, "auth_service", auth_service, raising=False)
 
-    # Simulate fake rbac_store
     rbac_store = MagicMock()
-    rbac_store.get_user_groups = MagicMock(return_value=groups)
+    rbac_store.get_user_groups = MagicMock(
+        side_effect=lambda iid: groups_by_identity_id.get(iid, [])
+    )
+    monkeypatch.setattr(backoffice_state, "rbac_store", rbac_store, raising=False)
 
-    # ---- replicate the fixed function ----
-    if rbac_store is None:
-        return False, None
-    if auth_service is None:
-        return False, None
-    try:
-        record = await auth_service.get_account_by_id(account_id)
-    except Exception:
-        return False, None
-    if record is None:
-        return False, None
-    email = getattr(record, "email", None) or getattr(record, "username", None)
-    if not email:
-        return False, None
-    email_used = email
-    try:
-        groups_list = rbac_store.get_user_groups(email)
-    except Exception:
-        return False, email_used
-    for g in groups_list:
-        if g.id == role or getattr(g, "display_name", None) == role:
-            return True, email_used
-    return False, email_used
+    if registry:
+        monkeypatch.setattr(
+            backoffice_state,
+            "identity_registry",
+            _FakeIdentityRegistry(email_to_identity_id),
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(backoffice_state, "identity_registry", None, raising=False)
+
+    return rbac_store
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests — real function, real call path
 # ---------------------------------------------------------------------------
 
 
-class TestDetokenizeRBACGate:
-    """LAURA-30-003: gate resolves UUID→email before RBAC lookup."""
+class TestDetokenizeRBACGateIdentityIdResolution:
+    """v4.1.2 bug 2: gate must resolve email -> identity_id before the RBAC
+    lookup, since RBACStore.get_user_groups() is identity_id-keyed post-4.1
+    UID migration."""
 
-    def test_uuid_resolved_to_email_before_rbac_lookup(self):
-        """Gate resolves the account's email and passes it to get_user_groups,
-        NOT the raw UUID (which would always return empty → always deny)."""
-        account_uuid = "550e8400-e29b-41d4-a716-446655440000"
-        email = "alice@example.com"
-        role = "detokenize-admins"
+    def test_member_by_identity_id_is_granted(self, monkeypatch):
+        """The real-world case the conformance suite proved broken: a group
+        has the admin's IDENTITY_ID as a member (exactly how production RBAC
+        group membership is populated — RBACStore.add_member takes
+        identity_id, never email). The gate must resolve the caller's email
+        to that same identity_id and find the membership."""
+        account_record = _FakeAccountRecord(email="admin-stepup@acme.com", username="admin-stepup@acme.com")
+        matching_group = _FakeGroup(id="docteam", display_name="Doc Team")
 
-        account_record = _FakeAccountRecord(email=email, username=email)
-        matching_group = _FakeGroup(id=role, display_name=role)
-
-        result = asyncio.run(
-            _call_gate(
-                account_uuid,
-                role,
-                account_record=account_record,
-                groups=[matching_group],
-            )
+        _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={"idnt_5f9e3aa1b2c3": [matching_group]},
+            email_to_identity_id={"admin-stepup@acme.com": "idnt_5f9e3aa1b2c3"},
         )
-        # result is (True, email) — gate approved
-        assert result[0] is True
-        # Confirm the email was what was used (not the UUID)
-        assert result[1] == email
 
-    def test_uuid_lookup_fails_closed_when_no_account(self):
-        """When auth_service returns None for the UUID, gate denies."""
-        allowed, email_used = asyncio.run(
-            _call_gate(
-                "non-existent-uuid",
-                "some-role",
-                account_record=None,
-                groups=[],
-            )
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-stepup", "docteam"))
+        assert allowed is True
+
+    def test_lookup_by_raw_email_never_matches_post_migration(self, monkeypatch):
+        """Documents the OLD (broken) behaviour would have looked like: if
+        the gate (incorrectly) passed the raw email to get_user_groups, it
+        would never match a real, identity_id-keyed group. This test proves
+        our fixed gate does NOT do that -- it resolves to identity_id first,
+        so passing membership keyed by email (which no real deployment would
+        ever populate) is irrelevant; membership must be identity_id-keyed
+        to be found."""
+        account_record = _FakeAccountRecord(email="admin-stepup@acme.com", username="admin-stepup@acme.com")
+        matching_group = _FakeGroup(id="docteam", display_name="Doc Team")
+
+        rbac_store = _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={"admin-stepup@acme.com": [matching_group]},  # email-keyed (wrong shape)
+            email_to_identity_id={"admin-stepup@acme.com": "idnt_5f9e3aa1b2c3"},
         )
+
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-stepup", "docteam"))
         assert allowed is False
-        assert email_used is None
+        # Confirm the gate called get_user_groups with the RESOLVED
+        # identity_id, not the email -- this is the actual fix under test.
+        rbac_store.get_user_groups.assert_called_once_with("idnt_5f9e3aa1b2c3")
 
-    def test_group_match_by_id(self):
-        """Group membership matched by group.id."""
-        email = "bob@example.com"
-        role = "grp-123"
-        account_record = _FakeAccountRecord(email=email, username=email)
-        groups = [_FakeGroup(id="grp-123", display_name="Some Group")]
+    def test_non_member_still_denied(self, monkeypatch):
+        """Control still enforces: an admin who resolves to a real
+        identity_id, but is NOT in the required group, is denied."""
+        account_record = _FakeAccountRecord(email="outsider@acme.com", username="outsider@acme.com")
 
-        result = asyncio.run(
-            _call_gate("uuid-bob", role, account_record=account_record, groups=groups)
+        _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={"idnt_deadbeef0001": []},
+            email_to_identity_id={"outsider@acme.com": "idnt_deadbeef0001"},
         )
-        assert result[0] is True
 
-    def test_group_match_by_display_name(self):
-        """Group membership matched by display_name when id differs."""
-        email = "carol@example.com"
-        role = "Detokenize Admins"
-        account_record = _FakeAccountRecord(email=email, username=email)
-        groups = [_FakeGroup(id="grp-456", display_name="Detokenize Admins")]
-
-        result = asyncio.run(
-            _call_gate("uuid-carol", role, account_record=account_record, groups=groups)
-        )
-        assert result[0] is True
-
-    def test_no_matching_group_denies(self):
-        """User in groups but none matching the required role → deny."""
-        email = "dan@example.com"
-        role = "detokenize-admins"
-        account_record = _FakeAccountRecord(email=email, username=email)
-        groups = [_FakeGroup(id="read-only", display_name="Read Only")]
-
-        allowed, email_used = asyncio.run(
-            _call_gate("uuid-dan", role, account_record=account_record, groups=groups)
-        )
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-outsider", "docteam"))
         assert allowed is False
-        # Email was still resolved; the lookup ran but found no matching group.
-        assert email_used == email
 
-    def test_account_with_no_email_falls_back_to_username(self):
-        """If record.email is None/empty, username is used as fallback."""
-        username = "eve@example.com"
-        role = "detokenize-admins"
-        # email=None, username set — mimics an account where email is not populated
-        account_record = _FakeAccountRecord(email=None, username=username)
-        groups = [_FakeGroup(id=role, display_name=role)]
+    def test_no_identity_registry_fails_closed(self, monkeypatch):
+        """If the identity registry is unavailable, the gate must deny --
+        never fall through to an email-keyed lookup that could accidentally
+        match on some legacy/dual-mode store."""
+        account_record = _FakeAccountRecord(email="admin@acme.com", username="admin@acme.com")
 
-        result = asyncio.run(
-            _call_gate("uuid-eve", role, account_record=account_record, groups=groups)
+        _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={"idnt_x": [_FakeGroup(id="docteam", display_name="Doc Team")]},
+            email_to_identity_id={"admin@acme.com": "idnt_x"},
+            registry=False,
         )
-        assert result[0] is True
-        assert result[1] == username
 
-    def test_account_with_no_email_and_no_username_denies(self):
-        """If neither email nor username is available, gate fails closed."""
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-admin", "docteam"))
+        assert allowed is False
+
+    def test_email_with_no_registered_identity_fails_closed(self, monkeypatch):
+        """Registry is present but has no entry for this email -> deny."""
+        account_record = _FakeAccountRecord(email="ghost@acme.com", username="ghost@acme.com")
+
+        _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={},
+            email_to_identity_id={},  # no mapping for ghost@acme.com
+        )
+
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-ghost", "docteam"))
+        assert allowed is False
+
+    def test_group_match_by_display_name(self, monkeypatch):
+        """Membership matched by group.display_name when id differs --
+        preserved behaviour from the original LAURA-30-003 fix."""
+        account_record = _FakeAccountRecord(email="carol@example.com", username="carol@example.com")
+        group = _FakeGroup(id="grp-456", display_name="Detokenize Admins")
+
+        _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={"idnt_carol": [group]},
+            email_to_identity_id={"carol@example.com": "idnt_carol"},
+        )
+
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-carol", "Detokenize Admins"))
+        assert allowed is True
+
+    def test_account_with_no_email_and_no_username_denies(self, monkeypatch):
+        """If neither email nor username is available, gate fails closed
+        before ever reaching identity_registry resolution."""
         account_record = _FakeAccountRecord(email=None, username=None)
 
-        allowed, email_used = asyncio.run(
-            _call_gate("uuid-ghost", "some-role", account_record=account_record, groups=[])
+        rbac_store = _wire(
+            monkeypatch,
+            account_record=account_record,
+            groups_by_identity_id={},
+            email_to_identity_id={},
         )
+
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-ghost", "some-role"))
         assert allowed is False
-        assert email_used is None
+        rbac_store.get_user_groups.assert_not_called()
+
+    def test_account_lookup_none_denies(self, monkeypatch):
+        """auth_service returns None for the account_id -> deny."""
+        _wire(
+            monkeypatch,
+            account_record=None,
+            groups_by_identity_id={},
+            email_to_identity_id={},
+        )
+
+        allowed = asyncio.run(_admin_in_detokenize_role("non-existent-uuid", "some-role"))
+        assert allowed is False
+
+    def test_rbac_store_none_denies(self, monkeypatch):
+        monkeypatch.setattr(backoffice_state, "rbac_store", None, raising=False)
+        allowed = asyncio.run(_admin_in_detokenize_role("uuid-x", "some-role"))
+        assert allowed is False

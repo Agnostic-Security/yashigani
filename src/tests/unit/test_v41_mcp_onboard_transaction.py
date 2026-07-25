@@ -21,6 +21,7 @@ Contract under test:
 """
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -118,6 +119,26 @@ def txn_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "YASHIGANI_SERVICE_MANIFEST_PATH", str(tmp_path / "service_identities.yaml"),
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): run_approve_transaction
+    # now builds pki_paths with agents_dir=$YASHIGANI_AGENTS_DIR (default
+    # /run/secrets-rw/agents — a real container path absent under pytest) and
+    # reads $YASHIGANI_SVID_INIT_DIR for the step-2b staging dir (default
+    # /run/secrets-rw/svid-init). Point both at tmp_path so the mint/svid-init
+    # side effects land where this fixture (and the assertions below, which
+    # still expect secrets_dir/"svid-init"/<tenant>/<server>) can see them.
+    # Reuse secrets_dir (already created above) rather than a fresh subdir —
+    # this suite tests transaction ORCHESTRATION, not agents_dir/secrets_dir
+    # path separation (covered by pki/issuer.py unit tests); the mint mock
+    # below (_mint_side_effect) writes via paths.agent_cert()/agent_key()
+    # directly with no mkdir(parents=True), so the target must pre-exist.
+    monkeypatch.setenv("YASHIGANI_AGENTS_DIR", str(secrets_dir))
+    monkeypatch.setenv("YASHIGANI_SVID_INIT_DIR", str(secrets_dir / "svid-init"))
+    # FINDING-V412-SVID-INIT-KEY-PERM: step 2b chgrps the staged key to
+    # $YASHIGANI_SVID_GID (default 2003, the svid-sidecar/Caddy group) — the
+    # test process isn't a member of that real GID. Point it at the test
+    # process's OWN gid (any process may chgrp a file it owns to its own
+    # current gid without needing supplementary group membership).
+    monkeypatch.setenv("YASHIGANI_SVID_GID", str(os.getgid()))
     monkeypatch.setenv("YASHIGANI_CONTAINER_RUNTIME", "docker")
     monkeypatch.delenv("YSG_REQUIRE_SIGNED_MANIFEST", raising=False)
     monkeypatch.delenv("YSG_REQUIRE_CADDY_VALIDATE", raising=False)
@@ -189,17 +210,27 @@ class TestApproveTransactionCommit:
         assert (svid_init / "client.key").is_file()
         assert (svid_init / "ca.crt").read_text() == "INTERMEDIATE-CA-PEM"
 
-        # Wrap snippet + compose override written under the artifact root.
-        snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
+        # Compose override written under the artifact root.
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the wrap
+        # snippet ("docker/caddy/agents/<server>-mcp.caddy") is DELIBERATELY
+        # NOT written here anymore — codegen no longer authors Caddy
+        # content at all; the approve transaction instead REGISTERS the
+        # route with caddy-config-broker (the injected `reloader` stub
+        # below stands in for that call — see
+        # test_v412_caddy_config_broker.py for the broker's own render/
+        # self-check coverage of the verify-mcp + X-Caddy-Verified-Secret
+        # content this test used to assert directly from codegen's output).
         override = artifact_root / f"docker/{_SERVER}-compose.override.yml"
-        assert snippet.is_file() and override.is_file()
-        assert f"/auth/verify-mcp?tenant={_TENANT}&server={_SERVER}" in snippet.read_text()
-        # Layer B marker on the forward_auth hop (required for the backoffice
-        # CaddyVerifiedMiddleware + Option C x-spiffe-id preservation).
-        assert "header_up X-Caddy-Verified-Secret" in snippet.read_text()
+        assert override.is_file()
+        snippet = artifact_root / f"docker/caddy/agents/{_SERVER}-mcp.caddy"
+        assert not snippet.exists(), (
+            "BUG: codegen wrote the Caddy-front wrap snippet directly — "
+            "FINDING-V412-CADDYADMIN-002 requires this to go through "
+            "caddy-config-broker's route-registration contract instead."
+        )
 
-        # Reload happened exactly once, and the durable commit carried the
-        # real identity with svid_issued=True.
+        # Route registration happened exactly once, and the durable commit
+        # carried the real identity with svid_issued=True.
         assert reloader.calls == 1
         kwargs = svc.mint_envelope.call_args.kwargs
         assert kwargs["svid_issued"] is True
@@ -207,7 +238,15 @@ class TestApproveTransactionCommit:
         assert kwargs["svid_spiffe_id"] == result.spiffe_id
         assert result.envelope_id == 77
         assert result.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{result.instance_id}")
-        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" in result.artifact_paths
+        assert f"docker/caddy/agents/{_SERVER}-mcp.caddy" not in result.artifact_paths
+
+        # FINDING-V412-ONBOARDING-ROBUSTNESS #5 (Tom, 2026-07-21): the
+        # ceremony registers the envelope + route but does NOT start the
+        # container (backoffice has no docker socket, LAURA-30-001) — the
+        # result must carry actionable, server_id-scoped deploy guidance
+        # rather than leaving the operator to guess.
+        assert _SERVER in result.deploy_hint["commands"][0]
+        assert "compose.override.yml" in result.deploy_hint["commands"][0]
 
     @pytest.mark.asyncio
     async def test_nico_contract_kwargs_passed_to_mint(self, txn_env):
@@ -226,6 +265,71 @@ class TestApproveTransactionCommit:
         assert captured["scope_hash"].startswith("sha384:")
         assert captured["image_digest"] == _DIGEST
         assert captured["approved_by"] == "orchid"
+
+
+class TestDeployHint:
+    """FINDING-V412-ONBOARDING-ROBUSTNESS #5 — _agent_container_deploy_hint()
+    in isolation (docker vs k8s; component isolation)."""
+
+    def test_docker_hint_scoped_to_server_id(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        assert hint["runtime"] == "docker"
+        assert f"{_SERVER}-compose.override.yml" in hint["commands"][0]
+        assert "install.sh --onboard" in hint["note"]  # explicitly disambiguated
+
+    def test_n5_docker_hint_names_exact_services_not_bare_up_d(self):
+        """FINDING-V412-ONBOARDING-ROBUSTNESS N5 (Su, 2026-07-21).
+
+        Regression for: the previous command was a BARE `up -d` (no service
+        name). The vendored podman-compose fork computes one PROJECT-WIDE
+        config hash, not a per-service hash, so a bare `up -d` after any
+        override merge tears down + recreates every existing container
+        (proven live by Ava re-onboarding demo-mcp; reproduced with an
+        isolated 2-service compose fixture during this fix — an untouched
+        service's container ID changed on bare `up -d` and did NOT change
+        when the same command named services explicitly).
+
+        The command must now end with exactly the 3 services the Shape-C
+        override touches (agent, its svid-sidecar, caddy) and must NOT be a
+        bare `up -d` with nothing after it.
+        """
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        cmd = hint["commands"][0]
+        assert cmd.rstrip().endswith(
+            f"up -d {_SERVER} {_SERVER}-svid-sidecar caddy"
+        ), cmd
+        assert not cmd.rstrip().endswith("up -d"), (
+            "N5 regression: bare `up -d` with no service name recreates the "
+            "WHOLE stack on the vendored podman-compose fork (project-wide "
+            "config hash, not per-service) — see docstring."
+        )
+        # No core/other-agent service is ever named.
+        for _untouched in ("postgres", "redis", "backoffice", "gateway"):
+            assert _untouched not in cmd
+
+    def test_n5_docker_hint_note_documents_blast_radius(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        assert f"{_SERVER}-svid-sidecar" in hint["note"]
+        assert "caddy" in hint["note"]
+        assert "N5" in hint["note"]
+
+    def test_k8s_hint_uses_helm(self):
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="k8s",
+        )
+        assert hint["runtime"] == "k8s"
+        assert "helm" in hint["commands"][0]
+        assert _SERVER in hint["commands"][0]
 
 
 class TestApproveTransactionFailClosed:
@@ -324,6 +428,96 @@ class TestApproveTransactionFailClosed:
         assert reloader.calls == 2
         events = [c.args[0] for c in audit.write.call_args_list]
         assert any(e.failed_step == "envelope_mint" for e in events)
+
+
+class TestFindingBReimportIdempotent:
+    """FINDING B (v4.1.2 final onboarding e2e, 2026-07-21): re-importing the
+    SAME (tenant, server_id) WITHOUT a prior decommission must succeed —
+    previously it 502'd (surfaced by Ava as a 403) with a bare
+    PermissionError, because the FIRST onboarding's step 2b leaves
+    svid-init/<t>/<s>/client.key chmod'd to 0o440 (FINDING-V412-SVID-INIT-
+    KEY-PERM, owner READ-only) and the SECOND onboarding's
+    shutil.copy2(..., "client.key") opens that existing path for writing
+    and hits PermissionError. Decommission "fixed" this only as a side
+    effect (unlink() only needs parent-dir write, not target-file mode) —
+    re-import must be idempotent regardless of whether decommission ran."""
+
+    @pytest.mark.asyncio
+    async def test_reimport_without_decommission_succeeds(self, txn_env):
+        """The exact regression: import, then import the SAME server_id
+        again with NO decommission in between. Must NOT raise."""
+        artifact_root, secrets_dir = txn_env
+
+        r1 = await _run(secrets_dir)
+        assert r1.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{r1.instance_id}")
+
+        # Re-import — same tenant/server_id, no decommission call at all.
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()  # mirrors the real per-request codegen session reset
+        r2 = await _run(secrets_dir)
+
+        # A fresh instance_id/spiffe_id was minted — re-import is a full
+        # re-onboard, not a no-op — and it succeeded without any stale-file
+        # error (the bug this regression closes).
+        assert r2.instance_id != r1.instance_id
+        assert r2.spiffe_id.endswith(f"/{_TENANT}/{_SERVER}/{r2.instance_id}")
+
+    @pytest.mark.asyncio
+    async def test_reimport_overwrites_stale_svid_init_files(self, txn_env):
+        """The svid-init staging files on disk after a re-import reflect
+        the SECOND onboarding's cert — not stale bytes retained from the
+        first (proves 'overwrite', not just 'no crash')."""
+        artifact_root, secrets_dir = txn_env
+        svid_init = secrets_dir / "svid-init" / _TENANT / _SERVER
+
+        def _mint_labelled(label: str):
+            def _mint(paths, tenant_id, agent_name, *, instance_id="", scope_hash="",
+                      image_digest="", approved_by="", audit_writer=None, **kw):
+                cert = paths.agent_cert(tenant_id, agent_name, instance_id)
+                key = paths.agent_key(tenant_id, agent_name, instance_id)
+                cert.write_text(f"CERT-{label}")
+                key.write_text(f"KEY-{label}")
+                return f"spiffe://yashigani.internal/agents/{tenant_id}/{agent_name}/{instance_id}"
+            return _mint
+
+        await _run(secrets_dir, mint=_mint_labelled("first"))
+        assert (svid_init / "client.crt").read_text() == "CERT-first"
+        assert (svid_init / "client.key").read_text() == "KEY-first"
+
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()
+        await _run(secrets_dir, mint=_mint_labelled("second"))
+
+        assert (svid_init / "client.crt").read_text() == "CERT-second"
+        assert (svid_init / "client.key").read_text() == "KEY-second"
+
+    @pytest.mark.asyncio
+    async def test_reimport_permission_denied_regression(self, txn_env):
+        """Direct regression for the ORIGINAL failure mode: without the fix,
+        the second import raised McpOnboardError(step='svid_init') wrapping
+        a bare PermissionError because client.key was chmod'd 0o440 by the
+        first import. Assert the step never fails and the mode is restored
+        to a writable-by-owner state after every import (so a THIRD import
+        would also succeed — not just the second)."""
+        artifact_root, secrets_dir = txn_env
+        svid_init = secrets_dir / "svid-init" / _TENANT / _SERVER
+
+        await _run(secrets_dir)
+        # First-import invariant unchanged: key is still group-readable only
+        # for the sidecar (FINDING-V412-SVID-INIT-KEY-PERM), i.e. NOT
+        # world/owner-writable at rest — the fix must not weaken this.
+        mode_after_first = (svid_init / "client.key").stat().st_mode & 0o777
+        assert mode_after_first == 0o440
+
+        from yashigani.manifest.codegen import reset_codegen_registry
+        reset_codegen_registry()
+        # Must not raise (the regression) — and must succeed a 3rd time too,
+        # proving this isn't a one-shot unlock.
+        await _run(secrets_dir)
+        reset_codegen_registry()
+        await _run(secrets_dir)
+        mode_after_third = (svid_init / "client.key").stat().st_mode & 0o777
+        assert mode_after_third == 0o440
 
 
 class TestMintEnvelopeSvidGuard:

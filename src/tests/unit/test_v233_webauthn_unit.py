@@ -393,7 +393,20 @@ class TestRedisWebAuthnChallengeStore:
 # ---------------------------------------------------------------------------
 
 class TestExpectedOrigin:
-    def test_origin_from_forwarded_proto_and_host(self):
+    def test_origin_from_forwarded_proto_and_host(self, monkeypatch):
+        """
+        LAURA/AVA-412 (2026-07-24): the Host presented here must be within
+        the configured public-host allowlist (YASHIGANI_TLS_DOMAIN +
+        "localhost") -- Caddy's public edge is path-routed, not
+        host-vhosted, so an arbitrary Host is now rejected rather than
+        blindly trusted as the WebAuthn expected_origin. See
+        test_origin_rejects_host_outside_allowlist below for the rejection
+        path, and src/tests/regression/v4.1.2/
+        test_tom_webauthn_origin_mismatch_fix.py for the X-Forwarded-Host
+        preference over the internal Caddy->backoffice upstream Host that
+        this fix actually closes.
+        """
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "admin.example.com")
         from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
         request = MagicMock()
         request.headers = {
@@ -402,13 +415,26 @@ class TestExpectedOrigin:
         }
         assert _expected_origin(request) == "https://admin.example.com"
 
-    def test_origin_falls_back_to_url(self):
+    def test_origin_falls_back_to_url(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "localhost")
         from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
         request = MagicMock()
         request.headers = {}
         request.url.scheme = "https"
         request.url.netloc = "localhost:8443"
         assert _expected_origin(request) == "https://localhost:8443"
+
+    def test_origin_rejects_host_outside_allowlist(self, monkeypatch):
+        """Host not in the configured allowlist must raise, not be trusted."""
+        monkeypatch.setenv("YASHIGANI_TLS_DOMAIN", "yashigani.example.com")
+        from yashigani.backoffice.routes.webauthn_v1 import _expected_origin
+        request = MagicMock()
+        request.headers = {
+            "x-forwarded-proto": "https",
+            "host": "evil.attacker.example",
+        }
+        with pytest.raises(ValueError, match="not in configured allowlist"):
+            _expected_origin(request)
 
 
 # ---------------------------------------------------------------------------

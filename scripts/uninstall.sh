@@ -1,11 +1,59 @@
 #!/usr/bin/env bash
-# scripts/uninstall.sh — Yashigani v0.6.0
+# scripts/uninstall.sh — Yashigani v0.6.0 — DEPRECATED, see below.
 # Clean removal of Yashigani. Optionally preserves data volumes.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# DEPRECATION-STALE-LEGACY-UNINSTALL-2026-07-22 (gap-map Finding 6, P3)
+#
+# This file (v0.6.0) is stale and un-referenced by any documented flow (only
+# a test fixture pointed at it). It is docker-only (no podman/k8s), has no
+# --project/multi-instance awareness, no MI-4 step-up gate, no ringfence
+# sweep, and hardcodes volume names (yashigani_postgres_data/audit_data/
+# redis_data) that DO NOT match the canonical per-project volume list the
+# real ./uninstall.sh uses. An operator who finds this browsing scripts/
+# could run it expecting parity with the real uninstall.sh and get a
+# materially weaker, non-multi-instance, non-k8s teardown.
+#
+# Tiago directive: do NOT delete this file (deletion requires explicit
+# Tiago approval) — deprecate loudly and hard-stop instead.
+#
+# Deliberately NOT auto-exec'ing the canonical ../uninstall.sh: the flag
+# semantics are INVERTED, not just renamed —
+#   this script:        default = DELETE data; --keep-data = preserve
+#   ../uninstall.sh:     default = PRESERVE data; --remove-volumes = delete
+# A blind flag-forward (e.g. mapping bare --force here to bare --yes there)
+# would silently invert an operator's data-loss intent — worse than a hard
+# stop. Print the mapping and let the operator choose deliberately.
+# ---------------------------------------------------------------------------
+cat >&2 <<'DEPRECATION_EOF'
+================================================================================
+DEPRECATED — scripts/uninstall.sh (v0.6.0) is stale and no longer maintained.
+
+Use the top-level ./uninstall.sh instead:
+
+    cd <yashigani install directory>
+    ./uninstall.sh                          # preserves data (default)
+    ./uninstall.sh --remove-volumes         # also deletes all data volumes
+    ./uninstall.sh --remove-volumes --yes   # unattended, deletes all data
+
+NOTE the flag semantics are INVERTED, not renamed:
+    scripts/uninstall.sh (this file)  default = DELETE data; --keep-data preserves
+    ./uninstall.sh       (canonical)  default = PRESERVE data; --remove-volumes deletes
+
+./uninstall.sh also supports podman, k8s, multi-instance (--project=NAME),
+and the MI-4 step-up gate on destructive ops — none of which this legacy
+script implements.
+
+Refusing to run. This file is being kept only because deletion requires
+explicit approval (Tiago) — do not use it.
+================================================================================
+DEPRECATION_EOF
+exit 1
 
 # ---------------------------------------------------------------------------
 # Parse flags

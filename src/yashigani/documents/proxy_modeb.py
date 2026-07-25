@@ -179,6 +179,9 @@ async def egress_decide(
     route: str = PROXY_EGRESS_ROUTE,
     egress_mode: str = "B",
     detokenize_rbac_role: Optional[str] = None,
+    identity_id: str = "",
+    tenant: str = "",
+    surface: Optional[str] = None,
 ) -> EgressOutcome:
     """OUTBOUND: ask REAL OPA what to do with a document leaving via the proxy,
     then apply the OPA-decided action.
@@ -219,7 +222,27 @@ async def egress_decide(
     never a crash and never a half-transformed body.  A real BLOCK (OPA deny,
     oversize, mismatch, residual, small-set escalation, OPA-unreachable →
     synthetic BLOCK) is honoured as ``blocked=True`` — the proxy MUST hold the
-    document.  That distinction is the whole point of the fail-closed gate."""
+    document.  That distinction is the whole point of the fail-closed gate.
+
+    ``identity_id`` (RESTART-013 gap #4, optional): the caller's canonical
+    Yashigani identity_id, threaded to ``evaluate_document_decision`` so a
+    per-user REDACT/PSEUDONYMIZE policy can bind to this caller. ``tenant``
+    (RESTART-013 gap #5) is carried on the audit event only. ``surface``
+    optionally overrides the audit surface baked into the shared callback at
+    construction time (e.g. ``"mcp-tool-call"`` when the MCP document bridge,
+    ``documents/mcp_document_bridge.py``, calls this same function for a
+    tool-call payload instead of a generic proxy-egress body); ``None``
+    (default) keeps the callback's own default (``"proxy-egress"``). All of
+    identity_id/tenant/surface flow through the task-scoped audit context
+    (``documents/audit_bridge.py``) since this ``pipeline`` is a SHARED
+    singleton (gateway/entrypoint.py) reused by every concurrent request —
+    never a closure-captured mutable dict here."""
+    from yashigani.documents.audit_bridge import (
+        set_document_audit_context,
+        update_document_audit_obligations,
+    )
+
+    set_document_audit_context(identity_id=identity_id, tenant=tenant, surface=surface)
     try:
         # --- Pass 1: enumerate (LOG) — build the OPA input, apply no transform.
         enum_result = pipeline.inspect(
@@ -259,7 +282,11 @@ async def egress_decide(
         opa_input,
         route=route,
         pseudonymize_mode=egress_mode,
+        identity_id=identity_id,
     )
+    # RESTART-013 gap #5 — obligations now known; the apply-pass pipeline.inspect()
+    # call(s) below record them on the audit event via the task-scoped context.
+    update_document_audit_obligations(decision.get("obligations", []))
     opa_action = decision.get("action", DISPOSITION_BLOCK)
     opa_mode = decision.get("pseudonymize_mode", egress_mode)
 

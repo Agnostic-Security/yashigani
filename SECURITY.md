@@ -6,11 +6,11 @@ A single release line is actively maintained on the `main` branch. Open WebUI is
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| 3.0.x   | ✅ Current | Document-content data protection (doc-OPA: pass/redact/pseudonymize/block), every-hop OPA agent orchestration, MCP hardening, OpenWebUI at root behind the owui-users gate; full pre-release SAST + DAST + tooling security gate |
-| 2.25.x  | ✅ Patch window | Single auth portal + role routing, admin-UX layer, sensitivity taxonomy, AI pattern authoring |
-| 2.24.x  | ❌ | Superseded by 2.25.x |
-| 2.23.x  | ❌ | Superseded by 2.24.x |
-| < 2.23  | ❌ | End of life |
+| 4.1.2   | ✅ Current | Deny/RBAC hardening (LAURA-412-002 / W3-007 / W3-008), complete logout / session invalidation (WA-10), podman 6.x compose bifurcation fix; full pre-release SAST + DAST + tooling security gate |
+| 4.1.1   | ✅ Patch window | Model-ID normalisation, force-password-change scoping, routing-telemetry header gating, cloud_override SOD dual-control hardening |
+| 4.1.0   | ❌ | Superseded by 4.1.1 |
+| 3.0.x   | ❌ | Superseded by 4.x |
+| < 3.0   | ❌ | End of life |
 
 ## Reporting a Vulnerability
 

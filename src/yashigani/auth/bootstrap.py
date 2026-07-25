@@ -110,11 +110,44 @@ def print_credentials(creds: BootstrapCredentials) -> None:
     print("\n" + output + "\n", file=sys.stdout, flush=True)
 
 
-def write_docker_secrets(creds: BootstrapCredentials, secrets_dir: str = "/run/secrets") -> None:
+def write_docker_secrets(
+    creds: BootstrapCredentials,
+    secrets_dir: str = "/run/secrets",
+    write_dir: Optional[str] = None,
+) -> None:
     """
     Write credentials to Docker secret files if the directory is writable.
     Used in local/dev mode — in production secrets are managed by the KSM provider.
+
+    FINDING-LIC-012 (2026-07-20): docker-compose.yml/values.yaml now mount the
+    shared secrets directory read-only to backoffice, with individual RW
+    shadow-mounts for exactly the filenames this function legitimately
+    writes (admin_initial_password, grafana_admin_password, redis_password,
+    license_key) — CA/root/intermediate/leaf trust material is never
+    writable here. prometheus_password is NOT given an RW shadow-mount
+    (nothing in the codebase reads it back — see the class docstring above;
+    it is retained only for backward-compatible credential printing). Any
+    per-file write can therefore now legitimately hit a read-only
+    filesystem in normal operation (not just a misconfiguration) — catch it
+    per field so one unwritable field never aborts bootstrap for the
+    others (fail-loud via stderr, fail-open for the process as a whole:
+    the credential was still generated and printed by print_credentials()).
+
+    FINDING-V412-RESTART-012 (2026-07-21): the LIC-012 shadow-mounts above
+    used to sit UNDER secrets_dir itself (/run/secrets/<name>:rw nested under
+    /run/secrets:ro) — a podman-compose fork bug silently dropped the PARENT
+    :ro when a :rw child shared its path prefix, making the whole /run/secrets
+    tree writable (Laura, laura-012-rogue-reattack.md). The 4 writable
+    filenames now live at a SEPARATE top-level mount (write_dir, default
+    /run/secrets-rw — see docker-compose.yml) that shares no path prefix with
+    secrets_dir, so there is no nested-mount collision left for the fork to
+    mishandle. Both mountpoints bind the SAME underlying host file, so a write
+    via write_dir is immediately visible to every reader still using
+    secrets_dir (unchanged) — see DockerSecretsProvider, licensing/loader.py,
+    etc. write_dir defaults to secrets_dir for direct/test callers that pass a
+    single scratch directory for both.
     """
+    write_dir = write_dir if write_dir is not None else secrets_dir
     mapping = {
         "admin_initial_password": creds.admin_password,
         "grafana_admin_password": creds.grafana_admin_password,
@@ -123,13 +156,23 @@ def write_docker_secrets(creds: BootstrapCredentials, secrets_dir: str = "/run/s
     }
     mapping.update({f"extra_{k}": v for k, v in creds.extras.items()})
 
-    os.makedirs(secrets_dir, exist_ok=True)
+    os.makedirs(write_dir, exist_ok=True)
     for name, value in mapping.items():
-        path = os.path.join(secrets_dir, name)
-        if not os.path.exists(path):
+        path = os.path.join(write_dir, name)
+        if os.path.exists(path):
+            continue
+        try:
             with open(path, "w") as f:
                 f.write(value)
             os.chmod(path, 0o400)
+        except OSError as exc:
+            print(
+                f"write_docker_secrets: could not write {path!r} ({exc}) — "
+                "skipping (this mount may be intentionally read-only for "
+                "this field; see FINDING-LIC-012 / FINDING-V412-RESTART-012)",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def load_or_generate(

@@ -3,11 +3,13 @@ Regression test — P1/P2 header stripping (RISK-108 / FIND-3.1-AGENT-BEARER-IMP
 
 Proves:
 1. A P1 agent bearer cannot set X-Yashigani-Orchestration-Principal to impersonate a user.
-2. A P1 agent bearer cannot set X-OpenWebUI-User-Email to impersonate a user.
+2. A P1 agent bearer cannot set X-Yashigani-Identity-Id to impersonate a user.
+   (4.1 SEC-GAP-1: X-OpenWebUI-User-Email is a dead header — not read at all.)
 3. An AGENT_HEADER_STRIPPED audit event is emitted when a P1 caller presents P2 headers.
 4. The P2 orchestrator path (brain/self-call) is preserved — orchestration-principal
    is honoured only for the p2_orchestrator role.
-5. The P2 forwarder path (OWUI) honours X-OpenWebUI-User-Email only for p2_forwarder.
+5. The P2 forwarder path honours X-Yashigani-Identity-Id only for p2_forwarder.
+   (4.1 SEC-GAP-1: X-OpenWebUI-User-Email path removed; idnt_ PK is the only forward.)
 
 Reference: nhi-p1p2-langflow-spec.md §B.1-B.4 / RECONCILIATION R2/R9
 """
@@ -91,9 +93,13 @@ def test_p1_agent_cannot_impersonate_via_orchestration_principal(monkeypatch) ->
     assert ev.severity == "HIGH"
 
 
-def test_p1_agent_cannot_impersonate_via_owui_email(monkeypatch) -> None:
-    """A p1_agent token sets X-OpenWebUI-User-Email.
-    The header must be stripped; identity stays as the agent's own.
+def test_p1_agent_cannot_impersonate_via_ysg_identity_id(monkeypatch) -> None:
+    """4.1 SEC-GAP-1: a p1_agent token sets X-Yashigani-Identity-Id.
+    The header must be STRIPPED and AGENT_HEADER_STRIPPED event emitted.
+    Identity stays as the agent's own — impersonation impossible.
+
+    Note: X-OpenWebUI-User-Email is a dead header in 4.1 (not read at any path),
+    so the live P1 impersonation vector is X-Yashigani-Identity-Id.
     """
     import yashigani.gateway.openai_router as router_mod
 
@@ -109,7 +115,7 @@ def test_p1_agent_cannot_impersonate_via_owui_email(monkeypatch) -> None:
 
     req = _make_request({
         "Authorization": f"Bearer {p1_token}",
-        "X-OpenWebUI-User-Email": "victim@corp.example",  # P2 header — must be stripped
+        "X-Yashigani-Identity-Id": "idnt_victim0000000",  # P2 header — must be stripped
     })
 
     result = router_mod._resolve_identity(req)
@@ -124,10 +130,10 @@ def test_p1_agent_cannot_impersonate_via_owui_email(monkeypatch) -> None:
         if hasattr(e, "event_type") and e.event_type == "AGENT_HEADER_STRIPPED"
     ]
     assert len(stripped_events) >= 1, (
-        "RISK-108 regression: AGENT_HEADER_STRIPPED must be emitted for X-OpenWebUI-User-Email"
+        "RISK-108 regression: AGENT_HEADER_STRIPPED must be emitted for X-Yashigani-Identity-Id"
     )
     ev = stripped_events[0]
-    assert "email" in ev.stripped_header.lower()
+    assert "yashigani-identity-id" in ev.stripped_header.lower()
     assert ev.caller_token_role == "p1_agent"
 
 
@@ -167,9 +173,10 @@ def test_p2_orchestrator_honours_orch_principal(monkeypatch) -> None:
     assert result.get("_orchestration_self_call") is True
 
 
-def test_p2_forwarder_honours_owui_email(monkeypatch) -> None:
-    """A p2_forwarder token with X-OpenWebUI-User-Email must resolve the
-    forwarded user (OWUI trusted-forwarder path preserved).
+def test_p2_forwarder_honours_ysg_identity_id(monkeypatch) -> None:
+    """4.1 SEC-GAP-1: a p2_forwarder token with X-Yashigani-Identity-Id must
+    resolve the forwarded user identity (trusted-forwarder path).
+    X-OpenWebUI-User-Email path is removed; idnt_ PK is the only forward header.
     """
     import yashigani.gateway.openai_router as router_mod
 
@@ -178,35 +185,30 @@ def test_p2_forwarder_honours_owui_email(monkeypatch) -> None:
         forwarder_token: ("p2_forwarder", "owui"),
     })
 
-    mock_registry = MagicMock()
-    mock_registry.get_by_slug.return_value = {
-        "identity_id": "bob",
+    bob_identity = {
+        "identity_id": "idnt_bob0000000000",
         "status": "active",
         "groups": [],
         "sensitivity_ceiling": "INTERNAL",
         "allowed_models": [],
     }
+    mock_registry = MagicMock()
+    mock_registry.get.return_value = bob_identity
     monkeypatch.setattr(router_mod._state, "identity_registry", mock_registry)
     monkeypatch.setattr(router_mod._state, "audit_writer", None)
 
-    # Patch _resolve_owui_forwarded_user to return the mocked identity
-    forwarder_identity = {
-        "identity_id": "bob",
-        "status": "active",
-        "groups": [],
-        "sensitivity_ceiling": "INTERNAL",
-        "allowed_models": [],
-    }
-    with patch.object(router_mod, "_resolve_owui_forwarded_user", return_value=forwarder_identity):
-        req = _make_request({
-            "Authorization": f"Bearer {forwarder_token}",
-            "X-OpenWebUI-User-Email": "bob@corp.example",
-        })
-        result = router_mod._resolve_identity(req)
+    req = _make_request({
+        "Authorization": f"Bearer {forwarder_token}",
+        "X-Yashigani-Identity-Id": "idnt_bob0000000000",
+    })
+    result = router_mod._resolve_identity(req)
 
     assert result is not None
-    assert result["identity_id"] == "bob", (
-        f"OWUI forwarder path broken: expected bob, got {result['identity_id']!r}"
+    assert result["identity_id"] == "idnt_bob0000000000", (
+        f"P2 forwarder (4.1) path broken: expected idnt_bob0000000000, got {result['identity_id']!r}"
+    )
+    assert result.get("_yashigani_identity_header") is True, (
+        "P2 forwarder must mark identity as resolved via X-Yashigani-Identity-Id"
     )
 
 

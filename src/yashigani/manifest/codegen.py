@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlsplit
 
-from yashigani.manifest.linter import _is_private_address
+from yashigani.manifest.linter import _is_private_address, _RESERVED_BASE_SERVICE_NAMES
 
 _log = logging.getLogger(__name__)
 
@@ -239,6 +239,79 @@ def reset_codegen_registry() -> None:
     Call between independent onboard sessions."""
     _SEEN_PAIRS.clear()
     _SEEN_MESH_PORTS.clear()
+
+
+def release_agent_pair(tenant_id: str, agent_id: str) -> bool:
+    """
+    Symmetric counterpart to :func:`_assert_unique_agent_pair` (C3).
+
+    ``_assert_unique_agent_pair`` registers ``(tenant_id, agent_id)`` in the
+    in-process ``_SEEN_PAIRS`` set the FIRST time an agent is onboarded in a
+    backoffice process's lifetime, so that a second onboard of the SAME
+    server_id within the same process — without going through decommission —
+    is rejected (C3_duplicate_agent).
+
+    FINDING N2 (v4.1.2 finalized onboarding e2e, Ava, 2026-07-21): decommission
+    never released this entry, so a legitimate decommission -> re-onboard of
+    the SAME server_id failed C3_duplicate_agent until the backoffice process
+    restarted. Called from
+    ``backoffice.mcp_onboard.run_decommission_transaction`` so the in-process
+    dedup registry stays in sync with the durable registry it mirrors.
+
+    This is pure in-process bookkeeping with no security effect: C3 exists to
+    catch a single onboard SESSION silently double-registering an agent_id
+    (e.g. a retried request racing itself), not to block a legitimate
+    decommission -> re-onboard cycle for an operator-initiated removal.
+
+    Args:
+        tenant_id: same tenant_id used at onboard time.
+        agent_id:  the manifest's ``metadata.name`` / server_id — the same
+                   value passed to ``_assert_unique_agent_pair`` at onboard.
+
+    Returns:
+        True if the pair was registered and has now been removed. False if
+        the pair was never registered in this process (e.g. decommissioning
+        a server_id onboarded in a PRIOR process lifetime, or retrying an
+        already-released decommission) — idempotent, never raises for an
+        absent entry.
+    """
+    pair = (tenant_id, agent_id)
+    if pair in _SEEN_PAIRS:
+        _SEEN_PAIRS.discard(pair)
+        return True
+    return False
+
+
+def _assert_not_reserved_service_name(agent_id: str) -> None:
+    """
+    C3-b (HIGH, onboarding-robustness batch finding #3, Su, 2026-07-21):
+    reject an agent_id that collides with a service already defined in
+    docker/docker-compose.yml or one of its opt-in overlays.
+
+    Single source of truth: _RESERVED_BASE_SERVICE_NAMES lives in
+    linter.py (_lint_reserved_service_name is the primary gate — it runs
+    before codegen in the real onboarding flow, mcp_onboard.py.
+    _validate_manifest_or_raise). This is the defence-in-depth mirror for
+    any caller that constructs a CodegenEngine*/render() directly.
+
+    Raises:
+        CodegenError: C3b_reserved_service_name
+    """
+    if agent_id in _RESERVED_BASE_SERVICE_NAMES:
+        raise CodegenError(
+            "C3b_reserved_service_name",
+            "agent name %r collides with a service already defined in "
+            "docker/docker-compose.yml (or an opt-in overlay). The generated "
+            "compose override's services.%s: stanza would merge against the "
+            "EXISTING base service of the same name — Docker Compose hard-"
+            "rejects the resulting duplicate security_opt/cap_drop entries "
+            "at config-parse time (\"services.%s.security_opt items at 0 "
+            "and 1 are equal\"), refusing to start the whole stack. Choose "
+            "a different metadata.name; reserved names: %s." % (
+                agent_id, agent_id, agent_id,
+                ", ".join(sorted(_RESERVED_BASE_SERVICE_NAMES)),
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +642,67 @@ def _safe_write(dest: Path, content: str, allowed_root: Path) -> None:
         except OSError:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# v4.1.2 fix (RESTART-013 MCP leg, Gap B) — runtime-scoped artifact persistence.
+#
+# Root cause of the ``artifact_write`` 502 (McpOnboardError, mcp_onboard.py):
+# CodegenEngine.render() / CodegenEngineShapeC.render() write EVERY key in the
+# rendered artifact map to ``output_root`` unconditionally on dry_run=False,
+# regardless of ``runtime``.  The artifact map mirrors the FULL install-tree
+# layout (docker/, helm/, opa/, tests/, plus loose top-level fragments) so
+# dry-run callers can introspect every rendered artifact for any runtime — but
+# a REAL install's output_root is (deliberately, for blast-radius reasons —
+# docker/docker-compose.yml backoffice volumes comment, iris-phase1d-audit
+# §5-B) scoped to only the ``docker/`` subtree on compose runtimes (the bind
+# mount is ``./:/mnt/install/docker:rw`` with the container's root filesystem
+# otherwise read-only).  Writing a "helm/..." key under that output_root asks
+# ``Path.mkdir(parents=True)`` to create a directory under a read-only parent,
+# which raises ``PermissionError`` (verified: mkdir under a chmod 0555 parent
+# raises errno 13) — NOT a CodegenError, so it falls into mcp_onboard.py's
+# generic ``except Exception`` and aborts the WHOLE approve transaction
+# (502 onboard_transaction_failed / artifact_write), even though the two
+# artifacts a compose runtime actually needs (the compose override + the
+# Caddy-front/egress snippet, both "docker/"-prefixed) had already been
+# written successfully moments earlier — exactly what Ava's 2026-07-20
+# byte-proof observed live for both ``mirror-mcp`` and ``cloud9-demo``.
+#
+# Fix: persist only the subset of the artifact map that the target runtime's
+# output_root is actually scoped to receive and that something reads back at
+# install time:
+#   * runtime == "k8s"                     -> "helm/"-prefixed keys only
+#     (consumed via `helm upgrade -f values-<agent>.yaml`; no docker-compose
+#     exists on K8s).
+#   * docker / podman-rootful / -rootless  -> "docker/"-prefixed keys only
+#     (the compose override + Caddy snippet Caddy/compose actually read back;
+#     no Helm release exists on a single-host compose install).
+# Every other key — service_identities.yaml.fragment, pki_ownership-<agent>.sh,
+# opa/<agent>.rego, tests/contracts/* — is advisory / dev-time-only: nothing
+# reads them back from output_root at approve-time for ANY runtime (OPA
+# grants/baselines are pushed live via the separate push_egress_grants data
+# API — mcp_onboard.py step 4b-iii — not from this static rego file;
+# service_identities.yaml.fragment and pki_ownership-<agent>.sh are for manual
+# operator review per this module's own docstring; tests/contracts/* are CI
+# fixtures). They remain in the FULL artifact map returned to the caller
+# (introspection / API response / dry-run contract unchanged) but are never
+# persisted to disk during a real approve transaction, so the intentionally
+# narrow compose bind mount is sufficient and this failure mode cannot recur.
+# ---------------------------------------------------------------------------
+
+
+def is_artifact_relevant_for_runtime(rel_path: str, runtime: str) -> bool:
+    """Whether *rel_path* should be PERSISTED to output_root for *runtime*.
+
+    Used only to scope the disk-write side effect of ``render(dry_run=False)``
+    — the returned artifact map itself is unchanged (still every rendered
+    key, for every runtime) so introspection/tests/API-display behaviour is
+    unaffected. See the module-level comment above this function for the
+    full rationale (RESTART-013 MCP leg Gap B / artifact_write 502 root cause).
+    """
+    if runtime == "k8s":
+        return rel_path.startswith("helm/")
+    return rel_path.startswith("docker/")
 
 
 # ---------------------------------------------------------------------------
@@ -1752,6 +1886,19 @@ def _mcp_mesh_port(parsed: dict) -> int:
     return port
 
 
+def _mcp_shim_port(parsed: dict) -> int:
+    """Resolve the MCP shim's plain-HTTP port on the ringfence bridge.
+
+    FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): pulled out of
+    _gen_caddy_snippet_mcp() into its own function so mcp_onboard.py's
+    approve transaction can pass this value to caddy-config-broker's
+    POST /route DATA contract without needing to author any Caddy content
+    itself (see that module's docstring).
+    """
+    mcp_exposes = ((parsed.get("spec") or {}).get("mcp") or {}).get("exposes") or {}
+    return mcp_exposes.get("shim_port") or _SC_BRIDGE_PORT
+
+
 # ---------------------------------------------------------------------------
 # C1 (unified-sidecar must-fix #10) — mesh-port registry persistence seed
 # ---------------------------------------------------------------------------
@@ -2371,7 +2518,17 @@ def _gen_egress_forwarder_compose(
         "      - ./caddy/egress/%s-forwarder.caddy:/etc/caddy/egress-forwarder.caddy:ro" % system,
     ] + svid_volume_lines + [
         "    tmpfs:",
-        "      - /tmp:size=16m,mode=0700",
+        "      # mode=1777 (was 0700 — same crash-loop bug class as the svid-sidecar",
+        "      # /run/ringfence finding, 2026-07-21): this forwarder writes",
+        "      # XDG_CONFIG_HOME=/tmp/caddy/config + XDG_DATA_HOME=/tmp/caddy/data",
+        "      # (env above) as its own non-root user (65534:65534 volume mode, or",
+        "      # 1000:1000 transitional mode — see user_line below); a bare tmpfs",
+        "      # with no uid=/gid= is created root:root by both Docker and Podman",
+        "      # regardless of `user:`, so mode=0700 blocked BOTH UIDs from ever",
+        "      # creating /tmp/caddy/* (proven live: `podman run --user 1000:1000",
+        "      # --tmpfs /tmp:...,mode=0700` -> `mkdir: Permission denied`). Same",
+        "      # fix, same reasoning as _gen_svid_sidecar_service's /run/ringfence.",
+        "      - /tmp:size=16m,mode=1777",
         "    networks:",
         "      # Egress ringfence (2-member: %s + this forwarder) + caddy_internal" % system,
         "      # to reach caddy:%d. L1 default-deny (init below) pins caddy:%d as" % (
@@ -3155,9 +3312,16 @@ def _gen_caddy_snippet_mcp(
         (McpHttpTransport appends /mcp to the base URL).
       - X-SPIFFE-ID strip-before-set from the VERIFIED peer cert URI SAN
         (zero-trust header discipline, EX-231-08).
-      - forward_auth backoffice /auth/verify-mcp: app-layer ingress gate
-        (endpoint lands with Tom's Phase 1b/2 work; the gate fails closed —
-        Caddy 502s the route until the endpoint exists).
+      - forward_auth backoffice /auth/verify-mcp: app-layer ingress gate.
+        Carries its own ``header_up X-SPIFFE-ID`` (FINDING-V412-ONBOARDING-
+        ROBUSTNESS #1, 2026-07-21): forward_auth's auth-subrequest is
+        independent of the surrounding handler chain and does NOT inherit
+        the ``request_header X-SPIFFE-ID`` set above — only header_up
+        entries declared inside the forward_auth block itself reach the
+        auth backend (proven against a live caddy 2.11.4 binary). Without
+        it every caller (agent leaf AND gateway mesh identity) got
+        401 no_spiffe_id even though the TLS handshake + forward_auth hop
+        were both live.
       - reverse_proxy http://<server_id>:<shim_port> over the MCP's ringfence
         bridge.  Plain HTTP on the isolated bridge is intentional (T2): the
         per-instance identity travels via the leaf Caddy presents/verifies +
@@ -3224,6 +3388,19 @@ def _gen_caddy_snippet_mcp(
                     # C10-validated standalone, where named snippets from the
                     # monolith are not defined).
                     header_up X-Caddy-Verified-Secret {{$CADDY_INTERNAL_HMAC}}
+                    # FINDING-V412-ONBOARDING-ROBUSTNESS #1 fix: forward_auth
+                    # builds an INDEPENDENT subrequest to the auth backend — it
+                    # does NOT inherit headers set by the request_header
+                    # directive above (empirically proven: a real caddy 2.11.4
+                    # instance with only `request_header X-SPIFFE-ID ...` and no
+                    # header_up here forwards Host/UA/X-Forwarded-* to the auth
+                    # backend but NEVER X-Spiffe-Id). Only a header_up entry
+                    # declared inside THIS block reaches /auth/verify-mcp. Uses
+                    # the cert SAN placeholder directly (not the request_header-
+                    # set value) — immune to header spoofing since
+                    # require_and_verify already ran. Mirrors the (correct,
+                    # already-proven) _gen_agent_ingress_caddyfile pattern.
+                    header_up X-SPIFFE-ID {{http.request.tls.client.san.uris.0}}
                     transport http {{
                         tls
                         tls_trust_pool file /run/secrets/ca_intermediate.crt
@@ -3340,8 +3517,13 @@ def _gen_svid_sidecar_service(
 
     Security:
       - ``user: "1002:2003"`` — UID 1002 (svid-sidecar), PRIMARY GID 2003
-        (svid GID).  Files written inherit GID 2003 → Caddy reads via
-        ``group_add: ["2003"]`` (emitted in the caddy stanza).
+        (svid GID).  Files written inherit GID 2003 → Caddy reads via the
+        STATIC ``group_add: ["2003"]`` on the BASE caddy: service in
+        docker/docker-compose.yml (batch-finding #3: this used to be
+        re-emitted per-agent here, which duplicated the value across every
+        Shape-C override file and hard-failed Docker Compose's merge —
+        "services.caddy.group_add items at 0 and 1 are equal" — once 2+
+        Shape-C agents were onboarded together).
       - ``read_only: true`` — root FS read-only; writable paths are the SVID
         named volume + the ringfence-ready tmpfs.
       - ``caddy_internal`` network ONLY — no ringfence bridge access; no
@@ -3378,7 +3560,8 @@ def _gen_svid_sidecar_service(
         "        source: %s" % init_dir_host,
         "        target: /init",
         "        read_only: true",
-        "      # SVID named volume (rw): sidecar writes; Caddy reads via group_add 2003.",
+        "      # SVID named volume (rw): sidecar writes; Caddy reads via the static",
+        "      # base group_add 2003 (docker/docker-compose.yml — batch-finding #3).",
         "      - %s:%s" % (svid_vol, svid_dir),
     ]
     if runtime == "podman-rootless":
@@ -3386,14 +3569,30 @@ def _gen_svid_sidecar_service(
     lines += [
         "    tmpfs:",
         "      # /run/ringfence: ready-flag (rotate.sh healthcheck; agent depends_on).",
-        "      - /run/ringfence:size=1m,mode=0700",
+        "      # mode=1777 (was 0700 — svid-sidecar crash-loop finding, 2026-07-21):",
+        "      # a bare tmpfs mount with no uid=/gid= option is created root:root by",
+        "      # both Docker and Podman regardless of the container's `user:` directive",
+        "      # (proven live: `podman run --user 1002:2003 --tmpfs ...,mode=0700` ->",
+        "      # `touch: Permission denied` — UID 1002 cannot write its OWN readiness",
+        "      # flag under a root-owned 0700 dir). rotate.sh dies under `set -eu` on",
+        "      # that write, so the sidecar never reaches the rotation loop -> crash-loop.",
+        "      # mode=1777 (world-writable + sticky, /tmp semantics) is the SAME pattern",
+        "      # already used for this EXACT path everywhere else in this codebase",
+        "      # (_ringfence_init_service_lines above, letta/openclaw/langflow egress-",
+        "      # forwarder overrides, docker/ringfence-init/README.md) — this stanza was",
+        "      # the sole 0700 outlier. Safe: the flag holds only a UTC timestamp (no",
+        "      # secret; rotate.sh comment: \"only a timestamp\"), sticky bit still",
+        "      # restricts delete/rename to the flag's own owner (UID 1002).",
+        "      - /run/ringfence:size=1m,mode=1777",
         "    networks:",
         "      # caddy_internal: reaches backoffice:8443 for cert rotation POST.",
         "      # NOT joined to ringfence_<server>: sidecar never dials the MCP shim.",
         "      - caddy_internal",
         "    # UID 1002 (svid-sidecar image USER), primary GID 2003 (svid GID).",
         "    # Files written by rotate.sh inherit GID 2003 (belt+suspenders: rotate.sh",
-        "    # also does chown :2003 explicitly).  Caddy reads via group_add: [\"2003\"].",
+        "    # also does chown :2003 explicitly).  Caddy reads via the static base",
+        "    # group_add: [\"2003\"] (docker/docker-compose.yml, batch-finding #3 —",
+        "    # NOT re-declared per-agent anymore, see the caddy: stanza above).",
         '    user: "1002:%d"' % _MCP_SVID_GID,
         "    security_opt:",
         "      - no-new-privileges:true",
@@ -3644,17 +3843,38 @@ def _gen_compose_override_shape_c(
         "  # supp-group %d (shared with the svid-sidecar, _MCP_SVID_GID)." % _MCP_SVID_GID,
         "  # Key mode: 0440 (owner-read + group-read). NOT 0400, NOT 0444.",
         "  # Su: rotate.sh must chmod 0440 + chown :%d the key after each write." % _MCP_SVID_GID,
+        "  #",
+        "  # FINDING-V412-CADDYADMIN-002-e / batch-finding #3 (Su, 2026-07-21):",
+        "  # group_add: [\"%d\"] is intentionally NOT emitted here anymore. It used" % _MCP_SVID_GID,
+        "  # to be repeated in EVERY Shape-C agent's override (this is a fixed",
+        "  # constant, not agent-specific), so onboarding >=2 Shape-C MCPs (or any",
+        "  # sequence of onboard/offboard/re-onboard that leaves 2+ agent override",
+        "  # files live) fed `docker compose -f base -f agent1-override -f",
+        "  # agent2-override ...` with the SAME group_add value declared twice for",
+        "  # the shared `caddy:` service. Docker Compose v2 hard-validates",
+        "  # uniqueness for THIS specific attribute (confirmed live, compose",
+        "  # v5.1.3): \"services.caddy.group_add items at 0 and 1 are equal\" -- a",
+        "  # config-parse error that refuses to start ANYTHING, not a soft warning",
+        "  # (podman-compose silently tolerates the duplicate; Docker does not --",
+        "  # this is a real cross-runtime divergence, not a hypothetical). The",
+        "  # fix: GID %d is now a STATIC, always-present group_add on the BASE" % _MCP_SVID_GID,
+        "  # caddy: service in docker/docker-compose.yml (harmless no-op when no",
+        "  # Shape-C MCP is onboarded — the GID reads nothing until an SVID volume",
+        "  # exists) instead of being re-declared identically in every per-agent",
+        "  # override. `networks:`/`volumes:` below stay per-agent (each entry's",
+        "  # VALUE is unique per agent — a distinct ringfence bridge / SVID volume",
+        "  # name -- so compose's plain list-append merge for those keys is safe;",
+        "  # only a REPEATED IDENTICAL value like the fixed GID hit this class).",
         "  caddy:",
         "    networks:",
         "      - %s" % ringfence_bridge,
         "    # SVID volume: per-instance leaf+key written by the svid-sidecar.",
         "    # Sidecar mounts this same volume at the same path with SVID_DIR set.",
-        "    # Key perm: 0440 GID %d — Caddy reads via group_add below." % _MCP_SVID_GID,
+        "    # Key perm: 0440 GID %d — Caddy reads via the STATIC base group_add" % _MCP_SVID_GID,
+        "    # (docker/docker-compose.yml), not a per-agent override (see above).",
         "    volumes:",
         "      - %s:/run/secrets/svid/%s/%s" % (
             _mcp_svid_volume_name(tenant_id, agent_name), tenant_id, agent_name),
-        "    group_add:",
-        '      - "%d"' % _MCP_SVID_GID,
         "",
         "# Shape-C tenant-namespaced workspace volume (LAURA-FS-TM-008 — no cross-tenant sharing)",
         "# Phase 1b-ii SVID volume: sidecar + Caddy share this; key mode 0440 GID %d." % _MCP_SVID_GID,
@@ -4627,6 +4847,20 @@ class CodegenEngineShapeC:
                 "(default %d)." % (self._agent_id, listen_port, _SC_BRIDGE_PORT),
             )
 
+        # C3-b (onboarding-robustness batch finding #3, Su, 2026-07-21):
+        # metadata.name must not collide with a reserved base-compose-
+        # service name (e.g. the bundled "demo-mcp" opt-in demo upstream —
+        # the LIVE failure this closes). The linter (_lint_reserved_service_
+        # name) already rejects this at manifest-lint time for the real
+        # onboarding flow (mcp_onboard.py._validate_manifest_or_raise runs
+        # BEFORE codegen); this is a defence-in-depth re-check here — same
+        # posture as _assert_unique_agent_pair (C3) — so a caller that
+        # invokes CodegenEngineShapeC directly, bypassing the linter, still
+        # cannot generate a compose override that collides with an existing
+        # service and hard-fails `docker compose config`
+        # ("services.<name>.security_opt items at 0 and 1 are equal").
+        _assert_not_reserved_service_name(self._agent_id)
+
     def render(
         self,
         *,
@@ -4685,32 +4919,39 @@ class CodegenEngineShapeC:
         test_compose_content = _gen_contract_test_compose_shape_c(self._parsed, **kwargs)
 
         # v4.1 Phase 1b-i — the wrap: per-MCP Caddy-front snippet.
-        # This is an INGRESS front (Caddy presents the per-instance leaf +
-        # require_and_verify-gates callers), NOT an egress route —
-        # SC-EGRESS-NONE still holds.
-        mcp_caddy_content = _gen_caddy_snippet_mcp(self._parsed, **kwargs)
-        leaf_crt, leaf_key = _mcp_svid_paths(self._tenant_id, agent_name)
-        _validate_caddy_snippet_mcp(
-            mcp_caddy_content,
-            [leaf_crt, "/run/secrets/ca_intermediate.crt",
-             "/run/secrets/caddy_client.crt"],
-            [leaf_key, "/run/secrets/caddy_client.key"],
-            _validator=self._caddy_validator,
+        # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): this codegen
+        # engine NO LONGER renders or writes the Caddy-front wrap snippet.
+        # Laura's final re-attack (laura-final-reattack.md) proved that
+        # backoffice authoring ANY Caddy content — even through this
+        # template-based path — combined with backoffice's writable
+        # docker/caddy/agents/ mount, gave a compromised backoffice a
+        # filesystem-write primitive onto Caddy's live trust surface (R2),
+        # fully bypassing the FINDING-V412-CADDYADMIN-001 admin-socket
+        # broker. The fix moves ALL rendering + writing authority for this
+        # snippet into caddy-config-broker (docker/caddy/config_broker.py
+        # render_mcp_route()) — backoffice's approve transaction now sends
+        # route DATA only (tenant_id, server_id, mesh_port, shim_port) over
+        # a dedicated socket; see mcp_onboard.py
+        # _register_route_via_broker_socket(). `_gen_caddy_snippet_mcp()`/
+        # `_validate_caddy_snippet_mcp()` above are kept (unused by this
+        # engine) only because existing unit tests exercise them directly as
+        # pure functions — the broker's render_mcp_route() is a parity-
+        # tested independent port of this same template, not a caller of it.
+        #
+        # NOTE: No Caddy EGRESS route generated either (SC-EGRESS-NONE).
+        _log.info(
+            "codegen: Shape-C agent %r — Caddy-front (ingress wrap) is now "
+            "registered with caddy-config-broker by the approve transaction "
+            "(FINDING-V412-CADDYADMIN-002), not rendered/written here; no "
+            "egress route either (SC-EGRESS-NONE)",
+            agent_name,
         )
 
         # S6 — validate shell fragment
         _validate_shell_fragment(pki_content, "pki_ownership-%s.sh" % agent_name)
 
-        # NOTE: No Caddy EGRESS route generated (SC-EGRESS-NONE).
-        _log.info(
-            "codegen: Shape-C agent %r — Caddy-front (ingress wrap) snippet "
-            "generated; no egress route (SC-EGRESS-NONE)",
-            agent_name,
-        )
-
         artifacts: dict[str, str] = {
             "docker/%s-compose.override.yml" % agent_name: compose_content,
-            "docker/caddy/agents/%s-mcp.caddy" % agent_name: mcp_caddy_content,
             "helm/yashigani/values-%s.yaml" % agent_name: values_content,
             "helm/yashigani/values-%s-networkpolicy.yaml" % agent_name: netpol_content,
             "helm/yashigani/templates/agents/%s-policy-exception.yaml" % agent_name: kyverno_content,
@@ -4721,16 +4962,19 @@ class CodegenEngineShapeC:
         }
 
         # SC-EGRESS-NONE assertion: no Shape-A-style EGRESS caddy route in the
-        # artifact map ("<agent>.caddy" — LLM egress). The "<agent>-mcp.caddy"
-        # INGRESS front is required to be present (Phase 1b-i wrap).
+        # artifact map ("<agent>.caddy" — LLM egress). FINDING-V412-CADDYADMIN-002:
+        # the "<agent>-mcp.caddy" INGRESS front is ALSO no longer present here
+        # (it is registered with caddy-config-broker instead — see above).
         caddy_key = "docker/caddy/agents/%s.caddy" % agent_name
         assert caddy_key not in artifacts, (
             "BUG: Caddy egress snippet unexpectedly in Shape-C artifact map for %r. "
             "SC-EGRESS-NONE violated." % agent_name
         )
-        assert "docker/caddy/agents/%s-mcp.caddy" % agent_name in artifacts, (
-            "BUG: Phase 1b-i MCP Caddy-front snippet missing for %r — the MCP "
-            "would be onboarded UNWRAPPED." % agent_name
+        assert "docker/caddy/agents/%s-mcp.caddy" % agent_name not in artifacts, (
+            "BUG: Phase 1b-i MCP Caddy-front snippet unexpectedly WRITTEN by "
+            "codegen for %r — FINDING-V412-CADDYADMIN-002 requires this to be "
+            "registered with caddy-config-broker instead, never written into "
+            "a backoffice-writable path." % agent_name
         )
 
         # v4.1 unified-sidecar Phase 2a — capability-keyed, NEVER name- or
@@ -4764,6 +5008,17 @@ class CodegenEngineShapeC:
         if not dry_run:
             assert output_root is not None
             for rel_path, content in artifacts.items():
+                # v4.1.2 fix (RESTART-013 MCP leg, Gap B — artifact_write 502
+                # root cause): only persist artifacts the target runtime's
+                # output_root is actually scoped to receive. See
+                # is_artifact_relevant_for_runtime()'s module-level comment.
+                if not is_artifact_relevant_for_runtime(rel_path, runtime):
+                    _log.info(
+                        "codegen: skip write %s (not applicable to runtime=%r "
+                        "— advisory-only or other-runtime artifact)",
+                        rel_path, runtime,
+                    )
+                    continue
                 dest = output_root / rel_path
                 _safe_write(dest, content, output_root)
                 _log.info("codegen: wrote %s", rel_path)
@@ -4877,6 +5132,11 @@ class CodegenEngine:
         # C3 — duplicate pair check
         _assert_unique_agent_pair(self._tenant_id, self._agent_id)
 
+        # C3-b — reserved base-compose-service-name collision guard
+        # (onboarding-robustness batch finding #3, Su, 2026-07-21 — see
+        # _assert_not_reserved_service_name docstring)
+        _assert_not_reserved_service_name(self._agent_id)
+
         agent_name = self._agent_id
         mhash = self._manifest_hash
         runtime = self._runtime
@@ -4928,6 +5188,17 @@ class CodegenEngine:
         if not dry_run:
             assert output_root is not None  # already checked above
             for rel_path, content in artifacts.items():
+                # v4.1.2 fix (RESTART-013 MCP leg, Gap B — artifact_write 502
+                # root cause): only persist artifacts the target runtime's
+                # output_root is actually scoped to receive. See
+                # is_artifact_relevant_for_runtime()'s module-level comment.
+                if not is_artifact_relevant_for_runtime(rel_path, runtime):
+                    _log.info(
+                        "codegen: skip write %s (not applicable to runtime=%r "
+                        "— advisory-only or other-runtime artifact)",
+                        rel_path, runtime,
+                    )
+                    continue
                 dest = output_root / rel_path
                 _safe_write(dest, content, output_root)
                 _log.info("codegen: wrote %s", rel_path)
@@ -4960,9 +5231,13 @@ def approve_mcp_onboard(
 
     On ``dry_run=False`` (production approve path):
       - Writes all artifacts to ``output_root``.
-      - Caddy picks up ``docker/caddy/agents/<server>-mcp.caddy`` on the next
-        ``caddy reload`` (or SIGUSR1) — the approve transaction is responsible
-        for issuing the reload signal after this function returns.
+      - FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the Caddy-front
+        wrap ("docker/caddy/agents/<server>-mcp.caddy") is NO LONGER among
+        these artifacts — it is registered with caddy-config-broker via a
+        separate DATA-only call (mcp_onboard.py
+        _register_route_via_broker_socket(), using
+        codegen._mcp_mesh_port()/_mcp_shim_port()). The approve transaction
+        is responsible for making that call after this function returns.
 
     Args:
         manifest:        Validated parsed manifest dict (Shape-C / mcp_server).
@@ -4980,9 +5255,9 @@ def approve_mcp_onboard(
         Artifact map ``{relative_path: content}`` — same shape as
         ``CodegenEngineShapeC.render()``.  Load-bearing keys for Phase 1c:
 
-        ``docker/caddy/agents/<server_id>-mcp.caddy``
-            Caddy-front snippet — write to the caddy agents/ directory, then
-            ``caddy reload``.
+        ``docker/caddy/agents/<server_id>-mcp.caddy`` is DELIBERATELY ABSENT
+        (FINDING-V412-CADDYADMIN-002) — the Caddy-front snippet is registered
+        with caddy-config-broker separately, never written to this map.
 
         ``docker/<server_id>-compose.override.yml``
             Compose override — write and run ``docker compose up -d``

@@ -30,6 +30,7 @@ The OPA data contract these tests pin::
 """
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -489,6 +490,19 @@ def txn_env(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "YASHIGANI_SERVICE_MANIFEST_PATH", str(tmp_path / "service_identities.yaml"),
     )
+    # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): run_approve_transaction
+    # now resolves agent cert/key/runtime-manifest writes under
+    # $YASHIGANI_AGENTS_DIR (default /run/secrets-rw/agents, absent under
+    # pytest) and svid-init staging under $YASHIGANI_SVID_INIT_DIR (default
+    # /run/secrets-rw/svid-init). Reuse secrets_dir (already created above)
+    # for both — matches the pre-fix behaviour these tests were written
+    # against and avoids a FileNotFoundError from the mint mock, which
+    # writes directly with no mkdir(parents=True).
+    monkeypatch.setenv("YASHIGANI_AGENTS_DIR", str(secrets_dir))
+    monkeypatch.setenv("YASHIGANI_SVID_INIT_DIR", str(secrets_dir / "svid-init"))
+    # step 2b chgrps the staged key to $YASHIGANI_SVID_GID (default 2003) —
+    # point it at this process's own gid so the chown succeeds under pytest.
+    monkeypatch.setenv("YASHIGANI_SVID_GID", str(os.getgid()))
     monkeypatch.setenv("YASHIGANI_CONTAINER_RUNTIME", "docker")
     monkeypatch.delenv("YSG_REQUIRE_SIGNED_MANIFEST", raising=False)
     monkeypatch.delenv("YSG_REQUIRE_CADDY_VALIDATE", raising=False)

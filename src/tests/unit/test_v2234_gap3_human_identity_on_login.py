@@ -115,6 +115,32 @@ class _StubRedis:
     def scan_iter(self, pattern):
         return iter([])
 
+    def eval(self, script, numkeys, *args):
+        """
+        Minimal single-threaded re-implementation of auth.py's
+        _THROTTLE_ADMIT_LUA (LAURA-412-HIGH, r5 2026-07-19:
+        _apply_auth_throttle now calls _throttle_admit(), which issues a
+        real Redis Lua script via EVAL — this hand-rolled stub predates
+        that and needs the same atomic-shape semantics reproduced in
+        Python; sufficient for this file's non-concurrent scenarios, which
+        never exercise the actual race the real Lua script closes).
+        """
+        keys = args[:numkeys]
+        ip_fail_key, ip_throttle_key, acct_fail_key, acct_throttle_key = keys
+        ip_threshold, acct_threshold, _window, max_level = (int(a) for a in args[numkeys:])
+
+        ip_fails = self.incr(ip_fail_key)
+        ip_level_before = int(self._data.get(ip_throttle_key) or 0)
+        if ip_fails >= ip_threshold and ip_level_before < max_level:
+            self._data[ip_throttle_key] = ip_level_before + 1
+
+        acct_fails = self.incr(acct_fail_key)
+        acct_level_before = int(self._data.get(acct_throttle_key) or 0)
+        if acct_fails >= acct_threshold and acct_level_before < max_level:
+            self._data[acct_throttle_key] = acct_level_before + 1
+
+        return [ip_fails, ip_level_before, acct_fails, acct_level_before]
+
 
 class _StubPipeline:
     def __init__(self, redis):

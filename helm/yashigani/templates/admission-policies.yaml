@@ -2,10 +2,13 @@
 {{- /*
 YSG-RISK-008 — Kyverno ClusterPolicy admission control.
 
-When admissionPolicies.enabled is true, this template renders five Kyverno
-ClusterPolicy resources that enforce the container-hardening baseline for the
-yashigani namespace. Pods that violate the baseline are REJECTED at admission
-time (validationFailureAction: Enforce) rather than discovered post-deployment.
+When admissionPolicies.enabled is true, this template renders seven Kyverno
+ClusterPolicy resources. Policies 1-5 enforce the container-hardening baseline
+for the yashigani namespace; policy 6 (FINDING-V412-UNIVERSAL-003) restricts
+PKI trust-plane access from runtime/pool-managed pods; policy 7
+(FINDING-V412-DNS-001 companion) denies tenant pods from binding the DNS port.
+Pods that violate a policy are REJECTED at admission time
+(validationFailureAction: Enforce) rather than discovered post-deployment.
 
 PREREQUISITE: Kyverno must be installed cluster-wide before helm install/upgrade.
 Install with: helm install kyverno kyverno/kyverno -n kyverno --create-namespace
@@ -14,6 +17,31 @@ The chart does not bundle Kyverno.
 NOTE: ClusterPolicy is a cluster-scoped CRD — it does not live inside the
 yashigani namespace but it is owned by this Helm release (release name in labels).
 Helm will delete these policies on helm uninstall.
+
+MULTI-ORG NAMING (fix/v412-k8s-clusterpolicy-multiorg-naming, CAPTAIN LIVE FIND
+2026-07-23): install.sh's k8s convention pins the Helm RELEASE NAME to the
+literal "yashigani" for every org — only --namespace varies per org (e.g.
+org-a ns=yashigani, org-b ns=yashigani-orgb; confirmed install.sh:13672-13674
+`helm upgrade --install yashigani "$chart_dir" --namespace "$NAMESPACE"`).
+These policies are PER-ORG (each org's install owns and governs only its own
+namespace's Pods — see each rule's `match.any[].resources.namespaces:
+{{ "{{" }} .Release.Namespace {{ "}}" }}` scoping below, unchanged by this
+fix). Cluster-scoped CRD names must therefore embed the per-org discriminator
+too, or a 2nd org's `helm install` collides on "invalid ownership metadata"
+against the 1st org's identically-named ClusterPolicy (reproduced live:
+testing_runs/yashigani/wt-fix-clusterpolicy-multiorg/evidence/before-org{a,b}.yaml
+— both rendered `yashigani-require-run-as-non-root` etc. before this fix).
+Fix: every ClusterPolicy name below embeds {{ .Release.Namespace }} (not
+multiTenant.tenantId — that value is optional/gated behind the separate
+multiTenant.enabled flag and defaults to "" independent of
+admissionPolicies.enabled, so keying on it here would either collide again
+on unset installs or force a new required value on every existing
+admissionPolicies.enabled=true deployment; Release.Namespace is always
+present, already the operative per-org boundary per install.sh, and mirrors
+cilium-clusterwide-networkpolicy.yaml's per-tenant-naming PATTERN — a
+different discriminator VALUE, same per-org naming PRINCIPLE). Namespace
+names are already RFC1123-DNS-label-constrained by Kubernetes itself, so no
+additional sanitization is needed for use in a ClusterPolicy resource name.
 */ -}}
 {{- if .Values.admissionPolicies.enabled }}
 {{- /*
@@ -33,11 +61,11 @@ lookup always returns empty in that context (correct: no cluster connection).
 {{- fail "admissionPolicies.enabled=true but the Kyverno ClusterPolicy CRD is not installed in this cluster.\n\nREMEDIATION: Install Kyverno first, then re-run helm install/upgrade:\n\n  helm repo add kyverno https://kyverno.github.io/kyverno/\n  helm repo update\n  helm install kyverno kyverno/kyverno -n kyverno --create-namespace\n\nWait for Kyverno to become ready before deploying Yashigani:\n  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=kyverno -n kyverno --timeout=120s\n\nThen re-run your helm install/upgrade command.\nAlternatively, set --set admissionPolicies.enabled=false to install without Kyverno (document in risk register per YSG-RISK-008)." }}
 {{- end }}
 ---
-# Policy 1/5: require runAsNonRoot
+# Policy 1/6: require runAsNonRoot
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-run-as-non-root
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-run-as-non-root
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -75,11 +103,11 @@ spec:
                 operator: Equals
                 value: 0
 ---
-# Policy 2/5: require allowPrivilegeEscalation: false
+# Policy 2/6: require allowPrivilegeEscalation: false
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-no-privilege-escalation
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-no-privilege-escalation
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -117,11 +145,11 @@ spec:
                     operator: NotEquals
                     value: false
 ---
-# Policy 3/5: require seccomp RuntimeDefault or Localhost
+# Policy 3/6: require seccomp RuntimeDefault or Localhost
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-seccomp-profile
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-seccomp-profile
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -159,11 +187,11 @@ spec:
                   - Unconfined
                   - ""
 ---
-# Policy 4/5: require capabilities.drop: [ALL]
+# Policy 4/6: require capabilities.drop: [ALL]
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-require-drop-all-capabilities
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-require-drop-all-capabilities
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -200,11 +228,11 @@ spec:
                     operator: AnyNotIn
                     value: "{{ "{{" }} element.securityContext.capabilities.drop[] || `[]` {{ "}}" }}"
 ---
-# Policy 5/5: restrict runAsUser: 0
+# Policy 5/6: restrict runAsUser: 0
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-restrict-root-user
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-restrict-root-user
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
@@ -258,4 +286,299 @@ spec:
                   - key: "{{ "{{" }} element.securityContext.runAsUser || `1` {{ "}}" }}"
                     operator: Equals
                     value: 0
+---
+# Policy 6/7: restrict PKI trust-plane access (FINDING-V412-UNIVERSAL-003, CRITICAL)
+#
+# The gateway ServiceAccount holds pods:create in-namespace (YSG-RISK-070,
+# rbac-pool-manager.yaml) so it can spawn per-identity pool pods. Policies 1-5
+# stop those pods being PRIVILEGED, but NONE of them stop a compromised gateway
+# from creating a Pod that (a) assumes the yashigani-pki ServiceAccount — which
+# can read/update the CA private-key Secret — or (b) mounts/references that
+# CA-keys Secret directly (volume / projected-source / env). Either = full mTLS
+# trust-plane forgery.
+#
+# SCOPING (Nico+Captain CRITICAL-1): the deny is gated on the NON-FORGEABLE
+# authenticated caller identity (request.userInfo.username), NOT on client-
+# supplied object metadata. An earlier draft exempted pods by
+# ownerReferences[0].kind != Job, but K8s does not validate submitted
+# ownerReferences — the gateway SA could forge ownerReferences:[{kind:Job}] on a
+# bare pod and bypass every rule. These rules instead fire when the pod's CREATOR
+# (request.userInfo.username, set by the API server from the bearer token — not
+# spoofable) matches the gateway ServiceAccount. The precondition uses AnyIn over
+# BOTH (a) the chart's SA-name helper — the gateway's ACTUAL runtime identity,
+# which tracks a serviceAccount.name override (IRSA/Workload-Identity); a hardcoded
+# literal would be silently defeated by that override (Captain R2 HIGH) — and (b)
+# the literal `yashigani` that rbac-pool-manager.yaml hard-binds pods:create to, so
+# the pods:create holder is always covered even if it diverges from the gateway SA.
+# Legit PKI pods (yashigani-pki-bootstrap Job, mtls-rotation CronJob) are created by
+# the kube-system controllers, never by these identities, so they are never matched.
+# INVARIANT: only the gateway SA holds pods:create in-ns (verified
+# rbac-pool-manager.yaml + extractor-job-template.yaml). NOTE (chart wart, out of
+# this finding's scope, flagged for the team): rbac-pool-manager binds pods:create
+# to literal `yashigani` while gateway.yaml runs under the helper — under a
+# serviceAccount.name override these DIVERGE and the pool backend loses pods:create
+# (functional bug); the AnyIn set here keeps policy 6 safe regardless.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-restrict-pki-trust-plane
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    policies.kyverno.io/title: "Restrict PKI trust-plane access (UNIVERSAL-003)"
+    policies.kyverno.io/category: "Privilege Escalation"
+    policies.kyverno.io/severity: "critical"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      FINDING-V412-UNIVERSAL-003: deny the gateway ServiceAccount from creating
+      Pods that assume the yashigani-pki ServiceAccount or mount/reference the CA
+      private-key Secret (volume/projected/env), closing the gateway pods:create
+      -> CA-key -> mTLS-forgery path.
+    yashigani.io/finding: "FINDING-V412-UNIVERSAL-003"
+    yashigani.io/risk-id: "YSG-RISK-070"
+spec:
+  validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
+  # background: false — request.userInfo (the gate below) is only present in the
+  # admission request, not in background scans of pre-existing resources.
+  background: false
+  rules:
+    # Rule 1: the gateway SA may not create a Pod that assumes yashigani-pki.
+    - name: deny-assume-pki-sa
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          # NON-FORGEABLE gate — the authenticated creator identity (see header).
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that assumes the
+          privileged 'yashigani-pki' ServiceAccount.
+        deny:
+          conditions:
+            all:
+              - key: "{{ "{{" }} request.object.spec.serviceAccountName || 'default' {{ "}}" }}"
+                operator: Equals
+                value: yashigani-pki
+    # Rule 2: the gateway SA may not create a Pod that mounts the CA-keys Secret
+    # as a volume — direct secret volume OR projected secret source.
+    - name: deny-mount-ca-keys-secret
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that mounts the CA
+          private-key Secret '{{ .Values.mtls.caKeysSecretName }}'.
+        foreach:
+          # Direct secret volume (null-safe list; a Pod may have no volumes).
+          - list: "request.object.spec.volumes[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secret.secretName || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          # CRITICAL-2 fix (Nico+Captain): projected secret sources use a
+          # different field path (element.secret.name); the direct-volume check
+          # above is null for a projected volume, so cover it explicitly.
+          - list: "request.object.spec.volumes[].projected.sources[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secret.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+    # Rule 3: the gateway SA may not create a Pod that references the CA-keys
+    # Secret via env (secretKeyRef) / envFrom (secretRef) — containers,
+    # initContainers, and ephemeralContainers (defense-in-depth; the gateway SA
+    # lacks pods/ephemeralcontainers per rbac-pool-manager.yaml, but cover it).
+    - name: deny-env-ca-keys-secret
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      preconditions:
+        all:
+          - key: "{{ "{{" }} request.userInfo.username {{ "}}" }}"
+            operator: AnyIn
+            value:
+              # The gateway's ACTUAL runtime identity (tracks a serviceAccount.name
+              # override, e.g. IRSA/Workload-Identity) — gateway.yaml uses this helper.
+              - "system:serviceaccount:{{ .Release.Namespace }}:{{ include "yashigani.serviceAccountName" . }}"
+              # The literal SA that rbac-pool-manager.yaml hard-binds pods:create to
+              # (unchanged by the override) — belt-and-braces so the pods:create holder
+              # is always covered even if it diverges from the gateway identity.
+              - "system:serviceaccount:{{ .Release.Namespace }}:yashigani"
+      validate:
+        message: >-
+          FINDING-V412-UNIVERSAL-003: the gateway ServiceAccount may not create a
+          Pod ('{{ "{{" }} request.object.metadata.name {{ "}}" }}') that references the
+          CA private-key Secret '{{ .Values.mtls.caKeysSecretName }}' via env/envFrom.
+        foreach:
+          - list: "request.object.spec.containers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.containers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.initContainers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.initContainers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.ephemeralContainers[].env[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.valueFrom.secretKeyRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+          - list: "request.object.spec.ephemeralContainers[].envFrom[] || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ "{{" }} element.secretRef.name || '' {{ "}}" }}"
+                    operator: Equals
+                    value: {{ .Values.mtls.caKeysSecretName | quote }}
+---
+# Policy 7/7: deny rogue in-namespace DNS bind (FINDING-V412-DNS-001 companion)
+#
+# yashigani-k8s-dns-hardening-design-20260719.md §2: the network-layer half of
+# this finding is the scoped allow-dns-egress NetworkPolicy fix
+# (networkpolicy.yaml) restricting :53 egress to the real kube-dns/CoreDNS pod
+# only. This is the admission-time half: deny tenant-namespace pods from
+# declaring containerPort or hostPort 53 in the first place, so no rogue
+# in-cluster resolver can ever be scheduled to squat on the DNS port and
+# spoof answers for a same-node/same-namespace neighbor.
+#
+# Unlike policy 6, this does NOT need the non-forgeable request.userInfo gate
+# — the condition is a pure pod-spec field check (port number), not an
+# identity-dependent authorization decision, so the simpler pattern-validate
+# style (policies 1-5) applies. Scope is the tenant namespace only;
+# kube-system's real CoreDNS is unaffected (different namespace, not matched).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ .Release.Name }}-{{ .Release.Namespace }}-deny-rogue-dns-bind
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-policy
+  annotations:
+    policies.kyverno.io/title: "Deny tenant pods binding port 53"
+    policies.kyverno.io/category: "Network Security"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      FINDING-V412-DNS-001 companion control: deny tenant-namespace pods from
+      declaring containerPort or hostPort 53. CoreDNS in kube-system is the
+      sole permitted resolver.
+    yashigani.io/finding: "FINDING-V412-DNS-001"
+spec:
+  validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
+  background: true
+  rules:
+    - name: deny-hostport-or-containerport-53
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      validate:
+        message: >-
+          FINDING-V412-DNS-001: pods may not bind hostPort 53 or containerPort
+          53 — CoreDNS in kube-system is the sole resolver. Pod:
+          '{{ "{{" }} request.object.metadata.name {{ "}}" }}'.
+        # F-K8S-POLICY7-BUG (2026-07-21, caught LIVE): the prior `pattern` form with
+        # X()/"!53" anchors denied EVERY container port (postgres 5432, prometheus 9090,
+        # gateway, …), DoS-ing the whole namespace — static review + helm template both
+        # missed it; only a real deploy surfaced it. Correct form: a foreach that denies
+        # ONLY when a port actually equals 53. Covers containers + native-sidecar
+        # initContainers + ephemeralContainers (LAURA-CIL HIGH).
+        foreach:
+          - list: "request.object.spec.containers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+          - list: "request.object.spec.initContainers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+          - list: "request.object.spec.ephemeralContainers[].ports[] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ "{{" }} element.containerPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
+                  - key: "{{ "{{" }} element.hostPort || `0` {{ "}}" }}"
+                    operator: Equals
+                    value: 53
 {{- end }}

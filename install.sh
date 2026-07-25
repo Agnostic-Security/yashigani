@@ -82,7 +82,7 @@ else
 fi
 
 # =============================================================================
-# Yashigani Installer
+# Yashigani v4.1.2 Installer
 # https://yashigani.io
 #
 # Usage:
@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="4.1.0"
+YASHIGANI_VERSION="4.1.2"
 # GIT_SHA: git short-hash of the current source tree used as a cache-busting
 # build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
 # backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
@@ -235,6 +235,35 @@ if [[ -n "${YSG_RUNTIME:-}" ]]; then
 fi
 SKIP_PREFLIGHT=false
 SKIP_PULL=false
+# FINDING-V412-UNIVERSAL-004: skip the install-time NetworkPolicy-enforcement
+# probe (k8s only). Default off — the probe runs and fails the install if the
+# cluster CNI does not enforce NetworkPolicy. Skipping records a risk-register
+# exception (operator accepts an unverified ring-fence).
+SKIP_NETWORKPOLICY_PROBE=false
+# YSG-RISK-123: skip the k8s local-image freshness build/push/verify sequence
+# (k8s_ensure_fresh_local_images + k8s_verify_image_provenance). Default off —
+# by default install.sh k8s path builds gateway/backoffice/caddy-config-broker/
+# extractor from CURRENT source, pushes to an ephemeral local registry, and
+# verifies the deployed pod's imageID digest matches what was just pushed
+# before declaring success. Intended escape hatch for operators who supply
+# their OWN pre-built, registry-hosted, immutable-digest images via
+# --set global.imageRegistry=... (real CI/CD pipeline owns freshness there).
+SKIP_K8S_IMAGE_BUILD=false
+# Cilium ratified as the k8s CNI standard (2026-07-19 design). These two gates
+# are cheap/fast, static-ish checks that fail fast BEFORE the wizard runs.
+# Kernel check is skippable (soft heuristic, node kernels can legitimately
+# vary); the Cilium CRD precondition is intentionally NOT skippable anywhere
+# in this file — see _preflight_k8s_cilium_crds.
+SKIP_KERNEL_EBPF_PROBE=false
+# CoreDNS DNSSEC+DoT MUST-HAVE (design doc §1). Default on, skippable like the
+# NetworkPolicy probe (records a risk-register exception).
+SKIP_COREDNS_DNSSEC_PROBE=false
+# Opt-in: patch this cluster's kube-system CoreDNS Corefile with the DoT/DNSSEC
+# forward block via scripts/coredns-hardening-apply.sh before the DNS preflight
+# probe runs. Off by default — kube-system's CoreDNS is a shared cluster
+# resource, not owned by this Helm release; mutating it without explicit
+# operator consent on a BYO cluster is not a safe default.
+APPLY_COREDNS_HARDENING=false
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
@@ -274,6 +303,22 @@ PKI_ACTION=""             # --pki-action=bootstrap|rotate-leaves|rotate-intermed
 # YSG_RUNTIME_4WAY is set by _detect_runtime() (W2 lib/detect_runtime.sh) after
 # resolve_compose_cmd() completes. Used by the onboard codegen path.
 YSG_RUNTIME_4WAY="${YSG_RUNTIME_4WAY:-}"
+
+# Host-native ollama port for the Apple Metal / Mac path (feat/v411-mac-ollama-port-detect-ask).
+# Resolved by _resolve_host_ollama_port() inside compose_up() via:
+#   a. --ollama-port flag or this env var (if pre-set)
+#   b. OLLAMA_HOST env parse (host:port or :port)
+#   c. probe 127.0.0.1:11434; if absent, lsof-scan for listening ollama port
+#   d. interactive prompt (if TTY + not --non-interactive)
+#   e. non-interactive + unresolved → abort with --ollama-port hint
+# Default empty → resolution runs. Override: --ollama-port N or YASHIGANI_HOST_OLLAMA_PORT=N.
+YASHIGANI_HOST_OLLAMA_PORT="${YASHIGANI_HOST_OLLAMA_PORT:-}"
+
+# LAURA-411-001 — inference-backend firewall hardening (consent-gated convenience).
+# Non-interactive: applies only when --secure-backend-firewall is passed.
+# Interactive: prompts the operator at the end of install.
+# The function never breaks an install — errors warn + point at the doc and continue.
+SECURE_BACKEND_FIREWALL=false
 
 # P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
 ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
@@ -400,6 +445,18 @@ OPTIONS
                                           VRAM and prompts interactively when multiple cards
                                           are present. Equivalent to setting YSG_GPU_INDEX.
                                           Example: --gpu-index 1 (selects the second card).
+  --ollama-port  N                        Mac Apple Metal only. Port where the host-native
+                                          ollama process is listening on 127.0.0.1.
+                                          Without this flag install.sh resolves the port
+                                          automatically (detection order):
+                                            1. YASHIGANI_HOST_OLLAMA_PORT env var
+                                            2. OLLAMA_HOST env (host:port or :port)
+                                            3. probe 127.0.0.1:11434 (normal case)
+                                            4. lsof-scan for listening ollama process
+                                            5. interactive prompt (TTY only)
+                                            6. abort — use --ollama-port or start ollama
+                                          Equivalent to setting YASHIGANI_HOST_OLLAMA_PORT.
+                                          Not applicable to Linux or Kubernetes installs.
 
   GPU support (source: docs.ollama.com/gpu — Linux + macOS platforms):
     NVIDIA CUDA      — Linux: compute capability 5.0+ (GTX 750 Ti/K2200 through RTX/GB10);
@@ -412,12 +469,15 @@ OPTIONS
                        Overlay: docker-compose.gpu-amd.yml [untested on hardware here].
     Apple Metal      — macOS: M1/M2/M3/M4 via host-native ollama (Metal GPU, full UMA).
                        Container ollama bypassed; host ollama must be pre-installed
-                       and bound to 127.0.0.1:11434 (Laura C3: loopback binding,
-                       Docker Desktop VPNKit relays container→host.docker.internal
-                       to Mac loopback — LAN fully isolated):
-                         OLLAMA_HOST=127.0.0.1:11434 ollama serve
+                       and bound to 127.0.0.1 (Laura C3: loopback binding):
+                         OLLAMA_HOST=127.0.0.1:11434 ollama serve   # standard port
+                         OLLAMA_HOST=127.0.0.1:<N>  ollama serve    # non-standard: use --ollama-port N
+                       Port auto-detected (probe→OLLAMA_HOST→lsof→prompt); see --ollama-port.
+                       Docker: VPNKit relays container→host.docker.internal to Mac loopback.
+                       Podman: gvproxy (192.168.127.254) relays container→host.containers.internal.
+                       Both runtimes: LAN fully isolated, loopback-only binding.
                        Auto-detected on Darwin arm64.
-                       Overlay: docker-compose.gpu-mac-metal.yml. [TESTED: Apple M4 ✓]
+                       Overlay: gpu-mac-metal.yml (Docker) / gpu-mac-metal-podman.yml (Podman). [TESTED: Apple M4 ✓]
     Vulkan           — Linux: Intel Arc (A/B-series) + Intel iGPU (HD/UHD/Iris/Xe)
     (Intel iGPU /      + AMD Ryzen AI APUs (gfx1150/1151 — ROCm experimental on APU,
      AMD APU)           Vulkan preferred). Requires mesa-vulkan-drivers + /dev/dri.
@@ -453,6 +513,35 @@ OPTIONS
                                           Useful when demos are accessed directly by IP.
   --skip-preflight                        Skip preflight checks
   --skip-pull                             Skip docker compose pull (use local images)
+  --skip-networkpolicy-probe              (k8s) Skip the NetworkPolicy-enforcement probe.
+                                          By default install.sh fails the k8s install if the
+                                          cluster CNI does not enforce NetworkPolicy (flannel/
+                                          kindnet silently no-op it — FINDING-V412-UNIVERSAL-004).
+                                          This flag also skips the sibling cross-namespace
+                                          tenant-isolation probe (same underlying question).
+                                          Skipping records a risk-register exception.
+  --skip-kernel-ebpf-probe                 (k8s) Skip the node-kernel eBPF/cgroupv2 preflight
+                                          (Cilium requires kernel >= 5.10 on every node).
+                                          Skipping records a risk-register exception.
+  --skip-coredns-dnssec-probe              (k8s) Skip the CoreDNS DNSSEC-delegated-validation
+                                          + DoT preflight (design doc §1, DNS-01/DNS-02). By
+                                          default install.sh fails the k8s install if CoreDNS
+                                          is not forwarding over tls:// with tls_servername
+                                          pinned, or if live external resolution fails.
+                                          Skipping records a risk-register exception.
+  --skip-k8s-image-build                   (k8s) Skip the local-image build/push/provenance
+                                          sequence (YSG-RISK-123). By default install.sh builds
+                                          gateway/backoffice/caddy-config-broker/extractor from
+                                          CURRENT source, pushes to an ephemeral local registry,
+                                          and verifies the deployed pod's image digest matches
+                                          what was just built. Use this flag only when you supply
+                                          your own pre-built, registry-hosted images via
+                                          --set global.imageRegistry=... .
+  --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
+                                          Corefile with the DNSSEC-delegated/DoT forward block
+                                          (scripts/coredns-hardening-apply.sh) before the
+                                          preflight probe runs. Off by default — kube-system's
+                                          CoreDNS is a shared cluster resource; this mutates it.
   --upgrade                               Upgrade an existing installation
   --reuse-volumes                         Skip pre-install contaminated-volume detection.
                                           Use only when deliberately reusing volumes from a
@@ -693,6 +782,11 @@ parse_args() {
         ;;
       --skip-preflight)  SKIP_PREFLIGHT=true;   shift ;;
       --skip-pull)       SKIP_PULL=true;         shift ;;
+      --skip-networkpolicy-probe) SKIP_NETWORKPOLICY_PROBE=true; shift ;;
+      --skip-kernel-ebpf-probe)   SKIP_KERNEL_EBPF_PROBE=true;   shift ;;
+      --skip-coredns-dnssec-probe) SKIP_COREDNS_DNSSEC_PROBE=true; shift ;;
+      --apply-coredns-hardening)  APPLY_COREDNS_HARDENING=true;  shift ;;
+      --skip-k8s-image-build)    SKIP_K8S_IMAGE_BUILD=true;      shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
@@ -712,6 +806,20 @@ parse_args() {
         fi
         YSG_GPU_INDEX="$_raw_gpu_index"
         export YSG_GPU_INDEX
+        shift 2
+        ;;
+      --ollama-port)
+        # Apple Metal / Mac only: explicit host ollama listen port on 127.0.0.1.
+        # Overrides the auto-detection order (probe → OLLAMA_HOST → lsof → prompt).
+        # Equivalent to setting YASHIGANI_HOST_OLLAMA_PORT in the environment.
+        _raw_ollama_port="${2:?'--ollama-port requires a port number (1-65535)'}"
+        if ! [[ "$_raw_ollama_port" =~ ^[0-9]+$ ]] || \
+           [[ "$_raw_ollama_port" -lt 1 || "$_raw_ollama_port" -gt 65535 ]]; then
+          log_error "--ollama-port must be an integer 1-65535, got: ${_raw_ollama_port}"
+          exit 1
+        fi
+        YASHIGANI_HOST_OLLAMA_PORT="$_raw_ollama_port"
+        export YASHIGANI_HOST_OLLAMA_PORT
         shift 2
         ;;
       --pki-action)
@@ -736,6 +844,12 @@ parse_args() {
         YASHIGANI_INTERMEDIATE_LIFETIME_DAYS="${2:?}"; shift 2 ;;
       --cert-lifetime-days)
         YASHIGANI_CERT_LIFETIME_DAYS="${2:?}"; shift 2 ;;
+      --secure-backend-firewall)
+        # LAURA-411-001: non-interactive consent gate for inference-backend firewall.
+        # In interactive mode the operator is prompted; this flag forces apply without prompt.
+        SECURE_BACKEND_FIREWALL=true
+        shift
+        ;;
       --help|-h)         usage; exit 0 ;;
       *)
         log_error "Unknown option: $1"
@@ -1423,14 +1537,141 @@ require_cmd() {
 }
 
 # Resolve the compose command based on detected runtime
-# Sets COMPOSE_CMD as an array (e.g. "docker compose" or "podman compose")
+# Sets COMPOSE_CMD as an array (e.g. "docker compose" or the vendored fork invocation)
 # Sets YSG_PODMAN_RUNTIME=true if using Podman (for auto-applying override file)
+# Sets YSG_PODMAN_COMPOSE_FORK=true when the vendored podman-compose-ysg fork
+#   (vendor/podman-compose-ysg/podman_compose.py) is the selected driver — the
+#   ONLY Podman-path driver as of 2026-07-18 (Tiago directive). COMPOSE_CMD[0] is
+#   "python3" in this case, NOT a usable engine-binary name — call sites that
+#   need the underlying container engine must use _ysg_compose_engine_bin(),
+#   never parse COMPOSE_CMD[0] as if it were "podman"/"podman-compose" text.
+# Sets YSG_PODMAN_COMPOSE_V2=true whenever the YSG-RISK-074 unconfined-seccomp
+#   workaround must stay active for the selected Podman driver. Historically this
+#   flag distinguished podman-compose (Python) from `podman compose` v2 (which
+#   inlines the JSON content of security_opt:seccomp=<path> into the Podman socket
+#   call → ENAMETOOLONG). Both of those paths are now retired on the Podman
+#   runtime — the fork is the only driver — but the flag is KEPT and still forced
+#   true whenever the fork is selected (Captain review condition 2, ae45c678):
+#   the fork's AS-FIX-1 patch fixes the *path-resolution* bug that originally
+#   forced this workaround, but enforceability of the REAL seccomp profile across
+#   every podman-machine client/server split has not yet been live-validated
+#   (Laura condition 4) — retiring "unconfined" here is a separate, validation-
+#   gated follow-up, not decided by this wiring step.
+#   Ref: Pentest #95 TM-V231-005; YSG-RISK-074 (seccomp on Podman is kernel-enforced,
+#   not compose-enforced; the unconfined compose flag does not disable seccomp).
 YSG_PODMAN_RUNTIME=false
+YSG_PODMAN_COMPOSE_V2=false        # initialised here; authoritative value set by resolve_compose_cmd
+YSG_PODMAN_COMPOSE_FORK=false      # initialised here; authoritative value set by resolve_compose_cmd
 COMPOSE_CMD=()   # global declaration so ${#COMPOSE_CMD[@]} is safe under set -u before first resolve
+
+# ── Podman compose engine selection: vendored fork only ────────────────────────
+# Defined as top-level functions (not nested) so bats tests can extract them.
+#
+# Tiago directive (2026-07-18, post FINDING-V412-RESTART-001/005 + Captain's
+# GO-WITH-CONDITIONS review of the fork, ae45c678): on the Podman runtime,
+# install.sh invokes ONLY the vendored podman-compose-ysg fork
+# (vendor/podman-compose-ysg/podman_compose.py) as the compose driver. Two
+# previously-supported paths are permanently retired from this runtime:
+#   - pip podman-compose (any version) — 1.6.x's dependency-graph hang was the
+#     original reason to prefer podman compose v2; the fork supersedes both.
+#   - `podman compose` v2 — this Podman built-in subcommand dispatches to
+#     whatever external docker-compose-compatible binary happens to be on PATH
+#     (FINDING-V412-RESTART-001: the operator's real ~/.docker/config.json
+#     credsStore hung the client-side registry-credential lookup indefinitely
+#     on a virgin Podman-only host during a compose build). docker-compose must
+#     never drive Podman.
+# If the fork is unavailable (missing from the tree) or fails integrity
+# verification, we fail loud — never silently fall back to either retired path.
+
+# Locate the vendored fork directory. Checks WORK_DIR first (the resolved
+# install tree), then the directory install.sh itself lives in (covers
+# relative/symlinked invocation before WORK_DIR is set), then $PWD as a last
+# resort — same search order as load_airgap_bundle()'s manifest lookup.
+# Echoes the directory path and returns 0 on success; returns 1 if the fork's
+# entrypoint file is not found anywhere.
+_ysg_fork_compose_dir() {
+  local _d
+  for _d in "${WORK_DIR:-}" \
+            "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" \
+            "$(pwd)"; do
+    [[ -z "$_d" ]] && continue
+    if [[ -f "${_d}/vendor/podman-compose-ysg/podman_compose.py" ]]; then
+      printf '%s' "${_d}/vendor/podman-compose-ysg"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The fork requires PyYAML + python-dotenv (unlike the rest of install.sh's
+# python3 usage, which is stdlib-only). Verify both are importable by the
+# system python3 BEFORE selecting the fork as the compose driver — fail loud
+# with clear remediation rather than silently falling through to a retired path.
+_ysg_fork_compose_python_ready() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import yaml, dotenv" >/dev/null 2>&1
+}
+
+_YSG_FORK_MANIFEST_VERIFIED=false  # process-local cache; verified once per run
+
+# Fail-closed integrity check for the vendored fork — run BEFORE the fork is
+# ever invoked (mirrors load_airgap_bundle()'s image-digest fail-closed
+# contract, install.sh's existing pattern for a vendored/downloaded artefact
+# whose provenance must be established before use). Exits the whole installer
+# non-zero on ANY mismatch or missing file — no downgrade-to-warning path
+# (S1/SOP4 discipline: never "treating as PASS"). Cached per process so the
+# ~10 resolve_compose_cmd() call sites in a single install run don't re-hash
+# the manifest repeatedly.
+_ysg_verify_fork_manifest() {
+  local _fork_dir="$1"
+  if [[ "${_YSG_FORK_MANIFEST_VERIFIED}" == "true" ]]; then
+    return 0
+  fi
+  local _verify_script="${_fork_dir}/verify-manifest.sh"
+  if [[ ! -f "$_verify_script" ]]; then
+    log_error "podman-compose-ysg vendored fork found at ${_fork_dir} but"
+    log_error "verify-manifest.sh is missing alongside it — cannot establish"
+    log_error "integrity. ABORTING (refusing to invoke an unverifiable fork)."
+    exit 1
+  fi
+  local _verify_out
+  if _verify_out="$(bash "$_verify_script" 2>&1)"; then
+    log_info "podman-compose-ysg fork integrity verified: ${_verify_out}"
+    _YSG_FORK_MANIFEST_VERIFIED=true
+    return 0
+  fi
+  log_error "podman-compose-ysg vendored-fork INTEGRITY VERIFICATION FAILED:"
+  log_error "$_verify_out"
+  log_error "The fork may be tampered or corrupted. ABORTING — refusing to"
+  log_error "invoke it. Re-fetch a clean Yashigani release tree and retry."
+  exit 1
+}
+
+# Return the underlying container-engine binary ("podman" or "docker") for the
+# currently-resolved compose driver. Prefers the authoritative YSG_PODMAN_RUNTIME
+# flag (set by resolve_compose_cmd for every Podman-path driver, including the
+# vendored fork, where COMPOSE_CMD[0] is "python3" — not a usable engine-binary
+# name on its own) — falls back to text-matching COMPOSE_CMD[0] (docker /
+# docker-compose / podman / podman-compose) when the flag is unset, e.g. a call
+# site that runs before resolve_compose_cmd has been invoked this process.
+_ysg_compose_engine_bin() {
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    printf 'podman'
+    return 0
+  fi
+  local _b="${COMPOSE_CMD[0]:-docker}"
+  _b="${_b%%-compose}"
+  case "$_b" in
+    podman*) printf 'podman' ;;
+    *)       printf 'docker' ;;
+  esac
+}
 
 resolve_compose_cmd() {
   COMPOSE_CMD=()
   YSG_PODMAN_RUNTIME=false   # reset before resolution — prevents stale env/state bleed
+  YSG_PODMAN_COMPOSE_V2=false
+  YSG_PODMAN_COMPOSE_FORK=false
 
   # ── HARD RUNTIME SEPARATION (maintainer directive 2026-04-29 after 3rd cross-runtime
   # bug: Pentest #95 docker-compose-shim against Podman socket "file name too long",
@@ -1482,64 +1723,101 @@ resolve_compose_cmd() {
       log_error "If you meant Docker, set YSG_RUNTIME=docker instead."
       exit 1
     fi
-    # podman-compose (Python) FIRST: sequential, stable, native to Podman.
-    # We do NOT fall through to docker-compose — passing docker-compose a Podman
-    # socket via DOCKER_HOST works for simple cases but breaks on seccomp profile
-    # paths (Pentest #95 TM-V231-005), security_opt parsing, and a few other places
-    # where docker-compose makes Docker-specific assumptions about the socket.
-    if command -v podman-compose >/dev/null 2>&1; then
+
+    # The vendored podman-compose-ysg fork is the ONLY accepted compose driver
+    # on this runtime (see the block comment above this helper section). Verify
+    # its integrity BEFORE it is ever invoked, then verify the interpreter has
+    # its two extra deps (PyYAML + python-dotenv) importable.
+    local _fork_dir
+    if _fork_dir="$(_ysg_fork_compose_dir)"; then
+      _ysg_verify_fork_manifest "$_fork_dir"   # fail-closed; exits 1 on mismatch
+      if ! _ysg_fork_compose_python_ready; then
+        log_error "podman-compose-ysg fork found at ${_fork_dir} but the system"
+        log_error "python3 cannot import PyYAML + python-dotenv (both required)."
+        log_error "Install both, e.g.:"
+        log_error "  python3 -m pip install --user pyyaml python-dotenv"
+        log_error "Then re-run this installer."
+        exit 1
+      fi
       # --in-pod=false: do NOT place the stack in a shared pod (ROOTLESS-CDI-003).
       # podman-compose defaults to one pod per project; the NVIDIA CDI hook
       # (/usr/bin/nvidia-cdi-hook) fails (exit 1) when the GPU container starts
-      # inside that pod, wedging ollama + everything that depends on it. The same
-      # CDI device works in a standalone `podman run` (no pod), so we disable the
-      # pod. Must be a global arg so up/down/ps are all pod-less + consistent.
-      COMPOSE_CMD=("podman-compose" "--in-pod=false")
+      # inside that pod, wedging ollama + everything that depends on it.
+      #
+      # The letta/letta-pgbouncer "stuck Created" issue (podman-compose 1.x does
+      # not honour service_healthy/service_completed_successfully) is handled by
+      # _podman_compose_letta_waitloop() in compose_up() — the fork inherits this
+      # limitation unchanged from upstream (none of AS-FIX-1/2/3 touch it).
+      COMPOSE_CMD=("python3" "${_fork_dir}/podman_compose.py" "--in-pod=false")
       YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (native, sequential, --in-pod=false)"
+      YSG_PODMAN_COMPOSE_FORK=true
+      # YSG-RISK-074 unconfined-seccomp workaround: KEPT (Captain review
+      # condition 2, ae45c678 fork-review gate) even though the fork's AS-FIX-1
+      # fixes podman-compose's relative-seccomp-path realpath() bug. Enforceability
+      # of the REAL profile across every podman-machine client/server split (this
+      # Mac = applehv+virtiofs; Linux rootless subuid handling differs) is still
+      # an open live-test item (Laura condition 4) — retirement is validation-
+      # gated and tracked separately, not flipped at this wiring step.
+      YSG_PODMAN_COMPOSE_V2=true
+      log_info "Compose tool: podman-compose-ysg 1.5.0+ysg.1 (vendored fork, --in-pod=false; seccomp→unconfined per YSG-RISK-074, pending validation-gated retirement)"
       return 0
     fi
-    if podman compose version >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (Podman 4+ built-in)"
-      return 0
-    fi
-    log_error "YSG_RUNTIME=podman but no native Podman compose tool found. Install:"
-    log_error "  • podman-compose:  pip install podman-compose"
-    log_error "  • OR Podman 4+ with built-in compose subcommand"
+
+    log_error "YSG_RUNTIME=podman but the vendored podman-compose-ysg fork was"
+    log_error "not found (expected vendor/podman-compose-ysg/podman_compose.py"
+    log_error "under the install tree or alongside install.sh)."
     log_error ""
-    log_error "Do NOT install docker-compose against the Podman socket — that path"
-    log_error "is explicitly NOT supported (cross-runtime compatibility issues, see"
-    log_error "Pentest #95 TM-V231-005 + v2.23.1 retro #3a-fix)."
+    log_error "This installer no longer supports pip podman-compose or the"
+    log_error "native 'podman compose' v2 subcommand on the Podman runtime — both"
+    log_error "are retired: pip podman-compose 1.6.x hangs on dependency-graph"
+    log_error "resolution, and 'podman compose' v2 dispatches to whatever external"
+    log_error "docker-compose binary is on PATH, which must never drive Podman"
+    log_error "(FINDING-V412-RESTART-001; Tiago directive 2026-07-18)."
+    log_error ""
+    log_error "Re-fetch a complete Yashigani release tree (the fork ships in"
+    log_error "vendor/podman-compose-ysg/) and re-run."
     exit 1
   fi
 
   # ── Auto-detect (YSG_RUNTIME unset or =auto) ───────────────────────────────
   # Prefer Podman for rootless-first security posture. Strict-self-contained:
-  # the Podman branch only considers podman-compose / podman compose; the
+  # the Podman branch only considers the vendored podman-compose-ysg fork; the
   # Docker branch only considers docker compose / docker-compose. No mixing.
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    if command -v podman-compose >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman-compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman-compose (auto-detect)"
-      return 0
+    # Same fork-only selection as the explicit-podman branch above.
+    local _fork_dir
+    if _fork_dir="$(_ysg_fork_compose_dir)"; then
+      # Fail-closed even in auto-detect: a tamper/corruption signal on the fork
+      # must never be silently downgraded to "just try Docker instead" — that
+      # would mask a genuine supply-chain integrity failure (SOP4 discipline).
+      _ysg_verify_fork_manifest "$_fork_dir"
+      if _ysg_fork_compose_python_ready; then
+        COMPOSE_CMD=("python3" "${_fork_dir}/podman_compose.py" "--in-pod=false")
+        YSG_PODMAN_RUNTIME=true
+        YSG_PODMAN_COMPOSE_FORK=true
+        # YSG-RISK-074 workaround kept — see rationale in the Podman-only branch above.
+        YSG_PODMAN_COMPOSE_V2=true
+        log_info "Compose tool: podman-compose-ysg 1.5.0+ysg.1 (vendored fork, auto-detect, --in-pod=false; seccomp→unconfined per YSG-RISK-074)"
+        return 0
+      fi
+      log_warn "Podman is installed and the podman-compose-ysg fork is present,"
+      log_warn "but the system python3 cannot import PyYAML + python-dotenv."
+      log_warn "Install both (python3 -m pip install --user pyyaml python-dotenv)"
+      log_warn "to use the Podman path, OR set YSG_RUNTIME=docker explicitly."
+      log_warn "Continuing auto-detect to look for Docker..."
+    else
+      # Podman is reachable but the vendored fork is not present in this tree.
+      # pip podman-compose and native `podman compose` v2 are both retired on
+      # this runtime (docker-compose must never drive Podman — FINDING-001) —
+      # we refuse to silently fall through to either. Tell the user and try Docker.
+      log_warn "Podman is installed but the vendored podman-compose-ysg fork was"
+      log_warn "not found under this install tree — pip podman-compose and native"
+      log_warn "'podman compose' v2 are no longer supported on this runtime."
+      log_warn "Set YSG_RUNTIME=docker if you intend to use Docker, or re-fetch a"
+      log_warn "complete Yashigani release tree (fork ships in vendor/podman-compose-ysg/)."
+      log_warn "Continuing auto-detect to look for Docker..."
     fi
-    if podman compose version >/dev/null 2>&1; then
-      COMPOSE_CMD=("podman" "compose")
-      YSG_PODMAN_RUNTIME=true
-      log_info "Compose tool: podman compose (auto-detect, built-in)"
-      return 0
-    fi
-    # Podman is reachable but neither podman-compose nor `podman compose` is
-    # available. We refuse to silently fall through to docker-compose against
-    # the Podman socket (cross-runtime bug pattern). Tell the user.
-    log_warn "Podman is installed but no Podman-native compose tool found."
-    log_warn "Install podman-compose (pip install podman-compose) for the native"
-    log_warn "Podman path, OR set YSG_RUNTIME=docker if you intend to use Docker."
-    log_warn "Continuing auto-detect to look for Docker..."
   fi
 
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -1575,7 +1853,9 @@ resolve_compose_cmd() {
 
   log_error "No compose command found. Install one of:"
   log_error "  • Docker:  Docker Desktop OR docker + docker compose plugin"
-  log_error "  • Podman:  podman + podman-compose (pip install podman-compose)"
+  log_error "  • Podman:  install Podman (this installer brings its own compose"
+  log_error "    driver — vendor/podman-compose-ysg — no separate pip install"
+  log_error "    needed; a complete Yashigani release tree already ships it)"
   log_error ""
   log_error "Then set YSG_RUNTIME=docker or YSG_RUNTIME=podman to lock the runtime."
   exit 1
@@ -3248,11 +3528,30 @@ _write_aes_key_to_env() {
   # tolerated it because Podman on macOS ignores unknown apparmor profile
   # names silently, but fails HARD when the seccomp FILE path is wrong.
 
-  # Seccomp: set absolute path for both runtimes. Admin can still override to
-  # "unconfined" via YASHIGANI_SECCOMP_PROFILE env var if a host kernel rejects
-  # the profile (e.g. nested virtualisation, non-standard kernels).
+  # Seccomp: set absolute path for Docker/podman-compose paths. Admin can still
+  # override to "unconfined" via YASHIGANI_SECCOMP_PROFILE env var if a host
+  # kernel rejects the profile (e.g. nested virtualisation, non-standard kernels).
+  #
+  # Podman path (YSG_PODMAN_COMPOSE_V2=true): MUST be "unconfined" for now.
+  # Historically this was forced because `podman compose` v2 inlines the JSON
+  # content of security_opt:seccomp=<path> into the API call; the Podman socket
+  # treats the multi-KB blob as a filename → ENAMETOOLONG → caddy/gateway/
+  # backoffice cannot start (YSG-RISK-074: seccomp on Podman is kernel-enforced,
+  # not compose-enforced — "unconfined" in the compose security_opt does not
+  # disable the host kernel seccomp profile, it only avoids that inlining bug).
+  # `podman compose` v2 is now retired from this runtime (2026-07-18, the
+  # vendored podman-compose-ysg fork is the only Podman driver — see
+  # resolve_compose_cmd()) and the fork's AS-FIX-1 patch fixes the underlying
+  # relative-path realpath() bug. The flag is nonetheless KEPT true whenever the
+  # fork is selected (Captain review condition 2, ae45c678): enforceability of
+  # the REAL profile across every podman-machine client/server split has not yet
+  # been live-validated (Laura condition 4). Retiring "unconfined" here is a
+  # separate, validation-gated follow-up — not decided by this wiring step.
   local _seccomp_profile="${WORK_DIR}/docker/seccomp/yashigani.json"
-  if [[ ! -f "$_seccomp_profile" ]]; then
+  if [[ "${YSG_PODMAN_COMPOSE_V2:-false}" == "true" ]]; then
+    log_info "Seccomp: unconfined (Podman vendored-fork driver — YSG-RISK-074, pending validation-gated retirement)"
+    _env_set "YASHIGANI_SECCOMP_PROFILE" "unconfined"
+  elif [[ ! -f "$_seccomp_profile" ]]; then
     log_warn "Seccomp profile not found at ${_seccomp_profile} — falling back to unconfined"
     _env_set "YASHIGANI_SECCOMP_PROFILE" "unconfined"
   else
@@ -3791,6 +4090,32 @@ _backup_existing_data() {
         log_info "  secrets-caddy/ backed up (ownership/mode preserved)"
       else
         log_warn "  secrets-caddy/ partial copy — some files owned by container UIDs are unreadable as $(id -un); non-fatal."
+      fi
+    fi
+  fi
+
+  # FINDING-V412-RESTART-012: back up the postgres-only root-attestation dir
+  # (ca_root.attested_sha256, if present — most installs never run rotate-root
+  # so this is frequently empty) alongside docker/secrets — same pattern as
+  # secrets-caddy above. restore.sh restores it into docker/secrets-pki-attest/.
+  if [[ -d "${WORK_DIR}/docker/secrets-pki-attest" ]]; then
+    local _attest_src="${WORK_DIR}/docker/secrets-pki-attest"
+    local _attest_dest="${backup_dir}/secrets-pki-attest"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" && "$(id -u)" != "0" ]]; then
+      mkdir -p "$_attest_dest"
+      if podman unshare bash -c "tar -cf - -C '${_attest_src}' ." \
+           | tar -xpf - -C "$_attest_dest" 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up via podman unshare tar (FINDING-V412-RESTART-012)"
+      else
+        log_warn "  secrets-pki-attest/ backup via podman unshare failed — skipping (non-fatal; regenerated on next rotate-root)"
+        rm -rf "$_attest_dest"
+      fi
+    else
+      mkdir -p "$_attest_dest"
+      if cp -rp "$_attest_src"/. "$_attest_dest"/ 2>/dev/null; then
+        log_info "  secrets-pki-attest/ backed up (ownership/mode preserved)"
+      else
+        log_warn "  secrets-pki-attest/ partial copy — non-fatal."
       fi
     fi
   fi
@@ -4638,7 +4963,10 @@ check_existing_installation() {
       # Multi-instance (3.0): scope to THIS install's project (not hardcoded
       # "docker") and use the runtime's own compose-project label key (podman and
       # docker differ), so a 2nd named instance is detected correctly.
-      local _runtime_bin="${COMPOSE_CMD[0]%%[[:space:]]*}"
+      # _ysg_compose_engine_bin(): NOT COMPOSE_CMD[0] text-parsing — COMPOSE_CMD[0]
+      # is "python3" when the podman-compose-ysg fork is selected, which is not a
+      # usable engine-binary name (fork wiring, 2026-07-18).
+      local _runtime_bin; _runtime_bin="$(_ysg_compose_engine_bin)"
       local _proj="${COMPOSE_PROJECT_NAME:-docker}"
       local _label_key="com.docker.compose.project"
       [[ "$_runtime_bin" == podman* ]] && _label_key="io.podman.compose.project"
@@ -5396,11 +5724,23 @@ _build_ringfence_images() {
   # overlay gate in compose_up (non-interactive --agent-bundles is only
   # pushed into COMPOSE_PROFILES at step 8).
   local _rf_active="false"
-  if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx openclaw; then
-    _rf_active="true"
-  else
+  # Build ringfence images whenever ANY bundle that layers an egress-forwarder
+  # overlay is active — not just openclaw.  langflow and letta overlays also
+  # reference ghcr.io/agnosticsec/ringfence-init (ringfence-init-egress-langflow
+  # and ringfence-init-egress-letta services).  A clean install without a
+  # pre-seeded image fails on the ghcr.io pull when only openclaw triggered the
+  # build.  Fix: activate for langflow, letta, OR openclaw.
+  local _rf_bundle
+  for _rf_bundle in langflow letta openclaw; do
+    if printf '%s\n' "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}" | grep -qx "$_rf_bundle"; then
+      _rf_active="true"
+      break
+    fi
+  done
+  if [[ "$_rf_active" != "true" ]]; then
     local _rf_ab=",${AGENT_BUNDLES//[[:space:]]/},"
-    if [[ "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
+    if [[ "$_rf_ab" == *",langflow,"* || "$_rf_ab" == *",letta,"* || \
+          "$_rf_ab" == *",openclaw,"* || "$_rf_ab" == *",all,"* ]]; then
       _rf_active="true"
     fi
   fi
@@ -5450,6 +5790,223 @@ _build_ringfence_images() {
   fi
   # Alias tag for the codegen per-MCP stanza reference (:${YASHIGANI_VERSION}).
   "$_ctr_cmd" tag "$_svid_img" "$_svid_alias" 2>/dev/null || true
+}
+
+# =============================================================================
+# FINDING-V412-RESTART-001: bounded progress watchdog + native Podman image
+# build (decouples gateway/backoffice/gateway-only builds from the compose
+# provider on the Podman runtime).
+# =============================================================================
+#
+# ROOT CAUSE (measured, RESTART leg, macOS podman-6 rootless, 2026-07-18):
+# On a virgin host, `"${COMPOSE_CMD[@]}" build gateway backoffice` under
+# podman-compose-v2 (item D: podman compose → external provider, observed
+# /usr/local/bin/docker-compose v5.1.3) hung INDEFINITELY (59 min at 0% CPU,
+# zero buildah/build activity server-side). Direct `podman build` of the
+# identical Dockerfile progressed normally (probe 2b/2d). Discriminator:
+# re-running the exact same external-provider build with DOCKER_CONFIG
+# pointed at a config.json with no credsStore/credHelpers completed
+# successfully end-to-end (both images tagged). Root cause: the external
+# compose provider's client-side registry-credential lookup
+# (docker-credential-desktop, driven by the operator's real
+# ~/.docker/config.json "credsStore":"desktop") blocks forever when Docker
+# Desktop's backend is not running — the default state on a Podman-only
+# host. This is a client-side hang before any request reaches podman's
+# socket; it is not a BuildKit-protocol or podman-compat-API defect.
+#
+# FIX: on the Podman runtime, gateway/backoffice images are built via
+# `podman build` directly (proven healthy in probes 2b/2d) instead of via
+# the compose provider — this is the SAME pattern the codebase already uses
+# for the extractor image and already used, downstream, in compose_up()
+# ("compose build uses Docker buildx"). Extracting it into a shared
+# function and calling it from compose_pull() (step 9, so PKI bootstrap at
+# step 9b has an image) removes ALL THREE Podman-path compose-build call
+# sites (step 9 cold build, step 9 parallel-pull-retry rebuild, step 10
+# compose_up fallback) in one place — single source of truth, no duplicate
+# `podman build` invocations drifting out of sync.
+#
+# The Docker runtime path is untouched: it still builds via
+# "${COMPOSE_CMD[@]} build" (docker compose / buildx), which is unaffected
+# by this finding — the Docker runtime path is only selected when the
+# Docker daemon (and therefore Docker Desktop, when applicable) is already
+# confirmed running by _ensure_docker_running.
+#
+# DEFENSE IN DEPTH (required regardless of root cause — an install must
+# never hang silently): every build invocation below, on BOTH runtimes, is
+# wrapped in `_run_with_progress_watchdog`, which independently tracks
+# output growth and kills the whole process tree (not just the top-level
+# PID — orphaned credential-helper children were observed to outlive a
+# plain top-level kill) if a build produces literally zero output for
+# YASHIGANI_BUILD_WATCHDOG_SECS (default 300s). A real build — even a slow
+# one — always produces periodic step/layer output; total silence for
+# multiple minutes is the confirmed hang signature (59 min at 0% CPU, zero
+# output) for this finding.
+_YSG_BUILD_WATCHDOG_SECS_DEFAULT=300
+
+# Recursively kill a process tree (children before parent). Portable: pgrep
+# -P is available on both macOS/BSD and Linux. Used so a killed build cannot
+# leave orphaned grandchildren running (observed: docker-credential-desktop
+# children survived a top-level-only kill in this finding's evidence).
+_kill_process_tree() {
+  local _root="$1" _sig="${2:-TERM}"
+  local _child
+  for _child in $(pgrep -P "$_root" 2>/dev/null || true); do
+    _kill_process_tree "$_child" "$_sig"
+  done
+  kill -"$_sig" "$_root" 2>/dev/null || true
+}
+
+# Usage: _run_with_progress_watchdog <command> [args...]
+# Runs <command> in the background; the operator still sees its output live
+# (stdout/stderr are inherited from the current shell exactly as a
+# foreground call would, so terminal display and install.log capture are
+# unchanged). Independently tees a private, disposable copy of that output
+# purely to detect silence — this works even when global logging is
+# disabled (YSG_NO_LOG=true), so the watchdog does not depend on
+# install.log existing.
+_run_with_progress_watchdog() {
+  local _limit="${YASHIGANI_BUILD_WATCHDOG_SECS:-$_YSG_BUILD_WATCHDOG_SECS_DEFAULT}"
+  local _poll=15
+  local _progress_dir="${WORK_DIR:-${HOME:-.}}/.ysg_build_watchdog"
+  mkdir -p "$_progress_dir" 2>/dev/null || true
+  local _progress_file
+  _progress_file="$(mktemp "${_progress_dir}/progress.XXXXXX" 2>/dev/null || echo "/dev/null")"
+
+  "$@" > >(tee "$_progress_file") 2>&1 &
+  local _pid=$!
+
+  local _last_size=-1 _stall=0
+  while kill -0 "$_pid" 2>/dev/null; do
+    sleep "$_poll"
+    kill -0 "$_pid" 2>/dev/null || break
+    local _size
+    _size="$(wc -c < "$_progress_file" 2>/dev/null | tr -d '[:space:]')"
+    _size="${_size:-0}"
+    if [[ "$_size" == "$_last_size" ]]; then
+      _stall=$((_stall + _poll))
+    else
+      _stall=0
+      _last_size="$_size"
+    fi
+    if [[ "$_stall" -ge "$_limit" ]]; then
+      log_error "Build watchdog: '$*' produced no output for ${_stall}s while still running — presumed HUNG, not merely slow."
+      log_error "See FINDING-V412-RESTART-001: a build/compose client can block indefinitely on a"
+      log_error "client-side dependency (e.g. a registry credential helper) at 0% CPU with no error."
+      log_error "Killing process tree (root PID ${_pid}) and failing this step instead of hanging forever."
+      _kill_process_tree "$_pid" TERM
+      sleep 3
+      _kill_process_tree "$_pid" KILL
+      wait "$_pid" 2>/dev/null || true
+      rm -rf "$_progress_dir"
+      return 124
+    fi
+  done
+  wait "$_pid"
+  local _rc=$?
+  rm -rf "$_progress_dir"
+  return "$_rc"
+}
+
+# Native podman-build primitives — no compose provider involved at all.
+_podman_build_gateway_image() {
+  _run_with_progress_watchdog podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
+    --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+    "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+    -t "yashigani/gateway:${YASHIGANI_VERSION}" \
+    -t yashigani/gateway:latest "${WORK_DIR}"
+}
+
+_podman_build_backoffice_image() {
+  _run_with_progress_watchdog podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
+    --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+    "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
+    -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
+    -t yashigani/backoffice:latest "${WORK_DIR}"
+}
+
+_podman_build_gateway_backoffice_images() {
+  log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
+  _podman_build_gateway_image || {
+    log_error "Podman build failed for gateway (Dockerfile.gateway). See output above."
+    return 1
+  }
+  _podman_build_backoffice_image || {
+    log_error "Podman build failed for backoffice (Dockerfile.backoffice). See output above."
+    return 1
+  }
+  log_success "Images built with Podman"
+}
+
+# =============================================================================
+# FINDING-V412-RESTART-002 / YSG-RISK-091: scheme-agnostic container-name
+# resolution.
+# =============================================================================
+# Root cause (measured, r2 restart leg, macOS podman-6 rootless, 2026-07-18):
+# podman-compose (Python, present+broken at 1.6.x on the affected host) and
+# native `podman compose` v2 / `docker compose` construct DIFFERENT container
+# names for the same service — podman-compose uses
+# "${project}_${service}_1" (underscore); compose-v2 uses
+# "${project}-${service}-N" (hyphen). Any code that CONSTRUCTS a container
+# name by string interpolation, instead of asking the runtime what it
+# actually is, silently targets a container that does not exist whenever
+# the naming scheme guessed does not match the one actually in use —
+# exactly what happened at scripts/health-check.sh (separate finding fix)
+# and at the two install.sh call sites fixed below.
+#
+# Fix: derive the name from the RUNTIME via compose labels (present
+# regardless of which compose tool created the container — positive
+# derivation, not version-sniffing or inference), with a scheme-agnostic
+# name-pattern fallback. This is the same pattern already proven correct in
+# uninstall.sh's _list_project_containers() (label filter on BOTH
+# com.docker.compose.project/service AND io.podman.compose.project/service,
+# plus a bracket-class name fallback that matches either separator) and in
+# install.sh's own _backup_existing_data() / restore.sh's
+# find_pg_container() (substring-grep on live `ps` output). Volumes and
+# networks are NOT affected by this bug class — measured empirically on the
+# standing r2 stack: compose-v2 containers are hyphen-named but volumes and
+# networks remain underscore-named regardless of scheme (do not "fix" the
+# volume/network helpers in uninstall.sh — they are already correct).
+#
+# Usage: ysg_resolve_compose_container <runtime-binary> <project> <service>
+# Prints the first matching RUNNING container's name to stdout; prints
+# nothing and returns 1 if no match (callers MUST check — never assume a
+# `-1` or `_1` suffix).
+#
+# DUPLICATED in scripts/health-check.sh (that file cannot source install.sh —
+# it must run standalone). The function body below is kept BYTE-IDENTICAL to
+# that copy — if you change one, change both (Captain review of 507acee7:
+# the copies had drifted to be logically-but-not-byte identical; this
+# comment is the fix for that drift, in both directions).
+ysg_resolve_compose_container() {
+  local _rt="${1:?ysg_resolve_compose_container: runtime binary required}"
+  local _proj="${2:?ysg_resolve_compose_container: project required}"
+  local _svc="${3:?ysg_resolve_compose_container: service required}"
+  local _name="" _label_prefix
+
+  # Primary: compose labels. Stamped by every compose implementation this
+  # codebase supports, regardless of container-naming scheme.
+  for _label_prefix in "com.docker.compose" "io.podman.compose"; do
+    _name="$("$_rt" ps \
+      --filter "label=${_label_prefix}.project=${_proj}" \
+      --filter "label=${_label_prefix}.service=${_svc}" \
+      --format '{{.Names}}' 2>/dev/null | head -1)"
+    if [[ -n "$_name" ]]; then
+      printf '%s\n' "$_name"
+      return 0
+    fi
+  done
+
+  # Fallback: scheme-agnostic name pattern (bracket class matches either
+  # separator) in case labels are ever absent.
+  _name="$("$_rt" ps \
+    --filter "name=^${_proj}[_-]${_svc}[_-]" \
+    --format '{{.Names}}' 2>/dev/null | head -1)"
+  if [[ -n "$_name" ]]; then
+    printf '%s\n' "$_name"
+    return 0
+  fi
+
+  return 1
 }
 
 # =============================================================================
@@ -5646,9 +6203,16 @@ except Exception:
     # images are pre-seeded by a trusted source (harness tarball cache, airgap
     # bundle); fresh installs build+pull with digest verification as usual.
     YASHIGANI_COMPOSE_PULL_POLICY="never"
+  elif [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    # FINDING-V412-RESTART-001: build via podman directly, never via the
+    # compose provider — see the block comment above _run_with_progress_watchdog.
+    _podman_build_gateway_backoffice_images || {
+      log_error "Failed to build gateway/backoffice images (Podman). Check Dockerfiles."
+      exit 1
+    }
   else
     log_info "Building gateway and backoffice images from source (SHA ${YASHIGANI_GIT_SHA})..."
-    "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
+    _run_with_progress_watchdog "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway backoffice || {
       log_error "Failed to build gateway/backoffice images. Check Dockerfiles."
       exit 1
     }
@@ -5735,7 +6299,8 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
     done
     if [[ "$_gw_check" == "0" ]]; then
       log_error "Gateway image not found after parallel pull — rebuilding..."
-      "${COMPOSE_CMD[@]}" -f "$compose_file" build gateway || {
+      # FINDING-V412-RESTART-001: native podman build, not the compose provider.
+      _podman_build_gateway_image || {
         log_error "Gateway rebuild failed — cannot continue"
         exit 1
       }
@@ -6224,6 +6789,7 @@ _fix_config_perms() {
   find "${work_dir}" \
     -not \( -path "${work_dir}/docker/secrets" -prune \) \
     -not \( -path "${work_dir}/docker/secrets-caddy" -prune \) \
+    -not \( -path "${work_dir}/docker/secrets-pki-attest" -prune \) \
     -not \( -path "${work_dir}/.git" -prune \) \
     -not \( -path "${work_dir}/.ysg_work" -prune \) \
     -not \( -path "${work_dir}/docker/.env" -prune \) \
@@ -6239,8 +6805,15 @@ _fix_config_perms() {
   # Note: *.crt files are intentionally 0644 (public material — CA and client certs
   # must be readable by all container UIDs for mTLS peer verification). Only private
   # keys and password/token files are checked here.
-  # YSG-RISK-053: sweep BOTH secret dirs — the flat docker/secrets/ and the
-  # Caddy-scoped docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # YSG-RISK-053: sweep the flat docker/secrets/ and the Caddy-scoped
+  # docker/secrets-caddy/ (caddy_client.{key,crt} + hmac).
+  # NOTE: docker/secrets-pki-attest/ (FINDING-V412-RESTART-012) is
+  # deliberately NOT swept here — ca_root.attested_sha256 holds a SHA-256
+  # digest, not key material; like *.crt below, its VALUE is public
+  # (disclosure confers no capability), only its ISOLATION matters (no other
+  # mesh container may mount the directory it lives in — see
+  # docker-compose.yml + test_i10_pki_chain_of_continuity.py). It is 0644 by
+  # design (install.sh rotate-root case); see the directory-level check below.
   local _sweep_dir
   for _sweep_dir in "${work_dir}/docker/secrets" "${work_dir}/docker/secrets-caddy"; do
     if [[ -d "$_sweep_dir" ]]; then
@@ -6262,6 +6835,20 @@ _fix_config_perms() {
       fi
     fi
   done
+
+  # FINDING-V412-RESTART-012: docker/secrets-pki-attest/ (postgres-only
+  # attestation dir) is not subject to the world-readable file sweep above
+  # (its one file's VALUE is non-sensitive — see comment above), but the
+  # DIRECTORY itself must never be world-writable/world-searchable-for-write
+  # — self-heal + assert, same fail-closed pattern as the loop above.
+  local _attest_dir="${work_dir}/docker/secrets-pki-attest"
+  if [[ -d "$_attest_dir" ]]; then
+    chmod o-w "$_attest_dir" 2>/dev/null || true
+    if find "$_attest_dir" -maxdepth 0 -perm -002 2>/dev/null | grep -q .; then
+      log_error "FINDING-V412-RESTART-012: ${_attest_dir} is world-writable after self-heal — investigate." >&2
+      exit 1
+    fi
+  fi
 
   log_success "Bind-mounted config permissions verified"
 }
@@ -6672,15 +7259,115 @@ PYEOF
 # Idempotent: skips when the key already exists (rotation is a separate concern;
 # the key is long-lived like the wazuh-admin cert — 825 days).  Fail-closed:
 # returns non-zero if the intermediate CA material is missing.
+#
+# _ec_signing_key_is_valid — generic content validation for a PEM EC private
+# key (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21).
+#
+# A NON-EMPTY / `-f` presence check alone is NOT sufficient for a generated
+# EC signing key that a production loader parses strictly: a prior
+# interrupted/killed install can leave a corrupt-but-nonempty key file that
+# some openssl builds parse leniently while the strict loader
+# (`cryptography.load_pem_private_key`, used both by the gateway's MCP JWT
+# issuer AND the backoffice audit-checkpoint signer) rejects — "EC private
+# key is not encoded properly: private key value is too short". Root-caused
+# live 2026-07-21 for mcp_identity_signing_key (Maxine, gateway RestartCount
+# 143): a partial write left a SEC1 key whose private-key OCTET STRING
+# scalar was shorter than required while otherwise well-formed DER.
+#
+# Reproduced with hand-crafted short-scalar fixtures in BOTH formats this
+# function has to accept — SEC1 ("BEGIN EC PRIVATE KEY", the MCP key's
+# format) AND PKCS#8 ("BEGIN PRIVATE KEY", the audit-signing key's format,
+# via `openssl pkcs8 -topk8`) — confirming a bare `openssl ec -noout -text`
+# parse ACCEPTS both corrupted fixtures (reports a plausible "NIST CURVE"
+# line — the exact false-positive that shipped the incident) while
+# `cryptography.load_pem_private_key` correctly rejects both.
+#
+# Validation strategy (in preference order):
+#   1. python3 + `cryptography` (the EXACT production loader) — used
+#      whenever importable.
+#   2. openssl fallback (always available — openssl is a hard prerequisite
+#      for generating these keys at all): normalise via
+#      `openssl ec -outform DER` (accepts SEC1 OR PKCS#8 input, always
+#      re-encodes as SEC1/traditional — this is what makes the SAME
+#      asn1parse check below work for both key formats), then require BOTH
+#      (a) the depth-1 OCTET STRING (the SEC1 private-key scalar) is EXACTLY
+#      the expected byte length for the curve, AND (b) the curve name
+#      matches. The scalar-LENGTH check is what catches the corruption class
+#      above — a bare `-text` parse alone does not (proven during this fix).
+#
+# Podman-rootless-aware: reads via `_safe_read_secret` (same helper
+# `_secret_is_valid` relies on) so a subuid-remapped key file the host
+# installer user cannot `cat` directly is still read via `podman unshare`
+# rather than silently mis-validated.
+#
+# Usage: _ec_signing_key_is_valid <file> <cryptography-curve-class> \
+#          <expected-scalar-bytes> <openssl-curve-name-regex>
+# Returns 0 (valid) / 1 (invalid, corrupt, or absent).
+_ec_signing_key_is_valid() {
+  local _f="$1" _curve_class="$2" _scalar_bytes="$3" _curve_regex="$4"
+  local _pem
+  _pem="$(_safe_read_secret "$_f" "" "")"
+  [[ -n "$_pem" ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    local _py_rc
+    printf '%s\n' "$_pem" | YASHIGANI_EC_CURVE_CLASS="$_curve_class" python3 -c '
+import sys, os
+try:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric import ec
+except ImportError:
+    sys.exit(2)  # cryptography not importable -> fall through to openssl method
+curve_cls = getattr(ec, os.environ["YASHIGANI_EC_CURVE_CLASS"], None)
+try:
+    key = load_pem_private_key(sys.stdin.buffer.read(), password=None)
+    sys.exit(0 if (curve_cls is not None and isinstance(key.curve, curve_cls)) else 1)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null
+    _py_rc=$?
+    case "$_py_rc" in
+      0) return 0 ;;   # valid EC key on the expected curve per the exact production loader
+      1) return 1 ;;   # definitively invalid (wrong curve / load failure)
+      *) : ;;          # 2 = cryptography module not importable -> fall through
+    esac
+  fi
+
+  # Fallback: normalise (SEC1 or PKCS#8 -> SEC1 DER) then check scalar length + curve.
+  command -v openssl >/dev/null 2>&1 || return 1
+  local _asn1 _oct_line
+  _asn1="$(printf '%s\n' "$_pem" | openssl ec -outform DER 2>/dev/null | openssl asn1parse -inform DER 2>/dev/null)"
+  [[ -n "$_asn1" ]] || return 1
+  _oct_line="$(printf '%s\n' "$_asn1" | grep -E 'd=1.*prim: OCTET STRING' | head -1)"
+  [[ -n "$_oct_line" ]] || return 1
+  printf '%s\n' "$_oct_line" | grep -Eq "\\bl= *${_scalar_bytes}\\b" || return 1
+  printf '%s\n' "$_pem" | openssl ec -noout -text 2>/dev/null | grep -Eqi "$_curve_regex"
+}
+
+# _audit_signing_key_is_valid — audit_signing.key (PKCS#8, P-256) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 pattern-sweep, Su 2026-07-21):
+# the pre-existing skip-gate below checked `-f` presence ONLY (not even
+# non-emptiness) — the SAME corrupt-key-preserved-across-a-re-run hazard
+# proven for mcp_identity_signing_key applies here: this is another
+# strictly-loaded EC private key (backoffice's audit-checkpoint signer). A
+# partial write from an interrupted install would be silently preserved and
+# only surface as a signing failure at the next daily checkpoint.
+_audit_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP256R1" 32 'P-256|prime256v1|secp256r1'
+}
+
 _provision_audit_signing_key() {
   local secrets="${WORK_DIR}/docker/secrets"
   local asd="${secrets}/audit-signing"
   local keyf="${asd}/audit_signing.key"
   local crtf="${asd}/audit_signing.crt"
 
-  if [[ -f "$keyf" && -f "$crtf" ]]; then
+  if [[ -f "$keyf" && -f "$crtf" ]] && _audit_signing_key_is_valid "$keyf"; then
     log_info "Audit-chain signing key already provisioned — skipping"
     return 0
+  elif [[ -f "$keyf" && -f "$crtf" ]]; then
+    log_warn "audit_signing.key present but FAILED content validation (corrupt/truncated EC key — consistent with a partial write from an interrupted prior install) — regenerating"
   fi
   if [[ ! -f "${secrets}/ca_intermediate.crt" || ! -f "${secrets}/ca_intermediate.key" ]]; then
     log_error "Audit signing-key provisioning: intermediate CA material missing — aborting (fail-closed)"
@@ -7002,6 +7689,623 @@ _ensure_agent_databases() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# _apply_inference_backend_firewall — LAURA-411-001 consent-gated convenience
+#
+# Detects the active firewall on macOS (pf) and Linux (ufw → firewalld →
+# nftables → iptables) and applies the loopback+gateway-allow / external-drop
+# rule for the host inference-backend port (default 11434).
+#
+# Consent gate:
+#   interactive  → prompts "Apply firewall rule? [y/N]"; applies on 'y'/'Y'
+#   non-interactive → applies only when SECURE_BACKEND_FIREWALL=true
+#                     (set by --secure-backend-firewall flag)
+#
+# Fail-safe contract:
+#   - ANY error in detection or apply → log_warn + doc reference, return 0
+#   - Missing privilege (not root) → print exact rule + doc reference, return 0
+#   - NEVER propagates failure out of this function; install never aborts here.
+#
+# Called from main() after run_health_check, before print_completion_summary.
+# -----------------------------------------------------------------------------
+_apply_inference_backend_firewall() {
+  # ── Resolve backend port ────────────────────────────────────────────────────
+  # Reuse the value already resolved by _resolve_host_ollama_port (or the env
+  # default). Fall back to 11434 when the Mac GPU path was not exercised.
+  local _port="${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
+  if ! [[ "$_port" =~ ^[0-9]+$ ]] || [[ "$_port" -lt 1 || "$_port" -gt 65535 ]]; then
+    log_warn "backend-firewall: YASHIGANI_HOST_OLLAMA_PORT='${_port}' is not a valid port — skipping."
+    log_warn "  See: docs/security/securing-inference-backend.md"
+    return 0
+  fi
+
+  local _doc="docs/security/securing-inference-backend.md"
+
+  # ── Detect active firewall ──────────────────────────────────────────────────
+  local _fw=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    _fw="pf"
+  else
+    # Linux precedence: ufw (active) → firewalld (running) → nftables → iptables
+    if command -v ufw >/dev/null 2>&1 && \
+       ufw status 2>/dev/null | grep -q "^Status: active"; then
+      _fw="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1 && \
+         firewall-cmd --state 2>/dev/null | grep -q "^running"; then
+      _fw="firewalld"
+    elif command -v nft >/dev/null 2>&1 && \
+         nft list ruleset 2>/dev/null | grep -q .; then
+      _fw="nftables"
+    elif command -v iptables >/dev/null 2>&1; then
+      _fw="iptables"
+    fi
+  fi
+
+  if [[ -z "$_fw" ]]; then
+    log_warn "backend-firewall: no supported firewall detected (pf/ufw/firewalld/nftables/iptables)."
+    log_warn "  Apply rules manually — see: ${_doc}"
+    return 0
+  fi
+
+  log_info "backend-firewall: detected firewall '${_fw}' (port ${_port})"
+
+  # ── Derive gateway subnet ───────────────────────────────────────────────────
+  # Attempt to read the subnet from the compose/podman network; fall back to
+  # known defaults (podman: 10.89.0.0/16, docker: 172.16.0.0/12).
+  local _gw_subnet=""
+  local _runtime="${YSG_RUNTIME:-docker}"
+  if [[ "$_runtime" == "podman" ]]; then
+    _gw_subnet="$( { podman network inspect yashigani 2>/dev/null || \
+                     podman network inspect "${PROJECT:-docker}" 2>/dev/null; } \
+      | grep -oE '"subnet":[[:space:]]*"[^"]+"' \
+      | head -1 \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+      2>/dev/null || true )"
+    [[ -z "$_gw_subnet" ]] && _gw_subnet="10.89.0.0/16"
+  else
+    _gw_subnet="$( { docker network inspect yashigani 2>/dev/null || \
+                     docker network inspect "${PROJECT:-docker}" 2>/dev/null; } \
+      | grep -oE '"Subnet":[[:space:]]*"[^"]+"' \
+      | head -1 \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+      2>/dev/null || true )"
+    [[ -z "$_gw_subnet" ]] && _gw_subnet="172.16.0.0/12"
+  fi
+
+  log_info "backend-firewall: gateway subnet resolved as ${_gw_subnet}"
+
+  # ── Generate firewall rule commands ────────────────────────────────────────
+  local _rule_cmds=()
+  local _rule_note=""
+
+  case "$_fw" in
+    pf)
+      # macOS: block on the active physical interface; loopback is untouched.
+      # The operator may be multi-homed — we detect the default-route interface.
+      local _iface
+      _iface="$(route get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+      [[ -z "$_iface" ]] && _iface="en0"
+      # Write anchor file then load it; enable pf if not already running.
+      _rule_cmds=(
+        "sudo sh -c 'printf \"block drop in quick on ${_iface} proto tcp to any port ${_port}\\n\" > /etc/pf.anchors/com.yashigani.backend'"
+        "sudo pfctl -a com.yashigani.backend -f /etc/pf.anchors/com.yashigani.backend"
+        "sudo pfctl -e"
+      )
+      _rule_note="pf anchor written to /etc/pf.anchors/com.yashigani.backend (interface: ${_iface})"
+      ;;
+    ufw)
+      _rule_cmds=(
+        "sudo ufw allow from ${_gw_subnet} to any port ${_port} proto tcp"
+        "sudo ufw deny ${_port}/tcp"
+      )
+      _rule_note="ufw: allow gateway subnet ${_gw_subnet}, deny remainder"
+      ;;
+    firewalld)
+      _rule_cmds=(
+        "sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=${_gw_subnet} port port=${_port} protocol=tcp accept'"
+        "sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 port port=${_port} protocol=tcp drop'"
+        "sudo firewall-cmd --reload"
+      )
+      _rule_note="firewalld: allow gateway subnet ${_gw_subnet}, drop remainder (permanent, reloaded)"
+      ;;
+    nftables)
+      _rule_cmds=(
+        "sudo nft add rule inet filter input tcp dport ${_port} iif lo accept"
+        "sudo nft add rule inet filter input tcp dport ${_port} ip saddr ${_gw_subnet} accept"
+        "sudo nft add rule inet filter input tcp dport ${_port} drop"
+      )
+      _rule_note="nftables: loopback + gateway ${_gw_subnet} accept, drop remainder"
+      ;;
+    iptables)
+      _rule_cmds=(
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -i lo -j ACCEPT"
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -s ${_gw_subnet} -j ACCEPT"
+        "sudo iptables -A INPUT -p tcp --dport ${_port} -j DROP"
+      )
+      _rule_note="iptables: loopback + gateway ${_gw_subnet} accept, drop remainder"
+      ;;
+  esac
+
+  # ── Consent gate ────────────────────────────────────────────────────────────
+  local _apply=false
+  if [[ "${SECURE_BACKEND_FIREWALL}" == "true" ]]; then
+    # Non-interactive explicit opt-in via --secure-backend-firewall flag.
+    _apply=true
+  elif [[ "${NON_INTERACTIVE}" != "true" ]] && [[ -t 0 ]]; then
+    # Interactive: prompt the operator.
+    local _answer
+    printf '\n[security] Apply %s rule to restrict port %s to the gateway?\n' \
+           "$_fw" "$_port" >&2
+    printf '  (%s)\n' "$_rule_note" >&2
+    printf '  [y/N]: ' >&2
+    read -r _answer
+    if [[ "${_answer}" =~ ^[Yy]$ ]]; then
+      _apply=true
+    else
+      printf '[security] Skipped. To apply later, run:\n' >&2
+      local _cmd
+      for _cmd in "${_rule_cmds[@]}"; do
+        printf '  %s\n' "$_cmd" >&2
+      done
+      printf '  See: %s\n' "$_doc" >&2
+    fi
+  else
+    # Non-interactive without --secure-backend-firewall: print + point at doc.
+    log_info "backend-firewall: non-interactive; pass --secure-backend-firewall to auto-apply."
+    log_info "  Manual commands for ${_fw} (port ${_port}, subnet ${_gw_subnet}):"
+    local _cmd
+    for _cmd in "${_rule_cmds[@]}"; do
+      log_info "    ${_cmd}"
+    done
+    log_info "  See: ${_doc}"
+    return 0
+  fi
+
+  [[ "$_apply" != "true" ]] && return 0
+
+  # ── Privilege check ────────────────────────────────────────────────────────
+  if [[ "$(id -u)" -ne 0 ]]; then
+    log_warn "backend-firewall: root/sudo required to apply ${_fw} rules."
+    log_warn "  Run these commands manually:"
+    local _cmd
+    for _cmd in "${_rule_cmds[@]}"; do
+      log_warn "    ${_cmd}"
+    done
+    log_warn "  See: ${_doc}"
+    return 0
+  fi
+
+  # ── Apply rules ────────────────────────────────────────────────────────────
+  local _rc=0
+  local _cmd
+  for _cmd in "${_rule_cmds[@]}"; do
+    log_info "backend-firewall: applying: ${_cmd}"
+    eval "$_cmd" 2>&1 | while IFS= read -r _line; do
+      log_info "  ${_line}"
+    done || { _rc=1; break; }
+  done
+
+  if [[ "$_rc" -ne 0 ]]; then
+    log_warn "backend-firewall: one or more ${_fw} commands failed — rules may be partially applied."
+    log_warn "  Verify manually and see: ${_doc}"
+    return 0   # fail-safe: never abort install
+  fi
+
+  log_success "backend-firewall: ${_fw} rule applied — port ${_port} restricted to loopback + ${_gw_subnet}."
+  log_info "  See '${_doc}' for the honest-limitation note on same-host loopback residual."
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# _resolve_host_ollama_port — Apple Metal / Darwin path only
+#
+# Resolves the port where the host-native ollama process is listening on
+# 127.0.0.1.  Called once from compose_up() before both Docker and Podman
+# Mac Metal GPU overlay blocks.  Exports YASHIGANI_HOST_OLLAMA_PORT on success;
+# returns non-zero on failure (caller must handle with || return 1).
+#
+# Resolution order (Tiago req 2026-07-13, feat/v411-mac-ollama-port-detect-ask):
+#   a. YASHIGANI_HOST_OLLAMA_PORT already set (pre-set env or --ollama-port flag)
+#   b. Parse OLLAMA_HOST env (accepts host:port and bare :port)
+#   c. Probe 127.0.0.1:11434 (normal case); if absent, lsof-scan for listening
+#      process named "ollama" and probe the discovered port
+#   d. Interactive prompt if [ -t 0 ] and not --non-interactive
+#   e. Non-interactive + unresolved → abort with --ollama-port hint
+#
+# Final gate: curl probe against the resolved port (fail-closed, Laura C3).
+# Backward-compat: ollama on 11434 + no flag → step c succeeds immediately,
+#   behaviour identical to the pre-v411 hardcoded path.
+# -----------------------------------------------------------------------------
+_resolve_host_ollama_port() {
+  local _port=""
+  local _source=""
+
+  # ── a. Explicit flag / env already set ─────────────────────────────────────
+  if [[ -n "${YASHIGANI_HOST_OLLAMA_PORT:-}" ]]; then
+    _port="${YASHIGANI_HOST_OLLAMA_PORT}"
+    _source="YASHIGANI_HOST_OLLAMA_PORT / --ollama-port"
+    log_info "ollama port: using pre-set value ${_port} (${_source})"
+  fi
+
+  # ── b. Parse OLLAMA_HOST env (host:port or :port) ──────────────────────────
+  if [[ -z "$_port" ]] && [[ -n "${OLLAMA_HOST:-}" ]]; then
+    # Extract the token after the last colon; handles "host:port" and ":port".
+    local _oh_port="${OLLAMA_HOST##*:}"
+    if [[ "$_oh_port" =~ ^[0-9]+$ ]] && \
+       [[ "$_oh_port" -ge 1 ]] && [[ "$_oh_port" -le 65535 ]]; then
+      _port="$_oh_port"
+      _source="OLLAMA_HOST=${OLLAMA_HOST}"
+      log_info "ollama port: parsed ${_port} from OLLAMA_HOST=${OLLAMA_HOST}"
+    else
+      log_warn "ollama port: OLLAMA_HOST=${OLLAMA_HOST} — no valid port extracted; continuing detection"
+    fi
+  fi
+
+  # ── c. Probe 11434 (default); then lsof-scan for non-default port ──────────
+  if [[ -z "$_port" ]]; then
+    if curl -fs --max-time 2 --connect-timeout 2 \
+         http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      _port=11434
+      _source="probe:11434"
+      log_info "ollama port: responding on default port 11434"
+    else
+      log_info "ollama: not on 11434 — scanning via lsof for listening port..."
+      # lsof -nP -iTCP -sTCP:LISTEN: list all listening TCP ports.
+      # Filter process name containing "ollama" (case-insensitive), extract port
+      # from the last colon-delimited field of the NAME column (format: *:PORT
+      # or host:PORT). Takes the first match — if multiple ollama processes are
+      # listening, the operator should disambiguate via --ollama-port.
+      local _lsof_port=""
+      _lsof_port=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+        | awk 'tolower($1) ~ /ollama/ {
+            n = split($9, a, ":");
+            p = a[n];
+            if (p+0 >= 1 && p+0 <= 65535) { print p; exit }
+          }')
+      if [[ -n "$_lsof_port" ]]; then
+        # Verify the discovered port is actually the ollama API before accepting.
+        if curl -fs --max-time 2 --connect-timeout 2 \
+             "http://127.0.0.1:${_lsof_port}/api/tags" >/dev/null 2>&1; then
+          _port="$_lsof_port"
+          _source="lsof-detect:${_lsof_port}"
+          log_info "ollama port: found via lsof on port ${_port} (reachable)"
+        else
+          log_warn "ollama port: lsof found port ${_lsof_port} but /api/tags not reachable on 127.0.0.1:${_lsof_port}"
+        fi
+      else
+        log_info "ollama port: lsof found no listening process named ollama"
+      fi
+    fi
+  fi
+
+  # ── d. Interactive prompt ───────────────────────────────────────────────────
+  if [[ -z "$_port" ]]; then
+    if [[ "${NON_INTERACTIVE}" != "true" ]] && [[ -t 0 ]]; then
+      local _prompt_input
+      printf '\nApple Metal: host ollama not found on default port 11434.\n' >&2
+      printf 'Enter the port where host ollama is listening [11434]: ' >&2
+      read -r _prompt_input
+      _prompt_input="${_prompt_input:-11434}"
+      if [[ "$_prompt_input" =~ ^[0-9]+$ ]] && \
+         [[ "$_prompt_input" -ge 1 ]] && [[ "$_prompt_input" -le 65535 ]]; then
+        _port="$_prompt_input"
+        _source="interactive-prompt"
+        log_info "ollama port: using prompted port ${_port}"
+      else
+        log_error "Invalid port entered: '${_prompt_input}' — must be an integer 1-65535"
+        return 1
+      fi
+    fi
+  fi
+
+  # ── e. Non-interactive + unresolved → abort ─────────────────────────────────
+  if [[ -z "$_port" ]]; then
+    log_error "Apple Metal: host ollama port could not be determined."
+    log_error "  127.0.0.1:11434 not reachable; lsof found no listening ollama process."
+    log_error "  Running in non-interactive mode — cannot prompt for port."
+    log_error "  Fix options:"
+    log_error "    --ollama-port <N>                (CLI flag)"
+    log_error "    YASHIGANI_HOST_OLLAMA_PORT=<N>   (env var)"
+    log_error "    OLLAMA_HOST=127.0.0.1:<N>        (ollama env — used by install.sh)"
+    log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+    log_error "    OLLAMA_HOST=127.0.0.1:<N> ollama serve"
+    return 1
+  fi
+
+  # ── Validate + final reachability gate ─────────────────────────────────────
+  # Validate port range (catches values from steps a/b that were not probe-verified).
+  if ! [[ "$_port" =~ ^[0-9]+$ ]] || \
+     [[ "$_port" -lt 1 ]] || [[ "$_port" -gt 65535 ]]; then
+    log_error "ollama port '${_port}' is not a valid port number 1-65535 (source: ${_source})"
+    return 1
+  fi
+
+  # Definitive reachability check — covers all resolution paths including
+  # steps a/b (where no probe was done during resolution).
+  if ! curl -fs --max-time 2 --connect-timeout 2 \
+       "http://127.0.0.1:${_port}/api/tags" >/dev/null 2>&1; then
+    log_error "Apple Metal: host ollama not reachable on 127.0.0.1:${_port} (source: ${_source})"
+    log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
+    log_error "    OLLAMA_HOST=127.0.0.1:${_port} ollama serve"
+    log_error "  Then pre-pull models:"
+    log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
+    else
+      log_error "  gvproxy will relay caddy→host.containers.internal:${_port} to 127.0.0.1."
+    fi
+    log_error "Aborting — host ollama must be running on 127.0.0.1:${_port} before install."
+    return 1
+  fi
+
+  export YASHIGANI_HOST_OLLAMA_PORT="$_port"
+  log_info "Apple Metal: ollama confirmed on 127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} (source: ${_source}, Laura C3: loopback)"
+}
+
+# =============================================================================
+# _podman_compose_letta_waitloop — Part-2 fix for cacc23da regression
+# =============================================================================
+# podman-compose 1.x does not honour `depends_on: condition: service_healthy`
+# or `service_completed_successfully`. As a result, after `podman-compose up -d`
+# the following services remain stuck in "Created" state (never started):
+#   • agent-db-init  — depends_on postgres: service_healthy
+#   • letta-pgbouncer — depends_on postgres: service_healthy
+#                                  agent-db-init: service_completed_successfully
+#   • letta           — depends_on gateway: service_healthy
+#                                  postgres: service_healthy
+#                                  letta-pgbouncer: service_healthy
+#                                  agent-db-init: service_completed_successfully
+#
+# This function detects that state and explicitly walks the dependency chain:
+#   1. Wait for postgres to report healthy (no compose dep — starts unconditionally).
+#   2. `podman start agent-db-init`; wait for it to exit 0.
+#   3. `podman start letta-pgbouncer`; wait for it to be healthy.
+#   4. Wait for gateway healthy; `podman start letta`.
+#
+# Design constraints:
+#   • NO-OP when:
+#       – provider is NOT the podman-compose-ysg fork (YSG_PODMAN_COMPOSE_FORK
+#         is the authoritative flag as of 2026-07-18's fork wiring — `podman
+#         compose` v2 and docker compose both honour service_healthy natively
+#         and are no longer selectable on the Podman runtime in any case)
+#       – letta profile is not active (lean installs without --letta flag)
+#       – K8s path (YSG_PODMAN_RUNTIME=false)
+#       – DRY_RUN=true
+#   • Idempotent: `podman start` on an already-running container returns exit 0.
+#   • Fail-closed on postgres timeout (required dep; no point starting chain).
+#   • Warn-and-continue on letta-pgbouncer / agent-db-init failures (letta may
+#     crash-loop, but core gateway/backoffice are unaffected — non-fatal).
+#   • Timeout: YSG_LETTA_WAITLOOP_TIMEOUT_S (default 300s).
+#   • Does NOT touch K8s bootstrap or modify compose files.
+#   • Uses podman-compose naming convention:
+#       ${COMPOSE_PROJECT_NAME}_${service}_1
+#
+# Root cause of why provider was NOT swapped to `podman compose` here:
+#   `podman compose` passes security_opt:seccomp=<abs-path> by inlining the JSON
+#   content as the option value sent to the Podman socket, which then treats the
+#   multi-KB blob as a filename → ENAMETOOLONG → caddy/gateway/backoffice fail to
+#   create. `podman-compose` passes the path string directly to `podman run
+#   --security-opt seccomp=/abs/path`, which the kernel accepts correctly.
+#   Ref: Pentest #95 TM-V231-005 (original cross-runtime seccomp finding).
+#   The seccomp regression is a BLOCKER; the letta ordering issue is fixable here.
+#
+# Called from compose_up() after both upgrade and fresh-install compose-up paths
+# converge, before log_success "Services started".
+# =============================================================================
+_podman_compose_letta_waitloop() {
+  # ── Guard 1: only applies when the podman-compose-ysg fork is the selected
+  # tool ───────────────────────────────────────────────────────────────────────
+  # `podman compose` v2 and `docker compose` honour service_healthy natively —
+  # neither is reachable here anyway (fork is the only Podman driver as of the
+  # 2026-07-18 wiring), but the guard is kept explicit and belt-and-suspenders.
+  # YSG_PODMAN_COMPOSE_FORK (not a COMPOSE_CMD[0] text match — COMPOSE_CMD[0] is
+  # "python3" for the fork, not a driver name) is the authoritative flag.
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] \
+     || [[ "${YSG_PODMAN_COMPOSE_FORK:-false}" != "true" ]]; then
+    return 0
+  fi
+
+  # ── Guard 2: only when letta profile is active ─────────────────────────────
+  local _letta_active="false"
+  local _wl_p
+  for _wl_p in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
+    [[ "$_wl_p" == "letta" ]] && _letta_active="true" && break
+  done
+  if [[ "$_letta_active" != "true" ]]; then
+    return 0
+  fi
+
+  # ── Guard 3: skip dry-run ──────────────────────────────────────────────────
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "_podman_compose_letta_waitloop: would gate letta on dependency health"
+    return 0
+  fi
+
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  local _timeout_s="${YSG_LETTA_WAITLOOP_TIMEOUT_S:-300}"
+  local _deadline=$(( $(date +%s) + _timeout_s ))
+
+  # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): false-positive-success
+  # tracker. Pre-fix, every stage past postgres logged only a WARNING on
+  # failure and the function always fell through to an unconditional
+  # `log_success "... letta started"` at the end regardless of whether
+  # `podman start` actually succeeded or the container ever reached a real
+  # Running/healthy state — a silent lie. `_wl_failed` is set non-zero the
+  # instant any stage fails to reach its ACTUAL verified state (not merely
+  # "the start command returned 0"); the function's own return code and the
+  # final log line are both driven off this, never off command-issued-ness.
+  local _wl_failed=0
+
+  # Container names follow podman-compose convention: ${project}_${service}_1
+  local _pg_ctr="${_proj}_postgres_1"
+  local _gw_ctr="${_proj}_gateway_1"
+  local _adb_ctr="${_proj}_agent-db-init_1"
+  local _lpgb_ctr="${_proj}_letta-pgbouncer_1"
+  local _letta_ctr="${_proj}_letta_1"
+
+  # ── Quick probe: are letta-tier containers actually stuck in created? ───────
+  local _stuck_ctrs
+  _stuck_ctrs="$(
+    podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null \
+    | grep -E "^${_proj}_(letta|agent-db-init)" | sort -u || true
+  )"
+  if [[ -z "$_stuck_ctrs" ]]; then
+    log_info "Letta wait-loop: no letta/agent-db-init containers in created state — skipping"
+    return 0
+  fi
+
+  log_info "Letta wait-loop: podman-compose 1.x service_healthy workaround (timeout ${_timeout_s}s)"
+  log_info "Letta wait-loop: stuck containers: $(printf '%s ' ${_stuck_ctrs})"
+
+  # ── Helper: poll container health from OCI inspect ─────────────────────────
+  _letta_wl_health() {
+    podman inspect --format '{{.State.Health.Status}}' "$1" 2>/dev/null || echo ""
+  }
+  # ── Helper: container lifecycle state ─────────────────────────────────────
+  _letta_wl_state() {
+    podman inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo "absent"
+  }
+  # ── Helper: exit code of a one-shot container ──────────────────────────────
+  _letta_wl_exitcode() {
+    podman inspect --format '{{.State.ExitCode}}' "$1" 2>/dev/null || echo "-1"
+  }
+
+  # ── Step 1: wait for postgres healthy ─────────────────────────────────────
+  log_info "Letta wait-loop [1/4]: waiting for postgres healthy..."
+  local _pg_ok=0
+  while [[ $(date +%s) -lt $_deadline ]]; do
+    [[ "$(_letta_wl_health "$_pg_ctr")" == "healthy" ]] && { _pg_ok=1; break; }
+    sleep 3
+  done
+  if [[ "$_pg_ok" -eq 0 ]]; then
+    log_error "Letta wait-loop: timed out waiting for postgres healthy (${_timeout_s}s)"
+    log_error "Letta wait-loop: letta tier will not start; check: podman logs ${_pg_ctr}"
+    return 1
+  fi
+  log_success "Letta wait-loop [1/4]: postgres healthy"
+
+  # ── Step 2: start agent-db-init; wait for exit 0 ──────────────────────────
+  if [[ "$(_letta_wl_state "$_adb_ctr")" == "absent" ]]; then
+    log_error "Letta wait-loop [2/4]: agent-db-init container absent — letta DB may be missing"
+    _wl_failed=1
+  else
+    log_info "Letta wait-loop [2/4]: starting agent-db-init..."
+    # `podman start` on an already-running container is a no-op exit-0; safe to call.
+    # The start-command return code is NOT the success signal here — a one-shot
+    # job's actual outcome is its exit code, checked below. Both are logged.
+    podman start "$_adb_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start agent-db-init returned non-zero — will still poll actual state"
+    log_info "Letta wait-loop [2/4]: waiting for agent-db-init to exit 0..."
+    local _adb_ok=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      local _adb_s _adb_x
+      _adb_s="$(_letta_wl_state "$_adb_ctr")"
+      _adb_x="$(_letta_wl_exitcode "$_adb_ctr")"
+      if [[ "$_adb_s" == "exited" && "$_adb_x" == "0" ]]; then
+        _adb_ok=1; break
+      fi
+      # Failed exit — don't keep waiting
+      [[ "$_adb_s" == "exited" && "$_adb_x" != "0" ]] && break
+      sleep 3
+    done
+    if [[ "$_adb_ok" -eq 1 ]]; then
+      log_success "Letta wait-loop [2/4]: agent-db-init completed (exit 0)"
+    else
+      local _final_x
+      _final_x="$(_letta_wl_exitcode "$_adb_ctr")"
+      log_error "Letta wait-loop [2/4]: agent-db-init did NOT exit 0 (state=$(_letta_wl_state "$_adb_ctr") exit=${_final_x}) — letta DB is not confirmed to exist"
+      _wl_failed=1
+    fi
+  fi
+
+  # ── Step 3: start letta-pgbouncer; wait for healthy (verified, not assumed) ─
+  if [[ "$(_letta_wl_state "$_lpgb_ctr")" == "absent" ]]; then
+    log_error "Letta wait-loop [3/4]: letta-pgbouncer container absent"
+    _wl_failed=1
+  else
+    log_info "Letta wait-loop [3/4]: starting letta-pgbouncer..."
+    podman start "$_lpgb_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start letta-pgbouncer returned non-zero — will still poll actual state"
+    log_info "Letta wait-loop [3/4]: waiting for letta-pgbouncer healthy..."
+    local _lpgb_ok=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_health "$_lpgb_ctr")" == "healthy" ]] && { _lpgb_ok=1; break; }
+      sleep 3
+    done
+    if [[ "$_lpgb_ok" -eq 1 ]]; then
+      log_success "Letta wait-loop [3/4]: letta-pgbouncer healthy"
+    else
+      log_error "Letta wait-loop [3/4]: letta-pgbouncer NOT healthy before timeout (state=$(_letta_wl_state "$_lpgb_ctr") health=$(_letta_wl_health "$_lpgb_ctr")) — letta will fail DB connect"
+      _wl_failed=1
+    fi
+  fi
+
+  # ── Step 4: wait for gateway healthy; start letta; VERIFY it actually runs ──
+  # gateway has no service_healthy depends_on so podman-compose starts it
+  # unconditionally, but it may still be converging. letta depends on it.
+  if [[ "$(_letta_wl_health "$_gw_ctr")" != "healthy" ]]; then
+    log_info "Letta wait-loop [4/4]: waiting for gateway healthy (letta dep)..."
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_health "$_gw_ctr")" == "healthy" ]] && break
+      sleep 3
+    done
+    if [[ "$(_letta_wl_health "$_gw_ctr")" != "healthy" ]]; then
+      log_warn "Letta wait-loop [4/4]: gateway not healthy before timeout — letta start proceeding anyway"
+    fi
+  fi
+
+  if [[ "$(_letta_wl_state "$_letta_ctr")" == "absent" ]]; then
+    log_error "Letta wait-loop [4/4]: letta container absent — cannot start"
+    _wl_failed=1
+  else
+    log_info "Letta wait-loop [4/4]: starting letta..."
+    # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): pre-fix, this block
+    # logged `ok Letta wait-loop [4/4]: letta started` unconditionally right
+    # after issuing `podman start`, regardless of its return code AND
+    # regardless of whether the container ever reached Running — a
+    # false-positive success. `podman start` returning 0 only means the
+    # engine accepted the request; on the exact YSG-PODMAN-LETTA-001 bug this
+    # fix addresses, `podman start` on letta previously returned non-zero
+    # (dependency-graph-construction error) while this code path still
+    # printed success. Fix: poll `_letta_wl_state` for the container to
+    # actually reach "running" (the literal, verifiable fact asked for — not
+    # "the command that asks it to run returned 0"), then additionally wait
+    # for "healthy" within the remaining budget as a stronger, non-blocking
+    # bonus signal. FAIL LOUDLY (log_error + _wl_failed=1) if letta never
+    # reaches Running before the deadline — no downgrade to a warning.
+    podman start "$_letta_ctr" 2>/dev/null \
+      || log_warn "Letta wait-loop: podman start letta returned non-zero — will still poll actual state"
+    local _letta_running=0
+    while [[ $(date +%s) -lt $_deadline ]]; do
+      [[ "$(_letta_wl_state "$_letta_ctr")" == "running" ]] && { _letta_running=1; break; }
+      sleep 3
+    done
+    if [[ "$_letta_running" -ne 1 ]]; then
+      log_error "Letta wait-loop [4/4]: letta did NOT reach Running before timeout (state=$(_letta_wl_state "$_letta_ctr")) — letta tier FAILED to start"
+      _wl_failed=1
+    else
+      # Bonus: wait for healthy within whatever budget remains, but Running
+      # (already confirmed) is the pass/fail gate this defect fix targets.
+      local _letta_healthy=0
+      while [[ $(date +%s) -lt $_deadline ]]; do
+        [[ "$(_letta_wl_health "$_letta_ctr")" == "healthy" ]] && { _letta_healthy=1; break; }
+        [[ "$(_letta_wl_state "$_letta_ctr")" != "running" ]] && break
+        sleep 3
+      done
+      if [[ "$_letta_healthy" -eq 1 ]]; then
+        log_success "Letta wait-loop [4/4]: letta started and healthy"
+      else
+        log_success "Letta wait-loop [4/4]: letta started (running; health=$(_letta_wl_health "$_letta_ctr") — did not confirm healthy before timeout)"
+      fi
+    fi
+  fi
+
+  if [[ "$_wl_failed" -ne 0 ]]; then
+    log_error "Letta wait-loop: one or more letta-tier stages FAILED — letta tier is NOT fully up (core gateway/backoffice services are unaffected and remain usable)"
+    return 1
+  fi
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -7124,34 +8428,71 @@ compose_up() {
   # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
   # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
   # service_started). ollama-init is also a no-op (models managed on host).
-  # HOST-EGRESS SURFACE: caddy→127.0.0.1:11434 via VPNKit (TCP only). Laura C3: CLOSED.
-  # PREREQUISITE: host-native ollama bound to 127.0.0.1:11434 with models pre-pulled.
-  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:<PORT> via VPNKit (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve   (standard port — auto-detected)
+  #   OLLAMA_HOST=127.0.0.1:<N>   ollama serve   (non-standard — see --ollama-port)
   #   VPNKit relays container→host.docker.internal to Mac loopback; LAN fully isolated.
+
+  # Port resolution — runs once, before both Docker and Podman apple_metal blocks.
+  # _resolve_host_ollama_port() implements the probe→OLLAMA_HOST→lsof→prompt→abort
+  # chain and exports YASHIGANI_HOST_OLLAMA_PORT. Both overlay files then pick it up
+  # via ${YASHIGANI_HOST_OLLAMA_PORT:-11434} compose interpolation.
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "$MODE" != "k8s" ]]; then
+    _resolve_host_ollama_port || return 1
+    # Persist to docker/.env so future compose re-runs (upgrade, docker compose restart)
+    # pick up the same port without needing to re-run install.sh.
+    local _env_file="${WORK_DIR}/docker/.env"
+    if [[ -f "$_env_file" ]]; then
+      if grep -q "^YASHIGANI_HOST_OLLAMA_PORT=" "$_env_file" 2>/dev/null; then
+        local _tmp_env
+        _tmp_env="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+        sed "s|^YASHIGANI_HOST_OLLAMA_PORT=.*|YASHIGANI_HOST_OLLAMA_PORT=${YASHIGANI_HOST_OLLAMA_PORT}|" \
+          "$_env_file" > "$_tmp_env"
+        mv "$_tmp_env" "$_env_file"
+      else
+        printf 'YASHIGANI_HOST_OLLAMA_PORT=%s\n' "${YASHIGANI_HOST_OLLAMA_PORT}" >> "$_env_file"
+      fi
+      log_info "ollama port ${YASHIGANI_HOST_OLLAMA_PORT} persisted to docker/.env"
+    fi
+  fi
+
   local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
   if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
      [[ "$(uname -s)" == "Darwin" ]] && \
      [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && \
      [[ "$MODE" != "k8s" ]] && \
      [[ -f "$_gpu_overlay_mac_metal" ]]; then
-    # Preflight: verify host ollama is reachable on loopback (Laura C3 binding).
-    # 127.0.0.1 is the definitive binding — 0.0.0.0 exposes LAN, not acceptable.
-    if ! curl -fs --max-time 2 --connect-timeout 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-      log_error "Apple Metal: host ollama not reachable on 127.0.0.1:11434"
-      log_error "  Start host ollama with loopback binding (Laura C3 — LAN isolation):"
-      log_error "    OLLAMA_HOST=127.0.0.1:11434 ollama serve"
-      log_error "  Then pre-pull models:"
-      log_error "    ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"
-      log_error "  Docker Desktop VPNKit will relay caddy→host.docker.internal to 127.0.0.1."
-      log_error "Aborting — host ollama must be running on 127.0.0.1:11434 before install."
-      return 1
-    fi
     compose_files+=("-f" "$_gpu_overlay_mac_metal")
     log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
-    log_info "  caddy routes /ollama/* to host ollama (Metal) via extra_hosts[ollama:host-gateway]"
+    log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:host-gateway]"
     log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
     log_info "  ollama-init disabled (models managed on host)"
-    log_warn "  HOST-EGRESS: caddy→127.0.0.1:11434 via VPNKit (Laura C3: CLOSED — loopback only)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via VPNKit (Laura C3: CLOSED — loopback only)"
+  fi
+
+  # GPU overlay — Apple Metal / macOS host-native ollama — Podman runtime path.
+  # Identical intent to the Docker path above; different host-loopback relay.
+  # Podman machine on macOS uses gvproxy (192.168.127.254) — no VPNKit.
+  # Container→192.168.127.254:<PORT> → gvproxy → 127.0.0.1:<PORT> on Mac host.
+  # HOST-EGRESS SURFACE: caddy→127.0.0.1:<PORT> via gvproxy (TCP only). Laura C3: CLOSED.
+  # PREREQUISITE: host-native ollama bound to 127.0.0.1 with models pre-pulled.
+  #   OLLAMA_HOST=127.0.0.1:11434 ollama serve   (standard — auto-detected)
+  #   OLLAMA_HOST=127.0.0.1:<N>   ollama serve   (non-standard — see --ollama-port)
+  local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && \
+     [[ "$(uname -s)" == "Darwin" ]] && \
+     [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && \
+     [[ "$MODE" != "k8s" ]] && \
+     [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
+    compose_files+=("-f" "$_gpu_overlay_mac_metal_podman")
+    log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml)"
+    log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:192.168.127.254]"
+    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
+    log_info "  ollama-init disabled (models managed on host)"
+    log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via gvproxy 192.168.127.254 (loopback only)"
   fi
 
   # GPU overlay — AMD ROCm (discrete: Radeon RX 5000+/6000+/7000+, Instinct).
@@ -7440,7 +8781,6 @@ compose_up() {
           "${YASHIGANI_FORCE_REBUILD:-0}" != "1" ]]; then
       log_info "Images already current (v${YASHIGANI_VERSION}, SHA ${YASHIGANI_GIT_SHA}) — skipping rebuild (Podman)"
     else
-      log_info "Building images with Podman (SHA ${YASHIGANI_GIT_SHA})..."
       # retro #32: do NOT pipe through `tail -1`. The script's outer exec
       # redirect at the top of main() already tees stdout+stderr to
       # install.log. Piping through `tail -1` here truncates build output
@@ -7448,17 +8788,11 @@ compose_up() {
       # errors ("no space left on device"), Dockerfile syntax errors, and
       # cache-eviction warnings are silently dropped from the log.
       # Verbose terminal output is the explicit tradeoff for visibility.
-      podman build -f "${WORK_DIR}/docker/Dockerfile.gateway" \
-        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
-        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
-        -t "yashigani/gateway:${YASHIGANI_VERSION}" \
-        -t yashigani/gateway:latest "${WORK_DIR}"
-      podman build -f "${WORK_DIR}/docker/Dockerfile.backoffice" \
-        --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
-        "${YSG_PROXY_BUILD_ARGS[@]+"${YSG_PROXY_BUILD_ARGS[@]}"}" \
-        -t "yashigani/backoffice:${YASHIGANI_VERSION}" \
-        -t yashigani/backoffice:latest "${WORK_DIR}"
-      log_success "Images built with Podman"
+      # FINDING-V412-RESTART-001: shared with compose_pull() step 9 — see
+      # _podman_build_gateway_backoffice_images (single source of truth for
+      # the native-podman build path; usually a no-op here since step 9
+      # already built current images, but re-runs safely if invoked alone).
+      _podman_build_gateway_backoffice_images
     fi
 
     # 3.0 doc-OPA: build the per-job extractor image (release artifact) under
@@ -7735,17 +9069,22 @@ compose_up() {
   # --pull never, `docker compose up` still issues Pulling calls for any image not
   # locally cached — failing on truly isolated networks.
   #
-  # docker compose v2 / docker-compose / podman compose: --pull never
-  # podman-compose (Python): does NOT support --pull never; omitting --pull is
-  #   correct (no flag = don't pull). We must not pass --pull never to podman-compose
-  #   or it will error ("unrecognized arguments").
+  # docker compose v2 / docker-compose: --pull never
+  # podman-compose-ysg (vendored fork, the only Podman driver as of 2026-07-18) /
+  # podman-compose (Python) upstream lineage: does NOT support --pull never (its
+  # argparse defines --pull as a boolean action=store_true flag, not a policy
+  # value — "--pull never" would be parsed as "--pull" followed by an unrecognised
+  # positional "never"). Omitting --pull is correct here (no flag = don't pull).
+  # We must not pass --pull never to the fork or it will error ("unrecognized
+  # arguments: never"). Gate on YSG_PODMAN_RUNTIME (not COMPOSE_CMD[0] text —
+  # COMPOSE_CMD[0] is "python3" for the fork, not a driver name).
   local _pull_flag=()
   if [[ "$AIR_GAP" == "true" ]]; then
-    if [[ "${COMPOSE_CMD[0]}" != "podman-compose" ]]; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
       _pull_flag=("--pull" "never")
       log_info "Air-gap mode: passing --pull never to compose up (BUG-AG-001)"
     else
-      log_info "Air-gap mode: podman-compose selected; omitting --pull (no flag = no pull)"
+      log_info "Air-gap mode: Podman fork selected; omitting --pull (no flag = no pull)"
     fi
   fi
 
@@ -7803,7 +9142,21 @@ compose_up() {
       # before calling _upgrade_postgres_ssl. _upgrade_postgres_ssl reads the
       # certs from /run/secrets inside the container; this cp makes them available
       # regardless of which bind-mount directory is active.
-      local _pg_container_name="docker_postgres_1"
+      # FINDING-V412-RESTART-002 / YSG-RISK-091: was hardcoded
+      # "docker_postgres_1" — wrong project name (ignored
+      # COMPOSE_PROJECT_NAME) AND wrong separator on any compose-v2-created
+      # stack (hyphen, not underscore). Resolve the real name from the
+      # runtime instead of guessing it.
+      # `|| true` is required: "not found" is a legitimate outcome this
+      # block checks for below, not a script-fatal error — without it,
+      # `set -e` would abort compose_up()/install.sh here, before the
+      # log_error + return 1 below ever runs.
+      local _pg_container_name
+      _pg_container_name="$(ysg_resolve_compose_container "podman" "${COMPOSE_PROJECT_NAME:-docker}" "postgres")" || true
+      if [[ -z "$_pg_container_name" ]]; then
+        log_error "FINDING-V412-RESTART-002: could not resolve a running postgres container (project '${COMPOSE_PROJECT_NAME:-docker}') for SSL cert injection"
+        return 1
+      fi
       local _host_secrets="${WORK_DIR}/docker/secrets"
       if ! "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
              test -f /run/secrets/postgres_client.crt 2>/dev/null; then
@@ -7936,6 +9289,37 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         log_info "postgres SSL injection complete — starting remaining services..."
       fi
     fi
+    # Podman-compose stale-container guard (Bug 5 / BUG-411-PODMAN-STALE-CTR v2):
+    # When a previous install attempt created containers but failed before they
+    # started, those containers remain in "created" or "exited" state.
+    # On re-run, dependency resolution fails with:
+    #   "container X depends on container Y not found in input list"
+    # because new containers pick up --requires=<old-container-id> via name
+    # lookup, and that old container references an even-older dependency that
+    # no longer exists.  podman-compose down and --remove-orphans do NOT cover
+    # this: down removes containers whose services are still defined, but stale
+    # containers from earlier install attempts (with different dependency chain
+    # IDs) survive and pollute the dependency graph for new containers.
+    # Fix v2: remove ALL non-running (created + exited + stopped) project
+    # containers before compose up, not just "created"-state ones.
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+      local _proj_name="${COMPOSE_PROJECT_NAME:-docker}"
+      local _stale_ctrs
+      _stale_ctrs="$(
+        { podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=exited" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=stopped" --format '{{.Names}}' 2>/dev/null
+        } | grep "^${_proj_name}_" | sort -u || true)"
+      if [[ -n "$_stale_ctrs" ]]; then
+        log_info "Podman: removing stale non-running containers for project '${_proj_name}'"
+        while IFS= read -r _ctr; do
+          [[ -z "$_ctr" ]] && continue
+          podman rm -f "$_ctr" 2>/dev/null && \
+            log_info "  removed stale container: ${_ctr}" || \
+            log_warn "  could not remove ${_ctr} — proceeding (non-fatal)"
+        done <<< "$_stale_ctrs"
+      fi
+    fi
     log_info "Starting services (upgrade — removing orphaned containers)..."
     # ROOTLESS-9 (v2.23.1): podman-compose up -d returns non-zero when optional
     # services (otel-collector, promtail, grafana) fail to start — even if all
@@ -7953,8 +9337,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     # The compose file on disk is NOT modified — the temp file is used only for up.
     # This is equivalent to the --air-gap bundle behaviour.
     local _compose_files_up=("${compose_files[@]}")
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
       local _digest_stripped_compose
       _digest_stripped_compose="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
@@ -7971,17 +9354,35 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
     # Clean up temp compose file if it was created
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose:-}" 2>/dev/null || true
     fi
   else
+    # Podman stale-container guard (same as upgrade path above — see comment).
+    # v2: also covers exited/stopped containers, not just created-state.
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+      local _proj_name2="${COMPOSE_PROJECT_NAME:-docker}"
+      local _stale_ctrs2
+      _stale_ctrs2="$(
+        { podman ps --all --filter "status=created" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=exited" --format '{{.Names}}' 2>/dev/null
+          podman ps --all --filter "status=stopped" --format '{{.Names}}' 2>/dev/null
+        } | grep "^${_proj_name2}_" | sort -u || true)"
+      if [[ -n "$_stale_ctrs2" ]]; then
+        log_info "Podman: removing stale non-running containers for project '${_proj_name2}'"
+        while IFS= read -r _ctr2; do
+          [[ -z "$_ctr2" ]] && continue
+          podman rm -f "$_ctr2" 2>/dev/null && \
+            log_info "  removed stale container: ${_ctr2}" || \
+            log_warn "  could not remove ${_ctr2} — proceeding (non-fatal)"
+        done <<< "$_stale_ctrs2"
+      fi
+    fi
     log_info "Starting services..."
     # ROOTLESS-9: same rationale as upgrade path above.
     # v2.23.3: same digest-strip for pre-seeded images (fresh install path).
     local _compose_files_up2=("${compose_files[@]}")
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       log_info "Pre-seeded mode: stripping image digests in compose file for local cache lookup"
       local _digest_stripped_compose2
       _digest_stripped_compose2="$(mktemp "${WORK_DIR}/docker/docker-compose.tmp.XXXXXX.yml")"
@@ -7997,10 +9398,36 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
     fi
     "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
-    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]] && \
-       [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+    if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
     fi
+  fi
+
+  # ── podman-compose letta wait-loop ─────────────────────────────────────────
+  # podman-compose 1.x ignores depends_on: service_healthy, leaving letta,
+  # letta-pgbouncer, and agent-db-init stuck in "Created" state. This call
+  # detects that case and explicitly sequences them on their dep health.
+  # NO-OP for all other providers (podman compose, docker) and lean installs.
+  # See _podman_compose_letta_waitloop() definition above for full rationale.
+  #
+  # AS-FIX (2026-07-23, YSG-PODMAN-LETTA-001 defect 2): the call used to be
+  # bare — under `set -euo pipefail` a real non-zero return here would abort
+  # the ENTIRE install (including core gateway/backoffice, already up and
+  # healthy at this point), which contradicts this function's own documented
+  # design ("Warn-and-continue on letta-pgbouncer / agent-db-init failures —
+  # core gateway/backoffice are unaffected — non-fatal", see function docblock
+  # above). The bug was never "the whole install aborts" — it was the
+  # opposite: the function's own false-positive `log_success` meant it never
+  # actually returned non-zero in practice. Now that the function honestly
+  # returns 1 on a real letta-tier failure, `|| true` is REQUIRED to preserve
+  # the pre-existing "core install succeeds regardless" contract while still
+  # surfacing the failure loudly and distinctly (never silently) below.
+  local _letta_waitloop_rc=0
+  _podman_compose_letta_waitloop || _letta_waitloop_rc=$?
+
+  if [[ "$_letta_waitloop_rc" -ne 0 ]]; then
+    log_error "LETTA TIER FAILED TO START — see 'Letta wait-loop' errors above for the exact stage that failed"
+    log_error "Core services (gateway/backoffice/postgres/etc.) are unaffected; re-run with --letta or retry 'podman start ${COMPOSE_PROJECT_NAME:-docker}_letta_1' after investigating"
   fi
 
   log_success "Services started"
@@ -9183,6 +10610,16 @@ run_health_check() {
   bash "$health_script"
   log_success "Health checks passed"
 
+  # FINDING-V412-RESTART-012 (Captain, 2026-07-21): fail-loud, hard-block
+  # assertion that the RO-mount fix actually took at RUNTIME, not just in the
+  # compose YAML text — a podman-compose fork bug (or any future regression
+  # of it) silently drops a :ro flag on backoffice's /run/secrets when a :rw
+  # child mount shares its path prefix (Laura, laura-012-rogue-reattack.md).
+  # This is the single highest-value post-up assertion in the whole install:
+  # if it fails, the PKI attestation-pin's un-forgeability guarantee is false
+  # and a compromised backoffice can inject a rogue CA. FATAL, not a warning.
+  _verify_backoffice_secrets_ro_mount
+
   # OLLAMA-INIT-EXIT-001: check ollama-init exit status and warn loudly if it
   # failed. ollama-init is a one-shot container (no restart-unless-stopped) so
   # a failed pull is silent once compose_up returns — the step-12 health check
@@ -9191,6 +10628,80 @@ run_health_check() {
   # agents return 404 "model not found". Non-fatal: the core stack is healthy;
   # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
   _check_ollama_init_exit "${WORK_DIR}/docker"
+}
+
+# _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
+#
+# Runs `podman inspect` / `docker inspect` against the LIVE backoffice
+# container and asserts its /run/secrets mount reports RW=false. This is a
+# runtime assertion, deliberately independent of the compose YAML text (see
+# tests/invariants/test_i10_pki_chain_of_continuity.py for the static/text
+# check) — the whole point of this finding was that the YAML SAID :ro while
+# the runtime behaviour was RW=true on this podman-compose fork. Only the
+# runtime check catches a regression of the underlying bug itself.
+#
+# Only meaningful for compose/vm deployments (K8s's backoffice /run/secrets
+# is, by design, a genuinely writable emptyDir — see backoffice.yaml — so
+# RW=true there is CORRECT, not a regression).
+_verify_backoffice_secrets_ro_mount() {
+  # K8s/helm deploys use a genuinely writable emptyDir at /run/secrets by
+  # design (see backoffice.yaml) — this check only applies to compose/vm
+  # (docker/podman) deploys. Same MODE/YSG_RUNTIME check used at install.sh
+  # lines 4085/9530/14389 for this exact compose-vs-k8s branch decision.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+
+  # Locate the running backoffice container by name pattern via a direct
+  # runtime `ps` call (NOT the vendored podman-compose-ysg fork's `ps`
+  # subcommand — it does not accept `-a`/other docker-compose-standard flags;
+  # see _check_ollama_init_exit above, which has the same latent gap. A
+  # direct runtime call is the same pattern already used elsewhere in this
+  # file for exactly this reason — see e.g. the postgres-container lookup in
+  # _backup_existing_data).
+  local _inspect_cmd="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _inspect_cmd="podman"
+
+  local _ctr_name
+  _ctr_name="$("$_inspect_cmd" ps --format '{{.Names}}' 2>/dev/null | grep -E 'backoffice' | head -1 || true)"
+
+  if [[ -z "$_ctr_name" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not locate the backoffice container to verify /run/secrets RW state — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  local _rw
+  _rw="$("$_inspect_cmd" inspect "$_ctr_name" --format \
+    '{{range .Mounts}}{{if eq .Destination "/run/secrets"}}{{.RW}}{{end}}{{end}}' 2>/dev/null || true)"
+
+  if [[ -z "$_rw" ]]; then
+    log_error "FINDING-V412-RESTART-012: could not read /run/secrets mount state on ${_ctr_name} via '${_inspect_cmd} inspect' — refusing to assume the RO mount is enforced."
+    exit 1
+  fi
+
+  if [[ "$_rw" != "false" ]]; then
+    log_error "################################################################"
+    log_error "FATAL: FINDING-V412-RESTART-012 REGRESSION"
+    log_error "  backoffice's /run/secrets mount reports RW=${_rw} (expected"
+    log_error "  RW=false). This means the PKI root-attestation pin's"
+    log_error "  un-forgeability guarantee is FALSE right now — a compromised"
+    log_error "  backoffice process can write ca_root.crt / any file under"
+    log_error "  /run/secrets, enabling rogue-CA injection into the mesh"
+    log_error "  (proven exploit chain: laura-012-rogue-reattack.md)."
+    log_error "  Checked: ${_inspect_cmd} inspect ${_ctr_name} -> /run/secrets RW=${_rw}"
+    log_error "  This is a HARD BLOCK — the install is refusing to proceed"
+    log_error "  with a known-forgeable trust chain. Do not work around this"
+    log_error "  with a manual kubectl/podman patch; investigate the compose"
+    log_error "  mount emission (docker-compose.yml backoffice volumes) and"
+    log_error "  re-run install.sh."
+    log_error "################################################################"
+    exit 1
+  fi
+
+  log_success "FINDING-V412-RESTART-012: backoffice /run/secrets confirmed RW=false at runtime (${_inspect_cmd} inspect)"
 }
 
 # _check_ollama_init_exit — inspect the stopped ollama-init container exit code.
@@ -9605,6 +11116,26 @@ _do_chown() {
     _chown_mode="direct"
   fi
 
+  # FINDING-V412-DOCKER-MAC-VIRTIOFS-CHOWN — Docker Desktop for Mac (VirtioFS).
+  # On Docker Desktop macOS the secrets dir is a VirtioFS bind mount, which
+  # presents bind-mounted files to a container as ITS OWN uid regardless of the
+  # host-side owner/mode (verified live: a UID-1001 container reads a 0400
+  # host-max-owned token with NO chown). So host-side chown here:
+  #   1. is COSMETIC — it does NOT isolate; on Mac the real secret isolation is
+  #      which containers MOUNT which secrets (compose), not the file uid →
+  #      skipping it loses no security; and
+  #   2. is IMPOSSIBLE on read-only-mode files (0400/0444): VirtioFS rejects any
+  #      metadata syscall on a no-owner-write file → "Permission denied" → the
+  #      install aborts on a genuinely-unnecessary op.
+  # Per-runtime correctness (docker+Darwin only), NOT a band-aid — the op is
+  # skipped because it is unnecessary on THIS runtime. Linux docker (native fs,
+  # host uid DOES gate access) and podman are unaffected; file modes are set by
+  # the writers (PKI issuer etc.).
+  if [[ "$_chown_mode" == "docker_run" && "$(uname 2>/dev/null)" == "Darwin" ]]; then
+    log_info "_do_chown: Docker Desktop macOS (VirtioFS) — host-side chown is cosmetic + unrunnable on 0400; isolation is via compose mount scoping. Skipping for ${_label}."
+    return 0
+  fi
+
   local _alpine_image="alpine:3@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
   local _secrets_dir="${WORK_DIR}/docker/secrets"
 
@@ -9974,6 +11505,23 @@ _secret_is_valid() {
   fi
   [[ "$_sv_first" == "#" ]] && return 1
   return 0
+}
+
+# _mcp_signing_key_is_valid — mcp_identity_signing_key (SEC1, P-384) wrapper.
+#
+# (FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3, Su 2026-07-21). Root-caused
+# live: a NON-EMPTY check alone (`[[ -s ]]`) preserved a corrupt-but-nonempty
+# key across a re-run and the gateway crash-looped at startup (RestartCount
+# 143) with "EC private key is not encoded properly: private key value is
+# too short". See `_ec_signing_key_is_valid` (defined near
+# `_provision_audit_signing_key` above) for the full validation strategy,
+# the reproduced short-scalar fixture, and why a bare `openssl ec -text`
+# parse alone is not a safe substitute for the exact gateway loader
+# (`cryptography.load_pem_private_key` in src/yashigani/mcp/_jwt.py).
+#
+# Returns 0 (valid P-384 EC private key) / 1 (invalid, corrupt, or absent).
+_mcp_signing_key_is_valid() {
+  _ec_signing_key_is_valid "$1" "SECP384R1" 48 'P-384|secp384r1'
 }
 
 # _safe_read_secret — BUG-B+-004: Podman-rootless-aware secret file reader
@@ -10410,27 +11958,57 @@ generate_secrets() {
     # BEGIN YSG-P3-MCP-SIGKEY-UPGRADE
     # MCP signing key — generate if absent on upgrade path (same idempotency as caddy_internal_hmac above).
     # This covers upgrades from pre-v2.25.0 where the key did not yet exist.
+    #
+    # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+    # NON-EMPTY check alone preserved a corrupt-but-nonempty key left by a
+    # prior interrupted install, and the gateway crash-looped at startup
+    # (RestartCount 143, measured live). Fix: validate CONTENT
+    # (_mcp_signing_key_is_valid — strict P-384 EC load, see its definition
+    # above _secret_is_valid) not just non-emptiness. UPGRADE PATH policy is
+    # deliberately asymmetric from the fresh-install path below: absent →
+    # generate (unchanged upgrade-from-pre-v2.25.0 behaviour); PRESENT BUT
+    # INVALID → FAIL LOUD, never silently regenerate — an existing file might
+    # be a real key rotated by scripts/rotate-secret.sh that this upgrade run
+    # cannot distinguish from corruption with certainty, so we refuse to
+    # clobber it and force a human to look.
     local _mcp_key_file_up="${secrets_dir}/mcp_identity_signing_key"
     local _env_file_up="${WORK_DIR}/docker/.env"
 
     if [[ ! -s "$_mcp_key_file_up" ]]; then
       log_info "Generating MCP P-384 signing key (upgrade path) → ${_mcp_key_file_up}"
+      local _mcp_key_tmp_up
+      _mcp_key_tmp_up="$(mktemp "${_mcp_key_file_up}.XXXXXX")" || {
+        log_error "MCP P-384 signing key generation (upgrade path): mktemp failed — aborting"
+        return 1
+      }
       (
         umask 077
         if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-             | openssl ec -out "${_mcp_key_file_up}" 2>/dev/null; then
+             | openssl ec -out "${_mcp_key_tmp_up}" 2>/dev/null; then
           printf 'ERROR: Failed to generate MCP P-384 signing key (upgrade path)\n' >&2
-          rm -f "${_mcp_key_file_up}" 2>/dev/null || true
           exit 1
         fi
-        chmod 0600 "${_mcp_key_file_up}"
+        chmod 0600 "${_mcp_key_tmp_up}"
       ) || {
         log_error "MCP P-384 signing key generation failed (upgrade path) — aborting"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
         return 1
       }
+      # Atomic: a kill/interrupt between here and the `mv` leaves either the
+      # (still-absent) target untouched or the temp file — never a
+      # half-written target that a future run would wrongly preserve.
+      if ! _mcp_signing_key_is_valid "${_mcp_key_tmp_up}"; then
+        log_error "Freshly-generated MCP P-384 signing key (upgrade path) failed content validation — this should not happen; aborting rather than installing a bad key"
+        rm -f "${_mcp_key_tmp_up}" 2>/dev/null || true
+        return 1
+      fi
+      mv -f "${_mcp_key_tmp_up}" "${_mcp_key_file_up}"
       log_info "MCP P-384 signing key generated (mode 0600, upgrade path)"
+    elif ! _mcp_signing_key_is_valid "$_mcp_key_file_up"; then
+      log_error "mcp_identity_signing_key exists (${_mcp_key_file_up}) but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install). Upgrade path refuses to clobber a file that might be a real, deliberately-rotated key. Investigate manually, or rotate via scripts/rotate-secret.sh, then re-run. Aborting."
+      return 1
     else
-      log_info "mcp_identity_signing_key already present — preserving (upgrade path)"
+      log_info "mcp_identity_signing_key already present and valid — preserving (upgrade path)"
     fi
 
     # No .env sync needed — the gateway reads the key from
@@ -10842,36 +12420,67 @@ generate_secrets() {
   # storing the raw private key in .env is wider exposure (docker inspect,
   # backup tools, process env) and is intentionally avoided.
   #
-  # Idempotent: if the key file already exists, preserve it.
+  # Idempotent: if the key file already exists AND validates, preserve it.
   # Rotation: use scripts/rotate-secret.sh (separate documented operation).
   # Backup: the file lands in ${secrets_dir}/ which is captured by
   #   _backup_existing_data → bundle.enc (YSG-RISK-050/051 dual-wrap).
   # Uninstall: wipe of docker/secrets/* in uninstall.sh --remove-volumes covers this.
+  #
+  # FINDING-V412-MCP-SIGNING-KEY-VALIDATION / N3 (Su, 2026-07-21): a
+  # NON-EMPTY check alone (the old `[[ ! -s ]]` gate) preserved a
+  # corrupt-but-nonempty key left by a prior interrupted install, and the
+  # gateway crash-looped at startup (RestartCount 143, measured live) with
+  # "EC private key is not encoded properly: private key value is too
+  # short". Fix: validate CONTENT (_mcp_signing_key_is_valid, defined above
+  # _secret_is_valid — strict P-384 EC load via the same loader class the
+  # gateway uses), not just non-emptiness. FRESH-INSTALL PATH policy:
+  # invalid (whether absent OR corrupt) → regenerate. (Contrast with the
+  # upgrade path above, which FAILS LOUD instead of clobbering an existing
+  # invalid file — a fresh install has no prior "real key" to protect.)
   local _mcp_key_file="${secrets_dir}/mcp_identity_signing_key"
 
-  if [[ ! -s "$_mcp_key_file" ]]; then
+  if ! _mcp_signing_key_is_valid "$_mcp_key_file"; then
+    if [[ -s "$_mcp_key_file" ]]; then
+      log_warn "mcp_identity_signing_key present but FAILED content validation (corrupt/truncated P-384 EC key — consistent with a partial write from an interrupted prior install) — regenerating (fresh-install path)"
+    fi
     log_info "Generating MCP P-384 signing key → ${_mcp_key_file}"
-    umask 077
     # Generate a P-384 (secp384r1) EC private key in unencrypted PEM format.
     # openssl ecparam + openssl ec produces a PKCS#8-compatible PEM that the
     # Python cryptography library reads via load_pem_private_key().
-    # Use a subshell to scope umask 077 tightly to the key file write.
+    #
+    # Atomic write (N3): generate into a mktemp sibling file, validate THAT
+    # file's content, then `mv` it into place. `mv` on the same filesystem
+    # is an atomic rename — an interrupt/kill at any point before the `mv`
+    # leaves either the (untouched or absent) target or an orphan temp file,
+    # NEVER a half-written target that a future run would wrongly preserve
+    # (the exact failure mode this finding closes).
+    local _mcp_key_tmp
+    _mcp_key_tmp="$(mktemp "${_mcp_key_file}.XXXXXX")" || {
+      log_error "MCP P-384 signing key generation: mktemp failed — aborting"
+      return 1
+    }
     (
       umask 077
       if ! openssl ecparam -name secp384r1 -genkey -noout 2>/dev/null \
-           | openssl ec -out "${_mcp_key_file}" 2>/dev/null; then
+           | openssl ec -out "${_mcp_key_tmp}" 2>/dev/null; then
         printf 'ERROR: Failed to generate MCP P-384 signing key\n' >&2
-        rm -f "${_mcp_key_file}" 2>/dev/null || true
         exit 1
       fi
-      chmod 0600 "${_mcp_key_file}"
+      chmod 0600 "${_mcp_key_tmp}"
     ) || {
       log_error "MCP P-384 signing key generation failed — aborting"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
       return 1
     }
+    if ! _mcp_signing_key_is_valid "${_mcp_key_tmp}"; then
+      log_error "Freshly-generated MCP P-384 signing key failed content validation — this should not happen; aborting rather than installing a bad key"
+      rm -f "${_mcp_key_tmp}" 2>/dev/null || true
+      return 1
+    fi
+    mv -f "${_mcp_key_tmp}" "${_mcp_key_file}"
     log_info "MCP P-384 signing key generated (mode 0600)"
   else
-    log_info "mcp_identity_signing_key already present — preserving (use scripts/rotate-secret.sh to rotate)"
+    log_info "mcp_identity_signing_key already present and valid — preserving (use scripts/rotate-secret.sh to rotate)"
   fi
 
   # S1 invariant check: the key file must be 0600 — never world or group readable.
@@ -11079,7 +12688,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN1_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-512, 8-digit (admin tier — SHA-1 apps NOT compatible)"
   if [[ -n "$GEN_ADMIN1_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN1_TOTP_URI}"
@@ -11089,7 +12698,7 @@ print_completion_summary() {
   printf "  ${C_YELLOW}║${C_RESET}    Username:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_USERNAME}"
   printf "  ${C_YELLOW}║${C_RESET}    Password:     %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_PASSWORD}"
   printf "  ${C_YELLOW}║${C_RESET}    TOTP secret:  %-44s ${C_YELLOW}║${C_RESET}\n" "${GEN_ADMIN2_TOTP_SECRET}"
-  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-1 (RFC 6238 default — works with all authenticator apps)"
+  printf "  ${C_YELLOW}║${C_RESET}    TOTP algo:    %-44s ${C_YELLOW}║${C_RESET}\n" "HMAC-SHA-512, 8-digit (admin tier — SHA-1 apps NOT compatible)"
   if [[ -n "$GEN_ADMIN2_TOTP_URI" ]]; then
   printf "  ${C_YELLOW}║${C_RESET}    TOTP URI (paste into authenticator app):                     ${C_YELLOW}║${C_RESET}\n"
   printf "  ${C_YELLOW}║${C_RESET}    %s\n" "${GEN_ADMIN2_TOTP_URI}"
@@ -11162,7 +12771,7 @@ print_completion_summary() {
   # --- Next steps ---
   printf "  ${C_BOLD}Next steps:${C_RESET}\n"
   printf "    1. Save ALL credentials above in a password manager\n"
-  printf "    2. Scan the TOTP QR URIs into any authenticator app (Google Authenticator, Authy, Aegis,\n       1Password, Microsoft Authenticator, etc.) — Yashigani uses standard HMAC-SHA-1 TOTP\n       (RFC 6238 default), compatible with all authenticator apps.\n"
+  printf "    2. Scan the TOTP QR URIs using an authenticator app that supports SHA-256/SHA-512\n       (e.g. agnosticOTP or Aegis) — admin accounts use HMAC-SHA-512/8-digit, user accounts\n       use HMAC-SHA-256/6-digit. Classic SHA-1-only apps (e.g. Google Authenticator, Authy)\n       are NOT compatible and will generate codes the server rejects. The QR/URI carries the\n       correct algorithm=/digits= parameters, so a compliant app auto-configures.\n"
   printf "    3. Log in to the backoffice as '%s' and change the default password\n" "${GEN_ADMIN1_USERNAME}"
   printf "    4. Store '%s' credentials in a safe/vault (break-glass backup)\n" "${GEN_ADMIN2_USERNAME}"
   printf "    5. Register your first AI agent\n"
@@ -11218,6 +12827,188 @@ print_completion_summary() {
 # =============================================================================
 # Kubernetes flow steps
 # =============================================================================
+
+# STEP 7b (k8s): ensure fresh, provenance-verifiable local images
+# -----------------------------------------------------------------------------
+# YSG-RISK-123 (2026-07-24): Ava live-diagnosed a k8s-deployed backoffice pod
+# executing PRE-d48a65df code (webauthn_v1._expected_origin still read the raw
+# Host header) while the source at HEAD already carried the fix, causing
+# register/finish 400 origin-mismatch. Root cause — static analysis + LIVE
+# verification against docker-desktop k8s same day
+# (testing_runs/yashigani/v412-final3-k8s-image-123/):
+#
+#   1. Docker Desktop's embedded "Kubernetes" runs kubelet against a SEPARATE
+#      containerd store inside a kind-style node (kubectl get nodes shows
+#      `desktop-control-plane`, CONTAINER-RUNTIME containerd://2.2.1) — NOT
+#      the top-level dockerd store `docker build` populates. LIVE-PROVEN: a
+#      throwaway image built via plain `docker build` stayed
+#      `ErrImageNeverPull` under a Pod referencing it with
+#      imagePullPolicy: Never for 60s+ (no auto-sync). The SAME image pushed
+#      to a registry at localhost:5000 and referenced as
+#      localhost:5000/<repo>:<tag> pulled successfully in 94ms — the registry
+#      round-trip is the only proven bridge on this topology.
+#   2. helm/yashigani/values.yaml ships gateway/backoffice/caddy-config-broker
+#      with HYPHEN repository names (yashigani-gateway, yashigani-backoffice,
+#      yashigani-caddy-config-broker) and global.imageRegistry="" by default —
+#      the `yashigani.ownImage` helper then renders a bare "<repo>:<tag>"
+#      local-store lookup. docker-compose.yml (the only automated build path
+#      in install.sh before this fix) builds and tags first-party images with
+#      SLASH names instead (yashigani/gateway, yashigani/backoffice) — a
+#      DIFFERENT local image. Nothing in install.sh, scripts/k8s-install.sh,
+#      or the manual rebuild steps previously documented in
+#      docs/kubernetes_deployment.md (which itself used the wrong slash name)
+#      ever built, tagged, or pushed an image under the chart's hyphenated
+#      name. Whatever image already happened to exist locally under that
+#      name — however old — is what imagePullPolicy: IfNotPresent serves,
+#      silently, forever.
+#   3. LIVE CONFIRMATION: `yashigani-backoffice:4.1.2` and
+#      `yashigani-gateway:4.1.2` were both found cached with image Created
+#      12:21:23+01:00 — three minutes BEFORE commit d48a65df (12:24:27+01:00,
+#      the WebAuthn _expected_origin fix) landed. That is precisely the stale
+#      image Ava's live probe caught.
+#
+# Fix: build first-party images fresh from CURRENT source under the EXACT
+# repository names the chart expects (closing the naming mismatch), push them
+# to an ephemeral local registry, and point the chart at that registry via
+# global.imageRegistry/imageOwner. A registry pull is a supported CRI path on
+# every runtime regardless of whether kubelet's containerd shares storage
+# with `docker build` — this defeats the store-separation problem
+# categorically rather than papering over this one symptom.
+#
+# Skippable with --skip-k8s-image-build / SKIP_K8S_IMAGE_BUILD=1 for operators
+# supplying their own pre-built, registry-hosted, immutable-digest images via
+# --set global.imageRegistry=... (their own CI/CD owns freshness there).
+k8s_ensure_fresh_local_images() {
+  set_step "7b" "k8s local image freshness (YSG-RISK-123)"
+
+  if [[ "${SKIP_K8S_IMAGE_BUILD:-false}" == "true" ]]; then
+    log_warn "Skipping k8s local image build/push/provenance (--skip-k8s-image-build)."
+    log_warn "Ensure your own images use an IMMUTABLE tag/digest and that"
+    log_warn "global.imageRegistry is set — install.sh cannot verify freshness otherwise."
+    return 0
+  fi
+
+  # Operator already pointed the chart at a real registry (their own CI/CD
+  # owns image freshness there) — do not build or push anything local.
+  local _operator_registry=""
+  _operator_registry="$(grep -E '^\s*imageRegistry:' "${WORK_DIR}/.env.helm" 2>/dev/null \
+    | tail -1 | sed -E 's/^[[:space:]]*imageRegistry:[[:space:]]*"?([^"[:space:]]*)"?.*/\1/' || true)"
+  if [[ -n "${_operator_registry}" ]]; then
+    log_info "global.imageRegistry already set to '${_operator_registry}' — skipping local build/push (operator-managed registry)."
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "k8s_ensure_fresh_local_images: build gateway/backoffice/caddy-config-broker/extractor from source, push to ${YASHIGANI_K8S_LOCAL_REGISTRY:-localhost:5000}, set global.imageRegistry"
+    return 0
+  fi
+
+  log_step "7b/${TOTAL_STEPS}" "Building + pushing first-party k8s images (YSG-RISK-123)..."
+  require_cmd "docker"   # k8s path is Docker-only today (no podman-k8s support upstream)
+
+  local _reg="${YASHIGANI_K8S_LOCAL_REGISTRY:-localhost:5000}"
+  local _owner="local"
+  local _reg_port="${_reg##*:}"
+
+  # 1) Ensure a local registry is reachable at $_reg — start an ephemeral one
+  #    (named so re-runs are idempotent) if nothing is listening there yet.
+  if ! docker ps --filter "name=^yashigani-k8s-local-registry$" --filter "status=running" \
+       --format '{{.Names}}' | grep -q .; then
+    if docker ps -a --filter "name=^yashigani-k8s-local-registry$" --format '{{.Names}}' | grep -q .; then
+      docker start yashigani-k8s-local-registry >/dev/null
+    else
+      docker run -d --name yashigani-k8s-local-registry \
+        --restart unless-stopped \
+        -p "${_reg_port}:5000" \
+        registry:2 >/dev/null
+    fi
+    log_success "Ephemeral local registry running at ${_reg}"
+  else
+    log_info "Reusing existing local registry at ${_reg}"
+  fi
+
+  # 2) Build + push each first-party image under the EXACT name the chart's
+  #    default values.yaml expects. --build-arg GIT_SHA + LABEL
+  #    org.opencontainers.image.revision mirror the existing compose-path
+  #    cache-busting pattern (_local_images_cached above) so `docker inspect`
+  #    can prove provenance without a registry round-trip too.
+  #    bash-3.2-safe (macOS system bash — see scripts/test-installer.sh
+  #    portability gate): plain pipe-delimited list, not an associative array.
+  # YSG-RISK-123b: extractor renamed yashigani/extractor -> yashigani-extractor
+  # (hyphen) to match helm/yashigani/values.yaml documentEnforcement.image.repository
+  # and the yashigani.ownImage naming convention shared by gateway/backoffice/
+  # caddy-config-broker. This is the K8s-only image list — the docker-compose
+  # path (_build_extractor_image, docker-compose.extractor.yml) is untouched and
+  # still builds/tags the slash name "yashigani/extractor", which is correct
+  # there (compose's single dockerd store does not hit the kubelet-separate-
+  # containerd-store bug this whole function exists to defeat).
+  local _k8s_images
+  _k8s_images="$(cat <<'IMGLIST'
+yashigani-gateway|docker/Dockerfile.gateway
+yashigani-backoffice|docker/Dockerfile.backoffice
+yashigani-caddy-config-broker|docker/caddy/Dockerfile.caddy-broker
+yashigani-extractor|docker/Dockerfile.extractor
+IMGLIST
+)"
+  local _repo _dockerfile _local_tag _remote_tag _pushed_digest
+  while IFS='|' read -r _repo _dockerfile; do
+    [[ -z "$_repo" ]] && continue
+    _local_tag="${_repo}:${YASHIGANI_VERSION}"
+    _remote_tag="${_reg}/${_owner}/${_repo}:${YASHIGANI_VERSION}"
+
+    log_info "Building ${_local_tag} (SHA ${YASHIGANI_GIT_SHA}) from ${_dockerfile}..."
+    docker build \
+      -f "${WORK_DIR}/${_dockerfile}" \
+      -t "${_local_tag}" \
+      --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
+      --label "org.opencontainers.image.revision=${YASHIGANI_GIT_SHA}" \
+      "${WORK_DIR}" || {
+        log_error "Failed to build ${_local_tag} — cannot continue k8s install"
+        exit 1
+      }
+
+    docker tag "${_local_tag}" "${_remote_tag}"
+    docker push "${_remote_tag}" >/dev/null || {
+      log_error "Failed to push ${_remote_tag} to local registry ${_reg}"
+      exit 1
+    }
+    log_success "Pushed ${_remote_tag}"
+
+    # Capture the just-pushed content digest for gateway/backoffice so
+    # k8s_verify_image_provenance can prove the DEPLOYED pod runs THIS exact
+    # content, not merely a same-tag image (YSG-RISK-123 — the whole point).
+    _pushed_digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${_remote_tag}" 2>/dev/null \
+      | awk -F@ '{print $2}' || true)"
+    case "$_repo" in
+      yashigani-gateway)    export _YSG_K8S_EXPECTED_DIGEST_GATEWAY="${_pushed_digest}" ;;
+      yashigani-backoffice) export _YSG_K8S_EXPECTED_DIGEST_BACKOFFICE="${_pushed_digest}" ;;
+      # YSG-RISK-123b: recorded for operator audit trail / k8s_verify_image_provenance's
+      # log-only note below. Unlike gateway/backoffice there is no long-running
+      # extractor Deployment/pod at install time to diff a running imageID
+      # against (extractor pods are per-job ephemeral, created on-demand by
+      # KubernetesBackend.run_extractor_job) — the provenance guarantee for
+      # extractor is the registry-aware image wiring itself (gateway.yaml /
+      # backoffice.yaml YASHIGANI_EXTRACTOR_IMAGE -> yashigani.ownImage ->
+      # this exact just-pushed tag), not a post-hoc running-pod digest check.
+      yashigani-extractor)  export _YSG_K8S_EXPECTED_DIGEST_EXTRACTOR="${_pushed_digest}" ;;
+    esac
+  done <<< "$_k8s_images"
+
+  # 3) Point the chart at the local registry. Appended to .env.helm so
+  #    k8s_helm_install's `-f .env.helm` picks it up; an operator's own --set
+  #    still wins per normal helm precedence.
+  {
+    printf '\nglobal:\n'
+    printf '  imageRegistry: "%s"\n' "${_reg}"
+    printf '  imageOwner: "%s"\n' "${_owner}"
+  } >> "${WORK_DIR}/.env.helm"
+
+  # Remembered for the post-deploy provenance check (k8s_verify_image_provenance).
+  export _YSG_K8S_IMAGE_REGISTRY="${_reg}"
+  export _YSG_K8S_IMAGE_OWNER="${_owner}"
+
+  log_success "First-party k8s images fresh, pushed, and wired into helm values (YSG-RISK-123)"
+}
 
 # STEP 7 (k8s): helm dependency update
 k8s_helm_dep_update() {
@@ -11318,6 +13109,16 @@ _write_helm_values() {
     if [[ -n "${UPSTREAM_URL:-}" ]]; then
       printf "    upstreamUrl: '%s'\n" "${UPSTREAM_URL}"
     fi
+    # F-K8S-OPAURL (2026-07-20): production/staging require gateway.env.opaUrl or
+    # validate-security OPA-URL-001 fail-closes (empty opaUrl => OPA allow:True bypass).
+    printf "    opaUrl: 'https://yashigani-policy:8181'\n"
+
+    # F-K8S-ADMISSION (2026-07-20): production requires admissionPolicies.enabled=true
+    # (validate-security ~line 118). Kyverno is a k8s prereq; enable the chart's
+    # ClusterPolicies (container hardening + PKI trust-plane + rogue-DNS-bind).
+    printf '\n'
+    printf 'admissionPolicies:\n'
+    printf '  enabled: true\n'
 
     printf '\n'
     printf 'backoffice:\n'
@@ -11348,6 +13149,15 @@ _write_helm_values() {
     if [[ -n "${CMVP_CERT:-}" ]]; then
       printf "  cmvpCert: '%s'\n" "${CMVP_CERT//\'/\'\'}"
     fi
+
+    # F-K8S-BEARER (2026-07-20): the k8s path MUST supply internalBearer.value, or the
+    # chart's validate-security.yaml (INTERNAL-BEARER-001) fail-closes in production.
+    # Compose generates YASHIGANI_INTERNAL_BEARER into docker/secrets; mirror it into the
+    # helm values here. secrets.yaml's lookup preserves an existing bearer on upgrade
+    # regardless of this value, so a per-install generated token is upgrade-safe.
+    printf '\n'
+    printf 'internalBearer:\n'
+    printf "  value: '%s'\n" "${YASHIGANI_INTERNAL_BEARER:-$(openssl rand -hex 32)}"
 
     # License key: read from file if operator passed --license-key.
     # Written last — it may be multi-line (YAML literal block scalar).
@@ -11381,6 +13191,637 @@ _write_helm_values() {
 
   log_success "Helm values written: ${helm_values}"
   log_info "  tlsDomain=${DOMAIN:-<unset>}  tlsMode=${TLS_MODE:-<unset>}  upstreamUrl=${UPSTREAM_URL:-<unset>}"
+}
+
+# ---------------------------------------------------------------------------
+# Kubernetes CNI/DNS hardening gates — Cilium ratified as the CNI standard,
+# DNSSEC+DoT ratified as a MUST-HAVE (2026-07-19 design doc:
+# yashigani-k8s-dns-hardening-design-20260719.md). Four gates, cheapest/
+# fastest-failing first:
+#   1. _preflight_k8s_kernel_ebpf     — node kernels support Cilium's eBPF datapath
+#   2. _preflight_k8s_cilium_crds     — Cilium is actually installed (NON-SKIPPABLE)
+#   3. _preflight_coredns_dnssec_dot  — CoreDNS forwards over DoT w/ pinned tls_servername
+#   4. _probe_cross_tenant_isolation  — sibling of _probe_networkpolicy_enforcement
+# ---------------------------------------------------------------------------
+
+# _kernel_ge_5_10 — true if a kernelVersion string (e.g. "5.15.0-105-generic",
+# "6.8.0-51-generic", "5.15.133+") parses to >= 5.10. Unparseable -> false
+# (fail closed: an unrecognised format is treated as "not verified", not "ok").
+_kernel_ge_5_10() {
+  local v="$1" major minor
+  if [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if (( major > 5 )); then return 0; fi
+  if (( major == 5 && minor >= 10 )); then return 0; fi
+  return 1
+}
+
+# _preflight_k8s_kernel_ebpf — verify every cluster node's kernel supports
+# Cilium's eBPF/cgroupv2 datapath (>= 5.10) BEFORE spending time in the wizard.
+# Queries the TARGET CLUSTER's nodes via kubectl, not the operator's local
+# machine — install.sh commonly runs against a remote/BYO cluster.
+# Skippable with --skip-kernel-ebpf-probe / KERNEL_EBPF_REQUIRE_ENFORCEMENT=false
+# (records a risk-register exception).
+_preflight_k8s_kernel_ebpf() {
+  if [[ "${SKIP_KERNEL_EBPF_PROBE:-false}" == "true" || "${KERNEL_EBPF_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "Kernel eBPF preflight SKIPPED (--skip-kernel-ebpf-probe / KERNEL_EBPF_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  Cilium's eBPF datapath is NOT verified compatible with this cluster's node kernels."
+    log_warn "  Record a risk-register exception before relying on Cilium enforcement."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe cluster node kernel versions for eBPF/cgroupv2 support (Cilium requires >= 5.10)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Checking cluster node kernel versions for Cilium eBPF compatibility..."
+
+  local _nodes_raw
+  if ! _nodes_raw="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.nodeInfo.kernelVersion}{"\n"}{end}' 2>/dev/null)"; then
+    log_error "Kernel preflight: could not list cluster nodes (is kubectl configured against the target cluster?)"
+    return 1
+  fi
+  if [[ -z "$_nodes_raw" ]]; then
+    log_error "Kernel preflight: cluster reported zero nodes"
+    return 1
+  fi
+
+  local _fail_nodes="" _name _kver
+  while IFS='|' read -r _name _kver; do
+    [[ -z "$_name" ]] && continue
+    if ! _kernel_ge_5_10 "$_kver"; then
+      _fail_nodes+="  - ${_name}: ${_kver}"$'\n'
+    fi
+  done <<< "$_nodes_raw"
+
+  if [[ -n "$_fail_nodes" ]]; then
+    log_error "=============================================================="
+    log_error "Kernel preflight FAILED: Cilium requires kernel >= 5.10 (eBPF + cgroupv2) on every node."
+    log_error "Node(s) below this baseline:"
+    printf '%s' "$_fail_nodes" >&2
+    log_error ""
+    log_error "REMEDIATION: upgrade the affected node(s) to a kernel >= 5.10, or move Yashigani"
+    log_error "pods off them (taint/cordon), before installing with Cilium as CNI."
+    log_error ""
+    log_error "To proceed WITHOUT this check (records a risk-register exception):"
+    log_error "  re-run with --skip-kernel-ebpf-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  log_success "Cluster node kernels verified >= 5.10 (Cilium eBPF/cgroupv2 compatible)."
+  return 0
+}
+
+# _preflight_k8s_cilium_crds — verify Cilium is actually installed on the
+# target cluster (CRDs present AND the cilium agent DaemonSet is Ready).
+# Cilium is the ratified CNI standard for the k8s/multi-tenant path
+# (2026-07-19) — the DNSSEC/DoT-over-CoreDNS control (design §1) and the
+# toFQDNs egress-allowlist model (design §3) both depend transitively on
+# Cilium's DNS-proxy consuming CoreDNS's validated answer. A non-Cilium CNI
+# silently drops that dependency with no other local signal, so THIS CHECK
+# IS INTENTIONALLY NOT SKIPPABLE — there is no --skip-* flag for it anywhere
+# in this file, unlike every other probe in this section.
+_preflight_k8s_cilium_crds() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "verify Cilium CRDs + agent DaemonSet are installed and Ready (non-skippable)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Verifying Cilium is the cluster CNI (ratified standard, non-skippable)..."
+
+  local _crds=(ciliumnetworkpolicies.cilium.io ciliumendpoints.cilium.io ciliumidentities.cilium.io)
+  local _missing=() _crd
+  for _crd in "${_crds[@]}"; do
+    kubectl get crd "$_crd" >/dev/null 2>&1 || _missing+=("$_crd")
+  done
+
+  if (( ${#_missing[@]} > 0 )); then
+    log_error "=============================================================="
+    log_error "Cilium CRD precondition FAILED: this cluster does not have Cilium installed."
+    log_error "Missing CRD(s):"
+    local _m
+    for _m in "${_missing[@]}"; do log_error "  - ${_m}"; done
+    log_error ""
+    log_error "Cilium is the RATIFIED CNI standard for Yashigani's k8s path (2026-07-19) —"
+    log_error "this precondition is NOT skippable (no --skip flag exists for it)."
+    log_error ""
+    log_error "REMEDIATION: bootstrap Cilium on this cluster first — see scripts/k3s-bootstrap.sh"
+    log_error "for a reference k3s+Cilium stand-up, or install Cilium directly:"
+    log_error "  helm repo add cilium https://helm.cilium.io/"
+    log_error "  helm install cilium cilium/cilium --version <pinned> -n kube-system"
+    log_error ""
+    log_error "EXISTING non-Cilium k8s cluster (migration — IRIS-CIL-002 / LAURA-CIL): Cilium"
+    log_error "is the ratified CNI standard (2026-07-19). Migrate this cluster's CNI to Cilium"
+    log_error "BEFORE upgrading Yashigani — see the migration section of"
+    log_error "Products/Yashigani/cni-decision-cilium-20260719.md. This is a one-way, cluster-"
+    log_error "wide change; plan a maintenance window. There is intentionally no run-without-"
+    log_error "Cilium bypass — the ring-fence + tenant segregation depend on an enforcing CNI."
+    log_error "=============================================================="
+    return 1
+  fi
+
+  # CRDs present is necessary but not sufficient — a cluster mid-uninstall could
+  # have stale CRDs with no running agents, which would silently give every pod
+  # zero enforcement. Confirm the agent DaemonSet exists and is Ready.
+  if ! kubectl -n kube-system get daemonset cilium >/dev/null 2>&1; then
+    log_error "Cilium CRD precondition FAILED: CRDs are present but no 'cilium' DaemonSet"
+    log_error "exists in kube-system — Cilium is only partially installed or was removed."
+    log_error "This precondition is not skippable. Re-run scripts/k3s-bootstrap.sh or repair"
+    log_error "the Cilium install before proceeding."
+    return 1
+  fi
+  if ! kubectl -n kube-system rollout status daemonset/cilium --timeout=120s >/dev/null 2>&1; then
+    log_error "Cilium CRD precondition FAILED: 'cilium' DaemonSet in kube-system did not"
+    log_error "reach Ready within 120s. Investigate with:"
+    log_error "  kubectl -n kube-system get pods -l k8s-app=cilium"
+    log_error "This precondition is not skippable."
+    return 1
+  fi
+
+  log_success "Cilium CRDs + agent DaemonSet verified Ready — CNI precondition satisfied."
+  return 0
+}
+
+# _apply_coredns_hardening — invoked only when --apply-coredns-hardening was
+# passed. Delegates to scripts/coredns-hardening-apply.sh (single source of
+# truth for the Corefile DoT/DNSSEC block — do NOT duplicate the block content
+# here) so k3s-bootstrap.sh and install.sh never drift on what "hardened"
+# means. Off by default: kube-system's CoreDNS is a shared cluster resource
+# not owned by this Helm release, so mutating it requires explicit consent.
+_apply_coredns_hardening() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "bash ${WORK_DIR}/scripts/coredns-hardening-apply.sh"
+    return 0
+  fi
+  local _script="${WORK_DIR}/scripts/coredns-hardening-apply.sh"
+  if [[ ! -f "$_script" ]]; then
+    log_error "--apply-coredns-hardening requested but ${_script} not found"
+    exit 1
+  fi
+  log_info "Applying CoreDNS DNSSEC/DoT hardening (kube-system, design doc §1)..."
+  if ! bash "$_script"; then
+    log_error "CoreDNS hardening patch failed — see output above. Aborting k8s install."
+    exit 1
+  fi
+  log_success "CoreDNS DNSSEC/DoT hardening applied."
+}
+
+# _preflight_coredns_dnssec_dot — DNS-01 + DNS-02 (design doc §6). Verifies
+# CoreDNS's external ("." ) zone forwards over DoT with a pinned tls_servername
+# (DNS-01, static Corefile inspection) AND that live external-name resolution
+# through cluster DNS actually succeeds (DNS-02, throwaway-pod probe). The
+# cluster.local zone is intentionally NOT inspected here — different, non-DNSSEC
+# integrity model (design §1: mTLS covers that case).
+# Fail-closed by default: per the design doc, a degraded/plaintext resolver
+# must never be silently accepted. Skippable with --skip-coredns-dnssec-probe /
+# COREDNS_REQUIRE_DOT_DNSSEC=false (records a risk-register exception).
+_preflight_coredns_dnssec_dot() {
+  if [[ "${SKIP_COREDNS_DNSSEC_PROBE:-false}" == "true" || "${COREDNS_REQUIRE_DOT_DNSSEC:-true}" == "false" ]]; then
+    log_warn "CoreDNS DNSSEC/DoT preflight SKIPPED (--skip-coredns-dnssec-probe / COREDNS_REQUIRE_DOT_DNSSEC=false)."
+    log_warn "  External DNS resolution is NOT verified DNSSEC-delegated-validated over DoT."
+    log_warn "  A forged toFQDNs-allowed answer could be silently accepted (design doc §3)."
+    log_warn "  Record a risk-register exception before relying on toFQDNs as a security control."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe kube-system CoreDNS Corefile for tls:// forward + live DoT resolution (DNS-01/DNS-02)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  log_info "Verifying CoreDNS DNSSEC-delegated-validation over DoT (design doc §1, DNS-01/DNS-02)..."
+
+  # ---- DNS-01: static Corefile check ----
+  local _corefile
+  if ! _corefile="$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)" || [[ -z "$_corefile" ]]; then
+    log_error "CoreDNS DNSSEC preflight (DNS-01) FAILED: could not read a non-empty Corefile from"
+    log_error "configmap/coredns in kube-system."
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
+    log_error "--apply-coredns-hardening) to patch CoreDNS with the DoT/DNSSEC forward block."
+    return 1
+  fi
+
+  # Extract the "." (external) server block only.
+  local _root_block
+  _root_block="$(printf '%s\n' "$_corefile" | awk '/^\.:53[[:space:]]*\{/{f=1} f{print} f && /^\}/{exit}')"
+  if [[ -z "$_root_block" ]]; then
+    log_error "CoreDNS DNSSEC preflight (DNS-01) FAILED: no '.:53' external-zone server block found"
+    log_error "in the Corefile — cannot verify DoT forwarding is configured."
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh."
+    return 1
+  fi
+
+  if ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
+    log_error "=============================================================="
+    log_error "FINDING (DNS-01): CoreDNS's external-zone 'forward' block does NOT use tls://."
+    log_error "DNSSEC-delegated-validation (design doc §1) requires the upstream forward to be"
+    log_error "over DoT with a pinned tls_servername — a plaintext forward is spoofable on-path"
+    log_error "and silently defeats every toFQDNs egress-allowlist rule that trusts it (§3)."
+    log_error ""
+    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
+    log_error "--apply-coredns-hardening) to patch CoreDNS's Corefile."
+    log_error ""
+    log_error "To proceed WITHOUT this verified (records a risk-register exception):"
+    log_error "  re-run with --skip-coredns-dnssec-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+  if ! grep -qE 'tls_servername[[:space:]]+\S+' <<< "$_root_block"; then
+    log_error "FINDING (DNS-01): CoreDNS forward uses tls:// but has no 'tls_servername' pinned —"
+    log_error "  DoT without a pinned server name does not authenticate the upstream. Fix the"
+    log_error "  Corefile (scripts/coredns-hardening-apply.sh) or --skip-coredns-dnssec-probe."
+    return 1
+  fi
+  # Anti-pattern guard: a plaintext IP-literal fallback forward anywhere in the
+  # file (documented anti-pattern in the design doc — never add "forward . 8.8.8.8").
+  if printf '%s\n' "$_corefile" | grep -qE 'forward[[:space:]]+\.[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}([[:space:]]|$)'; then
+    log_error "FINDING (DNS-01): a plaintext IP-literal 'forward' stanza was found in the Corefile"
+    log_error "  in addition to the DoT block. This is a documented anti-pattern (design doc §1) —"
+    log_error "  a 'resilience' plaintext fallback silently defeats the DNSSEC/DoT control. Remove it."
+    return 1
+  fi
+  log_success "DNS-01 PASS: CoreDNS external-zone forward uses tls:// with tls_servername pinned, no plaintext fallback."
+
+  # ---- DNS-02: live resolution probe (throwaway pod) ----
+  local _ns="ysg-dnsprobe-$$"
+  # shellcheck disable=SC2317
+  _dnsprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
+  trap _dnsprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: could not create throwaway namespace ${_ns}"
+    return 1
+  fi
+  kubectl label namespace "$_ns" --overwrite pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _img="${DNS_PROBE_IMAGE:-busybox:1.37}"
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+  if ! kubectl run dns-probe -n "$_ns" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"dns-probe","image":"'"$_img"'","command":["sh","-c","sleep 120"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: probe pod did not create."
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/dns-probe -n "$_ns" --timeout=60s >/dev/null 2>&1; then
+    log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: probe pod not Ready (image pull? set DNS_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+
+  local _domain="${DNS_PROBE_DOMAIN:-cloudflare-dns.com}"
+  local _resolved="no" _attempt=0
+  while [[ "$_attempt" -lt 3 ]]; do
+    if kubectl exec dns-probe -n "$_ns" -- nslookup "$_domain" 2>/dev/null | grep -qE 'Address( 1)?:'; then
+      _resolved="yes"
+      break
+    fi
+    _attempt=$((_attempt + 1)); sleep 2
+  done
+
+  if [[ "$_resolved" != "yes" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING (DNS-02): live external-name resolution through cluster DNS FAILED"
+    log_error "(3 attempts, target: ${_domain}). Per the design doc's fail-closed forward"
+    log_error "behavior, this most likely means BOTH DoT upstreams are unreachable or failing"
+    log_error "the TLS handshake — CoreDNS is correctly SERVFAILing rather than downgrading,"
+    log_error "but that means external DNS resolution is currently BROKEN cluster-wide."
+    log_error ""
+    log_error "Do NOT work around this by adding a plaintext fallback forward — fix upstream"
+    log_error "reachability (egress to the configured DoT upstream, e.g. 1.1.1.1/1.0.0.1:853)."
+    log_error ""
+    log_error "To proceed WITHOUT this verified (records a risk-register exception):"
+    log_error "  re-run with --skip-coredns-dnssec-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  log_success "DNS-02 PASS: live external-name resolution through cluster DNS succeeded (DoT upstream reachable)."
+  return 0
+}
+
+# _probe_cross_tenant_isolation — sibling of _probe_networkpolicy_enforcement
+# (Iris/Ava gap). The existing probe only proves same-namespace ingress-deny
+# works. Tenant isolation in this chart rests on default-deny-ingress + bare
+# `podSelector` (no `namespaceSelector`) `from:` rules in networkpolicy.yaml,
+# which the k8s NetworkPolicy API scopes to the policy's OWN namespace by
+# construction — but that only protects tenants IF the CNI enforces that
+# namespace-boundary semantic identically to same-namespace enforcement, which
+# this probe verifies directly rather than assuming it from the other result.
+#
+# Method: two throwaway namespaces, each stamped yashigani.io/tenant=<own
+# name> (same label convention stamped on the real release namespace — see
+# k8s_helm_install), same allow->deny->allow 3-phase pattern as
+# _probe_networkpolicy_enforcement:
+#   Phase A (baseline, no policy in tenant-a): tenant-b client MUST reach
+#            tenant-a server (rules out an unrelated connectivity fault).
+#   Phase B (same-namespace-only ingress policy applied in tenant-a): tenant-b
+#            client MUST be blocked.
+#   Phase C (policy removed): tenant-b client MUST reconnect, disambiguating a
+#            real policy block from probe-infra flakiness.
+# Shares the NetworkPolicy-probe skip flag — this is the same underlying
+# CNI-enforcement question, cross-namespace instead of same-namespace.
+_probe_cross_tenant_isolation() {
+  if [[ "${SKIP_NETWORKPOLICY_PROBE:-false}" == "true" || "${NETPOL_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "Cross-tenant isolation probe SKIPPED (--skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  Cross-namespace tenant isolation is NOT verified enforced on this cluster."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe cross-namespace tenant isolation (two labeled namespaces, allow->deny->allow)"
+    return 0
+  fi
+  require_cmd "kubectl"
+
+  local _ns_a="ysg-tenprobe-a-$$"
+  local _ns_b="ysg-tenprobe-b-$$"
+  local _img="${NETPOL_PROBE_IMAGE:-busybox:1.37}"
+  local _port=8080
+
+  log_info "Probing cross-namespace tenant isolation (K8S-GATE-TENANT-ISOLATION-001)..."
+
+  # shellcheck disable=SC2317
+  _tenprobe_cleanup() {
+    kubectl delete namespace "$_ns_a" "$_ns_b" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
+  }
+  trap _tenprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns_a" >/dev/null 2>&1 || ! kubectl create namespace "$_ns_b" >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: could not create throwaway namespaces"
+    return 1
+  fi
+  kubectl label namespace "$_ns_a" --overwrite yashigani.io/tenant="$_ns_a" pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+  kubectl label namespace "$_ns_b" --overwrite yashigani.io/tenant="$_ns_b" pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+
+  if ! kubectl run tp-server -n "$_ns_a" --image="$_img" --restart=Never --labels="app=tp-server" \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"tp-server","image":"'"$_img"'","command":["sh","-c","echo ok > /tmp/i && httpd -f -p '"$_port"' -h /tmp"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: server pod (tenant-a) failed to create"
+    return 1
+  fi
+  if ! kubectl run tp-client -n "$_ns_b" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"tp-client","image":"'"$_img"'","command":["sh","-c","sleep 3600"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: client pod (tenant-b) failed to create"
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/tp-server -n "$_ns_a" --timeout=90s >/dev/null 2>&1 || \
+     ! kubectl wait --for=condition=Ready pod/tp-client -n "$_ns_b" --timeout=90s >/dev/null 2>&1; then
+    log_error "Cross-tenant probe: probe pods not Ready (image pull? set NETPOL_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+
+  local _svc_ip
+  _svc_ip="$(kubectl get pod tp-server -n "$_ns_a" -o jsonpath='{.status.podIP}' 2>/dev/null)"
+  if [[ -z "$_svc_ip" ]]; then
+    log_error "Cross-tenant probe: could not resolve server pod IP"
+    return 1
+  fi
+
+  _tp_reach() {
+    local _n="$1" _i=0
+    while [ "$_i" -lt "$_n" ]; do
+      if kubectl exec tp-client -n "$_ns_b" -- wget -q -T 4 -O - "http://${_svc_ip}:${_port}/i" 2>/dev/null | grep -q ok; then
+        return 0
+      fi
+      _i=$((_i + 1)); sleep 2
+    done
+    return 1
+  }
+
+  # Phase A (baseline, NO policy): tenant-b MUST reach tenant-a.
+  if ! _tp_reach 5; then
+    log_error "Cross-tenant probe: baseline connectivity FAILED (tenant-b could not reach tenant-a"
+    log_error "  with NO policy applied). Environment fault, not a policy result — aborting."
+    return 1
+  fi
+
+  # Phase B: same-namespace-only ingress policy in tenant-a — tenant-b MUST be
+  # blocked. Bare `podSelector` (no namespaceSelector) in a `from:` clause
+  # matches ONLY pods in the policy's own namespace, per k8s NetworkPolicy API
+  # semantics — the exact rule shape used by every allow-*-ingress policy in
+  # networkpolicy.yaml.
+  if ! kubectl apply -n "$_ns_a" -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenprobe-same-namespace-only
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+EOF
+  then
+    log_error "Cross-tenant probe: could not apply the same-namespace-only test NetworkPolicy"
+    return 1
+  fi
+  sleep 3
+  local _blocked="no"
+  if _tp_reach 3; then _blocked="no"; else _blocked="yes"; fi
+
+  # Phase C (policy REMOVED): tenant-b MUST reconnect (disambiguates a real
+  # policy block from probe-infra flakiness).
+  kubectl delete networkpolicy tenprobe-same-namespace-only -n "$_ns_a" --ignore-not-found=true >/dev/null 2>&1 || true
+  sleep 2
+  local _recovered="no"
+  if _tp_reach 5; then _recovered="yes"; fi
+
+  if [[ "$_blocked" == "no" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING (cross-tenant isolation): a same-namespace-only NetworkPolicy in tenant-a"
+    log_error "did NOT block ingress from a pod in a DIFFERENT namespace (tenant-b). This CNI is"
+    log_error "not enforcing the namespace boundary that Yashigani's default-deny-ingress +"
+    log_error "bare-podSelector allow rules rely on for tenant isolation — a co-tenant on a"
+    log_error "shared cluster could reach another tenant's pods directly."
+    log_error ""
+    log_error "REMEDIATION: install a policy-enforcing CNI (Cilium — see scripts/k3s-bootstrap.sh)."
+    log_error ""
+    log_error "To proceed WITHOUT enforcement (records a risk-register exception):"
+    log_error "  re-run with --skip-networkpolicy-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  if [[ "$_recovered" != "yes" ]]; then
+    log_error "Cross-tenant probe: INCONCLUSIVE — traffic was blocked under the test policy but did"
+    log_error "  NOT recover after removal. Cannot attribute the block to the NetworkPolicy"
+    log_error "  (likely test-infra/CNI flakiness) — enforcement is NOT verified."
+    log_error "  Re-run the install, or use --skip-networkpolicy-probe (records a risk exception)."
+    return 1
+  fi
+
+  log_success "Cross-tenant isolation VERIFIED — namespace-scoped default-deny blocked cross-tenant traffic AND removal restored it."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# _probe_networkpolicy_enforcement — FINDING-V412-UNIVERSAL-004
+#
+# Positively verify the cluster CNI ENFORCES NetworkPolicy before deploying a
+# chart whose entire ring-fence (egress via Caddy->OPA, mesh isolation) depends
+# on it. flannel (k3s default) and kindnet (kind default) silently NO-OP
+# NetworkPolicy, so a green `helm install` could ship with NO ring-fence at all —
+# Enterprise/k8s weaker than Professional/compose.
+#
+# Method (positive verification, not CNI-name sniffing):
+#   1. throwaway namespace + a busybox server pod + a client pod.
+#   2. baseline: client CAN reach server with NO policy (rules out env faults —
+#      a broken overlay would else masquerade as "enforced").
+#   3. apply default-deny-ingress on the server; client MUST no longer reach it.
+#   If step 3 still connects, the CNI is not enforcing -> FAIL the install.
+#
+# Skippable with --skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false
+# (records a risk-register exception: operator accepts an unverified ring-fence).
+# ---------------------------------------------------------------------------
+_probe_networkpolicy_enforcement() {
+  if [[ "${SKIP_NETWORKPOLICY_PROBE:-false}" == "true" || "${NETPOL_REQUIRE_ENFORCEMENT:-true}" == "false" ]]; then
+    log_warn "NetworkPolicy enforcement probe SKIPPED (--skip-networkpolicy-probe / NETPOL_REQUIRE_ENFORCEMENT=false)."
+    log_warn "  The k8s ring-fence (Caddy->OPA egress control) is NOT verified enforced on this cluster."
+    log_warn "  Record a risk-register exception (FINDING-V412-UNIVERSAL-004) before relying on it."
+    return 0
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    dry_print "probe NetworkPolicy enforcement (throwaway ns + default-deny reachability assertion)"
+    return 0
+  fi
+
+  require_cmd "kubectl"
+  local _ns="ysg-npprobe-$$"
+  local _img="${NETPOL_PROBE_IMAGE:-busybox:1.37}"
+  local _port=8080
+
+  log_info "Probing NetworkPolicy enforcement (FINDING-V412-UNIVERSAL-004)..."
+
+  # Always tear down the throwaway namespace on return.
+  # shellcheck disable=SC2317
+  _npprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
+  trap _npprobe_cleanup RETURN
+
+  if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: could not create throwaway namespace ${_ns}"
+    return 1
+  fi
+  # Probe pods run non-root + drop-all + seccomp, so a restricted PSA is fine too.
+  kubectl label namespace "$_ns" --overwrite pod-security.kubernetes.io/enforce=baseline >/dev/null 2>&1 || true
+
+  local _sc='"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}'
+
+  # Server: busybox httpd serving "ok" on :$_port. Top-level apiVersion in the
+  # override for older-kubectl tolerance (generator-era required it).
+  if ! kubectl run np-server -n "$_ns" --image="$_img" --restart=Never --labels="app=np-server" \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"np-server","image":"'"$_img"'","command":["sh","-c","echo ok > /tmp/i && httpd -f -p '"$_port"' -h /tmp"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: server pod failed to create"
+    return 1
+  fi
+  # Client: a LONG-LIVED pod we `kubectl exec` into (Captain MEDIUM) — avoids the
+  # `kubectl run --rm -i` attach race that could make a flaky connect look like a
+  # policy block, i.e. a false "enforced" verdict.
+  if ! kubectl run np-client -n "$_ns" --image="$_img" --restart=Never \
+      --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"np-client","image":"'"$_img"'","command":["sh","-c","sleep 3600"],'"$_sc"'}]}}' \
+      >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: client pod failed to create"
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready pod/np-server pod/np-client -n "$_ns" --timeout=90s >/dev/null 2>&1; then
+    log_error "NetworkPolicy probe: probe pods not Ready (image pull? set NETPOL_PROBE_IMAGE=<preloaded busybox>)."
+    return 1
+  fi
+  local _svc_ip
+  _svc_ip="$(kubectl get pod np-server -n "$_ns" -o jsonpath='{.status.podIP}' 2>/dev/null)"
+  if [[ -z "$_svc_ip" ]]; then
+    log_error "NetworkPolicy probe: could not resolve server pod IP"
+    return 1
+  fi
+
+  # Reachability via exec into the persistent client. Returns 0 iff it fetched
+  # the server's "ok" within $1 attempts (retries absorb transient noise).
+  _np_reach() {
+    local _n="$1" _i=0
+    while [ "$_i" -lt "$_n" ]; do
+      if kubectl exec np-client -n "$_ns" -- wget -q -T 4 -O - "http://${_svc_ip}:${_port}/i" 2>/dev/null | grep -q ok; then
+        return 0
+      fi
+      _i=$((_i + 1)); sleep 2
+    done
+    return 1
+  }
+
+  # Phase A (baseline, NO policy): client MUST reach server. If not, environment
+  # fault (CNI overlay/DNS/scheduling) — abort; draw no enforcement conclusion.
+  if ! _np_reach 5; then
+    log_error "NetworkPolicy probe: baseline connectivity FAILED (server unreachable with NO policy)."
+    log_error "  Environment fault (CNI overlay/DNS/scheduling), not a policy result — aborting."
+    return 1
+  fi
+
+  # Phase B (default-deny-ingress applied): client MUST now be blocked.
+  if ! kubectl apply -n "$_ns" -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: npprobe-deny-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: np-server
+  policyTypes:
+    - Ingress
+EOF
+  then
+    log_error "NetworkPolicy probe: could not apply the test NetworkPolicy"
+    return 1
+  fi
+  sleep 3  # let the CNI program the datapath
+  local _blocked="no"
+  if _np_reach 3; then _blocked="no"; else _blocked="yes"; fi
+
+  # Phase C (policy REMOVED): connectivity MUST recover. This disambiguates a real
+  # policy block (recovers) from test-infra flakiness (does not) — the false-PASS
+  # Captain flagged. We declare ENFORCED only if B blocked AND C recovered.
+  kubectl delete networkpolicy npprobe-deny-ingress -n "$_ns" --ignore-not-found=true >/dev/null 2>&1 || true
+  sleep 2
+  local _recovered="no"
+  if _np_reach 5; then _recovered="yes"; fi
+
+  if [[ "$_blocked" == "no" ]]; then
+    log_error "=============================================================="
+    log_error "FINDING-V412-UNIVERSAL-004: NetworkPolicy is NOT enforced by this cluster's CNI."
+    log_error "A default-deny-ingress policy did NOT block traffic to the server pod."
+    log_error "The Yashigani ring-fence (Caddy->OPA egress control, mesh isolation) would be"
+    log_error "SILENTLY ABSENT — Enterprise/k8s weaker than Professional/compose."
+    log_error ""
+    log_error "REMEDIATION: install a policy-enforcing CNI (Calico or Cilium). flannel (k3s"
+    log_error "default) and kindnet (kind default) do NOT enforce NetworkPolicy. For k3s:"
+    log_error "install with --flannel-backend=none --disable-network-policy and deploy Calico/"
+    log_error "Cilium, or use a distro that ships an enforcing CNI."
+    log_error ""
+    log_error "To proceed WITHOUT enforcement (records a risk-register exception):"
+    log_error "  re-run with --skip-networkpolicy-probe"
+    log_error "=============================================================="
+    return 1
+  fi
+
+  if [[ "$_recovered" != "yes" ]]; then
+    log_error "NetworkPolicy probe: INCONCLUSIVE — traffic was blocked under the test policy but did"
+    log_error "  NOT recover after the policy was removed. The block cannot be attributed to the"
+    log_error "  NetworkPolicy (likely test-infra/CNI flakiness), so enforcement is NOT verified."
+    log_error "  Re-run the install, or use --skip-networkpolicy-probe (records a risk exception)."
+    return 1
+  fi
+
+  log_success "NetworkPolicy enforcement VERIFIED — default-deny blocked traffic AND removal restored it (CNI enforces)."
+  return 0
 }
 
 # STEP 8 (k8s): helm upgrade --install
@@ -11465,13 +13906,46 @@ k8s_helm_install() {
     kubectl create namespace "$NAMESPACE"
   fi
   # Apply / refresh PSA labels (idempotent via --overwrite). Safe on existing ns.
+  # yashigani.io/tenant: stamps the tenancy boundary this namespace represents
+  # (design doc §2/§4) — each Yashigani k8s install owns one namespace, which
+  # IS the tenancy boundary (see the instance-identity comment near
+  # _k8s_trust_domain below). Override via YASHIGANI_TENANT_ID for a
+  # customer-supplied tenant id; defaults to the namespace name itself so the
+  # label is always present even when no override is given.
   kubectl label namespace "$NAMESPACE" --overwrite \
     pod-security.kubernetes.io/warn=baseline \
     pod-security.kubernetes.io/warn-version=latest \
     pod-security.kubernetes.io/audit=baseline \
     pod-security.kubernetes.io/audit-version=latest \
+    "yashigani.io/tenant=${YASHIGANI_TENANT_ID:-$NAMESPACE}" \
     >/dev/null
-  log_success "PSA warn+audit baseline labels applied to namespace ${NAMESPACE}"
+  log_success "PSA warn+audit baseline labels + yashigani.io/tenant applied to namespace ${NAMESPACE}"
+
+  # FINDING-V412-UNIVERSAL-004: verify the CNI enforces NetworkPolicy BEFORE we
+  # deploy a ring-fence that depends on it. Fails fast on a non-enforcing CNI
+  # (flannel/kindnet) so we never ship a silently-absent ring-fence. Skippable
+  # with --skip-networkpolicy-probe (risk-register exception).
+  if ! _probe_networkpolicy_enforcement; then
+    log_error "Aborting k8s install: NetworkPolicy enforcement not verified (FINDING-V412-UNIVERSAL-004)."
+    exit 1
+  fi
+
+  # Sibling probe: cross-namespace tenant isolation (Iris/Ava gap — the probe
+  # above only proves same-namespace ingress-deny works). Shares the same skip
+  # flag since it is the same underlying CNI-enforcement question.
+  if ! _probe_cross_tenant_isolation; then
+    log_error "Aborting k8s install: cross-namespace tenant isolation not verified."
+    exit 1
+  fi
+
+  # DNSSEC+DoT MUST-HAVE (design doc §1/§6, DNS-01/DNS-02). Fails closed if
+  # CoreDNS is not forwarding over tls:// with a pinned tls_servername, or if
+  # live external resolution through cluster DNS fails. Skippable with
+  # --skip-coredns-dnssec-probe (risk-register exception).
+  if ! _preflight_coredns_dnssec_dot; then
+    log_error "Aborting k8s install: CoreDNS DNSSEC/DoT hardening not verified (design doc §1)."
+    exit 1
+  fi
 
   local helm_args=(
     upgrade --install yashigani "$chart_dir"
@@ -11582,6 +14056,100 @@ k8s_rollout_status() {
     --timeout=300s
 
   log_success "Gateway deployment is ready"
+}
+
+# STEP 9b (k8s): verify deployed image provenance
+# -----------------------------------------------------------------------------
+# YSG-RISK-123: a green `kubectl rollout status` only proves the pod is
+# Ready — it says nothing about WHICH code is inside it (SOP 2, healthcheck
+# semantic discipline, applies equally to rollout-status). Ava's live
+# WebAuthn diagnosis is exactly this failure mode: rollout reported healthy,
+# but the running backoffice was serving pre-d48a65df code.
+#
+# When k8s_ensure_fresh_local_images ran (the default path — see that
+# function's header for full root-cause + LIVE evidence), it recorded the
+# content digest of the image it JUST built and pushed. This step reads back
+# the ACTUAL running pod's image digest and fails the install loud if they
+# don't match, instead of letting a stale-image silently declare success.
+#
+# Skipped when k8s_ensure_fresh_local_images itself skipped (operator-managed
+# registry / --skip-k8s-image-build) — install.sh has no "expected" digest to
+# compare against in that case; the operator's own CI/CD owns that guarantee.
+k8s_verify_image_provenance() {
+  set_step "9b" "verify deployed image provenance (YSG-RISK-123)"
+
+  if [[ -z "${_YSG_K8S_EXPECTED_DIGEST_GATEWAY:-}" && -z "${_YSG_K8S_EXPECTED_DIGEST_BACKOFFICE:-}" ]]; then
+    log_info "No expected image digest recorded (--skip-k8s-image-build or operator registry) — skipping provenance check."
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "k8s_verify_image_provenance: compare running pod imageID digests to just-pushed digests"
+    return 0
+  fi
+
+  require_cmd "kubectl"
+  log_step "9b/${TOTAL_STEPS}" "Verifying deployed pods run the image just built (YSG-RISK-123)..."
+
+  local _fail=0
+  local _svc _label _expected _actual _actual_digest
+
+  for _svc in gateway backoffice; do
+    _label="app.kubernetes.io/name=yashigani-${_svc}"
+    case "$_svc" in
+      gateway)    _expected="${_YSG_K8S_EXPECTED_DIGEST_GATEWAY:-}" ;;
+      backoffice) _expected="${_YSG_K8S_EXPECTED_DIGEST_BACKOFFICE:-}" ;;
+    esac
+    [[ -z "$_expected" ]] && continue
+
+    _actual="$(kubectl get pods -n "$NAMESPACE" -l "$_label" \
+      -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null || true)"
+    if [[ -z "$_actual" ]]; then
+      log_error "Could not read imageID for ${_svc} pod (label ${_label}) — cannot verify provenance"
+      _fail=1
+      continue
+    fi
+    _actual_digest="${_actual#*@}"   # strip "<repo>@" prefix if present
+
+    if [[ "$_actual_digest" != "sha256:${_expected#sha256:}" && "$_actual_digest" != "$_expected" ]]; then
+      log_error "PROVENANCE MISMATCH: ${_svc} pod is running a DIFFERENT image than was just built/pushed."
+      log_error "  Expected digest: ${_expected}"
+      log_error "  Running imageID: ${_actual}"
+      log_error "  This is the exact stale-serve pattern from YSG-RISK-123 — the cluster"
+      log_error "  reused a cached image instead of pulling the freshly-pushed one."
+      _fail=1
+    else
+      log_success "${_svc} pod provenance verified — running image matches source SHA ${YASHIGANI_GIT_SHA}"
+    fi
+  done
+
+  if [[ "$_fail" -ne 0 ]]; then
+    log_error "Aborting: deployed image provenance could not be verified (YSG-RISK-123)."
+    log_error "Do not treat this install as successful. Investigate imagePullPolicy,"
+    log_error "node-local image cache, and whether ${NAMESPACE} pods were scheduled onto"
+    log_error "a node that already had a same-tag image cached before this install ran."
+    exit 1
+  fi
+
+  # YSG-RISK-123b: the extractor is a per-job EPHEMERAL pod (no long-running
+  # Deployment), so there is no running pod to diff an imageID against at
+  # install time the way gateway/backoffice are checked above. Its provenance
+  # guarantee is the registry-aware config wiring itself: gateway.yaml /
+  # backoffice.yaml set YASHIGANI_EXTRACTOR_IMAGE from the same
+  # yashigani.ownImage(global.imageRegistry, global.imageOwner,
+  # documentEnforcement.image.repository, .tag) expression used to build+push
+  # in step 7b, so KubernetesBackend.run_extractor_job (backend.py) can only
+  # ever reference this exact just-pushed tag — never the stale hardcoded
+  # DEFAULT_IMAGE fallback in documents/sandbox.py. This is a config-time
+  # guarantee, not a runtime-verified one. Flagged for a LIVE check as part of
+  # the x8x k3s smoke run: trigger one document-enforcement job with
+  # documentEnforcement.enabled=true and diff the spawned pod's
+  # status.containerStatuses[0].imageID against the digest below.
+  if [[ -n "${_YSG_K8S_EXPECTED_DIGEST_EXTRACTOR:-}" ]]; then
+    log_info "Extractor image built+pushed, digest ${_YSG_K8S_EXPECTED_DIGEST_EXTRACTOR}"
+    log_info "  (config-verified via YASHIGANI_EXTRACTOR_IMAGE wiring — ephemeral per-job"
+    log_info "   pods have nothing running yet to runtime-verify; see YSG-RISK-123b note)"
+  fi
 }
 
 # STEP 10 (k8s): Access instructions
@@ -11822,6 +14390,32 @@ _ensure_caddy_secrets_dir() {
   # so no other host UID needs traversal. In-container access control is the
   # per-file mode/owner (key 0600 UID 0, hmac 0640 UID 1001), same as before.
   # Best-effort: on re-runs the dir may be owned by a prior installer user.
+  chmod 0700 "$_dir" 2>/dev/null || true
+  return 0
+}
+
+# _ensure_pki_attest_dir — FINDING-V412-RESTART-012 (Captain, 2026-07-21).
+#
+# Dedicated, postgres-ONLY directory for the root-attestation pin
+# (ca_root.attested_sha256). Same rationale/pattern as
+# _ensure_caddy_secrets_dir above (YSG-RISK-053), simpler in one respect: this
+# file is never minted at the flat docker/secrets/ path by the PKI issuer, so
+# there is no relocate-and-stub dance needed — only rotate-root ever writes
+# it, and it now writes directly to this dedicated dir. The dir must still
+# exist BEFORE the first `compose up` (Podman rootless bind-mount fails hard
+# on a missing host path — Docker auto-creates, Podman does not; same
+# constraint as docker/secrets-caddy/), so this is called unconditionally
+# from _pki_run_issuer after every mutating PKI action (bootstrap included),
+# guaranteeing it exists before postgres's compose service ever starts.
+_ensure_pki_attest_dir() {
+  local _dir="${WORK_DIR}/docker/secrets-pki-attest"
+  if [[ ! -d "$_dir" ]]; then
+    mkdir -p "$_dir" || { log_error "FINDING-V412-RESTART-012: cannot create ${_dir}"; return 1; }
+  fi
+  # 0700 — owner-only, same rationale as _ensure_caddy_secrets_dir: bind-mount
+  # source resolution is performed by the container runtime; in-container
+  # access is postgres-only via the compose mount (ro), no other UID needs
+  # host-side traversal.
   chmod 0700 "$_dir" 2>/dev/null || true
   return 0
 }
@@ -12550,11 +15144,22 @@ PYHASH
     fi
     rm -f "$_hashpy"
     # fail-closed verification — the explicit ISSUE-009 action-item gate
+    #
+    # BUG-GREP-C-DOUBLE-PRINT-2026-07-23 (found via uninstall.sh P3a pattern-
+    # sweep): `grep -c ... || echo 0` double-prints "0\n0" when the count is
+    # genuinely zero (grep -c already emits "0" on no-match AND exits 1, so
+    # the `|| echo 0` fallback ALSO fires). That two-line value fed into
+    # `[[ "$_pop" -lt 1 ]]` throws a bash arithmetic syntax error which
+    # evaluates the condition FALSE — silently DEFEATING this fail-closed
+    # gate exactly when it matters most (0 populated tokens). Fixed by
+    # dropping the redundant `|| echo 0` (grep -c's own stdout already
+    # covers the zero case; `|| true` only guards set -e from the no-match
+    # exit code).
     local _pop
     if [[ "$_use_unshare2" == "true" ]]; then
-      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+      _pop="$(podman unshare grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || true)"
     else
-      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || echo 0)"
+      _pop="$(grep -cE 'bootstrap_token_sha256: "[0-9a-f]{64}"' "$manifest_in" 2>/dev/null || true)"
     fi
     if [[ "${_pop:-0}" -lt 1 ]]; then
       log_error "_pki_run_issuer: runtime manifest has 0 populated bootstrap_token_sha256 fields after issuance (ISSUE-009) — aborting fail-closed"
@@ -12569,6 +15174,12 @@ PYHASH
   # caddy (e.g. rotate-leaves --only <agent>). `status` never writes — skip.
   if [[ "$_issuer_rc" -eq 0 && "$subcmd" != "status" ]]; then
     _relocate_caddy_scoped_secrets || return 1
+    # FINDING-V412-RESTART-012: ensure the postgres-only attestation dir
+    # exists before ANY compose service (postgres included) can attempt to
+    # mount it — same idempotent-and-unconditional pattern as the caddy sweep
+    # above, run after every mutating action including the initial bootstrap
+    # so a virgin install always has this directory before the first `up`.
+    _ensure_pki_attest_dir || return 1
   fi
   return "$_issuer_rc"
 }
@@ -13031,6 +15642,44 @@ _pki_chown_client_keys() {
       fi
     done < <(grep -E '^[[:space:]]*# BEGIN YSG-ONBOARD-' "$_sid_runtime" 2>/dev/null || true)
   fi
+
+  # Podman-specific: podman-compose ignores the uid/gid/mode fields in a
+  # service's secrets: section — secrets are bind-mounted directly from the
+  # host file, so the host file permissions govern what the container can read.
+  # Docker is not affected: Docker Compose creates an in-container tmpfs file
+  # with the compose-spec mode regardless of host file permissions.
+  #
+  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2):
+  #
+  # generate_secrets() sets langflow_yashigani_token to root:root 0440 via
+  # _do_chown "0:0" ... "0440".  langflow runs uid=1000 gid=0 inside the
+  # container; the group bit (0440 group=0) should allow read access.
+  #
+  # Root cause: _prepare_secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/"
+  # for rootful Podman (just before _pki_run_issuer).  This recursively clobbers
+  # ALL secret file ownership — including langflow_yashigani_token — to 1001:1001.
+  # After the sweep the file is maxine:ysgteam 0440 (uid=1001 != 1000, gid=1001 != 0):
+  # langflow gets EACCES.
+  #
+  # Fix: re-apply chown 0:0 0440 here so the group-read path (langflow gid=0 ==
+  # file group 0) is restored AFTER _prepare_secrets_dir_for_pki's sweep and AFTER
+  # the PKI issuer's own writes.  Mode 0440 (NOT 0444) avoids CWE-732: world-read
+  # is not needed because gid=0 is sufficient for langflow's access path.
+  # _fix_config_perms() strips world-read (chmod o-rwx) — 0440 is unaffected.
+  #
+  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from 1001:1001
+  # back to 0:0), not just the mode.  _do_chown handles all three dispatch modes
+  # (direct / unshare / podman_run) consistently across Podman rootful/rootless.
+  if [[ "$_effective_runtime" == "podman" ]]; then
+    local _lf_tok_path="${_secrets_dir}/langflow_yashigani_token"
+    if [[ -f "$_lf_tok_path" ]]; then
+      if _do_chown "0:0" "$_lf_tok_path" "langflow_yashigani_token" "0440" "${_secrets_dir}"; then
+        log_info "Podman: langflow_yashigani_token re-chown 0:0 0440 OK (restored after _prepare_secrets_dir_for_pki sweep)"
+      else
+        log_warn "Podman: langflow_yashigani_token re-chown 0:0 0440 failed — langflow may EACCES on startup"
+      fi
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -13225,6 +15874,27 @@ _prepare_secrets_dir_for_pki() {
     fi
   fi
   # Docker / non-Podman path: chown was already applied in generate_secrets().
+
+  # FINDING-V412-SVID-WRITE-PATH (Captain, 2026-07-21): pre-create + chown
+  # the two NEW writable dirs backoffice's agent-onboarding write path needs
+  # (docker-compose.yml /run/secrets-rw/agents + /run/secrets-rw/svid-init;
+  # pki.issuer.IssuerPaths.agents_dir / mcp_onboard.py YASHIGANI_SVID_INIT_DIR).
+  # Both are BRAND-NEW, always-empty-at-install-time host dirs — never
+  # contain CA material (ca_root.*/ca_intermediate.* stay under secrets_dir
+  # proper, mounted :ro-only into backoffice). Once the DIRECTORY itself is
+  # 1001-owned+writable, backoffice (runAsUser 1001) creates every nested
+  # per-tenant/per-server file/subdirectory itself at runtime
+  # (Path.mkdir(parents=True) in _write_secret / mcp_onboard.py step 2b) —
+  # those inherit UID 1001 automatically because the CREATING process IS
+  # UID 1001, so no recursive host-side chown is needed here, only the two
+  # empty parents. Idempotent (mkdir -p / chown re-run safe) — runs on both
+  # fresh install and upgrade (this function is the single funnel point for
+  # both — see call sites in install() step 9b and handle_pki_subcommand).
+  mkdir -p "${secrets_dir}/agents" "${secrets_dir}/svid-init"
+  _do_chown "1001:1001" "${secrets_dir}/agents" "backoffice agent-cert write dir" \
+    || log_warn "Could not chown ${secrets_dir}/agents to 1001:1001 — agent onboarding (mint SVID) will fail with EACCES until fixed manually"
+  _do_chown "1001:1001" "${secrets_dir}/svid-init" "backoffice svid-init staging dir" \
+    || log_warn "Could not chown ${secrets_dir}/svid-init to 1001:1001 — agent onboarding (svid-init population) will fail with EACCES until fixed manually"
 }
 
 # ---------------------------------------------------------------------------
@@ -13308,12 +15978,28 @@ _chown_agent_volumes() {
   elif [[ "$_effective_runtime" == "podman" ]]; then
     # Determine Podman sub-mode (same logic as _pki_chown_client_keys).
     if [[ "$(id -u)" == "0" ]]; then
-      # Rootful Podman: use podman run (plain chown not available for named volumes).
-      if podman run --rm \
-           --volume "${_lf_vol}:/vol:rw" \
-           "$_alpine_image" \
-           chown 1000:1000 /vol 2>/dev/null; then
-        _chown_ok=1
+      # Rootful Podman: pre-create the volume, inspect its storage mountpoint,
+      # then chown directly.  Avoids the pinned alpine digest
+      # (alpine@sha256:... only available in the online cache; offline/airgap
+      # installs hit a "no such image" error on podman run with a digest ref).
+      # Confirmed fix: VM rootful-podman coldsmoke 2026-07-12.
+      podman volume create "${_lf_vol}" 2>/dev/null || true
+      local _lf_vol_path_root
+      _lf_vol_path_root="$(podman volume inspect "${_lf_vol}" \
+          --format '{{.Mountpoint}}' 2>/dev/null || echo "")"
+      if [[ -n "$_lf_vol_path_root" && -d "$_lf_vol_path_root" ]]; then
+        if chown 1000:1000 "$_lf_vol_path_root"; then
+          _chown_ok=1
+        fi
+      fi
+      # Fallback: podman run (if storage path inspection failed).
+      if [[ "$_chown_ok" == "0" ]]; then
+        if podman run --rm \
+             --volume "${_lf_vol}:/vol:rw" \
+             "$_alpine_image" \
+             chown 1000:1000 /vol 2>/dev/null; then
+          _chown_ok=1
+        fi
       fi
     elif awk -v u="$(id -un)" -F: '$1==u && $3>=65536 {found=1} END{exit !found}' \
            /etc/subuid 2>/dev/null; then
@@ -13420,6 +16106,30 @@ bootstrap_internal_pki() {
       # Lu wire-sink-gate P2 (v2.25.2): ensure the audit signing key exists after
       # rotation (idempotent — does not rotate the long-lived signing leaf).
       _provision_audit_signing_key || return 1
+      # FINDING-V412-RESTART-012: propagate rotated leaves to ANY ALREADY-RUNNING
+      # mesh member. On a fresh install this is a no-op (nothing is running yet
+      # — compose_up hasn't happened). On a stack that lives long enough to hit
+      # time-based renewal / URI-SAN-drift and gets install.sh re-run against
+      # it, every mesh member was previously left serving/trusting whatever
+      # material it loaded at its own last (re)start while docker/secrets/
+      # moved on — the exact drift Laura (r6) and Tom (r3) reproduced against
+      # backoffice, and independently full-stack reproduced+fixed live here
+      # (2026-07-20): redis, budget-redis, pgbouncer AND caddy all needed a
+      # restart too, not just postgres — Caddy specifically was found still
+      # rejecting backoffice's rotated leaf ("x509: certificate signed by
+      # unknown authority") until restarted. Fail loud (return 1) rather than
+      # let a silent miss here become a certificate-verify crash loop
+      # discovered only at runtime.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "Leaf rotation: could not confirm the running postgres picked up the rotated trust material."
+        log_error "  Refusing to continue with a possibly-stale postgres server leaf — see remediation above."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "Leaf rotation: could not confirm every mesh service picked up the rotated material."
+        log_error "  Refusing to continue with possibly-stale trust state — see remediation above."
+        return 1
+      fi
     else
       log_success "Certs current — no rotation needed"
       _pki_persist_env
@@ -13501,10 +16211,19 @@ bootstrap_internal_pki() {
 #
 # Cross-platform: works on Docker Engine (macOS + Linux) and Podman (rootful +
 # rootless) by trying the docker exec path first, then the podman exec path.
-# The postgres container name follows the compose project naming convention:
-#   Docker Engine: docker-postgres-1 (project prefix "docker")
-#   Podman Compose: docker_postgres_1 (project prefix "docker", underscore separator)
-# Both patterns are tried.
+#
+# FINDING-V412-RESTART-002 / YSG-RISK-091: the postgres container name does
+# NOT reliably follow a guessable convention — it depends on
+# COMPOSE_PROJECT_NAME (which this function previously ignored, hardcoding
+# only "docker"/"yashigani") AND on which compose tool created the stack
+# (podman-compose: underscore separator; podman/docker compose v2: hyphen).
+# A hardcoded 4-entry guess list silently matched nothing on any other
+# project name (e.g. a project named "localhost"), causing this function to
+# conclude "postgres container not running" when it was in fact up and
+# healthy — skipping the CA trust-bundle resync after a BYO-CA rotation.
+# Fixed: resolve the real name from the runtime via
+# ysg_resolve_compose_container() (label-based, scheme-agnostic) instead of
+# guessing it.
 #
 # IMPORTANT: This function is Captain's scope only. It does NOT perform any
 # validation of the BYO CA files (Su's scope) or any PKI issuer operations
@@ -13515,15 +16234,7 @@ _postgres_byo_ca_trust_sync() {
 
   local _script_path="/docker-entrypoint-initdb.d/05-enable-ssl.sh"
   local _sync_ok=false
-
-  # Enumerate candidate container names in order of likelihood.
-  # Docker Compose v2 uses hyphen separator; Podman Compose uses underscore.
-  local _pg_names=(
-    "docker-postgres-1"
-    "docker_postgres_1"
-    "yashigani-postgres-1"
-    "yashigani_postgres_1"
-  )
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
 
   # Fall back to trying docker then podman directly.
   local _exec_tools=()
@@ -13541,39 +16252,172 @@ _postgres_byo_ca_trust_sync() {
     return 0
   fi
 
-  for _tool in "${_exec_tools[@]}"; do
-    for _cname in "${_pg_names[@]}"; do
-      # Check if the container exists and is running.
-      if "${_tool}" inspect --format '{{.State.Running}}' "${_cname}" 2>/dev/null | grep -q '^true$'; then
-        log_info "  Found running postgres container: ${_cname} (via ${_tool})"
-        log_info "  Invoking trust-bundle sync inside container..."
+  # Captain review of 507acee7 (finding #4): distinguish "postgres confirmed
+  # NOT running" from "resolution failed" -- the finding's own contract.
+  # A runtime query that itself errors (unreachable socket, broken PATH, a
+  # project name that breaks the filter/regex, etc.) must NOT be silently
+  # read as "not running"; it must fail loudly instead.
+  # `_runtime_reachable` tracks whether at least one exec tool's `ps` query
+  # itself succeeded (proving the tool/runtime IS queryable), independent of
+  # whether postgres specifically was found by it.
+  local _runtime_reachable=false
 
-        # Run the idempotent 05-enable-ssl.sh inside the container.
-        # It will detect the checksum change, update root.crt atomically, and
-        # issue pg_ctl reload. Output is forwarded to the installer log.
-        if "${_tool}" exec "${_cname}" bash "${_script_path}" 2>&1 | while IFS= read -r _line; do
-            log_info "    [postgres] ${_line}"
-          done; then
-          log_success "BYO CA trust-bundle synced in running postgres container (${_cname})"
-          log_info "  Postgres re-reads root.crt via pg_ctl reload — no restart required"
-          _sync_ok=true
-          break 2
-        else
-          log_warn "BYO CA trust-bundle sync via ${_tool} exec ${_cname} failed (exit non-zero)"
-          log_warn "  Manual remediation: docker compose restart postgres"
-          _sync_ok=false
-          break 2
-        fi
+  for _tool in "${_exec_tools[@]}"; do
+    local _cname
+    # `|| true`: "not found" (try the next tool) is expected here, not
+    # script-fatal — see the same note at the compose_up() call site.
+    _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "postgres" 2>/dev/null)" || true
+    if [[ -n "$_cname" ]]; then
+      _runtime_reachable=true
+      log_info "  Found running postgres container: ${_cname} (via ${_tool})"
+      log_info "  Invoking trust-bundle sync inside container..."
+
+      # Run the idempotent 05-enable-ssl.sh inside the container.
+      # It will detect the checksum change, update root.crt atomically, and
+      # issue pg_ctl reload. Output is forwarded to the installer log.
+      if "${_tool}" exec "${_cname}" bash "${_script_path}" 2>&1 | while IFS= read -r _line; do
+          log_info "    [postgres] ${_line}"
+        done; then
+        log_success "BYO CA trust-bundle synced in running postgres container (${_cname})"
+        log_info "  Postgres re-reads root.crt via pg_ctl reload — no restart required"
+        _sync_ok=true
+        break
+      else
+        log_warn "BYO CA trust-bundle sync via ${_tool} exec ${_cname} failed (exit non-zero)"
+        log_warn "  Manual remediation: docker compose restart postgres"
+        _sync_ok=false
+        break
       fi
-    done
+    fi
+    # Postgres was not resolved via this tool. Independently confirm the
+    # tool itself is actually reachable (positive determination, not
+    # inference) by querying it for ANY container belonging to this project,
+    # in ANY state. If this query itself fails (nonzero exit), the tool
+    # cannot be trusted to have told us the truth about postgres either --
+    # do not count it as having confirmed "not running".
+    if "${_tool}" ps -a --filter "label=com.docker.compose.project=${_proj}" --format '{{.Names}}' >/dev/null 2>&1; then
+      _runtime_reachable=true
+    fi
   done
 
   if [[ "$_sync_ok" == "false" ]]; then
-    # Postgres is not running. Trust bundle will be picked up at next start.
-    log_info "BYO CA trust-bundle sync: postgres container not running"
-    log_info "  Updated ca_root.crt + ca_intermediate.crt will be consumed by"
-    log_info "  05-enable-ssl.sh at next postgres container start — no action needed now."
+    if [[ "$_runtime_reachable" == "true" ]]; then
+      # At least one tool was genuinely queryable and found no postgres
+      # container for this project in any state — postgres is CONFIRMED not
+      # running, not merely unresolved. Legitimate no-op: the trust bundle
+      # will be picked up at next start.
+      log_info "BYO CA trust-bundle sync: postgres container not running"
+      log_info "  Updated ca_root.crt + ca_intermediate.crt will be consumed by"
+      log_info "  05-enable-ssl.sh at next postgres container start — no action needed now."
+    else
+      # Every available runtime failed to even confirm reachability — we
+      # genuinely do NOT know whether postgres is running. Concluding "not
+      # running" here would be the exact silent-miss the finding named.
+      # Fail loud instead so an unresolvable-but-running postgres cannot
+      # silently keep serving a stale CA trust bundle after a BYO-CA rotation.
+      log_error "BYO CA trust-bundle sync: could not determine postgres container state"
+      log_error "  Every available runtime (${_exec_tools[*]}) failed to respond to 'ps' for project '${_proj}'."
+      log_error "  This is NOT the same as 'postgres is not running' — do not assume the trust bundle is safe."
+      log_error "  Manual remediation: verify the runtime is reachable, then either re-run this"
+      log_error "  step or manually sync: <tool> exec <postgres-container> bash ${_script_path}"
+      return 1
+    fi
   fi
+
+  return 0
+}
+
+# =============================================================================
+# _pki_restart_mesh_services — propagate a rotation to any ALREADY-RUNNING
+# services that read their PKI material once at process start
+# =============================================================================
+# FINDING-V412-RESTART-012 (full live reproduction, 2026-07-20): forcing a
+# rotation and then walking the mesh one service at a time (redis,
+# budget-redis, pgbouncer, caddy, gateway, backoffice) proved EVERY one of
+# them keeps serving/trusting whatever material it read at its OWN last
+# process start — none of them re-read cert/key/CA files from the
+# bind-mounted secrets dir on their own. A plain restart (not a full
+# recreate) IS sufficient for all of them — each was confirmed to pick up
+# the rotated files correctly after `podman restart` — but the restart must
+# actually happen. The pre-fix behaviour only ever PRINTED a restart hint
+# (and that hint omitted caddy entirely, and separately told the operator to
+# "restart postgres", which is FALSE — see _postgres_byo_ca_trust_sync,
+# postgres needs the exec-based init-script re-run, not a bare restart,
+# because a restart does not re-execute docker-entrypoint-initdb.d/* against
+# an already-initialized PGDATA).
+#
+# Safe to restart: redis/budget-redis persist via AOF to a named volume (see
+# the B1 AOF-enablement note at the top of docker-compose.yml); pgbouncer,
+# caddy, gateway and backoffice are stateless proxies/app servers.
+#
+# Same honesty contract as _postgres_byo_ca_trust_sync: "not running" is only
+# ever concluded from a runtime query that itself succeeded. A runtime that
+# fails to answer is NOT the same as "service is down" — fail loud instead of
+# silently leaving stale trust material in place.
+#
+# Args: one or more compose service names to restart if currently running.
+# =============================================================================
+_pki_restart_mesh_services() {
+  local _services=("$@")
+  log_info "Leaf/intermediate rotation: propagating to running mesh services: ${_services[*]}"
+
+  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
+  local _exec_tools=()
+  command -v docker >/dev/null 2>&1 && _exec_tools+=("docker")
+  command -v podman >/dev/null 2>&1 && _exec_tools+=("podman")
+
+  if [[ ${#_exec_tools[@]} -eq 0 ]]; then
+    log_warn "Rotation propagation: no container runtime found (docker/podman) — skipping restarts"
+    log_warn "  Manual remediation: docker compose restart ${_services[*]}"
+    return 0
+  fi
+
+  local _runtime_reachable=false
+  local _svc
+  for _svc in "${_services[@]}"; do
+    local _restarted=false
+    local _tool
+    for _tool in "${_exec_tools[@]}"; do
+      local _cname
+      _cname="$(ysg_resolve_compose_container "${_tool}" "${_proj}" "${_svc}" 2>/dev/null)" || true
+      if [[ -n "$_cname" ]]; then
+        _runtime_reachable=true
+        log_info "  Found running ${_svc} container: ${_cname} (via ${_tool}) — restarting to pick up rotated material"
+        # FINDING-V412-RESTART-012 live-verify: podman's `restart` subcommand
+        # can refuse with "dependencies ... container state improper" when a
+        # one-shot init container (e.g. ollama-init) it depends on has
+        # already exited 0 (its correct terminal state) — a podman-compose
+        # dependency-tracking quirk, unrelated to PKI. Fall back to
+        # stop+start (proven live to work identically) rather than fail the
+        # whole rotation over an orchestration quirk.
+        if "${_tool}" restart "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} restarted (${_cname}) — rotated material now in effect"
+          _restarted=true
+        elif "${_tool}" stop "${_cname}" >/dev/null 2>&1 && "${_tool}" start "${_cname}" >/dev/null 2>&1; then
+          log_success "  ${_svc} stopped+started (${_cname}) — rotated material now in effect (restart fallback)"
+          _restarted=true
+        else
+          log_error "Rotation propagation: both '${_tool} restart' and stop+start failed for ${_svc} (${_cname})"
+          return 1
+        fi
+        break
+      fi
+      if "${_tool}" ps -a --filter "label=com.docker.compose.project=${_proj}" --format '{{.Names}}' >/dev/null 2>&1; then
+        _runtime_reachable=true
+      fi
+    done
+    if [[ "$_restarted" == "false" ]]; then
+      if [[ "$_runtime_reachable" == "true" ]]; then
+        log_info "  ${_svc} container not running — rotated material will be used at next start (no action needed now)"
+      else
+        log_error "Rotation propagation: could not determine ${_svc} container state"
+        log_error "  Every available runtime (${_exec_tools[*]}) failed to respond to 'ps' for project '${_proj}'."
+        log_error "  This is NOT the same as '${_svc} is not running' — do not assume the rotated material is safe."
+        log_error "  Manual remediation: verify the runtime is reachable, then restart ${_svc} manually."
+        return 1
+      fi
+    fi
+  done
 
   return 0
 }
@@ -13941,7 +16785,7 @@ _ysg_onboard_stepup_gate() {
   read -rs _password </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read password from tty"; return 1; }
   printf "\n" >/dev/tty
 
-  printf "  TOTP code for login (6 digits): " >/dev/tty
+  printf "  TOTP code for login (6 or 8 digits per your tier): " >/dev/tty
   read -rs _totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read TOTP from tty"; return 1; }
   printf "\n" >/dev/tty
 
@@ -13951,7 +16795,7 @@ _ysg_onboard_stepup_gate() {
   # their authenticator (a fresh 30-second window).
   log_info "  Wait for the NEXT code in your authenticator (new 30-second window),"
   log_info "  then enter it below for the step-up verification."
-  printf "  TOTP code for step-up (6 digits, NEXT window): " >/dev/tty
+  printf "  TOTP code for step-up (6 or 8 digits per your tier, NEXT window): " >/dev/tty
   read -rs _stepup_totp </dev/tty 2>/dev/null || { log_error "Step-up gate: cannot read step-up TOTP from tty"; _username=""; _password=""; _totp=""; _stepup_totp=""; return 1; }
   printf "\n" >/dev/tty
 
@@ -13961,13 +16805,23 @@ _ysg_onboard_stepup_gate() {
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: login TOTP must be exactly 6 digits."
+  # FINDING-V412-STEPUP-TOTP-8DIGIT-REJECTED: admin-tier accounts are minted
+  # HMAC-SHA-512/8-digit (install.sh _gen_totp_uri, ~line 10500); user-tier
+  # accounts are HMAC-SHA-256/6-digit. This shell-side gate cannot know which
+  # tier the operator belongs to (it never sees the account record), so it
+  # must accept BOTH tiered lengths here. The server is the actual authority:
+  # /auth/login and /auth/stepup (src/yashigani/backoffice/routes/auth.py)
+  # already validate the exact digit count against the account's enrolled
+  # algorithm/digits after resolving the account tier — this regex is only a
+  # cheap pre-flight to avoid a wasted network round-trip on an obviously
+  # malformed code.
+  if ! printf '%s' "$_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: login TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
-  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$'; then
-    log_error "Step-up gate: step-up TOTP must be exactly 6 digits."
+  if ! printf '%s' "$_stepup_totp" | grep -qE '^[0-9]{6}$|^[0-9]{8}$'; then
+    log_error "Step-up gate: step-up TOTP must be exactly 6 (user-tier) or 8 (admin-tier) digits."
     _username=""; _password=""; _totp=""; _stepup_totp=""
     return 1
   fi
@@ -14712,9 +17566,13 @@ PYEOF
         resolve_compose_cmd 2>/dev/null || true
       fi
       local _gw_container=""
-      local _runtime_bin_ps="${COMPOSE_CMD[0]:-docker}"
-      # strip -compose suffix: "docker-compose" → "docker", "podman-compose" → "podman"
-      _runtime_bin_ps="${_runtime_bin_ps%%-compose}"
+      # _ysg_compose_engine_bin(): NOT COMPOSE_CMD[0] text-parsing. COMPOSE_CMD[0]
+      # is "python3" when the podman-compose-ysg fork is selected (the only
+      # Podman driver as of the 2026-07-18 fork wiring) — stripping a "-compose"
+      # suffix off "python3" would leave "python3" unchanged, breaking all five
+      # detection tiers below on the Podman path. The engine-binary helper
+      # resolves the real engine ("podman"/"docker") via YSG_PODMAN_RUNTIME first.
+      local _runtime_bin_ps; _runtime_bin_ps="$(_ysg_compose_engine_bin)"
 
       # Derive the compose project name from the compose-file directory name
       # (same logic Docker Compose v2 uses by default).
@@ -15243,6 +18101,17 @@ handle_offboard_subcommand() {
 
 # Subcommand entry — for `install.sh --pki-action=<action>` used in maintenance.
 handle_pki_subcommand() {
+  # FINDING-V412-RESTART-012: this maintenance entrypoint runs standalone (no
+  # full install(), no prior resolve_compose_cmd()/COMPOSE_PROJECT_NAME
+  # resolution). The rotate-leaves/rotate-intermediate branches below need
+  # both to actually propagate a rotation into a RUNNING stack instead of
+  # just printing a hint. Resolve them here, defensively, if not already set.
+  if [[ -z "${COMPOSE_PROJECT_NAME:-}" && -f "${WORK_DIR}/docker/.env" ]]; then
+    COMPOSE_PROJECT_NAME="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2-)"
+    [[ -n "$COMPOSE_PROJECT_NAME" ]] && export COMPOSE_PROJECT_NAME
+  fi
+  resolve_compose_cmd 2>/dev/null || true
+
   case "$PKI_ACTION" in
     bootstrap)
       _prepare_secrets_dir_for_pki
@@ -15268,15 +18137,42 @@ handle_pki_subcommand() {
       # offboard-triggered path (install.sh --pki-action rotate-leaves) therefore
       # left keys unreadable by their owning containers.
       _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-leaves — keys may be unreadable by containers"; return 1; }
-      log_success "Leaf certs rotated — restart services to pick up new certs"
-      log_info "  docker compose restart gateway backoffice postgres pgbouncer redis budget-redis policy"
+      # FINDING-V412-RESTART-012 (full live reproduction + fix, 2026-07-20):
+      # this used to be a printed hint only ("restart these services
+      # yourself") — and the hint itself was wrong (told the operator to
+      # "restart postgres", which does not resync PGDATA; a bare restart
+      # does not re-run docker-entrypoint-initdb.d/* against an
+      # already-initialized data dir) and incomplete (omitted caddy, which
+      # live-testing proved ALSO needs a restart — it independently caches
+      # its upstream mTLS trust and was found rejecting backoffice's rotated
+      # leaf with "x509: certificate signed by unknown authority" until
+      # restarted). Now automated + fail-loud instead of a hope-the-operator-
+      # reads-the-log hint.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-leaves: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-leaves: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Leaf certs rotated and propagated to every running mesh service"
       ;;
     rotate-intermediate)
       log_step "-" "Rotating intermediate + leaf certs"
       _pki_run_issuer rotate-intermediate \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Intermediate + leaves rotated — restart the stack"
+      _pki_chown_client_keys || { log_error "C-003: _pki_chown_client_keys failed after rotate-intermediate — keys may be unreadable by containers"; return 1; }
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-intermediate: could not confirm the running postgres picked up the rotated trust material."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-intermediate: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Intermediate + leaves rotated and propagated to every running mesh service"
       ;;
     rotate-root)
       log_warn "Root CA rotation is DESTRUCTIVE — every service's trust bundle"
@@ -15292,7 +18188,72 @@ handle_pki_subcommand() {
         --root-lifetime-years "$YASHIGANI_ROOT_CA_LIFETIME_YEARS" \
         --intermediate-lifetime-days "$YASHIGANI_INTERMEDIATE_LIFETIME_DAYS" \
         --leaf-lifetime-days "$YASHIGANI_CERT_LIFETIME_DAYS"
-      log_success "Full PKI rotated — restart all services"
+      local _rr_rc=$?
+      if [[ $_rr_rc -ne 0 ]]; then
+        log_error "rotate-root: issuer failed (exit ${_rr_rc}) — attestation NOT written, prior root remains pinned everywhere"
+        return 1
+      fi
+      # FINDING-LAURA-V412-PKI-PIN: root CAs are self-signed — there is no
+      # prior root to openssl-verify a NEW root against. The trust anchor for
+      # "is this an operator-sanctioned root swap, not a rogue in-mesh
+      # container write" is THIS ceremony itself: host shell access + the
+      # typed-YES confirmation above. Stamp the sha256 of the freshly-rotated
+      # root as an explicit, host-written attestation. 05-enable-ssl.sh (and
+      # any future trust-sync) requires this to match before accepting a root
+      # change — see docker/postgres/05-enable-ssl.sh. A compromised mesh
+      # service can overwrite ca_root.crt (pre-existing LIC-012 write
+      # primitive, now :ro everywhere except the issuer — see
+      # docker-compose.yml) but can never produce a matching attestation: it
+      # has no host shell (Laura Q3/Q4, LAURA-V412-RESTART-012-TM).
+      #
+      # FINDING-V412-RESTART-012 (2026-07-21): the attestation file is now
+      # written to a DEDICATED, postgres-ONLY directory
+      # (docker/secrets-pki-attest/), not the shared docker/secrets/ tree —
+      # Laura proved backoffice's nominal :ro mount of that shared tree was
+      # not enforced on podman-compose (laura-012-rogue-reattack.md Attack 3:
+      # forged attestation via the same write primitive that overwrites
+      # ca_root.crt). This directory has no other mesh consumer at all, so
+      # even a future regression of SOME OTHER service's RO mount cannot
+      # reach this file. ca_root.crt itself legitimately stays in the shared
+      # tree (every service needs to read it); only the attestation POINTER
+      # is isolated.
+      local _new_root="${WORK_DIR}/docker/secrets/ca_root.crt"
+      if [[ ! -f "$_new_root" ]]; then
+        log_error "rotate-root: issuer reported success but ${_new_root} not found — refusing to write attestation"
+        return 1
+      fi
+      _ensure_pki_attest_dir || { log_error "rotate-root: could not prepare docker/secrets-pki-attest/ — refusing to write attestation"; return 1; }
+      local _new_root_sha
+      _new_root_sha="$(sha256sum "$_new_root" | cut -d' ' -f1)"
+      local _attest_tmp
+      _attest_tmp="$(mktemp "${WORK_DIR}/docker/secrets-pki-attest/.ca_root_attest.XXXXXX")"
+      printf '%s\n' "$_new_root_sha" > "$_attest_tmp"
+      chmod 0644 "$_attest_tmp"
+      mv -f "$_attest_tmp" "${WORK_DIR}/docker/secrets-pki-attest/ca_root.attested_sha256"
+      # Best-effort cleanup of any STALE pre-fix attestation file left over
+      # from an upgrade of an install that already ran rotate-root before
+      # this fix shipped — it is dead weight (05-enable-ssl.sh no longer
+      # reads /run/secrets/ca_root.attested_sha256 at all) but leaving stale
+      # attestation material sitting in the flat, widely-mounted secrets dir
+      # is worth tidying up rather than ignoring.
+      if [[ -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" ]]; then
+        rm -f "${WORK_DIR}/docker/secrets/ca_root.attested_sha256" 2>/dev/null \
+          && log_info "rotate-root: removed stale pre-fix attestation file from docker/secrets/ (relocated to docker/secrets-pki-attest/)"
+      fi
+      log_success "rotate-root: wrote operator-attested root pin (sha256=${_new_root_sha:0:12}...)"
+      # Propagate + verify, same as rotate-leaves/rotate-intermediate — root
+      # rotation used to be the ONE PKI action that never confirmed postgres
+      # (or the rest of the mesh) actually picked up the new material; it
+      # only printed a hint. Now fail-loud like its siblings.
+      if ! _postgres_byo_ca_trust_sync; then
+        log_error "rotate-root: could not confirm the running postgres picked up the rotated root (chain-of-continuity check may have rejected it — see postgres logs)."
+        return 1
+      fi
+      if ! _pki_restart_mesh_services redis budget-redis pgbouncer caddy gateway backoffice policy; then
+        log_error "rotate-root: could not confirm every mesh service picked up the rotated material."
+        return 1
+      fi
+      log_success "Full PKI rotated, attested, and propagated to every running mesh service"
       ;;
     status)
       _pki_run_issuer status
@@ -15437,6 +18398,25 @@ main() {
     # Step 5: Preflight
     run_preflight
 
+    # Kubernetes CNI/DNS hard gates (Cilium ratified CNI standard, DNSSEC+DoT
+    # MUST-HAVE — 2026-07-19 design). Cheap/fast checks first, before the
+    # wizard asks the operator anything. _preflight_k8s_cilium_crds has no
+    # skip flag anywhere in this file — it is intentionally non-skippable.
+    if ! _preflight_k8s_kernel_ebpf; then
+      log_error "Aborting k8s install: node kernel eBPF preflight not verified."
+      exit 1
+    fi
+    if ! _preflight_k8s_cilium_crds; then
+      log_error "Aborting k8s install: Cilium CNI precondition not satisfied (non-skippable)."
+      exit 1
+    fi
+
+    # Optional: patch this cluster's kube-system CoreDNS with the DoT/DNSSEC
+    # forward block before the (fail-closed) preflight probe verifies it.
+    if [[ "${APPLY_COREDNS_HARDENING:-false}" == "true" ]]; then
+      _apply_coredns_hardening
+    fi
+
     # Step 6: Wizard / config
     run_wizard
 
@@ -15449,6 +18429,12 @@ main() {
     # AES key pre-seed happens before helm installs the backoffice Secret.
     _write_helm_values
 
+    # Step 7b: build/push first-party images + wire local registry into
+    # helm values (YSG-RISK-123). Must run AFTER _write_helm_values (appends
+    # global.imageRegistry to .env.helm) and BEFORE k8s_helm_dep_update /
+    # k8s_helm_install so the release picks up the freshly-pushed images.
+    k8s_ensure_fresh_local_images
+
     # Step 7: Helm dependency update
     k8s_helm_dep_update
 
@@ -15457,6 +18443,9 @@ main() {
 
     # Step 9: Rollout status
     k8s_rollout_status
+
+    # Step 9b: verify the deployed pods run the image just built (YSG-RISK-123)
+    k8s_verify_image_provenance
 
     # Step 10: Access instructions
     k8s_print_access
@@ -15506,6 +18495,12 @@ main() {
         printf 'INSTALL_USER=%s\n'       "$(id -un)"
         printf 'INSTALL_TIMESTAMP=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'YASHIGANI_VERSION=%s\n'  "${YASHIGANI_VERSION:-unknown}"
+        # CROSS-ORG-COREDNS-WARN-2026-07-22 (gap-map Finding 4, P2): record
+        # whether this install patched the SHARED kube-system CoreDNS
+        # ConfigMap so uninstall.sh can WARN (never auto-revert — it's a
+        # cluster-wide resource other namespaces/orgs may depend on).
+        printf 'COREDNS_HARDENING_APPLIED=%s\n' "${APPLY_COREDNS_HARDENING:-false}"
+        printf 'COREDNS_BACKUP_DIR=%s\n'  "${COREDNS_BACKUP_DIR:-/var/lib/yashigani/coredns-backups}"
       } > "$_k8s_state_path"
       chmod 0644 "$_k8s_state_path"
       log_info "Install state written: ${_k8s_state_path}"
@@ -15595,14 +18590,15 @@ main() {
     # Returns 0 if this is NOT a re-run path (continues full install).
     # Exits 0 or 1 if this IS a re-run path (does not return).
     _activate_byo_ca_rerun
-    # Derive RUNTIME from resolved COMPOSE_CMD: "podman-compose" or "podman compose"
-    # → podman; "docker compose" or "docker-compose" → docker.
+    # Derive RUNTIME from the resolved compose driver. Prefer the authoritative
+    # YSG_PODMAN_RUNTIME flag (_ysg_compose_engine_bin()) over text-matching
+    # COMPOSE_CMD[0] — COMPOSE_CMD[0] is "python3" when the podman-compose-ysg
+    # fork is selected (the only Podman driver as of the 2026-07-18 fork
+    # wiring), which the old podman*/docker* case match would silently miss and
+    # fall through to RUNTIME="${YSG_RUNTIME:-docker}" (wrong under auto-detect
+    # with YSG_RUNTIME unset).
     if [[ -z "${RUNTIME:-}" ]]; then
-      case "${COMPOSE_CMD[0]:-}" in
-        podman*) RUNTIME="podman" ;;
-        docker*) RUNTIME="docker" ;;
-        *)       RUNTIME="${YSG_RUNTIME:-docker}" ;;
-      esac
+      RUNTIME="$(_ysg_compose_engine_bin)"
     fi
     _check_contaminated_volumes
 
@@ -16202,6 +19198,11 @@ main() {
     chmod 0644 "$_state_path"
     log_info "Install state written: ${_state_path}"
     log_info "  PROJECT=${PROJECT:-docker}  DOMAIN=${DOMAIN:-(none)}  TRUST_DOMAIN=${_trust_domain}"
+
+    # Step 12c: Inference-backend firewall hardening (LAURA-411-001, item B).
+    # Consent-gated: interactive prompts, non-interactive requires --secure-backend-firewall.
+    # Fail-safe: never aborts install on error.
+    _apply_inference_backend_firewall || true
 
     # Step 13: Completion summary
     print_completion_summary

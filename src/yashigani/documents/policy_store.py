@@ -254,6 +254,17 @@ class DocumentPolicyStore:
             raise ValueError(f"invalid route: {policy['route']!r}")
         if policy.get("pseudonymize_mode", "A") not in _MODES:
             raise ValueError(f"invalid pseudonymize_mode: {policy.get('pseudonymize_mode')!r}")
+        # RESTART-013 gap #4: identity_id is either "" (global — the default,
+        # applies to any caller) or a well-formed "idnt_" identity key. Reject
+        # anything else fail-closed rather than silently persisting a row that
+        # can never match any caller (a typo'd identity_id would look like it
+        # "saved" but would never enforce for anyone — worse than an error).
+        identity_id = policy.get("identity_id", "") or ""
+        if identity_id and not identity_id.startswith("idnt_"):
+            raise ValueError(
+                f"invalid identity_id: {identity_id!r} — must be empty (global) "
+                "or a canonical 'idnt_' identity key"
+            )
 
     def add_policy(
         self,
@@ -269,13 +280,21 @@ class DocumentPolicyStore:
         policy_id: str = "",
         user_message: str = "",
         code: str = "",
+        identity_id: str = "",
     ) -> dict:
         """Add a policy row with a fresh id (write-through).  Returns the row.
 
         ``name`` / ``policy_id`` / ``user_message`` / ``code`` are the
         self-describing display fields (mirrors the rego decision contract) the
         admin UI shows and the audit/alert reuse; optional for operator-created
-        rows."""
+        rows.
+
+        ``identity_id`` (RESTART-013 gap #4 — per-user/identity policy
+        dimension): the canonical Yashigani identity_id ("idnt_{12hex}") this
+        row is scoped to.  Default "" (empty) means the row applies to ANY
+        caller — every pre-existing/global policy keeps working unmodified.
+        When non-empty, the row ONLY applies to a caller whose resolved
+        identity_id matches (policy/document.rego ``_identity_matches``)."""
         try:
             new_id = str(self._redis.incr(_KEY_SEQ))
         except Exception as exc:
@@ -295,6 +314,7 @@ class DocumentPolicyStore:
             "user_message": user_message,
             "description": description,
             "example": False,
+            "identity_id": identity_id,
         }
         self._validate(policy)
         self._policies[new_id] = policy
@@ -365,6 +385,9 @@ class DocumentPolicyStore:
                     "policy_id": p.get("policy_id", ""),
                     "user_message": p.get("user_message", ""),
                     "code": p.get("code", ""),
+                    # RESTART-013 gap #4 — "" (default) = applies to any caller;
+                    # non-empty = scoped to exactly that identity_id.
+                    "identity_id": p.get("identity_id", ""),
                 }
                 for p in self.list_policies()
             ],

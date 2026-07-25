@@ -128,63 +128,48 @@ def _render(manifest: dict[str, Any] | None = None) -> dict[str, str]:
 
 
 def test_wrap_snippet_present_and_egress_route_absent():
+    """FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the Phase 1b-i
+    wrap snippet is DELIBERATELY ABSENT from codegen's artifact map —
+    Laura's final re-attack proved backoffice authoring this content
+    (even via a fixed template) combined with the backoffice-writable
+    docker/caddy/agents/ mount gave a compromised backoffice a filesystem-
+    write primitive onto Caddy's live trust surface (R2). Rendering +
+    writing authority moved ENTIRELY into caddy-config-broker
+    (docker/caddy/config_broker.py render_mcp_route() — see
+    src/tests/unit/test_v412_caddy_config_broker.py for the equivalent
+    snippet-contract coverage against that authoritative source now).
+    The MCP is NOT "onboarded unwrapped" — mcp_onboard.py's approve
+    transaction registers the route with the broker via a separate DATA-only
+    call (see src/tests/unit/test_v41_mcp_onboard_transaction.py)."""
     artifacts = _render()
-    assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts, (
-        "Phase 1b-i wrap snippet missing — MCP would onboard UNWRAPPED"
-    )
-    # SC-EGRESS-NONE unchanged: no Shape-A LLM-egress route.
+    assert "docker/caddy/agents/filesystem-mcp.caddy" not in artifacts
+    # SC-EGRESS-NONE unchanged: no Shape-A LLM-egress route either.
     assert "docker/caddy/agents/filesystem.caddy" not in artifacts
 
 
 # ---------------------------------------------------------------------------
-# 2. Snippet contract — every load-bearing element pinned
+# 2. Snippet contract — moved to caddy-config-broker
+#    (src/tests/unit/test_v412_caddy_config_broker.py TestRenderMcpRoute /
+#    TestSelfCheckSnippet — same content pins, tested against the NEW
+#    authoritative renderer). codegen.py's own _gen_caddy_snippet_mcp() is
+#    kept as an unused pure function (existing unit-test coverage still
+#    exercises it directly), not re-tested here to avoid duplicate-source
+#    drift with the broker's independent port of the same template.
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_snippet_contract():
-    artifacts = _render()
-    snip = artifacts["docker/caddy/agents/filesystem-mcp.caddy"]
-
-    # Route namespace, prefix-stripping route.
-    assert "handle_path /mcp/acme-corp/filesystem/*" in snip
-    # Per-instance leaf presented by Caddy (svid-sidecar tmpfs projection).
-    assert ("tls /run/secrets/svid/acme-corp/filesystem/client.crt "
-            "/run/secrets/svid/acme-corp/filesystem/client.key") in snip
-    # Mesh clients MUST present a cert chained to the internal intermediate.
-    assert "mode require_and_verify" in snip
-    assert "trust_pool file /run/secrets/ca_intermediate.crt" in snip
-    assert "protocols tls1.3" in snip
-    # Zero-trust header discipline: strip inbound, then set from VERIFIED cert.
-    strip_idx = snip.index("request_header -X-SPIFFE-ID")
-    set_idx = snip.index(
-        "request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}")
-    assert strip_idx < set_idx
-    # App-layer ingress gate via backoffice.
-    assert "forward_auth https://backoffice:8443" in snip
-    assert "uri /auth/verify-mcp?tenant=acme-corp&server=filesystem" in snip
-    # forward_auth itself is mTLS to backoffice.
-    assert "tls_client_auth /run/secrets/caddy_client.crt /run/secrets/caddy_client.key" in snip
-    # Upstream: shim over the ringfence bridge, plain HTTP (T2), C8 cap.
-    assert "reverse_proxy http://filesystem:8000" in snip
-    assert "max_conns_per_host 64" in snip
-    # tls_insecure_skip_verify is NEVER emitted (C5 discipline).
-    assert "tls_insecure_skip_verify" not in snip
-    # Default-deny tail.
-    assert 'respond "Not Found" 404' in snip
-
-
 def test_wrap_listener_port_deterministic_and_in_range():
-    artifacts = _render()
-    snip = artifacts["docker/caddy/agents/filesystem-mcp.caddy"]
-    m = re.search(r"^:(\d+) \{", snip, re.MULTILINE)
-    assert m, "dedicated mesh listener block missing"
-    port = int(m.group(1))
+    """Mesh-port RESOLUTION (not rendering) stays load-bearing — codegen
+    still computes it (compose-override guidance comment,
+    mcp_onboard.py's data payload to the broker) even though it no longer
+    renders the Caddy snippet itself."""
+    port = _mcp_mesh_port(_base_manifest())
     assert _MCP_MESH_PORT_BASE <= port < _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE
 
     # Deterministic across sessions.
     reset_codegen_registry()
-    snip2 = _render()["docker/caddy/agents/filesystem-mcp.caddy"]
-    assert snip == snip2
+    port2 = _mcp_mesh_port(_base_manifest())
+    assert port == port2
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +178,8 @@ def test_wrap_listener_port_deterministic_and_in_range():
 
 
 def test_mesh_port_explicit_pin_honoured():
-    artifacts = _render(_base_manifest(mesh_port=9700))
-    snip = artifacts["docker/caddy/agents/filesystem-mcp.caddy"]
-    assert "\n:9700 {" in snip
+    port = _mcp_mesh_port(_base_manifest(mesh_port=9700))
+    assert port == 9700
 
 
 @pytest.mark.parametrize("bad", [443, 8444, 80, 100, 70000, "9700", True])
@@ -255,29 +239,27 @@ def test_compose_caddy_joins_ringfence_and_mcp_stays_isolated():
 
 
 # ---------------------------------------------------------------------------
-# 5. C10 — validator gate applies to the wrap snippet
+# 5. C10 — FINDING-V412-CADDYADMIN-002: render() no longer applies a C10
+#    caddy_validator gate to the wrap snippet AT ALL (it no longer renders
+#    one). The equivalent self-check now lives in caddy-config-broker
+#    (config_broker.py _self_check_snippet / _self_check_full_merge — always
+#    real `caddy adapt`, no injectable stub, no fail-open "caddy not on
+#    PATH" skip — see src/tests/unit/test_v412_caddy_config_broker.py
+#    TestSelfCheckSnippet). A caddy_validator=... kwarg passed to
+#    CodegenEngineShapeC is simply unused for Shape-C now (still consumed by
+#    other artifact validators — pki_ownership shell fragment etc. — so the
+#    constructor keeps accepting it without error).
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_snippet_c10_validator_failure_aborts():
+def test_render_ignores_caddy_validator_for_the_removed_wrap_snippet():
+    """A failing caddy_validator must NOT abort render() anymore — there is
+    no wrap-snippet C10 check left in this engine to fail."""
     engine = CodegenEngineShapeC(
         _base_manifest(), runtime="docker", caddy_validator=lambda _cfg: 1,
     )
-    with pytest.raises(CodegenError) as exc:
-        engine.render(dry_run=True)
-    assert exc.value.code == "C10_caddy_validate_failed"
-
-
-def test_wrap_snippet_passes_real_caddy_if_present():
-    """Adapt + validate the generated snippet with the REAL caddy binary
-    (ephemeral-cert substitution). Skipped when caddy is not on PATH."""
-    import shutil as _shutil
-
-    if _shutil.which("caddy") is None:
-        pytest.skip("caddy binary not on PATH")
-    engine = CodegenEngineShapeC(_base_manifest(), runtime="docker")
-    artifacts = engine.render(dry_run=True)  # raises CodegenError on C10 failure
-    assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts
+    artifacts = engine.render(dry_run=True)  # must NOT raise
+    assert "docker/caddy/agents/filesystem-mcp.caddy" not in artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -402,24 +384,31 @@ def _demo_mcp_manifest() -> dict[str, Any]:
 
 
 def test_demo_mcp_gets_caddy_front_via_codegen():
-    """demo-mcp must receive a Caddy-front snippet through the codegen flow,
-    not a hand-wired leaf.  Verifies the snippet is present, route-namespaced,
-    and the SVID paths use the correct tenant."""
+    """demo-mcp must NOT receive a Caddy-front snippet through codegen
+    (FINDING-V412-CADDYADMIN-002 — that authority moved to
+    caddy-config-broker). It gets wrapped via mcp_onboard.py's route-DATA
+    registration call instead — see
+    src/tests/unit/test_v41_mcp_onboard_transaction.py. This test now
+    confirms the mesh-port/route-namespace DATA codegen still resolves for
+    the demo tenant (what mcp_onboard.py sends the broker), not a rendered
+    snippet."""
     reset_codegen_registry()
     artifacts = CodegenEngineShapeC(
         _demo_mcp_manifest(), runtime="docker", caddy_validator=lambda _: 0,
     ).render(dry_run=True)
 
-    # Wrap snippet is present and correctly named.
-    assert "docker/caddy/agents/demo-mcp-mcp.caddy" in artifacts
-    # No egress route.
+    # Wrap snippet is DELIBERATELY absent — broker-owned now.
+    assert "docker/caddy/agents/demo-mcp-mcp.caddy" not in artifacts
+    # No egress route either (unchanged, SC-EGRESS-NONE).
     assert "docker/caddy/agents/demo-mcp.caddy" not in artifacts
 
-    snip = artifacts["docker/caddy/agents/demo-mcp-mcp.caddy"]
-    # Route namespace uses the demo tenant.
-    assert "handle_path /mcp/yashigani-demo/demo-mcp/*" in snip
-    # SVID paths use the demo tenant — no cross-tenant path confusion.
-    assert "tls /run/secrets/svid/yashigani-demo/demo-mcp/client.crt" in snip
+    # The route-namespace/SVID-path DATA the demo tenant would carry into
+    # the broker's /route call is still correctly resolved by codegen's
+    # (unused-by-render, still-imported-elsewhere) helpers.
+    from yashigani.manifest.codegen import _mcp_svid_paths
+
+    leaf_crt, _leaf_key = _mcp_svid_paths("yashigani-demo", "demo-mcp")
+    assert leaf_crt == "/run/secrets/svid/yashigani-demo/demo-mcp/client.crt"
 
 
 def test_demo_mcp_compose_has_svid_volume_and_gid():
@@ -447,7 +436,9 @@ def test_demo_mcp_compose_has_svid_volume_and_gid():
 def test_approve_hook_returns_artifact_map():
     """approve_mcp_onboard() is the single entry point Tom calls from the
     approve transaction.  Smoke-test: it returns the same artifact map as
-    CodegenEngineShapeC.render()."""
+    CodegenEngineShapeC.render() — FINDING-V412-CADDYADMIN-002: the wrap
+    snippet is deliberately absent (registered with caddy-config-broker by
+    the caller instead, using codegen._mcp_mesh_port()/_mcp_shim_port())."""
     reset_codegen_registry()
     artifacts = approve_mcp_onboard(
         _base_manifest(),
@@ -455,23 +446,24 @@ def test_approve_hook_returns_artifact_map():
         dry_run=True,
         caddy_validator=lambda _: 0,
     )
-    # Load-bearing Phase 1c artifacts must be present.
-    assert "docker/caddy/agents/filesystem-mcp.caddy" in artifacts
+    assert "docker/caddy/agents/filesystem-mcp.caddy" not in artifacts
+    # Other load-bearing Phase 1c artifacts are still present.
     assert "docker/filesystem-compose.override.yml" in artifacts
     assert "helm/yashigani/values-filesystem-networkpolicy.yaml" in artifacts
 
 
-def test_approve_hook_error_propagates():
-    """C10 failure inside approve_mcp_onboard propagates as CodegenError."""
+def test_approve_hook_mesh_and_shim_port_resolvable_for_broker_call():
+    """mcp_onboard.py's approve transaction needs mesh_port + shim_port to
+    build the caddy-config-broker /route DATA payload — both must resolve
+    cleanly from the same parsed manifest approve_mcp_onboard() consumes."""
+    from yashigani.manifest.codegen import _mcp_mesh_port, _mcp_shim_port
+
     reset_codegen_registry()
-    with pytest.raises(CodegenError) as exc:
-        approve_mcp_onboard(
-            _base_manifest(),
-            runtime="docker",
-            dry_run=True,
-            caddy_validator=lambda _: 1,  # simulate caddy validate failure
-        )
-    assert exc.value.code == "C10_caddy_validate_failed"
+    manifest = _base_manifest()
+    mesh_port = _mcp_mesh_port(manifest)
+    shim_port = _mcp_shim_port(manifest)
+    assert _MCP_MESH_PORT_BASE <= mesh_port < _MCP_MESH_PORT_BASE + _MCP_MESH_PORT_RANGE
+    assert shim_port == 8000  # pinned in _base_manifest()'s exposes.shim_port
 
 
 def test_approve_hook_svid_volume_in_output():

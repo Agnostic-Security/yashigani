@@ -671,7 +671,7 @@ class TestOpaDenyFailClosed:
 # ---------------------------------------------------------------------------
 
 class TestAuthMissing:
-    """EMBED-005: no auth → 401 AUTHENTICATION_REQUIRED, same as chat."""
+    """EMBED-005: no auth → 401 generic OpenAI-format error (LAURA-411-004)."""
 
     @pytest.mark.asyncio
     async def test_no_auth_header_returns_401(self):
@@ -702,7 +702,10 @@ class TestAuthMissing:
             f"Expected 401, got {response.status_code}"
         )
         body = response.json()
-        assert body["detail"]["error"] == "AUTHENTICATION_REQUIRED"
+        # LAURA-411-004: 401 body now uses generic OpenAI format (no internal header names)
+        assert body["detail"]["error"]["type"] == "authentication_error"
+        assert body["detail"]["error"]["code"] == "unauthorized"
+        assert "Authentication required" in body["detail"]["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_wrong_bearer_returns_401(self):

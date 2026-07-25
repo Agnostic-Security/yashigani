@@ -31,9 +31,9 @@
 caddy:
   image:
     repository: docker.io/library/caddy
-    tag: "2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
-    digest: "sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d"
-    # Full pinned ref: docker.io/library/caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    tag: "2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+    digest: "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+    # Full pinned ref: docker.io/library/caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
 policy:
   image:
@@ -44,14 +44,14 @@ policy:
 redis:
   image:
     repository: docker.io/library/redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
-    digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+    digest: "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 
 budgetRedis:
   image:
     repository: docker.io/library/redis
-    tag: "7.4.9-alpine@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
-    digest: "sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee"
+    tag: "7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+    digest: "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 
 ollama:
   image:
@@ -74,8 +74,13 @@ grafana:
 postgres:
   image:
     repository: docker.io/pgvector/pgvector
-    tag: "0.8.2-pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
-    digest: "sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff"
+    # FINDING-V412-K8S-PG-SSL (Captain, 2026-07-24): digest re-verified live via
+    # `docker buildx imagetools inspect` — the previously pinned digest
+    # (7d400e340e...) no longer resolves (upstream republished the tag);
+    # `docker manifest inspect` on the old pin returned "manifest verification
+    # failed". Re-pinned to the current, live-verified index digest.
+    tag: "0.8.2-pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
+    digest: "sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
 
 pgbouncer:
   image:

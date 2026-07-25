@@ -96,12 +96,19 @@ class TestC2AdminSocket:
 
     @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
     def test_unix_socket_in_compose_caddyfiles(self, name: str, path: pathlib.Path):
-        """All compose Caddyfiles must use admin unix socket."""
+        """All compose Caddyfiles must use admin unix socket.
+
+        FINDING-V412-CADDYADMIN-001 fix (2026-07-21): the raw admin API now
+        lives on a caddy-PRIVATE path (/run/caddy-admin) that is never
+        bind-mounted into backoffice — see TestCaddyAdmin001ReloadRelay below
+        for the narrow /run/caddy relay backoffice actually talks to.
+        """
         text = _load(path)
-        assert "admin unix//run/caddy/admin.sock" in text, (
-            f"Caddyfile.{name}: admin must use unix socket "
-            f"('admin unix//run/caddy/admin.sock'), not TCP :2019. "
-            f"C2 / MUST-4 / v2.24.1 hardening."
+        assert "admin unix//run/caddy-admin/admin.sock" in text, (
+            f"Caddyfile.{name}: admin must use a CADDY-PRIVATE unix socket "
+            f"('admin unix//run/caddy-admin/admin.sock'), not TCP :2019 and "
+            f"not the backoffice-shared path. C2 / MUST-4 / v2.24.1 hardening "
+            f"+ FINDING-V412-CADDYADMIN-001."
         )
 
     def test_unix_socket_in_helm_caddyfile(self):
@@ -159,6 +166,410 @@ class TestC2AdminSocket:
             "The Caddy admin port must never be exposed as a K8s NetworkPolicy "
             "ingress rule — it is unix-socket-only (C2)."
         )
+
+
+# ---------------------------------------------------------------------------
+# FINDING-V412-CADDYADMIN-002 — route-registration contract (REWORK)
+# ---------------------------------------------------------------------------
+#
+# REWORK of the FINDING-V412-CADDYADMIN-001 R1+R2 broker (5443f11f) after
+# Laura's final re-attack (laura-final-reattack.md) proved that design FAILED
+# live: BLOCKER-A (the broker's own `caddy adapt` EPERM'd under
+# no-new-privileges — every legitimate reload 502'd) and BLOCKER-B (R2 was
+# still open — backoffice could drop a rogue docker/caddy/agents/*.caddy
+# file, bypassing the broker entirely via Caddy's own container-start/
+# restart import). See docker/caddy/config_broker.py module docstring for
+# the full writeup and src/tests/unit/test_v412_caddy_config_broker.py for
+# the validation-LOGIC regression suite. This class verifies the WIRING:
+# the old raw-/load relay is GONE, the broker owns a dedicated route socket,
+# the dynamic-agents directory is broker-owned, and backoffice's RW install
+# tree correctly RO-shadows the static agents directory.
+
+_BROKER_PY = _DOCKER / "caddy" / "config_broker.py"
+_BROKER_DOCKERFILE = _DOCKER / "caddy" / "Dockerfile.caddy-broker"
+
+
+def _compose_broker_svc(text: str) -> dict:
+    data = yaml.safe_load(text)
+    assert "services" in data and "caddy-config-broker" in data["services"], (
+        "caddy-config-broker service missing from docker-compose.yml"
+    )
+    return data["services"]["caddy-config-broker"]
+
+
+def _compose_backoffice_svc(text: str) -> dict:
+    data = yaml.safe_load(text)
+    assert "services" in data and "backoffice" in data["services"]
+    return data["services"]["backoffice"]
+
+
+class TestCaddyAdmin002OldRelayRemoved:
+    """The OLD raw-/load reload relay (FINDING-V412-CADDYADMIN-001 R1 fix)
+    must be completely gone — it's exactly the mechanism BLOCKER-A/R1
+    depended on."""
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_old_reload_relay_site_block_absent(self, name: str, path: pathlib.Path):
+        text = _load(path)
+        assert "MCP-onboarding reload relay" not in text, (
+            f"Caddyfile.{name}: the OLD raw-/load relay site block must be "
+            f"removed entirely — FINDING-V412-CADDYADMIN-002 replaces it "
+            f"with backoffice talking directly to caddy-config-broker."
+        )
+        assert ":9999 {" not in text, (
+            f"Caddyfile.{name}: the old relay's inert placeholder site "
+            f"address must be gone."
+        )
+        assert "reverse_proxy unix//run/caddy-broker/broker.sock" not in text, (
+            f"Caddyfile.{name}: no reference to the old broker socket path "
+            f"should remain."
+        )
+
+    def test_old_caddy_admin_sock_volume_absent(self):
+        data = yaml.safe_load(_load(_COMPOSE))
+        assert "caddy_admin_sock" not in data.get("volumes", {}), (
+            "docker-compose.yml: the OLD caddy_admin_sock volume (backoffice-"
+            "shared reload relay) must be removed — FINDING-V412-CADDYADMIN-002."
+        )
+        assert "caddy_broker_sock" not in data.get("volumes", {}), (
+            "docker-compose.yml: the OLD caddy_broker_sock volume (caddy-"
+            "dials-broker) must be removed — caddy is no longer a peer of "
+            "the broker at all post-rework."
+        )
+
+    def test_caddy_service_no_longer_mounts_backoffice_relay_socket(self):
+        svc = _compose_caddy_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        assert not any("caddy_admin_sock" in str(v) for v in volumes), (
+            "docker-compose.yml caddy: must not mount caddy_admin_sock — "
+            "the relay it served is removed."
+        )
+        assert not any("caddy_broker_sock" in str(v) for v in volumes), (
+            "docker-compose.yml caddy: must not mount caddy_broker_sock — "
+            "caddy no longer talks to the broker over any shared socket."
+        )
+
+
+class TestCaddyAdmin002BrokerRouteSocket:
+    """The NEW contract: backoffice <-> caddy-config-broker over a dedicated
+    socket, NEVER shared with caddy."""
+
+    def test_backoffice_mounts_broker_route_socket(self):
+        svc = _compose_backoffice_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        assert any(
+            "caddy_broker_route_sock:/run/caddy-broker-route" in str(v)
+            for v in volumes
+        ), (
+            "docker-compose.yml backoffice: missing caddy_broker_route_sock "
+            "mount — the ONLY channel backoffice has to register MCP routes "
+            "post-rework."
+        )
+
+    def test_backoffice_no_longer_mounts_caddyfile_or_admin_socket(self):
+        svc = _compose_backoffice_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        assert not any(
+            str(v).endswith(":/etc/caddy/Caddyfile:ro") for v in volumes
+        ), (
+            "docker-compose.yml backoffice: must not mount the monolith "
+            "Caddyfile — it no longer reads or reposts Caddy content at all."
+        )
+        assert not any("caddy_admin_sock" in str(v) for v in volumes), (
+            "docker-compose.yml backoffice: must not mount caddy_admin_sock."
+        )
+
+    def test_broker_mounts_dedicated_route_socket_not_shared_with_caddy(self):
+        broker_svc = _compose_broker_svc(_load(_COMPOSE))
+        broker_volumes = broker_svc.get("volumes", [])
+        assert any(
+            "caddy_broker_route_sock:/run/caddy-broker-route" in str(v)
+            for v in broker_volumes
+        ), "caddy-config-broker: missing caddy_broker_route_sock mount."
+
+        caddy_svc = _compose_caddy_svc(_load(_COMPOSE))
+        caddy_volumes = caddy_svc.get("volumes", [])
+        assert not any(
+            "caddy_broker_route_sock" in str(v) for v in caddy_volumes
+        ), (
+            "docker-compose.yml caddy: must NOT mount caddy_broker_route_sock "
+            "— only backoffice and the broker are peers on this socket."
+        )
+
+    def test_broker_net_pairs_backoffice_and_broker_not_caddy(self):
+        """caddy_broker_net must now pair {backoffice, caddy-config-broker}
+        — caddy is no longer a member (it never talks to the broker over
+        network; it only dials the real admin socket, a client role, via a
+        separate shared-volume unix socket)."""
+        data = yaml.safe_load(_load(_COMPOSE))
+        net = data["networks"].get("caddy_broker_net")
+        assert net is not None and net.get("internal") is True
+
+        members = [
+            name for name, svc in data["services"].items()
+            if "caddy_broker_net" in (svc.get("networks") or [])
+        ]
+        assert set(members) == {"backoffice", "caddy-config-broker"}, (
+            f"caddy_broker_net must have EXACTLY "
+            f"{{backoffice, caddy-config-broker}} as members, found "
+            f"{sorted(members)}."
+        )
+
+
+class TestCaddyAdmin002R2ClosedAtSource:
+    """BLOCKER-B: backoffice must no longer have ANY filesystem write path
+    to anything Caddy imports — docker/caddy/agents/ RO-shadowed (same
+    technique as secrets/var/.env/Caddyfile, FINDING-LIC-012 precedent) AND
+    the dynamic MCP-route directory is a separate volume never mounted into
+    backoffice at all."""
+
+    def test_agents_dir_ro_shadowed_in_backoffice(self):
+        svc = _compose_backoffice_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        shadow = next(
+            (v for v in volumes
+             if str(v).startswith("./caddy/agents:/mnt/install/docker/caddy/agents")),
+            None,
+        )
+        assert shadow is not None, (
+            "docker-compose.yml backoffice: docker/caddy/agents/ must be "
+            "RO-shadowed under /mnt/install/docker (same technique as "
+            "secrets/var/.env/Caddyfile) — without this a compromised "
+            "backoffice can still write a rogue *.caddy file via the "
+            "broader RW ./:/mnt/install/docker:rw mount (R2)."
+        )
+        assert str(shadow).endswith(":ro"), (
+            "docker-compose.yml backoffice: the docker/caddy/agents/ shadow "
+            "mount must be :ro."
+        )
+
+    def test_broker_owned_dynamic_dir_never_mounted_into_backoffice(self):
+        svc = _compose_backoffice_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        assert not any("caddy_broker_agents" in str(v) for v in volumes), (
+            "docker-compose.yml backoffice: must NEVER mount "
+            "caddy_broker_agents (the broker-owned dynamic MCP-route "
+            "directory) — R2's fix depends on backoffice having zero "
+            "filesystem path to it, not a narrowed one."
+        )
+
+    def test_broker_owns_dynamic_dir_rw(self):
+        svc = _compose_broker_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        mount = next(
+            (v for v in volumes
+             if str(v).startswith("caddy_broker_agents:/etc/caddy/agents-dynamic")),
+            None,
+        )
+        assert mount is not None, (
+            "docker-compose.yml caddy-config-broker: missing the "
+            "caddy_broker_agents:/etc/caddy/agents-dynamic mount."
+        )
+        assert str(mount).endswith(":rw"), (
+            "docker-compose.yml caddy-config-broker: the dynamic-agents "
+            "mount must be :rw — this is the ONLY legitimate writer."
+        )
+
+    def test_caddy_mounts_dynamic_dir_readonly(self):
+        svc = _compose_caddy_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        mount = next(
+            (v for v in volumes
+             if str(v).startswith("caddy_broker_agents:/etc/caddy/agents-dynamic")),
+            None,
+        )
+        assert mount is not None and str(mount).endswith(":ro"), (
+            "docker-compose.yml caddy: caddy_broker_agents must be mounted "
+            "read-only."
+        )
+
+    @pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+    def test_dynamic_agents_import_sentinel_present(self, name: str, path: pathlib.Path):
+        text = _load(path)
+        assert "import /etc/caddy/agents-dynamic/*.caddy" in text, (
+            f"Caddyfile.{name}: missing the broker-owned dynamic-agents "
+            f"import sentinel."
+        )
+        # Must appear AFTER the static agents sentinel (ordering is cosmetic
+        # here, but pins the documented contract).
+        static_idx = text.index("import /etc/caddy/agents/*.caddy")
+        dynamic_idx = text.index("import /etc/caddy/agents-dynamic/*.caddy")
+        assert static_idx < dynamic_idx
+
+
+class TestCaddyAdmin002BrokerCapabilityStrip:
+    """BLOCKER-A: the broker's copy of the caddy binary must have its file
+    capability stripped at build time — the root cause of the live 502s
+    Laura measured (execve EPERM under no-new-privileges when the binary
+    would gain a capability it doesn't already have)."""
+
+    def test_broker_script_exists(self):
+        assert _BROKER_PY.exists()
+
+    def test_broker_script_compiles(self):
+        import ast
+        ast.parse(_load(_BROKER_PY))
+
+    def test_broker_dockerfile_exists(self):
+        assert _BROKER_DOCKERFILE.exists()
+
+    def test_broker_dockerfile_strips_caddy_capability(self):
+        text = _load(_BROKER_DOCKERFILE)
+        assert "setcap -r" in text, (
+            "Dockerfile.caddy-broker: missing the `setcap -r` step that "
+            "strips the caddy binary's file capability — without it, "
+            "`caddy adapt` EPERMs under this container's "
+            "no-new-privileges security_opt (BLOCKER-A, verified live)."
+        )
+        assert "getcap" in text, (
+            "Dockerfile.caddy-broker: the setcap step must VERIFY the strip "
+            "succeeded (getcap check + FATAL exit on any remaining "
+            "capability), not just attempt it."
+        )
+
+    def test_broker_dockerfile_no_longer_bakes_a_baseline(self):
+        """The old build-time baseline stage (adapted-<mode>.json) is gone —
+        the broker now self-checks fresh from RO-trusted live sources on
+        every call (safe post-rework: nothing feeding it is backoffice-
+        writable anymore)."""
+        text = _load(_BROKER_DOCKERFILE)
+        assert "AS baseline" not in text
+        assert "/app/reference" not in text
+
+    def test_broker_dockerfile_pins_caddy_digest(self):
+        """The broker's caddy binary must come from the SAME digest-pinned
+        image as the real caddy service (docker/caddy/Dockerfile.caddy) —
+        drift here would mean the broker's self-checks run a different
+        Caddyfile-adapter version than what actually runs."""
+        broker_text = _load(_BROKER_DOCKERFILE)
+        real_caddy_text = _load(_DOCKER / "caddy" / "Dockerfile.caddy")
+        broker_digest = re.search(
+            r"caddy:2\.11\.2-alpine@sha256:[0-9a-f]+", broker_text,
+        )
+        real_digest = re.search(
+            r"caddy:2\.11\.2-alpine@sha256:[0-9a-f]+", real_caddy_text,
+        )
+        assert broker_digest and real_digest
+        assert broker_digest.group(0) == real_digest.group(0)
+
+    def test_broker_runs_as_nonroot(self):
+        text = _load(_BROKER_DOCKERFILE)
+        assert re.search(r"^USER 65532:65532\s*$", text, re.MULTILINE)
+
+    def test_broker_no_secrets_mounted(self):
+        svc = _compose_broker_svc(_load(_COMPOSE))
+        volumes = svc.get("volumes", [])
+        assert not any("/run/secrets" in str(v) for v in volumes), (
+            "docker-compose.yml caddy-config-broker: must not mount "
+            "/run/secrets — this service needs no cert/key material."
+        )
+
+    def test_broker_hardening_parity_with_extractor_svc(self):
+        svc = _compose_broker_svc(_load(_COMPOSE))
+        assert svc.get("cap_drop") == ["ALL"]
+        assert svc.get("read_only") is True
+        sec_opts = svc.get("security_opt", [])
+        assert any("no-new-privileges:true" in o for o in sec_opts)
+        assert any("seccomp" in str(o) for o in sec_opts)
+
+
+# ---------------------------------------------------------------------------
+# FINDING-V412-CADDYADMIN-002 — K8s parity (helm)
+# ---------------------------------------------------------------------------
+
+class TestCaddyAdmin002HelmParity:
+    """K8s :2019 relay must route through the SAME broker DATA contract as
+    compose. R2 (rogue docker/caddy/agents/*.caddy) still has NO K8s
+    equivalent (zero chart RBAC rules grant any workload configmaps
+    access) — the dynamic-agents emptyDir is pod-local and shared ONLY
+    between the caddy container and the broker sidecar."""
+
+    def test_relay_proxies_route_not_load(self):
+        text = _load(_CONFIGMAPS_YAML)
+        assert "path /route" in text, (
+            "configmaps.yaml: the :2019 relay must matcher-gate on "
+            "path /route (the new DATA-only contract), not the old raw "
+            "/load body."
+        )
+        assert "path /load" not in text, (
+            "configmaps.yaml: the OLD raw-/load matcher must be removed."
+        )
+        assert "method POST DELETE" in text, (
+            "configmaps.yaml: the relay must admit both POST (register) "
+            "and DELETE (unregister) for /route."
+        )
+
+    def test_relay_proxies_to_broker_sidecar(self):
+        text = _load(_CONFIGMAPS_YAML)
+        assert "reverse_proxy 127.0.0.1:{{ .Values.caddy.configBroker.port }}" in text
+
+    def test_dynamic_agents_import_sentinel_present(self):
+        text = _load(_CONFIGMAPS_YAML)
+        assert "import /etc/caddy/agents-dynamic/*.caddy" in text
+
+    def test_broker_sidecar_present_in_caddy_pod(self):
+        text = _load(_CADDY_YAML)
+        assert "caddy-config-broker" in text
+
+    def test_broker_sidecar_hardened(self):
+        text = _load(_CADDY_YAML)
+        idx = text.index("name: caddy-config-broker")
+        next_container = text.find("\n        - name:", idx + 1)
+        block = text[idx:next_container if next_container != -1 else idx + 3000]
+        assert "runAsNonRoot: true" in block
+        assert "runAsUser: 65532" in block
+        assert 'drop: ["ALL"]' in block
+        assert "readOnlyRootFilesystem: true" in block
+        assert "allowPrivilegeEscalation: false" in block
+
+    def test_broker_sidecar_no_secrets_mount(self):
+        text = _load(_CADDY_YAML)
+        idx = text.index("name: caddy-config-broker")
+        next_container = text.find("\n        - name:", idx + 1)
+        block = text[idx:next_container if next_container != -1 else idx + 3000]
+        assert "pki-certs" not in block
+
+    def test_broker_sidecar_writes_dynamic_agents_dir(self):
+        text = _load(_CADDY_YAML)
+        idx = text.index("name: caddy-config-broker")
+        next_container = text.find("\n        - name:", idx + 1)
+        block = text[idx:next_container if next_container != -1 else idx + 3000]
+        assert "caddy-agents-dynamic" in block
+        assert "BROKER_AGENTS_DYNAMIC_DIR" in block
+
+    def test_caddy_container_mounts_dynamic_agents_dir_readonly(self):
+        text = _load(_CADDY_YAML)
+        idx = text.index("- name: caddy\n")
+        next_container = text.find("\n        - name:", idx + 1)
+        block = text[idx:next_container if next_container != -1 else idx + 3000]
+        assert "caddy-agents-dynamic" in block
+
+    def test_backoffice_no_longer_mounts_caddyfile_configmap(self):
+        """FINDING-V412-CADDYADMIN-002: backoffice no longer reads the
+        monolith Caddyfile on K8s at all — it sends route DATA only."""
+        text = _load(_REPO / "helm" / "yashigani" / "templates" / "backoffice.yaml")
+        assert "YASHIGANI_CADDY_CADDYFILE" not in text
+
+    def test_no_workload_rbac_grants_configmaps(self):
+        """Regression guard for the R2-has-no-K8s-equivalent safety
+        argument: if a future change ever grants any workload ServiceAccount
+        configmaps RBAC, that assumption breaks silently — this must be
+        caught, not just documented."""
+        offending = []
+        for p in _HELM_TEMPLATES.glob("*.yaml"):
+            text = _load(p)
+            if "configmaps" in text and "resources:" in text:
+                if re.search(r'resources:\s*\[[^\]]*"?configmaps"?', text) or \
+                   re.search(r'resources:\s*\n(\s*-\s*.*\n)*\s*-\s*"?configmaps"?', text):
+                    offending.append(p.name)
+        assert not offending, (
+            f"RBAC rule(s) granting 'configmaps' found in {offending} — "
+            f"this INVALIDATES the R2-has-no-K8s-equivalent safety argument "
+            f"(a workload could now write a rogue agents ConfigMap the same "
+            f"way backoffice could on compose pre-fix). Re-audit "
+            f"FINDING-V412-CADDYADMIN-002."
+        )
+
 
 
 # ---------------------------------------------------------------------------
