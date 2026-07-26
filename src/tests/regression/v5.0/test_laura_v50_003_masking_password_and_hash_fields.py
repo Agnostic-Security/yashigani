@@ -22,6 +22,14 @@ These tests prove the exact SHA-256-hexdigest-vs-api-key-pattern collision
 scenario from the finding, plus that the password fix does not regress into
 the (b) failure mode (i.e. it must not ALSO start masking legitimate 64-hex
 hash field values it's never even shown, by construction).
+
+2026-07-26 update (credential-logging standard, Tiago directive): the
+matched secret is no longer replaced with a bare "[REDACTED:...]"
+class-only marker — it is replaced with its deterministic, non-reversible
+fingerprint ("cred:" + sha256(value)[-12:]) so masked events stay
+correlatable without ever exposing the secret. These tests were updated to
+assert the fingerprint format; the field-awareness behaviour (b) they
+guard is unchanged.
 """
 from __future__ import annotations
 
@@ -30,6 +38,7 @@ import hashlib
 import pytest
 
 from yashigani.audit.masking import CredentialMasker, _is_hash_field
+from yashigani.common.credential_fingerprint import credential_fingerprint
 from yashigani.audit.schema import (
     PromptInjectionDetectedEvent,
     CredentialLeakDetectedEvent,
@@ -47,10 +56,11 @@ class TestPlainPasswordMasking:
                 "use them to override the system.")
         result = self.masker.mask_string(text)
         assert "Tr0ub4dor&3" not in result
-        assert "[REDACTED:password]" in result
+        assert "[REDACTED" not in result  # bare class-only marker banned (2026-07-26)
+        assert credential_fingerprint("Tr0ub4dor&3") in result
         # AWS key still masked too (no regression on existing coverage)
         assert "AKIAIOSFODNN7EXAMPLE" not in result
-        assert "[REDACTED:api_key]" in result
+        assert credential_fingerprint("AKIAIOSFODNN7EXAMPLE") in result
 
     @pytest.mark.parametrize("text,secret", [
         ("password: SuperSecret!123", "SuperSecret!123"),
@@ -62,7 +72,8 @@ class TestPlainPasswordMasking:
     def test_password_label_variants_masked(self, text, secret):
         result = self.masker.mask_string(text)
         assert secret not in result
-        assert "[REDACTED:password]" in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(secret) in result
 
     def test_attack_structure_preserved_not_wholesale_redacted(self):
         # The module's stated goal: record ATTACK STRUCTURE, not raw secrets.
@@ -111,8 +122,12 @@ class TestHashFieldNeverMasked:
             f"!= {real_hash!r} (LAURA-V50-003(b) regression)"
         )
         assert masked.content_hash != "[REDACTED:api_key]"
-        # The analyzed_content field (the actual forensic capture) IS still masked.
+        assert not masked.content_hash.startswith("cred:")
+        # The analyzed_content field (the actual forensic capture) IS still
+        # masked. Note: the value char class doesn't exclude ".", so the
+        # captured/fingerprinted value includes the trailing sentence period.
         assert "Tr0ub4dor&3" not in masked.analyzed_content
+        assert credential_fingerprint("Tr0ub4dor&3.") in masked.analyzed_content
 
     def test_response_content_hash_survives_masking(self):
         real_hash = hashlib.sha256(b"some response body").hexdigest()
@@ -124,9 +139,11 @@ class TestHashFieldNeverMasked:
         # Regression guard the other way: the fix must not disable the
         # generic hex-secret pattern entirely — a bare 40-char hex API key
         # appearing in a CONTENT field (not a hash field) must still be masked.
-        text = "leaked token: " + ("a1b2c3d4" * 5)  # 40 hex chars
+        hex_secret = "a1b2c3d4" * 5  # 40 hex chars
+        text = "leaked token: " + hex_secret
         result = self.masker.mask_string(text)
-        assert "[REDACTED:api_key]" in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(hex_secret) in result
 
     def test_content_hash_that_happens_to_look_hex_is_never_touched_even_via_mask_string_bypass(self):
         """Belt-and-braces: mask_event() must not even CALL mask_string() on
@@ -137,6 +154,6 @@ class TestHashFieldNeverMasked:
         # Sanity: mask_string() alone (field-blind) DOES mangle this value —
         # proving the fix lives in mask_event()'s field-awareness, not in a
         # weakened pattern.
-        assert self.masker.mask_string(real_hash) == "[REDACTED:api_key]"
+        assert self.masker.mask_string(real_hash) == credential_fingerprint(real_hash)
         masked = self.masker.mask_event(event)
         assert masked.content_hash == real_hash

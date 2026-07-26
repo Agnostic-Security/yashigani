@@ -13,6 +13,7 @@ import pytest
 
 from yashigani.audit.config import AuditConfig
 from yashigani.audit.masking import CredentialMasker, IMMUTABLE_FLOOR_EVENTS
+from yashigani.common.credential_fingerprint import credential_fingerprint
 from yashigani.audit.schema import (
     AuditEvent,
     CredentialLeakDetectedEvent,
@@ -33,44 +34,70 @@ from yashigani.audit.export import AuditLogExporter
 # ---------------------------------------------------------------------------
 
 class TestCredentialMasker:
+    """
+    2026-07-26 credential-logging standard (Tiago directive): a bare
+    "[REDACTED:...]" class-only marker is not enough — every matched
+    credential is replaced with its deterministic, non-reversible
+    fingerprint ("cred:" + sha256(value)[-12:]) so events stay
+    correlatable without ever exposing the secret. See
+    yashigani.common.credential_fingerprint.credential_fingerprint().
+    """
     masker = CredentialMasker()
 
     def test_masks_jwt(self):
-        text = "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c end"
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        text = f"token {jwt} end"
         result = self.masker.mask_string(text)
-        assert "[REDACTED:jwt]" in result
         assert "eyJhbGci" not in result
+        assert "[REDACTED" not in result  # bare class-only marker banned
+        assert credential_fingerprint(jwt) in result
 
     def test_masks_bearer(self):
-        text = "Authorization: Bearer abc123def456ghi789"
+        token = "abc123def456ghi789"
+        text = f"Authorization: Bearer {token}"
         result = self.masker.mask_string(text)
-        assert "[REDACTED:bearer]" in result
         assert "abc123def456" not in result
+        assert "[REDACTED" not in result
+        assert f"Bearer {credential_fingerprint(token)}" in result
 
     def test_masks_sk_api_key(self):
-        text = "key=sk-abcdefghijklmnopqrstuvwxyz123456"
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        text = f"key={secret}"
         result = self.masker.mask_string(text)
-        assert "[REDACTED:api_key]" in result
+        assert secret not in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(secret) in result
 
     def test_masks_github_pat(self):
-        text = "token ghp_" + "A" * 36
+        secret = "ghp_" + "A" * 36
+        text = f"token {secret}"
         result = self.masker.mask_string(text)
-        assert "[REDACTED:api_key]" in result
+        assert secret not in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(secret) in result
 
     def test_masks_aws_key(self):
-        text = "AKIAIOSFODNN7EXAMPLE"
-        result = self.masker.mask_string(text)
-        assert "[REDACTED:api_key]" in result
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        result = self.masker.mask_string(secret)
+        assert secret not in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(secret) in result
 
     def test_masks_pem_header(self):
-        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK..."
+        header = "-----BEGIN RSA PRIVATE KEY-----"
+        text = f"{header}\nMIIEowIBAAK..."
         result = self.masker.mask_string(text)
-        assert "[REDACTED:private_key]" in result
+        assert header not in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(header) in result
 
     def test_masks_basic_auth(self):
-        text = "Authorization: Basic dXNlcjpwYXNzd29yZA=="
+        token = "dXNlcjpwYXNzd29yZA=="
+        text = f"Authorization: Basic {token}"
         result = self.masker.mask_string(text)
-        assert "[REDACTED:basic_auth]" in result
+        assert token not in result
+        assert "[REDACTED" not in result
+        assert f"Basic {credential_fingerprint(token)}" in result
 
     def test_clean_string_unchanged(self):
         text = "Hello, this is a normal log message with no secrets."
@@ -78,26 +105,50 @@ class TestCredentialMasker:
         assert result == text
 
     def test_mask_dict_recursive(self):
+        bearer_token = "abc123def456ghi789jkl"
+        sk_secret = "sk-" + "x" * 25
         data = {
-            "message": "Bearer abc123def456ghi789jkl",
-            "nested": {"token": "sk-" + "x" * 25},
+            "message": f"Bearer {bearer_token}",
+            "nested": {"token": sk_secret},
             "count": 42,
         }
         result = self.masker.mask_dict(data)
-        assert "[REDACTED:bearer]" in result["message"]
-        assert "[REDACTED:api_key]" in result["nested"]["token"]
+        assert f"Bearer {credential_fingerprint(bearer_token)}" in result["message"]
+        assert result["nested"]["token"] == credential_fingerprint(sk_secret)
         assert result["count"] == 42
 
     def test_mask_event_strings(self):
+        bearer_token = "abc123defghijklmnopqrstu"
         event = AdminLoginEvent(
             account_tier="admin",
             admin_account="admin1",
             outcome="failure",
-            failure_reason="Bearer abc123defghijklmnopqrstu",
+            failure_reason=f"Bearer {bearer_token}",
         )
         masked = CredentialMasker().mask_event(event)
-        assert "[REDACTED:bearer]" in masked.failure_reason
+        assert masked.failure_reason == f"Bearer {credential_fingerprint(bearer_token)}"
         assert masked.admin_account == "admin1"
+
+    def test_fingerprint_is_deterministic_same_secret_same_fingerprint(self):
+        """Round-trip: the SAME secret produces the SAME fingerprint every
+        time it's masked, so operators can correlate events without the
+        plaintext ever being logged."""
+        secret = "sk-" + "z" * 30
+        result_a = self.masker.mask_string(f"first use: {secret}")
+        result_b = self.masker.mask_string(f"second use, elsewhere: {secret}")
+        fp_a = result_a.split("first use: ", 1)[1]
+        fp_b = result_b.split("elsewhere: ", 1)[1]
+        assert fp_a == fp_b
+        assert fp_a == credential_fingerprint(secret)
+
+    def test_fingerprint_never_bare_redacted_marker(self):
+        """The 2026-07-26 standard explicitly bans the old bare
+        "[REDACTED:...]" class-only marker — it must be a correlatable
+        fingerprint."""
+        text = "password: hunter2, and sk-" + "a" * 25
+        result = self.masker.mask_string(text)
+        assert "REDACTED" not in result
+        assert "hunter2" not in result
 
     def test_raw_query_logged_always_false(self):
         event = PromptInjectionDetectedEvent(

@@ -1,6 +1,16 @@
 """
 Yashigani Audit — Credential masking pipeline.
 Applied to all content before it reaches any model or log sink.
+
+Credential-logging standard (Tiago directive 2026-07-26): a credential must
+NEVER appear in plaintext in any log or audit record, and a bare
+"[REDACTED:...]" class-only marker is not enough (it destroys
+correlatability). Every matched secret below is replaced with its
+deterministic, non-reversible fingerprint — see
+``yashigani.common.credential_fingerprint`` — so events stay correlatable
+("this same credential appeared in N other events") without ever exposing
+the secret value. This supersedes the bare-marker replacement text used by
+LAURA-V50-003: still no plaintext, but now correlatable.
 """
 from __future__ import annotations
 
@@ -10,6 +20,7 @@ import re
 from typing import Any
 
 from yashigani.audit.schema import AuditEvent
+from yashigani.common.credential_fingerprint import credential_fingerprint
 
 # ---------------------------------------------------------------------------
 # Immutable floor — these event types are ALWAYS masked regardless of config
@@ -117,44 +128,70 @@ def _is_never_masked_field(field_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Replacement callables — each returns the fingerprint of the ACTUAL matched
+# secret value (never a class-only placeholder). Structural context (the
+# "Bearer "/"Basic " scheme prefix, the "password:" label) is preserved
+# where present so the attack/log STRUCTURE stays legible; only the secret
+# value itself is replaced.
+# ---------------------------------------------------------------------------
+
+def _fingerprint_whole_match(match: re.Match) -> str:
+    """Replacement for patterns where the entire match IS the secret."""
+    return credential_fingerprint(match.group(0))
+
+
+def _fingerprint_bearer(match: re.Match) -> str:
+    return f"Bearer {credential_fingerprint(match.group(1))}"
+
+
+def _fingerprint_basic(match: re.Match) -> str:
+    return f"Basic {credential_fingerprint(match.group(1))}"
+
+
+def _fingerprint_password(match: re.Match) -> str:
+    return f"{match.group(1)}: {credential_fingerprint(match.group(2))}"
+
+
+# ---------------------------------------------------------------------------
 # Regex patterns — compiled once at module import
 # ---------------------------------------------------------------------------
 
-_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # JWT  (three base64url segments)
+_PATTERNS: list[tuple[re.Pattern, Any]] = [
+    # JWT  (three base64url segments) — whole match is the secret.
     (re.compile(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'),
-     "[REDACTED:jwt]"),
-    # Bearer token in header/string
-    (re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', re.IGNORECASE),
-     "[REDACTED:bearer]"),
+     _fingerprint_whole_match),
+    # Bearer token in header/string — fingerprint the token, keep the scheme.
+    (re.compile(r'Bearer\s+([A-Za-z0-9\-._~+/]+=*)', re.IGNORECASE),
+     _fingerprint_bearer),
     # LAURA-V50-003(a): labelled plain-password disclosure — "password is X",
     # "password: X", "pwd=X". Plain passwords don't match any vendor-format
     # pattern below (not hex, no known key prefix), so they previously leaked
     # in cleartext into forensically-captured audit content. Keeps the label
-    # (attack structure) but drops the value.
-    (re.compile(r'(?i)\b(password|passwd|pwd)\b\s*(?:is\s+|[:=]\s*)[\'"]?[^\s\'",;]+'),
-     r'\1: [REDACTED:password]'),
-    # OpenAI / Anthropic / generic sk- keys
+    # (attack structure) but drops the value, replacing it with its
+    # fingerprint (2026-07-26 credential-logging standard).
+    (re.compile(r'(?i)\b(password|passwd|pwd)\b\s*(?:is\s+|[:=]\s*)[\'"]?([^\s\'",;]+)'),
+     _fingerprint_password),
+    # OpenAI / Anthropic / generic sk- keys — whole match is the secret.
     (re.compile(r'sk-[A-Za-z0-9]{20,}'),
-     "[REDACTED:api_key]"),
-    # GitHub personal access token
+     _fingerprint_whole_match),
+    # GitHub personal access token — whole match is the secret.
     (re.compile(r'ghp_[A-Za-z0-9]{36}'),
-     "[REDACTED:api_key]"),
-    # GitLab PAT
+     _fingerprint_whole_match),
+    # GitLab PAT — whole match is the secret.
     (re.compile(r'glpat-[A-Za-z0-9\-]{20,}'),
-     "[REDACTED:api_key]"),
-    # AWS access key ID
+     _fingerprint_whole_match),
+    # AWS access key ID — whole match is the secret.
     (re.compile(r'AKIA[0-9A-Z]{16}'),
-     "[REDACTED:api_key]"),
-    # 32–64 char hex strings (generic secret)
+     _fingerprint_whole_match),
+    # 32–64 char hex strings (generic secret) — whole match is the secret.
     (re.compile(r'\b[0-9a-fA-F]{32,64}\b'),
-     "[REDACTED:api_key]"),
-    # PEM private key header
+     _fingerprint_whole_match),
+    # PEM private key header — whole match is the secret marker.
     (re.compile(r'-----BEGIN [A-Z ]+PRIVATE KEY-----'),
-     "[REDACTED:private_key]"),
-    # Basic auth header
-    (re.compile(r'Basic\s+[A-Za-z0-9+/=]{8,}', re.IGNORECASE),
-     "[REDACTED:basic_auth]"),
+     _fingerprint_whole_match),
+    # Basic auth header — fingerprint the credential, keep the scheme.
+    (re.compile(r'Basic\s+([A-Za-z0-9+/=]{8,})', re.IGNORECASE),
+     _fingerprint_basic),
 ]
 
 
@@ -162,6 +199,11 @@ class CredentialMasker:
     """
     Applies all credential-detection patterns to strings and dicts.
     Thread-safe (stateless after init — compiled patterns are read-only).
+
+    Every matched secret is replaced with its deterministic fingerprint
+    (``cred:<12 hex chars>`` — see ``credential_fingerprint()``), never a
+    bare class-only marker and never the plaintext (2026-07-26 credential-
+    logging standard).
     """
 
     def mask_string(self, text: str) -> str:

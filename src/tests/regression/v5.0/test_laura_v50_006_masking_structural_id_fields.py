@@ -26,6 +26,12 @@ class rather than one field at a time. Free-form/captured-payload fields
 `_digest`/`_shaNNN` and remain fully masked, preserving LAURA-V50-003(a)'s
 plain-password-in-content coverage and LAURA-V50-003(b)'s content_hash
 integrity-field fix.
+
+2026-07-26 update (credential-logging standard, Tiago directive): masked
+secrets are now replaced with their deterministic fingerprint
+("cred:" + sha256(value)[-12:]), not a bare "[REDACTED:...]" marker. Tests
+updated accordingly; the field-exemption behaviour this file guards is
+unchanged.
 """
 from __future__ import annotations
 
@@ -38,6 +44,7 @@ from yashigani.audit.masking import (
     _is_hash_field,
     _is_never_masked_field,
 )
+from yashigani.common.credential_fingerprint import credential_fingerprint
 from yashigani.audit.schema import RulePromotionEvent
 
 
@@ -103,6 +110,7 @@ class TestStructuralIdFieldsNeverMasked:
             f"!= {real_candidate_id!r} (LAURA-V50-006 regression)"
         )
         assert masked.candidate_id != "[REDACTED:api_key]"
+        assert masked.candidate_id != credential_fingerprint(real_candidate_id)
 
     def test_candidate_id_survives_rule_promotion_approved_masking(self):
         real_candidate_id = uuid.uuid4().hex
@@ -121,7 +129,7 @@ class TestStructuralIdFieldsNeverMasked:
         mangle a bare uuid4().hex value, proving the fix lives in
         mask_event()'s field-awareness, not in a weakened pattern."""
         real_candidate_id = uuid.uuid4().hex
-        assert self.masker.mask_string(real_candidate_id) == "[REDACTED:api_key]"
+        assert self.masker.mask_string(real_candidate_id) == credential_fingerprint(real_candidate_id)
         event = RulePromotionEvent(candidate_id=real_candidate_id)
         masked = self.masker.mask_event(event)
         assert masked.candidate_id == real_candidate_id
@@ -138,15 +146,18 @@ class TestNoRegressionOnCredentialMasking:
         text = "password is Tr0ub4dor&3"
         result = self.masker.mask_string(text)
         assert "Tr0ub4dor&3" not in result
-        assert "[REDACTED:password]" in result
+        assert "[REDACTED" not in result  # bare class-only marker banned (2026-07-26)
+        assert credential_fingerprint("Tr0ub4dor&3") in result
 
     def test_generic_hex_secret_in_content_field_still_masked(self):
         # A bare 40-char hex API key in a CONTENT field (not an _id/_hash
         # field) must still be masked — the fix must not disable the
         # generic hex-secret pattern for legitimate free-text captures.
-        text = "leaked token: " + ("a1b2c3d4" * 5)  # 40 hex chars
+        hex_secret = "a1b2c3d4" * 5  # 40 hex chars
+        text = "leaked token: " + hex_secret
         result = self.masker.mask_string(text)
-        assert "[REDACTED:api_key]" in result
+        assert "[REDACTED" not in result
+        assert credential_fingerprint(hex_secret) in result
 
     def test_content_hash_and_candidate_id_both_survive_same_event(self):
         import hashlib
@@ -164,4 +175,5 @@ class TestNoRegressionOnCredentialMasking:
         assert masked.request_id == event.request_id
         assert masked.identity_id == "agent-42"
         assert "hunter2" not in masked.analyzed_content
-        assert "[REDACTED:password]" in masked.analyzed_content
+        assert "[REDACTED" not in masked.analyzed_content
+        assert credential_fingerprint("hunter2") in masked.analyzed_content
