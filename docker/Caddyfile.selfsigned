@@ -387,6 +387,34 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers. Root cause: this path reverse_proxy'd straight to gateway
+        # with NO forward_auth step; strip-identity-headers (site-level,
+        # above) strips any inbound X-Yashigani-Identity-Id and nothing ever
+        # re-populated it — unlike /admin/grafana etc, which forward_auth to
+        # /auth/verify-admin. backoffice's GET /auth/verify (the user-tier
+        # sibling — routes/auth.py verify_session) was fully implemented for
+        # exactly this purpose but had ZERO callers in the Caddy config.
+        # Every cookie-authenticated end user resolved to identity_id="unknown"
+        # at the gateway boundary resolver, which is never an RBAC group
+        # member, so allow_rbac denied unconditionally regardless of any
+        # configured/pushed group grant.
+        # Scoped to session-cookie-bearing requests only (@has_user_session)
+        # — Bearer/API-key agent traffic (no cookie) is unaffected and
+        # continues to resolve identity downstream exactly as before this fix.
+        # A cookie IS present but invalid/expired/admin-tier/password-change-
+        # pending → /auth/verify 401s/403s → forward_auth blocks (fail-closed).
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify
+            copy_headers X-Yashigani-Identity-Id
+            @verify_denied status 401 403
+            handle_response @verify_denied {
+                respond "Unauthorized" 401
+            }
+        }
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -426,6 +454,34 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers. Root cause: this path reverse_proxy'd straight to gateway
+        # with NO forward_auth step; strip-identity-headers (site-level,
+        # above) strips any inbound X-Yashigani-Identity-Id and nothing ever
+        # re-populated it — unlike /admin/grafana etc, which forward_auth to
+        # /auth/verify-admin. backoffice's GET /auth/verify (the user-tier
+        # sibling — routes/auth.py verify_session) was fully implemented for
+        # exactly this purpose but had ZERO callers in the Caddy config.
+        # Every cookie-authenticated end user resolved to identity_id="unknown"
+        # at the gateway boundary resolver, which is never an RBAC group
+        # member, so allow_rbac denied unconditionally regardless of any
+        # configured/pushed group grant.
+        # Scoped to session-cookie-bearing requests only (@has_user_session)
+        # — Bearer/API-key agent traffic (no cookie) is unaffected and
+        # continues to resolve identity downstream exactly as before this fix.
+        # A cookie IS present but invalid/expired/admin-tier/password-change-
+        # pending → /auth/verify 401s/403s → forward_auth blocks (fail-closed).
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify
+            copy_headers X-Yashigani-Identity-Id
+            @verify_denied status 401 403
+            handle_response @verify_denied {
+                respond "Unauthorized" 401
+            }
+        }
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified

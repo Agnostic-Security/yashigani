@@ -1485,10 +1485,18 @@ async def verify_session(request: Request):
     resp.headers["X-Forwarded-Email"] = email
     # 4.1 SEC-GAP-1: inject X-Yashigani-Identity-Id for the gateway boundary resolver.
     # Caddy propagates this via copy_headers in the forward_auth block.
+    # LAURA-V50-008 (2026-07-26): get_by_account_id() returns the FULL identity
+    # dict (see identity/registry.py — it's `self.get(identity_id)` under the
+    # hood), not the identity_id string. Assigning the dict directly to a
+    # header raised a TypeError that this except swallowed at DEBUG level —
+    # X-Yashigani-Identity-Id was silently NEVER set on ANY /auth/verify*
+    # response, on every deployment, since 4.1 SEC-GAP-1 shipped. Extract the
+    # identity_id field explicitly.
     _idreg = getattr(state, "identity_registry", None)
     if _idreg is not None:
         try:
-            _iid = _idreg.get_by_account_id(session.account_id)
+            _identity = _idreg.get_by_account_id(session.account_id)
+            _iid = _identity.get("identity_id", "") if _identity else ""
             if _iid:
                 resp.headers["X-Yashigani-Identity-Id"] = _iid
         except Exception as _idreg_exc:
@@ -1538,10 +1546,14 @@ async def verify_admin_session(request: Request):
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
     # 4.1 SEC-GAP-1: inject identity_id for forward_auth copy_headers propagation.
+    # LAURA-V50-008 (2026-07-26): get_by_account_id() returns the FULL identity
+    # dict, not the identity_id string — see verify_session() above for the
+    # full explanation. Extract the identity_id field explicitly.
     _idreg_a = getattr(state, "identity_registry", None)
     if _idreg_a is not None:
         try:
-            _iid_a = _idreg_a.get_by_account_id(session.account_id)
+            _identity_a = _idreg_a.get_by_account_id(session.account_id)
+            _iid_a = _identity_a.get("identity_id", "") if _identity_a else ""
             if _iid_a:
                 resp.headers["X-Yashigani-Identity-Id"] = _iid_a
         except Exception as _idreg_a_exc:
@@ -1687,10 +1699,14 @@ async def verify_user_session(request: Request):
     resp.headers["X-Forwarded-Name"] = record.username
     resp.headers["X-Forwarded-Email"] = email
     # 4.1 SEC-GAP-1: inject identity_id for forward_auth copy_headers propagation.
+    # LAURA-V50-008 (2026-07-26): get_by_account_id() returns the FULL identity
+    # dict, not the identity_id string — see verify_session() above for the
+    # full explanation. Extract the identity_id field explicitly.
     _idreg_u = getattr(state, "identity_registry", None)
     if _idreg_u is not None:
         try:
-            _iid_u = _idreg_u.get_by_account_id(session.account_id)
+            _identity_u = _idreg_u.get_by_account_id(session.account_id)
+            _iid_u = _identity_u.get("identity_id", "") if _identity_u else ""
             if _iid_u:
                 resp.headers["X-Yashigani-Identity-Id"] = _iid_u
         except Exception as _idreg_u_exc:

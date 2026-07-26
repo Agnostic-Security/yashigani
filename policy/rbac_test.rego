@@ -158,6 +158,66 @@ test_rbac_denial_entry_present_when_rbac_denies if {
 	d.policy_id == "yashigani.rbac.group-permission"
 }
 
+# ---------------------------------------------------------------------------
+# LAURA-V50-008 (2026-07-26) — MCP tool-call (POST /mcp/{agent}) RBAC gate.
+#
+# Live-reproduced root cause: allow_rbac itself was NEVER broken — Caddy's
+# /v1/* and /mcp/* handle blocks had NO forward_auth step, so every cookie-
+# authenticated end user's identity_id never reached input.session.identity_id
+# at all (it resolved to "unknown" — see test_allow_rbac_false_when_identity_
+# not_in_any_group above for the OPA-side proof that an unresolved identity_id
+# is correctly denied regardless of any group grant). These two tests pin the
+# EXACT scenario from the finding: POST /mcp/** grant → allow; no grant → deny.
+# ---------------------------------------------------------------------------
+
+test_allow_rbac_true_for_mcp_toolcall_with_post_grant if {
+	data.yashigani.allow_rbac with data.yashigani.rbac as {
+		"groups": {"data-team": {"allowed_resources": [
+			{"method": "*", "path_glob": "/v1/**"},
+			{"method": "POST", "path_glob": "/mcp/**"},
+		]}},
+		"user_groups": {"idnt_6e6c589d04d9": ["data-team"]},
+	}
+		with input as {
+			"session": {"identity_id": "idnt_6e6c589d04d9"},
+			"request": {"method": "POST", "path": "/mcp/cloud9-demo"},
+		}
+}
+
+test_allow_rbac_false_for_mcp_toolcall_without_post_grant if {
+	# data-team's ORIGINAL demo grant (POST /mcp/** absent, /v1/**-only) —
+	# the exact pre-grant state LAURA-V50-008 was reproduced against.
+	not data.yashigani.allow_rbac with data.yashigani.rbac as {
+		"groups": {"data-team": {"allowed_resources": [
+			{"method": "*", "path_glob": "/v1/**"},
+		]}},
+		"user_groups": {"idnt_6e6c589d04d9": ["data-team"]},
+	}
+		with input as {
+			"session": {"identity_id": "idnt_6e6c589d04d9"},
+			"request": {"method": "POST", "path": "/mcp/cloud9-demo"},
+		}
+}
+
+test_allow_rbac_false_for_mcp_toolcall_when_identity_unresolved if {
+	# The ACTUAL pre-fix failure mode: identity_id never reaches OPA (Caddy
+	# wiring gap), so input.session.identity_id is "unknown" — never a member
+	# of ANY group, even though the real identity (idnt_6e6c589d04d9) IS
+	# correctly granted POST /mcp/**. Proves the grant was unreachable
+	# because of identity resolution, not an OPA data/keying bug.
+	not data.yashigani.allow_rbac with data.yashigani.rbac as {
+		"groups": {"data-team": {"allowed_resources": [
+			{"method": "*", "path_glob": "/v1/**"},
+			{"method": "POST", "path_glob": "/mcp/**"},
+		]}},
+		"user_groups": {"idnt_6e6c589d04d9": ["data-team"]},
+	}
+		with input as {
+			"session": {"identity_id": "unknown"},
+			"request": {"method": "POST", "path": "/mcp/cloud9-demo"},
+		}
+}
+
 test_no_rbac_denial_entry_when_rbac_permits if {
 	ds := data.yashigani.denials with data.yashigani.rbac as {
 		"groups": {"eng": {"allowed_resources": [{"method": "*", "path_glob": "**"}]}},

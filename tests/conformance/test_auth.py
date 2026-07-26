@@ -597,6 +597,114 @@ class TestAuthVerifyUser:
 
 
 # ---------------------------------------------------------------------------
+# LAURA-V50-008 (2026-07-26) — X-Yashigani-Identity-Id header regression.
+#
+# IdentityRegistry.get_by_account_id() returns the FULL identity dict (see
+# yashigani/identity/registry.py — it's `self.get(identity_id)` under the
+# hood), not the identity_id string. All THREE /auth/verify* endpoints
+# (verify_session, verify_admin_session, verify_user_session) assigned that
+# dict DIRECTLY to resp.headers["X-Yashigani-Identity-Id"]. Starlette's
+# MutableHeaders.__setitem__ calls value.encode("latin-1") — a dict has no
+# .encode — raising AttributeError, silently swallowed by the surrounding
+# `except Exception: _log.debug(...)`. Net effect: X-Yashigani-Identity-Id
+# was NEVER set on ANY /auth/verify* response, on every deployment, since
+# 4.1 SEC-GAP-1 shipped — the exact mechanism LAURA-V50-008 traced live
+# (identity_id resolved to "unknown" at the gateway boundary for every
+# cookie-authenticated caller, defeating RBAC group grants unconditionally).
+# The existing TestAuthVerify*::test_*_200 tests above never caught this
+# because identity_registry is unwired (None) by default in this group's
+# fixtures — the buggy branch never executed. This fixture + these tests
+# close that gap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_identity_registry(monkeypatch):
+    """Installs a MagicMock identity_registry whose get_by_account_id()
+    returns the SAME shape the real yashigani.identity.registry.IdentityRegistry
+    returns — a full identity dict, not a bare identity_id string. This is
+    the exact contract mismatch LAURA-V50-008 found: callers in auth.py
+    treated the return value as if it were already the identity_id string."""
+    from unittest.mock import MagicMock
+
+    from yashigani.backoffice.state import backoffice_state
+
+    registry = MagicMock()
+    registry.get_by_account_id = MagicMock(return_value={
+        "identity_id": "idnt_conformance01",
+        "kind": "human",
+        "status": "active",
+    })
+    monkeypatch.setattr(backoffice_state, "identity_registry", registry, raising=False)
+    return registry
+
+
+class TestAuthVerifyIdentityIdHeader:
+    def test_verify_sets_identity_id_string_not_dict_repr(
+        self, user_client, fake_auth_service, fake_identity_registry
+    ):
+        """GET /auth/verify must forward the STRING identity_id, not the dict
+        get_by_account_id() actually returns. Before the fix, the header was
+        silently ABSENT (AttributeError swallowed at DEBUG); it must never
+        contain a Python dict repr either — that would poison
+        input.session.identity_id at the OPA RBAC gate just as badly as
+        "unknown" does (no real group is ever keyed on a str(dict))."""
+        _seed_provisioned_account(
+            fake_auth_service, account_id="conformance-userA",
+            username="verify-idheader@example.com", tier="user",
+        )
+        r = user_client.get("/auth/verify")
+        assert r.status_code == 200
+        assert r.headers.get("X-Yashigani-Identity-Id") == "idnt_conformance01", (
+            f"Expected the bare identity_id string, got {r.headers.get('X-Yashigani-Identity-Id')!r}. "
+            "LAURA-V50-008 regression: get_by_account_id() returns a dict; "
+            "the header must be set from dict['identity_id'], not the dict itself."
+        )
+        fake_identity_registry.get_by_account_id.assert_called_once_with("conformance-userA")
+
+    def test_verify_no_identity_match_omits_header(
+        self, user_client, fake_auth_service, fake_identity_registry
+    ):
+        """When get_by_account_id() returns None (no linked identity), the
+        header must be OMITTED, not set to an empty/garbage value."""
+        fake_identity_registry.get_by_account_id.return_value = None
+        _seed_provisioned_account(
+            fake_auth_service, account_id="conformance-userA",
+            username="verify-idheader-none@example.com", tier="user",
+        )
+        r = user_client.get("/auth/verify")
+        assert r.status_code == 200
+        assert "X-Yashigani-Identity-Id" not in r.headers
+
+    def test_verify_admin_sets_identity_id_string_not_dict_repr(
+        self, admin_client, fake_auth_service, fake_identity_registry
+    ):
+        """Same regression, /auth/verify-admin leg (verify_admin_session) —
+        the identical bug pattern, feeding /admin/grafana, /admin/wazuh,
+        /admin/loki, /admin/prometheus, /admin/alertmanager forward_auth."""
+        _seed_provisioned_account(
+            fake_auth_service, account_id="conformance-admin1",
+            username="verify-admin-idheader@example.com", tier="admin",
+        )
+        r = admin_client.get("/auth/verify-admin")
+        assert r.status_code == 200
+        assert r.headers.get("X-Yashigani-Identity-Id") == "idnt_conformance01"
+
+    def test_verify_user_sets_identity_id_string_not_dict_repr(
+        self, user_client, fake_auth_service, fake_identity_registry
+    ):
+        """Same regression, /auth/verify-user leg (verify_user_session) —
+        feeds /app/webui's OWUI forward_auth gate."""
+        _seed_provisioned_account(
+            fake_auth_service, account_id="conformance-userA",
+            username="verify-user-idheader@example.com", tier="user",
+        )
+        r = user_client.get("/auth/verify-user")
+        assert r.status_code == 200
+        assert r.headers.get("X-Yashigani-Identity-Id") == "idnt_conformance01"
+
+
+# ---------------------------------------------------------------------------
 # auth.py — /auth/verify-mcp
 # ---------------------------------------------------------------------------
 

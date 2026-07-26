@@ -573,6 +573,35 @@ data:
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers before proxying to gateway. CRITICAL: MUST stay byte-parity
+        # with docker/Caddyfile.{selfsigned,ca,acme}. Root cause: this path
+        # reverse_proxy'd straight to yashigani-gateway with NO forward_auth
+        # step; strip-identity-headers (above) strips any inbound
+        # X-Yashigani-Identity-Id and nothing ever re-populated it — unlike
+        # /admin/grafana etc, which forward_auth to /auth/verify-admin.
+        # backoffice's GET /auth/verify (the user-tier sibling) was fully
+        # implemented for exactly this purpose but had ZERO callers anywhere
+        # in Caddy config. Every cookie-authenticated end user resolved to
+        # identity_id="unknown" at the gateway boundary resolver, which is
+        # never an RBAC group member, so allow_rbac denied unconditionally
+        # regardless of any configured/pushed group grant.
+        # Scoped to session-cookie-bearing requests only (@has_user_session)
+        # — Bearer/API-key agent traffic (no cookie) is unaffected and
+        # continues to resolve identity downstream exactly as before this fix.
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify
+          copy_headers X-Yashigani-Identity-Id
+          @verify_denied status 401 403
+          handle_response @verify_denied {
+            respond "Unauthorized" 401
+          }
+        }
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway
@@ -595,6 +624,35 @@ data:
       }
       handle /mcp/* {
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers before proxying to gateway. CRITICAL: MUST stay byte-parity
+        # with docker/Caddyfile.{selfsigned,ca,acme}. Root cause: this path
+        # reverse_proxy'd straight to yashigani-gateway with NO forward_auth
+        # step; strip-identity-headers (above) strips any inbound
+        # X-Yashigani-Identity-Id and nothing ever re-populated it — unlike
+        # /admin/grafana etc, which forward_auth to /auth/verify-admin.
+        # backoffice's GET /auth/verify (the user-tier sibling) was fully
+        # implemented for exactly this purpose but had ZERO callers anywhere
+        # in Caddy config. Every cookie-authenticated end user resolved to
+        # identity_id="unknown" at the gateway boundary resolver, which is
+        # never an RBAC group member, so allow_rbac denied unconditionally
+        # regardless of any configured/pushed group grant.
+        # Scoped to session-cookie-bearing requests only (@has_user_session)
+        # — Bearer/API-key agent traffic (no cookie) is unaffected and
+        # continues to resolve identity downstream exactly as before this fix.
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://yashigani-backoffice:8443 {
+          {{- if .Values.mtls.enabled }}
+          import internal-mtls-backoffice
+          {{- end }}
+          import inject-caddy-verified
+          uri /auth/verify
+          copy_headers X-Yashigani-Identity-Id
+          @verify_denied status 401 403
+          handle_response @verify_denied {
+            respond "Unauthorized" 401
+          }
+        }
         reverse_proxy https://yashigani-gateway:8080 {
           {{- if .Values.mtls.enabled }}
           import internal-mtls-gateway

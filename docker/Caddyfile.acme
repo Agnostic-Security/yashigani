@@ -350,6 +350,22 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers before proxying to gateway. See docker/Caddyfile.selfsigned
+        # for full root-cause rationale. Scoped to session-cookie-bearing
+        # requests only (@has_user_session) — Bearer/API-key agent traffic
+        # (no cookie) is unaffected and resolves identity downstream as before.
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify
+            copy_headers X-Yashigani-Identity-Id
+            @verify_denied status 401 403
+            handle_response @verify_denied {
+                respond "Unauthorized" 401
+            }
+        }
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
@@ -384,6 +400,22 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-OpenWebUI-User-Role
         request_header -X-Forwarded-User
         import strip-orchestration-headers
+        # LAURA-V50-008 (2026-07-26): resolve identity_id for cookie-session
+        # callers before proxying to gateway. See docker/Caddyfile.selfsigned
+        # for full root-cause rationale. Scoped to session-cookie-bearing
+        # requests only (@has_user_session) — Bearer/API-key agent traffic
+        # (no cookie) is unaffected and resolves identity downstream as before.
+        @has_user_session header_regexp Cookie __Host-yashigani_session=
+        forward_auth @has_user_session https://backoffice:8443 {
+        import internal-mtls
+        import inject-caddy-verified
+            uri /auth/verify
+            copy_headers X-Yashigani-Identity-Id
+            @verify_denied status 401 403
+            handle_response @verify_denied {
+                respond "Unauthorized" 401
+            }
+        }
         reverse_proxy https://gateway:8080 {
         import internal-mtls
         import inject-caddy-verified
