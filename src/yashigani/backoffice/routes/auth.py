@@ -2328,6 +2328,23 @@ async def provision_totp_start(
 
     prov, _code_set = await state.auth_service.provision_totp_start(record.username)
 
+    # TOTP_PROVISION_TOKEN_ISSUED (schema.py) — a fresh seed/QR was minted for
+    # this account. Previously had zero production emitters (audit stub-emitter
+    # finding); this is the seed-issuance half of the provision lifecycle
+    # (TotpProvisionCompletedEvent already covers the confirm half).
+    if state.audit_writer is not None:
+        try:
+            from yashigani.audit.schema import TotpProvisionTokenIssuedEvent
+
+            state.audit_writer.write(
+                TotpProvisionTokenIssuedEvent(
+                    account_tier=record.account_tier,
+                    user_handle=record.username,
+                )
+            )
+        except Exception as exc:
+            _log.warning("TotpProvisionTokenIssuedEvent audit write failed: %s", exc)
+
     # Phase 13: include algorithm and digit count in the response so the client
     # can display role-appropriate instructions.
     _digit_word = f"{prov.digits}-digit"
@@ -2386,6 +2403,21 @@ async def provision_totp_confirm(
 
     ok, reason = await state.auth_service.provision_totp_confirm(record.username, body.totp_code)
     if not ok:
+        # TOTP_PROVISION_FAILED (schema.py) — previously had zero production
+        # emitters (audit stub-emitter finding); the confirm code did not
+        # match the seed issued by provision_totp_start.
+        try:
+            from yashigani.audit.schema import TotpProvisionFailedEvent
+
+            state.audit_writer.write(
+                TotpProvisionFailedEvent(
+                    account_tier=record.account_tier,
+                    user_handle=record.username,
+                    reason=reason or "invalid_code",
+                )
+            )
+        except Exception as exc:
+            _log.warning("TotpProvisionFailedEvent audit write failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -3316,7 +3348,27 @@ def _make_login_event(username: str, outcome: str, reason, account_tier: str = "
     login() line ~299 where authenticate() returned (False, None, reason) and
     no record is available.  All post-auth call sites MUST pass
     record.account_tier or session.account_tier explicitly.
+
+    Dispatches to the correct schema event by tier: a "user"-tier record (the
+    non-admin, local-password/TOTP account created via local_auth.py /
+    pg_auth.py — distinct from the SSO/SAML path, which already writes its own
+    SSOLoginSuccessEvent/SAMLLoginSuccessEvent) writes ``UserLoginEvent``
+    (auth_mode="local").  Previously EVERY tier — including "user" — was
+    force-wrapped in ``AdminLoginEvent``, so ``UserLoginEvent`` (schema.py)
+    had zero production emitters despite being the correct event for this
+    exact call site (audit stub-emitter finding).
     """
+    if account_tier == "user":
+        from yashigani.audit.schema import UserLoginEvent
+
+        return UserLoginEvent(
+            account_tier=account_tier,
+            user_handle=username,
+            auth_mode="local",
+            outcome=outcome,
+            failure_reason=reason,
+        )
+
     from yashigani.audit.schema import AdminLoginEvent
 
     return AdminLoginEvent(

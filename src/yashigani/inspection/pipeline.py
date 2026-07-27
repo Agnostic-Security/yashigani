@@ -259,6 +259,18 @@ class InspectionPipeline:
                 clean_query = san.clean_query
                 sanitized = True
 
+        # yashigani_inspection_sanitizations_total (metrics/registry.py) —
+        # "Sanitization outcomes for CREDENTIAL_EXFIL detections."  Previously
+        # had zero production emitters (metrics stub-emitter finding — 9
+        # metrics behind LIVE Prometheus alerts).
+        try:
+            from yashigani.metrics.registry import inspection_sanitizations_total
+            inspection_sanitizations_total.labels(
+                outcome="sanitized" if sanitized else "discarded"
+            ).inc()
+        except Exception:
+            pass  # metrics must never break the inspection pipeline
+
         admin_alert = {
             "alert_type": "CREDENTIAL_EXFIL_DETECTED",
             "severity": "CRITICAL",

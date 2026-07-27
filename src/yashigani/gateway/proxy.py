@@ -191,6 +191,23 @@ def create_gateway_app(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
+        # yashigani_fips_mode_active (metrics/registry.py, Nico N-002) — set
+        # once at startup from the FIPS_MODE env var, same contract as
+        # backoffice/routes/crypto_inventory.py's module-load-time set.  The
+        # gateway is a SEPARATE process/container with its own /metrics
+        # endpoint and its own OpenSSL provider chain, so the backoffice's
+        # gauge-set does not cover it — this is the gateway's own emitter
+        # (metrics stub-emitter finding: previously never set on this
+        # process, so an operator scraping the gateway's /metrics saw the
+        # default 0 regardless of the gateway container's actual FIPS_MODE).
+        # Purely informational — never fail-closes startup (SOP 1 applies to
+        # security-critical dependencies, not an attestation gauge).
+        try:
+            from yashigani.metrics.registry import fips_mode_active as _gw_fips_gauge
+            _gw_fips_gauge.set(1 if os.environ.get("FIPS_MODE", "0") == "1" else 0)
+        except Exception as _fips_exc:
+            logger.warning("Gateway: fips_mode_active gauge set failed: %s", _fips_exc)
+
         # Layer B: load the per-install caddy_internal_hmac secret.
         # Must be the FIRST thing in startup so the module-level _caddy_secret
         # is populated before any request reaches CaddyVerifiedMiddleware.

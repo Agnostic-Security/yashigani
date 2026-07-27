@@ -256,6 +256,15 @@ class PostgresLocalAuthService:
             )
 
             if not totp_ok:
+                # yashigani_auth_totp_failures_total (metrics/registry.py) —
+                # "TOTP verification failures (backoff events)". Previously
+                # had zero production emitters (metrics stub-emitter
+                # finding — 9 metrics behind LIVE Prometheus alerts).
+                try:
+                    from yashigani.metrics.registry import auth_totp_failures_total
+                    auth_totp_failures_total.labels(account_tier=record.account_tier).inc()
+                except Exception:
+                    logger.warning("Failed to increment auth_totp_failures_total metric", exc_info=True)
                 record.totp_failed_attempts += 1
                 n = record.totp_failed_attempts
                 if n >= _MAX_FAILED_ATTEMPTS:
@@ -1046,6 +1055,17 @@ def _emit_lockout_event(
     account_tier is derived from the fetched AccountRecord at call site —
     defence-in-depth: RBAC bypass visible in audit (ASVS V7.3.4).
     """
+    # yashigani_auth_lockouts_total (metrics/registry.py) — behind a LIVE
+    # Prometheus alert; previously had zero production emitters (metrics
+    # stub-emitter finding). Independent of the audit_writer being present so
+    # the metric still fires even when audit is unavailable.
+    try:
+        from yashigani.metrics.registry import auth_lockouts_total
+
+        auth_lockouts_total.labels(account_tier=account_tier).inc()
+    except Exception:
+        logger.warning("Failed to increment auth_lockouts_total metric", exc_info=True)
+
     if audit_writer is None:
         return
     try:
