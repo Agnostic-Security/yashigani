@@ -580,5 +580,8 @@ class TestSingleSessionLogoutRegression:
         mock_state.audit_writer.write.assert_called_once()
         event = mock_state.audit_writer.write.call_args[0][0]
         assert event.account_tier == "user"
-        # _make_login_event maps the first arg (session.account_id) → admin_account field
-        assert event.admin_account == "uid-audit"
+        # YSG-RISK emitter fix: a user-tier session now emits UserLoginEvent
+        # (auth_mode="local"), where the account/username maps to user_handle —
+        # previously every tier was force-wrapped in AdminLoginEvent.admin_account
+        # (the audit stub-emitter mislabel, now corrected).
+        assert event.user_handle == "uid-audit"
