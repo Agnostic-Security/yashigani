@@ -103,7 +103,12 @@ class TestFailClosedRegistry:
 
         registry = fail_closed_registry("redis exploded")
         verdict = registry.classify("anything", request_id="req-1")
-        assert verdict.label == "PROMPT_INJECTION_ONLY"
+        # YSG-RISK-138 (2026-07-27): a backend-exhausted verdict is an
+        # infrastructure failure, not a content verdict — must be labelled
+        # CLASSIFIER_ERROR (routes to the honest "inspection unavailable"
+        # disposition), never PROMPT_INJECTION_ONLY (routes to
+        # _handle_injection_only, which accuses the caller of an attack).
+        assert verdict.label == LABEL_CLASSIFIER_ERROR
         assert verdict.confidence == pytest.approx(1.0)
         assert verdict.backend == "fail_closed"
 
@@ -116,6 +121,18 @@ class TestFailClosedRegistry:
         )
         result = pipeline.process("hello", "sess-1", "agent-1", "user-1")
         assert result.action == "DISCARDED"
+        # YSG-RISK-138 regression guard (LAURA-V50-009 fidelity re-test):
+        # when the classifier backend chain is exhausted (e.g. the
+        # Caddy->Ollama relay is down), the pipeline must discard as an
+        # honest infrastructure failure, NOT mislabel benign traffic as a
+        # detected prompt injection. Before the fix this classification was
+        # PROMPT_INJECTION_ONLY and the user_alert accused the caller of
+        # "an attempt to override the assistant's instructions".
+        assert result.classification == LABEL_CLASSIFIER_ERROR
+        assert result.user_alert is not None
+        _alert = result.user_alert.get("yashigani_alert", {})
+        assert "prompt injection" not in _alert.get("reason", "").lower()
+        assert "unavailable" in _alert.get("rule", "").lower()
 
 
 class TestIdentityConcurrencyGuard:

@@ -245,8 +245,11 @@ class TestApproveTransactionCommit:
         # container (backoffice has no docker socket, LAURA-30-001) — the
         # result must carry actionable, server_id-scoped deploy guidance
         # rather than leaving the operator to guess.
+        # commands[0] = the YSG-RISK-138 SVID-mountpoint-stub mkdir;
+        # commands[-1] = the compose up (see TestDeployHint for isolated
+        # coverage of both commands).
         assert _SERVER in result.deploy_hint["commands"][0]
-        assert "compose.override.yml" in result.deploy_hint["commands"][0]
+        assert "compose.override.yml" in result.deploy_hint["commands"][-1]
 
     @pytest.mark.asyncio
     async def test_nico_contract_kwargs_passed_to_mint(self, txn_env):
@@ -277,8 +280,40 @@ class TestDeployHint:
             tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
         )
         assert hint["runtime"] == "docker"
-        assert f"{_SERVER}-compose.override.yml" in hint["commands"][0]
+        assert f"{_SERVER}-compose.override.yml" in hint["commands"][-1]
         assert "install.sh --onboard" in hint["note"]  # explicitly disambiguated
+
+    def test_docker_hint_mkdir_svid_mountpoint_stub_first(self):
+        """YSG-RISK-138 (LAURA-V50-009): the documented ceremony's first
+        command must pre-create the SVID mountpoint stub under
+        docker/secrets/ so caddy's read-only /run/secrets bind does not
+        crash container-create when the override adds the SVID volume
+        mount (nested-under-ro-bind mkdir failure, same class as
+        YSG-RISK-053)."""
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        assert len(hint["commands"]) == 2
+        mkdir_cmd = hint["commands"][0]
+        assert mkdir_cmd == f"mkdir -p docker/secrets/svid/{_TENANT}/{_SERVER}"
+        assert "YSG-RISK-138" in hint["note"]
+
+    def test_docker_hint_compose_carries_pinned_override_set(self):
+        """TD-2026-07-25-06: the compose command must read the install-pinned
+        COMPOSE_FILE (docker/.env) rather than hardcoding only the base +
+        this agent's override, so caddy's OTHER active-agent ringfence
+        memberships survive its restart."""
+        from yashigani.backoffice.mcp_onboard import _agent_container_deploy_hint
+        hint = _agent_container_deploy_hint(
+            tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
+        )
+        compose_cmd = hint["commands"][-1]
+        assert "COMPOSE_FILE" in compose_cmd
+        assert "docker/.env" in compose_cmd
+        assert "-f docker/docker-compose.yml" in compose_cmd
+        assert f"-f docker/{_SERVER}-compose.override.yml" in compose_cmd
+        assert "TD-2026-07-25-06" in hint["note"]
 
     def test_n5_docker_hint_names_exact_services_not_bare_up_d(self):
         """FINDING-V412-ONBOARDING-ROBUSTNESS N5 (Su, 2026-07-21).
@@ -300,7 +335,7 @@ class TestDeployHint:
         hint = _agent_container_deploy_hint(
             tenant_id=_TENANT, server_id=_SERVER, runtime="docker",
         )
-        cmd = hint["commands"][0]
+        cmd = hint["commands"][-1]
         assert cmd.rstrip().endswith(
             f"up -d {_SERVER} {_SERVER}-svid-sidecar caddy"
         ), cmd

@@ -1617,6 +1617,43 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
     echo "Volume cleanup complete: ${_removed} removed, ${_skipped} not present."
 
     # ---------------------------------------------------------------------------
+    # Onboarding-created MCP volume sweep (YSG-RISK-138 completeness gap,
+    # Su, 2026-07-27).
+    #
+    # _CANONICAL_VOLUMES above is a FIXED, hand-maintained list — but every
+    # onboarded Shape-C MCP server mints TWO dynamically-named volumes at
+    # onboard time (manifest/codegen.py):
+    #   ysg_fs_<tenant>_<agent>_workspace   (_sc_volume_name)
+    #   ysg_svid_<tenant>_<server>          (_mcp_svid_volume_name)
+    # Tenant/server are operator-chosen at onboard time, so these names
+    # cannot be enumerated statically — a static list can never cover them,
+    # and they were silently left behind by every prior uninstall. Sweep by
+    # NAME PATTERN, scoped to this install's project prefix (same
+    # cross-org-safety discipline as the dangling-volume prune below — never
+    # remove a volume that cannot be positively attributed to this project).
+    # ---------------------------------------------------------------------------
+    echo "=== Removing onboarding-created MCP volumes (ysg_fs_*/ysg_svid_*) ==="
+    _mcp_vol_removed=0
+    _mcp_vol_ids="$("$RUNTIME" volume ls -q 2>/dev/null \
+        | grep -E "^${_PROJECT_PREFIX}_ysg_(fs|svid)_" || true)"
+    if [ -n "$_mcp_vol_ids" ]; then
+        while IFS= read -r _mcp_vol; do
+            [ -z "$_mcp_vol" ] && continue
+            if "$RUNTIME" volume rm "$_mcp_vol" >/dev/null 2>&1; then
+                echo "  [removed] $_mcp_vol"
+                _mcp_vol_removed=$(( _mcp_vol_removed + 1 ))
+            else
+                echo "  [WARN] failed to remove $_mcp_vol (in use?)" >&2
+            fi
+        done <<< "$_mcp_vol_ids"
+    fi
+    if [ "$_mcp_vol_removed" -gt 0 ]; then
+        echo "  MCP volume sweep: ${_mcp_vol_removed} removed."
+    else
+        echo "  [ok] No onboarding-created MCP volumes found."
+    fi
+
+    # ---------------------------------------------------------------------------
     # Straggler volume retry pass.
     #
     # After the container teardown and initial volume rm, re-check all canonical

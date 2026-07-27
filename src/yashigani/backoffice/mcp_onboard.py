@@ -132,6 +132,33 @@ rework — Captain, FINDING-V412-CADDYADMIN-002):
     (default ``docker``); install.sh sets it per selected runtime.
 Until that wiring lands, the transaction fails CLOSED (503/502 + rollback) —
 no partial onboarding is possible.
+
+Step 6 (operator, host shell) — starting the container, docker/podman only
+(YSG-RISK-138 / TD-2026-07-25-06, Su, 2026-07-27 — LAURA-V50-009 fidelity
+re-test found the PREVIOUS version of this documented step crashed Caddy):
+``_agent_container_deploy_hint`` returns exactly TWO commands, in order:
+  1. ``mkdir -p docker/secrets/svid/<tenant>/<server>`` — pre-creates the
+     SVID mountpoint stub. The compose override's SVID volume mount lands
+     at a path NESTED under caddy's own base ``./secrets:/run/secrets:ro``
+     bind; without this directory already existing on the host, container-
+     create fails ("mkdir ...: read-only file system", same class as
+     YSG-RISK-053). Zero secret content — an inert placeholder, same as the
+     install.sh single-file mountpoint-stub pattern.
+  2. ``docker compose -f docker/docker-compose.yml $YSG_EXTRA_F -f
+     docker/<server>-compose.override.yml up -d <server> <server>-svid-
+     sidecar caddy`` — ``$YSG_EXTRA_F`` is read from the ``COMPOSE_FILE``
+     install.sh pins into ``docker/.env`` (compose_up()), carrying every
+     OTHER standing override (langflow/letta/openclaw egress-forwarder,
+     gpu, podman). Recreating caddy WITHOUT that full set drops its OTHER
+     ringfence memberships and 502s the other agents' deliver-hops
+     (TD-2026-07-25-06) — this is what the onboarding-recovery cascade hit
+     before the Caddy->Ollama relay came back, which the inspection
+     pipeline then mislabelled as a detected prompt injection instead of an
+     honest backend-unavailable block (backend_registry.py
+     ``_FAIL_CLOSED_RESULT`` fix, same finding).
+Skip both for ``runtime="k8s"`` — that branch returns a single ``helm
+upgrade`` command; SVID delivery there is Secret+fsGroup, no mountpoint
+nesting or compose file-set to carry.
 """
 from __future__ import annotations
 
@@ -601,17 +628,65 @@ def _agent_container_deploy_hint(
     # named (it reconnects to the new ringfence bridge + SVID volume and
     # WILL restart briefly) but nothing else in the base stack is.
     deploy_services = "%s %s caddy" % (server_id, svid_sidecar)
+
+    # YSG-RISK-138 (Su, 2026-07-27 — LAURA-V50-009 fidelity re-test): the
+    # SVID named-volume mount this override adds to the shared `caddy:`
+    # service (manifest/codegen.py _gen_compose_override_shape_c) lands at
+    # /run/secrets/svid/<tenant>/<server> — NESTED under caddy's own base
+    # `./secrets:/run/secrets:ro` bind (docker/docker-compose.yml). Docker/
+    # Podman must create that mountpoint directory at container-create time;
+    # since the parent is already a read-only bind, the mkdir fails hard
+    # ("mkdir ...: read-only file system" — same class as the YSG-RISK-053
+    # single-file mountpoint-stub finding, runtime-verified Docker 29.4.1)
+    # UNLESS the directory already exists on the host underneath ./secrets
+    # BEFORE this override is applied. This is the documented ceremony's
+    # OWN crash: following these steps as previously written took Caddy
+    # down. Fix: emit the mountpoint stub as step 1 — mirrors the
+    # already-proven install.sh pattern (pre-create, zero secret content)
+    # instead of inventing a new mount scheme. The sidecar populates the
+    # volume's actual CONTENTS separately (step 2b above); this directory is
+    # inert until then.
+    mkdir_stub_cmd = "mkdir -p docker/secrets/svid/%s/%s" % (tenant_id, server_id)
+
+    # TD-2026-07-25-06 (OPS-1, Su, 2026-07-27): recreating `caddy` via a
+    # compose invocation that omits the standing override set (langflow/
+    # letta/openclaw egress-forwarder overlays, gpu overlay, podman
+    # overrides) drops caddy's OTHER ringfence network memberships —
+    # `dial tcp: lookup letta ... no such host`, 502 on every deliver-hop —
+    # exactly what the onboarding-recovery cascade hit (YSG-RISK-138). The
+    # PREVIOUS version of this command was itself an instance of the
+    # footgun: `-f docker/docker-compose.yml -f <this override>` only,
+    # dropping every OTHER active agent's overlay on caddy's restart.
+    # install.sh compose_up() now pins its fully-resolved file-set into
+    # docker/.env as COMPOSE_FILE (single source of truth) after every
+    # apply; this command reads that pinned list and appends ONLY the new
+    # per-agent override, so the ceremony's own deploy step can never
+    # regress an already-active agent. Degrades gracefully to base+this
+    # override (prior behaviour, not a new failure mode) on an install that
+    # predates the COMPOSE_FILE pin. $YSG_EXTRA_F is intentionally unquoted
+    # in the second command — it must word-split into separate -f tokens.
+    compose_cmd = (
+        'YSG_EXTRA_F=$(grep -m1 "^COMPOSE_FILE=" docker/.env 2>/dev/null '
+        '| cut -d= -f2- | tr ":" "\\n" | grep -vx "docker-compose.yml" '
+        '| sed "s|^|-f docker/|" | tr "\\n" " "); '
+        'docker compose -f docker/docker-compose.yml $YSG_EXTRA_F -f %s up -d %s'
+        % (compose_override, deploy_services)
+    )
+
     return {
         "runtime": runtime,
-        "commands": [
-            "docker compose -f docker/docker-compose.yml -f %s up -d %s"
-            % (compose_override, deploy_services),
-        ],
+        "commands": [mkdir_stub_cmd, compose_cmd],
         "note": (
             "backoffice has no docker/podman socket access by design "
             "(LAURA-30-001 / YSG-RISK-080) — this envelope/route registration "
             "does NOT start the container. Run this from the host/operator "
-            "shell. SCOPED explicitly to the 3 services this override "
+            "shell, IN ORDER: (1) mkdir pre-creates the SVID mountpoint under "
+            "docker/secrets/ so caddy's read-only /run/secrets bind doesn't "
+            "crash container-create (YSG-RISK-138); (2) the compose command "
+            "carries the FULL standing override set (from the install-pinned "
+            "docker/.env COMPOSE_FILE, TD-2026-07-25-06) plus this agent's own "
+            "override, so caddy's OTHER ringfence memberships survive its "
+            "restart. SCOPED explicitly to the 3 services this override "
             "touches: %r (the agent), %r (its svid-sidecar), and caddy "
             "(reconnected to the new ringfence bridge + SVID volume — it "
             "WILL restart briefly). No OTHER service is named, so "
