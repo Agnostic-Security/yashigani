@@ -47,6 +47,60 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _make_ksm_rotation_event_handler(audit_writer: AuditLogWriter):
+    """
+    YSG-RISK-153: build the ``on_event`` callback for ``KSMRotationScheduler``.
+
+    ``KSMRotationScheduler._rotate`` / ``_rotate_with_retry`` invoke
+    ``self._on_event(name, data)`` where ``name`` is one of
+    ``KSM_ROTATION_SUCCESS`` / ``KSM_ROTATION_FAILURE`` / ``KSM_ROTATION_CRITICAL``
+    and ``data`` is a plain dict (secret_key, provider, outcome, rotation_type,
+    new_version) — see ``yashigani/kms/rotation.py``. Previously ``on_event``
+    defaulted to a no-op, so none of these events ever reached the audit trail
+    or Prometheus. Passing ``audit_writer.write`` directly here would also be
+    wrong: ``AuditLogWriter.write()`` takes a single ``AuditEvent`` instance,
+    not a ``(str, dict)`` pair, and would ``AttributeError`` the moment it
+    tried to treat the event-name string as an event object. This adapter
+    translates the (name, data) callback into the correct ``KsmRotationEvent``
+    dataclass, writes it, and updates ``kms_rotations_total`` /
+    ``kms_rotation_last_success_timestamp`` so the two live Prometheus alerts
+    on rotation outcome and the staleness alert on last-success can actually
+    fire.
+
+    The metric update happens in a ``finally`` block so rotation observability
+    (the Prometheus counters/gauge) survives even if the audit sink write
+    itself fails — the two are independent failure domains. The audit-write
+    failure is NOT swallowed: it propagates out of the scheduler job (fail
+    loud, consistent with SOP 1) rather than silently dropping the record.
+    """
+    from yashigani.audit.schema import EventType, KsmRotationEvent
+    from yashigani.metrics.registry import (
+        kms_rotations_total,
+        kms_rotation_last_success_timestamp,
+    )
+
+    def _handler(name: str, data: dict) -> None:
+        outcome = data.get("outcome", "") or "unknown"
+        rotation_type = data.get("rotation_type", "") or "unknown"
+        try:
+            event = KsmRotationEvent(
+                event_type=name,
+                outcome=data.get("outcome", ""),
+                rotation_type=data.get("rotation_type", ""),
+                provider_name=data.get("provider", ""),
+                new_token_handle=data.get("new_version"),
+            )
+            audit_writer.write(event)
+        finally:
+            kms_rotations_total.labels(
+                outcome=outcome, rotation_type=rotation_type
+            ).inc()
+            if name == EventType.KSM_ROTATION_SUCCESS:
+                kms_rotation_last_success_timestamp.set(time.time())
+
+    return _handler
+
+
 def _bootstrap():
     # ── First-run credential generation ────────────────────────────────────
     admin_username = os.getenv("YASHIGANI_ADMIN_USERNAME", "admin@yashigani.local")
@@ -158,6 +212,7 @@ def _bootstrap():
             provider=kms_provider,
             secret_key=secret_key,
             cron_expr=cron_expr,
+            on_event=_make_ksm_rotation_event_handler(audit_writer),
         )
         rotation_scheduler.start()
 
