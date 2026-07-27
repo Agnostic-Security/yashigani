@@ -1446,7 +1446,11 @@ class InspectionBackendFallbackExhaustedEvent(AuditEvent):
     account_tier: str = AccountTier.SYSTEM
     backends_tried: list = field(default_factory=list)
     request_id: str = ""
-    action_taken: str = "PROMPT_INJECTION_ONLY"
+    # YSG-RISK-138 (2026-07-27): default matches backend_registry.py's
+    # LABEL_CLASSIFIER_ERROR — an exhausted fallback chain is an
+    # infrastructure failure, not a content verdict; must never read
+    # PROMPT_INJECTION_ONLY (see backend_registry.py module docstring).
+    action_taken: str = "CLASSIFIER_ERROR"
 
 
 @dataclass

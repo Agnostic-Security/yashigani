@@ -8828,6 +8828,63 @@ compose_up() {
     fi
   fi
 
+  # ---------------------------------------------------------------------------
+  # TD-2026-07-25-06 (OPS-1, Su, 2026-07-27) — pin the resolved compose
+  # file-set as COMPOSE_FILE in docker/.env.
+  #
+  # compose_files is now FINAL for this runtime (base + wazuh overlay + any
+  # active langflow/letta/openclaw egress-forwarder overlays + gpu overlay +
+  # podman overrides). Docker Compose auto-loads COMPOSE_FILE from a `.env`
+  # in the project directory (the directory of the FIRST -f file — docker/,
+  # given every entry here is `${WORK_DIR}/docker/...`) for ANY invocation
+  # that passes NO explicit -f of its own. Explicit -f flags always win over
+  # COMPOSE_FILE — this pin is a safety net for ad-hoc/manual compose ops
+  # (`cd docker && docker compose up caddy`), not a substitute for
+  # compose_files being correct in THIS function.
+  #
+  # Found live (Ava, final retest): recreating `caddy` via a bare
+  # `docker compose up caddy` (no -f) picks up ONLY the auto-discovered
+  # docker-compose.yml — dropping caddy's ringfence membership in every
+  # OTHER active overlay (letta/langflow egress-forwarder, gpu) —
+  # `dial tcp: lookup letta ... no such host`, 502 on every deliver-hop.
+  # Idempotent (re-written on every compose_up() call, both fresh install
+  # and upgrade — this function is the single funnel point for the
+  # overlay-selection logic, so COMPOSE_FILE never drifts from reality).
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "Pin COMPOSE_FILE (resolved overlay set) to docker/.env"
+  else
+    local _cf_i _cf_rel _cf_list=()
+    for ((_cf_i=0; _cf_i<${#compose_files[@]}; _cf_i++)); do
+      [[ "${compose_files[$_cf_i]}" == "-f" ]] && continue
+      _cf_rel="${compose_files[$_cf_i]#"${WORK_DIR}/docker/"}"
+      _cf_list+=("$_cf_rel")
+    done
+    if [[ ${#_cf_list[@]} -gt 0 ]]; then
+      local _cf_joined _cf_env_file
+      _cf_joined="$(IFS=:; echo "${_cf_list[*]}")"
+      # NOTE: _env_set (defined inside _write_aes_key_to_env) is NOT safely
+      # callable here — its `env_file` is a `local` of that function's own
+      # call frame and goes out of scope once that function returns; under
+      # `set -u` a cross-function call would abort with "env_file: unbound
+      # variable" (verified). Self-contained update-or-append, matching the
+      # inline pattern already used below for YASHIGANI_PUBLIC_URL /
+      # YASHIGANI_ENABLED_PROFILES (same "runtime-agnostic .env write"
+      # class, same reason).
+      _cf_env_file="${WORK_DIR}/docker/.env"
+      touch "$_cf_env_file"
+      chmod 0600 "$_cf_env_file"  # A4: secrets-bearing env file, owner-only
+      if grep -q "^COMPOSE_FILE=" "$_cf_env_file" 2>/dev/null; then
+        local _cf_tmp_env
+        _cf_tmp_env="$(mktemp "${WORK_DIR}/docker/.env.XXXXXX")"
+        sed "s|^COMPOSE_FILE=.*|COMPOSE_FILE=${_cf_joined}|" "$_cf_env_file" > "$_cf_tmp_env"
+        mv "$_cf_tmp_env" "$_cf_env_file"
+      else
+        echo "COMPOSE_FILE=${_cf_joined}" >> "$_cf_env_file"
+      fi
+      log_info "Pinned COMPOSE_FILE to docker/.env (${#_cf_list[@]} file(s)): ${_cf_joined}"
+    fi
+  fi
+
   # --- Runtime-agnostic .env writes (MUST run for docker AND podman) ----------
   # BUGFIX (2026-06-08): YASHIGANI_PUBLIC_URL and YASHIGANI_ENABLED_PROFILES were
   # only written inside the `if podman` branch above, so on Docker they were never

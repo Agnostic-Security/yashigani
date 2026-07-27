@@ -3,11 +3,26 @@ Yashigani Inspection — Backend registry with fallback chain.
 
 Manages the active classifier backend and orchestrates fallback on failure.
 All backends are tried in order; if all fail, the registry returns a
-fail-closed result (PROMPT_INJECTION_ONLY, confidence=1.0).
+fail-closed result (CLASSIFIER_ERROR, confidence=1.0).
+
+YSG-RISK-138 / TD-2026-07-25-06 (2026-07-27, Su): the exhausted-fallback
+result used to be labelled PROMPT_INJECTION_ONLY. InspectionPipeline treats
+that label as a genuine content verdict (_handle_injection_only), so a
+BACKEND OUTAGE — e.g. the Caddy->Ollama relay dropping out during the
+onboarding-recovery cascade (LAURA-V50-009) — was reported to the caller as
+"Your message looked like an attempt to override the assistant's
+instructions (a prompt injection)", discarding benign traffic under a
+security accusation instead of an honest "temporarily unavailable" message.
+CLASSIFIER_ERROR already has its own honest disposition handler
+(_handle_classifier_error -> _build_unavailable_alert): "Your message could
+not be security-checked right now ... temporary protection measure." Every
+backend being unreachable (relay down) is exactly that case, not a positive
+injection verdict — still fail-closed (blocks the request), just truthfully
+labelled.
 
 Thread-safe: swap() uses a lock so live config changes are atomic.
 
-Last updated: 2026-05-03
+Last updated: 2026-07-27
 """
 from __future__ import annotations
 
@@ -21,11 +36,15 @@ from yashigani.inspection.backend_base import (
     ClassifierResult,
     BackendUnavailableError,
 )
+from yashigani.inspection.classifier import LABEL_CLASSIFIER_ERROR
 
 logger = logging.getLogger(__name__)
 
+# YSG-RISK-138: label is CLASSIFIER_ERROR, not PROMPT_INJECTION_ONLY — see
+# module docstring. confidence=1.0 / severity stays HIGH (still fail-closed);
+# only the disposition/label honesty changes.
 _FAIL_CLOSED_RESULT = ClassifierResult(
-    label="PROMPT_INJECTION_ONLY",
+    label=LABEL_CLASSIFIER_ERROR,
     confidence=1.0,
     backend="fail_closed",
     latency_ms=0,
@@ -229,7 +248,7 @@ class BackendRegistry:
             self._audit.write(InspectionBackendFallbackExhaustedEvent(
                 backends_tried=backends_tried,
                 request_id=request_id,
-                action_taken="PROMPT_INJECTION_ONLY",
+                action_taken=LABEL_CLASSIFIER_ERROR,
             ))
         except Exception as e:
             logger.debug("BackendRegistry: failed to emit exhausted event: %s", e)

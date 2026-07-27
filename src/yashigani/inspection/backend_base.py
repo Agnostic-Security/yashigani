@@ -13,7 +13,7 @@ from typing import Optional
 
 @dataclass
 class ClassifierResult:
-    label: str           # CLEAN | CREDENTIAL_EXFIL | PROMPT_INJECTION_ONLY
+    label: str           # CLEAN | CREDENTIAL_EXFIL | PROMPT_INJECTION_ONLY | CLASSIFIER_ERROR
     confidence: float    # 0.0–1.0
     backend: str         # name of backend that produced this result
     latency_ms: int      # time taken in milliseconds
