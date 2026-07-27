@@ -3960,17 +3960,55 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             agent_messages = [{"role": m.role, "content": m.content or ""} for m in body.messages]
 
             if agent_protocol == "letta":
-                from yashigani.gateway.letta_client import letta_chat
+                # YSG-RISK-147: this is the STATIC/globally-registered @letta
+                # path (agent_upstream = a fixed registry upstream_url, NOT
+                # pool://) — it previously ALWAYS dispatched via the
+                # module-level letta_chat()/_ensure_agent(), which caches ONE
+                # shared "yashigani-default" agent (_default_agent_id) for
+                # every caller. Two different users hitting this path shared
+                # the same Letta agent -> cross-user memory bleed.
+                # RISK-107 closed cross-user bleed ONLY for the persona/pool
+                # path (LettaClientPool, ~line 2767); this static path was the
+                # gap. Fix: mirror the persona path here — any request
+                # carrying a real user identity is routed through the SAME
+                # per-user LettaClientPool.letta_chat(), keyed on
+                # identity_id, so each user gets their own Letta agent.
+                # The legacy shared-agent module path is retained ONLY for
+                # traffic with no user identity to bleed across
+                # (identity_id == "internal" — service/system callers) or
+                # when no per-user pool is configured in this deployment
+                # (PoolManager unavailable, e.g. minimal/dev installs) — in
+                # that case no per-user isolation is possible either way, so
+                # falling back to the single legacy agent is a no-worse-than-
+                # before degrade, never used for identified user traffic.
+                _letta_peruser = bool(
+                    identity_id
+                    and identity_id != "internal"
+                    and _state.pool_manager is not None
+                )
                 try:
-                    agent_resp = await letta_chat(
-                        base_url=agent_upstream,
-                        messages=agent_messages,
-                        timeout=120.0,
-                    )
+                    if _letta_peruser:
+                        from yashigani.gateway.letta_client import (
+                            LettaClientPool as _StaticLettaPool,
+                        )
+                        _slp = _StaticLettaPool(_state.pool_manager)
+                        agent_resp = await _slp.letta_chat(
+                            user_id=identity_id,
+                            messages=agent_messages,
+                            timeout=120.0,
+                        )
+                        route_reason = f"agent:{selected_model[1:]}:letta:peruser"
+                    else:
+                        from yashigani.gateway.letta_client import letta_chat
+                        agent_resp = await letta_chat(
+                            base_url=agent_upstream,
+                            messages=agent_messages,
+                            timeout=120.0,
+                        )
+                        route_reason = f"agent:{selected_model[1:]}:letta:shared"
                     choices = agent_resp.get("choices", [])
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
                     backend_body = agent_resp
-                    route_reason = f"agent:{selected_model[1:]}:letta"
                 except Exception as exc:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Letta agent %s failed", selected_model)
