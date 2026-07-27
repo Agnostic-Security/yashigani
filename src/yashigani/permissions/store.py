@@ -211,6 +211,40 @@ class PermissionStore:
         n: int = self._redis.delete(_browser_cap_key("org", org_id))
         return n > 0
 
+    def has_org(self, org_id: str) -> bool:
+        """
+        Return True if *org_id* has an explicit browser-capability policy key
+        in Redis (i.e. the org has been provisioned via set_browser_cap_org_policy).
+
+        Deliberately does NOT fall back to a default like get_browser_cap_org_policy
+        does — this is an existence check used to decide whether a PUT is creating
+        a NEW org (subject to the license max_orgs cap) or updating an existing one.
+        """
+        return bool(self._redis.exists(_browser_cap_key("org", org_id)))
+
+    def count_orgs(self) -> int:
+        """
+        Return the number of distinct provisioned orgs (perm:browser_cap:org:*
+        keys in Redis).  This is the canonical org count backing license
+        enforcement (YSG-RISK-152).
+
+        Fail-closed by design: unlike get_browser_cap_org_policy, this method
+        does NOT catch Redis errors and return a fallback count.  A caller
+        enforcing the max_orgs cap must not silently under-count on error —
+        that would fail-open the cap (the same trap documented on
+        count_canonical_end_users). Callers that need the count purely for
+        display (not enforcement) should catch exceptions themselves and
+        decide their own fallback.
+        """
+        cursor = 0
+        count = 0
+        while True:
+            cursor, keys = self._redis.scan(cursor, match="perm:browser_cap:org:*", count=200)
+            count += len(keys)
+            if cursor == 0:
+                break
+        return count
+
     # ------------------------------------------------------------------
     # Browser capability — group/user partial overrides
     # ------------------------------------------------------------------

@@ -867,6 +867,31 @@ async def test_put_org_by_id_emits_audit_event():
     mock_audit.write = lambda ev: audit_events.append(ev)
     state.audit_writer = mock_audit
 
+    # YSG-RISK-152: creating "acme-corp" is a NEW org (the store already
+    # seeded "default" at init) and is now subject to the license max_orgs
+    # cap. This test is about audit-event shape, not license enforcement —
+    # set an unlimited-orgs license so it exercises the same path it always
+    # has, and restore the prior license afterwards so other tests aren't
+    # affected by ordering.
+    from yashigani.licensing.enforcer import set_license, get_license
+    from yashigani.licensing.model import LicenseState, LicenseTier
+    from datetime import datetime, timezone
+    original_license = get_license()
+    set_license(LicenseState(
+        tier=LicenseTier.ENTERPRISE,
+        org_domain="example.com",
+        max_agents=-1,
+        max_end_users=-1,
+        max_admin_seats=-1,
+        max_orgs=-1,
+        features=frozenset(),
+        issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        expires_at=None,
+        license_id="test-unlimited",
+        valid=True,
+        error=None,
+    ))
+
     original = cp_mod.backoffice_state
     cp_mod.backoffice_state = state
     try:
@@ -880,6 +905,7 @@ async def test_put_org_by_id_emits_audit_event():
         result = await cp_mod.set_org_by_id("acme-corp", body, _make_admin_session())
     finally:
         cp_mod.backoffice_state = original
+        set_license(original_license)
 
     assert len(audit_events) == 1
     evt = audit_events[0]
@@ -1097,3 +1123,306 @@ async def test_store_not_configured_returns_503():
         assert exc_info.value.status_code == 503
     finally:
         cp_mod.backoffice_state = original
+
+
+# ============================================================================
+# F. YSG-RISK-152 — max_orgs license cap enforcement
+# ============================================================================
+#
+# check_org_limit() (yashigani.licensing.enforcer) previously had zero
+# callers: any tier could create unlimited orgs via PUT /orgs/{org_id}, and
+# the license status endpoint hardcoded current_orgs=1. This section covers:
+#   - creation at the cap is allowed; the next creation over the cap is
+#     rejected with a 402 limit-exceeded error
+#   - unlimited tier (-1) always allows creation
+#   - updating an ALREADY-provisioned org_id does not re-check the cap
+#   - the status endpoint reports the real provisioned-org count
+#   - a Redis failure while counting orgs fails CLOSED (blocks creation),
+#     never fails open
+
+def _make_org_license(max_orgs: int):
+    from datetime import datetime, timezone
+    from yashigani.licensing.model import LicenseState, LicenseTier
+    return LicenseState(
+        tier=LicenseTier.PROFESSIONAL,
+        org_domain="example.com",
+        max_agents=-1,
+        max_end_users=-1,
+        max_admin_seats=-1,
+        max_orgs=max_orgs,
+        features=frozenset(),
+        issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        expires_at=None,
+        license_id="test-org-cap",
+        valid=True,
+        error=None,
+    )
+
+
+class TestOrgLimitEnforcement:
+
+    def _new_state(self):
+        import fakeredis
+        from yashigani.capability_policy.store import CapabilityPolicyStore
+        from yashigani.backoffice.state import BackofficeState
+        state = BackofficeState()
+        redis = fakeredis.FakeRedis(decode_responses=False)
+        state.capability_policy_store = CapabilityPolicyStore(redis_client=redis)
+        state.audit_writer = MagicMock()
+        return state
+
+    @pytest.mark.asyncio
+    async def test_creation_at_cap_is_allowed(self):
+        """max_orgs=2: 'default' (seeded) + one new org reaches the cap and is allowed."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from yashigani.backoffice.routes import capability_policy as cp_mod
+        from yashigani.backoffice.routes.capability_policy import (
+            CapabilityPolicyBody, CapabilitySettingIn
+        )
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        state = self._new_state()
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=2))
+
+        original_state = cp_mod.backoffice_state
+        cp_mod.backoffice_state = state
+        try:
+            body = CapabilityPolicyBody(
+                camera=CapabilitySettingIn(value="off"),
+                microphone=CapabilitySettingIn(value="self"),
+                geolocation=CapabilitySettingIn(value="self"),
+                fullscreen=CapabilitySettingIn(value="self"),
+                display_capture=CapabilitySettingIn(value="self"),
+            )
+            result = await cp_mod.set_org_by_id("org-two", body, _make_admin_session())
+            assert result["org_id"] == "org-two"
+            assert state.capability_policy_store.count_orgs() == 2
+        finally:
+            cp_mod.backoffice_state = original_state
+            set_license(original_license)
+
+    @pytest.mark.asyncio
+    async def test_creation_over_cap_is_rejected(self):
+        """max_orgs=2: 'default' + 'org-two' already at cap; a third org is rejected 402."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from fastapi import HTTPException
+        from yashigani.capability_policy.model import default_policy
+        from yashigani.backoffice.routes import capability_policy as cp_mod
+        from yashigani.backoffice.routes.capability_policy import (
+            CapabilityPolicyBody, CapabilitySettingIn
+        )
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        state = self._new_state()
+        state.capability_policy_store.set_org("org-two", default_policy())  # pre-seed to hit cap
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=2))
+
+        original_state = cp_mod.backoffice_state
+        cp_mod.backoffice_state = state
+        try:
+            body = CapabilityPolicyBody(
+                camera=CapabilitySettingIn(value="off"),
+                microphone=CapabilitySettingIn(value="self"),
+                geolocation=CapabilitySettingIn(value="self"),
+                fullscreen=CapabilitySettingIn(value="self"),
+                display_capture=CapabilitySettingIn(value="self"),
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                await cp_mod.set_org_by_id("org-three", body, _make_admin_session())
+            assert exc_info.value.status_code == 402
+            assert exc_info.value.detail["error"] == "org_limit_exceeded"
+            assert exc_info.value.detail["limit"] == 2
+            assert exc_info.value.detail["current"] == 2
+            # Rejected — must NOT have been written.
+            assert state.capability_policy_store.has_org("org-three") is False
+            assert state.capability_policy_store.count_orgs() == 2
+        finally:
+            cp_mod.backoffice_state = original_state
+            set_license(original_license)
+
+    @pytest.mark.asyncio
+    async def test_unlimited_tier_always_allowed(self):
+        """max_orgs=-1: creating many orgs is always allowed."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from yashigani.backoffice.routes import capability_policy as cp_mod
+        from yashigani.backoffice.routes.capability_policy import (
+            CapabilityPolicyBody, CapabilitySettingIn
+        )
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        state = self._new_state()
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=-1))
+
+        original_state = cp_mod.backoffice_state
+        cp_mod.backoffice_state = state
+        try:
+            body = CapabilityPolicyBody(
+                camera=CapabilitySettingIn(value="off"),
+                microphone=CapabilitySettingIn(value="self"),
+                geolocation=CapabilitySettingIn(value="self"),
+                fullscreen=CapabilitySettingIn(value="self"),
+                display_capture=CapabilitySettingIn(value="self"),
+            )
+            for org_id in ("org-a", "org-b", "org-c", "org-d", "org-e"):
+                result = await cp_mod.set_org_by_id(org_id, body, _make_admin_session())
+                assert result["org_id"] == org_id
+            assert state.capability_policy_store.count_orgs() == 6  # default + 5
+        finally:
+            cp_mod.backoffice_state = original_state
+            set_license(original_license)
+
+    @pytest.mark.asyncio
+    async def test_updating_existing_org_does_not_recheck_cap(self):
+        """max_orgs=1 already at cap: updating the EXISTING 'default' org is not a new org."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from yashigani.backoffice.routes import capability_policy as cp_mod
+        from yashigani.backoffice.routes.capability_policy import (
+            CapabilityPolicyBody, CapabilitySettingIn
+        )
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        state = self._new_state()
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=1))  # already at cap with just "default"
+
+        original_state = cp_mod.backoffice_state
+        cp_mod.backoffice_state = state
+        try:
+            body = CapabilityPolicyBody(
+                camera=CapabilitySettingIn(value="off"),
+                microphone=CapabilitySettingIn(value="self"),
+                geolocation=CapabilitySettingIn(value="self"),
+                fullscreen=CapabilitySettingIn(value="self"),
+                display_capture=CapabilitySettingIn(value="self"),
+            )
+            result = await cp_mod.set_org_by_id("default", body, _make_admin_session())
+            assert result["org_id"] == "default"
+            assert result["org"]["camera"]["value"] == "off"
+        finally:
+            cp_mod.backoffice_state = original_state
+            set_license(original_license)
+
+    @pytest.mark.asyncio
+    async def test_org_count_failure_fails_closed(self):
+        """count_orgs() raising must block creation (503), never fail open and allow it."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from fastapi import HTTPException
+        from yashigani.backoffice.routes import capability_policy as cp_mod
+        from yashigani.backoffice.routes.capability_policy import (
+            CapabilityPolicyBody, CapabilitySettingIn
+        )
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        state = self._new_state()
+        state.capability_policy_store.count_orgs = MagicMock(
+            side_effect=RuntimeError("redis unavailable")
+        )
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=5))  # nowhere near cap — must still fail closed
+
+        original_state = cp_mod.backoffice_state
+        cp_mod.backoffice_state = state
+        try:
+            body = CapabilityPolicyBody(
+                camera=CapabilitySettingIn(value="off"),
+                microphone=CapabilitySettingIn(value="self"),
+                geolocation=CapabilitySettingIn(value="self"),
+                fullscreen=CapabilitySettingIn(value="self"),
+                display_capture=CapabilitySettingIn(value="self"),
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                await cp_mod.set_org_by_id("org-new", body, _make_admin_session())
+            assert exc_info.value.status_code == 503
+            assert exc_info.value.detail["error"] == "org_count_unavailable"
+            # Not written — fail-closed means the create did NOT go through.
+            assert "org-new" not in state.capability_policy_store.perm_store._redis.keys(
+                "perm:browser_cap:org:org-new"
+            )
+        finally:
+            cp_mod.backoffice_state = original_state
+            set_license(original_license)
+
+
+class TestLicenseStatusOrgCount:
+
+    @pytest.mark.asyncio
+    async def test_status_reports_real_org_count(self):
+        """GET /admin/license reports the real provisioned-org count, not hardcoded 1."""
+        try:
+            import fakeredis  # noqa: F401
+        except ImportError:
+            pytest.skip("fakeredis not installed")
+
+        from yashigani.capability_policy.store import CapabilityPolicyStore
+        from yashigani.capability_policy.model import default_policy
+        from yashigani.backoffice.routes import license as license_mod
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        # license.py imports the singleton `backoffice_state` LOCALLY inside the
+        # route function body (`from yashigani.backoffice.state import
+        # backoffice_state`), so there is no module-level `license_mod.backoffice_state`
+        # attribute to monkeypatch. Mutate the singleton's fields in place and
+        # restore them afterwards instead.
+        from yashigani.backoffice.state import backoffice_state as singleton
+        redis = fakeredis.FakeRedis(decode_responses=False)
+        store = CapabilityPolicyStore(redis_client=redis)
+        store.set_org("org-two", default_policy())
+        store.set_org("org-three", default_policy())
+
+        original_cap_store = singleton.capability_policy_store
+        singleton.capability_policy_store = store
+
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=-1))
+
+        try:
+            result = await license_mod.get_license_status(session=_make_admin_session())
+        finally:
+            singleton.capability_policy_store = original_cap_store
+            set_license(original_license)
+
+        assert result["limits"]["orgs"]["current"] == 3  # default + org-two + org-three
+
+    @pytest.mark.asyncio
+    async def test_status_reports_zero_when_store_unconfigured(self):
+        """No capability_policy_store configured — fail-open to 0 for DISPLAY only."""
+        from yashigani.backoffice.routes import license as license_mod
+        from yashigani.backoffice.state import backoffice_state as singleton
+        from yashigani.licensing.enforcer import set_license, get_license
+
+        original_cap_store = singleton.capability_policy_store
+        singleton.capability_policy_store = None
+
+        original_license = get_license()
+        set_license(_make_org_license(max_orgs=-1))
+
+        try:
+            result = await license_mod.get_license_status(session=_make_admin_session())
+        finally:
+            singleton.capability_policy_store = original_cap_store
+            set_license(original_license)
+
+        assert result["limits"]["orgs"]["current"] == 0

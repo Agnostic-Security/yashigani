@@ -90,6 +90,18 @@ class CapabilityPolicyStore:
         """
         return self._perm_store.delete_browser_cap_org_policy(org_id)
 
+    def has_org(self, org_id: str) -> bool:
+        """Return True if *org_id* has been explicitly provisioned (existence check, no fallback)."""
+        return self._perm_store.has_org(org_id)
+
+    def count_orgs(self) -> int:
+        """
+        Return the number of provisioned orgs (YSG-RISK-152 license enforcement).
+        Fail-closed: raises on Redis error rather than under-counting. See
+        PermissionStore.count_orgs for rationale.
+        """
+        return self._perm_store.count_orgs()
+
     # ------------------------------------------------------------------
     # Group overrides (partial)
     # ------------------------------------------------------------------

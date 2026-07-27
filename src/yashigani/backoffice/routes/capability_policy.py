@@ -276,10 +276,43 @@ async def set_org_by_id(
     """
     Overwrite the org-level Permissions-Policy for *org_id*.
     All 5 capabilities must be supplied.
+
+    YSG-RISK-152: an org_id that has never been provisioned before is a NEW
+    org and is subject to the license tier's max_orgs cap (-1 = unlimited).
+    Updating an already-provisioned org_id's policy is not a new org and is
+    not re-checked against the cap.
     """
     store = _get_store()
     policy = body.to_capability_dict()
     _validate_and_raise(policy, require_all=True)
+
+    if not store.has_org(org_id):
+        from yashigani.licensing.enforcer import check_org_limit, LicenseLimitExceeded
+
+        try:
+            current_orgs = store.count_orgs()
+        except Exception as exc:
+            # Fail closed: if we cannot trust the count, we cannot safely allow
+            # a new org past an unknown cap. Do NOT default to 0 and let the
+            # create through (that would be the same fail-open trap documented
+            # on count_canonical_end_users).
+            logger.error(
+                "cap_policy: org count unavailable, failing closed on org-limit check "
+                "for new org '%s': %s", org_id, exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "org_count_unavailable"},
+            )
+
+        try:
+            check_org_limit(current_orgs)
+        except LicenseLimitExceeded as exc:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={"error": "org_limit_exceeded", "limit": exc.max_val, "current": exc.current},
+            )
+
     store.set_org(org_id, policy)
     _emit_audit(
         admin_account=session.account_id,

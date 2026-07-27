@@ -217,8 +217,20 @@ async def get_license_status(session=Depends(require_admin_session)):
         except Exception:
             current_admin_seats = 0
 
-    # Org count (single-org in non-Enterprise deployments)
-    current_orgs = 1
+    # Org count — real provisioned-org count (YSG-RISK-152).
+    # Previously hardcoded to 1; capability_policy_store is the source of
+    # truth (perm:browser_cap:org:* keys). Fail-open to 0 on error, same
+    # convention as the other counters in this endpoint — this is a display
+    # value only; the actual max_orgs cap is enforced fail-closed at the
+    # org-creation call site (backoffice/routes/capability_policy.py
+    # set_org_by_id), not here.
+    current_orgs = 0
+    cap_store = backoffice_state.capability_policy_store
+    if cap_store is not None:
+        try:
+            current_orgs = cap_store.count_orgs()
+        except Exception:
+            current_orgs = 0
 
     expires_at = lic.expires_at.isoformat() if lic.expires_at is not None else None
 
