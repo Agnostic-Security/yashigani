@@ -371,10 +371,16 @@ class Shredder:
     def seal(self, event, tenant_id: Optional[str] = None):
         """Seal subject fields on *event* in place; return the mutated event.
 
-        Fail-open is NOT acceptable for a privacy control, but neither is losing
-        the audit event: on a seal error we leave the field cleartext and emit a
-        loud error so monitoring catches it (the event still records; the gap is
-        alertable) — this matches the audit subsystem's never-drop-the-event rule.
+        Fail-CLOSED for a privacy control (YSG-RISK-148): a per-field seal
+        failure — or a failure to even determine which fields need sealing —
+        raises ``CryptoShredError`` instead of leaving the field cleartext and
+        continuing. Writing cleartext PII into the append-only/immutable audit
+        chain while implying it was sealed is worse than a delayed/refused
+        write: the chain cannot be redacted after the fact, and a later
+        ``erase_subject()`` call would issue a false erasure certificate for
+        data that was never actually under DEK control. The caller
+        (``AuditLogWriter.write``) does not commit the event to the chain when
+        this raises — see ``AuditWriteError`` in ``writer.py``.
         """
         if not dataclasses.is_dataclass(event):
             return event
@@ -383,29 +389,40 @@ class Shredder:
             pairs = self._fields_to_seal(event)
         except Exception as exc:
             logger.error("crypto_shred: field selection failed: %s", exc)
-            return event
+            raise CryptoShredError(f"crypto_shred: field selection failed: {exc}") from exc
         for field, plaintext in pairs:
             subject_id = derive_subject_id(tenant, plaintext)
             try:
                 sealed = self._seal_value(tenant, subject_id, field, plaintext)
-                object.__setattr__(event, field, sealed)
             except Exception as exc:
                 logger.error("crypto_shred: seal failed field=%s subject=%s: %s",
                              field, subject_id, exc)
+                raise CryptoShredError(
+                    f"crypto_shred: seal failed field={field} subject={subject_id}: {exc}"
+                ) from exc
+            object.__setattr__(event, field, sealed)
         return event
 
     # ── erasure ─────────────────────────────────────────────────────────────
     def erase_subject(self, tenant_id: str, subject_id: str) -> dict:
         """Crypto-shred a data subject: destroy the DEK across all stores.
 
-        Returns an erasure certificate (for the DSAR trail + the SUBJECT_ERASED
-        tombstone). The ciphertext in every sink is now inert; the hash chain is
-        unaffected because it covers ciphertext.
+        Returns an HONEST erasure certificate (for the DSAR trail + the
+        SUBJECT_ERASED tombstone) — YSG-RISK-148. ``shredded`` reflects
+        ``dek_existed``: a DEK is only ever created inside ``_seal_value``
+        the first time a field for this subject is successfully sealed
+        (``seal()`` is now fail-closed — see above), so "no DEK ever
+        existed" means no field for this subject was ever actually sealed
+        under key material this call can destroy. Reporting
+        ``shredded: True`` in that case would be a false erasure
+        certificate: there would be nothing this call actually erased. The
+        ciphertext in every sink is now inert when ``shredded`` is True; the
+        hash chain is unaffected because it covers ciphertext.
         """
         existed = self._ks.destroy_dek(tenant_id, subject_id)
         return {
             "subject_id": subject_id,
             "tenant_id": tenant_id,
-            "shredded": True,
+            "shredded": existed,
             "dek_existed": existed,
         }

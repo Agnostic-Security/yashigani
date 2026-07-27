@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from yashigani.audit.crypto_shred import CryptoShredKeyStore, Shredder, is_envelope
+from yashigani.audit.crypto_shred import CryptoShredError, CryptoShredKeyStore, Shredder, is_envelope
 from yashigani.audit.schema import AdminLoginEvent
 from yashigani.kms.base import ProviderError
 from yashigani.kms.factory import create_provider
@@ -267,9 +267,22 @@ class TestFactoryWiresCryptoShredKeksDir:
 class TestPreFixBehaviourReproduced:
     """Documents the exact pre-fix failure mode (no cryptoshred_keys_dir
     configured) so a future regression re-fails this test rather than the
-    live e2e finding."""
+    live e2e finding.
 
-    def test_seal_without_kek_dir_logs_error_reproducing_original_finding(
+    Superseded by YSG-RISK-148 (2026-07-27): the original YSG-GATE-V50-C fix
+    left seal() "fail-open-safe by design" — on a seal error (e.g. no
+    writable KEK namespace) it logged an ERROR and returned the event with
+    the field still CLEARTEXT, which was then written into the immutable
+    audit chain. That is a distinct, worse finding: cleartext PII in an
+    append-only chain, plus erase_subject() later issuing a false
+    "shredded: True" erasure certificate for data that was never sealed.
+    seal() is now fail-closed: the same "no writable KEK namespace"
+    condition raises CryptoShredError instead of returning cleartext, and
+    AuditLogWriter.write() aborts the event write (AuditWriteError) rather
+    than committing it.
+    """
+
+    def test_seal_without_kek_dir_raises_instead_of_leaking_cleartext(
         self, tmp_path, mock_redis, caplog
     ):
         import logging
@@ -278,11 +291,18 @@ class TestPreFixBehaviourReproduced:
         key_store = CryptoShredKeyStore(mock_redis, provider, dsn=None)
         shredder = Shredder(key_store)
 
+        event = _admin_event()
         with caplog.at_level(logging.ERROR, logger="yashigani.audit.crypto_shred"):
-            sealed = shredder.seal(_admin_event())
+            with pytest.raises(CryptoShredError):
+                shredder.seal(event)
 
-        # Fail-open-safe by design: the event is never dropped, but the field
-        # stays cleartext and an ERROR is logged — this IS the finding's
-        # symptom when no writable KEK namespace is configured.
-        assert not is_envelope(sealed.admin_account)
+        # Fail-CLOSED (YSG-RISK-148): the missing writable KEK namespace must
+        # never result in the field being left/observed as cleartext, and it
+        # must raise so the caller (AuditLogWriter.write) refuses to commit
+        # the event rather than silently writing unsealed PII.
+        assert event.admin_account == "alice@example.com", (
+            "field must be provably unchanged (never marked sealed while "
+            "actually cleartext) when seal() raises"
+        )
+        assert not is_envelope(event.admin_account)
         assert "seal failed" in caplog.text

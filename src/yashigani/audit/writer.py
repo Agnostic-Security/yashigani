@@ -254,7 +254,9 @@ class AuditLogWriter:
         """
         Write an audit event to the volume sink (always) and forward to
         enabled SIEM targets (best-effort). Raises AuditWriteError if the
-        volume write fails — the caller MUST abort their operation.
+        volume write fails, or if a crypto-shred seal failure means this
+        event would otherwise carry cleartext PII into the chain
+        (YSG-RISK-148) — the caller MUST abort their operation.
 
         The ``prev_event_hash`` field is injected immediately before
         serialisation so that the hash chain is always consistent on disk.
@@ -276,8 +278,19 @@ class AuditLogWriter:
         if self._shredder is not None:
             try:
                 event = self._shredder.seal(event)
-            except Exception:  # never drop the audit event on a seal error
+            except Exception as exc:
+                # YSG-RISK-148 (fail-closed): a seal failure must never let
+                # cleartext PII reach the immutable/append-only chain while
+                # implying it was sealed. Previously this logged-and-continued,
+                # writing the cleartext field verbatim and leaving
+                # erase_subject() unable to actually erase it later (a false
+                # erasure certificate). Abort the write instead, same contract
+                # as AuditWriteError below: the caller MUST abort their
+                # operation.
                 logger.error("crypto_shred seal failed in audit write path", exc_info=True)
+                raise AuditWriteError(
+                    f"Audit event seal failed; refusing to write unsealed PII: {exc}"
+                ) from exc
 
         with self._lock:
             # Compute and inject prev_event_hash before serialisation

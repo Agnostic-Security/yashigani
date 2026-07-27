@@ -128,3 +128,65 @@ def test_derive_subject_id_case_insensitive():
     a = cs.derive_subject_id("t1", "Alice@Corp.com")
     b = cs.derive_subject_id("t1", "alice@corp.com")
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-148 — fail-closed seal() / honest erase_subject()
+# ---------------------------------------------------------------------------
+
+
+def test_seal_failure_raises_and_leaves_no_cleartext_committed(shredder, monkeypatch):
+    """A per-field seal failure must raise CryptoShredError, not silently
+    leave the field cleartext (the old swallow-and-continue behaviour)."""
+
+    def _boom(self, tenant_id, subject_id, field, plaintext):
+        raise RuntimeError("KMS unavailable")
+
+    monkeypatch.setattr(cs.Shredder, "_seal_value", _boom)
+    e = _Evt()
+    with pytest.raises(cs.CryptoShredError):
+        shredder.seal(e)
+    # The event object itself was never mutated with a sealed value, and the
+    # caller (AuditLogWriter.write) never proceeds to serialise/write it —
+    # see test_writer_fail_closed.py for the write-path proof. Here we prove
+    # the field is provably still the original cleartext (i.e. nothing was
+    # partially/silently written as "sealed" while actually cleartext).
+    assert e.admin_account == "alice@corp.com"
+    assert not cs.is_envelope(e.admin_account)
+
+
+def test_field_selection_failure_raises(shredder, monkeypatch):
+    """A failure to even determine which fields need sealing must also raise
+    — we cannot claim "nothing needed sealing" when we don't know."""
+
+    def _boom(self, event):
+        raise RuntimeError("dataclass introspection failed")
+
+    monkeypatch.setattr(cs.Shredder, "_fields_to_seal", _boom)
+    with pytest.raises(cs.CryptoShredError):
+        shredder.seal(_Evt())
+
+
+def test_erase_subject_never_sealed_is_honest(shredder):
+    """A subject that was never sealed (no DEK was ever created for it) must
+    NOT get a `shredded: True` erasure certificate — that would be a false
+    GDPR Art 17 erasure cert for data that was never actually shreddable."""
+    unseen_subject = cs.derive_subject_id("t1", "never-appeared@corp.com")
+    cert = shredder.erase_subject("t1", unseen_subject)
+    assert cert["dek_existed"] is False
+    assert cert["shredded"] is False, (
+        "false erasure certificate: reported shredded=True for a subject "
+        "whose DEK never existed (no field was ever sealed for them)"
+    )
+
+
+def test_erase_subject_actually_sealed_is_honest(shredder):
+    """The normal, happy-path counterpart: a subject that WAS sealed gets a
+    truthful shredded=True certificate."""
+    e = shredder.seal(_Evt())
+    subject = cs.derive_subject_id("t1", "alice@corp.com")
+    cert = shredder.erase_subject("t1", subject)
+    assert cert["dek_existed"] is True
+    assert cert["shredded"] is True
+    # and it is now genuinely unrecoverable
+    assert shredder.unseal_value("t1", e.admin_account, "admin_account") is None
