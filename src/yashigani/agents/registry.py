@@ -49,6 +49,27 @@ def _now_iso() -> str:
     return datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
 
 
+def _record_durable_write_failure(operation: str, kind: str) -> None:
+    """YSG-RISK-155: make a swallowed durable-write failure observable.
+
+    The register()/register_nhi() dual-write is intentionally best-effort —
+    a Postgres blip must not roll back a successful Redis registration, so the
+    exception is caught and logged there. Fail-loud-log alone is easy to miss
+    in practice; increment a Prometheus counter too so a dashboard/alert can
+    catch a durability drop even if nobody is tailing logs at the moment it
+    happens. Import is local + wrapped so a metrics-layer problem can never
+    mask or replace the original registration error (mirrors gateway/agent_auth.py).
+    """
+    try:
+        from yashigani.metrics.registry import agent_durable_write_failures_total
+        agent_durable_write_failures_total.labels(operation=operation, kind=kind).inc()
+    except Exception:
+        logger.debug(
+            "AgentRegistry: metric increment failed for agent_durable_write_failures_total "
+            "(operation=%s, kind=%s)", operation, kind, exc_info=True,
+        )
+
+
 class AgentRegistry:
     """
     Thread-safe agent registry backed by Redis db/3.
@@ -243,26 +264,21 @@ return 1
         # can re-trigger before the next redis recreate.
         if self._durable is not None:
             try:
-                self._durable.upsert(
-                    {
-                        "agent_id": agent_id,
-                        "name": name,
-                        "upstream_url": upstream_url,
-                        "protocol": protocol,
-                        "status": "active",
-                        "groups": groups,
-                        "allowed_caller_groups": allowed_caller_groups,
-                        "allowed_paths": allowed_paths,
-                        "allowed_cidrs": allowed_cidrs or [],
-                    },
-                    token_hash=token_hash,
-                )
+                # YSG-RISK-155: use the freshly-decoded Redis record (via get())
+                # rather than a hand-built partial dict, so kind/sensitivity_ceiling/
+                # allowed_tools (4.0 Phase 5 / §A.3 — set via the kind=/sensitivity_
+                # ceiling=/allowed_tools= kwargs above) round-trip to Postgres instead
+                # of silently defaulting on restore.
+                full = self.get(agent_id)
+                if full is not None:
+                    self._durable.upsert(full, token_hash=token_hash)
             except Exception as exc:
                 logger.error(
                     "AgentRegistry: DURABLE write failed for %s (%s) — agent is live in "
                     "Redis but will NOT survive a redis recreate until re-registered: %s",
                     agent_id, name, exc,
                 )
+                _record_durable_write_failure("register", kind)
 
         return agent_id, plaintext_token
 
@@ -334,6 +350,7 @@ return 1
             # (token_hash unchanged → None). Read the full post-update hash back so
             # the durable row reflects every field, not just the changed ones.
             if self._durable is not None:
+                agent = None
                 try:
                     agent = self.get(agent_id)
                     if agent is not None:
@@ -343,6 +360,7 @@ return 1
                         "AgentRegistry: DURABLE update failed for %s — Postgres mirror "
                         "stale until next mutation: %s", agent_id, exc,
                     )
+                    _record_durable_write_failure("update", (agent or {}).get("kind") or "agent")
 
     def deactivate(self, agent_id: str) -> None:
         """Set status=inactive and remove from active indexes.
@@ -368,7 +386,7 @@ return 1
 
     # ── Reconcile (ISSUE-AGENT-REG-DURABILITY) ─────────────────────────────────
 
-    def restore_from_durable(self, agent: dict, token_hash: str) -> None:
+    def restore_from_durable(self, agent: dict, token_hash: Optional[str]) -> None:
         """Re-materialise one durable agent row into Redis db/3 (idempotent).
 
         Called by the startup reconciler (AgentReconciler) when Redis db/3 has
@@ -378,6 +396,28 @@ return 1
         breaking every caller's stored PSK. We restore the EXACT stored hash so
         existing agent tokens keep working.
 
+        YSG-RISK-155 — ``kind == "nhi"`` is handled differently:
+          * An NHI's bearer token lives PLAINTEXT in ``nhi:token:{nhi_id}``, not
+            bcrypt-hashed in ``agent:token:{agent_id}`` — and it is a one-time
+            secret that ``register_nhi()`` deliberately never re-persists to
+            Postgres (``token_hash`` is always NULL for an NHI's durable row).
+            So there is nothing durable to restore into either token key:
+            ``token_hash`` is expected to be ``None`` here for an NHI, and this
+            method does NOT touch ``agent:token:*``/``nhi:token:*`` at all.
+          * What IS restored is the NHI's full registration metadata (kind,
+            template_id, owner_identity_id, allowed_tools/models,
+            sensitivity_ceiling, budget_cap, svid_issued, pids_limit,
+            memory_mb, spiffe_id, scope_hash) plus its index memberships
+            (``agent:index:all``/``active``, ``nhi:index:active`` when it was
+            durably active + SVID-approved) — so the NHI comes back as an NHI
+            (visible to admin UI, RBAC/identity-dispatch code, GAP-2 scope_hash
+            comparisons) rather than either vanishing or restoring as a plain
+            "agent" with none of its fields. The NHI's caller-presented bearer
+            token will not validate again until it is re-provisioned (rotate /
+            re-approve) — this is called out at WARNING by the caller
+            (AgentReconciler) so it is an operator-visible follow-up, not a
+            silent gap.
+
         Does not enforce the licence limit: this is a restore of already-licensed
         registrations, not a new registration. Idempotent — re-running overwrites
         with identical data.
@@ -386,14 +426,13 @@ return 1
         reg_key = f"agent:reg:{agent_id}"
         token_key = f"agent:token:{agent_id}"
         status = agent.get("status") or "active"
+        kind = agent.get("kind") or "agent"
 
-        kind = agent.get("kind", "agent")
         mapping = {
             b"name": str(agent.get("name", "")).encode("utf-8"),
             b"upstream_url": str(agent.get("upstream_url", "")).encode("utf-8"),
             b"protocol": str(agent.get("protocol") or "openai").encode("utf-8"),
             b"status": status.encode("utf-8"),
-            b"kind": kind.encode("utf-8"),
             b"created_at": str(agent.get("created_at", "") or _now_iso()).encode("utf-8"),
             b"last_seen_at": str(agent.get("last_seen_at", "")).encode("utf-8"),
             b"groups": json.dumps(agent.get("groups", [])).encode("utf-8"),
@@ -402,7 +441,7 @@ return 1
             b"allowed_cidrs": json.dumps(agent.get("allowed_cidrs", [])).encode("utf-8"),
             # 4.0 Phase 5 / §A.3: additive fields restored from durable store.
             # Pre-4.0 durable rows lack these; default to "agent" / "" / [].
-            b"kind": str(agent.get("kind") or "agent").encode("utf-8"),
+            b"kind": kind.encode("utf-8"),
             b"sensitivity_ceiling": str(agent.get("sensitivity_ceiling") or "").encode("utf-8"),
             b"allowed_tools": json.dumps(agent.get("allowed_tools") or []).encode("utf-8"),
         }
@@ -418,18 +457,42 @@ return 1
                 b"pids_limit":          str(agent.get("pids_limit", 64)).encode("utf-8"),
                 b"memory_mb":           str(agent.get("memory_mb", 512)).encode("utf-8"),
                 b"spiffe_id":           str(agent.get("spiffe_id", "")).encode("utf-8"),
+                b"scope_hash":          str(agent.get("scope_hash", "")).encode("utf-8"),
             })
+
         pipe = self._r.pipeline()
         pipe.hset(reg_key, mapping=mapping)
-        pipe.set(token_key, token_hash.encode("utf-8"))
         pipe.sadd("agent:index:all", agent_id.encode("utf-8"))
-        if status == "active":
-            pipe.sadd("agent:index:active", agent_id.encode("utf-8"))
+
+        if kind == "nhi":
+            # No durable token to restore (see docstring) — index membership
+            # only. An NHI only ever entered nhi:index:active via approve_svid,
+            # so mirror that invariant: active + svid_issued => nhi:index:active.
+            if status == "active":
+                pipe.sadd("agent:index:active", agent_id.encode("utf-8"))
+                if agent.get("svid_issued"):
+                    pipe.sadd("nhi:index:active", agent_id.encode("utf-8"))
+                else:
+                    pipe.srem("nhi:index:active", agent_id.encode("utf-8"))
+            else:
+                pipe.srem("agent:index:active", agent_id.encode("utf-8"))
+                pipe.srem("nhi:index:active", agent_id.encode("utf-8"))
         else:
-            pipe.srem("agent:index:active", agent_id.encode("utf-8"))
+            if token_hash is None:
+                raise ValueError(
+                    f"restore_from_durable: token_hash is required for non-NHI agent {agent_id!r}"
+                )
+            pipe.set(token_key, token_hash.encode("utf-8"))
+            if status == "active":
+                pipe.sadd("agent:index:active", agent_id.encode("utf-8"))
+            else:
+                pipe.srem("agent:index:active", agent_id.encode("utf-8"))
+
         pipe.execute()
-        logger.info("AgentRegistry: restored %s (%s) into Redis db/3 from durable store",
-                    agent_id, agent.get("name", ""))
+        logger.info(
+            "AgentRegistry: restored %s (%s, kind=%s) into Redis db/3 from durable store",
+            agent_id, agent.get("name", ""), kind,
+        )
 
     def get_token_hash(self, agent_id: str) -> Optional[str]:
         """Return the stored bcrypt token_hash for an agent, or None.
@@ -584,24 +647,29 @@ return 1
 
         if self._durable is not None:
             try:
-                self._durable.upsert(
-                    {
-                        "agent_id": nhi_id,
-                        "name": name,
-                        "upstream_url": "",
-                        "protocol": "openai",
-                        "status": "active",
-                        "groups": [],
-                        "allowed_caller_groups": [],
-                        "allowed_paths": allowed_paths,
-                        "allowed_cidrs": [],
-                    },
-                    token_hash=None,
-                )
+                # YSG-RISK-155: use the freshly-decoded Redis record (via get())
+                # instead of a hand-built partial dict. get() decodes kind="nhi"
+                # and includes ALL NHI fields (template_id, owner_identity_id,
+                # allowed_models, budget_cap, svid_issued, pids_limit, memory_mb,
+                # spiffe_id, scope_hash) — the previous partial dict carried only
+                # agent_id/name/upstream_url/protocol/status/groups/allowed_*,
+                # silently dropping every NHI-specific field even when the
+                # underlying upsert() bug (dead UPDATE-only branch on a brand-new
+                # row) is fixed. token_hash stays None — an NHI's plaintext
+                # bearer token is a one-time secret and is NEVER durably
+                # persisted (see this method's docstring); durable_store.upsert()
+                # now permits a NULL token_hash for kind="nhi" rows (migration
+                # 0030) so the INSERT still succeeds.
+                full = self.get(nhi_id)
+                if full is not None:
+                    self._durable.upsert(full, token_hash=None)
             except Exception as exc:
                 logger.error(
-                    "AgentRegistry: DURABLE write failed for NHI %s: %s", nhi_id, exc
+                    "AgentRegistry: DURABLE write failed for NHI %s — the NHI is live in "
+                    "Redis but will NOT survive a redis recreate until re-registered: %s",
+                    nhi_id, exc,
                 )
+                _record_durable_write_failure("register_nhi", "nhi")
 
         return nhi_id, plaintext_token
 
@@ -634,6 +702,26 @@ return 1
         pipe.sadd("nhi:index:active", nhi_id.encode("utf-8"))
         pipe.execute()
         logger.info("AgentRegistry: NHI %s SVID approved — now executable", nhi_id)
+
+        # YSG-RISK-155: mirror svid_issued=True into the durable store. Without
+        # this, an NHI approved via this method restores from a redis wipe with
+        # svid_issued=False (its durable row would still show the pre-approval
+        # state) — i.e. an already-executable NHI would come back as
+        # pending-approval, contradicting "restore an NHI with its NHI fields
+        # intact". Best-effort/logged, same as every other durable dual-write —
+        # the approval itself already succeeded in Redis and must not roll back.
+        if self._durable is not None:
+            try:
+                full = self.get(nhi_id)
+                if full is not None:
+                    self._durable.upsert(full, token_hash=None)
+            except Exception as exc:
+                logger.error(
+                    "AgentRegistry: DURABLE svid-approval write failed for NHI %s — Postgres "
+                    "mirror stale (would restore as pending-approval) until next mutation: %s",
+                    nhi_id, exc,
+                )
+                _record_durable_write_failure("approve_svid", "nhi")
 
     def get_nhi_token_map(self) -> dict[str, str]:
         """Return {plaintext_token: nhi_id} for all active NHIs (svid_issued=1).

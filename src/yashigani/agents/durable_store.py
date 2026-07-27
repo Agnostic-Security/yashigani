@@ -101,9 +101,26 @@ class AgentDurableStore:
 
         ``agent`` is the AgentRegistry hash dict (agent_id, name, upstream_url,
         protocol, status, groups, allowed_caller_groups, allowed_paths,
-        allowed_cidrs). ``token_hash`` is supplied on initial registration and
-        on token rotation; on metadata-only updates it is None and the existing
-        hash is preserved.
+        allowed_cidrs, kind, sensitivity_ceiling, allowed_tools, and — for
+        ``kind == "nhi"`` — template_id, owner_identity_id, allowed_models,
+        budget_cap, svid_issued, pids_limit, memory_mb, spiffe_id, scope_hash).
+        ``token_hash`` is supplied on initial registration and on token
+        rotation; on metadata-only updates it is None and the existing hash
+        (if any) is preserved.
+
+        YSG-RISK-155: this is ALWAYS a single INSERT ... ON CONFLICT DO UPDATE.
+        The previous shape branched on ``token_hash is None`` into either an
+        INSERT (token_hash supplied) or a bare ``UPDATE ... WHERE agent_id=%s``
+        (token_hash None) — for a BRAND-NEW row with no existing durable entry,
+        the UPDATE-only branch matched zero rows and silently dropped the
+        registration. ``register_nhi()`` always calls this with
+        ``token_hash=None`` (an NHI's bearer token is a one-time secret, never
+        durably persisted — see register_nhi's docstring), so every new NHI
+        hit exactly that dead branch. A single upsert statement has no such
+        branch: the INSERT always fires for a new agent_id, and
+        ``token_hash IS NOT NULL`` in agent_registry's schema is now only
+        required for kind='agent' rows (migration 0030) so a NULL token_hash
+        on a brand-new NHI INSERT succeeds.
 
         Fail-loud: durability is the whole point of this store, so any failure
         re-raises after logging — the caller decides whether to surface it.
@@ -118,63 +135,76 @@ class AgentDurableStore:
         allowed_caller_groups = json.dumps(agent.get("allowed_caller_groups", []))
         allowed_paths = json.dumps(agent.get("allowed_paths", []))
         allowed_cidrs = json.dumps(agent.get("allowed_cidrs", []))
+        kind = agent.get("kind") or "agent"
+        sensitivity_ceiling = agent.get("sensitivity_ceiling") or ""
+        allowed_tools = json.dumps(agent.get("allowed_tools") or [])
+        template_id = agent.get("template_id") or ""
+        owner_identity_id = agent.get("owner_identity_id") or ""
+        allowed_models = json.dumps(agent.get("allowed_models") or [])
+        budget_cap = json.dumps(agent.get("budget_cap") or {})
+        svid_issued = bool(agent.get("svid_issued") or False)
+        pids_limit = int(agent.get("pids_limit") or 64)
+        memory_mb = int(agent.get("memory_mb") or 512)
+        spiffe_id = agent.get("spiffe_id") or ""
+        scope_hash = agent.get("scope_hash") or ""
 
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                if token_hash is not None:
-                    cur.execute(
-                        """
-                        INSERT INTO agent_registry
-                            (tenant_id, agent_id, agent_name, upstream_url, token_hash,
-                             protocol, status, is_active, groups, allowed_caller_groups,
-                             allowed_paths, allowed_cidrs, updated_at)
-                        VALUES
-                            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                        ON CONFLICT (tenant_id, agent_id) DO UPDATE SET
-                            agent_name            = EXCLUDED.agent_name,
-                            upstream_url          = EXCLUDED.upstream_url,
-                            token_hash            = EXCLUDED.token_hash,
-                            protocol              = EXCLUDED.protocol,
-                            status                = EXCLUDED.status,
-                            is_active             = EXCLUDED.is_active,
-                            groups                = EXCLUDED.groups,
-                            allowed_caller_groups = EXCLUDED.allowed_caller_groups,
-                            allowed_paths         = EXCLUDED.allowed_paths,
-                            allowed_cidrs         = EXCLUDED.allowed_cidrs,
-                            updated_at            = now()
-                        """,
-                        (
-                            _PLATFORM_TENANT_ID, agent_id, name, upstream_url, token_hash,
-                            protocol, status, is_active, groups, allowed_caller_groups,
-                            allowed_paths, allowed_cidrs,
-                        ),
-                    )
-                else:
-                    # Metadata-only update — preserve existing token_hash.
-                    cur.execute(
-                        """
-                        UPDATE agent_registry SET
-                            agent_name            = %s,
-                            upstream_url          = %s,
-                            protocol              = %s,
-                            status                = %s,
-                            is_active             = %s,
-                            groups                = %s,
-                            allowed_caller_groups = %s,
-                            allowed_paths         = %s,
-                            allowed_cidrs         = %s,
-                            updated_at            = now()
-                        WHERE tenant_id = %s AND agent_id = %s
-                        """,
-                        (
-                            name, upstream_url, protocol, status, is_active,
-                            groups, allowed_caller_groups, allowed_paths, allowed_cidrs,
-                            _PLATFORM_TENANT_ID, agent_id,
-                        ),
-                    )
+                cur.execute(
+                    """
+                    INSERT INTO agent_registry
+                        (tenant_id, agent_id, agent_name, upstream_url, token_hash,
+                         protocol, status, is_active, groups, allowed_caller_groups,
+                         allowed_paths, allowed_cidrs, kind, sensitivity_ceiling,
+                         allowed_tools, template_id, owner_identity_id, allowed_models,
+                         budget_cap, svid_issued, pids_limit, memory_mb, spiffe_id,
+                         scope_hash, updated_at)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (tenant_id, agent_id) DO UPDATE SET
+                        agent_name             = EXCLUDED.agent_name,
+                        upstream_url           = EXCLUDED.upstream_url,
+                        -- Metadata-only writes pass token_hash=NULL: keep the
+                        -- existing hash rather than clobbering it. A real
+                        -- rotation/new registration always passes a value.
+                        token_hash              = COALESCE(EXCLUDED.token_hash, agent_registry.token_hash),
+                        protocol                = EXCLUDED.protocol,
+                        status                  = EXCLUDED.status,
+                        is_active               = EXCLUDED.is_active,
+                        groups                  = EXCLUDED.groups,
+                        allowed_caller_groups   = EXCLUDED.allowed_caller_groups,
+                        allowed_paths           = EXCLUDED.allowed_paths,
+                        allowed_cidrs           = EXCLUDED.allowed_cidrs,
+                        kind                    = EXCLUDED.kind,
+                        sensitivity_ceiling     = EXCLUDED.sensitivity_ceiling,
+                        allowed_tools           = EXCLUDED.allowed_tools,
+                        template_id             = EXCLUDED.template_id,
+                        owner_identity_id       = EXCLUDED.owner_identity_id,
+                        allowed_models          = EXCLUDED.allowed_models,
+                        budget_cap              = EXCLUDED.budget_cap,
+                        svid_issued             = EXCLUDED.svid_issued,
+                        pids_limit              = EXCLUDED.pids_limit,
+                        memory_mb               = EXCLUDED.memory_mb,
+                        spiffe_id               = EXCLUDED.spiffe_id,
+                        scope_hash              = EXCLUDED.scope_hash,
+                        updated_at              = now()
+                    """,
+                    (
+                        _PLATFORM_TENANT_ID, agent_id, name, upstream_url, token_hash,
+                        protocol, status, is_active, groups, allowed_caller_groups,
+                        allowed_paths, allowed_cidrs, kind, sensitivity_ceiling,
+                        allowed_tools, template_id, owner_identity_id, allowed_models,
+                        budget_cap, svid_issued, pids_limit, memory_mb, spiffe_id,
+                        scope_hash,
+                    ),
+                )
             conn.commit()
-            logger.info("AgentDurableStore: upserted %s (%s) into Postgres", agent_id, name)
+            logger.info(
+                "AgentDurableStore: upserted %s (%s, kind=%s) into Postgres",
+                agent_id, name, kind,
+            )
         except Exception:
             conn.rollback()
             logger.exception("AgentDurableStore: upsert FAILED for %s", agent_id)
@@ -213,7 +243,20 @@ class AgentDurableStore:
         Async — uses the open asyncpg pool. Used by the startup reconciler to
         re-push Postgres → Redis db/3. ``token_hash`` is included so the
         reconciler can restore the bcrypt hash directly into Redis without a
-        token rotation (existing tokens keep working).
+        token rotation (existing tokens keep working) — it is legitimately
+        NULL for ``kind == "nhi"`` rows (migration 0030); the reconciler
+        handles that case separately (an NHI's bearer token is a one-time
+        secret, never durably persisted).
+
+        YSG-RISK-155: also SELECTs ``kind`` and the NHI-specific columns
+        (template_id, owner_identity_id, allowed_models, budget_cap,
+        svid_issued, pids_limit, memory_mb, spiffe_id, scope_hash) plus the
+        generic 4.0 Phase 5 additive columns (sensitivity_ceiling,
+        allowed_tools). Previously these were not selected at all, so
+        ``AgentRegistry.restore_from_durable()``'s ``if kind == "nhi":``
+        branch always saw ``kind == "agent"`` (the dataclass default) and
+        never fired — an NHI restored after a Redis wipe came back as a plain
+        agent with none of its NHI fields.
         """
         from yashigani.db import tenant_transaction
 
@@ -223,7 +266,10 @@ class AgentDurableStore:
                 """
                 SELECT agent_id, agent_name, upstream_url, token_hash, protocol,
                        status, groups, allowed_caller_groups, allowed_paths,
-                       allowed_cidrs, created_at, last_seen_at
+                       allowed_cidrs, created_at, last_seen_at, kind,
+                       sensitivity_ceiling, allowed_tools, template_id,
+                       owner_identity_id, allowed_models, budget_cap,
+                       svid_issued, pids_limit, memory_mb, spiffe_id, scope_hash
                 FROM agent_registry
                 WHERE agent_id IS NOT NULL
                 ORDER BY agent_id
@@ -244,6 +290,18 @@ class AgentDurableStore:
                     "allowed_cidrs": _as_list(r["allowed_cidrs"]),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else "",
                     "last_seen_at": r["last_seen_at"].isoformat() if r["last_seen_at"] else "",
+                    "kind": r["kind"] or "agent",
+                    "sensitivity_ceiling": r["sensitivity_ceiling"] or "",
+                    "allowed_tools": _as_list(r["allowed_tools"]),
+                    "template_id": r["template_id"] or "",
+                    "owner_identity_id": r["owner_identity_id"] or "",
+                    "allowed_models": _as_list(r["allowed_models"]),
+                    "budget_cap": _as_dict(r["budget_cap"]),
+                    "svid_issued": bool(r["svid_issued"]),
+                    "pids_limit": r["pids_limit"] if r["pids_limit"] is not None else 64,
+                    "memory_mb": r["memory_mb"] if r["memory_mb"] is not None else 512,
+                    "spiffe_id": r["spiffe_id"] or "",
+                    "scope_hash": r["scope_hash"] or "",
                 }
             )
         return rows
@@ -262,3 +320,18 @@ def _as_list(val) -> list:
         except Exception:
             return []
     return []
+
+
+def _as_dict(val) -> dict:
+    """asyncpg returns JSON columns as str (or already-decoded); normalise to dict."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, (str, bytes)):
+        try:
+            decoded = json.loads(val)
+            return decoded if isinstance(decoded, dict) else {}
+        except Exception:
+            return {}
+    return {}

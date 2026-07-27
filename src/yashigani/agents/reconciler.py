@@ -96,9 +96,22 @@ async def reconcile_agents_from_durable(agent_registry, durable_store) -> int:
     for row in durable_rows:
         agent_id = row.get("agent_id")
         token_hash = row.get("token_hash")
-        if not agent_id or not token_hash:
+        kind = row.get("kind") or "agent"
+        if not agent_id:
             logger.warning(
-                "AGENT-RECONCILE: durable row missing agent_id/token_hash (%r) — skipping",
+                "AGENT-RECONCILE: durable row missing agent_id (%r) — skipping",
+                {k: row.get(k) for k in ("agent_id", "name")},
+            )
+            continue
+        # YSG-RISK-155: token_hash is legitimately NULL for kind="nhi" — an
+        # NHI's bearer token is a one-time plaintext secret that register_nhi()
+        # deliberately never re-persists to Postgres (see restore_from_durable's
+        # docstring). Only a non-NHI agent missing its bcrypt hash is a corrupt/
+        # incomplete durable row worth skipping.
+        if kind != "nhi" and not token_hash:
+            logger.warning(
+                "AGENT-RECONCILE: durable row missing token_hash for non-NHI agent (%r) — "
+                "skipping",
                 {k: row.get(k) for k in ("agent_id", "name")},
             )
             continue
@@ -108,6 +121,15 @@ async def reconcile_agents_from_durable(agent_registry, durable_store) -> int:
         try:
             agent_registry.restore_from_durable(row, token_hash)
             restored += 1
+            if kind == "nhi":
+                logger.warning(
+                    "AGENT-RECONCILE: restored NHI %s (%s) metadata from Postgres — its "
+                    "bearer token is a one-time secret that is NOT durably stored, so it "
+                    "was NOT restored; the NHI is visible/approved again but any caller "
+                    "using its old token will get 401 until the token is re-provisioned "
+                    "(rotate / re-approve)",
+                    agent_id, row.get("name", "?"),
+                )
         except Exception as exc:
             logger.error(
                 "AGENT-RECONCILE: failed to restore %s (%s) into Redis (%s) — this agent "
@@ -147,6 +169,26 @@ def _backfill_durable_from_redis(agent_registry, durable_store) -> int:
     for agent in agents:
         agent_id = agent.get("agent_id")
         if not agent_id:
+            continue
+        kind = agent.get("kind") or "agent"
+        if kind == "nhi":
+            # YSG-RISK-155: an NHI has no bcrypt token_hash to back-fill — its
+            # bearer token lives PLAINTEXT in nhi:token:{nhi_id} and is a
+            # one-time secret, never durably persisted (get_token_hash() reads
+            # agent:token:{agent_id}, which an NHI never populates, so the
+            # `if not token_hash: skip` guard below would previously have
+            # skipped EVERY NHI here too). Back-fill the metadata row with
+            # token_hash=None — durable_store.upsert()/agent_registry now
+            # permit a NULL hash for kind="nhi" (migration 0030) — so the NHI
+            # at least survives a redis recreate as a restorable identity.
+            try:
+                durable_store.upsert(agent, token_hash=None)
+                count += 1
+            except Exception as exc:
+                logger.error(
+                    "AGENT-RECONCILE: back-fill upsert FAILED for NHI %s (%s) — will retry "
+                    "next boot: %s", agent_id, agent.get("name", "?"), exc,
+                )
             continue
         token_hash = agent_registry.get_token_hash(agent_id)
         if not token_hash:

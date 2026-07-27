@@ -406,6 +406,15 @@ agent_registry_size = _G(
     ["status"],
 )
 
+agent_durable_write_failures_total = _C(
+    "yashigani_agent_durable_write_failures_total",
+    "YSG-RISK-155: durable Postgres mirror write failures for agent/NHI "
+    "registrations, by operation and kind. Non-zero means a registration is "
+    "live in Redis but will NOT survive a redis db/3 recreate until the "
+    "write succeeds (retried on the next mutation, or manually re-synced).",
+    ["operation", "kind"],
+)
+
 # ---------------------------------------------------------------------------
 # Inspection backend metrics
 # ---------------------------------------------------------------------------
