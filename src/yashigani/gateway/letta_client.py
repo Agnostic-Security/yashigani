@@ -46,9 +46,27 @@ with a per-user pool. Each user gets their own Letta container (via PoolManager)
 their own Letta agent within that container. Cross-user memory bleed is closed at
 both the container (separate process) and DB (schema-per-user) layers.
 
+YSG-RISK-147 (v5.0, 2026-07-27): RISK-107 only wired LettaClientPool into the
+persona/pool @-alias path (openai_router.py, LettaClientPool.for_user() at the
+"persona" branch). The STATIC/globally-registered @letta agent path (an agent
+record in agent_registry with protocol="letta" and a plain, non-pool://
+upstream_url) still called the module-level letta_chat()/_ensure_agent()
+below for EVERY caller, sharing the single "yashigani-default" agent across
+all users — the exact cross-user memory bleed RISK-107 was meant to close.
+openai_router.py's static-@letta branch now routes any request carrying a
+real user identity (identity_id not None/"internal") through
+LettaClientPool.letta_chat(user_id=identity_id, ...) instead, so it gets its
+own per-user agent. The module-level _default_agent_id/_ensure_agent/
+letta_chat below are retained ONLY as the fallback for traffic with no user
+identity to bleed across (service/system callers) or deployments with no
+PoolManager configured — never for identified user traffic.
+
 PINNED SEAM (Tom → Captain): LettaClientPool.for_user(identity_id) returns
-(httpx.AsyncClient, base_url, agent_id). Tom's OpenAI router uses this seam to route
-@letta messages. The seam signature is STABLE — do not change without Tom's sign-off.
+(httpx.AsyncClient, base_url, agent_id); LettaClientPool.letta_chat(user_id,
+messages, timeout) is the convenience wrapper. openai_router.py uses these
+seams to route @letta messages for BOTH the persona/pool @-alias path and
+(as of YSG-RISK-147) the static registry @letta path. The seam signature is
+STABLE — do not change without Tom's sign-off.
 """
 
 import logging
@@ -106,9 +124,12 @@ def _handle_not_found_hint(status_code: int, response_text: str) -> str:
 
 
 # Cache the default agent ID after first creation.
-# DEPRECATED (4.0 — use LettaClientPool). Retained for backward-compat with any
-# 3.0 call sites that still invoke letta_chat() directly during the migration.
-# Will be removed once Tom wires all call sites to LettaClientPool.for_user().
+# DEPRECATED (4.0 — use LettaClientPool). YSG-RISK-147 (2026-07-27) wired the
+# last identified-user call site (openai_router.py static @letta path) to
+# LettaClientPool; this module-global now backs ONLY the no-identity
+# (internal/system) and no-PoolManager fallback branches — it is never used
+# for identified user traffic. Retained for those fallbacks and for any
+# direct callers of module-level letta_chat() (see TestLettaDispatchWiring).
 _default_agent_id: str | None = None
 
 
