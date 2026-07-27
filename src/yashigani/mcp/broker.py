@@ -1067,8 +1067,13 @@ class McpBroker:
           - Resolve server key: ctx.mcp_id (v4.0 stable UUID) or ctx.server_id
               or ctx.agent_name (backward compat fallback).
           - Call resolve_boolean_grant(MCP_SERVER, server_key, org_id,
-              group_ids=[], principal_scope=None, principal_id=None) — org-level check only.
-          - Returns "mcp_server_not_permitted" when no org grant or org denies.
+              group_ids=ctx.caller_group_ids,
+              principal_scope=ctx.caller_principal_scope,
+              principal_id=ctx.caller_principal_id) — org ceiling AND
+              group/principal narrowing (YSG-RISK-151).
+          - Returns "mcp_server_not_permitted" when no org grant, org denies,
+            a group the caller belongs to denies, or the caller's own
+            principal-scope grant denies.
 
         Fail-closed: any exception from the resolver is already caught inside
         resolve_boolean_grant (it returns False on any error).
@@ -1088,13 +1093,22 @@ class McpBroker:
 
         org_id = self._config.org_id or "default"
 
+        # YSG-RISK-151: group_ids/principal_scope/principal_id now come from
+        # ctx — populated by the MCP router runtime from the identity
+        # registry (mirrors gateway/orchestrator.py's EXTERNAL_API grant
+        # check). Previously hardcoded to [] / None / None here, which meant
+        # an admin-written group- or user-scope mcp_server DENY (with its own
+        # audit event) was structurally unreachable — resolve_boolean_grant's
+        # group/principal tiers only NARROW an org-level allow (INV-2/INV-3
+        # in permissions/resolver.py), so passing the real values here can
+        # only make this MORE restrictive, never less (fail-closed direction).
         allowed = resolve_boolean_grant(
             ResourceType.MCP_SERVER,
             server_key,
             org_id=org_id,
-            group_ids=[],
-            principal_scope=None,  # org-level only; no group/user narrowing
-            principal_id=None,
+            group_ids=ctx.caller_group_ids,
+            principal_scope=ctx.caller_principal_scope,
+            principal_id=ctx.caller_principal_id,
             store=self._config.permission_store,  # type: ignore[arg-type]
         )
         return None if allowed else "mcp_server_not_permitted"

@@ -183,6 +183,25 @@ class McpCallContext:
     # all tools on any registered MCP server).
     caller_allowed_tools: Optional[list[str]] = None
 
+    # YSG-RISK-151 — per-group/per-principal mcp_server grant narrowing.
+    # Populated by the MCP router runtime from the SAME identity-registry
+    # lookup as caller_allowed_tools (IdentityRecord.groups for the caller
+    # identified by caller_agent_id). Consumed by
+    # McpBroker._check_connection_permit() → permissions.resolve_boolean_grant
+    # for the mcp_server ResourceType — before this fix the broker hardcoded
+    # group_ids=[], principal_scope=None, principal_id=None, so an admin-
+    # written group/user-scope mcp_server grant/deny was NEVER evaluated
+    # (only the org-level ceiling applied).
+    #   caller_group_ids:    IDs of the groups the caller belongs to (narrows,
+    #                        never widens — an org grant is still required).
+    #   caller_principal_scope: "agent" | "user" | None. None → principal
+    #                        tier skipped (org+group ceiling only — e.g.
+    #                        gateway:orchestrator / unidentified caller).
+    #   caller_principal_id: scope-specific ID (agent_id for "agent" scope).
+    caller_group_ids: list[str] = field(default_factory=list)
+    caller_principal_scope: Optional[str] = None
+    caller_principal_id: Optional[str] = None
+
 
 @dataclass
 class OpaDecision:
