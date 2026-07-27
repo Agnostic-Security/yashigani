@@ -1276,6 +1276,20 @@ agentBundles:
       repository: ghcr.io/openclaw/openclaw
       tag: "2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
       pullPolicy: IfNotPresent
+    # NEW-K8S-OPENCLAW-NONROOT-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28): the pinned openclaw image (Node.js base) runs as uid=1000
+    # with named user "node" (non-numeric USER directive) — confirmed via
+    # `docker run --rm --entrypoint sh <image> -c 'id node'` => uid=1000(node)
+    # gid=1000(node). K8s runAsNonRoot rejects non-numeric USER directives
+    # without an explicit runAsUser (kubelet error: "container has
+    # runAsNonRoot and image has non-numeric user (node), cannot verify user
+    # is non-root" — CreateContainerConfigError, every pod, every start).
+    # Identical root cause + fix already applied to the langflow bundle above
+    # (see its podSecurityContext comment) — openclaw never got the same
+    # treatment. Fix: pin the same numeric UID the image itself declares.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
     replicaCount: 1
     env:
       OPENCLAW_SERVER_MODE: "true"
