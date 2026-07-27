@@ -1106,6 +1106,46 @@ def _build_app(mesh_mode: bool = False):
     # bricks due to a slow-starting inference backend.
     _available_models = _fetch_ollama_models_sync(ollama_url, timeout=3.0)
 
+    # ── Delegated-context machinery (YSG-RISK-141 / R2/R12/R13) ──────────────
+    # DelegatedContextStore mints/resolves the signed X-Yashigani-Session-Id
+    # binding an NHI-forwarded call to the invoking human's identity — closes
+    # FIND-3.1-AGENT-BEARER-IMPERSONATION / RISK-097 for the NHI-forwarding leg
+    # (module was dead code — zero production callers — until this wiring).
+    #
+    # Soft-degrade on Redis db/4 unavailability, deliberately UNLIKE the
+    # orchestration-principal machinery below (which raises): this feature is
+    # narrower — it only gates NHI-forwarded on-behalf-of calls, not every
+    # hop — and a store of None is SAFE by construction: every mint()/resolve()
+    # call site (gateway/openai_router.py) treats "no store" as "no delegated
+    # context, no on_behalf_of elevation", never as an implicit grant. A
+    # genuine ES384 signing-key/FIPS failure is already fatal via
+    # build_principal_machinery below (same key, R13) — no need to duplicate
+    # that hard-fail here.
+    delegated_context_store = None
+    try:
+        import redis as _redis_dc
+        from yashigani.mcp._nonce import RedisNonceStore
+        from yashigani.gateway.delegated_context import build_delegated_context_store
+        redis_client_dc = _redis_dc.from_url(_gw_redis_url(4), decode_responses=False)
+        redis_client_dc.ping()
+        _dc_tenant_id = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
+        delegated_context_store = build_delegated_context_store(
+            redis_client_dc,
+            tenant_id=_dc_tenant_id,
+            nonce_store=RedisNonceStore(redis_client_dc),
+        )
+        logger.info(
+            "delegated-context: DelegatedContextStore wired (Redis db/4, "
+            "audience=yashigani-delegated-context, YSG-RISK-141)"
+        )
+    except Exception as exc:
+        logger.warning(
+            "DelegatedContextStore unavailable (%s) — NHI-forwarded calls will "
+            "carry no verified on_behalf_of binding (safe: no elevation, not a "
+            "privilege loosening) — YSG-RISK-141",
+            exc,
+        )
+
     # Configure and prepare the /v1 router BEFORE creating the gateway app
     # (it must be registered before the catch-all proxy route)
     configure_openai_router(
@@ -1152,6 +1192,7 @@ def _build_app(mesh_mode: bool = False):
         # BLOCK on outbound tool-call arguments. None when mode-B-proxy is not
         # opted in (dark) — unchanged pre-fix behaviour.
         document_pipeline=document_pipeline,
+        delegated_context_store=delegated_context_store,  # YSG-RISK-141
     )
 
     # ── Egress evaluation proxy (v4.1 — general egress content gate) ─────────

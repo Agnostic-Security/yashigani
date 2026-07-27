@@ -14,13 +14,30 @@ NHI container via a settable header.  Instead it:
      TTL = nonce ``exp`` − ``iat`` (same window, single-use via jti replay guard).
   3. The NHI container carries ONLY the signed nonce as a request header —
      it CANNOT forge the user identity or the effective_scope.
-  4. On each NHI callback, ``resolve_context()`` verifies the nonce signature,
+  4. On each NHI callback, ``DelegatedContextStore.resolve()`` verifies the nonce signature,
      reads the Redis record, and ASSERTS that ``record.nhi_id`` matches the
      ``presenting_agent_spiffe`` of the caller (R12: leaked nonce unusable by
      another agent even within TTL).
 
 OPA sees ``on_behalf_of`` from the resolved context, NEVER from a header the
 NHI can set.  This closes RISK-097 / FIND-3.1-AGENT-BEARER-IMPERSONATION.
+
+WIRING (YSG-RISK-141)
+----------------------
+Mint site:    gateway/openai_router.py:chat_completions(), the generic
+              OpenAI-compatible NHI-forwarding branch (immediately after
+              ``agent_headers["Authorization"]`` is set) — only when the target
+              is an admin-approved (``svid_issued=1``) per-user NHI resolved via
+              the ``@``-handle path, so ``bound_spiffe`` is always the NHI's real
+              registry-assigned SPIFFE, never empty.
+Resolve site: gateway/openai_router.py:_resolve_identity(), the ``p1_nhi``
+              branch — reads ``X-Yashigani-Session-Id``, calls ``resolve()``,
+              and populates ``identity["on_behalf_of"]`` only on success.
+Fail-closed:  no store / no header / any verification failure → no
+              ``on_behalf_of`` is set — the NHI proceeds under its own identity
+              with no elevation.  A client-supplied header can never set
+              ``on_behalf_of`` directly; only a value that verifies through
+              ``resolve()`` reaches OPA input.
 
 DEDICATED SIGNING KEY (R13)
 ---------------------------
@@ -44,7 +61,7 @@ This is isolated from:
   - db/1 — nonce store (MCP relay JWT + orchestration-principal JTIs)
   - db/3 — agent registry (AgentRegistry)
 
-Last updated: 2026-06-27T00:00:00+00:00
+Last updated: 2026-07-27T00:00:00+00:00
 """
 from __future__ import annotations
 
@@ -82,7 +99,7 @@ class DelegatedContextError(Exception):
 class DelegatedContext:
     """Server-side delegated context for an NHI invocation.
 
-    Stored in Redis as JSON; reconstructed by ``resolve_context()``.
+    Stored in Redis as JSON; reconstructed by ``DelegatedContextStore.resolve()``.
     ``effective_scope`` is the server-computed intersection (R3) — NOT
     client-supplied.  It is what OPA evaluates as ``on_behalf_of.authority``.
     """
@@ -92,7 +109,7 @@ class DelegatedContext:
     exp: float                   # Unix timestamp for TTL
     effective_scope: dict = field(default_factory=dict)   # allowed_paths, tools, models
     # R12: presenting agent's SPIFFE id — the delegation record is bound to this.
-    # resolve_context() asserts presenting_agent_spiffe == this value (fail-closed).
+    # resolve() asserts presenting_agent_spiffe == this value (fail-closed).
     bound_spiffe: str = ""
 
     def to_json(self) -> str:
@@ -339,6 +356,27 @@ class DelegatedContextStore:
         return ctx
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def audit_jti(self, token: str) -> str:
+        """Return the VERIFIED jti claim from a token this store just minted.
+
+        YSG-RISK-141 wiring: the mint call site needs the jti to build the
+        DelegatedCtxMintedEvent.binding_hash immediately after mint() returns
+        (which gives back only the opaque token string). This performs a FULL
+        ES384 signature + audience verification (never a bare unverified
+        decode) — it is only ever called on our own just-minted token, never
+        as part of a resolve()/authorization decision. Returns "" on any
+        verification failure (should never happen for a token we just signed;
+        fails safe into an empty binding_hash component rather than raising).
+        """
+        try:
+            payload = pyjwt.decode(
+                token, self._issuer._public_key, algorithms=[_ALGORITHM],
+                audience=_AUDIENCE, leeway=5,
+            )
+        except pyjwt.PyJWTError:
+            return ""
+        return payload.get("jti", "")
 
     @staticmethod
     def session_id_hash(raw_session_id: str) -> str:

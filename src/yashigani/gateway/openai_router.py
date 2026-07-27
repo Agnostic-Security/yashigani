@@ -83,6 +83,7 @@ from yashigani.audit.schema import (
     StreamTerminatedEvent,
 )
 from yashigani.gateway._client_enforce import evaluate_client_policies, scope_kind_for
+from yashigani.gateway.delegated_context import DelegatedContextError
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -962,6 +963,20 @@ _INTERNAL_BEARER: str = _load_internal_bearer()
 # ---------------------------------------------------------------------------
 _YASHIGANI_IDENTITY_ID_HEADER = "x-yashigani-identity-id"
 
+# ---------------------------------------------------------------------------
+# YSG-RISK-141: X-Yashigani-Session-Id — server-minted delegated-context nonce.
+#   - Value: an ES384-signed JWT minted by DelegatedContextStore.mint() (R2/R12/
+#     R13), audience "yashigani-delegated-context" — a client CANNOT forge one;
+#     the gateway ONLY trusts a value that verifies via
+#     DelegatedContextStore.resolve() (signature + Redis record + presenting-
+#     caller-spiffe cross-check). See gateway/delegated_context.py.
+#   - Consulted ONLY on the p1_nhi resolution path in _resolve_identity(). A
+#     present-but-unverifiable/absent value never grants on_behalf_of — the NHI
+#     simply runs as its own identity (fail-closed default, see resolve()
+#     call site below).
+# ---------------------------------------------------------------------------
+_YASHIGANI_SESSION_ID_HEADER = "x-yashigani-session-id"
+
 
 def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]":
     """Resolve identity from X-Yashigani-Identity-Id header on the trusted path.
@@ -1435,6 +1450,13 @@ class OpenAIRouterState:
         self.default_model: str = "qwen2.5:3b"
         self.available_models: list[dict] | None = None  # None=fetch-failed/permissive; []=fetched-empty; [...]= populated
         self.agent_registry = None
+        # YSG-RISK-141: DelegatedContextStore | None — mints/resolves the signed
+        # X-Yashigani-Session-Id on-behalf-of binding for NHI-forwarded calls
+        # (R2/R12/R13). None → the feature is soft-disabled (Redis db/4 or the
+        # ES384 signing key unavailable at startup); mint()/resolve() call sites
+        # treat None as "no delegation, no on_behalf_of elevation" — never as an
+        # implicit grant. See gateway/entrypoint.py wiring + gateway/delegated_context.py.
+        self.delegated_context_store = None
         # Track B1 (model-RBAC): durable allocation store + alias store, read on
         # the request path to compute effective-allowed-models for the caller.
         self.model_allocation_store = None   # ModelAllocationStore | None
@@ -1712,6 +1734,7 @@ def configure(
     permission_store=None,        # 3.1 Phase 6 — PermissionStore | None (cloud-model gate)
     rbac_store=None,              # W3-008 — RBACStore | None (group membership backfill)
     document_pipeline=None,       # FINDING-V412-RESTART-013 gap #6 — DocumentInspectionPipeline | None
+    delegated_context_store=None,  # YSG-RISK-141 — DelegatedContextStore | None
 ) -> None:
     """Configure the OpenAI router with dependencies. Called once at startup.
 
@@ -1736,6 +1759,7 @@ def configure(
     _state.default_model = default_model
     _state.available_models = available_models  # preserve None (fetch-failed) vs [] (fetched-empty) vs [...] (populated)
     _state.agent_registry = agent_registry
+    _state.delegated_context_store = delegated_context_store
     _state.response_inspection_pipeline = response_inspection_pipeline
     _state.request_inspection_pipeline = request_inspection_pipeline
     _state.system_prompt_leak_guard = system_prompt_leak_guard
@@ -2682,6 +2706,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     agent_upstream = None
     agent_protocol = "openai"
+    # YSG-RISK-141: captured ONLY on the per-user @-handle NHI path below
+    # (where the target NHI's registry record — and therefore its bound_spiffe
+    # — is known BEFORE forwarding).  Empty means "no delegated-context binding
+    # for this hop" — the forward proceeds unchanged; the NHI's later callback
+    # simply carries no on_behalf_of elevation (safe, never a silent grant).
+    _delegated_ctx_nhi_id = ""
+    _delegated_ctx_bound_spiffe = ""
+    _delegated_ctx_scope: dict = {}
     if is_agent_call and _state.agent_registry:
         agent_name = selected_model[1:]  # strip @
 
@@ -2968,6 +3000,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                 }
                             },
                         )
+                    # YSG-RISK-141: NHI is confirmed active + approved (svid_issued=1)
+                    # so its registry-assigned spiffe_id is authoritative — capture the
+                    # on-behalf-of binding inputs now, BEFORE forwarding, so the
+                    # generic OpenAI-compatible dispatch branch below can mint a
+                    # delegated context bound to this NHI's real SPIFFE (R12). A
+                    # pending/unapproved NHI never reaches here (403 above), so this
+                    # can never bind to an empty/placeholder spiffe_id.
+                    if identity and identity_id and identity_id != "internal":
+                        _delegated_ctx_nhi_id = _nhi_id
+                        _delegated_ctx_bound_spiffe = _nhi_entry.get("spiffe_id", "") or ""
+                        _delegated_ctx_scope = {
+                            "allowed_tools": _nhi_entry.get("allowed_tools", []),
+                        }
                     _nhi_url = _nhi_entry.get("upstream_url", "")
                     if _nhi_url.startswith("pool://"):
                         _nhi_image = _nhi_url[len("pool://"):]
@@ -4049,6 +4094,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         env_token = _token_path.read_text().strip()
                 if env_token:
                     agent_headers["Authorization"] = f"Bearer {env_token}"
+
+                # YSG-RISK-141: mint the signed on-behalf-of delegated context and
+                # carry it ONLY as X-Yashigani-Session-Id — the NHI receives an
+                # opaque, server-signed nonce, never the human's identity directly
+                # (R2/R12/R13, closes FIND-3.1-AGENT-BEARER-IMPERSONATION for the
+                # NHI-forwarding leg). _maybe_mint_delegated_context() never raises
+                # and returns None on any failure — the forward always proceeds,
+                # with or without a binding (see its docstring for why that's safe).
+                _dc_token = _maybe_mint_delegated_context(
+                    nhi_id=_delegated_ctx_nhi_id,
+                    bound_spiffe=_delegated_ctx_bound_spiffe,
+                    user_identity_id=identity_id,
+                    effective_scope=_delegated_ctx_scope,
+                )
+                if _dc_token:
+                    agent_headers["X-Yashigani-Session-Id"] = _dc_token
 
                 # YSG-GATE-V50-A: bundled/mesh-fronted "openai"-protocol agents
                 # (currently openclaw; langflow when mis-registered) dispatch
@@ -5713,6 +5774,113 @@ def _emit_agent_header_stripped(
         logger.warning("AGENT_HEADER_STRIPPED audit write failed: %s", exc)
 
 
+def _maybe_mint_delegated_context(
+    *, nhi_id: str, bound_spiffe: str, user_identity_id: str, effective_scope: dict,
+) -> Optional[str]:
+    """YSG-RISK-141: mint a delegated-context token for an NHI-forwarded call.
+
+    Called from the NHI-forwarding dispatch site (chat_completions), BEFORE the
+    outbound request to the NHI's upstream. Returns the signed
+    ``X-Yashigani-Session-Id`` token, or ``None`` when the store is unavailable,
+    any required input is missing, or minting itself fails.
+
+    ``None`` is ALWAYS safe: the caller simply forwards the request without a
+    delegated-context binding, and the NHI's later callback proceeds under its
+    own identity with no ``on_behalf_of`` elevation — this function can only
+    ever cost the delegation binding, never grant one. It never raises.
+    """
+    if (
+        _state.delegated_context_store is None
+        or not nhi_id
+        or not bound_spiffe
+        or not user_identity_id
+        or user_identity_id == "internal"
+    ):
+        return None
+    try:
+        token = _state.delegated_context_store.mint(
+            nhi_id=nhi_id,
+            user_identity_id=user_identity_id,
+            effective_scope=effective_scope,
+            bound_spiffe=bound_spiffe,
+        )
+    except Exception as exc:
+        logger.warning(
+            "delegated-context mint failed for nhi=%s identity=%s — forwarding "
+            "without a delegated-context binding (NHI runs as its own identity, "
+            "no elevation): %s",
+            nhi_id, user_identity_id, exc,
+        )
+        return None
+
+    if _state.audit_writer is not None:
+        try:
+            from yashigani.audit.schema import DelegatedCtxMintedEvent
+            from yashigani.gateway.delegated_context import (
+                DelegatedContextStore as _DCS,
+            )
+            # VERIFIED (ES384 + audience) jti recovery — see
+            # DelegatedContextStore.audit_jti() docstring for why this is a
+            # full-verification decode, never a bare unverified one.
+            dc_jti = _state.delegated_context_store.audit_jti(token)
+            _state.audit_writer.write(DelegatedCtxMintedEvent(
+                nhi_id=nhi_id,
+                user_identity_id=user_identity_id,
+                session_id_hash=_DCS.session_id_hash(token),
+                binding_hash=_DCS.binding_hash(nhi_id, user_identity_id, dc_jti),
+                ttl_seconds=getattr(_state.delegated_context_store, "_ttl", 0),
+            ))
+        except Exception as exc:
+            logger.warning("DelegatedCtxMintedEvent audit write failed: %s", exc)
+
+    return token
+
+
+def _maybe_resolve_delegated_context(request: "Request", nhi_identity: dict) -> None:
+    """YSG-RISK-141: resolve X-Yashigani-Session-Id (if present) into a VERIFIED
+    ``on_behalf_of`` binding on ``nhi_identity``, mutated IN PLACE.
+
+    Called from ``_resolve_identity``'s ``p1_nhi`` branch on every P1-authenticated
+    NHI callback. A client-supplied header alone can NEVER set ``on_behalf_of`` —
+    only a token that verifies through ``DelegatedContextStore.resolve()``
+    (ES384 signature, audience, Redis-record cross-check, AND that the
+    PRESENTING caller's own registry-resolved ``spiffe_id`` — never client
+    input — matches ``bound_spiffe``, R12) can populate it.
+
+    Fail-closed BY OMISSION, never by rejection: absent header, no store
+    wired, or ANY verification failure (bad signature, wrong audience,
+    expired, SPIFFE mismatch, nhi_id mismatch, Redis record missing/tampered)
+    → ``on_behalf_of`` is simply never set. The NHI still resolves as its own
+    identity with no elevation; this function never raises and the call is
+    NOT rejected outright (most NHI hops legitimately carry no delegated
+    context at all).
+    """
+    token = request.headers.get(_YASHIGANI_SESSION_ID_HEADER, "")
+    if not token or _state.delegated_context_store is None:
+        return
+    try:
+        ctx = _state.delegated_context_store.resolve(
+            token, presenting_agent_spiffe=nhi_identity.get("spiffe_id", ""),
+        )
+        if ctx.nhi_id != nhi_identity.get("identity_id", ""):
+            raise DelegatedContextError(
+                "delegated-context nhi_id does not match the presenting "
+                "caller's own identity"
+            )
+    except DelegatedContextError as exc:
+        logger.warning(
+            "delegated-context resolve REJECTED for nhi=%s — proceeding with "
+            "NO on_behalf_of elevation (fail-closed, YSG-RISK-141): %s",
+            nhi_identity.get("identity_id", "?"), exc,
+        )
+        return
+
+    nhi_identity["on_behalf_of"] = {
+        "user_identity_id": ctx.user_identity_id,
+        "effective_scope": ctx.effective_scope,
+    }
+
+
 def _resolve_nhi_identity(nhi_id: str) -> Optional[dict]:
     """Return the NHI identity dict from AgentRegistry, or None if not found.
 
@@ -5856,6 +6024,13 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                             detail={"error": "NHI_PENDING_APPROVAL",
                                     "message": "NHI identity not yet approved or not found."},
                         )
+                    # YSG-RISK-141: resolve the server-minted X-Yashigani-Session-Id
+                    # (if any) into a VERIFIED on_behalf_of binding for OPA input.
+                    # This is the ONLY path that can populate on_behalf_of — a
+                    # client cannot forge it by sending any other header/field.
+                    # See _maybe_resolve_delegated_context() for the fail-closed
+                    # (by omission, never by rejection) contract.
+                    _maybe_resolve_delegated_context(request, nhi_identity)
                     return nhi_identity
 
                 # p1_agent: resolve as a named agent identity from registry
