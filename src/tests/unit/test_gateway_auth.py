@@ -45,7 +45,16 @@ class TestAgentAuthMiddleware:
         assert response.status_code == 401
 
     def test_agent_path_with_valid_token_passes(self):
-        """Valid bearer token should be accepted and request.state set."""
+        """Valid bearer token should be accepted and request.state set.
+
+        YSG-RISK-154: the middleware now verifies via
+        yashigani.agents.token_rotation.verify_token_with_grace (current OR
+        within-grace old token) instead of the bare registry.verify_token —
+        that function reads registry._r directly (bcrypt against the stored
+        hash), so a bare MagicMock registry can no longer stand in for
+        "valid token" via .verify_token.return_value. Patch the grace-aware
+        verifier itself, which is exactly what the middleware calls.
+        """
         from yashigani.gateway.agent_auth import AgentAuthMiddleware
         app = FastAPI()
         received_state = {}
@@ -56,21 +65,25 @@ class TestAgentAuthMiddleware:
             return {"ok": True}
 
         mock_registry = MagicMock()
-        mock_registry.verify_token.return_value = True
         # Return None from .get() so the IP allowlist check is skipped (no CIDRs configured)
         mock_registry.get.return_value = None
         mock_audit = MagicMock()
         app.add_middleware(AgentAuthMiddleware, agent_registry=mock_registry, audit_writer=mock_audit)
 
         client = TestClient(app, raise_server_exceptions=False)
-        response = client.get(
-            "/agents/target-id/tools/list",
-            headers={
-                "Authorization": "Bearer " + "a" * 64,
-                "X-Yashigani-Caller-Agent-Id": "caller-id",
-            }
-        )
+        with patch(
+            "yashigani.agents.token_rotation.verify_token_with_grace",
+            return_value=True,
+        ) as mock_verify:
+            response = client.get(
+                "/agents/target-id/tools/list",
+                headers={
+                    "Authorization": "Bearer " + "a" * 64,
+                    "X-Yashigani-Caller-Agent-Id": "caller-id",
+                }
+            )
         assert response.status_code == 200
+        mock_verify.assert_called_once_with("caller-id", mock_registry, "a" * 64)
 
 
 class TestAgentRegistry:

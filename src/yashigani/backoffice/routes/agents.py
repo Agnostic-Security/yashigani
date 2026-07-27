@@ -918,21 +918,24 @@ async def rotate_agent_token(
     if existing is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    plaintext_token = registry.rotate_token(agent_id)
+    # YSG-RISK-154: route through the grace-aware rotation (token_rotation.py),
+    # NOT the bare AgentRegistry.rotate_token immediate overwrite. rotate_agent_token()
+    # preserves the OLD token hash under agent:token:grace:{agent_id} for
+    # grace_period_hours so an in-flight agent holding the pre-rotation token
+    # keeps working (verified via verify_token_with_grace in agent_auth.py)
+    # instead of being locked out the instant this endpoint returns.
+    # It also writes the AgentTokenRotatedEvent itself — do not double-write here.
+    from yashigani.agents.token_rotation import rotate_agent_token as _rotate_with_grace
 
-    # Audit
-    if audit is not None:
-        try:
-            from yashigani.audit.schema import AgentTokenRotatedEvent
-
-            audit.write(
-                AgentTokenRotatedEvent(
-                    agent_id=agent_id,
-                    admin_account=session.account_id,
-                )
-            )
-        except Exception as exc:
-            logger.error("Failed to write AgentTokenRotatedEvent: %s", exc)
+    grace_period_hours = int(os.getenv("YASHIGANI_AGENT_TOKEN_GRACE_HOURS", "1"))
+    plaintext_token = _rotate_with_grace(
+        agent_id=agent_id,
+        registry=registry,
+        kms_provider=backoffice_state.kms_provider,
+        audit_writer=audit,
+        admin_account=session.account_id,
+        grace_period_hours=grace_period_hours,
+    )
 
     _push_opa()
 
