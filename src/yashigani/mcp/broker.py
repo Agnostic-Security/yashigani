@@ -529,6 +529,9 @@ class McpBroker:
             # v4.1 Phase 2a (lu.md §3a) — identity.verified (transport-derived,
             # fail-closed default False) + per-instance target.
             identity_verified=ctx.identity_verified,
+            # YSG-RISK-137 — non-SPIFFE (human / API-key) RBAC branch signal,
+            # produced server-side by the runtime MCP router (allow_rbac).
+            rbac_verified=ctx.rbac_verified,
             mcp_id=ctx.mcp_id or None,
             cert_fingerprint=_sha256_label(_target_cert_fp),
             surface_hash=_sha256_label(_target_surface_hash),

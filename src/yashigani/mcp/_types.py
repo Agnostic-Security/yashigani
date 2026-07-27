@@ -127,6 +127,14 @@ class McpCallContext:
     # a broker-asserted identity does not claim verification.
     identity_verified: bool = False
 
+    # YSG-RISK-137 (2026-07-27): rbac_verified for the OPA input's non-SPIFFE
+    # (human / API-key) mcp.tools.call branch.  True ONLY when the gateway
+    # confirmed rbac.rego allow_rbac PASSED for the resolved identity_id
+    # (user_id) on THIS request — set server-side by the runtime MCP router,
+    # NEVER from the request body and NEVER for a cert-verified caller.  Flows
+    # into input.identity.rbac_verified.  Default False = fail-closed.
+    rbac_verified: bool = False
+
     # v4.1 Phase 2a (LU-MCP-A2 — lu.md §3a): SHA-256 fingerprint of the TARGET
     # MCP instance's leaf certificate ("sha256:<hex>" or bare hex; normalised
     # by the broker before the OPA input is built).  Populated by the runtime

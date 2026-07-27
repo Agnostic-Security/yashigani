@@ -32,6 +32,10 @@
           "type": "boolean",
           "description": "v4.1 Phase 2a/2b (LU-MCP-A1): true ONLY when the transport layer verified the caller's per-instance leaf certificate at TLS (SPIFFE URI SAN + trust chain — never hostname; instance-leaf SANs are loopback-only). MUST be set by the transport layer, never from the request body. false = identity.spiffe is a broker assertion built from context fields. Policy requires verified == true (strict boolean) on all mcp-b/mcp-c allow paths (yashigani.mcp _identity_verified rule); a broker-asserted, name-derived SPIFFE alone no longer authorizes. The producer always emits this field; absence is treated as false (fail-closed)."
         },
+        "rbac_verified": {
+          "type": "boolean",
+          "description": "YSG-RISK-137 (2026-07-27): SEPARATE server-derived flag for the NON-SPIFFE (human / API-key) mcp.tools.call authz branch. true ONLY when the gateway (mcp_router_runtime) confirmed rbac.rego allow_rbac PASSED for the resolved identity_id (input.caller.user_id) on THIS request. MUST be set by the gateway, never from the request body, and is NEVER derived in-rego from the absence of a SPIFFE cert. Does NOT influence identity.verified/spiffe. Policy consumes it in the parallel non-SPIFFE allow branch (yashigani.mcp _non_spiffe_caller_authorized), which still requires the target-integrity gates. Absence is treated as false (fail-closed)."
+        },
         "chain": {
           "type": "array",
           "description": "Full upstream identity chain for multi-hop MCP-C calls. Each entry is a SPIFFE URI representing a hop in call-order (index 0 = originating caller, last = immediate caller). Populated by the MCP-C JWT (P2/N3 chunk). Absent on mcp-a and mcp-b. Policy enforces max depth via mcp_chain_max_depth.",

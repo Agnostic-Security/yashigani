@@ -257,6 +257,65 @@ allow if {
     _exposed_tools_narrowing_ok
 }
 
+# ---------------------------------------------------------------------------
+# YSG-RISK-137 — NON-SPIFFE (human / API-key) mcp.tools.call authz branch
+# (Laura GO-WITH-CONSTRAINTS, 2026-07-27). Lets a REAL resolved user/agent that
+# is NOT cert-verified reach the broker WHEN they hold a valid RBAC grant.
+# ---------------------------------------------------------------------------
+
+# _non_spiffe_caller_authorized — true ONLY when the gateway has resolved a REAL
+# identity_id (never the "unknown"/"anonymous" sentinel) for this request AND
+# has asserted, server-side, that rbac.rego `allow_rbac` (keyed on that exact
+# resolved identity_id) PASSED for THIS request.
+#
+# INVARIANT (Laura #1): input.identity.rbac_verified is a SEPARATE, server-
+# derived field. A session/API-key request body can never set it. It is NEVER
+# inferred in-rego from the ABSENCE of a SPIFFE cert — the ONLY producer is the
+# gateway (mcp_router_runtime), which sets it true iff allow_rbac returned true.
+# rbac_verified alone does NOT authorize: the target-integrity gates
+# (_instance_identified / _grant_ok / _envelope_unchanged) still apply below.
+_non_spiffe_caller_authorized if {
+    is_string(input.caller.user_id)
+    input.caller.user_id != ""
+    input.caller.user_id != "unknown"
+    input.caller.user_id != "anonymous"
+    input.identity.rbac_verified == true
+}
+
+# MCP-B (non-SPIFFE branch) — mcp.tools.call for a real human / API-key caller.
+# PARALLEL allow (OR), NOT a relaxation of the SPIFFE rule above:
+#   - fires ONLY when the caller is NOT cert-verified (not _identity_verified),
+#     so it can never weaken the verified-SPIFFE path;
+#   - authorisation comes from the gateway-asserted RBAC flag on the resolved
+#     identity_id (_non_spiffe_caller_authorized), never a relaxed identity;
+#   - the SAME target-integrity gates (_instance_identified, _grant_ok,
+#     _envelope_unchanged) and the SAME posture/chain/subject/tool/narrowing
+#     gates remain MANDATORY, identical to the SPIFFE rule.
+#
+# INVARIANT (Laura #3): a caller that ASSERTS a SPIFFE identity but fails
+# verification must HARD-DENY and never reach this branch. That hard-deny is
+# enforced at the GATEWAY, not here: the mcp OPA input cannot yet distinguish
+# "no cert offered" from "cert offered but stripped/rejected" — input.identity.
+# spiffe is ALWAYS the target-derived agent URI (agent_spiffe_uri), so it carries
+# no caller-cert signal. See follow-up YSG-RISK-137-FUP: thread a
+# `cert_offered`/`spiffe_asserted_but_unverified` signal into the input so this
+# branch can additionally deny on it in-rego.
+allow if {
+    input.posture == "mcp-b"
+    input.action == "mcp.tools.call"
+    _posture_valid
+    not _identity_verified
+    _non_spiffe_caller_authorized
+    _chain_depth_ok
+    _exactly_one_subject
+    _tool_present
+    _action_recognised
+    _instance_identified
+    _grant_ok
+    _envelope_unchanged
+    _exposed_tools_narrowing_ok
+}
+
 # MCP-C (multi-hop chained, Shape C) — NON-invocation actions:
 #   Chain MUST be present and non-empty (chain is the core assertion of MCP-C).
 #   Chain depth must be within limit. Identity must be cert-verified.

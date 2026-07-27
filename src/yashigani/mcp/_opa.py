@@ -79,6 +79,10 @@ MCP_FS_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/filesystem_tool_allowed"
 # Git-specific tool-gating OPA path (P3-GIT / GIT-TM-001..004).
 # Queried for agents with is_git_agent=True after mcp_decision allow.
 MCP_GIT_TOOL_OPA_PATH = "/v1/data/yashigani/mcp/git_tool_allowed"
+# YSG-RISK-137 — rbac.rego `allow_rbac` (package yashigani).  Queried by the
+# gateway to PRODUCE identity.rbac_verified for the non-SPIFFE mcp.tools.call
+# branch.  Keyed on the resolved identity_id (input.session.identity_id).
+RBAC_OPA_PATH = "/v1/data/yashigani/allow_rbac"
 OPA_TIMEOUT_SECONDS = 0.5   # 500ms — C9 requirement
 
 
@@ -254,6 +258,13 @@ def _build_opa_input(
     # Default False = fail-closed: an unverified/asserted identity never claims
     # verification.  Lu's rego gates allow on input.identity.verified == true.
     identity_verified: bool = False,
+    # YSG-RISK-137 (2026-07-27): identity.rbac_verified — the NON-SPIFFE
+    # (human / API-key) authz branch signal.  True ONLY when the gateway
+    # confirmed rbac.rego allow_rbac PASSED for the resolved identity_id on this
+    # request.  SEPARATE from identity.verified/spiffe (Laura #1): a request body
+    # can never set it, and it is NEVER derived in-rego from cert absence.
+    # Default False = fail-closed.
+    rbac_verified: bool = False,
     # v4.1 Phase 2a (LU-MCP-A2/A3 — lu.md §3a): per-instance target object.
     # mcp_id           — the stable per-instance UUID (ctx.mcp_id, _types.py:119).
     # cert_fingerprint — "sha256:<hex>" fingerprint of the instance's leaf cert.
@@ -302,6 +313,10 @@ def _build_opa_input(
         # False = broker-asserted identity only; True = the transport layer
         # verified the caller's per-instance leaf (SPIFFE URI/trust).
         "verified": bool(identity_verified),
+        # YSG-RISK-137: ALWAYS present, explicit bool.  True ONLY when the
+        # gateway confirmed allow_rbac passed for the resolved identity_id.
+        # Consumed by the non-SPIFFE allow branch; independent of `verified`.
+        "rbac_verified": bool(rbac_verified),
     }
     doc: dict = {
         "posture": posture,
@@ -385,6 +400,66 @@ def _parse_opa_response(raw: dict, elapsed_ms: int) -> OpaDecisionResult:
     )
 
 
+async def query_rbac_verified(
+    opa_url: str,
+    identity_id: str,
+    method: str,
+    path: str,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> bool:
+    """
+    YSG-RISK-137 — query rbac.rego `allow_rbac` (package yashigani) for a
+    resolved identity_id on THIS request.
+
+    Returns True ONLY when OPA affirmatively returns {"result": true} for the
+    exact (identity_id, method, path).  Fail-closed False on ANY error, timeout,
+    non-200, undefined result, or non-true result.
+
+    This is the SOLE producer of input.identity.rbac_verified for the MCP
+    non-SPIFFE branch.  The gateway MUST NOT set rbac_verified from any other
+    source (never from a request body, never from the absence of a cert).
+
+    Parameters
+    ----------
+    opa_url:
+        Base URL of OPA (e.g. "http://localhost:8181").
+    identity_id:
+        The resolved canonical UID (idnt_/agnt_ ...), consumed by allow_rbac as
+        input.session.identity_id.  The caller MUST NOT pass "unknown"/"anonymous".
+    method, path:
+        The HTTP method + path of the request, consumed by allow_rbac as
+        input.request.{method,path} to match the group's allowed_resources.
+    """
+    input_doc = {
+        "input": {
+            # rbac.rego allow_rbac reads input.session.identity_id.
+            "session": {"identity_id": identity_id},
+            "request": {"method": method, "path": path},
+        }
+    }
+    url = f"{opa_url.rstrip('/')}{RBAC_OPA_PATH}"
+    own_client = http_client is None
+    try:
+        if own_client:
+            http_client = _make_opa_http_client()
+        assert http_client is not None
+        resp = await http_client.post(url, json=input_doc)
+        resp.raise_for_status()
+        # OPA returns {"result": true} only when allow_rbac is defined-true;
+        # an undefined (no matching group) result omits "result" → False.
+        return resp.json().get("result", False) is True
+    except Exception as exc:  # noqa: BLE001 — fail-closed on ANY failure (C9)
+        logger.warning(
+            "mcp-broker: [YSG-RISK-137] allow_rbac query failed for "
+            "identity_id=%r method=%r path=%r: %s — fail-closed rbac_verified=False",
+            identity_id, method, path, exc,
+        )
+        return False
+    finally:
+        if own_client and http_client is not None:
+            await http_client.aclose()
+
+
 async def query_mcp_decision(
     opa_url: str,
     posture: str,
@@ -407,6 +482,8 @@ async def query_mcp_decision(
     # v4.1 Phase 2a (lu.md §3a) — identity.verified + target{mcp_id,
     # cert_fingerprint, surface_hash}.  See _build_opa_input for semantics.
     identity_verified: bool = False,
+    # YSG-RISK-137 — non-SPIFFE RBAC branch signal (see _build_opa_input).
+    rbac_verified: bool = False,
     mcp_id: Optional[str] = None,
     cert_fingerprint: Optional[str] = None,
     surface_hash: Optional[str] = None,
@@ -440,6 +517,7 @@ async def query_mcp_decision(
             agent_name=agent_name,
             caller=caller,
             identity_verified=identity_verified,
+            rbac_verified=rbac_verified,
             mcp_id=mcp_id,
             cert_fingerprint=cert_fingerprint,
             surface_hash=surface_hash,

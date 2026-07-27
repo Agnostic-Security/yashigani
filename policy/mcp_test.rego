@@ -150,6 +150,118 @@ test_allow_mcp_c_with_valid_chain if {
         with data.yashigani.mcp.baselines as _baselines_ok
 }
 
+# ---------------------------------------------------------------------------
+# YSG-RISK-137 — non-SPIFFE (human / API-key) mcp.tools.call authz branch.
+# A REAL resolved identity that is NOT cert-verified reaches the broker ONLY
+# when the gateway asserts rbac_verified (allow_rbac passed) AND the SAME
+# target-integrity gates hold.  SPIFFE branch is untouched.
+# ---------------------------------------------------------------------------
+
+_identity_id_human := "idnt_0a1b2c3d4e5f"
+
+# Non-SPIFFE human caller: NOT cert-verified (verified=false), gateway-asserted
+# rbac_verified=true for a REAL resolved identity_id.  identity.spiffe stays the
+# target-derived agent URI (as on the real HTTP path) so the grant key resolves.
+_mcp_b_non_spiffe_ok := {
+    "posture": "mcp-b",
+    "action": "mcp.tools.call",
+    "identity": {"spiffe": _spiffe_langflow, "verified": false, "rbac_verified": true},
+    "caller": {"agent_id": "", "user_id": _identity_id_human},
+    "target": _target_ok,
+    "tool": {"name": "web_search", "args_redacted": {}},
+}
+
+# Non-SPIFFE human with rbac_verified + grant + integrity → ALLOW.
+test_allow_mcp_b_non_spiffe_rbac if {
+    data.yashigani.mcp.allow with input as _mcp_b_non_spiffe_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# SPIFFE-verified caller is unaffected by the new branch (regression) — the
+# verified path still allows even with no caller/rbac_verified fields present.
+test_allow_mcp_b_spiffe_regression_unaffected if {
+    data.yashigani.mcp.allow with input as _mcp_b_call_ok
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# Non-SPIFFE caller WITHOUT the gateway rbac_verified assertion → DENY.
+test_deny_mcp_b_non_spiffe_rbac_verified_false if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false, "rbac_verified": false},
+        "caller": {"agent_id": "", "user_id": _identity_id_human},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# rbac_verified absent entirely → DENY (fail-closed; never inferred in-rego).
+test_deny_mcp_b_non_spiffe_rbac_verified_absent if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false},
+        "caller": {"agent_id": "", "user_id": _identity_id_human},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# rbac_verified=true but resolved identity is the anonymous "unknown" sentinel
+# → DENY (unknown is never a real caller).
+test_deny_mcp_b_non_spiffe_unknown_identity if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false, "rbac_verified": true},
+        "caller": {"agent_id": "", "user_id": "unknown"},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# The non-SPIFFE branch is NOT a target-integrity bypass: a valid rbac_verified
+# caller with NO per-instance grant is still DENIED (grant/envelope gates hold).
+test_deny_mcp_b_non_spiffe_rbac_but_no_grant if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/nogrant", "verified": false, "rbac_verified": true},
+        "caller": {"agent_id": "", "user_id": _identity_id_human},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
+# Laura #3: a caller asserting a SPIFFE identity that FAILS verification
+# (verified=false) and carries NO gateway RBAC assertion satisfies NEITHER
+# branch → DENY.  The SPIFFE rule requires verified==true; the non-SPIFFE rule
+# requires rbac_verified==true + a real identity_id.  (The failed-SPIFFE vs
+# no-cert distinction at the INPUT is gateway follow-up YSG-RISK-137-FUP.)
+test_deny_mcp_b_failed_spiffe_never_reaches_rbac_branch if {
+    not data.yashigani.mcp.allow with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false},
+        "caller": {"agent_id": "", "user_id": "unknown"},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+}
+
 test_allow_mcp_a_ping if {
     data.yashigani.mcp.allow with input as {
         "posture": "mcp-a",

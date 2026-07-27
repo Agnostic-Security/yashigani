@@ -78,6 +78,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from yashigani.mcp._types import McpCallContext, McpPosture, PostureBinding
+from yashigani.mcp._opa import query_rbac_verified  # YSG-RISK-137 — non-SPIFFE RBAC branch
 from yashigani.mcp import _frame_shape  # G8 — server-initiated primitive gating
 from yashigani.mcp._transport_http import McpHttpTransport, HttpTransportError
 
@@ -454,6 +455,24 @@ async def _handle_mcp_call_inner(
     call_id = str(uuid.uuid4())
     request_id = str(uuid.uuid4())
 
+    # ── YSG-RISK-137 — non-SPIFFE (human / API-key) RBAC branch signal ──────
+    # A REAL resolved identity that is NOT cert-verified may still reach the MCP
+    # broker IF the RBAC gate (rbac.rego allow_rbac, keyed on THIS identity_id)
+    # permits the request.  We ASSERT that gate here, server-side, and thread the
+    # result into the OPA input as input.identity.rbac_verified — a SEPARATE
+    # field from identity.verified/spiffe (Laura #1).  Only ever set for a
+    # non-cert-verified caller with a real resolved identity_id; the anonymous
+    # "unknown" sentinel and any cert-verified caller never trigger this query.
+    # Fail-closed default False (query_rbac_verified fail-closes on any error).
+    rbac_verified = False
+    if (not _identity_verified) and user_id and user_id != "unknown":
+        rbac_verified = await query_rbac_verified(
+            opa_url=broker._opa_url,
+            identity_id=user_id,
+            method=request.method,
+            path=request.url.path,
+        )
+
     # G-ORCH-OPA-1: look up the caller's sensitivity_ceiling from the identity
     # registry (keyed by identity_id = idnt_{12hex}).
     # 4.1 SEC-GAP-1: use identity_registry.get(identity_id) directly since user_id
@@ -551,6 +570,10 @@ async def _handle_mcp_call_inner(
             # onboard transaction).  Both flow into the OPA input
             # (identity.verified + target.cert_fingerprint).
             identity_verified=_identity_verified,
+            # YSG-RISK-137 — non-SPIFFE (human / API-key) RBAC branch signal;
+            # server-derived via allow_rbac above, flows into
+            # input.identity.rbac_verified (separate from identity.verified).
+            rbac_verified=rbac_verified,
             target_cert_fingerprint=getattr(server_cfg, "cert_fingerprint", "") or "",
             # G-ORCH-OPA-1 / Option A: populate from identity registry lookup.
             # None when registry absent or user not found → fail-closed at egress.
