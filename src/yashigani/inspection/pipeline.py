@@ -241,8 +241,18 @@ class InspectionPipeline:
         sanitized = False
 
         if classifier_result.confidence >= self._threshold:
+            # YSG-RISK-149 (fail-closed): require_spans=True means an empty
+            # detected_payload_spans on this positive CREDENTIAL_EXFIL verdict
+            # is treated as sanitize FAILURE, not success. The BackendRegistry
+            # classifier path (_BackendResultAdapter) has no span-detection
+            # capability — it never carries real spans — so this is the only
+            # place that can catch "positive verdict, nothing to redact" and
+            # stop it from being forwarded unchanged while stamped SANITIZED.
+            # `action` stays at its "DISCARDED" default below on failure,
+            # which is already wired to block-and-not-forward in proxy.py.
             san: SanitizationResult = sanitize(
-                masked_query, classifier_result.detected_payload_spans
+                masked_query, classifier_result.detected_payload_spans,
+                require_spans=True,
             )
             if san.success and san.clean_query:
                 action = "SANITIZED"
