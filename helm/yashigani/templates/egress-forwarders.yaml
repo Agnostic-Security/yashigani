@@ -308,5 +308,5 @@ spec:
           port: 53
     # INTRA-ZONE-DENY marker (denied tuple, for audit + contract test 3c):
     # NO allow to pod {{ $system }} on port {{ $fwd.shimPort }} — deny-by-absence.
-{{- end }}
+{{ end -}}
 {{- end }}
