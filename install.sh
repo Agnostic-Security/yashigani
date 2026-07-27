@@ -13093,9 +13093,26 @@ _write_helm_values() {
       printf "  tlsDomain: '%s'\n" "${DOMAIN}"
     fi
 
-    if [[ -n "${TLS_MODE:-}" ]]; then
-      printf "  tlsMode: '%s'\n" "${TLS_MODE}"
-    fi
+    # NEW-K8S-TLSMODE-COLLISION-001 (found during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28): TLS_MODE here is the install.sh CLI vocabulary
+    # (--tls-mode acme|ca|selfsigned — Caddyfile.acme/.ca/.selfsigned
+    # cert-PROVISIONING mode, compose-only; the k8s Caddy ConfigMap always
+    # mounts the internal mTLS mesh cert unconditionally, see
+    # templates/configmaps.yaml). global.tlsMode is a DIFFERENT, chart-native
+    # key with its own vocabulary (caddy|nginx — edge-INGRESS-MECHANISM
+    # selector; see values.yaml comment + docs/kubernetes_deployment.md
+    # "helm upgrade ... --set global.tlsMode=caddy"). Writing the CLI value
+    # here clobbered the chart default ("caddy") with "acme"/"selfsigned",
+    # which is neither "caddy" nor "nginx" — ingress.yaml's
+    # `{{- if ne .Values.global.tlsMode "caddy" }}` then rendered a stray
+    # nginx-class Ingress (no nginx-ingress-controller in most k8s clusters,
+    # e.g. k3s ships Traefik) while networkpolicy.yaml's nginx-allow rule
+    # (`eq .Values.global.tlsMode "nginx"`) stayed OFF — an inconsistent,
+    # half-configured state on every k8s install that passed --tls-mode.
+    # Fix: never propagate the compose-only CLI TLS_MODE into the k8s-only
+    # global.tlsMode key. Operators who want nginx-ingress on k8s set it
+    # directly via `--set global.tlsMode=nginx` per the documented path;
+    # --tls-mode has no k8s meaning and is intentionally NOT forwarded.
 
     if [[ -n "${ADMIN_EMAIL:-}" ]]; then
       # acmeEmail used by ACME/Let's Encrypt — also the primary admin contact.
