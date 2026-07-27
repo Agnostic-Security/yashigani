@@ -110,6 +110,26 @@ def rotate_agent_token(
     token_key = f"agent:token:{agent_id}"
     r.set(token_key, new_hash.encode("utf-8"))
 
+    # ISSUE-AGENT-REG-DURABILITY (mirrors AgentRegistry.rotate_token): persist
+    # the new token_hash to the Postgres mirror so a post-rotation Redis
+    # recreate reconciles the ROTATED hash, not a stale pre-rotation one that
+    # would leave the agent's current token permanently rejected. Only this
+    # module (not AgentRegistry.rotate_token) is used by the admin rotate
+    # endpoint now — the dual-write must happen here too or the durability
+    # fix regresses silently on every grace-aware rotation.
+    durable = getattr(registry, "_durable", None)
+    if durable is not None:
+        try:
+            agent = registry.get(agent_id)
+            if agent is not None:
+                durable.upsert(agent, token_hash=new_hash)
+        except Exception as exc:
+            logger.error(
+                "token_rotation: DURABLE token-rotation write failed for %s — durable "
+                "store holds the OLD hash; rotate again after fixing Postgres: %s",
+                agent_id, exc,
+            )
+
     # --- 3. Push to KMS ---
     if kms_provider is not None:
         kms_key = f"agents/{agent_id}/psk"

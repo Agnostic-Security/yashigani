@@ -125,8 +125,20 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 status=503,
             )
 
-        # Verify PSK token
-        if not self._registry.verify_token(caller_agent_id, plaintext_token):
+        # Verify PSK token.
+        #
+        # YSG-RISK-154: use the grace-aware verifier, not the bare
+        # AgentRegistry.verify_token. rotate_agent_token() (token_rotation.py)
+        # preserves the OLD bcrypt hash under agent:token:grace:{agent_id}
+        # for grace_period_hours after a rotation; the plain verify_token
+        # only ever checks the CURRENT hash, so a rotated agent's in-flight
+        # requests with the old token were rejected the instant an admin
+        # rotated — the advertised grace window never actually applied on
+        # this path. verify_token_with_grace checks current-then-grace and
+        # is fail-closed (any error -> False) exactly like verify_token.
+        from yashigani.agents.token_rotation import verify_token_with_grace
+
+        if not verify_token_with_grace(caller_agent_id, self._registry, plaintext_token):
             return await self._reject(
                 request,
                 caller_agent_id=caller_agent_id,
