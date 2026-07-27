@@ -162,7 +162,7 @@ async def test_mcp_result_blocked_when_inspection_blocks(monkeypatch):
     async def fake_ingress(identity, server, tool):
         return {"allow": True, "reason": "ok"}
 
-    async def fake_egress(identity, server, tool, verdict, response_sensitivity=None):
+    async def fake_egress(identity, server, tool, verdict, response_sensitivity=None, pii_detected=False):
         # OPA egress allows; the inspection block is what fires here.
         return {"allow": True, "reason": "ok"}
 
@@ -206,7 +206,7 @@ async def test_mcp_result_blocked_when_opa_egress_denies(monkeypatch):
     async def fake_ingress(identity, server, tool):
         return {"allow": True, "reason": "ok"}
 
-    async def fake_egress(identity, server, tool, verdict, response_sensitivity=None):
+    async def fake_egress(identity, server, tool, verdict, response_sensitivity=None, pii_detected=False):
         return {"allow": False, "reason": "sensitivity_exceeds_ceiling"}
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", fake_ingress)
@@ -266,7 +266,7 @@ async def test_mcp_clean_result_passes_through(monkeypatch):
     async def ok_ingress(identity, server, tool):
         return {"allow": True, "reason": "ok"}
 
-    async def ok_egress(identity, server, tool, verdict, response_sensitivity=None):
+    async def ok_egress(identity, server, tool, verdict, response_sensitivity=None, pii_detected=False):
         return {"allow": True, "reason": "ok"}
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", ok_ingress)
@@ -377,7 +377,7 @@ async def test_exfil_via_tool_args_denied_on_egress(monkeypatch):
     # Args carry a credit-card-shaped secret → RESTRICTED.
     monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda text: "RESTRICTED")
 
-    async def deny_egress(identity, args_sensitivity):
+    async def deny_egress(identity, args_sensitivity, pii_detected=False):
         return {"allow": False, "reason": "sensitivity_exceeds_egress_ceiling"}
 
     monkeypatch.setattr(orchestrator, "_opa_egress_for_outbound_args", deny_egress)
@@ -408,7 +408,7 @@ async def test_public_args_not_egress_gated(monkeypatch):
     """PUBLIC outbound args do not trip the exfil guard (no false positive)."""
     monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda text: "PUBLIC")
 
-    async def boom_egress(identity, args_sensitivity):
+    async def boom_egress(identity, args_sensitivity, pii_detected=False):
         raise AssertionError("egress args check must not run for PUBLIC args")
 
     monkeypatch.setattr(orchestrator, "_opa_egress_for_outbound_args", boom_egress)
@@ -440,7 +440,7 @@ async def test_mcp_result_sensitivity_passed_to_egress(monkeypatch):
     async def ok_ingress(identity, server, tool):
         return {"allow": True, "reason": "ok"}
 
-    async def capture_egress(identity, server, tool, verdict, response_sensitivity=None):
+    async def capture_egress(identity, server, tool, verdict, response_sensitivity=None, pii_detected=False):
         seen["sensitivity"] = response_sensitivity
         return {"allow": True, "reason": "ok"}
 

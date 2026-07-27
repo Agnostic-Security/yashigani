@@ -145,7 +145,7 @@ async def _fake_ingress_allow(identity, server, tool):
     return {"allow": True, "reason": "ok"}
 
 
-async def _fake_egress_allow(identity, server, tool, verdict, response_sensitivity=None):
+async def _fake_egress_allow(identity, server, tool, verdict, response_sensitivity=None, pii_detected=False):
     return {"allow": True, "reason": "ok"}
 
 

@@ -427,9 +427,38 @@ def _args_text(args) -> str:
         return ""
 
 
+def _detect_pii(text: str) -> bool:
+    """Detect PII in a text fragment via the live pii_detector.
+
+    YSG-RISK-146: feeds the MCP-egress OPA checks (_opa_egress_for_mcp_result /
+    _opa_egress_for_outbound_args), which previously hardcoded
+    pii_detected=False — so OPA could never gate on PII leaving via MCP tool
+    results or outbound tool args.  Mirrors _classify_sensitivity's structure.
+
+    When the detector is not configured, PII detection is opt-in (same as
+    every other leg) — returns False.  When the detector IS configured but
+    raises, fail CLOSED: treat the fragment as PII-positive so an
+    unclassifiable fragment cannot silently pass the egress PII gate.
+    """
+    from yashigani.gateway.openai_router import _state
+    detector = _state.pii_detector
+    if not text or detector is None:
+        return False
+    try:
+        _redacted, result = detector.process_decoded(text)
+        return bool(result.detected)
+    except Exception as exc:
+        logger.warning(
+            "orchestration: PII detection failed on egress fragment: %s — "
+            "treating as PII-positive (fail-closed)", exc,
+        )
+        return True
+
+
 async def _opa_egress_for_mcp_result(identity, server: str, tool: str,
                                      response_verdict: str,
-                                     response_sensitivity: Optional[str] = None) -> dict:
+                                     response_sensitivity: Optional[str] = None,
+                                     pii_detected: bool = False) -> dict:
     """Explicit OPA EGRESS decision on an MCP tool RESULT — closes G-ORCH-OPA-1.
 
     Build sheet §0.1.3(a) / §3.4.1: today the MCP result path is inspected but
@@ -442,6 +471,10 @@ async def _opa_egress_for_mcp_result(identity, server: str, tool: str,
     sensitivity-ceiling breach (like the chat path), not only on the inspection
     verdict.  prompt_sensitivity stays PUBLIC (the request leg of the MCP hop is
     PUBLIC-shaped); v1_routing.rego evaluates MAX(prompt, response).
+
+    YSG-RISK-146: pii_detected is now the caller's real PII-detector result
+    (see _detect_pii) instead of a hardcoded False, so OPA can gate on PII
+    leaving via an MCP tool result.
     Fail-closed on any error.
     """
     from yashigani.gateway.openai_router import _opa_response_check
@@ -450,11 +483,12 @@ async def _opa_egress_for_mcp_result(identity, server: str, tool: str,
         response_sensitivity=response_sensitivity,
         prompt_sensitivity="PUBLIC",
         response_verdict=response_verdict,
-        pii_detected=False,
+        pii_detected=pii_detected,
     )
 
 
-async def _opa_egress_for_outbound_args(identity, args_sensitivity: str) -> dict:
+async def _opa_egress_for_outbound_args(identity, args_sensitivity: str,
+                                        pii_detected: bool = False) -> dict:
     """Per-hop OPA EGRESS check on OUTBOUND tool ARGS (LAURA-ORCH-001(c)).
 
     Before any tool hop, classify the outbound args and adjudicate them as an
@@ -462,6 +496,10 @@ async def _opa_egress_for_outbound_args(identity, args_sensitivity: str) -> dict
     RESTRICTED/CONFIDENTIAL context out through tool args to a PUBLIC-bound / MCP
     callee.  Reuses the response-leg OPA decision (sensitivity-ceiling logic) with
     the args sensitivity as the "response_sensitivity" being delivered outbound.
+
+    YSG-RISK-146: pii_detected is now the caller's real PII-detector result
+    (see _detect_pii) instead of a hardcoded False, so OPA can gate on PII
+    smuggled out through outbound tool args.
     Fail-closed on any error.
     """
     from yashigani.gateway.openai_router import _opa_response_check
@@ -470,7 +508,7 @@ async def _opa_egress_for_outbound_args(identity, args_sensitivity: str) -> dict
         response_sensitivity=args_sensitivity,
         prompt_sensitivity="PUBLIC",
         response_verdict="CLEAN",
-        pii_detected=False,
+        pii_detected=pii_detected,
     )
 
 
@@ -656,9 +694,16 @@ async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: 
     #     on the inspection verdict.  classify_decoded handles encoded payloads.
     result_sensitivity = _classify_sensitivity(result_text)
 
-    # 4) OPA EGRESS decision on the result (G-ORCH-OPA-1), now sensitivity-aware.
+    # 3c) Detect PII in the RESULT content (YSG-RISK-146): previously hardcoded
+    #     False in _opa_egress_for_mcp_result — OPA could never gate on PII
+    #     leaving via an MCP tool result.
+    result_pii_detected = _detect_pii(result_text)
+
+    # 4) OPA EGRESS decision on the result (G-ORCH-OPA-1), now sensitivity-aware
+    #    AND PII-aware.
     egress = await _opa_egress_for_mcp_result(
-        identity, server, tool, verdict, response_sensitivity=result_sensitivity)
+        identity, server, tool, verdict, response_sensitivity=result_sensitivity,
+        pii_detected=result_pii_detected)
     egress_allow = egress.get("allow", False)
     egress_reason = egress.get("reason", "ok")
 
@@ -901,11 +946,15 @@ async def _execute_api_call(
     # ── 4. ResponseInspection on the result ───────────────────────────────────
     verdict, confidence, _ = _inspect_result(result_text, identity, request_id)
 
-    # ── 5. Classify result sensitivity + OPA EGRESS ──────────────────────────
+    # ── 5. Classify result sensitivity + detect PII + OPA EGRESS ─────────────
+    # YSG-RISK-146: result_pii_detected feeds the OPA egress decision — the
+    # egress path previously hardcoded pii_detected=False here.
     result_sensitivity = _classify_sensitivity(result_text)
+    result_pii_detected = _detect_pii(result_text)
     egress = await _opa_egress_for_mcp_result(
         identity, connection_name, f"api_call:{method}:{path}",
         verdict, response_sensitivity=result_sensitivity,
+        pii_detected=result_pii_detected,
     )
     egress_allow = egress.get("allow", False)
     egress_reason = egress.get("reason", "ok")
@@ -986,7 +1035,12 @@ async def _execute_tool_call(*, tool_name: str, args: dict, catalog, identity,
     # agent callee.  The per-hop OPA egress denies on a sensitivity-ceiling breach.
     args_sensitivity = _classify_sensitivity(_args_text(args))
     if args_sensitivity in ("CONFIDENTIAL", "RESTRICTED"):
-        egress = await _opa_egress_for_outbound_args(identity, args_sensitivity)
+        # YSG-RISK-146: args_pii_detected feeds the OPA egress decision — this
+        # call previously hardcoded pii_detected=False, so OPA could never
+        # gate on PII smuggled out through outbound tool args.
+        args_pii_detected = _detect_pii(_args_text(args))
+        egress = await _opa_egress_for_outbound_args(
+            identity, args_sensitivity, pii_detected=args_pii_detected)
         if not egress.get("allow", False):
             from yashigani.audit.schema import OrchestrationExfilBlockedEvent
             _audit(OrchestrationExfilBlockedEvent(
