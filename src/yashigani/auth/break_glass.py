@@ -89,7 +89,7 @@ class BreakGlassManager:
         self,
         user_id: str,
         ttl_hours: int = _TTL_DEFAULT_HOURS,
-        require_second_approver: bool = False,
+        require_second_approver: bool = True,
     ) -> dict:
         """
         Activate a break-glass session.
@@ -101,9 +101,15 @@ class BreakGlassManager:
         ttl_hours:
             Session lifetime in hours. Must be between 1 and 72 (inclusive).
         require_second_approver:
-            When True the session enters PENDING_APPROVAL state. A second
+            SECURE DEFAULT (YSG-RISK-150/132): defaults to True. When True
+            the session enters PENDING_APPROVAL state — a second, DISTINCT
             admin must call ``approve_break_glass`` within 5 minutes or the
-            session is automatically cancelled.
+            session is automatically cancelled. A single admin can never
+            grant themselves immediate ACTIVE emergency access. Callers that
+            need to pass False explicitly (e.g. non-interactive DR tooling)
+            must opt in deliberately; the wired HTTP route
+            (backoffice/routes/break_glass.py) never exposes this parameter
+            to the caller and always activates with dual-control enforced.
 
         Returns
         -------
@@ -369,6 +375,27 @@ class BreakGlassManager:
         except Exception as exc:
             logger.error("BreakGlass: failed to write BREAK_GLASS_ACTIVATED audit event: %s", exc)
 
+        # YSG-RISK-150/132: _emit_activated is only ever called at the moment
+        # emergency access transitions to ACTIVE (either the single-admin
+        # immediate path, when a caller has deliberately opted out of
+        # dual-control, or the dual-control path via approve_break_glass()).
+        # That transition IS the emergency unlock being executed, so it must
+        # also land on the SECURITY_CRITICAL immutable-floor event — this was
+        # previously defined (audit/schema.py) but never emitted anywhere.
+        # target_account is left empty: break-glass grants the initiating
+        # admin platform-wide emergency access, it does not unlock a specific
+        # target account.
+        if self._audit is None:
+            return
+        try:
+            from yashigani.audit.schema import EmergencyUnlockExecutedEvent
+            self._audit.write(EmergencyUnlockExecutedEvent(
+                admin_account=user_id,
+                target_account="",
+            ))
+        except Exception as exc:
+            logger.error("BreakGlass: failed to write EMERGENCY_UNLOCK_EXECUTED audit event: %s", exc)
+
     def _emit_expired(
         self,
         activated_by: str,
@@ -434,7 +461,7 @@ def _require_manager() -> BreakGlassManager:
 def activate_break_glass(
     user_id: str,
     ttl_hours: int = _TTL_DEFAULT_HOURS,
-    require_second_approver: bool = False,
+    require_second_approver: bool = True,
 ) -> dict:
     """Module-level wrapper — see BreakGlassManager.activate_break_glass."""
     return _require_manager().activate_break_glass(user_id, ttl_hours, require_second_approver)

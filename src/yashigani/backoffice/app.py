@@ -1512,6 +1512,11 @@ def create_backoffice_app() -> FastAPI:
     # #25 — dual-admin cloud-LLM risk-accepted override (propose/approve/revoke/status)
     from yashigani.backoffice.routes.cloud_override import router as cloud_override_router
     app.include_router(cloud_override_router, prefix="/admin/cloud-override", tags=["cloud-override"])
+    # YSG-RISK-150/132 — break-glass emergency access (activate/approve/revoke/status).
+    # BreakGlassManager was instantiated at startup but previously had no route
+    # reaching it at all — this makes it reachable, with dual-control forced on.
+    from yashigani.backoffice.routes.break_glass import router as break_glass_router
+    app.include_router(break_glass_router, prefix="/admin/break-glass", tags=["break-glass"])
     # 5.0 T5 — model-security dual-control admin routes (A5 pin, rug-pull, promotion)
     from yashigani.backoffice.routes.model_security import router as model_security_router
     app.include_router(model_security_router, prefix="/admin/model-security", tags=["model-security"])

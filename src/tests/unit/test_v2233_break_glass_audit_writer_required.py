@@ -234,7 +234,14 @@ class TestBreakGlassManagerEmitGuards:
         mgr._emit_expired("admin@example.com", is_auto=True, revoked_by="__auto_expire__")
 
     def test_emit_activated_calls_audit_write_when_writer_present(self):
-        """With a real audit writer, _emit_activated must call write()."""
+        """With a real audit writer, _emit_activated must call write().
+
+        YSG-RISK-150/132: _emit_activated now writes TWO events —
+        BreakGlassActivatedEvent (unchanged) plus the new
+        EmergencyUnlockExecutedEvent (SECURITY_CRITICAL, previously defined
+        in audit/schema.py but never emitted anywhere). Count updated from
+        1 -> 2 to reflect that intentional addition.
+        """
         from yashigani.auth.break_glass import BreakGlassManager
         import datetime
         mock_audit = MagicMock()
@@ -244,8 +251,10 @@ class TestBreakGlassManagerEmitGuards:
             4,
             datetime.datetime.now(tz=datetime.timezone.utc),
         )
-        assert mock_audit.write.call_count == 1, (
-            f"Expected 1 audit write from _emit_activated, got {mock_audit.write.call_count}"
+        assert mock_audit.write.call_count == 2, (
+            f"Expected 2 audit writes from _emit_activated "
+            f"(BreakGlassActivatedEvent + EmergencyUnlockExecutedEvent), "
+            f"got {mock_audit.write.call_count}"
         )
 
     def test_emit_expired_calls_audit_write_when_writer_present(self):
