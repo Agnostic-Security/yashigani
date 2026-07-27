@@ -13070,10 +13070,28 @@ _write_helm_values() {
     return 0
   fi
 
-  # Create with 0600 IMMEDIATELY (may contain license key — paid credential).
-  # umask 022 would produce 0644 which is world-readable; explicit chmod prevents
-  # that race between touch and chmod.
-  touch "$helm_values"
+  # Create/TRUNCATE with 0600 IMMEDIATELY (may contain license key — paid
+  # credential). umask 022 would produce 0644 which is world-readable;
+  # explicit chmod prevents that race between create and chmod.
+  #
+  # NEW-K8S-ENVHELM-APPEND-001 (found during 4.1.2 k3s/Cilium e2e,
+  # 2026-07-28): this used to be a bare `touch`, which does NOT truncate an
+  # existing file. Every re-run of install.sh against the same WORK_DIR (a
+  # normal operational scenario — retry after a failed/aborted attempt,
+  # re-running with different flags, etc.) APPENDED a fresh `global:` /
+  # `gateway:` / ... block on top of the previous run's, producing a .env.helm
+  # with multiple duplicate top-level YAML keys in one document. K8s/Helm's
+  # YAML decoder resolves duplicate top-level keys last-value-wins per KEY —
+  # so if a later run's `global:` block (written here) lacked the
+  # `imageRegistry`/`imageOwner` keys that k8s_ensure_fresh_local_images had
+  # appended in an EARLIER run's `global:` block further down the same file,
+  # the earlier registry values were silently discarded, and every pod
+  # image reference fell back to the bare unqualified name (e.g.
+  # "yashigani-gateway:4.1.2"), which Docker Hub resolves to a nonexistent
+  # library/ image — ErrImagePull on every pod, cluster-wide, on any re-run.
+  # Fix: truncate on every call so each install.sh invocation starts from a
+  # clean, single-`global:`-block .env.helm, same as a first-ever install.
+  : > "$helm_values"
   chmod 0600 "$helm_values"
 
   # Write YAML values override.
