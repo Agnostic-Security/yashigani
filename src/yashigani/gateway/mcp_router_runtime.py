@@ -140,6 +140,21 @@ _STRIP_HEADERS = frozenset({
 # Methods that require tools/call enforcement gate
 _GATED_METHODS = frozenset({"tools/call"})
 
+# YSG-RISK-145: prompts/get + resources/read are READ/FETCH primitives that
+# return caller-controlled upstream content — the SAME injection/poisoning
+# vector class as tools/list tool descriptions (YSG-RISK-142/143), just for
+# a single prompt/resource instead of the whole catalogue. Before this fix
+# they fell into the generic pass-through `else` branch below: no
+# broker.enforce() OPA gate, no content-filter inspection, forwarded
+# uninspected both directions. They now get their own gate — OPA's existing
+# mcp.rego non-invocation allow blocks (input.action != "mcp.tools.call")
+# already cover mcp.prompts.get / mcp.resources.read (_recognised_actions),
+# requiring identity_verified + posture/chain/subject checks but NOT the
+# tools/call four-gate (_grant_ok / _envelope_unchanged do not apply to a
+# non-tool subject) — see policy/mcp.rego "MCP-B/-C — NON-invocation
+# actions" blocks. That policy path already existed; nothing invoked it.
+_READ_GATED_METHODS = frozenset({"prompts/get", "resources/read"})
+
 # Methods that are MCP session management — forwarded without tools-gating
 # but still with a gateway JWT attached
 _SESSION_METHODS = frozenset({
@@ -158,6 +173,54 @@ _SESSION_METHODS = frozenset({
     "notifications/tools/list_changed",
     "notifications/prompts/list_changed",
 })
+
+
+def _extract_read_response_text(result: dict) -> str:
+    """Best-effort extraction of all human-readable text from a
+    ``prompts/get`` or ``resources/read`` JSON-RPC ``result`` object, for M4
+    content-filter scanning (YSG-RISK-142/143/145).
+
+    Handles the documented MCP shapes:
+      prompts/get:     {"description": str, "messages": [{"content":
+                        {"type": "text", "text": str} | [...] | str}]}
+      resources/read:  {"contents": [{"uri": ..., "text": str} | {"blob": ...}]}
+
+    Falls back to the full JSON-serialised result when the shape is
+    unrecognised — over-inclusive (scans more than strictly necessary) is
+    the fail-closed direction; silently skipping an unknown shape would not
+    be.
+    """
+    if not isinstance(result, dict):
+        return ""
+    chunks: list[str] = []
+    desc = result.get("description")
+    if isinstance(desc, str):
+        chunks.append(desc)
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                chunks.append(content["text"])
+            elif isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and isinstance(c.get("text"), str):
+                        chunks.append(c["text"])
+            elif isinstance(content, str):
+                chunks.append(content)
+    contents = result.get("contents")  # resources/read shape
+    if isinstance(contents, list):
+        for c in contents:
+            if isinstance(c, dict) and isinstance(c.get("text"), str):
+                chunks.append(c["text"])
+    if chunks:
+        return "\n".join(chunks)
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 — filtering input only, never fatal
+        return ""
 
 
 async def dispatch_mcp_call(
@@ -507,7 +570,21 @@ async def _handle_mcp_call_inner(
     # Fallback: identity_registry.get(caller_agent_id) if get_by_slug misses.
     # "gateway:orchestrator" is exempt (unrestricted — skip lookup).
     # When caller_agent_id is None or identity_registry is absent, no restriction.
+    #
+    # YSG-RISK-151: the SAME lookup also resolves group_ids + principal_scope/
+    # principal_id for the mcp_server connection-permit grant
+    # (broker._check_connection_permit → resolve_boolean_grant). Before this
+    # fix the broker hardcoded group_ids=[], principal_scope=None,
+    # principal_id=None — an admin-written group/user-scope mcp_server grant
+    # (with its own audit event) was NEVER evaluated; only the org-level
+    # ceiling ever applied, so a group/user revocation silently never took
+    # effect. Mirrors the identical pattern in gateway/orchestrator.py's
+    # EXTERNAL_API grant check (principal_scope="agent"/"user", group_ids
+    # from IdentityRecord.groups).
     caller_allowed_tools: Optional[list[str]] = None
+    caller_group_ids: list[str] = []
+    caller_principal_scope: Optional[str] = None
+    caller_principal_id: Optional[str] = None
     if (
         _caller_agent_id is not None
         and _caller_agent_id != "gateway:orchestrator"
@@ -527,19 +604,33 @@ async def _handle_mcp_call_inner(
                 # IdentityRecord dataclass or dict from Redis-backed registry
                 if hasattr(_caller_rec, "allowed_tools"):
                     _at = _caller_rec.allowed_tools
+                    _gr = getattr(_caller_rec, "groups", None)
                 elif isinstance(_caller_rec, dict):
                     _at = _caller_rec.get("allowed_tools")
+                    _gr = _caller_rec.get("groups")
                 else:
                     _at = None
+                    _gr = None
                 # Only use it if it's a non-empty list — empty list = no restriction
                 if _at:
                     caller_allowed_tools = list(_at)
+                if _gr:
+                    caller_group_ids = [str(g) for g in _gr if g]
+                # YSG-RISK-151: the caller resolved by this lookup is always an
+                # AGENT principal (identity_registry is keyed on agent slug/id
+                # here — the user-scope narrowing tier is reached via a
+                # DIFFERENT identity rail, X-Yashigani-Identity-Id → user_id,
+                # not modelled by this lookup). "agent" scope only narrows
+                # (INV-3 in resolver.py) — absent grant = no effect either way.
+                caller_principal_scope = "agent"
+                caller_principal_id = _caller_agent_id
         except Exception as _at_exc:
             # Lookup failure → no per-caller restriction (fail-open for tools
             # lookup specifically; the connection deny-by-default still applies).
             logger.warning(
-                "mcp-runtime: [P3] caller allowed_tools lookup failed "
-                "caller=%r: %s — no per-caller tool restriction applied",
+                "mcp-runtime: [P3] caller allowed_tools/groups lookup failed "
+                "caller=%r: %s — no per-caller tool restriction or "
+                "group/agent grant narrowing applied",
                 _caller_agent_id, _at_exc,
             )
 
@@ -582,6 +673,11 @@ async def _handle_mcp_call_inner(
             caller_agent_id=_caller_agent_id,
             # 3.1 Phase 3 — per-caller tool allow-list (None = no restriction).
             caller_allowed_tools=caller_allowed_tools,
+            # YSG-RISK-151 — group/principal narrowing for the mcp_server
+            # connection-permit grant (McpBroker._check_connection_permit).
+            caller_group_ids=caller_group_ids,
+            caller_principal_scope=caller_principal_scope,
+            caller_principal_id=caller_principal_id,
         )
 
         try:
@@ -912,6 +1008,238 @@ async def _handle_mcp_call_inner(
             media_type="application/json",
         )
 
+    elif method in _READ_GATED_METHODS:
+        # YSG-RISK-145 — prompts/get / resources/read: OPA authorization
+        # (non-invocation gate — identity_verified + posture/chain/subject,
+        # NOT the tools/call four-gate) + M4 content filter on the response,
+        # in both directions. Previously pass-through (uninspected, no
+        # authz) via the generic `else` branch below.
+        read_prompt_name = (
+            params.get("name")
+            if method == "prompts/get" and isinstance(params, dict) else None
+        )
+        read_resource_uri = (
+            params.get("uri")
+            if method == "resources/read" and isinstance(params, dict) else None
+        )
+        read_action = "mcp.prompts.get" if method == "prompts/get" else "mcp.resources.read"
+
+        ctx_read = McpCallContext(
+            tenant_id=server_cfg.tenant_id,
+            agent_name=agent_name,
+            user_id=user_id,
+            posture=posture,
+            posture_binding=posture_binding,
+            action=read_action,
+            prompt_name=read_prompt_name,
+            resource_uri=read_resource_uri,
+            call_id=call_id,
+            request_id=request_id,
+            server_id=agent_name,
+            mcp_id=server_cfg.mcp_id,
+            identity_verified=_identity_verified,
+            rbac_verified=rbac_verified,
+            target_cert_fingerprint=getattr(server_cfg, "cert_fingerprint", "") or "",
+            caller_sensitivity_ceiling=caller_sensitivity_ceiling,
+            caller_agent_id=_caller_agent_id,
+            # YSG-RISK-151 — group/principal narrowing for the mcp_server
+            # connection-permit grant (McpBroker._check_connection_permit),
+            # same as the tools/call ctx above.
+            caller_group_ids=caller_group_ids,
+            caller_principal_scope=caller_principal_scope,
+            caller_principal_id=caller_principal_id,
+        )
+
+        try:
+            read_decision = await broker.enforce(ctx_read)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.error(
+                "mcp-runtime: broker.enforce raised unexpectedly (read) agent=%r "
+                "method=%r call_id=%s: %s",
+                agent_name, method, call_id, exc,
+            )
+            return JSONResponse(status_code=502, content={"error": "BROKER_ERROR"})
+
+        if not read_decision.allow:
+            logger.info(
+                "mcp-runtime: OPA denied (read) agent=%r method=%r prompt=%r "
+                "resource=%r reason=%s",
+                agent_name, method, read_prompt_name, read_resource_uri,
+                read_decision.deny_reason,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_READ_DENIED",
+                    "deny_reason": read_decision.deny_reason,
+                },
+            )
+
+        # Allowed — forward to the bridge with the issued JWT.
+        try:
+            async with McpHttpTransport(
+                upstream_url=server_cfg.upstream_url,
+                is_relay=False,
+                expected_spiffe_id=server_cfg.spiffe_id,  # FINDING C
+            ) as transport:
+                upstream_response = await transport.forward(
+                    mcp_request_json=body_str,
+                    gateway_jwt=read_decision.issued_jwt,
+                )
+        except HttpTransportError as exc:
+            logger.error(
+                "mcp-runtime: upstream transport error (read) agent=%r "
+                "call_id=%s: %s", agent_name, call_id, exc,
+            )
+            return JSONResponse(status_code=502, content={"error": "UPSTREAM_UNREACHABLE"})
+        except Exception as exc:
+            logger.error(
+                "mcp-runtime: unexpected forward error (read) agent=%r "
+                "call_id=%s: %s", agent_name, call_id, exc,
+            )
+            return JSONResponse(status_code=502, content={"error": "UPSTREAM_ERROR"})
+
+        # ── YSG-RISK-142/143/145 — M4 content filter on the response body ──
+        # (fetch_and_filter_prompt — the injection filter this endpoint was
+        # built for, wired in for the first time). A detected injection is a
+        # BLOCK, not a silent substitution: the caller never sees flagged
+        # prompt/resource content.
+        try:
+            _resp_obj = json.loads(upstream_response) if upstream_response else None
+        except (json.JSONDecodeError, ValueError):
+            _resp_obj = None
+        result_sensitivity = "PUBLIC"
+        pii_detected = False
+        if isinstance(_resp_obj, dict) and isinstance(_resp_obj.get("result"), dict):
+            _filter_text = _extract_read_response_text(_resp_obj["result"])
+            if _filter_text:
+                _filter_subject = read_prompt_name or read_resource_uri or ""
+                try:
+                    _filter_result = broker.fetch_and_filter_prompt(  # type: ignore[attr-defined]
+                        agent_name, _filter_subject, _filter_text,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "mcp-runtime: [M4] content-filter raised (read) agent=%r "
+                        "method=%r call_id=%s: %s — fail-closed withhold",
+                        agent_name, method, call_id, exc,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "MCP_CONTENT_FILTER_ERROR",
+                            "deny_reason": "content_filter_error",
+                        },
+                    )
+                if _filter_result.rejected:
+                    logger.warning(
+                        "mcp-runtime: [M4] content-filter BLOCKED (read) agent=%r "
+                        "method=%r subject=%r reason=%s",
+                        agent_name, method, _filter_subject,
+                        _filter_result.reject_reason,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "MCP_CONTENT_FILTER_BLOCKED",
+                            "deny_reason": "content_filter_rejected",
+                            "code": "MCP_CONTENT_FILTER_REJECTED",
+                            "user_message": (
+                                "This prompt/resource content was withheld "
+                                "because the content filter detected a "
+                                "potential injection."
+                            ),
+                        },
+                    )
+
+        # ── G-ORCH-OPA-1 egress gate — same independent OPA layer tools/call
+        # uses, applied here too (fail-closed on any error).
+        try:
+            if response_inspection_pipeline is not None and upstream_response:
+                resp_insp = response_inspection_pipeline.inspect(  # type: ignore[attr-defined]
+                    response_body=upstream_response,
+                    content_type="application/json",
+                    request_id=request_id,
+                    session_id=user_id,
+                    agent_id=agent_name,
+                )
+                result_sensitivity = getattr(resp_insp, "response_sensitivity", "PUBLIC") or "PUBLIC"
+                verdict = getattr(resp_insp, "verdict", "CLEAN")
+                if verdict == "BLOCKED":
+                    logger.info(
+                        "mcp-runtime: [G-ORCH-OPA-1] inspection BLOCKED (read) "
+                        "agent=%r method=%r — result withheld",
+                        agent_name, method,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "MCP_EGRESS_BLOCKED",
+                            "deny_reason": "response_inspection_blocked",
+                            "code": "MCP_RESPONSE_INSPECTION_BLOCKED",
+                            "user_message": (
+                                "The result was withheld because the content "
+                                "filter detected a potential injection in the "
+                                "response."
+                            ),
+                        },
+                    )
+                elif verdict == "FLAGGED":
+                    pii_detected = True
+        except Exception as exc:
+            logger.error(
+                "mcp-runtime: [G-ORCH-OPA-1] inspection error (read) agent=%r "
+                "method=%r call_id=%s: %s — fail-closed withhold",
+                agent_name, method, call_id, exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_INSPECTION_ERROR",
+                    "deny_reason": "inspection_error",
+                },
+            )
+
+        try:
+            egress = await broker.enforce_result(  # type: ignore[attr-defined]
+                ctx=ctx_read,
+                result_sensitivity=result_sensitivity,
+                pii_detected=pii_detected,
+            )
+        except Exception as exc:
+            logger.error(
+                "mcp-runtime: [G-ORCH-OPA-1] enforce_result raised (read) "
+                "agent=%r method=%r call_id=%s: %s — fail-closed withhold",
+                agent_name, method, call_id, exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": "MCP_EGRESS_ERROR", "deny_reason": "egress_decision_error"},
+            )
+
+        if not egress.allow:
+            logger.info(
+                "mcp-runtime: [G-ORCH-OPA-1] egress DENIED (read) agent=%r "
+                "method=%r reason=%s code=%s",
+                agent_name, method, egress.deny_reason, egress.code,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "MCP_EGRESS_DENIED",
+                    "deny_reason": egress.deny_reason,
+                    "code": egress.code,
+                    "user_message": egress.user_message,
+                    "policy_id": egress.policy_id,
+                },
+            )
+
+        return Response(
+            content=upstream_response.encode("utf-8"),
+            status_code=200,
+            media_type="application/json",
+        )
+
     elif method in _SESSION_METHODS or is_notification:
         # Session management or notification — forward through with a
         # session-level gateway JWT (so the MCP server trusts the gateway).
@@ -1009,6 +1337,75 @@ async def _handle_mcp_call_inner(
                     status_code=502,
                     content={"error": "UPSTREAM_ERROR"},
                 )
+
+            # ── YSG-RISK-142/143/144 — tool-description ingestion ──────────
+            # tools/list is the ONLY place the gateway ever sees the upstream
+            # server's advertised tool surface, so it is the ONLY place that
+            # can: (a) run the M4 content filter over tool descriptions
+            # (poisoning vector, previously dead code with zero production
+            # callers), and (b) populate McpBroker._catalogue_store so
+            # broker.enforce()'s target.surface_hash is non-empty (feeding
+            # FIX 1's OPA _envelope_unchanged comparison — before this wiring
+            # the catalogue was NEVER populated in production, so
+            # surface_hash was always "" regardless of the hash-function fix).
+            if method == "tools/list" and upstream_response:
+                try:
+                    _tl_obj = json.loads(upstream_response)
+                except (json.JSONDecodeError, ValueError):
+                    _tl_obj = None
+                _tl_result = _tl_obj.get("result") if isinstance(_tl_obj, dict) else None
+                _raw_tools = (
+                    _tl_result.get("tools")
+                    if isinstance(_tl_result, dict) and isinstance(_tl_result.get("tools"), list)
+                    else None
+                )
+                if _raw_tools is not None:
+                    try:
+                        await broker.refresh_and_triage_tools(  # type: ignore[attr-defined]
+                            agent_name, _raw_tools, None,
+                        )
+                    except Exception as exc:
+                        # Fail-closed: a catalogue/filter fault must not leave
+                        # a stale/absent catalogue silently — deny this
+                        # tools/list rather than forward an uninspected
+                        # surface (the agent can retry once the fault clears).
+                        logger.error(
+                            "mcp-runtime: [M4] refresh_and_triage_tools raised "
+                            "agent=%r call_id=%s: %s — fail-closed withhold",
+                            agent_name, call_id, exc,
+                        )
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "MCP_CONTENT_FILTER_ERROR",
+                                "deny_reason": "content_filter_error",
+                            },
+                        )
+                    _live_cat = broker._catalogue_store.get(  # type: ignore[attr-defined]
+                        server_cfg.tenant_id, agent_name,
+                    )
+                    if _live_cat is not None and _live_cat.rejected_tool_count > 0:
+                        logger.warning(
+                            "mcp-runtime: [M4] content-filter REJECTED %d/%d tool "
+                            "description(s) agent=%r — tools/list withheld "
+                            "(poisoning suspected, fail-closed)",
+                            _live_cat.rejected_tool_count, _live_cat.tool_count,
+                            agent_name,
+                        )
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "MCP_CONTENT_FILTER_BLOCKED",
+                                "deny_reason": "content_filter_rejected",
+                                "code": "MCP_CONTENT_FILTER_REJECTED",
+                                "user_message": (
+                                    "This server's advertised tools were "
+                                    "withheld because the content filter "
+                                    "detected a potential tool-description "
+                                    "poisoning attempt."
+                                ),
+                            },
+                        )
 
             return Response(
                 content=upstream_response.encode("utf-8"),
