@@ -2796,13 +2796,52 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                 }
                             },
                         )
+                    # YSG-RISK-134: resolve the CALLING USER's effective brain
+                    # model (own allowed_models + org/group/user allocations)
+                    # instead of always provisioning this persona's Letta
+                    # agent with the GLOBAL YASHIGANI_LETTA_BRAIN_MODEL
+                    # default. Only takes effect at first agent-creation for
+                    # this user (see letta_client._ensure_agent_for_user).
+                    from yashigani.gateway.letta_client import (
+                        _letta_brain_model as _default_letta_brain_handle,
+                    )
+                    _letta_default_handle = _default_letta_brain_handle()
+                    _letta_default_concrete = (
+                        _letta_default_handle.split("/", 1)[-1]
+                        if "/" in _letta_default_handle
+                        else _letta_default_handle
+                    )
+                    try:
+                        _letta_peruser_concrete = _resolve_agent_brain_model(
+                            identity, _letta_default_concrete
+                        )
+                    except ModelNotAllocatedError:
+                        logger.warning(
+                            "MODEL-RBAC DENIED (agent provisioning, "
+                            "YSG-RISK-134): identity=%s persona=%s no "
+                            "allocated local model for Letta brain — "
+                            "visible 403 (no silent default-substitute)",
+                            identity_id, selected_model,
+                        )
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": {
+                                    "message": _deny_message("model_not_allocated"),
+                                    "type": "policy_denied",
+                                    "code": "model_not_allocated",
+                                }
+                            },
+                            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+                        )
+                    _letta_peruser_handle = f"openai-proxy/{_letta_peruser_concrete}"
                     try:
                         from yashigani.gateway.letta_client import (
                             LettaClientPool as _PerUserLCPool,
                         )
                         _lcp = _PerUserLCPool(_state.pool_manager)
                         _lc_client, _lc_base, _lc_agent_id = await _lcp.for_user(
-                            identity_id
+                            identity_id, brain_model=_letta_peruser_handle,
                         )
                         # Use the agent's specific letta_agent_id if provisioned;
                         # otherwise use the default per-user agent.
@@ -4033,14 +4072,30 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 )
                 try:
                     if _letta_peruser:
+                        # YSG-RISK-134: resolve the CALLING USER's effective
+                        # brain model instead of always provisioning the
+                        # per-user Letta agent with the GLOBAL
+                        # YASHIGANI_LETTA_BRAIN_MODEL default (mirrors the
+                        # persona/pool path above, ~line 2799).
                         from yashigani.gateway.letta_client import (
                             LettaClientPool as _StaticLettaPool,
+                            _letta_brain_model as _default_letta_brain_handle2,
+                        )
+                        _letta_default_handle2 = _default_letta_brain_handle2()
+                        _letta_default_concrete2 = (
+                            _letta_default_handle2.split("/", 1)[-1]
+                            if "/" in _letta_default_handle2
+                            else _letta_default_handle2
+                        )
+                        _letta_peruser_handle2 = (
+                            f"openai-proxy/{_resolve_agent_brain_model(identity, _letta_default_concrete2)}"
                         )
                         _slp = _StaticLettaPool(_state.pool_manager)
                         agent_resp = await _slp.letta_chat(
                             user_id=identity_id,
                             messages=agent_messages,
                             timeout=120.0,
+                            brain_model=_letta_peruser_handle2,
                         )
                         route_reason = f"agent:{selected_model[1:]}:letta:peruser"
                     else:
@@ -4054,6 +4109,25 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     choices = agent_resp.get("choices", [])
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
                     backend_body = agent_resp
+                except ModelNotAllocatedError:
+                    logger.warning(
+                        "MODEL-RBAC DENIED (agent provisioning, "
+                        "YSG-RISK-134): identity=%s agent=%s no allocated "
+                        "local model for Letta brain — visible 403 (no "
+                        "silent default-substitute)",
+                        identity_id, selected_model,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": {
+                                "message": _deny_message("model_not_allocated"),
+                                "type": "policy_denied",
+                                "code": "model_not_allocated",
+                            }
+                        },
+                        headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+                    )
                 except Exception as exc:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Letta agent %s failed", selected_model)
@@ -4070,12 +4144,47 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                         headers={"X-Yashigani-Agent-Error": "true"},
                     )
             elif agent_protocol == "langflow":
-                from yashigani.gateway.langflow_client import langflow_chat
+                # YSG-RISK-135: resolve the CALLING USER's effective model
+                # (bare concrete name, no provider prefix — matches
+                # YASHIGANI_LANGFLOW_MODEL's format) instead of always
+                # running the shared default flow with the GLOBAL
+                # _DEFAULT_MODEL. The flow itself stays shared/global;
+                # langflow_chat() overrides the model used for THIS run only
+                # via Langflow's runtime `tweaks` mechanism (no per-user flow
+                # provisioning needed for the simple per-user-model case).
+                from yashigani.gateway.langflow_client import (
+                    langflow_chat,
+                    _DEFAULT_MODEL as _langflow_default_model,
+                )
                 try:
+                    try:
+                        _langflow_peruser_model = _resolve_agent_brain_model(
+                            identity, _langflow_default_model
+                        )
+                    except ModelNotAllocatedError:
+                        logger.warning(
+                            "MODEL-RBAC DENIED (agent provisioning, "
+                            "YSG-RISK-135): identity=%s agent=%s no "
+                            "allocated local model for Langflow brain — "
+                            "visible 403 (no silent default-substitute)",
+                            identity_id, selected_model,
+                        )
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": {
+                                    "message": _deny_message("model_not_allocated"),
+                                    "type": "policy_denied",
+                                    "code": "model_not_allocated",
+                                }
+                            },
+                            headers={"X-Yashigani-OPA-Reason": "model_not_allocated"},
+                        )
                     agent_resp = await langflow_chat(
                         base_url=agent_upstream,
                         messages=agent_messages,
                         timeout=120.0,
+                        model=_langflow_peruser_model,
                     )
                     choices = agent_resp.get("choices", [])
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
@@ -6246,6 +6355,68 @@ def _effective_allowed_models(identity: dict | None) -> "EffectiveModels":
         identity,
         getattr(_state, "model_allocation_store", None),
         getattr(_state, "model_alias_store", None),
+    )
+
+
+class ModelNotAllocatedError(RuntimeError):
+    """YSG-RISK-134/135: raised by ``_resolve_agent_brain_model`` when a
+    caller's model allocation is restricted (``has_restriction=True``) but no
+    usable local model can be resolved for agent-provisioning (Letta agent
+    creation / Langflow flow-run). Callers MUST turn this into a visible 403
+    ``model_not_allocated`` response (mirrors LAURA-B1-OBS-A) — NEVER swallow
+    it and silently fall back to the global default, which the caller may not
+    be allocated."""
+
+
+def _resolve_agent_brain_model(identity: dict | None, default_model: str) -> str:
+    """YSG-RISK-134/135: resolve the per-user brain/LLM model for agent
+    provisioning (Letta agent creation, Langflow flow-run tweaks) instead of
+    always using the GLOBAL deploy-default env var and ignoring the caller's
+    allocated model / ceiling.
+
+    Mirrors the /v1 chat leg's effective-allowed-models resolution
+    (``_effective_allowed_models`` / ``models.effective``) and reuses
+    ``EffectiveModels.pick_allowed_local_default``'s LOCAL-only fallback
+    semantics — an agent's brain model MUST be an Ollama-served local model
+    per the letta_client / langflow_client module docstrings (both agents
+    reach the gateway only via the internal mesh endpoint, never the cloud
+    egress leg), so substituting a cloud model here would violate the same
+    P1/P2/P3 data-residency guarantee ``pick_allowed_local_default`` protects
+    for the optimiser's local-route fallback.
+
+    Args:
+        identity: resolved caller identity dict (or None).
+        default_model: the BARE concrete model name (no provider/handle
+            prefix) the deploy default would use — e.g. "qwen2.5:3b".
+
+    Returns the concrete model name to use. Semantics (mirrors the /v1 leg's
+    "empty allowed_models == default"):
+      * No restriction on the caller -> the deploy default (unchanged
+        behaviour for deployments with no model RBAC configured).
+      * Restricted caller whose effective set does NOT deny the default's
+        concrete model -> the deploy default (already within their
+        allowlist).
+      * Restricted caller who IS denied the default but has some OTHER
+        allowed LOCAL concrete model -> that model.
+      * Restricted caller with NO usable local model in their effective set
+        -> raises ModelNotAllocatedError. Fail-safe: we never fall back to
+        the (denied) global default just because no local alternative
+        exists — callers MUST turn this into a visible 403, never a silently
+        provisioned agent running on a model the caller isn't allocated.
+    """
+    effective = _effective_allowed_models(identity)
+    if not effective.has_restriction:
+        return default_model
+    if not effective.is_model_denied(default_model):
+        return default_model
+    local = effective.pick_allowed_local_default(
+        getattr(_state, "model_alias_store", None), default_model
+    )
+    if local:
+        return local
+    raise ModelNotAllocatedError(
+        "caller has a model restriction but no allocated local model is "
+        f"available for agent provisioning (default {default_model!r} denied)"
     )
 
 

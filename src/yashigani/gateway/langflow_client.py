@@ -90,6 +90,33 @@ _flow_id: str | None = None
 _initialized = False
 # Cached OpenAIModel component template fetched from langflow /api/v1/all.
 _openai_component: dict | None = None
+# YSG-RISK-135: react-flow node id of the shared default flow's OpenAIModel
+# node, resolved once alongside _flow_id. Used to target a runtime `tweaks`
+# override at /api/v1/run/{flow_id} so a per-user model (resolved from the
+# caller's effective allocation, see openai_router._resolve_agent_brain_model)
+# can override the flow's configured default WITHOUT provisioning a separate
+# flow per user -- the flow itself stays shared/global; only the model used
+# for THIS request's run is varied. None when no OpenAIModel node could be
+# located (e.g. no starter template available) -- callers degrade to running
+# with the flow's own configured default (see langflow_chat()).
+_model_node_id: str | None = None
+
+
+def _find_model_node_id(flow_data: dict) -> str | None:
+    """Return the react-flow id of the OpenAIModel node in *flow_data*.
+
+    Returns None if no such node is found. Used to target Langflow's runtime
+    ``tweaks`` override at the correct component (YSG-RISK-135).
+    """
+    for node in flow_data.get("nodes", []) if isinstance(flow_data, dict) else []:
+        if not isinstance(node, dict):
+            continue
+        node_data = node.get("data", {})
+        if isinstance(node_data, dict) and node_data.get("type") == _TARGET_NODE_TYPE:
+            node_id = node.get("id")
+            if isinstance(node_id, str) and node_id:
+                return node_id
+    return None
 
 
 async def _fetch_openai_component(
@@ -247,11 +274,19 @@ def _rewrite_type_references(flow_data: dict, old_type: str, new_type: str) -> N
                     edge_data[ref_field] = _sub(edge_data[ref_field])
 
 
-async def _ensure_initialized(client: httpx.AsyncClient, base_url: str) -> tuple[str, str]:
-    """Initialize Langflow: auto-login, get API key, find or create flow."""
-    global _api_key, _flow_id, _initialized
+async def _ensure_initialized(
+    client: httpx.AsyncClient, base_url: str
+) -> tuple[str, str, str | None]:
+    """Initialize Langflow: auto-login, get API key, find or create flow.
+
+    Returns (api_key, flow_id, model_node_id). ``model_node_id`` (YSG-RISK-135)
+    is the react-flow id of the flow's OpenAIModel node, resolved so callers
+    can target a per-run ``tweaks`` override at the correct component -- None
+    if no such node could be located.
+    """
+    global _api_key, _flow_id, _initialized, _model_node_id
     if _initialized and _api_key and _flow_id:
-        return _api_key, _flow_id
+        return _api_key, _flow_id, _model_node_id
 
     # Step 1: Auto-login to get bearer token
     resp = await client.get(f"{base_url}/api/v1/auto_login")
@@ -328,6 +363,11 @@ async def _ensure_initialized(client: httpx.AsyncClient, base_url: str) -> tuple
             # continue rather than blocking initialization of a working flow.
             logger.warning("Langflow: self-heal of flow %s failed: %s", _flow_id, exc)
 
+        # YSG-RISK-135: resolve the model node id from the (possibly just
+        # self-healed) persisted flow data so per-run tweaks overrides have a
+        # target.
+        _model_node_id = _find_model_node_id(flow_data)
+
     if not _flow_id:
         # Find the "Basic Prompting" starter flow and convert its model node to
         # a gateway-pointed OpenAIModel so the new flow is runnable.
@@ -358,7 +398,11 @@ async def _ensure_initialized(client: httpx.AsyncClient, base_url: str) -> tuple
             headers=api_headers,
         )
         if resp.status_code in (200, 201):
-            _flow_id = resp.json().get("id", "")
+            _created = resp.json()
+            _flow_id = _created.get("id", "")
+            # YSG-RISK-135: prefer the server-returned data (authoritative
+            # node ids); fall back to what we posted if the response omits it.
+            _model_node_id = _find_model_node_id(_created.get("data") or starter_data or {})
             logger.info(
                 "Langflow: created flow %s with OpenAIModel/gateway config", _flow_id
             )
@@ -366,7 +410,7 @@ async def _ensure_initialized(client: httpx.AsyncClient, base_url: str) -> tuple
             raise RuntimeError(f"Langflow flow creation failed: {resp.status_code}")
 
     _initialized = True
-    return _api_key, _flow_id
+    return _api_key, _flow_id, _model_node_id
 
 
 async def create_flow(
@@ -401,7 +445,7 @@ async def create_flow(
     # (https://caddy:9705/agents/default/langflow) — present this process's
     # mesh leaf (backoffice leaf in the backoffice container).
     async with agent_dispatch_client(timeout=timeout) as client:
-        api_key, _flow_id_unused = await _ensure_initialized(client, base_url)
+        api_key, _flow_id_unused, _model_node_id_unused = await _ensure_initialized(client, base_url)
 
         resp = await client.post(
             f"{base_url}/api/v1/flows/",
@@ -432,6 +476,7 @@ async def langflow_chat(
     base_url: str,
     messages: list[dict],
     timeout: float = 120.0,
+    model: str | None = None,
 ) -> dict:
     """
     Send messages to Langflow and return an OpenAI-compatible response.
@@ -440,6 +485,18 @@ async def langflow_chat(
         base_url: Langflow upstream URL (e.g., http://langflow:7860)
         messages: List of {"role": ..., "content": ...} dicts
         timeout: Request timeout in seconds
+        model: YSG-RISK-135 — the caller's per-user resolved model (bare
+            concrete model name, e.g. "qwen2.5:3b"), computed by
+            openai_router.py's ``_resolve_agent_brain_model()`` from the
+            caller's EFFECTIVE allowed models. When set AND the shared
+            default flow's OpenAIModel node id was resolved by
+            ``_ensure_initialized``, overrides the flow's configured default
+            model for THIS run only via Langflow's runtime ``tweaks``
+            mechanism — the flow itself stays shared/global; only the model
+            used for this one request varies. When None (no identity to
+            resolve against) or when no model-node id could be resolved,
+            the flow's own configured default runs unchanged (legacy
+            behaviour).
 
     Returns:
         OpenAI ChatCompletionResponse-shaped dict
@@ -453,18 +510,34 @@ async def langflow_chat(
     if not user_message:
         user_message = messages[-1].get("content", "") if messages else ""
 
+    def _run_body(model_node_id: str | None) -> dict:
+        body: dict = {
+            "input_value": user_message,
+            "output_type": "chat",
+            "input_type": "chat",
+        }
+        if model and model_node_id:
+            body["tweaks"] = {model_node_id: {"model_name": model}}
+        elif model:
+            logger.warning(
+                "langflow_chat: per-user model override %r requested but no "
+                "OpenAIModel node id was resolved for the shared default "
+                "flow -- running with the flow's configured default model "
+                "instead (YSG-RISK-135 degrade, not a security gap: the "
+                "flow's default is a deploy-configured local model, never a "
+                "caller-controlled value).",
+                model,
+            )
+        return body
+
     # v4.1 §2.5: base_url is the langflow Caddy ingress front — present the
     # mesh leaf (gateway leaf in the gateway container).
     async with agent_dispatch_client(timeout=timeout) as client:
-        api_key, flow_id = await _ensure_initialized(client, base_url)
+        api_key, flow_id, model_node_id = await _ensure_initialized(client, base_url)
 
         resp = await client.post(
             f"{base_url}/api/v1/run/{flow_id}",
-            json={
-                "input_value": user_message,
-                "output_type": "chat",
-                "input_type": "chat",
-            },
+            json=_run_body(model_node_id),
             headers={"x-api-key": api_key},
         )
 
@@ -475,18 +548,15 @@ async def langflow_chat(
             #      slipped past init-time self-heal).
             # Either way: reset cache, re-init (which re-runs the self-heal /
             # repair path), and retry once.
-            global _api_key, _flow_id, _initialized
+            global _api_key, _flow_id, _initialized, _model_node_id
             _api_key = None
             _flow_id = None
             _initialized = False
-            api_key, flow_id = await _ensure_initialized(client, base_url)
+            _model_node_id = None
+            api_key, flow_id, model_node_id = await _ensure_initialized(client, base_url)
             resp = await client.post(
                 f"{base_url}/api/v1/run/{flow_id}",
-                json={
-                    "input_value": user_message,
-                    "output_type": "chat",
-                    "input_type": "chat",
-                },
+                json=_run_body(model_node_id),
                 headers={"x-api-key": api_key},
             )
 

@@ -180,7 +180,7 @@ class TestLangflowDispatchWiring:
             patch.object(lf, "agent_dispatch_client",
                          return_value=client) as mock_dispatch,
             patch.object(lf, "_ensure_initialized",
-                         new=AsyncMock(return_value=("key", "flow-1"))),
+                         new=AsyncMock(return_value=("key", "flow-1", None))),
         ):
             out = await lf.langflow_chat(
                 "https://caddy:9705/agents/default/langflow",
@@ -203,7 +203,7 @@ class TestLangflowDispatchWiring:
             patch.object(lf, "agent_dispatch_client",
                          return_value=client) as mock_dispatch,
             patch.object(lf, "_ensure_initialized",
-                         new=AsyncMock(return_value=("key", "flow-1"))),
+                         new=AsyncMock(return_value=("key", "flow-1", None))),
         ):
             flow_id = await lf.create_flow(
                 "https://caddy:9705/agents/default/langflow",

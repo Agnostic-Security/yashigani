@@ -559,5 +559,11 @@ class TestPersonaPathUnchanged:
         ):
             result = _run(mod.chat_completions(body, request))
 
-        fake_for_user.assert_awaited_once_with(alice_id)
+        # YSG-RISK-134: for_user() now also receives the caller's per-user
+        # resolved brain_model (mirrors the persona-pool path). alice_id has
+        # no allocation-store restriction configured in this fixture, so the
+        # resolved model is the unchanged deploy default handle.
+        fake_for_user.assert_awaited_once_with(
+            alice_id, brain_model="openai-proxy/qwen2.5:3b"
+        )
         assert not isinstance(result, JSONResponse) or result.status_code == 200

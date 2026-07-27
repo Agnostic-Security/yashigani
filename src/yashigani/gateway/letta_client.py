@@ -267,6 +267,7 @@ class LettaClientPool:
         user_id: str,
         base_url: str,
         client: httpx.AsyncClient,
+        brain_model: str | None = None,
     ) -> str:
         """Get or create the Letta agent for this user. Returns agent_id.
 
@@ -275,6 +276,17 @@ class LettaClientPool:
         The Letta container persists the agent in its own DB; if the process
         restarts, the agent list GET finds the existing agent and populates
         _agent_ids from the container's persistent store.
+
+        YSG-RISK-134: ``brain_model`` is the caller's per-user resolved brain
+        model (Letta handle form, e.g. "openai-proxy/qwen2.5:3b"), computed by
+        openai_router.py's ``_resolve_agent_brain_model()`` from the caller's
+        EFFECTIVE allowed models (own allowed_models + org/group/user
+        allocations -- see models.effective). When None (no identity to
+        resolve against, or a caller with no PoolManager-routed identity),
+        falls back to the GLOBAL ``YASHIGANI_LETTA_BRAIN_MODEL`` deploy
+        default -- unchanged legacy behaviour for those paths. This value is
+        used ONLY at first agent-creation time; an already-provisioned
+        agent's model is not retroactively changed (Letta persists it).
         """
         # Fast path: already in cache.
         cached = self._agent_ids.get(user_id)
@@ -288,7 +300,7 @@ class LettaClientPool:
                 return cached
 
             embedding_cfg = await _letta_embedding_config(client)
-            brain_model = _letta_brain_model()
+            brain_model = brain_model or _letta_brain_model()
 
             # Check for an existing agent in this user's container.
             resp = await client.get(f"{base_url}/v1/agents/")
@@ -342,6 +354,7 @@ class LettaClientPool:
     async def for_user(
         self,
         identity_id: str,
+        brain_model: str | None = None,
     ) -> tuple[httpx.AsyncClient, str, str]:
         """Resolve (client, base_url, agent_id) for the given user identity.
 
@@ -349,6 +362,13 @@ class LettaClientPool:
 
         Creates the per-user Letta container on first call (via PoolManager).
         Creates the per-user Letta agent in that container on first call.
+
+        Args:
+            identity_id: caller's identity_id (keys the container + agent pool).
+            brain_model: YSG-RISK-134 — the caller's per-user resolved brain
+                model handle (see ``_ensure_agent_for_user``). Optional and
+                keyword-only-by-convention; existing callers that omit it keep
+                the legacy GLOBAL-default behaviour unchanged.
 
         Returns:
             (client, base_url, agent_id)
@@ -365,7 +385,9 @@ class LettaClientPool:
         base_url = f"http://{self.get_endpoint(identity_id)}"
         client = httpx.AsyncClient(timeout=120.0)
         try:
-            agent_id = await self._ensure_agent_for_user(identity_id, base_url, client)
+            agent_id = await self._ensure_agent_for_user(
+                identity_id, base_url, client, brain_model=brain_model
+            )
         except Exception:
             await client.aclose()
             raise
@@ -376,15 +398,21 @@ class LettaClientPool:
         user_id: str,
         messages: list[dict],
         timeout: float = 120.0,
+        brain_model: str | None = None,
     ) -> dict:
         """Send messages to this user's Letta agent; return OpenAI-format response.
 
         Convenience wrapper over for_user() for callers that don't need the raw
         (client, base_url, agent_id) triple. Manages the client lifetime internally.
+
+        ``brain_model`` — see ``_ensure_agent_for_user`` (YSG-RISK-134); only
+        takes effect at first agent-creation for this user.
         """
         base_url = f"http://{self.get_endpoint(user_id)}"
         async with httpx.AsyncClient(timeout=timeout) as client:
-            agent_id = await self._ensure_agent_for_user(user_id, base_url, client)
+            agent_id = await self._ensure_agent_for_user(
+                user_id, base_url, client, brain_model=brain_model
+            )
             letta_messages = [
                 {"role": m.get("role", "user"), "content": m.get("content", "")}
                 for m in messages
