@@ -127,22 +127,37 @@ class _StubPipeline:
 
 
 class _StubSessionStore:
+    """
+    In-memory session-store stub.  Sessions are keyed by token in `_sessions`
+    so `get(token)` reflects whatever has actually been seeded/created —
+    modelling real SessionStore.get() semantics (YSG-RISK-136: the admin
+    api-key route re-fetches from the store immediately before rotate_key(),
+    so tests need get() to be state-accurate rather than an unconditional
+    None).
+    """
+
     def __init__(self, redis=None):
         self.created = []
         self._redis = redis or _StubRedis()
+        self._sessions: dict = {}
 
     def create(self, *, account_id, account_tier, client_ip):
         sess = MagicMock()
         sess.token = f"tok-{account_id}"
         sess.account_tier = account_tier
         self.created.append(sess)
+        self._sessions[sess.token] = sess
         return sess
 
     def invalidate_all_for_account(self, account_id: str) -> int:
         return 0
 
     def get(self, token):
-        return None
+        return self._sessions.get(token)
+
+    def seed(self, session) -> None:
+        """Test helper — register a session so get(session.token) resolves it."""
+        self._sessions[session.token] = session
 
     def record_totp_stepup(self, token: str) -> None:
         pass
@@ -782,8 +797,30 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
     This tests the users.py admin override route guard.
     """
 
-    def _build_admin_app(self, admin_record, target_record, registry=None, stepup_age=60.0):
-        """Build a minimal app exposing /admin/users/* routes."""
+    def _build_admin_app(
+        self,
+        admin_record,
+        target_record,
+        registry=None,
+        stepup_age=60.0,
+        seed_in_store=True,
+        store_stepup_age=None,
+    ):
+        """Build a minimal app exposing /admin/users/* routes.
+
+        seed_in_store / store_stepup_age let tests model YSG-RISK-136's
+        re-fetch-before-mutation guard diverging from the (bypassed)
+        StepUpAdminSession dependency's session object:
+          - seed_in_store=False           -> store.get(token) returns None
+                                              (session invalidated/logged out
+                                              mid-handler).
+          - store_stepup_age=<seconds>     -> store's copy of the session has
+                                              a DIFFERENT step-up age than the
+                                              one the dependency override
+                                              handed back (step-up lapsed
+                                              between dependency resolution
+                                              and the pre-mutation re-check).
+        """
         pytest.importorskip("fastapi")
         from fastapi import FastAPI
         from yashigani.backoffice import state as state_mod
@@ -823,8 +860,9 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
             async def total_user_count(self):
                 return 1
 
+        session_store = _StubSessionStore(redis=stub_redis)
         state_mod.backoffice_state.auth_service = _TwoUserAuthService()
-        state_mod.backoffice_state.session_store = _StubSessionStore(redis=stub_redis)
+        state_mod.backoffice_state.session_store = session_store
         state_mod.backoffice_state.audit_writer = _StubAuditWriter()
         state_mod.backoffice_state.identity_registry = registry
 
@@ -840,8 +878,18 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
 
         app.dependency_overrides[mw_mod.require_stepup_admin_session] = _override_stepup_admin
 
+        if seed_in_store:
+            if store_stepup_age is None:
+                session_store.seed(admin_session)
+            else:
+                store_copy = _make_session(
+                    admin_record.account_id, "admin", stepup_age=store_stepup_age
+                )
+                store_copy.token = admin_session.token
+                session_store.seed(store_copy)
+
         originals = (orig_auth, orig_session, orig_audit, orig_registry)
-        return app, originals
+        return app, session_store, originals
 
     def test_admin_can_issue_key_for_user(self):
         from fastapi.testclient import TestClient
@@ -855,7 +903,9 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
             email="alice@example.com",
         )
         registry = _make_registry_stub()
-        app, originals = self._build_admin_app(admin_record, target_record, registry=registry)
+        app, session_store, originals = self._build_admin_app(
+            admin_record, target_record, registry=registry
+        )
         try:
             client = TestClient(app, raise_server_exceptions=True)
             resp = client.post("/admin/users/alice/api-key")
@@ -881,7 +931,9 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
             email="alice@example.com",
         )
         registry = _make_registry_stub()
-        app, originals = self._build_admin_app(admin_record, target_record, registry=registry)
+        app, session_store, originals = self._build_admin_app(
+            admin_record, target_record, registry=registry
+        )
         try:
             client = TestClient(app, raise_server_exceptions=False)
             # Attempt to issue key for a non-existent user
@@ -889,6 +941,134 @@ class TestAdminUsersUsernameApiKeyAdminOnly:
             assert resp.status_code == 404, (
                 f"Expected 404 for unknown user, got {resp.status_code}: {resp.text}"
             )
+        finally:
+            _teardown(originals)
+
+
+# ---------------------------------------------------------------------------
+# Test 14 (YSG-RISK-136): admin api-key mint is transactional — no rotation
+# unless auth + step-up passes at the point of mutation.
+# ---------------------------------------------------------------------------
+
+class TestAdminUsersApiKeyMintIsTransactional:
+    """
+    LAURA-V50-007 / YSG-RISK-136: registry.rotate_key() must never execute
+    on a request whose final auth/step-up state is a failure.
+
+    The StepUpAdminSession dependency resolves once, BEFORE the handler
+    body runs (get_account, identity-registry lookups are awaited I/O in
+    between).  These tests bypass that dependency directly (as the other
+    classes in this file do) and instead exercise the route's own
+    re-fetch-from-store + re-assert-freshness guard that now runs
+    immediately before rotate_key() (users.py, admin_issue_user_api_key).
+    """
+
+    def test_session_invalidated_mid_handler_blocks_rotation(self):
+        """Store has no record of the token (logout/revocation mid-handler)
+        -> 401 session_expired_or_invalid, rotate_key NEVER called, existing
+        key unchanged."""
+        from fastapi.testclient import TestClient
+
+        admin_record = _StubRecord(
+            username="admin@example.com", account_id="admin-001", account_tier="admin",
+            email="admin@example.com",
+        )
+        target_record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        registry = _make_registry_stub()
+        app, session_store, originals = TestAdminUsersUsernameApiKeyAdminOnly()._build_admin_app(
+            admin_record, target_record, registry=registry, seed_in_store=False,
+        )
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.post("/admin/users/alice/api-key")
+            assert resp.status_code == 401, (
+                f"Expected 401 when session is not present in the store, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            detail = resp.json().get("detail", {})
+            assert detail.get("error") == "session_expired_or_invalid", (
+                f"REGRESSION: expected error=session_expired_or_invalid, got: {detail}"
+            )
+            assert not registry.rotate_key.called, (
+                "REGRESSION (YSG-RISK-136): rotate_key was called even though the "
+                "session was invalidated before the mutation -- non-transactional."
+            )
+        finally:
+            _teardown(originals)
+
+    def test_stepup_lapsed_between_dependency_and_mutation_blocks_rotation(self):
+        """Dependency override hands back a session that was fresh AT
+        RESOLUTION TIME, but the store's copy (re-fetched immediately before
+        rotate_key) has a step-up older than STEPUP_TTL_SECONDS -> 401
+        step_up_required, rotate_key NEVER called."""
+        from fastapi.testclient import TestClient
+
+        admin_record = _StubRecord(
+            username="admin@example.com", account_id="admin-001", account_tier="admin",
+            email="admin@example.com",
+        )
+        target_record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        registry = _make_registry_stub()
+        app, session_store, originals = TestAdminUsersUsernameApiKeyAdminOnly()._build_admin_app(
+            admin_record, target_record, registry=registry,
+            stepup_age=60.0,       # fresh at Depends-resolution time
+            store_stepup_age=400.0,  # stale (>300s TTL) by mutation time
+        )
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.post("/admin/users/alice/api-key")
+            assert resp.status_code == 401, (
+                f"Expected 401 when step-up has lapsed by mutation time, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            detail = resp.json().get("detail", {})
+            assert detail.get("error") == "step_up_required", (
+                f"REGRESSION: expected error=step_up_required, got: {detail}"
+            )
+            assert not registry.rotate_key.called, (
+                "REGRESSION (YSG-RISK-136): rotate_key was called even though "
+                "step-up had lapsed by the time of the mutation -- "
+                "non-transactional (LAURA-V50-007)."
+            )
+        finally:
+            _teardown(originals)
+
+    def test_valid_stepped_up_call_rotates_once_and_returns_plaintext(self):
+        """Control case: session present + fresh in the store at
+        mutation-time -> rotate_key called exactly once, plaintext_token
+        returned."""
+        from fastapi.testclient import TestClient
+
+        admin_record = _StubRecord(
+            username="admin@example.com", account_id="admin-001", account_tier="admin",
+            email="admin@example.com",
+        )
+        target_record = _StubRecord(
+            username="alice", account_id="user-001", account_tier="user",
+            email="alice@example.com",
+        )
+        registry = _make_registry_stub(plaintext_key="yk_transactional_ok_1234")
+        app, session_store, originals = TestAdminUsersUsernameApiKeyAdminOnly()._build_admin_app(
+            admin_record, target_record, registry=registry,
+        )
+        try:
+            client = TestClient(app, raise_server_exceptions=True)
+            resp = client.post("/admin/users/alice/api-key")
+            assert resp.status_code == 200, (
+                f"Expected 200 for a valid stepped-up call, got {resp.status_code}: {resp.text}"
+            )
+            assert registry.rotate_key.call_count == 1, (
+                f"Expected rotate_key called exactly once, "
+                f"got {registry.rotate_key.call_count}"
+            )
+            body = resp.json()
+            assert body.get("plaintext_token") == "yk_transactional_ok_1234"
         finally:
             _teardown(originals)
 
@@ -939,8 +1119,9 @@ class TestAdminUsersApiKeyGraceWindow:
             async def total_user_count(self):
                 return 1
 
+        session_store = _StubSessionStore(redis=stub_redis)
         state_mod.backoffice_state.auth_service = _TargetAuthService()
-        state_mod.backoffice_state.session_store = _StubSessionStore(redis=stub_redis)
+        state_mod.backoffice_state.session_store = session_store
         state_mod.backoffice_state.audit_writer = _StubAuditWriter()
         state_mod.backoffice_state.identity_registry = registry
 
@@ -953,6 +1134,10 @@ class TestAdminUsersApiKeyGraceWindow:
             return admin_session
 
         app.dependency_overrides[mw_mod.require_stepup_admin_session] = _override_stepup
+        # YSG-RISK-136: the route re-fetches the session from the store
+        # immediately before rotate_key() -- seed it so this class's existing
+        # "grace_seconds=30" assertions still exercise the happy path.
+        session_store.seed(admin_session)
         return app, orig
 
     def test_admin_rotation_uses_30_sec_grace(self):

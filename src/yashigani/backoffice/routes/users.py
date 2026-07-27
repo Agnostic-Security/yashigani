@@ -761,6 +761,28 @@ async def admin_issue_user_api_key(username: str, session: StepUpAdminSession):
     # Admin rotation: 30-second grace window for client transition
     # (mirrors agents/token_rotation.py grace_period_hours pattern scaled to seconds)
     _ADMIN_GRACE_SECONDS = 30
+
+    # YSG-RISK-136 (LAURA-V50-007): `session` was resolved by the
+    # StepUpAdminSession dependency BEFORE this handler body started running.
+    # Everything between then and here (get_account, identity-registry
+    # lookups) is awaited I/O -- during which the session can be invalidated
+    # (logout, force_reset, concurrent revocation) or its step-up freshness
+    # can lapse, without the stale `session` object in hand reflecting it.
+    # Re-fetch from the store and re-assert admin tier + fresh step-up
+    # immediately before the mutation so a request whose FINAL auth state is
+    # a failure can never reach rotate_key() -- the existing key must be
+    # left unchanged whenever the response is session_expired_or_invalid /
+    # step_up_required.
+    from yashigani.auth.stepup import assert_fresh_stepup
+    assert state.session_store is not None
+    fresh_session = state.session_store.get(session.token)
+    if fresh_session is None or fresh_session.account_tier != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "session_expired_or_invalid"},
+        )
+    assert_fresh_stepup(fresh_session)
+
     plaintext_token = registry.rotate_key(identity_id, grace_seconds=_ADMIN_GRACE_SECONDS)
     key_last4 = plaintext_token[-4:]
 
