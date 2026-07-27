@@ -487,7 +487,7 @@ class PostgresLocalAuthService:
         admin_totp_code: str,
         admin_totp_algorithm: str = LEGACY_TOTP_ALGO,
         admin_totp_digits: int = 8,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, Optional[str]]:
         """
         Full-reset a user account. Requires admin TOTP re-verification.
 
@@ -495,6 +495,11 @@ class PostgresLocalAuthService:
         digit count on the acting admin's AccountRecord (from ``totp_algorithm``
         and ``ROLE_TOTP_DIGITS[account_tier]``). Callers must pass these
         explicitly; the defaults are conservative fail-safe values only.
+
+        Returns (success, reason, temporary_password). YSG-RISK-139 (CWE-640):
+        the caller MUST surface temporary_password to the admin exactly once
+        (HTTP response body) — it is never persisted in plaintext and never
+        logged. On failure the third element is None.
         """
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
             if not await self._verify_totp_with_replay(
@@ -504,11 +509,11 @@ class PostgresLocalAuthService:
                 algorithm=admin_totp_algorithm,
                 digits=admin_totp_digits,
             ):
-                return False, "invalid_admin_totp"
+                return False, "invalid_admin_totp", None
 
             record = await self._fetch_by_username(conn, username)
             if record is None:
-                return False, "user_not_found"
+                return False, "user_not_found", None
 
             record.totp_secret = ""
             record.totp_algorithm = LEGACY_TOTP_ALGO  # sentinel — requires re-enrolment
@@ -521,7 +526,7 @@ class PostgresLocalAuthService:
             temp_password = generate_password(36)
             record.password_hash = hash_password(temp_password, check_breach=False)
             await self._update(conn, record)
-            return True, "ok"
+            return True, "ok", temp_password
 
     async def disable(self, username: str) -> bool:
         async with tenant_transaction(_PLATFORM_TENANT_ID) as conn:
