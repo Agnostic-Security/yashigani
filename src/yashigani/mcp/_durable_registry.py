@@ -430,10 +430,14 @@ class DurableMcpRegistryStore:
                         "actions": grant.get("actions", ["tools/call"]),
                     }
 
-            # Baseline — normalise surface_hash to the same format the broker
-            # sends in the OPA input (sha384:<hex> as stored; _sha256_label not
-            # applied here — the broker normalises at send time using the same
-            # raw value from the live catalogue; the baseline must match that).
+            # Baseline — surface_hash is stored ALREADY in the exact OPA-input
+            # label form ("sha256:<hex>" over the full tool/prompt schemas —
+            # YSG-RISK-144, mcp/_envelope.py label_surface_hash / mcp_surface_hash,
+            # written at approve time in backoffice/mcp_onboard.py). No further
+            # normalisation happens here — pass the stored string straight
+            # through so it byte-matches the broker's target.surface_hash
+            # (mcp/broker.py, also produced via label_surface_hash from the
+            # same surface_set_hash() preimage).
             baseline = self.get_baseline(tenant_id, server_id)
             if baseline is not None:
                 baselines[mcp_id] = {

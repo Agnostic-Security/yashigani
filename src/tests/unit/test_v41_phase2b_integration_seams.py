@@ -633,6 +633,14 @@ class TestApproveTransactionGrantBaseline:
 
         env_mock = MagicMock()
         env_mock.tools = {"read_file": MagicMock(), "list_dir": MagicMock()}
+        # YSG-RISK-144: env.provenance_id / env.surface_set_hash are real
+        # fields on ServerEnvelope (mcp/_envelope.py project_surface()) that
+        # run_approve_transaction now reads directly for the OPA baseline
+        # write (label_surface_hash(env.surface_set_hash)) and for stripping
+        # the namespaced tool_key prefix — set them explicitly so the
+        # MagicMock doesn't feed a MagicMock repr into a real hash string.
+        env_mock.provenance_id = "prov-test-s1"
+        env_mock.surface_set_hash = "aa" * 32  # bare sha256 hex, as project_surface() produces
 
         registry_store = MagicMock()
         registry_store.put.return_value = None
@@ -725,7 +733,18 @@ class TestApproveTransactionGrantBaseline:
         assert grant_data["caller_spiffe"].endswith("/gateway")
         assert "tools/call" in grant_data["actions"]
 
-        # Verify baseline has a surface_hash
+        # Verify baseline has a surface_hash — YSG-RISK-144: this is now the
+        # OPA-input-boundary sha256-full-schema label (label_surface_hash over
+        # env.surface_set_hash), matching what mcp/broker.py sends as
+        # target.surface_hash, NOT the sha384-over-names X.509 cert-binding
+        # hash (pki.binding.tool_surface_hash, still patched above purely for
+        # the mint_agent_leaf() X.509 binding call, unaffected by this fix).
         baseline_data = registry_store.put_baseline.call_args[0][2]
         assert "surface_hash" in baseline_data
-        assert baseline_data["surface_hash"].startswith("sha384:")
+        assert baseline_data["surface_hash"] == "sha256:" + "aa" * 32
+
+        # Verify baseline/grant tool names are BARE (not namespaced
+        # provenance_id::tool_name) — OPA's _grant_ok / _envelope_unchanged
+        # test input.tool.name (bare) against these lists.
+        assert sorted(baseline_data["tools"]) == ["list_dir", "read_file"]
+        assert sorted(grant_data["tools"]) == ["list_dir", "read_file"]

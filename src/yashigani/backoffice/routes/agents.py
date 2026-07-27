@@ -1062,6 +1062,7 @@ async def rotate_agent_cert(
     validated) — the ``agent_id`` path param is only the ACL-gate cross-check.
     """
     from yashigani.identity.trust_domain import parse_agent_spiffe_uri
+    from yashigani.mcp._envelope import label_surface_hash
     from yashigani.pki.binding import tool_surface_hash
     from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
 
@@ -1204,6 +1205,16 @@ async def rotate_agent_cert(
                 )
             # Registry-CURRENT surface — same computation as the approve mint
             # (mcp_onboard.py: tool_surface_hash(sorted(env.tools.keys()))).
+            # scope_hash here is ONLY the X.509 leaf-binding input (mint_agent_leaf
+            # below) — it is NOT comparable to the durable registry-store baseline's
+            # surface_hash, which is the OPA-input sha256-full-schema label
+            # (YSG-RISK-144 — see mcp/_envelope.mcp_surface_hash/label_surface_hash;
+            # tool_surface_hash is sha384 over tool NAMES only, a different
+            # algorithm/preimage for a different contract). The registry-store
+            # drift check below therefore compares like-for-like instead: the
+            # Redis baseline (written at approve time from env.surface_set_hash,
+            # labelled) against rec.surface_set_hash (the SAME DB-persisted
+            # approved sha256-full-schema hash), both labelled identically.
             scope_hash = tool_surface_hash(sorted(rec.envelope.tools.keys()))
             store = _durable_registry_store()
             descriptor = store.get(tenant_id, agent_name) if store is not None else None
@@ -1211,8 +1222,9 @@ async def rotate_agent_cert(
                 image_digest = descriptor.get("image_digest", "") or ""
                 baseline = store.get_baseline(tenant_id, agent_name)
                 baseline_hash = (baseline or {}).get("surface_hash", "")
-                if baseline_hash and baseline_hash != scope_hash:
-                    raise _deny_surface_changed(caller_spiffe, baseline_hash, scope_hash)
+                _approved_labelled = label_surface_hash(rec.surface_set_hash) or ""
+                if baseline_hash and _approved_labelled and baseline_hash != _approved_labelled:
+                    raise _deny_surface_changed(caller_spiffe, baseline_hash, _approved_labelled)
             else:
                 logger.warning(
                     "cert-rotate: durable broker registry unavailable for %s — "

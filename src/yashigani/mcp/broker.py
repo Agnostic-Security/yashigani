@@ -64,6 +64,7 @@ from yashigani.mcp._content_filter import (
     build_catalogue,
     TenantCatalogue,
 )
+from yashigani.mcp._envelope import label_surface_hash
 from yashigani.mcp._upstream_pin import (
     UpstreamPinConfig,
     PinVerificationResult,
@@ -534,7 +535,12 @@ class McpBroker:
             rbac_verified=ctx.rbac_verified,
             mcp_id=ctx.mcp_id or None,
             cert_fingerprint=_sha256_label(_target_cert_fp),
-            surface_hash=_sha256_label(_target_surface_hash),
+            # YSG-RISK-144: surface_hash MUST use the same label function the
+            # onboarding baseline write uses (mcp/_envelope.label_surface_hash)
+            # — _sha256_label is a generic hex-normaliser and stays correct
+            # here too, but sharing the one function removes any risk of the
+            # two sites' labelling drifting apart again.
+            surface_hash=label_surface_hash(_target_surface_hash),
         )
 
         elapsed = int((time.monotonic() - t0) * 1000)

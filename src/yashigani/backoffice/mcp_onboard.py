@@ -664,6 +664,7 @@ async def run_approve_transaction(
         approve_mcp_onboard,
         is_artifact_relevant_for_runtime,
     )
+    from yashigani.mcp._envelope import label_surface_hash
     from yashigani.pki.binding import tool_surface_hash
     from yashigani.pki.issuer import IssuerPaths, mint_agent_leaf
 
@@ -1095,20 +1096,50 @@ async def run_approve_transaction(
             #
             # grant:    caller is always the gateway mesh identity (the only
             #           caller that reaches OPA via the broker transport path).
-            #           tools = the envelope's declared tool surface.
-            # baseline: surface_hash = scope_hash (sha384:...) — stored as-is;
-            #           normalised to the same format the broker sends in the OPA
-            #           input target.surface_hash at push time via list_all().
+            #           tools = the envelope's declared tool surface, as BARE
+            #           tool names — OPA's _grant_ok / _envelope_unchanged both
+            #           test ``input.tool.name in g.tools`` / ``b.tools`` where
+            #           input.tool.name is the bare MCP tool name
+            #           (gateway/mcp_router_runtime.py: params.get("name")).
+            #           env.tools is keyed by the NAMESPACED tool_key
+            #           (provenance_id::tool_name — mcp/_envelope.py
+            #           namespaced_tool_key); a namespaced key can never be
+            #           "in" against a bare name, so both gates were ALSO
+            #           unsatisfiable via this path (found fixing YSG-RISK-144)
+            #           — strip the provenance_id prefix back to the bare name.
+            # baseline: surface_hash — the OPA-input-boundary sha256-full-schema
+            #           label (YSG-RISK-144). env.surface_set_hash is the bare
+            #           hex produced by project_surface() -> surface_set_hash()
+            #           (mcp/_envelope.py), the SAME function build_catalogue()
+            #           calls for the broker's live TenantCatalogue.surface_set_hash
+            #           — label_surface_hash() applies the identical "sha256:"
+            #           OPA-input label both sides use (mcp/broker.py target.
+            #           surface_hash assembly), so this now byte-matches what
+            #           the broker sends for an unchanged surface.  Previously
+            #           this stored tool_surface_hash() (sha384 over sorted
+            #           NAMES, pki/binding.py) — a different algorithm AND
+            #           preimage from the broker's sha256-over-full-schema
+            #           value, so _envelope_unchanged could never be true for
+            #           ANY real onboarded server.  MIGRATION: an operator who
+            #           onboarded before this fix has a stale sha384-names
+            #           baseline in Redis; tools/call keeps fail-closing
+            #           (mismatch → deny, same as before) until the server is
+            #           re-approved/re-onboarded, which re-writes the baseline
+            #           in the new format — no silent pass-through either way.
             from yashigani.identity.trust_domain import trust_domain as _trust_domain
             _gateway_spiffe = "spiffe://%s/gateway" % _trust_domain()
-            _sorted_tools = sorted(env.tools.keys())
+            _tool_key_prefix = f"{env.provenance_id}::"
+            _sorted_tools = sorted(
+                k[len(_tool_key_prefix):] if k.startswith(_tool_key_prefix) else k
+                for k in env.tools.keys()
+            )
             registry_store.put_grant(tenant_id, server_id, {
                 "tools": _sorted_tools,
                 "actions": ["tools/call"],
                 "caller_spiffe": _gateway_spiffe,
             })
             registry_store.put_baseline(tenant_id, server_id, {
-                "surface_hash": scope_hash,   # sha384:<hex> — normalised at push time
+                "surface_hash": label_surface_hash(env.surface_set_hash) or "",
                 "tools": _sorted_tools,
             })
 

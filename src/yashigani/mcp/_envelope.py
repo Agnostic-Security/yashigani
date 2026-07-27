@@ -258,6 +258,14 @@ def surface_set_hash(raw_tools: list, raw_prompts: Optional[list] = None) -> str
     ``surface_set_hash``).  RFC-8785-style canonicalisation: sort keys,
     no whitespace, ensure_ascii=False.  This is the *change-detector* — a
     mismatch is the TRIGGER to triage, never the verdict.
+
+    Bare hex digest, no label prefix.  Internal / persisted callers
+    (``project_surface``, ``build_catalogue``, envelope-refresh triage,
+    ``CapabilityEnvelope.current_surface_hash``) use THIS bare form
+    consistently.  Callers producing/consuming the OPA-input boundary value
+    (``target.surface_hash`` / ``baselines[mcp_id].surface_hash``) must go
+    through :func:`mcp_surface_hash` or :func:`label_surface_hash` below —
+    never re-invent the ``"sha256:"`` prefix locally (YSG-RISK-144).
     """
     payload = {
         "tools": raw_tools or [],
@@ -267,6 +275,80 @@ def surface_set_hash(raw_tools: list, raw_prompts: Optional[list] = None) -> str
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# OPA-input-boundary surface hash (YSG-RISK-144)
+# ---------------------------------------------------------------------------
+#
+# The OPA ``_envelope_unchanged`` gate (policy/mcp.rego) compares
+# ``input.target.surface_hash`` (produced by the broker at call time, from
+# the LIVE tool/prompt surface) against ``data.yashigani.mcp.baselines
+# [mcp_id].surface_hash`` (produced by the onboarding/approve transaction,
+# from the APPROVED tool/prompt surface).  Both producers MUST derive that
+# string from the SAME algorithm over the SAME preimage (the full raw tool
+# — and, where available, prompt — schemas, not just tool names: a
+# description/param-schema change is a poisoning vector and must be caught,
+# not only an add/remove).  Before this fix the onboarding baseline used
+# ``pki.binding.tool_surface_hash`` (``"sha384:" + sha384(json({allowed_tools:
+# sorted(names)}))``) while the broker used ``surface_set_hash`` above
+# (bare sha256 hex over the full tool/prompt objects) labelled
+# ``"sha256:<hex>"`` — different algorithm AND different preimage, so the
+# two values could never be equal and ``_envelope_unchanged`` was
+# unsatisfiable for every real onboarded server, denying every real
+# ``tools/call``.
+#
+# ``pki.binding.tool_surface_hash`` / ``binding_digest`` are UNCHANGED and
+# remain the correct, separate mechanism for the X.509 change-prevention
+# leaf-cert extension (GAP-2) — that is a different contract (see
+# ``pki/binding.py`` module docstring; ``user_agents.py`` R3-instantiate
+# depends on it byte-for-byte) and is intentionally NOT touched here.
+_SURFACE_HASH_LABEL_PREFIX = "sha256:"
+
+
+def mcp_surface_hash(raw_tools: list, raw_prompts: Optional[list] = None) -> str:
+    """THE single canonical MCP tool/prompt-surface hash for the OPA-input
+    boundary (``target.surface_hash`` / ``baselines[mcp_id].surface_hash``).
+
+    Both the onboarding baseline producer (``project_surface`` →
+    ``ServerEnvelope.surface_set_hash``, threaded into the approve-time
+    baseline write in ``backoffice/mcp_onboard.py``) and the broker's live
+    surface producer (``build_catalogue`` → ``TenantCatalogue.
+    surface_set_hash``, threaded into the OPA input in ``mcp/broker.py``)
+    MUST agree with this function on the SAME ``raw_tools``/``raw_prompts``
+    input — enforced by
+    ``tests/contracts/test_mcp_envelope_hash_agreement.py``.
+
+    Returns the full OPA-input label form: ``"sha256:<64 lowercase hex
+    chars>"``.
+    """
+    return f"{_SURFACE_HASH_LABEL_PREFIX}{surface_set_hash(raw_tools, raw_prompts)}"
+
+
+def label_surface_hash(raw_hex: str) -> Optional[str]:
+    """Apply the ``"sha256:<hex>"`` OPA-input label to an already-computed
+    bare-hex :func:`surface_set_hash` digest (e.g. a value pulled from a
+    stored ``ServerEnvelope.surface_set_hash`` or ``TenantCatalogue.
+    surface_set_hash`` rather than recomputed from raw tools in-line).
+
+    This is the ONE labelling function both the broker (``mcp/broker.py``
+    target.surface_hash assembly) and the onboarding baseline write
+    (``backoffice/mcp_onboard.py``) use — no independent ``f"sha256:{...}"``
+    string-building at either site (YSG-RISK-144).
+
+    Returns ``None`` for empty input — the OPA input target key is then
+    omitted rather than sent as a bare ``"sha256:"`` (mirrors the existing
+    ``mcp.broker._sha256_label`` contract for ``cert_fingerprint``).
+    """
+    if not raw_hex:
+        return None
+    v = raw_hex.strip()
+    if v.lower().startswith(_SURFACE_HASH_LABEL_PREFIX):
+        v = v[len(_SURFACE_HASH_LABEL_PREFIX):]
+    v = v.replace(":", "").replace(" ", "").lower()
+    if not v:
+        return None
+    return f"{_SURFACE_HASH_LABEL_PREFIX}{v}"
 
 
 # ---------------------------------------------------------------------------

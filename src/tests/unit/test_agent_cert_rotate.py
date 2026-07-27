@@ -292,6 +292,7 @@ async def test_rotate_legacy_two_segment_identity(paths: IssuerPaths):
 
 def _fake_envelope(monkeypatch, rec, image_digest=_IMAGE, baseline_hash=None):
     from yashigani.backoffice.routes import mcp_servers as mcp_mod
+    from yashigani.mcp._envelope import label_surface_hash
 
     class _Svc:
         async def get_active_envelope(self, provenance_id: str):
@@ -303,7 +304,20 @@ def _fake_envelope(monkeypatch, rec, image_digest=_IMAGE, baseline_hash=None):
             return {"image_digest": image_digest, "svid_instance_id": _NHI}
 
         def get_baseline(self, tenant_id: str, server_id: str):
-            return {"surface_hash": baseline_hash or _SCOPE, "tools": list(_TOOLS)}
+            # YSG-RISK-144: real onboarding writes surface_hash =
+            # label_surface_hash(env.surface_set_hash) — the SAME approved
+            # sha256-full-schema value agents.py now compares against
+            # rec.surface_set_hash (labelled). Default here mirrors that so
+            # the happy-path fixture is internally consistent post-fix;
+            # override via baseline_hash= to force a mismatch.
+            default_hash = (
+                label_surface_hash(getattr(rec, "surface_set_hash", ""))
+                if rec is not None else None
+            )
+            return {
+                "surface_hash": baseline_hash or default_hash or _SCOPE,
+                "tools": list(_TOOLS),
+            }
 
     monkeypatch.setattr(mcp_mod, "_envelope_service", lambda: _Svc())
     monkeypatch.setattr(mcp_mod, "_durable_registry_store", lambda: _Store())
@@ -363,6 +377,27 @@ async def test_rotate_mcp_denied_on_superseded_identity(paths, monkeypatch):
         await rotate_agent_cert(agent_id=_NAME, caller_spiffe=_SPIFFE)
     assert exc.value.status_code == 403
     assert exc.value.detail["error"] == "identity_superseded_reapproval_required"
+
+
+@pytest.mark.asyncio
+async def test_rotate_mcp_denied_on_registry_baseline_drift(paths, monkeypatch):
+    """YSG-RISK-144 regression: the durable registry-store (Redis) baseline
+    surface_hash must be compared like-for-like against
+    label_surface_hash(rec.surface_set_hash) — a genuinely stale/divergent
+    Redis baseline (e.g. left over from a pre-fix onboard, or out of sync
+    with the DB row) must still deny, not silently pass because the two
+    sides use different hash algorithms."""
+    _mint_initial(paths)
+    _fake_envelope(
+        monkeypatch,
+        _envelope_rec(),
+        # Simulate a stale Redis baseline that disagrees with rec.surface_set_hash.
+        baseline_hash="sha256:" + "99" * 32,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await rotate_agent_cert(agent_id=_NAME, caller_spiffe=_SPIFFE)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "surface_changed_reapproval_required"
 
 
 @pytest.mark.asyncio
