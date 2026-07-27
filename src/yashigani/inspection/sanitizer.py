@@ -26,6 +26,7 @@ def sanitize(
     raw_query: str,
     payload_spans: list[dict],      # [{"start": int, "end": int}]
     min_clean_tokens: int = _MIN_CLEAN_TOKENS,
+    require_spans: bool = False,
 ) -> SanitizationResult:
     """
     Remove detected injection spans from raw_query and reconstruct a
@@ -37,9 +38,30 @@ def sanitize(
     3. Collapse whitespace.
     4. Token count check — if < min_clean_tokens, return discard sentinel.
 
+    require_spans: when True, an empty `payload_spans` list is treated as a
+    FAILURE, not a no-op success. This is the fail-closed guard for callers
+    on a confirmed-positive verdict (e.g. CREDENTIAL_EXFIL at/above threshold):
+    a positive detection with no spans to excise means the caller has no way
+    to prove the payload was actually redacted, so returning the query
+    "unchanged and successful" would silently forward the exfil content
+    while claiming it was sanitized (YSG-RISK-149). Callers that never carry
+    a positive-verdict-with-empty-spans case (or that intentionally treat
+    empty spans as "nothing to remove") should leave this False.
+
     Returns SanitizationResult. Never raises; on any error returns discard.
     """
     if not payload_spans:
+        if require_spans:
+            logger.warning(
+                "sanitize() called with require_spans=True and no payload_spans — "
+                "cannot prove redaction on a positive verdict; failing closed"
+            )
+            return SanitizationResult(
+                success=False,
+                clean_query=None,
+                tokens_remaining=0,
+                spans_removed=0,
+            )
         return SanitizationResult(
             success=True,
             clean_query=raw_query,
