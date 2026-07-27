@@ -220,6 +220,7 @@ class LocalAuthService:
             if record.failed_attempts >= _MAX_FAILED_ATTEMPTS:
                 record.locked_until = time.time() + _LOCKOUT_SECONDS
                 logger.warning("Account locked after %d failures: %s", _MAX_FAILED_ATTEMPTS, username)
+                _inc_lockout_metric(record.account_tier)
             return False, None, generic_fail
 
         # Password OK — check TOTP
@@ -250,6 +251,7 @@ class LocalAuthService:
             algorithm=record.totp_algorithm,
             digits=role_digits,
         ):
+            _inc_totp_failure_metric(record.account_tier)
             record.totp_failed_attempts += 1
             n = record.totp_failed_attempts
             if n >= _MAX_FAILED_ATTEMPTS:
@@ -262,6 +264,7 @@ class LocalAuthService:
                     _MAX_FAILED_ATTEMPTS,
                     username,
                 )
+                _inc_lockout_metric(record.account_tier)
             else:
                 delay = _TOTP_BACKOFF_SECONDS[min(n, len(_TOTP_BACKOFF_SECONDS) - 1)]
                 record.totp_backoff_until = time.time() + delay
@@ -498,6 +501,33 @@ class LocalAuthService:
 
 def _is_locked(record: AccountRecord) -> bool:
     return record.locked_until > time.time()
+
+
+def _inc_totp_failure_metric(account_tier: str) -> None:
+    """yashigani_auth_totp_failures_total (metrics/registry.py) — mirrors the
+    pg_auth.py Postgres-backed TOTP-failure emitter for the in-memory/
+    local-auth fallback backend. Previously had zero production emitters
+    (metrics stub-emitter finding)."""
+    try:
+        from yashigani.metrics.registry import auth_totp_failures_total
+
+        auth_totp_failures_total.labels(account_tier=account_tier).inc()
+    except Exception:
+        logger.warning("Failed to increment auth_totp_failures_total metric", exc_info=True)
+
+
+def _inc_lockout_metric(account_tier: str) -> None:
+    """yashigani_auth_lockouts_total (metrics/registry.py) — mirrors the
+    pg_auth.py Postgres-backed lockout emitter so the in-memory/local-auth
+    fallback backend (used when Postgres is unavailable) also feeds the
+    LIVE Prometheus alert. Previously had zero production emitters
+    (metrics stub-emitter finding)."""
+    try:
+        from yashigani.metrics.registry import auth_lockouts_total
+
+        auth_lockouts_total.labels(account_tier=account_tier).inc()
+    except Exception:
+        logger.warning("Failed to increment auth_lockouts_total metric", exc_info=True)
 
 
 def _new_id() -> str:

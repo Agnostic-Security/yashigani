@@ -877,6 +877,29 @@ async def deactivate_agent(
                 agent_name=existing.get("name", agent_id),
                 instance_id=agent_id,
             )
+            # AGENT_SVID_REVOKED (schema.py) — dedicated SVID-lifecycle event,
+            # distinct from the generic AgentDeactivatedEvent written below.
+            # Previously the SVID revoke had zero durable audit signal of its
+            # own (audit stub-emitter finding).
+            if audit is not None:
+                try:
+                    from yashigani.audit.schema import AccountTier, AgentSvidRevokedEvent
+
+                    audit.write(
+                        AgentSvidRevokedEvent(
+                            account_tier=AccountTier.ADMIN,
+                            agent_name=existing.get("name", agent_id),
+                            tenant_id=existing.get("owner_identity_id", "tenant"),
+                            spiffe_id=existing.get("spiffe_id", ""),
+                            revoked_by=session.account_id,
+                            revoke_reason=reason,
+                        )
+                    )
+                except Exception as _svid_audit_exc:
+                    logger.error(
+                        "Failed to write AgentSvidRevokedEvent for %s: %s",
+                        agent_id, _svid_audit_exc,
+                    )
         except Exception as exc:
             logger.error(
                 "NHI deactivate: runtime-manifest revocation failed for %s "
@@ -1257,6 +1280,34 @@ async def rotate_agent_cert(
         raise
     except Exception as exc:
         logger.error("cert-rotate: mint_agent_leaf FAILED for %s: %s", caller_spiffe, exc)
+        # AGENT_SVID_ROTATION_FAILED (schema.py) — fail-closed path: the
+        # sidecar's rotate call raised inside mint_agent_leaf. The sidecar
+        # itself (docker/svid-sidecar/rotate.sh) exits non-zero on a 502 here
+        # and PoolManager's health monitor replaces the container per the
+        # schema docstring; previously this had zero production emitters
+        # (audit stub-emitter finding).
+        if backoffice_state.audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AgentSvidRotationFailedEvent
+
+                _err_type = (
+                    "timeout" if isinstance(exc, TimeoutError)
+                    else "parse_error" if isinstance(exc, (ValueError, TypeError))
+                    else "api_error"
+                )
+                backoffice_state.audit_writer.write(
+                    AgentSvidRotationFailedEvent(
+                        agent_name=agent_name,
+                        tenant_id=tenant_id,
+                        spiffe_id=caller_spiffe,
+                        error_type=_err_type,
+                    )
+                )
+            except Exception as _svid_audit_exc:
+                logger.error(
+                    "Failed to write AgentSvidRotationFailedEvent for %s: %s",
+                    caller_spiffe, _svid_audit_exc,
+                )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -1295,6 +1346,30 @@ async def rotate_agent_cert(
         "cert-rotate: re-minted leaf for %s (agent_id path=%r, not_after=%s)",
         caller_spiffe, agent_id, cert_not_after,
     )
+
+    # AGENT_SVID_ROTATED (schema.py) — the sidecar cert-rotation callback's
+    # own event.  mint_agent_leaf() above already writes AgentSvidIssuedEvent
+    # (shared with initial issuance); this is the dedicated rotation-lifecycle
+    # event the schema docstring describes ("Written when the sidecar
+    # successfully rotates a leaf cert before expiry") and previously had zero
+    # production emitters (audit stub-emitter finding).
+    if backoffice_state.audit_writer is not None:
+        try:
+            from yashigani.audit.schema import AgentSvidRotatedEvent
+
+            backoffice_state.audit_writer.write(
+                AgentSvidRotatedEvent(
+                    agent_name=agent_name,
+                    tenant_id=tenant_id,
+                    spiffe_id=new_spiffe,
+                    new_cert_not_after=cert_not_after,
+                )
+            )
+        except Exception as _svid_audit_exc:
+            logger.error(
+                "Failed to write AgentSvidRotatedEvent for %s: %s",
+                caller_spiffe, _svid_audit_exc,
+            )
 
     return AgentCertRotateResponse(
         agent_id=agent_id,

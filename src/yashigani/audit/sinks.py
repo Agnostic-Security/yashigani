@@ -314,6 +314,21 @@ class PostgresSink(AuditSink):
         return self._last_write
 
 
+def _inc_siem_delivery_metric(*, outcome: str, target_name: str) -> None:
+    """yashigani_audit_siem_deliveries_total (metrics/registry.py) — "SIEM
+    forwarding attempts by outcome and target". Previously had zero
+    production emitters (metrics stub-emitter finding — 9 metrics behind LIVE
+    Prometheus alerts). Shared by both the Redis-queued (SiemWorker) and the
+    direct (SiemSink._deliver_direct, no-Redis) delivery paths, and both the
+    success and failure/DLQ outcomes on each. Never raises — a metrics
+    failure must never affect delivery or DLQ bookkeeping."""
+    try:
+        from yashigani.metrics.registry import audit_siem_deliveries_total
+        audit_siem_deliveries_total.labels(outcome=outcome, target_name=target_name).inc()
+    except Exception:
+        logger.warning("Failed to increment audit_siem_deliveries_total metric", exc_info=True)
+
+
 class SiemSink(AuditSink):
     """
     v0.9.0 (SC-04): HTTP-based SIEM delivery is Redis-backed and asynchronous.
@@ -384,12 +399,14 @@ class SiemSink(AuditSink):
             elif self._siem_type in ("elasticsearch", "wazuh"):
                 await self._send_elasticsearch(event)
             self._last_write = datetime.now(timezone.utc)
+            _inc_siem_delivery_metric(outcome="success", target_name=self._sink_name)
         except Exception as exc:
             try:
                 from yashigani.metrics.registry import siem_forward_errors_total
                 siem_forward_errors_total.labels(siem=self._siem_type).inc()
             except Exception:
                 pass
+            _inc_siem_delivery_metric(outcome="failure", target_name=self._sink_name)
             logger.warning("SiemSink(%s) direct forward error: %s", self._sink_name, exc)
 
     def _update_queue_gauge(self) -> None:
@@ -536,6 +553,7 @@ class SiemWorker:
                 finally:
                     loop.close()
                 self._sink._last_write = datetime.now(timezone.utc)
+                _inc_siem_delivery_metric(outcome="success", target_name=self._sink._sink_name)
                 return
             except Exception as exc:
                 last_exc = exc
@@ -547,6 +565,7 @@ class SiemWorker:
                     time.sleep(delay)
 
         # All retries exhausted — move to DLQ
+        _inc_siem_delivery_metric(outcome="failure", target_name=self._sink._sink_name)
         self._send_to_dlq(event, str(last_exc))
 
     def _send_to_dlq(self, event: dict, error: str) -> None:

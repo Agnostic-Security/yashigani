@@ -6474,6 +6474,24 @@ async def _opa_v1_check(
             )
             resp.raise_for_status()
             result = resp.json().get("result", {})
+            _sensitivity_allowed = bool(result.get("sensitivity_allowed", False))
+            if not _sensitivity_allowed:
+                # yashigani_sensitivity_ceiling_breaches_total (metrics/registry.py)
+                # — "Identity accessed data above their sensitivity ceiling".
+                # Previously had zero production emitters (metrics stub-emitter
+                # finding); this is the single OPA v1_routing sub-decision that
+                # signals a ceiling breach, shared by every /v1 caller
+                # (chat_completions, embeddings).
+                try:
+                    from yashigani.metrics.registry import (
+                        yashigani_sensitivity_ceiling_breaches_total,
+                    )
+                    yashigani_sensitivity_ceiling_breaches_total.inc()
+                except Exception:
+                    logger.warning(
+                        "Failed to increment yashigani_sensitivity_ceiling_breaches_total",
+                        exc_info=True,
+                    )
             return {
                 "allow": bool(result.get("allow", False)),
                 # Fail-closed on undefined sub-decisions (OPA-003/004 class):
@@ -6482,7 +6500,7 @@ async def _opa_v1_check(
                 # default-deny.
                 "model_allowed": bool(result.get("model_allowed", False)),
                 "routing_safe": bool(result.get("routing_safe", False)),
-                "sensitivity_allowed": bool(result.get("sensitivity_allowed", False)),
+                "sensitivity_allowed": _sensitivity_allowed,
                 "reason": result.get("reason", "unknown"),
             }
     except Exception as exc:
@@ -6594,6 +6612,25 @@ async def gate_relaxed_final(
                 ).inc()
             except Exception:  # noqa: BLE001 — metric must never break the gate
                 pass
+            # Audit — CREDENTIAL_LEAK_DETECTED (schema.py) is the flagship
+            # secret-detector's audit event; previously the detector only
+            # incremented a metric with no durable audit trail of the block.
+            if _state.audit_writer is not None:
+                try:
+                    from yashigani.audit.schema import CredentialLeakDetectedEvent
+                    _rid = identity.get("identity_id", request_id) if identity else request_id
+                    _aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
+                    _state.audit_writer.write(CredentialLeakDetectedEvent(
+                        session_id=_rid,
+                        agent_id=_aid,
+                        pattern_type=secret_verdict.detector or "unknown",
+                        content_hash=secret_verdict.span_hash or "",
+                        source_component="gate_relaxed_final",
+                    ))
+                except Exception as _aud_exc:  # noqa: BLE001 — audit must never break the gate
+                    logger.warning(
+                        "gate_relaxed_final: credential-leak audit write failed: %s",
+                        _aud_exc)
             return False, (
                 "[BLOCKED BY YASHIGANI RESPONSE INSPECTION] The orchestrator's "
                 "final answer contained credential material and was withheld; "
