@@ -1328,6 +1328,22 @@ agentBundles:
         memory: "1024Mi"
     tokenSecretName: "yashigani-openclaw-token"
     tokenSecretKey: "token"
+    # NEW-K8S-OPENCLAW-TMPDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation as the podSecurityContext fix above):
+    # with runAsNonRoot/runAsUser fixed, the container now actually starts —
+    # and immediately crashes: "[openclaw] Failed to start CLI: Error:
+    # Unable to create fallback OpenClaw temp dir: /tmp/openclaw-1000"
+    # (readOnlyRootFilesystem: true is the template default; nothing mounts
+    # a writable /tmp). Same class of fix already applied to langflow below
+    # (extraVolumeMounts/extraVolumes for a writable /tmp emptyDir).
+    extraVolumeMounts:
+      - name: openclaw-tmp
+        mountPath: /tmp
+    extraVolumes:
+      - name: openclaw-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
 
   # Langflow — Visual multi-agent workflow builder (MIT)
   # https://github.com/langflow-ai/langflow
