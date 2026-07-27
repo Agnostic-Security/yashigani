@@ -518,7 +518,7 @@ async def full_reset_user(
     # Phase 13: pass admin's algorithm and digit count so verify_totp uses the right HMAC.
     from yashigani.auth.totp import ROLE_TOTP_DIGITS as _FRU_ROLE_DIGITS
     _fru_admin_digits = _FRU_ROLE_DIGITS.get(admin_record.account_tier, 8)
-    success, reason = await state.auth_service.full_reset_user(
+    success, reason, temp_password = await state.auth_service.full_reset_user(
         username,
         admin_totp_secret=admin_record.totp_secret,
         admin_totp_code=body.totp_code,
@@ -536,13 +536,25 @@ async def full_reset_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": reason},
         )
+    # YSG-RISK-139 (CWE-640): full-reset MUST surface the new temp password —
+    # otherwise the reset user is locked out and unrecoverable. Mirrors the
+    # create-user / admin-self-reset one-time-delivery convention: plaintext
+    # goes ONLY in this HTTP response body, never into a log line or audit
+    # event. assert (not raise) — a True success from full_reset_user always
+    # carries a temp_password; a None here would indicate a service-layer bug.
+    assert temp_password, "full_reset_user returned success without a temporary_password"
 
     target = await state.auth_service.get_account(username)
     if target is not None:
         state.session_store.invalidate_all_for_account(target.account_id)
 
     state.audit_writer.write(_full_reset_event(admin_record.username, username, account_tier=session.account_tier))
-    return {"status": "ok", "message": "User account fully reset"}
+    return {
+        "status": "ok",
+        "message": "User account fully reset. Share this temporary password with the user out-of-band; it will not be shown again.",
+        "temporary_password": temp_password,
+        "force_password_change": True,
+    }
 
 
 @router.post("/{username}/disable")

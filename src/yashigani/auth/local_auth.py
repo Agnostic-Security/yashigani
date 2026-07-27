@@ -425,7 +425,7 @@ class LocalAuthService:
         admin_totp_code: str,
         admin_totp_algorithm: str = LEGACY_TOTP_ALGO,
         admin_totp_digits: int = 8,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, Optional[str]]:
         """
         Admin full-reset a user account (strips all access).
         Requires admin's TOTP re-verification (ASVS V2.8).
@@ -433,6 +433,11 @@ class LocalAuthService:
         admin_totp_algorithm / admin_totp_digits — must match the algorithm and
         digit count stored on the acting admin's AccountRecord.  Callers must
         fetch the admin's record and pass these explicitly.
+
+        Returns (success, reason, temporary_password). YSG-RISK-139 (CWE-640):
+        the caller MUST surface temporary_password to the admin exactly once
+        (HTTP response body) — it is never persisted in plaintext and never
+        logged. On failure the third element is None.
         """
         if not verify_totp(
             admin_totp_secret,
@@ -441,11 +446,11 @@ class LocalAuthService:
             algorithm=admin_totp_algorithm,
             digits=admin_totp_digits,
         ):
-            return False, "invalid_admin_totp"
+            return False, "invalid_admin_totp", None
 
         record = self._accounts.get(username)
         if record is None:
-            return False, "user_not_found"
+            return False, "user_not_found", None
 
         # Strip all access
         record.totp_secret = ""
@@ -460,7 +465,7 @@ class LocalAuthService:
         temp_password = generate_password(36)
         record.password_hash = hash_password(temp_password, check_breach=False)
 
-        return True, "ok"
+        return True, "ok", temp_password
 
     def disable(self, username: str) -> bool:
         record = self._accounts.get(username)
