@@ -45,6 +45,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pyotp
 import requests
 import urllib3
 
@@ -57,16 +58,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # pyotp.TOTP(secret).now() silently falls back to pyotp's SHA1/6-digit default,
 # which never matches an admin account's real algorithm and always 401s.
 # ---------------------------------------------------------------------------
-try:
-    from yashigani.auth.totp import ROLE_TOTP_ALGO, ROLE_TOTP_DIGITS, _totp_at
-except ImportError:
-    # Script may be invoked as `python3 scripts/populate-demo.py` outside an
-    # installed/editable yashigani environment — fall back to the repo's src/
-    # layout (scripts/ is a direct child of the repo root).
-    _repo_src = Path(__file__).resolve().parent.parent / "src"
-    if _repo_src.is_dir():
-        sys.path.insert(0, str(_repo_src))
-    from yashigani.auth.totp import ROLE_TOTP_ALGO, ROLE_TOTP_DIGITS, _totp_at
+# Computed directly with pyotp (self-contained). Importing yashigani.auth.totp
+# drags in the fastapi/app-runtime import chain, which is absent from a
+# standalone demo venv and raises ModuleNotFoundError('fastapi') → wrong code →
+# 401. These crypto params are RFC 6238 auth-client necessities (not
+# product-configured rules), mirrored from src/yashigani/auth/totp.py.
+import hashlib as _hashlib
+_ROLE_TOTP_DIGEST = {"admin": _hashlib.sha512, "user": _hashlib.sha256}
+_ROLE_TOTP_DIGITS = {"admin": 8, "user": 6}
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -121,12 +120,11 @@ S.verify = False
 # (_totp_at), never hand-rolled or defaulted to pyotp's SHA1/6.
 
 def _role_totp(secret: str, tier: str = "admin") -> str:
-    """Compute a role-tiered TOTP code via the product's TOTP core (single
-    source of truth — src/yashigani/auth/totp.py _totp_at / ROLE_TOTP_ALGO /
-    ROLE_TOTP_DIGITS). tier is "admin" (SHA512/8) or "user" (SHA256/6)."""
-    algorithm = ROLE_TOTP_ALGO[tier]
-    digits = ROLE_TOTP_DIGITS[tier]
-    return _totp_at(secret, int(time.time()), algorithm, digits)
+    """Role-tiered TOTP — admin SHA512/8-digit, user SHA256/6-digit (mirrors
+    src/yashigani/auth/totp.py ROLE_TOTP_ALGO / ROLE_TOTP_DIGITS)."""
+    return pyotp.TOTP(
+        secret, digest=_ROLE_TOTP_DIGEST[tier], digits=_ROLE_TOTP_DIGITS[tier]
+    ).now()
 
 
 def _totp(secret: str) -> str:
