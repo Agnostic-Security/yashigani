@@ -488,6 +488,42 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
                 caller_agent_id, target_agent_id, exc,
             )
 
+    # YSG-RISK-146: run the REAL PII detector on the response body instead of
+    # hardcoding response_pii_detected=False.  Same pii_detector the /v1 leg
+    # uses (openai_router._state.pii_detector) — here it arrives via the
+    # per-request `state` dict built in proxy.py (create_gateway_app._state),
+    # the identical dict passed to route_agent_call by proxy._handle_request.
+    # When the detector is not configured, response_pii_detected stays at its
+    # False default (PII detection is opt-in, same as every other leg).  When
+    # the detector IS configured but raises, fail CLOSED — treat the fragment
+    # as PII-positive so an unclassifiable response cannot silently clear the
+    # OPA pii_detected_in_response gate below (mirrors _classify_sensitivity's
+    # fail-closed-to-RESTRICTED posture in orchestrator.py).
+    pii_detector = state.get("pii_detector")
+    if pii_detector is not None and upstream_resp.content:
+        try:
+            resp_body_text_for_pii = upstream_resp.text
+            _redacted_pii_text, resp_pii_result = pii_detector.process_decoded(
+                resp_body_text_for_pii
+            )
+            if resp_pii_result.detected:
+                response_pii_detected = True
+                logger.info(
+                    "route_agent_call: PII detected in agent response "
+                    "(caller=%s → target=%s) types=%s views=%s",
+                    caller_agent_id, target_agent_id,
+                    [f.pii_type.value for f in resp_pii_result.findings],
+                    sorted(resp_pii_result.matched_views),
+                )
+        except Exception as exc:
+            response_pii_detected = True
+            logger.error(
+                "route_agent_call: PII detection failed "
+                "(caller=%s → target=%s): %s — treating response as PII-positive "
+                "(fail-closed)",
+                caller_agent_id, target_agent_id, exc,
+            )
+
     # OPA response-leg check — fail-closed
     if opa_url:
         # Use the VERIFIED principal's ceiling (the authoritative subject of the
