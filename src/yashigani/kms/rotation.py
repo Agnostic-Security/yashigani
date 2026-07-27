@@ -65,11 +65,24 @@ class KSMRotationScheduler:
             provider=provider,
             secret_key="production/db-password",
             cron_expr="0 2 * * *",   # daily at 02:00
-            on_event=audit_logger.write,
+            on_event=on_event_handler,
         )
         scheduler.start()
         # ...
         scheduler.stop()
+
+    ``on_event`` is called as ``on_event(name, data)`` where ``name`` is one
+    of ``KSM_ROTATION_SUCCESS`` / ``KSM_ROTATION_FAILURE`` /
+    ``KSM_ROTATION_CRITICAL`` and ``data`` is a plain dict of event fields.
+    Do NOT pass an ``AuditLogWriter.write`` bound method directly here —
+    ``write()`` expects a single ``AuditEvent`` instance, not a
+    ``(str, dict)`` pair, and will ``AttributeError`` the first time it tries
+    to treat the name string as an event object (YSG-RISK-153). Wrap it in an
+    adapter that constructs the correct ``KsmRotationEvent`` dataclass first
+    — see ``backoffice/entrypoint.py::_make_ksm_rotation_event_handler`` for
+    the reference implementation, which also updates the
+    ``kms_rotations_total`` counter and ``kms_rotation_last_success_timestamp``
+    gauge.
     """
 
     def __init__(
