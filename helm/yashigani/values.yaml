@@ -1336,14 +1336,26 @@ agentBundles:
     # (readOnlyRootFilesystem: true is the template default; nothing mounts
     # a writable /tmp). Same class of fix already applied to langflow below
     # (extraVolumeMounts/extraVolumes for a writable /tmp emptyDir).
+    # NEW-K8S-OPENCLAW-HOMEDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation): with /tmp fixed the container gets
+    # further, then crashes again: "Gateway failed to start: Error: EROFS:
+    # read-only file system, open '/home/node/.openclaw/openclaw.json.1....tmp'"
+    # — openclaw persists/atomically-rewrites its own config + state under
+    # its home directory (~/.openclaw), which also needs to be writable
+    # under readOnlyRootFilesystem: true.
     extraVolumeMounts:
       - name: openclaw-tmp
         mountPath: /tmp
+      - name: openclaw-home
+        mountPath: /home/node/.openclaw
     extraVolumes:
       - name: openclaw-tmp
         emptyDir:
           medium: Memory
           sizeLimit: 128Mi
+      - name: openclaw-home
+        emptyDir:
+          sizeLimit: 64Mi
 
   # Langflow — Visual multi-agent workflow builder (MIT)
   # https://github.com/langflow-ai/langflow
