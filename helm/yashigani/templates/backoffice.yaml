@@ -352,6 +352,18 @@ spec:
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
+            # YSG-RISK-125 fix (compose<->k8s name-resolution parity): user_ui.py
+            # and user_agents.py's chat/agent proxy default to
+            # os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
+            # — the bare "gateway" hostname only resolves in Compose, where the
+            # service is literally named "gateway". On k8s the Service is
+            # "yashigani-gateway" (see gateway.yaml Service, http-mesh port
+            # 8081); without this override every /user/chat/completions and
+            # /user/agents/* call fails DNS resolution ([Errno -2] Name or
+            # service not known) and every chat target (letta/langflow/
+            # openclaw/direct model) returns gateway_unreachable.
+            - name: YASHIGANI_GATEWAY_MESH_URL
+              value: "http://yashigani-gateway:8081/v1"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             # YSG-RISK-120 fix (k8s parity with compose FINDING-V412-RESTART-012):
