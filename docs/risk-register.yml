@@ -2639,7 +2639,6 @@ risks:
   - The other 3 agent paths (@langflow, @openclaw, direct model) and OPA
     enforcement are unaffected — this is scoped to letta's own
     openapi_letta.json write, not a shared mesh/gateway component.
-  status: mitigated
   closure_evidence:
   - rationale: >-
       Fix PREPARED and committed in helm/yashigani/templates/agent-bundles.yaml
@@ -2664,6 +2663,14 @@ risks:
       avoid release-wide churn disrupting her run. Live redeploy + full
       @letta/@langflow/@openclaw/direct-model chat-path verification
       (OPA-enforced) is the immediate next step once cleared to proceed.
+  status: mitigated_pending_verify
+  pending_verification: >-
+    Per Lu's findings audit (2026-07-28): closure_evidence above is static-only
+    (helm lint/template/dry-run); no live cluster confirmation. Downgraded from
+    `mitigated` — closure requires the deferred clean k8s redeploy (k8s leg
+    paused per Tiago for the Docker/Podman legs) confirming all 4 chat targets
+    (@letta/@langflow/@openclaw/direct-model) live, with yashigani-letta
+    reaching Running with 0 IsADirectoryError crashes.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
 - id: YSG-RISK-111
@@ -2693,7 +2700,6 @@ risks:
   compensating_controls:
   - No security boundary crossed — purely an availability/capacity-planning
     defect, contained to the ollama StatefulSet's own model-catalog state.
-  status: mitigated
   closure_evidence:
   - rationale: >-
       Fixed by setting ollama.replicaCount default 2 -> 1 in
@@ -2723,6 +2729,14 @@ risks:
       Staged, NOT yet applied to the live stack — held pending Ava's e2e
       completion + Tom's gateway event-loop-stall fix, to land in one clean
       redeploy rather than mid-flight churn.
+  status: mitigated_pending_verify
+  pending_verification: >-
+    Per Lu's findings audit (2026-07-28): closure_evidence above states the
+    replicaCount fix was staged/not yet applied to the live stack at finding
+    time. Downgraded from `mitigated` — closure requires the deferred clean
+    k8s redeploy (paused per Tiago for the Docker/Podman legs) confirming all
+    4 chat targets (@letta/@langflow/@openclaw/direct-model) live with a
+    single ollama replica and a fully-populated model catalog.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
 - id: YSG-RISK-112
@@ -2976,7 +2990,6 @@ risks:
     resolution defect, not an authz/authn bypass. The 401 on unauthenticated
     direct /v1/chat/completions calls and OPA policy enforcement on the
     gateway side remain unaffected once connectivity is restored.
-  status: mitigated
   closure_evidence:
   - rationale: >-
       Fixed in helm/yashigani/templates/backoffice.yaml: added an explicit
@@ -2991,6 +3004,15 @@ risks:
       (@letta/@langflow/@openclaw/direct model) via
       POST /user/chat/completions with an authenticated end-user session
       is the immediate next verification step.
+  status: mitigated_pending_verify
+  pending_verification: >-
+    Per Lu's findings audit (2026-07-28): closure_evidence above is helm
+    lint/template render verification only; the "immediate next
+    verification step" (live chat-target re-test) is not yet done.
+    Downgraded from `mitigated` — closure requires the deferred clean k8s
+    redeploy (paused per Tiago for the Docker/Podman legs) confirming all 4
+    chat targets (@letta/@langflow/@openclaw/direct-model) live via an
+    authenticated end-user POST /user/chat/completions session.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
 
@@ -3198,6 +3220,32 @@ risks:
       not networking) is OUT OF SCOPE for this entry — flagged to Tom.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
+  classification: regression
+  bug_reference: BUG-V241-LANGFLOW-LETTA-BASE-URL
+  regression_note: >-
+    Per Lu's findings audit (2026-07-28): RE-CLASSIFIED from net-new to a
+    REGRESSION of the BUG-V241-LANGFLOW-LETTA-BASE-URL class ("gateway
+    upstream URL bypasses mesh enforcement") -- that instance was agent-
+    to-gateway (YSG-RISK-059/076); this instance is gateway/backoffice-to-
+    ollama, same family: a config default pointing at a direct backend
+    connection instead of the mandated Caddy mesh-mTLS front. Compounded by
+    the LAURA-I1-01 NetworkPolicy hardening (v4.1 Phase 1b-ii) removing the
+    direct gateway/backoffice->ollama ingress rule without updating
+    gateway.env.ollamaUrl's default to match -- a dangling default left
+    behind by a security-hardening change, not by this bug's own
+    introduction.
+    Test-gap (root cause the regression shipped undetected): the F001
+    v4.1.1 suite (tests/contracts/test_f001_orchestrator_ssl.py) asserts the
+    CODE mTLS-dials caddy:11435 when GIVEN that URL, and
+    tests/contracts/test_agent_base_url_port.py (the BUG-V241 regression
+    gate) exhaustively scans agent-facing OPENAI_API_BASE/upstream URLs but
+    does NOT scan gateway's own ollamaUrl/OLLAMA_BASE_URL values -- so
+    neither existing contract test asserts helm/yashigani/values.yaml
+    actually SETS the mesh URL. Follow-up: extend
+    test_agent_base_url_port.py (or a sibling contract test) to assert
+    gateway.env.ollamaUrl / backoffice OLLAMA_BASE_URL never default to a
+    direct :11434 connection -- closing the same blind spot that let this
+    regression through.
 
 - id: YSG-RISK-129
   description: >-
@@ -3343,11 +3391,18 @@ risks:
     (the admin API path) once logged in, to register each bundle by hand.
     Not automated, but not a hard blocker for an operator who knows to do
     this.
-  status: mitigated
+  status: mitigated_pending_verify
   accepted_by: null
   accepted_at: null
   review_by: null
   last_threat_model_review: '2026-07-28'
+  pending_verification: >-
+    Per Lu's findings audit (2026-07-28): closure_evidence below self-describes
+    as "code-complete, NOT YET LIVE-VERIFIED — pending Captain's redeploy
+    cycle". Downgraded from `mitigated` — closure requires the deferred clean
+    k8s redeploy (paused per Tiago for the Docker/Podman legs) confirming all
+    4 chat targets (letta/langflow/openclaw/direct-model) return real
+    responses.
   closure_evidence:
   - rationale: >-
       NOT YET FIXED. Root-caused and filed by Captain; Maxine's dispatch
@@ -3603,3 +3658,323 @@ risks:
       mcp_broker_registry Optional-narrowing) — confirmed via git-stash
       before/after, zero new errors introduced.
   fix_in_version: v4.1.2
+- id: YSG-RISK-122
+  description: >-
+    K8s/Helm: yashigani-backoffice started 7s before yashigani-redis-0 (Ava,
+    live docker-desktop k8s @ ca720724). The in-process retry in
+    entrypoint._bootstrap() (1/2/4/8s x5, ~31s budget) exhausted before k8s
+    DNS for the headless Redis Service was resolvable, logged "RBAC and agent
+    registry disabled", and never retried again -- 10+ minutes later, with
+    Redis fully healthy, GET /admin/agents still returned 503,
+    /admin/api/permissions/declarations still returned 503
+    permission_store_not_configured, and /admin/budget/usage/* still returned
+    503. A transient boot race permanently disabled RBAC, agent-registry,
+    permission-store, and budget enforcement for the whole pod lifetime.
+    docker/podman compose ordering (depends_on: service_healthy) does not hit
+    this; k8s Deployments have no equivalent gate. Second, independent root
+    cause found during inspection: BUDGET_REDIS_HOST/PORT was set on
+    gateway.yaml (to yashigani-budget-redis) but MISSING on backoffice.yaml,
+    so backoffice's own budget enforcer never connected under k8s at all,
+    regardless of boot timing -- a standing config gap, not a race. Fixed
+    alongside since the new lazy reconnect would otherwise retry the wrong
+    hostname forever.
+    Back-filled into the register per Lu's findings audit (2026-07-28): this
+    is the PARENT self-heal class that YSG-RISK-131 (gateway's own,
+    later-discovered, un-self-healed sibling) explicitly builds on and
+    references by id -- until this entry existed only in code comments
+    (backoffice/redis_selfheal.py:5, entrypoint.py, rbac_stack.py,
+    budget_stack.py), not the register, leaving 131 citing a non-existent
+    parent id.
+  severity: high
+  controls_impacted:
+  - Availability -- RBAC, agent-registry, permission-store, and budget
+    enforcement can be silently, permanently disabled by a transient boot-
+    order race, on every fresh k8s install, with the pod reporting healthy
+    throughout.
+  - Defense-in-depth -- budget enforcement (spend/rate ceilings) silently
+    inert on any k8s backoffice deploy until this fix, independent of the
+    race (missing BUDGET_REDIS_HOST/PORT on backoffice.yaml).
+  compensating_controls:
+  - No auth/authz boundary is crossed -- every degraded path already fails
+    CLOSED (503, never a silent authz bypass); this is an availability gap,
+    not a security-bypass gap.
+  - A full pod restart always recovers the affected pod, since cold boot
+    re-attempts the same connection.
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-24'
+  closure_evidence:
+  - commit: e4c9e9c1
+    rationale: >-
+      Extracted the RBAC/Agent/Binding/DocumentPolicy/DocumentSet/
+      EnvelopePending/DpWeaken/CapabilityPolicy construction out of
+      entrypoint._bootstrap()'s inline try/except into
+      backoffice/rbac_stack.build_rbac_agent_stack(), and the two budget
+      Redis connections into backoffice/budget_stack.py
+      (build_budget_config_store, build_budget_enforcer) -- same
+      construction logic, now callable again later at request time. New
+      backoffice/redis_selfheal.py: ensure_rbac_stack() /
+      ensure_budget_config_store() / ensure_budget_enforcer(), each a
+      bounded, cooldown-gated (default 15s,
+      YASHIGANI_RBAC_RECONNECT_COOLDOWN_S /
+      YASHIGANI_BUDGET_RECONNECT_COOLDOWN_S) lazy reconnect firing only when
+      the corresponding backoffice_state field is still None. app.py wires a
+      redis_selfheal_middleware on every /admin/* request (maybe_selfheal()),
+      dispatching the blocking redis-py reconnect to a worker thread
+      (asyncio.to_thread) only when needed, so the event loop is never
+      blocked in the steady-state case -- a single choke point covering all
+      ~25 backoffice_state consumers across app.py and routes/{agents,rbac,
+      rbac_sources,license,documents,policies,dp_weaken,
+      envelope_reapproval,opa_assistant,scim,user_ui,auth}.py. Fail-closed
+      preserved: failure changes nothing, existing `if X is None: raise 503`
+      checks untouched -- NOT a fail-open change.
+      BUDGET_REDIS_HOST/PORT gap fixed alongside: added to
+      helm/yashigani/templates/backoffice.yaml (mirrors gateway.yaml).
+      Enumerated before editing per SOP:
+      `grep -rEn "BUDGET_REDIS_HOST|BUDGET_REDIS_PORT" src/ helm/ docker/
+      install.sh` -- 4 sites found, 1 fixed (backoffice.yaml), 3 already
+      correct.
+      Part 2 (defense-in-depth, Helm): new wait-for-redis + wait-for-
+      budget-redis initContainers on backoffice.yaml (unconditional, bounded
+      python3 socket.create_connection() loop, no TLS handshake -- matches
+      the actual race, which is DNS propagation not auth). New
+      values.yaml toggle backoffice.waitForRedis.enabled (default true).
+      Verified: 7 new regression tests in
+      src/tests/regression/v4.1.2/test_ysg_risk_122_k8s_redis_selfheal.py,
+      including test_rbac_stack_reconnects_once_redis_becomes_available (the
+      core regression proof: initial-unavailable -> later-available Redis,
+      client reconnects with no process restart) -- all 7 pass. ruff/mypy
+      clean-diff. helm lint clean; helm template renders valid YAML (128
+      docs mtls.enabled=true, 114 mtls.enabled=false) with both
+      initContainers present in both cases. 5807 tests collect with zero
+      errors. Verification was static-only (no live cluster available at
+      fix time) -- explicitly out of scope, flagged as a follow-up: gateway's
+      identity registry (SSO, Redis db/3) has the identical single-attempt,
+      no-retry exposure -- this became YSG-RISK-131's scope (13 gateway
+      Redis-dependent subsystems including identity_registry), fixed
+      2026-07-28.
+  fix_in_version: v4.1.2
+
+- id: YSG-RISK-132
+  description: >-
+    install.sh `--runtime docker` does NOT propagate to the 4-way
+    runtime-detection function, silently dropping L1 egress containment on
+    dual-runtime hosts (podman co-installed alongside Docker). Filed per
+    Lu's findings audit (2026-07-28) as DEPLOY-001 in
+    testing_runs/yashigani/v412-e2e-latest-20260727/FINDINGS.md -- unfiled
+    at finding time, now given a proper register entry.
+    RCA (lib/detect_runtime.sh::_detect_runtime): the detector honours an
+    explicit override ONLY via env YSG_RUNTIME_4WAY. It does NOT consume the
+    legacy YSG_RUNTIME=docker that `--runtime docker` sets --
+    `_legacy_hint` is computed but only used for the `k8s` case (lines
+    203-209). install.sh sets YSG_RUNTIME=docker (line 742) but never
+    YSG_RUNTIME_4WAY; the docker->docker fallback map exists ONLY in the
+    lib-ABSENT else branch (install.sh:17505-17510, confirmed by Lu at
+    17181-17184 in a since-rebased line range -- same branch, lib-absent
+    path only). When lib/detect_runtime.sh IS present (the normal case),
+    execution falls through to truth-table Case 6 ("Podman preferred, Docker
+    ignored") -> podman-rootless (uid 1001) -> emits
+    ROOTLESS-PODMAN-L1-GAP and SKIPS L1 iptables egress containment, even
+    though the operator explicitly asked for Docker and compose honours
+    that choice for the actual container runtime.
+    NOT excused by "Case 6 = design": Case 6 governs auto-detect behaviour
+    when the operator gives no explicit preference. Here the operator gave
+    an EXPLICIT `--runtime docker` override, and the function's own
+    docstring contract ("Respects YSG_RUNTIME if explicitly set", lines
+    162-164) is unmet for the docker/podman legs (only honoured for k8s).
+  severity: high
+  controls_impacted:
+  - ASVS V1.2 (Trust boundary / network segmentation)
+  - NIST SP 800-190 §4.4 (container network isolation)
+  - Availability of a documented security control -- L1 iptables egress
+    containment is silently absent despite the operator's explicit runtime
+    choice, invisible unless the runtime line in install output is read
+    carefully.
+  compensating_controls:
+  - Podman rootless still provides user-namespace isolation as a partial
+    compensating control even without L1 iptables egress containment (same
+    rationale already accepted for the general rootless-podman L1 gap).
+  - Only exploitable on dual-runtime hosts (both docker and podman reachable
+    at once) -- single-runtime hosts are unaffected.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-28'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  residuals:
+  - >-
+      Fix not yet implemented. Two candidate fixes (either sufficient): (a)
+      install.sh sets YSG_RUNTIME_4WAY=docker (and podman-rootful where
+      applicable) from the resolved --runtime BEFORE calling
+      _detect_runtime(), or (b) _detect_runtime() maps _legacy_hint=docker ->
+      docker the same way it already does for the k8s case. Add an
+      integration test asserting `install.sh --runtime docker` on a
+      dual-runtime host resolves YSG_RUNTIME_4WAY=docker (existing
+      tests/install/test_detect_runtime.bats only tests the function's 7
+      cases in isolation, not this integration path). Owner: Su.
+  source_grep: >-
+    testing_runs/yashigani/v412-e2e-latest-20260727/FINDINGS.md (DEPLOY-001)
+    + testing_runs/yashigani/v412-e2e-latest-20260727/lu/findings-audit.md
+
+- id: YSG-RISK-133
+  description: >-
+    Compose fresh-install: install.sh's register_agent_bundles() inline
+    Python (~line 10360) writes the gateway-facing agent auth token to
+    /run/secrets/<profile>_token inside the backoffice container. That mount
+    was hardened to pure `:ro` by the FINDING-V412-F1/012/SVID-WRITE-PATH
+    commits (2026-07-21/22) -- the writable shadow-mounts only cover
+    admin_initial_password, grafana_admin_password, redis_password,
+    license_key, and the agents/svid-init/ cert dirs, NOT <profile>_token.
+    So on ANY fresh compose install that reaches register_agent_bundles(),
+    agent registration in Redis/Postgres succeeds but the token-file write
+    throws [Errno 30] Read-only file system -- silently reported as FAIL
+    even though the agent IS registered -- and
+    gateway/openai_router.py:3410 (_token_path =
+    /run/secrets/{name}_token) then finds no token file, so bundled-agent
+    (langflow/letta/openclaw) chat requests go out with NO Authorization
+    header at all.
+    This is a THIRD instance of the same :ro-mount-flip class that
+    FINDING-V412-SVID-WRITE-PATH (mcp_onboard.py:785) already fixed once --
+    the same-pattern sweep after that fix MISSED this write site. Filed per
+    Lu's findings audit (2026-07-28); previously only in FINDINGS.md prose
+    (2026-07-27 run), not the register.
+    Moot on k8s: YSG-RISK-130's k8s_register_agent_bundles() reads
+    each agent's token from its existing Helm-managed K8s Secret rather than
+    writing a token file, so this class does not reach k8s.
+    NEEDS-LIVE-CONFIRM: the 2026-07-27 run's Docker leg deployed with agents
+    up and chat reachable via a manual workaround (AgentRegistry.rotate_token()
+    + writing the plaintext token to docker/secrets/<profile>_token on the
+    HOST, the same mechanism every other secret in that directory already
+    uses) -- Ava's chat e2e test against a stock (non-workaround) fresh
+    compose install is the pending confirmation that this actually blocks
+    bundled-agent auth end-to-end as described.
+  severity: high
+  controls_impacted:
+  - Availability / Authentication -- bundled-agent (langflow/letta/openclaw)
+    chat requests silently go out with no Authorization header on any fresh
+    compose install, defeating gateway-side agent-token authentication for
+    that dispatch path.
+  compensating_controls:
+  - No security boundary WEAKENED -- the failure mode is fail-closed-shaped
+    (no token means the agent call is unauthenticated and gateway-side
+    checks should reject it, not silently authenticate as anyone); the
+    residual risk is availability (bundled-agent chat broken), pending
+    NEEDS-LIVE-CONFIRM above on whether an unauthenticated agent call is
+    rejected or allowed through.
+  - A host-side workaround exists using the SAME mechanism every other
+    secret in docker/secrets/ already uses (write the token to
+    docker/secrets/<profile>_token on the host; both backoffice and gateway
+    already bind-mount ./secrets:/run/secrets:ro from the host) -- no
+    container restart or hand-edit needed, verified live in the 2026-07-27
+    run.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-11'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  bug_reference: FINDING-V412-SVID-WRITE-PATH
+  residuals:
+  - >-
+      Fix not yet implemented -- RELEASE-BLOCKING for compose fresh-installs
+      pending Ava's live confirmation. Recommended fix (Tom/Su): write the
+      token to a proper shadow-mounted /run/secrets-rw/agents/ path readable
+      by gateway too, or add a dedicated <profile>_token shadow mount
+      matching the existing 4-file pattern (admin_initial_password,
+      grafana_admin_password, redis_password, license_key). Pattern-sweep
+      follow-up (S2): add an invariant test asserting every /run/secrets
+      write path performed by install.sh has a corresponding writable
+      shadow-mount, so a 4th instance of this class cannot ship silently.
+  source_grep: >-
+    testing_runs/yashigani/v412-e2e-latest-20260727/FINDINGS.md (agent-bundle
+    token :ro, "Bonus finding") +
+    testing_runs/yashigani/v412-e2e-latest-20260727/lu/findings-audit.md
+
+- id: YSG-RISK-134
+  description: >-
+    egress-forwarders.yaml re-adds the NET_BIND_SERVICE capability to the
+    Caddy-based agent egress-forwarder pods as a workaround for the caddy
+    binary's own file-capability requirement to bind low ports -- documented
+    in a code comment, not tracked as a register entry or task. Filed per
+    Iris's pre-push review + Lu's cross-cutting note (2026-07-28): a
+    capability re-add on a hardened pod is a real, if narrow, security-
+    hardening rollback and deserves tracked follow-up rather than living
+    only as a comment that can silently rot.
+  severity: low
+  controls_impacted:
+  - NIST SP 800-190 §4.5 (least-privilege container capabilities) -- one
+    capability re-added beyond the cap_drop:ALL baseline for a documented,
+    narrow reason (upstream caddy binary file-capability exec requirement),
+    not an unbounded privilege grant.
+  compensating_controls:
+  - Scoped to exactly NET_BIND_SERVICE, on exactly the egress-forwarder
+    pods, not a blanket capability grant. No other hardening (seccomp,
+    readOnlyRootFilesystem, non-root UID where compatible) is affected.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-10-28'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  residuals:
+  - >-
+      Cleaner fix (not yet scheduled): a cap-stripped broker image that does
+      not require the caddy binary's own low-port file-capability at all
+      (e.g. bind only on ports >1024 and let a Kubernetes Service/iptables
+      DNAT handle the low-port mapping, or an alternative lightweight
+      forwarder binary with no low-port requirement). Owner: Captain.
+  source_grep: helm/yashigani/templates/egress-forwarders.yaml (code comment)
+    + Iris pre-push review 2026-07-28
+
+- id: YSG-RISK-135
+  description: >-
+    Systemic test-gap: the k8s config surface (Helm values env defaults +
+    NetworkPolicy reachability) has near-zero contract coverage. Per Lu's
+    cross-cutting finding P-4 (2026-07-28): YSG-RISK-125/126/127/128/130 ALL
+    slipped through this exact blind spot in a single e2e cycle -- existing
+    NetworkPolicy tests (test_helm_p2_wave2_findings.py) assert policy SHAPE
+    (AND-semantics, structural correctness) only, never the actual
+    reachability allow-rules (e.g. "does backoffice's pod selector actually
+    have an egress rule permitting gateway:8081"); no test at all asserts
+    that a Helm env-var default (gateway.env.ollamaUrl,
+    YASHIGANI_GATEWAY_MESH_URL, etc.) resolves to a k8s-correct hostname
+    rather than a Compose-only bare-service-name default. One consolidated
+    suite covering both dimensions together would have caught 5 of the 13
+    findings in this cycle.
+  severity: medium
+  controls_impacted:
+  - ASVS V14.2 (Configuration hardening / deployment verification) --
+    absence of contract coverage over Helm values.yaml env defaults and
+    NetworkPolicy reachability rules let 5 distinct availability-breaking
+    regressions ship to a "fully green" k8s deploy in a single cycle.
+  compensating_controls:
+  - Live e2e (Ava/Laura/Iris) does eventually catch these findings -- the
+    gap is in PRE-deploy contract coverage, not total absence of detection.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-28'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  residuals:
+  - >-
+      Fix not yet implemented -- tracked task, owner Tom/Ogen per Lu's
+      dispatch: add a consolidated helm-values + NetworkPolicy-reachability
+      contract test suite that (a) walks every Helm-templated env var
+      referencing an internal service hostname and asserts it resolves to
+      the chart's own Service name (never a bare Compose-only convention
+      like "gateway"/"redis"/"ollama"), and (b) walks each NetworkPolicy's
+      allow-rules and asserts specific known-required source/destination
+      pod-selector pairs are actually permitted (not just that the policy
+      object exists with correct AND-semantics shape). Consolidates the
+      grep-based Verification Protocol #1 sweep (host=postgres|host=pgbouncer|
+      host=redis|...) with a Python-level equivalent for os.environ defaults,
+      since the literal grep pattern already missed one instance
+      (YSG-RISK-125).
+  source_grep: >-
+    testing_runs/yashigani/v412-e2e-latest-20260727/lu/findings-audit.md
+    (cross-cutting P-4)
