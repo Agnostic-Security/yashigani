@@ -3288,3 +3288,83 @@ risks:
       pytest subset green.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
+
+- id: YSG-RISK-130
+  description: >-
+    K8s/Helm: `install.sh`'s `register_agent_bundles()` (Compose/Podman "Step
+    11b" — called from the `compose_up` code path only, ~line 19195) is the
+    ONLY place any Yashigani deployment ever populates gateway's durable
+    agent registry (Postgres `AgentDurableStore` + Redis db/3
+    `AgentRegistry`) with the deployed agent bundles (letta/langflow/
+    openclaw). It authenticates no admin session — runs a Python script
+    directly inside the backoffice container (`compose exec`) that: (1)
+    generates a fresh PSK token + bcrypt hash per agent, (2) upserts the
+    agent record (name/upstream_url/protocol/groups/allowed_paths/etc.) into
+    both the durable Postgres store and the fast Redis path, (3) writes the
+    raw token to a host-bind-mounted secrets file for the gateway/agent
+    containers to pick up, (4) mints capability envelopes
+    (SEC-ENVELOPE-001), (5) restarts the agent containers so they pick up
+    their new token.
+    `k8s_helm_install()` (line 13888 onward) has NO equivalent call anywhere
+    — grepped the entire function body. Agent bundle PODS deploy and run
+    healthy on k8s (letta 2/2, langflow/openclaw 1/1 Running, confirmed
+    every cycle this session), and each already receives a STABLE,
+    Helm-managed token via a K8s Secret (yashigani-{langflow,letta,
+    openclaw}-token, key "token", generated once at install time by
+    helm/yashigani/templates/secrets.yaml and preserved across upgrades —
+    confirmed live, non-empty, stable values) — but gateway's own registry
+    is NEVER told these agents exist. Confirmed live via gateway logs:
+    "AGENT-RECONCILE: durable store empty and no Redis agents to back-fill"
+    / "Gateway agent registry ready: 0 agent(s)" on a freshly, fully green
+    k8s deploy (25/25 pods, provenance verified). Every `/user/chat/
+    completions` call to @letta/@langflow/@openclaw returns
+    `{"error":{"message":"Agent @<name> not found or not active",
+    "code":"agent_not_found"}}` — a clean structured error (not a crash,
+    unaffected by YSG-RISK-128/129), but the chat/agent path is completely
+    unusable on EVERY fresh k8s install regardless of any other fix.
+    Found live re-verifying Maxine's chat-target item (c) after YSG-RISK-128
+    was fixed and Tom's YSG-RISK-129 crash fix confirmed the underlying
+    connectivity/crash issues resolved — this is the fourth, and by
+    elimination final, distinct blocker in the chat-target verification
+    chain (125 DNS -> 126 bootstrap NetworkPolicy -> 127 chat-proxy
+    NetworkPolicy -> 128 Ollama mesh routing -> 129 crash-on-failure ->
+    130 agent registration).
+  severity: high
+  controls_impacted:
+  - Availability — the entire @agent chat/agent-dispatch feature surface
+    (letta/langflow/openclaw) is non-functional on k8s regardless of pod
+    health, image provenance, or any networking fix, on every fresh install.
+  compensating_controls:
+  - No security boundary crossed — this is a missing-registration
+    availability gap, not an authz bypass. Direct-model (non-agent) chat
+    calls are unaffected by this specific finding (though currently blocked
+    by YSG-RISK-128, tracked separately).
+  - A manual workaround exists — an operator can call POST /admin/agents
+    (the admin API path) once logged in, to register each bundle by hand.
+    Not automated, but not a hard blocker for an operator who knows to do
+    this.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-28'
+  closure_evidence:
+  - rationale: >-
+      NOT YET FIXED. Root-caused and filed by Captain; Maxine's dispatch
+      directs implementing a k8s equivalent of register_agent_bundles() —
+      either (a) install.sh calls the registration flow against the
+      deployed k8s gateway/backoffice once healthy (kubectl exec into the
+      backoffice pod, mirroring the compose Python script's durable-store
+      write, but reading each agent's ALREADY-STABLE token from its
+      existing K8s Secret rather than generating + writing a new one, since
+      no pod restart/token-rotation is needed on k8s — the Secret-delivered
+      token is already correctly wired via agent-bundles.yaml's
+      tokenSecretName/tokenSecretKey), or (b) a Helm post-install hook Job
+      that performs the equivalent registration. Per Captain's own scope
+      discipline (installer orchestration-flow changes beyond a Helm
+      values/template tweak are Su's domain, not Captain's) this
+      implementation is being handed to Su, coordinated via Maxine, rather
+      than hand-hacked by Captain. This entry will be updated to
+      status: mitigated once Su's fix lands and is live-verified (all 4
+      chat targets returning real responses).
+  fix_in_version: v4.1.2
