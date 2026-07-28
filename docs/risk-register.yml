@@ -3851,13 +3851,32 @@ risks:
     Moot on k8s: YSG-RISK-130's k8s_register_agent_bundles() reads
     each agent's token from its existing Helm-managed K8s Secret rather than
     writing a token file, so this class does not reach k8s.
-    NEEDS-LIVE-CONFIRM: the 2026-07-27 run's Docker leg deployed with agents
-    up and chat reachable via a manual workaround (AgentRegistry.rotate_token()
-    + writing the plaintext token to docker/secrets/<profile>_token on the
-    HOST, the same mechanism every other secret in that directory already
-    uses) -- Ava's chat e2e test against a stock (non-workaround) fresh
-    compose install is the pending confirmation that this actually blocks
-    bundled-agent auth end-to-end as described.
+    CONFIRMED (2026-07-27/28): Ava reproduced this live on a fresh Docker
+    install (and previously on k8s) -- install.sh logs "No agents were
+    registered" and @letta/@langflow/@openclaw chat is 100% dead
+    out-of-the-box. Root cause refined after live confirm: the token-file
+    open() raises OSError errno=30 (EROFS) -- a BARE OSError, NOT a
+    PermissionError (EROFS has no dedicated Python exception subclass) --
+    so the code's own `except PermissionError: pass` guard never catches
+    it. The exception propagates to the outer `except Exception` handler,
+    which reports the agent registration as FAIL even though
+    durable.upsert()/registry.restore_from_durable() already committed the
+    registration to Postgres+Redis. Fixed (Su, YSG-RISK-133) by removing the
+    doomed container-side write entirely rather than reopening
+    RESTART-012's :ro mount or adding a new shadow-mount: the token is
+    always included in the Python script's OK: result line, and the
+    ALREADY-CORRECT host-side capture path (ISSUE-027, install.sh
+    register_agent_bundles()) persists it to
+    docker/secrets/<profile>_token on the HOST filesystem -- the exact
+    workaround mechanism below, now made the PERMANENT code path instead of
+    a manual fallback. Verified via a logic-level harness reproducing the
+    real errno.EROFS exception semantics (bash -n + python3 ast.parse clean;
+    updated tests/install/test_agent_bundle_registration.sh TEST (9) now
+    asserts no open(token_path,...) / no /run/secrets token_path derivation
+    / unconditional OK:+raw_token). Live fresh-compose-install re-verify
+    (Ava e2e chat against the CODE fix, not the manual workaround) is still
+    pending -- not run in this pass because the live docker-leg stack is
+    owned by Maxine (YSG-STACK-OWNER) and was not rebuilt.
   severity: high
   controls_impacted:
   - Availability / Authentication -- bundled-agent (langflow/letta/openclaw)
@@ -3865,37 +3884,47 @@ risks:
     compose install, defeating gateway-side agent-token authentication for
     that dispatch path.
   compensating_controls:
-  - No security boundary WEAKENED -- the failure mode is fail-closed-shaped
-    (no token means the agent call is unauthenticated and gateway-side
-    checks should reject it, not silently authenticate as anyone); the
-    residual risk is availability (bundled-agent chat broken), pending
-    NEEDS-LIVE-CONFIRM above on whether an unauthenticated agent call is
-    rejected or allowed through.
-  - A host-side workaround exists using the SAME mechanism every other
-    secret in docker/secrets/ already uses (write the token to
-    docker/secrets/<profile>_token on the host; both backoffice and gateway
-    already bind-mount ./secrets:/run/secrets:ro from the host) -- no
-    container restart or hand-edit needed, verified live in the 2026-07-27
-    run.
-  status: open
+  - No security boundary WEAKENED -- the fix makes ZERO write attempts
+    against /run/secrets from inside the backoffice container (stronger
+    than before -- previously there was at least an attempted-then-caught
+    write; now there is no attempt at all), fully preserving
+    FINDING-V412-RESTART-012's guarantee that a compromised backoffice
+    cannot write into that mount.
+  - Token persistence now happens via the SAME mechanism every other secret
+    in docker/secrets/ already uses (host-side write to
+    docker/secrets/<profile>_token; both backoffice and gateway bind-mount
+    ./secrets:/run/secrets:ro from the host) -- and matches the pattern k8s
+    already uses (Helm-managed K8s Secret, provisioned before the pod
+    starts, never written to by a running container).
+  status: mitigated_pending_verify
   accepted_by: null
   accepted_at: null
   review_by: '2026-08-11'
-  fix_in_version: null
+  fix_in_version: 4.1.2
   last_threat_model_review: '2026-07-28'
   classification: regression
   bug_reference: FINDING-V412-SVID-WRITE-PATH
   residuals:
   - >-
-      Fix not yet implemented -- RELEASE-BLOCKING for compose fresh-installs
-      pending Ava's live confirmation. Recommended fix (Tom/Su): write the
-      token to a proper shadow-mounted /run/secrets-rw/agents/ path readable
-      by gateway too, or add a dedicated <profile>_token shadow mount
-      matching the existing 4-file pattern (admin_initial_password,
-      grafana_admin_password, redis_password, license_key). Pattern-sweep
-      follow-up (S2): add an invariant test asserting every /run/secrets
-      write path performed by install.sh has a corresponding writable
-      shadow-mount, so a 4th instance of this class cannot ship silently.
+      Code fix implemented (install.sh register_agent_bundles(), commit on
+      fix/v412-e2e-x8x-20260725): container-side write to
+      /run/secrets/<profile>_token removed entirely; the Python script's
+      OK: result line always includes the raw token; the pre-existing
+      ISSUE-027 host-side capture path in install.sh (unchanged) persists it
+      to docker/secrets/<profile>_token with chmod 0640. k8s path
+      (k8s_register_agent_bundles(), YSG-RISK-130) was never affected --
+      it already reads the token from a Helm-managed Secret and makes no
+      filesystem write. Pending: a live fresh-compose-install run (Ava)
+      confirming register_agent_bundles() emits "Agent bundle registration
+      complete" (not "No agents were registered") with no [Errno 30] in the
+      install log, and that @letta/@langflow/@openclaw chat works
+      end-to-end against the CODE fix. Pattern-sweep (S2): grepped
+      install.sh, k8s_register_agent_bundles(), mcp_onboard.py, and
+      pki/issuer.py for other open(...,"w")-against-/run/secrets sites --
+      no other instance of this class found; the two prior instances
+      (FINDING-V412-F1 mint_agent_leaf, FINDING-V412-SVID-WRITE-PATH
+      svid-init staging) already use the /run/secrets-rw shadow-mount
+      pattern correctly.
   source_grep: >-
     testing_runs/yashigani/v412-e2e-latest-20260727/FINDINGS.md (agent-bundle
     token :ro, "Bonus finding") +

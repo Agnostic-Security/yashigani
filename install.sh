@@ -10308,8 +10308,40 @@ register_agent_bundles() {
   # Run the entire registration flow inside the backoffice container.
   # This avoids shell interpolation issues and timing problems with TOTP.
   # The Python script reads secrets from /run/secrets/, computes TOTP,
-  # authenticates, checks the live registry, registers each unregistered agent,
-  # and writes tokens to /run/secrets/.
+  # authenticates, checks the live registry, and registers each unregistered
+  # agent (Postgres + Redis db/3). The raw per-agent PSK is printed to stdout
+  # (OK: line) for HOST-SIDE capture — see YSG-RISK-133 below for why it is
+  # never written to a file from inside this container.
+  #
+  # YSG-RISK-133 (2026-07-27): this Python block used to also open()
+  # /run/secrets/<profile>_token for writing (a "3. Token file for gateway"
+  # step). FINDING-V412-RESTART-012 (2026-07-21) made backoffice's
+  # /run/secrets mount a PURE :ro bind — see docker-compose.yml — so that
+  # write was doomed on every runtime (Docker rootful, Podman rootless, and
+  # would be on k8s too, hence k8s_register_agent_bundles() below never
+  # attempts it). The write raised OSError: [Errno 30] Read-only file
+  # system, which is a BARE OSError (EROFS has no dedicated subclass) — NOT
+  # a PermissionError — so the old `except PermissionError: pass` guard
+  # never caught it. The exception propagated to the OUTER `except
+  # Exception as e` handler, which reported the whole agent as "FAIL" even
+  # though durable.upsert()/registry.restore_from_durable() had ALREADY
+  # committed the registration to Postgres+Redis. Every fresh compose
+  # install therefore logged "No agents were registered" and
+  # @letta/@langflow/@openclaw chat was 100% dead out-of-the-box, even
+  # though the registry itself was correct.
+  #
+  # Fix: this container makes ZERO write attempts against /run/secrets —
+  # preserves RESTART-012's guarantee completely (no reopened mount, no
+  # caught-and-swallowed write either). The raw token is included in the
+  # OK: result line unconditionally; the ALREADY-CORRECT host-side capture
+  # path (ISSUE-027, install.sh ~10520 below) persists it to
+  # ${secrets_dir}/${_profile}_token on the HOST filesystem (never through
+  # the RO container mount) with the same install-time-secret pattern used
+  # for every other generated secret (openclaw_gateway_token,
+  # license_key, admin_initial_password) — and the SAME pattern k8s already
+  # uses (yashigani-<agent>-token Helm Secret, provisioned before the pod
+  # starts, never written to by a running container — see
+  # k8s_register_agent_bundles() below).
   #
   # YSG-AGENT-REG-001 fix: skip decision moved into Python (registry-aware).
   # The old shell-side guard checked token file existence, which diverges from
@@ -10447,18 +10479,15 @@ for agent_spec in agents_spec:
         durable.upsert(agent_data, token_hash=token_hash)
         # 2. Fast write (Redis db/3) — request-time source of truth
         registry.restore_from_durable(agent_data, token_hash)
-        # 3. Token file for gateway
-        token_path = os.path.join("/run/secrets", profile + "_token")
-        try:
-            with open(token_path, "w") as _tf:
-                _tf.write(raw_token)
-            try:
-                # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read
-                os.chmod(token_path, 0o640)
-            except OSError as _ce:
-                print(f"WARNING:chmod_640_failed:{token_path}:{_ce}", file=sys.stderr)
-        except PermissionError:
-            pass  # printed below for host-side capture
+        # 3. YSG-RISK-133: NO container-side write against /run/secrets here
+        # (see the register_agent_bundles() header comment above for the full
+        # RESTART-012 rationale). The backoffice /run/secrets mount is a pure
+        # :ro mount by design -- this container never attempts to write to
+        # it, not even inside a caught exception. The raw token is persisted
+        # HOST-SIDE by the OK: handler in register_agent_bundles() (bash),
+        # which writes ${secrets_dir}/${_profile}_token directly on the host
+        # filesystem and chmods it 0640 -- the same install-time-secret
+        # pattern used for every other generated credential.
         results.append("OK:" + aname + ":" + profile + ":" + raw_token)
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
