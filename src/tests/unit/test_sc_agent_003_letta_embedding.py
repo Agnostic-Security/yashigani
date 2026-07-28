@@ -597,3 +597,153 @@ class TestComposeEnvVarRename:
         assert "YASHIGANI_LETTA_BRAIN_MODEL" in content, (
             "YASHIGANI_LETTA_BRAIN_MODEL must be declared in docker-compose.yml"
         )
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-138 — LLM side must mirror the embedding-config fix: an explicit
+# llm_config object (bypasses Letta's own handle-resolution catalog), not a
+# bare "model": "<provider>/<model>" handle string that 404s with
+# "Handle <provider>/<model> not found" because we never register a provider
+# with Letta (by design — the gateway owns routing, not Letta's defaults).
+# ---------------------------------------------------------------------------
+
+class TestLlmConfigShape:
+    """YSG-RISK-138: _letta_llm_config() returns a gateway-pointing full config."""
+
+    def test_strips_provider_prefix(self, monkeypatch):
+        """model field must be the bare Ollama name, not 'openai-proxy/...'."""
+        monkeypatch.setenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config()
+        assert cfg["model"] == "qwen2.5:3b", (
+            f"llm_config.model must be the bare model name, got {cfg['model']!r}"
+        )
+
+    def test_endpoint_type_is_openai(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config()
+        assert cfg["model_endpoint_type"] == "openai", (
+            f"model_endpoint_type must be 'openai', got {cfg['model_endpoint_type']!r}"
+        )
+
+    def test_endpoint_points_at_gateway(self, monkeypatch):
+        monkeypatch.setenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config()
+        assert "gateway" in cfg["model_endpoint"] and "8081" in cfg["model_endpoint"], (
+            f"model_endpoint must point at gateway:8081, got {cfg['model_endpoint']!r}"
+        )
+
+    def test_context_window_known_model(self, monkeypatch):
+        """qwen2.5:3b resolves context_window from the table (32768), no probe needed."""
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config("openai-proxy/qwen2.5:3b")
+        assert cfg["context_window"] == 32768
+
+    def test_context_window_unknown_model_fallback(self):
+        """An unlisted brain model falls back to a safe conservative context_window."""
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config("openai-proxy/some-unlisted-model:latest")
+        assert cfg["context_window"] == letta_client._LLM_CONTEXT_WINDOW_FALLBACK
+
+    def test_no_bare_prefix_model_returned_as_is(self):
+        """A brain model with no '/' is used as-is for the bare model name."""
+        from yashigani.gateway import letta_client
+
+        cfg = letta_client._letta_llm_config("qwen2.5:3b")
+        assert cfg["model"] == "qwen2.5:3b"
+
+
+class TestCreateAgentPayloadUsesLlmConfig:
+    """YSG-RISK-138: all 3 create-agent call sites send llm_config, not model."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_agent_sends_llm_config_not_model_handle(self, monkeypatch):
+        """_ensure_agent (legacy path) must not send a bare 'model' handle."""
+        monkeypatch.setenv("YASHIGANI_LETTA_EMBEDDING_MODEL", "qwen2.5:3b")
+        import yashigani.gateway.letta_client as _m
+        _m._default_agent_id = None
+
+        cm, mock_client = _make_httpx_client_mock()
+
+        with patch("httpx.AsyncClient", return_value=cm):
+            await _m._ensure_agent(mock_client, "http://letta:8283")
+
+        agent_posts = [p for p in mock_client.captured_posts if "/v1/agents/" in p["url"]]
+        payload = agent_posts[-1]["json"]
+
+        assert "model" not in payload, (
+            "create-agent payload must not carry a bare 'model' handle field "
+            f"(would 404 'Handle ... not found'); found: {payload.get('model')!r}"
+        )
+        llm_cfg = payload.get("llm_config")
+        assert llm_cfg is not None, "llm_config must be present in the create-agent payload"
+        assert llm_cfg.get("model") == "qwen2.5:3b"
+        assert llm_cfg.get("model_endpoint_type") == "openai"
+        assert "gateway" in llm_cfg.get("model_endpoint", "")
+
+    @pytest.mark.asyncio
+    async def test_ensure_agent_for_user_sends_llm_config_not_model_handle(self, monkeypatch):
+        """_ensure_agent_for_user (active 4.0 LettaClientPool path) — same contract."""
+        monkeypatch.setenv("YASHIGANI_LETTA_EMBEDDING_MODEL", "qwen2.5:3b")
+        from yashigani.gateway.letta_client import LettaClientPool
+
+        cm, mock_client = _make_httpx_client_mock()
+        pool = LettaClientPool(pool_manager=MagicMock())
+
+        with patch("httpx.AsyncClient", return_value=cm):
+            await pool._ensure_agent_for_user("user-abc-123", "http://letta:8283", mock_client)
+
+        agent_posts = [p for p in mock_client.captured_posts if "/v1/agents/" in p["url"]]
+        payload = agent_posts[-1]["json"]
+
+        assert "model" not in payload, (
+            f"create-agent payload must not carry a bare 'model' handle; found: {payload.get('model')!r}"
+        )
+        llm_cfg = payload.get("llm_config")
+        assert llm_cfg is not None, "llm_config must be present in the create-agent payload"
+        assert llm_cfg.get("model") == "qwen2.5:3b"
+
+    @pytest.mark.asyncio
+    async def test_brain_agent_sends_llm_config_not_model_handle(self, monkeypatch):
+        """_create_brain_agent (ORCH-PHASE2 Design A path) — same contract."""
+        monkeypatch.setenv("YASHIGANI_LETTA_EMBEDDING_MODEL", "qwen2.5:3b")
+        from yashigani.gateway import letta_brain, tool_catalog
+
+        cat = tool_catalog.ToolCatalog(tools=[], name_map={})
+        captured_bodies: list[dict] = []
+
+        create_resp = MagicMock()
+        create_resp.status_code = 201
+        create_resp.json.return_value = {"id": "brain-agent-llmcfg-001"}
+        create_resp.text = ""
+
+        async def mock_post(url, **kwargs):
+            captured_bodies.append({"url": url, "json": kwargs.get("json", {})})
+            return create_resp
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=cm):
+            await letta_brain._create_brain_agent("http://letta:8283", cat, timeout=30.0)
+
+        agent_posts = [p for p in captured_bodies if "/v1/agents/" in p["url"]]
+        payload = agent_posts[-1]["json"]
+
+        assert "model" not in payload, (
+            f"brain-agent create payload must not carry a bare 'model' handle; found: {payload.get('model')!r}"
+        )
+        llm_cfg = payload.get("llm_config")
+        assert llm_cfg is not None, "llm_config must be present in the brain-agent create payload"
+        assert llm_cfg.get("model") == "qwen2.5:3b"

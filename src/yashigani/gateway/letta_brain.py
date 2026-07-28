@@ -327,7 +327,7 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
     embeddings.letta.com — unreachable from the network-isolated Letta container).
     """
     import httpx
-    from yashigani.gateway.letta_client import _letta_embedding_config
+    from yashigani.gateway.letta_client import _letta_embedding_config, _letta_llm_config
 
     persona = (
         "I am a Yashigani orchestration BRAIN. I have NO network access; the only "
@@ -346,7 +346,11 @@ async def _create_brain_agent(base_url: str, catalog, timeout: float) -> str:
                                             "orchestration request."},
                 {"label": "persona", "value": persona},
             ],
-            "model": brain_model,
+            # YSG-RISK-1xx (chat-path repair, 2026-07-27): llm_config (full
+            # object), not "model" (handle) — see letta_client._letta_llm_config()
+            # docstring. Bare "model": handle 404s ("Handle ... not found") since
+            # Letta never has an "openai-proxy" provider registered.
+            "llm_config": _letta_llm_config(brain_model),
             "embedding_config": embedding_cfg,
         })
         if resp.status_code not in (200, 201):

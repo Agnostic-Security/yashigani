@@ -250,7 +250,9 @@ class LettaClientPool:
                         ),
                     },
                 ],
-                "model": brain_model,
+                # YSG-RISK-1xx (chat-path repair, 2026-07-27): llm_config (full
+                # object), not "model" (handle) — see _letta_llm_config() docstring.
+                "llm_config": _letta_llm_config(brain_model),
                 "embedding_config": embedding_cfg,
             })
             if resp.status_code not in (200, 201):
@@ -410,6 +412,54 @@ def _letta_brain_model() -> str:
     return os.getenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
 
 
+# ---------------------------------------------------------------------------
+# LLM context-window table (YSG-RISK-1xx — see YASHIGANI_LETTA_BRAIN_MODEL fix)
+# ---------------------------------------------------------------------------
+# Mirrors _OLLAMA_EMBEDDING_DIMS below: Letta's LLMConfig requires a
+# context_window at agent-creation time. Qwen2.5's published context length
+# (Qwen2.5 technical report / Ollama library manifest) is 32768 tokens.
+_OLLAMA_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen2.5:3b": 32768,
+}
+# Conservative fallback for a brain model not yet in the table above.
+_LLM_CONTEXT_WINDOW_FALLBACK = 8192
+
+
+def _letta_llm_config(model: str | None = None) -> dict:
+    """Build the explicit llm_config payload for a Letta create-agent call.
+
+    FIX (2026-07-27, chat-path repair): Letta 0.16.7's POST /v1/agents "model"
+    field is a *handle* ("format: provider/model-name") that Letta resolves
+    against its OWN provider catalog — NOT a free-form endpoint pointer. We
+    never register an "openai-proxy" provider with Letta (by design: the
+    docker-compose.yml comment for the letta service states "the gateway, not
+    the Letta server defaults, owns the routing decision"), so every agent
+    creation that sent bare ``"model": "openai-proxy/qwen2.5:3b"`` 404s with
+    "Handle openai-proxy/qwen2.5:3b not found" — breaking @letta chat and the
+    letta-as-orchestrating-brain (Design A) path.
+
+    Letta's (deprecated-but-functional) ``llm_config`` field accepts a full
+    LLMConfig object and bypasses handle resolution entirely — exactly the
+    same trick SC-AGENT-003 already applied to embedding_config to dodge the
+    unreachable "letta/letta-free" cloud handle. This mirrors that fix for the
+    LLM side.
+    """
+    brain_model = model if model is not None else _letta_brain_model()
+    # Strip the "openai-proxy/" (or any other "provider/") prefix — Ollama
+    # only knows the bare model name.
+    bare = brain_model.split("/", 1)[1] if "/" in brain_model else brain_model
+    context_window = _OLLAMA_CONTEXT_WINDOWS.get(bare, _LLM_CONTEXT_WINDOW_FALLBACK)
+    return {
+        "model": bare,
+        "model_endpoint_type": "openai",
+        "model_endpoint": _GATEWAY_EMBED_ENDPOINT,
+        "context_window": context_window,
+        # Cosmetic only (Letta does not use this for routing when llm_config
+        # is supplied) — keeps the original handle name visible in the UI.
+        "handle": brain_model,
+    }
+
+
 def _letta_embedding_model() -> str:
     """Return the bare Ollama model name to use for Letta embeddings.
 
@@ -534,7 +584,9 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
             {"label": "human", "value": "The user is interacting via the Yashigani AI security gateway."},
             {"label": "persona", "value": "I am a helpful AI assistant with persistent memory. I remember our conversations."},
         ],
-        "model": brain_model,
+        # YSG-RISK-1xx (chat-path repair, 2026-07-27): llm_config (full
+        # object), not "model" (handle) — see _letta_llm_config() docstring.
+        "llm_config": _letta_llm_config(brain_model),
         "embedding_config": embedding_cfg,
     })
 

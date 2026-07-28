@@ -4107,3 +4107,74 @@ risks:
     grep -rn 'totp:' src/yashigani/backoffice/static --include=*.js (found
     2 offenders pre-fix: api-client.js:151, _iam.js:41; dashboard.js:715
     already correct) -- FIND-DOCKER-001, Docker e2e 2026-07-27/28
+
+- id: YSG-RISK-138
+  description: >-
+    @letta chat fails on every install (Docker and k8s) with
+    "Handle openai-proxy/qwen2.5:3b not found" even when Ollama has
+    qwen2.5:3b pulled and the gateway<->Ollama mesh path is independently
+    reachable (verified: direct-model chat reaches Ollama with HTTP 200).
+    Root cause: Letta 0.16.7's POST /v1/agents "model" field is documented
+    as a *handle* ("format: provider/model-name") that Letta resolves
+    against its OWN internal provider catalog -- it is NOT a free-form
+    endpoint string. Yashigani deliberately never registers an
+    "openai-proxy" provider with Letta (LETTA_DEFAULT_LLM_HANDLE is
+    intentionally left unset per the docker-compose.yml comment: "the
+    gateway, not the Letta server defaults, owns the routing decision"),
+    so any create-agent call that sent a bare
+    "model": "openai-proxy/qwen2.5:3b" 404s with exactly this error at
+    THREE independent call sites: letta_client.py's _ensure_agent()
+    (legacy/deprecated 3.0 path), _ensure_agent_for_user() (the ACTIVE 4.0
+    LettaClientPool per-user path), and letta_brain.py's
+    _create_brain_agent() (ORCH-PHASE2 letta-as-orchestrating-brain path,
+    Design A). This is despite SC-AGENT-003 (3.1) already having solved
+    the exact same class of problem for embeddings -- explicit
+    embedding_config full-object payload replacing the unreachable
+    "letta/letta-free" cloud handle -- but that fix was never mirrored to
+    the LLM side, which kept sending "model": <handle> instead of an
+    explicit llm_config object.
+  severity: high
+  controls_impacted:
+  - Availability -- @letta is one of Yashigani's three bundled default
+    agents (langflow/letta/openclaw); its chat path is completely
+    non-functional on every fresh install (Docker and k8s) regardless of
+    Ollama/mesh health, model pull status, or the YSG-RISK-133 agent-token
+    registration fix (independent root cause -- fixing 133 alone does NOT
+    unblock @letta; this bug still 404s the agent-creation call before any
+    token is even used).
+  compensating_controls:
+  - No security-boundary weakening -- pure availability defect (feature
+    completely non-functional, not partially/insecurely functional).
+  - langflow and openclaw bundled-agent chat paths are unaffected (separate
+    upstreams, no Letta-handle dependency).
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  bug_reference: SC-AGENT-003
+  residuals:
+  - >-
+      Fixed: added letta_client._letta_llm_config(), mirroring the existing
+      _letta_embedding_config() pattern -- builds an explicit LLMConfig
+      object (model_endpoint_type="openai", model_endpoint pointing at the
+      gateway's /v1, context_window from a small per-model table defaulting
+      to 8192 for unlisted models) and passes it as "llm_config" (Letta's
+      deprecated-but-functional full-object field) instead of "model"
+      (handle). Applied at all three call sites:
+      letta_client.py _ensure_agent_for_user() and _ensure_agent(), and
+      letta_brain.py _create_brain_agent(). NEEDS-LIVE-CONFIRM: fix is
+      unit-tested (mocked httpx) but not yet verified against a live Letta
+      0.16.7 container end-to-end -- Ava/Iris to confirm on next e2e pass.
+      Also NOTE: this fix is independent of, and does not depend on,
+      Su's YSG-RISK-133 agent-token registration fix in progress on this
+      same branch -- both must land for @letta chat to be fully functional
+      end-to-end (133 gates the auth token being present; 138 gates the
+      Letta agent being creatable at all).
+  source_grep: >-
+    grep -n '"model": brain_model' src/yashigani/gateway/letta_client.py
+    src/yashigani/gateway/letta_brain.py (3 hits pre-fix, all now
+    "llm_config": _letta_llm_config(brain_model)) -- reported chat-path
+    repair investigation, 2026-07-27/28
