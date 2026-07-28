@@ -1631,7 +1631,25 @@ agentBundles:
       - name: pre-touch-letta-openapi-file
         image: "docker.io/library/busybox:1.37"
         imagePullPolicy: IfNotPresent
-        command: ["/bin/sh", "-c", "touch /letta-runtime-init/openapi_letta.json"]
+        # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 follow-up (found live during
+        # the SAME 4.1.2 k3s/Cilium e2e, immediately after the directory-vs-
+        # file fix above went live): fixing the directory-vs-file problem
+        # surfaced a SECOND, distinct error on the very next attempt:
+        # "PermissionError: [Errno 13] Permission denied: 'openapi_letta.json'".
+        # Root cause: letta's main container drops ALL capabilities
+        # (containerSecurityContext capabilities.drop: [ALL]), which
+        # includes CAP_DAC_OVERRIDE — the capability root normally uses to
+        # bypass file permission checks. Without it, letta's root (UID 0)
+        # process is subject to normal Unix permission bits like any other
+        # user. touch'ing the file as this initContainer's own UID 65534
+        # left it owned nobody:nogroup with the default umask (0644, no
+        # write for anyone but the owner) — root (UID 0, no DAC_OVERRIDE)
+        # cannot open it for writing. Fix: chmod the touched file to 0666
+        # (world-writable) so any UID, including capability-stripped root,
+        # can write it. Safe: this is a non-sensitive OpenAPI schema JSON
+        # file letta itself fully overwrites at every startup — no
+        # confidentiality/integrity concern from the permissive mode.
+        command: ["/bin/sh", "-c", "touch /letta-runtime-init/openapi_letta.json && chmod 0666 /letta-runtime-init/openapi_letta.json"]
         securityContext:
           runAsNonRoot: true
           runAsUser: 65534
