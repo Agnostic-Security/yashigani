@@ -13488,7 +13488,21 @@ _preflight_coredns_dnssec_dot() {
   local _ns="ysg-dnsprobe-$$"
   # shellcheck disable=SC2317
   _dnsprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
-  trap _dnsprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 (found live during 4.1.2 k3s/Cilium
+  # e2e, 2026-07-28): a bare `trap _fn RETURN` is NOT scoped to this one
+  # function call — bash keeps it armed for every subsequent function return
+  # at this call-stack depth for the REST OF SCRIPT EXECUTION unless
+  # explicitly cleared. This function's own $_ns goes out of scope the
+  # moment it returns, so the very next unrelated function return anywhere
+  # later in the script re-fires this stale trap and hits "_ns: unbound
+  # variable" under `set -u` — which happened to fire right after "Helm
+  # release deployed", aborting install.sh before it ever reached
+  # k8s_rollout_status / k8s_verify_image_provenance / k8s_print_access /
+  # credential output. This is the established, already-correct
+  # self-clearing pattern used elsewhere in this file (see _gate_cleanup
+  # ~line 16888): the trap handler clears itself as its last action.
+  # shellcheck disable=SC2064
+  trap "_dnsprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
     log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: could not create throwaway namespace ${_ns}"
@@ -13584,7 +13598,12 @@ _probe_cross_tenant_isolation() {
   _tenprobe_cleanup() {
     kubectl delete namespace "$_ns_a" "$_ns_b" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
   }
-  trap _tenprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 fix: self-clear (see
+  # _preflight_coredns_dnssec_dot's comment for the full mechanics — a bare
+  # `trap _fn RETURN` stays armed for every later function return in this
+  # script, not just this one call).
+  # shellcheck disable=SC2064
+  trap "_tenprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns_a" >/dev/null 2>&1 || ! kubectl create namespace "$_ns_b" >/dev/null 2>&1; then
     log_error "Cross-tenant probe: could not create throwaway namespaces"
@@ -13740,7 +13759,12 @@ _probe_networkpolicy_enforcement() {
   # Always tear down the throwaway namespace on return.
   # shellcheck disable=SC2317
   _npprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
-  trap _npprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 fix: self-clear (see
+  # _preflight_coredns_dnssec_dot's comment for the full mechanics — a bare
+  # `trap _fn RETURN` stays armed for every later function return in this
+  # script, not just this one call).
+  # shellcheck disable=SC2064
+  trap "_npprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
     log_error "NetworkPolicy probe: could not create throwaway namespace ${_ns}"
