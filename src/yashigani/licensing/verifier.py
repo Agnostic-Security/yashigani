@@ -504,11 +504,16 @@ def _compute_live_hash_bundle_str() -> "tuple[Optional[str], dict[str, Optional[
 # TARGETS, _INTEGRITY_PY_PATH).
 # ---------------------------------------------------------------------------
 
+# DEMO build root of trust: canonical 5.0 demo master "M-v5-demo"
+# (testing_runs/yashigani/demo-license-system-5.0/keys/master_public.pem —
+# throwaway, no custody). The AgnosticSecurity "Demo Licenses/" v5 set is signed
+# under this master. Production release-prep MUST swap this to the real KMS/PIV
+# master (release-blocking checklist item — NOT a demo-master ship).
 _PINNED_MASTER_ANCHOR_PEMS: tuple[str, ...] = (
     "-----BEGIN PUBLIC KEY-----\n"
-    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEDma++nz50wbNWi401tWqderBCXzUr84G\n"
-    "C029LvM6eJo9A2KvvZC6H4js11TAkwyFUyxHG0rhZbTj5GYbmPJNXcMmiRzj4mIf\n"
-    "Za1apDAAPGipJKkzPtXQ/e5DmR7TZ5w3\n"
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEbSQPx0WXGRjO5/gkr0eKKAw8mTKXH/n8\n"
+    "KA0OSke+edue6ZepTzBbBUvwBPtQ7CL+wZguuUuOgOpvCUPpyJglQyY/2EQrrAIA\n"
+    "PmJOWvM1TdxpDHpBNvBenQKH+Mm5RA4m\n"
     "-----END PUBLIC KEY-----\n",
 )
 
