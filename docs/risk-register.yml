@@ -2666,3 +2666,120 @@ risks:
       (OPA-enforced) is the immediate next step once cleared to proceed.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
+- id: YSG-RISK-111
+  description: >-
+    ollama StatefulSet replica/model asymmetry — half of all chat/inference
+    calls hang. helm/yashigani/values.yaml default was ollama.replicaCount: 2
+    ("2 replicas for HA"). Each StatefulSet replica gets its OWN PVC via
+    volumeClaimTemplates. helm/yashigani/templates/ollama.yaml's
+    yashigani-ollama-init Job pulls the configured model via a single set of
+    `OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull ...` calls against
+    the `yashigani-ollama` Service — a normal ClusterIP Service picks ONE
+    backend pod per connection, so the pull lands entirely on ONE replica
+    (ollama-0). Every other replica's PVC (ollama-1, ...) keeps an EMPTY
+    model catalog. Real inference traffic round-robins across replicas via
+    the same Service: roughly half of all @letta/@langflow/@openclaw/
+    direct-model chat calls hit the empty-catalog replica and hang/404.
+    Found live by Ava's e2e against the 4.1.2 k3s/Cilium deploy (2026-07-28)
+    — chat blocked across all 4 targets on an otherwise green stack.
+    (CWE-1188 Insecure Default Initialization of Resource — availability
+    class, not a security-boundary crossing.)
+  severity: medium
+  controls_impacted:
+  - Availability — ~50% of all LLM inference calls hang/fail depending on
+    which replica the Service round-robins a connection to
+  - Agent dispatch — @letta/@langflow/@openclaw/direct-model chat all
+    affected equally (shared ollama backend)
+  compensating_controls:
+  - No security boundary crossed — purely an availability/capacity-planning
+    defect, contained to the ollama StatefulSet's own model-catalog state.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fixed by setting ollama.replicaCount default 2 -> 1 in
+      helm/yashigani/values.yaml. Two independent justifications: (1) this is
+      also the functionally correct value for any single-GPU deployment (the
+      common shape for self-hosted Yashigani — see project sizing notes,
+      ~50 users/RTX3060) — a second replica cannot usefully hold the SAME
+      model concurrently in the SAME one GPU's VRAM, it only adds
+      contention, never capacity; (2) regardless of GPU count, the
+      ollama-init Job's pull-via-round-robin-Service design is broken for
+      ANY replicaCount > 1 until that Job is rewritten to pull per-pod
+      (e.g. iterate StatefulSet stable pod DNS names ollama-0.<headless-svc>,
+      ollama-1.<headless-svc>, ... instead of the round-robin Service VIP).
+      helm/yashigani/values.single-node.yaml already had replicaCount: 1
+      correct as an optional overlay, but install.sh's k8s path never layers
+      it in, so every k8s install got the broken default regardless — fixed
+      by correcting the chart's own baseline default instead of relying on
+      an overlay operators may not know to pass.
+      RESIDUAL (not fixed here, documented as a follow-up): true multi-GPU
+      multi-replica scale-out requires the ollama-init Job to be rewritten
+      to pull the model onto every replica's PVC individually before
+      replicaCount > 1 is safe again. ollama.hpa.* values in values.yaml are
+      NOT wired to any live HorizontalPodAutoscaler object in this chart
+      (no HPA template exists for ollama) — currently inert/dead config, so
+      autoscaling cannot reintroduce this bug today, but whoever eventually
+      wires HPA up must gate it on the per-pod-pull fix above.
+      Staged, NOT yet applied to the live stack — held pending Ava's e2e
+      completion + Tom's gateway event-loop-stall fix, to land in one clean
+      redeploy rather than mid-flight churn.
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
+- id: YSG-RISK-112
+  description: >-
+    gateway logs `ERROR:yashigani.db:yashigani_app credential sync skipped —
+    cannot read /run/secrets/postgres_password: [Errno 2] No such file or
+    directory` repeatedly at startup (once per gateway replica) on the K8s
+    path. src/yashigani/db/__init__.py's _sync_app_role_password() (called
+    from run_migrations(), which gateway's own entrypoint.py also invokes)
+    tries to read postgres_password as a FILE at
+    ${YASHIGANI_SECRETS_DIR:-/run/secrets}/postgres_password to replace
+    migration 0001's placeholder password on the yashigani_app role.
+    K8s delivers postgres_password to gateway ONLY via a secretKeyRef env
+    var (POSTGRES_PASSWORD, interpolated into YASHIGANI_DB_DSN via K8s'
+    native $(POSTGRES_PASSWORD) env-var substitution) — gateway.yaml's
+    copy-pki-to-writable initContainer copies pki-ro/license-ro/
+    mcp-signing-key-ro into the writable secrets emptyDir but does NOT copy
+    postgres_password the way backoffice.yaml's equivalent initContainer
+    does, so the file gateway is looking for never exists on K8s.
+    Investigated per Maxine's "confirm cosmetic or file it": NOT purely
+    cosmetic. In THIS observed deploy it is non-fatal because backoffice's
+    OWN copy of _sync_app_role_password() (which DOES have the file) already
+    successfully syncs the real password onto the yashigani_app role before
+    gateway's redundant attempt runs — gateway's own DB connections use the
+    correct password via the separate env-var-interpolation path regardless
+    of this failed file read. But this is a race-dependent, not
+    architecturally-guaranteed, safety net: if gateway's migration pass runs
+    before backoffice's ever succeeds (e.g. backoffice delayed/crash-looping
+    on a future regression), NEITHER replica would ever successfully sync
+    the real password, reproducing the exact migration-0001-placeholder
+    class of bug this session already saw block letta earlier (password
+    authentication failed for user "yashigani_app").
+  severity: low
+  controls_impacted:
+  - Availability — latent race window to the placeholder-password class of
+    bug if backoffice's own sync is ever delayed/absent
+  - Operational hygiene — logger.error (not warning) severity produces
+    alarming, misleading log noise on every gateway startup in normal
+    operation
+  compensating_controls:
+  - backoffice's copy-pki-to-writable initContainer already has the correct
+    postgres_password file-copy step and runs its own successful sync,
+    which is what actually protects this deploy today.
+  - _sync_app_role_password() fails closed/logged (never silently
+    half-applies a password change) — the DB role itself is never left in
+    an inconsistent state by gateway's failed attempt, only unchanged.
+  status: open
+  accepted_by: null
+  review_by: '2026-08-15'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  residuals:
+  - >-
+      Fix not yet implemented (flagged non-blocking for the current redeploy
+      per Maxine): mirror backoffice.yaml's copy-pki-to-writable
+      initContainer pattern in gateway.yaml — add postgres-secret-ro volume
+      + copy step so gateway's own postgres_password file exists at
+      /run/secrets/postgres_password, closing the parity gap and the log
+      noise. Deferred to a follow-up dispatch, not required for THIS
+      redeploy since backoffice's sync already covers the live risk.

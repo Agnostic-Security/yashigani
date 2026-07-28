@@ -803,7 +803,7 @@ redis:
     enabled: false
 
 # ---------------------------------------------------------------------------
-# Ollama — local LLM inference (StatefulSet, 2 replicas for HA)
+# Ollama — local LLM inference (StatefulSet)
 # ---------------------------------------------------------------------------
 ollama:
   enabled: true
@@ -811,7 +811,36 @@ ollama:
     repository: ollama/ollama
     tag: "0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
     pullPolicy: IfNotPresent
-  replicaCount: 2
+  # NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001 (found live by Ava's e2e against
+  # 4.1.2 k3s/Cilium, 2026-07-28): default was 2 (StatefulSet, "2 replicas for
+  # HA"), but ollama-init-job.yaml pulls the model via a single set of
+  # `ollama pull` calls against the `yashigani-ollama` Service — a normal
+  # ClusterIP Service picks ONE backend pod per connection, so the pull
+  # lands entirely on ONE replica (ollama-0's PVC). Every other replica's
+  # PVC (each StatefulSet replica gets its own PVC via
+  # volumeClaimTemplates) stays with an EMPTY model catalog. The Service
+  # then round-robins real inference traffic across replicas — roughly
+  # half of all chat/inference calls hit an empty-catalog replica and hang
+  # (Ava's exact @letta/@langflow/@openclaw/direct-model chat-blocking
+  # finding). Fixed at 1: this is also the functionally correct value for
+  # any single-GPU deployment (the common shape — see project sizing notes,
+  # ~50 users/RTX3060) — a second replica cannot usefully hold the SAME
+  # model concurrently in the SAME one GPU's VRAM; it only adds contention,
+  # never capacity. helm/yashigani/values.single-node.yaml already had this
+  # correct (replicaCount: 1) as an optional overlay, but install.sh's k8s
+  # path never layers it in, so every k8s install got the broken default.
+  # Made the chart's baseline default itself correct rather than relying on
+  # an overlay operators may not know to pass. RESIDUAL / follow-up (not
+  # fixed here): true multi-GPU multi-replica scale-out requires
+  # ollama-init-job.yaml to pull per-pod (e.g. iterate StatefulSet pod DNS
+  # names ollama-0.<headless-svc>, ollama-1.<headless-svc>, ... instead of
+  # the round-robin Service VIP) before replicaCount > 1 is safe again.
+  # ollama.hpa.* below is NOT wired to any live HorizontalPodAutoscaler
+  # object in this chart (grepped: no HPA template exists for ollama at
+  # all) — those values are currently inert/dead config, so no separate
+  # autoscale-reintroduces-the-bug risk exists today; flagged for whoever
+  # eventually wires HPA up to also gate it on the per-pod-pull fix above.
+  replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
   # LLM inference — high memory requirement, 2 CPUs to keep inference
   # from starving other services. Increase on GPU hosts.
