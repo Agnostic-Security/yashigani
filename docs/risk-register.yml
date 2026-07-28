@@ -2145,7 +2145,14 @@ risks:
   status: accepted
   accepted_by: tiago@agnosticsec.com
   accepted_at: '2026-06-26'
-  review_by: '2026-07-15'
+  review_by: '2026-10-28'
+  review_overdue_note: >-
+    Original review_by (2026-07-15) lapsed without re-review — re-dated
+    forward 2026-07-28 per standard quarterly cadence (~90 days from
+    today), since the v3.0.1 assert_fresh_stepup() fix referenced below has
+    not yet been confirmed landed against this specific endpoint set.
+    Compensating controls (TOTP-gated admin session, tamper-evident hash
+    chain, display-only impact) remain unchanged and still hold.
   closure_evidence:
   - rationale: >-
       Display-only impact; hash chain intact; no customer data corruption path.
@@ -3978,3 +3985,55 @@ risks:
   source_grep: >-
     testing_runs/yashigani/v412-e2e-latest-20260727/lu/findings-audit.md
     (cross-cutting P-4)
+
+- id: YSG-RISK-136
+  description: >-
+    POST /admin/license/activate (backoffice/routes/license.py:417-502)
+    unconditionally overwrites the license_key file with whatever content is
+    submitted -- including garbage, which fails open to Community tier
+    rather than rejecting the request. No backup of the prior license file
+    is taken, and no confirmation gate is required, unlike
+    DELETE /admin/license which already requires an explicit confirm:true
+    body field for an equivalent destructive action. An admin typo, or a
+    hijacked admin session, causes irrecoverable license-file destruction --
+    the prior valid license (and its tier entitlements) is gone with no
+    undo path. Found by Laura's Docker pentest pass (LAURA-412-D01,
+    2026-07-28).
+  severity: low
+  controls_impacted:
+  - ASVS V1.14.4 / V13.2.3 (destructive-operation confirmation, input
+    validation before persist)
+  - CWE-284 (Improper Access Control) adjacent -- specifically CWE-345
+    (Insufficient Verification of Data Authenticity) / availability class --
+    irrecoverable data loss from an unvalidated overwrite, not an authz
+    bypass.
+  compensating_controls:
+  - Endpoint is admin-auth gated (no unauthenticated exposure) -- requires
+    an already-compromised or already-privileged admin session, same
+    prerequisite class as several existing accepted-LOW entries in this
+    register.
+  - Fail-open-to-Community on garbage input is NOT a privilege-escalation
+    path (Community is the LOWEST tier) -- the damage is entitlement loss
+    (denial of paid features), not entitlement gain.
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-28'
+  fix_in_version: null
+  last_threat_model_review: '2026-07-28'
+  residuals:
+  - >-
+      Fix not yet implemented. Owner: Tom. Recommended fix (mirrors the
+      existing DELETE /admin/license pattern already in the same file):
+      (1) require an explicit confirm:true body field before any overwrite
+      of an existing, currently-valid license_key file; (2) back up the
+      prior license_key file (e.g. to license_key.bak or a timestamped
+      copy) before writing the new one, so an admin typo/hijack is
+      recoverable; (3) validate the submitted license content (signature/
+      structure check) BEFORE persisting it, rather than persisting first
+      and discovering invalidity only on next read (the current
+      fail-open-to-Community behaviour implies validation happens too
+      late, after the overwrite already occurred).
+  source_grep: >-
+    backoffice/routes/license.py:417-502 -- Laura Docker pentest pass,
+    finding LAURA-412-D01 (2026-07-28)
