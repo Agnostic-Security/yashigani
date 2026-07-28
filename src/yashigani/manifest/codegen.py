@@ -1770,9 +1770,16 @@ _SEEN_MESH_PORTS: dict[int, tuple[str, str]] = {}
 # Coordination contract with rotate.sh (Su domain):
 #   - Sidecar Dockerfile must set its GID to _MCP_SVID_GID (addgroup --gid 2003 svid)
 #     and chown/chmod the key: 0440 group=2003 (replace the current chmod 0400).
-#   - The codegen-emitted volume (ysg_svid_<tenant>_<server>) is backed by
-#     the local driver; the tmpfs overlay at /run/secrets/svid/<tenant>/<server>
-#     inside the sidecar makes rotation atomic (POSIX rename on tmpfs).
+#   - The codegen-emitted volume (ysg_svid_<tenant>_<server>) is a plain
+#     `driver: local` NAMED VOLUME (not tmpfs — it must be shared rw/ro
+#     between the sidecar and Caddy, which a single-container `tmpfs:`
+#     stanza cannot do). Rotation atomicity comes from POSIX rename being
+#     atomic on any same-filesystem mount, not specifically from tmpfs.
+#     LAURA-V50-012 (Captain, 2026-07-28): a fresh named volume is created
+#     root:root by the engine; ownership is fixed by the companion
+#     one-shot `<server>-svid-init` service (_gen_svid_init_service) BEFORE
+#     the sidecar or Caddy first mount it — see Dockerfile.svid-sidecar's
+#     SECURITY CONTEXT header for the full writeup.
 #   - The Caddy container image must have GID 2003 available (addgroup in
 #     Dockerfile.caddy or a USER instruction with the numeric GID).
 #
@@ -3492,6 +3499,107 @@ def _sc_volume_name(tenant_id: str, agent_name: str) -> str:
     return "ysg_fs_%s_%s_workspace" % (safe_tid, safe_name)
 
 
+def _gen_svid_init_service(
+    parsed: dict,
+    *,
+    runtime: str,
+) -> str:
+    """
+    Generate the one-shot ``<server>-svid-init`` compose service stanza.
+
+    LAURA-V50-012 (Captain, 2026-07-28): a freshly-created Docker/Podman
+    NAMED volume is created ``root:root`` by the engine — the mountpoint
+    directory is ``mkdir``'d by the container runtime itself, not by either
+    container's image, so neither the sidecar's ``USER 1002`` (Dockerfile)
+    nor its compose ``user: "1002:2003"`` has any effect on who owns it.
+    The svid-sidecar (``cap_drop: [ALL]``, ``read_only: true``, non-root)
+    has no mechanism to chown the volume itself, so ``rotate.sh``'s init
+    copy (``cp /init/client.crt -> $SVID_DIR/client.crt``) fails
+    ``Permission denied`` on every attempt and the sidecar crash-loops
+    forever — 100% reproducible on first onboarding of any Shape-C agent.
+
+    This CANNOT be fixed by baking ``mkdir+chown`` into the sidecar's
+    Dockerfile at build time (the pattern used for the fixed-path
+    ``/run/caddy-broker-route`` case — FINDING-V412-DOCKER-VOL-001): the
+    mount target here is ``/run/secrets/svid/<tenant>/<server>``, a path
+    that does not exist until manifest-apply time, so there is nothing to
+    pre-create in a build-time image layer. It also cannot be fixed by
+    switching the volume to a ``driver_opts: type: tmpfs, o: uid=...``
+    mount (the Dockerfile's own — now corrected — header comment used to
+    claim this): that option mounts tmpfs on the HOST/engine mount
+    namespace, which is not UID-portable under Podman rootless subuid/gid
+    remapping the way an in-container ``tmpfs:`` stanza is (proven live
+    for /run/ringfence below).
+
+    Fix: a one-shot, root, minimal-capability init service that mounts the
+    SAME named volume, ``mkdir -p``s the exact SVID_DIR path, chowns it to
+    the sidecar's UID:GID (1002:_MCP_SVID_GID), and exits 0. It reuses the
+    svid-sidecar IMAGE (no new image to build/pin/scan — smaller supply
+    chain than a bespoke "fix-perms" image) with an entrypoint override.
+    Both the svid-sidecar AND caddy (the two consumers of this volume)
+    ``depends_on: <this>: condition: service_completed_successfully`` —
+    see ``_gen_svid_sidecar_service`` and the ``caddy:`` stanza in
+    ``_gen_compose_override_shape_c`` — so ownership is always fixed
+    BEFORE either container's first touch of the (still-empty) volume,
+    closing the race regardless of Compose's start order (Compose does
+    not guarantee ordering between services with no depends_on edge).
+
+    Security: root is scoped to exactly this one-shot container, which
+    joins no network (``network_mode: none``), never runs the app, and
+    exits immediately — the caps granted (CHOWN/FOWNER/DAC_OVERRIDE) are
+    the minimum needed to chown a directory it does not already own.
+    """
+    meta = parsed.get("metadata") or {}
+    server_id = meta.get("name", "")
+    tenant_id = meta.get("tenant_id", "")
+    svid_vol = _mcp_svid_volume_name(tenant_id, server_id)
+    svid_dir = "%s/%s/%s" % (_MCP_SVID_MOUNT_ROOT, tenant_id, server_id)
+    svc_name = "%s-svid-init" % server_id
+    # $$ (not $) — Compose interpolates $VAR/${VAR} in ANY compose YAML
+    # string value, including inline command/entrypoint text, at CLIENT-
+    # SIDE config-parse time, using the host/.env environment (proven live
+    # via `docker compose config`: a bare $SVID_DIR here silently
+    # interpolated to an empty string because SVID_DIR isn't a host env
+    # var — the container would have run `mkdir -p "" && chown ... ""`).
+    # $$SVID_DIR renders as the literal `$SVID_DIR` in the emitted config,
+    # which /bin/sh -c then expands at CONTAINER RUNTIME from the
+    # `environment: SVID_DIR: ...` below — the value we actually want.
+    chown_cmd = (
+        'mkdir -p "$$SVID_DIR" && '
+        'chown -R 1002:%d "$$SVID_DIR" && '
+        'chmod 0750 "$$SVID_DIR"'
+    ) % _MCP_SVID_GID
+
+    return "\n".join([
+        "  # LAURA-V50-012: one-shot perms-fix ahead of the svid-sidecar +",
+        "  # caddy. Fresh named volumes are root:root; this chowns the exact",
+        "  # SVID_DIR to 1002:%d (the sidecar's uid:gid) BEFORE either" % _MCP_SVID_GID,
+        "  # consumer mounts the (still-empty) volume for the first time.",
+        "  # Reuses the svid-sidecar image (no new image to pin/scan).",
+        "  %s:" % svc_name,
+        "    image: ${YASHIGANI_SVID_SIDECAR_IMAGE:-%s}:${YASHIGANI_VERSION:-4.1.0}" % _MCP_SVID_SIDECAR_IMAGE,
+        "    entrypoint: ['/bin/sh', '-c', '%s']" % chown_cmd,
+        "    restart: \"no\"  # one-shot: must run to completion, never restart",
+        "    environment:",
+        "      SVID_DIR: %s" % svid_dir,
+        "    volumes:",
+        "      - %s:%s" % (svid_vol, svid_dir),
+        "    network_mode: none",
+        "    # Root ONLY here, ONLY to chown a volume it does not yet own —",
+        "    # the sidecar and caddy stay non-root throughout.",
+        '    user: "0:0"',
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    cap_drop:",
+        "      - ALL",
+        "    cap_add:",
+        "      - CHOWN",
+        "      - FOWNER",
+        "      - DAC_OVERRIDE",
+        "    read_only: true",
+    ])
+
+
 def _gen_svid_sidecar_service(
     parsed: dict,
     *,
@@ -3548,6 +3656,12 @@ def _gen_svid_sidecar_service(
         "  %s:" % svc_name,
         "    image: ${YASHIGANI_SVID_SIDECAR_IMAGE:-%s}:${YASHIGANI_VERSION:-4.1.0}" % _MCP_SVID_SIDECAR_IMAGE,
         "    restart: unless-stopped",
+        "    # LAURA-V50-012: wait for the volume-ownership fix to COMPLETE",
+        "    # (not just start) before touching the still-empty SVID volume —",
+        "    # see _gen_svid_init_service.",
+        "    depends_on:",
+        "      %s-svid-init:" % server_id,
+        "        condition: service_completed_successfully",
         "    environment:",
         "      AGENT_ID: %s" % server_id,
         "      SVID_DIR: %s" % svid_dir,
@@ -3868,6 +3982,17 @@ def _gen_compose_override_shape_c(
         "  caddy:",
         "    networks:",
         "      - %s" % ringfence_bridge,
+        "    # LAURA-V50-012: caddy is the OTHER consumer of the SVID volume —",
+        "    # it must also wait for the ownership fix to complete before its",
+        "    # first mount of the (possibly still-empty) volume; Compose gives",
+        "    # no ordering guarantee between caddy and the sidecar otherwise.",
+        "    # Additive across agents: depends_on is a map, keyed per-agent",
+        "    # (%s-svid-init), so multiple onboarded agents merge safely —" % agent_name,
+        "    # same reasoning as networks:/volumes: below (unlike the group_add",
+        "    # list-equality issue this is NOT a repeated identical value).",
+        "    depends_on:",
+        "      %s-svid-init:" % agent_name,
+        "        condition: service_completed_successfully",
         "    # SVID volume: per-instance leaf+key written by the svid-sidecar.",
         "    # Sidecar mounts this same volume at the same path with SVID_DIR set.",
         "    # Key perm: 0440 GID %d — Caddy reads via the STATIC base group_add" % _MCP_SVID_GID,
@@ -3914,15 +4039,22 @@ def _gen_compose_override_shape_c(
         "    internal: true",
     ]
 
-    # SEAM-1d-06: emit the per-MCP svid-sidecar service that projects the
-    # minted leaf into the shared SVID volume for Caddy to present.
+    # LAURA-V50-012: emit the one-shot svid-init service (fixes the SVID
+    # named-volume ownership BEFORE the sidecar or caddy first touch it),
+    # then the per-MCP svid-sidecar service that projects the minted leaf
+    # into the shared SVID volume for Caddy to present (SEAM-1d-06).
+    init_lines = _gen_svid_init_service(parsed, runtime=runtime)
     sidecar_lines = _gen_svid_sidecar_service(parsed, runtime=runtime)
     # Insert after the caddy: stanza and before the volumes: section.
     # We split on the "# Shape-C tenant-namespaced workspace volume" comment
-    # and re-join with the sidecar block interposed.
+    # and re-join with the init + sidecar blocks interposed.
     marker = "# Shape-C tenant-namespaced workspace volume"
     body = "\n".join(line for line in lines if line != "")
-    body = body.replace(marker, sidecar_lines + "\n\n" + marker, 1)
+    body = body.replace(
+        marker,
+        init_lines + "\n\n" + sidecar_lines + "\n\n" + marker,
+        1,
+    )
     return body + "\n"
 
 

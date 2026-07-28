@@ -28,12 +28,28 @@
 #   Populated by install.sh using the output of mint_agent_leaf().
 #
 # SECURITY CONTEXT
-#   - Non-root UID 1002 (no DAC_OVERRIDE needed; tmpfs owned by same UID via compose
-#     tmpfs uid= mount option or Podman :U flag).
+#   - Non-root UID 1002 (no DAC_OVERRIDE needed).
+#   - The SVID cert directory (/run/secrets/svid/<tenant>/<server>) is a
+#     NAMED DOCKER/PODMAN VOLUME, not a tmpfs — it must be shared, read-write,
+#     with the Caddy container (read-only), and a single-container `tmpfs:`
+#     compose stanza cannot span two services. A freshly-created named
+#     volume is owned root:root by the engine, which this non-root,
+#     cap_drop:ALL, read_only container has no way to chown itself.
+#     LAURA-V50-012 (Captain, 2026-07-28): ownership is fixed by a
+#     companion one-shot `<server>-svid-init` service (manifest/codegen.py
+#     ``_gen_svid_init_service``) that runs as root ONLY to
+#     `mkdir -p && chown 1002:2003 && chmod 0750` the exact SVID_DIR before
+#     this sidecar (or Caddy) ever mounts the volume — both `depends_on:
+#     <init>: condition: service_completed_successfully`. This sidecar
+#     itself never runs as root and never gains chown capabilities.
+#   - /run/ringfence (the readiness flag, NOT cert material) IS a plain
+#     compose `tmpfs:` mount (mode=1777 — see codegen.py comment for why
+#     0700 crash-loops identically to the SVID volume did) since it is
+#     single-container and ephemeral by design.
 #   - cap_drop: [ALL] — no capabilities required.
 #   - no-new-privileges: true.
-#   - read_only: true on the container root fs (tmpfs for /run mounted in compose/K8s).
-#   - No internet egress (ringfence internal bridge; only speaks to backoffice:8443).
+#   - read_only: true on the container root fs.
+#   - No internet egress (caddy_internal only; only speaks to backoffice:8443).
 #
 # BASE IMAGE
 #   Alpine 3.21.3 — matches ringfence-init for consistency + supply-chain coherence.
