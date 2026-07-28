@@ -29,10 +29,23 @@
 {{- $root := . -}}
 {{- $anyEnabled := false -}}
 {{- range $frontID, $front := .Values.agentIngressFronts }}{{ if $front.enabled }}{{ $anyEnabled = true }}{{ end }}{{ end }}
-{{- if $anyEnabled }}
+{{- if or $anyEnabled .Values.ollama.enabled }}
 ---
 # ClusterIP Service exposing the per-agent Caddy mesh-listener ports —
 # NEVER on the public LoadBalancer Service (see header rationale).
+#
+# YSG-RISK-128 fix: also exposes the Ollama mesh-mTLS front (:11435,
+# configmaps.yaml's `:11435 {` block, gated on .Values.ollama.enabled) —
+# same "internal-only ClusterIP, never the public LoadBalancer" rationale
+# as the per-agent mesh ports above. Prior to this fix the yashigani-caddy
+# Service (public LoadBalancer) had NO port for 11435 at all, so
+# gateway.env.ollamaUrl/backoffice's OLLAMA_BASE_URL (both
+# https://yashigani-caddy:11435/ollama) resolved to a ClusterIP with no
+# matching Service port — connections timed out with no route, identical
+# symptom to a NetworkPolicy silent drop. Render condition widened from
+# `$anyEnabled`-only (agentIngressFronts) to `or $anyEnabled
+# .Values.ollama.enabled` so this Service exists whenever EITHER feature
+# needs it, decoupled from agentIngressFronts being configured at all.
 apiVersion: v1
 kind: Service
 metadata:
@@ -49,6 +62,12 @@ spec:
     app.kubernetes.io/name: yashigani-caddy
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
+    {{- if .Values.ollama.enabled }}
+    - name: mesh-ollama
+      port: 11435
+      targetPort: 11435
+      protocol: TCP
+    {{- end }}
     {{- range $frontID, $front := .Values.agentIngressFronts }}
     {{- if $front.enabled }}
     - name: mesh-{{ $front.systemName }}

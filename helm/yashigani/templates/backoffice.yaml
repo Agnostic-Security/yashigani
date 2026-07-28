@@ -457,11 +457,23 @@ spec:
                   key: caddy_internal_hmac
             {{- end }}
             # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar
-            # (backoffice MCP import screen). Same Ollama backend as the gateway
-            # (OLLAMA_BASE_URL). Backoffice is on the data network and reaches
-            # ollama:11434 directly. Default ON; set "false" to disable.
+            # (backoffice MCP import screen). Same Ollama backend as the gateway.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
+            # YSG-RISK-128 fix: backoffice never set OLLAMA_BASE_URL at all, so
+            # entrypoint.py/routes/models.py fell back to their own Python
+            # default "http://ollama:11434" — wrong on two counts on k8s: (1)
+            # bare "ollama" doesn't resolve (compose-only hostname convention,
+            # same class of gap as YSG-RISK-125), and (2) even
+            # "yashigani-ollama:11434" is NetworkPolicy-blocked for backoffice
+            # (allow-ollama-ingress only admits the caddy pod — v4.1 Phase
+            # 1b-ii / LAURA-I1-01). Reuses gateway.env.ollamaUrl (single
+            # source of truth — both services share the same Ollama backend
+            # and the same mesh-mTLS front, matching docker-compose.yml where
+            # both gateway and backoffice set OLLAMA_BASE_URL to the identical
+            # https://caddy:11435/ollama value).
+            - name: OLLAMA_BASE_URL
+              value: {{ (.Values.gateway.env | default dict).ollamaUrl | quote }}
             # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document
             # enforcement admin routes (routes/documents.py, dp_weaken.py,
             # user_ui.py) read is_document_enforcement_enabled() directly.
