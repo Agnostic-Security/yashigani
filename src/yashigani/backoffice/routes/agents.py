@@ -66,44 +66,6 @@ from yashigani.backoffice.state import backoffice_state
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# SSRF guard for Open WebUI outbound calls — centralised HttpClient
-# (YSG-RISK-007.A #3ax / yashigani-retro#95 OWASP A10 / API7)
-# ---------------------------------------------------------------------------
-# Replaces the hand-rolled _assert_safe_owui_url helper with the centralised
-# HttpClient. The OWUI URL is admin-configured (OWUI_API_URL env var) and is
-# typically an internal Docker-network address (http://open-webui:8080) so:
-#   - allow_http=True   — internal mesh; HTTPS not available by default.
-#   - allowlist driven by YASHIGANI_OWUI_HOSTNAMES (same env as before).
-#   - Scheme still restricted to http/https (not file/gopher/etc).
-#   - Hard-blocks: loopback, link-local, IMDS — inherited from HttpClient.
-#
-# The hand-rolled _assert_safe_owui_url is removed; all SSRF enforcement
-# is now centralised in HttpClient._check_policy().
-# ---------------------------------------------------------------------------
-
-_OWUI_HTTP_CLIENT = None  # lazy-initialised on first use
-
-
-def _owui_http_client():
-    """Return a singleton HttpClient scoped to the OWUI allowlist."""
-    global _OWUI_HTTP_CLIENT
-    if _OWUI_HTTP_CLIENT is None:
-        from yashigani.net import HttpClient
-
-        raw_allowlist = os.getenv(
-            "YASHIGANI_OWUI_HOSTNAMES",
-            "open-webui,127.0.0.1,localhost",
-        )
-        allowlist = [h.strip() for h in raw_allowlist.split(",") if h.strip()]
-        _OWUI_HTTP_CLIENT = HttpClient(
-            allowlist=allowlist,
-            allow_http=True,  # OWUI runs on plain HTTP inside the Docker mesh
-            timeout_s=10.0,
-        )
-    return _OWUI_HTTP_CLIENT
-
-
 router = APIRouter()
 
 
@@ -457,151 +419,6 @@ def _build_quick_start(agent_id: str, token: str) -> dict:
     }
 
 
-async def _push_openwebui_model(agent_name: str, upstream_url: str) -> None:
-    """
-    Register agent as a selectable model in Open WebUI via its REST API.
-    Non-fatal: logs on failure. Idempotent — skips if already exists.
-
-    DNS-rebinding defence (extend-pr-112-owui-wrap / OWASP API7 / issue #91):
-    OWUI hostnames are admin-configurable and can be attacker-influenced via
-    licence-key compromise or admin-account takeover (TA-3 insider). The prior
-    implementation ran a pre-flight _check_policy() and then made outbound
-    requests via urllib.request.urlopen() — leaving a DNS-rebinding window
-    between the policy check and the TCP connect. This version replaces
-    urllib.request entirely with pinned_resolver, which resolves the OWUI
-    hostname once, verifies the IP, and pins the transport for all requests
-    inside the context block. Subsequent DNS changes cannot redirect the
-    connection to an internal address.
-
-    SSRF guard chain:
-      1. _owui_http_client()._check_policy() — scheme + allowlist pre-flight
-         (kept for non-async callers that may inspect policy without connecting)
-      2. pinned_resolver(...) — resolves, verifies, pins IP; replaces urllib
-
-    Every successful pin emits SSRF_PINNED_RESOLVER_USED at DEBUG level
-    (emitted internally by pinned_resolver).
-    """
-    try:
-        import time as _time
-        import jwt as _pyjwt
-        from urllib.parse import urlparse as _urlparse
-
-        from yashigani.net import BlockedByPolicy
-        from yashigani.net.pinned_resolver import pinned_resolver
-
-        raw_owui_url = os.getenv("OWUI_API_URL", "http://open-webui:8080")
-
-        # Pre-flight: scheme + allowlist check (fast path before DNS lookup).
-        try:
-            _owui_http_client()._check_policy(raw_owui_url)
-        except BlockedByPolicy as _bp_exc:
-            raise RuntimeError(f"owui_url_blocked: {_bp_exc} (CWE-918, YSG-RISK-007.A)") from _bp_exc
-
-        owui_url = raw_owui_url
-        parsed_owui = _urlparse(owui_url)
-        owui_hostname = parsed_owui.hostname or ""
-        owui_port = parsed_owui.port or (443 if parsed_owui.scheme == "https" else 80)
-
-        # Build OWUI allowlist from env — same source as _owui_http_client().
-        raw_allowlist = os.getenv(
-            "YASHIGANI_OWUI_HOSTNAMES",
-            "open-webui,127.0.0.1,localhost",
-        )
-        owui_allowlist = [h.strip() for h in raw_allowlist.split(",") if h.strip()]
-
-        owui_secret = os.getenv("OWUI_SECRET_KEY")
-        if not owui_secret:
-            # Fail-closed: OWUI integration requires an explicit secret. The
-            # installer generates this; refusing to fall back to a literal
-            # default prevents compose-without-installer deployments from
-            # shipping a publicly-known JWT signing key. See Compliance P0-1
-            # (YCS-20260423-v2.23.1-OWASP-3X).
-            raise RuntimeError(
-                "OWUI_SECRET_KEY is not set — cannot authenticate to Open WebUI. "
-                "Run install.sh to generate, or export it manually in the backoffice env."
-            )
-
-        # Generate a JWT for Open WebUI API auth.
-        # Open WebUI itself uses PyJWT with WEBUI_SECRET_KEY — we use the same
-        # library here (already an explicit dep; see gateway/jwt_inspector.py)
-        # rather than hand-rolling HMAC/base64. Defence-in-depth: PyJWT has a
-        # security track record, validates header shape, and avoids any
-        # chance of alg-confusion from hand-rolled JSON encoding. Internal
-        # P2 observation (re-audit reference held in compliance archive).
-        payload_data = {
-            "id": "00000000-0000-0000-0000-000000000000",
-            "sub": "admin",
-            "role": "admin",
-            "exp": int(_time.time()) + 300,
-        }
-        owui_jwt = _pyjwt.encode(payload_data, owui_secret, algorithm="HS256")
-        # PyJWT ≥2 returns str; older returned bytes. Normalise.
-        if isinstance(owui_jwt, bytes):
-            owui_jwt = owui_jwt.decode()
-
-        model_id = "@" + agent_name
-        req_headers = {
-            "Authorization": f"Bearer {owui_jwt}",
-            "Content-Type": "application/json",
-        }
-
-        # All outbound OWUI requests go through the pinned-resolver transport.
-        # DNS is resolved and verified once at context entry; every HTTP call
-        # inside the block uses the cached IP — DNS changes mid-block are ignored.
-        # verify=use_tls: False for http:// (OWUI on plain HTTP inside Docker mesh);
-        # httpx will not attempt TLS for http:// URLs regardless of the flag value.
-        # True for https:// deployments — certificate validation is preserved.
-        use_tls = parsed_owui.scheme == "https"
-        async with pinned_resolver(
-            owui_hostname,
-            port=owui_port,
-            allowlist=owui_allowlist,
-            verify=use_tls,
-            timeout_s=10.0,
-        ) as session:
-            # Check if model already exists
-            check_resp = await session.get(
-                f"{owui_url}/api/v1/models/{model_id}",
-                headers=req_headers,
-            )
-            if check_resp.status_code == 200:
-                logger.info("Open WebUI: model %s already exists", model_id)
-                return
-            if check_resp.status_code != 404:
-                logger.warning(
-                    "Open WebUI: model check returned unexpected status %s",
-                    check_resp.status_code,
-                )
-
-            # Create model
-            create_body = {
-                "id": model_id,
-                "name": agent_name + " Agent",
-                "base_model_id": os.getenv("OLLAMA_MODEL", "qwen2.5:3b"),
-                "meta": {
-                    "description": f"Yashigani agent: {agent_name} @ {upstream_url}",
-                    "profile_image_url": "",
-                    "capabilities": {"usage": True},
-                },
-                "params": {},
-                "is_active": True,
-            }
-            create_resp = await session.post(
-                f"{owui_url}/api/v1/models/create",
-                headers=req_headers,
-                json=create_body,
-            )
-            if create_resp.status_code in (200, 201):
-                logger.info("Open WebUI: registered model %s via pinned-resolver", model_id)
-            else:
-                logger.warning(
-                    "Open WebUI: model create returned status %s",
-                    create_resp.status_code,
-                )
-    except Exception as exc:
-        logger.warning("_push_openwebui_model failed: %s", exc)
-
-
 def _push_opa() -> None:
     """
     Push the combined RBAC + agent data to OPA after a registry mutation.
@@ -732,9 +549,6 @@ async def register_agent(
             logger.error("Failed to write AgentRegisteredEvent: %s", exc)
 
     _push_opa()
-    # Pool-managed agents have no real upstream URL; skip OWUI model push.
-    if not effective_upstream_url.startswith("pool://"):
-        await _push_openwebui_model(body.name, effective_upstream_url)
 
     return AgentRegisterResponse(
         agent_id=agent_id,
