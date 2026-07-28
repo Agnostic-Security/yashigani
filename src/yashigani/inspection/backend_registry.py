@@ -7,7 +7,18 @@ fail-closed result (PROMPT_INJECTION_ONLY, confidence=1.0).
 
 Thread-safe: swap() uses a lock so live config changes are atomic.
 
-Last updated: 2026-05-03
+YSG-RISK-113 (circuit breaker): a backend that has just failed
+``_BREAKER_FAILURE_THRESHOLD`` times in a row is short-circuited — skipped
+without attempting another blocking network call — for
+``_BREAKER_COOLDOWN_SECONDS``. This bounds worst-case per-request latency
+during a sustained backend outage (every request would otherwise re-pay the
+full connect/read timeout for a backend already known to be down) and stops
+the thread pool that now runs these blocking calls (see
+gateway/proxy.py, gateway/openai_router.py, gateway/agent_router.py,
+gateway/mcp_router_runtime.py, gateway/orchestrator.py — all offload via
+asyncio.to_thread) from filling up with doomed attempts.
+
+Last updated: 2026-07-28
 """
 from __future__ import annotations
 
@@ -30,6 +41,12 @@ _FAIL_CLOSED_RESULT = ClassifierResult(
     backend="fail_closed",
     latency_ms=0,
 )
+
+# YSG-RISK-113 circuit-breaker tuning. Consecutive-failure count that opens
+# the circuit, and how long it stays open before a single half-open trial
+# attempt is allowed through.
+_BREAKER_FAILURE_THRESHOLD = 3
+_BREAKER_COOLDOWN_SECONDS = 30.0
 
 
 class BackendRegistry:
@@ -56,6 +73,11 @@ class BackendRegistry:
         self._all_backends = dict(all_backends)
         self._audit = audit_writer
         self._lock = threading.Lock()
+
+        # YSG-RISK-113 circuit breaker state, keyed by backend name.
+        self._breaker_lock = threading.Lock()
+        self._breaker_failures: dict[str, int] = {}
+        self._breaker_opened_at: dict[str, float] = {}
 
     # ── Classification ────────────────────────────────────────────────────────
 
@@ -150,6 +172,31 @@ class BackendRegistry:
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
+    def _circuit_is_open(self, name: str) -> bool:
+        """YSG-RISK-113: True if *name*'s circuit is open and still cooling down.
+
+        A cooled-down circuit (elapsed >= _BREAKER_COOLDOWN_SECONDS since it
+        opened) returns False here so exactly one half-open trial attempt is
+        let through; success closes the circuit, failure re-opens it.
+        """
+        with self._breaker_lock:
+            opened_at = self._breaker_opened_at.get(name)
+            if opened_at is None:
+                return False
+            return time.monotonic() - opened_at < _BREAKER_COOLDOWN_SECONDS
+
+    def _record_breaker_success(self, name: str) -> None:
+        with self._breaker_lock:
+            self._breaker_failures.pop(name, None)
+            self._breaker_opened_at.pop(name, None)
+
+    def _record_breaker_failure(self, name: str) -> None:
+        with self._breaker_lock:
+            failures = self._breaker_failures.get(name, 0) + 1
+            self._breaker_failures[name] = failures
+            if failures >= _BREAKER_FAILURE_THRESHOLD:
+                self._breaker_opened_at[name] = time.monotonic()
+
     def _try_backend(
         self,
         backend: ClassifierBackend,
@@ -160,13 +207,33 @@ class BackendRegistry:
     ) -> Optional[ClassifierResult]:
         """
         Attempt classification on a single backend.
-        Returns ClassifierResult on success, None on BackendUnavailableError.
+        Returns ClassifierResult on success, None on BackendUnavailableError
+        or when the backend's circuit is open (YSG-RISK-113).
         Appends backend name to backends_tried regardless of outcome.
         """
         backends_tried.append(backend.name)
+
+        # YSG-RISK-113: skip the blocking network call entirely for a backend
+        # that has just failed repeatedly — every request during an outage
+        # would otherwise re-pay the full connect/read timeout sequentially.
+        if self._circuit_is_open(backend.name):
+            logger.warning(
+                "BackendRegistry: backend %r circuit OPEN — skipping attempt "
+                "without a network call (request_id=%s)",
+                backend.name, request_id,
+            )
+            self._emit_unreachable_event(
+                backend.name,
+                BackendUnavailableError("circuit_open (breaker cooldown)"),
+                request_id,
+            )
+            self._emit_metric_failure(backend.name)
+            return None
+
         start = int(time.monotonic() * 1000)
         try:
             result = backend.classify(content)
+            self._record_breaker_success(backend.name)
             return result
         except BackendUnavailableError as exc:
             elapsed = int(time.monotonic() * 1000) - start
@@ -174,6 +241,7 @@ class BackendRegistry:
                 "BackendRegistry: backend %r unavailable (request_id=%s, elapsed=%dms): %s",
                 backend.name, request_id, elapsed, exc,
             )
+            self._record_breaker_failure(backend.name)
             self._emit_unreachable_event(backend.name, exc, request_id)
             self._emit_metric_failure(backend.name)
             return None

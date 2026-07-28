@@ -67,6 +67,7 @@ v3.1 / G-ORCH-OPA-1 egress hardening.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -765,7 +766,11 @@ async def _handle_mcp_call_inner(
 
         try:
             if response_inspection_pipeline is not None and upstream_response:
-                resp_insp = response_inspection_pipeline.inspect(  # type: ignore[union-attr]
+                # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+                # call — offload to a thread so a slow/dead backend cannot
+                # block this event loop's /healthz probe (DoS class).
+                resp_insp = await asyncio.to_thread(  # type: ignore[union-attr]
+                    response_inspection_pipeline.inspect,
                     response_body=upstream_response,
                     content_type="application/json",
                     request_id=request_id,

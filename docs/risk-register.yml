@@ -2783,3 +2783,99 @@ risks:
       /run/secrets/postgres_password, closing the parity gap and the log
       noise. Deferred to a follow-up dispatch, not required for THIS
       redeploy since backoffice's sync already covers the live risk.
+
+- id: YSG-RISK-113
+  description: >-
+    A single unhealthy/slow Ollama backend (no model loaded, or generation
+    stalled) blocks the gateway's ASGI event loop and takes down the
+    /healthz liveness/readiness probe on that SAME pod, causing kubelet to
+    kill an otherwise-healthy gateway replica — availability/DoS class.
+    Live-reproduced by Ava on the k8s stack (2026-07-28): a chat/model call
+    to an ollama replica with no model hung >90s; gateway log showed
+    "could not fetch ollama model list ... available_models=None" followed
+    by the chat completion hanging; kubelet restarted the gateway pod
+    mid-request (2nd restart observed live).
+    Root cause: the request-inspection pipeline (inspection/pipeline.py
+    InspectionPipeline.process(), called from gateway/proxy.py:896) and the
+    response-inspection pipeline (inspection/pipeline.py
+    ResponseInspectionPipeline.inspect(), called from
+    gateway/openai_router.py chat_completions + gate_relaxed_final,
+    gateway/agent_router.py route_agent_call, and
+    gateway/mcp_router_runtime.py _handle_mcp_call_inner) are plain
+    SYNCHRONOUS methods. They call inspection/backend_registry.py
+    BackendRegistry.classify(), which sequentially tries the active backend
+    plus every entry in the fallback chain (inspection/backends/ollama.py
+    OllamaBackend.classify() / inspection/classifier.py
+    PromptInjectionClassifier.classify()), each performing a genuinely
+    BLOCKING httpx.Client call (inspection/_ollama_transport.py
+    ollama_post_json/ollama_get_json, default 30s timeout per backend) via
+    ollama_sync_client(). These sync calls were invoked DIRECTLY inside
+    `async def` FastAPI request handlers with no thread offload
+    (asyncio.to_thread / run_in_executor), so each blocking call — and the
+    cumulative chain across request-side + response-side inspection plus a
+    multi-backend fallback chain — monopolizes the single-threaded asyncio
+    event loop for its full duration. `gateway/proxy.py`'s
+    `/healthz` (`async def healthz(): return {"status": "ok"}`) is
+    otherwise instant and carries no blocking work of its own, but cannot be
+    scheduled while the loop is held hostage by the classify() call, so
+    kubelet's liveness/readiness probe times out and kills the pod — even
+    though the pod's actual dependencies (DB, Redis, OPA) are healthy.
+    The same synchronous-classify pattern also existed in
+    gateway/orchestrator.py's `_classify_sensitivity()` / `_inspect_result()`
+    helpers (agent/MCP-tool-result egress-sensitivity + response-inspection
+    legs of the agent orchestrator), called from `_execute_mcp_tool`,
+    `_execute_api_call`, `_execute_tool_call`, `_run_letta_brain_loop`, and
+    `run_orchestration` — all `async def` — with the same blocking-call
+    exposure on the agent-upstream path explicitly in scope for this fix.
+  severity: high
+  controls_impacted:
+  - Availability — CWE-400 (Uncontrolled Resource Consumption) / CWE-833
+    (Deadlock-adjacent event-loop starvation) — a single slow/dead backend
+    can take down a gateway replica's health probe and trigger a kubelet
+    restart mid-request, independent of any actual infra failure.
+  - OWASP API4:2023 (Unrestricted Resource Consumption)
+  compensating_controls:
+  - K8s/Helm normally runs >1 gateway replica behind a Service, so a single
+    killed pod does not fully outage the deployment — but under sustained
+    Ollama unavailability every replica can be hit in turn, and each restart
+    drops in-flight requests on that pod.
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-28'
+  closure_evidence:
+  - rationale: >-
+      (1) Offloaded every blocking classify()/inspect() call to a worker
+      thread via asyncio.to_thread() at all call sites: gateway/proxy.py
+      (_handle_request → pipeline.process), gateway/openai_router.py
+      (chat_completions + gate_relaxed_final →
+      response_inspection_pipeline.inspect), gateway/agent_router.py
+      (route_agent_call → response_inspection_pipeline.inspect),
+      gateway/mcp_router_runtime.py (_handle_mcp_call_inner →
+      response_inspection_pipeline.inspect), and gateway/orchestrator.py
+      (_classify_sensitivity / _inspect_result converted to `async def`,
+      internally awaiting asyncio.to_thread; all 7 call sites across
+      _execute_mcp_tool, _execute_api_call, _execute_tool_call,
+      _run_letta_brain_loop, run_orchestration updated to `await`). This is
+      the primary fix — the event loop is never held by a backend call, so
+      /healthz stays responsive regardless of backend health.
+      (2) inspection/_ollama_transport.py: explicit httpx.Timeout with a
+      fast-failing 5s connect-phase ceiling (_build_timeout /
+      _CONNECT_TIMEOUT_CEILING), decoupled from the caller's read timeout,
+      so a completely unreachable backend fails in seconds instead of
+      waiting out the full read timeout meant for a slow-but-alive model.
+      (3) inspection/backend_registry.py: per-backend-name circuit breaker
+      (_BREAKER_FAILURE_THRESHOLD=3, _BREAKER_COOLDOWN_SECONDS=30) —
+      BackendRegistry._try_backend() skips the network call entirely for a
+      backend that just failed repeatedly, bounding worst-case per-request
+      latency during a sustained outage instead of re-paying the full
+      timeout on every request.
+      Verified locally (no k8s deploy): asyncio-based test proves /healthz
+      responds in <100ms while a concurrent classify() call is blocked on
+      an unresponsive upstream for multiple seconds on the SAME event loop;
+      circuit-breaker test proves a backend open-circuited after 3
+      failures is skipped without a network call. ruff clean; full gateway
+      + orchestrator + inspection unit/regression subset green (792 passed,
+      4 pre-existing unrelated failures confirmed present before this fix
+      via git stash, 3 skipped).

@@ -53,6 +53,7 @@ Streaming limitations
 # Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -3676,7 +3677,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             resp_session_id = identity.get("identity_id", request_id) if identity else request_id
             resp_agent_id = identity.get("slug", "openai-router") if identity else "openai-router"
 
-            resp_result = _state.response_inspection_pipeline.inspect(
+            # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+            # call (Ollama et al.). Run off the event loop so a slow/dead
+            # backend cannot starve /healthz and every other coroutine on
+            # this worker (DoS class — see risk register).
+            resp_result = await asyncio.to_thread(
+                _state.response_inspection_pipeline.inspect,
                 response_body=assistant_content,
                 content_type="text/plain",
                 request_id=request_id,
@@ -5427,7 +5433,10 @@ async def gate_relaxed_final(
         try:
             rid = identity.get("identity_id", request_id) if identity else request_id
             aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
-            resp_result = _state.response_inspection_pipeline.inspect(
+            # YSG-RISK-113: offload the blocking classifier call — see the
+            # chat_completions call site above for the full rationale.
+            resp_result = await asyncio.to_thread(
+                _state.response_inspection_pipeline.inspect,
                 response_body=final_text, content_type="text/plain",
                 request_id=request_id, session_id=rid, agent_id=aid,
             )

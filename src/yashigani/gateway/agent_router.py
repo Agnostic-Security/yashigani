@@ -22,6 +22,7 @@ OPA enforcement (ASVS V4.2 — local policy only, fail-closed):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -472,7 +473,11 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
         try:
             resp_ct = upstream_resp.headers.get("content-type", "application/octet-stream")
             resp_body_text = upstream_resp.text
-            resp_insp = response_inspection_pipeline.inspect(
+            # YSG-RISK-113: .inspect() performs a SYNCHRONOUS blocking
+            # classifier call. Offload to a thread so a slow/dead backend
+            # cannot block this event loop's /healthz probe (DoS class).
+            resp_insp = await asyncio.to_thread(
+                response_inspection_pipeline.inspect,
                 response_body=resp_body_text,
                 content_type=resp_ct,
                 request_id=getattr(request.state, "request_id", caller_agent_id),
