@@ -3198,3 +3198,93 @@ risks:
       not networking) is OUT OF SCOPE for this entry — flagged to Tom.
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
+
+- id: YSG-RISK-129
+  description: >-
+    gateway/openai_router.py chat_completions() crashed with
+    `UnboundLocalError: cannot access local variable 'assistant_content'`
+    (also affects `backend_body`) instead of returning a clean error when a
+    backend LLM/agent call failed in a specific way. Found by Captain during
+    k8s chat verification alongside the YSG-RISK-113 fix (same request path:
+    a dead/slow backend must fail cleanly, never crash the handler).
+    Root cause: `assistant_content`/`backend_body` are ONLY assigned inside
+    individual success-path branches of the big backend-dispatch try block
+    (letta/langflow/openai-compat agent calls, cloud openai/anthropic,
+    local ollama) starting at what was line 3194. Every branch that fails
+    either raises HTTPException (which propagates straight out of the
+    function via the try's own except clauses, never reaching the later
+    unconditional reference) or returns a JSONResponse directly — so the
+    crash is NOT on those paths. The actual gap: at what was line 2063,
+    the entire agent-resolution block (which also owns the
+    `if not agent_upstream: return 404` guard) is gated on
+    `if is_agent_call and _state.agent_registry:`. When `is_agent_call` is
+    True but `_state.agent_registry` itself is falsy (the agent-registry
+    dependency, e.g. Redis-backed registry, unavailable/not yet
+    initialized), that ENTIRE block — including its own 404 guard — is
+    skipped, leaving `agent_upstream = None`. Execution then reaches
+    `if is_agent_call and agent_upstream:` (False, agent_upstream is None)
+    and `if not is_agent_call:` (False, is_agent_call is True) — NEITHER
+    branch runs, no exception is raised, no response is returned, and
+    `assistant_content`/`backend_body` are silently unbound. The function
+    falls through to the response-inspection section which references
+    `assistant_content` unconditionally at what was line 3742
+    (`if response_verdict == "clean" and assistant_content:`) →
+    UnboundLocalError → unhandled 500 instead of a clean error to the
+    caller. This pairs directly with YSG-RISK-113: a backend-availability
+    failure (agent registry down) must degrade to a clean 502/503, not
+    crash the gateway process path.
+  severity: medium
+  controls_impacted:
+  - Availability / error-handling — CWE-457 (Use of Uninitialized Variable)
+    surfacing as an unhandled 500 instead of a well-formed error response on
+    a backend-dependency failure; adjacent to CWE-703 (Improper Check or
+    Handling of Exceptional Conditions).
+  - OWASP API8:2023 (Security Misconfiguration) — a dependency-unavailable
+    condition should degrade gracefully, not crash the request handler.
+  compensating_controls:
+  - The specific trigger (is_agent_call=True with agent_registry falsy) is
+    an edge condition during registry-backend outage/startup race, not a
+    routinely-hit path — but it IS exactly the class of "backend call
+    fails" condition this brief targets, and any future similar branch gap
+    in the same dispatch block would hit the identical crash without the
+    fail-closed backstop added in the fix.
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-28'
+  closure_evidence:
+  - rationale: >-
+      Two-part fix in gateway/openai_router.py, both defensive (fail-closed,
+      no behaviour change on the success path):
+      (1) Root-cause guard: added an explicit
+      `if is_agent_call and not _state.agent_registry:` branch immediately
+      before the existing `if is_agent_call and _state.agent_registry:`
+      resolution block, returning a well-formed 503 JSONResponse
+      (`agent_registry_unavailable`) instead of silently falling through
+      with `agent_upstream` left as None.
+      (2) Defense-in-depth backstop: `assistant_content: str | None = None`
+      and `backend_body: dict | None = None` are now explicitly initialized
+      immediately before the backend-dispatch try block, and a guard
+      immediately after the try/except block
+      (`if assistant_content is None or backend_body is None: raise
+      HTTPException(502, "Backend communication error")`) converts ANY
+      future branch-completeness gap in that dispatch block into a clean
+      502 instead of an UnboundLocalError, composing with the YSG-RISK-113
+      timeout/circuit-breaker fix so a dead/slow backend always fails
+      clean — gateway process stays healthy, no crash, no event-loop block.
+      Verified locally (no deploy): new regression test
+      src/tests/regression/v4.1.2/test_ysg_risk_129_unbound_assistant_content.py
+      (a) simulates `is_agent_call=True` with `_state.agent_registry` set
+      to None and asserts a clean 503 JSONResponse (no UnboundLocalError,
+      no 500), (b) simulates a local-ollama backend call raising
+      `httpx.ConnectError`/timeout and asserts a clean 503/502 (not a
+      crash), confirming the YSG-RISK-113 failure path composes correctly
+      with this fix. ruff clean-diff (118 errors before/after, identical
+      rule-code histogram, only line-number shifts from the added code —
+      verified via git-stash before/after comparison). mypy clean-diff (3
+      pre-existing errors before/after at shifted line numbers only, zero
+      new errors — same git-stash method). Full openai_router-adjacent
+      pytest subset green.
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
