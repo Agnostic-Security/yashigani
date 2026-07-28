@@ -495,10 +495,31 @@ _bc_structural_ok if {
 }
 
 # v4.1 Phase 2b deny reasons (LU-MCP-A1..A4). Ladder — exactly one fires.
+#
+# FIX LAURA-V50-011 (mislabelled non-SPIFFE denials): the original first rung
+# fired "spiffe_not_verified" for ANY denial where `not _identity_verified`
+# held. That is WRONG for the entire YSG-RISK-137 non-SPIFFE/RBAC branch:
+# `not _identity_verified` is the EXPECTED, LEGITIMATE state for a real
+# human/API-key caller correctly authorized via `_non_spiffe_caller_authorized`
+# (RBAC), not a SPIFFE cert. Denials for that branch — failing
+# _instance_identified / _baseline_present / _grant_ok / _envelope_unchanged /
+# _exposed_tools_narrowing_ok downstream — were all misreported as
+# "spiffe_not_verified", pointing an analyst at cert/mTLS troubleshooting
+# instead of the real fault.
+#
+# Split into two mutually-exclusive states:
+#   - genuinely unverified: neither SPIFFE-verified NOR RBAC-authorized
+#     -> "spiffe_not_verified" (no recognised credential of any kind)
+#   - RBAC-authorized (_non_spiffe_caller_authorized) but blocked further down
+#     the four-gate chain -> a parallel "rbac_*" reason, mirroring the
+#     SPIFFE-branch rungs exactly (gated on posture mcp-b, the only posture
+#     the non-SPIFFE/RBAC branch supports), so the reported reason matches
+#     the actual failing gate.
 deny_reason := "spiffe_not_verified" if {
     not allow
     _bc_structural_ok
     not _identity_verified
+    not _non_spiffe_caller_authorized
 }
 
 deny_reason := "tool_subject_required" if {
@@ -509,10 +530,31 @@ deny_reason := "tool_subject_required" if {
     not _tool_present
 }
 
+deny_reason := "rbac_tool_subject_required" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
+    input.action == "mcp.tools.call"
+    not _tool_present
+}
+
 deny_reason := "instance_unidentified" if {
     not allow
     _bc_structural_ok
     _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    not _instance_identified
+}
+
+deny_reason := "rbac_instance_unidentified" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
     input.action == "mcp.tools.call"
     _tool_present
     not _instance_identified
@@ -528,10 +570,35 @@ deny_reason := "capability_envelope_not_active" if {
     not _baseline_present
 }
 
+deny_reason := "rbac_capability_envelope_not_active" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    not _baseline_present
+}
+
 deny_reason := "no_per_instance_grant" if {
     not allow
     _bc_structural_ok
     _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    not _grant_ok
+}
+
+deny_reason := "rbac_no_per_instance_grant" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
     input.action == "mcp.tools.call"
     _tool_present
     _instance_identified
@@ -551,12 +618,41 @@ deny_reason := "capability_envelope_drift" if {
     not _envelope_unchanged
 }
 
+deny_reason := "rbac_capability_envelope_drift" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    _grant_ok
+    not _envelope_unchanged
+}
+
 # mcp.tools.call: all four gates passed but the operator narrowing allowlist
 # excludes the tool.
 deny_reason := "tool_not_in_exposed_allowlist" if {
     not allow
     _bc_structural_ok
     _identity_verified
+    input.action == "mcp.tools.call"
+    _tool_present
+    _instance_identified
+    _baseline_present
+    _grant_ok
+    _envelope_unchanged
+    not _exposed_tools_narrowing_ok
+}
+
+deny_reason := "rbac_tool_not_in_exposed_allowlist" if {
+    not allow
+    _bc_structural_ok
+    input.posture == "mcp-b"
+    not _identity_verified
+    _non_spiffe_caller_authorized
     input.action == "mcp.tools.call"
     _tool_present
     _instance_identified

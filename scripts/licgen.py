@@ -27,8 +27,16 @@ This script is a thin orchestration layer over:
                               so passphrase env vars are read exactly once)
   - yashigani.licensing.chain.registry (durable key/anchor records)
   - yashigani.licensing.chain.kill_list (revocation entries)
-  - scripts/sign_license.py (v5 licence signing — Tom's SEAM, §9: "Tom:
-                              sign_license.py -> v5 ... wire into licgen issue")
+  - yashigani.licensing.chain.licence_v5 (v5 licence payload build + sign —
+                              `issue` calls build_licence_payload_v5() /
+                              sign_licence_v5() directly. FIX LAURA-V50-015:
+                              scripts/sign_license.py, which `issue` used to
+                              import, does not exist in this tree — `licgen
+                              issue` was a dead ModuleNotFoundError. These
+                              are the exact chain primitives proven this
+                              session to mint valid v5 .ysg licences.)
+  - yashigani.licensing.chain.signer (PemSigner — decrypts + wraps the
+                              licence leaf's local private key for signing)
   - scripts/inject_hashes.sh (build-embed — sign-build shells out to it)
 
 Requires: cryptography>=42, yashigani.licensing.chain importable.
@@ -322,7 +330,15 @@ def _cmd_sign_build(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_issue(args: argparse.Namespace) -> None:
+    import base64
+
+    import keygen  # scripts/keygen.py
+
+    from yashigani.licensing.chain.leaf_cert import LeafCert, Role
+    from yashigani.licensing.chain.licence_v5 import build_licence_payload_v5, sign_licence_v5
     from yashigani.licensing.chain.registry import KeyRegistry
+    from yashigani.licensing.chain.signer import PemSigner
+    from yashigani.licensing.model import TIER_DEFAULTS
 
     keys_dir, registry_path = _resolve_channel_dirs(args)
     registry = KeyRegistry(registry_path)
@@ -348,52 +364,62 @@ def _cmd_issue(args: argparse.Namespace) -> None:
             print(f"ERROR: expected licence-leaf artefact not found: {p}", file=sys.stderr)
             sys.exit(1)
 
-    # SEAM: Tom's scripts/sign_license.py — imported directly (§9: "Tom:
-    # sign_license.py -> v5 (leaf-sign + carry leaf_cert); wire into licgen
-    # issue"). build_payload_v5()/sign_licence_file() are the exact
-    # functions confirmed present in that file.
-    import sign_license  # scripts/sign_license.py
+    # FIX LAURA-V50-015: scripts/sign_license.py does not exist anywhere in
+    # this branch (nor the canonical v4.1.2 line) — `issue` imported it and
+    # crashed with ModuleNotFoundError on every invocation. Wired directly to
+    # the chain primitives it would have wrapped: build_licence_payload_v5() +
+    # sign_licence_v5() + PemSigner. Same primitives proven this session to
+    # mint valid, round-trippable v5 .ysg licences (Laura's Priority 2 forgery
+    # testing bypassed the broken CLI to call these directly).
+    leaf_cert_dict = json.loads(cert_path.read_text(encoding="utf-8"))
+    leaf_cert = LeafCert.from_canonical_dict(leaf_cert_dict)
+    leaf_cert_sig = base64.b64decode(sig_path.read_text(encoding="utf-8").strip())
 
-    expires_at = args.expires_at
-    if not expires_at:
+    # Decrypt with the SAME leaf passphrase (YASHIGANI_KEY_PASSPHRASE[_FILE])
+    # `licgen new-leaf` used to encrypt this key (keygen._write_private_key_
+    # encrypted / keygen._resolve_leaf_passphrase — single source of truth,
+    # no duplicated env-var resolution here).
+    leaf_passphrase = keygen._resolve_leaf_passphrase()
+    licence_private_key = keygen._load_private_key_encrypted(licence_key_path, leaf_passphrase)
+
+    if args.expires_at:
+        expires_at_dt = datetime.fromisoformat(args.expires_at.replace("Z", "+00:00"))
+    else:
         days = args.expires_days if args.expires_days is not None else 365
-        expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        expires_at_dt = datetime.now(timezone.utc) + timedelta(days=days)
 
     licence_serial = args.licence_serial or f"lic-{args.client_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
-    payload = sign_license.build_payload_v5(
-        tier=args.tier,
+    # Unspecified seat/limit flags fall back to the tier's published defaults
+    # (TIER_DEFAULTS — the SAME table verifier.py uses for backwards-compat)
+    # instead of a silent 0/None landing in the wire payload.
+    tier_defaults = TIER_DEFAULTS.get(args.tier, TIER_DEFAULTS["community"])
+    max_agents = args.max_agents if args.max_agents is not None else tier_defaults["max_agents"]
+    max_end_users = args.max_end_users if args.max_end_users is not None else tier_defaults["max_end_users"]
+    max_admin_seats = args.max_admin_seats if args.max_admin_seats is not None else tier_defaults["max_admin_seats"]
+    max_orgs = args.max_orgs if args.max_orgs is not None else tier_defaults["max_orgs"]
+
+    payload = build_licence_payload_v5(
         org_domain=args.domain,
+        tier=args.tier,
         client_id=args.client_id,
         licence_serial=licence_serial,
-        expires_at=expires_at,
-        max_agents=args.max_agents,
-        max_end_users=args.max_end_users,
-        max_admin_seats=args.max_admin_seats,
-        max_orgs=args.max_orgs,
+        max_agents=max_agents,
+        max_end_users=max_end_users,
+        max_admin_seats=max_admin_seats,
+        max_orgs=max_orgs,
         features=args.features,
+        expires_at=expires_at_dt,
     )
 
-    # Resolve via sign_license's OWN canonical resolver (single source of
-    # truth for the YASHIGANI_KEY_PASSPHRASE / YASHIGANI_LICENCE_KEY_PASSPHRASE
-    # precedence — see its docstring) rather than duplicating the env lookup
-    # here, which is exactly how the two call sites drifted onto different
-    # var names in the first place (2026-07-15 fix).
-    passphrase_bytes = sign_license._resolve_passphrase()
-
-    wire = sign_license.sign_licence_file(
-        payload=payload,
-        licence_key_pem_path=str(licence_key_path),
-        leaf_cert_json_path=str(cert_path),
-        leaf_cert_sig_b64=sig_path.read_text(encoding="utf-8").strip(),
-        licence_key_passphrase=passphrase_bytes,
-    )
+    signer = PemSigner(role=Role.LICENCE, private_key=licence_private_key, leaf_cert=leaf_cert)
+    wire = sign_licence_v5(payload, signer, leaf_cert, leaf_cert_sig)
 
     out_path = Path(args.out) if args.out else Path(f"{args.client_id}-{licence_serial}.ysg")
     out_path.write_text(wire, encoding="utf-8")
     print(f"Issued v5 licence: {out_path}")
     print(f"  tier={args.tier} org_domain={args.domain} client_id={args.client_id} "
-          f"licence_serial={licence_serial} expires_at={expires_at}")
+          f"licence_serial={licence_serial} expires_at={expires_at_dt.isoformat()}")
 
 
 # ---------------------------------------------------------------------------
