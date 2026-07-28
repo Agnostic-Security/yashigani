@@ -38,8 +38,6 @@ import types as _types
 from dataclasses import dataclass
 from typing import Any, Optional, TYPE_CHECKING
 
-import httpx
-
 from yashigani.mcp._types import (
     BrokerDecision,
     EgressDecision,
@@ -57,6 +55,7 @@ from yashigani.mcp._opa import (
     query_git_tool_allowed,
     OpaResponseDecisionResult,
     _normalize_tool_args,
+    _make_opa_http_client,
 )
 from yashigani.mcp._content_filter import (
     FilterResult,
@@ -1781,10 +1780,18 @@ class McpBroker:
 
         Returns True if OPA is healthy, False otherwise.
         Used by the gateway healthcheck endpoint (ASVS V11.1.1 / C9).
+
+        Uses the SAME mesh-mTLS client every other broker→OPA call site uses
+        (``_make_opa_http_client`` — query_mcp_decision, query_filesystem_
+        tool_allowed, query_git_tool_allowed, query_mcp_response_decision).
+        A bare, identity-less ``httpx.AsyncClient()`` is refused at the TLS
+        handshake by a mesh-mTLS OPA (require_and_verify), which made
+        ``/mcp/health`` report ``opa_unreachable`` even when OPA was healthy
+        and every other broker→OPA call was succeeding.
         """
         url = f"{self._opa_url.rstrip('/')}/health"
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with _make_opa_http_client(timeout=2.0) as client:
                 resp = await client.get(url)
                 return resp.status_code == 200
         except Exception as exc:
