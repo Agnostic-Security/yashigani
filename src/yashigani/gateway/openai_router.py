@@ -528,6 +528,22 @@ def _moderate_content(text: str, leg: str, identity_id: str, request_id: str):
     return None
 
 
+# LAURA-V50-013: a direct, first-person "use <tool> with <args>" imperative —
+# the user asking their OWN assistant to invoke a named tool — is the NORMAL,
+# EXPECTED shape of an orchestration_seed message (it is literally what the
+# orchestrator's own system prompt in orchestrator.py tells the brain to act
+# on: "When the user asks you to use a tool ... call the matching tool").
+# Anchored at the start of the message (^) so it only matches when the ENTIRE
+# seed opens with this imperative — a payload that PREPENDS override language
+# before an embedded "use X with Y" clause never matches here, and is still
+# caught by the deterministic suspicion-gate markers below regardless.
+_DIRECT_TOOL_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:use|call|invoke|run)\s+(?:the\s+)?(?:mcp\s+)?[\w.-]+"
+    r"\s+(?:with|to|and)\b",
+    re.IGNORECASE,
+)
+
+
 async def _run_request_leg_inspection(
     prompt_text: str, identity: dict | None, identity_id: str, request_id: str,
     leg: str = "request",
@@ -709,6 +725,8 @@ async def _run_request_leg_inspection(
     # and never reaches the LLM.
     _llm_suspicion = 0.0
     _run_llm = False
+    _susp = None  # LAURA-V50-013: must survive to the LLM-verdict override below
+    # even if the gate itself raised before assigning it (except-branch escalate).
     if prompt_text and _state.request_inspection_pipeline is not None:
         try:
             from yashigani.inspection.suspicion_gate import SuspicionGate as _SG
@@ -790,7 +808,62 @@ async def _run_request_leg_inspection(
                 headers={"X-Yashigani-Request-Id": request_id},
             )
 
-        if _insp.action != "PASS":
+        # LAURA-V50-013 (Med, over-block fix): the orchestration_seed leg's
+        # documented purpose is a user talking DIRECTLY to their own assistant,
+        # asking it to invoke a named tool ("Use mcp echo with text: ...") — that
+        # is normal, expected traffic on this leg, not injection. The LLM
+        # classifier's generic PROMPT_INJECTION_ONLY definition ("manipulate the
+        # AI's behavior") over-generalises that imperative phrasing as hijack
+        # intent even when every deterministic layer above found nothing.
+        #
+        # This override fires ONLY when ALL of the following hold — it narrows
+        # exactly the false-positive class Laura proved, and nothing else:
+        #   - leg == "orchestration_seed" (never the direct /v1 chat leg)
+        #   - the LLM verdict is PROMPT_INJECTION_ONLY specifically — a
+        #     CREDENTIAL_EXFIL verdict is NEVER overridden, at any confidence
+        #   - the suspicion gate's ONLY reason to escalate was
+        #     "sklearn_uncertain" — i.e. the mechanical filter, promoted
+        #     ruleset, conversation accumulator, AND the gate's own
+        #     instruction/role-shift/exfil marker + forged-structure +
+        #     obfuscation checks over the FULL seed text (envelope AND any
+        #     tool-argument content) already found ZERO injection-shaped
+        #     signal. This is exactly the LAURA-V50-001 threat model's
+        #     detection surface, and it is untouched: any seed carrying real
+        #     override/role-shift/exfil/forged-turn language still escalates
+        #     with reasons beyond sklearn_uncertain and is still blocked below.
+        #   - the seed text matches the narrow direct-tool-invocation envelope
+        #     shape (`_DIRECT_TOOL_REQUEST_RE`)
+        #
+        # What actually authorizes the named tool + its arguments remains the
+        # downstream MCP broker's own RBAC/OPA/tool-catalog gates — this
+        # override only stops the request-leg content classifier from
+        # rejecting the ENVELOPE syntax itself (Lu cross-check, finding
+        # recommendation). It does not weaken response-leg (indirect
+        # injection via tool output) inspection, which is a fully separate
+        # pipeline (ResponseInspectionPipeline) untouched by this change.
+        _seed_override = (
+            leg == "orchestration_seed"
+            and _insp.action != "PASS"
+            and _insp.classification == "PROMPT_INJECTION_ONLY"
+            and _susp is not None
+            and list(_susp.reasons) == ["sklearn_uncertain"]
+            and bool(prompt_text) and _DIRECT_TOOL_REQUEST_RE.match(prompt_text) is not None
+        )
+        if _seed_override:
+            logger.info(
+                "SUSPICION GATE OVERRIDE leg=%s (LAURA-V50-013): identity=%s LLM "
+                "flagged classification=%s confidence=%.2f on a direct "
+                "tool-invocation seed with no deterministic injection markers — "
+                "passing through to downstream MCP broker gates. request_id=%s",
+                leg, _req_identity, _insp.classification, _insp.confidence, request_id,
+            )
+            try:
+                from yashigani.metrics.registry import suspicion_gate_decisions_total
+                suspicion_gate_decisions_total.labels(
+                    decision="overridden_benign_tool_request").inc()
+            except Exception:
+                pass
+        elif _insp.action != "PASS":
             logger.warning(
                 "REQUEST INJECTION BLOCKED leg=%s (LLM): identity=%s action=%s "
                 "classification=%s confidence=%.2f request_id=%s",
