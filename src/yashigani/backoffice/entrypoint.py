@@ -625,6 +625,17 @@ def _bootstrap():
     from yashigani.licensing import load_license, set_license
     license_state = load_license()
     set_license(license_state)
+    import os as _os_lic
+    if _os_lic.environ.get("YASHIGANI_ENV") == "dev":
+        from yashigani.licensing.enforcer import get_license as _get_lic
+        from yashigani.licensing.model import LicenseTier as _LicTier, COMMUNITY_LICENSE as _COMM_LIC
+        _lic = _get_lic()
+        if _lic.tier != _LicTier.COMMUNITY:
+            logger.critical(
+                "YASHIGANI_ENV=dev set with a non-Community licence — "
+                "forcing COMMUNITY (LAURA-P7-FIX)"
+            )
+            set_license(_COMM_LIC)
     logger.info(
         "License: tier=%s agents=%s/%s expires=%s",
         license_state.tier.value,
@@ -685,7 +696,12 @@ def _bootstrap():
     # v2.1 — Identity broker (OIDC/SAML SSO)
     try:
         from yashigani.auth.broker import IdentityBroker, IdPConfig
-        tier_name = license_state.tier.value if license_state else "community"
+        # LAURA-V2-007: read the tamper-AGGREGATED tier via enforcer.get_license()
+        # (set_license() already ran above), NOT the raw loaded license_state — a
+        # forged/tampered build must build the broker at COMMUNITY, mirroring
+        # gateway/entrypoint.py's verified pattern.
+        from yashigani.licensing.enforcer import get_license as _get_license_for_broker
+        tier_name = _get_license_for_broker().tier.value
         identity_broker = IdentityBroker(tier=tier_name)
 
         # Read IdP configurations from environment.

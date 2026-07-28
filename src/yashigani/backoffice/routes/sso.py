@@ -16,7 +16,9 @@ Security invariants:
     IdentityRegistry, then a session is issued via SessionStore.
   - Email is never stored in audit logs — HMAC-SHA256 hash only.
   - All state/nonce keys use a dedicated Redis namespace (sso:state:).
-  - require_feature("oidc") is called before any OIDC-specific work (tier gate).
+  - _licence_hard_gate("oidc") is called before any OIDC-specific work (tier
+    gate; LAURA-V2-001 follow-up, 2026-07-16 — reads the signed integrity
+    authority directly, no longer delegates to enforcer.require_feature()).
 
 V6.8.4 — acr/amr allowlist validation (ASVS V6.3.3):
   - OIDC: required_acr_values (allowlist) and required_amr_values (subset check)
@@ -38,6 +40,7 @@ import os
 import re
 import secrets
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -46,15 +49,258 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from yashigani.backoffice.state import backoffice_state
 from yashigani.auth.session import _mask_ip
 from yashigani.backoffice.schemas.bopla import IdPPublic
+from yashigani.licensing import _integrity as _mesh_integrity
 from yashigani.licensing.enforcer import (
-    require_feature,
     LicenseFeatureGated,
+    LicenseTier,
     license_feature_gated_response,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See licensing/verifier.py's
+# module-level comment block above _check_mesh_full() for the full
+# rationale. This is routes/sso.py's OWN independently-authored copy —
+# deliberately a DIFFERENT code shape (gather every peer's live hash via
+# dict-comprehension, then decide via a generator/any() pass) from
+# verifier.py's for-loop, enforcer.py's list-comprehension,
+# gate_middleware.py's class, sso/oidc.py's while-loop, and sso/saml.py's
+# functional map()/all(), so a single AST/regex strip-script cannot
+# pattern-match and remove all six at once.
+# ---------------------------------------------------------------------------
+
+_MESH_ROLE = "SSO_ROUTES"
+_mesh_integrity_violated = False
+
+
+def _mesh_targets() -> dict:
+    routes_dir = Path(__file__).parent
+    pkg_dir = routes_dir.parent.parent
+    licensing_dir = pkg_dir / "licensing"
+    return {
+        "VERIFIER": ("VERIFIER_HASH", licensing_dir / "verifier.py"),
+        "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
+        "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
+        "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+        "SAML": ("SAML_MODULE_HASH", pkg_dir / "sso" / "saml.py"),
+        "SSO_ROUTES": ("SSO_ROUTES_HASH", routes_dir / "sso.py"),
+        "SCIM_ROUTES": ("SCIM_ROUTES_HASH", routes_dir / "scim.py"),
+    }
+
+
+def _check_mesh_full() -> None:
+    """Style: dict-comprehension gathers {role: live_hash_or_None} for
+    EVERY peer (6, not 2) in one expression, then a generator/any() pass
+    decides the verdict."""
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    targets = _mesh_targets()
+
+    if _mesh_integrity.is_any_hash_placeholder() or _mesh_integrity.is_mesh_topology_placeholder():
+        if not is_dev:
+            _mesh_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/sso.py) "
+                "— hash or topology constants still placeholders in a "
+                "non-dev environment; hard-refusing"
+            )
+        return
+
+    try:
+        member_order = json.loads(_mesh_integrity.MESH_TOPOLOGY_JSON)["member_order"]
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(targets):
+            raise ValueError("member_order is not a permutation of the 7 mesh roles")
+        if member_order.count(_MESH_ROLE) != 1:
+            raise ValueError("member_order missing this file's role")
+        peer_roles = [role for role in member_order if role != _MESH_ROLE]
+    except Exception as exc:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/sso.py) — "
+            "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s", exc,
+        )
+        return
+
+    def _try_hash(p: Path):
+        try:
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+        except Exception:
+            return None
+
+    live_by_role = {role: _try_hash(targets[role][1]) for role in peer_roles}
+
+    if any(
+        live is None or live != getattr(_mesh_integrity, targets[role][0], "")
+        for role, live in live_by_role.items()
+    ):
+        _mesh_integrity_violated = True
+        for role, live in live_by_role.items():
+            const_name, _path = targets[role]
+            expected = getattr(_mesh_integrity, const_name, "")
+            if live is None or live != expected:
+                logger.critical(
+                    "LICENSE INTEGRITY VIOLATION: mesh full-check "
+                    "(routes/sso.py) — mesh peer role=%s (%s) %s "
+                    "(expected=%s, actual=%s) — independent detection "
+                    "(LAURA-V2-003 Phase D hardening)",
+                    role, const_name,
+                    "could not be read" if live is None else "live hash mismatch",
+                    (expected or "")[:16], (live or "<unreadable>")[:16],
+                )
+
+
+def get_mesh_integrity_status() -> bool:
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
+    return _mesh_integrity_violated
+
+
+def _emit_mesh_tamper_event(check_type: str, expected_hash: str, actual_hash: str) -> None:
+    """Emit a tamper-evidence audit event at gate-invocation time — own
+    inline copy, see gate_middleware.py's twin function for the full
+    rationale (LAURA-V2-003: no shared chokepoint)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        writer.write(LicenceIntegrityViolationEvent(
+            module="backoffice.routes.sso",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        ))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — this file's OWN copy of the
+# _integrity.py root-of-trust pin. See licensing/verifier.py's module-level
+# comment block above _check_integrity_root_pin() for the full rationale
+# (self-reference solved by hardcoding the expected hash HERE, injected at
+# build time before this file's own SSO_ROUTES_HASH is computed — no
+# circularity) and the named residual (covers only the 5 root-of-trust
+# fields; the rest of _integrity.py stays covered by BUNDLE_SIG/
+# INTEGRITY_HASH). Style: dict-driven verdict lookup, mirroring this file's
+# existing dict-comprehension flavour above. Note the `_mesh_integrity`
+# import alias (this file imports _integrity as _mesh_integrity already).
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_mesh_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_mesh_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_mesh_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_mesh_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_mesh_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    is_placeholder = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH
+
+    reasons = {
+        "placeholder": is_placeholder and not is_dev,
+        "mismatch": (not is_placeholder) and _live_integrity_root_hash() != _EXPECTED_INTEGRITY_ROOT_HASH,
+    }
+    if any(reasons.values()):
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (routes/sso.py) "
+            "— reason=%s (LAURA-V2-005)",
+            [k for k, v in reasons.items() if v],
+        )
+
+
+_check_mesh_full()
+_check_integrity_root_pin()
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate, route layer (LAURA-V2-001 follow-up,
+    2026-07-16; Phase D full-mesh hardening, 2026-07-17).
+
+    Deliberately does NOT call enforcer.require_feature() — see
+    sso/oidc.py's `_licence_hard_gate()` docstring for the full rationale.
+    This is a SEPARATE local copy (not a shared import with oidc.py/saml.py/
+    routes/scim.py) so patching any ONE of those guards, or
+    enforcer.require_feature() itself, does not affect this one.
+
+    Phase D (2026-07-17, LAURA-V2-003 RE-VERIFY): the integrity decision
+    below comes SOLELY from `_mesh_integrity_violated` — this file's OWN
+    inline full-mesh check (_check_mesh_full() above). The Phase C fallback
+    (calling verifier.get_integrity_status()/enforcer.get_enforcer_
+    integrity_status()) has been REMOVED, not merely supplemented — this
+    file (routes/sso.py) was ITSELF one of the 4 files in Laura's re-verify
+    4-file SAML bypass; its own Phase C ring-check didn't happen to cover
+    the touched files for that release's permutation, and the removed
+    fallback was exactly the neutered {verifier.py, enforcer.py} pair.
+    Hard-refuses (raises) on any integrity violation or missing feature;
+    never silently passes on error (IMPL-03).
+
+    One of THREE independent layers for OIDC/SAML (this route-level gate,
+    sso/oidc.py's / sso/saml.py's provider-level gate,
+    licensing/gate_middleware.py's ASGI-level gate) — see
+    gate_middleware.py's module docstring.
+
+    HONEST CEILING (Phase D, 2026-07-17 — see gate_middleware.py's module
+    docstring for the full statement): this file is now part of the 7-file
+    COMPLETE graph — tampering ANY 1-6 of the 7 mesh files, including
+    verifier.py+enforcer.py+gate_middleware.py together (the exact 3-file
+    combination that fooled Phase C's ring), is always caught by every
+    untouched member's own full-mesh check and audited. Only a coordinated
+    edit of ALL 7 removes every detector — tamper-EVIDENT and high-cost,
+    not tamper-proof.
+    """
+    if _mesh_integrity_violated:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: SSO routes hard-refusing "
+            "feature=%s — this file's own full-mesh check detected a "
+            "tampered peer (LAURA-V2-003 Phase D hardening, no fallback to "
+            "verifier.py/enforcer.py getters)",
+            feature,
+        )
+        _emit_mesh_tamper_event("mesh_full_check_mismatch", "clean", "tampered")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+
+    try:
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SSO routes: could not import enforcer for license state — "
+            "treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        _emit_mesh_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SSO routes: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
 
 # Redis TTL for OIDC state tokens (10 minutes — generous for slow IdPs).
 _STATE_TTL_SECONDS = 600
@@ -498,7 +744,7 @@ async def initiate_oidc(idp_id: str, request: Request):
     with a 10-minute TTL, then redirects the browser to the IdP.
     """
     try:
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -603,7 +849,7 @@ async def oidc_callback(
 
     # Verify feature gate
     try:
-        require_feature("oidc")
+        _licence_hard_gate("oidc")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -1070,7 +1316,7 @@ async def saml_acs(idp_id: str, request: Request):
     client_ip = request.client.host if request.client else "unknown"
 
     try:
-        require_feature("saml")
+        _licence_hard_gate("saml")
     except LicenseFeatureGated as exc:
         return JSONResponse(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,

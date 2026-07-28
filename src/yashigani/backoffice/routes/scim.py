@@ -27,9 +27,13 @@ Last updated: 2026-05-09T00:00:00+01:00
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
 import uuid
+from pathlib import Path
 from typing import Optional, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -39,12 +43,13 @@ from yashigani.backoffice.middleware import AdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.backoffice.routes.rbac import _push
 from yashigani.rbac.model import RBACGroup
+from yashigani.licensing import _integrity as _mesh_integrity
 from yashigani.licensing.enforcer import (
-    require_feature,
     check_end_user_limit,
     count_canonical_end_users,
     LicenseFeatureGated,
     LicenseLimitExceeded,
+    LicenseTier,
     license_feature_gated_response,
     license_limit_exceeded_response,
 )
@@ -52,6 +57,272 @@ from yashigani.licensing.enforcer import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See licensing/verifier.py's
+# module-level comment block above _check_mesh_full() for the full
+# rationale. This is routes/scim.py's OWN independently-authored copy —
+# deliberately a DIFFERENT code shape (recursion over the full peer-role
+# queue) from verifier.py's for-loop, enforcer.py's list-comprehension,
+# gate_middleware.py's class, sso/oidc.py's while-loop, sso/saml.py's
+# functional map()/all(), and routes/sso.py's dict-comprehension, so a
+# single AST/regex strip-script cannot pattern-match and remove all seven
+# at once.
+#
+# routes/scim.py is one of SCIM's TWO real enforcement layers (the other
+# being gate_middleware.py's ASGI gate) — Laura's re-verify 3-file attack
+# ({verifier.py, enforcer.py, gate_middleware.py}) defeated gate_middleware
+# but left THIS file's own gate as SCIM's only surviving layer; under
+# Phase C's ring this file's own ring-check happened not to cover the
+# touched files for that release's permutation, so it granted silently.
+# Under the Phase D complete graph, this file independently checks ALL 6
+# other members — including gate_middleware.py — every time.
+# ---------------------------------------------------------------------------
+
+_MESH_ROLE = "SCIM_ROUTES"
+_mesh_integrity_violated = False
+
+
+def _mesh_targets() -> dict:
+    routes_dir = Path(__file__).parent
+    pkg_dir = routes_dir.parent.parent
+    licensing_dir = pkg_dir / "licensing"
+    return {
+        "VERIFIER": ("VERIFIER_HASH", licensing_dir / "verifier.py"),
+        "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
+        "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
+        "OIDC": ("OIDC_MODULE_HASH", pkg_dir / "sso" / "oidc.py"),
+        "SAML": ("SAML_MODULE_HASH", pkg_dir / "sso" / "saml.py"),
+        "SSO_ROUTES": ("SSO_ROUTES_HASH", routes_dir / "sso.py"),
+        "SCIM_ROUTES": ("SCIM_ROUTES_HASH", routes_dir / "scim.py"),
+    }
+
+
+def _verify_one_mesh_peer(role: str, targets: dict) -> bool:
+    """Return True iff `role`'s live hash matches its signed value. Base
+    operation for the recursive walk below."""
+    const_name, path = targets[role]
+    expected = getattr(_mesh_integrity, const_name, "")
+    try:
+        live = hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception as exc:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/scim.py) — "
+            "could not read mesh peer role=%s (%s): %s", role, path, exc,
+        )
+        return False
+    if live != expected:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/scim.py) — "
+            "mesh peer role=%s (%s) live hash mismatch (expected=%s, "
+            "actual=%s) — independent detection (LAURA-V2-003 Phase D "
+            "hardening)",
+            role, const_name, expected[:16], live[:16],
+        )
+        return False
+    return True
+
+
+def _check_mesh_full_recursive(roles: list, targets: dict) -> bool:
+    """Recursively verify each role in `roles`; True iff ALL pass."""
+    if not roles:
+        return True
+    head, *tail = roles
+    ok_here = _verify_one_mesh_peer(head, targets)
+    ok_rest = _check_mesh_full_recursive(tail, targets)
+    return ok_here and ok_rest
+
+
+def _check_mesh_full() -> None:
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    targets = _mesh_targets()
+
+    if _mesh_integrity.is_any_hash_placeholder() or _mesh_integrity.is_mesh_topology_placeholder():
+        if not is_dev:
+            _mesh_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/scim.py) "
+                "— hash or topology constants still placeholders in a "
+                "non-dev environment; hard-refusing"
+            )
+        return
+
+    try:
+        member_order = json.loads(_mesh_integrity.MESH_TOPOLOGY_JSON)["member_order"]
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(targets):
+            raise ValueError("member_order is not a permutation of the 7 mesh roles")
+        if member_order.count(_MESH_ROLE) != 1:
+            raise ValueError("member_order missing this file's role")
+        peer_roles = [role for role in member_order if role != _MESH_ROLE]
+    except Exception as exc:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (routes/scim.py) — "
+            "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s", exc,
+        )
+        return
+
+    if not _check_mesh_full_recursive(peer_roles, targets):
+        _mesh_integrity_violated = True
+
+
+def get_mesh_integrity_status() -> bool:
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
+    return _mesh_integrity_violated
+
+
+def _emit_mesh_tamper_event(check_type: str, expected_hash: str, actual_hash: str) -> None:
+    """Emit a tamper-evidence audit event at gate-invocation time — own
+    inline copy, see gate_middleware.py's twin function for the full
+    rationale (LAURA-V2-003: no shared chokepoint)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        writer.write(LicenceIntegrityViolationEvent(
+            module="backoffice.routes.scim",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        ))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — this file's OWN copy of the
+# _integrity.py root-of-trust pin. See licensing/verifier.py's module-level
+# comment block above _check_integrity_root_pin() for the full rationale
+# (self-reference solved by hardcoding the expected hash HERE, injected at
+# build time before this file's own SCIM_ROUTES_HASH is computed — no
+# circularity) and the named residual (covers only the 5 root-of-trust
+# fields; the rest of _integrity.py stays covered by BUNDLE_SIG/
+# INTEGRITY_HASH). Style: matches this file's recursive flavour above with a
+# single-purpose helper, kept simple (not itself recursive — nothing here to
+# recurse over). Note the `_mesh_integrity` import alias (this file imports
+# _integrity as _mesh_integrity already).
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_mesh_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_mesh_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_mesh_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_mesh_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_mesh_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    is_placeholder = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH
+
+    if is_placeholder:
+        if is_dev:
+            return
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (routes/scim.py) "
+            "— _EXPECTED_INTEGRITY_ROOT_HASH is still a placeholder in a "
+            "non-dev environment; hard-refusing"
+        )
+        return
+
+    if _live_integrity_root_hash() != _EXPECTED_INTEGRITY_ROOT_HASH:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (routes/scim.py) "
+            "— _integrity.py's root-of-trust fields do not match this "
+            "file's hardcoded pin — _integrity.py has been modified since "
+            "this build was signed (LAURA-V2-005)"
+        )
+
+
+_check_mesh_full()
+_check_integrity_root_pin()
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate, route layer (LAURA-V2-001 follow-up,
+    2026-07-16; Phase D full-mesh hardening, 2026-07-17).
+
+    Deliberately does NOT call enforcer.require_feature() — see
+    sso/oidc.py's `_licence_hard_gate()` docstring for the full rationale.
+    SCIM has no separate provider module (unlike OIDC/SAML's oidc.py/
+    saml.py), so this route-level gate plus
+    licensing/gate_middleware.py's independent ASGI-level gate are the TWO
+    layers for SCIM.
+
+    Phase D (2026-07-17, LAURA-V2-003 RE-VERIFY): the integrity decision
+    below comes SOLELY from `_mesh_integrity_violated` — this file's OWN
+    inline full-mesh check (_check_mesh_full() above). The Phase C fallback
+    (calling verifier.get_integrity_status()/enforcer.get_enforcer_
+    integrity_status()) has been REMOVED, not merely supplemented — this
+    file (routes/scim.py) is SCIM's LAST surviving enforcement layer once
+    gate_middleware.py is also tampered (Laura's exact 3-file re-verify
+    attack, {verifier.py, enforcer.py, gate_middleware.py}); under Phase C
+    this file's own ring-check didn't happen to cover the touched files for
+    that release's permutation, and the removed fallback was exactly the
+    neutered {verifier.py, enforcer.py} pair — this file granted silently,
+    fully defeating SCIM end-to-end. Never enforcer.require_feature().
+    Hard-refuses (raises) on any integrity violation or missing feature;
+    never silently passes on error (IMPL-03).
+
+    HONEST CEILING (Phase D, 2026-07-17 — see gate_middleware.py's module
+    docstring for the full statement): this file is now part of the 7-file
+    COMPLETE graph — tampering ANY 1-6 of the 7 mesh files, including
+    verifier.py+enforcer.py+gate_middleware.py together, is always caught
+    by every untouched member's own full-mesh check and audited. Only a
+    coordinated edit of ALL 7 removes every detector — tamper-EVIDENT and
+    high-cost, not tamper-proof.
+    """
+    if _mesh_integrity_violated:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: SCIM routes hard-refusing "
+            "feature=%s — this file's own full-mesh check detected a "
+            "tampered peer (LAURA-V2-003 Phase D hardening, no fallback to "
+            "verifier.py/enforcer.py getters)",
+            feature,
+        )
+        _emit_mesh_tamper_event("mesh_full_check_mismatch", "clean", "tampered")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+
+    try:
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SCIM routes: could not import enforcer for license state — "
+            "treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        _emit_mesh_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SCIM routes: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
+
 
 # SCIM schema URNs
 _URN_USER = "urn:ietf:params:scim:schemas:core:2.0:User"
@@ -245,7 +516,7 @@ async def scim_provision_user(
     Membership is assigned separately via SCIM Group PATCH.
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -330,7 +601,7 @@ async def scim_deprovision_user(
     user_id is treated as the user's email address.
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -379,7 +650,7 @@ async def scim_create_group(
     session: AdminSession,
 ):
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -431,7 +702,7 @@ async def scim_patch_group(
         [{"value": "<email>", "display": "<optional>"}, ...]
     """
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 
@@ -523,7 +794,7 @@ async def scim_delete_group(
     session: AdminSession,
 ):
     try:
-        require_feature("scim")
+        _licence_hard_gate("scim")
     except LicenseFeatureGated as exc:
         from fastapi.responses import JSONResponse
 

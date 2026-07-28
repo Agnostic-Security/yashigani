@@ -27,16 +27,94 @@ from __future__ import annotations
 
 import bcrypt
 import datetime
+import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from yashigani.licensing.enforcer import LicenseLimitExceeded
 
 logger = logging.getLogger(__name__)
+
+# Module-level integrity state (T3)
+_agents_registry_integrity_violated = False
+
+
+def _emit_agents_registry_integrity_violation_event(
+    check_type: str,
+    expected_hash: str,
+    actual_hash: str,
+) -> None:
+    """Emit a typed LicenceIntegrityViolationEvent (defence-in-depth)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        event = LicenceIntegrityViolationEvent(
+            module="agents.registry",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        )
+        writer.write(event)
+    except Exception:
+        pass
+
+
+def _check_agents_registry_integrity() -> None:
+    """
+    T3: Self-check registry.py SHA-256 against _integrity.AGENTS_REGISTRY_HASH.
+    Sets _agents_registry_integrity_violated = True on mismatch.
+    Called from AgentRegistry.__init__ (DG-04: consuming class, not _integrity.py).
+    """
+    global _agents_registry_integrity_violated
+    from yashigani.licensing import _integrity
+
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+
+    if _integrity.is_agents_registry_hash_placeholder():
+        if not is_dev:
+            _agents_registry_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: AGENTS_REGISTRY_HASH is still a placeholder "
+                "in a non-dev environment; forcing COMMUNITY tier (T3)"
+            )
+        return
+
+    try:
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception as exc:
+        logger.warning("License integrity: could not read agents/registry.py for hash check: %s", exc)
+        return
+
+    if digest != _integrity.AGENTS_REGISTRY_HASH:
+        _agents_registry_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: agents/registry.py has been tampered with "
+            "(expected=%s, actual=%s); forcing COMMUNITY tier (T3)",
+            _integrity.AGENTS_REGISTRY_HASH[:16],
+            digest[:16],
+        )
+        _emit_agents_registry_integrity_violation_event(
+            check_type="self_hash",
+            expected_hash=_integrity.AGENTS_REGISTRY_HASH,
+            actual_hash=digest,
+        )
+
+
+def get_agents_registry_integrity_status() -> bool:
+    """Return True if the agents/registry integrity has been violated."""
+    return _agents_registry_integrity_violated
 
 _BCRYPT_COST = 12
 
@@ -126,6 +204,8 @@ return 1
         self._durable = durable_store
         total = self._r.scard("agent:index:all") or 0
         logger.info("AgentRegistry initialised: %d agent(s) in index", total)
+        # T3: integrity self-check (DG-04 — called in consuming class, not _integrity.py)
+        _check_agents_registry_integrity()
         # V232-CSCAN-01a migration check: warn on names that pre-date the slug constraint.
         # These entries are not deleted (non-breaking), but the gateway will skip their
         # secret-file lookup due to the path-resolution guard in openai_router.py.

@@ -6,17 +6,269 @@ Last updated: 2026-05-14T00:00:00+01:00
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-from yashigani.licensing.enforcer import require_feature
+from yashigani.licensing import _integrity
+from yashigani.licensing.enforcer import LicenseFeatureGated, LicenseTier
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Mesh FULL-graph check (licence-hardening-v2 Phase D, 2026-07-17 —
+# LAURA-V2-003 RE-VERIFY hardening). See licensing/verifier.py's
+# module-level comment block above _check_mesh_full() for the full
+# rationale. saml.py is a full mesh member for the FIRST time as of Phase D
+# — Phase C held it out of the 6-file ring entirely, leaving it with zero
+# independent peer-check of its own (only the shared verifier/enforcer-flag
+# fallback, which Laura's 4-file re-verify attack exploited alongside
+# gate_middleware.py + routes/sso.py to fully, silently defeat all three of
+# SAML's real enforcement layers). This is saml.py's OWN
+# independently-authored copy — deliberately a DIFFERENT code shape
+# (functional map()/all() pass over the peer list) from verifier.py's
+# for-loop, enforcer.py's list-comprehension, gate_middleware.py's class,
+# sso/oidc.py's while-loop, routes/sso.py's dict-comprehension+any(), and
+# routes/scim.py's recursion, so a single AST/regex strip-script cannot
+# pattern-match and remove all seven at once.
+# ---------------------------------------------------------------------------
+
+_MESH_ROLE = "SAML"
+_mesh_integrity_violated = False
+
+
+def _mesh_targets() -> dict:
+    sso_dir = Path(__file__).parent
+    pkg_dir = sso_dir.parent
+    licensing_dir = pkg_dir / "licensing"
+    return {
+        "VERIFIER": ("VERIFIER_HASH", licensing_dir / "verifier.py"),
+        "ENFORCER": ("ENFORCER_HASH", licensing_dir / "enforcer.py"),
+        "GATE_MIDDLEWARE": ("GATE_MIDDLEWARE_HASH", licensing_dir / "gate_middleware.py"),
+        "OIDC": ("OIDC_MODULE_HASH", sso_dir / "oidc.py"),
+        "SAML": ("SAML_MODULE_HASH", sso_dir / "saml.py"),
+        "SSO_ROUTES": ("SSO_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "sso.py"),
+        "SCIM_ROUTES": ("SCIM_ROUTES_HASH", pkg_dir / "backoffice" / "routes" / "scim.py"),
+    }
+
+
+def _peer_ok(role: str, targets: dict) -> bool:
+    """Return True iff `role`'s live hash matches its signed value. Base
+    predicate for the functional map()/all() pass below."""
+    const_name, path = targets[role]
+    expected = getattr(_integrity, const_name, "")
+    try:
+        live = hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception as exc:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (sso/saml.py) — "
+            "could not read mesh peer role=%s (%s): %s", role, path, exc,
+        )
+        return False
+    if live != expected:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (sso/saml.py) — "
+            "mesh peer role=%s (%s) live hash mismatch (expected=%s, "
+            "actual=%s) — independent detection (LAURA-V2-003 Phase D "
+            "hardening)",
+            role, const_name, expected[:16], live[:16],
+        )
+        return False
+    return True
+
+
+def _check_mesh_full() -> None:
+    """Style: functional map()/all() pass over the full peer list — the
+    result is computed eagerly (a list, not a lazy generator) so every peer
+    is checked and every mismatch is logged, not short-circuited on the
+    first failure."""
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    targets = _mesh_targets()
+
+    if _integrity.is_any_hash_placeholder() or _integrity.is_mesh_topology_placeholder():
+        if not is_dev:
+            _mesh_integrity_violated = True
+            logger.critical(
+                "LICENSE INTEGRITY VIOLATION: mesh full-check (sso/saml.py) "
+                "— hash or topology constants still placeholders in a "
+                "non-dev environment; hard-refusing"
+            )
+        return
+
+    try:
+        member_order = json.loads(_integrity.MESH_TOPOLOGY_JSON)["member_order"]
+        if not isinstance(member_order, list) or sorted(member_order) != sorted(targets):
+            raise ValueError("member_order is not a permutation of the 7 mesh roles")
+        if member_order.count(_MESH_ROLE) != 1:
+            raise ValueError("member_order missing this file's role")
+    except Exception as exc:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: mesh full-check (sso/saml.py) — "
+            "MESH_TOPOLOGY_JSON malformed or missing this file's role: %s", exc,
+        )
+        return
+
+    peers = [role for role in member_order if role != _MESH_ROLE]
+    results = list(map(lambda role: _peer_ok(role, targets), peers))
+    if not all(results):
+        _mesh_integrity_violated = True
+
+
+def get_mesh_integrity_status() -> bool:
+    """Return True if this file's independent full-mesh check has detected
+    a tampered peer (LAURA-V2-003 Phase D hardening)."""
+    return _mesh_integrity_violated
+
+
+def _emit_saml_tamper_event(check_type: str, expected_hash: str, actual_hash: str) -> None:
+    """Emit a tamper-evidence audit event at gate-invocation time — own
+    inline copy, see gate_middleware.py's twin function for the full
+    rationale (LAURA-V2-003: no shared chokepoint)."""
+    try:
+        from yashigani.audit.schema import LicenceIntegrityViolationEvent
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            writer = getattr(backoffice_state, "audit_writer", None)
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        writer.write(LicenceIntegrityViolationEvent(
+            module="sso.saml",
+            check_type=check_type,
+            expected_hash=expected_hash[:16],
+            actual_hash=actual_hash[:16],
+        ))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Root-of-trust pin (LAURA-V2-005, 2026-07-17) — this file's OWN copy of the
+# _integrity.py root-of-trust pin. See licensing/verifier.py's module-level
+# comment block above _check_integrity_root_pin() for the full rationale
+# (self-reference solved by hardcoding the expected hash HERE, injected at
+# build time before this file's own SAML_MODULE_HASH is computed — no
+# circularity) and the named residual (covers only the 5 root-of-trust
+# fields; the rest of _integrity.py stays covered by BUNDLE_SIG/
+# INTEGRITY_HASH). Style: ternary-assembled verdict, mirroring this file's
+# existing map()/all() functional flavour above.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+
+
+def _live_integrity_root_hash() -> str:
+    canonical = "\n".join([
+        f"MASTER_ANCHOR_SET_JSON={_integrity.MASTER_ANCHOR_SET_JSON}",
+        f"CODE_LEAF_CERT_JSON={_integrity.CODE_LEAF_CERT_JSON}",
+        f"CODE_LEAF_CERT_SIG={_integrity.CODE_LEAF_CERT_SIG}",
+        f"KILL_LIST_JSON={_integrity.KILL_LIST_JSON}",
+        f"CLIENT_DOMAIN_REGISTRY_JSON={_integrity.CLIENT_DOMAIN_REGISTRY_JSON}",
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_integrity_root_pin() -> None:
+    global _mesh_integrity_violated
+    is_dev = os.environ.get("YASHIGANI_ENV") == "dev"
+    is_placeholder = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH" in _EXPECTED_INTEGRITY_ROOT_HASH
+    mismatch = (not is_placeholder) and (_live_integrity_root_hash() != _EXPECTED_INTEGRITY_ROOT_HASH)
+
+    violated = mismatch or (is_placeholder and not is_dev)
+    if violated:
+        _mesh_integrity_violated = True
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: root-of-trust pin (sso/saml.py) — "
+            "%s (LAURA-V2-005)",
+            "_EXPECTED_INTEGRITY_ROOT_HASH is still a placeholder in a "
+            "non-dev environment" if is_placeholder else
+            "_integrity.py's root-of-trust fields do not match this file's "
+            "hardcoded pin — _integrity.py has been modified since this "
+            "build was signed",
+        )
+
+
+_check_mesh_full()
+_check_integrity_root_pin()
+
+
+def _licence_hard_gate(feature: str) -> None:
+    """
+    Point-of-use licence gate (LAURA-V2-001 follow-up, 2026-07-16; Phase D
+    full-mesh hardening, 2026-07-17 — saml.py is a full mesh member for the
+    FIRST time this phase).
+
+    Mirrors sso/oidc.py's `_licence_hard_gate()` — see that function's
+    docstring for the full rationale (deliberately a SEPARATE local copy,
+    not a shared import, so patching enforcer.require_feature() — or this
+    same function as defined in oidc.py/routes/sso.py/routes/scim.py — has
+    no effect on this file's own gate). Never calls
+    enforcer.require_feature(). Hard-refuses (raises) on any integrity
+    violation or missing feature — never silently passes on error (IMPL-03).
+
+    One of THREE independent layers for SAML (this provider-level gate,
+    backoffice/routes/sso.py's route-level gate, licensing/gate_middleware.py's
+    ASGI-level gate) — see gate_middleware.py's module docstring.
+
+    HONEST CEILING (Phase D, 2026-07-17 — mesh-topology note, supersedes
+    Phase C which held this file OUT of the ring entirely): saml.py is now
+    a full mesh member — its integrity decision comes SOLELY from
+    `_mesh_integrity_violated` (this file's own inline full-mesh check of
+    every OTHER mesh member's bytes, _check_mesh_full() above), exactly
+    like the other 6 mesh files. No fallback to
+    verifier.get_integrity_status()/enforcer.get_enforcer_integrity_status()
+    is consulted. Phase C's gap here (zero independent peer-check of its
+    own, only the shared verifier/enforcer-getter fallback) was exactly
+    what Laura's 4-file re-verify attack ({verifier.py, enforcer.py,
+    gate_middleware.py, routes/sso.py}) exploited to fully, silently defeat
+    all three of SAML's real enforcement layers at once — closed by this
+    fix. See gate_middleware.py's module docstring for the full
+    honest-ceiling statement covering all 7 mesh members.
+    """
+    if _mesh_integrity_violated:
+        logger.critical(
+            "LICENSE INTEGRITY VIOLATION: SAML provider hard-refusing "
+            "feature=%s — this file's own full-mesh check detected a "
+            "tampered peer (LAURA-V2-003 Phase D hardening, no fallback to "
+            "verifier.py/enforcer.py getters)",
+            feature,
+        )
+        _emit_saml_tamper_event("mesh_full_check_mismatch", "clean", "tampered")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY)
+
+    try:
+        from yashigani.licensing import enforcer as _enforcer
+    except Exception as exc:
+        logger.critical(
+            "SAML provider: could not import enforcer for license state — "
+            "treating as violation and refusing (IMPL-03): %s", exc,
+        )
+        _emit_saml_tamper_event("integrity_module_unavailable", "n/a", "import_failed")
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    try:
+        lic = _enforcer.get_license()
+    except Exception as exc:
+        logger.critical(
+            "SAML provider: enforcer.get_license() raised — treating as "
+            "violation and refusing: %s", exc,
+        )
+        raise LicenseFeatureGated(feature=feature, tier=LicenseTier.COMMUNITY) from exc
+
+    if not lic.has_feature(feature):
+        raise LicenseFeatureGated(feature=feature, tier=lic.tier)
 
 
 def _assert_rsa_sp_key(sp_private_key: str) -> None:
@@ -136,7 +388,7 @@ class SAMLProvider:
 
     def get_login_url(self, request_data: dict) -> str:
         """Build the IdP redirect URL for SP-initiated SSO."""
-        require_feature("saml")
+        _licence_hard_gate("saml")
         auth = self._build_auth(request_data)
         return auth.login()
 
@@ -145,7 +397,7 @@ class SAMLProvider:
         Process the IdP SAMLResponse (POST binding).
         Validates signature and returns SAMLUserInfo on success.
         """
-        require_feature("saml")
+        _licence_hard_gate("saml")
         auth = self._build_auth(request_data)
         auth.process_response()
         errors = auth.get_errors()

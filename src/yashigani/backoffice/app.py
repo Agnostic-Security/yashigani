@@ -646,6 +646,18 @@ async def lifespan(app: FastAPI):
                 max_instances=1,
             )
 
+        # Auth user count Redis sync (licence-hardening T13) — every 60s
+        try:
+            from yashigani.licensing.enforcer import _sync_auth_user_count
+            scheduler.add_job(
+                _sync_auth_user_count,
+                trigger="interval",
+                seconds=60,
+                id="licence_auth_user_count_sync",
+                replace_existing=True,
+            )
+        except ImportError:
+            pass
         scheduler.start()
         # Fire all immediately so the first check happens at startup
         asyncio.ensure_future(check_and_alert_licence_expiry())
@@ -1056,6 +1068,18 @@ def create_backoffice_app() -> FastAPI:
     from yashigani.gateway.spiffe_middleware import SpiffePeerCertMiddleware
 
     app.add_middleware(SpiffePeerCertMiddleware)
+
+    # Licence gate middleware (LAURA-V2-001 follow-up, 2026-07-16) — third,
+    # independent, ASGI-layer enforcement point for OIDC/SAML/SCIM. Hard-
+    # refuses matching requests BEFORE routing if build-integrity has been
+    # violated OR the active licence lacks the feature — redundant with, and
+    # deliberately independent of, each point-of-use file's own local
+    # `_licence_hard_gate()` (sso/oidc.py, sso/saml.py, routes/sso.py,
+    # routes/scim.py). See yashigani.licensing.gate_middleware module
+    # docstring for the full rationale.
+    from yashigani.licensing.gate_middleware import LicenseGateMiddleware
+
+    app.add_middleware(LicenseGateMiddleware)
 
     # CORS: backoffice serves its own frontend — no cross-origin needed
     app.add_middleware(

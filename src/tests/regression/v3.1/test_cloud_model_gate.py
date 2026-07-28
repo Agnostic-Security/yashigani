@@ -179,6 +179,23 @@ class TestOpaCloudModelPolicyCheck:
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
         orig_url = _r._state.opa_url
+        # Test-isolation fix (found while verifying LAURA-V2-001/002, 2026-07-15):
+        # unconditionally popping these env vars in `finally` — rather than
+        # restoring whatever value was present BEFORE this test (conftest.py's
+        # os.environ.setdefault("YASHIGANI_ENV", "dev") for the whole session)
+        # — left YASHIGANI_ENV UNSET for every test that ran after this one.
+        # That silently flipped every downstream is_dev = os.environ.get(...) ==
+        # "dev" check in yashigani.licensing/{verifier,enforcer,loader}.py and
+        # yashigani.agents/identity registry.py from "dev: skip" to "prod:
+        # fail-closed", permanently setting their integrity-violated flags for
+        # the rest of the pytest session (visible once anything constructs a
+        # real AgentRegistry()/IdentityRegistry(), e.g.
+        # test_langflow_callee.py::TestRestoreFromDurablePhase5). Capture and
+        # restore the ORIGINAL values instead, matching the correct pattern
+        # already used elsewhere in this file (e.g. the YASHIGANI_PERMISSION_STRICT
+        # test above).
+        orig_opa_optional = _os.environ.get("YASHIGANI_OPA_OPTIONAL")
+        orig_env = _os.environ.get("YASHIGANI_ENV")
         try:
             _r._state.opa_url = ""
             _os.environ["YASHIGANI_OPA_OPTIONAL"] = "true"
@@ -196,8 +213,14 @@ class TestOpaCloudModelPolicyCheck:
             assert "dev_opt_in" in result.get("reason", "")
         finally:
             _r._state.opa_url = orig_url
-            _os.environ.pop("YASHIGANI_OPA_OPTIONAL", None)
-            _os.environ.pop("YASHIGANI_ENV", None)
+            if orig_opa_optional is None:
+                _os.environ.pop("YASHIGANI_OPA_OPTIONAL", None)
+            else:
+                _os.environ["YASHIGANI_OPA_OPTIONAL"] = orig_opa_optional
+            if orig_env is None:
+                _os.environ.pop("YASHIGANI_ENV", None)
+            else:
+                _os.environ["YASHIGANI_ENV"] = orig_env
 
     def test_h2_invalid_policy_ref_blocked(self):
         """H2: policy_ref with invalid chars → allow=False (path-injection guard)."""

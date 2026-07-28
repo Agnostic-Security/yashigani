@@ -9150,6 +9150,125 @@ compose_up() {
     return 0
   fi
 
+  # ---------------------------------------------------------------------------
+  # S11 — pre-flight: check for un-injected (placeholder) integrity constants.
+  #
+  # Greps for _PLACEHOLDER_INTEGRITY sentinel inside the installed _integrity.py
+  # in the backoffice image.  An image built without running inject_hashes.sh
+  # will still contain placeholder strings.
+  #
+  # Technique: `docker run --rm --entrypoint python3 <image> -c "..."` so we
+  # inspect the installed package without starting the full service.
+  # Image name is read from COMPOSE_CMD + compose file — same image compose would pull.
+  # Skipped in DRY_RUN (already returned above) and when YASHIGANI_ENV=dev.
+  #
+  # licence-hardening-v2 §8 (Community production deployability, option A):
+  # v1 unconditionally hard-aborted here, which also blocked a legitimate
+  # community/self-build from source (Apache-2.0) — the runtime already
+  # fails safe to Community on placeholder keys, so an unconditional abort
+  # was redundant for safety and just broke the open self-build promise.
+  #
+  # YASHIGANI_BUILD_CHANNEL gates the response to a PLACEHOLDER_FOUND result:
+  #   community (default, unset) -> WARN and proceed as Community. A
+  #     self-build that never ran the internal signing pipeline is expected
+  #     to have placeholder chain constants; it stays freely prod-deployable
+  #     (paid-tier features still can't unlock — the runtime forces
+  #     Community on placeholders regardless of this pre-flight, §5).
+  #   official -> HARD-ABORT, unchanged from v1's behaviour. Set by the
+  #     official Agnostic Security release/CI pipeline ONLY — an official
+  #     build must never ship with un-injected chain constants.
+  # This flag only affects the PLACEHOLDER_FOUND branch. The "could not run
+  # the check at all" fail-closed behaviour (IMPL-02, empty/no-OK output)
+  # is unchanged for every channel — that failure means we could not
+  # determine the image's state at all, not that the image is a legitimate
+  # unsigned community build.
+  # ---------------------------------------------------------------------------
+  if [[ "${YASHIGANI_ENV:-}" != "dev" ]]; then
+    local _build_channel="${YASHIGANI_BUILD_CHANNEL:-community}"
+    if [[ "${_build_channel}" != "official" && "${_build_channel}" != "community" ]]; then
+      log_error "FATAL: YASHIGANI_BUILD_CHANNEL must be 'official' or 'community' (got '${_build_channel}')"
+      return 1
+    fi
+    log_info "Pre-flight: verifying backoffice image has no placeholder integrity constants (build channel: ${_build_channel})..."
+    local _backoffice_image=""
+    _backoffice_image="$(
+      "${COMPOSE_CMD[@]}" "${compose_files[@]}" \
+        config --format json 2>/dev/null \
+        | python3 -c "
+import sys, json
+cfg = json.load(sys.stdin)
+svc = cfg.get('services', {}).get('backoffice', {})
+print(svc.get('image', ''))
+" 2>/dev/null || echo ""
+    )"
+    if [[ -n "${_backoffice_image}" ]]; then
+      local _placeholder_check_out=""
+      local _placeholder_check_rc=0
+      # IMPL-02: capture exit code explicitly — do NOT use || true which
+      # silently passes when the docker command itself fails to launch,
+      # producing an empty output that falls through to the "OK" branch.
+      #
+      # licence-hardening-v2: checks is_any_hash_placeholder() (T1-T4
+      # per-module hashes, unchanged) + is_any_chain_placeholder() (the v2
+      # root->leaf chain constants: master anchor-SET / code leaf_cert /
+      # leaf_cert_sig / bundle_sig — supersedes v1's dropped
+      # is_bundle_sig_placeholder()/is_kdf_token_placeholder() KDF-token
+      # check, which no longer exists on the v2 _integrity.py and would
+      # otherwise raise AttributeError here, silently degrading this check
+      # to the "could not inspect" branch instead of a real placeholder
+      # check).
+      _placeholder_check_out="$(
+        "${COMPOSE_CMD[0]}" run --rm --entrypoint python3 "${_backoffice_image}" \
+          -c "
+import sys
+try:
+    from yashigani.licensing import _integrity
+    if _integrity.is_any_hash_placeholder() or _integrity.is_any_chain_placeholder():
+        print('PLACEHOLDER_FOUND')
+        sys.exit(1)
+    print('OK')
+except Exception as e:
+    print(f'ERROR:{e}')
+    sys.exit(2)
+" 2>&1
+      )" || _placeholder_check_rc=$?
+      if echo "${_placeholder_check_out}" | grep -q 'PLACEHOLDER_FOUND'; then
+        if [[ "${_build_channel}" == "official" ]]; then
+          log_error "FATAL: backoffice image ${_backoffice_image} still contains _PLACEHOLDER_INTEGRITY constants."
+          log_error "       The build pipeline did not run scripts/inject_hashes.sh / licgen sign-build before building the wheel."
+          log_error "       Re-build the image with: docker build --secret id=code_leaf_private_key,src=<key> ..."
+          log_error "       Refusing to start an OFFICIAL image with un-injected chain constants (S11 / §4.2 / §8)."
+          log_error "       Set YASHIGANI_BUILD_CHANNEL=community if this is a deliberate community/self-build."
+          return 1
+        fi
+        log_warn "Pre-flight: backoffice image ${_backoffice_image} has placeholder integrity constants."
+        log_warn "            Build channel is 'community' — proceeding as Community tier (design §8, option A)."
+        log_warn "            This is expected for a self-build from source that never ran the internal signing"
+        log_warn "            pipeline. Paid-tier features remain locked (runtime forces Community on placeholders"
+        log_warn "            regardless of this pre-flight). Set YASHIGANI_BUILD_CHANNEL=official only for the"
+        log_warn "            genuine Agnostic Security release pipeline."
+      elif echo "${_placeholder_check_out}" | grep -q 'ERROR:'; then
+        log_warn "Pre-flight: could not inspect _integrity.py in image (${_placeholder_check_out}) — proceeding (image may be freshly pulled)"
+      elif [[ -z "${_placeholder_check_out}" ]] || ! echo "${_placeholder_check_out}" | grep -q 'OK'; then
+        # docker run itself failed (daemon unreachable, image missing, etc.) —
+        # output is empty or doesn't contain the expected OK sentinel.
+        # This is NOT a clean pass; abort regardless of build channel
+        # (IMPL-02 fail-closed — we could not determine the image's state
+        # at all, which is not the same thing as "known unsigned community
+        # build").
+        log_error "FATAL: Pre-flight placeholder check did not produce expected output"
+        log_error "       (rc=${_placeholder_check_rc}, output='${_placeholder_check_out}')"
+        log_error "       Cannot confirm backoffice image integrity constants are injected."
+        log_error "       If the image is not yet pulled, pull it first: ${COMPOSE_CMD[0]} pull backoffice"
+        return 1
+      else
+        log_info "Pre-flight: backoffice image integrity constants OK (no placeholders)"
+      fi
+    else
+      log_warn "Pre-flight: could not determine backoffice image name from compose config — skipping placeholder check"
+    fi
+  fi
+
   # Clean up any stale containers/networks from failed previous runs.
   # NEVER use -v (--volumes) — that destroys user data (Postgres, Redis, audit logs).
   log_info "Stopping any existing containers (preserving data volumes)..."
