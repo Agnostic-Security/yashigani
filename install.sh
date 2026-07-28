@@ -3190,6 +3190,26 @@ _apply_deploy_defaults() {
       ;;
   esac
 
+  # Su Finding B: `--deploy demo` unconditionally forces Community tier and
+  # SKIPS handle_license() entirely (see the Step 7 branch later in main()).
+  # Previously, an operator who passed a real paid --license-key alongside
+  # --deploy demo had that key silently discarded — the licence file was
+  # never even copied into docker/secrets/, and the installer proceeded as
+  # Community with zero warning. Silent downgrade of a licensing/security
+  # input is a fail-open bug: fail LOUDLY instead so the operator cannot be
+  # silently downgraded.
+  if [[ "$DEPLOY_MODE" == "demo" && ( -n "$LICENSE_KEY_PATH" || -n "${YASHIGANI_LICENSE_FILE:-}" ) ]]; then
+    log_error "Incompatible options: --license-key was supplied together with --deploy demo."
+    log_error ""
+    log_error "  --deploy demo always runs as Community tier (no licence key is read or"
+    log_error "  installed in this mode) — your licence key would otherwise be silently"
+    log_error "  discarded. Choose ONE of:"
+    log_error "    • Licensed tier : --deploy production --license-key <path>"
+    log_error "                      (or --deploy enterprise --license-key <path> for k8s)"
+    log_error "    • Community demo: --deploy demo   (drop --license-key)"
+    exit 1
+  fi
+
   # Offline mode forces self-signed and skip-pull
   if [[ "$OFFLINE" == "true" ]]; then
     TLS_MODE="selfsigned"
