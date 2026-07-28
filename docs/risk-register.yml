@@ -3116,3 +3116,85 @@ risks:
       YSG-RISK-125, since both fixes gate the identical proxy call path).
   fix_in_version: v4.1.2
   last_threat_model_review: '2026-07-28'
+
+- id: YSG-RISK-128
+  description: >-
+    K8s/Helm: EVERY Ollama-backed LLM call from gateway or backoffice was
+    completely broken — the root cause of all 4 chat targets
+    (@letta/@langflow/@openclaw/direct model) failing even after fixing
+    YSG-RISK-125/126/127 (DNS + chat-proxy NetworkPolicy). Two compounding
+    gaps, both Compose<->K8s parity drift:
+    (1) `helm/yashigani/values.yaml` `gateway.env.ollamaUrl` defaulted to
+    `http://yashigani-ollama:11434` — a DIRECT connection. But
+    networkpolicy.yaml's `allow-ollama-ingress` (v4.1 Phase 1b-ii /
+    LAURA-I1-01 hardening) admits ONLY the caddy pod on port 11434;
+    gateway/backoffice's direct-to-ollama ingress rule was deliberately
+    REMOVED when that hardening landed, in favour of routing exclusively
+    through caddy's :11435 mesh-mTLS front
+    (configmaps.yaml's `:11435 {` block). The values.yaml default was never
+    updated to match, so gateway silently lost all Ollama connectivity on
+    k8s — a TCP connect() timeout indistinguishable from a dead backend
+    without packet inspection. docker-compose.yml already has this correct
+    (`OLLAMA_BASE_URL: https://caddy:11435/ollama` for both gateway and
+    backoffice) — k8s was the only place this drifted.
+    (2) `helm/yashigani/templates/backoffice.yaml` never set OLLAMA_BASE_URL
+    at all, so backoffice fell back to its own Python default
+    `http://ollama:11434` (entrypoint.py) — doubly broken (bare "ollama"
+    compose-only hostname, AND the same NetworkPolicy block as (1)).
+    (3) Even after pointing at the correct mesh-mTLS URL, the
+    `yashigani-caddy` Service (type LoadBalancer, the public edge) had NO
+    port 11435 entry at all — Service-name DNS resolved fine (ClusterIP)
+    but the destination Service had no port mapping, so connections to
+    `yashigani-caddy:11435` had nowhere to route (direct pod-IP connection
+    to the same port succeeded instantly, isolating this as a Service
+    definition gap rather than a NetworkPolicy or pod-readiness issue).
+    Manifested as gateway app-layer errors after connectivity was otherwise
+    fixed: `UnboundLocalError: cannot access local variable
+    'assistant_content'` (gateway/openai_router.py:3742, an error-handling
+    bug that fires when the backend LLM call itself fails/times out — NOT
+    fixed here, flagged separately for Tom, Python application logic is out
+    of Captain's remit) for @letta/@langflow/@openclaw, and
+    `{"detail":"Backend communication error"}` for the direct model target.
+    Found live on the TRUE clean redeploy (2026-07-28) verifying Maxine's
+    GO item (b) — all 4 chat targets end-to-end.
+  severity: high
+  controls_impacted:
+  - Availability — every Ollama-routed chat/agent call was completely
+    broken on k8s regardless of any of the YSG-RISK-125/126/127 fixes,
+    because the LLM backend itself was unreachable.
+  compensating_controls:
+  - No security boundary crossed — this restores the INTENDED mesh-mTLS-only
+    access path (matching the already-correct docker-compose.yml
+    configuration and the LAURA-I1-01 NetworkPolicy hardening's own design
+    intent), rather than reverting to the less-secure direct-to-ollama
+    path. The new yashigani-caddy-mesh Service port is ClusterIP-only
+    (never the public LoadBalancer), consistent with the existing
+    agent-ingress-front Service split rationale already documented in
+    agent-ingress-fronts.yaml.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fixed: (1) helm/yashigani/values.yaml gateway.env.ollamaUrl changed to
+      "https://yashigani-caddy:11435/ollama" (matches docker-compose.yml
+      exactly). (2) helm/yashigani/templates/backoffice.yaml: added explicit
+      OLLAMA_BASE_URL env var reusing gateway.env.ollamaUrl as the single
+      source of truth. (3) helm/yashigani/templates/agent-ingress-fronts.yaml:
+      widened the yashigani-caddy-mesh ClusterIP Service's render condition
+      from agentIngressFronts-only to `or ... .Values.ollama.enabled`, and
+      added a `mesh-ollama` port 11435 entry — decoupled from
+      agentIngressFronts being configured at all, since ollama's mesh front
+      is an independent feature. No NetworkPolicy change needed —
+      allow-ollama-ingress and allow-caddy-ingress already correctly permit
+      this exact path (caddy->ollama:11434, gateway/backoffice->caddy:11435
+      respectively); only the Service definition and the client URL
+      defaults were out of sync. Verified render via
+      `helm upgrade --dry-run=server` against the live cluster (zero
+      errors; confirmed OLLAMA_BASE_URL renders correctly on both gateway
+      and backoffice, confirmed yashigani-caddy-mesh Service renders with
+      the mesh-ollama:11435 port). Live re-verification (fresh clean
+      install, not a helm upgrade per standing directive) of all 4 chat
+      targets is the immediate next step. The separate
+      gateway/openai_router.py UnboundLocalError (application-code bug,
+      not networking) is OUT OF SCOPE for this entry — flagged to Tom.
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
