@@ -3461,8 +3461,35 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if env_token:
                     agent_headers["Authorization"] = f"Bearer {env_token}"
 
+                # YSG-RISK-139: registered upstreams under the v4.1 unified-sidecar
+                # dispatch repoint (§2.5) are the agent's Caddy INGRESS front —
+                # https://caddy:<mesh_port>/agents/<tenant>/<system> on compose,
+                # https://yashigani-caddy-mesh:<mesh_port>/agents/<tenant>/<system>
+                # on k8s (install.sh register_agent_bundles / k8s_register_agent_bundles).
+                # That front terminates mTLS require_and_verify with a leaf signed by
+                # the INTERNAL CA — a bare httpx.AsyncClient only trusts the public/
+                # certifi CA bundle and fails the handshake with
+                # CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+                # (openclaw's only path in this generic branch; letta/langflow have
+                # their own dedicated clients above which already use
+                # agent_dispatch_client()). Detect a mesh ingress front by the
+                # portable /agents/<tenant>/<system> path signature (hostname differs
+                # between compose and k8s; the path does not) and present the
+                # internal-PKI mesh leaf via the SAME single-source client the
+                # letta/langflow branches use. Genuine externally-deployed
+                # OpenAI-compatible agents (AgentRegisterRequest.upstream_url, no
+                # /agents/ path) are unaffected and keep the public-CA-trusting
+                # bare client.
+                from urllib.parse import urlparse as _urlparse
+                _is_mesh_agent_front = _urlparse(agent_upstream).path.startswith("/agents/")
+                if _is_mesh_agent_front:
+                    from yashigani.gateway._dispatch_client import agent_dispatch_client
+                    _agent_http_client_cm = agent_dispatch_client(timeout=120.0)
+                else:
+                    _agent_http_client_cm = httpx.AsyncClient(timeout=120.0)
+
                 try:
-                    async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with _agent_http_client_cm as client:
                         resp = await client.post(
                             f"{agent_upstream}/v1/chat/completions",
                             json=agent_body,

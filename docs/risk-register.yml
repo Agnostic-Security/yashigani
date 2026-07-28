@@ -4207,3 +4207,100 @@ risks:
     src/yashigani/gateway/letta_brain.py (3 hits pre-fix, all now
     "llm_config": _letta_llm_config(brain_model)) -- reported chat-path
     repair investigation, 2026-07-27/28
+
+- id: YSG-RISK-139
+  description: >-
+    @openclaw chat fails on every install (Docker confirmed live; same code
+    path on k8s) with httpx.ConnectError wrapping
+    ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+    certificate verify failed: unable to get local issuer certificate,
+    logged as "Agent @openclaw unreachable" (gateway container, Docker e2e
+    2026-07-28). This is a THIRD independent root cause on the
+    @openclaw/@letta/@langflow/direct-model chat quartet -- distinct from
+    Su's YSG-RISK-133 (agent-token registration) and Tom's YSG-RISK-138
+    (Letta model-handle 404); YSG-RISK-138's residuals note ("langflow and
+    openclaw bundled-agent chat paths are unaffected") is superseded by this
+    finding for openclaw.
+    Root cause: the generic OpenAI-compatible dispatch branch in
+    gateway/openai_router.py (~line 3465, the "else" branch handling any
+    agent whose registry protocol is not "letta"/"langflow" -- openclaw's
+    registered protocol per install.sh register_agent_bundles() /
+    k8s_register_agent_bundles()) opened a bare httpx.AsyncClient(timeout=
+    120.0) with NO verify= override, i.e. default public/certifi CA trust,
+    to dial agent_upstream directly. Under the v4.1 unified-sidecar dispatch
+    repoint (§2.5), openclaw's registered upstream is its Caddy INGRESS
+    front -- https://caddy:9671/agents/default/openclaw (compose) /
+    https://yashigani-caddy-mesh:9671/agents/default/openclaw (k8s),
+    docker/caddy/agents/openclaw-ingress.caddy:13-20 -- which presents
+    caddy_client.crt (signed by the Yashigani INTERNAL intermediate CA, NOT
+    a public CA) and requires client_auth mode require_and_verify. A client
+    trusting only the public CA bundle cannot build a chain to that leaf's
+    issuer -> "unable to get local issuer certificate" at the client's own
+    verify step (server-side require_and_verify never even reached; this is
+    the CLIENT failing to verify the SERVER'S cert, not the reverse). The
+    cert chain, SANs, and trust anchor are all correctly configured
+    (verified: docker/service_identities.yaml:54-58 caddy dns_sans includes
+    both "caddy" and "yashigani-caddy-mesh") -- this is a call-site bug, not
+    a PKI/cert-content defect. The sibling letta/langflow dispatch branches
+    (openai_router.py ~3373-3426) already call letta_client.letta_chat() /
+    langflow_client.langflow_chat(), both of which go through
+    gateway/_dispatch_client.py::agent_dispatch_client() -- the SINGLE
+    documented place for mesh-ingress-front dispatch clients, wired with
+    the internal-PKI ServiceIdentity leaf + internal CA trust
+    (pki/ssl_context.py::client_ssl_context(), per the internal-mTLS
+    convention) -- so only this third, generic branch was left on a bare
+    client.
+  severity: high
+  controls_impacted:
+  - Availability -- @openclaw is one of Yashigani's three bundled default
+    agents; its chat path is completely non-functional on every fresh
+    install (Docker confirmed; k8s shares the identical code path so is
+    assessed equally affected) regardless of the YSG-RISK-133 token fix
+    (independent root cause -- fixing 133 alone does NOT unblock @openclaw;
+    this bug ConnectErrors before the bearer token is even checked
+    server-side).
+  compensating_controls:
+  - No security-boundary weakening, and no weakening applied by this fix --
+    the mesh front's require_and_verify + SPIFFE caller-gate is untouched;
+    the fix only corrects which CLIENT-side trust store the gateway uses
+    when the upstream is recognised as one of our own mesh ingress fronts.
+  - Genuinely externally-deployed custom OpenAI-compatible agents
+    (AgentRegisterRequest.upstream_url without an /agents/ path -- an
+    intentional, tested, non-mesh feature, backoffice/routes/agents.py:151-
+    203) are unaffected -- the fix only routes upstreams whose URL path
+    matches the mesh ingress signature (/agents/<tenant>/<system>) onto the
+    internal-PKI client; everything else keeps the existing public-CA-
+    trusting bare client unchanged.
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  residuals:
+  - >-
+      Fixed: gateway/openai_router.py generic agent-dispatch branch now
+      detects a mesh ingress front by URL path prefix "/agents/" (portable
+      across compose "caddy" and k8s "yashigani-caddy-mesh" hostnames -- the
+      path is identical on both runtimes, the hostname is not) and, when
+      matched, opens the client via
+      gateway/_dispatch_client.py::agent_dispatch_client() -- the same
+      internal-PKI mesh client already used by the letta/langflow dispatch
+      branches -- instead of a bare httpx.AsyncClient. Non-mesh upstreams
+      (no /agents/ path) are unchanged. NEEDS-LIVE-CONFIRM: fix verified by
+      static code-path tracing + confirmed cert chain/SAN correctness
+      (service_identities.yaml) against the live Docker CERTIFICATE_VERIFY_
+      FAILED error, but the live mTLS handshake itself was not re-exercised
+      against a redeployed gateway image in this pass -- Captain does not
+      own the shared stack's redeploy (owner: Maxine/Tiago verification
+      pass). Needs image rebuild + redeploy to confirm handshake succeeds
+      end-to-end.
+  source_grep: >-
+    docker logs <gateway> | grep -i "openclaw\|CERTIFICATE_VERIFY" (Docker
+    e2e 2026-07-28): "ERROR:yashigani.gateway.openai_router:Agent @openclaw
+    unreachable" / "httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED]
+    certificate verify failed: unable to get local issuer certificate";
+    grep -n "httpx.AsyncClient(timeout=120.0)" src/yashigani/gateway/
+    openai_router.py (pre-fix bare client at the openclaw dispatch call
+    site).
