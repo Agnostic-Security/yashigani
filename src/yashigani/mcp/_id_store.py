@@ -53,7 +53,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,61 @@ class McpIdStore:
             new_id, agent_name,
         )
         return new_id
+
+    # ------------------------------------------------------------------
+    # Eager mint — LAURA-V50-010 startup / approve-time invariant
+    # ------------------------------------------------------------------
+
+    def mint_all(self, agent_names: Iterable[str]) -> dict[str, str]:
+        """Eagerly ``get_or_mint`` an mcp_id for every name in ``agent_names``.
+
+        LAURA-V50-010: a registered/imported MCP server must have a
+        non-empty mcp_id BEFORE the gateway reports healthy, not only
+        on-demand at the first live ``tools/call`` (the lazy
+        ``McpBrokerRegistry.get()`` path — SEAM-1d-07). Without this, a
+        server registered only in the durable registry (live import
+        ceremony) sat with ``server_cfg.mcp_id == ""`` until its first
+        real request, so OPA's ``_instance_identified`` gate denied every
+        call unconditionally until that first hit happened to succeed.
+
+        Best-effort per-name: a single mint failure (e.g. a transient
+        Redis blip) is logged and the name is OMITTED from the returned
+        mapping rather than aborting the whole pass — the omitted server
+        falls back to the existing lazy-mint-on-first-call path (still
+        fail-closed at the OPA gate in the meantime; never fail-open).
+
+        Parameters
+        ----------
+        agent_names:
+            Every currently-registered MCP server's agent_name — the union
+            of YASHIGANI_MCP_SERVERS boot-list entries and durable-registry
+            (SEAM-1d-07 live-import) descriptors. Blank/empty names are
+            skipped.
+
+        Returns
+        -------
+        dict[str, str]
+            agent_name -> mcp_id for every name that resolved successfully.
+            Names absent from the mapping FAILED to mint this pass — the
+            caller should log the size mismatch against
+            ``len(agent_names)`` as an explicit startup health signal
+            (see gateway/entrypoint.py's eager-mint startup log).
+        """
+        resolved: dict[str, str] = {}
+        for raw_name in agent_names:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            try:
+                resolved[name] = self.get_or_mint(name)
+            except Exception as exc:
+                logger.error(
+                    "mcp-id-store: mint_all — get_or_mint FAILED for "
+                    "agent_name=%r: %s (server stays unidentified until "
+                    "the next startup pass or its first live request)",
+                    name, exc,
+                )
+        return resolved
 
     def _upsert_registry(
         self,

@@ -715,6 +715,7 @@ async def run_approve_transaction(
     audit_writer: Any = None,
     caddy_reloader: Optional[Callable[[], Awaitable[None]]] = None,
     registry_store: Any = None,  # DurableMcpRegistryStore — v4.1 Ph2a / SEAM-1d-07
+    mcp_id_store: Any = None,    # McpIdStore — v5.0 LAURA-V50-010
 ) -> McpOnboardResult:
     """Run the atomic approve transaction (see module docstring).
 
@@ -726,6 +727,23 @@ async def run_approve_transaction(
         a wrap the broker can never dial is a partial onboarding.
       * dev/test           → step 4b is skipped with a warning
         (backwards-compatible with unit tests / pre-Phase-3 wiring).
+
+    ``mcp_id_store`` (v5.0 LAURA-V50-010, Tom, 2026-07-28): the McpIdStore
+    (Redis db/3, same instance the gateway constructs). When supplied, step
+    4b resolves a stable mcp_id at APPROVE time (not left for the gateway's
+    lazy on-demand mint on first live request) and writes it into the
+    broker descriptor as ``"mcp_id"``, so ``registry.py:_build_broker_and_
+    config``'s ``override_mcp_id`` picks it up directly on the FIRST
+    ``McpBrokerRegistry.get()`` lazy build — no unminted window in which
+    OPA's ``_instance_identified`` gate denies every ``tools/call`` for this
+    server unconditionally. Also used by the post-commit OPA push below to
+    push the full ``grants``/``baselines``/``egress_grants`` document live
+    (not only ``egress_grants``), so ``_grant_ok``/``_envelope_unchanged``
+    are reachable for this instance without waiting for a gateway restart.
+    When None (dev/test without Redis, or an install that has not wired
+    McpIdStore into the backoffice), the descriptor's ``mcp_id`` field is
+    left empty and the gateway's existing lazy-mint fallback still applies
+    — degrades to the pre-fix behaviour, never fails the transaction.
 
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
@@ -1135,6 +1153,30 @@ async def run_approve_transaction(
             _mesh_port = _mcp_mesh_port(parsed)
             _leaf_fp = _leaf_cert_fingerprint(cert_path)
             _meta_name = str((parsed.get("metadata") or {}).get("name", ""))
+            # v5.0 LAURA-V50-010 (Tom, 2026-07-28) — resolve a stable mcp_id
+            # at APPROVE time so the descriptor written below carries it
+            # directly, instead of leaving it for the gateway's lazy
+            # on-demand mint on the FIRST live tools/call
+            # (McpBrokerRegistry.get() -> registry.py:_build_broker_and_
+            # config). Idempotent: get_or_mint() is a Redis check-then-set
+            # keyed on agent_name — a re-approve of the same server_id
+            # returns the SAME id it already minted. Non-fatal on failure
+            # (e.g. transient Redis blip): the gateway's existing lazy-mint
+            # fallback still covers this server on first request; the
+            # descriptor's mcp_id is simply left empty until then (same
+            # fail-closed posture as the pre-fix behaviour — OPA denies
+            # rather than fails open).
+            _resolved_mcp_id: str = ""
+            if mcp_id_store is not None:
+                try:
+                    _resolved_mcp_id = mcp_id_store.get_or_mint(server_id)
+                except Exception as _mid_exc:
+                    logger.warning(
+                        "mcp-onboard: mcp_id mint failed at approve time for "
+                        "%s/%s (%s) — the gateway's lazy on-demand mint still "
+                        "covers this server on its first live request",
+                        tenant_id, server_id, _mid_exc,
+                    )
             descriptor = {
                 "agent_name": server_id,
                 # Base URL only — McpHttpTransport.forward() appends /mcp;
@@ -1148,6 +1190,13 @@ async def run_approve_transaction(
                 # the filesystem / git bundles by metadata.name.
                 "is_filesystem_agent": _meta_name in {"filesystem", "filesystem-mcp"},
                 "is_git_agent": _meta_name in {"git", "git-mcp"},
+                # v5.0 LAURA-V50-010 — stable per-instance grant key, minted
+                # above. registry.py's _build_broker_and_config treats a
+                # present "mcp_id" as an operator-pinned override (no extra
+                # Redis round-trip / no race at the gateway's lazy-load
+                # time) — empty string when mcp_id_store is unavailable,
+                # matching the pre-fix descriptor shape (backward compatible).
+                "mcp_id": _resolved_mcp_id,
                 # v4.1 Phase 2a (LU-MCP-A2): per-instance leaf fingerprint —
                 # threaded into the OPA input target.cert_fingerprint.
                 "cert_fingerprint": _leaf_fp,
@@ -1348,27 +1397,58 @@ async def run_approve_transaction(
         len(artifact_paths),
     )
 
-    # ── Post-commit: push egress grants to OPA (v4.1 Phase 1 / Lu M1) ───────
-    # Sub-path PUT of the FULL egress_grants document — the new grant goes
-    # live without a gateway restart; the same re-push mechanism is the
-    # revocation path (grant absence in the document = kill switch, Nico Q3).
+    # ── Post-commit: push MCP OPA data to OPA (v4.1 Phase 1 / Lu M1 +
+    #    v5.0 LAURA-V50-010 companion fix, Tom, 2026-07-28) ─────────────────
+    # Previously this step pushed ONLY egress_grants. grants/baselines
+    # (written to the durable store at step 4b-ii above) were left to the
+    # NEXT gateway restart's startup push (entrypoint.py — the only other
+    # push_mcp_opa_data call site) — there was no live re-push here at all.
+    # That gap meant a server onboarded via the live import ceremony had NO
+    # data.yashigani.mcp.grants[mcp_id] / .baselines[mcp_id] entry in OPA's
+    # in-memory data until a gateway restart, so even a correctly-minted
+    # mcp_id (this step's sibling fix above) could not satisfy
+    # _grant_ok / _envelope_unchanged — the broker's four-gate stayed
+    # unreachable for the SAME reason LAURA-V50-010 targets.
+    #
+    # push_mcp_opa_data() PUTs the WHOLE data.yashigani.mcp sub-document
+    # (grants + baselines + egress_grants — OPA sub-path PUT semantics, see
+    # _opa_push.py module docstring) built FRESH from the durable store, so
+    # it supersedes (and folds in) the egress-only push: every currently
+    # onboarded server's grant/baseline/egress data goes live in one PUT,
+    # not just this one. Requires mcp_id_store to resolve the grant key
+    # (build_mcp_opa_data keys grants/baselines by mcp_id, same UUID as
+    # step 4b's descriptor); falls back to the pre-fix egress-only push
+    # when mcp_id_store is not wired (dev/test parity).
+    #
     # Best-effort AFTER the commit point: a failed push never unwinds a
-    # committed onboarding — the instance simply DENIES egress (fail-closed)
-    # until the gateway startup push (or a later approve) re-pushes.
+    # committed onboarding — the instance simply DENIES (fail-closed,
+    # _grant_ok / _envelope_unchanged / caller_not_granted_prefix as
+    # applicable) until the gateway startup push or a later approve
+    # re-pushes.
     if registry_store is not None:
         try:
             from yashigani.mcp._egress_grants import build_egress_grants_doc  # noqa: PLC0415
-            from yashigani.mcp._opa_push import push_egress_grants  # noqa: PLC0415
+            from yashigani.mcp._opa_push import (  # noqa: PLC0415
+                push_egress_grants,
+                push_mcp_opa_data,
+            )
             _opa_url = os.environ.get(
                 "YASHIGANI_OPA_URL", "https://policy:8181",
             ).strip() or "https://policy:8181"
-            push_egress_grants(_opa_url, build_egress_grants_doc(registry_store))
+            if mcp_id_store is not None:
+                _org_id = os.environ.get(
+                    "YASHIGANI_ORG_ID", "default",
+                ).strip() or "default"
+                _opa_doc = registry_store.build_mcp_opa_data(mcp_id_store, _org_id)
+                push_mcp_opa_data(_opa_url, _opa_doc)
+            else:
+                push_egress_grants(_opa_url, build_egress_grants_doc(registry_store))
         except Exception as push_exc:  # noqa: BLE001 — committed tx; deny-until-pushed
             logger.error(
-                "mcp-onboard: egress-grant OPA push failed after commit (%s) — "
-                "server=%s will DENY egress (caller_not_granted_prefix, "
+                "mcp-onboard: MCP OPA data push failed after commit (%s) — "
+                "server=%s will DENY (grant/baseline/egress not live in OPA, "
                 "fail-closed) until the gateway startup push or the next "
-                "approve re-pushes data.yashigani.mcp.egress_grants",
+                "approve re-pushes data.yashigani.mcp",
                 push_exc, server_id,
             )
 

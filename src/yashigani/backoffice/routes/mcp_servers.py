@@ -140,6 +140,49 @@ def _durable_registry_store():
         return None
 
 
+def _mcp_id_store():
+    """Return a McpIdStore over Redis db/3, or None (dev/test).
+
+    v5.0 LAURA-V50-010 (Tom, 2026-07-28): shares Redis db/3 with
+    ``_durable_registry_store()`` above (same instance, different key
+    prefix — ``mcp:name_to_id:*`` / ``mcp:id_registry:*``, same DB the
+    gateway's own McpIdStore uses). Passed into ``run_approve_transaction``
+    so a server onboarded through the live import ceremony gets a stable
+    mcp_id minted AT APPROVE TIME, instead of only via the gateway's lazy
+    on-demand mint on the server's first live ``tools/call``.
+
+    Degrades to None when Redis is unreachable — run_approve_transaction
+    then leaves the descriptor's mcp_id empty and the gateway's existing
+    lazy-mint fallback still covers the server (fail-closed in the
+    meantime, never fail-open; same degrade posture as
+    ``_durable_registry_store()``).
+    """
+    try:
+        import redis as _redis  # noqa: PLC0415
+        from yashigani.gateway._redis_url import build_redis_url  # noqa: PLC0415
+        from yashigani.mcp._id_store import McpIdStore  # noqa: PLC0415
+
+        _use_tls = os.getenv("REDIS_USE_TLS", "true").lower() == "true"
+        _secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+        url = build_redis_url(
+            3,
+            use_tls=_use_tls,
+            secrets_dir=_secrets_dir,
+            client_cert_name="backoffice_client",
+        )
+        client = _redis.from_url(url, decode_responses=False)
+        client.ping()
+        return McpIdStore(client)
+    except Exception as exc:  # noqa: BLE001 — degrades to the gateway's lazy mint
+        logger.warning(
+            "mcp-servers: McpIdStore unavailable (%s) — the approve "
+            "transaction will leave mcp_id unminted; the gateway's lazy "
+            "on-demand mint (McpBrokerRegistry.get) still covers this "
+            "server on its first live request (LAURA-V50-010)", exc,
+        )
+        return None
+
+
 def _tool_summary(rec) -> dict:
     """Compact, JSON-safe view of one active EnvelopeRecord for the registry list."""
     tools = []
@@ -671,6 +714,11 @@ async def import_mcp_server(
                 # routes without a gateway reboot.  None → the transaction
                 # fail-closes in production/staging, warn-skips in dev/test.
                 registry_store=_durable_registry_store(),
+                # v5.0 LAURA-V50-010 (Tom, 2026-07-28): mint a stable mcp_id
+                # at approve time + push grants/baselines live (see
+                # mcp_onboard.py docstring). None → degrades to the
+                # gateway's lazy on-demand mint (dev/test parity).
+                mcp_id_store=_mcp_id_store(),
             )
         except McpOnboardError as exc:
             raise HTTPException(

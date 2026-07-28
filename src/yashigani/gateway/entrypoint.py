@@ -1311,6 +1311,48 @@ def _build_app(mesh_mode: bool = False):
             # 5.0 rug-pull — block invocations of a pending-re-approval manifest.
             manifest_reapproval_gate=_manifest_reapproval_gate,
         )
+        # v5.0 LAURA-V50-010 — eager mcp_id mint for EVERY registered MCP
+        # server BEFORE the gateway reports healthy, not only lazily on the
+        # first live tools/call. YASHIGANI_MCP_SERVERS boot-list entries are
+        # already minted above (inside build_registry_from_env's per-entry
+        # _build_broker_and_config). This pass ADDITIONALLY covers servers
+        # registered only via the live import/approve ceremony (durable
+        # registry, SEAM-1d-07) that never go through the boot loop — those
+        # previously stayed at mcp_id="" (McpBrokerRegistry.get()'s lazy
+        # build had never fired yet) until whatever request happened to hit
+        # them first, during which window OPA's _instance_identified gate
+        # denied every tools/call unconditionally for a properly-onboarded
+        # server. Best-effort / non-fatal (mint_all logs+skips per-name
+        # failures): the MCP subsystem as a whole already degrades
+        # gracefully when Redis db/3 is unavailable (permission_store=None
+        # guard above) — this pass follows the same established pattern,
+        # just loud instead of silent.
+        if _mcp_id_store is not None and _mcp_durable_store is not None:
+            try:
+                _durable_agent_names = [
+                    d.get("agent_name", "") for d in _mcp_durable_store.list_all()
+                ]
+            except Exception as _list_exc:
+                _durable_agent_names = []
+                logger.error(
+                    "mcp-id-store: eager mint startup pass — durable "
+                    "registry list_all() failed (%s); durable-only servers "
+                    "stay unminted until their first live request (lazy "
+                    "fallback still applies, fail-closed in the meantime)",
+                    _list_exc,
+                )
+            if _durable_agent_names:
+                _eager_resolved = _mcp_id_store.mint_all(_durable_agent_names)
+                _eager_missing = sorted(
+                    set(n for n in _durable_agent_names if n) - set(_eager_resolved)
+                )
+                logger.info(
+                    "mcp-id-store: eager startup mint — %d/%d durable-registered "
+                    "server(s) identified (non-empty mcp_id)%s",
+                    len(_eager_resolved), len(_durable_agent_names),
+                    "" if not _eager_missing else f" — FAILED: {_eager_missing!r}",
+                )
+
         _extra_routers: list = [openai_router, egress_proxy_router]
 
         # v5.0 LAURA-V50-014 (Critical, fail-OPEN bypass — Laura live re-
