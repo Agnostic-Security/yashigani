@@ -236,27 +236,27 @@ _PLACEHOLDER_INTEGRITY = "PLACEHOLDER_YASHIGANI_INTEGRITY"
 
 # VERIFIER_HASH
 # Replace with: sha256sum src/yashigani/licensing/verifier.py | cut -d' ' -f1
-VERIFIER_HASH: str = _PLACEHOLDER_INTEGRITY + "_VERIFIER_HASH"
+VERIFIER_HASH: str = "672a953affc17dca342506c996d29cca693c8613f453be123acc7d1a7764629d"
 
 # ENFORCER_HASH
 # Replace with: sha256sum src/yashigani/licensing/enforcer.py | cut -d' ' -f1
-ENFORCER_HASH: str = _PLACEHOLDER_INTEGRITY + "_ENFORCER_HASH"
+ENFORCER_HASH: str = "1584d7da63903cfab926aba639bc08c90b3249c3180af9ca0a3864c2e8fa85d1"
 
 # LOADER_HASH
 # Replace with: sha256sum src/yashigani/licensing/loader.py | cut -d' ' -f1
-LOADER_HASH: str = _PLACEHOLDER_INTEGRITY + "_LOADER_HASH"
+LOADER_HASH: str = "b2210667a345b82969014440d17d8ea2624732793d9c8f528d0ceb2ed4aa7034"
 
 # INTEGRITY_HASH (self-referential — computed over this file before replacement)
 # Replace with: sha256sum src/yashigani/licensing/_integrity.py | cut -d' ' -f1
-INTEGRITY_HASH: str = _PLACEHOLDER_INTEGRITY + "_INTEGRITY_HASH"
+INTEGRITY_HASH: str = "ec06279b9f8a21e8a9261af4154e660d92e0da2623a9f63a0756e6312d140d2d"
 
 # AGENTS_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/agents/registry.py | cut -d' ' -f1
-AGENTS_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_AGENTS_REGISTRY_HASH"
+AGENTS_REGISTRY_HASH: str = "869174fbc128dddcadde3df98c1f550e1cb42abeedc68864cfe0ab548757e177"
 
 # IDENTITY_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/identity/registry.py | cut -d' ' -f1
-IDENTITY_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_IDENTITY_REGISTRY_HASH"
+IDENTITY_REGISTRY_HASH: str = "4552eb7a567cc5f3dd82f8a49b2bb8a9a6bd9dccf9bc16f3ba8f3759e15d71ad"
 
 # ---------------------------------------------------------------------------
 # Point-of-use (POU) protected-file hashes — 2026-07-16, LAURA-V2-001
@@ -266,23 +266,23 @@ IDENTITY_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_IDENTITY_REGISTRY_HASH"
 
 # OIDC_MODULE_HASH
 # Replace with: sha256sum src/yashigani/sso/oidc.py | cut -d' ' -f1
-OIDC_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_OIDC_MODULE_HASH"
+OIDC_MODULE_HASH: str = "95decf0af5940f0883385fd8880a756405eaa15c0a9c50c510e05bf6ad7f38bf"
 
 # SAML_MODULE_HASH
 # Replace with: sha256sum src/yashigani/sso/saml.py | cut -d' ' -f1
-SAML_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_SAML_MODULE_HASH"
+SAML_MODULE_HASH: str = "6ec6de22026f3087653eed3374449a612a366271ea1af3eae98354331a9ab98d"
 
 # SSO_ROUTES_HASH
 # Replace with: sha256sum src/yashigani/backoffice/routes/sso.py | cut -d' ' -f1
-SSO_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SSO_ROUTES_HASH"
+SSO_ROUTES_HASH: str = "4220eb6865a35e9badd6f3c680ec307495202f1a95fdb2ea0685d0ea5966536d"
 
 # SCIM_ROUTES_HASH
 # Replace with: sha256sum src/yashigani/backoffice/routes/scim.py | cut -d' ' -f1
-SCIM_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SCIM_ROUTES_HASH"
+SCIM_ROUTES_HASH: str = "5cba251290f9769553b2a381cfb07806a81a6617b31e507b30cb6d4a3884b530"
 
 # GATE_MIDDLEWARE_HASH
 # Replace with: sha256sum src/yashigani/licensing/gate_middleware.py | cut -d' ' -f1
-GATE_MIDDLEWARE_HASH: str = _PLACEHOLDER_INTEGRITY + "_GATE_MIDDLEWARE_HASH"
+GATE_MIDDLEWARE_HASH: str = "b43d82ed8072e3a2ccbc5429dd1582e03a6a2433ec28ab4c4cbc76d41efa3d0d"
 
 # ---------------------------------------------------------------------------
 # Mesh FULL topology — Phase D, 2026-07-17 (LAURA-V2-003 RE-VERIFY
@@ -296,7 +296,7 @@ GATE_MIDDLEWARE_HASH: str = _PLACEHOLDER_INTEGRITY + "_GATE_MIDDLEWARE_HASH"
 # import compute_mesh_order; import json; print(json.dumps({'version': V,
 # 'seed': S, 'member_order': compute_mesh_order(V, S)}))"  (scripts/inject_hashes.sh
 # Step 3c does this automatically; MESH_SEED auto-generates if unset).
-MESH_TOPOLOGY_JSON: str = _PLACEHOLDER_INTEGRITY + "_MESH_TOPOLOGY_JSON"
+MESH_TOPOLOGY_JSON: str = "{\"member_order\":[\"GATE_MIDDLEWARE\",\"VERIFIER\",\"OIDC\",\"SSO_ROUTES\",\"SCIM_ROUTES\",\"SAML\",\"ENFORCER\"],\"seed\":\"29097ff64ef4e63d667eec33443f7e3c\",\"version\":\"0.0.0-unset\"}"
 
 # ---------------------------------------------------------------------------
 # Licence-hardening-v2 chain constants (design §2.2/§3.1/§3.3, §4a)
@@ -304,22 +304,22 @@ MESH_TOPOLOGY_JSON: str = _PLACEHOLDER_INTEGRITY + "_MESH_TOPOLOGY_JSON"
 
 # MASTER_ANCHOR_SET_JSON
 # Emit via: licgen anchor-set emit  (Su tooling — design "MASTER-ROTATION READINESS")
-MASTER_ANCHOR_SET_JSON: str = _PLACEHOLDER_INTEGRITY + "_MASTER_ANCHOR_SET_JSON"
+MASTER_ANCHOR_SET_JSON: str = "[{\"added\":\"2026-07-28T00:24:12.849409+00:00\",\"alg\":\"ecdsa-p384-sha384\",\"anchor_id\":\"M-v5-demo\",\"pubkey_pem\":\"-----BEGIN PUBLIC KEY-----\\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEbSQPx0WXGRjO5/gkr0eKKAw8mTKXH/n8\\nKA0OSke+edue6ZepTzBbBUvwBPtQ7CL+wZguuUuOgOpvCUPpyJglQyY/2EQrrAIA\\nPmJOWvM1TdxpDHpBNvBenQKH+Mm5RA4m\\n-----END PUBLIC KEY-----\\n\",\"status\":\"active\"}]"
 
 # CODE_LEAF_CERT_JSON
 # Emit via: licgen new-leaf --channel prod --version <x.y.z>
-CODE_LEAF_CERT_JSON: str = _PLACEHOLDER_INTEGRITY + "_CODE_LEAF_CERT_JSON"
+CODE_LEAF_CERT_JSON: str = "{\"alg\":\"ecdsa-p384-sha384\",\"client_id\":\"*\",\"csr_pop\":{\"client_id\":\"*\",\"csr_self_sig\":\"MGYCMQDOBXOsT8BrlH6lV5xCrz6Ar02USyvI777VAOtCVJwcCdpALwjscNyoQBKygPJhNXQCMQD+UOEqvN3wz5Hf3fKfJECSR5mCP3V6su4rc+gFCnb9jY16a9hfqNM0e9o41Ji/QP8=\",\"leaf_pubkey_pem\":\"-----BEGIN PUBLIC KEY-----\\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEi/nzaxBlSb7WpWczQPKkqXPQIzawBJW2\\nBeXEnkduARFM9rwt80w7b9mb9D4/Yg9XOn2zJiLG7dVgErchcrlDMpv0LS+FLUMA\\nyIz+lhUoT49fXGANnqanswcMbBcMglW0\\n-----END PUBLIC KEY-----\\n\",\"role\":\"code\"},\"leaf_pubkey_pem\":\"-----BEGIN PUBLIC KEY-----\\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEi/nzaxBlSb7WpWczQPKkqXPQIzawBJW2\\nBeXEnkduARFM9rwt80w7b9mb9D4/Yg9XOn2zJiLG7dVgErchcrlDMpv0LS+FLUMA\\nyIz+lhUoT49fXGANnqanswcMbBcMglW0\\n-----END PUBLIC KEY-----\\n\",\"not_after\":\"2026-08-27T00:24:35.897246+00:00\",\"not_before\":\"2026-07-28T00:24:35.897246+00:00\",\"release\":\"5.0.0\",\"role\":\"code\",\"serial\":\"code-5.0.0-20260728002435\",\"signed_at\":\"2026-07-28T00:24:35.897246+00:00\"}"
 
 # CODE_LEAF_CERT_SIG
 # Emitted alongside CODE_LEAF_CERT_JSON by the same `licgen new-leaf` call — the
 # master's signature over CODE_LEAF_CERT_JSON's signing digest.
-CODE_LEAF_CERT_SIG: str = _PLACEHOLDER_INTEGRITY + "_CODE_LEAF_CERT_SIG"
+CODE_LEAF_CERT_SIG: str = "MGYCMQCcY8pM4eJD8Uocpx3JEsqWd6WPHrVzS5qeiZ0vKWtZZVeyX7g4vihL0SFUdRu2RLcCMQDi45EX63Ub8AConMW1+W8RZuVB2RIu98etEyQBSMFik7927NWCual/7v1P65mj32c="
 
 # BUNDLE_SIG
 # Emit via: licgen sign-build --channel prod --version <x.y.z>
 # (supersedes the v1 HASH_BUNDLE_SIG produced by scripts/sign_bundle.py against
 # the old counter key — same constant name, new chain-based signer/scheme).
-BUNDLE_SIG: str = _PLACEHOLDER_INTEGRITY + "_BUNDLE_SIG"
+BUNDLE_SIG: str = "MGQCMFUHPTLK6lep9FkDiezTehg4tm7HhfxzKC4cWZb93lso0CMLBPPHCGcKRDe0tlPlswIwByWuXzXOy+RuL/FmV43tlrQFntYXyl+FwLxqeU6HdILNH0x8mRJ5azjg+Be7lZV2"
 
 # KILL_LIST_JSON
 # Bundled with every release. SAFE DEFAULT: "[]" (empty — nothing revoked).

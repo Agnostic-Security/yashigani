@@ -990,7 +990,7 @@ def get_integrity_status() -> bool:
 # un-suppressible check.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_INTEGRITY_ROOT_HASH: str = "PLACEHOLDER_YASHIGANI_INTEGRITY_ROOT_HASH"
+_EXPECTED_INTEGRITY_ROOT_HASH: str = "a76fbc6aff00e77042ab977b73911a7318684232d3c24f4cb05750e866962573"
 
 
 def _live_integrity_root_hash() -> str:
