@@ -185,9 +185,9 @@ import /etc/caddy/Caddyfile.openclaw-webhooks
 # (depth, principal, root-request-id) the gateway uses for model-RBAC. A real
 # external user proved they can FORGE X-Yashigani-Orchestration-Depth at the
 # public edge to bypass model-RBAC. These headers are LEGITIMATE only on the
-# internal mesh self-call path (gateway:8081), exactly like X-OpenWebUI-User-*.
-# Imported into EVERY public handle that reaches the gateway (direct or via the
-# OWUI catch-all). Single-source snippet = no per-handle drift across renders.
+# internal mesh self-call path (gateway:8081).
+# Imported into EVERY public handle that reaches the gateway. Single-source
+# snippet = no per-handle drift across renders.
 # Pairs with Tom's gateway-side identity-gate (the two halves ship together).
 # `request_header -X` (delete) runs unconditionally here; no inbound value
 # survives to the gateway, so it can only ever see an internally-set value.
@@ -378,13 +378,11 @@ Hiring: https://agnosticsec.com/careers
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         # Track C (F-B) anti-spoof: strip any client-supplied forwarded-user
-        # identity headers on the public /v1 path so an external caller cannot
-        # impersonate an OWUI user. ONLY OWUI (internal, via gateway:8081) may
-        # set these; the gateway honours them solely under the internal bearer.
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
+        # identity header on the public /v1 path. The legacy X-OpenWebUI-User-*
+        # forwarding lines were removed here (2026-07-28): OWUI is gone in 4.x
+        # and the gateway confirms (openai_router.py SEC-GAP-1) it never reads
+        # X-OpenWebUI-User-* at all — stripping it defended nothing. X-Forwarded-User
+        # is a distinct, still-checked header and stays stripped at the edge.
         request_header -X-Forwarded-User
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {
@@ -419,11 +417,8 @@ Hiring: https://agnosticsec.com/careers
         # close the X-Forwarded-User spoof vector at the edge. Mirrors /v1/* treatment.
         # OPA blocks /mcp/* before these headers are consulted, but stripping here
         # removes the spoof surface entirely rather than relying solely on the
-        # application-layer gate.
-        request_header -X-OpenWebUI-User-Email
-        request_header -X-OpenWebUI-User-Id
-        request_header -X-OpenWebUI-User-Name
-        request_header -X-OpenWebUI-User-Role
+        # application-layer gate. Legacy X-OpenWebUI-User-* strip removed
+        # 2026-07-28 — OWUI is gone in 4.x and the header is never read.
         request_header -X-Forwarded-User
         import strip-orchestration-headers
         reverse_proxy https://gateway:8080 {

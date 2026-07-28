@@ -274,7 +274,6 @@ TOTAL_STEPS=13
 WORK_DIR=""
 AGENT_BUNDLES=""          # comma-separated: langflow,letta,openclaw
 INSTALL_WAZUH=false       # opt-in: --wazuh flag
-INSTALL_OPENWEBUI=false   # opt-in: --with-openwebui flag
 INSTALL_INTERNAL_CA=false    # opt-in: --with-internal-ca flag
 INTERNAL_CA_CERT=""          # --internal-ca-cert path; empty = no BYO CA or deferred
 INTERNAL_CA_KEY=""           # --internal-ca-key path
@@ -406,11 +405,6 @@ OPTIONS
   --no-agents                             Exclude ALL agent bundles. Non-interactive shorthand for
                                           --agent-bundles none. Lean/minimal installs should pass this
                                           flag explicitly to suppress the langflow+letta defaults.
-  --with-openwebui                        Install Open WebUI chat surface (non-interactive explicit opt-in).
-                                          In interactive mode a wizard question is presented instead
-                                          ("Will Yashigani be used by humans with a web UI? [Y/n]").
-                                          Pulls image unmodified from ghcr.io/open-webui/open-webui;
-                                          Open WebUI is governed by its own licence terms.
   --with-internal-ca                      Enable BYO internal CA for service-to-service mTLS.
                                           Without --internal-ca-cert/--internal-ca-key, activates
                                           deferred mode (install runs with Yashigani-generated PKI;
@@ -703,7 +697,6 @@ parse_args() {
         DB_AES_KEY="${2:?'--db-aes-key requires a value (64-char hex or 44-char base64)'}"
         shift 2
         ;;
-      --with-openwebui)  INSTALL_OPENWEBUI=true;  shift ;;
       --with-internal-ca) INSTALL_INTERNAL_CA=true; shift ;;
       --internal-ca-cert)
         INTERNAL_CA_CERT="${2:?'--internal-ca-cert requires a path'}"
@@ -3470,7 +3463,7 @@ _write_aes_key_to_env() {
   # A4 (Laura BLOCKING / CWE-732 / ASVS V6.4.1): chmod 0600 IMMEDIATELY after
   # touch, before any credentials are written.  Without this, ambient umask 022
   # creates a 0644 file; secrets (YASHIGANI_DB_AES_KEY, POSTGRES_PASSWORD,
-  # REDIS_PASSWORD, OWUI_SECRET_KEY, TOTP material) land world-readable until a
+  # REDIS_PASSWORD, TOTP material) land world-readable until a
   # later chmod corrects it.  This also ensures A2's o+rX sweep cannot widen the
   # file: o+rX on a 0600 file would set 0604 (world-readable), which the explicit
   # 0600 here prevents because the sweep runs after this function.
@@ -3611,7 +3604,7 @@ _write_aes_key_to_env() {
   # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
   # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
   # model and enable response inspection so the egress block fires and renders in
-  # OWUI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
   # enterprise leave it OFF; demo turns it ON to showcase the injection block.
   if [[ "$DEPLOY_MODE" == "demo" ]]; then
     _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
@@ -4990,13 +4983,13 @@ check_existing_installation() {
   fi
 
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
-    # BUG-B+-002: additive re-run (--with-openwebui / --agent-bundles on a
+    # BUG-B+-002: additive re-run (--agent-bundles on a
     # running stack). The live project volumes are NOT contamination — they belong
     # to the running install and carry the current PKI CA. Mark REUSE_VOLUMES so
     # _check_contaminated_volumes skips the false-positive check on REUSE_VOLUMES=true.
     # The live project volumes belong to the running install (same PKI CA) — not contamination.
-    if [[ "$INSTALL_OPENWEBUI" == "true" || -n "$AGENT_BUNDLES" ]]; then
-      log_info "Additive re-run detected (--with-openwebui / --agent-bundles on running stack)"
+    if [[ -n "$AGENT_BUNDLES" ]]; then
+      log_info "Additive re-run detected (--agent-bundles on running stack)"
       # MI-4: add-component on a RUNNING stack mutates a live instance — gate it
       # with the shared step-up (auth/stepup.py via the API path; token/ack on the
       # host-shell path). Fail-closed if unattended without a step-up proof.
@@ -5084,7 +5077,9 @@ _INSTALL_CANONICAL_VOLUMES=(
     openclaw_data
     langflow_data
     letta_data
-    openwebui_data
+    openwebui_data  # legacy — OWUI service removed in 4.0; volume may still exist
+                    # on hosts upgrading from 3.x. Kept so upgrade backup/contamination
+                    # checks still see it. Do not reintroduce the service.
     budget_redis_data
     step_ca_data
     wazuh_api_configuration
@@ -5512,7 +5507,7 @@ select_agent_bundles() {
   printf "\n"
   printf "${C_YELLOW}╔═══════════════════════════════════════════════════════════╗${C_RESET}\n"
   printf "${C_YELLOW}║  THIRD-PARTY AGENT BUNDLES — COURTESY INTEGRATIONS        ║${C_RESET}\n"
-  printf "${C_YELLOW}║  Integrations: OpenWebUI, Wazuh, Langflow, Letta, OpenClaw║${C_RESET}\n"
+  printf "${C_YELLOW}║  Integrations: Wazuh, Langflow, Letta, OpenClaw           ║${C_RESET}\n"
   printf "${C_YELLOW}╠═══════════════════════════════════════════════════════════╣${C_RESET}\n"
   printf "${C_YELLOW}║  The following agents are provided AS IS by               ║${C_RESET}\n"
   printf "${C_YELLOW}║  Agnostic Security as a convenience.                      ║${C_RESET}\n"
@@ -7627,7 +7622,7 @@ DKRAUDIT
 # -----------------------------------------------------------------------------
 _ensure_agent_databases() {
   # Only meaningful when at least one agent bundle that needs a postgres DB is
-  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/openwebui/wazuh
+  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/wazuh
   # carry no dedicated agent DB). We gate on COMPOSE_PROFILES containing `letta`
   # rather than hard-coding the DB name — if a future bundle adds a DB to the init
   # script, add its profile here and the init script remains the single source for
@@ -8833,7 +8828,7 @@ compose_up() {
   # only written inside the `if podman` branch above, so on Docker they were never
   # set. Result: the backoffice Optional-Services panel read an empty
   # YASHIGANI_ENABLED_PROFILES and showed EVERY deployed optional service + agent
-  # (openwebui, wazuh, langflow, letta, openclaw) as "Not deployed"; external
+  # (wazuh, langflow, letta, openclaw) as "Not deployed"; external
   # sub-apps (Grafana/Wazuh) had no public-URL to self-reference. Recomputed here
   # (the in-branch `local`s never execute on docker) and written unconditionally.
   local _env_file_rt="${WORK_DIR}/docker/.env"
@@ -19158,12 +19153,6 @@ main() {
       fi
     fi
 
-    # Step 8b: 4.0 — ui4 is built-in (no OWUI). --with-openwebui is accepted
-    # but silently ignored for backward-compat with existing operator scripts.
-    if [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]]; then
-      log_info "--with-openwebui is a no-op in 4.0 (ui4 chat surface is built in — Open WebUI removed)"
-    fi
-
     # Step 8b-ii: Write OLLAMA_MODEL to .env for the gateway + ui4 chat inference.
     # ollama-init reads OLLAMA_MODEL and pulls the model when any agent bundle is active.
     # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM.
@@ -19232,7 +19221,7 @@ main() {
     # then falls back to `podman unshare tee` (rootless namespace) and finally
     # an ephemeral container write.
     # Covers every profile that may have been added in steps 8/8b/8c
-    # (langflow, letta, openclaw, openwebui, wazuh, ...).
+    # (langflow, letta, openclaw, wazuh, ...).
     local _tok_secrets_dir="${WORK_DIR}/docker/secrets"
     for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
       [[ -z "$_profile" ]] && continue

@@ -220,7 +220,9 @@ _CANONICAL_VOLUMES=(
     openclaw_data
     langflow_data
     letta_data
-    openwebui_data
+    openwebui_data  # legacy — OWUI service removed in 4.0; volume may still exist
+                    # on hosts upgraded from 3.x. Kept here so --remove-volumes
+                    # still cleans it up. Do not reintroduce the service.
     budget_redis_data
     step_ca_data
     wazuh_api_configuration

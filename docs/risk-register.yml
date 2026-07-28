@@ -4304,3 +4304,93 @@ risks:
     grep -n "httpx.AsyncClient(timeout=120.0)" src/yashigani/gateway/
     openai_router.py (pre-fix bare client at the openclaw dispatch call
     site).
+- id: YSG-RISK-140
+  description: >-
+    Cleanup (Tiago directive, 2026-07-28): OpenWebUI (OWUI) was replaced by
+    the native ui4 chat/agents/builder/workflows SPA in 4.0, but the
+    `--with-openwebui` install.sh flag and a substantial amount of
+    OWUI-shaped dead plumbing remained in the tree — a no-op CLI option that
+    still appeared in --help, a full optional Helm Deployment/Service/PVC
+    (helm/yashigani/templates/open-webui.yaml) + values block + three
+    openWebui.enabled-gated NetworkPolicy blocks + a gated Secret template,
+    and four `request_header -X-OpenWebUI-User-*` Caddyfile strip lines
+    across all four Caddyfile-family renders (docker/Caddyfile.selfsigned,
+    .ca, .acme, docker/caddy/Caddyfile.waf, helm/yashigani/templates/
+    configmaps.yaml). Confirmed via openai_router.py's own SEC-GAP-1
+    comments + regression tests (test_track_c_owui_identity.py,
+    test_identity_id_header_forwarding.py, test_p1p2_header_strip.py,
+    test_4_0_gate_fixes.py) that X-OpenWebUI-User-Email/-Id/-Name/-Role is
+    NEVER read by the gateway in 4.1 — the Caddyfile strip lines defended
+    a header nothing consumes. Separately, src/yashigani/backoffice/
+    routes/auth.py's `/auth/verify-user` endpoint (owui-users RBAC gate)
+    was confirmed unreachable — no Caddyfile forward_auth block calls it;
+    `/app/webui*` is now a bare `redir * /chat 302` — and
+    _push_openwebui_model()/_owui_http_client() in routes/agents.py POSTed
+    agent configs into a container that has not existed since 4.0.
+  severity: low
+  controls_impacted:
+  - CWE-1164 (Irrelevant Code) — dead CLI option + dead Helm resources +
+    dead Caddy header-strip rules presented as live/usable surface
+  - Maintainability / attack-surface hygiene — every dead code path is a
+    future misconfiguration or reintroduction risk
+  compensating_controls:
+  - None needed — this is a removal of already-inert functionality, not a
+    live control being weakened. Nothing security-relevant depended on any
+    of the removed pieces (verified per description above).
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: >-
+      REMOVED: install.sh --with-openwebui flag (arg parse, help text,
+      INSTALL_OPENWEBUI var, no-op handler, additive-re-run check,
+      Integrations banner line) — now falls through to the standard
+      "Unknown option" + exit 1 error, same as any other retired flag.
+      helm/yashigani/templates/open-webui.yaml deleted whole (329 lines:
+      Deployment + Service + PVC). helm/yashigani/values.yaml openWebui:
+      block (~80 lines) replaced with a removal-note comment; matching
+      override blocks dropped from values.single-node.yaml. Three
+      openWebui.enabled-gated blocks removed from helm/yashigani/templates/
+      networkpolicy.yaml (gateway:8081 ingress rule, allow-open-webui-
+      ingress/egress NetworkPolicy pair, allow-caddy-egress open-webui
+      rule) and the matching gate in ollama.yaml's ollama-init Job —
+      kept the two gate conditions byte-identical to each other per the
+      pre-existing F-K8S-OLLAMA-INIT-NETPOL finding (a prior LIVE bug from
+      the two gates drifting). The openWebui-gated yashigani-open-webui-
+      secrets Secret template removed from secrets.yaml (a pre-existing
+      Secret of that name from an old release may linger in-cluster,
+      helm.sh/resource-policy: keep — harmless orphan, not recreated/read
+      by anything). Four `request_header -X-OpenWebUI-User-*` lines
+      removed from each of the five Caddyfile-family renders (both /v1/*
+      and /mcp/* handles where present); X-Forwarded-User strip left
+      in place (distinct, still-checked header). `helm lint` and
+      `helm template` both verified clean post-removal (0 chart failures,
+      full render succeeds). install.sh/uninstall.sh's own
+      `openwebui_data` legacy-volume entries in the canonical volume list
+      were DELIBERATELY KEPT + comment-annotated — a real docker volume by
+      that name may still exist on hosts upgraded from 3.x, and both
+      install.sh's upgrade-backup path and uninstall.sh's --remove-volumes
+      cleanup path need to keep managing it. Docs sweep (install_config.md
+      §21, preflight_check.md, THIRD-PARTY-LICENSES.md, README-adjacent
+      manuals) tracked separately in the same change.
+  - rationale: >-
+      DELIBERATELY KEPT (guardrail, not removed): X-Forwarded-User strip
+      in all Caddyfiles (distinct header from X-OpenWebUI-User-*, still
+      consulted); the Caddy `/app/webui*` -> `/chat` 302 back-compat
+      redirect (serves old bookmarks, does not depend on OWUI); the
+      X-Yashigani-Identity-Id / X-Yashigani-User-Id trusted-header identity
+      rail and YASHIGANI_INTERNAL_BEARER mesh-trust gate (live, unrelated
+      mechanism, name predates OWUI removal but the mechanism itself is
+      current — not renamed, per explicit instruction). Python-side dead
+      code (_push_openwebui_model, _owui_http_client, the unreachable
+      /auth/verify-user endpoint, the openwebui optional-service admin
+      panel entry) removed separately in commit da0a9e93 (Tom).
+  last_threat_model_review: '2026-07-28'
+  classification: cleanup
+  source_grep: >-
+    grep -rniE "openwebui|open.?webui|--with-openwebui" install.sh docker/
+    helm/ — pre-change: 47 matches across install.sh/docker-compose.yml/
+    Caddyfile family/helm templates+values; post-change: only historical/
+    removal-note comments and the deliberately-kept X-Forwarded-User +
+    legacy-volume-list entries remain.

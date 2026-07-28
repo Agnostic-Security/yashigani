@@ -340,8 +340,8 @@ adminBootstrap:
 # ---------------------------------------------------------------------------
 # Internal Bearer Token (Captain Bucket-C — per-install, rotatable secret)
 # ---------------------------------------------------------------------------
-# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (open-webui,
-# langflow, letta) present as the OpenAI `Authorization: Bearer <token>` when
+# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (langflow,
+# letta) present as the OpenAI `Authorization: Bearer <token>` when
 # calling gateway:8081/v1. The gateway's AgentAuthMiddleware validates it at
 # the app layer. Previously hardcoded to "yashigani-internal"; now per-install.
 #
@@ -906,9 +906,9 @@ ollama:
     home: "/data"
     ollamaModels: "/data/models"
   # initJob — one-shot Kubernetes Job to pull the default model on first deploy.
-  # Activated only when openWebui.enabled=true (no model needed for API-only).
-  # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
-  #   chat surface shows it as an available backend.
+  # Activated only when an agent bundle needing it is enabled (no model needed
+  # for API-only). defaultModel: model to pull, so the ui4 chat surface shows
+  # it as an available backend.
   # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
   #   Default is "skip" — Ollama republishes models on upstream updates, which
   #   changes the manifest SHA and hard-fails every clean install if a stale
@@ -1495,7 +1495,7 @@ agentBundles:
       # remaining GID 2002 consumer on Compose path (reads bearer as group).
       # In K8s, bearer is delivered via secretKeyRef env var — supplementalGroups
       # is not functionally required here but retained for documentation parity.
-      # All other services (postgres, redis, budget-redis, open-webui, letta)
+      # All other services (postgres, redis, budget-redis, letta)
       # have had supplementalGroups: [2002] removed.
       supplementalGroups: [2002]
     containerSecurityContext:
@@ -1863,84 +1863,14 @@ agentBundles:
         drop: ["ALL"]
 
 # ---------------------------------------------------------------------------
-# Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
-# Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).
-# Open WebUI is governed by its own licence terms — review at
-# https://github.com/open-webui/open-webui/blob/main/LICENSE before enabling.
-# Yashigani orchestrates deployment via Helm; it does not redistribute Open
-# WebUI binaries. Internal only — all inference routes through the gateway.
-#
-# DEPRECATED (v2.23.2): Open WebUI integration is sunsetting. Yashigani's own
-# built-in UI ships in v2.24.0. Set enabled: false (the default) unless you
-# are running a v2.23.x install that previously opted in.
-# LU-7023360-001: default corrected from true → false.
+# Open WebUI — REMOVED in 4.0 (YSG-RISK-142). ui4, Yashigani's first-party
+# Lit-based chat/agents/builder/workflows SPA, is served directly by the
+# backoffice and replaces it. The helm/yashigani/templates/open-webui.yaml
+# Deployment/Service/PVC template, the openWebui-gated blocks in
+# secrets.yaml/networkpolicy.yaml/ollama.yaml, and this values block were all
+# removed together on 2026-07-28. Do not reintroduce without a design review —
+# see the risk register entry for what depended on it and why it was cut.
 # ---------------------------------------------------------------------------
-openWebui:
-  enabled: false
-  # B12 fix (TOM-K8S-001): existingSecretName for OWUI_SECRET_KEY injection
-  # into backoffice. Leave empty to use the chart-managed yashigani-open-webui-secrets.
-  # Set to a pre-created Secret name if managing the secret out-of-band.
-  existingSecretName: ""
-  image:
-    # Pinned to v0.9.1 to match docker-compose.yml (was floating :main — fixed
-    # in v2.23.2 image-pin sweep 2026-05-02).
-    repository: ghcr.io/open-webui/open-webui
-    tag: "v0.9.2@sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49"
-    pullPolicy: IfNotPresent
-  replicaCount: 1
-  # Retro #3ar — open-webui OOMKilled (exit 137) with 512Mi limit on K8s.
-  # The bundled SvelteKit + Python embedding + LangChain stack consistently
-  # peaks at ~1.2-1.5 GiB on first boot. 512Mi was guesswork carried over
-  # from the docker-compose default; insufficient for the K8s pod where
-  # there is no host page cache to lean on.
-  # Retro #3as — OOMKilled again at 2Gi limit. LangChain + sentence-transformers
-  # stack imports during startup push peak RSS above 2Gi even with
-  # HF_HUB_OFFLINE=1 (which eliminates download wait but not model-graph init).
-  # 3Gi limit gives stable headroom on Docker Desktop single-node cluster.
-  # YSG-RISK-005 #3av: requests = 50% of limit (risk register sizing: 3072m/1.0).
-  resources:
-    requests:
-      cpu: "500m"
-      memory: "1536Mi"
-    limits:
-      cpu: "1000m"
-      memory: "3072Mi"
-  service:
-    port: 8080
-    type: ClusterIP
-  env:
-    webuiAuth: "false"
-    webuiAuthTrustedEmailHeader: "X-Forwarded-User"
-    webuiAuthTrustedNameHeader: "X-Forwarded-Name"
-    # Phase 2 / 2.25.5-auth-ingress: OWUI served under /app/webui.
-    # See docker-compose.yml for full rationale.
-    webuiUrl: "/app/webui"
-    webuiBaseUrl: "/app/webui"
-    # Single-logout: OWUI signout redirects to /auth/logout-redirect which
-    # clears the Yashigani session cookie and redirects to /login.
-    webuiAuthSignoutRedirectUrl: "/auth/logout-redirect"
-    enableSignup: "true"
-    # Track C (F-B): forward the authenticated OWUI user to the gateway so OWUI
-    # emits X-OpenWebUI-User-Email/-Id/-Name/-Role on upstream calls. The
-    # gateway trusted-forwarder resolver maps the email -> per-user Yashigani
-    # identity so per-user/group/org RBAC applies (compose parity).
-    enableForwardUserInfoHeaders: "true"
-    webuiSecretKeySecretName: "yashigani-open-webui-secrets"
-    webuiSecretKeySecretKey: "secret_key"
-    # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
-    # (8081, plain HTTP). Network isolation (K8s NetworkPolicy) is the transport
-    # guard; AgentAuthMiddleware enforces token auth at the app layer.
-    openaiApiBaseUrl: "http://yashigani-gateway:8081/v1"
-    # openaiApiKey is now wired via secretKeyRef (internalBearer Secret) in
-    # open-webui.yaml — Captain Bucket-C fix. This field is intentionally absent.
-    ollamaBaseUrl: ""
-    enableOllamaApi: "false"
-    defaultModels: "qwen2.5:3b"
-    webuiName: "Yashigani AI"
-  persistence:
-    enabled: true
-    size: 5Gi
-    storageClass: ""
 
 # ---------------------------------------------------------------------------
 # Budget Redis — dedicated Redis for token budget counters (v1.0)
