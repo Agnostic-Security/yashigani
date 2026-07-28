@@ -336,19 +336,35 @@ def build_principal_machinery(
     the shared jti nonce store (G-NEW-5 / R3).
 
     Reuses the SAME key path the MCP broker uses (via ``McpJwtIssuer``) and the
-    SAME ``NonceStore`` wiring (RedisNonceStore when ``REDIS_URL`` is set, else
-    InMemoryNonceStore for dev) — we do NOT invent a new key path or a new nonce
-    store.  Fail-closed: a key/FIPS misconfiguration (or a missing persistent key
-    in production/staging) raises here at startup, not at request time.
+    SAME ``NonceStore`` wiring (RedisNonceStore when Redis is configured via the
+    split ``REDIS_HOST``/``REDIS_PORT``/``REDIS_USE_TLS`` env vars — the actual
+    deployment contract, identical to ``mcp/registry.py``'s nonce-store wiring
+    (LAURA-V50-016) — else InMemoryNonceStore for dev) — we do NOT invent a new
+    key path or a new nonce store.  Fail-closed: a key/FIPS misconfiguration (or
+    a missing persistent key in production/staging) raises here at startup, not
+    at request time.
+
+    LAURA-V50-018: this function previously read a bare ``REDIS_URL`` env var
+    that this deployment never sets (the identical defect to LAURA-V50-016 in
+    ``mcp/registry.py``) — silently degrading to ``InMemoryNonceStore`` in
+    production.  Fixed by gating on ``REDIS_HOST`` (the split-env "is Redis
+    configured" signal) and building the URL via
+    ``gateway/_redis_url.py::build_redis_url()`` — DB 3, ``client_cert_name=
+    "gateway_client"`` — the SAME DB the MCP broker's own nonce store uses
+    (``mcp/registry.py``, matching this docstring's "SAME store the MCP broker
+    uses" — see module docstring lines 28-29/50).  ``REDIS_URL`` is no longer
+    read.
     """
     import os
 
     signer = OrchestrationPrincipalSigner(tenant_id=tenant_id)
 
     nonce_store: Optional[NonceStore] = None
-    redis_url = os.environ.get("REDIS_URL", "").strip()
-    if redis_url:
+    redis_host = os.environ.get("REDIS_HOST", "").strip()
+    if redis_host:
         try:
+            from yashigani.gateway._redis_url import build_redis_url
+            redis_url = build_redis_url(3, client_cert_name="gateway_client")
             import redis  # type: ignore[import-untyped]
             from yashigani.mcp._nonce import RedisNonceStore
             nonce_store = RedisNonceStore(
@@ -356,16 +372,20 @@ def build_principal_machinery(
             )
             logger.info(
                 "orchestration-principal: RedisNonceStore wired for replay "
-                "prevention (multi-replica safe)"
+                "prevention (REDIS_HOST=%s, db=3 — shared with the MCP "
+                "broker's nonce store) — multi-replica safe",
+                redis_host,
             )
         except ImportError as exc:
             raise RuntimeError(
-                "REDIS_URL is set but the 'redis' package is not installed — "
+                "REDIS_HOST is set but the 'redis' package is not installed — "
                 "cannot wire the orchestration-principal replay store."
             ) from exc
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to construct the orchestration-principal nonce store: {exc}"
+                f"Failed to construct the orchestration-principal nonce store "
+                f"from split Redis env (REDIS_HOST/REDIS_PORT/REDIS_USE_TLS): "
+                f"{exc}"
             ) from exc
     else:
         from yashigani.mcp._nonce import InMemoryNonceStore
