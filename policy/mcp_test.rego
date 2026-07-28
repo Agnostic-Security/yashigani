@@ -244,6 +244,68 @@ test_deny_mcp_b_non_spiffe_rbac_but_no_grant if {
         with data.yashigani.mcp.baselines as _baselines_ok
 }
 
+# ---------------------------------------------------------------------------
+# LAURA-V50-011 — deny_reason ladder must report the ACTUAL failing gate for
+# the non-SPIFFE/RBAC branch, never the generic "spiffe_not_verified" label.
+# Reproduces the live finding: a real, RBAC-authorized (rbac_verified=true)
+# caller denied downstream (here: no per-instance grant) must get a
+# "rbac_*"-prefixed reason, NOT "spiffe_not_verified" — that label is reserved
+# for callers who are NEITHER SPIFFE-verified NOR RBAC-authorized.
+# ---------------------------------------------------------------------------
+
+test_deny_reason_rbac_no_per_instance_grant_not_mislabelled_spiffe if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": "spiffe://cluster.local/ns/default/sa/nogrant", "verified": false, "rbac_verified": true},
+        "caller": {"agent_id": "", "user_id": _identity_id_human},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+
+    d == "rbac_no_per_instance_grant"
+    d != "spiffe_not_verified"
+}
+
+# Same live-repro shape as the finding: RBAC-authorized caller, but the
+# per-instance mcp_id is missing entirely (_instance_identified fails) —
+# must report "rbac_instance_unidentified", not "spiffe_not_verified".
+test_deny_reason_rbac_instance_unidentified_not_mislabelled_spiffe if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false, "rbac_verified": true},
+        "caller": {"agent_id": "", "user_id": _identity_id_human},
+        "target": {"mcp_id": "", "cert_fingerprint": "sha256:leaf-fp-1", "surface_hash": _hash_ok},
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+
+    d == "rbac_instance_unidentified"
+    d != "spiffe_not_verified"
+}
+
+# A caller with NEITHER SPIFFE verification NOR RBAC authorization is the ONLY
+# case that should still report "spiffe_not_verified" — genuinely no
+# recognised credential of any kind.
+test_deny_reason_genuinely_unverified_still_reports_spiffe_not_verified if {
+    d := data.yashigani.mcp.deny_reason with input as {
+        "posture": "mcp-b",
+        "action": "mcp.tools.call",
+        "identity": {"spiffe": _spiffe_langflow, "verified": false},
+        "caller": {"agent_id": "", "user_id": "unknown"},
+        "target": _target_ok,
+        "tool": {"name": "web_search", "args_redacted": {}},
+    }
+        with data.yashigani.mcp.grants as _grants_ok
+        with data.yashigani.mcp.baselines as _baselines_ok
+
+    d == "spiffe_not_verified"
+}
+
 # Laura #3: a caller asserting a SPIFFE identity that FAILS verification
 # (verified=false) and carries NO gateway RBAC assertion satisfies NEITHER
 # branch → DENY.  The SPIFFE rule requires verified==true; the non-SPIFFE rule
