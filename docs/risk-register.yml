@@ -4037,3 +4037,73 @@ risks:
   source_grep: >-
     backoffice/routes/license.py:417-502 -- Laura Docker pentest pass,
     finding LAURA-412-D01 (2026-07-28)
+
+- id: YSG-RISK-137
+  description: >-
+    Admin step-up (ASVS V6.8.4) is universally broken from the browser: the
+    ApiClient.mutate() step-up interceptor in
+    backoffice/static/ui4/core/api-client.js:151 POSTed
+    {"totp": code} to POST /auth/stepup, but the server's StepUpRequest model
+    (backoffice/routes/auth.py:2451-2453) requires field name totp_code
+    (min_length=6, max_length=8, pattern ^\d{6,8}$). FastAPI 422-rejects any
+    body missing the required totp_code field before the handler even runs,
+    so /auth/stepup ALWAYS returns non-2xx from the browser modal -- with a
+    100% correct TOTP code -- for every one of the 22 admin modules that
+    route mutations through ApiClient.mutate()'s shared step-up-retry path.
+    A second, independent instance of the identical bug was found in
+    backoffice/static/ui4/admin/modules/_iam.js:41 (elevate()) -- the
+    client-enforced step-up helper used by RBAC policy force-push, RBAC
+    group/member mutations, and SCIM interactive writes (routes that carry a
+    plain AdminSession server-side, so ApiClient's own interceptor never
+    fires for them). elevate() posts the step-up request directly (not via
+    ApiClient) and had the same stale {"totp": code} shape, so those
+    specific dangerous mutations could NEVER be step-up-elevated from the UI
+    at all -- not even via retry.
+    The legacy static/js/dashboard.js:715 step-up submit handler (3.0 UI)
+    already used the CORRECT {"totp_code": code} shape, confirming the
+    server contract and that this was a frontend regression isolated to the
+    ui4 admin shell, not a server-side change.
+    Root cause of why this was missed on k8s (FIND-DOCKER-001, Docker e2e,
+    2026-07-27/28): step-up was previously verified via direct API curl
+    calls against /auth/stepup with the correct field name, never by
+    driving the actual browser modal end-to-end -- a test-gap in UI
+    exercise coverage, not a k8s-specific defect (the bug is platform
+    agnostic; it is a static-JS bug served identically on Docker, Podman,
+    and k8s).
+  severity: high
+  controls_impacted:
+  - ASVS V6.8.4 (Re-authentication before critical operations) -- the
+    control exists and is enforced server-side, but is completely
+    unusable from the browser, meaning every step-up-gated admin
+    mutation across all 22 admin modules is either permanently blocked
+    (false negative -- an operationally severe availability/functionality
+    break) for retry-based flows, or entirely unreachable (never
+    step-up-elevated) for the client-enforced RBAC/SCIM subset.
+  compensating_controls:
+  - No authorization bypass -- the failure mode is fail-closed (mutations
+    that require step-up simply cannot complete via the UI at all), not a
+    control that silently passes without verification.
+  - Server-side contract (StepUpRequest.totp_code) is unaffected and
+    correct; the API remains directly callable (curl/Postman) with the
+    right field name, so no server-side regression exists.
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  residuals:
+  - >-
+      Fixed: api-client.js:151 and _iam.js:41 both now POST
+      {"totp_code": code}, matching the server's StepUpRequest field name.
+      Repo-wide grep confirmed no other static JS posts a bare {totp: ...}
+      body to /auth/stepup. Regression coverage added:
+      src/tests/unit/test_stepup_auth.py::TestStepUpClientPayloadContract
+      (4 new tests: server-contract field assertion, both fixed call
+      sites individually, and a repo-wide static-JS sweep guarding against
+      a third instance of the stale shape).
+  source_grep: >-
+    grep -rn 'totp:' src/yashigani/backoffice/static --include=*.js (found
+    2 offenders pre-fix: api-client.js:151, _iam.js:41; dashboard.js:715
+    already correct) -- FIND-DOCKER-001, Docker e2e 2026-07-27/28

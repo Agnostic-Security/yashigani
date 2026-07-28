@@ -38,7 +38,7 @@ export async function elevate(api, message) {
         'Content-Type': 'application/json',
         'X-Yashigani-Plane': api.sessionKind,
       },
-      body: JSON.stringify({ totp: code }),
+      body: JSON.stringify({ totp_code: code }),
     });
     return resp.ok;
   } catch {
