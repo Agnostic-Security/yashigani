@@ -14062,7 +14062,26 @@ k8s_helm_install() {
   # Merge order note: these -f land AFTER -f .env.helm — distinct key
   # (egressForwarders, additive per-system map keys), no collision; --set
   # still wins over both.
-  local _hb_agent _hb_ab _hb_overlay
+  # YSG-RISK-130 fix: layer the INGRESS-front overlay (values-<agent>-
+  # ingress.yaml) alongside the pre-existing egress-forwarder overlay. This
+  # overlay was already fully authored (agentIngressFronts map -> templates/
+  # agent-ingress-fronts.yaml's yashigani-caddy-mesh Service + 4 NetworkPolicies
+  # + templates/caddy-agents-configmap.yaml's Caddy vhost snippet) but was
+  # NEVER passed to helm — agentIngressFronts stayed {} on every k8s install,
+  # so no agent had a Caddy mesh front to dispatch through at all. Without
+  # this, k8s_register_agent_bundles() below has no valid upstream_url to
+  # register: gateway's agent_dispatch_client() (src/yashigani/gateway/
+  # _dispatch_client.py) unconditionally presents the mesh ServiceIdentity
+  # client leaf and requires the target to be a Caddy ingress front doing
+  # require_and_verify — "a bare client is refused at the TLS handshake and
+  # every dispatch fails closed" (agent_router.py). A direct Service URL
+  # (http://yashigani-<agent>:<port>, bypassing Caddy) was considered and
+  # rejected: it does not present through the mesh front the dispatch code
+  # requires, and it would silently drop the mTLS peer-auth invariant the
+  # compose path enforces (§2.6 — Caddy is each agent's sole legitimate
+  # ingress peer). Same fail-closed-if-overlay-missing pattern as the egress
+  # loop above.
+  local _hb_agent _hb_ab _hb_overlay _hb_ingress_overlay
   _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
   for _hb_agent in openclaw langflow letta; do
     if [[ "$_hb_ab" == *",${_hb_agent},"* || "$_hb_ab" == *",all,"* ]]; then
@@ -14073,8 +14092,17 @@ k8s_helm_install() {
         log_error "${_hb_agent} bundle requested (--agent-bundles) but overlay not found: ${_hb_overlay}"
         exit 1
       fi
-      helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay")
-      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay (unified-sidecar v4.1)"
+      _hb_ingress_overlay="${chart_dir}/values-${_hb_agent}-ingress.yaml"
+      if [[ ! -f "$_hb_ingress_overlay" ]]; then
+        # Fail-closed: without the ingress front, gateway has no mTLS-verified
+        # path to this agent — registering it anyway (YSG-RISK-130) would
+        # ship a registration that fails closed at the TLS handshake on
+        # every dispatch.
+        log_error "${_hb_agent} bundle requested (--agent-bundles) but ingress-front overlay not found: ${_hb_ingress_overlay}"
+        exit 1
+      fi
+      helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay" -f "$_hb_ingress_overlay")
+      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-130 / unified-sidecar v4.1)"
     fi
   done
 
@@ -14209,6 +14237,244 @@ k8s_verify_image_provenance() {
     log_info "  (config-verified via YASHIGANI_EXTRACTOR_IMAGE wiring — ephemeral per-job"
     log_info "   pods have nothing running yet to runtime-verify; see YSG-RISK-123b note)"
   fi
+}
+
+# STEP 9c (k8s): register agent bundles with gateway's durable registry
+#
+# YSG-RISK-130: register_agent_bundles() (compose/Podman path, "Step 11b",
+# called from compose_up only) is the ONLY place any deployment populates
+# gateway's durable agent registry (Postgres AgentDurableStore + Redis db/3
+# AgentRegistry). k8s had no equivalent — agent bundle pods ran healthy but
+# gateway never learned they existed, so every @letta/@langflow/@openclaw
+# chat call returned a clean "agent_not_found" (not a crash — a genuine
+# missing-registration availability gap, see risk-register.yml entry).
+#
+# k8s diverges from compose in two load-bearing ways:
+#
+#  1. UPSTREAM URL. A "direct Service URL" (http://yashigani-<agent>:<port>)
+#     was the initial hypothesis (Captain, root-cause dispatch) but is
+#     INCOMPATIBLE with the actual gateway dispatch code: agent_dispatch_client()
+#     (src/yashigani/gateway/_dispatch_client.py) unconditionally presents the
+#     process's mesh ServiceIdentity client leaf, and agent_router.py's v4.1
+#     §2.5 dispatch-repoint comment states registered upstreams MUST be the
+#     agent's Caddy ingress front (require_and_verify) — "a bare client is
+#     refused at the TLS handshake and every dispatch fails closed". A direct
+#     Service URL bypasses that front entirely: it either fails the TLS
+#     handshake (if the agent pod isn't itself doing require_and_verify — it
+#     isn't, Caddy is) or silently drops the mTLS peer-auth invariant the
+#     compose path enforces (§2.6: Caddy is each agent's sole legitimate
+#     ingress peer). Neither is acceptable, so this function registers the
+#     SAME Caddy-ingress-front URL shape compose uses:
+#         https://yashigani-caddy-mesh:<meshPort>/agents/<tenant>/<system>
+#     matching the DISPATCH CONTRACT documented in
+#     helm/yashigani/templates/agent-ingress-fronts.yaml. That front (Service
+#     + 4 NetworkPolicies) already existed in the chart but was never
+#     activated on any k8s install — fixed above in k8s_helm_install() by
+#     layering values-<agent>-ingress.yaml. meshPort/tenantId below are the
+#     same values pinned in those codegen-generated overlay files (single
+#     source of truth: langflow=9705, letta=9775, openclaw=9671, tenant
+#     "default" — identical to compose's pinned mesh ports).
+#
+#  2. TOKEN SOURCE. Compose generates a FRESH token per agent and restarts
+#     the agent container to pick it up. k8s doesn't need either: each
+#     bundle already gets a STABLE token from a Helm-managed K8s Secret
+#     (yashigani-<agent>-token, key "token", templates/secrets.yaml, wired
+#     into the agent's own env via agentBundles.<agent>.tokenSecretName/
+#     tokenSecretKey). This function reads that EXISTING token and registers
+#     a bcrypt hash of it — no generation, no secrets-file write, no restart.
+#
+# Idempotent: same registry.list_all()-based skip-if-already-registered
+# check as compose's script (preserves the existing token/hash on re-run).
+#
+# Secret-handling note: the token is piped to the in-pod Python via stdin
+# (kubectl exec -i ... <<<"$agents_json"), NOT via -e/env or a CLI arg —
+# keeps it out of `ps` on the host and off the kubectl exec command line.
+k8s_register_agent_bundles() {
+  set_step "9c" "register agent bundles (k8s, YSG-RISK-130)"
+
+  local _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
+  if [[ "$_hb_ab" == ",," ]]; then
+    log_info "No agent bundles selected — skipping k8s agent registration"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "k8s: register agent bundles against gateway durable registry (kubectl exec into backoffice)"
+    return 0
+  fi
+
+  require_cmd "kubectl"
+  log_step "9c/${TOTAL_STEPS}" "Registering agent bundles with gateway (k8s, YSG-RISK-130)..."
+
+  local _bo_pod
+  _bo_pod="$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=yashigani-backoffice \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "$_bo_pod" ]]; then
+    log_warn "No Running backoffice pod found — cannot register agent bundles."
+    log_warn "Register manually via /admin/agents once the pod is healthy."
+    return 0
+  fi
+
+  local agents_json='['
+  local first=true
+  local _agent _name _url _proto _mesh_port _tenant _secret_name _raw_token
+  local _lf_groups _lf_caller_groups _lf_paths _lf_kind _lf_ceiling
+
+  for _agent in langflow letta openclaw; do
+    [[ "$_hb_ab" == *",${_agent},"* || "$_hb_ab" == *",all,"* ]] || continue
+
+    _lf_groups='[]'; _lf_caller_groups='[]'; _lf_paths='[]'; _lf_kind=""; _lf_ceiling=""
+    case "$_agent" in
+      # Phase 5 §C caps — mirror register_agent_bundles() (install.sh
+      # ~10342-10357) exactly. Mesh ports match values-<agent>-ingress.yaml.
+      langflow)  _name="agent__langflow"  _proto="openai"  _mesh_port="9705"  _tenant="default"  _secret_name="yashigani-langflow-token"
+                 _lf_kind="agent"; _lf_ceiling="INTERNAL"
+                 _lf_groups='["langflow_callee"]'
+                 _lf_caller_groups='["admin","user"]'
+                 _lf_paths='["/v1/chat/completions"]'
+                 ;;
+      letta)     _name="letta"     _proto="letta"   _mesh_port="9775"  _tenant="default"  _secret_name="yashigani-letta-token" ;;
+      openclaw)  _name="openclaw"  _proto="openai"  _mesh_port="9671"  _tenant="default"  _secret_name="yashigani-openclaw-token" ;;
+    esac
+
+    _raw_token="$(kubectl get secret "$_secret_name" -n "$NAMESPACE" \
+      -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    if [[ -z "$_raw_token" ]]; then
+      log_warn "  ${_agent}: Secret ${_secret_name} not found or empty — skipping registration"
+      continue
+    fi
+
+    _url="https://yashigani-caddy-mesh:${_mesh_port}/agents/${_tenant}/${_agent}"
+
+    $first || agents_json+=','
+    agents_json+="{\"profile\":\"${_agent}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\",\"token\":\"${_raw_token}\",\"groups\":${_lf_groups},\"allowed_caller_groups\":${_lf_caller_groups},\"allowed_paths\":${_lf_paths},\"kind\":\"${_lf_kind}\",\"sensitivity_ceiling\":\"${_lf_ceiling}\"}"
+    first=false
+  done
+  agents_json+=']'
+
+  if [[ "$agents_json" == "[]" ]]; then
+    log_info "No agent tokens available — nothing to register"
+    return 0
+  fi
+
+  local reg_output
+  reg_output="$(kubectl exec -i -n "$NAMESPACE" "$_bo_pod" -- python3 -c '
+# YSG-RISK-130: k8s equivalent of register_agent_bundles() (compose). Same
+# durable-store + Redis db/3 upsert, idempotent by name — but the token is
+# READ from stdin (already Helm-Secret-stable), never generated, and no
+# container restart follows.
+import json, os, sys
+sys.path.insert(0, "/app/src")
+
+agents_spec = json.load(sys.stdin)
+results = []
+
+for agent_spec in agents_spec:
+    aname          = agent_spec["name"]
+    aurl           = agent_spec["url"]
+    aproto         = agent_spec.get("protocol", "openai")
+    araw_token     = agent_spec["token"]
+    agroups        = agent_spec.get("groups") or []
+    acaller_groups = agent_spec.get("allowed_caller_groups") or []
+    apaths         = agent_spec.get("allowed_paths") or []
+    akind          = agent_spec.get("kind") or "agent"
+    aceiling       = agent_spec.get("sensitivity_ceiling") or None
+
+    try:
+        from yashigani.agents.registry import AgentRegistry
+        from yashigani.agents.durable_store import AgentDurableStore
+        from yashigani.gateway._redis_url import build_redis_url
+        import redis as _redis
+        import bcrypt as _bcrypt
+        import secrets as _sec_mod
+
+        _redis_url = build_redis_url(
+            3,
+            use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+            secrets_dir="/run/secrets",
+            client_cert_name="backoffice_client",
+        )
+        _rc = _redis.from_url(_redis_url, decode_responses=True)
+        registry = AgentRegistry(_rc)
+        durable  = AgentDurableStore()
+
+        # Skip if already registered by name (idempotent; preserves token hash).
+        existing_names = {a.get("name", "") for a in registry.list_all()}
+        if aname in existing_names:
+            results.append("SKIP:" + aname)
+            continue
+
+        token_hash = _bcrypt.hashpw(araw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
+        agent_id = "agnt_" + _sec_mod.token_hex(8)
+
+        agent_data = {
+            "agent_id": agent_id,
+            "name": aname,
+            "upstream_url": aurl,
+            "protocol": aproto,
+            "status": "active",
+            "groups": agroups,
+            "allowed_caller_groups": acaller_groups,
+            "allowed_paths": apaths,
+            "allowed_cidrs": [],
+            "kind": akind,
+            "sensitivity_ceiling": aceiling,
+        }
+
+        durable.upsert(agent_data, token_hash=token_hash)
+        registry.restore_from_durable(agent_data, token_hash)
+        results.append("OK:" + aname)
+    except Exception as e:
+        results.append("FAIL:" + aname + ":" + str(e))
+
+# POST-REGISTRATION: mint capability envelopes for bundled agents
+# (SEC-ENVELOPE-001) — same rationale as compose'\''s register_agent_bundles():
+# lifespan bootstrap ran before this script with an empty registry, so mint
+# here immediately after each agent lands in Redis+Postgres.
+import asyncio as _asyncio
+
+async def _mint_bundled_envelopes():
+    import asyncpg as _asyncpg
+    import redis as _r2
+    from yashigani.gateway._redis_url import build_redis_url as _bru
+    from yashigani.agents.registry import AgentRegistry as _AR
+    from yashigani.mcp.envelope_service import CapabilityEnvelopeService as _CES
+    from yashigani.backoffice.bundled_envelopes import bootstrap_bundled_agent_envelopes as _bbe
+    _dsn = os.environ.get("YASHIGANI_DB_DSN_DIRECT") or os.environ.get("YASHIGANI_DB_DSN", "")
+    if not _dsn:
+        return []
+    _ru = _bru(3, use_tls=os.getenv("REDIS_USE_TLS", "true").lower() == "true",
+               secrets_dir="/run/secrets", client_cert_name="backoffice_client")
+    _rc2 = _r2.from_url(_ru, decode_responses=False)
+    _pool = await _asyncpg.create_pool(_dsn, min_size=1, max_size=1)
+    try:
+        return await _bbe(_CES(_pool), _AR(_rc2))
+    finally:
+        await _pool.close()
+
+try:
+    for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
+        results.append("ENVELOPE_MINTED:" + _pid)
+except Exception as _me:
+    results.append("ENVELOPE_WARN:" + str(_me))
+
+for r in results:
+    print(r)
+' <<<"$agents_json" 2>&1)" || true
+
+  while IFS= read -r line; do
+    case "$line" in
+      OK:*)              log_success "  ${line#OK:}: registered" ;;
+      SKIP:*)            log_info "  ${line#SKIP:}: already registered — skipping" ;;
+      FAIL:*)            log_warn "  ${line#FAIL:}" ;;
+      ENVELOPE_MINTED:*) log_success "  envelope minted: ${line#ENVELOPE_MINTED:}" ;;
+      ENVELOPE_WARN:*)   log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}" ;;
+      *)                 [[ -n "$line" ]] && log_warn "  agent-register: ${line}" ;;
+    esac
+  done <<< "$reg_output"
+
+  log_success "Agent bundle registration complete (k8s)"
 }
 
 # STEP 10 (k8s): Access instructions
@@ -18505,6 +18771,12 @@ main() {
 
     # Step 9b: verify the deployed pods run the image just built (YSG-RISK-123)
     k8s_verify_image_provenance
+
+    # Step 9c: register agent bundles with gateway's durable registry
+    # (YSG-RISK-130) — k8s equivalent of the compose path's Step 11b
+    # register_agent_bundles(). Must run AFTER rollout/provenance so gateway
+    # and backoffice are confirmed healthy and running the correct image.
+    k8s_register_agent_bundles
 
     # Step 10: Access instructions
     k8s_print_access

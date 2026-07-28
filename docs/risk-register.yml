@@ -3343,7 +3343,7 @@ risks:
     (the admin API path) once logged in, to register each bundle by hand.
     Not automated, but not a hard blocker for an operator who knows to do
     this.
-  status: open
+  status: mitigated
   accepted_by: null
   accepted_at: null
   review_by: null
@@ -3367,4 +3367,62 @@ risks:
       than hand-hacked by Captain. This entry will be updated to
       status: mitigated once Su's fix lands and is live-verified (all 4
       chat targets returning real responses).
+  - rationale: >-
+      FIXED by Su (code-complete, NOT YET LIVE-VERIFIED — pending Captain's
+      redeploy cycle). Implemented Option (a): a new k8s_register_agent_bundles()
+      (install.sh, "Step 9c") that kubectl execs into the running backoffice
+      pod and runs the same durable-store + Redis db/3 upsert logic as
+      compose's register_agent_bundles(), idempotent by agent name. Wired
+      into the k8s sequence right after k8s_verify_image_provenance and
+      before k8s_print_access.
+
+      DIVERGED FROM CAPTAIN'S DIRECT-SERVICE-URL HYPOTHESIS, with evidence:
+      checked src/yashigani/gateway/_dispatch_client.py and agent_router.py —
+      agent_dispatch_client() unconditionally presents the mesh
+      ServiceIdentity client leaf, and the v4.1 §2.5 dispatch-repoint comment
+      states registered upstreams MUST be the agent's Caddy ingress front
+      (require_and_verify): "a bare client is refused at the TLS handshake
+      and every dispatch fails closed." A direct Service URL
+      (http://yashigani-<agent>:<port>) bypasses that front and either fails
+      closed or silently drops the mTLS peer-auth invariant compose enforces
+      (§2.6: Caddy is each agent's sole legitimate ingress peer) — the
+      allow-gateway-egress NetworkPolicy Captain found permitting direct
+      reach is a transitional allow (UA-10, retired by the split-ringfence
+      parity step), not a green light to route through it.
+
+      Registered upstream_url is instead the SAME Caddy-ingress-front shape
+      compose uses: https://yashigani-caddy-mesh:<meshPort>/agents/<tenant>/<system>
+      (langflow meshPort 9705, letta 9775, openclaw 9671, tenant "default" —
+      identical to compose's pinned ports). This front (yashigani-caddy-mesh
+      Service + 4 NetworkPolicies) was ALREADY FULLY BUILT in the chart
+      (helm/yashigani/templates/agent-ingress-fronts.yaml +
+      caddy-agents-configmap.yaml, gated on .Values.agentIngressFronts, with
+      ready per-agent codegen overlays values-{langflow,letta,openclaw}-ingress.yaml)
+      but was never passed to helm — k8s_helm_install() only ever layered the
+      EGRESS-forwarder overlay (values-<agent>-egress.yaml, outbound LLM
+      traffic), never the ingress one. Fixed k8s_helm_install() to layer
+      both overlays (fail-closed if either is missing, same pattern). Verified
+      with `helm template`: all 4 agent-ingress-front NetworkPolicies + the
+      yashigani-caddy-mesh Service render correctly for langflow/letta/openclaw
+      once the overlay is layered (previously rendered nothing —
+      agentIngressFronts stayed {} on every k8s install to date).
+
+      Token handling: no fresh token generated on k8s (unlike compose) — each
+      agent's existing stable token is read from its Helm-managed K8s Secret
+      (yashigani-<agent>-token, key "token") via `kubectl get secret -o
+      jsonpath` + base64 decode, then bcrypt-hashed and upserted. No pod
+      restart needed (token was already correctly wired via
+      agentBundles.<agent>.tokenSecretName). Piped to the in-pod Python via
+      stdin (kubectl exec -i <<<"$agents_json"), not -e/env or a CLI arg, to
+      keep the token out of `ps` output and the exec command line.
+
+      Verified: bash -n install.sh clean; shellcheck -x install.sh — zero
+      new findings in the touched region (lines ~14051-14453); helm lint +
+      helm template clean with all three -egress/-ingress overlay pairs
+      layered together.
+
+      NOT YET LIVE-VERIFIED: per dispatch, Su does not touch the live k8s
+      cluster. Captain owns the redeploy cycle and will confirm all 4 chat
+      targets (letta/langflow/openclaw/direct-model) return real responses.
+      This entry should be re-reviewed after that confirmation lands.
   fix_in_version: v4.1.2
