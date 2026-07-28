@@ -1234,7 +1234,7 @@ def _build_app(mesh_mode: bool = False):
     # Guard: if env var is unset/empty, both return values are empty/None and
     # the gateway behaves exactly as before (backward-compatible).
     try:
-        from yashigani.mcp.registry import build_registry_from_env
+        from yashigani.mcp.registry import build_registry_from_env, is_mcp_configured
         from yashigani.mcp.router import create_mcp_router
         # Note: create_mcp_call_router is no longer imported here.
         # The call router is no longer mounted as an extra_router (Fix-1).
@@ -1313,10 +1313,66 @@ def _build_app(mesh_mode: bool = False):
         )
         _extra_routers: list = [openai_router, egress_proxy_router]
 
-        if len(_mcp_registry) > 0 and _mcp_jwks_store is not None:
-            # Pick any broker for the /mcp/health OPA probe (they all share opa_url)
-            _representative_broker = _mcp_registry.all_brokers()[0]
-            _mcp_info_router = create_mcp_router(_mcp_jwks_store, _representative_broker)
+        # v5.0 LAURA-V50-014 (Critical, fail-OPEN bypass — Laura live re-
+        # attack, 2026-07-28) — FIX: the condition below used to be
+        # `len(_mcp_registry) > 0 and _mcp_jwks_store is not None`, and the
+        # `else` branch (further down) discarded the registry entirely
+        # (`_mcp_registry = None`). len(_mcp_registry) only reflects
+        # servers ALREADY built (boot-list entries + any durable descriptor
+        # a PREVIOUS request already lazy-loaded) — it is legitimately 0 on
+        # a fresh boot with an empty YASHIGANI_MCP_SERVERS and zero live
+        # requests so far, which is the NORMAL topology for a live-onboard-
+        # only / demo / production deployment (servers are onboarded
+        # POST-boot via POST /admin/mcp/servers/import, SEAM-1d-07).
+        #
+        # Root cause confirmed live: with the registry discarded to None,
+        # gateway/proxy.py's catch-all only intercepts /mcp/<agent_name>
+        # when `state["mcp_broker_registry"] is not None`
+        # (gateway/proxy.py ~line 1052) — so EVERY /mcp/* request (a real
+        # onboarded server AND a garbage name like
+        # "totally-fake-nonexistent-server-xyz123") fell through to the
+        # generic upstream-forward and was blindly proxied to
+        # YASHIGANI_UPSTREAM_URL. None of _identity_verified /
+        # _instance_identified / _grant_ok / _envelope_unchanged ever
+        # evaluated — fail-OPEN, not fail-closed (proven live: a tools/call
+        # to a never-onboarded name returned 200; GET /mcp/health returned
+        # mcp_not_configured).
+        #
+        # Fix: gate ONLY on `_mcp_jwks_store is not None` — i.e. "is the
+        # MCP feature genuinely configured at all" (build_registry_from_env
+        # only returns a None jwks_store when BOTH boot-list entries are
+        # empty AND the durable registry/Redis is unavailable — see
+        # mcp/registry.py:279-284). The registry is NEVER discarded below
+        # this point; it stays attached to gateway state (mcp_broker_
+        # registry=_mcp_registry, further down) even when len()==0 right
+        # now, so proxy.py's catch-all ALWAYS intercepts /mcp/* once the
+        # feature is configured. The registry itself still fail-closes
+        # correctly for BOTH failure modes this fix must preserve:
+        #   * unknown agent_name  -> registry.get() returns None ->
+        #     dispatch_mcp_call() 404s (gateway/mcp_router_runtime.py
+        #     ~line 432-438) — never proxied upstream.
+        #   * known-but-unidentified/ungranted server -> the OPA four-gate
+        #     (_instance_identified / _grant_ok / _envelope_unchanged in
+        #     policy/mcp.rego) denies once the call reaches broker.enforce().
+        # This fix only ensures that path is REACHED at all.
+        if is_mcp_configured(_mcp_registry, _mcp_jwks_store):
+            # A "representative" broker instance for the /mcp/health OPA
+            # probe requires at least one broker to already be built
+            # (McpBrokerRegistry.all_brokers() reads only the in-memory,
+            # already-registered dict — durable-store entries are NOT
+            # eagerly built here, only lazily on their first /mcp/<name>
+            # request). None is now a valid, handled input to
+            # create_mcp_router (LAURA-V50-014 fix, mcp/router.py) — the
+            # health probe falls back to a direct OPA reachability check
+            # via opa_url so GET /mcp/health reports the feature
+            # CONFIGURED (not mcp_not_configured) even before any server
+            # has been onboarded / lazily built this process lifetime.
+            _representative_broker = (
+                _mcp_registry.all_brokers()[0] if len(_mcp_registry) > 0 else None
+            )
+            _mcp_info_router = create_mcp_router(
+                _mcp_jwks_store, _representative_broker, opa_url=opa_url,
+            )
             # Fix-1 (Laura ship-blocker): do NOT mount _mcp_call_router as an
             # extra_router — that path bypasses rate-limiter + DDoSProtector.
             # Instead, proxy.py intercepts /mcp/<agent_name> in the catch-all
@@ -1325,9 +1381,11 @@ def _build_app(mesh_mode: bool = False):
             # IS mounted as extra_router — those endpoints are intentionally public.
             _extra_routers = [openai_router, egress_proxy_router, _mcp_info_router]
             logger.info(
-                "MCP broker wiring: %d server(s) registered, JWKS info routes mounted "
+                "MCP broker wiring: %d boot-list server(s) registered "
+                "(durable lazy-load %s), JWKS info routes mounted "
                 "(call routes wired through catch-all — Fix-1)",
                 len(_mcp_registry),
+                "attached" if _mcp_durable_store is not None else "unavailable",
             )
 
             # 3.1 Phase 4 / 4.0 Item A — seed org-level grants (B1 / auto-seed).
@@ -1444,9 +1502,26 @@ def _build_app(mesh_mode: bool = False):
                         "(Seam-3): %s", _opa_push_exc,
                     )
         else:
-            _mcp_registry = None
-            _mcp_jwks_store = None
-            logger.info("MCP broker wiring: no servers configured (YASHIGANI_MCP_SERVERS unset)")
+            # v5.0 LAURA-V50-014 — genuinely unconfigured: no boot-list
+            # entries AND no durable registry (Redis unavailable — see
+            # mcp/registry.py:279-284, the only case build_registry_from_env
+            # returns a None jwks_store). _mcp_registry is DELIBERATELY left
+            # as the (empty, no lazy source attached) McpBrokerRegistry()
+            # build_registry_from_env already returned — NEVER set to None.
+            # A None registry made proxy.py's catch-all (gateway/proxy.py
+            # ~line 1052, `if mcp_broker_registry is not None`) skip /mcp/*
+            # entirely, falling through to blind upstream-forwarding — the
+            # exact fail-open LAURA-V50-014 proved. Keeping the (harmless)
+            # empty registry object means /mcp/* is ALWAYS intercepted and
+            # registry.get() cleanly 404s an unknown agent_name instead of
+            # ever reaching the generic upstream-forward path, regardless of
+            # Redis availability.
+            logger.info(
+                "MCP broker wiring: MCP feature not configured (no boot-list "
+                "entries and no durable registry/Redis) — /mcp/* is still "
+                "intercepted by the catch-all (registry.get() 404s any "
+                "agent_name; never falls through to upstream-forward)."
+            )
 
     except Exception as exc:
         # Fail-closed: MCP wiring failure must not silently degrade.

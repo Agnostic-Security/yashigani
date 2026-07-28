@@ -465,3 +465,43 @@ def build_registry_from_env(
         " (+durable lazy load)" if durable_store is not None else "",
     )
     return registry, jwks_store
+
+
+def is_mcp_configured(
+    registry: McpBrokerRegistry, jwks_store: Optional[object],
+) -> bool:
+    """Whether the MCP feature is genuinely configured for this gateway
+    process — i.e. whether ``registry`` must be attached to gateway state
+    (mcp_broker_registry=registry, NEVER None) rather than discarded.
+
+    v5.0 LAURA-V50-014 (Critical, fail-OPEN bypass — Laura live re-attack,
+    2026-07-28): the gateway startup wiring previously gated registry
+    attachment on ``len(registry) > 0 and jwks_store is not None``. That
+    condition is WRONG for a live-onboard-only deployment (empty
+    YASHIGANI_MCP_SERVERS at boot, the normal demo/production topology,
+    SEAM-1d-07): ``len(registry)`` only reflects servers ALREADY built
+    (boot-list entries + any durable descriptor a PREVIOUS request already
+    lazy-loaded) — it is legitimately 0 on a fresh boot with zero live
+    requests so far, even though the durable registry lazy-load source IS
+    attached and servers CAN be onboarded/routed post-boot. With that
+    condition False, the OLD code discarded the registry to None entirely
+    — gateway/proxy.py's catch-all only intercepts ``/mcp/*`` when
+    ``mcp_broker_registry is not None``, so a None registry made EVERY
+    ``/mcp/*`` request (a real onboarded server AND a garbage name) fall
+    through to the generic upstream-forward, fully bypassing
+    ``_identity_verified`` / ``_instance_identified`` / ``_grant_ok`` /
+    ``_envelope_unchanged`` (fail-OPEN, proven live: a tools/call to a
+    never-onboarded name returned 200; GET /mcp/health returned
+    mcp_not_configured).
+
+    The correct signal is simply whether ``build_registry_from_env``
+    produced a usable ``jwks_store`` — True whenever EITHER boot-list
+    entries exist OR the durable registry/Redis is wired (the only case a
+    None jwks_store is returned is BOTH being absent — see the early
+    return above, ~line 279). ``len(registry)`` plays NO role in this
+    decision; the registry itself already fail-closes correctly for an
+    unknown agent_name (registry.get() -> None -> 404, never proxied) and
+    for a known-but-unidentified/ungranted server (the OPA four-gate
+    denies) — this function only ensures that path is REACHED at all.
+    """
+    return jwks_store is not None

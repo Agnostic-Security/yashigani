@@ -525,23 +525,39 @@ def create_gateway_app(
 
     @app.get("/mcp/health", include_in_schema=False)
     async def _gateway_mcp_health_guard():
-        """MCP health guard — always gateway-handled, never forwarded to upstream."""
-        reg = _state.get("mcp_broker_registry")
-        if reg is None:
+        """MCP health guard — always gateway-handled, never forwarded to upstream.
+
+        v5.0 LAURA-V50-014: since entrypoint.py no longer discards
+        mcp_broker_registry to None on an empty YASHIGANI_MCP_SERVERS boot
+        list (the fix — a live-onboard-only deployment is the NORMAL
+        demo/production topology, SEAM-1d-07), `reg is not None` alone no
+        longer distinguishes "MCP genuinely not configured" from "MCP
+        configured, zero servers lazily built yet this process lifetime."
+        mcp_jwks_store IS still None in the genuinely-unconfigured case
+        (no boot-list entries AND no durable registry/Redis — see
+        mcp/registry.py:279-284) — check that first. When configured but
+        reg.all_brokers() is empty (fresh boot, no live /mcp/<name>
+        request has lazily built a broker yet), fall back to a direct
+        OPA reachability check via config.opa_url — mirrors
+        mcp/router.py's create_mcp_router / _opa_health_check fallback.
+        """
+        if _state.get("mcp_jwks_store") is None:
             return JSONResponse(
                 status_code=503,
                 content={"status": "error", "detail": "mcp_not_configured"},
             )
-        try:
-            brokers = reg.all_brokers()  # type: ignore[attr-defined]
-        except Exception:
-            brokers = []
-        if not brokers:
-            return JSONResponse(
-                status_code=503,
-                content={"status": "error", "detail": "mcp_no_brokers"},
-            )
-        opa_ok = await brokers[0].opa_health()  # type: ignore[attr-defined]
+        reg = _state.get("mcp_broker_registry")
+        brokers = []
+        if reg is not None:
+            try:
+                brokers = reg.all_brokers()  # type: ignore[attr-defined]
+            except Exception:
+                brokers = []
+        if brokers:
+            opa_ok = await brokers[0].opa_health()  # type: ignore[attr-defined]
+        else:
+            from yashigani.mcp.router import _opa_health_check
+            opa_ok = await _opa_health_check(config.opa_url)
         if opa_ok:
             return {"status": "ok", "opa": "healthy"}
         return JSONResponse(
