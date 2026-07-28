@@ -2939,3 +2939,180 @@ risks:
       + orchestrator + inspection unit/regression subset green (792 passed,
       4 pre-existing unrelated failures confirmed present before this fix
       via git stash, 3 skipped).
+
+- id: YSG-RISK-125
+  description: >-
+    K8s/Helm backoffice path: ALL 4 chat/agent targets (@letta, @langflow,
+    @openclaw, direct model) returned {"error":"gateway_unreachable"} from
+    POST /user/chat/completions on the otherwise fully-green 4.1.2 k3s/Cilium
+    e2e deploy (2026-07-28), post letta+ollama+gateway-event-loop fixes
+    (YSG-RISK-110/111/113). Backoffice logs showed
+    `user_chat_proxy: gateway unreachable: [Errno -2] Name or service not
+    known` — a DNS resolution failure, not a network-policy or mTLS block.
+    Root cause: src/yashigani/backoffice/routes/user_ui.py:993 and
+    src/yashigani/backoffice/routes/user_agents.py:1944/2167 all resolve the
+    gateway's internal mesh URL via
+    `os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")`.
+    The bare hostname "gateway" is a Compose-only convention (the compose
+    service is literally named `gateway`); on k8s the gateway's Service is
+    `yashigani-gateway` (helm/yashigani/templates/gateway.yaml, http-mesh
+    port 8081). helm/yashigani/templates/backoffice.yaml never set
+    YASHIGANI_GATEWAY_MESH_URL at all, so backoffice on k8s ALWAYS fell
+    through to the broken compose default and could never resolve gateway's
+    hostname — a Compose<->K8s name-resolution parity gap (the same bug
+    class Captain's own Verification Protocol #1 sweeps for via
+    `host=postgres |host=pgbouncer |host=redis |...` grep patterns, but this
+    instance is a Python-level os.environ default rather than a Helm
+    template string literal, so the literal grep pattern didn't catch it).
+    Found live while verifying Maxine's GO redeploy item (b) — all 4 chat
+    targets end-to-end via the node-IP path.
+  severity: high
+  controls_impacted:
+  - Availability — every user-facing chat/agent path (@letta, @langflow,
+    @openclaw, direct model) was completely broken on k8s; no chat target
+    could ever reach the gateway regardless of any other fix.
+  compensating_controls:
+  - No security boundary crossed — this is a pure connectivity/name-
+    resolution defect, not an authz/authn bypass. The 401 on unauthenticated
+    direct /v1/chat/completions calls and OPA policy enforcement on the
+    gateway side remain unaffected once connectivity is restored.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fixed in helm/yashigani/templates/backoffice.yaml: added an explicit
+      `YASHIGANI_GATEWAY_MESH_URL` env var set to
+      "http://yashigani-gateway:8081/v1" (matching the actual k8s Service
+      name and the http-mesh port already used elsewhere in the chart for
+      internal gateway calls), overriding the broken compose-only default.
+      Values/template-only change — no image rebuild required. Verified via
+      `helm lint` + `helm template --show-only templates/backoffice.yaml`
+      (env var renders correctly) before live application via targeted
+      `helm upgrade`. Live re-test of all 4 chat targets
+      (@letta/@langflow/@openclaw/direct model) via
+      POST /user/chat/completions with an authenticated end-user session
+      is the immediate next verification step.
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
+
+- id: YSG-RISK-126
+  description: >-
+    K8s/Helm pre-install/pre-upgrade hook Jobs that call the k8s API server
+    (admin-bootstrap-job.yaml's `applier` container and mtls-bootstrap-job.yaml's
+    `applier` container — both run `kubectl apply` to write the Secret they
+    mint) had NO NetworkPolicy egress rule permitting that traffic.
+    default-deny-egress (podSelector: {} — applies to every pod in the
+    namespace) blocks it; only allow-dns-egress is similarly
+    podSelector-less, so these Jobs could resolve DNS but never actually
+    connect to the apiserver ClusterIP. Reproduced live (2026-07-28) applying
+    the YSG-RISK-125 fix via `helm upgrade`: the admin-bootstrap Job's
+    applier container hung with ZERO log output, `kubectl exec` into the
+    stuck pod showed `wget https://kubernetes.default.svc:443` timing out,
+    and the pod's labels (app.kubernetes.io/component=bootstrap) matched no
+    NetworkPolicy in the namespace. Job hit backoffLimit=2 (3 total
+    attempts) and failed, aborting the helm upgrade
+    ("pre-upgrade hooks failed: resource Job/.../yashigani-admin-bootstrap
+    not ready. status: Failed"). The identical failure signature appears
+    earlier in this release's own history (revision 2, same message,
+    at the time misattributed to an unrelated Kyverno field-manager issue).
+    Masked on `helm install` by a startup race: Cilium's eBPF datapath takes
+    a few seconds to program after a NetworkPolicy object is created, and a
+    fresh install's hook Job pod sometimes completes within that unenforced
+    window; on `helm upgrade` against an already-running release the policy
+    has been enforcing for its entire lifetime, so the Job reliably hangs.
+  severity: high
+  controls_impacted:
+  - Availability — every `helm upgrade` against a live release with the
+    admin-bootstrap or pki-bootstrap Secret NOT already fully populated (i.e.
+    every genuinely-first bootstrap, and any future rotation flow) would hang
+    and fail the upgrade, independent of any application-layer bug.
+  compensating_controls:
+  - No security boundary crossed — pure connectivity gap, not an authz bypass.
+  - Idempotent "preserve if already populated" design in both bootstrap Jobs
+    means an upgrade where the Secrets are ALREADY correctly populated (the
+    common case post-initial-install) can be recovered with `--no-hooks`
+    without any data loss or security regression, buying time to land this
+    fix — used as the immediate workaround for this exact incident.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fixed in helm/yashigani/templates/networkpolicy.yaml: new NetworkPolicy
+      `allow-bootstrap-jobs-apiserver-egress` (inserted after
+      allow-dns-egress) — podSelector matchExpressions
+      app.kubernetes.io/component In [bootstrap, pki], egress to an ipBlock
+      resolved via `lookup "v1" "Service" "default" "kubernetes"` (same
+      lookup() precedent already used elsewhere in this chart for CRD/Secret
+      detection, so the CIDR is cluster-correct at template time rather than
+      a hardcoded guess; falls back to k3s's documented default 10.43.0.1/32
+      only when lookup() returns empty, i.e. `helm template`/
+      `--dry-run=client` with no live cluster connection). Verified render
+      via `helm upgrade --dry-run=server` (confirms the resolved CIDR
+      matches the live cluster's actual `kubernetes` Service ClusterIP).
+      Verified live: recovered the stuck release via `helm upgrade
+      --no-hooks` (bootstrap Secrets already correctly populated from
+      earlier revisions — confirmed via the minter initContainer's
+      idempotent "already minted" log with preserved original timestamps),
+      landing this policy; a subsequent `helm upgrade` WITH hooks enabled
+      is the pending full-cycle verification (hooks were skipped on the
+      immediate recovery upgrade specifically to land this fix without
+      re-hitting the same chicken-and-egg ordering problem in one step).
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
+
+- id: YSG-RISK-127
+  description: >-
+    K8s/Helm: backoffice's user_chat_proxy / user_agents proxy
+    (src/yashigani/backoffice/routes/user_ui.py `user_chat_proxy`,
+    user_agents.py's forward-to-gateway helpers — the trusted-forwarder
+    `/user/chat/completions` and `/user/agents/*` paths, FIND-4.0-CHAT-001)
+    forwards every end-user chat/agent call to gateway's internal mesh port
+    8081 via `YASHIGANI_INTERNAL_BEARER`. NEITHER `allow-backoffice-egress`
+    NOR `allow-gateway-ingress` (helm/yashigani/templates/networkpolicy.yaml)
+    had a rule permitting backoffice -> gateway:8081 traffic — under
+    default-deny-egress/ingress every one of these calls was silently
+    dropped. Manifested as `httpx.ConnectTimeout` (an EMPTY-message
+    exception) inside user_ui.py's `_stream_gateway()` generator; the
+    ConnectTimeout is NOT a subtype of `httpx.ConnectError`
+    (it's a `httpx.TimeoutException` subtype), so it fell through the
+    specific `except httpx.ConnectError` handler (which yields the more
+    diagnostic "gateway_unreachable" message) into the generic
+    `except Exception` handler, surfacing to the end user as an
+    uninformative `{"error":"stream_error","message":"Unexpected error
+    streaming from gateway."}` with a misleading HTTP 200 (StreamingResponse
+    had already started). Confirmed live: `kubectl exec` into a running
+    backoffice pod, a direct httpx call to
+    `http://yashigani-gateway:8081/v1/chat/completions` raised
+    `httpx.ConnectTimeout('')` after the connect timeout elapsed; gateway
+    pod logs showed ZERO corresponding request log lines for any of the 4
+    chat targets tested (@letta/@langflow/@openclaw/direct model) — the
+    traffic never reached the gateway process at all, consistent with a
+    silent NetworkPolicy drop rather than an application-level rejection.
+    Found immediately after fixing YSG-RISK-125 (the DNS-resolution gap) —
+    that fix was necessary but not sufficient; this is the SECOND, separate
+    layer blocking the same feature.
+  severity: high
+  controls_impacted:
+  - Availability — every user-facing chat/agent path (@letta, @langflow,
+    @openclaw, direct model) remained completely broken on k8s even after
+    the YSG-RISK-125 DNS fix, because the traffic was reachable by name but
+    still denied at L3/L4 by NetworkPolicy.
+  compensating_controls:
+  - No security boundary crossed — this widens backoffice's own egress and
+    gateway's own ingress ONLY for the exact traffic the trusted-forwarder
+    feature is designed to carry (backoffice already holds
+    YASHIGANI_INTERNAL_BEARER and is the sole intended caller of this path);
+    no other pod gains new access as a result of this change.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fixed in helm/yashigani/templates/networkpolicy.yaml: added a
+      `from: backoffice` entry (port 8081) to `allow-gateway-ingress`'s
+      existing port-8081 ingress block (alongside open-webui and the agent
+      bundle pods), and a symmetric `to: gateway` entry (port 8081) to
+      `allow-backoffice-egress`. Verified render via
+      `helm upgrade --dry-run=server` (clean, both objects render with the
+      new rules). Live re-test of all 4 chat targets via
+      POST /user/chat/completions with a fresh authenticated end-user
+      session is the immediate next verification step (same test as
+      YSG-RISK-125, since both fixes gate the identical proxy call path).
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'
