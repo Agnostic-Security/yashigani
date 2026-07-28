@@ -2606,3 +2606,63 @@ risks:
       and already protected by AdminSession + mTLS + SPIFFE. Deferred.
   fix_in_version: v4.0
   last_threat_model_review: '2026-07-03'
+- id: YSG-RISK-110
+  description: >-
+    letta bundle (K8s/Helm path) CrashLoopBackOff — IsADirectoryError writing
+    openapi_letta.json. letta 0.16.7 (upstream, app.py:162) writes
+    openapi_letta.json relative to its CWD (/app) at module import time.
+    helm/yashigani/values.yaml's letta.extraVolumeMounts subPath-mounts that
+    path from an emptyDir named `letta-runtime`
+    (helm/yashigani/templates/agent-bundles.yaml renders the generic
+    extraVolumeMounts/extraVolumes list). The emptyDir starts completely
+    empty and the subPath target (openapi_letta.json) does not already exist
+    in it. This is a well-known kubelet gotcha: when a subPath mount target
+    does not already exist in the source volume, kubelet creates the missing
+    path as a DIRECTORY (not a file), then bind-mounts that directory onto
+    the intended file path inside the container. So /app/openapi_letta.json
+    became a directory, and letta's `open(..., "w")` call raised
+    IsADirectoryError, crash-looping the entire @letta chat path — blocking
+    the specific integration Laura's adversarial probe surfaced this on
+    (CWE-706, related to CWE-27 misconfiguration class).
+    Found live by Laura's red-team pass against the 4.1.2 k3s/Cilium e2e
+    deploy (2026-07-28), on an otherwise fully-green stack (all other 25
+    pods healthy, image provenance verified).
+  severity: medium
+  controls_impacted:
+  - Availability — @letta chat path fully broken (the historically critical
+    4.1.2 break this exact class of bug caused before)
+  - Agent dispatch — letta orchestrating-brain (Design A) path cannot start
+  compensating_controls:
+  - No security boundary crossed — availability-only impact, contained to the
+    letta bundle's own pod (readOnlyRootFilesystem, cap_drop ALL,
+    allowPrivilegeEscalation:false all remain intact regardless of this bug).
+  - The other 3 agent paths (@langflow, @openclaw, direct model) and OPA
+    enforcement are unaffected — this is scoped to letta's own
+    openapi_letta.json write, not a shared mesh/gateway component.
+  status: mitigated
+  closure_evidence:
+  - rationale: >-
+      Fix PREPARED and committed in helm/yashigani/templates/agent-bundles.yaml
+      + helm/yashigani/values.yaml: added generic `extraInitContainers`
+      support to the shared agent-bundles.yaml template (any bundle can now
+      declare initContainers), and wired a `pre-touch-letta-openapi-file`
+      initContainer (busybox:1.37, non-root UID 65534, readOnlyRootFilesystem,
+      cap_drop ALL) that mounts the `letta-runtime` emptyDir at its ROOT
+      (not via subPath) and `touch`es openapi_letta.json into existence
+      BEFORE the main letta container's subPath mount is established.
+      Since the file now pre-exists as a real file in the source volume,
+      kubelet correctly bind-mounts a file (not a directory) onto
+      /app/openapi_letta.json. Standard, documented K8s workaround for this
+      exact subPath-of-nonexistent-path gotcha.
+      Verified via `helm lint` + `helm template --show-only
+      templates/agent-bundles.yaml` (renders correctly, initContainer +
+      volumeMount present) + `kubectl apply --dry-run=server` (validates
+      clean against the live cluster's API server with zero mutation).
+      NOT YET verified live: Ava was mid-flight on the same deployed stack
+      at finding time — applying this fix (helm upgrade / targeted letta
+      redeploy) was deliberately held until Ava's e2e pass completed, to
+      avoid release-wide churn disrupting her run. Live redeploy + full
+      @letta/@langflow/@openclaw/direct-model chat-path verification
+      (OPA-enforced) is the immediate next step once cleared to proceed.
+  fix_in_version: v4.1.2
+  last_threat_model_review: '2026-07-28'

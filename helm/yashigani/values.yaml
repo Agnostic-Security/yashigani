@@ -1583,11 +1583,44 @@ agentBundles:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 (found live during 4.1.2 k3s/Cilium
+    # e2e via Laura, 2026-07-28): letta CrashLoopBackOff — IsADirectoryError
+    # writing openapi_letta.json (app.py:162 writes this file RELATIVE to CWD
+    # /app at module import). Root cause: subPath mounts a path from an
+    # emptyDir that does NOT already contain that path as a real file — this
+    # is a well-known kubelet gotcha: when a subPath target does not already
+    # exist in the source volume, kubelet creates the MISSING path as a
+    # DIRECTORY (not a file), then bind-mounts that directory onto the
+    # intended file path in the container. So /app/openapi_letta.json became
+    # a directory, and Python's open(..., "w") raised IsADirectoryError.
+    # Fix: pre-seed the file into the SAME `letta-runtime` emptyDir via an
+    # initContainer that mounts the volume's ROOT (not via subPath) and
+    # `touch`es the file BEFORE the main container's subPath mount resolves
+    # — kubelet then correctly bind-mounts an existing FILE. Standard,
+    # documented K8s workaround for this exact class of gotcha.
+    extraInitContainers:
+      - name: pre-touch-letta-openapi-file
+        image: "docker.io/library/busybox:1.37"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "touch /letta-runtime-init/openapi_letta.json"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534
+          runAsGroup: 65534
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+          - name: letta-runtime
+            mountPath: /letta-runtime-init
     # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
     extraVolumeMounts:
       # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
       # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
-      # rest of /app. subPath mounts the single file path only.
+      # rest of /app. subPath mounts the single file path only. The file is pre-created by
+      # the pre-touch-letta-openapi-file initContainer above (see that entry's comment for
+      # why — subPath-of-a-not-yet-existing-path silently becomes a directory otherwise).
       - name: letta-runtime
         mountPath: /app/openapi_letta.json
         subPath: openapi_letta.json
