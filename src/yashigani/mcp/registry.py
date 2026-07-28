@@ -288,7 +288,7 @@ def build_registry_from_env(
             "empty; durable-store lazy load active (SEAM-1d-07)"
         )
 
-    # Fix-4 (HA-correctness): wire RedisNonceStore when REDIS_URL is configured,
+    # Fix-4 (HA-correctness): wire RedisNonceStore when Redis is configured,
     # fall back to InMemoryNonceStore for dev.
     #
     # Multi-replica implication: InMemoryNonceStore is PER-PROCESS.  If the
@@ -300,37 +300,61 @@ def build_registry_from_env(
     # (mcp:jti:seen:{tenant_id}).  Redis ZADD NX provides atomic replay dedup
     # across ALL gateway replicas.  REQUIRED for multi-replica deployments.
     #
-    # When REDIS_URL is unset (dev/test), InMemoryNonceStore is used.  This is
-    # intentional: the InMemoryNonceStore constructor logs a WARNING that it is
-    # dev-mode only.  Operators must set REDIS_URL in production.
+    # LAURA-V50-016: this deployment (and every deployment installed via
+    # docker/docker-compose.yml or helm/) configures Redis via the SPLIT
+    # REDIS_HOST / REDIS_PORT / REDIS_USE_TLS env vars — the same trio every
+    # other Redis consumer in gateway/entrypoint.py resolves through
+    # gateway/_redis_url.py::build_redis_url() (entrypoint.py's local
+    # _gw_redis_url() helper).  A bare, single-string REDIS_URL is NEVER set
+    # for the gateway service.  Reading REDIS_URL here (the previous code)
+    # silently fell back to InMemoryNonceStore in production, which
+    # McpBroker.__init__'s LAURA-411-002/YSG-RISK-055 fail-closed guard then
+    # correctly refused — raising on every lazy broker build (SEAM-1d-07,
+    # i.e. every server onboarded via the live-import ceremony) and
+    # downgrading to a 404 at McpBrokerRegistry.get().
+    #
+    # REDIS_HOST presence is the "is Redis actually configured" signal (it
+    # replaces the old REDIS_URL-presence check).  Unit tests that build a
+    # registry with no Redis infra leave REDIS_HOST unset and correctly get
+    # InMemoryNonceStore (constructor logs a dev-mode-only WARNING).  A real
+    # deployment (dev-compose OR production) always sets REDIS_HOST via
+    # docker/helm and gets a real RedisNonceStore, built from the SAME
+    # split-env → rediss:// URL construction the rest of the gateway's Redis
+    # consumers use — DB 3, shared with the MCP id store / durable registry
+    # store (both already namespace their own keys under "mcp:"; the nonce
+    # store's own keys are "mcp:jti:seen:{tenant_id}" — no collision risk).
     _nonce_store: Optional[object] = None
-    redis_url = os.environ.get("REDIS_URL", "").strip()
-    if redis_url:
+    _redis_host = os.environ.get("REDIS_HOST", "").strip()
+    if _redis_host:
         try:
+            from yashigani.gateway._redis_url import build_redis_url
+            redis_url = build_redis_url(3, client_cert_name="gateway_client")
             import redis  # type: ignore[import-untyped]
             redis_client = redis.from_url(redis_url, decode_responses=False)
             from yashigani.mcp._nonce import RedisNonceStore
             _nonce_store = RedisNonceStore(redis_client)
             logger.info(
                 "mcp-registry: RedisNonceStore wired for replay prevention "
-                "(REDIS_URL=%s) — safe for multi-replica deployments",
-                redis_url.split("@")[-1] if "@" in redis_url else redis_url,
+                "(REDIS_HOST=%s, db=3) — safe for multi-replica deployments",
+                _redis_host,
             )
         except ImportError:
             raise RuntimeError(
-                "REDIS_URL is set but the 'redis' package is not installed. "
+                "REDIS_HOST is set but the 'redis' package is not installed. "
                 "Install redis>=5.0 (already in pyproject.toml). "
-                "Cannot start without RedisNonceStore when REDIS_URL is configured."
+                "Cannot start without RedisNonceStore when Redis is configured."
             )
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to construct RedisNonceStore from REDIS_URL: {exc}. "
-                "Check REDIS_URL and Redis connectivity."
+                f"Failed to construct RedisNonceStore from split Redis env "
+                f"(REDIS_HOST/REDIS_PORT/REDIS_USE_TLS): {exc}. Check Redis "
+                "connectivity."
             ) from exc
     else:
         # Dev/test: InMemoryNonceStore — logs a warning automatically in its __init__.
         # NOTE: InMemoryNonceStore is NOT safe for multi-replica deployments.
-        # Set REDIS_URL in production/staging to use RedisNonceStore.
+        # Set REDIS_HOST (+ REDIS_PORT/REDIS_USE_TLS) in production/staging to
+        # use RedisNonceStore.
         from yashigani.mcp._nonce import InMemoryNonceStore
         _nonce_store = InMemoryNonceStore()
 

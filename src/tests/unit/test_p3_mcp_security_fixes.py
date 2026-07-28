@@ -7,8 +7,13 @@ Covers:
   - Fix-2: _BridgeProcess in-flight cap — 503 + Retry-After at boundary.
   - Fix-3: Body size cap at BOTH the router layer (mcp_router_runtime.py) and
             the bridge layer (_bridge.py).
-  - Fix-4: RedisNonceStore wired when REDIS_URL is set; InMemoryNonceStore
-            used when REDIS_URL is unset (dev/test).
+  - Fix-4: RedisNonceStore wired when Redis is configured via the split
+            REDIS_HOST/REDIS_PORT/REDIS_USE_TLS env vars (the actual
+            deployment contract — see gateway/_redis_url.py::build_redis_url
+            / gateway/entrypoint.py::_gw_redis_url); InMemoryNonceStore used
+            when REDIS_HOST is unset (dev/test). LAURA-V50-016: a bare
+            REDIS_URL is NEVER read here — no deployment sets it for the
+            gateway service.
   - Fix-5: McpJwtIssuer raises RuntimeError in production/staging when
             ephemeral key would be used.
   - Fix-6: Helm gateway template emits YASHIGANI_MCP_SERVERS.
@@ -335,11 +340,18 @@ class TestFix3BodySizeCap:
 # ---------------------------------------------------------------------------
 
 class TestFix4RedisNonceStoreWiring:
-    """Fix-4 (HA-correctness): RedisNonceStore wired when REDIS_URL is set."""
+    """Fix-4 (HA-correctness): RedisNonceStore wired when Redis is
+    configured via the split REDIS_HOST/REDIS_PORT/REDIS_USE_TLS env vars —
+    the ACTUAL deployment contract (LAURA-V50-016: this deployment, and
+    every deployment installed via docker-compose.yml/helm, never sets a
+    bare REDIS_URL for the gateway service; it always sets the split trio).
+    A bare REDIS_URL is no longer read by build_registry_from_env at all.
+    """
 
-    def test_in_memory_nonce_store_used_when_redis_url_absent(self, monkeypatch):
-        """When REDIS_URL is unset → InMemoryNonceStore is used (dev/test mode)."""
+    def test_in_memory_nonce_store_used_when_redis_host_absent(self, monkeypatch):
+        """When REDIS_HOST is unset → InMemoryNonceStore is used (dev/test mode)."""
         monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.delenv("REDIS_HOST", raising=False)
         monkeypatch.setenv("YASHIGANI_MCP_SERVERS", json.dumps([{
             "agent_name": "test-mcp",
             "upstream_url": "http://test-mcp:8000",
@@ -358,12 +370,19 @@ class TestFix4RedisNonceStoreWiring:
         broker, _ = reg.get("test-mcp")
         # broker._nonce_store is set from McpBrokerConfig.nonce_store
         assert isinstance(broker._nonce_store, InMemoryNonceStore), (
-            "When REDIS_URL is unset, broker must use InMemoryNonceStore"
+            "When REDIS_HOST is unset, broker must use InMemoryNonceStore"
         )
 
-    def test_redis_nonce_store_wired_when_redis_url_set(self, monkeypatch):
-        """When REDIS_URL is set → RedisNonceStore is constructed and passed to each broker."""
-        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    def test_redis_nonce_store_wired_when_redis_host_split_env_set(self, monkeypatch):
+        """When REDIS_HOST/REDIS_PORT/REDIS_USE_TLS are set (REDIS_URL
+        unset — the real deployment contract) → RedisNonceStore is
+        constructed and passed to each broker. LAURA-V50-016 regression:
+        this is the exact env shape docker-compose.yml/helm set for the
+        gateway service; REDIS_URL is never set there."""
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.setenv("REDIS_HOST", "redis")
+        monkeypatch.setenv("REDIS_PORT", "6380")
+        monkeypatch.setenv("REDIS_USE_TLS", "true")
         monkeypatch.setenv("YASHIGANI_MCP_SERVERS", json.dumps([{
             "agent_name": "test-mcp",
             "upstream_url": "http://test-mcp:8000",
@@ -387,12 +406,15 @@ class TestFix4RedisNonceStoreWiring:
         assert len(reg) == 1
         broker, _ = reg.get("test-mcp")
         assert isinstance(broker._nonce_store, RedisNonceStore), (
-            "When REDIS_URL is set, broker must use RedisNonceStore"
+            "When REDIS_HOST (split-env) is set, broker must use RedisNonceStore"
         )
 
     def test_redis_import_error_raises_runtime_error(self, monkeypatch):
-        """If REDIS_URL is set but redis package is missing → RuntimeError at startup."""
-        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+        """If REDIS_HOST is set but redis package is missing → RuntimeError at startup."""
+        monkeypatch.delenv("REDIS_URL", raising=False)
+        monkeypatch.setenv("REDIS_HOST", "redis")
+        monkeypatch.setenv("REDIS_PORT", "6380")
+        monkeypatch.setenv("REDIS_USE_TLS", "true")
         monkeypatch.setenv("YASHIGANI_MCP_SERVERS", json.dumps([{
             "agent_name": "test-mcp",
             "upstream_url": "http://test-mcp:8000",
