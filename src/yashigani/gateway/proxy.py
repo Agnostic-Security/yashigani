@@ -322,6 +322,18 @@ def create_gateway_app(
         lifespan=_lifespan,
     )
 
+    # YSG-RISK-131: expose the SAME `_state` dict every middleware/route in
+    # this module already reads live (`state["key"]` / `state.get("key")`) so
+    # `gateway/redis_selfheal.py` can repopulate it after a cold-boot Redis
+    # failure without this module needing to know anything about self-heal.
+    # Since dicts are mutable and shared by reference, a write to
+    # `app.state.internal_state["rate_limiter"]` (etc.) from outside this
+    # closure is visible to every function below on the very next read — no
+    # separate fallback/singleton needed for anything that already reads
+    # `_state` live (unlike `AgentAuthMiddleware` / `MetricsCollector`, which
+    # snapshot a value at construction — see gateway/state.py).
+    app.state.internal_state = _state
+
     # Security headers
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -360,6 +372,28 @@ def create_gateway_app(
             except Exception as _pp_exc:
                 logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
+
+    # YSG-RISK-131 self-heal: bounded lazy reconnect for every Redis-backed
+    # gateway subsystem that failed to connect at cold boot (e.g. k8s
+    # boot-order race — yashigani-gateway scheduled before yashigani-redis,
+    # see gateway/redis_selfheal.py docstring for full context). Registered
+    # AFTER security_headers (above) so — per Starlette's "last-registered
+    # decorator middleware is outermost" ordering — this runs BEFORE
+    # security_headers on the way in, meaning a same-request reconnect is
+    # visible to security_headers' own capability_policy_store/rbac_store
+    # read, and to every downstream route (openai_router's chat-completions
+    # handler is the innermost layer, so it always sees the post-self-heal
+    # state within the SAME request). Excluded from /healthz and /metrics so
+    # the container health probe never blocks on a Redis reconnect attempt.
+    # No-ops (pure None-checks, zero Redis round-trips) once every subsystem
+    # is healthy, and each subsystem is independently cooldown-gated while
+    # unhealthy so an outage cannot turn into a reconnect storm.
+    @app.middleware("http")
+    async def gateway_redis_selfheal_middleware(request: Request, call_next):
+        if request.url.path not in ("/healthz", "/metrics"):
+            from yashigani.gateway.redis_selfheal import maybe_selfheal
+            await maybe_selfheal(_state)
+        return await call_next(request)
 
     # Internal health check — used by Caddy and container health probe
     @app.get("/healthz")

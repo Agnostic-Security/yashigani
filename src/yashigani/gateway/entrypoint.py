@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Callable, Literal, cast
 
 from yashigani.audit.config import AuditConfig
@@ -22,8 +23,6 @@ from yashigani.inspection.pipeline import InspectionPipeline, ResponseInspection
 from yashigani.kms.factory import create_provider
 from yashigani.ratelimit.config import RateLimitConfig
 from yashigani.ratelimit.limiter import RateLimiter
-from yashigani.rbac.store import RBACStore
-from yashigani.agents.registry import AgentRegistry
 from yashigani.metrics.collectors import MetricsCollector
 from yashigani.metrics.middleware import PrometheusMiddleware
 from yashigani.gateway.proxy import GatewayConfig, create_gateway_app
@@ -189,49 +188,62 @@ def _build_app(mesh_mode: bool = False):
     except Exception as exc:
         logger.warning("Response cache unavailable (%s) — caching disabled", exc)
 
-    # RBAC store and Agent registry — Redis DB 3 (shared instance, separate key namespaces)
+    # RBAC store, Agent registry, Capability-Policy store, Permission store —
+    # Redis DB 3 (shared instance, separate key namespaces).
+    #
+    # YSG-RISK-131 (Iris, live k8s @ 4.1.2, 17h uptime / 0 restarts, permanently
+    # degraded): a single-attempt try/except here left every one of these four
+    # objects `None` for the pod's ENTIRE lifetime whenever `yashigani-redis`
+    # Service-DNS wasn't resolvable at this exact instant (k8s boot-order race
+    # — the Redis Pod can be scheduled after the gateway Pod, and headless-
+    # Service DNS only populates once the Pod IP registers with kube-dns).
+    # docker/podman compose ordering (`depends_on: condition: service_healthy`)
+    # hides this class entirely, which is why it shipped unnoticed. Mirrors
+    # backoffice's YSG-RISK-122 fix exactly: the construction logic now lives
+    # in `gateway/rbac_stack.build_rbac_agent_stack()` so this bounded startup
+    # retry AND `gateway/redis_selfheal.py`'s lazy, cooldown-gated, request-time
+    # reconnect both call the SAME code — see that module's docstring for the
+    # full self-heal design (also covers 12 further Redis-dependent gateway
+    # subsystems from the same finding).
     rbac_store = None
     agent_registry = None
-    redis_client_rbac = None
     capability_policy_store = None  # 3.0 — browser Permissions-Policy
     permission_store = None          # 3.1 Phase 4 — MCP connection allow-list
-    try:
-        import redis as _redis
-        redis_client_rbac = _redis.from_url(_gw_redis_url(3), decode_responses=False)
-        redis_client_rbac.ping()
-        rbac_store = RBACStore(redis_client=redis_client_rbac)
-        logger.info("Gateway RBAC store ready: %d group(s)", len(rbac_store.list_groups()))
-        agent_registry = AgentRegistry(redis_client=redis_client_rbac)
-        logger.info(
-            "Gateway agent registry ready: %d agent(s)",
-            agent_registry.count("all"),
-        )
-        # 3.0 — Capability policy store shares Redis db/3 (key prefix cap_policy:*)
-        from yashigani.capability_policy.store import CapabilityPolicyStore as _CapPolStore
-        _cap_pol_org_id = os.getenv("YASHIGANI_ORG_ID", "default").strip() or "default"
-        capability_policy_store = _CapPolStore(
-            redis_client=redis_client_rbac,
-            default_org_id=_cap_pol_org_id,
-        )
-        logger.info(
-            "Gateway capability policy store ready (Permissions-Policy, 3.0, org=%s)",
-            _cap_pol_org_id,
-        )
-        # 3.1 Phase 4 / 4.1 SEC-GAP-1 — Permission Store is the inner perm_store
-        # of capability_policy_store (same Redis backing, same default_org_id,
-        # same Python object as used by the backoffice routes).
-        # Sourced from capability_policy_store.perm_store so there is exactly ONE
-        # PermissionStore instance — prevents the getattr(rbac_store, "_perm_store")
-        # dead-migration pattern from the discarded 3fb42f51 restore attempt.
-        permission_store = capability_policy_store.perm_store
-        logger.info(
-            "Gateway permission store ready (Phase 4 MCP allow-list, org=%s)",
-            _cap_pol_org_id,
-        )
-    except Exception as exc:
-        logger.warning(
-            "RBAC/Agent Redis unavailable (%s) — RBAC and agent routing disabled", exc
-        )
+    # Reused below by identity_registry + the MCP id_store/durable_store (both
+    # share this exact db/3 connection, matching pre-extraction behaviour).
+    redis_client_rbac = None
+    _RBAC_MAX_ATTEMPTS = 5
+    _rbac_backoff = 1.0
+    for _rbac_attempt in range(1, _RBAC_MAX_ATTEMPTS + 1):
+        try:
+            from yashigani.gateway.rbac_stack import build_rbac_agent_stack
+            _rbac_stack = build_rbac_agent_stack(_gw_redis_url(3))
+            rbac_store = _rbac_stack.rbac_store
+            agent_registry = _rbac_stack.agent_registry
+            capability_policy_store = _rbac_stack.capability_policy_store
+            permission_store = _rbac_stack.permission_store
+            redis_client_rbac = _rbac_stack.redis_client
+            break  # success
+        except Exception as exc:
+            if _rbac_attempt < _RBAC_MAX_ATTEMPTS:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable (attempt %d/%d): %s — retrying in %.0f s",
+                    _rbac_attempt, _RBAC_MAX_ATTEMPTS, exc, _rbac_backoff,
+                )
+                time.sleep(_rbac_backoff)
+                _rbac_backoff *= 2
+            else:
+                logger.warning(
+                    "RBAC/Agent Redis unavailable after %d attempts (%s) — RBAC and "
+                    "agent routing disabled at startup; a bounded lazy reconnect will "
+                    "keep retrying at request time (YSG-RISK-131 self-heal, "
+                    "gateway/redis_selfheal.py)",
+                    _RBAC_MAX_ATTEMPTS, exc,
+                )
+
+    from yashigani.gateway.state import gateway_fallback_state
+    gateway_fallback_state.rbac_store = rbac_store
+    gateway_fallback_state.agent_registry = agent_registry
 
     # JWT inspector — Phase 7
     jwt_inspector = None

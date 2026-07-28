@@ -3426,3 +3426,180 @@ risks:
       targets (letta/langflow/openclaw/direct-model) return real responses.
       This entry should be re-reviewed after that confirmation lands.
   fix_in_version: v4.1.2
+
+- id: YSG-RISK-131
+  description: >-
+    K8s/Helm chat blocker, live-reproduced by Iris (4.1.2, `fix/v412-e2e-x8x-
+    20260725`): both `yashigani-gateway-*` pods, 17h uptime, 0 restarts,
+    PERMANENTLY degraded. `gateway/entrypoint.py`'s cold-boot init (was
+    lines ~192-234) builds `rbac_store` / `agent_registry` /
+    `capability_policy_store` / `permission_store` in a single try/except —
+    no retry, no self-heal — sharing the SAME class of bug as the already-
+    fixed backoffice YSG-RISK-122. On k8s, `yashigani-redis:6380` Service-DNS
+    is not resolvable at that exact instant (`Error -2 ... Name or service
+    not known` — the Redis Pod can be scheduled after the gateway Pod, and
+    headless-Service DNS only populates once the Pod IP registers with
+    kube-dns); the single attempt fails once and `agent_registry` (plus the
+    other three) stays `None` for the pod's ENTIRE lifetime. Live gateway
+    logs confirmed the failure fires ONCE at boot and never retries:
+    "RBAC/Agent Redis unavailable (Error -2 ...) — RBAC and agent routing
+    disabled" with no later "Gateway RBAC store ready" / "agent registry
+    ready" line ever appearing. Result: `/user/chat/completions` returned
+    `agent_registry_unavailable` for every @agent call and degraded routing
+    for the direct-model path, even though agents WERE registered in
+    Postgres (YSG-RISK-130 had already fixed registration — this is a
+    SEPARATE, later-stage blocker in the same chat-verification chain: 125
+    DNS -> 126/127 NetworkPolicy -> 128 Ollama mesh -> 129 crash-on-failure
+    -> 130 agent registration -> 131 boot-race self-heal). `proxy.py`'s
+    lifespan agent-reconcile (ISSUE-AGENT-REG-DURABILITY) cannot recover this
+    state either — it only refills an EXISTING registry object, and is a
+    no-op when `agent_registry is None`. docker/podman compose ordering
+    (`depends_on: condition: service_healthy`) hides this class entirely,
+    which is why it shipped unnoticed until a live k8s deployment reproduced
+    it. Iris's systemic follow-up review (remediation_map.md) found the SAME
+    unretried-one-shot-try/except shape repeated across 13 total gateway
+    Redis-dependent subsystems (rate_limiter, endpoint_rate_limiter,
+    response_cache, jwt_inspector, identity_registry, budget_enforcer,
+    cloud_override_getter, model_allocation_store, model_alias_store,
+    workflow_scheduler, ddos_protector, egress_limit_enforcer, plus this
+    finding's rbac/agent/cap-policy/permission-store row) and 6 further
+    instances on the backoffice admin plane (P2, smaller blast radius,
+    tracked as a documented follow-up, not this finding).
+  severity: high
+  controls_impacted:
+  - Availability — the entire chat feature surface (agent calls AND
+    direct-model routing degradation) can be silently, permanently disabled
+    by a transient boot-order race, on every fresh k8s install, with the pod
+    reporting healthy (0 restarts) throughout — a "healthy-looking zombie"
+    that evades the existing `/healthz`-only install-time convergence gate.
+  - Defense-in-depth silently disabled — 12 further Redis-backed security/
+    reliability controls (rate limiting, DDoS throttle, JWT validation,
+    per-endpoint rate caps, egress rate cap, budget enforcement) share the
+    identical class of permanent silent degradation.
+  compensating_controls:
+  - No auth/authz boundary is crossed — every degraded path already fails
+    CLOSED (503/agent_registry_unavailable, rate limiting simply disabled
+    rather than fail-open bypass, etc.); this finding is an AVAILABILITY gap
+    (feature silently stops working), not a security-bypass gap.
+  - A full pod restart (kubectl rollout restart / pod eviction) always
+    recovers the affected pod, since cold boot re-attempts the same
+    connection — operators are not permanently stuck, just unaware the
+    degradation is silent and requires a manual restart absent this fix.
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-28'
+  closure_evidence:
+  - rationale: >-
+      FIXED (code-complete, locally verified — k8s live re-verification
+      explicitly DEFERRED per Tiago, k8s leg paused for the Docker/Podman
+      legs; Captain will re-verify against a clean k8s redeploy when that
+      leg resumes). Reuses the backoffice YSG-RISK-122 self-heal SHAPE
+      without duplicating its bookkeeping a second time, per Iris's
+      remediation map:
+
+      1. `yashigani/common/redis_selfheal.py` (NEW) — the shared, generic,
+      cooldown-gated (default 15s, overridable),
+      at-most-one-attempt-per-window bounded-reconnect primitive
+      (`ensure(name, is_healthy, build, on_success, cooldown_s, ...)`).
+      `backoffice/redis_selfheal.py` and the new gateway module are now both
+      thin call-sites over this ONE primitive instead of two independently
+      hand-rolled cooldown/dispatch implementations.
+
+      2. `gateway/rbac_stack.py` (NEW) — `build_rbac_agent_stack()`, the
+      RBAC/Agent/Capability-Policy/Permission-store construction logic
+      extracted out of `entrypoint._build_app()` exactly like backoffice's
+      122 fix, so the SAME code runs at both the bounded startup retry loop
+      (1/2/4/8/16s x5, mirroring 122) and the lazy request-time reconnect.
+
+      3. `gateway/redis_selfheal.py` (NEW) — one `ensure_*()` per Iris-listed
+      gateway Redis-dependent subsystem (all 13, plus this finding's row),
+      each writing the rebuilt object into every live-state container its
+      real consumers already read: `openai_router._state` (module singleton,
+      read live by `chat_completions()` — the exact gate that produced
+      `agent_registry_unavailable`), `proxy.py`'s per-app `_state` dict
+      (exposed to this module via `app.state.internal_state`, read live by
+      every proxy.py middleware/route already using `state["key"]` /
+      `state.get("key")`), and `egress_proxy._state` (that module's own
+      live-read singleton). `maybe_selfheal()` is the async orchestrator:
+      dispatches ONLY the currently-unhealthy subsystems via
+      `asyncio.to_thread` (never blocks the event loop once healthy; a
+      request burst during an outage cannot become a reconnect storm, each
+      subsystem independently cooldown-gated) and correctly defers
+      `WorkflowScheduler.start()` (which requires a running event loop) to
+      the coroutine itself rather than calling it inside the to_thread
+      worker.
+
+      4. `gateway/state.py` (NEW) — a tiny fallback singleton
+      (`gateway_fallback_state`) for the ONE gateway consumer that
+      snapshots `agent_registry` BY VALUE at construction instead of
+      reading live state: `AgentAuthMiddleware` (`/agents/*` inter-service
+      auth). `gateway/agent_auth.py` now falls back to
+      `gateway_fallback_state.agent_registry` when its own constructor
+      snapshot is None. `MetricsCollector`'s rbac/agent-registry gauges are
+      an ACCEPTED, DOCUMENTED residual (cosmetic metric only, shared cross-
+      component module — not wired, to avoid coupling `metrics/collectors.py`
+      to gateway internals for a non-functional gauge).
+
+      5. `gateway/proxy.py` wires `gateway_redis_selfheal_middleware`
+      (calls `maybe_selfheal()` before every request except `/healthz` and
+      `/metrics`) and exposes the module's per-app `_state` dict via
+      `app.state.internal_state` so `redis_selfheal.py` can write into it
+      without any new fallback/singleton for the many subsystems that
+      already read that dict live. Middleware ordering verified empirically
+      (Starlette 1.3.1 / FastAPI 0.136.3, `.venv`) so a same-request
+      reconnect is visible to `openai_router`'s chat-completions handler
+      (always innermost — the confirmed bug's exact gate) and to
+      `security_headers`' own capability-policy/rbac read; the
+      `AgentAuthMiddleware` case (added even later, in
+      `entrypoint._build_app()`) recovers on the NEXT request instead of the
+      same one — an explicit, documented, acceptable tradeoff (bounded
+      cooldown retry, not "never recovers").
+
+      DEFERRED (explicitly, per dispatch): (a) 6 backoffice-admin-plane P2
+      siblings (rate_limiter, backend_registry, model_alias_store,
+      model_allocation_store, response_cache, identity_registry — Iris's
+      findings #14-19) — same bug class, smaller blast radius, NOT this
+      change; (b) the missing `wait-for-redis` initContainer in
+      `helm/yashigani/templates/gateway.yaml` (backoffice has one,
+      `backoffice.yaml:61-125`) — belt-and-braces defence-in-depth that
+      reduces the ODDS of hitting the race; flagged for Captain, does not
+      replace the self-heal fix (per the 122 postmortem, DNS propagation can
+      outlast even the initContainer's wait budget); (c) live k8s
+      re-verification — Tiago paused the k8s leg for the Docker/Podman legs;
+      Captain re-verifies against a clean k8s redeploy when that leg
+      resumes (confirm no "Redis unavailable" lines survive past the first
+      ~10s of gateway boot, and confirm the self-heal log line appears if
+      the race is hit).
+
+      Verified locally (no deploy):
+      `src/tests/regression/v4.1.2/test_ysg_risk_131_gateway_redis_selfheal.py`
+      — 13 tests, all proving actual RECOVERY (not just "doesn't crash"):
+      the shared primitive's fail/reconnect/cooldown/healthy-noop shapes;
+      `ensure_rbac_agent_stack()`'s fails-then-succeeds transition populating
+      `openai_router._state`, `gateway_fallback_state`, AND the proxy.py
+      app_state dict simultaneously (the exact three consumers the live bug
+      evidence showed broken); `build_rbac_agent_stack()` against real
+      fakeredis (docker/podman parity — no regression from the extraction);
+      `AgentAuthMiddleware`'s fallback recovering a 503-registry_unavailable
+      request into a 200 on the very next request once
+      `gateway_fallback_state.agent_registry` is populated, with NO process
+      restart; three representative siblings
+      (`ensure_rate_limiter`/`ensure_egress_limit_enforcer`/
+      `ensure_ddos_protector`, covering all three state-container shapes —
+      app_state-only, egress_proxy._state-only, and dual-write); the
+      `maybe_selfheal()` orchestrator dispatching ONLY unhealthy subsystems;
+      and `WorkflowScheduler.start()` correctly running on the event loop
+      (not inside the to_thread worker, which would raise "no running event
+      loop"). Full pre-existing gateway/rbac/ratelimit/ddos/v4.1.2 pytest
+      subset (546 tests) green, zero regressions (13 unrelated pre-existing
+      failures confirmed via git-stash diff — all a `upstream.example.com`
+      DNS-resolution environment issue in backoffice's `/admin/agents`
+      route, untouched by this change). ruff `--select G` (the repo's actual
+      gating rule set) clean on every touched/new file. mypy clean-diff: 4
+      pre-existing errors at unrelated, unshifted line numbers (proxy.py
+      InferenceRecord arg, entrypoint.py cloud_override_getter/
+      mcp_broker_registry Optional-narrowing) — confirmed via git-stash
+      before/after, zero new errors introduced.
+  fix_in_version: v4.1.2
