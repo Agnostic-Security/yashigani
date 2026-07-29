@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -28,6 +28,24 @@ REVISION = "b" * 40
 GOOD_SHA256 = "c" * 64
 GOOD_LFS_OBJECT_ID = "f" * 64
 ISSUED_AT = "2026-07-22T00:00:00Z"
+
+
+class _ConvertedFields(TypedDict):
+    """Exact per-field types for the unsigned `ConvertedManifestEntry` kwargs the
+    tests below build, then `**`-unpack into the constructor alongside an explicit
+    `signature=`. An unannotated dict literal infers to `dict[str, object]`, whose
+    `object` values are not assignable to the constructor's `str`/`int` params
+    (the 12 standing arg-type errors); a TypedDict gives mypy the exact key→type
+    map so the unpack typechecks without a blanket `# type: ignore`."""
+
+    source_sha256: str
+    convert_tool_commit: str
+    quant: str
+    output_sha256: str
+    provenance_tier: str
+    issued_at: str
+    max_trust_age_seconds: int
+    signer_key_id: str
 
 
 def _make_signed_entry(private_key, **overrides) -> SignedCatalogEntry:
@@ -232,7 +250,7 @@ def test_verify_accepts_a_valid_converted_manifest(keypair, tmp_path: Path) -> N
     source_path.write_bytes(b"source bytes")
 
     measurement = measure_conversion_tuple(source_path, output_path, convert_tool_commit="a" * 40, quant="Q4_K_M")
-    unsigned_payload_fields = {
+    unsigned_payload_fields: _ConvertedFields = {
         "source_sha256": measurement.source_sha256,
         "convert_tool_commit": measurement.convert_tool_commit,
         "quant": measurement.quant,
@@ -276,7 +294,7 @@ def test_verify_rejects_converted_manifest_when_output_bytes_were_substituted(ke
     measurement = measure_conversion_tuple(source_path, output_path, convert_tool_commit="a" * 40, quant="Q4_K_M")
     from kuroshio.convert_provenance import ConvertedManifestEntry
 
-    fields = {
+    fields: _ConvertedFields = {
         "source_sha256": measurement.source_sha256,
         "convert_tool_commit": measurement.convert_tool_commit,
         "quant": measurement.quant,
@@ -315,7 +333,7 @@ def test_verify_fails_closed_when_no_converted_verifier_configured(keypair, tmp_
     measurement = measure_conversion_tuple(source_path, output_path, convert_tool_commit="a" * 40, quant="Q4_K_M")
     from kuroshio.convert_provenance import ConvertedManifestEntry
 
-    fields = {
+    fields: _ConvertedFields = {
         "source_sha256": measurement.source_sha256,
         "convert_tool_commit": measurement.convert_tool_commit,
         "quant": measurement.quant,
