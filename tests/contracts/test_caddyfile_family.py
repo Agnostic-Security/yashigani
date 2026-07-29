@@ -48,6 +48,7 @@ a clear message naming the Caddyfile and the missing proxy target.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -776,25 +777,19 @@ def _env_stub() -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
-def test_caddy_adapt_exits_zero(
-    name: str, path: Path, tmp_path: Path
-) -> None:
+def _stage_and_adapt(
+    caddy: str, name: str, path: Path, tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
     """
-    Run ``caddy adapt --config <Caddyfile>`` and assert exit 0.
-    Skipped if no caddy binary is on PATH or pointed to by CADDY_BIN.
+    Stage a Caddyfile + its /etc/caddy siblings under tmp_path with stub env
+    vars expanded, then run ``caddy adapt`` and return the CompletedProcess
+    (stdout carries the adapted JSON on success).
 
-    This catches syntax errors that the regex-based static tests cannot: missing
-    braces, unknown directives, and Caddyfile adapter parse failures.
+    Shared by test_caddy_adapt_exits_zero and
+    test_strict_tt_matches_registered_exact_routes — both need the identical
+    staged tree; duplicating the staging logic is exactly the kind of drift
+    this test file exists to prevent.
     """
-    caddy = _caddy_binary()
-    if caddy is None:
-        pytest.skip(
-            "caddy binary not found (set CADDY_BIN or install caddy).  "
-            "This check runs in CI when caddy is pre-installed."
-        )
-
-    # Write the Caddyfile with stub env vars expanded
     src = _load(path)
     stub_env = _env_stub()
     # Caddy {$VAR} is parse-time; we expand manually so caddy adapt sees literals
@@ -836,16 +831,131 @@ def test_caddy_adapt_exits_zero(
     caddyfile_copy = tmp_path / f"Caddyfile.{name}"
     caddyfile_copy.write_text(expanded, encoding="utf-8")
 
-    result = subprocess.run(
+    return subprocess.run(
         [caddy, "adapt", "--config", str(caddyfile_copy)],
         capture_output=True,
         text=True,
         env=stub_env,
     )
 
+
+@pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+def test_caddy_adapt_exits_zero(
+    name: str, path: Path, tmp_path: Path
+) -> None:
+    """
+    Run ``caddy adapt --config <Caddyfile>`` and assert exit 0.
+    Skipped if no caddy binary is on PATH or pointed to by CADDY_BIN.
+
+    This catches syntax errors that the regex-based static tests cannot: missing
+    braces, unknown directives, and Caddyfile adapter parse failures.
+    """
+    caddy = _caddy_binary()
+    if caddy is None:
+        pytest.skip(
+            "caddy binary not found (set CADDY_BIN or install caddy).  "
+            "This check runs in CI when caddy is pre-installed."
+        )
+
+    result = _stage_and_adapt(caddy, name, path, tmp_path)
+
     assert result.returncode == 0, (
         f"\ncaddy adapt FAILED for Caddyfile.{name} (exit {result.returncode}):\n"
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}\n"
-        f"Caddyfile path: {caddyfile_copy}"
     )
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-147 regression — @strict_tt must match backoffice's EXACT routes
+# ---------------------------------------------------------------------------
+#
+# Root cause: @strict_tt only listed wildcard entries (/chat/*, /agents/*,
+# /builder/*, /workflows/*). The backoffice routes for these pages are
+# registered WITHOUT a trailing slash/wildcard (see
+# src/yashigani/backoffice/routes/user_ui.py — @router.get("/chat") etc.),
+# so Caddy's path matcher (exact-segment semantics, `/chat/*` requires a `/`
+# after `chat`) never matched the live page and it shipped with NO CSP header
+# (Laura, YSG-RISK-147). This test compiles each Caddyfile with the real
+# `caddy adapt` binary and inspects the resulting JSON config for the
+# @strict_tt matcher's compiled path list — a regex/text check on the
+# Caddyfile source is NOT sufficient because it can't tell you whether Caddy's
+# path matcher actually matches the route; only the compiled adapter output can.
+
+_STRICT_TT_EXACT_PATHS_REQUIRED = ("/chat", "/agents", "/builder", "/workflows")
+
+
+def _strict_tt_path_lists(adapted: dict) -> list[list[str]]:
+    """
+    Walk the adapted Caddy JSON config and return every path list from a
+    `match` block that contains BOTH '/admin/' and '/chat' or '/chat/*'
+    (i.e. the @strict_tt matcher, identified by its distinctive path set
+    rather than by matcher name — Caddy's JSON adapter output does not
+    preserve Caddyfile matcher names).
+    """
+    found: list[list[str]] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            match = node.get("match")
+            if isinstance(match, list):
+                for entry in match:
+                    if isinstance(entry, dict):
+                        paths = entry.get("path")
+                        if isinstance(paths, list) and "/admin/" in paths and (
+                            "/chat" in paths or "/chat/*" in paths
+                        ):
+                            found.append(paths)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(adapted)
+    return found
+
+
+@pytest.mark.parametrize("name,path", list(CADDYFILES.items()))
+def test_strict_tt_matches_registered_exact_routes(
+    name: str, path: Path, tmp_path: Path
+) -> None:
+    """
+    YSG-RISK-147 regression test.
+
+    Compile Caddyfile.<name> with the real caddy binary and assert the
+    @strict_tt matcher's compiled path list includes the EXACT routes
+    backoffice actually registers (/chat, /agents, /builder, /workflows) —
+    not just their /* wildcards, which never match the exact page.
+
+    Skipped if no caddy binary is on PATH or pointed to by CADDY_BIN (same
+    gate as test_caddy_adapt_exits_zero).
+    """
+    caddy = _caddy_binary()
+    if caddy is None:
+        pytest.skip(
+            "caddy binary not found (set CADDY_BIN or install caddy).  "
+            "This check runs in CI when caddy is pre-installed."
+        )
+
+    result = _stage_and_adapt(caddy, name, path, tmp_path)
+    assert result.returncode == 0, (
+        f"\ncaddy adapt FAILED for Caddyfile.{name} (exit {result.returncode}):\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\n"
+    )
+
+    adapted = json.loads(result.stdout)
+    matcher_hits = _strict_tt_path_lists(adapted)
+    assert matcher_hits, (
+        f"Caddyfile.{name}: could not locate the @strict_tt matcher in the "
+        f"compiled config (looked for a path list containing '/admin/' and "
+        f"'/chat' or '/chat/*')."
+    )
+
+    for paths in matcher_hits:
+        missing = [p for p in _STRICT_TT_EXACT_PATHS_REQUIRED if p not in paths]
+        assert not missing, (
+            f"Caddyfile.{name}: @strict_tt compiled path list is missing exact "
+            f"route(s) {missing} — these pages would be served with NO CSP "
+            f"header (YSG-RISK-147 regression). Compiled path list: {paths!r}"
+        )

@@ -30,8 +30,19 @@ class VaultKMSProvider(KSMProvider):
         self._vault_addr = os.getenv("VAULT_ADDR", _VAULT_ADDR_DEFAULT)
         self._namespace = os.getenv("VAULT_NAMESPACE")
         self._token = os.getenv("VAULT_TOKEN")
-        self._role_id_file = os.getenv("VAULT_ROLE_ID_FILE", "/run/secrets/vault_role_id")
-        self._secret_id_file = os.getenv("VAULT_SECRET_ID_FILE", "/run/secrets/vault_secret_id")
+        # YSG-RISK-160: VAULT_ROLE_ID_FILE / VAULT_SECRET_ID_FILE remain the
+        # primary (documented, working) override for a fully custom path —
+        # unchanged, not broken. The DEFAULT (when neither is set) now routes
+        # through YASHIGANI_SECRETS_DIR instead of a bare "/run/secrets/..."
+        # literal, so a non-default secrets mount doesn't silently fall back
+        # to the wrong directory (same class as YSG-RISK-150).
+        _secrets_dir = os.getenv("YASHIGANI_SECRETS_DIR", "/run/secrets")
+        self._role_id_file = os.getenv(
+            "VAULT_ROLE_ID_FILE", os.path.join(_secrets_dir, "vault_role_id")
+        )
+        self._secret_id_file = os.getenv(
+            "VAULT_SECRET_ID_FILE", os.path.join(_secrets_dir, "vault_secret_id")
+        )
         self._authenticate()
 
     # -- Identity properties -------------------------------------------------

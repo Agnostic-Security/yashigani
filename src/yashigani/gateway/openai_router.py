@@ -206,6 +206,22 @@ def _deny_message(reason: str) -> str:
     return _DENY_MESSAGES.get(reason, _GENERIC_DENY)
 
 
+def _agent_token_secrets_root():
+    """Root directory for per-bundled-agent gateway token files
+    (V232-CSCAN-01a resolve-and-confine guard). Returns a pathlib.Path.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare ``Path("/run/secrets")`` literal with no override, the same
+    convention-bypass class as YSG-RISK-150 (and inconsistent with
+    ``_load_token_role_map``'s ``_secrets_dir`` in this same module, which
+    already honoured the env var). Resolved at call time (not import time)
+    so tests can monkeypatch YASHIGANI_SECRETS_DIR without a module reload.
+    """
+    from pathlib import Path as _Path
+
+    return _Path(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")).resolve()
+
+
 # ---------------------------------------------------------------------------
 # LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
 # ---------------------------------------------------------------------------
@@ -3446,7 +3462,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
                 # Read agent auth token from env var or secrets file
                 import os
-                from pathlib import Path as _Path
                 agent_headers: dict[str, str] = {"Content-Type": "application/json"}
                 # Check env var first (e.g., OPENCLAW_GATEWAY_TOKEN), then secrets file
                 env_token = os.getenv(f"{agent_name_lower.upper()}_GATEWAY_TOKEN", "")
@@ -3456,7 +3471,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     # constrained by AgentRegisterRequest.name pattern='^[a-z][a-z0-9_-]{0,63}$',
                     # but we guard here too as defence-in-depth against pre-existing registry
                     # entries that predate the pattern constraint (CWE-22).
-                    _secrets_root = _Path("/run/secrets").resolve()
+                    # YSG-RISK-160: secrets root now honours YASHIGANI_SECRETS_DIR
+                    # (see _agent_token_secrets_root() docstring).
+                    _secrets_root = _agent_token_secrets_root()
                     _token_path = (_secrets_root / f"{agent_name_lower}_token").resolve()
                     if not _token_path.is_relative_to(_secrets_root):
                         logger.warning(
