@@ -82,7 +82,16 @@ def generate_event_to_ndjson(event: dict[str, Any], model: str) -> tuple[bytes, 
         "done_reason": "stop",
         "context": event.get("tokens_cached_ids", []),
         "total_duration": timings.get("predicted_ms", 0),
+        # ollama always emits load_duration (ns). llama-server does NOT surface
+        # model-load time in the per-request completion `timings` block, so this
+        # is a best-effort value: use a load timing if the supervisor injected
+        # one onto the event, else 0. The field must be byte-present regardless
+        # (ollama clients index it directly) — never silently omit it.
+        "load_duration": int(event.get("load_duration", 0)),
         "prompt_eval_count": event.get("tokens_evaluated", 0),
+        # ollama emits prompt_eval_duration in NANOSECONDS; llama-server reports
+        # timings.prompt_ms in MILLISECONDS — convert ms -> ns.
+        "prompt_eval_duration": int(timings.get("prompt_ms", 0) * 1_000_000),
         "eval_count": event.get("tokens_predicted", 0),
         "eval_duration": timings.get("predicted_ms", 0),
     }
