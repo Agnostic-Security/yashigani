@@ -220,9 +220,22 @@ def _deny_message(reason: str) -> str:
 # re.ASCII ensures the char-class [a-zA-Z0-9] is strictly 7-bit ASCII; no
 # Unicode letter/digit will match.  \Z (not $) anchors the end to prevent
 # a trailing \n from slipping through (Python's $ matches before a terminal \n).
-# Callers with @-prefix (agent calls) are exempted BEFORE _validate_model_string
-# is invoked, so @ appears in the allowlist only for digest formats (model@sha256:…).
+# @ appears in the allowlist for digest formats (model@sha256:…) and — since
+# YSG-RISK-158 — as the FIRST character for agent-call handles, validated
+# below by _AGENT_CALL_VALID_RE (see _validate_model_string).
 _MODEL_VALID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
+
+# YSG-RISK-158: agent-call handles ("@agent-name") were previously EXEMPTED
+# from _validate_model_string entirely at the call site (openai_router.py,
+# `if body.model and not is_agent_call ...`), because _MODEL_VALID_RE anchors
+# the first character to [a-zA-Z0-9] — an "@"-prefixed string always failed
+# that regex. Skipping validation for ANY string starting with "@" let a
+# caller smuggle URL-scheme forms, path-traversal sequences, null-sentinel
+# literals, or Unicode Cf/control chars past every LAURA-412-002 defense —
+# agent-call spoofing. Fix: validate the @-prefixed form HERE, in the
+# validator, with the same charset applied to the remainder after "@"
+# (non-empty), instead of bypassing validation at the call site.
+_AGENT_CALL_VALID_RE = re.compile(r"^@[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
 
 
 def _validate_model_string(model: str) -> Optional[str]:
@@ -264,6 +277,17 @@ def _validate_model_string(model: str) -> Optional[str]:
         return "path_traversal_not_allowed"
     if s_lower in ("null", "none", "undefined"):
         return "null_not_allowed"
+    # YSG-RISK-158: agent-call handles ("@agent-name") go through the SAME
+    # gate — the URL-scheme/path-traversal/null-sentinel checks above already
+    # ran unconditionally against the full string (including the "@"), so an
+    # agent-call payload like "@http://evil" or "@../../etc/passwd" is caught
+    # above exactly like an ordinary model string would be. Only the final
+    # charset check needs an @-aware branch, because _MODEL_VALID_RE anchors
+    # the first character to alnum.
+    if s.startswith("@"):
+        if not _AGENT_CALL_VALID_RE.match(s):
+            return "invalid_model"
+        return None
     # LAURA-412-002 (layer 1): positive allowlist — reject anything outside
     # the ASCII-safe model-name charset.
     if not _MODEL_VALID_RE.match(s):
@@ -1794,10 +1818,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── LAURA-411-002 / Ava FINDING-1: model input validation + normalization ──
     # Runs BEFORE RBAC deny and optimisation so URL/path/null variants cannot
     # bypass the deny check by triggering the silent local-default fallback.
-    # Exempt: agent calls (start with @), brain-reasoning leg (server-minted,
-    # no alloc), and calls where body.model is absent (explicit default-model
-    # path — preserved per brief).
-    if body.model and not is_agent_call and not brain_reasoning_leg:
+    #
+    # YSG-RISK-158: agent calls (@-prefix) are NO LONGER exempted from
+    # _validate_model_string itself — the @-prefix exemption now lives INSIDE
+    # the validator (see _validate_model_string / _AGENT_CALL_VALID_RE), so an
+    # agent-call payload gets the SAME positive-validation gate (URL-scheme,
+    # path-traversal, null-sentinel, ASCII charset) as any other model string.
+    # Only brain-reasoning-leg (server-minted, no user-supplied value) and an
+    # absent body.model (explicit default-model path — preserved per brief)
+    # skip validation entirely.
+    if body.model and not brain_reasoning_leg:
         _mv_err = _validate_model_string(body.model)
         if _mv_err is not None:
             logger.warning(
@@ -1814,6 +1844,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     }
                 },
             )
+    # Normalization + known-model gating stay agent-call-exempt: an @-handle
+    # is an agent identifier resolved via agent_registry, not an LLM model
+    # name, so provider/model normalization and the alias/installed-model
+    # allowlist check below do not apply to it.
+    if body.model and not is_agent_call and not brain_reasoning_leg:
         # Normalize: lowercase + provider/model → provider:model.
         # The normalized form flows through optimisation and RBAC;
         # body.model (original) is retained for audit/logging.

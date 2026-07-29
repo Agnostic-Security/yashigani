@@ -31,18 +31,20 @@ class CacheConfigRequest(BaseModel):
 
 @cache_router.get("/admin/cache")
 async def list_cache_configs(session=Depends(require_admin_session)):
+    """List every per-tenant cache config.
+
+    YSG-RISK-143: this MUST read from the same store that PUT/GET/DELETE
+    write to (Redis, via ResponseCache) — it previously queried a Postgres
+    ``cache_config`` table that no code path ever wrote to, so a config set
+    via PUT never appeared here. See ResponseCache.list_tenant_configs().
+    """
     from yashigani.backoffice.state import backoffice_state
     rc = getattr(backoffice_state, "response_cache", None)
     if rc is None:
         return {"tenants": [], "cache_available": False}
     try:
-        from yashigani.db.postgres import get_pool
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT tenant_id::text, enabled, ttl_seconds FROM cache_config ORDER BY tenant_id"
-            )
-        return {"tenants": [dict(r) for r in rows], "cache_available": True}
+        tenants = rc.list_tenant_configs()
+        return {"tenants": tenants, "cache_available": True}
     except Exception as exc:
         # V232-CSCAN-01e: log full exception server-side; return safe envelope to client.
         payload, _ = safe_error_envelope(exc, public_message="cache config unavailable")
