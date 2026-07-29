@@ -24,6 +24,27 @@ is opened exactly ONCE with `O_NOFOLLOW`, and that single fd is used for
 hashing, GGUF parsing, AND ingestion into the blob store
 (`BlobStore.put_from_open_file`) — no second open-by-path, closing the
 TOCTOU window where the path could be swapped for a symlink between checks.
+
+Red-Council H3 (Iris, 2026-07-29 design-review — RC-2, HIGH): this adapter
+used to build `metadata["name"]` as `header.name or str(ref)` — preferring
+the GGUF-embedded, vendor-supplied `general.name` title over the
+structured `namespace/model:tag` reference, with the reference used only
+as a fallback when the header had no name at all (which it almost always
+does). That fallback order is backwards for THIS adapter specifically:
+Yashigani's entire existing surface (`/api/chat`, `/api/tags`, Postgres
+budget/policy/model-allocation rows, UI dropdowns) addresses models by the
+ollama-tag string (`"qwen2.5:3b"`), not by a GGUF's arbitrary vendor title
+("Qwen2.5 3B Instruct" — different casing, different separator
+convention, no guaranteed match). At cutover, re-importing an already-
+resident Ollama model through this adapter would silently rename it away
+from the identifier every existing policy/budget/agent config already
+references, 404-ing on first post-cutover inference. This adapter now
+ALWAYS names by the parsed, structured `ref` — it is migrating FROM a
+system that already used that exact string as the addressing key, so it
+is authoritative here, not merely a fallback. (The other three adapters —
+Hugging Face, LM Studio, local-file — are NOT changed: they have no
+pre-existing external addressing convention to preserve; Iris's fix is
+scoped to this one adapter.)
 """
 
 from __future__ import annotations
@@ -174,7 +195,11 @@ class OllamaStoreAdapter(SourceAdapter):
 
             metadata = {
                 "family": header.architecture,
-                "name": header.name or str(ref),
+                # H3: the ollama-tag reference is authoritative for THIS
+                # adapter — never the GGUF's own vendor-supplied name (see
+                # module docstring). `str(ref)` is always non-empty
+                # (`parse_model_ref` guarantees every component is present).
+                "name": str(ref),
                 "parameter_size": header.parameter_size_label(),
                 "quantization_level": header.quantization_level,
                 "gguf_version": header.version,

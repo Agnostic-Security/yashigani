@@ -74,6 +74,26 @@ def test_resolve_imports_from_ollama_store(
     assert "manifest_path" in resolved.provenance.extra
 
 
+def test_resolve_names_by_the_ollama_tag_reference_not_the_gguf_vendor_name(
+    tmp_blob_store: BlobStore, tmp_path: Path, minimal_gguf_bytes: bytes
+) -> None:
+    """Red-Council H3 (Iris RC-2, 2026-07-29): the GGUF fixture's own
+    `general.name` is "tiny-test-model" — this adapter must name the
+    resolved model by the ollama-tag reference instead, since that is the
+    identifier every existing policy/budget/agent config already uses.
+    A regression here silently 404s every migrated customer reference at
+    cutover."""
+    ollama_dir = _write_ollama_store(
+        tmp_path / "dot-ollama", model_bytes=minimal_gguf_bytes, namespace="library", model="llama3", tag="8b"
+    )
+    adapter = OllamaStoreAdapter(tmp_blob_store)
+
+    resolved = adapter.resolve(model_ref="llama3:8b", ollama_dir=ollama_dir)
+
+    assert resolved.metadata["name"] == "library/llama3:8b"
+    assert resolved.metadata["name"] != "tiny-test-model"  # the GGUF's own general.name must NOT win
+
+
 def test_resolve_raises_on_missing_manifest(tmp_blob_store: BlobStore, tmp_path: Path) -> None:
     ollama_dir = tmp_path / "dot-ollama"
     ollama_dir.mkdir()

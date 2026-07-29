@@ -43,6 +43,22 @@ class BlobTamperError(BlobStoreError):
     a symlink planted where a regular blob file is expected)."""
 
 
+class NameCollisionError(BlobStoreError):
+    """Raised when an incoming model's display name collides with a
+    DIFFERENT, already-stored model's name (Iris integration-seam audit
+    RC-2, 2026-07-29 design-review H3).
+
+    `find_by_name`'s linear scan has no uniqueness guarantee otherwise: two
+    imported GGUFs sharing an identical (or uploader-supplied, colliding)
+    `general.name` — or, after the H3 fix, two DIFFERENT ollama-tag
+    references that happen to collide — would resolve non-deterministically
+    to whichever was imported/enumerated first. This is a routing-contract
+    gap, not a byte-integrity one (content-addressing already guarantees
+    the underlying blob bytes cannot be swapped under a given digest); the
+    fix here is to refuse the SECOND write outright rather than let two
+    digests silently share one name."""
+
+
 class ProvenanceDowngradeError(BlobStoreError):
     """Raised when a dedup write would silently replace an existing,
     signed-manifest-backed metadata record with one that carries no signed
@@ -215,6 +231,27 @@ class BlobStore:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def _check_no_name_collision(self, sha256: str, metadata: dict[str, Any]) -> None:
+        """Refuse a metadata write whose `name` already maps to a DIFFERENT
+        digest (see `NameCollisionError`). A write for the SAME digest is
+        never a collision (dedup path, not a naming conflict)."""
+        name = metadata.get("name")
+        if not name:
+            return
+        for existing_digest in self.list_digests():
+            if existing_digest == sha256:
+                continue  # same blob — dedup path, not a collision
+            existing_record = self.get_metadata(existing_digest)
+            if existing_record is None:
+                continue
+            existing_name = existing_record.get("metadata", {}).get("name")
+            if existing_name == name:
+                raise NameCollisionError(
+                    f"name {name!r} already maps to digest {existing_digest} — refusing to also map it to "
+                    f"{sha256} (find_by_name has no uniqueness guarantee otherwise; re-name or remove the "
+                    "existing entry first if this is genuinely intended)"
+                )
+
     def _check_no_provenance_downgrade(self, sha256: str, provenance: Provenance) -> None:
         """Refuse a metadata write that would erase a previously-signed
         provenance record with an unsigned one for the SAME digest (see
@@ -235,6 +272,7 @@ class BlobStore:
         )
 
     def _write_metadata(self, sha256: str, metadata: dict[str, Any], provenance: Provenance) -> None:
+        self._check_no_name_collision(sha256, metadata)
         self._check_no_provenance_downgrade(sha256, provenance)
         record = {"sha256": sha256, "metadata": metadata, "provenance": provenance.to_dict()}
         meta_path = self._meta_path(sha256)
@@ -322,6 +360,7 @@ __all__ = [
     "BlobStoreError",
     "BlobTamperError",
     "DigestMismatchError",
+    "NameCollisionError",
     "ProvenanceDowngradeError",
     "sha256_bytes",
     "sha256_file",

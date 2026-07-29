@@ -12,6 +12,7 @@ from yashigani_infer.blobstore.store import (
     BlobStore,
     BlobTamperError,
     DigestMismatchError,
+    NameCollisionError,
     ProvenanceDowngradeError,
     sha256_bytes,
     sha256_file,
@@ -157,6 +158,46 @@ def test_dest_symlink_tamper_is_refused(tmp_blob_store: BlobStore, tmp_path: Pat
 
     with pytest.raises(BlobTamperError):
         tmp_blob_store.put_from_bytes(data, metadata={}, provenance=_prov(digest))
+
+
+# --- Red-Council H3 (2026-07-29): find_by_name has no uniqueness guarantee ---
+
+
+def test_put_refuses_a_name_that_already_maps_to_a_different_digest(tmp_blob_store: BlobStore) -> None:
+    d1 = sha256_bytes(b"first model bytes")
+    d2 = sha256_bytes(b"second, totally different model bytes")
+    tmp_blob_store.put_from_bytes(b"first model bytes", metadata={"name": "llama3:8b"}, provenance=_prov(d1))
+
+    with pytest.raises(NameCollisionError):
+        tmp_blob_store.put_from_bytes(
+            b"second, totally different model bytes", metadata={"name": "llama3:8b"}, provenance=_prov(d2)
+        )
+
+    # the original mapping must survive untouched
+    resolved = tmp_blob_store.find_by_name("llama3:8b")
+    assert resolved is not None
+    assert resolved.sha256 == d1
+
+
+def test_put_allows_re_ingesting_the_same_digest_under_the_same_name(tmp_blob_store: BlobStore) -> None:
+    data = b"same bytes, same name, re-ingested"
+    digest = sha256_bytes(data)
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "llama3:8b"}, provenance=_prov(digest))
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "llama3:8b"}, provenance=_prov(digest))  # must not raise
+
+
+def test_put_allows_distinct_names_for_distinct_digests(tmp_blob_store: BlobStore) -> None:
+    d1 = sha256_bytes(b"model one")
+    d2 = sha256_bytes(b"model two")
+    tmp_blob_store.put_from_bytes(b"model one", metadata={"name": "llama3:8b"}, provenance=_prov(d1))
+    tmp_blob_store.put_from_bytes(b"model two", metadata={"name": "qwen2.5:3b"}, provenance=_prov(d2))  # must not raise
+
+
+def test_put_without_a_name_never_triggers_a_collision_check(tmp_blob_store: BlobStore) -> None:
+    d1 = sha256_bytes(b"named model")
+    d2 = sha256_bytes(b"unnamed model")
+    tmp_blob_store.put_from_bytes(b"named model", metadata={"name": "llama3:8b"}, provenance=_prov(d1))
+    tmp_blob_store.put_from_bytes(b"unnamed model", metadata={}, provenance=_prov(d2))  # must not raise
 
 
 # --- Red-Council H2 (2026-07-29): no silent provenance downgrade on dedup ---
