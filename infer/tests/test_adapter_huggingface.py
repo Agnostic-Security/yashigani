@@ -167,6 +167,47 @@ def test_resolve_with_catalog_uses_the_signed_sha256_never_re_derived(
     assert resolved.provenance.extra["provenance_tier"] == "vetted"
 
 
+def test_resolve_with_catalog_persists_the_raw_signed_manifest(
+    tmp_blob_store: BlobStore, minimal_gguf_bytes: bytes
+) -> None:
+    """H2 (Nico/Tom, 2026-07-29): the RAW signed manifest must be persisted
+    alongside the blob, not just the flattened provenance_tier string — this
+    is what makes serve-time re-verification (provenance_reverify.py)
+    possible at all."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    digest = sha256_bytes(minimal_gguf_bytes)
+    catalog = _signed_catalog_with(private_key, private_key.public_key(), sha256=digest)
+
+    downloader = FakeDownloader(minimal_gguf_bytes)
+    adapter = HuggingFaceAdapter(tmp_blob_store, downloader, catalog=catalog)
+
+    resolved = adapter.resolve(
+        repo_id="acme/tiny-model", revision=PINNED_REVISION, filename="tiny-model.gguf", licence_accepted=True
+    )
+
+    signed_manifest = resolved.provenance.extra["signed_manifest"]
+    assert signed_manifest["sha256"] == digest
+    assert signed_manifest["provenance_tier"] == "vetted"
+    assert "signature" in signed_manifest
+
+    reloaded = SignedCatalogEntry.from_json_dict(signed_manifest)
+    CatalogVerifier(private_key.public_key()).verify(reloaded)  # must not raise
+
+
+def test_resolve_without_catalog_never_persists_a_signed_manifest(
+    tmp_blob_store: BlobStore, minimal_gguf_bytes: bytes
+) -> None:
+    """The v1-foundation dev-mode fallback (no catalog wired) has nothing
+    signed to persist — must not fabricate one."""
+    downloader = FakeDownloader(minimal_gguf_bytes)
+    adapter = HuggingFaceAdapter(tmp_blob_store, downloader)
+
+    resolved = adapter.resolve(
+        repo_id="acme/tiny-model", revision=PINNED_REVISION, filename="tiny-model.gguf", licence_accepted=True
+    )
+    assert "signed_manifest" not in resolved.provenance.extra
+
+
 def test_resolve_with_catalog_refuses_when_download_does_not_match_signed_digest(
     tmp_blob_store: BlobStore, minimal_gguf_bytes: bytes
 ) -> None:

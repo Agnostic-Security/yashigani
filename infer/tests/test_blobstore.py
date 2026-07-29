@@ -12,6 +12,7 @@ from yashigani_infer.blobstore.store import (
     BlobStore,
     BlobTamperError,
     DigestMismatchError,
+    ProvenanceDowngradeError,
     sha256_bytes,
     sha256_file,
 )
@@ -156,6 +157,57 @@ def test_dest_symlink_tamper_is_refused(tmp_blob_store: BlobStore, tmp_path: Pat
 
     with pytest.raises(BlobTamperError):
         tmp_blob_store.put_from_bytes(data, metadata={}, provenance=_prov(digest))
+
+
+# --- Red-Council H2 (2026-07-29): no silent provenance downgrade on dedup ---
+
+
+def _signed_prov(digest: str, *, tier: str = "vetted") -> Provenance:
+    return Provenance(
+        kind=ProvenanceKind.HUGGINGFACE,
+        origin="acme/tiny-model",
+        sha256=digest,
+        operator_supplied=False,
+        extra={
+            "provenance_tier": tier,
+            "signed_manifest": {"provenance_tier": tier, "sha256": digest, "signature": "ZmFrZQ=="},
+        },
+    )
+
+
+def test_dedup_refuses_to_downgrade_a_signed_record_to_unsigned(tmp_blob_store: BlobStore) -> None:
+    data = b"previously signed bytes"
+    digest = sha256_bytes(data)
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "vetted-model"}, provenance=_signed_prov(digest))
+
+    # A later write for the SAME digest with no signed_manifest at all (e.g.
+    # a LOCAL_FILE re-ingestion, which only needs filesystem access) must be
+    # refused — it would silently erase the audit trail this blob was ever
+    # verified.
+    with pytest.raises(ProvenanceDowngradeError):
+        tmp_blob_store.put_from_bytes(data, metadata={"name": "vetted-model"}, provenance=_prov(digest))
+
+    # the original signed record must survive untouched
+    stored = tmp_blob_store.get_metadata(digest)
+    assert stored is not None
+    assert stored["provenance"]["extra"]["signed_manifest"]["provenance_tier"] == "vetted"
+
+
+def test_dedup_allows_another_signed_record_for_the_same_digest(tmp_blob_store: BlobStore) -> None:
+    """Not a downgrade — the incoming write is ALSO signed, so it's allowed
+    (e.g. re-admission via a freshly-minted manifest)."""
+    data = b"re-signed bytes"
+    digest = sha256_bytes(data)
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "m"}, provenance=_signed_prov(digest, tier="vetted"))
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "m"}, provenance=_signed_prov(digest, tier="vetted"))
+    # must not raise
+
+
+def test_first_write_for_a_digest_is_never_a_downgrade(tmp_blob_store: BlobStore) -> None:
+    data = b"brand new bytes, never seen before"
+    digest = sha256_bytes(data)
+    # No prior record exists — an unsigned first write must be allowed.
+    tmp_blob_store.put_from_bytes(data, metadata={"name": "x"}, provenance=_prov(digest))  # must not raise
 
 
 def test_mkstemp_temp_files_are_same_directory_as_dest(tmp_blob_store: BlobStore) -> None:

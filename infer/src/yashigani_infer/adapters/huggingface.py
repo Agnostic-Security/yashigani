@@ -120,10 +120,19 @@ class HuggingFaceAdapter(SourceAdapter):
         # none is wired, fall back to the v1-foundation dev-mode behaviour
         # (record the downloaded content's own digest, honestly labelled).
         required_sha256: str | None
+        signed_manifest: dict[str, Any] | None
         if self._catalog is not None:
             entry = self._catalog.require(repo_id, revision, filename)  # raises if unsigned/absent — no override
             required_sha256 = entry.sha256
             provenance_tier = entry.provenance_tier
+            # H2 (Nico/Tom, 2026-07-29 design-review): persist the RAW signed
+            # manifest alongside the blob, not just the flattened
+            # `provenance_tier` string — a plain sidecar field is an unsigned,
+            # mutable local annotation the moment it hits disk. Anything that
+            # later wants to trust this tier for a policy decision must
+            # re-verify THIS stored signature (see `provenance_reverify.py`),
+            # never read `provenance_tier` off the sidecar directly.
+            signed_manifest = entry.to_json_dict()
             if expected_sha256 is not None and expected_sha256.lower() != required_sha256.lower():
                 raise DigestMismatchError(
                     f"caller-supplied expected_sha256 {expected_sha256!r} conflicts with the signed "
@@ -132,6 +141,7 @@ class HuggingFaceAdapter(SourceAdapter):
         else:
             required_sha256 = expected_sha256
             provenance_tier = "unverified-dev-mode"
+            signed_manifest = None
 
         url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
         self._scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -170,13 +180,16 @@ class HuggingFaceAdapter(SourceAdapter):
                 "quantization_level": header.quantization_level,
                 "gguf_version": header.version,
             }
+            extra: dict[str, Any] = {"filename": filename, "licence_accepted": True, "provenance_tier": provenance_tier}
+            if signed_manifest is not None:
+                extra["signed_manifest"] = signed_manifest
             provenance = Provenance(
                 kind=ProvenanceKind.HUGGINGFACE,
                 origin=repo_id,
                 revision=revision,
                 sha256=final_sha256,
                 operator_supplied=False,
-                extra={"filename": filename, "licence_accepted": True, "provenance_tier": provenance_tier},
+                extra=extra,
             )
             return self.blob_store.put_from_path(
                 scratch_path, metadata=metadata, provenance=provenance, expected_sha256=final_sha256

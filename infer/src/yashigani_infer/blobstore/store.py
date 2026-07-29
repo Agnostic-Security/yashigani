@@ -43,6 +43,34 @@ class BlobTamperError(BlobStoreError):
     a symlink planted where a regular blob file is expected)."""
 
 
+class ProvenanceDowngradeError(BlobStoreError):
+    """Raised when a dedup write would silently replace an existing,
+    signed-manifest-backed metadata record with one that carries no signed
+    manifest at all (Nico/Tom finding, 2026-07-29 design-review H2).
+
+    `_write_metadata` used to unconditionally `os.replace` the metadata
+    sidecar on every dedup hit, with no comparison against what was already
+    on record — a blob legitimately admitted via a counter-signed Hugging
+    Face pull (`Provenance.extra["signed_manifest"]` populated,
+    `provenance_tier` cryptographically bound to the signature) could be
+    silently re-labelled by ANY later write for the same digest (e.g. a
+    `LOCAL_FILE` re-ingestion, which only needs local filesystem access, not
+    a valid signature) with no error, no warning, no audit event. This
+    permanently erases the audit trail that the blob was ever verified —
+    exploitable the moment anything starts making a policy decision off the
+    persisted `provenance_tier` (multi-tenant model allowlists, future
+    EU-AI-Act conformity tiering).
+    """
+
+
+def _extract_signed_manifest(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    extra = record.get("provenance", {}).get("extra", {})
+    manifest = extra.get("signed_manifest")
+    return manifest if isinstance(manifest, dict) else None
+
+
 def sha256_file(path: Path) -> str:
     """Stream-hash a file. Never loads the whole file into memory."""
     h = hashlib.sha256()
@@ -187,7 +215,27 @@ class BlobStore:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def _check_no_provenance_downgrade(self, sha256: str, provenance: Provenance) -> None:
+        """Refuse a metadata write that would erase a previously-signed
+        provenance record with an unsigned one for the SAME digest (see
+        `ProvenanceDowngradeError`). A first-ever write for a digest (no
+        existing record) is never a downgrade — nothing to protect yet."""
+        existing_manifest = _extract_signed_manifest(self.get_metadata(sha256))
+        if existing_manifest is None:
+            return  # no prior signed record for this digest — nothing to protect
+        incoming_manifest = (provenance.extra or {}).get("signed_manifest")
+        if isinstance(incoming_manifest, dict):
+            return  # incoming write is ALSO signed — not a downgrade, allowed
+        raise ProvenanceDowngradeError(
+            f"blob {sha256} already has a signed-manifest-backed provenance record "
+            f"(existing provenance_tier={existing_manifest.get('provenance_tier')!r}) — refusing to "
+            f"overwrite it with an unsigned {provenance.kind.value!r} record; this would silently erase "
+            "the audit trail that this blob was ever verified. Remove the existing entry first if this "
+            "downgrade is genuinely intended."
+        )
+
     def _write_metadata(self, sha256: str, metadata: dict[str, Any], provenance: Provenance) -> None:
+        self._check_no_provenance_downgrade(sha256, provenance)
         record = {"sha256": sha256, "metadata": metadata, "provenance": provenance.to_dict()}
         meta_path = self._meta_path(sha256)
         self._atomic_write_bytes(meta_path, json.dumps(record, indent=2, sort_keys=True).encode("utf-8"))
@@ -272,9 +320,10 @@ class BlobStore:
 __all__ = [
     "BlobStore",
     "BlobStoreError",
-    "DigestMismatchError",
     "BlobTamperError",
+    "DigestMismatchError",
+    "ProvenanceDowngradeError",
+    "sha256_bytes",
     "sha256_file",
     "sha256_stream",
-    "sha256_bytes",
 ]
