@@ -63,6 +63,11 @@ _HOP_BY_HOP = frozenset({
 })
 
 _OPA_AGENT_ALLOWED_PATH = "/v1/data/yashigani/agent_call_allowed"
+# LAURA-V50-COV-001: queried ONLY on deny, to fetch the specific reason
+# agents.rego already computes (caller_group_not_in_allowed_caller_groups /
+# path_traversal_attempt / path_not_in_allowed_paths / target_agent_not_in_data)
+# instead of surfacing a generic "opa_denied" in the audit event + HTTP response.
+_OPA_AGENT_DENY_REASON_PATH = "/v1/data/yashigani/agent_call_deny_reason"
 
 # #47 / G-NEW-5 / R3 — signed orchestration-principal claim header.  The gateway
 # SIGNS this on forward (ES384, bound to the caller SPIFFE) and VERIFIES it on
@@ -681,6 +686,16 @@ async def _opa_agent_check(opa_url: str, opa_input: dict) -> tuple[bool, str]:
     Query OPA for agent_call_allowed decision.
     Returns (allowed: bool, reason: str).
     Fail-closed: any OPA error returns (False, "opa_unreachable").
+
+    LAURA-V50-COV-001: on deny, a SECOND targeted query fetches agents.rego's
+    agent_call_deny_reason (caller_group_not_in_allowed_caller_groups /
+    path_traversal_attempt / path_not_in_allowed_paths / target_agent_not_in_data)
+    instead of hardcoding "opa_denied" — mirrors the (allowed, reason) tuple
+    contract _opa_agent_response_check already returns from the
+    agent_response_decision compound object. The reason-query is best-effort:
+    the ALLOW/DENY decision itself is unaffected by its outcome (already
+    fail-closed above), so a failure here only degrades the reason LABEL back
+    to the generic "opa_denied", never the enforcement decision.
     """
     try:
         async with internal_httpx_client(timeout=5.0) as client:
@@ -694,8 +709,25 @@ async def _opa_agent_check(opa_url: str, opa_input: dict) -> tuple[bool, str]:
             allowed = bool(data.get("result", False))
             if allowed:
                 return True, ""
-            # Try to get deny reason
-            return False, "opa_denied"
+
+            reason = "opa_denied"
+            try:
+                reason_resp = await client.post(
+                    opa_url.rstrip("/") + _OPA_AGENT_DENY_REASON_PATH,
+                    json={"input": opa_input},
+                    headers={"Content-Type": "application/json"},
+                )
+                reason_resp.raise_for_status()
+                fetched_reason = reason_resp.json().get("result")
+                if isinstance(fetched_reason, str) and fetched_reason:
+                    reason = fetched_reason
+            except Exception as reason_exc:
+                logger.warning(
+                    "route_agent_call: agent_call_deny_reason query failed — "
+                    "falling back to generic 'opa_denied' reason label "
+                    "(decision unaffected): %s", reason_exc,
+                )
+            return False, reason
     except Exception as exc:
         logger.error(
             "route_agent_call: OPA unreachable for agent check "

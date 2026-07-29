@@ -45,7 +45,7 @@ from typing import Optional
 import httpx
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import (
@@ -1012,38 +1012,89 @@ async def user_chat_proxy(request: Request, session: UserSession):
         "Accept": "text/event-stream",
     }
 
+    # V50-026: previously this proxy ALWAYS answered the browser with HTTP 200
+    # (StreamingResponse's default) and re-wrapped a non-2xx gateway response
+    # (e.g. 403 request_injection_blocked) as a single SSE `data:` frame
+    # carrying the raw {"error": {...}} body. That shape matches neither the
+    # structured decision_codes/user_alert/blocked contract (decode.js) nor an
+    # HTTP error (sse.js's `!resp.ok` pre-stream path) — the browser's
+    # onBlocked handler never fired and the chat bubble was left empty
+    # forever with no verdict banner and no loading-state cleanup.
+    #
+    # Fix: open the gateway request with `client.send(..., stream=True)` so
+    # the status line is available BEFORE any body bytes are consumed, then
+    # branch:
+    #   - non-2xx  → return a real Response with the gateway's OWN status
+    #                code and body verbatim (matches the docstring's existing
+    #                promise: "All gateway errors (4xx/5xx) are forwarded
+    #                verbatim"). This makes `resp.ok` false in the browser,
+    #                which drives sse.js's onBlocked/onError paths correctly.
+    #   - 200/201/206 → stream the already-open response through unchanged.
+    client = httpx.AsyncClient(timeout=httpx.Timeout(
+        connect=10.0,
+        read=_GATEWAY_STREAM_TIMEOUT_S,
+        write=30.0,
+        pool=5.0,
+    ))
+    try:
+        gw_request = client.build_request(
+            "POST", target_url, content=body_bytes, headers=forward_headers,
+        )
+        gw_response = await client.send(gw_request, stream=True)
+    except httpx.ConnectError as exc:
+        await client.aclose()
+        logger.error("user_chat_proxy: gateway unreachable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "gateway_unreachable",
+                "message": "Could not connect to the governed gateway.",
+            },
+        )
+    except Exception as exc:
+        await client.aclose()
+        logger.error("user_chat_proxy: gateway request failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "gateway_error",
+                "message": "Unexpected error contacting the governed gateway.",
+            },
+        )
+
+    if gw_response.status_code not in (200, 201, 206):
+        error_body = await gw_response.aread()
+        content_type = gw_response.headers.get("content-type", "application/json")
+        passthrough_headers = {
+            k: v for k, v in gw_response.headers.items()
+            if k.lower() in (
+                "x-yashigani-request-id",
+                "x-yashigani-request-verdict",
+                "x-yashigani-request-classification",
+                "x-yashigani-detection-layer",
+            )
+        }
+        await gw_response.aclose()
+        await client.aclose()
+        return Response(
+            content=error_body,
+            status_code=gw_response.status_code,
+            media_type=content_type,
+            headers=passthrough_headers or None,
+        )
+
     async def _stream_gateway():
-        """Async generator: iterate gateway SSE chunks and yield to client."""
+        """Async generator: iterate the already-open gateway SSE response."""
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(
-                connect=10.0,
-                read=_GATEWAY_STREAM_TIMEOUT_S,
-                write=30.0,
-                pool=5.0,
-            )) as client:
-                async with client.stream(
-                    "POST",
-                    target_url,
-                    content=body_bytes,
-                    headers=forward_headers,
-                ) as resp:
-                    # Forward non-2xx as a synthetic SSE error event so the
-                    # browser's onBlocked / onError handlers fire correctly.
-                    if resp.status_code not in (200, 201, 206):
-                        error_body = await resp.aread()
-                        yield (
-                            f"data: {error_body.decode('utf-8', errors='replace')}\n\n"
-                        ).encode("utf-8")
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            yield chunk
-        except httpx.ConnectError as exc:
-            logger.error("user_chat_proxy: gateway unreachable: %s", exc)
-            yield b'data: {"error":"gateway_unreachable","message":"Could not connect to the governed gateway."}\n\n'
+            async for chunk in gw_response.aiter_bytes():
+                if chunk:
+                    yield chunk
         except Exception as exc:
             logger.error("user_chat_proxy: stream error: %s", exc)
             yield b'data: {"error":"stream_error","message":"Unexpected error streaming from gateway."}\n\n'
+        finally:
+            await gw_response.aclose()
+            await client.aclose()
 
     return StreamingResponse(
         _stream_gateway(),

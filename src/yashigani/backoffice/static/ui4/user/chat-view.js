@@ -95,6 +95,40 @@ export class YsChatView extends LitElement {
         && this.conversationId !== this._loadedConversationId) {
       this._loadConversation(this.conversationId);
     }
+    // V50-025: `models` arrives asynchronously (GET /user/models resolves after
+    // first render) while `selectedModel` starts empty. The MODEL <select> still
+    // renders and — because no <option> matches an empty/agent-id `sel` — the
+    // BROWSER silently shows its first entry (e.g. qwen2.5:3b) even though the
+    // app's `selectedModel` state stays ''. `_currentModel()` then falls through
+    // to `activeAgentId` (a bundled agent id, not a model), so the first Send
+    // targets a nonexistent model and 422s the gateway with no visible error
+    // (the UI just hangs). Once `models` populates for the first time, sync
+    // `selectedModel` to whatever the freshly-rendered dropdown actually shows
+    // (or its first entry) so state matches the visible UI BEFORE the user can
+    // send — and echo it to the app the same way _onModelChange does, so the
+    // app (the single source of truth per this file's header) stays in sync.
+    if (changed.has('models') && !this.selectedModel) {
+      this._syncDefaultModelSelection();
+    }
+  }
+
+  // Called once, the first time `models` populates with no explicit selection
+  // yet. Reads the live <select> (already patched into the DOM by this point —
+  // updated() runs after Lit commits the render) so the value we adopt is
+  // exactly what the user sees, not a re-derived guess.
+  _syncDefaultModelSelection() {
+    if (this.selectedModel) return;
+    const models = Array.isArray(this.models) ? this.models : [];
+    if (!models.length) return;
+    const selectEl = this.querySelector('.ys-model-select');
+    const domValue = selectEl && selectEl.value;
+    const first = String(models[0].id ?? models[0].model ?? models[0].name ?? '');
+    const model = domValue || first;
+    if (!model) return;
+    this.selectedModel = model;
+    this.dispatchEvent(new CustomEvent('ys-model-select', {
+      detail: { model }, bubbles: true, composed: true,
+    }));
   }
 
   // ── conversation load ──────────────────────────────────────
