@@ -742,6 +742,36 @@ class TestAuthVerifyWebhook:
         assert r.status_code == 503
         assert r.json()["detail"]["error"] == "telegram_secret_unavailable"
 
+    def test_telegram_secret_read_from_custom_secrets_dir(self, unauth_client, monkeypatch, tmp_path):
+        """YSG-RISK-160 regression: with YASHIGANI_SECRETS_DIR pointed at a
+        non-default mount (real file, no default /run/secrets path present
+        at all), the Telegram webhook secret must still be found and the
+        constant-time compare must still run. Before the fix this always
+        503'd (telegram_secret_unavailable) because the path was hardcoded
+        to /run/secrets/openclaw_telegram_webhook_secret."""
+        custom = tmp_path / "custom-secrets-mount"
+        custom.mkdir()
+        (custom / "openclaw_telegram_webhook_secret").write_text("expected-telegram-secret\n")
+        monkeypatch.setenv("YASHIGANI_SECRETS_DIR", str(custom))
+
+        r_wrong = unauth_client.get(
+            "/auth/verify-webhook",
+            params={"provider": "telegram"},
+            headers={"x-forwarded-method": "POST", "x-telegram-bot-api-secret-token": "wrong-token"},
+        )
+        assert r_wrong.status_code == 401
+        assert r_wrong.json()["detail"]["error"] == "telegram_token_mismatch"
+
+        r_right = unauth_client.get(
+            "/auth/verify-webhook",
+            params={"provider": "telegram"},
+            headers={
+                "x-forwarded-method": "POST",
+                "x-telegram-bot-api-secret-token": "expected-telegram-secret",
+            },
+        )
+        assert r_right.status_code == 200
+
 
 # ---------------------------------------------------------------------------
 # auth.py — /auth/password/change

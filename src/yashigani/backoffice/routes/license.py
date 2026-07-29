@@ -26,11 +26,22 @@ from yashigani.backoffice.middleware import require_admin_session, require_stepu
 logger = logging.getLogger(__name__)
 license_router = APIRouter(tags=["license"])
 
-_LICENSE_SECRET_PATH = "/run/secrets/license_key"
+def _license_secret_path() -> str:
+    """Path to the read-only license_key secret mount.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare "/run/secrets/license_key" literal with no override, the same
+    convention-bypass class as YSG-RISK-150. Resolved at call time (not
+    import time) so tests can monkeypatch YASHIGANI_SECRETS_DIR without a
+    module reload — same pattern as yashigani.mcp._jwt._get_signing_key_path().
+    """
+    return os.path.join(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"), "license_key")
+
+
 # FINDING-V412-RESTART-012 (2026-07-21): /run/secrets is now a pure :ro mount
 # on backoffice (docker-compose.yml) — writes/deletes of the license key go
 # via a SEPARATE writable mount (default /run/secrets-rw) that binds the SAME
-# underlying host file, so existence/read checks against _LICENSE_SECRET_PATH
+# underlying host file, so existence/read checks against _license_secret_path()
 # above stay accurate (see auth/bootstrap.py write_docker_secrets() docstring
 # for the full rationale).
 _LICENSE_SECRET_WRITE_PATH = os.path.join(
@@ -545,7 +556,7 @@ async def revert_license(body: RevertRequest, session=Depends(require_stepup_adm
     set_license(COMMUNITY_LICENSE)
 
     try:
-        if os.path.exists(_LICENSE_SECRET_PATH):
+        if os.path.exists(_license_secret_path()):
             os.remove(_LICENSE_SECRET_WRITE_PATH)
     except OSError as exc:
         logger.warning("Could not remove license key secret file: %s", exc)

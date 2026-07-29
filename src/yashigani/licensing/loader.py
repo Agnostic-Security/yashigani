@@ -3,11 +3,14 @@ Load license from file or Docker secret.
 
 Resolution order:
 1. YASHIGANI_LICENSE_FILE env var (path)
-2. /run/secrets/license_key
+2. {YASHIGANI_SECRETS_DIR}/license_key (default /run/secrets/license_key)
 3. ./license.ysg in CWD
 4. Not found → COMMUNITY_LICENSE (no error, no warning about absence)
 
-Last updated: 2026-05-05T00:00:00+01:00
+Last updated: 2026-07-29T00:00:00+01:00 (YSG-RISK-160: step 2 now honours
+YASHIGANI_SECRETS_DIR instead of a bare "/run/secrets/license_key" literal —
+was the same convention-bypass class as YSG-RISK-150. YASHIGANI_LICENSE_FILE
+(step 1) is unchanged and still takes priority.)
 """
 from __future__ import annotations
 
@@ -55,7 +58,7 @@ def _normalise_domain(d: str) -> str:
 
 _CANDIDATES = [
     lambda: os.environ.get("YASHIGANI_LICENSE_FILE"),
-    lambda: "/run/secrets/license_key",
+    lambda: os.path.join(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"), "license_key"),
     lambda: str(Path.cwd() / "license.ysg"),
 ]
 
