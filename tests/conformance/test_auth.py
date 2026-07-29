@@ -261,12 +261,14 @@ def pg_tenant_transaction_stub(pg_stub_factory):
 
 @pytest.fixture
 def caddy_hmac_secret_file(monkeypatch):
-    """MOCKED: issue_operator_token()/verify_operator_token() hardcode
-    `open('/run/secrets/caddy_internal_hmac')` with no env-var override
-    (unlike stepup.py's `_load_signing_key`, which honours
-    YASHIGANI_STEPUP_SIGNING_KEY). Intercepts ONLY that exact path so the
-    mint+verify round-trip is genuinely testable offline; every other path
-    falls through to the real builtins.open."""
+    """MOCKED: issue_operator_token()/verify_operator_token() read
+    `open(f"{YASHIGANI_SECRETS_DIR}/caddy_internal_hmac")` (default
+    YASHIGANI_SECRETS_DIR=/run/secrets — YSG-RISK-150 fix, 2026-07-29).
+    Intercepts ONLY that exact default-mount path so the mint+verify
+    round-trip is genuinely testable offline; every other path falls
+    through to the real builtins.open. See
+    `caddy_hmac_secret_file_custom_dir` below for the non-default-mount
+    regression coverage."""
     import builtins
     import io
 
@@ -279,6 +281,22 @@ def caddy_hmac_secret_file(monkeypatch):
         return real_open(file, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", _fake_open)
+    return secret_value
+
+
+@pytest.fixture
+def caddy_hmac_secret_file_custom_dir(monkeypatch, tmp_path):
+    """YSG-RISK-150 regression fixture: a genuinely non-default
+    YASHIGANI_SECRETS_DIR, with the secret written to a REAL file under it
+    (no builtins.open interception — this exercises the actual env-var
+    resolution path end to end, not just a mocked exact-path match).
+    Proves issue_operator_token()/verify_operator_token() no longer
+    hardcode '/run/secrets/caddy_internal_hmac'."""
+    secrets_dir = tmp_path / "custom-secrets-mount"
+    secrets_dir.mkdir()
+    secret_value = "test-operator-token-hmac-secret-custom-mount-0123456789ab"
+    (secrets_dir / "caddy_internal_hmac").write_text(secret_value)
+    monkeypatch.setenv("YASHIGANI_SECRETS_DIR", str(secrets_dir))
     return secret_value
 
 
@@ -957,6 +975,28 @@ class TestAuthOperatorToken:
         r = unauth_client.get("/auth/operator-token/verify", headers={"Authorization": "Bearer not-a-real-jwt"})
         assert r.status_code == 401
         assert r.json()["detail"]["error"] == "invalid_token"
+
+    def test_mint_and_verify_roundtrip_custom_secrets_dir(
+        self, stepup_admin_client, fake_auth_service, caddy_hmac_secret_file_custom_dir
+    ):
+        """YSG-RISK-150 regression: with YASHIGANI_SECRETS_DIR pointed at a
+        non-default mount (and a real file at
+        {YASHIGANI_SECRETS_DIR}/caddy_internal_hmac, no default
+        /run/secrets/caddy_internal_hmac present at all), both
+        POST /auth/operator-token and GET /auth/operator-token/verify must
+        still resolve the signing key and complete the round trip. Before
+        the fix this 500'd with signing_key_unavailable because the path
+        was hardcoded to /run/secrets/caddy_internal_hmac."""
+        _seed_provisioned_account(
+            fake_auth_service, account_id="conformance-admin-stepup", username="optoken-customdir@example.com"
+        )
+        r = stepup_admin_client.post("/auth/operator-token", json={"issued_for": "test-agent-custom-dir"})
+        assert r.status_code == 200, r.json()
+        token = r.json()["token"]
+
+        r2 = unauth_client_placeholder_call(stepup_admin_client, token)
+        assert r2.status_code == 200
+        assert r2.json()["sub"] == "optoken-customdir@example.com"
 
 
 def unauth_client_placeholder_call(client, token: str):

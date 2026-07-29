@@ -532,7 +532,11 @@ data:
         not path /admin/grafana/* /admin/wazuh/* /admin/prometheus/* /admin/loki/* /admin/alertmanager/*
         not path /admin/api-redoc /redoc
       }
-      @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+      # YSG-RISK-147 fix: /chat /agents /builder /workflows are EXACT backoffice
+      # routes (no trailing slash) — the wildcard-only entries never matched
+      # them. Keep both exact + wildcard; see docker/Caddyfile.csp for the
+      # full rationale (single source of truth, mirrored here for Helm).
+      @strict_tt path /admin/ /admin4/ /chat /chat/* /agents /agents/* /builder /builder/* /workflows /workflows/* /user/* /flow/*
       # frame-src 'self': explicit (default-src 'self' already implies it);
       # admin pages iframe /admin/grafana/ and /admin/loki/ — same-origin.
       header @strict_legacy Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; report-uri /admin/csp-report; report-to default"
