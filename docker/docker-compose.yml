@@ -1787,8 +1787,9 @@ services:
     # via the Caddy :11435 mesh front (require_and_verify), never directly.
     depends_on:
       ollama-init:
-        # required:false — ollama-init is profile-gated [openwebui,langflow,letta,
-        # openclaw]. When no AI profile is active this dependency is skipped and
+        # required:false — ollama-init is profile-gated [langflow,letta,openclaw]
+        # (openwebui removed 2026-07-28, YSG-RISK-140). When no AI profile is
+        # active this dependency is skipped and
         # ollama starts immediately (base install: no models, but service is up).
         # When a profile IS active, ollama waits for ollama-init to exit 0 (models
         # fully written to ollama_data) before starting — ensures strict sequential

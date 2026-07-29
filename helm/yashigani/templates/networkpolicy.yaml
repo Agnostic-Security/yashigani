@@ -11,8 +11,9 @@
 #     removed prometheus direct scrape)
 #   - prometheus egress: via Caddy :8444/:8445 ONLY (when metrics listeners
 #     enabled); direct pod-scrape egress only when listeners explicitly disabled
-#   - open-webui egress: via Caddy :443 only
 #   - helm test pods: via Caddy only (test connects to caddy, not direct)
+#   (open-webui ingress/egress NetworkPolicies removed 2026-07-28 — OWUI
+#    removed in 4.0, YSG-RISK-140.)
 #
 # NOTE: Pod selectors use app.kubernetes.io/name labels, which match the
 # labels emitted by every Deployment and StatefulSet in this chart.
@@ -195,9 +196,10 @@ spec:
 ---
 # Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4 + A4 v2.25.0-P2):
 #   Port 8080 (mTLS): Caddy ONLY — Caddy is the sole external ingress.
-#   Port 8081 (mesh): open-webui + agent bundle pods — internal mesh port, plain HTTP.
-#     open-webui and agent bundles cannot reach port 8080 (mTLS+CaddyVerified blocks it).
+#   Port 8081 (mesh): agent bundle pods — internal mesh port, plain HTTP.
+#     Agent bundles cannot reach port 8080 (mTLS+CaddyVerified blocks it).
 #     Port 8081 never serves Caddy-proxied traffic; it has no CaddyVerified gate.
+#     (open-webui was also a port 8081 mesh caller pre-4.0; removed 2026-07-28.)
 # A4 fix: agent bundle pods (langflow/letta/openclaw) connect to gateway:8081 for
 # LLM dispatch (values.yaml configures them with OPENAI_API_BASE=http://gateway:8081/v1).
 # Without this rule, default-deny-ingress drops all agent LLM calls silently in K8s.

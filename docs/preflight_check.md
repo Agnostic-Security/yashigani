@@ -913,8 +913,6 @@ The current agent lineup is: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 ### Optional Services
 
 ```
-[ ] Open WebUI: enabled with --with-openwebui flag (optional compose profile)
-[ ] Open WebUI: trusted header authentication confirmed
 [ ] Internal CA: enabled with --with-internal-ca flag (Smallstep step-ca, optional)
 [ ] Internal CA: additional disk/RAM for step-ca service
 [ ] Wazuh SIEM: enabled with --wazuh flag (optional)

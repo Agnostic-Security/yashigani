@@ -55,7 +55,8 @@
 #     NOT in _YSG_PKI_SERVICE_MAP below (that map covers TLS *_client.key files only).
 #
 #   yashigani_internal_bearer → 0:2002 0640  (UNCHANGED)
-#     open-webui (UID 0) + letta (UID 0): read as owner.
+#     letta (UID 0): reads as owner. (open-webui also read as UID 0 pre-4.0;
+#     removed along with the OWUI service — YSG-RISK-140.)
 #     langflow (UID 1000): reads via group GID 2002 (group_add:["2002"] retained
 #     on langflow only in compose — Captain scope, YSG-SECRETS-DIST-002).
 #     gateway + backoffice: ENV-ONLY (os.environ.get — no file DAC needed).
@@ -233,7 +234,7 @@ pki_services_all() {
 #
 #   Mandatory services: those that are part of the core control plane and
 #   must always have a client cert regardless of install profile.
-#   Optional services: profile-gated (open-webui, langflow, letta, openclaw,
+#   Optional services: profile-gated (langflow, letta, openclaw,
 #   letta-pgbouncer) — their absence is normal on lean installs.
 #
 #   S8 (MEDIUM): this function was declared-but-unimplemented in prior versions.
@@ -246,8 +247,10 @@ pki_key_missing_is_error() {
     return 1
   fi
   # Profile-gated (optional) services — absence is NOT an operator error.
+  # (open-webui removed 2026-07-28 — no longer in _YSG_PKI_SERVICE_MAP at all,
+  # so this branch was already unreachable for it; removed for clarity.)
   case "$_svc" in
-    open-webui|langflow|letta|letta-pgbouncer|openclaw)
+    langflow|letta|letta-pgbouncer|openclaw)
       return 1
       ;;
     *)

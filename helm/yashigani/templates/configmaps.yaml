@@ -740,7 +740,7 @@ data:
       # B4 (v2.25.0 P2): absent from Helm Caddyfile since v2.23.3 when this
       # route was added to the compose Caddyfiles (Ava SWEEP-16 / ASVS V9.1 /
       # API5 BFLA). Without this block, Caddy returns 404 on all /api/v1/admin/*
-      # requests on K8s; the open-webui catch-all cannot route API calls.
+      # requests on K8s; the catch-all cannot route API calls.
       # Parity with docker/Caddyfile.{selfsigned,ca,acme} line ~319/297/266.
       # SPIFFE injection: same pattern as /admin/* — Caddy injects its own
       # identity so require_spiffe_id() on backoffice can verify the caller.

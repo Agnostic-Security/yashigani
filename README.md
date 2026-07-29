@@ -24,7 +24,7 @@
 > - **RBAC group membership** now backfilled at first authenticated request for identities missing group records (W3-008).
 
 ---
-**Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
+**Single branch:** `main` — all features, all tiers. Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
 **Document Date:** 2026-07-15
 ---
@@ -126,7 +126,7 @@ For a more detailed explanation, see the [Pre-flight Checklist](docs/preflight_c
 
 ## 4. How to Deploy
 
-The **Installation and Configuration Guide** is the primary deployment reference. It covers the full universal-installer flow on Docker Compose, Kubernetes via Helm, and Podman. Podman is supported as a first-class runtime since v0.8.4 — the installer auto-detects the runtime, picks the correct compose command (`docker compose`, `docker-compose`, or `podman compose`), and auto-applies the Podman Compose override file when Podman is active. The guide walks through TLS bootstrap (ACME / CA-signed / self-signed), KMS provisioning, optional service profiles (`--with-openwebui`, `--wazuh`, `--with-internal-ca`, `--agent-bundles`), and admin credential bootstrap. For a more detailed explanation, see the [Installation and Configuration Guide](docs/yashigani_install_config.md).
+The **Installation and Configuration Guide** is the primary deployment reference. It covers the full universal-installer flow on Docker Compose, Kubernetes via Helm, and Podman. Podman is supported as a first-class runtime since v0.8.4 — the installer auto-detects the runtime, picks the correct compose command (`docker compose`, `docker-compose`, or `podman compose`), and auto-applies the Podman Compose override file when Podman is active. The guide walks through TLS bootstrap (ACME / CA-signed / self-signed), KMS provisioning, optional service profiles (`--wazuh`, `--with-internal-ca`, `--agent-bundles`), and admin credential bootstrap. For a more detailed explanation, see the [Installation and Configuration Guide](docs/yashigani_install_config.md).
 
 The **Kubernetes Deployment Guide** is the dedicated reference for production K8s deployments using the Helm chart. It covers KEDA-based horizontal autoscaling, multi-replica HA, Kubernetes network policies (the `allow-backoffice-ingress` and `allow-gateway-ingress` policies that admit only `yashigani-caddy` pods), pod disruption budgets, and the StatefulSet vs Deployment trade-offs across services (gateway, backoffice, postgres, redis, budget-redis, vault, observability stack, pool-manager DaemonSet). For a more detailed explanation, see the [Kubernetes Deployment Guide](docs/kubernetes_deployment.md).
 
@@ -476,7 +476,7 @@ The following features are included in **all seven tiers** at parity. They are d
 - Container hardening (seccomp, AppArmor, non-root)
 - Trivy container scanning
 - Agent bundles (Langflow / Letta / OpenClaw)
-- Open WebUI integration (since v2.0)
+- Native `ui4` chat/agents/builder/workflows SPA (OWUI replaced, since v4.0)
 
 ---
 
