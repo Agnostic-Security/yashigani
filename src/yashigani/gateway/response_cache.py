@@ -77,6 +77,45 @@ class ResponseCache:
             "ttl_seconds": min(ttl_seconds, MAX_TTL),
         })
 
+    def list_tenant_configs(self) -> list[dict]:
+        """Return every per-tenant cache config currently stored in Redis.
+
+        YSG-RISK-143: this is now the SINGLE source of truth for
+        GET /admin/cache (list). Previously the list endpoint queried a
+        Postgres ``cache_config`` table that no code path ever wrote to,
+        while get/set/invalidate all read/write Redis via this class — so a
+        PUT'd config could never appear in the list. Reading and writing
+        MUST hit the same store; this method reads the exact keys
+        get_tenant_config()/set_tenant_config() use (``rc:cfg:<tenant_id>``).
+        """
+        cfg_prefix = "rc:cfg:"
+        try:
+            keys = self._redis.keys(f"{cfg_prefix}*")
+        except Exception as exc:
+            logger.error("ResponseCache.list_tenant_configs error: %s", exc)
+            raise
+
+        results: list[dict] = []
+        for key in keys:
+            key_str = key.decode() if isinstance(key, bytes) else key
+            if not key_str.startswith(cfg_prefix):
+                continue
+            tenant_id = key_str[len(cfg_prefix):]
+            try:
+                data = self._redis.hgetall(key)
+            except Exception:
+                logger.debug(
+                    "response_cache: tenant config read failed during list for "
+                    "tenant_id=%s", tenant_id, exc_info=True,
+                )
+                continue
+            results.append({
+                "tenant_id": tenant_id,
+                "enabled": _hval(data, "enabled", "false") == "true",
+                "ttl_seconds": int(_hval(data, "ttl_seconds", str(DEFAULT_TTL))),
+            })
+        return sorted(results, key=lambda r: r["tenant_id"])
+
     @staticmethod
     def _make_key(tenant_id: str, body: bytes) -> str:
         normalized = _normalize_body(body)
@@ -93,6 +132,20 @@ class ResponseCache:
             return True
         except Exception:
             return False
+
+
+def _hval(data: dict, field: str, default: str) -> str:
+    """Read a hash field from a redis HGETALL result, tolerating both
+    bytes-keyed (real redis-py / fakeredis default) and str-keyed
+    (decode_responses=True) dicts.
+    """
+    if field.encode() in data:
+        raw = data[field.encode()]
+    elif field in data:
+        raw = data[field]
+    else:
+        return default
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
 def _normalize_body(body: bytes) -> bytes:
