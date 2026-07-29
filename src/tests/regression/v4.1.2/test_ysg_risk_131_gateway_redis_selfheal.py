@@ -314,12 +314,31 @@ def test_agent_auth_middleware_falls_back_to_gateway_fallback_state():
     from starlette.testclient import TestClient
     from yashigani.gateway.agent_auth import AgentAuthMiddleware
 
+    class _FakeRedisClient:
+        """Minimal .get() double backing verify_token_with_grace's direct
+        Redis reads (YSG-RISK-154, merged 5.0->4.1.2: AgentAuthMiddleware now
+        calls the grace-aware verifier, not the bare AgentRegistry.verify_token,
+        so the fake registry must expose ._r the same way the real one does)."""
+        import bcrypt as _bcrypt
+
+        _hash = _bcrypt.hashpw(b"good-token", _bcrypt.gensalt())
+
+        def get(self, key):
+            if key == "agent:token:caller-1":
+                return self._hash
+            return None  # no grace-period key set
+
     class _FakeRegistry:
+        _r = _FakeRedisClient()
+
         def verify_token(self, agent_id, token):
             return agent_id == "caller-1" and token == "good-token"
 
         def get(self, agent_id):
             return {"allowed_cidrs": []}
+
+        def _update_last_seen(self, agent_id):
+            pass  # no-op — last-seen bookkeeping isn't under test here
 
     async def handler(request):
         return PlainTextResponse("ok")

@@ -81,6 +81,20 @@ def _make_state(**overrides):
     state.streaming_inspect_interval = 200
     state.response_inspection_pipeline = None
     state.low_confidence_stepup_threshold = 0.7
+    # 5.0 optional injection-defence gates (mechanical-first block, rule
+    # promotion, suspicion gate, content moderation, model-pin, transcriber)
+    # merged in after this test was written. A bare MagicMock() is truthy
+    # and its .matches()/.classify()/etc return another truthy MagicMock,
+    # so every one of these gates must be explicitly disabled here or the
+    # request/response never reaches the YSG-RISK-129 code path under test.
+    state.content_moderation_guard = None
+    state.promoted_ruleset = None
+    state.conversation_risk_tracker = None
+    state._suspicion_gate_singleton = None
+    state.sklearn_injection_backend = None
+    state.rule_promotion_store = None
+    state.model_integrity_verifier = None
+    state.audio_transcriber = None
     for key, value in overrides.items():
         setattr(state, key, value)
     return state
