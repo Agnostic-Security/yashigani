@@ -100,6 +100,17 @@ verified against real hardware.
   such instead of silently claimed GREEN. Verified via `helm template` with/without the knob set
   (see gates below) — no live Intel GPU node available this session.
 
+- **C1 deploy-side (Captain finding #4) — k8s `sessionAffinity`.** `infer-chat`'s Service now sets
+  `sessionAffinity: ClientIP` so a caller sticks to one replica — defense-in-depth pairing with
+  Tom's `cache_prompt=off`/`--parallel` engine-level slot hygiene. **This does NOT provide
+  multi-tenant isolation on its own** — it only affects k8s load-balancing across
+  `chat.replicas`; the actual KV-cache/prompt-prefix isolation guarantee (or lack of one before
+  C3 lands) lives entirely in Tom's in-process llama-server slot-hygiene code. True per-tenant
+  isolation remains container-per-model (C3, `supervisorRbac.enabled: false` /
+  `admissionPolicies.enabled: false` by default — gated off, not yet wired to a real
+  `ContainerOrchestrationHook` implementation). Documented here so this fix isn't mistaken for
+  closing C1 outright.
+
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
 Tom's v1 supervisor (`supervisor/supervisor.py`, `supervisor/process.py`) is
