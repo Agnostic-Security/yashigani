@@ -67,10 +67,13 @@ class FakeProcessRunner(ProcessRunner):
 
     def __init__(self) -> None:
         self.spawned: list[dict[str, Any]] = []
+        self.handles: list[FakeProcessHandle] = []
 
     def spawn(self, *, binary: str, args: list[str], env: dict[str, str]) -> ProcessHandle:
         self.spawned.append({"binary": binary, "args": args, "env": env})
-        return FakeProcessHandle()
+        handle = FakeProcessHandle()
+        self.handles.append(handle)
+        return handle
 
 
 @pytest.fixture()

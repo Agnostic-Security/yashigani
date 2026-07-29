@@ -52,12 +52,38 @@ class ProvenanceVerifier(Protocol):
     def verify(self, resolved_model: ResolvedModel) -> None: ...
 
 
+class ReadinessProbe(Protocol):
+    """Structural contract for a post-spawn llama-server readiness gate
+    (Red-Council Tom F4, 2026-07-29 design-review). After `Supervisor.load()`
+    spawns a NEW llama-server process it calls `wait_until_ready(port)` BEFORE
+    recording the instance or returning it to the caller — so the app never
+    forwards a request to a port whose backend is still loading the GGUF and
+    answering `/health` with `503` (or refusing the connection). The probe must
+    block until the backend reports ready, or raise `BackendNotReadyError` once
+    its own bounded timeout elapses (fail closed — never hang forever, never
+    return while the backend is still loading). Only invoked on a real spawn,
+    never on the already-resident fast path (that instance was already proven
+    ready when it was first loaded). See `readiness.HttpReadinessProbe` for the
+    concrete HTTP implementation; this Protocol only defines the calling
+    contract so the supervisor's dependency graph stays minimal."""
+
+    def wait_until_ready(self, port: int) -> None: ...
+
+
 class SupervisorError(Exception):
     """Base error for supervisor operations."""
 
 
 class ModelNotLoadedError(SupervisorError):
     pass
+
+
+class BackendNotReadyError(SupervisorError):
+    """Raised (by a `ReadinessProbe`) when a freshly-spawned llama-server never
+    became ready within the probe's bounded timeout (Red-Council Tom F4).
+    `Supervisor.load()` treats it as fail-closed: the just-spawned process is
+    terminated and no residency state is recorded, so a backend that never comes
+    up neither hangs the request nor leaks an orphaned process."""
 
 
 class ResourceLimitExceeded(SupervisorError):
@@ -196,6 +222,7 @@ class Supervisor:
         port_allocator: Callable[[], int] | None = None,
         clock: Callable[[], datetime] | None = None,
         provenance_verifier: ProvenanceVerifier | None = None,
+        readiness_probe: ReadinessProbe | None = None,
     ) -> None:
         self._runner = process_runner
         self._binary = llama_server_binary
@@ -204,6 +231,7 @@ class Supervisor:
         self._resource_limits = resource_limits or ResourceLimits()
         self._clock = clock or _default_clock
         self._provenance_verifier = provenance_verifier
+        self._readiness_probe = readiness_probe
         self._instances: dict[str, ModelInstance] = {}
         self._inflight: dict[str, int] = {}
         self._next_port_offset = 0
@@ -307,6 +335,15 @@ class Supervisor:
         existing instance (if any) is left untouched, and the caller never
         gets a `ModelInstance` back for a model whose provenance no longer
         checks out.
+
+        Red-Council Tom F4: on a REAL spawn (not the already-resident fast
+        path) a configured `ReadinessProbe` is polled AFTER spawn and BEFORE
+        the instance is recorded/returned — so the caller (and therefore the
+        app forwarding traffic) never sees a `ModelInstance` for a backend
+        whose port is not yet answering. If the probe raises
+        `BackendNotReadyError` (its bounded timeout elapsed), the just-spawned
+        process is terminated and no residency state is recorded: the load
+        fails closed rather than hanging or leaking a never-ready process.
         """
         if self._provenance_verifier is not None:
             self._provenance_verifier.verify(resolved_model)
@@ -320,6 +357,15 @@ class Supervisor:
         port = self._port_allocator()
         args = self.build_args(resolved_model, load_config, port)
         handle = self._runner.spawn(binary=self._binary, args=args, env={})
+        if self._readiness_probe is not None:
+            try:
+                self._readiness_probe.wait_until_ready(port)
+            except BackendNotReadyError:
+                # Fail closed: terminate the spawned-but-never-ready process and
+                # record nothing, so the model is not treated as resident and
+                # nothing is leaked. The caller sees the raised error.
+                handle.terminate()
+                raise
         now = self._clock()
         instance = ModelInstance(
             sha256=resolved_model.sha256,
@@ -401,10 +447,12 @@ class Supervisor:
 
 
 __all__ = [
+    "BackendNotReadyError",
     "LoadConfig",
     "ModelInstance",
     "ModelNotLoadedError",
     "ProvenanceVerifier",
+    "ReadinessProbe",
     "ResourceLimitExceeded",
     "ResourceLimits",
     "Supervisor",

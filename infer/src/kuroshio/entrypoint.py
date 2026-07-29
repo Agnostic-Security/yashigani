@@ -98,6 +98,7 @@ from kuroshio.app import create_app
 from kuroshio.blobstore.store import BlobStore
 from kuroshio.config import EngineConfig, _default_blob_store_root
 from kuroshio.supervisor.process import SubprocessProcessRunner
+from kuroshio.supervisor.readiness import HttpReadinessProbe
 from kuroshio.supervisor.supervisor import LoadConfig, ResourceLimits, Supervisor
 from kuroshio.upstream import HttpxUpstreamClient
 
@@ -284,6 +285,13 @@ def create_asgi_app(env: Mapping[str, str] | None = None) -> FastAPI:
         idle_unload_seconds=role_config.engine_config.idle_unload_seconds,
         max_resident_models=role_config.engine_config.max_resident_models,
         resource_limits=role_config.resource_limits,
+        # Red-Council Tom F4: gate first-inference on a real `/health` poll of
+        # the freshly-spawned llama-server, so the app never forwards to a
+        # backend that is still loading the GGUF. Fails closed (terminates the
+        # process, records nothing) if it never comes up. Defaults are sensible
+        # for a cold GGUF load; the probe only ever blocks a model's FIRST load
+        # (every later request hits the already-resident fast path).
+        readiness_probe=HttpReadinessProbe(),
     )
     upstream = HttpxUpstreamClient()
 

@@ -12,7 +12,9 @@ import pytest
 
 from tests.conftest import FakeProcessRunner
 from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
+from kuroshio.supervisor.readiness import HttpReadinessProbe
 from kuroshio.supervisor.supervisor import (
+    BackendNotReadyError,
     LoadConfig,
     ModelNotLoadedError,
     ResourceLimitExceeded,
@@ -38,6 +40,26 @@ class _FakeProvenanceVerifier:
         self.calls.append(resolved_model)
         if self._fail_on_call is not None and len(self.calls) == self._fail_on_call:
             raise self.VerificationFailed(f"forced failure on call {len(self.calls)}")
+
+
+class _FakeReadinessProbe:
+    """Test double for the `ReadinessProbe` Protocol (Red-Council Tom F4).
+
+    Records the port of every `wait_until_ready()` call so tests can assert the
+    supervisor polls readiness on a real spawn (and NOT on the already-resident
+    fast path). `never_ready=True` models a backend that never comes up: it
+    raises `BackendNotReadyError` exactly as the real `HttpReadinessProbe` does
+    once its bounded timeout elapses — so the supervisor's fail-closed cleanup
+    path is exercised without any real port to wait on."""
+
+    def __init__(self, *, never_ready: bool = False) -> None:
+        self.polled_ports: list[int] = []
+        self._never_ready = never_ready
+
+    def wait_until_ready(self, port: int) -> None:
+        self.polled_ports.append(port)
+        if self._never_ready:
+            raise BackendNotReadyError(f"forced never-ready backend on port {port}")
 
 
 def _resolved_model(sha: str) -> ResolvedModel:
@@ -375,3 +397,86 @@ def test_load_re_verifies_on_every_call_including_the_already_resident_fast_path
     assert (
         len(fake_process_runner.spawned) == 1
     )  # still only ever spawned once — the failure is at the gate, not a respawn
+
+
+# --- Red-Council Tom F4 (2026-07-29): supervisor->serve readiness race ---
+
+
+def test_load_without_readiness_probe_configured_behaves_exactly_as_before(
+    fake_process_runner: FakeProcessRunner, clock: _FakeClock
+) -> None:
+    supervisor = Supervisor(process_runner=fake_process_runner, clock=clock)
+    instance = supervisor.load(_resolved_model("a" * 64), LoadConfig())
+    assert supervisor.is_loaded("a" * 64)
+    assert instance is not None
+
+
+def test_load_polls_readiness_after_spawn_before_recording_the_instance(
+    fake_process_runner: FakeProcessRunner, clock: _FakeClock
+) -> None:
+    """A not-yet-ready backend must be WAITED FOR: the supervisor calls the
+    readiness probe with the spawned port and only records the instance once the
+    probe returns (i.e. the backend reported ready)."""
+    probe = _FakeReadinessProbe()
+    supervisor = Supervisor(process_runner=fake_process_runner, clock=clock, readiness_probe=probe)
+    model = _resolved_model("a" * 64)
+
+    instance = supervisor.load(model, LoadConfig())
+
+    # probe was polled exactly once, for the port that was actually spawned
+    assert probe.polled_ports == [instance.port]
+    assert supervisor.is_loaded("a" * 64)
+
+
+def test_load_fails_closed_when_backend_never_becomes_ready(
+    fake_process_runner: FakeProcessRunner, clock: _FakeClock
+) -> None:
+    """A never-ready backend must FAIL CLOSED, not hang and not be served: the
+    load raises `BackendNotReadyError`, the just-spawned process is terminated,
+    and no residency state is recorded."""
+    probe = _FakeReadinessProbe(never_ready=True)
+    supervisor = Supervisor(process_runner=fake_process_runner, clock=clock, readiness_probe=probe)
+    model = _resolved_model("a" * 64)
+
+    with pytest.raises(BackendNotReadyError):
+        supervisor.load(model, LoadConfig())
+
+    assert not supervisor.is_loaded("a" * 64)  # nothing recorded — never treated as resident
+    assert len(fake_process_runner.spawned) == 1  # it WAS spawned...
+    spawned_handle = fake_process_runner.handles[0]
+    assert spawned_handle.terminate_calls == 1  # ...and then terminated — no leaked process
+
+
+def test_load_does_not_re_poll_readiness_on_the_already_resident_fast_path(
+    fake_process_runner: FakeProcessRunner, clock: _FakeClock
+) -> None:
+    """The probe gates FIRST load only — a hit against an already-resident
+    instance (already proven ready when first loaded) must not re-poll."""
+    probe = _FakeReadinessProbe()
+    supervisor = Supervisor(process_runner=fake_process_runner, clock=clock, readiness_probe=probe)
+    model = _resolved_model("a" * 64)
+
+    supervisor.load(model, LoadConfig())
+    supervisor.load(model, LoadConfig())  # fast path — no respawn, no re-poll
+
+    assert len(probe.polled_ports) == 1
+    assert len(fake_process_runner.spawned) == 1
+
+
+def test_http_readiness_probe_fails_closed_on_an_unreachable_port() -> None:
+    """Real `HttpReadinessProbe` against a port nothing is listening on: every
+    poll is connection-refused, so it exhausts its bounded timeout and raises
+    `BackendNotReadyError` (fail closed) rather than hanging forever. Exercises
+    the real code with no llama-server binary — a closed port is all it needs."""
+    import socket
+
+    # Grab a port the OS just handed us, then close it so nothing is listening —
+    # a deterministic "connection refused" target.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+
+    probe = HttpReadinessProbe(timeout_seconds=0.3, poll_interval_seconds=0.05)
+    with pytest.raises(BackendNotReadyError):
+        probe.wait_until_ready(closed_port)
