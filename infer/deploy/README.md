@@ -111,6 +111,17 @@ verified against real hardware.
   `ContainerOrchestrationHook` implementation). Documented here so this fix isn't mistaken for
   closing C1 outright.
 
+- **Helm CPU-cascade (Captain finding #7) — `expectGpu` day-one healthz trap.** `values.yaml`'s
+  `classifier.expectGpu`/`chat.expectGpu` defaulted `true` completely decoupled from
+  `backend: cpu` — the compose CPU overlay already correctly forces
+  `YSG_INFER_EXPECT_GPU: "false"`, but the Helm chart had no equivalent cascade, so a stock
+  `helm install` (no `--set backend=...`, no GPU) shipped `YSG_INFER_EXPECT_GPU=true` into the
+  env-var contract the GPU-engaged healthcheck consumes — a day-one `/healthz` hard-fail out of
+  the box. Fixed: both Deployments now cascade `YSG_INFER_EXPECT_GPU` to `"false"` whenever
+  `.Values.backend == "cpu"`, regardless of the `expectGpu` value's own top-level default.
+  Verified with `helm template --set backend=cpu` (renders `"false"`) vs `--set backend=cuda`
+  (renders the configured `"true"` default unchanged).
+
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
 Tom's v1 supervisor (`supervisor/supervisor.py`, `supervisor/process.py`) is

@@ -97,7 +97,14 @@ spec:
             - name: YSG_INFER_MAX_RESIDENT_MODELS
               value: {{ .Values.chat.maxResidentModels | quote }}
             - name: YSG_INFER_EXPECT_GPU
-              value: {{ .Values.chat.expectGpu | quote }}
+              # Captain finding #7 (Red Council 2026-07-29): backend: cpu MUST cascade
+              # expectGpu: false regardless of chat.expectGpu's own default -- mirrors
+              # docker-compose.infer.cpu.yml's YSG_INFER_EXPECT_GPU: "false" override, which
+              # already gets this right. Without this cascade, a stock `helm install` (no
+              # --set backend=..., no GPU) ships chat.expectGpu's top-level default (true)
+              # into the env-var contract Tom's entrypoint/gpu-engaged healthcheck consume,
+              # hard-failing /healthz out of the box on the CPU backend.
+              value: {{ if eq .Values.backend "cpu" }}"false"{{ else }}{{ .Values.chat.expectGpu | quote }}{{ end }}
             - name: YSG_INFER_EXPECTED_VRAM_MB
               value: {{ .Values.chat.expectedVramMb | quote }}
             {{- if .Values.chat.overrideTensor }}
