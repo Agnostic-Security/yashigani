@@ -167,7 +167,7 @@ def create_app(
         body = await request.json()
         model = _require_model(body.get("model", ""))
         instance = _ensure_loaded(model)
-        llama_request = translate_chat_request(body)
+        llama_request = translate_chat_request(body, cache_prompt=load_config.cache_prompt)
         _clamp_request_params(llama_request)
         model_name = body.get("model", "")
 
@@ -195,7 +195,7 @@ def create_app(
         body = await request.json()
         model = _require_model(body.get("model", ""))
         instance = _ensure_loaded(model)
-        llama_request = translate_generate_request(body)
+        llama_request = translate_generate_request(body, cache_prompt=load_config.cache_prompt)
         _clamp_request_params(llama_request)
         model_name = body.get("model", "")
 

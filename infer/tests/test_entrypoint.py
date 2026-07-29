@@ -233,6 +233,47 @@ def test_override_tensor_absent_is_empty_tuple(tmp_path: Path) -> None:
     assert config.default_load_config.override_tensor == ()
 
 
+# --- Red-Council C1 (2026-07-29): cache_prompt / parallel_slots env wiring ---
+
+
+def test_cache_prompt_absent_defaults_to_false(tmp_path: Path) -> None:
+    config = load_role_config(_chat_env(tmp_path))
+    assert config.default_load_config.cache_prompt is False
+
+
+def test_cache_prompt_true_parses(tmp_path: Path) -> None:
+    env = _chat_env(tmp_path)
+    env["YSG_INFER_CACHE_PROMPT"] = "true"
+    config = load_role_config(env)
+    assert config.default_load_config.cache_prompt is True
+
+
+def test_cache_prompt_invalid_fails_closed(tmp_path: Path) -> None:
+    env = _chat_env(tmp_path)
+    env["YSG_INFER_CACHE_PROMPT"] = "maybe"
+    with pytest.raises(EntrypointConfigError, match="YSG_INFER_CACHE_PROMPT"):
+        load_role_config(env)
+
+
+def test_parallel_slots_absent_defaults_to_none(tmp_path: Path) -> None:
+    config = load_role_config(_chat_env(tmp_path))
+    assert config.default_load_config.parallel_slots is None
+
+
+def test_parallel_slots_parses_when_set(tmp_path: Path) -> None:
+    env = _chat_env(tmp_path)
+    env["YSG_INFER_PARALLEL_SLOTS"] = "4"
+    config = load_role_config(env)
+    assert config.default_load_config.parallel_slots == 4
+
+
+def test_parallel_slots_invalid_fails_closed(tmp_path: Path) -> None:
+    env = _chat_env(tmp_path)
+    env["YSG_INFER_PARALLEL_SLOTS"] = "not-an-int"
+    with pytest.raises(EntrypointConfigError, match="YSG_INFER_PARALLEL_SLOTS"):
+        load_role_config(env)
+
+
 # ── create_asgi_app — full wiring, offline (no live process/network) ──────────────
 
 

@@ -36,6 +36,22 @@ def test_translate_chat_request_defaults_stream_true() -> None:
     assert llama_request["stream"] is True
 
 
+# --- Red-Council C1 (2026-07-29): cache_prompt must always be explicit ---
+
+
+def test_translate_chat_request_defaults_cache_prompt_to_false() -> None:
+    """Ava's T2: the outgoing llama-server body must contain an explicit
+    cache_prompt field — this must never fall through to llama-server's own
+    (permissive) default by omission."""
+    llama_request = translate_chat_request({"messages": []})
+    assert llama_request["cache_prompt"] is False
+
+
+def test_translate_chat_request_honours_explicit_cache_prompt_true() -> None:
+    llama_request = translate_chat_request({"messages": []}, cache_prompt=True)
+    assert llama_request["cache_prompt"] is True
+
+
 def test_chat_event_to_ndjson_intermediate_chunk_shape() -> None:
     line, is_final = chat_event_to_ndjson({"content": "hel", "stop": False}, "llama3:8b")
     assert is_final is False
@@ -91,6 +107,16 @@ def test_translate_generate_request_maps_prompt_and_system() -> None:
     assert llama_request["prompt"] == "why is the sky blue?"
     assert llama_request["system_prompt"] == "be concise"
     assert llama_request["stream"] is False
+
+
+def test_translate_generate_request_defaults_cache_prompt_to_false() -> None:
+    llama_request = translate_generate_request({"prompt": "x"})
+    assert llama_request["cache_prompt"] is False
+
+
+def test_translate_generate_request_honours_explicit_cache_prompt_true() -> None:
+    llama_request = translate_generate_request({"prompt": "x"}, cache_prompt=True)
+    assert llama_request["cache_prompt"] is True
 
 
 def test_generate_event_to_ndjson_uses_response_field_not_message() -> None:

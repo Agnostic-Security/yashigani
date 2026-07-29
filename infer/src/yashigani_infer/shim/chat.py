@@ -8,7 +8,19 @@ for pinning a vetted server-side template family and diffing GGUF-embedded
 templates against known-good before this shim goes anywhere near
 production traffic. That is a template-registry/config concern layered on
 top of this translation function, not built here — flagged so it is not
-mistaken for "already handled."
+mistaken for "already handled." (H4, 2026-07-29: the fail-closed GUARD that
+refuses to serve a model with no extractable chat_template IS built now —
+see `app.py`'s `_require_chat_template` — but the template-FAMILY-diffing
+registry itself remains this documented gap.)
+
+Red-Council C1 (2026-07-29 design review — Laura/Ava/Tom/Iris, all
+independently CRITICAL): `translate_chat_request` now ALWAYS emits an
+explicit `cache_prompt` field rather than silently omitting it (which let
+llama-server's own default — `true` upstream — apply completely unexamined,
+turning shared-process slot/prefix-cache reuse into a cross-tenant timing
+side channel). The caller (`app.py`) passes `cache_prompt` through from
+`LoadConfig.cache_prompt`, whose OWN default is `False` — see that
+dataclass's docstring for the full isolation rationale.
 """
 
 from __future__ import annotations
@@ -35,12 +47,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def translate_chat_request(ollama_request: dict[str, Any]) -> dict[str, Any]:
-    """Translate an ollama `/api/chat` request body into a llama-server request body."""
+def translate_chat_request(ollama_request: dict[str, Any], *, cache_prompt: bool = False) -> dict[str, Any]:
+    """Translate an ollama `/api/chat` request body into a llama-server request body.
+
+    Args:
+        cache_prompt: forwarded verbatim as the outgoing `/completion` body's
+            `cache_prompt` field — ALWAYS set explicitly (never omitted), so
+            this shim never silently inherits llama-server's own default
+            (Red-Council C1). Defaults to `False` (the isolation-safe
+            baseline posture — see `supervisor.LoadConfig.cache_prompt`);
+            callers that have decided a per-tenant/high-assurance posture
+            makes cache reuse safe may explicitly pass `True`.
+    """
     messages = ollama_request.get("messages", [])
     llama_request: dict[str, Any] = {
         "messages": list(messages),
         "stream": bool(ollama_request.get("stream", True)),
+        "cache_prompt": cache_prompt,
     }
     options = ollama_request.get("options") or {}
     for ollama_key, llama_key in _OPTION_MAP.items():

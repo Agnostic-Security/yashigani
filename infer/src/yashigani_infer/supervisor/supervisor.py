@@ -86,6 +86,52 @@ class LoadConfig:
             not a warning (Captain #3 / platform-requirements §4.5).
         context_length: `--ctx-size` passthrough.
         extra_args: any additional raw `llama-server` CLI args.
+        cache_prompt: Red-Council C1 (Laura/Ava/Tom/Iris, 2026-07-29
+            design-review): whether the shim is ALLOWED to set
+            `cache_prompt: true` on outgoing `/completion` bodies. Defaults
+            to **False** — the conservative, isolation-safe posture. A
+            shared `infer-chat` process serves every tenant reaching that
+            model through a finite llama-server slot pool; llama-server's
+            own `cache_prompt` reuse selects a slot by longest-common-prefix
+            match against WHATEVER is currently cached, with no notion of
+            caller identity. With a near-universal shared system prompt
+            (the common gated-deployment case), leaving `cache_prompt` at
+            llama-server's own default (`true`) turns time-to-first-token
+            into a cross-tenant prefix-confirmation side channel (Laura's
+            F1 finding — deterministic given llama-server's documented
+            slot-selection behaviour, not speculative). Forcing it off
+            costs re-eval performance on legitimately-repeated prompts;
+            that cost is accepted as the price of the baseline (shared-
+            process) posture being safe OUT OF THE BOX. The only way to
+            get real per-conversation isolation approaching "safe to leave
+            cache_prompt on" is per-tenant model instances (C3, gated,
+            separately tracked) — this default does not claim to be that;
+            it only ensures the SHARED baseline this v1 foundation actually
+            ships never silently inherits an unexamined library default.
+            **Deferred, not built here:** a live multi-user canary-bleed
+            proof (T1 in Ava's report — fire concurrent request pairs
+            against a REAL llama-server and assert a per-run canary token
+            never crosses between callers) requires an actual llama-server
+            binary/GPU rig, which does not exist in this offline package;
+            do not fabricate that proof here. What IS proven here (unit
+            tests, this commit): the shim always emits an explicit
+            `cache_prompt` field (never silently omitted so llama-server's
+            own default applies), and it is wired end-to-end through
+            `LoadConfig` / `EngineConfig` / the env-var contract so an
+            operator opting into the high-assurance/per-tenant-instance
+            posture can deliberately re-enable it.
+        parallel_slots: sizes the `--parallel` (`-np`) llama-server CLI
+            flag — previously never emitted at all (Tom/Laura/Ava/Iris
+            finding: "whatever the compiled binary defaults to,
+            unconfigured"). When `None` (the default), `build_args` derives
+            it from `ResourceLimits.max_concurrent_requests` so the two
+            previously "independent, unconnected numbers" (the Python
+            admission-control ceiling and llama-server's own slot count)
+            can never silently drift apart. An explicit value here
+            overrides that derivation for deployments that need to run a
+            different slot count than the request-admission ceiling (e.g.
+            fewer slots than admitted requests, deliberately serializing
+            some traffic) — a documented escape hatch, not a silent gap.
     """
 
     n_gpu_layers: int | None = None
@@ -94,6 +140,8 @@ class LoadConfig:
     expect_gpu: bool = False
     context_length: int | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    cache_prompt: bool = False
+    parallel_slots: int | None = None
 
 
 @dataclass
@@ -204,6 +252,20 @@ class Supervisor:
             args += ["--override-tensor", rule]
         if load_config.context_length is not None:
             args += ["--ctx-size", str(load_config.context_length)]
+        # Red-Council C1: always emit an explicit slot count rather than
+        # relying on the llama-server binary's own compiled-in default,
+        # which this codebase never examined before (Tom/Laura/Ava/Iris
+        # finding). Deriving from `max_concurrent_requests` when the
+        # deploy hasn't overridden it directly ties the Python-level
+        # admission ceiling to the actual number of llama-server slots
+        # serving that ceiling — previously two independent, unconnected
+        # numbers.
+        parallel = (
+            load_config.parallel_slots
+            if load_config.parallel_slots is not None
+            else self._resource_limits.max_concurrent_requests
+        )
+        args += ["--parallel", str(parallel)]
         args += list(load_config.extra_args)
         return args
 

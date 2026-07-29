@@ -50,6 +50,18 @@ Env-var contract (source of truth: the inline comment block in
     YSG_INFER_N_GPU_LAYERS             optional int -> LoadConfig.n_gpu_layers.
     YSG_INFER_OVERRIDE_TENSOR          optional, comma-separated MoE `--override-tensor`
                                         regex rules -> LoadConfig.override_tensor.
+    YSG_INFER_CACHE_PROMPT             optional bool -> LoadConfig.cache_prompt (Red-Council
+                                        C1, 2026-07-29). Defaults to false — the
+                                        isolation-safe posture for a shared-process
+                                        `infer-chat` instance (see LoadConfig's docstring).
+                                        An operator that has adopted the high-assurance
+                                        per-tenant-instance posture (C3) may set this true.
+    YSG_INFER_PARALLEL_SLOTS           optional int -> LoadConfig.parallel_slots (Red-Council
+                                        C1). When unset, `Supervisor.build_args` derives the
+                                        llama-server `--parallel` slot count from
+                                        `ResourceLimits.max_concurrent_requests` instead —
+                                        set this only to run a DIFFERENT slot count than the
+                                        request-admission ceiling.
 
 Every var above except ``YSG_INFER_ROLE`` is optional — absence means "use the existing
 dataclass default" (never "crash"), matching the supervisor/app foundation's own
@@ -108,6 +120,8 @@ _KEEP_ALIVE_PIN_ENV = "YSG_INFER_KEEP_ALIVE_PIN"
 _EXPECT_GPU_ENV = "YSG_INFER_EXPECT_GPU"
 _N_GPU_LAYERS_ENV = "YSG_INFER_N_GPU_LAYERS"
 _OVERRIDE_TENSOR_ENV = "YSG_INFER_OVERRIDE_TENSOR"
+_CACHE_PROMPT_ENV = "YSG_INFER_CACHE_PROMPT"
+_PARALLEL_SLOTS_ENV = "YSG_INFER_PARALLEL_SLOTS"
 
 
 class EntrypointConfigError(RuntimeError):
@@ -227,11 +241,15 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
     expect_gpu = _parse_optional_bool(env, _EXPECT_GPU_ENV, default=False)
     n_gpu_layers = _parse_optional_int(env, _N_GPU_LAYERS_ENV)
     override_tensor = _parse_override_tensor(env)
+    cache_prompt = _parse_optional_bool(env, _CACHE_PROMPT_ENV, default=False)
+    parallel_slots = _parse_optional_int(env, _PARALLEL_SLOTS_ENV)
     default_load_config = LoadConfig(
         n_gpu_layers=n_gpu_layers,
         override_tensor=override_tensor,
         keep_alive_pin=keep_alive_pin,
         expect_gpu=expect_gpu,
+        cache_prompt=cache_prompt,
+        parallel_slots=parallel_slots,
     )
 
     return RoleConfig(

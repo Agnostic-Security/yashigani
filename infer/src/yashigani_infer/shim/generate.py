@@ -5,6 +5,9 @@
 Same NDJSON-vs-SSE re-framing risk as `/api/chat` (chat.py), but the
 response body shape differs: ollama uses a bare `"response"` string field
 per chunk instead of a `"message": {"role", "content"}` object.
+
+Red-Council C1 (2026-07-29): same `cache_prompt` explicit-emission fix as
+`shim/chat.py` — see that module's docstring for the full rationale.
 """
 
 from __future__ import annotations
@@ -30,11 +33,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def translate_generate_request(ollama_request: dict[str, Any]) -> dict[str, Any]:
-    """Translate an ollama `/api/generate` request body into a llama-server request body."""
+def translate_generate_request(ollama_request: dict[str, Any], *, cache_prompt: bool = False) -> dict[str, Any]:
+    """Translate an ollama `/api/generate` request body into a llama-server request body.
+
+    Args:
+        cache_prompt: see `shim.chat.translate_chat_request`'s docstring —
+            identical rationale, always emitted explicitly, defaults False.
+    """
     llama_request: dict[str, Any] = {
         "prompt": ollama_request.get("prompt", ""),
         "stream": bool(ollama_request.get("stream", True)),
+        "cache_prompt": cache_prompt,
     }
     if ollama_request.get("system"):
         llama_request["system_prompt"] = ollama_request["system"]

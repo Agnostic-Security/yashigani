@@ -246,3 +246,55 @@ def test_release_request_slot_is_safe_when_nothing_inflight(fake_process_runner:
     supervisor = Supervisor(process_runner=fake_process_runner)
     supervisor.release_request_slot("never-acquired")  # must not raise
     assert supervisor.inflight_count("never-acquired") == 0
+
+
+# --- Red-Council C1 (2026-07-29): session-isolation config surface ---
+
+
+def test_build_args_always_emits_an_explicit_parallel_flag(fake_process_runner: FakeProcessRunner) -> None:
+    """Previously `--parallel` was never emitted at all — llama-server's own
+    compiled-in default applied completely unexamined (Tom/Laura/Ava/Iris
+    finding). This must never regress to silent omission."""
+    supervisor = Supervisor(process_runner=fake_process_runner)
+    model = _resolved_model("a" * 64)
+    args = supervisor.build_args(model, LoadConfig(), port=40000)
+    assert "--parallel" in args
+
+
+def test_build_args_sizes_parallel_from_max_concurrent_requests_by_default(
+    fake_process_runner: FakeProcessRunner,
+) -> None:
+    """The Python-level admission ceiling and llama-server's own slot count
+    must never be two independent, silently-drifting numbers."""
+    limits = ResourceLimits(max_concurrent_requests=6)
+    supervisor = Supervisor(process_runner=fake_process_runner, resource_limits=limits)
+    model = _resolved_model("a" * 64)
+
+    args = supervisor.build_args(model, LoadConfig(), port=40000)
+
+    idx = args.index("--parallel")
+    assert args[idx + 1] == "6"
+
+
+def test_build_args_honours_explicit_parallel_slots_override(fake_process_runner: FakeProcessRunner) -> None:
+    """An explicit LoadConfig.parallel_slots overrides the ResourceLimits-derived
+    default — a documented escape hatch for deployments that want a different
+    slot count than the admission ceiling."""
+    limits = ResourceLimits(max_concurrent_requests=6)
+    supervisor = Supervisor(process_runner=fake_process_runner, resource_limits=limits)
+    model = _resolved_model("a" * 64)
+
+    args = supervisor.build_args(model, LoadConfig(parallel_slots=2), port=40000)
+
+    idx = args.index("--parallel")
+    assert args[idx + 1] == "2"
+
+
+def test_load_config_cache_prompt_defaults_to_false() -> None:
+    """Isolation-safe default: a caller that forgets to set this explicitly
+    must never accidentally inherit a permissive value."""
+    assert LoadConfig().cache_prompt is False
+
+
+def test_load_config_parallel_slots_defaults_to_none() -> None:
+    assert LoadConfig().parallel_slots is None

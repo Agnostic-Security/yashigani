@@ -141,6 +141,54 @@ def test_api_chat_streams_ndjson_and_spawns_the_process(
     assert supervisor.inflight_count(ingested_model.sha256) == 0
 
 
+def test_api_chat_sends_explicit_cache_prompt_false_by_default(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    """Red-Council C1 / Ava T2: the actual outgoing llama-server request body
+    (not just the shim's own unit test) must carry an explicit cache_prompt
+    field — the isolation-safe default, never silently omitted."""
+    sse_lines = format_sse_event({"content": "", "stop": True, "timings": {"predicted_ms": 1}}).splitlines()
+    app, _supervisor, upstream = _build_app(tmp_blob_store, sse_lines=sse_lines)
+    client = TestClient(app)
+
+    client.post("/api/chat", json={"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]})
+
+    assert upstream.requested_bodies[0]["cache_prompt"] is False
+
+
+def test_api_generate_sends_explicit_cache_prompt_false_by_default(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    sse_lines = format_sse_event({"content": "", "stop": True, "timings": {"predicted_ms": 1}}).splitlines()
+    app, _supervisor, upstream = _build_app(tmp_blob_store, sse_lines=sse_lines)
+    client = TestClient(app)
+
+    client.post("/api/generate", json={"model": "llama3:8b", "prompt": "hi"})
+
+    assert upstream.requested_bodies[0]["cache_prompt"] is False
+
+
+def test_api_chat_honours_cache_prompt_true_from_load_config(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    """An operator that has explicitly opted into a posture where cache reuse
+    is safe (e.g. per-tenant instances) can still enable it via LoadConfig."""
+    supervisor = Supervisor(process_runner=FakeProcessRunner())
+    sse_lines = format_sse_event({"content": "", "stop": True, "timings": {"predicted_ms": 1}}).splitlines()
+    upstream = FakeUpstreamClient(sse_lines=sse_lines)
+    app = create_app(
+        blob_store=tmp_blob_store,
+        supervisor=supervisor,
+        upstream=upstream,
+        default_load_config=LoadConfig(cache_prompt=True),
+    )
+    client = TestClient(app)
+
+    client.post("/api/chat", json={"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]})
+
+    assert upstream.requested_bodies[0]["cache_prompt"] is True
+
+
 def test_api_chat_returns_404_for_unknown_model(tmp_blob_store: BlobStore) -> None:
     app, _supervisor, _upstream = _build_app(tmp_blob_store)
     client = TestClient(app)
