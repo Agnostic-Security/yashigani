@@ -248,7 +248,7 @@ LOADER_HASH: str = "b2210667a345b82969014440d17d8ea2624732793d9c8f528d0ceb2ed4aa
 
 # INTEGRITY_HASH (self-referential — computed over this file before replacement)
 # Replace with: sha256sum src/yashigani/licensing/_integrity.py | cut -d' ' -f1
-INTEGRITY_HASH: str = "ec06279b9f8a21e8a9261af4154e660d92e0da2623a9f63a0756e6312d140d2d"
+INTEGRITY_HASH: str = "c72d6e903e8cbff8150f0b98b8b2d1d8c1888db90175cde1b1163e9260b96077"
 
 # AGENTS_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/agents/registry.py | cut -d' ' -f1
@@ -256,7 +256,7 @@ AGENTS_REGISTRY_HASH: str = "869174fbc128dddcadde3df98c1f550e1cb42abeedc68864cfe
 
 # IDENTITY_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/identity/registry.py | cut -d' ' -f1
-IDENTITY_REGISTRY_HASH: str = "4552eb7a567cc5f3dd82f8a49b2bb8a9a6bd9dccf9bc16f3ba8f3759e15d71ad"
+IDENTITY_REGISTRY_HASH: str = "9e6d516f1e0901b104ee41197bdb69d6da5476907bfe34dda1a80363743cf5bb"
 
 # ---------------------------------------------------------------------------
 # Point-of-use (POU) protected-file hashes — 2026-07-16, LAURA-V2-001
@@ -296,7 +296,7 @@ GATE_MIDDLEWARE_HASH: str = "b43d82ed8072e3a2ccbc5429dd1582e03a6a2433ec28ab4c4cb
 # import compute_mesh_order; import json; print(json.dumps({'version': V,
 # 'seed': S, 'member_order': compute_mesh_order(V, S)}))"  (scripts/inject_hashes.sh
 # Step 3c does this automatically; MESH_SEED auto-generates if unset).
-MESH_TOPOLOGY_JSON: str = "{\"member_order\":[\"GATE_MIDDLEWARE\",\"VERIFIER\",\"OIDC\",\"SSO_ROUTES\",\"SCIM_ROUTES\",\"SAML\",\"ENFORCER\"],\"seed\":\"29097ff64ef4e63d667eec33443f7e3c\",\"version\":\"0.0.0-unset\"}"
+MESH_TOPOLOGY_JSON: str = "{\"member_order\":[\"VERIFIER\",\"SAML\",\"ENFORCER\",\"SCIM_ROUTES\",\"SSO_ROUTES\",\"GATE_MIDDLEWARE\",\"OIDC\"],\"seed\":\"1e69c8d388f3a22fd72947d6a9d8d04b\",\"version\":\"0.0.0-unset\"}"
 
 # ---------------------------------------------------------------------------
 # Licence-hardening-v2 chain constants (design §2.2/§3.1/§3.3, §4a)
@@ -319,7 +319,7 @@ CODE_LEAF_CERT_SIG: str = "MGYCMQCcY8pM4eJD8Uocpx3JEsqWd6WPHrVzS5qeiZ0vKWtZZVeyX
 # Emit via: licgen sign-build --channel prod --version <x.y.z>
 # (supersedes the v1 HASH_BUNDLE_SIG produced by scripts/sign_bundle.py against
 # the old counter key — same constant name, new chain-based signer/scheme).
-BUNDLE_SIG: str = "MGQCMFUHPTLK6lep9FkDiezTehg4tm7HhfxzKC4cWZb93lso0CMLBPPHCGcKRDe0tlPlswIwByWuXzXOy+RuL/FmV43tlrQFntYXyl+FwLxqeU6HdILNH0x8mRJ5azjg+Be7lZV2"
+BUNDLE_SIG: str = "MGUCMQCzbJsyFDc7A6OHpUkCegTwFvqOxdefUjjOBuMRFIclfPPTStiXD8By/nHRyZ5IkE8CMF7hA2poO6bmfo2j7A8ZyFD/m3y2NRFHX4aEouPFI7kB7ZZ2rolrH0Bv4Qt/Fzvgdg=="
 
 # KILL_LIST_JSON
 # Bundled with every release. SAFE DEFAULT: "[]" (empty — nothing revoked).
