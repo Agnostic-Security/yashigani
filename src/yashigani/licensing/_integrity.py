@@ -248,7 +248,7 @@ LOADER_HASH: str = "b2210667a345b82969014440d17d8ea2624732793d9c8f528d0ceb2ed4aa
 
 # INTEGRITY_HASH (self-referential — computed over this file before replacement)
 # Replace with: sha256sum src/yashigani/licensing/_integrity.py | cut -d' ' -f1
-INTEGRITY_HASH: str = "287ffc4165043e1d7c6bb397ad99337cd4dfe6b3df89b0416e0266621571362f"
+INTEGRITY_HASH: str = "40da2883f96edd5d8507b2d726a66500be9a877ef5ff61148a319c799d64a27c"
 
 # AGENTS_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/agents/registry.py | cut -d' ' -f1
@@ -296,7 +296,7 @@ GATE_MIDDLEWARE_HASH: str = "b43d82ed8072e3a2ccbc5429dd1582e03a6a2433ec28ab4c4cb
 # import compute_mesh_order; import json; print(json.dumps({'version': V,
 # 'seed': S, 'member_order': compute_mesh_order(V, S)}))"  (scripts/inject_hashes.sh
 # Step 3c does this automatically; MESH_SEED auto-generates if unset).
-MESH_TOPOLOGY_JSON: str = "{\"member_order\":[\"VERIFIER\",\"SCIM_ROUTES\",\"SAML\",\"SSO_ROUTES\",\"GATE_MIDDLEWARE\",\"OIDC\",\"ENFORCER\"],\"seed\":\"80a26ad8285b82026c822ea5e6e769a2\",\"version\":\"0.0.0-unset\"}"
+MESH_TOPOLOGY_JSON: str = "{\"member_order\":[\"OIDC\",\"SCIM_ROUTES\",\"ENFORCER\",\"SAML\",\"SSO_ROUTES\",\"VERIFIER\",\"GATE_MIDDLEWARE\"],\"seed\":\"da993c786f2ac97e7ded33e5e6267e79\",\"version\":\"0.0.0-unset\"}"
 
 # ---------------------------------------------------------------------------
 # Licence-hardening-v2 chain constants (design §2.2/§3.1/§3.3, §4a)
@@ -319,7 +319,7 @@ CODE_LEAF_CERT_SIG: str = "MGYCMQCcY8pM4eJD8Uocpx3JEsqWd6WPHrVzS5qeiZ0vKWtZZVeyX
 # Emit via: licgen sign-build --channel prod --version <x.y.z>
 # (supersedes the v1 HASH_BUNDLE_SIG produced by scripts/sign_bundle.py against
 # the old counter key — same constant name, new chain-based signer/scheme).
-BUNDLE_SIG: str = "MGUCMFVGOyRckzzZ4d2dtNU/p5gtMoUnNG0cONvG6aUiQ4kII55ZwrWywwOgZLsPRaFi7AIxAMJXysaCDjn9EnXf2MMRYQV/O4wrwqlCt6Ig3GmkjvP3hy4AGFNK61xoNo1DOIiU3Q=="
+BUNDLE_SIG: str = "MGYCMQDprHl6TKqld4m80++ow+9i/v/KK8yzgyhqv8h6EULwAstLSQ8kx/wDK5uuAf5W9hkCMQCQzZDLHQu0PqzY1faNnTWq9MCkePp0VbtC/45mzSKzPyS7YTXxls57q4zSF9Qvquo="
 
 # KILL_LIST_JSON
 # Bundled with every release. SAFE DEFAULT: "[]" (empty — nothing revoked).
