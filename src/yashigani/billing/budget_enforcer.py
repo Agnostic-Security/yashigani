@@ -100,6 +100,105 @@ class BudgetEnforcer:
         key = f"budget:allocation:{identity_id}:{provider}"
         self._r.set(key, str(token_budget))
 
+    def get_group_allocation(self, group_id: str, provider: str = "cloud") -> int:
+        """Get the group budget allocation from Redis. 0 = unlimited/unset."""
+        key = f"budget:allocation:group:{group_id}:{provider}"
+        val = self._r.get(key)
+        return int(val) if val else 0
+
+    def set_group_allocation(self, group_id: str, provider: str, token_budget: int) -> None:
+        """Cache a group budget allocation in Redis (called by the budget admin API).
+
+        YSG-RISK-144: this was previously referenced only in a docstring
+        (list_group_utilisation) but never actually called anywhere — group
+        budgets set via POST /admin/budget/groups were persisted to Postgres
+        but never synced to Redis, so the per-request hierarchy check had no
+        group cap to read. create_group_budget() now calls this.
+        """
+        key = f"budget:allocation:group:{group_id}:{provider}"
+        self._r.set(key, str(token_budget))
+
+    def get_org_allocation(self, org_id: str, provider: str = "cloud") -> int:
+        """Get the org token cap from Redis. 0 = unlimited/unset."""
+        key = f"budget:allocation:org:{org_id}:{provider}"
+        val = self._r.get(key)
+        return int(val) if val else 0
+
+    def set_org_allocation(self, org_id: str, provider: str, token_cap: int) -> None:
+        """Cache an org token cap in Redis (called by the budget admin API).
+
+        YSG-RISK-144: org caps set via POST /admin/budget/org-caps were
+        persisted to Postgres but never synced to Redis, so the per-request
+        hierarchy check had no org cap to read. create_org_cap() now calls this.
+        """
+        key = f"budget:allocation:org:{org_id}:{provider}"
+        self._r.set(key, str(token_cap))
+
+    def check_hierarchy(
+        self,
+        identity_id: str,
+        provider: str,
+        budget_total: int = 0,
+        group_ids: list[str] | None = None,
+        org_id: str = "",
+        period: str = "monthly",
+    ) -> BudgetState:
+        """
+        YSG-RISK-144 (individual <= group <= org hierarchy — claimed but not
+        enforced): the per-request budget check previously called only
+        ``check()`` (the individual tier). An identity whose OWN budget was
+        fine but whose GROUP or ORG cap was exhausted was never denied/
+        degraded, silently violating the documented invariant.
+
+        Evaluates all three tiers the identity is subject to and returns the
+        MOST RESTRICTIVE signal (EXHAUSTED > WARN > NORMAL) across:
+          - the identity's own allocation (``budget_total``)
+          - every group in ``group_ids`` that has a configured allocation
+          - the org cap for ``org_id``, if configured
+
+        The returned BudgetState's used/total/pct reflect the identity's OWN
+        tier (for continuity with existing callers/metrics); ``signal`` is
+        the worst-case across the hierarchy — callers that gate on
+        ``signal == EXHAUSTED`` therefore correctly deny/degrade an
+        individual who is within their own budget but over their group or
+        org cap.
+
+        A tier with no configured allocation (0/unset) is treated as
+        unlimited for that tier — it never escalates the signal.
+        """
+        _RANK = {BudgetSignal.NORMAL: 0, BudgetSignal.WARN: 1, BudgetSignal.EXHAUSTED: 2}
+
+        own = self.check(identity_id, provider, budget_total=budget_total, period=period)
+        worst_signal = own.signal
+
+        for gid in (group_ids or []):
+            if not gid:
+                continue
+            group_budget = self.get_group_allocation(gid, provider)
+            if group_budget <= 0:
+                continue
+            group_state = self.check_group(gid, provider, group_budget, period=period)
+            if _RANK[group_state.signal] > _RANK[worst_signal]:
+                worst_signal = group_state.signal
+
+        if org_id:
+            org_cap = self.get_org_allocation(org_id, provider)
+            if org_cap > 0:
+                org_state = self.check_org(org_id, provider, org_cap, period=period)
+                if _RANK[org_state.signal] > _RANK[worst_signal]:
+                    worst_signal = org_state.signal
+
+        if worst_signal == own.signal:
+            return own
+        return BudgetState(
+            identity_id=own.identity_id,
+            provider=own.provider,
+            used=own.used,
+            total=own.total,
+            signal=worst_signal,
+            pct=own.pct,
+        )
+
     def sync_allocations(self, allocations: list[dict]) -> int:
         """
         Bulk-sync budget allocations from Postgres to Redis.
