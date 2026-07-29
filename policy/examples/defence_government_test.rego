@@ -80,3 +80,37 @@ test_decision_contract_shape if {
 	d.policy_id == "clients.gov.classification-control"
 	d.code == 403
 }
+
+# --- Additive against-spec coverage (Lu conf/v412-opa-templates) -------------
+# The two documented obligations (two_person_integrity, audit_classified_access)
+# had no assertion in 2d582105's G2 tests.
+
+# TOP SECRET (clearance dominates, local route) => both obligations fire.
+test_obligation_two_person_integrity_top_secret if {
+	i := object.union(_base_input, {
+		"identity": {"clearance": "TOP SECRET", "caveats": [], "compartments": []},
+		"data": {"classification": "TOP SECRET", "caveats": [], "compartment": ""},
+		"routing_decision": {"route": "local"},
+	})
+	d := data.clients.gov.decision with input as i
+	d.allow
+	"two_person_integrity" in d.obligations
+	"audit_classified_access" in d.obligations
+}
+
+# OFFICIAL-SENSITIVE => audit obligation only, NOT two-person integrity.
+test_obligation_audit_classified_access_official_sensitive if {
+	i := object.union(_base_input, {
+		"data": {"classification": "OFFICIAL-SENSITIVE", "caveats": [], "compartment": ""},
+	})
+	d := data.clients.gov.decision with input as i
+	"audit_classified_access" in d.obligations
+	not "two_person_integrity" in d.obligations
+}
+
+# OFFICIAL (lowest) => neither obligation fires.
+test_no_classified_obligations_for_official if {
+	d := data.clients.gov.decision with input as _base_input
+	not "audit_classified_access" in d.obligations
+	not "two_person_integrity" in d.obligations
+}
