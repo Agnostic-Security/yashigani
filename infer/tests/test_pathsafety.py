@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from yashigani_infer.pathsafety import (
+from kuroshio.pathsafety import (
     PathTraversalError,
     SymlinkEscapeError,
     canonicalize_and_contain,

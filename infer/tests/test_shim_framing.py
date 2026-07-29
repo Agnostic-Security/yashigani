@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from yashigani_infer.shim.framing import (
+from kuroshio.shim.framing import (
     SSEFramingError,
     format_ndjson_line,
     format_sse_event,

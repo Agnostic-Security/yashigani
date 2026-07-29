@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import FakeProcessRunner
-from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
-from yashigani_infer.supervisor.supervisor import (
+from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
+from kuroshio.supervisor.supervisor import (
     LoadConfig,
     ModelNotLoadedError,
     ResourceLimitExceeded,

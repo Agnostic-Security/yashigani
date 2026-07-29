@@ -12,14 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from yashigani_infer.adapters.local_file import LocalFileAdapter, LocalFileAdapterError
-from yashigani_infer.blobstore.store import BlobStore
-from yashigani_infer.containment.hooks import (
+from kuroshio.adapters.local_file import LocalFileAdapter, LocalFileAdapterError
+from kuroshio.blobstore.store import BlobStore
+from kuroshio.containment.hooks import (
     default_first_parse_jail_hook,
     select_first_parse_jail_hook,
     unimplemented_orchestrated_first_parse_jail_hook,
 )
-from yashigani_infer.gguf.header import GGUFParseError
+from kuroshio.gguf.header import GGUFParseError
 
 # ── default_first_parse_jail_hook (the v1 in-process guard) ─────────────────
 

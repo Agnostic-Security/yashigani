@@ -13,14 +13,14 @@ import struct
 
 import pytest
 
-from yashigani_infer.adapters.convert import (
+from kuroshio.adapters.convert import (
     ConvertAdapter,
     PickleRefusedError,
     StubConversionInvoker,
     UnsupportedSourceFormatError,
     guard_safetensors_only,
 )
-from yashigani_infer.blobstore.store import BlobStore
+from kuroshio.blobstore.store import BlobStore
 
 
 def _write(path, data: bytes):

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Agnostic Security Ltd
-"""Unit tests for the ASGI wiring entrypoint (`yashigani_infer.entrypoint`).
+"""Unit tests for the ASGI wiring entrypoint (`kuroshio.entrypoint`).
 
 Hard constraint (same as the rest of this suite): no real `llama-server` binary, no
 network, no live process spawn. `create_asgi_app` builds a real `SubprocessProcessRunner`
@@ -18,71 +18,71 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from yashigani_infer.config import EngineConfig
-from yashigani_infer.entrypoint import (
+from kuroshio.config import EngineConfig
+from kuroshio.entrypoint import (
     VALID_ROLES,
     EntrypointConfigError,
     RoleConfig,
     create_asgi_app,
     load_role_config,
 )
-from yashigani_infer.supervisor.supervisor import LoadConfig, ResourceLimits
+from kuroshio.supervisor.supervisor import LoadConfig, ResourceLimits
 
 
 def _classifier_env(blob_root: Path) -> dict[str, str]:
-    """Mirrors the actual `infer-classifier` service block in
-    `infer/deploy/docker/docker-compose.infer.yml`, plus an explicit blob-store root
+    """Mirrors the actual `kuroshio-classifier` service block in
+    `infer/deploy/docker/docker-compose.kuroshio.yml`, plus an explicit blob-store root
     (the compose file itself does not set one today — see final report)."""
     return {
-        "YSG_INFER_ROLE": "classifier",
-        "YSG_INFER_BLOB_STORE_ROOT": str(blob_root),
-        "YSG_INFER_KEEP_ALIVE_PIN": "true",
-        "YSG_INFER_MAX_CTX": "2048",
-        "YSG_INFER_MAX_CONCURRENCY": "8",
-        "YSG_INFER_MAX_TOKENS_PER_REQUEST": "512",
-        "YSG_INFER_IDLE_UNLOAD_SECONDS": "0",
-        "YSG_INFER_MAX_RESIDENT_MODELS": "1",
-        "YSG_INFER_EXPECT_GPU": "true",
+        "YSG_KUROSHIO_ROLE": "classifier",
+        "YSG_KUROSHIO_BLOB_STORE_ROOT": str(blob_root),
+        "YSG_KUROSHIO_KEEP_ALIVE_PIN": "true",
+        "YSG_KUROSHIO_MAX_CTX": "2048",
+        "YSG_KUROSHIO_MAX_CONCURRENCY": "8",
+        "YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST": "512",
+        "YSG_KUROSHIO_IDLE_UNLOAD_SECONDS": "0",
+        "YSG_KUROSHIO_MAX_RESIDENT_MODELS": "1",
+        "YSG_KUROSHIO_EXPECT_GPU": "true",
     }
 
 
 def _chat_env(blob_root: Path) -> dict[str, str]:
-    """Mirrors the actual `infer-chat` service block."""
+    """Mirrors the actual `kuroshio-chat` service block."""
     return {
-        "YSG_INFER_ROLE": "chat",
-        "YSG_INFER_BLOB_STORE_ROOT": str(blob_root),
-        "YSG_INFER_KEEP_ALIVE_PIN": "false",
-        "YSG_INFER_MAX_CTX": "8192",
-        "YSG_INFER_MAX_CONCURRENCY": "4",
-        "YSG_INFER_MAX_TOKENS_PER_REQUEST": "4096",
-        "YSG_INFER_IDLE_UNLOAD_SECONDS": "600",
-        "YSG_INFER_MAX_RESIDENT_MODELS": "3",
-        "YSG_INFER_EXPECT_GPU": "true",
+        "YSG_KUROSHIO_ROLE": "chat",
+        "YSG_KUROSHIO_BLOB_STORE_ROOT": str(blob_root),
+        "YSG_KUROSHIO_KEEP_ALIVE_PIN": "false",
+        "YSG_KUROSHIO_MAX_CTX": "8192",
+        "YSG_KUROSHIO_MAX_CONCURRENCY": "4",
+        "YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST": "4096",
+        "YSG_KUROSHIO_IDLE_UNLOAD_SECONDS": "600",
+        "YSG_KUROSHIO_MAX_RESIDENT_MODELS": "3",
+        "YSG_KUROSHIO_EXPECT_GPU": "true",
     }
 
 
 def _puller_env(blob_root: Path) -> dict[str, str]:
-    """Mirrors the actual `infer-puller` service block: YSG_INFER_ROLE is the ONLY
+    """Mirrors the actual `kuroshio-puller` service block: YSG_KUROSHIO_ROLE is the ONLY
     contract var it sets — no llama_server_binary, no ceilings, no keep-alive/GPU flags."""
-    return {"YSG_INFER_ROLE": "puller", "YSG_INFER_BLOB_STORE_ROOT": str(blob_root)}
+    return {"YSG_KUROSHIO_ROLE": "puller", "YSG_KUROSHIO_BLOB_STORE_ROOT": str(blob_root)}
 
 
-# ── YSG_INFER_ROLE — required, fail-closed ──────────────────────────────────────────
+# ── YSG_KUROSHIO_ROLE — required, fail-closed ──────────────────────────────────────────
 
 
 def test_missing_role_fails_closed() -> None:
-    with pytest.raises(EntrypointConfigError, match="YSG_INFER_ROLE"):
+    with pytest.raises(EntrypointConfigError, match="YSG_KUROSHIO_ROLE"):
         load_role_config({})
 
 
 def test_blank_role_fails_closed() -> None:
-    with pytest.raises(EntrypointConfigError, match="YSG_INFER_ROLE"):
-        load_role_config({"YSG_INFER_ROLE": "   "})
+    with pytest.raises(EntrypointConfigError, match="YSG_KUROSHIO_ROLE"):
+        load_role_config({"YSG_KUROSHIO_ROLE": "   "})
 
 
 def test_unrecognised_role_fails_closed() -> None:
     with pytest.raises(EntrypointConfigError, match="not a recognised role"):
-        load_role_config({"YSG_INFER_ROLE": "admin"})
+        load_role_config({"YSG_KUROSHIO_ROLE": "admin"})
 
 
 def test_valid_roles_constant_matches_documented_contract() -> None:
@@ -91,7 +91,7 @@ def test_valid_roles_constant_matches_documented_contract() -> None:
 
 @pytest.mark.parametrize("role", ["classifier", "chat", "puller"])
 def test_each_documented_role_parses_successfully(role: str, tmp_path: Path) -> None:
-    config = load_role_config({"YSG_INFER_ROLE": role, "YSG_INFER_BLOB_STORE_ROOT": str(tmp_path)})
+    config = load_role_config({"YSG_KUROSHIO_ROLE": role, "YSG_KUROSHIO_BLOB_STORE_ROOT": str(tmp_path)})
     assert isinstance(config, RoleConfig)
     assert config.role == role
 
@@ -129,7 +129,7 @@ def test_chat_env_maps_to_expected_engine_and_load_config(tmp_path: Path) -> Non
 
 
 def test_puller_env_uses_documented_defaults_for_everything_else(tmp_path: Path) -> None:
-    """The puller compose service sets ONLY YSG_INFER_ROLE — every other contract var
+    """The puller compose service sets ONLY YSG_KUROSHIO_ROLE — every other contract var
     must fall back to the dataclass defaults, never crash on absence."""
     default_engine = EngineConfig()
     default_limits = ResourceLimits()
@@ -148,10 +148,10 @@ def test_puller_env_uses_documented_defaults_for_everything_else(tmp_path: Path)
 
 
 def test_llama_server_binary_absent_defaults_rather_than_crashes(tmp_path: Path) -> None:
-    """Contract explicitly documents YSG_INFER_LLAMA_SERVER_BINARY as ABSENT in the
+    """Contract explicitly documents YSG_KUROSHIO_LLAMA_SERVER_BINARY as ABSENT in the
     puller image — absence must never be a fail-closed condition for this var."""
-    env = {"YSG_INFER_ROLE": "puller", "YSG_INFER_BLOB_STORE_ROOT": str(tmp_path)}
-    assert "YSG_INFER_LLAMA_SERVER_BINARY" not in env
+    env = {"YSG_KUROSHIO_ROLE": "puller", "YSG_KUROSHIO_BLOB_STORE_ROOT": str(tmp_path)}
+    assert "YSG_KUROSHIO_LLAMA_SERVER_BINARY" not in env
     config = load_role_config(env)
     assert config.engine_config.llama_server_binary == "llama-server"
 
@@ -161,20 +161,20 @@ def test_llama_server_binary_absent_defaults_rather_than_crashes(tmp_path: Path)
 
 def test_blob_store_root_override_is_honoured(tmp_path: Path) -> None:
     custom_root = tmp_path / "custom-blobs"
-    config = load_role_config({"YSG_INFER_ROLE": "chat", "YSG_INFER_BLOB_STORE_ROOT": str(custom_root)})
+    config = load_role_config({"YSG_KUROSHIO_ROLE": "chat", "YSG_KUROSHIO_BLOB_STORE_ROOT": str(custom_root)})
     assert config.engine_config.blob_store_root == custom_root
 
 
 def test_blob_store_root_defaults_under_home_when_unset() -> None:
-    config = load_role_config({"YSG_INFER_ROLE": "chat"})
-    assert config.engine_config.blob_store_root == Path.home() / ".yashigani" / "infer" / "blobs"
+    config = load_role_config({"YSG_KUROSHIO_ROLE": "chat"})
+    assert config.engine_config.blob_store_root == Path.home() / ".yashigani" / "kuroshio" / "blobs"
 
 
 # ── Numeric / boolean / list parsing — invalid explicit values fail closed ─────────
 
 
 @pytest.mark.parametrize(
-    "env_var", ["YSG_INFER_MAX_CTX", "YSG_INFER_MAX_CONCURRENCY", "YSG_INFER_MAX_TOKENS_PER_REQUEST"]
+    "env_var", ["YSG_KUROSHIO_MAX_CTX", "YSG_KUROSHIO_MAX_CONCURRENCY", "YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST"]
 )
 def test_invalid_integer_env_fails_closed(env_var: str, tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
@@ -183,7 +183,7 @@ def test_invalid_integer_env_fails_closed(env_var: str, tmp_path: Path) -> None:
         load_role_config(env)
 
 
-@pytest.mark.parametrize("env_var", ["YSG_INFER_KEEP_ALIVE_PIN", "YSG_INFER_EXPECT_GPU"])
+@pytest.mark.parametrize("env_var", ["YSG_KUROSHIO_KEEP_ALIVE_PIN", "YSG_KUROSHIO_EXPECT_GPU"])
 def test_invalid_boolean_env_fails_closed(env_var: str, tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
     env[env_var] = "maybe"
@@ -194,7 +194,7 @@ def test_invalid_boolean_env_fails_closed(env_var: str, tmp_path: Path) -> None:
 @pytest.mark.parametrize("truthy", ["true", "1", "yes", "TRUE", "Yes"])
 def test_boolean_env_accepts_documented_truthy_values(truthy: str, tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_EXPECT_GPU"] = truthy
+    env["YSG_KUROSHIO_EXPECT_GPU"] = truthy
     config = load_role_config(env)
     assert config.default_load_config.expect_gpu is True
 
@@ -202,28 +202,28 @@ def test_boolean_env_accepts_documented_truthy_values(truthy: str, tmp_path: Pat
 @pytest.mark.parametrize("falsy", ["false", "0", "no", "FALSE"])
 def test_boolean_env_accepts_documented_falsy_values(falsy: str, tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_EXPECT_GPU"] = falsy
+    env["YSG_KUROSHIO_EXPECT_GPU"] = falsy
     config = load_role_config(env)
     assert config.default_load_config.expect_gpu is False
 
 
 def test_n_gpu_layers_parses_when_set(tmp_path: Path) -> None:
     env = _classifier_env(tmp_path)
-    env["YSG_INFER_N_GPU_LAYERS"] = "999"
+    env["YSG_KUROSHIO_N_GPU_LAYERS"] = "999"
     config = load_role_config(env)
     assert config.default_load_config.n_gpu_layers == 999
 
 
 def test_n_gpu_layers_invalid_fails_closed(tmp_path: Path) -> None:
     env = _classifier_env(tmp_path)
-    env["YSG_INFER_N_GPU_LAYERS"] = "all-of-them"
-    with pytest.raises(EntrypointConfigError, match="YSG_INFER_N_GPU_LAYERS"):
+    env["YSG_KUROSHIO_N_GPU_LAYERS"] = "all-of-them"
+    with pytest.raises(EntrypointConfigError, match="YSG_KUROSHIO_N_GPU_LAYERS"):
         load_role_config(env)
 
 
 def test_override_tensor_splits_and_trims_comma_separated_rules(tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_OVERRIDE_TENSOR"] = r"\.ffn_.*_exps\.weight=CPU ,  \.attn_.*=GPU ,,"
+    env["YSG_KUROSHIO_OVERRIDE_TENSOR"] = r"\.ffn_.*_exps\.weight=CPU ,  \.attn_.*=GPU ,,"
     config = load_role_config(env)
     assert config.default_load_config.override_tensor == (r"\.ffn_.*_exps\.weight=CPU", r"\.attn_.*=GPU")
 
@@ -243,15 +243,15 @@ def test_cache_prompt_absent_defaults_to_false(tmp_path: Path) -> None:
 
 def test_cache_prompt_true_parses(tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_CACHE_PROMPT"] = "true"
+    env["YSG_KUROSHIO_CACHE_PROMPT"] = "true"
     config = load_role_config(env)
     assert config.default_load_config.cache_prompt is True
 
 
 def test_cache_prompt_invalid_fails_closed(tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_CACHE_PROMPT"] = "maybe"
-    with pytest.raises(EntrypointConfigError, match="YSG_INFER_CACHE_PROMPT"):
+    env["YSG_KUROSHIO_CACHE_PROMPT"] = "maybe"
+    with pytest.raises(EntrypointConfigError, match="YSG_KUROSHIO_CACHE_PROMPT"):
         load_role_config(env)
 
 
@@ -262,15 +262,15 @@ def test_parallel_slots_absent_defaults_to_none(tmp_path: Path) -> None:
 
 def test_parallel_slots_parses_when_set(tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_PARALLEL_SLOTS"] = "4"
+    env["YSG_KUROSHIO_PARALLEL_SLOTS"] = "4"
     config = load_role_config(env)
     assert config.default_load_config.parallel_slots == 4
 
 
 def test_parallel_slots_invalid_fails_closed(tmp_path: Path) -> None:
     env = _chat_env(tmp_path)
-    env["YSG_INFER_PARALLEL_SLOTS"] = "not-an-int"
-    with pytest.raises(EntrypointConfigError, match="YSG_INFER_PARALLEL_SLOTS"):
+    env["YSG_KUROSHIO_PARALLEL_SLOTS"] = "not-an-int"
+    with pytest.raises(EntrypointConfigError, match="YSG_KUROSHIO_PARALLEL_SLOTS"):
         load_role_config(env)
 
 
@@ -303,7 +303,7 @@ def test_create_asgi_app_wires_pull_resolver_none_for_every_role(tmp_path: Path)
 
 def test_create_asgi_app_fails_closed_on_missing_role(tmp_path: Path) -> None:
     with pytest.raises(EntrypointConfigError):
-        create_asgi_app({"YSG_INFER_BLOB_STORE_ROOT": str(tmp_path)})
+        create_asgi_app({"YSG_KUROSHIO_BLOB_STORE_ROOT": str(tmp_path)})
 
 
 def test_create_asgi_app_fails_closed_before_touching_the_filesystem(tmp_path: Path) -> None:
@@ -312,13 +312,13 @@ def test_create_asgi_app_fails_closed_before_touching_the_filesystem(tmp_path: P
     refusing to start."""
     unused_root = tmp_path / "should-never-be-created"
     with pytest.raises(EntrypointConfigError):
-        create_asgi_app({"YSG_INFER_BLOB_STORE_ROOT": str(unused_root)})
+        create_asgi_app({"YSG_KUROSHIO_BLOB_STORE_ROOT": str(unused_root)})
     assert not unused_root.exists()
 
 
 def test_create_asgi_app_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("YSG_INFER_ROLE", "chat")
-    monkeypatch.setenv("YSG_INFER_BLOB_STORE_ROOT", str(tmp_path))
+    monkeypatch.setenv("YSG_KUROSHIO_ROLE", "chat")
+    monkeypatch.setenv("YSG_KUROSHIO_BLOB_STORE_ROOT", str(tmp_path))
     app = create_asgi_app()  # no explicit env -> os.environ
     client = TestClient(app)
     assert client.get("/healthz").status_code == 200

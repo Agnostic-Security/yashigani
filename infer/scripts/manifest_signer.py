@@ -7,10 +7,10 @@ Yashigani Model-Manifest Signing Tool — MINT SIDE
 YASHIGANI SIGNING INFRA ONLY. This module holds the private-key half of the
 model-manifest signature scheme (`catalog.SignedCatalogEntry`,
 `convert_provenance.ConvertedManifestEntry`). It must never be imported by
-`src/yashigani_infer/` runtime/serving code (`app.py`, `supervisor/`,
+`src/kuroshio/` runtime/serving code (`app.py`, `supervisor/`,
 `shim/`) — the engine ships only the PUBLIC key (see
 `keygen_manifest.py`'s "Real-key provisioning note" and Nico's provenance
-red-team finding #9). Living in `scripts/`, not `src/yashigani_infer/`,
+red-team finding #9). Living in `scripts/`, not `src/kuroshio/`,
 mirrors the licence-hardening precedent's own separation
 (`scripts/sign_bundle.py` mint-side vs `src/yashigani/licensing/verifier.py`
 verify-side) — physically keeping signing capability out of every
@@ -34,8 +34,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-from yashigani_infer.catalog import CatalogVerifier, SignedCatalogEntry
-from yashigani_infer.convert_provenance import (
+from kuroshio.catalog import CatalogVerifier, SignedCatalogEntry
+from kuroshio.convert_provenance import (
     ConversionMeasurement,
     ConvertedManifestEntry,
     ConvertedManifestVerifier,

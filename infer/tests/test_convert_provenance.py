@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from yashigani_infer.catalog import ECDSA_P256_SHA256
-from yashigani_infer.convert_provenance import (
+from kuroshio.catalog import ECDSA_P256_SHA256
+from kuroshio.convert_provenance import (
     ConvertedManifestEntry,
     measure_conversion_tuple,
     measure_source_digest,

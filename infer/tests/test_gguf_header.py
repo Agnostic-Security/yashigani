@@ -9,7 +9,7 @@ import struct
 import pytest
 
 from tests.fixtures.gguf_builder import build_minimal_gguf
-from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+from kuroshio.gguf.header import GGUFParseError, parse_gguf_header
 
 
 def test_parses_magic_version_and_architecture(minimal_gguf_bytes: bytes) -> None:

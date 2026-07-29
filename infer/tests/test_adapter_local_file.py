@@ -9,9 +9,9 @@ from pathlib import Path
 import pytest
 
 from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE, build_minimal_gguf
-from yashigani_infer.adapters.local_file import LocalFileAdapter, LocalFileAdapterError
-from yashigani_infer.blobstore.store import BlobStore, sha256_bytes
-from yashigani_infer.models import ProvenanceKind
+from kuroshio.adapters.local_file import LocalFileAdapter, LocalFileAdapterError
+from kuroshio.blobstore.store import BlobStore, sha256_bytes
+from kuroshio.models import ProvenanceKind
 
 
 def test_resolve_imports_a_local_gguf(

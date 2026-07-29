@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from yashigani_infer.adapters.ollama_store import (
+from kuroshio.adapters.ollama_store import (
     OllamaStoreAdapter,
     OllamaStoreAdapterError,
     parse_model_ref,
 )
-from yashigani_infer.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
-from yashigani_infer.containment.hooks import default_first_parse_jail_hook
-from yashigani_infer.models import ProvenanceKind
+from kuroshio.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
+from kuroshio.containment.hooks import default_first_parse_jail_hook
+from kuroshio.models import ProvenanceKind
 
 
 def _write_ollama_store(

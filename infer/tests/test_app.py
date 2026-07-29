@@ -13,11 +13,11 @@ from fastapi.testclient import TestClient
 
 from tests.conftest import FakeProcessRunner, FakeUpstreamClient
 from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE
-from yashigani_infer.app import create_app
-from yashigani_infer.blobstore.store import BlobStore
-from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
-from yashigani_infer.shim.framing import format_sse_event
-from yashigani_infer.supervisor.supervisor import LoadConfig, ResourceLimits, Supervisor
+from kuroshio.app import create_app
+from kuroshio.blobstore.store import BlobStore
+from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
+from kuroshio.shim.framing import format_sse_event
+from kuroshio.supervisor.supervisor import LoadConfig, ResourceLimits, Supervisor
 
 
 @pytest.fixture()

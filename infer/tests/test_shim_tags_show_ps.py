@@ -7,11 +7,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from yashigani_infer.blobstore.store import BlobStore
-from yashigani_infer.models import Provenance, ProvenanceKind
-from yashigani_infer.shim.ps import PsRow, synthesize_ps
-from yashigani_infer.shim.show import synthesize_show
-from yashigani_infer.shim.tags import synthesize_tag_entry, synthesize_tags
+from kuroshio.blobstore.store import BlobStore
+from kuroshio.models import Provenance, ProvenanceKind
+from kuroshio.shim.ps import PsRow, synthesize_ps
+from kuroshio.shim.show import synthesize_show
+from kuroshio.shim.tags import synthesize_tag_entry, synthesize_tags
 
 
 def _ingest(tmp_blob_store: BlobStore, tmp_path: Path, minimal_gguf_bytes: bytes, name: str):

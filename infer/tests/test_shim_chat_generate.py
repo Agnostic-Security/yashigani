@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import json
 
-from yashigani_infer.shim.chat import chat_event_to_ndjson, translate_chat_request, translate_sse_lines_to_ndjson
-from yashigani_infer.shim.framing import format_sse_event
-from yashigani_infer.shim.generate import (
+from kuroshio.shim.chat import chat_event_to_ndjson, translate_chat_request, translate_sse_lines_to_ndjson
+from kuroshio.shim.framing import format_sse_event
+from kuroshio.shim.generate import (
     generate_event_to_ndjson,
     translate_generate_request,
 )
-from yashigani_infer.shim.generate import translate_sse_lines_to_ndjson as translate_generate_sse_lines_to_ndjson
+from kuroshio.shim.generate import translate_sse_lines_to_ndjson as translate_generate_sse_lines_to_ndjson
 
 
 def test_translate_chat_request_maps_messages_and_options() -> None:

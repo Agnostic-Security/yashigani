@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from yashigani_infer import config, entrypoint
-from yashigani_infer.config import BLOB_STORE_ROOT_ENV, EngineConfig, _default_blob_store_root
+from kuroshio import config, entrypoint
+from kuroshio.config import BLOB_STORE_ROOT_ENV, EngineConfig, _default_blob_store_root
 
 
 def test_default_blob_store_root_honours_override_from_injected_env(tmp_path: Path) -> None:
@@ -19,7 +19,7 @@ def test_default_blob_store_root_honours_override_from_injected_env(tmp_path: Pa
 
 
 def test_default_blob_store_root_defaults_under_home_when_env_lacks_override() -> None:
-    assert _default_blob_store_root({}) == Path.home() / ".yashigani" / "infer" / "blobs"
+    assert _default_blob_store_root({}) == Path.home() / ".yashigani" / "kuroshio" / "blobs"
 
 
 def test_default_blob_store_root_reads_real_os_environ_when_no_env_passed(monkeypatch, tmp_path: Path) -> None:
@@ -48,10 +48,10 @@ def test_entrypoint_resolve_blob_store_root_delegates_to_config(monkeypatch, tmp
     monkeypatch.setattr(config, "_default_blob_store_root", _fake_default)
     monkeypatch.setattr(entrypoint, "_default_blob_store_root", _fake_default)
 
-    result = entrypoint._resolve_blob_store_root({"YSG_INFER_BLOB_STORE_ROOT": "/whatever"})
+    result = entrypoint._resolve_blob_store_root({"YSG_KUROSHIO_BLOB_STORE_ROOT": "/whatever"})
 
     assert result == sentinel
-    assert calls == [{"YSG_INFER_BLOB_STORE_ROOT": "/whatever"}]
+    assert calls == [{"YSG_KUROSHIO_BLOB_STORE_ROOT": "/whatever"}]
 
 
 def test_entrypoint_and_config_agree_on_the_default_root_when_unset() -> None:

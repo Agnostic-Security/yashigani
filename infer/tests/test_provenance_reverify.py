@@ -16,13 +16,13 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from yashigani_infer.catalog import CatalogVerifier, SignedCatalogEntry, StaticRevocationSource
-from yashigani_infer.convert_provenance import (
+from kuroshio.catalog import CatalogVerifier, SignedCatalogEntry, StaticRevocationSource
+from kuroshio.convert_provenance import (
     ConvertedManifestVerifier,
     measure_conversion_tuple,
 )
-from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
-from yashigani_infer.provenance_reverify import ServeTimeProvenanceVerifier, ServeTimeVerificationError
+from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
+from kuroshio.provenance_reverify import ServeTimeProvenanceVerifier, ServeTimeVerificationError
 
 REVISION = "b" * 40
 GOOD_SHA256 = "c" * 64
@@ -223,7 +223,7 @@ def test_verify_fails_closed_on_malformed_stored_manifest(keypair) -> None:
 
 
 def test_verify_accepts_a_valid_converted_manifest(keypair, tmp_path: Path) -> None:
-    from yashigani_infer.convert_provenance import ConvertedManifestVerifier as _CMV  # noqa: F401
+    from kuroshio.convert_provenance import ConvertedManifestVerifier as _CMV  # noqa: F401
 
     private_key, public_key = keypair
     output_path = tmp_path / "output.gguf"
@@ -244,7 +244,7 @@ def test_verify_accepts_a_valid_converted_manifest(keypair, tmp_path: Path) -> N
         "max_trust_age_seconds": 90 * 24 * 3600,
         "signer_key_id": "k1",
     }
-    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+    from kuroshio.convert_provenance import ConvertedManifestEntry
 
     unsigned = ConvertedManifestEntry(**unsigned_payload_fields, signature=b"")
     signature = private_key.sign(unsigned.signed_payload(), ec.ECDSA(hashes.SHA256()))
@@ -274,7 +274,7 @@ def test_verify_rejects_converted_manifest_when_output_bytes_were_substituted(ke
     source_path.write_bytes(b"source bytes")
 
     measurement = measure_conversion_tuple(source_path, output_path, convert_tool_commit="a" * 40, quant="Q4_K_M")
-    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+    from kuroshio.convert_provenance import ConvertedManifestEntry
 
     fields = {
         "source_sha256": measurement.source_sha256,
@@ -313,7 +313,7 @@ def test_verify_fails_closed_when_no_converted_verifier_configured(keypair, tmp_
     source_path = tmp_path / "source.safetensors"
     source_path.write_bytes(b"src")
     measurement = measure_conversion_tuple(source_path, output_path, convert_tool_commit="a" * 40, quant="Q4_K_M")
-    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+    from kuroshio.convert_provenance import ConvertedManifestEntry
 
     fields = {
         "source_sha256": measurement.source_sha256,

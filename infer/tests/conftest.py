@@ -16,10 +16,10 @@ from typing import Any, AsyncIterator
 import pytest
 
 from tests.fixtures.gguf_builder import build_minimal_gguf
-from yashigani_infer.adapters.downloader import Downloader
-from yashigani_infer.blobstore.store import BlobStore
-from yashigani_infer.supervisor.process import ProcessHandle, ProcessRunner
-from yashigani_infer.upstream import UpstreamClient
+from kuroshio.adapters.downloader import Downloader
+from kuroshio.blobstore.store import BlobStore
+from kuroshio.supervisor.process import ProcessHandle, ProcessRunner
+from kuroshio.upstream import UpstreamClient
 
 
 @pytest.fixture()

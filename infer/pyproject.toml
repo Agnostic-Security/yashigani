@@ -1,12 +1,12 @@
-# Last updated: 2026-07-22T23:00:00+00:00 (feat: model-manifest signing/mint side + counter-signed format hardening — Nico provenance red-team)
+# Last updated: 2026-07-29T00:00:00+00:00 (chore: rename yashigani-infer -> kuroshio — Tiago 2026-07-29 official engine naming)
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yashigani-infer"
+name = "kuroshio"
 version = "0.1.0"
-description = "Yashigani first-party inference-engine control plane (commodity layer) — thin supervisor + ollama-API shim over llama.cpp/llama-server (GGUF)."
+description = "Kuroshio — Yashigani first-party inference-engine control plane (commodity layer) — thin supervisor + ollama-API shim over llama.cpp/llama-server (GGUF)."
 readme = { file = "NOTICE", content-type = "text/plain" }
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -15,7 +15,7 @@ authors = [{ name = "Agnostic Security Ltd" }]
 # Deliberately minimal runtime surface:
 #  - No torch. Conversion (safetensors->GGUF) is an isolated ephemeral v2 job; torch
 #    must never be a runtime dependency of this control plane (design doc §3b).
-#  - No heavy ML deps. GGUF header parsing is pure-Python (src/yashigani_infer/gguf/).
+#  - No heavy ML deps. GGUF header parsing is pure-Python (src/kuroshio/gguf/).
 #  - httpx is used only behind the injectable Downloader interface (adapters/downloader.py);
 #    unit tests never hit the network — every test mocks Downloader/ProcessRunner.
 dependencies = [
@@ -44,21 +44,21 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"yashigani_infer" = ["py.typed"]
+"kuroshio" = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 # `scripts/` holds the mint-side (private-key) signing tooling
 # (`keygen_manifest.py`, `manifest_signer.py`) — deliberately kept OUT of
-# `src/yashigani_infer/` so it never ships in the runtime wheel (see
+# `src/kuroshio/` so it never ships in the runtime wheel (see
 # `scripts/manifest_signer.py`'s module docstring). This path is added only
 # so pytest can import it directly for round-trip tests; it does not change
 # what gets built/installed.
 pythonpath = ["scripts"]
 
 [tool.coverage.run]
-source = ["yashigani_infer"]
+source = ["kuroshio"]
 branch = true
 
 [tool.mypy]

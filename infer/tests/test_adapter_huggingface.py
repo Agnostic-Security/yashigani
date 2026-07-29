@@ -11,15 +11,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from tests.conftest import FailingDownloader, FakeDownloader
-from yashigani_infer.adapters.huggingface import (
+from kuroshio.adapters.huggingface import (
     HuggingFaceAdapter,
     InvalidRepoReferenceError,
     InvalidRevisionError,
 )
-from yashigani_infer.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
-from yashigani_infer.catalog import CatalogVerificationError, CatalogVerifier, SignedCatalog, SignedCatalogEntry
-from yashigani_infer.containment.hooks import default_first_parse_jail_hook
-from yashigani_infer.models import ProvenanceKind
+from kuroshio.blobstore.store import BlobStore, DigestMismatchError, sha256_bytes
+from kuroshio.catalog import CatalogVerificationError, CatalogVerifier, SignedCatalog, SignedCatalogEntry
+from kuroshio.containment.hooks import default_first_parse_jail_hook
+from kuroshio.models import ProvenanceKind
 
 PINNED_REVISION = "a" * 40
 

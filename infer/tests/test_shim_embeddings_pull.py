@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
-from yashigani_infer.shim.embeddings import translate_embeddings_request, translate_embeddings_response
-from yashigani_infer.shim.pull import iter_pull_progress
+from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
+from kuroshio.shim.embeddings import translate_embeddings_request, translate_embeddings_response
+from kuroshio.shim.pull import iter_pull_progress
 
 
 def test_translate_embeddings_request_prefers_input_over_prompt() -> None:

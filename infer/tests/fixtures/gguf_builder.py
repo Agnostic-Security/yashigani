@@ -6,7 +6,7 @@ NOT part of the shipped package (lives under tests/) — no real multi-GB
 model is ever required to test the parser; this constructs the smallest
 possible valid header + a couple of tiny tensor-info entries by hand,
 matching the binary layout documented in
-`yashigani_infer.gguf.header`.
+`kuroshio.gguf.header`.
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from yashigani_infer.blobstore.store import (
+from kuroshio.blobstore.store import (
     BlobStore,
     BlobTamperError,
     DigestMismatchError,
@@ -17,7 +17,7 @@ from yashigani_infer.blobstore.store import (
     sha256_bytes,
     sha256_file,
 )
-from yashigani_infer.models import Provenance, ProvenanceKind
+from kuroshio.models import Provenance, ProvenanceKind
 
 
 def _prov(digest: str) -> Provenance:

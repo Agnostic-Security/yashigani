@@ -23,7 +23,7 @@ from keygen_manifest import (
 )
 from manifest_signer import ConvertedManifestSigner, ManifestSigner, load_signing_key
 
-from yashigani_infer.catalog import (
+from kuroshio.catalog import (
     ECDSA_P256_SHA256,
     CatalogVerificationError,
     CatalogVerifier,
@@ -31,7 +31,7 @@ from yashigani_infer.catalog import (
     SignedCatalogEntry,
     StaticRevocationSource,
 )
-from yashigani_infer.convert_provenance import (
+from kuroshio.convert_provenance import (
     ConvertedManifestVerificationError,
     ConvertedManifestVerifier,
     measure_conversion_tuple,
@@ -333,7 +333,7 @@ def test_convert_manifest_rejects_tampered_source_digest(signing_keypair, tmp_pa
         measurement, provenance_tier="converted-derived", signer_key_id="k1", max_trust_age_seconds=3600
     )
 
-    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+    from kuroshio.convert_provenance import ConvertedManifestEntry
 
     tampered = ConvertedManifestEntry(
         source_sha256="0" * 64,  # laundered source digest, unsigned edit
@@ -431,7 +431,7 @@ def test_verifier_rejects_a_converted_manifest_relabelled_to_an_unrecognised_sig
         measurement, provenance_tier="converted-derived", signer_key_id="k1", max_trust_age_seconds=3600
     )
 
-    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+    from kuroshio.convert_provenance import ConvertedManifestEntry
 
     relabelled = ConvertedManifestEntry(
         source_sha256=entry.source_sha256,

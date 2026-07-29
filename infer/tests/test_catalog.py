@@ -14,7 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from yashigani_infer.catalog import (
+from kuroshio.catalog import (
     ECDSA_P256_SHA256,
     CatalogVerificationError,
     CatalogVerifier,
