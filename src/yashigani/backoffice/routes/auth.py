@@ -1797,7 +1797,21 @@ _WEBHOOK_RATE_IP_LIMIT = 60        # per-IP per 60s
 _WEBHOOK_RATE_GLOBAL_LIMIT = 300   # global per 60s
 _WEBHOOK_RATE_WINDOW = 60          # seconds
 _WEBHOOK_REPLAY_TTL = 600          # Slack sig replay-dedup window (seconds)
-_TELEGRAM_SECRET_PATH = "/run/secrets/openclaw_telegram_webhook_secret"
+
+
+def _telegram_secret_path() -> str:
+    """Path to the Telegram webhook shared-secret mount.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare "/run/secrets/openclaw_telegram_webhook_secret" literal with no
+    override, the same convention-bypass class as YSG-RISK-150 (same file).
+    Resolved at call time (not import time) so tests can monkeypatch
+    YASHIGANI_SECRETS_DIR without a module reload.
+    """
+    return os.path.join(
+        os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+        "openclaw_telegram_webhook_secret",
+    )
 
 
 def _webhook_audit_deny(provider: str, reason: str, client_ip: str) -> None:
@@ -1959,13 +1973,14 @@ async def verify_webhook_ingress(request: Request, provider: str = ""):
         presented = request.headers.get("x-telegram-bot-api-secret-token", "")
         if not presented:
             _webhook_deny(401, "telegram_token_missing", provider, client_ip)
+        _telegram_secret_file = _telegram_secret_path()
         try:
-            expected = open(_TELEGRAM_SECRET_PATH).read().strip()  # noqa: WPS515
+            expected = open(_telegram_secret_file).read().strip()  # noqa: WPS515
         except OSError as exc:
             _log.error(
                 "verify-webhook: cannot read Telegram webhook secret at %r: %s — "
                 "denying (fail-closed; mount the secret in install.sh)",
-                _TELEGRAM_SECRET_PATH, exc,
+                _telegram_secret_file, exc,
             )
             from fastapi import HTTPException as _HTTPException
             raise _HTTPException(
