@@ -242,6 +242,27 @@ services:
       # admitted IDs from the per-instance trust domain.
       YASHIGANI_LANGFLOW_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/langflow
       YASHIGANI_LETTA_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/letta
+      # YSG-RISK-142 (2026-07-29, chat-egress last-hop fix): the gateway-only
+      # caller-gate on /deliver/* (Caddyfile.openclaw-egress
+      # gateway-egress-deliver-gate) was MISSING from this env block entirely.
+      # Its Caddyfile default (`{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}`)
+      # is a BARE literal with no trust-domain qualifier — every OTHER
+      # caller-gate id above is composed from the per-instance
+      # YASHIGANI_SPIFFE_TRUST_DOMAIN, but gateway's was silently falling back
+      # to the un-qualified default. gateway_client.crt's real URI SAN is
+      # spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN}/gateway (service_identities.yaml
+      # `gateway` entry, same per-instance domain as every other leaf) — the
+      # mismatch 403'd EVERY /deliver/{llm,slack,slack-hooks,telegram}/* call,
+      # which is the ONLY path from egress/eval back out to the real
+      # destination (Slack/Telegram/the inference surface). Confirmed live:
+      # caddy access log showed gateway's mTLS handshake succeed
+      # (client_common_name=gateway) while the stamped
+      # X-Yashigani-Verified-Spiffe compared unequal to the un-qualified
+      # default — 403 on every chat completion. K8s is unaffected: the Helm
+      # render (configmaps.yaml Delta 3) string-replaces the bare
+      # "spiffe://yashigani.internal/" prefix for the WHOLE egress Caddyfile
+      # at template time, before Caddy ever parses the default literal.
+      YASHIGANI_GATEWAY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/gateway
       # v4.1 Phase 1c (LAURA-I1-03): when "1" (install.sh sets it iff the
       # openclaw profile is enabled), caddy-entrypoint.sh appends
       # slack.com:443 hooks.slack.com:443 api.telegram.org:443 to the iptables

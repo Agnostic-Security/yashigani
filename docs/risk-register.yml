@@ -4518,3 +4518,118 @@ risks:
       `backoffice/redis_selfheal.py`, `agents/reconciler.py`,
       `agents/durable_store.py` (0 new errors).
   fix_in_version: v4.1.2
+- id: YSG-RISK-142
+  description: >-
+    Chat-egress final hop 403 (v4.1.2 x8x Docker e2e, 2026-07-29): the
+    gateway → caddy `/deliver/{llm,slack,slack-hooks,telegram}/*` egress
+    delivery hop (Caddyfile.openclaw-egress `gateway-egress-deliver-gate`,
+    `:18790` listener) returned 403 Forbidden for every call, on a fully
+    valid mTLS handshake (`client_common_name=gateway`).  `/deliver/llm/*`
+    is the ONLY path from `/egress/eval` back out to the real inference
+    surface — this broke chat end-to-end for every wrapped system
+    (openclaw, langflow, letta), confirmed live: `docker compose exec
+    egress-langflow curl ... https://caddy:18790/llm/v1/models` passed the
+    `llm-egress-caller-gate`, reached `gateway:8080/egress/eval/llm/v1/models`
+    (gateway log: `egress-eval: ALLOW caller=spiffe://localhost.yashigani.internal/langflow
+    ... upstream_status=403`), and gateway's own onward call
+    (`POST https://caddy:18790/deliver/llm/v1/models`) got the 403 from
+    Caddy's static `respond ... 403` in `gateway-egress-deliver-gate` —
+    relayed verbatim back through `/egress/eval` to the original caller.
+
+    Root cause: `docker/docker-compose.yml`'s `caddy` service `environment:`
+    block composed `YASHIGANI_CADDY_SPIFFE_ID`, `YASHIGANI_OPENCLAW_SPIFFE_ID`,
+    `YASHIGANI_LANGFLOW_SPIFFE_ID` and `YASHIGANI_LETTA_SPIFFE_ID` from the
+    per-instance `YASHIGANI_SPIFFE_TRUST_DOMAIN`
+    (`spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/<name>`)
+    but never set the fifth, `YASHIGANI_GATEWAY_SPIFFE_ID` — the identity
+    `gateway-egress-deliver-gate` checks. Caddy's parse-time
+    `{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}`
+    substitution therefore always fell back to the BARE, un-qualified
+    literal default. `gateway_client.crt`'s real URI SAN
+    (`service_identities.yaml` `gateway` entry, minted with the same
+    per-instance trust domain as every other mesh leaf) is
+    `spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN}/gateway` — on this install
+    `spiffe://localhost.yashigani.internal/gateway` — which never equals
+    the bare default, so `gateway-egress-deliver-gate`'s `not header`
+    matcher fired 403 on every single `/deliver/*` call, for every wrapped
+    system, on every install whose trust domain differs from the bare
+    default (i.e. every per-instance install — this is not a legacy-only
+    edge case).
+
+    K8s/Helm is NOT affected by this defect class: `helm/yashigani/templates/
+    configmaps.yaml`'s Delta 3 string-replaces the bare
+    `spiffe://yashigani.internal/` prefix across the WHOLE mirrored egress
+    Caddyfile at Helm template-render time — before Caddy ever parses the
+    inline default literal — so the K8s render's default is always correctly
+    domain-qualified regardless of whether a `YASHIGANI_GATEWAY_SPIFFE_ID`
+    pod env var is set. Verified via `helm template` + a live `caddy adapt`
+    + `caddy validate` against the rendered ConfigMap
+    (`test_helm_rendered_caddyfile_adapts_and_validates`).
+  severity: high
+  controls_impacted:
+  - Availability — chat/inference delivery for every bundled agent
+    (openclaw, langflow, letta) was completely broken on Docker compose
+    installs; the deliver hop is a single point of failure for all
+    egress-wrapped LLM traffic.
+  - ASVS V10.3.5 / mesh mTLS identity propagation parity (compose vs K8s
+    must present the SAME caller-gate posture; compose silently regressed
+    to relying on an unqualified default it does not actually satisfy).
+  compensating_controls:
+  - Fail-closed, not fail-open — the missing env var caused an over-strict
+    403 deny, never a bypass. No unauthorised caller was ever admitted;
+    the defect is availability-only.
+  - K8s/Helm deployments were never exposed to this defect class (template-time
+    substitution, not a Caddy parse-time env fallback).
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-29'
+  closure_evidence:
+  - rationale: >-
+      Fixed: `docker/docker-compose.yml` `caddy` service environment block
+      now also composes `YASHIGANI_GATEWAY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/gateway`,
+      mirroring the four existing caller-gate SPIFFE-ID lines byte-for-byte
+      in pattern. No Caddyfile change required (Caddyfile is single-sourced
+      to Helm and was already correct/documented — only the compose env
+      wiring was incomplete) — `docker/Caddyfile.openclaw-egress` /
+      `helm/yashigani/files/Caddyfile.openclaw-egress` remain byte-identical,
+      untouched.
+
+      New regression test:
+      `tests/contracts/test_openclaw_egress_single_source.py::
+      test_compose_caddy_service_declares_all_caller_gate_spiffe_ids` —
+      asserts all five `:18790` caller-gate SPIFFE-ID env vars are present
+      and per-instance-domain-composed in the compose `caddy:` service
+      block. Mutation-guard verified: reverting the fix makes this test
+      fail with the exact missing var named. Full existing
+      `tests/contracts/test_openclaw_egress_single_source.py` suite (8
+      tests, including the two `caddy adapt`/`caddy validate` C10 gates
+      against both the compose-shim canonical file and the Helm-rendered
+      ConfigMap) green — zero regressions, K8s render unaffected as
+      expected.
+
+      Live reproduction + fix-mechanism proof (v4.1.2 x8x Docker e2e stack,
+      compose project `localhost`, 2026-07-29, read-only diagnosis —
+      redeploy + end-to-end chat re-verification is Maxine's / stack
+      owner's next step, not run from this dispatch): confirmed
+      `gateway_client.crt`'s live URI SAN is
+      `spiffe://localhost.yashigani.internal/gateway`
+      (`openssl x509 -text` on the live secret) while `docker compose exec
+      caddy env` showed `YASHIGANI_CADDY_SPIFFE_ID`,
+      `YASHIGANI_OPENCLAW_SPIFFE_ID`, `YASHIGANI_LANGFLOW_SPIFFE_ID`,
+      `YASHIGANI_LETTA_SPIFFE_ID` all present and correctly
+      domain-qualified, `YASHIGANI_GATEWAY_SPIFFE_ID` ABSENT. Caddy's own
+      live compiled config (`GET /config/` on `caddy-admin/admin.sock`)
+      showed the `gateway-egress-deliver-gate` matcher's stamped value as
+      the un-qualified `spiffe://yashigani.internal/gateway` literal on
+      all four `/deliver/*` routes, while the `llm-egress-caller-gate` /
+      `openclaw-egress-caller-gate` matchers correctly showed the
+      domain-qualified values — the one asymmetry pinpointed the exact
+      missing var. `docker compose logs caddy`/`gateway` around a live
+      natural chat attempt and a manual `curl` repro from
+      `egress-langflow` both captured the full failure chain: caller-gate
+      pass → `egress-eval: ALLOW` → onward `POST
+      https://caddy:18790/deliver/llm/v1/models` → 403 → relayed verbatim
+      back to the original caller.
+  fix_in_version: v4.1.2
