@@ -470,6 +470,25 @@ def create_bridge_app(
                 content={"error": "invalid_json", "detail": str(exc)},
             )
 
+        # YSG-RISK-146: a JSON-RPC message MUST be a JSON object. A
+        # syntactically valid but non-object top-level value (e.g. `42`,
+        # `null`, `"x"`, `[1,2]`) parses fine via json.loads() but crashes
+        # below — `"id" not in msg` raises TypeError for scalars/None, and
+        # `msg.get("id")` raises AttributeError for lists — an unhandled 500
+        # instead of a 400. Reject fail-fast, before any attribute access.
+        if not isinstance(msg, dict):
+            logger.warning(
+                "mcp-bridge: malformed JSON-RPC body (not a JSON object): type=%s",
+                type(msg).__name__,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_json_rpc_message",
+                    "detail": "JSON-RPC message must be a JSON object",
+                },
+            )
+
         # Laura SB-1: extract JWT from Authorization header WITHOUT logging its value.
         # Pass it to the subprocess environment for this call if needed.
         # We do NOT log the header value at any log level.
