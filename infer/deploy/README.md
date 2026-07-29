@@ -78,9 +78,26 @@ infer/deploy/
    query at PROBE TIME (never a cached load-time value), cross-checked against an
    operator-declared expected-VRAM-floor (policy-aware, not a bare `>0` check — closes the MoE
    partial-offload ambiguity). NVIDIA Container Toolkit CDI escape CVE class (CVE-2024-0132)
-   noted in `manifests/llama-cpp-build-manifest.md`'s sibling concern — the digest-pin/scan gate
-   for base images (item 1) is the mitigation; this is a host-escape risk independent of the
-   ring-fence (a vulnerable toolkit version is not fixed by network isolation).
+   noted in `manifests/llama-cpp-build-manifest.md`'s sibling concern.
+   **CORRECTION (Laura F3, Red Council 2026-07-29): the digest-pin/scan gate for base images
+   (item 1) is NOT the mitigation for this CVE class — that claim was wrong as originally
+   written here.** Digest-pinning `infer-cuda`'s base image only pins what ships INSIDE the
+   container (the CUDA runtime libraries); CVE-2024-0132 and its class live in the
+   HOST-INSTALLED `nvidia-container-toolkit`/`libnvidia-container` version — the component
+   that generates the CDI spec and mediates the ioctl-based GPU device grant — which sits
+   entirely outside the container image's own supply chain. Pinning/scanning `infer-cuda`'s
+   digest gives zero assurance about the host toolkit version; `seccomp/infer-llama-server.json`
+   necessarily allow-lists `ioctl` (required for `/dev/nvidia*` functionality, correct and
+   expected), which means no layer in this deploy tree actually gates on host toolkit version.
+   The real mitigation is a HOST-SIDE preflight: check the installed
+   `nvidia-container-toolkit`/`libnvidia-container` version against a documented minimum-safe
+   floor before selecting the CUDA overlay, failing closed (fall back to `infer-cpu`, or abort
+   with a clear message) below that floor — the natural hook is `install.sh`'s GPU-dispatch
+   function, same lane as the existing ollama CDI-vs-devpath probe
+   (`install.sh` ~2302-2420/~7070-7193). **This preflight is explicitly NOT built here** —
+   HARD CONSTRAINT for this dispatch is `infer/` files only; the host-toolkit-version gate is
+   a `release/5.0`/`install.sh`-side cutover item, documented accurately here so it isn't
+   silently mistaken for already-covered by the digest-pin gate.
 
 ## Red Council fixes — 2026-07-29 session (deploy/GPU-side gates)
 
@@ -178,6 +195,17 @@ verified against real hardware.
   compose file was never able to catch a runtime wrapper bug anyway. Verified via
   `docker compose config` on all six overlay combinations (cuda, cuda+podman-override,
   cuda-podman-devpath standalone, rocm, vulkan, cpu) — all pass.
+
+- **CVE-2024-0132 mitigation doc correction (Laura F3).** Item 8's original text claimed the
+  digest-pin/scan gate for base images was "the mitigation" for the NVIDIA Container Toolkit
+  CDI-escape CVE class — **wrong as written**: digest-pinning only pins what ships inside the
+  image (CUDA runtime libs), while CVE-2024-0132's class lives in the HOST-installed
+  `nvidia-container-toolkit`/`libnvidia-container` version, entirely outside the image's
+  supply chain. Corrected item 8's text to state the real mitigation (a host-side toolkit
+  version preflight, install.sh-side, gating the CUDA overlay selection) and explicitly mark
+  it NOT built in this dispatch (HARD CONSTRAINT: `infer/`-only scope) rather than continuing
+  to imply it's already covered. Documentation-only fix, no code/config change — nothing to
+  gate beyond re-reading the corrected text.
 
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
