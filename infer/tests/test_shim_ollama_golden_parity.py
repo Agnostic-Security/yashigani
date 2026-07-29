@@ -108,14 +108,13 @@ def test_tags_model_entry_field_set_matches_golden(
 def test_show_envelope_parity_against_golden(
     tmp_blob_store: BlobStore, tmp_path: Path, minimal_gguf_bytes: bytes
 ) -> None:
-    """Characterization + parity test for /api/show.
+    """True envelope-parity test for /api/show.
 
-    The shim already emits the core show keys in parity with ollama. This test
-    pins that overlap AND documents the residual top-level divergence explicitly
-    so any future drift (in either direction) trips the assertion. The residual
-    gap (capabilities/license/system/tensors not yet synthesized; an extra
-    `parameters` key) was NOT in this cycle's fix scope — it is tracked here as a
-    known, deliberate divergence for a follow-up parity pass.
+    The shim's `/api/show` top-level field set must now match ollama's golden
+    envelope EXACTLY — no missing keys, no extra keys. The previous parity gap
+    (capabilities/license/system/tensors not synthesized; an extra `parameters`
+    key) is closed by this cycle's fix, so this assertion is an exact set-equality
+    rather than a documented-divergence characterization.
     """
     golden = _golden_show()
     resolved = _ingest(tmp_blob_store, tmp_path, minimal_gguf_bytes, "qwen2.5:3b")
@@ -124,9 +123,22 @@ def test_show_envelope_parity_against_golden(
     golden_keys = set(golden.keys())
     shim_keys = set(body.keys())
 
-    # Keys the shim emits in parity with ollama's /api/show today:
-    assert {"modelfile", "template", "details", "model_info", "modified_at"} <= (shim_keys & golden_keys)
+    # Exact envelope parity — the whole point of the golden fixture:
+    assert shim_keys == golden_keys
+    assert golden_keys - shim_keys == set()  # nothing ollama emits is missing
+    assert shim_keys - golden_keys == set()  # the extra `parameters` key is gone
+    assert "parameters" not in body
 
-    # Documented, out-of-scope residual divergence (update if show is extended):
-    assert golden_keys - shim_keys == {"capabilities", "license", "system", "tensors"}
-    assert shim_keys - golden_keys == {"parameters"}
+    # The four keys that were MISSING pre-fix are now byte-present (never omitted),
+    # even against this minimal fixture GGUF that carries no licence/system text:
+    for key in ("capabilities", "license", "system", "tensors"):
+        assert key in body
+    assert isinstance(body["capabilities"], list) and body["capabilities"]  # never over-claimed, never empty
+    assert isinstance(body["license"], str)  # byte-present empty-shape, not None/omitted
+    assert isinstance(body["system"], str)
+    # tensors are derived from the real GGUF tensor-info table (2 in the fixture),
+    # each a {name, type, shape} entry mirroring ollama's golden tensor shape:
+    assert isinstance(body["tensors"], list) and body["tensors"]
+    golden_tensor_keys = set(golden["tensors"][0].keys())
+    for tensor in body["tensors"]:
+        assert set(tensor.keys()) == golden_tensor_keys
