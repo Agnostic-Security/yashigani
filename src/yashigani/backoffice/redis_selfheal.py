@@ -211,6 +211,31 @@ async def maybe_selfheal() -> None:
 
     if backoffice_state.agent_registry is None:
         await asyncio.to_thread(ensure_rbac_stack)
+        # YSG-RISK-141 — ensure_rbac_stack() (above) rebuilds a BRAND NEW
+        # AgentRegistry wrapping whatever is CURRENTLY in Redis db/3. If
+        # Redis db/3 lost its data mid-life while the connection itself
+        # recovered, the rebuilt registry is EMPTY even though the durable
+        # Postgres mirror (agent_registry table) still holds every
+        # registration. entrypoint._bootstrap()'s lifespan reconcile
+        # (ISSUE-AGENT-REG-DURABILITY) only runs ONCE, before uvicorn starts
+        # accepting connections — it never re-fires after this lazy
+        # self-heal path reconnects. Must run HERE, back on the event loop
+        # (not inside the to_thread worker above) — reconcile_agents_from_
+        # durable() reads the asyncpg pool, which is bound to the loop it
+        # was created on.
+        _agent_reg = backoffice_state.agent_registry
+        if _agent_reg is not None:
+            try:
+                from yashigani.agents.durable_store import AgentDurableStore
+                from yashigani.agents.reconciler import reconcile_agents_from_durable
+
+                await reconcile_agents_from_durable(_agent_reg, AgentDurableStore())
+            except Exception as exc:
+                logger.error(
+                    "Backoffice self-heal: agent reconcile from durable store "
+                    "FAILED (%s) — /admin/agents may be missing entries until "
+                    "the registry is restored", exc,
+                )
 
     from yashigani.backoffice.routes import budget as _budget_routes
 

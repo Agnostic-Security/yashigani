@@ -4394,3 +4394,127 @@ risks:
     Caddyfile family/helm templates+values; post-change: only historical/
     removal-note comments and the deliberately-kept X-Forwarded-User +
     legacy-volume-list entries remain.
+
+- id: YSG-RISK-141
+  description: >-
+    Dispatched as "the reconciler queries a different tenant" chat-blocker
+    theory (v4.1.2 x8x Docker e2e, 2026-07-29) — DISPROVEN by live evidence,
+    but investigation surfaced a real, distinct, still-open durability gap
+    in the exact same code area (ISSUE-AGENT-REG-DURABILITY /
+    YSG-RISK-131's self-heal).
+
+    What was hypothesized: `AgentDurableStore.list_all()` (the Postgres
+    read side of the agent-registry reconciler) queries a different
+    tenant/org than the all-zeros `_PLATFORM_TENANT_ID` sentinel
+    `register_agent_bundles()` persists agents under, so the reconciler
+    would never find the durable rows and Redis db/3 would stay empty
+    forever.
+
+    What live evidence actually showed (live Docker stack, compose project
+    `localhost`, 2026-07-29): `docker exec` into `localhost-postgres-1`
+    confirmed 3 `agent_registry` rows under tenant_id
+    `00000000-0000-0000-0000-000000000000` (openclaw/letta/agent__langflow).
+    A raw-SQL replay of the EXACT query `AgentDurableStore.list_all()` runs
+    (`SET LOCAL app.tenant_id = <same sentinel>; SELECT ... FROM
+    agent_registry WHERE agent_id IS NOT NULL`), executed as the actual
+    runtime role `yashigani_app` (no RLS bypass — `\du` confirms only
+    `yashigani_admin` has BYPASSRLS), returned all 3 rows. A live
+    in-container Python repro
+    (`AgentDurableStore().list_all()` against the gateway's own real asyncpg
+    pool) also returned all 3 rows correctly. `docker exec` into
+    `localhost-redis-1` (TLS + password required — `redis-server --tls-port
+    6380 --requirepass ...`; the naive `redis-cli -n 3 DBSIZE` on the
+    default port/no-TLS that produced the original "Redis db/3 is EMPTY"
+    read was itself a connection-refused false read, the exact same mistake
+    the wrong port/no-TLS attempt makes) showed `agent:index:all` /
+    `agent:index:active` each holding all 3 agent_ids, status `active`,
+    correct bcrypt `token_hash`. `AgentDurableStore.upsert()` and
+    `.list_all()` (`src/yashigani/agents/durable_store.py`) both hard-code
+    the identical `_PLATFORM_TENANT_ID` constant — there is no org/tenant
+    resolution divergence in this file. The gateway's ONE-SHOT lifespan
+    reconcile (`gateway/proxy.py`) DID log "durable store empty and no
+    Redis agents to back-fill" at boot (`docker logs localhost-gateway-1`)
+    — but this is the expected, harmless, first-boot branch: the reconcile
+    runs at gateway startup (18:14:14), roughly 29s BEFORE `install.sh`'s
+    `register_agent_bundles()` step registered the 3 bundle agents
+    (Postgres `created_at` ~18:14:43) — at reconcile time Postgres genuinely
+    had 0 rows. Registration itself dual-writes directly into the SAME live
+    Redis db/3 connection the gateway already holds (`AgentRegistry.
+    register()`'s Lua HSET/SADD, via backoffice), so no reconcile was ever
+    needed for the fresh-install case — corroborated by the direct Redis
+    read above showing all 3 agents present and active right now.
+
+    The REAL, still-open gap found during this investigation: YSG-RISK-131 /
+    122's lazy, cooldown-gated, REQUEST-TIME self-heal reconnect
+    (`gateway/redis_selfheal.py::ensure_rbac_agent_stack`,
+    `backoffice/redis_selfheal.py::ensure_rbac_stack`) rebuilds a BRAND NEW
+    `AgentRegistry` wrapping whatever is CURRENTLY in Redis db/3 whenever
+    the in-process registry object is found `None` — but neither call-site
+    ever re-ran `reconcile_agents_from_durable()` afterward. If Redis db/3
+    loses its agent data mid-life (`FLUSHDB`, a fast recreate that
+    reconnects before the in-process object goes `None` between requests,
+    etc.) WITHOUT the whole gateway/backoffice process restarting (which
+    would re-run the one-shot lifespan reconcile), the self-heal path
+    "recovers" into a permanently-empty registry — every `@agent` stays
+    `agent_not_found` indefinitely, with no further recovery path short of
+    a manual process restart. `docs/risk-register.yml`'s own YSG-RISK-131
+    entry names this exact interaction explicitly: "`proxy.py`'s lifespan
+    agent-reconcile ... cannot recover this state either — it only refills
+    an EXISTING registry object, and is a no-op when `agent_registry is
+    None`" — describing the boot-race case, not the mid-life-data-loss case
+    this finding closes.
+  severity: medium
+  controls_impacted:
+  - Availability — the agent-registry durability guarantee
+    (ISSUE-AGENT-REG-DURABILITY) is incomplete, since it only self-heals
+    across a full process restart, not across a mid-life Redis data-loss +
+    fast reconnect, which is exactly the scenario YSG-RISK-131's self-heal
+    primitive was built to cover for every OTHER Redis-dependent subsystem.
+  compensating_controls:
+  - No auth/authz boundary crossed — the failure mode is `agent_not_found`
+    (fail-closed unavailability), never a silent authorization bypass.
+  - A full gateway/backoffice process restart always recovers (re-runs the
+    one-shot lifespan reconcile), so operators are not permanently stuck —
+    just unaware a targeted restart is required absent this fix.
+  - The originally-hypothesized tenant-mismatch failure mode does not
+    reproduce at all on the current codebase — this entry exists for the
+    genuinely-found gap, not the disproven theory.
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-29'
+  closure_evidence:
+  - rationale: >-
+      Fixed: `gateway/redis_selfheal.py::maybe_selfheal()` now re-runs
+      `reconcile_agents_from_durable()` immediately after
+      `ensure_rbac_agent_stack()` reports a successful reconnect — back on
+      the event loop (in the per-tag follow-up loop alongside the existing
+      `workflow_scheduler.start()` follow-up), never inside the
+      `asyncio.to_thread` builder worker, since `reconcile_agents_from_
+      durable()` reads the loop-bound asyncpg pool.
+      `backoffice/redis_selfheal.py::maybe_selfheal()` gets the identical
+      fix after `ensure_rbac_stack()` succeeds. Both call sites use a fresh
+      `AgentDurableStore()`, matching `gateway/proxy.py`'s existing lifespan
+      call exactly. Failure is caught and logged (never raised) — matches
+      `reconcile_agents_from_durable()`'s own existing "never raises"
+      contract, so a transient DB blip during self-heal cannot block the
+      request.
+
+      New regression suite:
+      `src/tests/regression/v4.1.2/test_ysg_risk_141_agent_reconcile_selfheal.py`
+      (7 tests): (1-3) direct unit tests of `reconcile_agents_from_durable()`
+      proving N durable rows + empty Redis-view backfills all N, proving
+      already-present rows are skipped, and proving a genuinely-empty
+      durable store (first boot) is a harmless no-op distinct from a
+      tenant-mismatch bug; (4-5) gateway `maybe_selfheal()` wiring — proves
+      the reconcile fires after a successful `ensure_rbac_agent_stack()`
+      reconnect and is skipped when already healthy; (6-7) the identical
+      pair for backoffice's `maybe_selfheal()`. All 7 pass; full existing
+      `src/tests/regression/v4.1.2/` suite (444 tests, 2 pre-existing skips)
+      green, zero regressions. ruff (full default ruleset, not just
+      `--select G`) clean on both touched source files + the new test file.
+      mypy clean-diff on `gateway/redis_selfheal.py`,
+      `backoffice/redis_selfheal.py`, `agents/reconciler.py`,
+      `agents/durable_store.py` (0 new errors).
+  fix_in_version: v4.1.2
