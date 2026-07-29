@@ -137,12 +137,21 @@ async def update_runtime_setting(
     prev_record = await svc.get_one(key)
     old_value = prev_record["value"] if prev_record else meta.class_default
 
-    record = await svc.set(
-        key=key,
-        value=body.value,
-        changed_by=session.account_id,
-        source="api",
-    )
+    # YSG-RISK-155: RuntimeSettingsService.set() now enforces SettingMeta
+    # min_value/max_value and raises ValueError on an out-of-range value —
+    # map that to 422 (previously unhandled -> unhandled 500).
+    try:
+        record = await svc.set(
+            key=key,
+            value=body.value,
+            changed_by=session.account_id,
+            source="api",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "value_out_of_range", "message": str(exc)},
+        ) from exc
 
     _emit_audit(session, key, old_value, record["value"], source="api")
 

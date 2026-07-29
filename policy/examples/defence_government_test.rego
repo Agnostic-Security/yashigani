@@ -32,16 +32,21 @@ test_deny_classification_label_missing_key_absent if {
 	"classification_label_missing" in data.clients.gov.decision.deny with input as i
 }
 
-# KNOWN GAP (found while writing this test — same root cause as
-# data_residency_test.rego's test_KNOWN_GAP_empty_string_region_not_caught,
-# flagged for Lu, NOT silently fixed here): `not input.data.classification`
-# only fires when the `classification` key is entirely ABSENT — a defined
-# empty string ("") does not trigger this deny. This test pins the current
-# behaviour rather than asserting the doc comment's stated (but not fully
-# implemented) fail-closed intent.
-test_KNOWN_GAP_empty_string_classification_not_caught_by_missing_check if {
+# YSG-RISK-152 (fixed — same root cause as data_residency_test.rego's
+# equivalent region test): `not input.data.classification` only fired when
+# the `classification` key was entirely ABSENT — a defined empty string ("")
+# did not trigger this deny (though the classification_rank "unknown->99"
+# sentinel happened to catch it indirectly via clearance_below_classification,
+# giving the wrong deny code). Fixed via _classification_blank (missing OR
+# blank/whitespace after trim_space). These tests assert the closed behaviour.
+test_deny_classification_label_missing_empty_string if {
 	i := object.union(_base_input, {"data": {"classification": "", "caveats": [], "compartment": ""}})
-	not "classification_label_missing" in data.clients.gov.decision.deny with input as i
+	"classification_label_missing" in data.clients.gov.decision.deny with input as i
+}
+
+test_deny_classification_label_missing_whitespace_only if {
+	i := object.union(_base_input, {"data": {"classification": "   ", "caveats": [], "compartment": ""}})
+	"classification_label_missing" in data.clients.gov.decision.deny with input as i
 }
 
 test_deny_clearance_below_classification if {
