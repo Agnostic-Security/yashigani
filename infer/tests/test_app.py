@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import FakeProcessRunner, FakeUpstreamClient
-from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE
+from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE, build_minimal_gguf
 from kuroshio.app import create_app
 from kuroshio.blobstore.store import BlobStore
 from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
@@ -54,6 +54,28 @@ def ingested_model_without_chat_template(
     return tmp_blob_store.put_from_path(
         src,
         metadata={"name": "no-template:latest", "family": "llama", "quantization_level": "Q4_K_M"},
+        provenance=provenance,
+    )
+
+
+@pytest.fixture()
+def second_ingested_model(tmp_blob_store: BlobStore, tmp_path) -> ResolvedModel:
+    """A SECOND, distinct resident model (a classifier), so the realistic gated
+    deploy — classifier + chat BOTH resident — can be exercised (Red-Council
+    Ava F4). Built with a different GGUF `name` so its content digest differs
+    from `ingested_model` and it lands as a separate blob."""
+    raw = build_minimal_gguf(name="classifier-model")
+    src = tmp_path / "classifier.gguf"
+    src.write_bytes(raw)
+    provenance = Provenance(kind=ProvenanceKind.LOCAL_FILE, origin=str(src), sha256="")
+    return tmp_blob_store.put_from_path(
+        src,
+        metadata={
+            "name": "classifier:latest",
+            "family": "bert",
+            "quantization_level": "Q4_K_M",
+            "chat_template": DEFAULT_CHAT_TEMPLATE,
+        },
         provenance=provenance,
     )
 
@@ -284,6 +306,69 @@ def test_v1_passthrough_non_streaming_with_explicit_model(
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "hi"
     assert supervisor.inflight_count(ingested_model.sha256) == 0
+
+
+# --- Red-Council Ava F4 (2026-07-29): /v1/* model resolution on multi-resident ---
+
+
+def test_v1_passthrough_rejects_no_model_field_when_two_models_resident(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel, second_ingested_model: ResolvedModel
+) -> None:
+    """The realistic gated deploy (classifier + chat BOTH resident): a request
+    with no `model` field must fail closed with an explicit 400 naming the
+    resident models — NEVER silently route to an arbitrary resident. The old
+    "no model -> use the single resident" fallback was only correct for the
+    zero-or-one-resident edge."""
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    supervisor.load(ingested_model, LoadConfig())
+    supervisor.load(second_ingested_model, LoadConfig())
+    assert len(supervisor.resident_shas) == 2
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={"messages": []})
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "2 models are resident" in detail
+    # both resident models are named so the caller knows what to disambiguate
+    assert "llama3:8b" in detail and "classifier:latest" in detail
+    # no request was ever forwarded to either backend
+    assert supervisor.inflight_count(ingested_model.sha256) == 0
+    assert supervisor.inflight_count(second_ingested_model.sha256) == 0
+
+
+def test_v1_passthrough_routes_to_the_explicitly_named_model_when_two_resident(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel, second_ingested_model: ResolvedModel
+) -> None:
+    """With two models resident, an explicit `model` field routes to THAT
+    model's llama-server instance — deterministically, not to whichever
+    happens to be first."""
+    app, supervisor, upstream = _build_app(tmp_blob_store, json_response={"choices": [{"message": {"content": "hi"}}]})
+    supervisor.load(ingested_model, LoadConfig())
+    classifier_instance = supervisor.load(second_ingested_model, LoadConfig())
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={"model": "classifier:latest", "messages": []})
+
+    assert resp.status_code == 200
+    # forwarded specifically to the classifier's port, not the chat model's
+    assert upstream.requested_urls[0] == f"http://127.0.0.1:{classifier_instance.port}/v1/chat/completions"
+    assert supervisor.inflight_count(second_ingested_model.sha256) == 0
+
+
+def test_v1_passthrough_still_auto_selects_the_single_resident(
+    tmp_blob_store: BlobStore, ingested_model: ResolvedModel
+) -> None:
+    """The exactly-one-resident convenience is preserved (dev/test single-model
+    box): no `model` field auto-selects the sole resident."""
+    app, supervisor, upstream = _build_app(tmp_blob_store, json_response={"choices": [{"message": {"content": "hi"}}]})
+    only_instance = supervisor.load(ingested_model, LoadConfig())
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={"messages": []})
+
+    assert resp.status_code == 200
+    assert upstream.requested_urls[0] == f"http://127.0.0.1:{only_instance.port}/v1/chat/completions"
 
 
 # --- Red-Council H4 (2026-07-29): chat_template fail-closed guard ---

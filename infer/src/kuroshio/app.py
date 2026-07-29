@@ -130,6 +130,16 @@ def create_app(
         if "n_predict" in llama_request:
             llama_request["n_predict"] = supervisor.clamp_max_tokens(llama_request["n_predict"])
 
+    def _resident_display_name(sha256: str) -> str:
+        """Best-effort human-readable name for a resident model, for use in the
+        ambiguous-`/v1/*` error message. Falls back to the digest if the model
+        metadata can't be reconstructed (never raises — this only builds a
+        diagnostic string)."""
+        model = blob_store.get_resolved_model(sha256)
+        if model is None:
+            return sha256
+        return str(model.metadata.get("name") or sha256)
+
     def _acquire_slot_or_429(sha256: str) -> None:
         try:
             supervisor.acquire_request_slot(sha256)
@@ -277,11 +287,26 @@ def create_app(
     async def v1_passthrough(path: str, request: Request) -> Any:
         """Thin OpenAI-compat passthrough — llama-server serves `/v1/*` natively.
 
-        v1 foundation limitation: with multi-model residency, passthrough
-        needs to know which resident instance to target. This picks the
-        model named in the request body's `model` field if present,
-        otherwise falls back to "exactly one model resident" — a full
-        model-routing header/config scheme is a follow-up increment.
+        Model resolution (Red-Council Ava F4, 2026-07-29 design-review): the
+        passthrough must know which resident llama-server instance to target.
+        The rule is deterministic and fail-closed:
+
+          1. If the request body names a `model`, that model is resolved and
+             used (the normal, unambiguous case — an OpenAI-compat client
+             ALWAYS sends `model`).
+          2. Otherwise, auto-selection applies ONLY when EXACTLY ONE model is
+             resident (the trivial single-model dev/test box).
+          3. With ZERO or MORE-THAN-ONE resident and no `model` field, the
+             request is REJECTED with an explicit 400 — never silently routed
+             to an arbitrary resident.
+
+        Case 3 is the realistic gated deploy: a classifier + a chat model are
+        BOTH resident, so "no model -> use the single resident" is ambiguous
+        and unsafe. The engine has no notion of a "default chat role" to
+        disambiguate on the caller's behalf (roles live one layer up, in the
+        per-container split), so guessing would risk routing a chat request to
+        the classifier (or vice-versa). Requiring an explicit `model` is the
+        safe, unambiguous behaviour; the error message says exactly that.
         """
         body: dict[str, Any] = {}
         model_name = None
@@ -301,10 +326,23 @@ def create_app(
             instance = _ensure_loaded(model)
         else:
             resident = supervisor.resident_shas
-            if len(resident) != 1:
+            if len(resident) == 0:
                 raise HTTPException(
                     status_code=400,
-                    detail="/v1/* passthrough requires a 'model' field when zero or multiple models are resident",
+                    detail="/v1/* passthrough requires an explicit 'model' field: no model is resident to auto-select",
+                )
+            if len(resident) > 1:
+                # Realistic gated deploy (classifier + chat both resident):
+                # auto-selection is ambiguous, so fail closed rather than route
+                # to an arbitrary resident (Red-Council Ava F4).
+                resident_names = sorted(_resident_display_name(sha) for sha in resident)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "/v1/* passthrough requires an explicit 'model' field: "
+                        f"{len(resident)} models are resident ({', '.join(resident_names)}) — "
+                        "auto-selection only applies when exactly one model is resident"
+                    ),
                 )
             instance = supervisor.get_instance(resident[0])
             if instance is None:  # pragma: no cover - defensive, resident_shas guarantees presence
