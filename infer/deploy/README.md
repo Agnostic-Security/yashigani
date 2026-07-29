@@ -122,6 +122,20 @@ verified against real hardware.
   Verified with `helm template --set backend=cpu` (renders `"false"`) vs `--set backend=cuda`
   (renders the configured `"true"` default unchanged).
 
+- **NVIDIA CDI scoping (Captain finding #3) — least-privilege on multi-GPU hosts.**
+  `docker-compose.infer.cuda.yml` previously shared ONE `YSG_GPU_CDI` env var, identically
+  defaulted to `nvidia.com/gpu=all`, across both `infer-classifier` AND `infer-chat` — harmless
+  on a single-GPU host, but on any multi-GPU host every infer container got CDI access to every
+  physical GPU, including `infer-chat` (the component this design explicitly treats as
+  hostile — it runs untrusted, byte-authentic-but-behaviourally-poisoned models). Fixed:
+  independent `YSG_INFER_GPU_CDI_CLASSIFIER` / `YSG_INFER_GPU_CDI_CHAT` vars, each now
+  defaulting to `nvidia.com/gpu=0` (not `all`) — still correct on the common single-GPU host,
+  no longer permissive-by-default on multi-GPU hosts. Multi-GPU operators must override both
+  independently to pin distinct indices/UUIDs. `install.sh`-side automatic GPU-count/index
+  detection to set these is deferred (5.0-side cutover work, out of scope for this
+  infer/deploy-only dispatch). Verified via `docker compose config` — confirmed both default to
+  scoped `gpu=0` and resolve independently when each var is overridden separately.
+
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
 Tom's v1 supervisor (`supervisor/supervisor.py`, `supervisor/process.py`) is

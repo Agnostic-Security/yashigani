@@ -12,11 +12,23 @@
 # CDI device grant (same mechanism as docker/docker-compose.gpu.yml's ollama CDI wiring —
 # Docker↔Podman parity from one device syntax; docker-compose.infer.podman-override.yml
 # does NOT need a separate device block, only the read_only relaxation CDI hooks require).
+#
+# Captain finding #3 (Red Council 2026-07-29, MEDIUM): previously both infer-classifier and
+# infer-chat shared the SAME YSG_GPU_CDI env var, both defaulting to nvidia.com/gpu=all — on
+# a single-GPU host harmless, but on any multi-GPU host this grants EVERY infer container
+# CDI access to EVERY physical GPU, widening the blast radius for the one component this
+# design explicitly treats as hostile (infer-chat runs untrusted, byte-authentic-but-
+# behaviourally-poisoned models). Fixed: independent per-service env vars, each defaulting
+# to GPU index 0 (still correct/harmless on the common single-GPU host) rather than `all`.
+# Multi-GPU hosts MUST override both vars independently to pin distinct indices/UUIDs, e.g.
+# YSG_INFER_GPU_CDI_CLASSIFIER=nvidia.com/gpu=0 YSG_INFER_GPU_CDI_CHAT=nvidia.com/gpu=1.
+# install.sh-side GPU-count/index detection to set these automatically is deferred (5.0-side
+# cutover work, out of scope for this infer/deploy-only dispatch) — documented, not silent.
 services:
   infer-classifier:
     image: ${YSG_INFER_IMAGE_CUDA:-yashigani/infer-cuda:local}
     devices:
-      - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+      - "${YSG_INFER_GPU_CDI_CLASSIFIER:-nvidia.com/gpu=0}"
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       YSG_INFER_BACKEND: cuda
@@ -25,7 +37,7 @@ services:
   infer-chat:
     image: ${YSG_INFER_IMAGE_CUDA:-yashigani/infer-cuda:local}
     devices:
-      - "${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+      - "${YSG_INFER_GPU_CDI_CHAT:-nvidia.com/gpu=0}"
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       YSG_INFER_BACKEND: cuda
