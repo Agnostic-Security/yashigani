@@ -725,15 +725,23 @@ def test_user_ui_get_route_user_session_2xx(user_ui_app, session_store, path):
 
 
 def test_user_ui_memory_is_a_declared_stub():
-    """STRUCTURAL FINDING (self-documented, not hidden): /user/memory returns a
-    hardcoded {"configured": false, "entries": []} regardless of session or
-    state — the route body contains no branching logic at all. The docstring
-    calls this out as a 'Phase 3 stub'. Recorded as a conformance fact, not a
-    defect (the code is honest about it), per findings-doc discipline."""
+    """STRUCTURAL FINDING (self-documented, not hidden): /user/memory is
+    unconditionally NOT IMPLEMENTED — the route body contains no branching
+    logic, it always raises 501. The docstring calls this out as a
+    'Phase 3' item (NHI/SVID mesh + per-user Letta container, RISK-107).
+    Recorded as a conformance fact, not a defect (the code is honest about
+    it), per findings-doc discipline.
+
+    YSG-RISK-156 (merged v4.1.2 integrated fixbatch 2026-07-30) rewrote this
+    route from a misleading 200 {"configured": false, "entries": []} to an
+    honest 501 — updated this test's marker from the old return-value literal
+    to the new one accordingly (test-inventory drift at the integration seam,
+    same class as the route-count fixes elsewhere in this file)."""
     import inspect as _inspect
     from yashigani.backoffice.routes import user_ui as uiroutes
     src = _inspect.getsource(uiroutes.user_memory)
-    assert '"configured": False' in src
+    assert '"error": "not_implemented"' in src
+    assert "HTTP_501_NOT_IMPLEMENTED" in src
     assert "Phase 3 stub" in _inspect.getsource(uiroutes) or "Phase 3" in src
 
 
