@@ -504,6 +504,13 @@ async def duplicate_template(body: DuplicateTemplateRequest, session: StepUpAdmi
     if "package" not in rego:
         rego = f"package clients.{new_name}\n\nimport rego.v1\n\n" + rego
 
+    # YSG-RISK-141: belt-and-suspenders — the rewrite above should always force
+    # package clients.<new_name>, but assert it explicitly rather than trust the
+    # regex substitution silently (e.g. if the template had an unusual package
+    # statement layout the substitution failed to match).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(rego, new_name)
+
     # Save as clients/<new_name>
     pol_id = f"clients/{new_name}"
     dst_url = _opa_base() + "/v1/policies/" + pol_id
@@ -591,6 +598,9 @@ async def edit_custom_policy_rego(
             detail={"error": "missing_package",
                     "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
         )
+    # YSG-RISK-141: reject cross-namespace package declarations (see save_policy).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(body.rego, name)
 
     from yashigani.opa_assistant.sanity import static_sanity_check
     sanity = await static_sanity_check(body.rego, name)
@@ -728,6 +738,12 @@ async def edit_core_policy(
             status_code=400,
             detail={"error": "missing_package", "message": "policy must declare a package"},
         )
+    # YSG-RISK-141: a core-policy edit must stay within the core (yashigani)
+    # package tree — reject a submitted package that escapes into clients.*
+    # or any other namespace, even though this endpoint is already gated by
+    # confirm_danger + step-up.
+    from yashigani.opa_assistant.rego_package import assert_core_package_scope
+    assert_core_package_scope(body.rego)
 
     # Sanity check before touching a core policy
     from yashigani.opa_assistant.sanity import static_sanity_check
@@ -869,6 +885,13 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
             detail={"error": "missing_package",
                     "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
         )
+    # YSG-RISK-141: the package DECLARED inside the Rego source must exactly
+    # match clients.<name> — OPA keys the evaluated data document by the
+    # package statement, not by the module id used in the PUT path. Without
+    # this check a caller could save under their own name while declaring a
+    # package that shadows another tenant's namespace (or a core namespace).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(body.rego, name)
 
     # #17 (OPA Phase 3a): behavioural sanity check in a throwaway sandbox BEFORE
     # the live PUT. Compile error -> 400 invalid_rego. HIGH warnings (deny-all /
