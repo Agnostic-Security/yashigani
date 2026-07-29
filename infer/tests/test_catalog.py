@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from yashigani_infer.catalog import (
+    ECDSA_P256_SHA256,
     CatalogVerificationError,
     CatalogVerifier,
     SignedCatalog,
@@ -216,6 +217,96 @@ def test_entry_rejects_eternal_trust_window() -> None:
             signature=b"",
             signer_key_id="key-1",
         )
+
+
+# --- Nico crypto-agility rec (2026-07-29 design-review): sig_alg dispatch ---
+
+
+def test_entry_defaults_sig_alg_to_ecdsa_p256_sha256(keypair) -> None:
+    private_key, _public_key = keypair
+    entry = _make_signed_entry(private_key)
+    assert entry.sig_alg == ECDSA_P256_SHA256 == "ecdsa-p256-sha256"
+
+
+def test_entry_rejects_blank_sig_alg() -> None:
+    with pytest.raises(ValueError, match="sig_alg"):
+        SignedCatalogEntry(
+            repo_id="acme/tiny-model",
+            revision=REVISION,
+            filename="tiny-model.gguf",
+            quant="Q4_K_M",
+            sha256=GOOD_SHA256,
+            lfs_object_id=GOOD_LFS_OBJECT_ID,
+            provenance_tier="vetted",
+            issued_at=ISSUED_AT,
+            max_trust_age_seconds=3600,
+            signature=b"",
+            signer_key_id="key-1",
+            sig_alg="   ",
+        )
+
+
+def test_verifier_accepts_explicit_ecdsa_sig_alg(keypair) -> None:
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key, sig_alg=ECDSA_P256_SHA256)
+    CatalogVerifier(public_key).verify(entry)  # must not raise
+
+
+def test_verifier_fails_closed_on_an_unrecognised_sig_alg(keypair) -> None:
+    """Crypto-agility means new algorithms are ADDABLE later without a
+    breaking fleet re-mint -- but until this build actually implements one,
+    an entry claiming it must be refused, never silently verified as if it
+    were ECDSA."""
+    private_key, public_key = keypair
+    # Sign it correctly (a real future ML-DSA entry would be signed with the
+    # NEW algorithm's key, not ECDSA — this test only needs to prove the
+    # verifier refuses based on the CLAIMED alg, never reaching the
+    # signature-bytes check at all for an unrecognised one).
+    entry = _make_signed_entry(private_key, sig_alg="ml-dsa-65")
+    with pytest.raises(CatalogVerificationError, match="does not implement"):
+        CatalogVerifier(public_key).verify(entry)
+
+
+def test_sig_alg_is_bound_into_the_signature_tampering_fails(keypair) -> None:
+    """sig_alg is part of signed_payload() -- editing it independently of
+    the signature (e.g. claiming a stronger algorithm than what was
+    actually used) must invalidate the signature, same discipline as
+    provenance_tier (finding #5)."""
+    private_key, public_key = keypair
+    entry = _make_signed_entry(private_key)  # signed with the default sig_alg
+    tampered = SignedCatalogEntry(
+        repo_id=entry.repo_id,
+        revision=entry.revision,
+        filename=entry.filename,
+        quant=entry.quant,
+        sha256=entry.sha256,
+        lfs_object_id=entry.lfs_object_id,
+        provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
+        signature=entry.signature,
+        signer_key_id=entry.signer_key_id,
+        sig_alg=ECDSA_P256_SHA256,  # same value, but re-asserted independently of the signature
+    )
+    # sanity: identical value round-trips fine (not a false-positive test)
+    CatalogVerifier(public_key).verify(tampered)
+
+    relabelled = SignedCatalogEntry(
+        repo_id=entry.repo_id,
+        revision=entry.revision,
+        filename=entry.filename,
+        quant=entry.quant,
+        sha256=entry.sha256,
+        lfs_object_id=entry.lfs_object_id,
+        provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
+        signature=entry.signature,  # still the OLD signature
+        signer_key_id=entry.signer_key_id,
+        sig_alg="some-other-alg",  # relabelled without a fresh signature
+    )
+    with pytest.raises(CatalogVerificationError):
+        CatalogVerifier(public_key).verify(relabelled)
 
 
 def test_signed_catalog_load_and_require_roundtrip(keypair) -> None:

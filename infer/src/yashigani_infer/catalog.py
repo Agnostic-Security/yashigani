@@ -85,6 +85,17 @@ _QUANT_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 # constant, never a runtime config knob.
 _MAX_TRUST_AGE_CEILING_SECONDS = 180 * 24 * 3600
 
+# Crypto-agility (Nico rec, 2026-07-29 design-review): the DEFAULT and only
+# implemented signature algorithm today. `sig_alg` is a field on the SIGNED
+# payload itself (not just a loose annotation) so a future entry minted
+# under a different algorithm (e.g. "ml-dsa-65", once `cryptography` ships
+# ML-DSA/FIPS-204 support) can coexist in the same manifest format during a
+# staged fleet rotation, rather than forcing a hard, simultaneous cutover
+# the day that support lands. `CatalogVerifier.verify()` DISPATCHES on this
+# field; an entry claiming an algorithm this verify-side build doesn't
+# implement fails closed (never silently falls back to ECDSA).
+ECDSA_P256_SHA256 = "ecdsa-p256-sha256"
+
 
 class CatalogVerificationError(ValueError):
     """Raised when a catalog entry's signature does not verify, no admitted
@@ -137,6 +148,14 @@ class SignedCatalogEntry:
             whichever public key the `CatalogVerifier` was constructed
             with — matching `signer_key_id` against an expected value is a
             deploy-time policy decision, not enforced by this dataclass).
+        sig_alg: which signature algorithm `signature` was produced with
+            (Nico crypto-agility rec, 2026-07-29). Defaults to
+            `ECDSA_P256_SHA256` — the only algorithm this build implements
+            today. Part of the SIGNED payload (see `signed_payload`), so an
+            attacker cannot downgrade/relabel the claimed algorithm without
+            invalidating the signature. `CatalogVerifier.verify()` dispatches
+            on this field and fails closed on any value it does not
+            recognise — never assumes ECDSA for an unrecognised string.
     """
 
     repo_id: str
@@ -150,8 +169,11 @@ class SignedCatalogEntry:
     max_trust_age_seconds: int
     signature: bytes
     signer_key_id: str
+    sig_alg: str = ECDSA_P256_SHA256
 
     def __post_init__(self) -> None:
+        if not self.sig_alg.strip():
+            raise ValueError("catalog entry sig_alg must not be blank")
         if not _SHA256_HEX.match(self.sha256.lower()):
             raise ValueError(f"catalog entry sha256 is not a 64-char hex digest: {self.sha256!r}")
         if not _LFS_OBJECT_ID_RE.match(self.lfs_object_id.lower()):
@@ -190,6 +212,7 @@ class SignedCatalogEntry:
             "provenance_tier": self.provenance_tier,
             "issued_at": self.issued_at,
             "max_trust_age_seconds": self.max_trust_age_seconds,
+            "sig_alg": self.sig_alg,
         }
         return canonical_json_bytes(payload)
 
@@ -219,6 +242,7 @@ class SignedCatalogEntry:
             "issued_at": self.issued_at,
             "max_trust_age_seconds": self.max_trust_age_seconds,
             "signer_key_id": self.signer_key_id,
+            "sig_alg": self.sig_alg,
             "signature": base64.b64encode(self.signature).decode("ascii"),
         }
 
@@ -249,6 +273,18 @@ class CatalogVerifier:
         self._public_key = public_key
 
     def verify(self, entry: SignedCatalogEntry) -> None:
+        if entry.sig_alg != ECDSA_P256_SHA256:
+            # Crypto-agility (Nico rec): an entry claiming an algorithm this
+            # verify-side build does not implement fails closed — it is
+            # NEVER assumed to be ECDSA regardless of what `signature`
+            # contains. This is what makes a future staged ML-DSA rotation
+            # safe: old verifiers refuse new-algorithm entries loudly rather
+            # than mis-verifying them.
+            raise CatalogVerificationError(
+                f"catalog entry for {entry.repo_id}@{entry.revision}/{entry.filename} claims sig_alg "
+                f"{entry.sig_alg!r}, which this build does not implement (supported: {ECDSA_P256_SHA256!r}) — "
+                "refusing to verify rather than guessing"
+            )
         try:
             self._public_key.verify(entry.signature, entry.signed_payload(), ec.ECDSA(hashes.SHA256()))
         except InvalidSignature as exc:
@@ -349,10 +385,11 @@ class SignedCatalog:
 
 
 __all__ = [
-    "SignedCatalogEntry",
-    "CatalogVerifier",
-    "SignedCatalog",
+    "ECDSA_P256_SHA256",
     "CatalogVerificationError",
+    "CatalogVerifier",
     "RevocationSource",
+    "SignedCatalog",
+    "SignedCatalogEntry",
     "StaticRevocationSource",
 ]

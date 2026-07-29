@@ -24,6 +24,7 @@ from keygen_manifest import (
 from manifest_signer import ConvertedManifestSigner, ManifestSigner, load_signing_key
 
 from yashigani_infer.catalog import (
+    ECDSA_P256_SHA256,
     CatalogVerificationError,
     CatalogVerifier,
     SignedCatalog,
@@ -205,6 +206,39 @@ def test_expired_manifest_rejected_at_require_time(signing_keypair) -> None:
         catalog.require("acme/tiny-model", REVISION, "tiny-model.Q4_K_M.gguf", now=long_after)
 
 
+# --- Nico crypto-agility rec (2026-07-29 design-review): sig_alg dispatch ---
+
+
+def test_minted_pull_entry_defaults_to_ecdsa_sig_alg(signing_keypair) -> None:
+    private_key, _public_key = signing_keypair
+    signer = ManifestSigner(private_key)
+    entry = _mint_pull_entry(signer)
+    assert entry.sig_alg == ECDSA_P256_SHA256
+
+
+def test_verifier_rejects_a_pull_entry_relabelled_to_an_unrecognised_sig_alg(signing_keypair) -> None:
+    private_key, public_key = signing_keypair
+    signer = ManifestSigner(private_key)
+    entry = _mint_pull_entry(signer)
+
+    relabelled = SignedCatalogEntry(
+        repo_id=entry.repo_id,
+        revision=entry.revision,
+        filename=entry.filename,
+        quant=entry.quant,
+        sha256=entry.sha256,
+        lfs_object_id=entry.lfs_object_id,
+        provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
+        signature=entry.signature,
+        signer_key_id=entry.signer_key_id,
+        sig_alg="ml-dsa-65",  # not (yet) implemented by this verify-side build
+    )
+    with pytest.raises(CatalogVerificationError, match="does not implement"):
+        CatalogVerifier(public_key).verify(relabelled)
+
+
 def test_revoked_manifest_rejected_at_require_time(signing_keypair) -> None:
     private_key, public_key = signing_keypair
     signer = ManifestSigner(private_key)
@@ -361,6 +395,59 @@ def test_convert_manifest_rejects_revoked(signing_keypair, tmp_path: Path) -> No
     verifier = ConvertedManifestVerifier(public_key)
     with pytest.raises(ConvertedManifestVerificationError, match="deny-list"):
         verify_converted_manifest(entry, output_path=output_path, verifier=verifier, revocation_source=revocation)
+
+
+def test_minted_converted_manifest_defaults_to_ecdsa_sig_alg(signing_keypair, tmp_path: Path) -> None:
+    private_key, _public_key = signing_keypair
+    source_path = tmp_path / "source.safetensors"
+    output_path = tmp_path / "output.gguf"
+    source_path.write_bytes(b"source bytes")
+    output_path.write_bytes(b"output bytes")
+
+    measurement = measure_conversion_tuple(
+        source_path, output_path, convert_tool_commit=CONVERT_TOOL_COMMIT, quant="Q4_K_M"
+    )
+    signer = ConvertedManifestSigner(private_key)
+    entry = signer.mint(
+        measurement, provenance_tier="converted-derived", signer_key_id="k1", max_trust_age_seconds=3600
+    )
+    assert entry.sig_alg == ECDSA_P256_SHA256
+
+
+def test_verifier_rejects_a_converted_manifest_relabelled_to_an_unrecognised_sig_alg(
+    signing_keypair, tmp_path: Path
+) -> None:
+    private_key, public_key = signing_keypair
+    source_path = tmp_path / "source.safetensors"
+    output_path = tmp_path / "output.gguf"
+    source_path.write_bytes(b"source bytes")
+    output_path.write_bytes(b"output bytes")
+
+    measurement = measure_conversion_tuple(
+        source_path, output_path, convert_tool_commit=CONVERT_TOOL_COMMIT, quant="Q4_K_M"
+    )
+    signer = ConvertedManifestSigner(private_key)
+    entry = signer.mint(
+        measurement, provenance_tier="converted-derived", signer_key_id="k1", max_trust_age_seconds=3600
+    )
+
+    from yashigani_infer.convert_provenance import ConvertedManifestEntry
+
+    relabelled = ConvertedManifestEntry(
+        source_sha256=entry.source_sha256,
+        convert_tool_commit=entry.convert_tool_commit,
+        quant=entry.quant,
+        output_sha256=entry.output_sha256,
+        provenance_tier=entry.provenance_tier,
+        issued_at=entry.issued_at,
+        max_trust_age_seconds=entry.max_trust_age_seconds,
+        signature=entry.signature,
+        signer_key_id=entry.signer_key_id,
+        sig_alg="ml-dsa-65",
+    )
+    verifier = ConvertedManifestVerifier(public_key)
+    with pytest.raises(ConvertedManifestVerificationError, match="does not implement"):
+        verify_converted_manifest(relabelled, output_path=output_path, verifier=verifier)
 
 
 def test_measure_conversion_tuple_refuses_floating_tool_ref(tmp_path: Path) -> None:

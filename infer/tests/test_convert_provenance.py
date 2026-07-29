@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from yashigani_infer.catalog import ECDSA_P256_SHA256
 from yashigani_infer.convert_provenance import (
     ConvertedManifestEntry,
     measure_conversion_tuple,
@@ -72,6 +73,21 @@ def test_entry_rejects_non_positive_ttl(bad_ttl: int) -> None:
 def test_entry_rejects_eternal_trust_window() -> None:
     with pytest.raises(ValueError, match="ceiling"):
         ConvertedManifestEntry(**_base_fields(max_trust_age_seconds=999_999_999))
+
+
+def test_entry_defaults_sig_alg_to_ecdsa_p256_sha256() -> None:
+    entry = ConvertedManifestEntry(**_base_fields())
+    assert entry.sig_alg == ECDSA_P256_SHA256
+
+
+def test_entry_rejects_blank_sig_alg() -> None:
+    with pytest.raises(ValueError, match="sig_alg"):
+        ConvertedManifestEntry(**_base_fields(sig_alg="   "))
+
+
+def test_sig_alg_is_included_in_the_signed_payload() -> None:
+    entry = ConvertedManifestEntry(**_base_fields())
+    assert entry.sig_alg in entry.signed_payload().decode("utf-8")
 
 
 def test_signed_payload_is_deterministic_and_field_complete() -> None:

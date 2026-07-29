@@ -64,7 +64,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from yashigani_infer.blobstore.store import sha256_file
-from yashigani_infer.catalog import RevocationSource, StaticRevocationSource
+from yashigani_infer.catalog import ECDSA_P256_SHA256, RevocationSource, StaticRevocationSource
 from yashigani_infer.provenance_canon import canonical_json_bytes
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -188,6 +188,10 @@ class ConvertedManifestEntry:
         signature: raw ECDSA signature (DER-encoded) over `signed_payload()`.
         signer_key_id: opaque identifier for which signing key produced
             `signature` (rotation bookkeeping only, not itself signed over).
+        sig_alg: which signature algorithm `signature` was produced with
+            (Nico crypto-agility rec, 2026-07-29) — same rationale and
+            dispatch discipline as `catalog.SignedCatalogEntry.sig_alg`.
+            Defaults to `ECDSA_P256_SHA256`.
     """
 
     source_sha256: str
@@ -199,8 +203,11 @@ class ConvertedManifestEntry:
     max_trust_age_seconds: int
     signature: bytes
     signer_key_id: str
+    sig_alg: str = ECDSA_P256_SHA256
 
     def __post_init__(self) -> None:
+        if not self.sig_alg.strip():
+            raise ValueError("converted-GGUF manifest sig_alg must not be blank")
         if not _SHA256_HEX.match(self.source_sha256.lower()):
             raise ValueError(f"source_sha256 is not a 64-char hex digest: {self.source_sha256!r}")
         if not _SHA256_HEX.match(self.output_sha256.lower()):
@@ -233,6 +240,7 @@ class ConvertedManifestEntry:
             "provenance_tier": self.provenance_tier,
             "issued_at": self.issued_at,
             "max_trust_age_seconds": self.max_trust_age_seconds,
+            "sig_alg": self.sig_alg,
         }
         return canonical_json_bytes(payload)
 
@@ -256,6 +264,7 @@ class ConvertedManifestEntry:
             "issued_at": self.issued_at,
             "max_trust_age_seconds": self.max_trust_age_seconds,
             "signer_key_id": self.signer_key_id,
+            "sig_alg": self.sig_alg,
             "signature": base64.b64encode(self.signature).decode("ascii"),
         }
 
@@ -281,6 +290,15 @@ class ConvertedManifestVerifier:
         self._public_key = public_key
 
     def verify(self, entry: ConvertedManifestEntry) -> None:
+        if entry.sig_alg != ECDSA_P256_SHA256:
+            # Crypto-agility (Nico rec): fail closed on an unrecognised
+            # algorithm — see `catalog.CatalogVerifier.verify`'s identical
+            # rationale.
+            raise ConvertedManifestVerificationError(
+                f"converted-GGUF manifest (convert_tool_commit={entry.convert_tool_commit!r}) claims sig_alg "
+                f"{entry.sig_alg!r}, which this build does not implement (supported: {ECDSA_P256_SHA256!r}) — "
+                "refusing to verify rather than guessing"
+            )
         try:
             self._public_key.verify(entry.signature, entry.signed_payload(), ec.ECDSA(hashes.SHA256()))
         except InvalidSignature as exc:
