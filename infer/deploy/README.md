@@ -25,7 +25,9 @@ infer/deploy/
 │   ├── apparmor/yashigani-infer-llama-server                          (item 4)
 │   ├── Caddyfile.infer-front                       ring-fence front, single source (item 6)
 │   ├── docker-compose.infer.yml                    base topology (items 3, 5, 6, 7)
-│   └── docker-compose.infer.{cuda,rocm,vulkan,cpu,podman-override}.yml   image-SWAP overlays (item 7)
+│   ├── docker-compose.infer.{cuda,rocm,vulkan,cpu,podman-override}.yml   image-SWAP overlays (item 7)
+│   └── docker-compose.infer.cuda-podman-devpath.yml   CDI-failure fallback (Iris RC-5, standalone
+│                                                        alternative to cuda.yml, not layered on it)
 ├── gpu/healthcheck-gpu-engaged.sh                  live re-measure healthcheck (item 8)
 ├── helm/yashigani-infer/                           standalone chart (items 3, 5, 6, 7)
 └── scripts/{resolve-and-pin-digests,verify-seccomp-json,sync-infer-deploy-artifacts-to-helm,verify-offline}.sh
@@ -148,6 +150,34 @@ verified against real hardware.
   wiring to set these automatically is Su's lane, deferred (out of scope here). K8s is
   unaffected (AMD device-plugin manages device cgroup rules itself). Verified via
   `docker compose config` both with the default and with a numeric override.
+
+- **Podman + CUDA CDI devpath fallback (Iris RC-5).** Some rootless-Podman + NVIDIA driver
+  combinations fail `nvidia-ctk cdi generate` outright — install.sh already has this exact
+  probe-and-fallback pattern for ollama, but the infer engine's CUDA backend had no equivalent
+  sibling file at all; a CDI-failure host had zero documented recovery path. New file
+  `docker/docker-compose.infer.cuda-podman-devpath.yml` mirrors ollama's
+  `docker-compose.gpu-podman-devpath.yml` — direct `/dev/nvidia*` device-node passthrough,
+  per-service scoped (same least-privilege fix as finding #3 above), applied **as a full
+  standalone alternative to** `docker-compose.infer.cuda.yml` (verified this session: Compose
+  merges/appends `devices:` lists across files rather than replacing them, so layering on top
+  of `cuda.yml` would leave both the broken CDI entry and the devpath entries present
+  simultaneously — still fails on a genuine CDI-failure host; hence the standalone-file
+  design, matching the same mutual-exclusivity convention already used for cuda/rocm/vulkan/
+  cpu backend selection). `install.sh`-side CDI-probe wiring to select this file automatically
+  is deferred (5.0-side cutover work, out of scope here).
+
+  **Also fixed while gate-testing this** (pre-existing, discovered here, not introduced by
+  this session): `docker-compose.infer.podman-override.yml` re-declared `security_opt`
+  byte-identical to the base file's own — Compose 29.4.1 treats exact-duplicate
+  `security_opt` list entries across merged files as a hard validation error
+  (`docker compose config` failed outright on the existing `cuda.yml` + `podman-override.yml`
+  combination, with or without this session's new devpath file). Removed the redundant
+  redeclaration; the base file's `security_opt` stands unchanged, and the YSG-RISK-074
+  seccomp-persistence verification remains live-only (`podman inspect`) as
+  `scripts/verify-offline.sh` already documents — a second textual declaration in another
+  compose file was never able to catch a runtime wrapper bug anyway. Verified via
+  `docker compose config` on all six overlay combinations (cuda, cuda+podman-override,
+  cuda-podman-devpath standalone, rocm, vulkan, cpu) — all pass.
 
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
