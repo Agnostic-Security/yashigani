@@ -2717,7 +2717,13 @@ async def issue_operator_token(
 
     # Signing key: reuse caddy_internal_hmac (already a 32+ byte secret at runtime).
     # Fail closed if the secret file is not readable.
-    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    # YSG-RISK-150: resolve via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    # matches the convention used everywhere else in the codebase (e.g.
+    # yashigani/auth/caddy_verified.py load_caddy_secret()). A hardcoded
+    # "/run/secrets/..." path breaks on any install with a non-default
+    # secrets mount.
+    _secrets_dir = os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    _hmac_path = os.path.join(_secrets_dir, "caddy_internal_hmac")
     try:
         with open(_hmac_path) as _f:
             _signing_key = _f.read().strip()
@@ -2806,7 +2812,10 @@ async def verify_operator_token(
         )
     _raw_token = auth_header[len("Bearer "):].strip()
 
-    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    # YSG-RISK-150: resolve via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    # same convention as the issuance endpoint above and the rest of the codebase.
+    _secrets_dir = os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    _hmac_path = os.path.join(_secrets_dir, "caddy_internal_hmac")
     try:
         with open(_hmac_path) as _f:
             _signing_key = _f.read().strip()
