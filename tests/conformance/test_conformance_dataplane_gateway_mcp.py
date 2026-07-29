@@ -816,7 +816,24 @@ class _WorkerSubprocessBackend:
     def run_extractor_job(self, *, stdin, timeout_s, command, **kwargs):
         import subprocess
         from pathlib import Path
-        repo_root = Path(__file__).resolve().parents[3]
+        # YSG-RISK-161 bisection (Iris, 4.1.2 integrated fixbatch, 2026-07-30):
+        # this file lives at tests/conformance/<file>.py — only 2 levels below
+        # repo root (parents[0]=conformance, parents[1]=tests, parents[2]=repo
+        # root). The parents[3] constant was copy-pasted from
+        # src/tests/unit/test_user_documents_gaps_3_4_5.py, which sits 3 levels
+        # below repo root (src/tests/unit/<file>.py) — correct THERE, wrong HERE.
+        # parents[3] resolved one directory ABOVE the actual repo root, so the
+        # subprocess command pointed at a worker.py that does not exist:
+        # "can't open file '.../worker.py': [Errno 2] No such file or directory",
+        # exit code 2. The pipeline's fail-closed-on-subprocess-failure guard
+        # then (correctly) forced BLOCK for the REDACT/PSEUDONYMIZE rungs,
+        # masquerading as a disposition-ladder product regression. Confirmed
+        # test-harness artifact, not a product bug — LOG/BLOCK rungs never
+        # exercise this subprocess path (LOG needs no re-render; BLOCK's
+        # expected outcome coincides with the same fail-closed result the
+        # broken path already produced), which is why only REDACT/PSEUDONYMIZE
+        # surfaced the defect.
+        repo_root = Path(__file__).resolve().parents[2]
         worker_path = repo_root / "docker" / "extractor" / "worker.py"
         env = dict(os.environ)
         env["PYTHONPATH"] = str(repo_root / "src")
