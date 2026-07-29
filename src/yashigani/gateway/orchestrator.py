@@ -57,6 +57,7 @@ classifier + framing reduce influence; the gates + caps bound consequence.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -392,13 +393,17 @@ async def _opa_ingress_for_mcp(identity, server: str, tool: str) -> dict:
     )
 
 
-def _classify_sensitivity(text: str) -> str:
+async def _classify_sensitivity(text: str) -> str:
     """Classify a text fragment's sensitivity level via the live classifier.
 
     Returns one of PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED.  Uses
     classify_decoded so an encoded secret elevates exactly as plaintext (F-RT1).
     Fail-closed: if the classifier is unavailable OR raises, return RESTRICTED so
     an unclassifiable fragment cannot pass an egress sensitivity ceiling silently.
+
+    YSG-RISK-113: classify_decoded() is a SYNCHRONOUS blocking classifier call.
+    Run it via asyncio.to_thread so a slow/dead backend cannot block this
+    event loop's /healthz probe (DoS class — orchestrator agent-upstream leg).
     """
     from yashigani.gateway.openai_router import _state
     classifier = _state.sensitivity_classifier
@@ -408,7 +413,7 @@ def _classify_sensitivity(text: str) -> str:
         return "RESTRICTED"
     try:
         from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
-        result = classifier.classify_decoded(text)
+        result = await asyncio.to_thread(classifier.classify_decoded, text)
         # R14/R15 (v2.25.5): SensitivityResult.level is int; .value would raise AttributeError.
         # Use _LEVEL_TO_LEGACY_STRING to convert to the legacy string OPA/callers expect.
         return _LEVEL_TO_LEGACY_STRING.get(int(result.level), "RESTRICTED")
@@ -512,13 +517,17 @@ async def _opa_egress_for_outbound_args(identity, args_sensitivity: str,
     )
 
 
-def _inspect_result(text: str, identity, request_id: str):
+async def _inspect_result(text: str, identity, request_id: str):
     """Run ResponseInspectionPipeline.inspect on a tool result (§3.4).
 
     Returns (verdict_str, confidence, raw_result_or_None).  When the pipeline is
     not configured, returns ("skipped", 1.0, None) — but note that in the demo the
     pipeline is enabled (YASHIGANI_INSPECT_RESPONSES=true), which is what makes the
     cloud-9 block fire.
+
+    YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier call. Run it
+    via asyncio.to_thread so a slow/dead backend cannot block this event
+    loop's /healthz probe (DoS class — orchestrator agent-upstream leg).
     """
     from yashigani.gateway.openai_router import _state
     pipeline = _state.response_inspection_pipeline
@@ -526,7 +535,8 @@ def _inspect_result(text: str, identity, request_id: str):
         return "skipped", 1.0, None
     try:
         session_id = _principal_id(identity)
-        result = pipeline.inspect(
+        result = await asyncio.to_thread(
+            pipeline.inspect,
             response_body=text, content_type="text/plain",
             request_id=request_id, session_id=session_id, agent_id="orchestrator",
         )
@@ -687,12 +697,12 @@ async def _execute_mcp_tool(*, server: str, upstream_url: str, tool: str, args: 
     result_text = _extract_mcp_text(upstream)
 
     # 3) ResponseInspection on the RESULT (before it can re-enter the model).
-    verdict, confidence, _ = _inspect_result(result_text, identity, request_id)
+    verdict, confidence, _ = await _inspect_result(result_text, identity, request_id)
 
     # 3b) Classify the RESULT-content sensitivity (FIX N2 / LAURA): the egress OPA
     #     decision must be able to deny on a sensitivity-ceiling breach, not only
     #     on the inspection verdict.  classify_decoded handles encoded payloads.
-    result_sensitivity = _classify_sensitivity(result_text)
+    result_sensitivity = await _classify_sensitivity(result_text)
 
     # 3c) Detect PII in the RESULT content (YSG-RISK-146): previously hardcoded
     #     False in _opa_egress_for_mcp_result — OPA could never gate on PII
@@ -944,12 +954,14 @@ async def _execute_api_call(
         )
 
     # ── 4. ResponseInspection on the result ───────────────────────────────────
-    verdict, confidence, _ = _inspect_result(result_text, identity, request_id)
+    verdict, confidence, _ = await _inspect_result(result_text, identity, request_id)
 
     # ── 5. Classify result sensitivity + detect PII + OPA EGRESS ─────────────
     # YSG-RISK-146: result_pii_detected feeds the OPA egress decision — the
     # egress path previously hardcoded pii_detected=False here.
-    result_sensitivity = _classify_sensitivity(result_text)
+    # _classify_sensitivity is async (YSG-RISK-113: keeping heavy
+    # classification off the event loop) — must be awaited.
+    result_sensitivity = await _classify_sensitivity(result_text)
     result_pii_detected = _detect_pii(result_text)
     egress = await _opa_egress_for_mcp_result(
         identity, connection_name, f"api_call:{method}:{path}",
@@ -1033,7 +1045,7 @@ async def _execute_tool_call(*, tool_name: str, args: dict, catalog, identity,
     # hop runs.  A malicious tool result must not be able to make the model smuggle
     # RESTRICTED/CONFIDENTIAL context out through the args of a PUBLIC-bound / MCP /
     # agent callee.  The per-hop OPA egress denies on a sensitivity-ceiling breach.
-    args_sensitivity = _classify_sensitivity(_args_text(args))
+    args_sensitivity = await _classify_sensitivity(_args_text(args))
     if args_sensitivity in ("CONFIDENTIAL", "RESTRICTED"):
         # YSG-RISK-146: args_pii_detected feeds the OPA egress decision — this
         # call previously hardcoded pii_detected=False, so OPA could never
@@ -1468,7 +1480,7 @@ async def _run_letta_brain_loop(*, body, identity, request, request_id, catalog,
                 from yashigani.gateway.openai_router import gate_relaxed_final
                 allow, gated = await gate_relaxed_final(
                     identity=identity, final_text=candidate,
-                    prompt_sensitivity=_classify_sensitivity(user_prompt))
+                    prompt_sensitivity=await _classify_sensitivity(user_prompt))
                 if not allow:
                     blocked_any = True
                 final_text = gated
@@ -1778,7 +1790,7 @@ async def run_orchestration(*, body, identity, request, request_id: str,
                 (m.content or "") for m in body.messages if m.content)
             allow, gated = await gate_relaxed_final(
                 identity=identity, final_text=candidate,
-                prompt_sensitivity=_classify_sensitivity(user_prompt))
+                prompt_sensitivity=await _classify_sensitivity(user_prompt))
             if not allow:
                 blocked_any = True
             final_text = gated

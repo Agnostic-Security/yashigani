@@ -18,6 +18,22 @@ data:
 {{ .Files.Get "files/postgres-05-enable-ssl.sh" | indent 4 }}
   10-pgbouncer-auth.sh: |
 {{ .Files.Get "files/10-pgbouncer-auth.sh" | indent 4 }}
+  # NEW-K8S-POSTGRES-MISSING-AGENT-DBS-001 (found live during 4.1.2 k3s/Cilium
+  # e2e, 2026-07-28): this ConfigMap only ever shipped 05-/10- — the compose
+  # side ALSO mounts docker/postgres/init-agent-dbs.sh at
+  # /docker-entrypoint-initdb.d/11-agent-dbs.sh (docker-compose.yml), which
+  # creates the yashigani_app role (idempotently, ahead of migration 0001)
+  # and the `letta` database + pgvector extension + schema grants. The K8s
+  # path never had an equivalent, so on a fresh PGDATA the `letta` database
+  # was never created: letta's own Alembic migration then FATALs "database
+  # letta does not exist", CrashLoopBackOff forever (a stateful init-time
+  # gap — restarting the pod never re-runs docker-entrypoint-initdb.d once
+  # PGDATA is non-empty, same class of one-shot-init issue as the SSL/server
+  # key fixes above). Byte-identical mirror of
+  # docker/postgres/init-agent-dbs.sh (verified via diff) — no K8s-specific
+  # divergence needed (pure psql SQL, no UID/chown operations).
+  11-agent-dbs.sh: |
+{{ .Files.Get "files/init-agent-dbs.sh" | indent 4 }}
 ---
 apiVersion: v1
 kind: ConfigMap

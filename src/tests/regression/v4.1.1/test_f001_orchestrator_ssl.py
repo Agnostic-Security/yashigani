@@ -223,9 +223,9 @@ class TestExecuteMcpToolSslContext:
         with patch("yashigani.gateway.orchestrator._opa_ingress_for_mcp",
                    AsyncMock(return_value=self._make_opa_allow())), \
              patch("yashigani.gateway.orchestrator._inspect_result",
-                   MagicMock(return_value=("PASS", 0.99, {}))), \
+                   AsyncMock(return_value=("PASS", 0.99, {}))), \
              patch("yashigani.gateway.orchestrator._classify_sensitivity",
-                   MagicMock(return_value="PUBLIC")), \
+                   AsyncMock(return_value="PUBLIC")), \
              patch("yashigani.gateway.orchestrator._opa_egress_for_mcp_result",
                    AsyncMock(return_value={"allow": True, "reason": "ok"})), \
              patch("yashigani.gateway.orchestrator._audit", MagicMock()), \
@@ -266,12 +266,15 @@ class TestExecuteMcpToolSslContext:
         mock_internal = MagicMock(return_value=mock_cm)
         mock_plain = MagicMock(return_value=mock_cm)
 
+        # YSG-RISK-113: _inspect_result / _classify_sensitivity are now async
+        # (offload the blocking classifier call via asyncio.to_thread) —
+        # mocks must be AsyncMock so `await` on them works.
         with patch("yashigani.gateway.orchestrator._opa_ingress_for_mcp",
                    AsyncMock(return_value=self._make_opa_allow())), \
              patch("yashigani.gateway.orchestrator._inspect_result",
-                   MagicMock(return_value=("PASS", 0.99, {}))), \
+                   AsyncMock(return_value=("PASS", 0.99, {}))), \
              patch("yashigani.gateway.orchestrator._classify_sensitivity",
-                   MagicMock(return_value="PUBLIC")), \
+                   AsyncMock(return_value="PUBLIC")), \
              patch("yashigani.gateway.orchestrator._opa_egress_for_mcp_result",
                    AsyncMock(return_value={"allow": True, "reason": "ok"})), \
              patch("yashigani.gateway.orchestrator._audit", MagicMock()), \
@@ -324,8 +327,15 @@ class TestOllamaAsyncClientSchemeSelection:
         mock_factory.assert_called_once(), (
             "ollama_async_client for https:// must call internal_httpx_client"
         )
-        # Timeout must be applied.
-        assert mock_internal_client.timeout == 120.0
+        # YSG-RISK-113: a bare float timeout is normalized into an explicit
+        # httpx.Timeout with a fast-failing connect phase (fail-fast hardening
+        # so a completely dead backend doesn't wait out the full read
+        # timeout). The read/write/pool phases still carry the caller's
+        # original value.
+        import httpx
+        assert isinstance(mock_internal_client.timeout, httpx.Timeout)
+        assert mock_internal_client.timeout.read == 120.0
+        assert mock_internal_client.timeout.connect == 5.0
 
     def test_http_scheme_returns_plain_httpx(self):
         """ollama_async_client("http://...") must NOT call internal_httpx_client."""

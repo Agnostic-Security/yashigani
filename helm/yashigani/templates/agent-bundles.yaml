@@ -84,6 +84,17 @@ spec:
         {{- end }}
         seccompProfile:
           type: RuntimeDefault
+      {{- if $bundle.extraInitContainers }}
+      # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001: generic initContainer hook —
+      # a bundle MAY need to pre-seed a file into an emptyDir it later
+      # subPath-mounts (K8s/kubelet gotcha: when a subPath target does not
+      # already exist in the source volume, kubelet creates it as a
+      # DIRECTORY, not a file, silently turning an intended file-mount into
+      # a directory-mount). See letta's extraInitContainers entry
+      # (values.yaml) for the concrete case this closes.
+      initContainers:
+        {{- toYaml $bundle.extraInitContainers | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ $bundleID }}
           image: "{{ $bundle.image.repository }}:{{ $bundle.image.tag | default "latest" }}"

@@ -43,10 +43,33 @@ logger = logging.getLogger(__name__)
 # Default request timeout mirrors the classifier's historical default.
 _DEFAULT_TIMEOUT = 30.0
 
+# YSG-RISK-113: hard ceiling on the CONNECT phase, decoupled from the (often
+# much longer) read timeout that a caller passes for model-generation latency.
+# A backend that is completely unreachable (TCP refused / host down / no
+# listener) must fail in seconds, not wait out the full read timeout meant
+# for a slow-but-alive model. Never raised above the caller's own timeout.
+_CONNECT_TIMEOUT_CEILING = 5.0
+
 
 def _is_mesh_url(base_url: str) -> bool:
     """True when *base_url* requires the internal-mesh mTLS client."""
     return base_url.strip().lower().startswith("https://")
+
+
+def _build_timeout(timeout: float | httpx.Timeout) -> httpx.Timeout:
+    """Normalize *timeout* into an explicit httpx.Timeout with a fast-failing
+    connect phase (YSG-RISK-113 fail-fast hardening).
+
+    A bare float applies the SAME duration to connect/read/write/pool, which
+    means a fully dead backend (nothing listening) waits just as long as a
+    slow-but-alive one before failing. Splitting connect off to a short,
+    fixed ceiling makes "backend unreachable" fail fast while preserving the
+    caller's intended read timeout for "backend alive but slow to respond".
+    """
+    if isinstance(timeout, httpx.Timeout):
+        return timeout
+    connect = min(float(timeout), _CONNECT_TIMEOUT_CEILING)
+    return httpx.Timeout(float(timeout), connect=connect)
 
 
 def ollama_sync_client(
@@ -58,8 +81,11 @@ def ollama_sync_client(
     http  → plain client (legacy/dev path, unchanged behaviour).
 
     ``timeout`` accepts a plain float or an ``httpx.Timeout`` (needed by the
-    long-running model-pull stream).
+    long-running model-pull stream). A bare float is normalized via
+    :func:`_build_timeout` so the connect phase fails fast even when the
+    read timeout is long (YSG-RISK-113).
     """
+    timeout = _build_timeout(timeout)
     if _is_mesh_url(base_url):
         # Lazy import: pki.client pulls in ssl-context machinery that must not
         # be a hard import cost for test environments using http:// URLs.
@@ -74,6 +100,7 @@ def ollama_async_client(
     base_url: str, *, timeout: "float | httpx.Timeout" = _DEFAULT_TIMEOUT,
 ) -> httpx.AsyncClient:
     """Async variant of :func:`ollama_sync_client` (same scheme rule)."""
+    timeout = _build_timeout(timeout)
     if _is_mesh_url(base_url):
         from yashigani.pki.client import internal_httpx_client  # noqa: PLC0415
         client = internal_httpx_client()

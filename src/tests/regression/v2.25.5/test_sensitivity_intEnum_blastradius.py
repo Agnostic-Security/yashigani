@@ -64,22 +64,27 @@ _LEVEL_CASES = [
 # ---------------------------------------------------------------------------
 
 class TestSiteA:
-    """orchestrator._classify_sensitivity() must return a string (legacy label)."""
+    """orchestrator._classify_sensitivity() must return a string (legacy label).
 
-    def _call(self, level: int, text: str = "some text") -> str:
+    YSG-RISK-113: _classify_sensitivity is now async (offloads the blocking
+    classifier call via asyncio.to_thread) — every call site below awaits it.
+    """
+
+    async def _call(self, level: int, text: str = "some text") -> str:
         from yashigani.gateway import openai_router as router
         import yashigani.gateway.orchestrator as orch
         original = router._state.sensitivity_classifier
         try:
             router._state.sensitivity_classifier = _FakeClassifier(level)
-            return orch._classify_sensitivity(text)
+            return await orch._classify_sensitivity(text)
         finally:
             router._state.sensitivity_classifier = original
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("level,expected_label", _LEVEL_CASES)
-    def test_returns_legacy_string(self, level, expected_label):
+    async def test_returns_legacy_string(self, level, expected_label):
         """_classify_sensitivity must return the legacy string label, not an int."""
-        result = self._call(level)
+        result = await self._call(level)
         assert isinstance(result, str), (
             f"SITE-A BROKEN: _classify_sensitivity returned {type(result).__name__!r}={result!r}, "
             f"expected str for level {level}"
@@ -88,38 +93,41 @@ class TestSiteA:
             f"SITE-A wrong label: got {result!r}, expected {expected_label!r} for level {level}"
         )
 
-    def test_no_classifier_returns_public(self):
+    @pytest.mark.asyncio
+    async def test_no_classifier_returns_public(self):
         from yashigani.gateway import openai_router as router
         import yashigani.gateway.orchestrator as orch
         original = router._state.sensitivity_classifier
         try:
             router._state.sensitivity_classifier = None
-            result = orch._classify_sensitivity("some text")
+            result = await orch._classify_sensitivity("some text")
         finally:
             router._state.sensitivity_classifier = original
         assert result == "RESTRICTED", (
             "SITE-A: None classifier must return RESTRICTED (fail-closed)"
         )
 
-    def test_empty_text_returns_public(self):
+    @pytest.mark.asyncio
+    async def test_empty_text_returns_public(self):
         from yashigani.gateway import openai_router as router
         import yashigani.gateway.orchestrator as orch
         original = router._state.sensitivity_classifier
         try:
             router._state.sensitivity_classifier = _FakeClassifier(5)
-            result = orch._classify_sensitivity("")
+            result = await orch._classify_sensitivity("")
         finally:
             router._state.sensitivity_classifier = original
         assert result == "PUBLIC", (
             "SITE-A: empty text must return PUBLIC regardless of classifier"
         )
 
-    def test_does_not_raise_attribute_error(self):
+    @pytest.mark.asyncio
+    async def test_does_not_raise_attribute_error(self):
         """The pre-fix code called .level.value on an int — this proved it crashed."""
         # If the fix is missing, _FakeClassifier.classify_decoded returns a
         # SensitivityResult whose .level is an int (4).  Calling .value on that
         # int raises AttributeError.  If we reach this assert, the fix is in place.
-        result = self._call(4)
+        result = await self._call(4)
         assert result == "RESTRICTED"
 
 

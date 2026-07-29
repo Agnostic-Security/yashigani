@@ -177,6 +177,25 @@ spec:
               # live: identical failure on pgbouncer 1.25.1 AND 1.25.2, auth_query AND
               # static userlist.txt, direct-to-postgres AND via pgbouncer).
               cp -L /postgres-secret-ro/postgres_password /secrets-rw/
+              # NEW-K8S-BACKOFFICE-LICENSE-SUBPATH-001 (found live during 4.1.2
+              # k3s/Cilium e2e, 2026-07-28): same bug class as
+              # YSG-GW-SUBPATH-MOUNT (gateway.yaml) — the license Secret used
+              # to be subPath-mounted directly at /run/secrets/license_key
+              # (nested inside the ALREADY-mounted `secrets` emptyDir).
+              # kubelet/containerd cannot create a subPath mountpoint at a
+              # path that doesn't already exist as a real file/dir inside
+              # another volume's mount: every backoffice pod with a license
+              # configured hit RunContainerError "create target of file
+              # bind-mount: mknod regular file .../run/secrets/license_key:
+              # read-only file system". gateway.yaml was fixed for this exact
+              # pattern (tier-tests-20260720) with a comment claiming it
+              # "mirrors backoffice.yaml's pattern exactly" — but backoffice's
+              # own initContainer was never actually given the matching
+              # license_key copy step, so the broken subPath mount silently
+              # remained. Fix: copy license_key here too, same as gateway.
+              if [ -d /license-ro ]; then
+                cp -L /license-ro/license_key /secrets-rw/
+              fi
               chmod 0400 /secrets-rw/*
           securityContext:
             runAsUser: 1001
@@ -200,6 +219,11 @@ spec:
             - name: postgres-secret-ro
               mountPath: /postgres-secret-ro
               readOnly: true
+            {{- if .Values.licensing.licenseKey }}
+            - name: license-ro
+              mountPath: /license-ro
+              readOnly: true
+            {{- end }}
             - name: secrets
               mountPath: /secrets-rw
       {{- end }}
@@ -328,6 +352,18 @@ spec:
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
+            # YSG-RISK-125 fix (compose<->k8s name-resolution parity): user_ui.py
+            # and user_agents.py's chat/agent proxy default to
+            # os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
+            # — the bare "gateway" hostname only resolves in Compose, where the
+            # service is literally named "gateway". On k8s the Service is
+            # "yashigani-gateway" (see gateway.yaml Service, http-mesh port
+            # 8081); without this override every /user/chat/completions and
+            # /user/agents/* call fails DNS resolution ([Errno -2] Name or
+            # service not known) and every chat target (letta/langflow/
+            # openclaw/direct model) returns gateway_unreachable.
+            - name: YASHIGANI_GATEWAY_MESH_URL
+              value: "http://yashigani-gateway:8081/v1"
             - name: YASHIGANI_SECRETS_DIR
               value: "/run/secrets"
             # YSG-RISK-120 fix (k8s parity with compose FINDING-V412-RESTART-012):
@@ -445,9 +481,7 @@ spec:
                   key: caddy_internal_hmac
             {{- end }}
             # YSG-RISK-076 / DP-Y-003 §3.4 — semantic-intent import classifier sidecar
-            # (backoffice MCP import screen). Same Ollama backend as the gateway
-            # (OLLAMA_BASE_URL). Backoffice is on the data network and reaches
-            # ollama:11434 directly. Default ON; set "false" to disable.
+            # (backoffice MCP import screen). Same Ollama backend as the gateway.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
             # DP-Y-003 §3.4 — tool-poisoning strict-import gate. Default "" →
@@ -458,6 +492,20 @@ spec:
             - name: YASHIGANI_MCP_IMPORT_STRICT
               value: {{ .Values.backoffice.mcpImportStrict | quote }}
             {{- end }}
+            # YSG-RISK-128 fix: backoffice never set OLLAMA_BASE_URL at all, so
+            # entrypoint.py/routes/models.py fell back to their own Python
+            # default "http://ollama:11434" — wrong on two counts on k8s: (1)
+            # bare "ollama" doesn't resolve (compose-only hostname convention,
+            # same class of gap as YSG-RISK-125), and (2) even
+            # "yashigani-ollama:11434" is NetworkPolicy-blocked for backoffice
+            # (allow-ollama-ingress only admits the caddy pod — v4.1 Phase
+            # 1b-ii / LAURA-I1-01). Reuses gateway.env.ollamaUrl (single
+            # source of truth — both services share the same Ollama backend
+            # and the same mesh-mTLS front, matching docker-compose.yml where
+            # both gateway and backoffice set OLLAMA_BASE_URL to the identical
+            # https://caddy:11435/ollama value).
+            - name: OLLAMA_BASE_URL
+              value: {{ (.Values.gateway.env | default dict).ollamaUrl | quote }}
             # v4.1.2 fix (RESTART-013 MCP leg, Gap A / helm parity) — document
             # enforcement admin routes (routes/documents.py, dp_weaken.py,
             # user_ui.py) read is_document_enforcement_enabled() directly.
@@ -627,17 +675,14 @@ spec:
               mountPath: /data/backups
               readOnly: true
             {{- end }}
-            {{- if .Values.licensing.licenseKey }}
-            # Petra P0-1 (v2.24.4): mount the licence key so loader.py candidate 2
-            # (/run/secrets/license_key) resolves. subPath keeps the mount scoped to
-            # a single file; coexists with the (now readOnly, YSG-RISK-120 fix)
-            # /run/secrets emptyDir (initContainer seeds PKI there; this adds the
-            # licence file separately — both are read-only from the main container).
-            - name: license
-              mountPath: /run/secrets/license_key
-              subPath: license_key
-              readOnly: true
-            {{- end }}
+            # NEW-K8S-BACKOFFICE-LICENSE-SUBPATH-001 fix: the license_key subPath
+            # mount that used to live here (nested inside the already-mounted
+            # `secrets` emptyDir) is REMOVED — it hit the same containerd
+            # subPath-mount bug as YSG-GW-SUBPATH-MOUNT (gateway.yaml). The
+            # copy-pki-to-writable initContainer now copies license_key into
+            # /secrets-rw (see that initContainer's command), so loader.py's
+            # candidate 2 (/run/secrets/license_key) resolves via the same
+            # already-mounted `secrets` volume with no separate mount needed.
             {{- if .Values.audit.signingKey.enabled }}
             # v2.25.2 (Lu wire-sink-gate P2): audit-chain signing key — RO, backoffice
             # ONLY. Distinct mountPath (/run/audit-signing) NOT under /run/secrets so
@@ -747,12 +792,19 @@ spec:
             type: DirectoryOrCreate
         {{- end }}
         {{- if .Values.licensing.licenseKey }}
-        # Petra P0-1 (v2.24.4): licence Secret volume.
-        # Mounted via subPath at /run/secrets/license_key (readOnly).
-        - name: license
+        # Petra P0-1 (v2.24.4): licence Secret volume — read-only source for the
+        # initContainer copy (NEW-K8S-BACKOFFICE-LICENSE-SUBPATH-001 fix; was
+        # subPath-mounted directly at /run/secrets/license_key in the main
+        # container, which broke — see initContainer comment). items-scoped
+        # to the single key actually needed, matching gateway.yaml's
+        # license-ro volume (YSG-GW-SUBPATH-MOUNT fix).
+        - name: license-ro
           secret:
             secretName: yashigani-license
             defaultMode: 0440
+            items:
+              - key: license_key
+                path: license_key
         {{- end }}
         # FINDING-V412-CADDYADMIN-002 (Captain, 2026-07-21): the caddyfile
         # ConfigMap volume is REMOVED — backoffice no longer reads the

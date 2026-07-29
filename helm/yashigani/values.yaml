@@ -460,7 +460,35 @@ gateway:
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
-    ollamaUrl: "http://yashigani-ollama:11434"
+    # YSG-RISK-128 fix: this MUST match docker-compose.yml's gateway/backoffice
+    # OLLAMA_BASE_URL (https://caddy:11435/ollama) — the NetworkPolicy hardening
+    # in networkpolicy.yaml (v4.1 Phase 1b-ii / LAURA-I1-01) removed the direct
+    # gateway/backoffice -> yashigani-ollama:11434 ingress rule; ONLY the caddy
+    # pod may reach ollama:11434 now (allow-ollama-ingress). This default was
+    # never updated in lockstep when that NetworkPolicy hardening landed, so
+    # every k8s gateway Ollama call (direct-model chat AND the fallback local
+    # backend behind every agent route) was silently dropped by NetworkPolicy
+    # (TCP connect timeout, no RST — indistinguishable from a dead backend
+    # without packet-level inspection). ollama_async_client/ollama_sync_client
+    # (inspection/_ollama_transport.py) already handle this mesh-mTLS URL
+    # scheme (used for the "Mac Metal" front too) — this is a values-only fix,
+    # no code change needed. See caddy.yaml Service (port 11435 added) +
+    # networkpolicy.yaml (already correct, unchanged by this fix).
+    #
+    # YSG-RISK-128 FOLLOW-UP (live-verification catch, same day): the first cut
+    # of this fix pointed at hostname "yashigani-caddy" — but that's the MAIN
+    # LoadBalancer Service (public edge, only ports 80/443, deliberately never
+    # carries the internal mesh port — see agent-ingress-fronts.yaml's own
+    # "NEVER on the public LoadBalancer Service" rationale). Port 11435 was
+    # added to a SEPARATE, purpose-built ClusterIP Service,
+    # "yashigani-caddy-mesh" (same file), specifically so it would NOT land on
+    # the public LB. The hostname here must match THAT service, not the main
+    # one. Confirmed live: yashigani-caddy:11435 timed out (Service has no
+    # such port — direct pod-IP connect to the same caddy pod succeeded
+    # instantly, isolating this as a Service-definition/hostname mismatch, not
+    # a NetworkPolicy or pod-readiness issue); yashigani-caddy-mesh:11435
+    # connects immediately.
+    ollamaUrl: "https://yashigani-caddy-mesh:11435/ollama"
     redisHost: "yashigani-redis"
     redisPort: "6379"
     agentRoutingEnabled: "true"
@@ -835,7 +863,7 @@ redis:
     enabled: false
 
 # ---------------------------------------------------------------------------
-# Ollama — local LLM inference (StatefulSet, 2 replicas for HA)
+# Ollama — local LLM inference (StatefulSet)
 # ---------------------------------------------------------------------------
 ollama:
   enabled: true
@@ -843,7 +871,36 @@ ollama:
     repository: ollama/ollama
     tag: "0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
     pullPolicy: IfNotPresent
-  replicaCount: 2
+  # NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001 (found live by Ava's e2e against
+  # 4.1.2 k3s/Cilium, 2026-07-28): default was 2 (StatefulSet, "2 replicas for
+  # HA"), but ollama-init-job.yaml pulls the model via a single set of
+  # `ollama pull` calls against the `yashigani-ollama` Service — a normal
+  # ClusterIP Service picks ONE backend pod per connection, so the pull
+  # lands entirely on ONE replica (ollama-0's PVC). Every other replica's
+  # PVC (each StatefulSet replica gets its own PVC via
+  # volumeClaimTemplates) stays with an EMPTY model catalog. The Service
+  # then round-robins real inference traffic across replicas — roughly
+  # half of all chat/inference calls hit an empty-catalog replica and hang
+  # (Ava's exact @letta/@langflow/@openclaw/direct-model chat-blocking
+  # finding). Fixed at 1: this is also the functionally correct value for
+  # any single-GPU deployment (the common shape — see project sizing notes,
+  # ~50 users/RTX3060) — a second replica cannot usefully hold the SAME
+  # model concurrently in the SAME one GPU's VRAM; it only adds contention,
+  # never capacity. helm/yashigani/values.single-node.yaml already had this
+  # correct (replicaCount: 1) as an optional overlay, but install.sh's k8s
+  # path never layers it in, so every k8s install got the broken default.
+  # Made the chart's baseline default itself correct rather than relying on
+  # an overlay operators may not know to pass. RESIDUAL / follow-up (not
+  # fixed here): true multi-GPU multi-replica scale-out requires
+  # ollama-init-job.yaml to pull per-pod (e.g. iterate StatefulSet pod DNS
+  # names ollama-0.<headless-svc>, ollama-1.<headless-svc>, ... instead of
+  # the round-robin Service VIP) before replicaCount > 1 is safe again.
+  # ollama.hpa.* below is NOT wired to any live HorizontalPodAutoscaler
+  # object in this chart (grepped: no HPA template exists for ollama at
+  # all) — those values are currently inert/dead config, so no separate
+  # autoscale-reintroduces-the-bug risk exists today; flagged for whoever
+  # eventually wires HPA up to also gate it on the per-pod-pull fix above.
+  replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
   # LLM inference — high memory requirement, 2 CPUs to keep inference
   # from starving other services. Increase on GPU hosts.
@@ -1308,6 +1365,20 @@ agentBundles:
       repository: ghcr.io/openclaw/openclaw
       tag: "2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
       pullPolicy: IfNotPresent
+    # NEW-K8S-OPENCLAW-NONROOT-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28): the pinned openclaw image (Node.js base) runs as uid=1000
+    # with named user "node" (non-numeric USER directive) — confirmed via
+    # `docker run --rm --entrypoint sh <image> -c 'id node'` => uid=1000(node)
+    # gid=1000(node). K8s runAsNonRoot rejects non-numeric USER directives
+    # without an explicit runAsUser (kubelet error: "container has
+    # runAsNonRoot and image has non-numeric user (node), cannot verify user
+    # is non-root" — CreateContainerConfigError, every pod, every start).
+    # Identical root cause + fix already applied to the langflow bundle above
+    # (see its podSecurityContext comment) — openclaw never got the same
+    # treatment. Fix: pin the same numeric UID the image itself declares.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
     replicaCount: 1
     env:
       OPENCLAW_SERVER_MODE: "true"
@@ -1346,6 +1417,34 @@ agentBundles:
         memory: "1024Mi"
     tokenSecretName: "yashigani-openclaw-token"
     tokenSecretKey: "token"
+    # NEW-K8S-OPENCLAW-TMPDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation as the podSecurityContext fix above):
+    # with runAsNonRoot/runAsUser fixed, the container now actually starts —
+    # and immediately crashes: "[openclaw] Failed to start CLI: Error:
+    # Unable to create fallback OpenClaw temp dir: /tmp/openclaw-1000"
+    # (readOnlyRootFilesystem: true is the template default; nothing mounts
+    # a writable /tmp). Same class of fix already applied to langflow below
+    # (extraVolumeMounts/extraVolumes for a writable /tmp emptyDir).
+    # NEW-K8S-OPENCLAW-HOMEDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation): with /tmp fixed the container gets
+    # further, then crashes again: "Gateway failed to start: Error: EROFS:
+    # read-only file system, open '/home/node/.openclaw/openclaw.json.1....tmp'"
+    # — openclaw persists/atomically-rewrites its own config + state under
+    # its home directory (~/.openclaw), which also needs to be writable
+    # under readOnlyRootFilesystem: true.
+    extraVolumeMounts:
+      - name: openclaw-tmp
+        mountPath: /tmp
+      - name: openclaw-home
+        mountPath: /home/node/.openclaw
+    extraVolumes:
+      - name: openclaw-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
+      - name: openclaw-home
+        emptyDir:
+          sizeLimit: 64Mi
 
   # Langflow — Visual multi-agent workflow builder (MIT)
   # https://github.com/langflow-ai/langflow
@@ -1573,11 +1672,62 @@ agentBundles:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 (found live during 4.1.2 k3s/Cilium
+    # e2e via Laura, 2026-07-28): letta CrashLoopBackOff — IsADirectoryError
+    # writing openapi_letta.json (app.py:162 writes this file RELATIVE to CWD
+    # /app at module import). Root cause: subPath mounts a path from an
+    # emptyDir that does NOT already contain that path as a real file — this
+    # is a well-known kubelet gotcha: when a subPath target does not already
+    # exist in the source volume, kubelet creates the MISSING path as a
+    # DIRECTORY (not a file), then bind-mounts that directory onto the
+    # intended file path in the container. So /app/openapi_letta.json became
+    # a directory, and Python's open(..., "w") raised IsADirectoryError.
+    # Fix: pre-seed the file into the SAME `letta-runtime` emptyDir via an
+    # initContainer that mounts the volume's ROOT (not via subPath) and
+    # `touch`es the file BEFORE the main container's subPath mount resolves
+    # — kubelet then correctly bind-mounts an existing FILE. Standard,
+    # documented K8s workaround for this exact class of gotcha.
+    extraInitContainers:
+      - name: pre-touch-letta-openapi-file
+        image: "docker.io/library/busybox:1.37"
+        imagePullPolicy: IfNotPresent
+        # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 follow-up (found live during
+        # the SAME 4.1.2 k3s/Cilium e2e, immediately after the directory-vs-
+        # file fix above went live): fixing the directory-vs-file problem
+        # surfaced a SECOND, distinct error on the very next attempt:
+        # "PermissionError: [Errno 13] Permission denied: 'openapi_letta.json'".
+        # Root cause: letta's main container drops ALL capabilities
+        # (containerSecurityContext capabilities.drop: [ALL]), which
+        # includes CAP_DAC_OVERRIDE — the capability root normally uses to
+        # bypass file permission checks. Without it, letta's root (UID 0)
+        # process is subject to normal Unix permission bits like any other
+        # user. touch'ing the file as this initContainer's own UID 65534
+        # left it owned nobody:nogroup with the default umask (0644, no
+        # write for anyone but the owner) — root (UID 0, no DAC_OVERRIDE)
+        # cannot open it for writing. Fix: chmod the touched file to 0666
+        # (world-writable) so any UID, including capability-stripped root,
+        # can write it. Safe: this is a non-sensitive OpenAPI schema JSON
+        # file letta itself fully overwrites at every startup — no
+        # confidentiality/integrity concern from the permissive mode.
+        command: ["/bin/sh", "-c", "touch /letta-runtime-init/openapi_letta.json && chmod 0666 /letta-runtime-init/openapi_letta.json"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534
+          runAsGroup: 65534
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+          - name: letta-runtime
+            mountPath: /letta-runtime-init
     # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
     extraVolumeMounts:
       # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
       # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
-      # rest of /app. subPath mounts the single file path only.
+      # rest of /app. subPath mounts the single file path only. The file is pre-created by
+      # the pre-touch-letta-openapi-file initContainer above (see that entry's comment for
+      # why — subPath-of-a-not-yet-existing-path silently becomes a directory otherwise).
       - name: letta-runtime
         mountPath: /app/openapi_letta.json
         subPath: openapi_letta.json

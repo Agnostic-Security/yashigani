@@ -255,6 +255,43 @@ spec:
                 - Pod
               namespaces:
                 - {{ .Release.Namespace }}
+      # NEW-K8S-KYVERNO-ROOT-EXCLUDE-001 (found live during 4.1.2 k3s/Cilium
+      # e2e, 2026-07-28): letta (agent-bundles.yaml podSecurityContext
+      # runAsNonRoot:false/runAsUser:0 — upstream image requires root for
+      # /root/.letta persistence, documented compensating controls: seccomp
+      # RuntimeDefault, cap_drop ALL, allowPrivilegeEscalation:false,
+      # network policy restricting egress to gateway+pgbouncer only) and
+      # ollama-init-job.yaml (same documented root requirement to pull
+      # models into the shared /data volume) are BOTH pre-existing,
+      # intentionally-accepted root workloads in this chart — but this
+      # ClusterPolicy has zero exception mechanism, so a live cluster with
+      # this policy enforcing (validationFailureAction: Enforce) hard-blocks
+      # BOTH at admission time: "FailedCreate", 0 pods ever created,
+      # deterministic on every clean deploy where Kyverno's webhook is
+      # already warmed up (previously masked by a startup race where
+      # Kyverno hadn't yet begun enforcing at the exact moment these pods
+      # were first created — not reliable, now closed properly). Kyverno's
+      # PolicyException CRD is unavailable here (kyverno-admission-controller
+      # is running with --enablePolicyException=false, a shared cluster-wide
+      # Kyverno setting outside this chart's ownership — not changed).
+      # Fix: exclude these two ALREADY-DOCUMENTED root workloads directly in
+      # this ClusterPolicy's own match/exclude (core Kyverno functionality,
+      # always available, no PolicyException/cluster-controller flag
+      # needed) — narrowly scoped by label selector, not a blanket bypass.
+      exclude:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - letta
+                      - yashigani-ollama-init
       validate:
         message: >-
           YSG-RISK-008: Pod '{{ "{{" }} request.object.metadata.name {{ "}}" }}'
@@ -273,6 +310,22 @@ spec:
                 - Pod
               namespaces:
                 - {{ .Release.Namespace }}
+      # See restrict-root-pod-level's exclude comment above (same two
+      # documented root workloads, same rationale).
+      exclude:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - letta
+                      - yashigani-ollama-init
       validate:
         message: >-
           YSG-RISK-008: All containers in pod

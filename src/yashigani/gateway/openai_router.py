@@ -53,6 +53,7 @@ Streaming limitations
 # Last updated: 2026-06-09T00:00:00+00:00
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -2787,6 +2788,34 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _delegated_ctx_nhi_id = ""
     _delegated_ctx_bound_spiffe = ""
     _delegated_ctx_scope: dict = {}
+    if is_agent_call and not _state.agent_registry:
+        # YSG-RISK-129: is_agent_call=True but the agent_registry dependency
+        # itself is unavailable (e.g. Redis-backed registry down/not yet
+        # initialized). Without this guard, agent_upstream stays None, the
+        # resolution block below is skipped entirely (its own `if not
+        # agent_upstream: return 404` guard at the end of that block never
+        # runs because the block is gated on `_state.agent_registry` too),
+        # AND — further down — BOTH the `if is_agent_call and agent_upstream`
+        # buffered-agent branch and the `if not is_agent_call` cloud/local
+        # branch are skipped, falling straight through with `assistant_content`
+        # / `backend_body` never assigned → UnboundLocalError instead of a
+        # clean error. Fail closed here with a well-formed 503 immediately.
+        logger.error(
+            "Agent call %s received but agent_registry is unavailable "
+            "(backend dependency down) request_id=%s",
+            selected_model, request_id,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "Agent registry is temporarily unavailable. Please try again shortly.",
+                    "type": "agent_error",
+                    "agent": selected_model,
+                    "code": "agent_registry_unavailable",
+                }
+            },
+        )
     if is_agent_call and _state.agent_registry:
         agent_name = selected_model[1:]  # strip @
 
@@ -3978,6 +4007,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             use_streaming = False
             logger.info("Streaming disabled: PII mode=%s requires buffered response inspection", _state.pii_detector.mode.value)
 
+    # YSG-RISK-129: assistant_content/backend_body are only ever assigned
+    # inside individual success-path branches of the try block below (agent
+    # letta/langflow/openai-compat, cloud openai/anthropic, local ollama).
+    # Every branch either assigns them, returns a JSONResponse directly, or
+    # raises (propagating out of this function immediately via the except
+    # clauses below). Initializing them to None here — rather than leaving
+    # them undefined — turns "some future/edge branch falls through without
+    # assigning or returning/raising" from an UnboundLocalError crash into a
+    # detectable, fail-closed state that the guard right after the try/except
+    # converts into a clean 502.
+    assistant_content: str | None = None
+    backend_body: dict | None = None
+
     try:
         import httpx
 
@@ -4590,6 +4632,25 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             detail="Backend communication error",
         )
 
+    # YSG-RISK-129: fail-closed backstop. The try block above either assigns
+    # assistant_content/backend_body on a success path, returns a JSONResponse
+    # directly, or raises HTTPException (which exits the function immediately
+    # via the except clauses above and never reaches this line). Reaching here
+    # with either variable still None means some branch fell through without
+    # assigning, returning, or raising — treat that as a backend failure and
+    # respond cleanly instead of crashing downstream with UnboundLocalError.
+    if assistant_content is None or backend_body is None:
+        logger.error(
+            "chat_completions: no backend branch produced a response "
+            "(request_id=%s, is_agent_call=%s, agent_upstream=%r, "
+            "selected_provider=%s) — fail-closed 502",
+            request_id, is_agent_call, agent_upstream, selected_provider,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Backend communication error",
+        )
+
     # ── 7b. Response inspection ───────────────────────────────────────
     # Inspect assistant_content as plain text — we care about what the model
     # *said*, not the JSON envelope wrapping it. Using "text/plain" ensures
@@ -4612,7 +4673,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             resp_session_id = identity.get("identity_id", request_id) if identity else request_id
             resp_agent_id = identity.get("slug", "openai-router") if identity else "openai-router"
 
-            resp_result = _state.response_inspection_pipeline.inspect(
+            # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+            # call (Ollama et al.). Run off the event loop so a slow/dead
+            # backend cannot starve /healthz and every other coroutine on
+            # this worker (DoS class — see risk register).
+            resp_result = await asyncio.to_thread(
+                _state.response_inspection_pipeline.inspect,
                 response_body=assistant_content,
                 content_type="text/plain",
                 request_id=request_id,
@@ -6798,7 +6864,10 @@ async def gate_relaxed_final(
         try:
             rid = identity.get("identity_id", request_id) if identity else request_id
             aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
-            resp_result = _state.response_inspection_pipeline.inspect(
+            # YSG-RISK-113: offload the blocking classifier call — see the
+            # chat_completions call site above for the full rationale.
+            resp_result = await asyncio.to_thread(
+                _state.response_inspection_pipeline.inspect,
                 response_body=final_text, content_type="text/plain",
                 request_id=request_id, session_id=rid, agent_id=aid,
             )

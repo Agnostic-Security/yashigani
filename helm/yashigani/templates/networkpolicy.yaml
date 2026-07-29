@@ -94,6 +94,105 @@ spec:
           port: 53
 
 ---
+# YSG-RISK-126 fix: pre-install/pre-upgrade hook Jobs that talk to the k8s API
+# server (admin-bootstrap-job.yaml's `applier` container, mtls-bootstrap-job.yaml's
+# `applier` container — both run `kubectl apply` to write the Secret they mint)
+# had NO NetworkPolicy egress rule permitting that traffic. default-deny-egress
+# (podSelector: {} — applies to every pod) blocks it by default; only
+# allow-dns-egress is similarly pod-selector-less, so these Jobs could resolve
+# DNS but never actually connect to the apiserver ClusterIP.
+#
+# This was masked on a fresh install: Cilium's eBPF datapath rules for a
+# NetworkPolicy take a few seconds to program after the K8s object is created,
+# and on `helm install` the hook Job's pod is sometimes scheduled and completes
+# within that short unenforced window, racing past the not-yet-active
+# default-deny-egress. On `helm upgrade` against an already-running release
+# the policy has been enforcing for the release's entire lifetime, so the Job
+# reliably hangs (kubectl's TCP connect() blocks silently — no log output —
+# until the client-side dial timeout, then retries, eventually hitting
+# backoffLimit and failing the upgrade / triggering an --atomic rollback).
+# Found live reproducing Maxine's GO redeploy verification pass (2026-07-28)
+# — revision 5's admin-bootstrap Job hung with zero applier-container log
+# output; confirmed via `kubectl exec ... wget https://kubernetes.default.svc`
+# from inside the stuck pod timing out.
+#
+# Fix: explicit egress rule to the `kubernetes.default` Service ClusterIP AND
+# its real backend Endpoint. NetworkPolicy has no podSelector concept for the
+# apiserver (it isn't backed by a pod), so this uses ipBlock — resolved via
+# Helm `lookup` against the live cluster's actual Service/Endpoints objects
+# (same lookup() precedent already used elsewhere in this chart for
+# CRD/Secret detection), not a hardcoded CIDR guess.
+#
+# BOTH the ClusterIP and the resolved Endpoint are included, not just the
+# ClusterIP: on Cilium with kube-proxy-replacement/socket-LB (this cluster's
+# config), the destination address for Service traffic is rewritten at the
+# SOCKET layer inside the pod's netns before the packet is ever emitted, so
+# by the time NetworkPolicy enforcement evaluates the flow it sees the
+# REAL backend address (here, the apiserver's actual hostNetwork endpoint,
+# e.g. the control-plane node IP:6443 from `kubectl get endpoints
+# kubernetes -n default`), not the virtual ClusterIP (10.43.0.1:443) —an
+# ipBlock scoped to the ClusterIP alone silently never matches on this class
+# of CNI, even though it renders and applies without error. Confirmed live
+# (2026-07-28): the ClusterIP-only version of this rule was already active
+# in the cluster, yet the admin-bootstrap Job's `kubectl apply` still failed
+# with "dial tcp 10.43.0.1:443: i/o timeout" (`kubectl get endpoints
+# kubernetes -n default` showed the real backend as 172.16.6.24:6443 — the
+# node's own address, apiserver runs hostNetwork on this single-node k3s).
+# On CNIs that enforce NetworkPolicy pre-DNAT against the ClusterIP directly
+# (e.g. iptables kube-proxy, most non-socket-LB setups), the ClusterIP entry
+# is the one that matches instead — hence both are present, harmlessly
+# redundant depending on the CNI's enforcement point.
+#
+# lookup() returns an empty dict under `helm template`/`--dry-run=client`
+# (no cluster connection) — fixed fallbacks (10.43.0.1/32 for the k3s
+# default service CIDR ClusterIP; a permissive Endpoint-less list) keep a
+# first-ever `helm install` renderable; any subsequent `helm upgrade`
+# re-resolves both against the real cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-bootstrap-jobs-apiserver-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.labels" . | nindent 4 }}
+  annotations:
+    yashigani.io/finding: "YSG-RISK-126"
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - bootstrap
+          - pki
+  policyTypes:
+    - Egress
+  egress:
+    {{- $apiSvc := lookup "v1" "Service" "default" "kubernetes" }}
+    {{- $apiSvcPort := (((($apiSvc | default dict).spec).ports | default (list (dict "port" 443))) | first).port | default 443 }}
+    - to:
+        - ipBlock:
+            cidr: {{ (($apiSvc | default dict).spec).clusterIP | default "10.43.0.1" }}/32
+      ports:
+        - protocol: TCP
+          port: {{ $apiSvcPort }}
+    {{- $apiEp := lookup "v1" "Endpoints" "default" "kubernetes" }}
+    {{- $apiEpSubsets := (($apiEp | default dict).subsets) | default list }}
+    {{- range $apiEpSubsets }}
+    {{- $subset := . }}
+    {{- range ($subset.addresses | default list) }}
+    - to:
+        - ipBlock:
+            cidr: {{ .ip }}/32
+      ports:
+        {{- range ($subset.ports | default (list (dict "port" 6443))) }}
+        - protocol: TCP
+          port: {{ .port }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+
+---
 # Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4 + A4 v2.25.0-P2):
 #   Port 8080 (mTLS): Caddy ONLY — Caddy is the sole external ingress.
 #   Port 8081 (mesh): open-webui + agent bundle pods — internal mesh port, plain HTTP.
@@ -165,6 +264,26 @@ spec:
             matchLabels:
               yashigani.io/bundle: "openclaw"
         {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8081
+    # YSG-RISK-127 fix: backoffice's user_chat_proxy / user_agents proxy
+    # (src/yashigani/backoffice/routes/user_ui.py user_chat_proxy,
+    # user_agents.py forward-to-gateway helpers — the trusted-forwarder
+    # /user/chat/completions and /user/agents/* paths, FIND-4.0-CHAT-001)
+    # forwards end-user chat/agent calls to gateway's internal mesh port 8081
+    # using YASHIGANI_INTERNAL_BEARER. This ingress rule was never added when
+    # that feature was built — under default-deny-ingress, every one of those
+    # calls was silently dropped (httpx.ConnectTimeout, empty-message, falling
+    # through user_ui.py's generic `except Exception` handler as
+    # "stream_error" rather than the more diagnostic "gateway_unreachable"
+    # ConnectError path). Found live re-testing all 4 chat targets
+    # (@letta/@langflow/@openclaw/direct model) after fixing YSG-RISK-125 —
+    # all 4 share this one proxy code path, so all 4 failed identically.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-backoffice
       ports:
         - protocol: TCP
           port: 8081
@@ -443,6 +562,18 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+    # YSG-RISK-127 fix: backoffice's user_chat_proxy / user_agents proxy
+    # dials gateway's internal mesh port 8081 directly (see matching ingress
+    # rule added to allow-gateway-ingress above, same finding). Missing
+    # entirely before this fix — every /user/chat/completions and
+    # /user/agents/* call silently timed out under default-deny-egress.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: yashigani-gateway
+      ports:
+        - protocol: TCP
+          port: 8081
     # Direct-to-postgres for bootstrap-class advisory locks only.
     # run_migrations() acquires a session-scoped pg_advisory_lock directly on
     # the postgres backend — pgbouncer transaction-pool mode routes each new
