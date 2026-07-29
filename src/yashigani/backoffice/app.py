@@ -1479,6 +1479,20 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(accounts_router, prefix="/admin/accounts", tags=["admin-accounts"])
     app.include_router(users_router, prefix="/admin/users", tags=["user-accounts"])
     app.include_router(kms_router, prefix="/admin/kms", tags=["kms"])
+    # YSG-RISK-142: audit_sinks_router MUST be registered BEFORE audit_router.
+    # audit_sinks_router carries literal full paths (e.g.
+    # POST /admin/audit/siem/config/test); audit.py's audit_router (mounted
+    # with prefix /admin/audit) registers a path-PARAM route
+    # POST /siem/{name}/test that is the same segment depth. Starlette/FastAPI
+    # matches routes in registration order across the whole app, so whichever
+    # router is added first "wins" a same-depth collision — with audit_router
+    # first, POST /admin/audit/siem/config/test silently resolved to
+    # test_siem_target(name="config") instead of the intended test_siem()
+    # handler, making the SIEM-backend-config test endpoint unreachable.
+    # Registering the literal-path router first restores the intended match;
+    # the /siem/{name}/test named-target-test route in audit.py still matches
+    # for every OTHER name value.
+    app.include_router(audit_sinks_router, tags=["audit-sinks"])
     app.include_router(audit_router, prefix="/admin/audit", tags=["audit"])
     app.include_router(inspection_router, prefix="/admin/inspection", tags=["inspection"])
     app.include_router(inspection_backend_router, prefix="/admin/inspection", tags=["inspection-backend"])
@@ -1489,7 +1503,6 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(infrastructure_router, prefix="/admin/infrastructure", tags=["infrastructure"])
     app.include_router(jwt_config_router, tags=["jwt-config"])
     app.include_router(cache_router, tags=["cache"])
-    app.include_router(audit_sinks_router, tags=["audit-sinks"])
     app.include_router(kms_vault_router, tags=["kms-vault"])
     app.include_router(license_router, prefix="/admin/license", tags=["license"])
 
