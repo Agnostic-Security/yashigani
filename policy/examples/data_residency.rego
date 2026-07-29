@@ -21,8 +21,18 @@ default _provider_ok := false
 
 _provider_ok if input.routing_decision.provider in _allowed_for_region
 
-# Fail-closed: an unlabelled region cannot be placed safely.
-deny contains "data_region_missing" if not input.data.region
+# YSG-RISK-151: `not input.data.region` only catches a MISSING key — Rego's
+# `not` succeeds when the reference is undefined, not when it holds a falsy
+# JSON value. An explicit input.data.region="" (or whitespace) is a DEFINED
+# value, so the bare `not` check silently passed it through, and for a
+# "local" route (no cross_region_egress check) the request was allowed with
+# no region label at all. Fail-closed on missing OR blank/whitespace-only.
+_region_blank if not input.data.region
+
+_region_blank if trim_space(input.data.region) == ""
+
+# Fail-closed: an unlabelled (or blank) region cannot be placed safely.
+deny contains "data_region_missing" if _region_blank
 
 # Cloud egress must use a provider approved for the data's region.
 deny contains "cross_region_egress" if {
