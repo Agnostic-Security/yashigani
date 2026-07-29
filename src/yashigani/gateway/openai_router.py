@@ -1770,8 +1770,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if _state.budget_enforcer and identity:
         from yashigani.billing.budget_enforcer import BudgetState
         allocation = _state.budget_enforcer.get_allocation(identity_id, "cloud")
-        budget_state = _state.budget_enforcer.check(
+        # YSG-RISK-144: check_hierarchy (not check) — the documented
+        # individual<=group<=org invariant was never enforced because the
+        # per-request path only ever checked the identity's OWN allocation.
+        # An identity within its own budget but over its group/org cap was
+        # never denied/degraded. group_ids/org_id come straight off the
+        # already-resolved identity dict (identity registry populates both).
+        budget_state = _state.budget_enforcer.check_hierarchy(
             identity_id, "cloud", budget_total=allocation,
+            group_ids=identity.get("groups") or [],
+            org_id=identity.get("org_id", "") or "",
         )
         budget_signal = budget_state.signal.value
         budget_pct = budget_state.pct
@@ -3232,10 +3240,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 _total = pt + ct
                 if _state.budget_enforcer and selected_provider != "ollama" and identity:
                     try:
+                        # YSG-RISK-144: pass group_ids/org_id so the group and
+                        # org counters actually accumulate usage — previously
+                        # omitted, meaning check_hierarchy's group/org lookups
+                        # would always read 0 usage regardless of configured caps.
                         _state.budget_enforcer.record(
                             identity_id=identity_id,
                             provider=selected_provider,
                             tokens=_total,
+                            group_ids=identity.get("groups") or [],
+                            org_id=identity.get("org_id", "") or "",
                         )
                     except Exception as _exc:
                         logger.warning("Streaming budget recording failed: %s", _exc)
@@ -3860,10 +3874,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # Record token usage in budget system
     if _state.budget_enforcer and selected_provider != "ollama":
         try:
+            # YSG-RISK-144: pass group_ids/org_id — see streaming _usage_callback
+            # above for why (group/org counters were never incremented before).
             _state.budget_enforcer.record(
                 identity_id=identity_id,
                 provider=selected_provider,
                 tokens=total_tokens,
+                group_ids=(identity.get("groups") or []) if identity else [],
+                org_id=(identity.get("org_id", "") or "") if identity else "",
             )
         except Exception as exc:
             logger.warning("Budget recording failed: %s", exc)
