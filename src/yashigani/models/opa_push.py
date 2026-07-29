@@ -14,6 +14,15 @@ document is the inspectable / reconciled mirror of the allocation set; pushing
 it keeps OPA's view consistent and supports operator inspection + any future
 in-rego use. The push targets a SEPARATE ``allocations`` namespace and never
 touches the ``rbac`` document.
+
+V50-022 (Tom, 2026-07-29): this module's OWN write was always correctly
+scoped. It was, however, at risk of being WIPED BY rbac/opa_push.py, which
+(until V50-022) PUT the PARENT path ``/v1/data/yashigani`` instead of a
+scoped sub-path — every RBAC mutation silently replaced the ENTIRE
+data.yashigani subtree, including this module's data.yashigani.allocations.
+Fixed at the source (rbac/opa_push.py now scopes to /v1/data/yashigani/rbac
++ /v1/data/yashigani/agents) — no change needed here, noted for the audit
+trail.
 """
 from __future__ import annotations
 

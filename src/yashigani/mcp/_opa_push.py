@@ -13,13 +13,20 @@ Fix
 ---
 At gateway startup (after ``build_registry_from_env``), build the combined MCP
 data document from the durable broker-registry store (Redis db/3) and push it
-to OPA at ``/v1/data/yashigani/mcp``.  This is orthogonal to the existing
-RBAC push (``rbac/opa_push.py`` → ``/v1/data/yashigani``).
+to OPA at ``/v1/data/yashigani/mcp``.  This is orthogonal to the RBAC push
+(``rbac/opa_push.py`` → ``/v1/data/yashigani/rbac`` + ``/v1/data/yashigani/
+agents``, scoped as of V50-022 — previously a PARENT-path PUT to
+``/v1/data/yashigani`` that silently wiped this module's sub-document on
+every RBAC mutation; see rbac/opa_push.py's module docstring for the full
+incident writeup).
 
 OPA partial PUT semantics (see https://www.openpolicyagent.org/docs/latest/rest-api/):
     PUT /v1/data/yashigani/mcp   replaces only the mcp sub-document and does
-    NOT touch the rbac/agents sub-documents already present.  Both pushes are
-    safe to run independently; no lock is needed.
+    NOT touch the rbac/agents sub-documents already present — PROVIDED every
+    writer under data.yashigani.* scopes its own PUT the same way (V50-022:
+    this was, briefly, not true of rbac/opa_push.py).  All pushes under
+    data.yashigani.* are safe to run independently; no lock is needed, as
+    long as each writer stays scoped to its own sub-path.
 
 Failure posture: any error is logged at WARNING and propagated — the caller
 decides whether a push failure is fatal (startup) or best-effort (mutation).

@@ -13,9 +13,20 @@ OPA Data API endpoint:
     PUT {opa_url}/v1/data/yashigani/document
 
 This replaces the entire ``data.yashigani.document`` sub-document atomically
-(policies + config).  The RBAC push targets ``/v1/data/yashigani`` (rbac +
-agents); because OPA's PUT-by-path only replaces the addressed sub-tree, the two
-pushes are independent and order-insensitive.
+(policies + config).  The RBAC push targets ``/v1/data/yashigani/rbac`` +
+``/v1/data/yashigani/agents`` (scoped as of V50-022); because OPA's
+PUT-by-path only replaces the addressed sub-tree, all pushes under
+data.yashigani.* are independent and order-insensitive PROVIDED every writer
+stays scoped to its own sub-path.
+
+V50-022 (Tom, 2026-07-29): until fixed, ``rbac/opa_push.py`` PUT the PARENT
+path ``/v1/data/yashigani`` (not a scoped sub-path) — that is NOT "the two
+pushes are independent"; a parent-path PUT replaces the WHOLE
+``data.yashigani`` subtree, which silently wiped THIS module's ``document``
+sub-document (along with ``mcp`` and ``allocations``) on every RBAC
+mutation. The claim above is only true now that every writer under
+data.yashigani.* is correctly scoped — see rbac/opa_push.py's module
+docstring for the full incident writeup.
 """
 from __future__ import annotations
 

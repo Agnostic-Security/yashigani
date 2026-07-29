@@ -1,9 +1,11 @@
 """Yashigani policy-bindings — OPA data push (#16, OPA Phase 2).
 
 Pushes the client-binding document to OPA under the SEPARATE
-/v1/data/client_bindings namespace. This is deliberately disjoint from
-/v1/data/yashigani (which push_rbac_data replaces atomically) so the two pushes
-are independent and neither clobbers the other.
+/v1/data/client_bindings namespace. This is deliberately disjoint from the
+ENTIRE /v1/data/yashigani tree (rbac/agents/mcp/document/allocations —
+scoped sub-paths under it as of V50-022, see rbac/opa_push.py's module
+docstring) so this push is independent and never clobbers, or is clobbered
+by, anything under data.yashigani.*.
 
 OPA holds data in memory only, so the backoffice re-pushes on startup (app.py
 lifespan) after the RBAC re-sync, using the same retry pattern.
