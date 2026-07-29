@@ -23,6 +23,17 @@ cache_router = APIRouter(tags=["cache"])
 
 MAX_TTL = 3600
 
+# V50-CACHE-500: cache_config carries ROW LEVEL SECURITY (0001_initial_schema.py)
+# with `USING (tenant_id = current_setting('app.tenant_id')::uuid)`. The pooled
+# connection returned by get_pool() never SETs app.tenant_id, so Postgres raises
+# `unrecognized configuration parameter "app.tenant_id"` before RLS is even
+# evaluated — every call to this handler 500'd unconditionally. Fixed by SETting
+# the platform tenant before the query, matching the established idiom used
+# elsewhere in this codebase (identity/durable_store.py, agents/durable_store.py,
+# audit/chain.py, backoffice/routes/jwt_config.py — all define the same
+# well-known all-zeros UUID locally rather than importing a shared constant).
+_PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
+
 
 class CacheConfigRequest(BaseModel):
     enabled: bool = False
@@ -39,16 +50,26 @@ async def list_cache_configs(session=Depends(require_admin_session)):
         from yashigani.db.postgres import get_pool
         pool = get_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT tenant_id::text, enabled, ttl_seconds FROM cache_config ORDER BY tenant_id"
-            )
+            async with conn.transaction():
+                # V50-CACHE-500: RLS on cache_config requires app.tenant_id to be
+                # set on this connection before any row is visible/queryable.
+                await conn.execute(
+                    "SELECT set_config('app.tenant_id', $1, true)", _PLATFORM_TENANT_ID
+                )
+                rows = await conn.fetch(
+                    "SELECT tenant_id::text, enabled, ttl_seconds FROM cache_config ORDER BY tenant_id"
+                )
         return {"tenants": [dict(r) for r in rows], "cache_available": True}
     except Exception as exc:
-        # V232-CSCAN-01e: log full exception server-side; return safe envelope to client.
+        # V232-CSCAN-01e: log full exception server-side; degrade gracefully to
+        # the client rather than a raw 500 — an admin page failing to fetch its
+        # config listing is not fatal, and this mirrors the `rc is None` path
+        # above plus the UI's existing `cache_available` badge support
+        # (static/ui4/admin/modules/infrastructure.js:299,304).
         payload, _ = safe_error_envelope(exc, public_message="cache config unavailable")
         return JSONResponse(
-            status_code=500,
-            content={"tenants": [], "cache_available": True, **payload},
+            status_code=200,
+            content={"tenants": [], "cache_available": False, **payload},
         )
 
 
