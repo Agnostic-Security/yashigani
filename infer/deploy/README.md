@@ -136,6 +136,19 @@ verified against real hardware.
   infer/deploy-only dispatch). Verified via `docker compose config` — confirmed both default to
   scoped `gpu=0` and resolve independently when each var is overridden separately.
 
+- **ROCm `group_add` GID stability (Captain finding #2).** `group_add: [video, render]`
+  resolves the group NAME against the container's own `/etc/group` (the base image's baked-in
+  GIDs) — for the grant to unlock `/dev/kfd`/`/dev/dri` on the host, that resolved GID must
+  match the host device node's owning GID. `render` is dynamically allocated per-install with
+  no cross-distro guarantee; a mismatch surfaces as `EACCES`, caught by the GPU-engaged
+  healthcheck but undiagnosable as a GID issue without knowing to check. Fixed:
+  `YSG_INFER_ROCM_VIDEO_GID` / `YSG_INFER_ROCM_RENDER_GID` env vars, defaulting to the
+  pre-fix name-based behaviour (`video`/`render`, unchanged default) but overridable to
+  numeric host GIDs (`stat -c '%g' /dev/kfd /dev/dri/renderD128`). `install.sh` host-GID-probe
+  wiring to set these automatically is Su's lane, deferred (out of scope here). K8s is
+  unaffected (AMD device-plugin manages device cgroup rules itself). Verified via
+  `docker compose config` both with the default and with a numeric override.
+
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
 Tom's v1 supervisor (`supervisor/supervisor.py`, `supervisor/process.py`) is
