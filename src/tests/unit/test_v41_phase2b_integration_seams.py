@@ -550,10 +550,45 @@ class TestDurableRegistryGrantBaseline:
 
 
 class TestPushMcpOpaData:
-    """Seam 3 — push_mcp_opa_data PUT-calls OPA /v1/data/yashigani/mcp."""
+    """Seam 3 — push_mcp_opa_data PUT-calls OPA /v1/data/yashigani/mcp.
+
+    LAURA-V50-017 Gap C: push_mcp_opa_data now reads back data.yashigani.mcp
+    after the PUT and verifies every pushed mcp_id landed (verify=True by
+    default) — every test in this class must mock BOTH client.put AND
+    client.get, matching the readback contract, unless explicitly testing
+    the verify=False escape hatch or the fail-loud path itself.
+    """
+
+    def _sync_client(self, mcp_doc: dict, *, landed: dict | None = None):
+        """Build a mocked internal_httpx_sync_client whose PUT succeeds and
+        whose readback GET reports *landed* (defaults to mcp_doc itself —
+        i.e. the push landed exactly as pushed)."""
+        captured: dict = {}
+        sync_client = MagicMock()
+        put_response = MagicMock()
+        put_response.raise_for_status.return_value = None
+        get_response = MagicMock()
+        get_response.raise_for_status.return_value = None
+        get_response.json.return_value = {"result": landed if landed is not None else mcp_doc}
+        sync_client.__enter__ = MagicMock(return_value=sync_client)
+        sync_client.__exit__ = MagicMock(return_value=False)
+
+        def _put(url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return put_response
+
+        def _get(url, headers=None):
+            captured["get_url"] = url
+            return get_response
+
+        sync_client.put.side_effect = _put
+        sync_client.get.side_effect = _get
+        return sync_client, captured
 
     def test_s3e_push_calls_opa_put(self):
-        """S3-e: push_mcp_opa_data PUT to /v1/data/yashigani/mcp with mTLS."""
+        """S3-e: push_mcp_opa_data PUT to /v1/data/yashigani/mcp with mTLS,
+        and (Gap C) the readback GET confirms it landed."""
         from yashigani.mcp._opa_push import push_mcp_opa_data
 
         mcp_doc = {
@@ -564,20 +599,7 @@ class TestPushMcpOpaData:
                 "uuid-x": {"surface_hash": "sha384:" + "f" * 96, "tools": ["t1"]},
             },
         }
-
-        captured: dict = {}
-        sync_client = MagicMock()
-        response_mock = MagicMock()
-        response_mock.raise_for_status.return_value = None
-        sync_client.__enter__ = MagicMock(return_value=sync_client)
-        sync_client.__exit__ = MagicMock(return_value=False)
-
-        def _put(url, json=None, headers=None):
-            captured["url"] = url
-            captured["json"] = json
-            return response_mock
-
-        sync_client.put.side_effect = _put
+        sync_client, captured = self._sync_client(mcp_doc)
 
         with patch(
             # internal_httpx_sync_client is a local import inside push_mcp_opa_data
@@ -588,6 +610,79 @@ class TestPushMcpOpaData:
 
         assert "/v1/data/yashigani/mcp" in captured["url"]
         assert captured["json"] == mcp_doc
+        assert "/v1/data/yashigani/mcp" in captured["get_url"]
+
+    def test_gap_c_raises_when_readback_shows_grant_missing(self):
+        """LAURA-V50-017 Gap C: PUT returns 2xx but the readback shows the
+        pushed mcp_id's grant absent -> RuntimeError, NOT a logged success."""
+        from yashigani.mcp._opa_push import push_mcp_opa_data
+
+        mcp_doc = {
+            "grants": {
+                "uuid-x": {"spiffe://td/gateway": {"tools": ["t1"], "actions": ["tools/call"]}},
+            },
+            "baselines": {
+                "uuid-x": {"surface_hash": "sha384:" + "f" * 96, "tools": ["t1"]},
+            },
+        }
+        # Readback shows an EMPTY document — exactly Laura's symptom.
+        sync_client, _ = self._sync_client(mcp_doc, landed={"grants": {}, "baselines": {}})
+
+        with patch(
+            "yashigani.pki.client.internal_httpx_sync_client",
+            return_value=sync_client,
+        ):
+            with pytest.raises(RuntimeError, match="did NOT land"):
+                push_mcp_opa_data("https://policy:8181", mcp_doc)
+
+    def test_gap_c_raises_when_readback_shows_baseline_missing(self):
+        """Grant landed but baseline didn't -> still a hard failure (both
+        are required for _grant_ok / _envelope_unchanged to pass)."""
+        from yashigani.mcp._opa_push import push_mcp_opa_data
+
+        mcp_doc = {
+            "grants": {
+                "uuid-x": {"spiffe://td/gateway": {"tools": ["t1"], "actions": ["tools/call"]}},
+            },
+            "baselines": {
+                "uuid-x": {"surface_hash": "sha384:" + "f" * 96, "tools": ["t1"]},
+            },
+        }
+        sync_client, _ = self._sync_client(
+            mcp_doc,
+            landed={"grants": mcp_doc["grants"], "baselines": {}},
+        )
+
+        with patch(
+            "yashigani.pki.client.internal_httpx_sync_client",
+            return_value=sync_client,
+        ):
+            with pytest.raises(RuntimeError, match="missing baselines"):
+                push_mcp_opa_data("https://policy:8181", mcp_doc)
+
+    def test_verify_false_skips_readback(self):
+        """verify=False (escape hatch) does not call client.get at all and
+        never raises on a would-be-missing readback."""
+        from yashigani.mcp._opa_push import push_mcp_opa_data
+
+        mcp_doc = {
+            "grants": {"uuid-x": {"spiffe://td/gateway": {"tools": [], "actions": []}}},
+            "baselines": {},
+        }
+        sync_client = MagicMock()
+        put_response = MagicMock()
+        put_response.raise_for_status.return_value = None
+        sync_client.__enter__ = MagicMock(return_value=sync_client)
+        sync_client.__exit__ = MagicMock(return_value=False)
+        sync_client.put.return_value = put_response
+
+        with patch(
+            "yashigani.pki.client.internal_httpx_sync_client",
+            return_value=sync_client,
+        ):
+            push_mcp_opa_data("https://policy:8181", mcp_doc, verify=False)
+
+        sync_client.get.assert_not_called()
 
 
 class TestApproveTransactionGrantBaseline:

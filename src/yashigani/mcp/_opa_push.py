@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 _OPA_MCP_DATA_PATH = "/v1/data/yashigani/mcp"
 
 
-def push_mcp_opa_data(opa_url: str, mcp_doc: dict) -> None:
+def push_mcp_opa_data(opa_url: str, mcp_doc: dict, *, verify: bool = True) -> None:
     """PUT the MCP grants + baselines document to OPA.
 
     Replaces ``data.yashigani.mcp`` atomically without touching the rbac/agents
@@ -52,9 +52,39 @@ def push_mcp_opa_data(opa_url: str, mcp_doc: dict) -> None:
           "egress_grants": {spiffe: {tenant: ..., prefixes: [...]}},
         }
 
+    LAURA-V50-017 Gap C: a 2xx PUT response is NOT sufficient evidence the
+    data is actually queryable afterwards. Laura observed a push that logged
+    "1 instance grant(s) + 1 baseline(s)" success, but a
+    ``GET /v1/data/yashigani/mcp/baselines`` minutes later (no OPA restart,
+    no other push call site in between — the specific "duplicate re-import
+    rollback" hypothesis was investigated and does NOT hold: codegen
+    rejection raises and rolls back BEFORE this transaction ever reaches the
+    grant/baseline write or the post-commit push, see
+    mcp_onboard.py's Step-3 handling) returned ``{}``. Root cause not
+    conclusively isolated this round, but "logged success, verifiably
+    absent" is exactly the silent-fail-open class Yashigani's defensive
+    posture forbids regardless of cause — so when ``verify=True`` (the
+    default), this function reads back ``data.yashigani.mcp`` immediately
+    after the PUT and confirms every ``mcp_id`` this push declared in
+    ``grants``/``baselines`` is genuinely present. A mismatch raises
+    ``RuntimeError`` — never silently logged as success. Both existing
+    callers (``mcp_onboard.py``'s post-commit push, ``gateway/entrypoint.py``'s
+    startup push) already wrap this call in a broad ``except Exception`` that
+    treats any failure as "deny until re-pushed" (fail-closed), so surfacing
+    this loudly is strictly safer than the prior trust-the-PUT-response
+    behaviour and requires no caller changes.
+
+    ``verify=False`` is provided for callers that need the pre-Gap-C
+    trust-the-PUT-response behaviour (e.g. a caller that does its own
+    readback under a different consistency contract); no in-tree caller uses
+    it.
+
     Raises:
-        httpx.HTTPStatusError  — OPA returned a non-2xx status.
+        httpx.HTTPStatusError  — OPA returned a non-2xx status on the PUT or
+                                  (when verify=True) the readback GET.
         httpx.RequestError     — Network or connection error.
+        RuntimeError           — verify=True and the readback confirms the
+                                  push did NOT land (Gap C fail-loud).
     """
     from yashigani.pki.client import internal_httpx_sync_client
 
@@ -67,12 +97,39 @@ def push_mcp_opa_data(opa_url: str, mcp_doc: dict) -> None:
         )
         resp.raise_for_status()
 
+        if verify:
+            readback = client.get(url, headers={"Content-Type": "application/json"})
+            readback.raise_for_status()
+            landed = (readback.json() or {}).get("result") or {}
+            landed_grants = landed.get("grants") or {}
+            landed_baselines = landed.get("baselines") or {}
+
+            missing_grants = sorted(
+                mcp_id for mcp_id in mcp_doc.get("grants", {})
+                if mcp_id not in landed_grants
+            )
+            missing_baselines = sorted(
+                mcp_id for mcp_id in mcp_doc.get("baselines", {})
+                if mcp_id not in landed_baselines
+            )
+            if missing_grants or missing_baselines:
+                raise RuntimeError(
+                    "push_mcp_opa_data: PUT returned 2xx but the readback "
+                    "shows the data did NOT land — missing grants for "
+                    f"mcp_id(s)={missing_grants}, missing baselines for "
+                    f"mcp_id(s)={missing_baselines}. Refusing to report "
+                    "success (fail-closed, LAURA-V50-017 Gap C). Affected "
+                    "instances will DENY (grant/baseline absent) until a "
+                    "subsequent push succeeds and verifies."
+                )
+
     n_grants = sum(len(v) for v in mcp_doc.get("grants", {}).values())
     n_baselines = len(mcp_doc.get("baselines", {}))
     n_egress = len(mcp_doc.get("egress_grants", {}))
     logger.info(
-        "OPA MCP data pushed: %d instance grant(s) + %d baseline(s) + "
+        "OPA MCP data pushed%s: %d instance grant(s) + %d baseline(s) + "
         "%d egress grant(s)",
+        " and verified landed" if verify else "",
         n_grants, n_baselines, n_egress,
     )
 
