@@ -277,6 +277,29 @@
 /* ── settings panel ──────────────────────────────────────────── */
 .ys-settings-save { min-width: 72px; }
 
+/* ── settings panel: API keys (/me/api-key*, V50-027) ────────── */
+.ys-apikeys-section { border-top: 1px solid var(--ys-border-faint); padding-top: var(--ys-sp-3); }
+.ys-apikey-list { display: flex; flex-direction: column; gap: var(--ys-sp-2); margin: var(--ys-sp-2) 0; }
+.ys-apikey-row {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--ys-sp-3);
+  padding: var(--ys-sp-2) var(--ys-sp-3); border: 1px solid var(--ys-border);
+  border-radius: var(--ys-radius-sm); background: var(--ys-surface);
+}
+.ys-apikey-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ys-apikey-last4 { font-family: var(--ys-mono); font-weight: 600; }
+.ys-apikey-issue { margin-top: var(--ys-sp-2); }
+.ys-apikey-reveal {
+  margin-top: var(--ys-sp-3); padding: var(--ys-sp-3); border-radius: var(--ys-radius-sm);
+  background: var(--ys-amber-bg); border: 1px solid var(--ys-amber-fg);
+  display: flex; flex-direction: column; gap: var(--ys-sp-2);
+}
+.ys-apikey-token-row { display: flex; align-items: center; gap: var(--ys-sp-2); }
+.ys-apikey-token {
+  flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-family: var(--ys-mono);
+  font-size: var(--ys-fs-sm); padding: var(--ys-sp-2); border-radius: var(--ys-radius-sm);
+  background: var(--ys-surface); border: 1px solid var(--ys-border);
+}
+
 /* ── dark theme (trivial token overrides; toggled via body class) ── */
 body.ys-theme-dark {
   --ys-bg: #0b1220;
