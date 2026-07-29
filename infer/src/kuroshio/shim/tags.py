@@ -41,6 +41,20 @@ def details_dict(model: ResolvedModel) -> dict[str, Any]:
     }
 
 
+def capabilities_list(model: ResolvedModel) -> list[str]:
+    """Ollama emits a `capabilities` array on every model object (see the golden
+    `tags.json` / `show.json` fixtures — e.g. ``["completion", "tools"]``).
+
+    Derived from model metadata when the source adapter recorded it, else falls
+    back to the universally-true ``["completion"]`` — we never over-claim
+    ``tools``/``vision`` support we cannot verify from the GGUF header. Shared by
+    both `/api/tags` and `/api/show` synthesis (show.py)."""
+    caps = model.metadata.get("capabilities")
+    if isinstance(caps, list) and caps:
+        return [str(c) for c in caps]
+    return ["completion"]
+
+
 def synthesize_tag_entry(model: ResolvedModel) -> dict[str, Any]:
     """Build one `/api/tags` `models[]` entry from a single ResolvedModel."""
     name = display_name(model)
@@ -51,6 +65,7 @@ def synthesize_tag_entry(model: ResolvedModel) -> dict[str, Any]:
         "size": blob_size(model),
         "digest": model.sha256,
         "details": details_dict(model),
+        "capabilities": capabilities_list(model),
     }
 
 
@@ -59,4 +74,11 @@ def synthesize_tags(models: list[ResolvedModel]) -> dict[str, Any]:
     return {"models": [synthesize_tag_entry(m) for m in models]}
 
 
-__all__ = ["details_dict", "display_name", "blob_size", "synthesize_tag_entry", "synthesize_tags"]
+__all__ = [
+    "details_dict",
+    "display_name",
+    "blob_size",
+    "capabilities_list",
+    "synthesize_tag_entry",
+    "synthesize_tags",
+]
