@@ -1,5 +1,20 @@
 """
-Yashigani 4.1.2 conformance suite — shared scaffold.
+Yashigani 4.1.2 conformance suite — shared scaffold (tests/security/ copy).
+
+PROVENANCE: byte-for-byte copy of tests/conformance/conftest.py as of the
+YTF consolidation (2026-07-29). tests/security/ is a SIBLING of
+tests/conformance/, not a child, so pytest does not automatically share
+conftest.py across them (directory-hierarchy-based fixture inheritance) —
+confirmed empirically: moving tests/security/test_pentest_*.py out of
+tests/conformance/ into their own directory broke `route_prefix_filter`/
+`admin_client`/etc. with "fixture not found" at collection. Duplicating
+the conftest here (rather than a fragile `from tests.conformance.conftest
+import *`, which this codebase's own docstrings document as unreliable
+under pytest's per-directory conftest import machinery) MIRRORS the
+existing precedent: conf/v412-admin-config-obs's own conftest.py was
+ALSO a byte-verified duplicate/port of this same scaffold. KEEP THESE TWO
+FILES IN SYNC — any fixture change here belongs in BOTH copies.
+
 
 Closes C5 release-gate blocker G1 (Lu audit, YCS-20260723-v4.1.2-CONFORMANCE):
 313/360 API endpoints had zero per-endpoint conformance assertion. This suite
