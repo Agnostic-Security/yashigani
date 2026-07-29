@@ -45,15 +45,30 @@ class JWTTestRequest(BaseModel):
 @jwt_config_router.get("/admin/jwt/config")
 async def list_jwt_configs(session=Depends(require_admin_session)):
     deployment_stream = os.getenv("YASHIGANI_DEPLOYMENT_STREAM", "opensource")
+    configs: list[dict] = []
+    available = True
     try:
         from yashigani.db.postgres import get_pool
 
         pool = get_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT tenant_id::text, jwks_url, issuer, audience, fail_closed, scope "
-                "FROM jwt_config ORDER BY scope DESC, tenant_id"
-            )
+            async with conn.transaction():
+                # V50-028: jwt_config carries ROW LEVEL SECURITY
+                # (0001_initial_schema.py) keyed on
+                # current_setting('app.tenant_id'). The pooled connection never
+                # SET it, so every call raised "unrecognized configuration
+                # parameter" — silently swallowed by the broad except below and
+                # returned as an empty list at 200, indistinguishable from a
+                # genuinely-empty config table. Fixed by SETting the platform
+                # tenant before the query, matching the established idiom
+                # (db/postgres.py:tenant_transaction(), routes/cache.py).
+                await conn.execute(
+                    "SELECT set_config('app.tenant_id', $1, true)", PLATFORM_TENANT_ID
+                )
+                rows = await conn.fetch(
+                    "SELECT tenant_id::text, jwks_url, issuer, audience, fail_closed, scope "
+                    "FROM jwt_config ORDER BY scope DESC, tenant_id"
+                )
             # BOPLA allowlist (#90): JWTConfigPublic enforces the allowed field set.
             configs = [
                 JWTConfigPublic(
@@ -66,13 +81,19 @@ async def list_jwt_configs(session=Depends(require_admin_session)):
                 ).model_dump()
                 for row in rows
             ]
-    except Exception as exc:
-        logger.warning("jwt_config list failed: %s", exc)
+    except Exception:
+        # Log full traceback server-side (was logger.warning with no stack
+        # trace); a real failure must never look identical to "no configs
+        # saved yet" — `available: false` lets the UI distinguish the two
+        # (mirrors cache_available in routes/cache.py).
+        logger.exception("jwt_config list failed")
         configs = []
+        available = False
     return {
         "configs": configs,
         "deployment_stream": deployment_stream,
         "platform_tenant_id": PLATFORM_TENANT_ID,
+        "available": available,
     }
 
 
@@ -92,22 +113,35 @@ async def set_jwt_config(body: JWTConfigRequest, session=Depends(require_stepup_
 
         pool = get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO jwt_config (tenant_id, jwks_url, issuer, audience, fail_closed, scope)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (tenant_id, scope) DO UPDATE
-                SET jwks_url=EXCLUDED.jwks_url, issuer=EXCLUDED.issuer,
-                    audience=EXCLUDED.audience, fail_closed=EXCLUDED.fail_closed,
-                    updated_at=now()
-                """,
-                uuid.UUID(body.tenant_id),
-                body.jwks_url,
-                body.issuer,
-                body.audience,
-                body.fail_closed,
-                body.scope,
-            )
+            async with conn.transaction():
+                # V50-028 sibling: same missing-set_config bug as the GET above,
+                # but here the exception surfaced as a hard 500 on every save —
+                # /admin/jwt/config could never be written. SET app.tenant_id to
+                # the tenant being configured (not hardcoded platform): the RLS
+                # policy's WITH CHECK (derived from USING, since no separate
+                # WITH CHECK is defined) requires the new row's tenant_id to
+                # equal current_setting('app.tenant_id') OR the platform
+                # sentinel, so a genuine per-tenant SaaS write must set the
+                # real tenant, not platform.
+                await conn.execute(
+                    "SELECT set_config('app.tenant_id', $1, true)", body.tenant_id
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO jwt_config (tenant_id, jwks_url, issuer, audience, fail_closed, scope)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (tenant_id, scope) DO UPDATE
+                    SET jwks_url=EXCLUDED.jwks_url, issuer=EXCLUDED.issuer,
+                        audience=EXCLUDED.audience, fail_closed=EXCLUDED.fail_closed,
+                        updated_at=now()
+                    """,
+                    uuid.UUID(body.tenant_id),
+                    body.jwks_url,
+                    body.issuer,
+                    body.audience,
+                    body.fail_closed,
+                    body.scope,
+                )
     except Exception as exc:
         payload, _ = safe_error_envelope(exc, public_message="jwt config update failed", status=500)
         raise HTTPException(status_code=500, detail=payload)
@@ -122,7 +156,13 @@ async def delete_jwt_config(tenant_id: str, session=Depends(require_stepup_admin
 
         pool = get_pool()
         async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM jwt_config WHERE tenant_id = $1", uuid.UUID(tenant_id))
+            async with conn.transaction():
+                # V50-028 sibling: same missing-set_config bug — SET the
+                # tenant being deleted (path param) before the DELETE.
+                await conn.execute(
+                    "SELECT set_config('app.tenant_id', $1, true)", tenant_id
+                )
+                await conn.execute("DELETE FROM jwt_config WHERE tenant_id = $1", uuid.UUID(tenant_id))
     except Exception as exc:
         payload, _ = safe_error_envelope(exc, public_message="jwt config delete failed", status=500)
         raise HTTPException(status_code=500, detail=payload)

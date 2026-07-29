@@ -28,6 +28,7 @@ export class YsAdminSso extends LitElement {
     _loading: { state: true },
     _idps: { state: true },
     _configs: { state: true },
+    _configsAvailable: { state: true },
     _platformTenant: { state: true },
     _form: { state: true },         // JWTConfigRequest draft
     _testToken: { state: true },
@@ -41,6 +42,7 @@ export class YsAdminSso extends LitElement {
     this._loading = true;
     this._idps = [];
     this._configs = [];
+    this._configsAvailable = true;
     this._platformTenant = '';
     this._form = { tenant_id: '', jwks_url: '', issuer: '', audience: '', scope: 'platform', fail_closed: true };
     this._testToken = '';
@@ -63,6 +65,10 @@ export class YsAdminSso extends LitElement {
     ]);
     this._idps = (idps && Array.isArray(idps.idps)) ? idps.idps : [];
     this._configs = (jwt && Array.isArray(jwt.configs)) ? jwt.configs : [];
+    // V50-028: `available` distinguishes "genuinely no configs saved" from
+    // "the list query failed server-side" (mirrors cache_available in
+    // infrastructure.js) — a bare empty array is ambiguous between the two.
+    this._configsAvailable = !jwt || jwt.available !== false;
     this._platformTenant = (jwt && jwt.platform_tenant_id) || '';
     if (!this._form.tenant_id && this._platformTenant) {
       this._form = { ...this._form, tenant_id: this._platformTenant };
@@ -181,13 +187,16 @@ export class YsAdminSso extends LitElement {
       </div>
 
       <div class="ys-panel">
-        <div class="ys-panel-header">JWT configs (${this._configs.length})</div>
+        <div class="ys-panel-header">
+          JWT configs (${this._configs.length})
+          ${this._configsAvailable ? nothing : html`<span class="ys-badge ys-badge-amber">unavailable</span>`}
+        </div>
         <div class="ys-panel-body">
           <table class="ys-table">
             <thead><tr><th>Tenant</th><th>Issuer</th><th>Audience</th><th>Scope</th><th>Fail closed</th><th>Actions</th></tr></thead>
             <tbody>
               ${this._configs.length === 0
-                ? html`<tr><td class="ys-table-empty" colspan="6">No JWT configs.</td></tr>`
+                ? html`<tr><td class="ys-table-empty" colspan="6">${this._configsAvailable ? 'No JWT configs.' : 'JWT config list unavailable — check server logs.'}</td></tr>`
                 : this._configs.map((c) => html`<tr>
                     <td>${c.tenant_id}</td><td>${c.issuer}</td><td>${c.audience}</td>
                     <td>${c.scope}</td><td>${yn(c.fail_closed)}</td>

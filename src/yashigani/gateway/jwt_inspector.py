@@ -169,11 +169,29 @@ class JWTInspector:
             from yashigani.db.postgres import get_pool
             pool = get_pool()
             async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT jwks_url, issuer, audience, fail_closed, scope "
-                    "FROM jwt_config WHERE tenant_id = $1 AND scope = $2 LIMIT 1",
-                    uuid.UUID(tenant_id), scope,
-                )
+                async with conn.transaction():
+                    # V50-RLS-SWEEP: jwt_config carries ROW LEVEL SECURITY
+                    # (0001_initial_schema.py) keyed on
+                    # current_setting('app.tenant_id'). This connection never
+                    # SET it, so every runtime JWT-validation lookup raised
+                    # "unrecognized configuration parameter" — caught here and
+                    # logged only as a warning, returning None. _resolve_config's
+                    # waterfall then fell through to the env-var fallback (or
+                    # "no_jwks_configured" if unset), meaning a DB-configured
+                    # JWKS (the documented primary configuration path — see
+                    # module docstring) NEVER actually took effect for ANY
+                    # inbound JWT, silently. Fixed by SETting the tenant being
+                    # looked up (the platform sentinel for scope='platform'
+                    # calls, the real tenant for scope='tenant' calls) before
+                    # the query, matching the established idiom.
+                    await conn.execute(
+                        "SELECT set_config('app.tenant_id', $1, true)", tenant_id
+                    )
+                    row = await conn.fetchrow(
+                        "SELECT jwks_url, issuer, audience, fail_closed, scope "
+                        "FROM jwt_config WHERE tenant_id = $1 AND scope = $2 LIMIT 1",
+                        uuid.UUID(tenant_id), scope,
+                    )
                 if row:
                     return JWTConfig(
                         jwks_url=row["jwks_url"],
