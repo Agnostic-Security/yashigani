@@ -208,8 +208,13 @@ def test_compose_and_python_extractor_fallback_versions_agree():
 
 _KNOWN_PERMANENT_STUBS = {
     # (file, route decorator line substring, must-contain marker)
+    # YSG-RISK-157 (merged v4.1.2 integrated fixbatch 2026-07-30) rewrote
+    # /admin/budget/tree from a misleading 200 {"tree": []} to an honest 501 —
+    # the old docstring phrase this marker checked for was replaced; updated
+    # to a phrase from the new docstring (test-inventory drift at the
+    # integration seam, same class as the route-count fixes elsewhere).
     ("src/yashigani/backoffice/routes/budget.py", '@router.get("/tree")',
-     "Placeholder — will be populated from Postgres in integration"),
+     "NOT IMPLEMENTED in 4.1.2"),
     ("src/yashigani/backoffice/routes/user_ui.py", '@router.get("/user/memory")',
      "Phase 3"),
 }
