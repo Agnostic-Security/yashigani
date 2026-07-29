@@ -271,6 +271,7 @@ export class YsUserApp extends LitElement {
             .activeAgentName=${this._activeAgentName}></ys-chat-view>
         </div>
         <ys-settings-panel
+          .api=${this.api}
           .open=${this._settingsOpen}
           .models=${this._models}
           .defaultModel=${this._defaultModel}
