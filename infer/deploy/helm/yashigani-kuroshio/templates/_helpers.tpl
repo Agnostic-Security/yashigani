@@ -1,13 +1,13 @@
 {{/*
-  yashigani-infer — template helpers. Pattern mirrors helm/yashigani/templates/_helpers.tpl
+  yashigani-kuroshio — template helpers. Pattern mirrors helm/yashigani/templates/_helpers.tpl
   for eventual convergence.
 */}}
 
-{{- define "yashigani-infer.name" -}}
+{{- define "yashigani-kuroshio.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "yashigani-infer.fullname" -}}
+{{- define "yashigani-kuroshio.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -20,26 +20,26 @@
 {{- end }}
 {{- end }}
 
-{{- define "yashigani-infer.chart" -}}
+{{- define "yashigani-kuroshio.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "yashigani-infer.labels" -}}
-helm.sh/chart: {{ include "yashigani-infer.chart" . }}
-{{ include "yashigani-infer.selectorLabels" . }}
+{{- define "yashigani-kuroshio.labels" -}}
+helm.sh/chart: {{ include "yashigani-kuroshio.chart" . }}
+{{ include "yashigani-kuroshio.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
-{{- define "yashigani-infer.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "yashigani-infer.name" . }}
+{{- define "yashigani-kuroshio.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "yashigani-kuroshio.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/* Resolve the per-backend image repository:tag from values.images.<backend> */}}
-{{- define "yashigani-infer.image" -}}
+{{- define "yashigani-kuroshio.image" -}}
 {{- $backend := .Values.backend -}}
 {{- $img := index .Values.images $backend -}}
 {{- printf "%s:%s" $img.repository $img.tag -}}

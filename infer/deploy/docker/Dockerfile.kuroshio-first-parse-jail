@@ -3,8 +3,8 @@
 # RED-COUNCIL C1 / Captain finding #1's sibling: "a distinct ephemeral seccomp-strict,
 # network=none, torn-down step that performs the FIRST GGUF parse of an untrusted model,
 # separate from the serving ring-fence." This image contains ONLY: Python + the existing
-# pure-Python, bounds-checked GGUF header parser already shipped in yashigani_infer
-# (src/yashigani_infer/gguf/header.py, gguf/quant_types.py) — vendored in at build time via
+# pure-Python, bounds-checked GGUF header parser already shipped in kuroshio
+# (src/kuroshio/gguf/header.py, gguf/quant_types.py) — vendored in at build time via
 # a normal COPY from the same source tree. No new parsing logic is authored here; this is
 # packaging Tom's existing defensive parser into an isolated, throwaway process boundary,
 # per the containment/hooks.py FirstParseJailHook seam contract:
@@ -24,8 +24,8 @@
 #
 # This container is spawned ONE-SHOT per untrusted model's first parse, torn down
 # immediately after (--rm on compose invocation / TTL Job on k8s) — see
-# docker/docker-compose.infer.yml (invoke-first-parse-jail) and
-# helm/yashigani-infer/templates/job-first-parse-jail.yaml. It NEVER stays resident and
+# docker/docker-compose.kuroshio.yml (invoke-first-parse-jail) and
+# helm/yashigani-kuroshio/templates/job-first-parse-jail.yaml. It NEVER stays resident and
 # NEVER shares a container/process with the serving ring-fence's llama-server instances.
 #
 # OFFLINE-AUTHORED (2026-07-22, Captain). FROM digest is a PLACEHOLDER.
@@ -36,15 +36,15 @@ RUN groupadd --gid 1003 yashigani-parsejail \
     && useradd --uid 1003 --gid 1003 --no-create-home --shell /bin/false yashigani-parsejail
 
 WORKDIR /app
-# Vendor ONLY the pure-Python GGUF header parser package — not the whole yashigani_infer
+# Vendor ONLY the pure-Python GGUF header parser package — not the whole kuroshio
 # wheel (this jail must not be able to spawn processes, reach the blob store, or touch the
 # network; shipping the full control-plane package would be a bigger attack surface than
-# the parser it's meant to sandbox). Namespace preserved (yashigani_infer.gguf.*) because
-# gguf/header.py does `from yashigani_infer.gguf.quant_types import ...` — an absolute
+# the parser it's meant to sandbox). Namespace preserved (kuroshio.gguf.*) because
+# gguf/header.py does `from kuroshio.gguf.quant_types import ...` — an absolute
 # intra-package import, not relative — so the parent package path must exist on disk.
-RUN mkdir -p ./yashigani_infer
-COPY infer/src/yashigani_infer/gguf/ ./yashigani_infer/gguf/
-RUN touch ./yashigani_infer/__init__.py
+RUN mkdir -p ./kuroshio
+COPY infer/src/kuroshio/gguf/ ./kuroshio/gguf/
+RUN touch ./kuroshio/__init__.py
 COPY infer/deploy/docker/entrypoint/first-parse-jail-entrypoint.sh /usr/local/bin/first-parse-jail-entrypoint.sh
 RUN chmod 0555 /usr/local/bin/first-parse-jail-entrypoint.sh
 
@@ -57,6 +57,6 @@ ENV PYTHONUNBUFFERED=1 \
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      yashigani.infer.role="first-parse-jail"
+      yashigani.kuroshio.role="first-parse-jail"
 
 ENTRYPOINT ["/usr/local/bin/first-parse-jail-entrypoint.sh"]

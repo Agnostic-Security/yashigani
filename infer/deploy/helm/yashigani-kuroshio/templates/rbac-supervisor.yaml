@@ -1,6 +1,6 @@
 {{- /*
 Captain finding #1 hardening requirement: "a dedicated ServiceAccount, RBAC-scoped to
-create/delete/get/list on Pods/Jobs INSIDE the infer namespace only, with NO get/list on
+create/delete/get/list on Pods/Jobs INSIDE the kuroshio namespace only, with NO get/list on
 Secrets, no bind/escalate verbs, and no cluster-scoped grants."
 
 Namespaced Role + RoleBinding — never a ClusterRole/ClusterRoleBinding for this SA. No
@@ -11,10 +11,10 @@ No `*` resource or `*` verb wildcards.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-supervisor
+  name: {{ include "yashigani-kuroshio.fullname" . }}-supervisor
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -32,16 +32,16 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-supervisor
+  name: {{ include "yashigani-kuroshio.fullname" . }}-supervisor
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
     name: {{ .Values.supervisorRbac.serviceAccountName }}
     namespace: {{ .Values.namespace }}
 roleRef:
   kind: Role
-  name: {{ include "yashigani-infer.fullname" . }}-supervisor
+  name: {{ include "yashigani-kuroshio.fullname" . }}-supervisor
   apiGroup: rbac.authorization.k8s.io
 {{- end }}

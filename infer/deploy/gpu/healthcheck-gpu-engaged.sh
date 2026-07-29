@@ -11,7 +11,7 @@
 #      "policy-correct partial offload" from "almost everything fell back to CPU except a
 #      residual few layers" — both produce a small positive number. This script compares the
 #      live-measured VRAM against an operator-declared expected-floor
-#      (YSG_INFER_EXPECTED_VRAM_MB), not just a bare non-zero test.
+#      (YSG_KUROSHIO_EXPECTED_VRAM_MB), not just a bare non-zero test.
 #
 # Exit 0 = healthy. Exit 1 = hard-fail (Docker HEALTHCHECK / k8s exec probe both treat
 # non-zero as unhealthy — this is deliberately NOT a soft warning path; platform doc §4.5:
@@ -19,9 +19,9 @@
 
 set -eu
 
-BACKEND="${YSG_INFER_BACKEND:-unknown}"
-EXPECT_GPU="${YSG_INFER_EXPECT_GPU:-true}"
-EXPECTED_VRAM_MB="${YSG_INFER_EXPECTED_VRAM_MB:-1}"  # operator-declared per-model floor; MoE
+BACKEND="${YSG_KUROSHIO_BACKEND:-unknown}"
+EXPECT_GPU="${YSG_KUROSHIO_EXPECT_GPU:-true}"
+EXPECTED_VRAM_MB="${YSG_KUROSHIO_EXPECTED_VRAM_MB:-1}"  # operator-declared per-model floor; MoE
                                                        # partial-offload deployments set this
                                                        # to the small-but-nonzero expected value,
                                                        # not left at the permissive default.
@@ -75,7 +75,7 @@ except Exception:
         exit 0
         ;;
     *)
-        echo "FAIL: unknown YSG_INFER_BACKEND=${BACKEND} for a GPU-expected deployment" >&2
+        echo "FAIL: unknown YSG_KUROSHIO_BACKEND=${BACKEND} for a GPU-expected deployment" >&2
         exit 1
         ;;
 esac

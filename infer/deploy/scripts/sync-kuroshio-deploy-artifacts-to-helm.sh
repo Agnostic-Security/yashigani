@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# infer/deploy/scripts/sync-infer-deploy-artifacts-to-helm.sh
+# infer/deploy/scripts/sync-kuroshio-deploy-artifacts-to-helm.sh
 #
 # Single-source discipline (Iris F5 pattern, matches scripts/sync-caddyfile-egress-helm.sh):
-# docker/Caddyfile.infer-front and docker/seccomp/infer-llama-server.json are CANONICAL.
+# docker/Caddyfile.kuroshio-front and docker/seccomp/kuroshio-llama-server.json are CANONICAL.
 # Helm cannot .Files.Get outside the chart root, so byte-identical mirrors live under
-# helm/yashigani-infer/files/ and are maintained ONLY by this script (one-way:
-# infer/deploy/docker/ -> infer/deploy/helm/yashigani-infer/files/).
+# helm/yashigani-kuroshio/files/ and are maintained ONLY by this script (one-way:
+# infer/deploy/docker/ -> infer/deploy/helm/yashigani-kuroshio/files/).
 #
 # Usage:
-#   scripts/sync-infer-deploy-artifacts-to-helm.sh           # sync
-#   scripts/sync-infer-deploy-artifacts-to-helm.sh --check   # verify only; exit 1 on drift
+#   scripts/sync-kuroshio-deploy-artifacts-to-helm.sh           # sync
+#   scripts/sync-kuroshio-deploy-artifacts-to-helm.sh --check   # verify only; exit 1 on drift
 
 set -euo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -21,12 +21,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # infer/deploy
 # default (no associative-array support), and this script must work identically on macOS and
 # Linux without requiring an interpreter upgrade (feedback_local_test_must_work_on_macos_and_linux).
 CANONICALS=(
-    "$REPO_ROOT/docker/Caddyfile.infer-front"
-    "$REPO_ROOT/docker/seccomp/infer-llama-server.json"
+    "$REPO_ROOT/docker/Caddyfile.kuroshio-front"
+    "$REPO_ROOT/docker/seccomp/kuroshio-llama-server.json"
 )
 MIRRORS=(
-    "$REPO_ROOT/helm/yashigani-infer/files/Caddyfile.infer-front"
-    "$REPO_ROOT/helm/yashigani-infer/files/seccomp/infer-llama-server.json"
+    "$REPO_ROOT/helm/yashigani-kuroshio/files/Caddyfile.kuroshio-front"
+    "$REPO_ROOT/helm/yashigani-kuroshio/files/seccomp/kuroshio-llama-server.json"
 )
 
 mode="${1:-sync}"

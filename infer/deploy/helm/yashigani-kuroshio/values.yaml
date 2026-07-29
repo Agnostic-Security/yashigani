@@ -14,22 +14,22 @@ backend: cpu
 
 images:
   cuda:
-    repository: yashigani/infer-cuda
+    repository: yashigani/kuroshio-cuda
     tag: local
   rocm:
-    repository: yashigani/infer-rocm
+    repository: yashigani/kuroshio-rocm
     tag: local
   vulkan:
-    repository: yashigani/infer-vulkan
+    repository: yashigani/kuroshio-vulkan
     tag: local
   cpu:
-    repository: yashigani/infer-cpu
+    repository: yashigani/kuroshio-cpu
     tag: local
   puller:
-    repository: yashigani/infer-puller
+    repository: yashigani/kuroshio-puller
     tag: local
   firstParseJail:
-    repository: yashigani/infer-first-parse-jail
+    repository: yashigani/kuroshio-first-parse-jail
     tag: local
 
 # GPU node scheduling (device-plugin resource requests, platform doc §4).
@@ -51,7 +51,7 @@ gpu:
   #
   # H6 (Red Council 2026-07-29, Captain finding #1): resourceName alone only grants /dev/dri
   # cgroup device access via the device plugin — it does NOT put a Vulkan ICD (the driver
-  # descriptor) inside the container (Dockerfile.infer-vulkan ships only the libvulkan1
+  # descriptor) inside the container (Dockerfile.kuroshio-vulkan ships only the libvulkan1
   # loader, matching the compose overlay's design: the ICD is always host-mounted, never
   # baked into the image). See vulkanIcdHostPath below for the second half of the grant.
   # WITHOUT BOTH values set correctly for backend: vulkan, the pod schedules, gets a
@@ -61,7 +61,7 @@ gpu:
   count: 1
   # Vulkan/Intel k8s ONLY — absolute host path to the node's Vulkan ICD directory,
   # bind-mounted read-only into the container at the SAME path (mirrors
-  # docker-compose.infer.vulkan.yml's `/usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro`
+  # docker-compose.kuroshio.vulkan.yml's `/usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro`
   # exactly, so operators moving from compose to k8s reuse the same value). REQUIRED VALUE
   # for a real Vulkan/Intel k8s deploy: "/usr/share/vulkan/icd.d" on Debian/Ubuntu-family GPU
   # nodes (the same path this chart's compose sibling already uses) — CONFIRM this path on
@@ -120,8 +120,8 @@ puller:
       cpu: "1"
       memory: 2Gi
 
-# infer-init — day-one default model auto-pull (Iris cutover-prep map Seam 2, engine-side
-# SF-011 analog — see templates/job-infer-init.yaml + infer/deploy/README.md "day-one
+# kuroshio-init — day-one default model auto-pull (Iris cutover-prep map Seam 2, engine-side
+# SF-011 analog — see templates/job-kuroshio-init.yaml + infer/deploy/README.md "day-one
 # models"). Gate mirrors release/5.0's ollama-init dual-AND condition (ollama.enabled AND an
 # AI-workload flag): here, `enabled` AND a non-empty `model` must BOTH hold before the Job
 # renders at all.
@@ -131,9 +131,9 @@ puller:
 # signing decision (Laura F2/F3, Nico #1, Lu SUPPLY-1 council findings on the HF adapter apply
 # here too — an unsigned client-chosen default would be exactly the "resolve a sha256 live
 # from the same repo you're trusting" anti-pattern). Empty = the Job is NOT rendered at all
-# (see the `{{- if and .Values.inferInit.enabled (ne .Values.inferInit.model "") }}` guard) —
+# (see the `{{- if and .Values.kuroshioInit.enabled (ne .Values.kuroshioInit.model "") }}` guard) —
 # deploy ships model-less by design, not a broken/crash-looping Job.
-inferInit:
+kuroshioInit:
   enabled: true
   model: ""
   # modelDigest: informational only client-side (echoed into the Job's log for operator
@@ -168,7 +168,7 @@ firstParseJail:
 # leave false until the dynamic per-model orchestration seam is actually wired).
 supervisorRbac:
   enabled: false
-  serviceAccountName: infer-supervisor
+  serviceAccountName: kuroshio-supervisor
 
 admissionPolicies:
   enabled: false
@@ -194,7 +194,7 @@ mtls:
 # via a Pod spec alone). true = install via the DaemonSet in
 # templates/daemonset-seccomp-profile-installer.yaml; false = Deployments use
 # seccompProfile.type: RuntimeDefault instead (cluster-portable, less strict than the
-# enumerated infer-llama-server.json deny-list — RuntimeDefault is still a real, non-trivial
+# enumerated kuroshio-llama-server.json deny-list — RuntimeDefault is still a real, non-trivial
 # profile, not Unconfined).
 seccomp:
   installViaDaemonSet: false

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # infer/deploy/scripts/resolve-and-pin-digests.sh
 #
-# THE required step before any live build of the infer/deploy/docker/Dockerfile.infer-*
+# THE required step before any live build of the infer/deploy/docker/Dockerfile.kuroshio-*
 # images (Verification Protocol #7: never guess a version). This script does NOT run in the
 # offline-authoring session that produced it — Captain has no rig/internet access here
 # (dispatch brief: "OFFLINE AUTHORING ONLY ... do NOT build or run any image or touch a

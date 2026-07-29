@@ -1,28 +1,28 @@
 {{- /*
 Captain finding #4: user-facing chat/generate/embeddings models — dedicated Deployment,
-physically separate from infer-classifier (never co-scheduled). Blob store read-only.
+physically separate from kuroshio-classifier (never co-scheduled). Blob store read-only.
 */ -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-chat
+  name: {{ include "yashigani-kuroshio.fullname" . }}-chat
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
-    app.kubernetes.io/component: infer-chat
-    yashigani.infer.managed: "true"
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-chat
+    yashigani.kuroshio.managed: "true"
 spec:
   replicas: {{ .Values.chat.replicas }}
   selector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: infer-chat
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-chat
   template:
     metadata:
       labels:
-        {{- include "yashigani-infer.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: infer-chat
-        yashigani.infer.managed: "true"
+        {{- include "yashigani-kuroshio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kuroshio-chat
+        yashigani.kuroshio.managed: "true"
     spec:
       # Explicit anti-affinity to the classifier component — belt-and-suspenders on top of
       # the separate-Deployment/separate-pod boundary already enforced above (finding #4
@@ -35,7 +35,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app.kubernetes.io/component: infer-classifier
+                    app.kubernetes.io/component: kuroshio-classifier
                 topologyKey: kubernetes.io/hostname
       {{- if .Values.gpu.nodeSelector }}
       nodeSelector:
@@ -50,7 +50,7 @@ spec:
         seccompProfile:
           {{- if .Values.seccomp.installViaDaemonSet }}
           type: Localhost
-          localhostProfile: profiles/infer-llama-server.json
+          localhostProfile: profiles/kuroshio-llama-server.json
           {{- else }}
           type: RuntimeDefault
           {{- end }}
@@ -73,49 +73,49 @@ spec:
               mountPath: /data/model-store
               readOnly: false
       containers:
-        - name: infer-chat
-          image: {{ include "yashigani-infer.image" . }}
+        - name: kuroshio-chat
+          image: {{ include "yashigani-kuroshio.image" . }}
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
           env:
-            - name: YSG_INFER_ROLE
+            - name: YSG_KUROSHIO_ROLE
               value: "chat"
-            - name: YSG_INFER_BLOB_STORE_ROOT
+            - name: YSG_KUROSHIO_BLOB_STORE_ROOT
               value: "/data/model-store"
-            - name: YSG_INFER_KEEP_ALIVE_PIN
+            - name: YSG_KUROSHIO_KEEP_ALIVE_PIN
               value: "false"
-            - name: YSG_INFER_MAX_CTX
+            - name: YSG_KUROSHIO_MAX_CTX
               value: {{ .Values.chat.maxCtx | quote }}
-            - name: YSG_INFER_MAX_CONCURRENCY
+            - name: YSG_KUROSHIO_MAX_CONCURRENCY
               value: {{ .Values.chat.maxConcurrency | quote }}
-            - name: YSG_INFER_MAX_TOKENS_PER_REQUEST
+            - name: YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST
               value: {{ .Values.chat.maxTokensPerRequest | quote }}
-            - name: YSG_INFER_IDLE_UNLOAD_SECONDS
+            - name: YSG_KUROSHIO_IDLE_UNLOAD_SECONDS
               value: {{ .Values.chat.idleUnloadSeconds | quote }}
-            - name: YSG_INFER_MAX_RESIDENT_MODELS
+            - name: YSG_KUROSHIO_MAX_RESIDENT_MODELS
               value: {{ .Values.chat.maxResidentModels | quote }}
-            - name: YSG_INFER_EXPECT_GPU
+            - name: YSG_KUROSHIO_EXPECT_GPU
               # Captain finding #7 (Red Council 2026-07-29): backend: cpu MUST cascade
               # expectGpu: false regardless of chat.expectGpu's own default -- mirrors
-              # docker-compose.infer.cpu.yml's YSG_INFER_EXPECT_GPU: "false" override, which
+              # docker-compose.kuroshio.cpu.yml's YSG_KUROSHIO_EXPECT_GPU: "false" override, which
               # already gets this right. Without this cascade, a stock `helm install` (no
               # --set backend=..., no GPU) ships chat.expectGpu's top-level default (true)
               # into the env-var contract Tom's entrypoint/gpu-engaged healthcheck consume,
               # hard-failing /healthz out of the box on the CPU backend.
               value: {{ if eq .Values.backend "cpu" }}"false"{{ else }}{{ .Values.chat.expectGpu | quote }}{{ end }}
-            - name: YSG_INFER_EXPECTED_VRAM_MB
+            - name: YSG_KUROSHIO_EXPECTED_VRAM_MB
               value: {{ .Values.chat.expectedVramMb | quote }}
             {{- if .Values.chat.overrideTensor }}
-            - name: YSG_INFER_OVERRIDE_TENSOR
+            - name: YSG_KUROSHIO_OVERRIDE_TENSOR
               value: {{ .Values.chat.overrideTensor | quote }}
             {{- end }}
             {{- if .Values.gpu.resourceName }}
-            - name: YSG_INFER_N_GPU_LAYERS
+            - name: YSG_KUROSHIO_N_GPU_LAYERS
               value: "999"
             {{- else }}
-            - name: YSG_INFER_N_GPU_LAYERS
+            - name: YSG_KUROSHIO_N_GPU_LAYERS
               value: "0"
             {{- end }}
           securityContext:
@@ -161,7 +161,7 @@ spec:
       volumes:
         - name: blobs
           persistentVolumeClaim:
-            claimName: {{ include "yashigani-infer.fullname" . }}-blobs
+            claimName: {{ include "yashigani-kuroshio.fullname" . }}-blobs
         - name: scratch
           emptyDir:
             sizeLimit: 8Gi
@@ -175,14 +175,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-chat
+  name: {{ include "yashigani-kuroshio.fullname" . }}-chat
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
-    app.kubernetes.io/component: infer-chat
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-chat
 spec:
   # C1 (Red Council 2026-07-29, Captain finding #4): sticky routing so one caller lands on
-  # the same infer-chat replica across requests -- defense-in-depth at the k8s Service layer
+  # the same kuroshio-chat replica across requests -- defense-in-depth at the k8s Service layer
   # pairing with Tom's cache_prompt=off / --parallel llama-server slot-hygiene defaults.
   # This is NOT the load-bearing multi-tenant isolation control: sessionAffinity only scopes
   # k8s load-balancing across chat.replicas, it does nothing for KV-cache/prompt-prefix
@@ -194,8 +194,8 @@ spec:
   # implementations with no routing affinity at all, widening blast radius for zero benefit.
   sessionAffinity: ClientIP
   selector:
-    {{- include "yashigani-infer.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: infer-chat
+    {{- include "yashigani-kuroshio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-chat
   ports:
     - port: 8000
       targetPort: 8000

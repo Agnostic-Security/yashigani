@@ -1,12 +1,12 @@
 #!/bin/sh
 # First-parse jail entrypoint — invocation contract documented in
-# Dockerfile.infer-first-parse-jail. Reads raw GGUF header bytes from stdin (bounded to 8 MiB
+# Dockerfile.kuroshio-first-parse-jail. Reads raw GGUF header bytes from stdin (bounded to 8 MiB
 # — a real GGUF header/metadata/tensor-info section for any model in the wild is well under
 # this; a hostile input trying to exhaust jail memory via an oversized stdin stream is capped
 # HERE, at the shell layer, before a single byte reaches the Python parser), invokes the
 # existing pure-Python defensive parser, emits a JSON verdict on stdout, and exits.
 #
-# This container has --network=none and a seccomp-strict profile (infer-first-parse-jail.json)
+# This container has --network=none and a seccomp-strict profile (kuroshio-first-parse-jail.json)
 # applied by the invoking orchestrator (compose `invoke-first-parse-jail` service / k8s
 # job-first-parse-jail.yaml) — this script does not and cannot enforce those itself; it is the
 # in-container half of the control, not the whole control.
@@ -26,7 +26,7 @@ if len(raw) > max_bytes:
     sys.exit(0)
 
 try:
-    from yashigani_infer.gguf.header import GGUFParseError, parse_gguf_header
+    from kuroshio.gguf.header import GGUFParseError, parse_gguf_header
 
     header = parse_gguf_header(raw, parse_tensors=True)
     print(

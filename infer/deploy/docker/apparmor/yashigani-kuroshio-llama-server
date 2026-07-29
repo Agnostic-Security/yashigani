@@ -1,18 +1,18 @@
-# Yashigani AppArmor profile — infer-{cuda,rocm,vulkan,cpu} serving containers
-# (infer-classifier / infer-chat). Pattern mirrors docker/apparmor/yashigani-gateway.
+# Yashigani AppArmor profile — kuroshio-{cuda,rocm,vulkan,cpu} serving containers
+# (kuroshio-classifier / kuroshio-chat). Pattern mirrors docker/apparmor/yashigani-gateway.
 #
 # To load this profile on the host before starting the stack:
-#   sudo apparmor_parser -r infer/deploy/docker/apparmor/yashigani-infer-llama-server
+#   sudo apparmor_parser -r infer/deploy/docker/apparmor/yashigani-kuroshio-llama-server
 # Verify it loaded:
-#   sudo apparmor_status | grep yashigani-infer-llama-server
-# Enable in compose by uncommenting in docker-compose.infer.yml:
-#   security_opt: ["apparmor=yashigani-infer-llama-server"]
+#   sudo apparmor_status | grep yashigani-kuroshio-llama-server
+# Enable in compose by uncommenting in docker-compose.kuroshio.yml:
+#   security_opt: ["apparmor=yashigani-kuroshio-llama-server"]
 # AppArmor requires the host kernel module enabled (Ubuntu/Debian default; RHEL/Fedora use
 # SELinux instead — see the SELinux :Z/:z note in infer/deploy/README.md).
 
 #include <tunables/global>
 
-profile yashigani-infer-llama-server flags=(attach_disconnected,mediate_deleted) {
+profile yashigani-kuroshio-llama-server flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
   #include <abstractions/nameservice>
   #include <abstractions/python>
@@ -30,7 +30,7 @@ profile yashigani-infer-llama-server flags=(attach_disconnected,mediate_deleted)
   /usr/local/bin/llama-server rix,
   /usr/local/bin/python* rix,
   /usr/local/bin/uvicorn ix,
-  /usr/local/bin/infer-entrypoint.sh rix,
+  /usr/local/bin/kuroshio-entrypoint.sh rix,
   /usr/local/bin/healthcheck-gpu-engaged.sh rix,
 
   # Finding #2/#4: blob store is READ-ONLY, no exception — including the classifier's own
@@ -41,7 +41,7 @@ profile yashigani-infer-llama-server flags=(attach_disconnected,mediate_deleted)
   /data/scratch/ rw,
   /data/scratch/** rw,
 
-  # Secrets — none mounted into infer-* (engine has no auth of its own, mtls_capable:false,
+  # Secrets — none mounted into kuroshio-* (engine has no auth of its own, mtls_capable:false,
   # platform doc §13 invariant #1). No /run/secrets/ rule at all — deliberate absence, not
   # an oversight; if a future change mounts a secret here, this profile will deny it by
   # default (no matching allow rule) until explicitly added and reviewed.

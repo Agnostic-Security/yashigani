@@ -1,4 +1,4 @@
-# Backend-selection overlay — ROCm (AMD). See docker-compose.infer.cuda.yml header for the
+# Backend-selection overlay — ROCm (AMD). See docker-compose.kuroshio.cuda.yml header for the
 # Iris F4/F5 image-SWAP rationale (identical logic, different backend).
 #
 # Captain finding #2 (Red Council 2026-07-29, MEDIUM) — group_add GID stability: `group_add:
@@ -14,34 +14,34 @@
 # Fix: numeric-GID-configurable via env vars, defaulting to the pre-fix name-based behaviour
 # (safe no-op for hosts where the names already happen to resolve correctly). Before a real
 # ROCm deploy, compute the HOST's actual device GIDs and override both vars:
-#   stat -c '%g' /dev/kfd            -> YSG_INFER_ROCM_KFD_GID
-#   stat -c '%g' /dev/dri/renderD128 -> YSG_INFER_ROCM_RENDER_GID
+#   stat -c '%g' /dev/kfd            -> YSG_KUROSHIO_ROCM_KFD_GID
+#   stat -c '%g' /dev/dri/renderD128 -> YSG_KUROSHIO_ROCM_RENDER_GID
 # (install.sh host-GID-probe wiring to set these automatically is deferred -- Su's lane,
 # same pattern as any other host-fact detection, out of scope for this infer/deploy-only
 # dispatch). K8s is unaffected -- the AMD device-plugin manages device cgroup rules itself,
 # not this compose file.
 services:
-  infer-classifier:
-    image: ${YSG_INFER_IMAGE_ROCM:-yashigani/infer-rocm:local}
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_ROCM:-yashigani/kuroshio-rocm:local}
     devices:
       - /dev/kfd
       - /dev/dri
     group_add:
-      - "${YSG_INFER_ROCM_VIDEO_GID:-video}"
-      - "${YSG_INFER_ROCM_RENDER_GID:-render}"
+      - "${YSG_KUROSHIO_ROCM_VIDEO_GID:-video}"
+      - "${YSG_KUROSHIO_ROCM_RENDER_GID:-render}"
     environment:
-      YSG_INFER_BACKEND: rocm
-      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CLASSIFIER_N_GPU_LAYERS:-999}
+      YSG_KUROSHIO_BACKEND: rocm
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CLASSIFIER_N_GPU_LAYERS:-999}
 
-  infer-chat:
-    image: ${YSG_INFER_IMAGE_ROCM:-yashigani/infer-rocm:local}
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_ROCM:-yashigani/kuroshio-rocm:local}
     devices:
       - /dev/kfd
       - /dev/dri
     group_add:
-      - "${YSG_INFER_ROCM_VIDEO_GID:-video}"
-      - "${YSG_INFER_ROCM_RENDER_GID:-render}"
+      - "${YSG_KUROSHIO_ROCM_VIDEO_GID:-video}"
+      - "${YSG_KUROSHIO_ROCM_RENDER_GID:-render}"
     environment:
-      YSG_INFER_BACKEND: rocm
-      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CHAT_N_GPU_LAYERS:-999}
-      YSG_INFER_OVERRIDE_TENSOR: ${YSG_INFER_OVERRIDE_TENSOR:-}
+      YSG_KUROSHIO_BACKEND: rocm
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CHAT_N_GPU_LAYERS:-999}
+      YSG_KUROSHIO_OVERRIDE_TENSOR: ${YSG_KUROSHIO_OVERRIDE_TENSOR:-}

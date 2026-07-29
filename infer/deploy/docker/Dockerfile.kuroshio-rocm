@@ -50,9 +50,9 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" build \
 # which is the honest lean-as-achievable answer for this backend.
 FROM rocm/dev-ubuntu-24.04:6.2@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME AS runtime
 
-RUN groupadd --gid 1002 yashigani-infer \
-    && useradd --uid 1002 --gid 1002 --no-create-home --shell /bin/false yashigani-infer \
-    && usermod -aG video,render yashigani-infer
+RUN groupadd --gid 1002 yashigani-kuroshio \
+    && useradd --uid 1002 --gid 1002 --no-create-home --shell /bin/false yashigani-kuroshio \
+    && usermod -aG video,render yashigani-kuroshio
 
 # Strip the build/compiler toolchain the dev image ships, keeping only the ROCm runtime
 # userspace (rocblas/hipblas/rocm-core) llama-server links against.
@@ -71,25 +71,25 @@ COPY --from=wheel-builder /dist/*.whl /tmp/
 RUN pip3 install --no-cache-dir --break-system-packages /tmp/*.whl \
     && rm -f /tmp/*.whl
 
-COPY infer/deploy/docker/entrypoint/infer-entrypoint.sh /usr/local/bin/infer-entrypoint.sh
+COPY infer/deploy/docker/entrypoint/kuroshio-entrypoint.sh /usr/local/bin/kuroshio-entrypoint.sh
 COPY infer/deploy/gpu/healthcheck-gpu-engaged.sh /usr/local/bin/healthcheck-gpu-engaged.sh
-RUN chmod 0555 /usr/local/bin/infer-entrypoint.sh /usr/local/bin/llama-server /usr/local/bin/healthcheck-gpu-engaged.sh \
+RUN chmod 0555 /usr/local/bin/kuroshio-entrypoint.sh /usr/local/bin/llama-server /usr/local/bin/healthcheck-gpu-engaged.sh \
     && mkdir -p /data/model-store /data/scratch \
-    && chown -R yashigani-infer:yashigani-infer /data
+    && chown -R yashigani-kuroshio:yashigani-kuroshio /data
 
-USER yashigani-infer
+USER yashigani-kuroshio
 EXPOSE 8000
-ENV YSG_INFER_BACKEND=rocm \
+ENV YSG_KUROSHIO_BACKEND=rocm \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /usr/local/bin/infer-entrypoint.sh --healthcheck || exit 1
+    CMD /usr/local/bin/kuroshio-entrypoint.sh --healthcheck || exit 1
 
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
-      yashigani.infer.backend="rocm"
+      yashigani.kuroshio.backend="rocm"
 
-ENTRYPOINT ["/usr/local/bin/infer-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/kuroshio-entrypoint.sh"]

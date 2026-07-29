@@ -3,16 +3,16 @@
 # (inference-engine-platform-requirements-20260722.md §5)
 #
 # SINGLE SOURCE. This file is imported by every Caddyfile variant
-#   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.infer-front
+#   docker/Caddyfile.{selfsigned,ca,acme}   via  import /etc/caddy/Caddyfile.kuroshio-front
 # and rendered byte-identically into the Helm ConfigMap
-#   helm/yashigani-infer/templates/configmap-caddy-infer-front.yaml
+#   helm/yashigani-kuroshio/templates/configmap-caddy-kuroshio-front.yaml
 # via the `.Files.Get` pattern (Iris F5 correction — NOT the ollama-front hand-sync
 # antipattern). The canonical copy lives here; the Helm mirror at
-# helm/yashigani-infer/files/Caddyfile.infer-front is kept in sync ONLY by
-# scripts/sync-caddyfile-infer-front-helm.sh — never hand-edited.
+# helm/yashigani-kuroshio/files/Caddyfile.kuroshio-front is kept in sync ONLY by
+# scripts/sync-caddyfile-kuroshio-front-helm.sh — never hand-edited.
 #
 # Mirrors docker/Caddyfile.ollama-front's proven shape (LAURA-I1-01 close):
-# the engine leaves any shared bridge and joins a dedicated `infer_ringfence`
+# the engine leaves any shared bridge and joins a dedicated `kuroshio_ringfence`
 # bridge (internal:true) whose ONLY other member is Caddy. The engine has no
 # non-loopback listener reachable except through this front — Caddy IS the
 # auth perimeter (platform doc §13 invariant #1); the engine speaks plain HTTP,
@@ -27,7 +27,7 @@
 # leaf" (Laura-probe F6 / platform doc §5). Stamped-header pattern (no CEL —
 # Caddy 2.11.x cannot evaluate URI SANs in CEL expressions, LAURA-I1-CEL fix;
 # same proven pattern as docker/Caddyfile.openclaw-egress's llm-egress-caller-gate).
-(infer-front-caller-gate) {
+(kuroshio-front-caller-gate) {
     request_header X-Yashigani-Verified-Spiffe {http.request.tls.client.san.uris.0}
     @caller_not_allowed {
         not header X-Yashigani-Verified-Spiffe "{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}"
@@ -49,20 +49,20 @@
         curves x25519mlkem768 x25519 secp384r1 secp256r1
     }
 
-    handle_path /infer/pull* {
-        import infer-front-caller-gate
+    handle_path /kuroshio/pull* {
+        import kuroshio-front-caller-gate
 
         # /api/pull ADMIN-GATE (Laura F6 / Lu / Red-Council MEDIUM): the puller upstream
         # is the ONLY container in the topology with blob-store WRITE access AND the only
         # one wired with a pull_resolver — routing narrows further than the generic
         # caller-gate above: only requests to THIS path prefix ever reach it, and nothing
-        # else does (infer-puller never receives /infer/chat|generate|embeddings traffic —
+        # else does (kuroshio-puller never receives /kuroshio/chat|generate|embeddings traffic —
         # see infer/deploy/README.md "classifier/chat/puller container split").
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         rewrite * /api/pull
 
-        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:infer-puller}:8000 {
+        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:kuroshio-puller}:8000 {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
             transport http {
@@ -72,23 +72,23 @@
         }
     }
 
-    handle_path /infer/api/pull* {
-        import infer-front-caller-gate
+    handle_path /kuroshio/api/pull* {
+        import kuroshio-front-caller-gate
 
         # URL-convention shim (Iris Seam 5, F1 cutover-prep map, her recommended
         # option (b)): a gateway/backoffice caller using the ollama convention
-        # `base + "/api/pull"` resolves to `/infer/api/pull`, which the literal
-        # `/infer/pull*` route above does NOT match (no `/api` segment) — without
-        # this route it would fall through to the generic `/infer/*` catch-all
-        # below and silently 501 against infer-chat (no pull_resolver on that
+        # `base + "/api/pull"` resolves to `/kuroshio/api/pull`, which the literal
+        # `/kuroshio/pull*` route above does NOT match (no `/api` segment) — without
+        # this route it would fall through to the generic `/kuroshio/*` catch-all
+        # below and silently 501 against kuroshio-chat (no pull_resolver on that
         # role). This route rewrites to `/api/pull` and reaches the SAME puller
-        # upstream as `/infer/pull*`, so `_ollama_base()`-shaped caller code stays
+        # upstream as `/kuroshio/pull*`, so `_ollama_base()`-shaped caller code stays
         # engine-agnostic regardless of which URL convention it uses.
         request_header -X-SPIFFE-ID
         request_header X-SPIFFE-ID {http.request.tls.client.san.uris.0}
         rewrite * /api/pull
 
-        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:infer-puller}:8000 {
+        reverse_proxy http://{$YASHIGANI_INFER_PULLER_UPSTREAM:kuroshio-puller}:8000 {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
             transport http {
@@ -98,8 +98,8 @@
         }
     }
 
-    handle_path /infer/* {
-        import infer-front-caller-gate
+    handle_path /kuroshio/* {
+        import kuroshio-front-caller-gate
 
         # Zero-trust header discipline (EX-231-08): strip any inbound value, then set
         # X-SPIFFE-ID from the VERIFIED peer cert's first URI SAN. Only Caddy sets this;
@@ -109,14 +109,14 @@
 
         # Classifier-vs-chat routing (Captain finding #4 MUST-separate-container):
         # requests explicitly targeting the mandatory sensitivity classifier route to the
-        # dedicated infer-classifier upstream; everything else routes to infer-chat.
+        # dedicated kuroshio-classifier upstream; everything else routes to kuroshio-chat.
         # The `model` field convention matches the ollama-shim `/api/*` body shape.
         @classifier_request {
-            path /infer/classifier/*
+            path /kuroshio/classifier/*
         }
         rewrite @classifier_request /{path.1}
 
-        reverse_proxy @classifier_request http://{$YASHIGANI_INFER_CLASSIFIER_UPSTREAM:infer-classifier}:8000 {
+        reverse_proxy @classifier_request http://{$YASHIGANI_INFER_CLASSIFIER_UPSTREAM:kuroshio-classifier}:8000 {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
             transport http {
@@ -127,7 +127,7 @@
             }
         }
 
-        reverse_proxy http://{$YASHIGANI_INFER_CHAT_UPSTREAM:infer-chat}:8000 {
+        reverse_proxy http://{$YASHIGANI_INFER_CHAT_UPSTREAM:kuroshio-chat}:8000 {
             header_up X-Forwarded-Proto https
             header_up X-Real-IP {remote_host}
             transport http {

@@ -1,189 +1,189 @@
 # Yashigani 6.0 inference engine — base compose overlay.
 #
 # Backend-agnostic. Actual image + GPU device grant is selected by exactly ONE of
-# docker-compose.infer.{cuda,rocm,vulkan,cpu}.yml (Iris F4/F5 corrected image-SWAP logic —
+# docker-compose.kuroshio.{cuda,rocm,vulkan,cpu}.yml (Iris F4/F5 corrected image-SWAP logic —
 # NOT additive-device passthrough on one fat image, platform doc §9). install.sh adds this
 # base file PLUS the one matching backend overlay to compose_files.
 #
 # Topology (Captain finding #4 MUST-separate-container + Red-Council convergence):
-#   infer-classifier  — the mandatory sensitivity classifier ONLY (keep_alive_pin=true,
+#   kuroshio-classifier  — the mandatory sensitivity classifier ONLY (keep_alive_pin=true,
 #                        WARMUP-001 analog). blob RO. No pull capability.
-#   infer-chat        — user-facing chat/generate/embeddings models. blob RO. No pull
+#   kuroshio-chat        — user-facing chat/generate/embeddings models. blob RO. No pull
 #                        capability. Multiple replicas may be added by an operator overlay;
 #                        this base ships one.
-#   infer-puller      — the ONLY container with blob-store WRITE access and a wired
-#                        pull_resolver. Built from Dockerfile.infer-puller which contains NO
+#   kuroshio-puller      — the ONLY container with blob-store WRITE access and a wired
+#                        pull_resolver. Built from Dockerfile.kuroshio-puller which contains NO
 #                        llama-server binary at all — even if a request reached its
-#                        /api/chat route (it must not; Caddyfile.infer-front routes
-#                        /infer/pull to this upstream exclusively), the supervisor's
+#                        /api/chat route (it must not; Caddyfile.kuroshio-front routes
+#                        /kuroshio/pull to this upstream exclusively), the supervisor's
 #                        ProcessRunner.spawn would fail closed (binary absent).
 #
-# All three join ONLY infer_ringfence (internal:true) — Caddy is the sole other member,
-# same LAURA-I1-01 pattern as ollama_ringfence. No infer-* container is ever host-mapped.
+# All three join ONLY kuroshio_ringfence (internal:true) — Caddy is the sole other member,
+# same LAURA-I1-01 pattern as ollama_ringfence. No kuroshio-* container is ever host-mapped.
 #
 # Resource ceilings (Captain finding #3 — numeric, not "supervisor enforces bounds"):
 # mem_limit / pids_limit / mem_swappiness=0 / memswap_limit=mem_limit per service below.
 # n_ctx / max_concurrency / max_tokens are supervisor-level ceilings passed via the
-# YSG_INFER_MAX_* env vars documented in infer/deploy/README.md — Tom's
-# yashigani_infer.entrypoint module (landed after this file's first commit; see
+# YSG_KUROSHIO_MAX_* env vars documented in infer/deploy/README.md — Tom's
+# kuroshio.entrypoint module (landed after this file's first commit; see
 # infer/deploy/README.md "Coordination gap — RESOLVED") now consumes them.
 #
 # Blob-store mount path (Tom's integration-seam fix, addressed here): `BlobStore.__init__`
-# (infer/src/yashigani_infer/blobstore/store.py) creates `<YSG_INFER_BLOB_STORE_ROOT>/blobs/`
-# AND `<YSG_INFER_BLOB_STORE_ROOT>/meta/` under the configured root — it is NOT itself a
+# (infer/src/kuroshio/blobstore/store.py) creates `<YSG_KUROSHIO_BLOB_STORE_ROOT>/blobs/`
+# AND `<YSG_KUROSHIO_BLOB_STORE_ROOT>/meta/` under the configured root — it is NOT itself a
 # "blobs" directory. Mounting the persistent volume at `/data/blobs` (the earlier shape)
 # would put the `blobs/` subdir on the volume but leave `meta/` (per-model provenance/
 # metadata JSON, read on every /api/tags, /api/show, /api/ps, find_by_name call) on the
 # container's own ephemeral/read-only rootfs — silently losing metadata every restart even
 # with the blob bytes themselves persisted. Fix: mount the WHOLE root at `/data/model-store`
-# and set `YSG_INFER_BLOB_STORE_ROOT=/data/model-store` — both `blobs/` and `meta/` then
+# and set `YSG_KUROSHIO_BLOB_STORE_ROOT=/data/model-store` — both `blobs/` and `meta/` then
 # live on the one mounted volume.
 
 networks:
-  infer_ringfence:
+  kuroshio_ringfence:
     internal: true
 
 volumes:
-  infer_model_store:
-  # Puller-only scratch for in-flight downloads before atomic promote into infer_model_store
+  kuroshio_model_store:
+  # Puller-only scratch for in-flight downloads before atomic promote into kuroshio_model_store
   # (Su C4/C5 lane — download atomicity, symlink/allowlist containment — not built here).
-  infer_puller_scratch:
+  kuroshio_puller_scratch:
 
 services:
-  infer-classifier:
-    # image: set by the backend overlay (docker-compose.infer.{cuda,rocm,vulkan,cpu}.yml)
+  kuroshio-classifier:
+    # image: set by the backend overlay (docker-compose.kuroshio.{cuda,rocm,vulkan,cpu}.yml)
     restart: unless-stopped
     user: "1002:1002"
-    mem_limit: ${YSG_INFER_CLASSIFIER_MEM_LIMIT:-4096m}
+    mem_limit: ${YSG_KUROSHIO_CLASSIFIER_MEM_LIMIT:-4096m}
     mem_swappiness: 0
-    memswap_limit: ${YSG_INFER_CLASSIFIER_MEM_LIMIT:-4096m}
+    memswap_limit: ${YSG_KUROSHIO_CLASSIFIER_MEM_LIMIT:-4096m}
     pids_limit: 256
-    cpus: ${YSG_INFER_CLASSIFIER_CPU_LIMIT:-2.0}
+    cpus: ${YSG_KUROSHIO_CLASSIFIER_CPU_LIMIT:-2.0}
     read_only: true
     tmpfs:
       - /data/scratch:size=2g
     security_opt:
       - no-new-privileges:true
-      - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
-      - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-infer-llama-server}
+      - seccomp=/etc/yashigani/seccomp/kuroshio-llama-server.json
+      - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-kuroshio-llama-server}
     cap_drop: [ALL]
     volumes:
-      - infer_model_store:/data/model-store:ro
-      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - kuroshio_model_store:/data/model-store:ro
+      - ./seccomp/kuroshio-llama-server.json:/etc/yashigani/seccomp/kuroshio-llama-server.json:ro
     environment:
-      YSG_INFER_ROLE: classifier
-      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
-      YSG_INFER_KEEP_ALIVE_PIN: "true"
-      YSG_INFER_MAX_CTX: ${YSG_INFER_CLASSIFIER_MAX_CTX:-2048}
-      YSG_INFER_MAX_CONCURRENCY: ${YSG_INFER_CLASSIFIER_MAX_CONCURRENCY:-8}
-      YSG_INFER_MAX_TOKENS_PER_REQUEST: ${YSG_INFER_CLASSIFIER_MAX_TOKENS:-512}
-      YSG_INFER_IDLE_UNLOAD_SECONDS: "0"  # keep_alive_pin exempts it from idle-unload anyway
-      YSG_INFER_MAX_RESIDENT_MODELS: "1"
-      YSG_INFER_EXPECT_GPU: ${YSG_INFER_EXPECT_GPU:-true}
-      YSG_INFER_EXPECTED_VRAM_MB: ${YSG_INFER_CLASSIFIER_EXPECTED_VRAM_MB:-256}
+      YSG_KUROSHIO_ROLE: classifier
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_KEEP_ALIVE_PIN: "true"
+      YSG_KUROSHIO_MAX_CTX: ${YSG_KUROSHIO_CLASSIFIER_MAX_CTX:-2048}
+      YSG_KUROSHIO_MAX_CONCURRENCY: ${YSG_KUROSHIO_CLASSIFIER_MAX_CONCURRENCY:-8}
+      YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST: ${YSG_KUROSHIO_CLASSIFIER_MAX_TOKENS:-512}
+      YSG_KUROSHIO_IDLE_UNLOAD_SECONDS: "0"  # keep_alive_pin exempts it from idle-unload anyway
+      YSG_KUROSHIO_MAX_RESIDENT_MODELS: "1"
+      YSG_KUROSHIO_EXPECT_GPU: ${YSG_KUROSHIO_EXPECT_GPU:-true}
+      YSG_KUROSHIO_EXPECTED_VRAM_MB: ${YSG_KUROSHIO_CLASSIFIER_EXPECTED_VRAM_MB:-256}
     networks:
-      - infer_ringfence
+      - kuroshio_ringfence
     depends_on:
-      # infer-puller's BlobStore.__init__ mkdir's `blobs/` + `meta/` under the shared volume
+      # kuroshio-puller's BlobStore.__init__ mkdir's `blobs/` + `meta/` under the shared volume
       # at process startup (Tom's entrypoint.py factory runs at uvicorn `--factory` load, not
       # lazily) — waiting for it healthy avoids a cold-start race where this READ-ONLY mount
       # tries to create those directories itself on a fresh, empty volume and fails closed
       # (EROFS) before any model has ever been pulled.
-      infer-puller:
+      kuroshio-puller:
         condition: service_healthy
 
-  infer-chat:
+  kuroshio-chat:
     # image: set by the backend overlay
     restart: unless-stopped
     user: "1002:1002"
-    mem_limit: ${YSG_INFER_CHAT_MEM_LIMIT:-16384m}
+    mem_limit: ${YSG_KUROSHIO_CHAT_MEM_LIMIT:-16384m}
     mem_swappiness: 0
-    memswap_limit: ${YSG_INFER_CHAT_MEM_LIMIT:-16384m}
+    memswap_limit: ${YSG_KUROSHIO_CHAT_MEM_LIMIT:-16384m}
     pids_limit: 512
-    cpus: ${YSG_INFER_CHAT_CPU_LIMIT:-4.0}
+    cpus: ${YSG_KUROSHIO_CHAT_CPU_LIMIT:-4.0}
     read_only: true
     tmpfs:
       - /data/scratch:size=8g
     security_opt:
       - no-new-privileges:true
-      - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
-      - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-infer-llama-server}
+      - seccomp=/etc/yashigani/seccomp/kuroshio-llama-server.json
+      - apparmor=${YASHIGANI_APPARMOR_PROFILE_INFER:-yashigani-kuroshio-llama-server}
     cap_drop: [ALL]
     volumes:
-      - infer_model_store:/data/model-store:ro
-      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - kuroshio_model_store:/data/model-store:ro
+      - ./seccomp/kuroshio-llama-server.json:/etc/yashigani/seccomp/kuroshio-llama-server.json:ro
     environment:
-      YSG_INFER_ROLE: chat
-      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
-      YSG_INFER_KEEP_ALIVE_PIN: "false"
-      YSG_INFER_MAX_CTX: ${YSG_INFER_CHAT_MAX_CTX:-8192}
-      YSG_INFER_MAX_CONCURRENCY: ${YSG_INFER_CHAT_MAX_CONCURRENCY:-4}
-      YSG_INFER_MAX_TOKENS_PER_REQUEST: ${YSG_INFER_CHAT_MAX_TOKENS:-4096}
-      YSG_INFER_IDLE_UNLOAD_SECONDS: ${YSG_INFER_CHAT_IDLE_UNLOAD_SECONDS:-600}
-      YSG_INFER_MAX_RESIDENT_MODELS: ${YSG_INFER_CHAT_MAX_RESIDENT_MODELS:-3}
-      YSG_INFER_EXPECT_GPU: ${YSG_INFER_EXPECT_GPU:-true}
-      YSG_INFER_EXPECTED_VRAM_MB: ${YSG_INFER_CHAT_EXPECTED_VRAM_MB:-1024}
+      YSG_KUROSHIO_ROLE: chat
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_KEEP_ALIVE_PIN: "false"
+      YSG_KUROSHIO_MAX_CTX: ${YSG_KUROSHIO_CHAT_MAX_CTX:-8192}
+      YSG_KUROSHIO_MAX_CONCURRENCY: ${YSG_KUROSHIO_CHAT_MAX_CONCURRENCY:-4}
+      YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST: ${YSG_KUROSHIO_CHAT_MAX_TOKENS:-4096}
+      YSG_KUROSHIO_IDLE_UNLOAD_SECONDS: ${YSG_KUROSHIO_CHAT_IDLE_UNLOAD_SECONDS:-600}
+      YSG_KUROSHIO_MAX_RESIDENT_MODELS: ${YSG_KUROSHIO_CHAT_MAX_RESIDENT_MODELS:-3}
+      YSG_KUROSHIO_EXPECT_GPU: ${YSG_KUROSHIO_EXPECT_GPU:-true}
+      YSG_KUROSHIO_EXPECTED_VRAM_MB: ${YSG_KUROSHIO_CHAT_EXPECTED_VRAM_MB:-1024}
     networks:
-      - infer_ringfence
+      - kuroshio_ringfence
     depends_on:
-      # Same cold-start-race rationale as infer-classifier above.
-      infer-puller:
+      # Same cold-start-race rationale as kuroshio-classifier above.
+      kuroshio-puller:
         condition: service_healthy
 
-  infer-puller:
+  kuroshio-puller:
     build:
       context: ../../..
-      dockerfile: infer/deploy/docker/Dockerfile.infer-puller
-    image: ${YSG_INFER_PULLER_IMAGE:-yashigani/infer-puller:local}
+      dockerfile: infer/deploy/docker/Dockerfile.kuroshio-puller
+    image: ${YSG_KUROSHIO_PULLER_IMAGE:-yashigani/kuroshio-puller:local}
     restart: unless-stopped
     user: "1002:1002"
-    mem_limit: ${YSG_INFER_PULLER_MEM_LIMIT:-2048m}
+    mem_limit: ${YSG_KUROSHIO_PULLER_MEM_LIMIT:-2048m}
     mem_swappiness: 0
-    memswap_limit: ${YSG_INFER_PULLER_MEM_LIMIT:-2048m}
+    memswap_limit: ${YSG_KUROSHIO_PULLER_MEM_LIMIT:-2048m}
     pids_limit: 128
     read_only: true
     tmpfs:
       - /tmp:size=1g
     security_opt:
       - no-new-privileges:true
-      - seccomp=/etc/yashigani/seccomp/infer-llama-server.json
+      - seccomp=/etc/yashigani/seccomp/kuroshio-llama-server.json
     cap_drop: [ALL]
     volumes:
-      - infer_model_store:/data/model-store:rw
-      - infer_puller_scratch:/data/scratch:rw
-      - ./seccomp/infer-llama-server.json:/etc/yashigani/seccomp/infer-llama-server.json:ro
+      - kuroshio_model_store:/data/model-store:rw
+      - kuroshio_puller_scratch:/data/scratch:rw
+      - ./seccomp/kuroshio-llama-server.json:/etc/yashigani/seccomp/kuroshio-llama-server.json:ro
     environment:
-      YSG_INFER_ROLE: puller
-      YSG_INFER_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_ROLE: puller
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
       # HF token, if configured, is secret-mounted (never an inline env value) — Su/Nico lane.
     networks:
-      - infer_ringfence
+      - kuroshio_ringfence
 
-  # ── infer-init — day-one default model auto-pull (Iris cutover-prep map Seam 2 / engine-
+  # ── kuroshio-init — day-one default model auto-pull (Iris cutover-prep map Seam 2 / engine-
   # side SF-011 analog — see infer/deploy/README.md "day-one models") ───────────────────────
   # `profiles: ["init"]` matches this file's own established one-shot-service convention
-  # (`invoke-first-parse-jail`/`infer-docker-socket-proxy` below) rather than a separate
+  # (`invoke-first-parse-jail`/`kuroshio-docker-socket-proxy` below) rather than a separate
   # override file — one-shot/optional services are gated in-file here, not via overlay.
-  # Invoke with: `docker compose -f docker-compose.infer.yml -f docker-compose.infer.<backend>.yml
-  # --profile init up infer-init`.
+  # Invoke with: `docker compose -f docker-compose.kuroshio.yml -f docker-compose.kuroshio.<backend>.yml
+  # --profile init up kuroshio-init`.
   #
-  # Mechanism differs from `docker-compose.yml`'s `ollama-init`: `infer-puller` is already a
+  # Mechanism differs from `docker-compose.yml`'s `ollama-init`: `kuroshio-puller` is already a
   # long-running service with a wired `/api/pull` route (app.py), unlike ollama-init's
   # self-contained temporary `ollama serve` — this is a thin HTTP client waiting on an
   # already-healthy peer (`depends_on: condition: service_healthy`, same pattern as
-  # infer-classifier/infer-chat above), not a second server process. Reuses the infer-puller
+  # kuroshio-classifier/kuroshio-chat above), not a second server process. Reuses the kuroshio-puller
   # image (python3 stdlib `urllib` only) — no new image to build/pin.
   #
-  # CRITICAL — no hardcoded default model. YSG_INFER_INIT_MODEL defaults EMPTY: which GGUF
+  # CRITICAL — no hardcoded default model. YSG_KUROSHIO_INIT_MODEL defaults EMPTY: which GGUF
   # ships as day-one default, and its signed provenance manifest, is Tiago's provenance/
   # signing decision, not something to forge here. Compose has no Helm-style conditional
   # resource omission, so this service definition always renders in `docker compose config`
-  # regardless of the env var — but when YSG_INFER_INIT_MODEL is empty the script below
+  # regardless of the env var — but when YSG_KUROSHIO_INIT_MODEL is empty the script below
   # detects that and exits 0 immediately as a no-op before attempting any pull; the deploy
   # ships model-less by design either way.
-  infer-init:
+  kuroshio-init:
     profiles: ["init"]
-    image: ${YSG_INFER_PULLER_IMAGE:-yashigani/infer-puller:local}
+    image: ${YSG_KUROSHIO_PULLER_IMAGE:-yashigani/kuroshio-puller:local}
     user: "1000:1000"
     restart: "no"
     read_only: true
@@ -197,31 +197,31 @@ services:
     memswap_limit: 256m
     pids_limit: 32
     environment:
-      YSG_INFER_PULLER_URL: "http://infer-puller:8000"
-      YSG_INFER_INIT_MODEL: ${YSG_INFER_INIT_MODEL:-}
-      YSG_INFER_INIT_MODEL_DIGEST: ${YSG_INFER_INIT_MODEL_DIGEST:-skip}
+      YSG_KUROSHIO_PULLER_URL: "http://kuroshio-puller:8000"
+      YSG_KUROSHIO_INIT_MODEL: ${YSG_KUROSHIO_INIT_MODEL:-}
+      YSG_KUROSHIO_INIT_MODEL_DIGEST: ${YSG_KUROSHIO_INIT_MODEL_DIGEST:-skip}
     networks:
-      - infer_ringfence
+      - kuroshio_ringfence
     depends_on:
-      infer-puller:
+      kuroshio-puller:
         condition: service_healthy
     entrypoint: ["python3", "-c"]
     command:
       - |
         import json, os, sys, urllib.error, urllib.request
 
-        model = os.environ.get("YSG_INFER_INIT_MODEL", "").strip()
+        model = os.environ.get("YSG_KUROSHIO_INIT_MODEL", "").strip()
         if not model:
-            print("infer-init: YSG_INFER_INIT_MODEL is empty -- no-op by design (day-one "
+            print("kuroshio-init: YSG_KUROSHIO_INIT_MODEL is empty -- no-op by design (day-one "
                   "default model + signed provenance manifest is a Tiago provenance/signing "
                   "decision; see infer/deploy/README.md 'day-one models'). "
                   "Deploy ships model-less.")
             sys.exit(0)
 
-        digest = os.environ.get("YSG_INFER_INIT_MODEL_DIGEST", "skip")
-        url = os.environ["YSG_INFER_PULLER_URL"] + "/api/pull"
+        digest = os.environ.get("YSG_KUROSHIO_INIT_MODEL_DIGEST", "skip")
+        url = os.environ["YSG_KUROSHIO_PULLER_URL"] + "/api/pull"
         body = json.dumps({"model": model, "name": model}).encode()
-        print(f"infer-init: requesting pull of '{model}' from {url} "
+        print(f"kuroshio-init: requesting pull of '{model}' from {url} "
               f"(modelDigest={digest} -- informational only, see infer/deploy/README.md)")
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
@@ -230,7 +230,7 @@ services:
             with urllib.request.urlopen(req, timeout=570) as r:
                 for line in r:
                     sys.stdout.write(line.decode(errors="replace"))
-                print(f"\ninfer-init: pull request for '{model}' completed (HTTP {r.status})")
+                print(f"\nkuroshio-init: pull request for '{model}' completed (HTTP {r.status})")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")
             if exc.code == 501:
@@ -239,7 +239,7 @@ services:
                 # until a source-adapter wiring lands (separate Python work, not this
                 # dispatch) -- /api/pull always 501s until then. Retrying will never help,
                 # so warn loudly and exit 0 rather than loop on a guaranteed failure.
-                print(f"WARNING: infer-puller has no pull source adapter wired yet "
+                print(f"WARNING: kuroshio-puller has no pull source adapter wired yet "
                       f"(HTTP 501): {detail}", file=sys.stderr)
                 print("WARNING: day-one model pull skipped -- deploy ships model-less "
                       "until adapter wiring lands", file=sys.stderr)
@@ -260,8 +260,8 @@ services:
     profiles: ["parse-jail"]
     build:
       context: ../../..
-      dockerfile: infer/deploy/docker/Dockerfile.infer-first-parse-jail
-    image: ${YSG_INFER_PARSE_JAIL_IMAGE:-yashigani/infer-first-parse-jail:local}
+      dockerfile: infer/deploy/docker/Dockerfile.kuroshio-first-parse-jail
+    image: ${YSG_KUROSHIO_PARSE_JAIL_IMAGE:-yashigani/kuroshio-first-parse-jail:local}
     network_mode: none
     read_only: true
     user: "1003:1003"
@@ -271,10 +271,10 @@ services:
     pids_limit: 32
     security_opt:
       - no-new-privileges:true
-      - seccomp=/etc/yashigani/seccomp/infer-first-parse-jail.json
+      - seccomp=/etc/yashigani/seccomp/kuroshio-first-parse-jail.json
     cap_drop: [ALL]
     volumes:
-      - ./seccomp/infer-first-parse-jail.json:/etc/yashigani/seccomp/infer-first-parse-jail.json:ro
+      - ./seccomp/kuroshio-first-parse-jail.json:/etc/yashigani/seccomp/kuroshio-first-parse-jail.json:ro
     # stdin piped in by the invoking caller; stdout captured; container removed (--rm) by
     # the caller immediately after — never left resident.
 
@@ -286,7 +286,7 @@ services:
   # orchestration. See infer/deploy/README.md "C3 threat model" for the residual gap this
   # proxy does NOT close (no per-image-digest allowlist enforcement at the proxy layer —
   # Tecnativa's proxy is coarse HTTP-method/resource-type only).
-  infer-docker-socket-proxy:
+  kuroshio-docker-socket-proxy:
     profiles: ["orchestration-v2"]
     image: docker.io/tecnativa/docker-socket-proxy:0.4@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME
     restart: unless-stopped
@@ -322,4 +322,4 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - infer_ringfence
+      - kuroshio_ringfence

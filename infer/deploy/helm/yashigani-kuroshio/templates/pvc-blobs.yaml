@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-blobs
+  name: {{ include "yashigani-kuroshio.fullname" . }}-blobs
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
   annotations:
     # Mirrors UNIVERSAL-001 (resource-policy: keep) so helm upgrade/uninstall don't silently
     # prune the model blob store.

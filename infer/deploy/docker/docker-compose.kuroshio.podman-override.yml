@@ -1,4 +1,4 @@
-# Podman-runtime overrides for the infer engine.
+# Podman-runtime overrides for the kuroshio engine.
 #
 # ROOTLESS-CDI-004 parity (see docker/docker-compose.gpu-podman.yml): podman's nvidia-cdi-hook
 # is a crun createContainer hook that writes driver-lib symlinks + ld.so.cache INTO the
@@ -11,26 +11,26 @@
 # scripts/verify-offline.sh's "podman inspect reports the intended profile, not unconfined"
 # release-gate assertion. CORRECTION (found while gate-testing Iris RC-5's devpath-fallback
 # overlay, 2026-07-29): this file previously ALSO re-declared `security_opt:
-# [no-new-privileges:true, seccomp=...]` here, byte-identical to what docker-compose.infer.yml
+# [no-new-privileges:true, seccomp=...]` here, byte-identical to what docker-compose.kuroshio.yml
 # already sets — the original intent ("redundant-but-explicit is deliberate... a harmless
 # no-op") does not hold against this toolchain's actual merge behaviour: Compose treats
 # exact-duplicate security_opt list entries across merged files as a HARD validation error
-# (`docker compose config` fails outright: "services.infer-chat.security_opt items at 0 and 3
+# (`docker compose config` fails outright: "services.kuroshio-chat.security_opt items at 0 and 3
 # are equal"), not a harmless no-op — and a textual redeclaration of the same value in a
 # second YAML file cannot catch a RUNTIME wrapper bug resetting security_opt at the actual
 # `podman run` invocation anyway (only the live `podman inspect` check verify-offline.sh
 # already documents can do that). Removed the redundant block; the base file's security_opt
 # stands unchanged and the live-only verification path remains the real gate.
 # Applied ONLY when YSG_GPU_TYPE=nvidia AND runtime=podman (install.sh selects this overlay
-# in ADDITION to docker-compose.infer.cuda.yml, mirroring docker-compose.gpu-podman.yml's
+# in ADDITION to docker-compose.kuroshio.cuda.yml, mirroring docker-compose.gpu-podman.yml's
 # relationship to docker-compose.gpu.yml). The read_only relaxation is scoped to the CUDA
 # path only — Vulkan/CPU/ROCm backends under Podman do not need it (no CDI createContainer
 # hook writing into rootfs on those paths). NOT applicable to the CDI-failure devpath
-# fallback (docker-compose.infer.cuda-podman-devpath.yml) either — direct device-node
+# fallback (docker-compose.kuroshio.cuda-podman-devpath.yml) either — direct device-node
 # passthrough never invokes the CDI hook, so read_only: true can stand there too; see that
 # file's own header for how to combine the two if ever needed.
 services:
-  infer-classifier:
-    read_only: ${YSG_INFER_PODMAN_CUDA_READ_ONLY:-false}
-  infer-chat:
-    read_only: ${YSG_INFER_PODMAN_CUDA_READ_ONLY:-false}
+  kuroshio-classifier:
+    read_only: ${YSG_KUROSHIO_PODMAN_CUDA_READ_ONLY:-false}
+  kuroshio-chat:
+    read_only: ${YSG_KUROSHIO_PODMAN_CUDA_READ_ONLY:-false}

@@ -1,36 +1,36 @@
 {{- /*
-Ring-fence, K8s side (platform doc §5): default-deny egress on every infer pod except an
-explicit allow-Caddy rule. Ingress: only Caddy may reach infer-classifier/infer-chat/
-infer-puller. Pattern mirrors helm/yashigani/templates/networkpolicy.yaml's Caddy-centric
+Ring-fence, K8s side (platform doc §5): default-deny egress on every kuroshio pod except an
+explicit allow-Caddy rule. Ingress: only Caddy may reach kuroshio-classifier/kuroshio-chat/
+kuroshio-puller. Pattern mirrors helm/yashigani/templates/networkpolicy.yaml's Caddy-centric
 isolation convention (EX-231-10).
 */ -}}
 {{- if .Values.networkPolicies.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-default-deny-egress
+  name: {{ include "yashigani-kuroshio.fullname" . }}-default-deny-egress
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      yashigani.infer.managed: "true"
+      yashigani.kuroshio.managed: "true"
   policyTypes:
     - Egress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-allow-classifier-ingress
+  name: {{ include "yashigani-kuroshio.fullname" . }}-allow-classifier-ingress
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: infer-classifier
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-classifier
   policyTypes:
     - Ingress
   ingress:
@@ -45,15 +45,15 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-allow-chat-ingress
+  name: {{ include "yashigani-kuroshio.fullname" . }}-allow-chat-ingress
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: infer-chat
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-chat
   policyTypes:
     - Ingress
   ingress:
@@ -68,15 +68,15 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-allow-puller-ingress
+  name: {{ include "yashigani-kuroshio.fullname" . }}-allow-puller-ingress
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: infer-puller
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-puller
   policyTypes:
     - Ingress
   ingress:
@@ -88,22 +88,22 @@ spec:
         - protocol: TCP
           port: 8000
 ---
-# Puller egress — the ONLY infer-* workload permitted external egress at all (HuggingFace /
+# Puller egress — the ONLY kuroshio-* workload permitted external egress at all (HuggingFace /
 # operator-configured OCI mirror), and only when a pull adapter is actually wired.
 # Classifier/chat get NO egress rule (they need none — Su path/downloader lane owns the
 # puller's egress-target scoping; not narrowed to a specific FQDN/ipBlock here).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-allow-puller-egress
+  name: {{ include "yashigani-kuroshio.fullname" . }}-allow-puller-egress
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: infer-puller
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-puller
   policyTypes:
     - Egress
   egress:

@@ -2,20 +2,20 @@
 #
 # WHY THIS EXISTS (Captain finding #4 / Red-Council convergence): the v1 supervisor bundles
 # the FastAPI control-plane (BlobStore write path, /api/pull) and the llama-server child-spawn
-# capability in the SAME process (see infer/src/yashigani_infer/app.py, supervisor/supervisor.py
+# capability in the SAME process (see infer/src/kuroshio/app.py, supervisor/supervisor.py
 # — no per-request container boundary exists yet inside that package). "Blob store mounted
 # read-only into every inference container without exception ... writes happen only through
 # the supervisor's own separate write path, never through any llama-server child process" is
 # only enforceable at CONTAINER granularity if the pull/write-capable instance and the
 # serving/llama-server-spawning instances are physically different containers.
 #
-# This image gives that separation for free, without touching yashigani_infer's Python:
+# This image gives that separation for free, without touching kuroshio's Python:
 # it installs the SAME wheel but never installs a llama-server binary at all. Even if a
 # request reached this container's /api/chat|generate|embeddings route (it must not —
-# Caddyfile.infer-front routes /infer/pull to this upstream ONLY), Supervisor.load's
+# Caddyfile.kuroshio-front routes /kuroshio/pull to this upstream ONLY), Supervisor.load's
 # ProcessRunner.spawn(binary="llama-server", ...) would fail with "no such file" — fail
 # closed by absence, not by trust. Mount the blob volume READ-WRITE only into THIS
-# container; infer-classifier/infer-chat mount it READ-ONLY.
+# container; kuroshio-classifier/kuroshio-chat mount it READ-ONLY.
 #
 # OFFLINE-AUTHORED (2026-07-22, Captain). FROM digest is a PLACEHOLDER.
 
@@ -28,8 +28,8 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" build \
 
 FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS runtime
 
-RUN groupadd --gid 1002 yashigani-infer \
-    && useradd --uid 1002 --gid 1002 --no-create-home --shell /bin/false yashigani-infer
+RUN groupadd --gid 1002 yashigani-kuroshio \
+    && useradd --uid 1002 --gid 1002 --no-create-home --shell /bin/false yashigani-kuroshio
 
 WORKDIR /app
 COPY --from=wheel-builder /dist/*.whl /tmp/
@@ -38,26 +38,26 @@ RUN pip install --no-cache-dir --upgrade "pip==26.0.1" \
     && rm -f /tmp/*.whl \
     && pip uninstall -y pip
 
-COPY infer/deploy/docker/entrypoint/infer-entrypoint.sh /usr/local/bin/infer-entrypoint.sh
-RUN chmod 0555 /usr/local/bin/infer-entrypoint.sh \
+COPY infer/deploy/docker/entrypoint/kuroshio-entrypoint.sh /usr/local/bin/kuroshio-entrypoint.sh
+RUN chmod 0555 /usr/local/bin/kuroshio-entrypoint.sh \
     && mkdir -p /data/model-store /data/scratch \
-    && chown -R yashigani-infer:yashigani-infer /data
+    && chown -R yashigani-kuroshio:yashigani-kuroshio /data
 
-USER yashigani-infer
+USER yashigani-kuroshio
 EXPOSE 8000
-ENV YSG_INFER_BACKEND=none \
-    YSG_INFER_ROLE=puller \
+ENV YSG_KUROSHIO_BACKEND=none \
+    YSG_KUROSHIO_ROLE=puller \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD /usr/local/bin/infer-entrypoint.sh --healthcheck-puller || exit 1
+    CMD /usr/local/bin/kuroshio-entrypoint.sh --healthcheck-puller || exit 1
 
 ARG GIT_SHA=dev
 LABEL org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      yashigani.infer.role="puller" \
-      yashigani.infer.backend="none"
+      yashigani.kuroshio.role="puller" \
+      yashigani.kuroshio.backend="none"
 
-ENTRYPOINT ["/usr/local/bin/infer-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/kuroshio-entrypoint.sh"]

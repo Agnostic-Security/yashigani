@@ -3,7 +3,7 @@ K8s custom `Localhost` seccomp profiles must exist on each node's kubelet seccom
 (<kubelet-root-dir>/seccomp/profiles/, default /var/lib/kubelet/seccomp/profiles/) — Helm
 cannot push files onto node filesystems via a Deployment/Pod spec alone. This DaemonSet
 copies the ConfigMap-held profile (single-sourced from
-infer/deploy/docker/seccomp/infer-llama-server.json) onto every node once, then the
+infer/deploy/docker/seccomp/kuroshio-llama-server.json) onto every node once, then the
 container sleeps (DaemonSets must have a long-running main container; the actual work
 happens in the initContainer). Gated behind seccomp.installViaDaemonSet — when false (or on
 a cluster where custom localhost profiles are already provisioned by other means), the
@@ -14,24 +14,24 @@ deployment-classifier.yaml / deployment-chat.yaml).
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "yashigani-infer.fullname" . }}-seccomp-installer
+  name: {{ include "yashigani-kuroshio.fullname" . }}-seccomp-installer
   namespace: {{ .Values.namespace }}
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      {{- include "yashigani-infer.selectorLabels" . | nindent 6 }}
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: seccomp-installer
   template:
     metadata:
       labels:
-        {{- include "yashigani-infer.selectorLabels" . | nindent 8 }}
+        {{- include "yashigani-kuroshio.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: seccomp-installer
     spec:
       # This DaemonSet's ONLY job is a hostPath file write to the kubelet seccomp root —
-      # it intentionally does NOT carry the yashigani.infer.managed label (it is not a
-      # supervisor-managed inference pod; the restrict-infer-supervisor-pod-spec Kyverno
+      # it intentionally does NOT carry the yashigani.kuroshio.managed label (it is not a
+      # supervisor-managed inference pod; the restrict-kuroshio-supervisor-pod-spec Kyverno
       # policy's hostPath-deny rule correctly does not apply to it).
       securityContext:
         runAsNonRoot: false  # root required for the hostPath write target ownership; see below
@@ -44,8 +44,8 @@ spec:
             - |
               set -eu
               mkdir -p /host-seccomp/profiles
-              cp /profile-src/infer-llama-server.json /host-seccomp/profiles/infer-llama-server.json
-              chmod 0444 /host-seccomp/profiles/infer-llama-server.json
+              cp /profile-src/kuroshio-llama-server.json /host-seccomp/profiles/kuroshio-llama-server.json
+              chmod 0444 /host-seccomp/profiles/kuroshio-llama-server.json
           securityContext:
             runAsNonRoot: false
             runAsUser: 0
@@ -75,7 +75,7 @@ spec:
       volumes:
         - name: profile-source
           configMap:
-            name: {{ include "yashigani-infer.fullname" . }}-seccomp-llama-server
+            name: {{ include "yashigani-kuroshio.fullname" . }}-seccomp-llama-server
         - name: kubelet-seccomp-root
           hostPath:
             path: {{ .Values.seccomp.kubeletSeccompRoot | default "/var/lib/kubelet/seccomp/profiles" }}

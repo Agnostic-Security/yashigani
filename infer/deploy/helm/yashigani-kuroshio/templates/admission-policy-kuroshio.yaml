@@ -8,7 +8,7 @@ compromised.'"
 
 Pattern/naming mirrors helm/yashigani/templates/admission-policies.yaml's Kyverno
 convention (same fail-fast CRD-presence guard). Scope: pods carrying label
-yashigani.infer.managed=true (the label every supervisor-created pod MUST carry — a pod
+yashigani.kuroshio.managed=true (the label every supervisor-created pod MUST carry — a pod
 without the label is not this policy's concern, but also then isn't a legitimate
 supervisor-managed pod either; the ServiceAccount-subject rule below catches that case
 independently of the label).
@@ -22,12 +22,12 @@ independently of the label).
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: {{ .Release.Name }}-restrict-infer-supervisor-pod-spec
+  name: {{ .Release.Name }}-restrict-kuroshio-supervisor-pod-spec
   labels:
-    {{- include "yashigani-infer.labels" . | nindent 4 }}
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
     app.kubernetes.io/component: admission-policy
   annotations:
-    policies.kyverno.io/title: "Restrict infer-supervisor-managed pod spec"
+    policies.kyverno.io/title: "Restrict kuroshio-supervisor-managed pod spec"
     policies.kyverno.io/category: "Pod Security"
     policies.kyverno.io/severity: "critical"
     policies.kyverno.io/subject: "Pod"
@@ -35,7 +35,7 @@ metadata:
       Captain finding #1: denies hostPath/hostNetwork/hostPID/privileged/capability-adds
       and assumption of the yashigani-pki ServiceAccount for any pod created via the
       {{ .Values.supervisorRbac.serviceAccountName }} ServiceAccount or carrying the
-      yashigani.infer.managed=true label. Enforced independently of supervisor code —
+      yashigani.kuroshio.managed=true label. Enforced independently of supervisor code —
       the threat model is "the supervisor itself gets compromised."
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
@@ -49,7 +49,7 @@ spec:
               namespaces: ["{{ .Values.namespace }}"]
               selector:
                 matchLabels:
-                  yashigani.infer.managed: "true"
+                  yashigani.kuroshio.managed: "true"
       validate:
         message: >-
           Infer-supervisor-managed pods must not set hostPath volumes, hostNetwork, or
@@ -74,7 +74,7 @@ spec:
               namespaces: ["{{ .Values.namespace }}"]
               selector:
                 matchLabels:
-                  yashigani.infer.managed: "true"
+                  yashigani.kuroshio.managed: "true"
       validate:
         message: >-
           Infer-supervisor-managed containers must not set privileged: true or add any
@@ -99,7 +99,7 @@ spec:
       validate:
         message: >-
           Pods created by the {{ .Values.supervisorRbac.serviceAccountName }} identity (or
-          carrying yashigani.infer.managed=true) must not assume the yashigani-pki
+          carrying yashigani.kuroshio.managed=true) must not assume the yashigani-pki
           ServiceAccount — closes the class this finding names: a compromised supervisor
           escalating via the PKI trust plane's own SA.
         deny:
@@ -108,7 +108,7 @@ spec:
               - key: "{{ "{{" }} request.object.spec.serviceAccountName || '' {{ "}}" }}"
                 operator: Equals
                 value: "yashigani-pki"
-              - key: "{{ "{{" }} request.object.metadata.labels.\"yashigani.infer.managed\" || '' {{ "}}" }}"
+              - key: "{{ "{{" }} request.object.metadata.labels.\"yashigani.kuroshio.managed\" || '' {{ "}}" }}"
                 operator: Equals
                 value: "true"
 {{- end }}

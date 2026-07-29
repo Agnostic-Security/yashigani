@@ -14,7 +14,7 @@ workaround / infra-gate rule.
 | Upstream repo | `https://github.com/ggml-org/llama.cpp` |
 | Pinned ref | `${LLAMA_CPP_TAG}` — **PLACEHOLDER, must be resolved to a real tag/commit SHA before build.** Never build against `master`/`HEAD`. |
 | Pinned commit SHA | `${LLAMA_CPP_COMMIT_SHA}` — filled by `resolve-and-pin-digests.sh`; the tag alone is not immutable (tags can move upstream — same reasoning as digest-pin vs tag-pin for base images below). |
-| License | MIT — see `infer/NOTICE` / `infer/LICENSE`; vendored source lives under a `third_party/llama.cpp/` build context, never merged into `yashigani_infer`'s own source tree (Petra F1 boundary). |
+| License | MIT — see `infer/NOTICE` / `infer/LICENSE`; vendored source lives under a `third_party/llama.cpp/` build context, never merged into `kuroshio`'s own source tree (Petra F1 boundary). |
 | Reproducible build | `cmake -B build -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF <backend flags below> && cmake --build build --config Release -j$(nproc)` — `GGML_NATIVE=OFF` so the build is portable across the CI builder's CPU and the deploy target's CPU (a native-tuned build baked with `-march=native` on the CI box can crash with `SIGILL` on a deploy host with a narrower instruction set). |
 | sha256 manifest | Generated at build time by `scripts/resolve-and-pin-digests.sh --emit-manifest`; committed alongside the signed git release tag (platform doc §3), never as a side-channel file. **Not generated this session — no build ran.** |
 
@@ -30,16 +30,16 @@ not a one-off note — the gate must run on every re-pin, not just the first.
 
 | Backend | CMake flags | Base image role |
 |---|---|---|
-| `infer-cuda` | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native-or-explicit-list` (explicit arch list recommended for reproducible multi-GPU-generation support, e.g. `75;80;86;89;90`) | build: CUDA devel image; runtime: CUDA runtime-only image (no devel/compiler toolchain shipped) |
-| `infer-rocm` | `-DGGML_HIP=ON -DAMDGPU_TARGETS=<explicit gfx list, e.g. gfx1030;gfx1100;gfx1101>` | build: ROCm dev image; runtime: same ROCm userspace runtime libs only (ROCm does not publish a slim runtime-only image the way CUDA does — rocBLAS/Tensile kernel blobs are inherently large; "lean" here means *lean relative to the fat multi-backend image*, not sub-1GB) |
-| `infer-vulkan` | `-DGGML_VULKAN=ON` (+ `glslc`/shaderc at build time to compile the Vulkan compute shaders) | build: Debian + Vulkan SDK headers/glslc; runtime: `libvulkan1` + loader only — the actual ICD (GPU driver) is host-mounted, never baked into the image |
-| `infer-cpu` | `-DGGML_BLAS=OFF -DGGML_NATIVE=OFF` + explicit `-DGGML_AVX2=ON -DGGML_FMA=ON` baseline (portable baseline; runtime CPU-feature dispatch via `GGML_CPU_ALL_VARIANTS=ON` is preferred if the pinned tag supports it, avoiding a `SIGILL` on older CPUs while still using AVX2/AVX512 where available) | universal fallback; also the Mac-in-VM / M-k8s dev-cell image |
+| `kuroshio-cuda` | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native-or-explicit-list` (explicit arch list recommended for reproducible multi-GPU-generation support, e.g. `75;80;86;89;90`) | build: CUDA devel image; runtime: CUDA runtime-only image (no devel/compiler toolchain shipped) |
+| `kuroshio-rocm` | `-DGGML_HIP=ON -DAMDGPU_TARGETS=<explicit gfx list, e.g. gfx1030;gfx1100;gfx1101>` | build: ROCm dev image; runtime: same ROCm userspace runtime libs only (ROCm does not publish a slim runtime-only image the way CUDA does — rocBLAS/Tensile kernel blobs are inherently large; "lean" here means *lean relative to the fat multi-backend image*, not sub-1GB) |
+| `kuroshio-vulkan` | `-DGGML_VULKAN=ON` (+ `glslc`/shaderc at build time to compile the Vulkan compute shaders) | build: Debian + Vulkan SDK headers/glslc; runtime: `libvulkan1` + loader only — the actual ICD (GPU driver) is host-mounted, never baked into the image |
+| `kuroshio-cpu` | `-DGGML_BLAS=OFF -DGGML_NATIVE=OFF` + explicit `-DGGML_AVX2=ON -DGGML_FMA=ON` baseline (portable baseline; runtime CPU-feature dispatch via `GGML_CPU_ALL_VARIANTS=ON` is preferred if the pinned tag supports it, avoiding a `SIGILL` on older CPUs while still using AVX2/AVX512 where available) | universal fallback; also the Mac-in-VM / M-k8s dev-cell image |
 
 ## Multi-arch
 
-`infer-vulkan` and `infer-cpu` are built as OCI image indexes (`docker buildx build --platform
-linux/amd64,linux/arm64`) so the same tag resolves per node arch (platform doc §3). `infer-cuda`
-and `infer-rocm` are `linux/amd64` only for v1 (arm64+CUDA/Jetson deferred per platform doc §15).
+`kuroshio-vulkan` and `kuroshio-cpu` are built as OCI image indexes (`docker buildx build --platform
+linux/amd64,linux/arm64`) so the same tag resolves per node arch (platform doc §3). `kuroshio-cuda`
+and `kuroshio-rocm` are `linux/amd64` only for v1 (arm64+CUDA/Jetson deferred per platform doc §15).
 
 ## Deferred to a live build (explicit — nothing here is guessed)
 

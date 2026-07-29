@@ -1,5 +1,5 @@
 apiVersion: v2
-name: yashigani-infer
+name: yashigani-kuroshio
 description: >-
   Yashigani 6.0 first-party commodity inference engine (llama.cpp/GGUF control plane) —
   pre-integration deploy chart. Standalone so it can be helm-lint/template verified

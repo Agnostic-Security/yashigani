@@ -1,5 +1,5 @@
 {
-  "_comment": "C1 first-parse jail seccomp profile (RED-COUNCIL C1 / Captain finding #1's sibling). STRICTER than infer-llama-server.json: this container never serves a network connection at all (compose --network=none / k8s Job with no NetworkPolicy egress at all), never spawns a child process, and touches only stdin/stdout + the bounded read-only filesystem the interpreter itself needs. No bind/connect/accept/socket family at all — this is the 'distinct ephemeral seccomp-strict, network=none, torn-down step' the brief calls for, structurally separated from the serving ring-fence's (looser, network-capable) profile.",
+  "_comment": "C1 first-parse jail seccomp profile (RED-COUNCIL C1 / Captain finding #1's sibling). STRICTER than kuroshio-llama-server.json: this container never serves a network connection at all (compose --network=none / k8s Job with no NetworkPolicy egress at all), never spawns a child process, and touches only stdin/stdout + the bounded read-only filesystem the interpreter itself needs. No bind/connect/accept/socket family at all — this is the 'distinct ephemeral seccomp-strict, network=none, torn-down step' the brief calls for, structurally separated from the serving ring-fence's (looser, network-capable) profile.",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "archMap": [
@@ -37,7 +37,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "_comment": "explicit deny — same post-RCE recon/escape toolkit as infer-llama-server.json, PLUS the entire networking syscall family (this jail must never open a socket of any kind).",
+      "_comment": "explicit deny — same post-RCE recon/escape toolkit as kuroshio-llama-server.json, PLUS the entire networking syscall family (this jail must never open a socket of any kind).",
       "names": [
         "ptrace", "process_vm_readv", "process_vm_writev", "personality",
         "unshare", "setns", "mount", "umount2", "pivot_root", "chroot",

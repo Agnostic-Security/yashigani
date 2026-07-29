@@ -1,17 +1,17 @@
 # Backend-selection overlay — CPU (universal fallback; also the Mac-in-VM / M-k8s dev-cell
-# image). No GPU device grant at all. See docker-compose.infer.cuda.yml header for the
+# image). No GPU device grant at all. See docker-compose.kuroshio.cuda.yml header for the
 # Iris F4/F5 image-SWAP rationale.
 services:
-  infer-classifier:
-    image: ${YSG_INFER_IMAGE_CPU:-yashigani/infer-cpu:local}
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_CPU:-yashigani/kuroshio-cpu:local}
     environment:
-      YSG_INFER_BACKEND: cpu
-      YSG_INFER_EXPECT_GPU: "false"
-      YSG_INFER_N_GPU_LAYERS: "0"
+      YSG_KUROSHIO_BACKEND: cpu
+      YSG_KUROSHIO_EXPECT_GPU: "false"
+      YSG_KUROSHIO_N_GPU_LAYERS: "0"
 
-  infer-chat:
-    image: ${YSG_INFER_IMAGE_CPU:-yashigani/infer-cpu:local}
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_CPU:-yashigani/kuroshio-cpu:local}
     environment:
-      YSG_INFER_BACKEND: cpu
-      YSG_INFER_EXPECT_GPU: "false"
-      YSG_INFER_N_GPU_LAYERS: "0"
+      YSG_KUROSHIO_BACKEND: cpu
+      YSG_KUROSHIO_EXPECT_GPU: "false"
+      YSG_KUROSHIO_N_GPU_LAYERS: "0"

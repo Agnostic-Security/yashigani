@@ -20,9 +20,9 @@ fi
 
 status=0
 files=(
-    "$REPO_ROOT/docker/seccomp/infer-llama-server.json"
-    "$REPO_ROOT/docker/seccomp/infer-first-parse-jail.json"
-    "$REPO_ROOT/helm/yashigani-infer/files/seccomp/infer-llama-server.json"
+    "$REPO_ROOT/docker/seccomp/kuroshio-llama-server.json"
+    "$REPO_ROOT/docker/seccomp/kuroshio-first-parse-jail.json"
+    "$REPO_ROOT/helm/yashigani-kuroshio/files/seccomp/kuroshio-llama-server.json"
 )
 
 for f in "${files[@]}"; do

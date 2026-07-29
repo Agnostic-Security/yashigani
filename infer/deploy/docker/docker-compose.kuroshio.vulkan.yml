@@ -1,24 +1,24 @@
 # Backend-selection overlay — Vulkan (Intel/broad-GPU + arm64 GPU fallback). See
-# docker-compose.infer.cuda.yml header for the Iris F4/F5 image-SWAP rationale.
+# docker-compose.kuroshio.cuda.yml header for the Iris F4/F5 image-SWAP rationale.
 # The Vulkan ICD (actual GPU driver) is host-mounted — never baked into the image
-# (Dockerfile.infer-vulkan ships only libvulkan1, the loader).
+# (Dockerfile.kuroshio-vulkan ships only libvulkan1, the loader).
 services:
-  infer-classifier:
-    image: ${YSG_INFER_IMAGE_VULKAN:-yashigani/infer-vulkan:local}
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_VULKAN:-yashigani/kuroshio-vulkan:local}
     devices:
       - /dev/dri
     volumes:
       - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
     environment:
-      YSG_INFER_BACKEND: vulkan
-      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CLASSIFIER_N_GPU_LAYERS:-999}
+      YSG_KUROSHIO_BACKEND: vulkan
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CLASSIFIER_N_GPU_LAYERS:-999}
 
-  infer-chat:
-    image: ${YSG_INFER_IMAGE_VULKAN:-yashigani/infer-vulkan:local}
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_VULKAN:-yashigani/kuroshio-vulkan:local}
     devices:
       - /dev/dri
     volumes:
       - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
     environment:
-      YSG_INFER_BACKEND: vulkan
-      YSG_INFER_N_GPU_LAYERS: ${YSG_INFER_CHAT_N_GPU_LAYERS:-999}
+      YSG_KUROSHIO_BACKEND: vulkan
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CHAT_N_GPU_LAYERS:-999}
