@@ -31,9 +31,20 @@ clearance_rank(l) := -1 if not l in object.keys(_rank)
 _id_caveats := {c | some c in input.identity.caveats}
 _id_compartments := {g | some g in input.identity.compartments}
 
+# YSG-RISK-152: `not input.data.classification` only catches a MISSING key —
+# an explicit input.data.classification="" (or whitespace) is a DEFINED value
+# so the bare `not` check silently passed it through. The classification_rank
+# "unknown label -> 99" sentinel below happens to catch "" indirectly via
+# clearance_below_classification, but that's incidental (breaks if _rank ever
+# changes) and gives the wrong deny code for diagnostics. Fail-closed
+# explicitly on missing OR blank/whitespace-only.
+_classification_blank if not input.data.classification
+
+_classification_blank if trim_space(input.data.classification) == ""
+
 # Fail-closed presence check — recommended pattern: a missing label is a violation,
 # not a silent allow. (The other example policies omit this for brevity; add it.)
-deny contains "classification_label_missing" if not input.data.classification
+deny contains "classification_label_missing" if _classification_blank
 
 # AC-3 "no read up" — clearance must dominate the data classification.
 deny contains "clearance_below_classification" if {
