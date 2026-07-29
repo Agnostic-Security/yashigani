@@ -21,6 +21,25 @@ from yashigani_infer.supervisor.supervisor import (
 )
 
 
+class _FakeProvenanceVerifier:
+    """Test double for the `ProvenanceVerifier` Protocol (Red-Council H1) —
+    records every `verify()` call and can be configured to raise on a
+    specific call number (1-indexed), so tests can assert re-verification
+    happens on EVERY `Supervisor.load()` call, not just the first."""
+
+    class VerificationFailed(RuntimeError):
+        pass
+
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self.calls: list[ResolvedModel] = []
+        self._fail_on_call = fail_on_call
+
+    def verify(self, resolved_model: ResolvedModel) -> None:
+        self.calls.append(resolved_model)
+        if self._fail_on_call is not None and len(self.calls) == self._fail_on_call:
+            raise self.VerificationFailed(f"forced failure on call {len(self.calls)}")
+
+
 def _resolved_model(sha: str) -> ResolvedModel:
     return ResolvedModel(
         sha256=sha,
@@ -298,3 +317,61 @@ def test_load_config_cache_prompt_defaults_to_false() -> None:
 
 def test_load_config_parallel_slots_defaults_to_none() -> None:
     assert LoadConfig().parallel_slots is None
+
+
+# --- Red-Council H1 (2026-07-29): serve-time provenance re-verification ---
+
+
+def test_load_without_verifier_configured_behaves_exactly_as_before(fake_process_runner: FakeProcessRunner) -> None:
+    supervisor = Supervisor(process_runner=fake_process_runner)
+    model = _resolved_model("a" * 64)
+    instance = supervisor.load(model, LoadConfig())
+    assert supervisor.is_loaded("a" * 64)
+    assert instance is not None
+
+
+def test_load_calls_the_provenance_verifier_before_spawning(fake_process_runner: FakeProcessRunner) -> None:
+    verifier = _FakeProvenanceVerifier()
+    supervisor = Supervisor(process_runner=fake_process_runner, provenance_verifier=verifier)
+    model = _resolved_model("a" * 64)
+
+    supervisor.load(model, LoadConfig())
+
+    assert len(verifier.calls) == 1
+    assert verifier.calls[0].sha256 == "a" * 64
+
+
+def test_load_fails_closed_and_never_spawns_when_verifier_raises(fake_process_runner: FakeProcessRunner) -> None:
+    verifier = _FakeProvenanceVerifier(fail_on_call=1)
+    supervisor = Supervisor(process_runner=fake_process_runner, provenance_verifier=verifier)
+    model = _resolved_model("a" * 64)
+
+    with pytest.raises(_FakeProvenanceVerifier.VerificationFailed):
+        supervisor.load(model, LoadConfig())
+
+    assert fake_process_runner.spawned == []  # never spawned — fail closed BEFORE the process runner is touched
+    assert not supervisor.is_loaded("a" * 64)
+
+
+def test_load_re_verifies_on_every_call_including_the_already_resident_fast_path(
+    fake_process_runner: FakeProcessRunner,
+) -> None:
+    """H1's core claim: a model that becomes revoked/expired WHILE already
+    resident must fail on the very next load() call, not keep serving until
+    the process happens to restart. The verifier must fire on the fast-path
+    hit too, not just on first spawn."""
+    verifier = _FakeProvenanceVerifier(fail_on_call=2)
+    supervisor = Supervisor(process_runner=fake_process_runner, provenance_verifier=verifier)
+    model = _resolved_model("a" * 64)
+
+    first = supervisor.load(model, LoadConfig())  # call 1 — verifier passes, spawns
+    assert first is not None
+    assert len(fake_process_runner.spawned) == 1
+
+    with pytest.raises(_FakeProvenanceVerifier.VerificationFailed):
+        supervisor.load(model, LoadConfig())  # call 2 — verifier fails on the ALREADY-RESIDENT fast path
+
+    assert len(verifier.calls) == 2
+    assert (
+        len(fake_process_runner.spawned) == 1
+    )  # still only ever spawned once — the failure is at the gate, not a respawn

@@ -14,16 +14,42 @@ Responsibilities (design doc §2 amendment, platform-requirements doc §11):
 
 Process spawn is behind the injectable `ProcessRunner` (process.py) — no
 real `llama-server` binary is required by this module's unit tests.
+
+Red-Council H1 (Tom, 2026-07-29 design-review): `load()` also re-runs an
+optional, injectable `ProvenanceVerifier` on EVERY call — including the
+fast path for an already-resident model — not just once at pull time.
+Signature/TTL/revocation verification previously happened only inside the
+Hugging Face pull adapter's admission gate (`catalog.SignedCatalog.require`);
+a model that became revoked or aged out AFTER it was already resident kept
+being served indefinitely, because this module had no concept of
+provenance at all, only sha256 identity. See `provenance_reverify.py` for
+the concrete `ServeTimeProvenanceVerifier` implementation — this module
+only depends on the narrow `ProvenanceVerifier` Protocol below, not on
+`catalog.py`/`convert_provenance.py` directly, keeping the supervisor's own
+dependency graph minimal.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Protocol
 
 from yashigani_infer.models import ResolvedModel
 from yashigani_infer.supervisor.process import ProcessHandle, ProcessRunner
+
+
+class ProvenanceVerifier(Protocol):
+    """Structural contract for a serve-time provenance re-verification hook
+    (Red-Council H1). `Supervisor.load()` calls `verify()` before EVERY
+    (re)load of a model — including a hit against an already-resident
+    instance — and treats any raised exception as fail-closed: the load is
+    refused, nothing is spawned, no residency state changes. Implementations
+    (e.g. `provenance_reverify.ServeTimeProvenanceVerifier`) decide what
+    "fails" means (bad signature, expired TTL, revoked, tampered tier); this
+    Protocol only defines the calling contract."""
+
+    def verify(self, resolved_model: ResolvedModel) -> None: ...
 
 
 class SupervisorError(Exception):
@@ -169,6 +195,7 @@ class Supervisor:
         resource_limits: ResourceLimits | None = None,
         port_allocator: Callable[[], int] | None = None,
         clock: Callable[[], datetime] | None = None,
+        provenance_verifier: ProvenanceVerifier | None = None,
     ) -> None:
         self._runner = process_runner
         self._binary = llama_server_binary
@@ -176,6 +203,7 @@ class Supervisor:
         self._max_resident_models = max_resident_models
         self._resource_limits = resource_limits or ResourceLimits()
         self._clock = clock or _default_clock
+        self._provenance_verifier = provenance_verifier
         self._instances: dict[str, ModelInstance] = {}
         self._inflight: dict[str, int] = {}
         self._next_port_offset = 0
@@ -270,7 +298,19 @@ class Supervisor:
         return args
 
     def load(self, resolved_model: ResolvedModel, load_config: LoadConfig) -> ModelInstance:
-        """Spawn (or return the existing) instance for this model's digest."""
+        """Spawn (or return the existing) instance for this model's digest.
+
+        Red-Council H1: if a `ProvenanceVerifier` is configured, it is
+        re-run here on EVERY call — including the fast path below for an
+        already-resident model — before any residency state is touched.
+        A raised exception fails this call closed: no spawn happens, the
+        existing instance (if any) is left untouched, and the caller never
+        gets a `ModelInstance` back for a model whose provenance no longer
+        checks out.
+        """
+        if self._provenance_verifier is not None:
+            self._provenance_verifier.verify(resolved_model)
+
         existing = self._instances.get(resolved_model.sha256)
         if existing is not None:
             existing.last_used_at = self._clock()
@@ -361,11 +401,12 @@ class Supervisor:
 
 
 __all__ = [
-    "Supervisor",
-    "SupervisorError",
-    "ModelNotLoadedError",
-    "ResourceLimitExceeded",
-    "ResourceLimits",
     "LoadConfig",
     "ModelInstance",
+    "ModelNotLoadedError",
+    "ProvenanceVerifier",
+    "ResourceLimitExceeded",
+    "ResourceLimits",
+    "Supervisor",
+    "SupervisorError",
 ]
