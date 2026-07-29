@@ -11,7 +11,7 @@ Routes
   GET  /workflows           — no-code workflow composer (returns ui4/workflows.html)
   GET  /user/agents         — list available agents (user-visible fields only)
   GET  /user/budget         — caller's own budget usage
-  GET  /user/memory         — per-user memory entries (Phase-3 Letta stub)
+  GET  /user/memory         — per-user memory entries (YSG-RISK-156: 501 Not Implemented — Phase-3 Letta)
   POST /user/documents      — file upload → doc-OPA verdict (RISK-112)
 
 SoD contract (RISK-100):
@@ -572,24 +572,30 @@ async def user_models(session: UserSession):
 @router.get("/user/memory")
 async def user_memory(session: UserSession):
     """
-    Return the calling user's per-identity memory entries.
+    Per-identity memory entries — NOT IMPLEMENTED in 4.1.2.
 
-    Phase 3 stub — Letta per-user isolation is built in Phase 3 (NHI/SVID
-    mesh + per-user Letta container, RISK-107).  Until that lands this
-    endpoint returns a structured empty response with a note so the UI can
-    render a 'Memory not yet configured' state without an error.
+    YSG-RISK-156: this previously returned a plain 200 with an empty
+    ``entries: []`` + a "not yet configured" note. A caller that checks only
+    the HTTP status (not every response body) would read that as "success,
+    zero entries" rather than "feature not built yet" — a misleading 200.
 
-    Phase 3 will replace this with a call to the per-user Letta client.
+    Per-user memory isolation is built in Phase 3 (NHI/SVID mesh + per-user
+    Letta container, RISK-107) — out of scope for 4.1.2. Returns an honest
+    501 Not Implemented until then so status-code-only consumers see the
+    correct signal.
     """
-    return {
-        "configured": False,
-        "entries": [],
-        "note": (
-            "Per-user memory isolation is built in Phase 3 (NHI/SVID mesh). "
-            "Until then, memory is shared via the Letta service — see /admin/ "
-            "for configuration."
-        ),
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "message": (
+                "Per-user memory isolation is not yet implemented — it ships in "
+                "Phase 3 (NHI/SVID mesh + per-user Letta container, RISK-107). "
+                "Until then, memory is shared via the Letta service — see /admin/ "
+                "for configuration."
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
