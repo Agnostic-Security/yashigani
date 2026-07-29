@@ -18,7 +18,6 @@ dropped): `/api/pull` requires an injected resolver to do anything, and the
 
 from __future__ import annotations
 
-import json
 from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -29,7 +28,7 @@ from kuroshio.containment.hooks import OutputInspectionHook, noop_output_inspect
 from kuroshio.models import ResolvedModel
 from kuroshio.shim.chat import chat_event_to_ndjson, translate_chat_request
 from kuroshio.shim.embeddings import translate_embeddings_request, translate_embeddings_response
-from kuroshio.shim.framing import SSE_DONE_SENTINEL
+from kuroshio.shim.framing import parse_sse_line
 from kuroshio.shim.generate import generate_event_to_ndjson, translate_generate_request
 from kuroshio.shim.ps import PsRow, synthesize_ps
 from kuroshio.shim.pull import iter_pull_progress
@@ -37,16 +36,6 @@ from kuroshio.shim.show import synthesize_show
 from kuroshio.shim.tags import synthesize_tags
 from kuroshio.supervisor.supervisor import LoadConfig, ResourceLimitExceeded, Supervisor
 from kuroshio.upstream import UpstreamClient
-
-
-def _parse_sse_line(raw_line: str) -> dict[str, Any] | None:
-    line = raw_line.rstrip("\r\n")
-    if not line or not line.startswith("data:"):
-        return None
-    payload = line[len("data:") :].strip()
-    if payload == SSE_DONE_SENTINEL:
-        return None
-    return json.loads(payload)
 
 
 def create_app(
@@ -210,10 +199,10 @@ def create_app(
         async def event_stream() -> AsyncIterator[bytes]:
             try:
                 async for raw_line in upstream.stream_lines(f"{_base_url(instance.port)}/completion", llama_request):
-                    event = _parse_sse_line(raw_line)
-                    if event is None:
-                        continue
-                    event = output_inspection_hook(event)
+                    parsed = parse_sse_line(raw_line)
+                    if not isinstance(parsed, dict):
+                        continue  # blank separator or terminal [DONE] — no event on this line
+                    event = output_inspection_hook(parsed)
                     line, is_final = chat_event_to_ndjson(event, model_name)
                     yield line
                     if is_final:
@@ -238,10 +227,10 @@ def create_app(
         async def event_stream() -> AsyncIterator[bytes]:
             try:
                 async for raw_line in upstream.stream_lines(f"{_base_url(instance.port)}/completion", llama_request):
-                    event = _parse_sse_line(raw_line)
-                    if event is None:
-                        continue
-                    event = output_inspection_hook(event)
+                    parsed = parse_sse_line(raw_line)
+                    if not isinstance(parsed, dict):
+                        continue  # blank separator or terminal [DONE] — no event on this line
+                    event = output_inspection_hook(parsed)
                     line, is_final = generate_event_to_ndjson(event, model_name)
                     yield line
                     if is_final:

@@ -21,6 +21,7 @@ the council review's insistence on byte-shape assertions in tests, not just
 from __future__ import annotations
 
 import json
+from enum import Enum
 from typing import Any, Iterable, Iterator
 
 SSE_DONE_SENTINEL = "[DONE]"
@@ -30,26 +31,59 @@ class SSEFramingError(ValueError):
     """Raised when an SSE line does not match the expected `data: ...` shape."""
 
 
+class SSELine(Enum):
+    """Non-event outcomes of parsing a single SSE line (see `parse_sse_line`)."""
+
+    SEPARATOR = "separator"  # a blank event-separator line — carries no event, keep reading
+    DONE = "done"  # the terminal `data: [DONE]` sentinel — end of stream
+
+
+def parse_sse_line(raw_line: str) -> dict[str, Any] | SSELine:
+    """Parse ONE line of an SSE text stream (the single-line primitive shared by
+    both the whole-stream `parse_sse_events` generator and `app.py`'s streaming
+    route handlers, so the two can never diverge).
+
+    Returns:
+      - the decoded JSON dict for a `data: {...}` event frame;
+      - `SSELine.SEPARATOR` for a blank event-separator line (no event — keep
+        reading);
+      - `SSELine.DONE` for the terminal `data: [DONE]` sentinel (end of stream).
+
+    Raises `SSEFramingError` for a line that is neither blank nor a `data:`
+    frame, or a `data:` frame whose payload is not valid JSON — a malformed
+    frame fails loudly rather than silently vanishing (the failure mode that
+    matters at real ollama-API consumers).
+    """
+    line = raw_line.rstrip("\r\n")
+    if line == "":
+        return SSELine.SEPARATOR
+    if not line.startswith("data:"):
+        raise SSEFramingError(f"expected an SSE 'data:' line, got: {raw_line!r}")
+    payload = line[len("data:") :].strip()
+    if payload == SSE_DONE_SENTINEL:
+        return SSELine.DONE
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise SSEFramingError(f"SSE data payload is not valid JSON: {payload!r} ({exc})") from exc
+
+
 def parse_sse_events(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
     """Parse an SSE byte-stream (as text lines) into decoded JSON event dicts.
 
     Blank lines (event separators) and the terminal `data: [DONE]` sentinel
     are consumed silently; anything not prefixed `data: ` is refused rather
     than silently dropped (a malformed frame should fail loudly, not vanish).
+    Delegates per-line parsing to `parse_sse_line` so the framing rules live in
+    exactly one place.
     """
     for raw_line in lines:
-        line = raw_line.rstrip("\r\n")
-        if line == "":
+        parsed = parse_sse_line(raw_line)
+        if parsed is SSELine.SEPARATOR:
             continue
-        if not line.startswith("data:"):
-            raise SSEFramingError(f"expected an SSE 'data:' line, got: {raw_line!r}")
-        payload = line[len("data:") :].strip()
-        if payload == SSE_DONE_SENTINEL:
+        if parsed is SSELine.DONE:
             return
-        try:
-            yield json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise SSEFramingError(f"SSE data payload is not valid JSON: {payload!r} ({exc})") from exc
+        yield parsed
 
 
 def format_sse_event(obj: dict[str, Any]) -> str:
@@ -62,4 +96,12 @@ def format_ndjson_line(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj) + "\n").encode("utf-8")
 
 
-__all__ = ["SSEFramingError", "SSE_DONE_SENTINEL", "parse_sse_events", "format_sse_event", "format_ndjson_line"]
+__all__ = [
+    "SSEFramingError",
+    "SSELine",
+    "SSE_DONE_SENTINEL",
+    "parse_sse_line",
+    "parse_sse_events",
+    "format_sse_event",
+    "format_ndjson_line",
+]
