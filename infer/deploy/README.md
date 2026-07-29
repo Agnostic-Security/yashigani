@@ -80,6 +80,26 @@ infer/deploy/
    for base images (item 1) is the mitigation; this is a host-escape risk independent of the
    ring-fence (a vulnerable toolkit version is not fixed by network isolation).
 
+## Red Council fixes — 2026-07-29 session (deploy/GPU-side gates)
+
+Findings from `internal-docs/yashigani/RED-COUNCIL-infer-6.0-design-synthesis-20260729.md` and
+`internal-docs/yashigani/captain-infer-6.0-design-redcouncil-20260729.md` (Captain's own design
+review, findings #1-#7). Each fix below is its own commit; live GPU validation (an actual Vulkan/
+Intel or ROCm rig) remains test-later per the original dispatch — nothing in this section was
+verified against real hardware.
+
+- **H6 (HIGH, Captain finding #1) — Vulkan/Intel k8s device grant.** Previously `gpu.resourceName`
+  left empty for `backend: vulkan` silently shipped CPU-only despite the platform doc's "GREEN"
+  claim. Fixed: `values.yaml` documents the required `gpu.resourceName` value
+  (`gpu.intel.com/i915` or `gpu.intel.com/xe`, Intel Device Plugin for Kubernetes — not installed
+  by this chart) AND adds a `gpu.vulkanIcdHostPath` knob (required value:
+  `/usr/share/vulkan/icd.d`, matching the compose overlay's own host ICD mount) that renders a
+  read-only `hostPath` volume + mount on `infer-classifier`/`infer-chat` ONLY when
+  `backend == "vulkan"` and the value is set. Both values must be set correctly for Vulkan to
+  actually engage a GPU in k8s — left empty (default), the cell is CPU-only, now documented as
+  such instead of silently claimed GREEN. Verified via `helm template` with/without the knob set
+  (see gates below) — no live Intel GPU node available this session.
+
 ## Classifier / chat / puller container split — the actual mechanism (finding #4)
 
 Tom's v1 supervisor (`supervisor/supervisor.py`, `supervisor/process.py`) is

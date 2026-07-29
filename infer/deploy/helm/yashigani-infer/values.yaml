@@ -35,10 +35,42 @@ images:
 # GPU node scheduling (device-plugin resource requests, platform doc §4).
 gpu:
   nodeSelector: {}
-  # e.g. cuda: {"nvidia.com/gpu.present": "true"}; rocm: {"amd.com/gpu.present": "true"}
+  # e.g. cuda: {"nvidia.com/gpu.present": "true"}; rocm: {"amd.com/gpu.present": "true"};
+  # vulkan/Intel: whatever label the Intel Device Plugin for Kubernetes' node-labeller
+  # applies (e.g. {"intel.feature.node.kubernetes.io/gpu": "true"}) or a manual operator
+  # label on Intel Arc/iGPU nodes.
   resourceName: ""
-  # e.g. cuda: "nvidia.com/gpu"; rocm: "amd.com/gpu"; vulkan/cpu: "" (no device-plugin resource)
+  # e.g. cuda: "nvidia.com/gpu"; rocm: "amd.com/gpu"; cpu: "" (no device-plugin resource,
+  # CPU-only by design).
+  #
+  # vulkan/Intel: "gpu.intel.com/i915" (older i915 kernel driver) or "gpu.intel.com/xe" (Xe
+  # kernel driver, newer kernels) — REQUIRED VALUE for the Vulkan backend to actually engage
+  # a GPU in k8s. Installing the Intel Device Plugin for Kubernetes
+  # (https://github.com/intel/intel-device-plugins-for-kubernetes) is a prerequisite this
+  # chart does NOT install itself.
+  #
+  # H6 (Red Council 2026-07-29, Captain finding #1): resourceName alone only grants /dev/dri
+  # cgroup device access via the device plugin — it does NOT put a Vulkan ICD (the driver
+  # descriptor) inside the container (Dockerfile.infer-vulkan ships only the libvulkan1
+  # loader, matching the compose overlay's design: the ICD is always host-mounted, never
+  # baked into the image). See vulkanIcdHostPath below for the second half of the grant.
+  # WITHOUT BOTH values set correctly for backend: vulkan, the pod schedules, gets a
+  # /dev/dri device node, but vkEnumeratePhysicalDevices returns zero usable devices and
+  # gpu/healthcheck-gpu-engaged.sh hard-fails the pod on the next probe — loud, not silent,
+  # but a real day-one break for anyone who assumed resourceName alone was sufficient.
   count: 1
+  # Vulkan/Intel k8s ONLY — absolute host path to the node's Vulkan ICD directory,
+  # bind-mounted read-only into the container at the SAME path (mirrors
+  # docker-compose.infer.vulkan.yml's `/usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro`
+  # exactly, so operators moving from compose to k8s reuse the same value). REQUIRED VALUE
+  # for a real Vulkan/Intel k8s deploy: "/usr/share/vulkan/icd.d" on Debian/Ubuntu-family GPU
+  # nodes (the same path this chart's compose sibling already uses) — CONFIRM this path on
+  # your specific node OS/image before relying on it; some distros package Mesa's ICD JSON
+  # elsewhere (e.g. some RPM-based layouts). Only rendered when .Values.backend == "vulkan"
+  # AND this is non-empty; left empty (default) + backend: vulkan == CPU-only — now
+  # documented as such rather than silently claimed GPU-engaged. Not applicable to
+  # cuda/rocm (device-plugin/CDI + /dev/kfd handle those paths without a host ICD mount).
+  vulkanIcdHostPath: ""
 
 classifier:
   replicas: 1

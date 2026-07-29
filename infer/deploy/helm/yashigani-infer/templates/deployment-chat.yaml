@@ -128,6 +128,14 @@ spec:
               readOnly: true
             - name: scratch
               mountPath: /data/scratch
+            {{- if and (eq .Values.backend "vulkan") .Values.gpu.vulkanIcdHostPath }}
+            # H6 (Captain finding #1, Red Council 2026-07-29): Vulkan ICD host-mount — see
+            # values.yaml gpu.vulkanIcdHostPath comment for why this is required alongside
+            # gpu.resourceName for the Vulkan/Intel backend to actually engage a GPU.
+            - name: vulkan-icd
+              mountPath: /usr/share/vulkan/icd.d
+              readOnly: true
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -150,6 +158,12 @@ spec:
         - name: scratch
           emptyDir:
             sizeLimit: 8Gi
+        {{- if and (eq .Values.backend "vulkan") .Values.gpu.vulkanIcdHostPath }}
+        - name: vulkan-icd
+          hostPath:
+            path: {{ .Values.gpu.vulkanIcdHostPath }}
+            type: Directory
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
