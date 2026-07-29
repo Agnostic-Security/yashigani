@@ -47,6 +47,10 @@ class LocalFileAdapter(SourceAdapter):
             "parameter_size": header.parameter_size_label(),
             "quantization_level": header.quantization_level,
             "gguf_version": header.version,
+            # H4 (Red-Council, 2026-07-29): extracted so the serve-path
+            # fail-closed guard (app.py::_require_chat_template) can check
+            # it without re-parsing the GGUF header at request time.
+            "chat_template": header.chat_template,
         }
 
         digest = sha256_file(path)

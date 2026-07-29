@@ -29,6 +29,14 @@ def _pack_kv(key: str, value_type: int, value_bytes: bytes) -> bytes:
     return _pack_string(key) + struct.pack("<I", value_type) + value_bytes
 
 
+#: A minimal, syntactically-valid Jinja chat template — used as the DEFAULT
+#: `chat_template` for every fixture GGUF this builder produces, so a real
+#: model's GGUF (which virtually always carries one) is the realistic
+#: default test shape. Tests that specifically exercise the H4 fail-closed
+#: guard (Red-Council 2026-07-29) pass `chat_template=None` explicitly.
+DEFAULT_CHAT_TEMPLATE = "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+
+
 def build_minimal_gguf(
     *,
     architecture: str = "llama",
@@ -36,6 +44,7 @@ def build_minimal_gguf(
     file_type: int | None = 15,  # Q4_K_M
     version: int = 3,
     tensors: list[tuple[str, tuple[int, ...], int]] | None = None,
+    chat_template: str | None = DEFAULT_CHAT_TEMPLATE,
 ) -> bytes:
     """Build a minimal, spec-valid GGUF byte blob (header + KV metadata + tensor
     info only — no tensor payload bytes, since the parser never reads those).
@@ -44,6 +53,10 @@ def build_minimal_gguf(
         tensors: list of (name, dimensions, ggml_type) tuples. Defaults to
             two small tensors whose element counts sum to a known, easily
             asserted total.
+        chat_template: `tokenizer.chat_template` KV value. Defaults to a
+            minimal valid template (realistic default — real GGUFs almost
+            always carry one); pass `None` to build a fixture that
+            deliberately lacks one (Red-Council H4 fail-closed-guard tests).
     """
     if tensors is None:
         tensors = [
@@ -55,6 +68,8 @@ def build_minimal_gguf(
         _pack_kv("general.architecture", _T_STRING, _pack_string(architecture)),
         _pack_kv("general.name", _T_STRING, _pack_string(name)),
     ]
+    if chat_template is not None:
+        kv_entries.append(_pack_kv("tokenizer.chat_template", _T_STRING, _pack_string(chat_template)))
     if file_type is not None:
         kv_entries.append(_pack_kv("general.file_type", _T_UINT32, struct.pack("<I", file_type)))
 
@@ -76,4 +91,4 @@ def build_minimal_gguf(
     return header
 
 
-__all__ = ["build_minimal_gguf"]
+__all__ = ["DEFAULT_CHAT_TEMPLATE", "build_minimal_gguf"]

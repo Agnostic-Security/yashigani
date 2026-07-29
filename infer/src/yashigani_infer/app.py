@@ -99,6 +99,29 @@ def create_app(
     def _ensure_loaded(model: ResolvedModel):
         return supervisor.load(model, load_config)
 
+    def _require_chat_template(model: ResolvedModel) -> None:
+        """Red-Council H4 (Ava/Tom, 2026-07-29 design-review): a GGUF with a
+        missing/blank `tokenizer.chat_template` does not error when served —
+        it produces a subtly wrong or garbled completion at HTTP 200
+        (llama.cpp falls back to its own built-in default, or mis-renders
+        role-turns for an architecture it doesn't template-detect
+        correctly). Fail closed HERE, before ever loading/forwarding to
+        llama-server, rather than serving garbage with a green status code.
+        Only wired on the CHAT-shaped routes (`/api/chat`, the OpenAI-compat
+        `/v1/chat/completions`) — `/api/generate` and `/api/embeddings` do
+        not depend on chat-templating and are unaffected.
+        """
+        chat_template = model.metadata.get("chat_template")
+        if not chat_template or not str(chat_template).strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"model {model.metadata.get('name', model.sha256)!r} has no extractable "
+                    "tokenizer.chat_template — refusing to serve a chat request against it rather than "
+                    "risk silently garbled role-turn rendering"
+                ),
+            )
+
     def _clamp_request_params(llama_request: dict[str, Any]) -> None:
         """Red-council item #7: clamp (never silently balloon) resource-shaped
         request params to the supervisor's configured ceilings."""
@@ -166,6 +189,7 @@ def create_app(
     async def api_chat(request: Request) -> StreamingResponse:
         body = await request.json()
         model = _require_model(body.get("model", ""))
+        _require_chat_template(model)
         instance = _ensure_loaded(model)
         llama_request = translate_chat_request(body, cache_prompt=load_config.cache_prompt)
         _clamp_request_params(llama_request)
@@ -265,8 +289,15 @@ def create_app(
             body = await request.json()
             model_name = body.get("model")
 
+        resolved_for_chat_guard: ResolvedModel | None = None
         if model_name:
             model = _require_model(model_name)
+            resolved_for_chat_guard = model
+            # H4: check BEFORE ever loading/spawning llama-server — only the
+            # chat-completions shape depends on chat-templating (`/v1/completions`,
+            # `/v1/embeddings`, etc. are unaffected).
+            if path == "chat/completions":
+                _require_chat_template(model)
             instance = _ensure_loaded(model)
         else:
             resident = supervisor.resident_shas
@@ -278,6 +309,9 @@ def create_app(
             instance = supervisor.get_instance(resident[0])
             if instance is None:  # pragma: no cover - defensive, resident_shas guarantees presence
                 raise HTTPException(status_code=500, detail="resident model instance vanished mid-request")
+            resolved_for_chat_guard = blob_store.get_resolved_model(instance.sha256)
+            if path == "chat/completions" and resolved_for_chat_guard is not None:
+                _require_chat_template(resolved_for_chat_guard)
 
         target_url = f"{_base_url(instance.port)}/v1/{path}"
         if request.method != "POST":

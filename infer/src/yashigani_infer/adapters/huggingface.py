@@ -179,6 +179,7 @@ class HuggingFaceAdapter(SourceAdapter):
                 "parameter_size": header.parameter_size_label(),
                 "quantization_level": header.quantization_level,
                 "gguf_version": header.version,
+                "chat_template": header.chat_template,
             }
             extra: dict[str, Any] = {"filename": filename, "licence_accepted": True, "provenance_tier": provenance_tier}
             if signed_manifest is not None:

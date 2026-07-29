@@ -203,6 +203,7 @@ class OllamaStoreAdapter(SourceAdapter):
                 "parameter_size": header.parameter_size_label(),
                 "quantization_level": header.quantization_level,
                 "gguf_version": header.version,
+                "chat_template": header.chat_template,
             }
             provenance = Provenance(
                 kind=ProvenanceKind.LOCAL_OLLAMA,

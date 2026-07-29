@@ -125,6 +125,25 @@ class GGUFHeader:
         return self.metadata.get("general.name")
 
     @property
+    def chat_template(self) -> str | None:
+        """`tokenizer.chat_template` — the Jinja template llama.cpp uses to
+        render an ollama-shim `messages[]` array into the actual prompt
+        string sent to the model (Red-Council H4, Ava/Tom, 2026-07-29
+        design-review). Missing/blank means llama.cpp falls back to its own
+        built-in default (or, for some architectures, produces silently
+        mis-rendered role-turns) — a different chat_template FAMILY
+        (ChatML/Llama3/Mistral/Gemma) does not error, it produces a subtly
+        wrong completion at HTTP 200. This property only EXTRACTS the raw
+        field (already present in `metadata` via the generic KV parser above
+        — no parser change needed); the fail-closed GUARD that refuses to
+        serve a model without one lives at the call site
+        (`app.py::_require_chat_template`), not here — this class stays a
+        pure, side-effect-free header reader.
+        """
+        value = self.metadata.get("tokenizer.chat_template")
+        return value if isinstance(value, str) and value.strip() else None
+
+    @property
     def total_parameters(self) -> int:
         """Sum of element counts across all tensors — an approximation of
         parameter count (real per-architecture accounting can differ

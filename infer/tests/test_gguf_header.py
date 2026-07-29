@@ -19,6 +19,30 @@ def test_parses_magic_version_and_architecture(minimal_gguf_bytes: bytes) -> Non
     assert header.name == "tiny-test-model"
 
 
+# --- Red-Council H4 (2026-07-29): chat_template extraction ---
+
+
+def test_chat_template_extracts_the_embedded_jinja_template() -> None:
+    from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE
+
+    data = build_minimal_gguf(chat_template="{{ custom template }}")
+    header = parse_gguf_header(data)
+    assert header.chat_template == "{{ custom template }}"
+    assert header.chat_template != DEFAULT_CHAT_TEMPLATE  # sanity: this fixture overrode the default
+
+
+def test_chat_template_is_none_when_absent_from_the_header() -> None:
+    data = build_minimal_gguf(chat_template=None)
+    header = parse_gguf_header(data)
+    assert header.chat_template is None
+
+
+def test_chat_template_is_none_when_blank_or_whitespace_only() -> None:
+    data = build_minimal_gguf(chat_template="   ")
+    header = parse_gguf_header(data)
+    assert header.chat_template is None
+
+
 def test_total_parameters_and_parameter_size_label() -> None:
     data = build_minimal_gguf(tensors=[("a", (10, 10), 0), ("b", (10, 10), 0)])
     header = parse_gguf_header(data)

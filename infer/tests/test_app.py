@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import FakeProcessRunner, FakeUpstreamClient
+from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE
 from yashigani_infer.app import create_app
 from yashigani_infer.blobstore.store import BlobStore
 from yashigani_infer.models import Provenance, ProvenanceKind, ResolvedModel
@@ -24,8 +25,36 @@ def ingested_model(tmp_blob_store: BlobStore, tmp_path, minimal_gguf_bytes: byte
     src = tmp_path / "model.gguf"
     src.write_bytes(minimal_gguf_bytes)
     provenance = Provenance(kind=ProvenanceKind.LOCAL_FILE, origin=str(src), sha256="")
+    # This fixture hand-builds its metadata dict directly (bypassing every
+    # real adapter) — `chat_template` is included explicitly here so it
+    # stays representative of what a real adapter now always populates
+    # (Red-Council H4) rather than accidentally exercising the fail-closed
+    # guard for every unrelated test that uses this fixture.
     return tmp_blob_store.put_from_path(
-        src, metadata={"name": "llama3:8b", "family": "llama", "quantization_level": "Q4_K_M"}, provenance=provenance
+        src,
+        metadata={
+            "name": "llama3:8b",
+            "family": "llama",
+            "quantization_level": "Q4_K_M",
+            "chat_template": DEFAULT_CHAT_TEMPLATE,
+        },
+        provenance=provenance,
+    )
+
+
+@pytest.fixture()
+def ingested_model_without_chat_template(
+    tmp_blob_store: BlobStore, tmp_path, minimal_gguf_bytes: bytes
+) -> ResolvedModel:
+    """Red-Council H4: a model whose GGUF header carries no chat_template —
+    exercises the fail-closed guard on the chat-shaped routes."""
+    src = tmp_path / "no-template-model.gguf"
+    src.write_bytes(minimal_gguf_bytes)
+    provenance = Provenance(kind=ProvenanceKind.LOCAL_FILE, origin=str(src), sha256="")
+    return tmp_blob_store.put_from_path(
+        src,
+        metadata={"name": "no-template:latest", "family": "llama", "quantization_level": "Q4_K_M"},
+        provenance=provenance,
     )
 
 
@@ -249,9 +278,69 @@ def test_v1_passthrough_requires_model_field_with_zero_resident(tmp_blob_store: 
 def test_v1_passthrough_non_streaming_with_explicit_model(
     tmp_blob_store: BlobStore, ingested_model: ResolvedModel
 ) -> None:
-    app, supervisor, upstream = _build_app(tmp_blob_store, json_response={"choices": [{"message": {"content": "hi"}}]})
+    app, supervisor, _upstream = _build_app(tmp_blob_store, json_response={"choices": [{"message": {"content": "hi"}}]})
     client = TestClient(app)
     resp = client.post("/v1/chat/completions", json={"model": "llama3:8b", "messages": []})
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "hi"
     assert supervisor.inflight_count(ingested_model.sha256) == 0
+
+
+# --- Red-Council H4 (2026-07-29): chat_template fail-closed guard ---
+
+
+def test_api_chat_fails_closed_422_when_model_has_no_chat_template(
+    tmp_blob_store: BlobStore, ingested_model_without_chat_template: ResolvedModel
+) -> None:
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/chat", json={"model": "no-template:latest", "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert resp.status_code == 422
+    assert "chat_template" in resp.json()["detail"]
+    # fails BEFORE ever loading/spawning llama-server
+    assert not supervisor.is_loaded(ingested_model_without_chat_template.sha256)
+
+
+def test_v1_chat_completions_fails_closed_422_when_model_has_no_chat_template(
+    tmp_blob_store: BlobStore, ingested_model_without_chat_template: ResolvedModel
+) -> None:
+    app, supervisor, _upstream = _build_app(tmp_blob_store)
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={"model": "no-template:latest", "messages": []})
+
+    assert resp.status_code == 422
+    assert not supervisor.is_loaded(ingested_model_without_chat_template.sha256)
+
+
+def test_v1_completions_non_chat_path_is_unaffected_by_missing_chat_template(
+    tmp_blob_store: BlobStore, ingested_model_without_chat_template: ResolvedModel
+) -> None:
+    """The guard is scoped to chat-completions specifically — a raw
+    /v1/completions call against the same template-less model must still
+    work (it doesn't do chat-templating at all)."""
+    app, _supervisor, upstream = _build_app(tmp_blob_store, json_response={"choices": [{"text": "hi"}]})
+    client = TestClient(app)
+
+    resp = client.post("/v1/completions", json={"model": "no-template:latest", "prompt": "hi"})
+
+    assert resp.status_code == 200
+    assert upstream.requested_bodies
+
+
+def test_api_generate_is_unaffected_by_missing_chat_template(
+    tmp_blob_store: BlobStore, ingested_model_without_chat_template: ResolvedModel
+) -> None:
+    """`/api/generate` does not depend on chat-templating — must still work
+    against a model with no extractable chat_template."""
+    sse_lines = format_sse_event({"content": "", "stop": True, "timings": {"predicted_ms": 1}}).splitlines()
+    app, _supervisor, _upstream = _build_app(tmp_blob_store, sse_lines=sse_lines)
+    client = TestClient(app)
+
+    resp = client.post("/api/generate", json={"model": "no-template:latest", "prompt": "hi"})
+
+    assert resp.status_code == 200

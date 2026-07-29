@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.gguf_builder import DEFAULT_CHAT_TEMPLATE, build_minimal_gguf
 from yashigani_infer.adapters.local_file import LocalFileAdapter, LocalFileAdapterError
 from yashigani_infer.blobstore.store import BlobStore, sha256_bytes
 from yashigani_infer.models import ProvenanceKind
@@ -25,6 +26,27 @@ def test_resolve_imports_a_local_gguf(
     assert resolved.provenance.kind == ProvenanceKind.LOCAL_FILE
     assert resolved.provenance.operator_supplied is True
     assert resolved.provenance.origin == str(minimal_gguf_file.resolve())
+
+
+def test_resolve_extracts_chat_template_into_metadata(tmp_blob_store: BlobStore, tmp_path: Path) -> None:
+    """Red-Council H4 (2026-07-29): chat_template must be extracted so the
+    serve-path fail-closed guard (app.py::_require_chat_template) can check
+    it without re-parsing the GGUF header at request time."""
+    path = tmp_path / "with-template.gguf"
+    path.write_bytes(build_minimal_gguf())  # default fixture carries DEFAULT_CHAT_TEMPLATE
+    adapter = LocalFileAdapter(tmp_blob_store)
+    resolved = adapter.resolve(path=path)
+    assert resolved.metadata["chat_template"] == DEFAULT_CHAT_TEMPLATE
+
+
+def test_resolve_records_none_chat_template_when_gguf_has_no_template(
+    tmp_blob_store: BlobStore, tmp_path: Path
+) -> None:
+    path = tmp_path / "no-template.gguf"
+    path.write_bytes(build_minimal_gguf(chat_template=None))
+    adapter = LocalFileAdapter(tmp_blob_store)
+    resolved = adapter.resolve(path=path)
+    assert resolved.metadata["chat_template"] is None
 
 
 def test_resolve_dedups_identical_bytes(tmp_blob_store: BlobStore, tmp_path: Path, minimal_gguf_bytes: bytes) -> None:
