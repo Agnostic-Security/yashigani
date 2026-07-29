@@ -716,6 +716,7 @@ async def run_approve_transaction(
     caddy_reloader: Optional[Callable[[], Awaitable[None]]] = None,
     registry_store: Any = None,  # DurableMcpRegistryStore — v4.1 Ph2a / SEAM-1d-07
     mcp_id_store: Any = None,    # McpIdStore — v5.0 LAURA-V50-010
+    permission_store: Any = None,  # PermissionStore — v5.0 LAURA-V50-017 Gap A
 ) -> McpOnboardResult:
     """Run the atomic approve transaction (see module docstring).
 
@@ -744,6 +745,26 @@ async def run_approve_transaction(
     McpIdStore into the backoffice), the descriptor's ``mcp_id`` field is
     left empty and the gateway's existing lazy-mint fallback still applies
     — degrades to the pre-fix behaviour, never fails the transaction.
+
+    ``permission_store`` (v5.0 LAURA-V50-017 Gap A, Tom, 2026-07-29): the
+    PermissionStore (Redis db/3, same instance the gateway/other backoffice
+    routes use — ``backoffice_state.capability_policy_store.perm_store``).
+    Step 4b-ii uses it to seed the ORG-LEVEL ``mcp_server`` connection-permit
+    boolean grant (``allow=True``) for this server, keyed by the SAME
+    ``mcp_id`` just resolved above — matching ``McpBroker._check_connection_
+    permit``'s own key precedence (``ctx.mcp_id or ctx.server_id or ctx.
+    agent_name``). Before this fix, ONLY the boot-time ``seed_mcp_grants()``
+    (keyed off the, for a live-onboard-only deployment empty,
+    ``YASHIGANI_MCP_SERVERS`` env var) ever wrote this grant — a server
+    onboarded via the live-import ceremony had NO org-level permit and every
+    call denied ``403 mcp_server_not_permitted`` before ever reaching OPA,
+    regardless of approval/tool-surface correctness. When None:
+      * production/staging → the transaction fails CLOSED up-front (503) —
+        an onboarded server with no possible connection-permit grant is a
+        partial onboarding (same posture as ``registry_store=None`` above).
+      * dev/test           → step 4b-ii's grant seed is skipped with a
+        warning (backwards-compatible with unit tests / installs that have
+        not wired PermissionStore into the backoffice).
 
     Raises McpOnboardError after rolling back on any step failure.  On
     success returns the committed identifiers + written artifact paths.
@@ -806,6 +827,26 @@ async def run_approve_transaction(
             "routable by the gateway broker (SEAM-1d-07). Onboarding fails "
             "closed. Wire Redis db/3 (DurableMcpRegistryStore) into the "
             "backoffice.",
+            http_status=503,
+        )
+
+    # v5.0 LAURA-V50-017 Gap A — the org-level mcp_server connection-permit
+    # grant is REQUIRED in production/staging: without permission_store, step
+    # 4b-ii below cannot seed it, and _check_connection_permit denies EVERY
+    # call to this server with mcp_server_not_permitted regardless of
+    # approval/grant correctness — the same "onboarded but structurally
+    # unusable" shape LAURA-V50-010/014/016 already closed for the registry/
+    # nonce-store paths. Fail closed BEFORE minting (same posture as
+    # registry_store above).
+    if permission_store is None and _env_name in {"production", "staging"}:
+        raise McpOnboardError(
+            "config",
+            "permission store is not wired (permission_store=None) in a "
+            f"{_env_name} environment — the onboarded MCP would have no "
+            "possible org-level connection-permit grant and every call "
+            "would deny mcp_server_not_permitted (LAURA-V50-017 Gap A). "
+            "Onboarding fails closed. Wire Redis db/3 (PermissionStore) "
+            "into the backoffice.",
             http_status=503,
         )
 
@@ -1250,8 +1291,33 @@ async def run_approve_transaction(
             #           (mismatch → deny, same as before) until the server is
             #           re-approved/re-onboarded, which re-writes the baseline
             #           in the new format — no silent pass-through either way.
-            from yashigani.identity.trust_domain import trust_domain as _trust_domain
+            #
+            # LAURA-V50-017 Gap B: the grant is written for BOTH caller-SPIFFE
+            # forms mcp.rego actually looks up, not only the gateway-mesh
+            # identity:
+            #   - _gateway_spiffe   ("spiffe://<td>/gateway") — the
+            #     SPIFFE-verified branch (MCP-A/MCP-C): the caller reaching
+            #     OPA via the broker's mesh-mTLS transport IS the gateway.
+            #   - _rbac_spiffe (agent_spiffe_uri(tenant_id, server_id), the
+            #     LEGACY 2-segment target-derived URI, no instance suffix) —
+            #     the RBAC/human-caller branch (MCP-B): mcp.rego sets
+            #     input.identity.spiffe to this EXACT value for a non-SPIFFE
+            #     (human/API-key) caller (mcp.rego's own comment on the MCP-B
+            #     rule: "input.identity.spiffe is ALWAYS the target-derived
+            #     agent URI"; mcp/broker.py:483/839/1218 all construct it via
+            #     agent_spiffe_uri(ctx.tenant_id, ctx.agent_name) with no
+            #     instance_id — verified against the actual call sites, not
+            #     assumed). Before this fix, onboarding wrote ONLY the
+            #     gateway-mesh key, so grants[mcp_id][_rbac_spiffe] was NEVER
+            #     written and every RBAC/human-session tools/call against a
+            #     live-onboarded server was structurally unsatisfiable at
+            #     _grant_ok regardless of any admin action.
+            from yashigani.identity.trust_domain import (
+                agent_spiffe_uri as _agent_spiffe_uri,
+                trust_domain as _trust_domain,
+            )
             _gateway_spiffe = "spiffe://%s/gateway" % _trust_domain()
+            _rbac_spiffe = _agent_spiffe_uri(tenant_id, server_id)
             _tool_key_prefix = f"{env.provenance_id}::"
             _sorted_tools = sorted(
                 k[len(_tool_key_prefix):] if k.startswith(_tool_key_prefix) else k
@@ -1261,11 +1327,68 @@ async def run_approve_transaction(
                 "tools": _sorted_tools,
                 "actions": ["tools/call"],
                 "caller_spiffe": _gateway_spiffe,
+                "caller_spiffes": sorted({_gateway_spiffe, _rbac_spiffe}),
             })
             registry_store.put_baseline(tenant_id, server_id, {
                 "surface_hash": label_surface_hash(env.surface_set_hash) or "",
                 "tools": _sorted_tools,
             })
+
+            # ── Step 4b-ii-b: org-level mcp_server connection-permit grant
+            #    (LAURA-V50-017 Gap A) ─────────────────────────────────────
+            #
+            # McpBroker._check_connection_permit ([P4], broker.py:1058) is the
+            # FIRST gate a call hits, ahead of the four-gate/OPA path entirely
+            # — it reads permission_store.resolve_boolean_grant(MCP_SERVER,
+            # server_key, ...), which was previously seeded ONLY at gateway
+            # BOOT time (permissions/seeder.py::seed_mcp_grants, keyed off the
+            # — for a live-onboard-only deployment, empty — YASHIGANI_MCP_
+            # SERVERS list). A server onboarded via THIS transaction had no
+            # possible org grant until a gateway restart with that server
+            # listed in the boot env, which never happens for a live-onboard
+            # topology. Seed it here, atomically with the OPA grant/baseline
+            # above (same try/except — a failure here rolls back the whole
+            # transaction exactly like a put_grant/put_baseline failure
+            # would).
+            #
+            # Keyed by _resolved_mcp_id when available, falling back to
+            # server_id — MUST mirror _check_connection_permit's own
+            # precedence (`ctx.mcp_id or ctx.server_id or ctx.agent_name`)
+            # exactly, or the seeded grant silently has no effect (this is
+            # the specific footgun Laura's manual workaround hit: a grant
+            # keyed by the server_id STRING is invisible to a call that
+            # resolves ctx.mcp_id first).
+            # Computed unconditionally (cheap; also needed by _undo_registry's
+            # rollback cleanup below regardless of whether permission_store
+            # is wired this call).
+            _perm_org_id = os.environ.get(
+                "YASHIGANI_ORG_ID", "default",
+            ).strip() or "default"
+            _connection_permit_key = _resolved_mcp_id or server_id
+            if permission_store is not None:
+                from yashigani.permissions import BooleanGrantValue, ResourceType
+                permission_store.set_boolean_grant(
+                    resource_type=ResourceType.MCP_SERVER,
+                    scope_kind="org",
+                    scope_id=_perm_org_id,
+                    resource_id=_connection_permit_key,
+                    value=BooleanGrantValue(allow=True),
+                )
+                logger.info(
+                    "mcp-onboard: seeded org-level mcp_server connection-permit "
+                    "grant org=%s key=%s (LAURA-V50-017 Gap A)",
+                    _perm_org_id, _connection_permit_key,
+                )
+            else:
+                logger.warning(
+                    "mcp-onboard: no permission_store wired — org-level "
+                    "mcp_server connection-permit grant NOT seeded for %s/%s; "
+                    "every call will deny mcp_server_not_permitted until an "
+                    "admin manually grants org/%s/mcp_server/%s (LAURA-V50-017 "
+                    "Gap A; dev/test only — production/staging fails closed "
+                    "up-front, see the permission_store=None guard above)",
+                    tenant_id, server_id, tenant_id, _resolved_mcp_id or server_id,
+                )
 
             # ── Step 4b-iii: (caller, prefix) egress grant (v4.1 Phase 1 /
             #                 Lu M1 — synthesis must-fix #1) ────────────────
@@ -1347,6 +1470,23 @@ async def run_approve_transaction(
             # v4.1 Phase 1 (Lu M1): a rolled-back onboarding must leave NO
             # egress grant behind (grant-absence is the kill switch).
             registry_store.delete_egress_grant(tenant_id, server_id)
+            # LAURA-V50-017 Gap A: a rolled-back onboarding must leave NO
+            # org-level connection-permit grant behind either — same
+            # kill-switch posture as the egress grant above.
+            if permission_store is not None:
+                try:
+                    from yashigani.permissions import ResourceType
+                    permission_store.delete_boolean_grant(
+                        ResourceType.MCP_SERVER,
+                        "org",
+                        _perm_org_id,
+                        _connection_permit_key,
+                    )
+                except Exception as perm_del_exc:  # noqa: BLE001 — rollback best-effort
+                    logger.error(
+                        "mcp-onboard: rollback connection-permit grant delete "
+                        "failed: %s", perm_del_exc,
+                    )
 
         rollback.append(_undo_registry)
     else:

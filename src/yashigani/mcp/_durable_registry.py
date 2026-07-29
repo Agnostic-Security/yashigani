@@ -56,7 +56,10 @@ logger = logging.getLogger(__name__)
 _KEY_SERVER = "mcp:broker:server:{tenant}:{server}"
 _KEY_INDEX = "mcp:broker:server_index"
 # Grant + baseline keys — written at approve time, read at OPA startup push.
-# grant:   {tools: [...], actions: [...], caller_spiffe: "spiffe://..."}
+# grant:   {tools: [...], actions: [...], caller_spiffe: "spiffe://...",
+#           caller_spiffes: ["spiffe://...", ...]}  (LAURA-V50-017 Gap B —
+#           caller_spiffes plural is optional and, when present, expands to
+#           one grants[mcp_id][spiffe] entry per list member; see put_grant)
 # baseline: {surface_hash: "sha384:<hex>", tools: [...]}
 _KEY_GRANT = "mcp:broker:grant:{tenant}:{server}"
 _KEY_BASELINE = "mcp:broker:baseline:{tenant}:{server}"
@@ -139,6 +142,19 @@ class DurableMcpRegistryStore:
         Raises on Redis failure — the approve transaction treats this as a step
         failure and rolls back (fail-closed, same as put()).
         grant_data shape: {tools: [...], actions: [...], caller_spiffe: "..."}.
+
+        LAURA-V50-017 Gap B: ``caller_spiffe`` (singular) is kept for backward
+        compatibility (pre-existing callers/tests; also the primary/mesh-
+        identity key). An OPTIONAL ``caller_spiffes`` (plural, list[str]) may
+        additionally be supplied — when present, ``build_mcp_opa_data`` writes
+        a ``grants[mcp_id][spiffe]`` entry for EVERY spiffe in the list, not
+        only the singular one. Onboarding (mcp_onboard.py) writes both the
+        gateway-mesh SPIFFE (agent-to-agent / SPIFFE-verified branch,
+        ``mcp.rego``'s MCP-A/MCP-C rules) AND ``agent_spiffe_uri(tenant,
+        server)`` (the RBAC/human-caller branch, ``mcp.rego``'s MCP-B rule,
+        which sets ``input.identity.spiffe`` to the target-derived agent URI
+        — see mcp.rego's own comment at the MCP-B rule) so BOTH call paths
+        resolve a grant for a live-onboarded server, not only the mesh path.
         """
         if not tenant_id or not server_id:
             raise ValueError("tenant_id and server_id must be non-empty")
@@ -421,10 +437,25 @@ class DurableMcpRegistryStore:
                 continue
 
             # Grant
+            #
+            # LAURA-V50-017 Gap B: write ONE grants[mcp_id][spiffe] entry per
+            # caller-SPIFFE key the stored record declares. "caller_spiffes"
+            # (plural, list) takes precedence when present — onboarding
+            # writes BOTH the gateway-mesh SPIFFE and the RBAC-branch
+            # agent_spiffe_uri(tenant,server) key there (see put_grant
+            # docstring). Falls back to the singular "caller_spiffe" for
+            # records written before this fix (backward compatible — no
+            # migration required; a pre-017 grant still resolves for the
+            # mesh/agent-to-agent branch exactly as before, it simply lacks
+            # the RBAC-branch key until the server is re-approved).
             grant = self.get_grant(tenant_id, server_id)
             if grant is not None:
-                caller_spiffe = grant.get("caller_spiffe", "")
-                if caller_spiffe:
+                _callers = grant.get("caller_spiffes") or (
+                    [grant["caller_spiffe"]] if grant.get("caller_spiffe") else []
+                )
+                for caller_spiffe in _callers:
+                    if not caller_spiffe:
+                        continue
                     grants.setdefault(mcp_id, {})[caller_spiffe] = {
                         "tools": grant.get("tools", []),
                         "actions": grant.get("actions", ["tools/call"]),

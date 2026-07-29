@@ -183,6 +183,49 @@ def _mcp_id_store():
         return None
 
 
+def _permission_store():
+    """Return the live PermissionStore from backoffice_state, or None.
+
+    v5.0 LAURA-V50-017 Gap A (Tom, 2026-07-29): reuses the SAME wired
+    PermissionStore instance every other admin permissions endpoint uses
+    (``backoffice/routes/permissions.py::_get_perm_store`` — same
+    ``backoffice_state.capability_policy_store.perm_store`` accessor, not a
+    fresh Redis connection like ``_durable_registry_store()``/
+    ``_mcp_id_store()`` above — PermissionStore is already constructed once
+    at backoffice startup via ``rbac_stack.build_rbac_agent_stack`` and
+    wired onto ``backoffice_state.capability_policy_store``).  Passed into
+    ``run_approve_transaction`` so step 4b-ii can seed the org-level
+    ``mcp_server`` connection-permit grant atomically with the OPA grant/
+    baseline — without it, ``McpBroker._check_connection_permit`` denies
+    EVERY call to a live-onboarded server with ``mcp_server_not_permitted``,
+    regardless of any other admin action.
+
+    Degrades to None when the capability-policy stack has not (yet) been
+    built (Redis unreachable at startup) — ``run_approve_transaction`` then
+    fails closed in production/staging and warn-skips in dev/test, same
+    posture as ``_durable_registry_store()``/``_mcp_id_store()``.
+    """
+    cap_store = getattr(backoffice_state, "capability_policy_store", None)
+    if cap_store is None:
+        logger.warning(
+            "mcp-servers: capability_policy_store not configured — "
+            "run_approve_transaction will fail closed in production/staging "
+            "(LAURA-V50-017 Gap A) or warn-skip the connection-permit seed "
+            "in dev/test"
+        )
+        return None
+    perm_store = getattr(cap_store, "perm_store", None)
+    if perm_store is None:
+        logger.warning(
+            "mcp-servers: capability_policy_store has no perm_store — "
+            "run_approve_transaction will fail closed in production/staging "
+            "(LAURA-V50-017 Gap A) or warn-skip the connection-permit seed "
+            "in dev/test"
+        )
+        return None
+    return perm_store
+
+
 def _tool_summary(rec) -> dict:
     """Compact, JSON-safe view of one active EnvelopeRecord for the registry list."""
     tools = []
@@ -719,6 +762,11 @@ async def import_mcp_server(
                 # mcp_onboard.py docstring). None → degrades to the
                 # gateway's lazy on-demand mint (dev/test parity).
                 mcp_id_store=_mcp_id_store(),
+                # v5.0 LAURA-V50-017 Gap A (Tom, 2026-07-29): seed the
+                # org-level mcp_server connection-permit grant atomically.
+                # None → fail-closed in production/staging, warn-skip in
+                # dev/test (see run_approve_transaction docstring).
+                permission_store=_permission_store(),
             )
         except McpOnboardError as exc:
             raise HTTPException(
