@@ -189,7 +189,14 @@ export class YsAdminBudgetModels extends LitElement {
     this._toast(res, 'Override proposed.'); if (res.ok) await this._load();
   }
   async _approveOverride() {
-    const res = await this.api.mutate('/admin/cloud-override/approve', { method: 'POST' });
+    // V50-023 sibling: server's ApproveRequest (routes/cloud_override.py) requires
+    // confirming_fingerprint (SOD-1 swap-attack guard) — the client sent no body
+    // at all, so this always 422'd. proposal_fingerprint comes back on the
+    // status/propose payload and is held in this._override by _load().
+    const fingerprint = (this._override && this._override.proposal_fingerprint) || '';
+    const res = await this.api.mutate('/admin/cloud-override/approve', {
+      method: 'POST', body: { confirming_fingerprint: fingerprint },
+    });
     this._toast(res, 'Override approved.'); if (res.ok) await this._load();
   }
   async _revokeOverride() {

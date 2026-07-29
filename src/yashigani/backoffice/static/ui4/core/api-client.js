@@ -148,7 +148,10 @@ export class ApiClient {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', 'X-Yashigani-Plane': this.sessionKind },
-          body: JSON.stringify({ totp: code }),
+          // V50-023: server's StepUpRequest (routes/auth.py) requires `totp_code`,
+          // not `totp` — a payload-key mismatch that made every step-up-gated
+          // write 422 before the TOTP check ever ran.
+          body: JSON.stringify({ totp_code: code }),
         });
         if (!stepup.ok) {
           return { ok: false, status: stepup.status, data: null, error: { code: 'step_up_failed', message: 'Step-up verification failed.' } };

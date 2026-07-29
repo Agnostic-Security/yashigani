@@ -38,7 +38,12 @@ export async function elevate(api, message) {
         'Content-Type': 'application/json',
         'X-Yashigani-Plane': api.sessionKind,
       },
-      body: JSON.stringify({ totp: code }),
+      // V50-023: server's StepUpRequest (routes/auth.py) requires `totp_code`,
+      // not `totp` — same client/server contract mismatch as api-client.js's
+      // built-in step-up interceptor. Second site of the same bug: this helper
+      // gates RBAC policy force-push, RBAC group/member mutations, and SCIM
+      // interactive writes (see module docstring above).
+      body: JSON.stringify({ totp_code: code }),
     });
     return resp.ok;
   } catch {

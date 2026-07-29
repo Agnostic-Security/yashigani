@@ -138,11 +138,21 @@ class YsAdminAgentPolicies extends LitElement {
     this._actionResult = null;
     try {
       const { tenant_id, system_id, selected_template_id } = this._applyDialog;
-      const result = await this.api.mutate(
-        'POST',
+      // V50-023 sibling: this previously called mutate('POST', path, body) — a
+      // 3-arg positional call that does NOT match ApiClient.mutate(path, opts).
+      // `path` silently became the literal string 'POST' (this.basePath + 'POST'),
+      // `opts` became the path string (destructured as {method,body,...} off a
+      // string yields all defaults), and `body` was dropped entirely — the
+      // request never reached the real endpoint and never carried a body.
+      const res = await this.api.mutate(
         `/admin/agent-policies/${encodeURIComponent(tenant_id)}/${encodeURIComponent(system_id)}/apply`,
-        { template_id: selected_template_id, overrides: {}, acknowledgements: [] },
+        { method: 'POST', body: { template_id: selected_template_id, overrides: {}, acknowledgements: [] } },
       );
+      if (!res.ok) {
+        this._actionResult = { ok: false, message: (res.error && res.error.message) || 'Apply failed' };
+        return;
+      }
+      const result = res.data || {};
       this._actionResult = {
         ok: true,
         message: `Template applied. Granted prefixes: ${(result.granted_prefixes || []).join(', ')}`,
@@ -161,11 +171,15 @@ class YsAdminAgentPolicies extends LitElement {
       'Grant absence in OPA data is the kill switch — egress will be denied until a template is re-applied.'
     )) return;
     try {
-      await this.api.mutate(
-        'DELETE',
+      // V50-023 sibling: same wrong positional-args call as _applyTemplate above.
+      const res = await this.api.mutate(
         `/admin/agent-policies/${encodeURIComponent(row.tenant_id)}/${encodeURIComponent(row.system_id)}/grant`,
-        null,
+        { method: 'DELETE' },
       );
+      if (!res.ok) {
+        this.app?.toast((res.error && res.error.message) || 'Revoke failed.', 'error');
+        return;
+      }
       this.app?.toast(`Grant revoked for ${row.system_id}`, 'success');
       await this._load();
     } catch (e) {

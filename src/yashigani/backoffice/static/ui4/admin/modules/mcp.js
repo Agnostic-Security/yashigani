@@ -143,7 +143,12 @@ export class YsAdminMcp extends LitElement {
     };
     const res = await this.api.mutate(`${SERVERS_BASE}/import`, {
       method: 'POST',
-      body: JSON.stringify(body),
+      // ApiClient.mutate() JSON.stringifies `body` itself (api-client.js §2.6);
+      // passing an already-stringified body here double-encoded the JSON, so
+      // FastAPI received a string literal instead of an object and 422'd
+      // ImportMcpServerRequest every time. Same client/server contract-mismatch
+      // class as V50-023 — pass the plain object.
+      body,
     });
     this._importing = false;
     if (res.ok) {

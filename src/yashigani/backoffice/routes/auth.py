@@ -1255,10 +1255,17 @@ async def logout_redirect(
 
     Behaviour:
       - Valid session (admin or user): invalidate in Redis, clear both cookies,
-        redirect to /login.
+        redirect to the caller's tier-appropriate login page (/admin/login for
+        admin, /login for user).
       - No session / expired session: clear cookies defensively, redirect to /login.
         (Not a security issue: if there is nothing to invalidate, forcing the user
         back to /login is correct.)
+
+    V50-024: this previously hardcoded redirect_to=/login for BOTH tiers, so an
+    admin logging out landed on the end-user login page. Fixed by keying the
+    redirect target off the admin cookie's presence in the request (captured
+    before cookie clearance) — the strongest available tier signal, since an
+    already-expired session may no longer resolve via store.get().
 
     Security: this is a GET handler that modifies state.  The CSRF risk is accepted
     because:
@@ -1271,6 +1278,12 @@ async def logout_redirect(
     only that one session was revoked.  Now BOTH cookie slots are checked and every
     distinct token is independently invalidated server-side.
     """
+    # V50-024: capture the tier signal BEFORE cookies are cleared. The admin
+    # cookie's presence in the request — not the invalidated session's
+    # account_tier — is used because an already-expired session may no longer
+    # resolve via store.get() by the time we get to it below.
+    _is_admin_tier = request.cookies.get(_SESSION_COOKIE) is not None
+
     # WA-10: collect every distinct session token present in the request.
     # The original code used user-cookie-first priority, leaving the admin session
     # live when both cookies were present.  Enumerate ALL slots.
@@ -1295,7 +1308,10 @@ async def logout_redirect(
             # Session already expired / gone — still clear the cookies.
             pass
 
-    redirect = _RedirectResponse(url="/login", status_code=302)
+    # V50-024: admin-tier sessions must land back on /admin/login, not the
+    # end-user /login page.
+    redirect_to = "/admin/login" if _is_admin_tier else "/login"
+    redirect = _RedirectResponse(url=redirect_to, status_code=302)
     # WA-10: use _clear_session_cookie (not delete_cookie) so the clearance
     # directive carries Secure; HttpOnly; Path=/ — required for __Host- cookies.
     _clear_session_cookie(redirect, _SESSION_COOKIE)
