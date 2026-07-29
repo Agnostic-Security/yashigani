@@ -434,6 +434,22 @@ async def _handle_mcp_call_inner(
             content={"error": "INVALID_JSON"},
         )
 
+    # YSG-RISK-146: a JSON-RPC message MUST be a JSON object. A syntactically
+    # valid but non-object top-level value (e.g. `42`, `null`, `"x"`, `[1,2]`)
+    # parses fine via json.loads() but crashes below with an unhandled
+    # AttributeError/TypeError (msg.get(...) on a list/int/str/None) — an
+    # unauthenticated malformed-body 500 instead of a 400. Reject fail-fast.
+    if not isinstance(msg, dict):
+        logger.warning(
+            "mcp-runtime: malformed JSON-RPC body (not a JSON object) agent=%r "
+            "type=%s",
+            agent_name, type(msg).__name__,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"error": "INVALID_JSON_RPC_MESSAGE", "detail": "JSON-RPC message must be a JSON object"},
+        )
+
     method = msg.get("method", "")
     params = msg.get("params") or {}
     msg_id = msg.get("id")  # None for notifications
