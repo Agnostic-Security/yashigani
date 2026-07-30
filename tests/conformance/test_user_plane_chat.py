@@ -951,12 +951,17 @@ class TestUserMemory:
         r = admin_client_with_user_cookie.get("/user/memory")
         assert r.status_code == 403
 
-    def test_user_phase3_stub(self, user_client):
+    def test_user_phase3_stub_honest_501(self, user_client):
+        """YSG-RISK-156 CLOSED: /user/memory (per-user Letta memory, Phase 3
+        / RISK-107) was a plain 200 with `entries: []` + a "not yet
+        configured" note — a caller checking only the HTTP status would
+        read that as "success, zero entries", not "not built yet". Deferred
+        past 4.1.2 (needs the Phase-3 NHI/SVID mesh + per-user Letta
+        container) — now an honest 501. See
+        test_tom_ysg_risk_156_157_honest_stub_endpoints.py."""
         r = user_client.get("/user/memory")
-        assert r.status_code == 200
-        body = r.json()
-        assert body["configured"] is False
-        assert body["entries"] == []
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
 
 
 class TestUserDocumentsUpload:

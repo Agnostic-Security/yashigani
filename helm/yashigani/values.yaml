@@ -460,7 +460,35 @@ gateway:
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
-    ollamaUrl: "http://yashigani-ollama:11434"
+    # YSG-RISK-128 fix: this MUST match docker-compose.yml's gateway/backoffice
+    # OLLAMA_BASE_URL (https://caddy:11435/ollama) — the NetworkPolicy hardening
+    # in networkpolicy.yaml (v4.1 Phase 1b-ii / LAURA-I1-01) removed the direct
+    # gateway/backoffice -> yashigani-ollama:11434 ingress rule; ONLY the caddy
+    # pod may reach ollama:11434 now (allow-ollama-ingress). This default was
+    # never updated in lockstep when that NetworkPolicy hardening landed, so
+    # every k8s gateway Ollama call (direct-model chat AND the fallback local
+    # backend behind every agent route) was silently dropped by NetworkPolicy
+    # (TCP connect timeout, no RST — indistinguishable from a dead backend
+    # without packet-level inspection). ollama_async_client/ollama_sync_client
+    # (inspection/_ollama_transport.py) already handle this mesh-mTLS URL
+    # scheme (used for the "Mac Metal" front too) — this is a values-only fix,
+    # no code change needed. See caddy.yaml Service (port 11435 added) +
+    # networkpolicy.yaml (already correct, unchanged by this fix).
+    #
+    # YSG-RISK-128 FOLLOW-UP (live-verification catch, same day): the first cut
+    # of this fix pointed at hostname "yashigani-caddy" — but that's the MAIN
+    # LoadBalancer Service (public edge, only ports 80/443, deliberately never
+    # carries the internal mesh port — see agent-ingress-fronts.yaml's own
+    # "NEVER on the public LoadBalancer Service" rationale). Port 11435 was
+    # added to a SEPARATE, purpose-built ClusterIP Service,
+    # "yashigani-caddy-mesh" (same file), specifically so it would NOT land on
+    # the public LB. The hostname here must match THAT service, not the main
+    # one. Confirmed live: yashigani-caddy:11435 timed out (Service has no
+    # such port — direct pod-IP connect to the same caddy pod succeeded
+    # instantly, isolating this as a Service-definition/hostname mismatch, not
+    # a NetworkPolicy or pod-readiness issue); yashigani-caddy-mesh:11435
+    # connects immediately.
+    ollamaUrl: "https://yashigani-caddy-mesh:11435/ollama"
     redisHost: "yashigani-redis"
     redisPort: "6379"
     agentRoutingEnabled: "true"

@@ -295,11 +295,13 @@ class TestBudgetUsageTreeInventory:
     def test_usage_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/usage/x").status_code == 401
 
-    # GAP-CLOSED: GET /admin/budget/tree
-    def test_tree_admin_200(self, admin_client):
+    # YSG-RISK-157 CLOSED: GET /admin/budget/tree is an honest 501, not a
+    # misleading 200/empty-tree stub — see test_tom_ysg_risk_156_157_honest_
+    # stub_endpoints.py.
+    def test_tree_admin_501_not_implemented(self, admin_client):
         r = admin_client.get("/admin/budget/tree")
-        assert r.status_code == 200
-        assert r.json()["tree"] == []
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
 
     def test_tree_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/tree").status_code == 401

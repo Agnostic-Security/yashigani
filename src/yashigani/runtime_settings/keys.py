@@ -32,6 +32,16 @@ class SettingMeta:
     allowed_type: str          # 'int' | 'float' | 'bool' | 'string'
     env_var: str               # env var that seeds this on first boot
     class_default: Any         # value used when env var is absent
+    # YSG-RISK-155: numeric settings previously had NO bounds — an admin
+    # could set gateway.ddos.window_seconds=0 (division-by-zero in the
+    # windowed counter) or gateway.ratelimit.per_user_rps=-1 (negative token
+    # bucket refill) or an absurdly large value, with only a type coercion
+    # in between. min_value/max_value are enforced by
+    # RuntimeSettingsService.set() (service.py _validate_bounds) — None means
+    # "no bound on that side" (used for bool/string settings and any
+    # numeric setting that genuinely has no natural limit).
+    min_value: float | None = None
+    max_value: float | None = None
 
 
 #: All settings managed by RuntimeSettingsService.
@@ -47,6 +57,10 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         allowed_type="float",
         env_var="YASHIGANI_RATE_LIMIT_PER_USER_RPS",
         class_default=100.0,
+        # Must be strictly positive (0 or negative would stall/invert the
+        # token-bucket refill); upper bound is a generous sanity ceiling.
+        min_value=0.01,
+        max_value=1_000_000.0,
     ),
     SettingMeta(
         key=KEY_DDOS_PER_IP_LIMIT,
@@ -58,6 +72,8 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         allowed_type="int",
         env_var="YASHIGANI_DDOS_PER_IP_LIMIT",
         class_default=5000,
+        min_value=1,
+        max_value=10_000_000,
     ),
     SettingMeta(
         key=KEY_DDOS_WINDOW_SECONDS,
@@ -69,6 +85,10 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         allowed_type="int",
         env_var="YASHIGANI_DDOS_WINDOW_SECONDS",
         class_default=60,
+        # A 0-or-negative window would divide-by-zero / invert the fixed-window
+        # counter; upper bound caps it at one day.
+        min_value=1,
+        max_value=86_400,
     ),
     SettingMeta(
         key=KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST,

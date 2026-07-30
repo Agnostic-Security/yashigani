@@ -31,6 +31,7 @@ import urllib.parse
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -165,7 +166,7 @@ def test_lr01_login_no_next_lands_at_admin():
     FAIL: final URL is '/' (root) — bug reproduced.
     """
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -186,7 +187,7 @@ def test_lr01_login_no_next_lands_at_admin():
 def test_lr02_empty_next_falls_back_to_admin():
     """Empty ?next= value — safeNext('') must return null; fallback to /admin/."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -211,7 +212,7 @@ def test_lr03_legitimate_next_lands_at_target():
     FAIL: redirect to /admin/ (ignoring next) or /login.
     """
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -240,7 +241,7 @@ def test_lr04_open_redirect_backslash_bypass_rejected():
     FAIL: final URL contains 'attacker.com' or location is off-origin.
     """
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -266,7 +267,7 @@ def test_lr04_open_redirect_backslash_bypass_rejected():
 def test_lr05_open_redirect_double_slash_rejected():
     """?next=//attacker.com must NOT redirect off-origin."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -287,7 +288,7 @@ def test_lr05_open_redirect_double_slash_rejected():
 def test_lr06_open_redirect_javascript_scheme_rejected():
     """?next=javascript:alert(1) must NOT execute JS redirect."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 
@@ -312,7 +313,7 @@ def test_lr06_open_redirect_javascript_scheme_rejected():
 def test_lr07_open_redirect_absolute_https_rejected():
     """?next=https://attacker.com must NOT redirect to attacker.com."""
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 

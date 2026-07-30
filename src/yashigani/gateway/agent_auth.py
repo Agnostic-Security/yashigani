@@ -114,8 +114,19 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 status=401,
             )
 
-        # Registry must be available
-        if self._registry is None:
+        # Registry must be available.
+        # YSG-RISK-131: self._registry is snapshotted BY VALUE at __init__
+        # time (gateway-app build). If the cold-boot RBAC/Agent Redis init
+        # raced a k8s DNS-not-ready window and failed, this stays None for
+        # the process lifetime unless something else keeps trying — fall
+        # back to gateway_fallback_state.agent_registry, which
+        # redis_selfheal.py keeps updated independently after a successful
+        # lazy reconnect (see gateway/state.py docstring).
+        registry = self._registry
+        if registry is None:
+            from yashigani.gateway.state import gateway_fallback_state
+            registry = gateway_fallback_state.agent_registry
+        if registry is None:
             logger.error("AgentAuthMiddleware: no agent_registry configured")
             return await self._reject(
                 request,
@@ -126,7 +137,7 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
             )
 
         # Verify PSK token
-        if not self._registry.verify_token(caller_agent_id, plaintext_token):
+        if not registry.verify_token(caller_agent_id, plaintext_token):
             return await self._reject(
                 request,
                 caller_agent_id=caller_agent_id,
@@ -136,7 +147,7 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
             )
 
         # IP allowlist check — only if the agent has CIDRs configured
-        agent = self._registry.get(caller_agent_id)
+        agent = registry.get(caller_agent_id)
         if agent is not None:
             allowed_cidrs = agent.get("allowed_cidrs") or []
             if allowed_cidrs:

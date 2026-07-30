@@ -33,7 +33,10 @@
 #                     and /admin4/ (redirect alias). Full strict policy + Trusted
 #                     Types (yashigani-render, dompurify, lit-html, drawflow-label).
 #                     Add every new 4.0 user-facing route prefix here before
-#                     deployment.
+#                     deployment — BOTH the exact path (if the FastAPI route has
+#                     no trailing slash, e.g. `/chat`) AND the `/*` wildcard (for
+#                     future sub-paths). A wildcard-only entry silently never
+#                     matches an exact-registered route — see YSG-RISK-147.
 
 (csp-policies) {
     # Lenient exception 1: observability sub-apps (third-party SPAs)
@@ -60,7 +63,17 @@
 
     # Strict + Trusted Types: 4.0 first-party paths.
     # Four named TT policies: yashigani-render, dompurify, lit-html, drawflow-label.
-    @strict_tt path /admin/ /admin4/ /chat/* /user/* /flow/* /agents/* /builder/* /workflows/*
+    #
+    # YSG-RISK-147 fix: /chat, /agents, /builder, /workflows are registered in
+    # backoffice as EXACT routes (src/yashigani/backoffice/routes/user_ui.py
+    # @router.get("/chat"|"/agents"|"/builder"|"/workflows"), no trailing
+    # slash, no sub-paths. The `/chat/*` style wildcard-only entries below
+    # NEVER matched the real page — Caddy's path matcher does not fold an
+    # exact prefix into its own `/*` wildcard. Laura found the live page
+    # served with zero CSP. Both the exact path AND the wildcard are kept:
+    # exact for the page as it exists today, wildcard in case a sub-route
+    # (e.g. /agents/new) is added later without another matcher-parity bug.
+    @strict_tt path /admin/ /admin4/ /chat /chat/* /agents /agents/* /builder /builder/* /workflows /workflows/* /user/* /flow/*
 
     # frame-src 'self': explicit (default-src 'self' already implies it, but
     # stated for clarity -- admin pages iframe /admin/grafana/, /admin/wazuh/,

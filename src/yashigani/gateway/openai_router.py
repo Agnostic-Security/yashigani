@@ -206,6 +206,22 @@ def _deny_message(reason: str) -> str:
     return _DENY_MESSAGES.get(reason, _GENERIC_DENY)
 
 
+def _agent_token_secrets_root():
+    """Root directory for per-bundled-agent gateway token files
+    (V232-CSCAN-01a resolve-and-confine guard). Returns a pathlib.Path.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare ``Path("/run/secrets")`` literal with no override, the same
+    convention-bypass class as YSG-RISK-150 (and inconsistent with
+    ``_load_token_role_map``'s ``_secrets_dir`` in this same module, which
+    already honoured the env var). Resolved at call time (not import time)
+    so tests can monkeypatch YASHIGANI_SECRETS_DIR without a module reload.
+    """
+    from pathlib import Path as _Path
+
+    return _Path(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")).resolve()
+
+
 # ---------------------------------------------------------------------------
 # LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
 # ---------------------------------------------------------------------------
@@ -220,9 +236,22 @@ def _deny_message(reason: str) -> str:
 # re.ASCII ensures the char-class [a-zA-Z0-9] is strictly 7-bit ASCII; no
 # Unicode letter/digit will match.  \Z (not $) anchors the end to prevent
 # a trailing \n from slipping through (Python's $ matches before a terminal \n).
-# Callers with @-prefix (agent calls) are exempted BEFORE _validate_model_string
-# is invoked, so @ appears in the allowlist only for digest formats (model@sha256:…).
+# @ appears in the allowlist for digest formats (model@sha256:…) and — since
+# YSG-RISK-158 — as the FIRST character for agent-call handles, validated
+# below by _AGENT_CALL_VALID_RE (see _validate_model_string).
 _MODEL_VALID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
+
+# YSG-RISK-158: agent-call handles ("@agent-name") were previously EXEMPTED
+# from _validate_model_string entirely at the call site (openai_router.py,
+# `if body.model and not is_agent_call ...`), because _MODEL_VALID_RE anchors
+# the first character to [a-zA-Z0-9] — an "@"-prefixed string always failed
+# that regex. Skipping validation for ANY string starting with "@" let a
+# caller smuggle URL-scheme forms, path-traversal sequences, null-sentinel
+# literals, or Unicode Cf/control chars past every LAURA-412-002 defense —
+# agent-call spoofing. Fix: validate the @-prefixed form HERE, in the
+# validator, with the same charset applied to the remainder after "@"
+# (non-empty), instead of bypassing validation at the call site.
+_AGENT_CALL_VALID_RE = re.compile(r"^@[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
 
 
 def _validate_model_string(model: str) -> Optional[str]:
@@ -264,6 +293,17 @@ def _validate_model_string(model: str) -> Optional[str]:
         return "path_traversal_not_allowed"
     if s_lower in ("null", "none", "undefined"):
         return "null_not_allowed"
+    # YSG-RISK-158: agent-call handles ("@agent-name") go through the SAME
+    # gate — the URL-scheme/path-traversal/null-sentinel checks above already
+    # ran unconditionally against the full string (including the "@"), so an
+    # agent-call payload like "@http://evil" or "@../../etc/passwd" is caught
+    # above exactly like an ordinary model string would be. Only the final
+    # charset check needs an @-aware branch, because _MODEL_VALID_RE anchors
+    # the first character to alnum.
+    if s.startswith("@"):
+        if not _AGENT_CALL_VALID_RE.match(s):
+            return "invalid_model"
+        return None
     # LAURA-412-002 (layer 1): positive allowlist — reject anything outside
     # the ASCII-safe model-name charset.
     if not _MODEL_VALID_RE.match(s):
@@ -1770,8 +1810,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if _state.budget_enforcer and identity:
         from yashigani.billing.budget_enforcer import BudgetState
         allocation = _state.budget_enforcer.get_allocation(identity_id, "cloud")
-        budget_state = _state.budget_enforcer.check(
+        # YSG-RISK-144: check_hierarchy (not check) — the documented
+        # individual<=group<=org invariant was never enforced because the
+        # per-request path only ever checked the identity's OWN allocation.
+        # An identity within its own budget but over its group/org cap was
+        # never denied/degraded. group_ids/org_id come straight off the
+        # already-resolved identity dict (identity registry populates both).
+        budget_state = _state.budget_enforcer.check_hierarchy(
             identity_id, "cloud", budget_total=allocation,
+            group_ids=identity.get("groups") or [],
+            org_id=identity.get("org_id", "") or "",
         )
         budget_signal = budget_state.signal.value
         budget_pct = budget_state.pct
@@ -1794,10 +1842,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── LAURA-411-002 / Ava FINDING-1: model input validation + normalization ──
     # Runs BEFORE RBAC deny and optimisation so URL/path/null variants cannot
     # bypass the deny check by triggering the silent local-default fallback.
-    # Exempt: agent calls (start with @), brain-reasoning leg (server-minted,
-    # no alloc), and calls where body.model is absent (explicit default-model
-    # path — preserved per brief).
-    if body.model and not is_agent_call and not brain_reasoning_leg:
+    #
+    # YSG-RISK-158: agent calls (@-prefix) are NO LONGER exempted from
+    # _validate_model_string itself — the @-prefix exemption now lives INSIDE
+    # the validator (see _validate_model_string / _AGENT_CALL_VALID_RE), so an
+    # agent-call payload gets the SAME positive-validation gate (URL-scheme,
+    # path-traversal, null-sentinel, ASCII charset) as any other model string.
+    # Only brain-reasoning-leg (server-minted, no user-supplied value) and an
+    # absent body.model (explicit default-model path — preserved per brief)
+    # skip validation entirely.
+    if body.model and not brain_reasoning_leg:
         _mv_err = _validate_model_string(body.model)
         if _mv_err is not None:
             logger.warning(
@@ -1814,6 +1868,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     }
                 },
             )
+    # Normalization + known-model gating stay agent-call-exempt: an @-handle
+    # is an agent identifier resolved via agent_registry, not an LLM model
+    # name, so provider/model normalization and the alias/installed-model
+    # allowlist check below do not apply to it.
+    if body.model and not is_agent_call and not brain_reasoning_leg:
         # Normalize: lowercase + provider/model → provider:model.
         # The normalized form flows through optimisation and RBAC;
         # body.model (original) is retained for audit/logging.
@@ -2059,6 +2118,34 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     agent_upstream = None
     agent_protocol = "openai"
+    if is_agent_call and not _state.agent_registry:
+        # YSG-RISK-129: is_agent_call=True but the agent_registry dependency
+        # itself is unavailable (e.g. Redis-backed registry down/not yet
+        # initialized). Without this guard, agent_upstream stays None, the
+        # resolution block below is skipped entirely (its own `if not
+        # agent_upstream: return 404` guard at the end of that block never
+        # runs because the block is gated on `_state.agent_registry` too),
+        # AND — further down — BOTH the `if is_agent_call and agent_upstream`
+        # buffered-agent branch and the `if not is_agent_call` cloud/local
+        # branch are skipped, falling straight through with `assistant_content`
+        # / `backend_body` never assigned → UnboundLocalError instead of a
+        # clean error. Fail closed here with a well-formed 503 immediately.
+        logger.error(
+            "Agent call %s received but agent_registry is unavailable "
+            "(backend dependency down) request_id=%s",
+            selected_model, request_id,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "Agent registry is temporarily unavailable. Please try again shortly.",
+                    "type": "agent_error",
+                    "agent": selected_model,
+                    "code": "agent_registry_unavailable",
+                }
+            },
+        )
     if is_agent_call and _state.agent_registry:
         agent_name = selected_model[1:]  # strip @
 
@@ -3190,6 +3277,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             use_streaming = False
             logger.info("Streaming disabled: PII mode=%s requires buffered response inspection", _state.pii_detector.mode.value)
 
+    # YSG-RISK-129: assistant_content/backend_body are only ever assigned
+    # inside individual success-path branches of the try block below (agent
+    # letta/langflow/openai-compat, cloud openai/anthropic, local ollama).
+    # Every branch either assigns them, returns a JSONResponse directly, or
+    # raises (propagating out of this function immediately via the except
+    # clauses below). Initializing them to None here — rather than leaving
+    # them undefined — turns "some future/edge branch falls through without
+    # assigning or returning/raising" from an UnboundLocalError crash into a
+    # detectable, fail-closed state that the guard right after the try/except
+    # converts into a clean 502.
+    assistant_content: str | None = None
+    backend_body: dict | None = None
+
     try:
         import httpx
 
@@ -3232,10 +3332,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 _total = pt + ct
                 if _state.budget_enforcer and selected_provider != "ollama" and identity:
                     try:
+                        # YSG-RISK-144: pass group_ids/org_id so the group and
+                        # org counters actually accumulate usage — previously
+                        # omitted, meaning check_hierarchy's group/org lookups
+                        # would always read 0 usage regardless of configured caps.
                         _state.budget_enforcer.record(
                             identity_id=identity_id,
                             provider=selected_provider,
                             tokens=_total,
+                            group_ids=identity.get("groups") or [],
+                            org_id=identity.get("org_id", "") or "",
                         )
                     except Exception as _exc:
                         logger.warning("Streaming budget recording failed: %s", _exc)
@@ -3397,7 +3503,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
                 # Read agent auth token from env var or secrets file
                 import os
-                from pathlib import Path as _Path
                 agent_headers: dict[str, str] = {"Content-Type": "application/json"}
                 # Check env var first (e.g., OPENCLAW_GATEWAY_TOKEN), then secrets file
                 env_token = os.getenv(f"{agent_name_lower.upper()}_GATEWAY_TOKEN", "")
@@ -3407,7 +3512,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     # constrained by AgentRegisterRequest.name pattern='^[a-z][a-z0-9_-]{0,63}$',
                     # but we guard here too as defence-in-depth against pre-existing registry
                     # entries that predate the pattern constraint (CWE-22).
-                    _secrets_root = _Path("/run/secrets").resolve()
+                    # YSG-RISK-160: secrets root now honours YASHIGANI_SECRETS_DIR
+                    # (see _agent_token_secrets_root() docstring).
+                    _secrets_root = _agent_token_secrets_root()
                     _token_path = (_secrets_root / f"{agent_name_lower}_token").resolve()
                     if not _token_path.is_relative_to(_secrets_root):
                         logger.warning(
@@ -3654,6 +3761,25 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             detail="Backend communication error",
         )
 
+    # YSG-RISK-129: fail-closed backstop. The try block above either assigns
+    # assistant_content/backend_body on a success path, returns a JSONResponse
+    # directly, or raises HTTPException (which exits the function immediately
+    # via the except clauses above and never reaches this line). Reaching here
+    # with either variable still None means some branch fell through without
+    # assigning, returning, or raising — treat that as a backend failure and
+    # respond cleanly instead of crashing downstream with UnboundLocalError.
+    if assistant_content is None or backend_body is None:
+        logger.error(
+            "chat_completions: no backend branch produced a response "
+            "(request_id=%s, is_agent_call=%s, agent_upstream=%r, "
+            "selected_provider=%s) — fail-closed 502",
+            request_id, is_agent_call, agent_upstream, selected_provider,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Backend communication error",
+        )
+
     # ── 7b. Response inspection ───────────────────────────────────────
     # Inspect assistant_content as plain text — we care about what the model
     # *said*, not the JSON envelope wrapping it. Using "text/plain" ensures
@@ -3860,10 +3986,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # Record token usage in budget system
     if _state.budget_enforcer and selected_provider != "ollama":
         try:
+            # YSG-RISK-144: pass group_ids/org_id — see streaming _usage_callback
+            # above for why (group/org counters were never incremented before).
             _state.budget_enforcer.record(
                 identity_id=identity_id,
                 provider=selected_provider,
                 tokens=total_tokens,
+                group_ids=(identity.get("groups") or []) if identity else [],
+                org_id=(identity.get("org_id", "") or "") if identity else "",
             )
         except Exception as exc:
             logger.warning("Budget recording failed: %s", exc)

@@ -313,6 +313,25 @@ class PostgresSink(AuditSink):
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
 
+    async def drain_now(self) -> int:
+        """Force-drain whatever is currently queued (admin flush — YSG-RISK-148,
+        DELETE /admin/audit/sinks/queue). Only drains what is already queued at
+        call time (does not wait for new arrivals); the background
+        ``_drain_loop`` keeps running independently and both consumers pull
+        safely from the same ``asyncio.Queue`` within the same event loop.
+
+        Returns the number of events flushed.
+        """
+        batch: list[dict] = []
+        while True:
+            try:
+                batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if batch:
+            await self._flush_batch(batch)
+        return len(batch)
+
 
 class SiemSink(AuditSink):
     """
@@ -429,6 +448,38 @@ class SiemSink(AuditSink):
 
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
+
+    async def drain_now(self, max_events: int = 10_000) -> int:
+        """Force-drain the Redis queue now (admin flush — YSG-RISK-148,
+        DELETE /admin/audit/sinks/queue). Delivers each popped event directly
+        (no exponential-backoff retry loop — that pipeline belongs to the
+        background SiemWorker; this is a best-effort one-shot admin flush).
+        A delivery failure here is logged and counted but the event is NOT
+        re-queued or DLQ'd by this path — it has already been popped.
+
+        Bounded by max_events per call so a pathological queue depth cannot
+        make this request run unboundedly; call again to continue draining.
+        Returns the number of events popped (attempted, not necessarily
+        successfully delivered).
+        """
+        if self._redis is None:
+            return 0
+        count = 0
+        for _ in range(max_events):
+            raw = self._redis.lpop(self._queue_key)
+            if raw is None:
+                break
+            count += 1
+            try:
+                event = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                await self._deliver_direct(event)
+            except Exception as exc:  # noqa: BLE001 — one popped event must not abort the drain loop
+                logger.warning(
+                    "SiemSink(%s) drain_now: failed to deliver popped event — %s",
+                    self._sink_name, exc,
+                )
+        self._update_queue_gauge()
+        return count
 
 
 # ---------------------------------------------------------------------------
@@ -724,4 +775,24 @@ class MultiSinkAuditWriter:
             result[sink.name] = {
                 "last_write": ts.isoformat() if ts else None,
             }
+        return result
+
+    async def drain_queues(self) -> dict:
+        """Force-drain every sink's pending queue now (admin flush —
+        YSG-RISK-148, DELETE /admin/audit/sinks/queue). Returns
+        {sink.name: events_drained} for sinks that expose a queue to drain
+        (PostgresSink, SiemSink); sinks with no queue (FileSink writes
+        synchronously) are simply omitted from the result — never fabricated
+        as a 0.
+        """
+        result: dict[str, int] = {}
+        for sink in self._sinks:
+            drain = getattr(sink, "drain_now", None)
+            if drain is None:
+                continue
+            try:
+                result[sink.name] = await drain()
+            except Exception as exc:  # noqa: BLE001 — one sink failing must not abort the fan-out
+                logger.error("Sink %s drain_now error: %s", sink.name, exc)
+                result[sink.name] = -1
         return result

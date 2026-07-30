@@ -32,10 +32,14 @@ from pathlib import Path
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
     get_admin_credentials,
+    get_admin_totp_code,
+    _wait_for_fresh_totp_window,
+    _api_totp_last_used,
 )
 
 # ---------------------------------------------------------------------------
@@ -66,32 +70,40 @@ def _tls_args(chromium) -> dict:
 def _do_login(page, username: str, password: str) -> None:
     """Log in via the admin login form.  Handles the force-password-change
     redirect only when it appears — if the password is already rotated the
-    test won't enter the change flow."""
+    test won't enter the change flow.
+
+    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): this
+    previously (a) looked for input[name='totp'] -- the real field is
+    id="totp_code"/name="totp_code" -- so totp_field was always None and NO
+    code was ever submitted; (b) even when found, used bare
+    pyotp.TOTP(secret).now() (SHA-1/6-digit default), which is WRONG for the
+    admin tier (SHA-512/8-digit, see conftest.get_admin_totp_code() F9 note);
+    (c) _read_totp_secret() used parents[4], one level above the repo root
+    (off-by-one, same class of bug fixed in test_v233_webauthn_e2e.py).
+    Net effect: login could never complete, so page.wait_for_url() always hit
+    its 10s timeout, failing every test in this file. Now reuses the shared,
+    correct conftest helpers (also respects the 62s TOTP-replay window)."""
+    _wait_for_fresh_totp_window(admin=1)
     page.goto(f"{BASE_URL}/admin/login")
     page.fill("input[name='username']", username)
     page.fill("input[name='password']", password)
-
-    # TOTP field may or may not be present depending on provisioning state
-    totp_field = page.query_selector("input[name='totp']")
-    if totp_field:
-        # Read TOTP secret and compute a code
-        try:
-            totp_secret = _read_totp_secret("admin1_totp_secret")
-            import pyotp
-            code = pyotp.TOTP(totp_secret).now()
-            page.fill("input[name='totp']", code)
-        except Exception:
-            pass  # skip TOTP if not provisioned yet
-
+    page.fill("#totp_code", get_admin_totp_code())
+    _api_totp_last_used[1] = time.time()
     page.click("button[type='submit']")
     # Allow redirect to settle
     page.wait_for_url(re.compile(r"/admin/"), timeout=10_000)
-
-
-def _read_totp_secret(name: str) -> str:
-    repo_root = Path(__file__).parents[4]
-    p = repo_root / "docker" / "secrets" / name
-    return p.read_text(encoding="utf-8").strip()
+    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the ui4 SPA
+    # bootstraps its nav asynchronously (module-registry / admin-nav.js) after
+    # the URL changes -- wait_for_url alone races the nav render, so an
+    # immediate query_selector("a[href='#backup']") right after this call can
+    # return None even though the element renders a moment later. Every other
+    # file's login helper either has an equivalent settle wait or relies on a
+    # wait_for_selector() with a generous timeout right after; this one had
+    # neither. Confirmed via test_webui_conformance_full.py's
+    # test_nav_entry_present, which explicitly does
+    # `page.wait_for_timeout(500)` after navigating to /admin/ before
+    # querying nav links.
+    page.wait_for_timeout(500)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +151,7 @@ class TestBackupUI:
     """
 
     def _get_page(self, playwright):
-        browser = playwright.chromium.launch(headless=True, **_tls_args(playwright.chromium))
+        browser = launch_chromium(playwright)
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
         return browser, context, page
@@ -153,8 +165,12 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                # Nav button with data-param="backup"
-                btn = page.query_selector('button[data-param="backup"]')
+                # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9):
+                # same class of stale-selector bug as test_pki_admin_ui.py /
+                # test_documents_admin_ui.py -- 'button[data-param="backup"]'
+                # is pre-ui4-nav-rewrite; the current nav renders
+                # `a[href='#module-id']` (see admin-nav.js/module-registry.js).
+                btn = page.query_selector("a[href='#backup']")
                 assert btn is not None, (
                     "PW-BAK-01 FAIL: Backup nav button not found in DOM after login."
                 )
@@ -174,7 +190,7 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                page.click('button[data-param="backup"]')
+                page.click("a[href='#backup']")
                 # Panel must be visible within 5 seconds
                 panel = page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
                 assert panel is not None, "PW-BAK-02 FAIL: #page-backup panel did not become visible."
@@ -198,7 +214,7 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                page.click('button[data-param="backup"]')
+                page.click("a[href='#backup']")
                 page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
                 # Wait for loading spinner to disappear (up to 8s for async data fetch)
                 page.wait_for_function(
@@ -228,7 +244,7 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                page.click('button[data-param="backup"]')
+                page.click("a[href='#backup']")
                 page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
                 btn = page.wait_for_selector("#btn-verify-latest", timeout=8_000)
                 assert btn is not None, "PW-BAK-04 FAIL: #btn-verify-latest not found."
@@ -251,7 +267,7 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                page.click('button[data-param="backup"]')
+                page.click("a[href='#backup']")
                 page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
                 page.wait_for_function(
                     "() => !document.querySelector('#backup-status-container .loading')",
@@ -326,7 +342,7 @@ class TestBackupUI:
                 browser, ctx, page = self._get_page(pw)
                 try:
                     _do_login(page, username, password)
-                    page.click('button[data-param="backup"]')
+                    page.click("a[href='#backup']")
                     page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
                     page.wait_for_function(
                         "() => !document.querySelector('#backup-status-container .loading')",
@@ -372,7 +388,7 @@ class TestBackupUI:
             browser, ctx, page = self._get_page(pw)
             try:
                 _do_login(page, username, password)
-                page.click('button[data-param="backup"]')
+                page.click("a[href='#backup']")
                 page.wait_for_selector("#page-backup", state="visible", timeout=5_000)
 
                 # Inject XSS payload via JS so apiMutate wires it through

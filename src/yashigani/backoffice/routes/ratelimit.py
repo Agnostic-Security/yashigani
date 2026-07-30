@@ -19,6 +19,7 @@ Last updated: 2026-05-03
 from __future__ import annotations
 
 import datetime
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ from yashigani.backoffice.middleware import AdminSession, require_admin_session
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -171,11 +173,23 @@ async def reset_bucket(bucket_key: str, session: AdminSession):
             detail=payload,
         )
 
-    assert state.audit_writer is not None  # set unconditionally at startup
-    state.audit_writer.write(_config_event(
-        session.account_id, "rate_limit_bucket_reset", bucket_key, "deleted",
-        account_tier=session.account_tier,
-    ))
+    # YSG-RISK-149: the bucket delete above has already succeeded — a missing
+    # audit_writer (e.g. degraded startup, test harness, future code path)
+    # must NOT turn a successful reset into a 500 via an unguarded assert.
+    # Bare `assert` is also stripped entirely under `python -O`, which would
+    # have caused an AttributeError on the next line instead. Guard + log;
+    # the reset response is still 2xx either way.
+    if state.audit_writer is not None:
+        state.audit_writer.write(_config_event(
+            session.account_id, "rate_limit_bucket_reset", bucket_key, "deleted",
+            account_tier=session.account_tier,
+        ))
+    else:
+        logger.warning(
+            "ratelimit reset: audit_writer not configured — "
+            "rate_limit_bucket_reset event NOT recorded for bucket_key=%s account=%s",
+            bucket_key, session.account_id,
+        )
     return {"status": "ok", "bucket_key": bucket_key}
 
 

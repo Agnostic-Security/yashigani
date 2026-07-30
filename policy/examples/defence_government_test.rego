@@ -32,16 +32,21 @@ test_deny_classification_label_missing_key_absent if {
 	"classification_label_missing" in data.clients.gov.decision.deny with input as i
 }
 
-# KNOWN GAP (found while writing this test — same root cause as
-# data_residency_test.rego's test_KNOWN_GAP_empty_string_region_not_caught,
-# flagged for Lu, NOT silently fixed here): `not input.data.classification`
-# only fires when the `classification` key is entirely ABSENT — a defined
-# empty string ("") does not trigger this deny. This test pins the current
-# behaviour rather than asserting the doc comment's stated (but not fully
-# implemented) fail-closed intent.
-test_KNOWN_GAP_empty_string_classification_not_caught_by_missing_check if {
+# YSG-RISK-152 (fixed — same root cause as data_residency_test.rego's
+# equivalent region test): `not input.data.classification` only fired when
+# the `classification` key was entirely ABSENT — a defined empty string ("")
+# did not trigger this deny (though the classification_rank "unknown->99"
+# sentinel happened to catch it indirectly via clearance_below_classification,
+# giving the wrong deny code). Fixed via _classification_blank (missing OR
+# blank/whitespace after trim_space). These tests assert the closed behaviour.
+test_deny_classification_label_missing_empty_string if {
 	i := object.union(_base_input, {"data": {"classification": "", "caveats": [], "compartment": ""}})
-	not "classification_label_missing" in data.clients.gov.decision.deny with input as i
+	"classification_label_missing" in data.clients.gov.decision.deny with input as i
+}
+
+test_deny_classification_label_missing_whitespace_only if {
+	i := object.union(_base_input, {"data": {"classification": "   ", "caveats": [], "compartment": ""}})
+	"classification_label_missing" in data.clients.gov.decision.deny with input as i
 }
 
 test_deny_clearance_below_classification if {
@@ -79,4 +84,38 @@ test_decision_contract_shape if {
 	d := data.clients.gov.decision with input as _base_input
 	d.policy_id == "clients.gov.classification-control"
 	d.code == 403
+}
+
+# --- Additive against-spec coverage (Lu conf/v412-opa-templates) -------------
+# The two documented obligations (two_person_integrity, audit_classified_access)
+# had no assertion in 2d582105's G2 tests.
+
+# TOP SECRET (clearance dominates, local route) => both obligations fire.
+test_obligation_two_person_integrity_top_secret if {
+	i := object.union(_base_input, {
+		"identity": {"clearance": "TOP SECRET", "caveats": [], "compartments": []},
+		"data": {"classification": "TOP SECRET", "caveats": [], "compartment": ""},
+		"routing_decision": {"route": "local"},
+	})
+	d := data.clients.gov.decision with input as i
+	d.allow
+	"two_person_integrity" in d.obligations
+	"audit_classified_access" in d.obligations
+}
+
+# OFFICIAL-SENSITIVE => audit obligation only, NOT two-person integrity.
+test_obligation_audit_classified_access_official_sensitive if {
+	i := object.union(_base_input, {
+		"data": {"classification": "OFFICIAL-SENSITIVE", "caveats": [], "compartment": ""},
+	})
+	d := data.clients.gov.decision with input as i
+	"audit_classified_access" in d.obligations
+	not "two_person_integrity" in d.obligations
+}
+
+# OFFICIAL (lowest) => neither obligation fires.
+test_no_classified_obligations_for_official if {
+	d := data.clients.gov.decision with input as _base_input
+	not "audit_classified_access" in d.obligations
+	not "two_person_integrity" in d.obligations
 }

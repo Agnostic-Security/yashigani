@@ -77,6 +77,7 @@ from typing import Optional
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -97,7 +98,15 @@ skip_no_stack = pytest.mark.skipif(
 # Repo-root helpers
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).parents[4]
+# FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): off-by-one --
+# this file lives at the same depth as conftest.py (src/tests/playwright/),
+# whose _read_secret() correctly uses parents[3] to reach the repo root.
+# parents[4] here pointed ONE level ABOVE the repo root, so every secret read
+# (admin1_username, etc.) 404'd with FileNotFoundError, failing every test in
+# this file at fixture setup. Confirmed directly:
+#   Path(__file__).parents[3] == <repo_root>   (correct)
+#   Path(__file__).parents[4] == <repo_root>/..  (wrong -- pre-existing bug)
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _read_secret(name: str) -> str:
@@ -488,7 +497,7 @@ def browser_page_with_va():
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 

@@ -21,7 +21,21 @@ handler as unreachable dead code. The two endpoints serve different purposes:
 
 SIEM endpoint URL changes still require step-up TOTP (ASVS V6.8.4).
 
-Last updated: 2026-05-02T00:00:00+01:00
+YSG-RISK-142 (2026-07-29): the POST .../config/test route was still
+UNREACHABLE despite the above rename — audit_sinks_router was included in
+app.py AFTER audit_router, and audit.py separately registers a path-param
+route POST /siem/{name}/test at the SAME segment depth. Registration order
+across the whole app (not just within one router) decides same-depth
+collisions, so audit_router's parameterized route was matching
+/admin/audit/siem/config/test with name="config" first. Fixed by moving
+audit_sinks_router's app.include_router() call before audit_router's in
+app.py.
+
+YSG-RISK-148 (2026-07-29): DELETE /admin/audit/sinks/queue was documented
+above since 2026-05-02 but never implemented (always 404). Implemented —
+see drain_audit_queue() below.
+
+Last updated: 2026-07-29T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -140,3 +154,31 @@ async def test_siem(session=Depends(require_admin_session)):
     }
     await sink.write(test_event)
     return {"status": "test_sent", "backend": backend}
+
+
+@audit_sinks_router.delete("/admin/audit/sinks/queue")
+async def drain_audit_queue(session=Depends(require_admin_session)):
+    """YSG-RISK-148 — force-drain any pending audit-sink queues now (admin flush).
+
+    Documented since 2026-05-02 but never implemented (always 404). Drains
+    whatever is currently queued in PostgresSink (asyncpg batch queue) and
+    SiemSink (Redis-backed forwarding queue) without waiting for the next
+    background poll/drain cycle. FileSink writes synchronously and has no
+    queue to drain, so it is simply absent from the response — never
+    fabricated as a 0.
+
+    Fail-closed on an unavailable audit writer (503) rather than a
+    misleading 200/empty response.
+    """
+    from yashigani.backoffice.state import backoffice_state
+    audit_writer = backoffice_state.audit_writer
+    if audit_writer is None:
+        raise HTTPException(status_code=503, detail={"error": "audit_writer_unavailable"})
+    if not hasattr(audit_writer, "drain_queues"):
+        # Legacy/single-sink writer without queueing — nothing to drain, and
+        # nothing wrong: report explicitly rather than pretending a drain ran.
+        return {"status": "no_queued_sinks", "sinks": {}}
+
+    result = await audit_writer.drain_queues()
+    logger.info("Admin %s drained audit sink queues: %s", session.account_id, result)
+    return {"status": "drained", "sinks": result}

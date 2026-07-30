@@ -183,9 +183,24 @@ def _emit_audit(
     capabilities_changed: list[str],
 ) -> None:
     """Write a CAPABILITY_POLICY_CHANGED event to the tamper-evident audit chain."""
+    # YSG-RISK-154: audit_writer being completely UNSET (startup-invariant
+    # violation) was previously an `assert` INSIDE this same try/except — the
+    # assert's AssertionError was silently caught by the broad `except
+    # Exception` right below it, so the "fail-fast" invariant check was
+    # actually fail-OPEN in practice (logged, mutation's caller still got a
+    # clean 200). Check explicitly and raise+propagate (503) instead of
+    # letting it fall into the generic write-failure catch. A genuine
+    # transient write failure (writer present, .write() itself raised) still
+    # falls through to the except below and is logged only — unified per
+    # infrastructure.py / rbac.py siblings.
+    if backoffice_state.audit_writer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "audit_writer_unavailable",
+                    "message": "Capability policy change rejected: the audit subsystem is not available."},
+        )
     try:
         from yashigani.audit.schema import CapabilityPolicyChangedEvent, EventType
-        assert backoffice_state.audit_writer is not None  # set unconditionally at startup
         backoffice_state.audit_writer.write(CapabilityPolicyChangedEvent(
             event_type=EventType.CAPABILITY_POLICY_CHANGED,
             admin_account=admin_account,

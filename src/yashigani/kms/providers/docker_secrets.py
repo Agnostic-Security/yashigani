@@ -38,7 +38,6 @@ from yashigani.kms.base import (
     SecretMetadata,
 )
 
-_SECRETS_DIR = Path("/run/secrets")
 _CLOUD_KEYS_DIR = Path("/run/cloud-keys")
 
 # Explicit allowlist of cloud-provider API key names that may be written at
@@ -67,11 +66,22 @@ class DockerSecretsProvider(KSMProvider):
     def __init__(
         self,
         environment_scope: str,
-        secrets_dir: Path = _SECRETS_DIR,
+        secrets_dir: Optional[Path] = None,
         cloud_keys_dir: Optional[Path] = None,
     ) -> None:
         self._environment_scope = environment_scope
-        self._secrets_dir = secrets_dir
+        # YSG-RISK-160: default resolved at instantiation time (not a frozen
+        # module-level constant baked in at import time) so it honours
+        # YASHIGANI_SECRETS_DIR — the factory (kms/factory.py) never passes
+        # secrets_dir explicitly, so this was silently always "/run/secrets"
+        # regardless of the env var (same convention-bypass class as
+        # YSG-RISK-150). Deferred-to-call-time also means tests can
+        # monkeypatch YASHIGANI_SECRETS_DIR without a module reload.
+        self._secrets_dir = (
+            secrets_dir
+            if secrets_dir is not None
+            else Path(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"))
+        )
         self._cloud_keys_dir = cloud_keys_dir
 
     # -- KSMProvider ---------------------------------------------------------

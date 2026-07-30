@@ -322,6 +322,18 @@ def create_gateway_app(
         lifespan=_lifespan,
     )
 
+    # YSG-RISK-131: expose the SAME `_state` dict every middleware/route in
+    # this module already reads live (`state["key"]` / `state.get("key")`) so
+    # `gateway/redis_selfheal.py` can repopulate it after a cold-boot Redis
+    # failure without this module needing to know anything about self-heal.
+    # Since dicts are mutable and shared by reference, a write to
+    # `app.state.internal_state["rate_limiter"]` (etc.) from outside this
+    # closure is visible to every function below on the very next read — no
+    # separate fallback/singleton needed for anything that already reads
+    # `_state` live (unlike `AgentAuthMiddleware` / `MetricsCollector`, which
+    # snapshot a value at construction — see gateway/state.py).
+    app.state.internal_state = _state
+
     # Security headers
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -360,6 +372,28 @@ def create_gateway_app(
             except Exception as _pp_exc:
                 logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
+
+    # YSG-RISK-131 self-heal: bounded lazy reconnect for every Redis-backed
+    # gateway subsystem that failed to connect at cold boot (e.g. k8s
+    # boot-order race — yashigani-gateway scheduled before yashigani-redis,
+    # see gateway/redis_selfheal.py docstring for full context). Registered
+    # AFTER security_headers (above) so — per Starlette's "last-registered
+    # decorator middleware is outermost" ordering — this runs BEFORE
+    # security_headers on the way in, meaning a same-request reconnect is
+    # visible to security_headers' own capability_policy_store/rbac_store
+    # read, and to every downstream route (openai_router's chat-completions
+    # handler is the innermost layer, so it always sees the post-self-heal
+    # state within the SAME request). Excluded from /healthz and /metrics so
+    # the container health probe never blocks on a Redis reconnect attempt.
+    # No-ops (pure None-checks, zero Redis round-trips) once every subsystem
+    # is healthy, and each subsystem is independently cooldown-gated while
+    # unhealthy so an outage cannot turn into a reconnect storm.
+    @app.middleware("http")
+    async def gateway_redis_selfheal_middleware(request: Request, call_next):
+        if request.url.path not in ("/healthz", "/metrics"):
+            from yashigani.gateway.redis_selfheal import maybe_selfheal
+            await maybe_selfheal(_state)
+        return await call_next(request)
 
     # Internal health check — used by Caddy and container health probe
     @app.get("/healthz")
@@ -645,15 +679,78 @@ async def _proxy_request_body(
     # auth-sensitive processing (rate limiting, OPA, audit).
     # For requests handled by openai_router or mcp_router_runtime (mounted as
     # extra_routers), request.state.ysg_principal is already set by those handlers.
-    # For the catch-all proxy (anything not matched by extra_routers), we resolve
-    # from the trusted Caddy-injected X-Yashigani-Identity-Id header here.
-    # Caddy STRIPS client-supplied X-Yashigani-Identity-Id at the edge
-    # (Caddyfile.selfsigned line ~211) — so any value in the header is trusted-internal.
-    # Fail-closed: if the header is absent or identity not in registry, ysg_principal
-    # stays None; downstream consumers treat None as anonymous (DENY).
+    # For the catch-all proxy (anything not matched by extra_routers — including
+    # /mcp/<agent_name>, which is dispatched from THIS function, not mounted as an
+    # extra_router — see step 4c below), we resolve from the X-Yashigani-Identity-Id
+    # header here.
+    #
+    # YSG-RISK-140 (CRITICAL, T-3): this header is ONLY trustworthy when the caller
+    # has proven a trusted transport — matching the SAME gate
+    # mcp_router_runtime._handle_mcp_call_inner already enforces (YSG-RISK-108
+    # T-3/T-4: X-Caddy-Verified-Secret validated, OR the per-install internal mesh
+    # bearer). On gateway:8080 (public/Caddy-fronted) CaddyVerifiedMiddleware
+    # already rejects every request without a valid secret before this code runs,
+    # so this check is always true there. On gateway:8081 (mesh_mode=True),
+    # CaddyVerifiedMiddleware + SpiffePeerCertMiddleware are intentionally SKIPPED
+    # ("network isolation only" — entrypoint.py) — WITHOUT this gate, any caller
+    # reaching :8081 could set X-Yashigani-Identity-Id to an arbitrary registered
+    # identity and have it accepted here, silently bypassing mcp_router_runtime's
+    # own T-3/T-4 gate entirely (that gate only fires when ysg_principal is still
+    # None — see mcp_router_runtime.py ~line 447). Verified exploitable pre-fix:
+    # src/tests/regression/v4.1.2/test_ysg_risk_140_boundary_identity_spoof.py.
+    #
+    # Fail-closed: if the header is absent, the caller is untrusted, or identity
+    # not in registry, ysg_principal stays None; downstream consumers (including
+    # mcp_router_runtime, which falls back to its OWN independently-gated raw
+    # header read) treat None as anonymous (DENY).
     if not hasattr(request.state, "ysg_principal") or request.state.ysg_principal is None:
         _id_reg = state.get("identity_registry")
         _iid_raw = request.headers.get("x-yashigani-identity-id", "").strip()
+
+        if _iid_raw:
+            from yashigani.auth.caddy_verified import validate_caddy_secret as _validate_caddy_boundary
+            _caller_is_caddy_verified = _validate_caddy_boundary(
+                request.headers.get("x-caddy-verified-secret", "")
+            )
+            _caller_is_internal_bearer = False
+            _auth_hdr_boundary = request.headers.get("authorization", "")
+            if _auth_hdr_boundary.lower().startswith("bearer "):
+                _presented_bearer = _auth_hdr_boundary[7:]
+                if _presented_bearer:
+                    try:
+                        _caller_is_internal_bearer = hmac.compare_digest(
+                            _presented_bearer.encode("ascii"),
+                            _internal_bearer().encode("ascii"),
+                        )
+                    except (UnicodeEncodeError, ValueError):
+                        _caller_is_internal_bearer = False
+            _caller_is_trusted_boundary = _caller_is_caddy_verified or _caller_is_internal_bearer
+
+            if not _caller_is_trusted_boundary:
+                logger.warning(
+                    "proxy: boundary resolution: YSG-RISK-140/T-3: untrusted caller "
+                    "presented X-Yashigani-Identity-Id=%r without a valid "
+                    "X-Caddy-Verified-Secret or internal bearer — treating as "
+                    "anonymous (spoof attempt) request_id=%s path=%r",
+                    _iid_raw[:64], request_id, norm_path[:128],
+                )
+                _audit_writer_boundary = state.get("audit_writer")
+                if _audit_writer_boundary is not None:
+                    try:
+                        from yashigani.audit.schema import MeshIdentityHeaderRejectedEvent
+                        _audit_writer_boundary.write(MeshIdentityHeaderRejectedEvent(
+                            path=norm_path[:256],
+                            method=request.method,
+                            rejected_header="x-yashigani-identity-id",
+                            claimed_value_truncated=_iid_raw[:64],
+                        ))
+                    except Exception as _ae:
+                        logger.error(
+                            "proxy: boundary resolution: failed to write "
+                            "MESH_IDENTITY_HEADER_REJECTED event: %s", _ae,
+                        )
+                _iid_raw = ""  # fail closed — do not resolve principal from an unproven header
+
         if _iid_raw and _id_reg is not None:
             try:
                 if not _iid_raw.startswith("idnt_"):
