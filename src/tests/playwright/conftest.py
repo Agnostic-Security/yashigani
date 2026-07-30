@@ -621,11 +621,13 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
         for _ in range(40)
     )
 
+    first_totp_code = totp.now()
+    _first_totp_used_at = _time.time()
     with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
         # Step 1: initial login with temp password -> force_password_change:true
         login_resp = c.post(
             f"{BASE_URL}/auth/login",
-            json={"username": username, "password": temp_password, "totp_code": totp.now()},
+            json={"username": username, "password": temp_password, "totp_code": first_totp_code},
         )
         assert login_resp.status_code == 200, (
             f"initial user login failed: {login_resp.status_code} {login_resp.text[:300]}"
@@ -647,8 +649,23 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
             f"user password change failed: {pw_resp.status_code} {pw_resp.text[:300]}"
         )
 
-    # Wait for a fresh TOTP window before re-login (server-side 60s replay cache).
-    _time.sleep(2)
+    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): this
+    # previously only aligned to a 30s window BOUNDARY (secs_into >= 25/27 ->
+    # sleep to the next window), which does NOT guarantee the user-tier 60s
+    # TOTP replay cache has expired since first_totp_code was used above --
+    # if step 2 (password change) completes quickly, totp.now() below can
+    # return the IDENTICAL code value as step 1, and the server correctly
+    # rejects it as a replay (surfaced as generic "invalid_credentials" for
+    # anti-enumeration, not an obviously-TOTP-shaped error). Confirmed live:
+    # this crashed "user re-login after password rotation failed: 401
+    # invalid_credentials" while testing the chat/PII byte-proof. Now
+    # explicitly waits until >=62s have elapsed since first_totp_code was
+    # used (mirrors _wait_for_fresh_totp_window's admin-tier logic), THEN
+    # additionally avoids the last few seconds of whatever window that lands
+    # in, guaranteeing a genuinely fresh, never-before-submitted code.
+    _elapsed = _time.time() - _first_totp_used_at
+    if _elapsed < 62:
+        _time.sleep(62 - _elapsed)
     secs_into = _time.time() % 30
     if secs_into >= 25:
         _time.sleep(32 - secs_into)
