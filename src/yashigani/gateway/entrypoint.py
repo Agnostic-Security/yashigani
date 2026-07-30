@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import platform
 import time
 from typing import Callable, Literal, cast
 
@@ -37,6 +38,32 @@ from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _pool_manager_prod_fail_closed(
+    container_backend,
+    *,
+    ysg_env: "str | None" = None,
+    os_name: "str | None" = None,
+) -> bool:
+    """YSG-RISK-180: True iff a missing pool-manager container backend must
+    fail closed (production Linux runtime) rather than silently degrade to
+    stub mode (CIAA container-per-identity isolation disabled).
+
+    A stub-mode PoolManager is an ACCEPTED dev-only limitation on macOS
+    Docker-Desktop (socket passthrough into the gateway container is
+    unreliable there — see pool/backend.py create_backend() docstring). On a
+    real production Linux deployment it must be a hard failure: a
+    misconfigured/missing docker.sock mount or K8s ServiceAccount RBAC would
+    otherwise ship a gateway that looks healthy but has never actually
+    isolated a single request.
+
+    ``ysg_env``/``os_name`` are injectable for unit testing; production code
+    always calls this with both omitted (reads live env / platform).
+    """
+    _env = (ysg_env if ysg_env is not None else os.getenv("YASHIGANI_ENV", "")).strip().lower()
+    _os_name = os_name if os_name is not None else platform.system()
+    return container_backend is None and _os_name == "Linux" and _env == "production"
 
 
 def _build_app(mesh_mode: bool = False):
@@ -529,6 +556,22 @@ def _build_app(mesh_mode: bool = False):
     # container without socket access, create_backend() returns None →
     # PoolManager runs in stub mode → pool-managed dispatch fails at dispatch
     # time with pool_backend_unavailable (502).
+    #
+    # YSG-RISK-180 (fail-closed in production): a stub-mode PoolManager means
+    # container-per-identity isolation (CIAA) is DISABLED — every pool-managed
+    # dispatch silently degrades instead of being isolated. On macOS
+    # Docker-Desktop this is an accepted dev-only limitation (socket
+    # passthrough into the gateway container is unreliable there — see
+    # pool/backend.py create_backend() docstring). On a real PRODUCTION Linux
+    # deployment this must be a hard failure, not a silent degrade: a
+    # misconfigured/missing docker.sock mount or K8s RBAC would otherwise ship
+    # a gateway that LOOKS healthy but has never actually isolated a single
+    # request. Dev-vs-prod determination is explicit and mirrors the existing
+    # zero-trust OPA-mandatory-in-production guard above (same YASHIGANI_ENV
+    # signal, same install.sh contract: docker-compose.yml/helm default
+    # YASHIGANI_ENV=production for every non-demo install) — ANDed with a
+    # platform check so a genuine macOS dev/test box is never caught even if
+    # YASHIGANI_ENV happens to be production (its default).
     pool_manager = None
     _pool_health = None
     try:
@@ -537,6 +580,20 @@ def _build_app(mesh_mode: bool = False):
         from yashigani.pool.backend import create_backend as _create_backend
 
         _container_backend = _create_backend()
+
+        if _pool_manager_prod_fail_closed(_container_backend):
+            raise RuntimeError(
+                "Pool Manager: no container backend (Docker/Podman/Kubernetes) "
+                "reachable on a PRODUCTION Linux deployment (YASHIGANI_ENV="
+                "production). Container-per-identity isolation (CIAA) cannot be "
+                "satisfied — refusing to start rather than silently degrading to "
+                "stub mode. Fix the docker/podman socket mount (see "
+                "pool/backend.py create_backend() docstring for the exact socket "
+                "paths tried) or the Kubernetes ServiceAccount RBAC "
+                "(helm/yashigani/templates/rbac-pool-manager.yaml). "
+                "macOS Docker-Desktop dev/test deployments are exempt from this "
+                "guard (this is a Linux-only check) — CI/local dev is unaffected."
+            )
 
         # LIC-002 / GROUP-5-1: tier from cryptographically-verified license only.
         try:
@@ -555,6 +612,11 @@ def _build_app(mesh_mode: bool = False):
             _verified_tier,
             _container_backend.name if _container_backend else "stub",
         )
+    except RuntimeError:
+        # YSG-RISK-180: the production fail-closed guard above raises
+        # RuntimeError deliberately — it must propagate to uvicorn (non-zero
+        # exit), never be swallowed by the broad except below.
+        raise
     except Exception as exc:
         logger.warning("Pool Manager unavailable (%s) — pool-managed dispatch disabled", exc)
 
