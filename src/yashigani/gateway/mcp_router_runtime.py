@@ -90,7 +90,7 @@ def _mesh_caller_is_internal(request: Request) -> bool:
     YSG-RISK-108 / T-3 + T-4 trust gate.
 
     The per-install YASHIGANI_INTERNAL_BEARER is present on ALL legitimate
-    mesh callers (orchestrator self-calls, OWUI, 4.0 native chat path).
+    mesh callers (orchestrator self-calls, the 4.0 native ui4 chat path).
     Only when this token is verified should identity-forwarding headers
     (X-Yashigani-Identity-Id, X-Yashigani-Orchestration-Depth/Principal)
     be trusted.  4.1 SEC-GAP-1: X-Forwarded-User removed from the trusted set.
@@ -275,7 +275,7 @@ async def _handle_mcp_call_inner(
     # 4.1 SEC-GAP-1: X-Forwarded-User removed; X-Yashigani-Identity-Id is the
     # canonical identity rail.
     #   (a) YASHIGANI_INTERNAL_BEARER — present on ALL legitimate mesh callers
-    #       (orchestrator self-calls, OWUI, 4.0 native chat path), OR
+    #       (orchestrator self-calls, the 4.0 native ui4 chat path), OR
     #   (b) X-Caddy-Verified-Secret — present on requests proxied through Caddy
     #       (SSO/API path via port 8080; Caddy strips inbound copies at the edge).
     #
