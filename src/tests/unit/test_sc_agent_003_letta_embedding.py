@@ -200,8 +200,16 @@ class TestEnsureAgentPayload:
         assert embed_cfg is not None, (
             "embedding_config must be present in the create-agent payload"
         )
-        assert "gateway" in embed_cfg.get("embedding_endpoint", ""), (
-            f"embedding_endpoint must point at the gateway: {embed_cfg.get('embedding_endpoint')!r}"
+        # YSG-RISK-169 (2026-07-30): _ensure_agent() is the STATIC/system-wide
+        # letta agent path — its network can reach egress-letta:9400/llm/v1
+        # (the egress-forwarder, matching docker-compose's own OPENAI_API_BASE
+        # for that service) but NOT gateway:8081 directly (v4.1 split-
+        # ringfence). Was asserting "gateway" here, which encoded the bug that
+        # caused every @letta reasoning step to fail with
+        # "Failed to connect to OpenAI: Connection error".
+        assert "egress-letta" in embed_cfg.get("embedding_endpoint", ""), (
+            f"embedding_endpoint must point at the reachable egress-letta "
+            f"forwarder: {embed_cfg.get('embedding_endpoint')!r}"
         )
         assert embed_cfg.get("embedding_endpoint_type") == "openai", (
             f"embedding_endpoint_type must be 'openai': {embed_cfg.get('embedding_endpoint_type')!r}"
@@ -686,7 +694,10 @@ class TestCreateAgentPayloadUsesLlmConfig:
         assert llm_cfg is not None, "llm_config must be present in the create-agent payload"
         assert llm_cfg.get("model") == "qwen2.5:3b"
         assert llm_cfg.get("model_endpoint_type") == "openai"
-        assert "gateway" in llm_cfg.get("model_endpoint", "")
+        # YSG-RISK-169 (2026-07-30): see test_embedding_config_in_create_agent_payload
+        # above — _ensure_agent() is the static/system path; must use the
+        # reachable egress-letta forwarder, not the unreachable gateway:8081.
+        assert "egress-letta" in llm_cfg.get("model_endpoint", "")
 
     @pytest.mark.asyncio
     async def test_ensure_agent_for_user_sends_llm_config_not_model_handle(self, monkeypatch):
