@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from yashigani.optimization.sensitivity_classifier import (
     SensitivityLevel,
@@ -70,6 +70,7 @@ class OptimizationEngine:
         trusted_cloud_providers: dict[str, str] | None = None,
         model_aliases: dict[str, tuple[str, str, bool]] | None = None,
         cloud_override_getter=None,
+        cloud_key_available: Optional[Callable[[], bool]] = None,
     ) -> None:
         """
         Args:
@@ -78,6 +79,27 @@ class OptimizationEngine:
             default_cloud_model: Default cloud model
             trusted_cloud_providers: {sensitivity_level: provider} for CONFIDENTIAL/RESTRICTED fallback
             model_aliases: {alias: (provider, model, force_local)} DB-driven aliases
+            cloud_key_available: zero-arg callable returning True iff a valid API
+                key is actually configured for ``default_cloud_provider``.
+                YSG-RISK-178 (product-correctness / default-model precedence):
+                the engine substitutes ``default_cloud_provider``/``default_cloud_model``
+                for an OLLAMA-resolved request in three places (P1 trusted-cloud,
+                P5 force_cloud, P6 complexity-HIGH) whenever the caller did not
+                explicitly pin a cloud model — i.e. the engine is choosing a
+                DEFAULT on the caller's behalf. Per the product rule ("the
+                default model is ALWAYS local UNLESS a cloud model is configured
+                with an API key AND set as default"), that implicit substitution
+                must never fire when no key is actually configured — doing so
+                silently 422/503s a request the caller never asked to route to
+                cloud. ``None`` (not wired) preserves legacy-permissive behaviour
+                (assume available) for callers that construct the engine directly
+                without wiring the check (unit tests, any deployment predating
+                this fix) — production wiring (gateway/entrypoint.py) always
+                passes a real callable backed by the same KMS/env-var resolution
+                the actual cloud call uses (openai_router._get_cloud_api_key).
+                An EXPLICIT cloud pin (caller/alias resolved to a non-ollama
+                provider BEFORE reaching these rules) is never gated by this —
+                only the implicit "engine chose cloud for you" substitution is.
         """
         self._default_model = default_model
         self._default_cloud_provider = default_cloud_provider
@@ -89,10 +111,33 @@ class OptimizationEngine:
         # LLM serve P1 (CONFIDENTIAL/RESTRICTED) traffic the engine would otherwise
         # pin local — the customer has a cloud agreement and accepts the P1-P9 risk.
         self._cloud_override_getter = cloud_override_getter
+        self._cloud_key_available = cloud_key_available
         logger.info(
             "OptimizationEngine: default_local=%s, default_cloud=%s/%s, trusted_cloud=%d",
             default_model, default_cloud_provider, default_cloud_model, len(self._trusted_cloud),
         )
+
+    def _default_cloud_usable(self) -> bool:
+        """True iff ``default_cloud_provider``/``default_cloud_model`` may be
+        silently substituted as an IMPLICIT default for an ollama-resolved
+        request (P1 trusted-cloud / P5 / P6).
+
+        YSG-RISK-178: when ``cloud_key_available`` was not wired at
+        construction time, legacy-permissive behaviour applies (assume
+        usable) — unchanged for existing callers. When it WAS wired but
+        raises, fail-closed to "not usable" — a broken checker must never be
+        read as "a key is configured".
+        """
+        if self._cloud_key_available is None:
+            return True
+        try:
+            return bool(self._cloud_key_available())
+        except Exception as exc:  # noqa: BLE001 — never fail-open the route
+            logger.warning(
+                "OptimizationEngine: cloud_key_available() raised (%s) — "
+                "treating default cloud as unavailable (fail-closed)", exc,
+            )
+            return False
 
     def route(
         self,
@@ -171,7 +216,11 @@ class OptimizationEngine:
                 int(sensitivity.level), str(sensitivity.level)
             )
             trusted = self._trusted_cloud.get(_level_key)
-            if trusted:
+            # YSG-RISK-178: trusted-cloud substitutes the DEFAULT cloud model —
+            # never silently attempt it when no API key is actually configured
+            # (falls through to the local decision below instead of a
+            # downstream 503 the caller never asked to hit).
+            if trusted and self._default_cloud_usable():
                 return self._decide(
                     provider=trusted,
                     model=self._default_cloud_model,
@@ -238,13 +287,34 @@ class OptimizationEngine:
             )
 
         # P5: Identity force_cloud + budget ok
+        # YSG-RISK-178: when the resolved model is already an EXPLICIT cloud
+        # pin (provider != "ollama"), always honour it — this is not the
+        # engine choosing a default. Only the "ollama -> substitute the
+        # DEFAULT cloud model" branch is gated on a configured API key; absent
+        # one, degrade to local instead of silently handing the caller a
+        # model that will 503 downstream (never asked for, never configured).
         if force_cloud:
+            if provider != "ollama" or self._default_cloud_usable():
+                return self._decide(
+                    provider=provider if provider != "ollama" else self._default_cloud_provider,
+                    model=model if provider != "ollama" else self._default_cloud_model,
+                    route="cloud",
+                    rule="P5",
+                    reason="Identity force_cloud",
+                    sensitivity=sensitivity,
+                    complexity=complexity,
+                    budget=budget,
+                    start_ns=start,
+                )
             return self._decide(
-                provider=provider if provider != "ollama" else self._default_cloud_provider,
-                model=model if provider != "ollama" else self._default_cloud_model,
-                route="cloud",
-                rule="P5",
-                reason="Identity force_cloud",
+                provider="ollama",
+                model=local_default,
+                route="local",
+                rule="P5-DEGRADED",
+                reason=(
+                    "Identity force_cloud but default cloud model has no "
+                    "configured API key — local fallback (YSG-RISK-178)"
+                ),
                 sensitivity=sensitivity,
                 complexity=complexity,
                 budget=budget,
@@ -252,13 +322,35 @@ class OptimizationEngine:
             )
 
         # P6: Complexity HIGH + budget ok -> PREFER CLOUD
+        # YSG-RISK-178: same guard as P5 — an implicit "prefer cloud" upgrade
+        # of an ollama-resolved (i.e. no explicit model requested) request
+        # must never silently pick the default cloud model when no API key
+        # is configured for it. This was the concrete out-of-box bug: a
+        # fresh LOCAL install (no cloud key) scored a plain, no-@mention chat
+        # as HIGH complexity and got auto-upgraded to the cloud default
+        # (claude-sonnet-4-6), which then 422/503'd with zero cloud config.
         if complexity.level == ComplexityLevel.HIGH:
+            if provider != "ollama" or self._default_cloud_usable():
+                return self._decide(
+                    provider=provider if provider != "ollama" else self._default_cloud_provider,
+                    model=model if provider != "ollama" else self._default_cloud_model,
+                    route="cloud",
+                    rule="P6",
+                    reason=f"Complexity HIGH — prefer cloud",
+                    sensitivity=sensitivity,
+                    complexity=complexity,
+                    budget=budget,
+                    start_ns=start,
+                )
             return self._decide(
-                provider=provider if provider != "ollama" else self._default_cloud_provider,
-                model=model if provider != "ollama" else self._default_cloud_model,
-                route="cloud",
-                rule="P6",
-                reason=f"Complexity HIGH — prefer cloud",
+                provider="ollama",
+                model=local_default,
+                route="local",
+                rule="P6-DEGRADED",
+                reason=(
+                    "Complexity HIGH would prefer cloud but default cloud model "
+                    "has no configured API key — local fallback (YSG-RISK-178)"
+                ),
                 sensitivity=sensitivity,
                 complexity=complexity,
                 budget=budget,

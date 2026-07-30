@@ -412,14 +412,41 @@ def _build_app(mesh_mode: bool = False):
         cloud_override_getter = None
 
     # ── v1.0: Optimization Engine ─────────────────────────────────────────
+    _default_cloud_provider = os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic")
+
+    # YSG-RISK-178 (product-correctness / default-model precedence): the
+    # engine's P1-trusted/P5/P6 rules substitute this DEFAULT cloud
+    # provider/model for an ollama-resolved (i.e. no explicit model
+    # requested) call. Per the design rule — "the default model is ALWAYS
+    # local UNLESS a cloud model is configured with an API key AND set as
+    # default" — that implicit substitution must never fire on a stack with
+    # no cloud key configured (a fresh local/demo install has neither KMS
+    # secret nor env var set). Lazy-imported: openai_router.configure() runs
+    # AFTER this engine is constructed but BEFORE any request can reach
+    # route() (which is when this callable actually fires), so the module
+    # and its _state.kms_provider are always ready by call time. Reuses the
+    # SAME KMS-then-env-var resolution (with its own 60s TTL cache) the real
+    # cloud call uses — one source of truth for "is a key configured".
+    def _cloud_key_available_for_default() -> bool:
+        try:
+            from yashigani.gateway.openai_router import _get_cloud_api_key
+            return bool(_get_cloud_api_key(_default_cloud_provider))
+        except Exception as _key_exc:
+            logger.warning(
+                "cloud_key_available check failed (%s) — treating default "
+                "cloud provider as unavailable (fail-closed)", _key_exc,
+            )
+            return False
+
     optimization_engine = None
     try:
         from yashigani.optimization.engine import OptimizationEngine
         optimization_engine = OptimizationEngine(
             default_model=model,
-            default_cloud_provider=os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic"),
+            default_cloud_provider=_default_cloud_provider,
             default_cloud_model=os.getenv("YASHIGANI_DEFAULT_CLOUD_MODEL", "claude-sonnet-4-6"),
             cloud_override_getter=cloud_override_getter,
+            cloud_key_available=_cloud_key_available_for_default,
         )
     except Exception as exc:
         logger.warning("Optimization Engine unavailable (%s)", exc)
