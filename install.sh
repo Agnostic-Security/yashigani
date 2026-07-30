@@ -8301,44 +8301,56 @@ _podman_compose_letta_waitloop() {
   fi
 }
 
-compose_up() {
-  set_step "10" "compose up"
-  log_step "10/${TOTAL_STEPS}" "Starting services..."
+YSG_COMPOSE_FILE_ARGS=()
 
-  resolve_compose_cmd
+# _ysg_assemble_compose_files — SINGLE SOURCE OF TRUTH for the docker-compose
+# -f file list (YSG-RISK-177 fix). Populates the global array
+# YSG_COMPOSE_FILE_ARGS. Every compose operation that can recreate a
+# container — the initial `up` in compose_up(), the YSG-RISK-084 self-heal
+# re-converge (reuses compose_up()'s local `compose_files` via bash dynamic
+# scoping — unaffected by this change since it's the same call stack),
+# register_agent_bundles()'s post-registration restart, and the --onboard
+# gateway recreate in handle_onboard_subcommand() — MUST use the SAME
+# complete file set the container was originally created with. Compose
+# recomputes each service's desired config from whatever `-f` files are
+# given; a REDUCED set silently drops overlay-added fields (GPU device
+# reservations, wazuh mTLS mounts, egress-forwarder network attachments) the
+# next time `up`/recreate touches that service — and it can touch a service
+# you didn't name: compose also recreates dependencies whose computed config
+# drifted.
+#
+# Root cause of the live incident this fixes: an out-of-band
+# `docker compose -f docker/docker-compose.yml up -d` (base file only, run
+# manually while iterating on gateway/backoffice code for YSG-RISK-172..175)
+# recreated gateway + backoffice + ollama (ollama pulled in as gateway's
+# `depends_on: service_healthy` dependency whose config had drifted) —
+# computed against the reduced file set, ollama came back up with NO GPU
+# device (docker-compose.gpu.yml omitted). install.sh's own compose_up() was
+# NOT the source of that drop (it always built the full list correctly); the
+# gap was that register_agent_bundles() and the --onboard gateway recreate
+# each independently re-derived a SHORTER file list, so any future codified
+# call through those paths carried the identical latent bug. This function
+# closes that gap by giving all call sites one shared, always-current list.
+#
+# Covers: wazuh overlay, per-agent egress-forwarder overlays, the Docker
+# native NVIDIA GPU overlay, and the Podman rootless override + macOS
+# virtiofs override. Deliberately EXCLUDES the Podman-CDI-GPU-probe /
+# mac-metal / AMD-ROCm / Vulkan branches still inline in compose_up() below —
+# those run live provisioning/probing side effects (_setup_podman_cdi_gpu, a
+# throwaway `podman run` CDI probe, host-ollama-port resolution) that belong
+# only in the initial convergence, not in every later idempotent
+# re-converge. KNOWN GAP: those GPU types are not yet protected by this
+# shared list outside compose_up() itself. Docker Engine + NVIDIA (this box,
+# and the common case) is fully covered by every call site.
+_ysg_assemble_compose_files() {
+  YSG_COMPOSE_FILE_ARGS=("-f" "${WORK_DIR}/docker/docker-compose.yml")
 
-  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-
-  # Auto-apply Podman rootless override when running on Podman
-  local compose_files=("-f" "$compose_file")
-
-  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
-  # is active, provision the deploy-local mTLS material (git-ignored) and layer the overlay
-  # that adds caps/cont-init/securityadmin/healthchecks + the internal-CA HTTP listener.
-  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
   local _wazuh_overlay="${WORK_DIR}/docker/docker-compose.wazuh.yml"
   if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "$_wazuh_overlay" ]]; then
-    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
-    compose_files+=("-f" "$_wazuh_overlay")
+    YSG_COMPOSE_FILE_ARGS+=("-f" "$_wazuh_overlay")
     log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
   fi
 
-  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): per-bundle
-  # egress-forwarder overlays. When a bundled agent (openclaw, langflow,
-  # letta) is enabled, layer the codegen-emitted override that stands up the
-  # egress-<agent> forwarder + the SPLIT ringfences
-  # (ringfence_<agent>_in = {<agent>, caddy}; ringfence_<agent>_eg =
-  # {<agent>, egress-<agent>} — design §2.6, 2-member invariant). Each
-  # agent's egress config dials its forwarder
-  # (http://egress-<agent>:9400/<prefix>) via that agent's REAL config
-  # mechanism (openclaw.json models.providers baseUrl + channels.telegram
-  # apiRoot; langflow/letta OPENAI_API_BASE), and the forwarder presents the
-  # agent's leaf to caddy:18790 → /egress/eval. The static caller/destination
-  # pins at :18790 remain in force (pin-AND-grant OVERLAP — synthesis
-  # must-fix #1; pin deletion is a later, Laura-gated step).
-  # Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the non-interactive
-  # --agent-bundles value is only pushed into COMPOSE_PROFILES at step 8
-  # (same defensive pattern as the YASHIGANI_OPENCLAW_EGRESS flag writer).
   local _fwd_agent _fwd_overlay _fwd_enabled _fwd_ab
   for _fwd_agent in openclaw langflow letta; do
     _fwd_overlay="${WORK_DIR}/docker/${_fwd_agent}-egress-forwarder.override.yml"
@@ -8353,7 +8365,7 @@ compose_up() {
     fi
     if [[ "$_fwd_enabled" == "true" ]]; then
       if [[ -f "$_fwd_overlay" ]]; then
-        compose_files+=("-f" "$_fwd_overlay")
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_fwd_overlay")
         log_info "Applying ${_fwd_agent} egress-forwarder overlay (unified-sidecar v4.1: egress-${_fwd_agent} + split ringfences)"
       else
         # Fail-closed: the agent's egress config points at the forwarder, so
@@ -8365,24 +8377,70 @@ compose_up() {
     fi
   done
 
-  # ── GPU overlay selection ─────────────────────────────────────────────────────
+  # Docker-native NVIDIA GPU overlay — file-existence check only, no probe/
+  # provisioning side effect, safe to re-evaluate on every call.
+  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
+    YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay")
+    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+  fi
+
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
+    if [[ -f "$podman_override" ]]; then
+      YSG_COMPOSE_FILE_ARGS+=("-f" "$podman_override")
+      log_info "Applying Podman rootless override (security_opt + env overrides)"
+    else
+      log_warn "Podman rootless override not found at ${podman_override}"
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
+      if [[ -f "$podman_virtiofs_override" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$podman_virtiofs_override")
+        log_info "Applying Podman virtiofs :U override (macOS only)"
+      else
+        log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
+      fi
+    fi
+  fi
+}
+
+compose_up() {
+  set_step "10" "compose up"
+  log_step "10/${TOTAL_STEPS}" "Starting services..."
+
+  resolve_compose_cmd
+
+  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
+
+  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
+  # is active, provision the deploy-local mTLS material (git-ignored) here — once, before
+  # the file list is assembled. _ysg_assemble_compose_files() below only checks for the
+  # overlay FILE; it does not (re-)provision the mTLS material.
+  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
+  if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "${WORK_DIR}/docker/docker-compose.wazuh.yml" ]]; then
+    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
+  fi
+
+  # YSG-RISK-177: file list assembled by the shared _ysg_assemble_compose_files()
+  # (defined above compose_up()) — single source of truth, also used by
+  # register_agent_bundles() and the --onboard gateway recreate, so no compose
+  # operation ever recreates a container against a REDUCED file set. See that
+  # function's header comment for the full incident writeup (ollama silently
+  # losing its GPU device).
+  _ysg_assemble_compose_files || return 1
+  local compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
+
+  # ── GPU overlay selection (continued) ─────────────────────────────────────────
   # Supported types (source: docs.ollama.com/gpu):
-  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker) or CDI+devpath (Podman)
+  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker, handled above via the
+  #                shared function) or CDI+devpath (Podman, handled below — this branch
+  #                runs a live provisioning/probe side effect so it stays compose_up-only)
   #   apple_metal— Metal via host-native ollama (Mac only; container ollama bypassed)
   #   amd_rocm   — ROCm v7 discrete (Radeon RX 5000+/6000+/7000+, Instinct); /dev/kfd+dri
   #   vulkan     — Vulkan backend (Intel Arc/iGPU, AMD APU gfx1150/1151); /dev/dri only
   #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
   # ─────────────────────────────────────────────────────────────────────────────
-
-  # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
-  # ollama service has its GPU reservation commented out and the nvidia runtime is not
-  # the daemon default, so without this ollama runs CPU-only. Pin a card with YSG_GPU_UUID
-  # (defaults to all). Podman uses CDI devices separately; K8s uses the device plugin.
-  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
-  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
-    compose_files+=("-f" "$_gpu_overlay")
-    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
-  fi
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
   # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
   # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
@@ -8721,23 +8779,11 @@ compose_up() {
     #      Linux: `podman unshare chown` sets per-file UIDs before containers start.
     #        Adding :U afterward overwrites those per-file UIDs, breaking services
     #        whose UID differs from the last container processed.
-    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
-    if [[ -f "$podman_override" ]]; then
-      compose_files+=("-f" "$podman_override")
-      log_info "Applying Podman rootless override (security_opt + env overrides)"
-    else
-      log_warn "Podman rootless override not found at ${podman_override}"
-    fi
-    # macOS virtiofs :U override — macOS Podman only
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
-      if [[ -f "$podman_virtiofs_override" ]]; then
-        compose_files+=("-f" "$podman_virtiofs_override")
-        log_info "Applying Podman virtiofs :U override (macOS only)"
-      else
-        log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
-      fi
-    fi
+    #
+    #    YSG-RISK-177: both overrides are now appended by the shared
+    #    _ysg_assemble_compose_files() call at the top of this function —
+    #    `compose_files` already includes them here. (Previously duplicated
+    #    inline; removed to avoid appending the same `-f` file twice.)
 
     # 5. Build images with podman build (compose build uses Docker buildx)
     #    Skip rebuild only when both version-tagged images exist AND their
@@ -10288,17 +10334,14 @@ register_agent_bundles() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
   local compose_file="${WORK_DIR}/docker/docker-compose.yml"
 
-  # Rebuild compose file args (same logic as compose_up — keep in sync)
-  local compose_files=("-f" "$compose_file")
-  if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
-    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
-    [[ -f "$podman_override" ]] && compose_files+=("-f" "$podman_override")
-    # macOS virtiofs :U override — macOS Podman only (see compose_up for full rationale)
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
-      [[ -f "$podman_virtiofs_override" ]] && compose_files+=("-f" "$podman_virtiofs_override")
-    fi
-  fi
+  # YSG-RISK-177: use the shared _ysg_assemble_compose_files() (compose_up()'s
+  # single source of truth) instead of re-deriving a reduced copy here. The
+  # old inline copy only ever applied the Podman override — never the
+  # wazuh/egress-forwarder/GPU overlays — so the `restart` below (and any
+  # future call site added to this function) ran against a file list that
+  # had already drifted from how these containers were actually created.
+  _ysg_assemble_compose_files || return 1
+  local compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
 
   # Run the entire registration flow inside the backoffice container.
   # This avoids shell interpolation issues and timing problems with TOTP.
@@ -18351,22 +18394,34 @@ PYREPLACE
           if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
             resolve_compose_cmd 2>/dev/null || true
           fi
+          # YSG-RISK-177: recreate against the shared full file list (wazuh/
+          # egress-forwarder/GPU overlays), not just the base compose file — a
+          # single-file `up` here permanently strips gateway of every
+          # overlay-added field (mTLS mounts, ringfence network attachments,
+          # and any dependency — e.g. ollama's GPU device — whose config also
+          # drifts against the reduced set) the next time this recreate fires.
+          local _onboard_compose_files=("-f" "$_compose_file")
+          if _ysg_assemble_compose_files; then
+            _onboard_compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
+          else
+            log_warn "Shape-C: could not assemble full compose file list — falling back to base file only (overlays may be dropped)"
+          fi
           log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
           if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
             local _gw_up_rc=0
-            "${COMPOSE_CMD[@]}" -f "$_compose_file" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
+            "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
             if [[ "$_gw_up_rc" -ne 0 ]]; then
               log_error "Gateway recreate failed (exit ${_gw_up_rc})."
               log_error "  The YASHIGANI_MCP_SERVERS env change requires a gateway restart to take effect."
               log_error "  Recovery:"
-              log_error "    ${COMPOSE_CMD[*]} -f ${_compose_file} up --no-deps -d gateway"
+              log_error "    ${COMPOSE_CMD[*]} ${_onboard_compose_files[*]} up --no-deps -d gateway"
               log_error "  If the gateway fails to start, check: docker compose logs gateway"
             else
               log_success "Gateway recreated with updated MCP server list."
             fi
           else
             log_warn "Shape-C: COMPOSE_CMD not resolved — cannot recreate gateway automatically."
-            log_warn "  Run manually: docker compose -f docker/docker-compose.yml up --no-deps -d gateway"
+            log_warn "  Run manually: docker compose ${_onboard_compose_files[*]} up --no-deps -d gateway"
           fi
         fi
       fi
