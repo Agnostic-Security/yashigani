@@ -686,6 +686,83 @@ def _service_account_full_list_enabled() -> bool:
     _SA_FULL_LIST_CACHE["ts"] = now
     return value
 
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-162 — admin-visible runtime toggle for the local-model "strict
+# dial" (gateway.permissions.strict_mode).
+#
+# permission_strict was previously ONLY an env var (YASHIGANI_PERMISSION_
+# STRICT), read once at configure() time -- invisible to any admin surface
+# and requiring a container restart to change. This mirrors the DB-backed,
+# TTL-cached, fail-open-to-configured-value pattern already used for
+# gateway.models.service_account_full_list above, so the setting is
+# discoverable and toggleable from the Admin Runtime Settings panel without
+# a restart.
+#
+# The DEFAULT VALUE stays False (unchanged) -- see runtime_settings/keys.py
+# KEY_PERMISSION_STRICT_MODE docstring / the v4.1.2 YSG-RISK-162 commit body
+# for the full rationale: cloud providers are ALREADY deny-by-default
+# (INV-1) independent of this dial, and local models already get full
+# detect+audit (PII/sensitivity/response-inspection, unconditional of
+# provider -- YSG-RISK-164). Flipping the DEFAULT to strict=True would 403
+# every local chat request on every fresh/community install with no grants
+# configured, which is a breaking change to the intentional local-detect-
+# only design, not a security fix -- so only the ADMIN TOGGLE ships here,
+# not a default flip.
+# ---------------------------------------------------------------------------
+_PERMISSION_STRICT_CACHE: dict = {"value": None, "ts": 0.0}
+_PERMISSION_STRICT_TTL = 30.0
+
+
+def _permission_strict_mode_enabled() -> bool:
+    """Live (DB-backed, 30s-cached) read of gateway.permissions.strict_mode.
+
+    Falls back to ``_state.permission_strict`` (the YASHIGANI_PERMISSION_
+    STRICT env value captured at configure() time) whenever no DB row
+    exists yet, the DB is unreachable, or the DSN is not configured --
+    fail-OPEN to the operator's already-configured value, matching the
+    established convention for this settings layer (gateway/entrypoint.py
+    _sync_read_setting: "fail-open for the settings layer, not the auth
+    layer"). This is deliberately NOT "fail-secure to True": forcing strict
+    mode on during a transient DB outage would 403 every local chat request
+    with no grants configured, which is an availability regression, not a
+    security improvement, for a setting whose insecure direction is
+    "permissive local access" (already accepted-by-design, YSG-RISK-164),
+    not "silently unenforced cloud egress" (INV-1 handles that
+    independently of this toggle).
+    """
+    import time as _t
+    now = _t.monotonic()
+    if now - _PERMISSION_STRICT_CACHE["ts"] < _PERMISSION_STRICT_TTL and _PERMISSION_STRICT_CACHE["value"] is not None:
+        return bool(_PERMISSION_STRICT_CACHE["value"])
+    value = bool(_state.permission_strict)
+    try:
+        import psycopg2, json as _json
+        from yashigani.runtime_settings.keys import KEY_PERMISSION_STRICT_MODE as _K
+        dsn = os.getenv("YASHIGANI_DB_DSN", "")
+        if dsn and "${POSTGRES_PASSWORD}" not in dsn:
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM runtime_settings WHERE key = %s", (_K,))
+                    row = cur.fetchone()
+                if row:
+                    raw = row[0]
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode()
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw)
+                    value = bool(raw)
+            finally:
+                conn.close()
+    except Exception as _exc:  # fail-open to the configured (env) value
+        logger.debug("permission_strict_mode read failed (%s) — using configured value %s", _exc, value)
+    _PERMISSION_STRICT_CACHE["value"] = value
+    _PERMISSION_STRICT_CACHE["ts"] = now
+    return value
+
+
 def is_orchestration_self_call(request) -> bool:
     """True when this request is an in-flight orchestration sub-hop.
 
@@ -2894,7 +2971,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         not is_agent_call
         and not brain_reasoning_leg
         and _state.permission_store is not None
-        and (_perm_is_cloud or _state.permission_strict)
+        and (_perm_is_cloud or _permission_strict_mode_enabled())
     )
 
     if _perm_needs_check:

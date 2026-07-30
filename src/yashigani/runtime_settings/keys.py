@@ -23,6 +23,9 @@ KEY_DDOS_WINDOW_SECONDS = "gateway.ddos.window_seconds"
 # ── Model-list visibility for service accounts (gateway.models) ──────────────
 KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST = "gateway.models.service_account_full_list"
 
+# ── Cloud-model permission strict dial (gateway.permissions) ─────────────────
+KEY_PERMISSION_STRICT_MODE = "gateway.permissions.strict_mode"
+
 
 @dataclass(frozen=True)
 class SettingMeta:
@@ -103,6 +106,29 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         ),
         allowed_type="bool",
         env_var="YASHIGANI_MODELS_SERVICE_ACCOUNT_FULL_LIST",
+        class_default=False,
+    ),
+    SettingMeta(
+        key=KEY_PERMISSION_STRICT_MODE,
+        description=(
+            "YSG-RISK-162: cloud LLM providers (openai/anthropic) are ALWAYS "
+            "deny-by-default and require an explicit cloud_model grant, "
+            "regardless of this setting (INV-1, not affected by this toggle). "
+            "When OFF (default), LOCAL Ollama models are permissive-by-default "
+            "-- no grant required -- so out-of-the-box local-LLM usage works "
+            "without any grant configuration (matches YSG-RISK-164: local "
+            "models are always detect+audit via the PII/sensitivity/response-"
+            "inspection pipelines regardless of this setting -- the egress "
+            "boundary, not local access, is the enforcement point). When ON, "
+            "LOCAL models ALSO require an explicit cloud_model grant "
+            "(deny-unless-permitted for every model). Turning this ON with no "
+            "grants configured will 403 every local chat request -- create "
+            "grants for every in-use local model FIRST. Intentionally left "
+            "OFF by default; flip only for orgs that require an allowlist for "
+            "local models too."
+        ),
+        allowed_type="bool",
+        env_var="YASHIGANI_PERMISSION_STRICT",
         class_default=False,
     ),
 ]
