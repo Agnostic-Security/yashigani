@@ -105,8 +105,16 @@ def _navigate_to_pki(page) -> None:
     The PKI panel fires an async loadPkiStatus() which fetches /api/v1/admin/pki/status.
     We wait for either a View button (success) or an error paragraph to appear
     in the container, with a generous timeout to allow the API round-trip.
+
+    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): this
+    previously targeted `button[data-param='pki']`, a stale selector from
+    before the ui4 nav rewrite -- the current admin nav renders anchors
+    (`a[href='#module-id']`, see admin-nav.js / module-registry.js and
+    test_webui_conformance_full.py's TestAdminModuleSweep), not buttons with
+    data-param. The old selector never matched anything, so every click/
+    locator call in this file timed out.
     """
-    page.click("button[data-param='pki']")
+    page.click("a[href='#pki']")
     page.wait_for_selector("#pki-status-container", timeout=8000)
     # Wait for the async API response to render: either buttons or error text
     page.wait_for_selector(
@@ -133,7 +141,7 @@ def test_pki_nav_button_exists():
         page.goto(_ADMIN_DASHBOARD)
         page.wait_for_timeout(2000)
 
-        pki_btn = page.locator("button[data-param='pki']")
+        pki_btn = page.locator("a[href='#pki']")
         expect(pki_btn).to_be_visible()
         pki_btn.click()
 

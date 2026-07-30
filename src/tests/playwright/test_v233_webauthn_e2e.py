@@ -98,7 +98,15 @@ skip_no_stack = pytest.mark.skipif(
 # Repo-root helpers
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).parents[4]
+# FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): off-by-one --
+# this file lives at the same depth as conftest.py (src/tests/playwright/),
+# whose _read_secret() correctly uses parents[3] to reach the repo root.
+# parents[4] here pointed ONE level ABOVE the repo root, so every secret read
+# (admin1_username, etc.) 404'd with FileNotFoundError, failing every test in
+# this file at fixture setup. Confirmed directly:
+#   Path(__file__).parents[3] == <repo_root>   (correct)
+#   Path(__file__).parents[4] == <repo_root>/..  (wrong -- pre-existing bug)
+_REPO_ROOT = Path(__file__).parents[3]
 
 
 def _read_secret(name: str) -> str:
