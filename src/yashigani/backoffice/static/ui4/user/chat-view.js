@@ -282,10 +282,26 @@ export class YsChatView extends LitElement {
       this._mentionsPromise = (async () => {
         if (!this.api) return [];
         const data = await this.api.get(MENTIONS_PATH);
+        // YSG-RISK-175 (live-verified, browser-gate probe 2026-07-30):
+        // GET /user/mentions actually responds `{"mentions": [...]}`
+        // (user_agents.py::list_user_mentions, "Response shape:
+        // {"mentions": [...]}") — this coercion never checked `data.mentions`,
+        // only `data.items`/`data.data`, so `list` was ALWAYS `[]` regardless
+        // of the fetch timing. This made every @-mention resolution silently
+        // no-op (this._mentions stayed `[]` forever, never null, so the
+        // race-ordering fix above alone could never have caught it) —
+        // _targetModel() always fell through to _currentModel()'s fallback
+        // for EVERY send, including explicit "@letta"/"@openclaw"/
+        // "@agent_langflow" turns, confirmed via a raw Playwright
+        // request-body capture showing model:"smart" sent for an
+        // "@letta ..." message. Checking `data.mentions` first fixes the
+        // actual payload shape without touching the generic items/data
+        // fallbacks other callers may still rely on.
         const list = Array.isArray(data)
           ? data
-          : (data && Array.isArray(data.items) ? data.items
-            : (data && Array.isArray(data.data) ? data.data : []));
+          : (data && Array.isArray(data.mentions) ? data.mentions
+            : (data && Array.isArray(data.items) ? data.items
+              : (data && Array.isArray(data.data) ? data.data : [])));
         this._mentions = list; // sync mirror for _resolveMentionTarget()
         return list;
       })();
@@ -347,8 +363,47 @@ export class YsChatView extends LitElement {
     return this._history.map((m) => ({ role: m.role, content: m.content }));
   }
 
+  // The model/target used when no @mention addresses the turn explicitly.
+  // YSG-RISK-175: this MUST NEVER be the raw internal agent id
+  // (`activeAgentId`, format `agnt_{12hex}` from AgentRegistry.agent_id).
+  // The gateway's model-string charset validator rejects the underscore in
+  // that id and returns 422 model_not_found (LAURA-411-002) — so a bare
+  // "chat with the active agent, no @mention" turn always 422'd before this
+  // fix. Resolve the active agent through its @-handle (the SAME catalog
+  // the mention menu autocompletes from — see _resolveActiveAgentTarget)
+  // instead, and only then fall back to a known model alias/name. The raw
+  // id is never returned.
   _currentModel() {
-    return this.selectedModel || this.activeAgentId || 'default';
+    if (this.selectedModel) return this.selectedModel;
+    const handle = this._resolveActiveAgentTarget();
+    if (handle) return handle;
+    const models = Array.isArray(this.models) ? this.models : [];
+    if (models.length) {
+      const m = models[0] || {};
+      const fallback = String(m.alias ?? m.id ?? m.model ?? m.name ?? '');
+      if (fallback) return fallback;
+    }
+    return 'default';
+  }
+
+  // Resolve this.activeAgentId to the "@handle" the same agent is
+  // addressable by in the mention catalog (GET /user/mentions). Matches by
+  // id first; falls back to matching by display name in case /user/models
+  // and /user/mentions ever disagree on id shape. Returns '' (never the raw
+  // internal id) when nothing matches, or when _mentions has not been
+  // fetched yet (see _ensureMentions/_send ordering fix).
+  _resolveActiveAgentTarget() {
+    const id = this.activeAgentId;
+    if (!id) return '';
+    const items = Array.isArray(this._mentions) ? this._mentions : [];
+    const byId = items.find((it) => it && String(it.id ?? '') === String(id));
+    if (byId && byId.handle) return `@${byId.handle}`;
+    const name = this.activeAgentName;
+    if (name) {
+      const byName = items.find((it) => it && String(it.display ?? '') === String(name));
+      if (byName && byName.handle) return `@${byName.handle}`;
+    }
+    return '';
   }
 
   // If the text addresses a KNOWN @handle, return "@handle" as the chat target
@@ -455,7 +510,19 @@ export class YsChatView extends LitElement {
     if (this._input) this._input.value = '';
     this._scrollToEnd();
 
-    await this._ensureConversation(); // persist subsequent turns server-side
+    // YSG-RISK-175: resolve @-mentions BEFORE streaming starts. Previously
+    // this._mentions was populated only by the async _ensureMentions() fired
+    // from the textarea's `input` handler (_syncMention) — a fast
+    // type-then-Enter (or any send whose text was set programmatically,
+    // never firing `input`) could reach _streamAssistant() → _targetModel()
+    // before that fetch resolved. this._mentions was then still null,
+    // _resolveMentionTarget() silently returned '' for an explicitly
+    // "@handle"-addressed turn, and _currentModel() took over — see
+    // _currentModel()'s own fix for why THAT fallback was unsafe too.
+    // Awaiting _ensureMentions() here (idempotent/cached, so this is a
+    // no-op fetch if _syncMention already kicked it off) makes mention
+    // resolution deterministic instead of a race.
+    await Promise.all([this._ensureMentions(), this._ensureConversation()]);
     this._streamAssistant();
   }
 
