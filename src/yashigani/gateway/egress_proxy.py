@@ -30,9 +30,24 @@ Codegen interface (wired into sidecar-wraps by Captain):
              502 + {"error": "egress_forward_failed"} on upstream error
 
 Sensitivity ceiling:
-  ``_EGRESS_CALLER_CEILING = "PUBLIC"`` — correct for external notification
-  services (Slack, Telegram).  Any body classified above PUBLIC (RESTRICTED
-  when secrets or injection patterns are detected) is withheld and audited.
+  Per-prefix (YSG-RISK-170, chat-path repair 2026-07-30): ``_EGRESS_CEILING_BY_PREFIX``
+  maps the ``llm`` prefix — the agent's OWN reasoning/completion self-call to
+  the fully-internal ``gateway-inference`` destination (bundles/*-egress.yaml
+  mark it a "Reserved internal class", never internet-facing) — to
+  ``_EGRESS_LLM_CEILING = "RESTRICTED"`` (i.e. no artificial cap beyond this
+  gate's own classifier maximum). Every other prefix (``slack``,
+  ``slack-hooks``, ``telegram``, and any future prefix) keeps
+  ``_EGRESS_EXTERNAL_CEILING = "PUBLIC"`` — correct for genuinely external
+  notification destinations. Applying PUBLIC uniformly to the ``llm`` prefix
+  previously false-DENYed an agent's own trivial self-call the instant the M4
+  injection-pattern heuristic produced a false positive on ordinary
+  system-prompt/tool-schema text (confirmed live: openclaw's embedded agent
+  403'd on "Please reply with a one-sentence greeting" with
+  ``result_sensitivity_exceeds_caller_ceiling``, surfaced to the user as a
+  masked 500). The independent hard PII/secrets gate (``mcp.rego``'s
+  ``pii_detected`` check) is UNCHANGED and still denies regardless of ceiling
+  — this fix does not weaken genuine DLP enforcement, only corrects a ceiling
+  meant for external egress that was misapplied to an internal self-call class.
 
 Design notes:
   * No second filter: the exact same ``filter_description()`` + ``scan_secrets()``
@@ -66,7 +81,24 @@ logger = logging.getLogger(__name__)
 
 # External notification services (Slack, Telegram) have a PUBLIC sensitivity
 # ceiling.  Any body classified above PUBLIC is withheld.
-_EGRESS_CALLER_CEILING = "PUBLIC"
+_EGRESS_EXTERNAL_CEILING = "PUBLIC"
+
+# YSG-RISK-170: the "llm" prefix is a Reserved internal class (agent's own
+# reasoning self-call to gateway-inference — see module docstring). RESTRICTED
+# is the top of the rank scale in policy/mcp.rego (_result_ceiling_rank), so
+# using it here means "no artificial ceiling cap for this class" while the
+# SEPARATE hard PII/secrets gate (mcp.rego pii_detected check) remains fully
+# enforced regardless.
+_EGRESS_LLM_CEILING = "RESTRICTED"
+
+_EGRESS_CEILING_BY_PREFIX: dict[str, str] = {
+    "llm": _EGRESS_LLM_CEILING,
+}
+
+
+def _egress_ceiling_for_prefix(prefix: str) -> str:
+    """Resolve the caller sensitivity ceiling for this egress prefix (RISK-170)."""
+    return _EGRESS_CEILING_BY_PREFIX.get(prefix, _EGRESS_EXTERNAL_CEILING)
 
 # Headers that must not be forwarded from gateway to the Caddy deliver path.
 _STRIP_FORWARD_HEADERS = frozenset({
@@ -273,7 +305,7 @@ async def egress_eval(
     opa_result = await query_mcp_response_decision(
         opa_url=_state.opa_url,
         caller_spiffe=caller_spiffe,
-        caller_sensitivity_ceiling=_EGRESS_CALLER_CEILING,
+        caller_sensitivity_ceiling=_egress_ceiling_for_prefix(prefix),
         caller_groups=[],
         result_sensitivity=result_sensitivity,
         pii_detected=pii_detected,

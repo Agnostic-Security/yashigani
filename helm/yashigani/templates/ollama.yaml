@@ -126,14 +126,17 @@ spec:
       targetPort: 11434
       protocol: TCP
 {{- end }}
-{{- if and .Values.ollama.enabled (or .Values.openWebui.enabled .Values.agentBundles.langflow.enabled .Values.agentBundles.letta.enabled .Values.agentBundles.openclaw.enabled) }}
+{{- if and .Values.ollama.enabled (or .Values.agentBundles.langflow.enabled .Values.agentBundles.letta.enabled .Values.agentBundles.openclaw.enabled) }}
 ---
 # ollama-init Job — pulls the default LLM model so any AI workload has a
-# backend on first deploy.  Runs once per helm install/upgrade when
-# openWebui.enabled OR any agentBundle (langflow/letta/openclaw) is enabled.
+# backend on first deploy.  Runs once per helm install/upgrade when any
+# agentBundle (langflow/letta/openclaw) is enabled.
 # SF-011 fix (2026-05-19): was gated on openWebui.enabled only; agent-bundle
 # installs without Open WebUI never pulled the model → HTTP 404 on all chat.
-# Helm chart equivalent of the compose ollama-init service (profiles: openwebui
+# openWebui.enabled removed from this OR (2026-07-28) — OWUI removed in 4.0;
+# helm/yashigani/templates/networkpolicy.yaml's allow-ollama-init-egress gate
+# was updated in the SAME commit — keep them identical (F-K8S-OLLAMA-INIT-NETPOL).
+# Helm chart equivalent of the compose ollama-init service (profiles:
 # langflow letta openclaw).
 apiVersion: batch/v1
 kind: Job

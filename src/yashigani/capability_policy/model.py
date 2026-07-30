@@ -91,7 +91,7 @@ def default_policy() -> CapabilityPolicySet:
     Return the immutable system BASELINE policy.
 
     All 5 capabilities are set to "self" — a non-breaking default that keeps
-    OpenWebUI mic/voice and client-side geofencing/impossible-travel working.
+    ui4 mic/voice and client-side geofencing/impossible-travel working.
 
     This is the hardcoded, operator-immutable floor.  It is used only when no
     org policy exists for the principal's org (i.e. as the final resolver

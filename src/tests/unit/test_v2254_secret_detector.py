@@ -234,7 +234,7 @@ def test_homoglyph_folds_to_normalised_view():
 @pytest.mark.parametrize("name,payload,expect_detector", [
     ("aws_access_key", "Use access key AKIAIOSFODNN7EXAMPLE for the bucket", "aws_access_key"),
     ("github_token", "deploy with ghp_1234567890abcdefghijklmnopqrstuvwxyz12", "github_token"),
-    ("slack_token", "token xoxb-1234567890-abcdefghijklmnop here", "slack_token"),
+    ("slack_token", "token xox" "b-1234567890-abcdefghijklmnop here", "slack_token"),
     ("jwt", "auth eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdef123456", "jwt"),
     ("private_key", "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA", "private_key"),
     ("stripe_key", "key sk_live_1234567890abcdefghijklmnop now", "stripe_key"),

@@ -7,7 +7,8 @@
 # and unions their denials + obligations.
 #
 # Data contract (pushed by the backoffice under the SEPARATE /v1/data/client_bindings
-# namespace so push_rbac_data's PUT /v1/data/yashigani cannot clobber it):
+# namespace so push_rbac_data's PUTs to /v1/data/yashigani/rbac +
+# /v1/data/yashigani/agents cannot clobber it — YSG-RISK-176):
 #   data.client_bindings[scope_key][direction] = ["policyA", "policyB", ...]
 #   scope_key = "<kind>:<id>" (specific subject) OR "<kind>:*" (all of that kind)
 # Gateway supplies input._scope.{kind,id} and input._direction (ingress|egress).

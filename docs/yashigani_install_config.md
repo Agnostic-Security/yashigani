@@ -29,7 +29,7 @@
 18. [Response Path Inspection (since v0.9.0)](#18-response-path-inspection-v090)
 19. [WebAuthn / Passkeys Configuration (since v0.9.0)](#19-webauthn--passkeys-configuration-v090)
 20. [Credential Summary and Dual Admin Accounts (since v0.9.1)](#20-credential-summary-and-dual-admin-accounts-v091)
-21. [Open WebUI Configuration (since v2.0)](#21-open-webui-configuration-v20)
+21. [Chat Surface and Model Picker Visibility](#21-chat-surface-and-model-picker-visibility)
 22. [Optimization Engine (since v2.0)](#22-optimization-engine-v20)
 23. [Budget System (since v2.0)](#23-budget-system-v20)
 24. [Container Pool Manager (since v2.0)](#24-container-pool-manager-v20)
@@ -347,7 +347,6 @@ The installer prompts for API keys immediately if you select a cloud backend, an
 
 **Step 14 — Optional services.** The installer prompts for optional service add-ons:
 
-- **Open WebUI:** `Enable Open WebUI chat interface? [y/N]` — deploys the Open WebUI container at `/chat/*` with trusted header authentication. Equivalent to `--with-openwebui` flag.
 - **Internal CA:** `Enable Internal CA (Smallstep step-ca)? [y/N]` — deploys an internal Certificate Authority for mTLS between services. Equivalent to `--with-internal-ca` flag.
 - **Wazuh SIEM:** If SIEM mode is `wazuh`, Wazuh is auto-enabled. Can also be enabled with the `--wazuh` flag.
 
@@ -1975,9 +1974,6 @@ The `--upgrade` flag backs up your current data, pulls the latest images, checks
 Additional install flags for optional services:
 
 ```bash
-# Enable Open WebUI chat interface
-./install.sh --with-openwebui
-
 # Enable Internal CA (Smallstep step-ca)
 ./install.sh --with-internal-ca
 
@@ -1985,7 +1981,7 @@ Additional install flags for optional services:
 ./install.sh --wazuh
 
 # Combine flags
-./install.sh --upgrade --with-openwebui --with-internal-ca --wazuh
+./install.sh --upgrade --with-internal-ca --wazuh
 ```
 
 For backup recovery, use `restore.sh` to restore from a previous backup.
@@ -2447,34 +2443,32 @@ All credentials are also written to `docker/secrets/` with chmod 600. On upgrade
 
 ---
 
-## 21. Open WebUI Configuration (since v2.0)
+## 21. Chat Surface and Model Picker Visibility
 
-v2.0 integrates Open WebUI as the primary chat interface, served at `/chat/*` behind Caddy. Open WebUI uses trusted headers injected by the gateway for seamless identity propagation.
+> **Open WebUI was removed in 4.0.** The chat interface at `/chat/*` is now
+> served natively by the backoffice's built-in `ui4` SPA (Lit-based
+> chat/agents/builder/workflows UI) — there is no separate container, no
+> `--with-openwebui` install flag, and no `YASHIGANI_OPENWEBUI_ENABLED` /
+> `YASHIGANI_OPENWEBUI_TRUSTED_HEADER` env vars (these v2.0-era settings no
+> longer exist in code and have been removed from this document). Identity
+> propagation to `/chat/*` uses the same trusted-header mechanism as every
+> other backoffice-served admin/user path — no separate configuration.
 
-### 21.1 Routing
+### 21.1 Populating the model picker — `gateway.models.service_account_full_list`
 
-Caddy routes all `/chat/*` requests to the Open WebUI container. Authentication is handled by the gateway before the request reaches Open WebUI — the gateway injects trusted headers (`X-Yashigani-User-Id`, `X-Yashigani-User-Kind`, `X-Yashigani-Groups`) that Open WebUI consumes for session establishment.
-
-### 21.2 `.env` Settings
-
-```dotenv
-YASHIGANI_OPENWEBUI_ENABLED=true              # Enable Open WebUI (default: true in v2.0)
-YASHIGANI_OPENWEBUI_TRUSTED_HEADER=X-Yashigani-User-Id   # Header containing authenticated user identity
-```
-
-### 21.3 Disabling Open WebUI
-
-Set `YASHIGANI_OPENWEBUI_ENABLED=false` in `.env` and restart Caddy. The `/chat/*` routes will return 404.
-
-### 21.4 Populating the model picker — `gateway.models.service_account_full_list`
-
-Open WebUI authenticates to the gateway with the shared **internal service bearer**, so to the gateway every Open WebUI request is one *service-account* identity. By default (OPA GAP-001/002 / FINDING-59-01 internal-topology-disclosure hardening) service accounts get a **RESTRICTED** `GET /v1/models` listing — only their `allowed_models` allowlist, empty by default — so the Open WebUI **model picker shows nothing** and end users cannot start a chat.
+The gateway (and by extension the `ui4` chat surface, which authenticates to
+it with the shared **internal service bearer**) treats every chat-surface
+request as one *service-account* identity. By default (OPA GAP-001/002 /
+FINDING-59-01 internal-topology-disclosure hardening) service accounts get a
+**RESTRICTED** `GET /v1/models` listing — only their `allowed_models`
+allowlist, empty by default — so the chat surface's **model picker shows
+nothing** and end users cannot start a chat.
 
 To make the picker populate, an operator enables the runtime setting:
 
 | Setting key | Type | Default | Effect when ON |
 |---|---|---|---|
-| `gateway.models.service_account_full_list` | bool | `false` | Service-account identities receive the **FULL** `/v1/models` list — the local Ollama models **plus** every registered agent (as `@agent`) **plus** every active service identity (as `@service`). Open WebUI's picker then lists them all; each is invoked the same way (e.g. `@langflow …`, a model name, or `@some-service`). |
+| `gateway.models.service_account_full_list` | bool | `false` | Service-account identities receive the **FULL** `/v1/models` list — the local Ollama models **plus** every registered agent (as `@agent`) **plus** every active service identity (as `@service`). The chat surface's picker then lists them all; each is invoked the same way (e.g. `@langflow …`, a model name, or `@some-service`). |
 
 **Set it from the admin UI:** *Admin → Runtime Settings →* edit `gateway.models.service_account_full_list` to `true` (step-up TOTP required; audited; takes effect within ~30s, no restart). Or via the API:
 
@@ -2485,7 +2479,7 @@ curl -X PUT https://<domain>/admin/runtime-settings/gateway.models.service_accou
 
 Seeded default value can also be set at install time via the env var `YASHIGANI_MODELS_SERVICE_ACCOUNT_FULL_LIST=true`.
 
-**Security note:** this only ever *widens* a service account's model **listing** (enumeration). It does not change which models a request may actually *call* (that is enforced separately), and it never affects human/admin principals (already full) or a hard OPA deny. Leave it OFF if you do not run Open WebUI or do not want service accounts enumerating the model/agent/service topology. Per-user/group/org model RBAC (allocations) is a separate, identity-scoped control.
+**Security note:** this only ever *widens* a service account's model **listing** (enumeration). It does not change which models a request may actually *call* (that is enforced separately), and it never affects human/admin principals (already full) or a hard OPA deny. Leave it OFF if you do not want service accounts enumerating the model/agent/service topology. Per-user/group/org model RBAC (allocations) is a separate, identity-scoped control.
 
 ---
 

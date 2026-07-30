@@ -990,7 +990,15 @@ async def _proxy_request_body(
     if pipeline is not None and body_bytes:
         raw_query = _decode_body_safe(body_bytes)
         if raw_query:
-            result = pipeline.process(
+            # YSG-RISK-113: pipeline.process() performs a SYNCHRONOUS blocking
+            # httpx call to the classifier backend (Ollama et al). Calling it
+            # directly here would hold the single-threaded asyncio event loop
+            # hostage for the full backend timeout — starving every other
+            # coroutine on this worker, INCLUDING the /healthz liveness probe,
+            # and causing kubelet to kill an otherwise-healthy gateway pod.
+            # Offload to the default thread pool so the loop stays responsive.
+            result = await asyncio.to_thread(
+                pipeline.process,
                 raw_query=raw_query,
                 session_id=session_id,
                 agent_id=agent_id,

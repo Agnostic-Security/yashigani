@@ -423,9 +423,21 @@ def _looks_like_word(token: str) -> bool:
     alphabetic ratio is very high and which contains a vowel in most syllables,
     is treated as a word.  Kept deliberately simple — the entropy floor is the
     real gate; this just suppresses obvious false positives.
+
+    YSG-RISK-173: ``/`` is also stripped as a joiner (alongside ``_``/``-``),
+    so a slash-joined or slash-fused run of ordinary words — a tool-schema
+    action enumeration ("status/describe/notify"), a filesystem path, or a
+    reassembly-pass window that happens to fuse real prose across a literal
+    "/" it kept inline — is judged on its full alphabetic content rather than
+    failing this check purely because a "/" is present. This does NOT weaken
+    genuine secret detection: every known credential format in this module
+    (AWS, GitHub, Slack, sk-, JWT, generic ``labelled_secret``) always carries
+    a digit somewhere in its body, so ``core.isalpha()`` already excludes it
+    regardless of whether ``/`` is stripped — the comment below predates this
+    fix and remains accurate.
     """
-    # Pure alphabetic (with _ or - as joiners) and contains vowels → a word.
-    core = token.replace("_", "").replace("-", "")
+    # Pure alphabetic (with _, -, or / as joiners) and contains vowels → a word.
+    core = token.replace("_", "").replace("-", "").replace("/", "")
     if core.isalpha():
         vowels = sum(core.lower().count(v) for v in "aeiou")
         # Real words/identifiers carry vowels; a 20+ alpha run with vowels is
@@ -434,38 +446,158 @@ def _looks_like_word(token: str) -> bool:
     return False
 
 
-def _normalise_for_reassembly(text: str) -> tuple[str, bool]:
-    """Produce a de-obfuscated copy of *text* in which spelled-out separators
-    are literal characters and filler words between fragments are removed, so a
-    split secret is concatenated back into a contiguous run.
+# Minimum '/'-separated segments for the slash-enumeration false-positive
+# guard (YSG-RISK-173) to fire.  2 segments ("read/write") is too weak a
+# signal (a real secret could coincidentally contain one slash); 3+ is a
+# deliberate enumeration shape ("status/describe/notify/camera") that never
+# occurs by chance inside a random high-entropy token.
+_SLASH_ENUM_MIN_SEGMENTS: int = 3
 
-    Returns ``(reassembled, obfuscation_seen)`` where ``obfuscation_seen`` is
-    True only when at least one spelled-out separator phrase was actually
-    substituted.  The caller scans the reassembly ONLY when obfuscation was
-    seen — concatenating ordinary space-separated PROSE would otherwise fuse a
-    long sentence into a spurious high-entropy run (false positive on product
-    names / long descriptions).  Genuine split-token payloads always carry a
-    spelled-out separator ("then a slash then", "underscore", ...), which is
-    the signal of intent.
+# A short trailing-numeric-suffix identifier segment ("cv_123" → core "cv123",
+# "v2", "SKILL42") — common in real filesystem/route paths (document IDs,
+# version suffixes). Digits must be a SHORT trailing run after >=1 leading
+# letter, or the segment is purely a short digit run on its own ("42").
+# Deliberately NOT "any alnum mix": a genuine secret fragment interleaves
+# digits THROUGHOUT (e.g. "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" has a digit
+# mid-run followed by more letters), which this pattern does not match.
+_SHORT_ALNUM_SEGMENT_RE = re.compile(r"^(?:[A-Za-z]{2,}[0-9]{0,6}|[0-9]{1,6})$")
+
+
+def _looks_like_slash_enumeration(token: str) -> bool:
+    """True when *token* is a ``/``-joined run of ordinary English words or
+    path-shaped identifiers — e.g. an MCP/tool-schema description listing
+    accepted actions (``"status/describe/pairing/notify/camera/photos/
+    screen"``) or a filesystem path made of pronounceable segments plus short
+    numeric IDs (``"/app/dist/extensions/browser/skills/browser-automation/
+    SKILL"``, ``"/__openclaw__/canvas/documents/cv_123/index"``). ``/`` is a
+    required member of the AWS-secret and generic base64 alphabets (real AWS
+    secret keys and base64 blobs legitimately contain it), so a long run of
+    dictionary-word / short-ID segments joined only by ``/`` satisfies both
+    the 40-char ``_AWS_SECRET_RE`` shape and the entropy floor purely because
+    slash-joined words happen to have high per-character diversity — not
+    because the content is a secret (YSG-RISK-173, confirmed live against
+    OpenClaw's own real outbound self-call body: both example strings above
+    were observed hard-blocking a trivial one-sentence greeting via the
+    agent's own self-call, one via ``aws_secret``, one via the generic
+    entropy floor).
+
+    Also splits on ``=`` (not just ``/``) so a config-style assignment whose
+    value is itself a slash-path (``"model=yashigani/qwen2"``,
+    ``"default_model=yashigani/qwen2"`` — both observed live in the same
+    OpenClaw runtime-info body) is judged the same way: every ``=``/``/``-
+    delimited segment must independently be benign. ``=`` is not part of the
+    AWS-secret alphabet (``_AWS_SECRET_RE`` never contains it) so this only
+    affects the generic entropy floor's token boundary, never the AWS-secret
+    check.
+
+    Requires >= :data:`_SLASH_ENUM_MIN_SEGMENTS` non-empty segments (leading/
+    trailing/doubled ``/`` produce empty segments that are dropped first, so
+    absolute paths are not penalised). EVERY segment must independently be
+    benign per :func:`_segment_is_benign` — either word-shaped (alphabetic
+    core with a vowel, ``_``/``-`` joiners stripped) or a short trailing-
+    numeric-suffix identifier. This does NOT weaken genuine secret detection:
+    a real credential hidden behind a slash (e.g. ``sk-ant/api03/<random>``)
+    has at least one segment whose digits are interleaved THROUGHOUT rather
+    than a short trailing run, or whose length/shape otherwise fails
+    :func:`_segment_is_benign` — so that token still fails this check and
+    remains flagged by the AWS-secret / entropy floor as before. Only a token
+    whose EVERY segment independently reads as an ordinary word or short path
+    identifier is treated as benign enumeration/path prose.
+    """
+    parts = [p for p in re.split(r"[/=]", token) if p]
+    if len(parts) < _SLASH_ENUM_MIN_SEGMENTS:
+        return False
+    return all(_segment_is_benign(part) for part in parts)
+
+
+def _segment_is_benign(part: str) -> bool:
+    """True when a single ``/``-delimited path/enumeration segment cannot
+    itself be a secret fragment: it reads as an ordinary word (alphabetic core
+    with a vowel) OR it matches the short trailing-numeric-suffix identifier
+    shape (:data:`_SHORT_ALNUM_SEGMENT_RE` — e.g. ``cv_123``, ``v2``, ``42``).
+    Anything else (a long/high-entropy or digit-interleaved segment) is NOT
+    benign — that is exactly the shape a real embedded secret fragment would
+    have, so it must keep the whole token subject to the normal AWS-secret /
+    entropy checks."""
+    core = part.replace("_", "").replace("-", "")
+    if core and core.isalpha():
+        vowels = sum(core.lower().count(v) for v in "aeiou")
+        if vowels >= 1:
+            return True
+    return bool(_SHORT_ALNUM_SEGMENT_RE.match(core))
+
+
+# Radius (chars, each side of a matched separator phrase) for the LOCAL
+# reassembly window (YSG-RISK-173 class-fix). A genuine split-token secret's
+# fragments sit IMMEDIATELY adjacent to the spelled-out separator ("wJalr...
+# then a slash then K7MDENG...") — comfortably under 100 chars either side even
+# for a fully-spelled multi-fragment AWS secret. 200 is generous headroom
+# without re-introducing whole-document fusion.
+_REASSEMBLY_WINDOW_RADIUS: int = 200
+
+
+def _normalise_for_reassembly_windows(text: str) -> list[str]:
+    """Produce de-obfuscated LOCAL windows around every spelled-out-separator
+    occurrence in *text*, each with the separator phrase converted to its
+    literal character and filler words removed/rejoined so an adjacent
+    split secret concatenates into a contiguous run.
+
+    Returns a list of reassembled window strings — empty when no separator
+    phrase was seen anywhere in *text* (the gate on "obfuscation seen" that
+    the previous whole-text implementation used, preserved here per-window).
+
+    YSG-RISK-173 class-fix: the PREVIOUS implementation fused the ENTIRE input
+    text into one contiguous run the instant any separator phrase ("slash",
+    "dash", "colon", ...) appeared ANYWHERE in it — fine for the short fixture
+    payloads this pass was designed against, but catastrophic against a real
+    multi-KB document (e.g. an agent's full system prompt): a single incidental
+    appearance of the common English word "slash" turns the WHOLE document into
+    one whitespace-free blob, and some 40-char window across a large fused blob
+    will essentially always coincidentally satisfy the AWS-secret entropy floor
+    (confirmed live: OpenClaw's ~78KB outbound self-call body — which legitimately
+    describes "preserve raw full command/script exactly as provided" — was
+    fused end-to-end by one stray "slash" occurrence and false-flagged via this
+    exact path). Bounding the fuse to a :data:`_REASSEMBLY_WINDOW_RADIUS`-char
+    window on EACH side of EACH separator-phrase occurrence keeps the original
+    split-token defeat intact (fragments always sit immediately adjacent to the
+    literal separator phrase — see ``test_laura_split_token_is_caught_by_reassembly``)
+    while eliminating whole-document fusion as a false-positive vector.
     """
     lowered = text.lower()
-    obfuscation_seen = False
-    # 1) spelled-out separators → literal chars (longest phrase first).
-    for phrase, literal in _SEPARATOR_PHRASES:
-        if phrase in lowered:
-            obfuscation_seen = True
-            lowered = lowered.replace(phrase, literal)
-    # 2) tokenise on whitespace; drop filler words; rejoin WITHOUT spaces so
-    #    adjacent alnum fragments concatenate.  Tokens that are pure separators
-    #    (now "/", ".", etc.) are kept inline.
-    out_parts: list[str] = []
-    for tok in re.split(r"\s+", lowered):
-        if not tok:
-            continue
-        if tok in _FILLER_WORDS:
-            continue
-        out_parts.append(tok)
-    return "".join(out_parts), obfuscation_seen
+    match_positions: list[int] = []
+    for phrase, _literal in _SEPARATOR_PHRASES:
+        start = 0
+        while True:
+            idx = lowered.find(phrase, start)
+            if idx == -1:
+                break
+            match_positions.append(idx)
+            start = idx + len(phrase)
+    if not match_positions:
+        return []
+
+    windows: list[str] = []
+    for pos in match_positions:
+        lo = max(0, pos - _REASSEMBLY_WINDOW_RADIUS)
+        hi = min(len(lowered), pos + _REASSEMBLY_WINDOW_RADIUS)
+        window_text = lowered[lo:hi]
+        # 1) spelled-out separators → literal chars (longest phrase first),
+        #    scoped to this window only.
+        for phrase, literal in _SEPARATOR_PHRASES:
+            if phrase in window_text:
+                window_text = window_text.replace(phrase, literal)
+        # 2) tokenise on whitespace; drop filler words; rejoin WITHOUT spaces
+        #    so adjacent alnum fragments concatenate. Tokens that are pure
+        #    separators (now "/", ".", etc.) are kept inline.
+        out_parts: list[str] = []
+        for tok in re.split(r"\s+", window_text):
+            if not tok:
+                continue
+            if tok in _FILLER_WORDS:
+                continue
+            out_parts.append(tok)
+        windows.append("".join(out_parts))
+    return windows
 
 
 def _looks_like_secret_fragment(tok: str) -> bool:
@@ -676,17 +808,53 @@ def _scan_known_formats(text: str) -> Optional[tuple[str, str]]:
     return None
 
 
+def _expand_to_full_run(text: str, start: int, end: int) -> str:
+    """Expand a matched ``[start:end)`` span to the maximal contiguous run of
+    the AWS/base64-alphabet character class (``[A-Za-z0-9/+]``) it sits inside.
+
+    ``_AWS_SECRET_RE`` is a FIXED 40-char window, so it can land mid-word —
+    e.g. slicing "...camera/photos/..." at exactly 40 chars yields a trailing
+    fragment "ph" (no vowel). Judging enumeration-shape on that arbitrarily
+    truncated fragment lets the truncation point defeat
+    :func:`_looks_like_slash_enumeration`'s per-segment vowel check by pure
+    coincidence (YSG-RISK-173). Expanding to the full surrounding run before
+    that check gives the real word context ("photos"), which does contain a
+    vowel — while the ENTROPY test still runs on the original 40-char span
+    (unchanged), so this expansion only affects the false-positive-suppression
+    decision, never the detection threshold itself."""
+    lo = start
+    while lo > 0 and (text[lo - 1].isalnum() or text[lo - 1] in "/+"):
+        lo -= 1
+    hi = end
+    while hi < len(text) and (text[hi].isalnum() or text[hi] in "/+"):
+        hi += 1
+    return text[lo:hi]
+
+
 def _scan_aws_secret(text: str) -> Optional[str]:
     """A 40-char base64-alphabet run with high entropy is an AWS secret access
     key candidate.  Returns the span or None.  Entropy-confirmed so a 40-char
     low-entropy run (unlikely but possible) does not trip.  A 40-char run that is
     base64-OF-PROSE (decodes to space-separated words) is NOT an AWS secret — the
     decode view re-scans it for any embedded key — so it is excluded here to
-    avoid a benign-base64 false positive that happens to land at 40 chars."""
+    avoid a benign-base64 false positive that happens to land at 40 chars.
+    A 40-char run that sits inside a ``/``-joined enumeration of ordinary words
+    (YSG-RISK-173 — see :func:`_looks_like_slash_enumeration`) is likewise
+    excluded: tool-schema/description prose listing accepted actions/paths
+    satisfies the base64-alphabet + entropy shape purely by coincidence, not
+    because it is a secret. The enumeration check runs against the FULL
+    surrounding word run (:func:`_expand_to_full_run`), not the raw 40-char
+    span, so an arbitrary truncation mid-word cannot defeat it."""
     for m in _AWS_SECRET_RE.finditer(text):
         span = m.group(0)
-        if _shannon_entropy(span) >= _ENTROPY_THRESHOLD and not _is_base64_of_prose(span):
-            return span
+        if _shannon_entropy(span) < _ENTROPY_THRESHOLD:
+            continue
+        if _is_base64_of_prose(span):
+            continue
+        full_run = _expand_to_full_run(text, m.start(), m.end())
+        if _looks_like_slash_enumeration(full_run):
+            continue
+        return span
     return None
 
 
@@ -731,6 +899,8 @@ def _scan_entropy(text: str, *, min_len: int) -> Optional[tuple[str, float]]:
         if len(tok) < min_len:
             continue
         if _looks_like_word(tok):
+            continue
+        if _looks_like_slash_enumeration(tok):
             continue
         if _is_base64_of_prose(tok):
             continue
@@ -832,9 +1002,12 @@ def _run_reassembly_passes(
         return f"{view_prefix}:{name}" if view_prefix else name
 
     # Pass B — spelled-out-separator reassembly (split-token defeat).
-    reassembled, obfuscation_seen = _normalise_for_reassembly(view_text)
-    if reassembled and obfuscation_seen:
-        r = _scan_view(reassembled, min_len=_REASSEMBLY_MIN_LEN, hex_floor=True)
+    # YSG-RISK-173: windowed per-occurrence (not whole-text) — see
+    # _normalise_for_reassembly_windows docstring for the class-fix rationale.
+    for reassembled_window in _normalise_for_reassembly_windows(view_text):
+        if not reassembled_window:
+            continue
+        r = _scan_view(reassembled_window, min_len=_REASSEMBLY_MIN_LEN, hex_floor=True)
         if r:
             record(r[0], r[1], True, r[2], _label("separator_reassembly"))
 

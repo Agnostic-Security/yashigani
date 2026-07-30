@@ -138,21 +138,21 @@ else
   _fail "functional: YASHIGANI_ENABLED_PROFILES after upgrade = '${_result}' (expected 'wazuh,langflow,letta')"
 fi
 
-# Simulate adding a new profile during --upgrade (operator passes --with-openwebui)
+# Simulate adding a new profile during --upgrade (operator passes --with-internal-ca)
 _ep_rt=()
 IFS=',' read -ra _existing_ep_arr <<< "$_existing_ep"
 _ep_rt+=("${_existing_ep_arr[@]}")
-_ep_rt+=("openwebui")  # newly selected
+_ep_rt+=("internal-ca")  # newly selected
 _ep_csv_rt="$(printf '%s\n' "${_ep_rt[@]}" | awk 'NF&&!seen[$0]++' | paste -sd, -)"
 _t3_rt="$(mktemp)"
 sed "s|^YASHIGANI_ENABLED_PROFILES=.*|YASHIGANI_ENABLED_PROFILES=${_ep_csv_rt}|" "$_fake_env" > "$_t3_rt"
 mv "$_t3_rt" "$_fake_env"
 
 _result2="$(grep '^YASHIGANI_ENABLED_PROFILES=' "$_fake_env" | sed 's/^YASHIGANI_ENABLED_PROFILES=//')"
-if [[ "$_result2" == "wazuh,langflow,letta,openwebui" ]]; then
+if [[ "$_result2" == "wazuh,langflow,letta,internal-ca" ]]; then
   _pass "functional: new profile added to existing set during --upgrade"
 else
-  _fail "functional: add-profile result = '${_result2}' (expected 'wazuh,langflow,letta,openwebui')"
+  _fail "functional: add-profile result = '${_result2}' (expected 'wazuh,langflow,letta,internal-ca')"
 fi
 
 # ---------------------------------------------------------------------------

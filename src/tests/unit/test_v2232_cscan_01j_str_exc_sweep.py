@@ -123,10 +123,10 @@ class TestServicesManageServiceFailure:
         session.account_id = "admin-001"
 
         import asyncio
-        result = asyncio.run(mod.manage_service("openwebui", body, session))
+        result = asyncio.run(mod.manage_service("wazuh", body, session))
 
         assert result["status"] == "deploy_time_managed"
-        assert result["service"] == "openwebui"
+        assert result["service"] == "wazuh"
         assert result["action"] == "enable"
         # guidance points the operator at the installer, not a runtime toggle
         assert "installer" in result["message"].lower()

@@ -4,8 +4,10 @@ Yashigani 4.1.2 conformance suite — AUTH / IDENTITY / RBAC surface.
 Target commit: mustui/acc/v412-integrated-latest-20260722 @ 250b486d.
 
 Closes the AUTH/IDENTITY/RBAC surface for:
-  routes/auth.py          (25 endpoints) — /auth/*  (includes TOTP provisioning,
-                            step-up, operator tokens, IP allow/block lists)
+  routes/auth.py          (24 endpoints) — /auth/*  (includes TOTP provisioning,
+                            step-up, operator tokens, IP allow/block lists;
+                            /auth/verify-user removed 2026-07-28, YSG-RISK-140
+                            OWUI removal — endpoint no longer exists)
   routes/me.py             (3 endpoints) — /me/api-key, /me/api-keys*
   routes/users.py          (9 endpoints) — /admin/users/*
   routes/accounts.py       (8 endpoints) — /admin/accounts/*
@@ -13,7 +15,7 @@ Closes the AUTH/IDENTITY/RBAC surface for:
   routes/rbac.py           (9 endpoints) — /admin/rbac/* (groups incl. members/policy push)
   routes/rbac_sources.py   (2 endpoints) — /admin/rbac/sources/*
   routes/budget.py         (9 endpoints) — /admin/budget/{org-caps,groups,individuals}
-Total: 71 endpoints.
+Total: 70 endpoints.
 
 SCOPE DECISION (documented per PROPOSE-FIRST discipline — flag, don't guess silently):
   The dispatch brief names "totp.py" and "groups.py" as separate files and lists
@@ -520,7 +522,10 @@ def caddy_secret_file(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _EXPECTED_ROUTES: set[tuple[str, str]] = {
-    # auth.py (25)
+    # auth.py (24) — /auth/verify-user removed 2026-07-28, YSG-RISK-140
+    # (OWUI removed in 4.0; Caddy's /app/webui* handle is now a bare
+    # redirect to /chat, no forward_auth, so this endpoint became
+    # unreachable dead code and was deleted).
     ("POST", "/auth/login"),
     ("POST", "/auth/logout"),
     ("GET", "/auth/logout-redirect"),
@@ -528,7 +533,6 @@ _EXPECTED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/auth/password/self-reset"),
     ("GET", "/auth/verify"),
     ("GET", "/auth/verify-admin"),
-    ("GET", "/auth/verify-user"),
     ("GET", "/auth/verify-mcp"),
     ("GET", "/auth/verify-webhook"),
     ("POST", "/auth/password/change"),
@@ -607,9 +611,10 @@ def test_group_covers_all_declared_routes(declared_routes):
     missing = _EXPECTED_ROUTES - declared_set
     assert not missing, f"Endpoints in scope but not found in the live route walk: {missing}"
     # Confirm we enumerated exactly the endpoint count claimed in the module
-    # docstring (71) — a route added/removed under these prefixes since this
+    # docstring (70) — a route added/removed under these prefixes since this
     # suite was authored should fail loudly, not silently under-cover.
-    assert len(_EXPECTED_ROUTES) == 71
+    # (71 -> 70: /auth/verify-user removed 2026-07-28, YSG-RISK-140 OWUI removal.)
+    assert len(_EXPECTED_ROUTES) == 70
 
 
 # ===========================================================================
@@ -853,23 +858,11 @@ class TestAuthVerifyEndpoints:
         r = admin_client.get("/auth/verify-admin")
         assert r.status_code == 200, r.text
 
-    # GAP-CLOSED: GET /auth/verify-user
-    def test_verify_user_unauth_401(self, unauth_client):
-        assert unauth_client.get("/auth/verify-user").status_code == 401
-
-    def test_verify_user_admin_session_403(self, admin_client):
-        r = admin_client.get("/auth/verify-user")
-        assert r.status_code == 403, r.text
-        assert r.json()["detail"]["error"] == "admin_session_not_allowed_user_path"
-
-    def test_verify_user_user_session_200(self, user_client, fake_auth_service, seed_account):
-        # rbac_store not wired -> getattr(state, "rbac_store", None) is None
-        # -> owui-users membership check is skipped (documented fail-open for
-        # community/no-RBAC deployments) -> 200.
-        seed_account(fake_auth_service, account_id=user_client.conformance_session.account_id,
-                      username="verifyuserU@x.com", tier="user")
-        r = user_client.get("/auth/verify-user")
-        assert r.status_code == 200, r.text
+    # /auth/verify-user removed 2026-07-28, YSG-RISK-140 (OWUI removal —
+    # endpoint is gone; Caddy's /app/webui* handle is now a bare redirect
+    # to /chat with no forward_auth leg). See TestAuthVerifyMcpWebhook and
+    # the /auth/verify, /auth/verify-admin cases above for the still-live
+    # verify endpoints.
 
 
 class TestAuthVerifyMcpWebhook:

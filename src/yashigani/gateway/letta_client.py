@@ -250,7 +250,9 @@ class LettaClientPool:
                         ),
                     },
                 ],
-                "model": brain_model,
+                # YSG-RISK-1xx (chat-path repair, 2026-07-27): llm_config (full
+                # object), not "model" (handle) — see _letta_llm_config() docstring.
+                "llm_config": _letta_llm_config(brain_model),
                 "embedding_config": embedding_cfg,
             })
             if resp.status_code not in (200, 201):
@@ -397,7 +399,38 @@ _OLLAMA_EMBEDDING_DIMS: dict[str, int] = {
 # The gateway's internal mesh port for embedding calls (same as the LLM openai-proxy).
 # Port 8081 is plain HTTP on the data bridge — no client certs required from Letta.
 # Port 8080 is mTLS-only; Letta cannot present client certs (pg8000 constraint parity).
+#
+# YSG-RISK-169 (chat-path repair, 2026-07-30): this endpoint is written into
+# the LETTA-SIDE llm_config/embedding_config — it must be reachable FROM
+# LETTA'S OWN CONTAINER, not from the gateway process constructing the config.
+# That reachability differs by deployment shape:
+#
+#   Per-user LettaClientPool containers (get_endpoint(); "persona" @-handles):
+#     networks [ringfence_letta_<user>, caddy_internal] — caddy_internal
+#     reaches gateway:8081 directly. _letta_container_env() sets the SAME
+#     value as this container's own OPENAI_API_BASE. Unaffected by this fix.
+#
+#   Static system-wide `letta` compose service (used by the shared @letta
+#     mention path via module-level _ensure_agent()/letta_chat()): networks
+#     ringfence_letta_in + ringfence_letta_eg + letta_db ONLY (v4.1 unified-
+#     sidecar split-ringfence) — it can reach egress-letta:9400 but NOT
+#     gateway:8081 directly. Hardcoding gateway:8081 here left every
+#     reasoning step failing inside Letta with
+#     "LLMConnectionError: Failed to connect to OpenAI: Connection error"
+#     (confirmed live via `docker logs letta`), surfaced to users as
+#     "Agent @letta (Letta) unreachable".
+#
+# _GATEWAY_EMBED_ENDPOINT stays the per-user-pool-safe default (preserves
+# existing behaviour for that path + the one-off _probe_embedding_dim() call
+# below, which is made BY THE GATEWAY PROCESS itself and is unaffected by
+# either topology). _ensure_agent() (static/system path) passes
+# _LETTA_STATIC_LLM_ENDPOINT explicitly instead.
 _GATEWAY_EMBED_ENDPOINT = "http://gateway:8081/v1"
+
+# Matches docker-compose's own OPENAI_API_BASE for the static `letta` service
+# and the "llm" egress-forwarder prefix wired in bundles/letta-egress.yaml —
+# the only destination the static letta container's network can reach.
+_LETTA_STATIC_LLM_ENDPOINT = "http://egress-letta:9400/llm/v1"
 
 
 def _letta_brain_model() -> str:
@@ -408,6 +441,65 @@ def _letta_brain_model() -> str:
     Ollama (pulled by the installer).  Installer default: qwen2.5:3b.
     """
     return os.getenv("YASHIGANI_LETTA_BRAIN_MODEL", "openai-proxy/qwen2.5:3b")
+
+
+# ---------------------------------------------------------------------------
+# LLM context-window table (YSG-RISK-1xx — see YASHIGANI_LETTA_BRAIN_MODEL fix)
+# ---------------------------------------------------------------------------
+# Mirrors _OLLAMA_EMBEDDING_DIMS below: Letta's LLMConfig requires a
+# context_window at agent-creation time. Qwen2.5's published context length
+# (Qwen2.5 technical report / Ollama library manifest) is 32768 tokens.
+_OLLAMA_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen2.5:3b": 32768,
+}
+# Conservative fallback for a brain model not yet in the table above.
+_LLM_CONTEXT_WINDOW_FALLBACK = 8192
+
+
+def _letta_llm_config(
+    model: str | None = None,
+    *,
+    llm_endpoint: str = _GATEWAY_EMBED_ENDPOINT,
+) -> dict:
+    """Build the explicit llm_config payload for a Letta create-agent call.
+
+    FIX (2026-07-27, chat-path repair): Letta 0.16.7's POST /v1/agents "model"
+    field is a *handle* ("format: provider/model-name") that Letta resolves
+    against its OWN provider catalog — NOT a free-form endpoint pointer. We
+    never register an "openai-proxy" provider with Letta (by design: the
+    docker-compose.yml comment for the letta service states "the gateway, not
+    the Letta server defaults, owns the routing decision"), so every agent
+    creation that sent bare ``"model": "openai-proxy/qwen2.5:3b"`` 404s with
+    "Handle openai-proxy/qwen2.5:3b not found" — breaking @letta chat and the
+    letta-as-orchestrating-brain (Design A) path.
+
+    Letta's (deprecated-but-functional) ``llm_config`` field accepts a full
+    LLMConfig object and bypasses handle resolution entirely — exactly the
+    same trick SC-AGENT-003 already applied to embedding_config to dodge the
+    unreachable "letta/letta-free" cloud handle. This mirrors that fix for the
+    LLM side.
+
+    ``llm_endpoint`` (YSG-RISK-169): the endpoint written into the config is
+    dialled by LETTA ITSELF, not by the caller of this function — it MUST be
+    reachable from the CALLING letta container's own network position, which
+    differs by deployment shape (see _GATEWAY_EMBED_ENDPOINT module comment).
+    Defaults to the per-user-pool-safe value; the static/system agent path
+    (_ensure_agent()) passes _LETTA_STATIC_LLM_ENDPOINT explicitly.
+    """
+    brain_model = model if model is not None else _letta_brain_model()
+    # Strip the "openai-proxy/" (or any other "provider/") prefix — Ollama
+    # only knows the bare model name.
+    bare = brain_model.split("/", 1)[1] if "/" in brain_model else brain_model
+    context_window = _OLLAMA_CONTEXT_WINDOWS.get(bare, _LLM_CONTEXT_WINDOW_FALLBACK)
+    return {
+        "model": bare,
+        "model_endpoint_type": "openai",
+        "model_endpoint": llm_endpoint,
+        "context_window": context_window,
+        # Cosmetic only (Letta does not use this for routing when llm_config
+        # is supplied) — keeps the original handle name visible in the UI.
+        "handle": brain_model,
+    }
 
 
 def _letta_embedding_model() -> str:
@@ -469,18 +561,29 @@ async def _probe_embedding_dim(client: httpx.AsyncClient, model: str) -> int:
     return 2048  # safe fallback for qwen-family models
 
 
-async def _letta_embedding_config(client: httpx.AsyncClient) -> dict:
+async def _letta_embedding_config(
+    client: httpx.AsyncClient,
+    *,
+    embedding_endpoint: str = _GATEWAY_EMBED_ENDPOINT,
+) -> dict:
     """Build the explicit embedding_config payload for a Letta create-agent call.
 
     Returns a plain dict matching Letta's EmbeddingConfig schema:
       embedding_endpoint_type: "openai"   (Letta uses the OpenAI client for this type)
-      embedding_endpoint:      http://gateway:8081/v1
+      embedding_endpoint:      <embedding_endpoint param — see below>
       embedding_model:         <bare ollama model name>
       embedding_dim:           <actual dim from table or live probe>
       embedding_chunk_size:    300  (Letta default)
 
     SC-AGENT-003: the cloud-endpoint handle "letta/letta-free" is replaced by this
     explicit config so Letta never tries to reach embeddings.letta.com.
+
+    ``embedding_endpoint`` (YSG-RISK-169) is dialled by LETTA ITSELF later, not
+    by ``client`` here (``client`` is only used for the ONE-OFF dimension probe
+    below, made by the calling gateway process against its own reachable
+    ``_GATEWAY_EMBED_ENDPOINT`` regardless of which deployment shape called
+    this function). Defaults to the per-user-pool-safe value; the static/
+    system agent path (_ensure_agent()) passes _LETTA_STATIC_LLM_ENDPOINT.
     """
     model = _letta_embedding_model()
     dim = _OLLAMA_EMBEDDING_DIMS.get(model)
@@ -492,7 +595,7 @@ async def _letta_embedding_config(client: httpx.AsyncClient) -> dict:
         dim = await _probe_embedding_dim(client, model)
     return {
         "embedding_endpoint_type": "openai",
-        "embedding_endpoint": _GATEWAY_EMBED_ENDPOINT,
+        "embedding_endpoint": embedding_endpoint,
         "embedding_model": model,
         "embedding_dim": dim,
         "embedding_chunk_size": 300,
@@ -526,7 +629,14 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
     # SC-AGENT-003: explicit embedding_config replaces "letta/letta-free" handle
     # (which resolves to the cloud endpoint https://embeddings.letta.com/ — unreachable
     # from our network-isolated Letta container).
-    embedding_cfg = await _letta_embedding_config(client)
+    # YSG-RISK-169: this is the STATIC/system-wide letta service — pass the
+    # egress-forwarder endpoint its own network can actually reach (see
+    # _LETTA_STATIC_LLM_ENDPOINT module comment). Do NOT use the bare
+    # _GATEWAY_EMBED_ENDPOINT default here — that is only reachable from the
+    # per-user LettaClientPool containers' caddy_internal membership.
+    embedding_cfg = await _letta_embedding_config(
+        client, embedding_endpoint=_LETTA_STATIC_LLM_ENDPOINT,
+    )
     # Create a new agent
     resp = await client.post(f"{base_url}/v1/agents/", json={
         "name": "yashigani-default",
@@ -534,7 +644,9 @@ async def _ensure_agent(client: httpx.AsyncClient, base_url: str) -> str:
             {"label": "human", "value": "The user is interacting via the Yashigani AI security gateway."},
             {"label": "persona", "value": "I am a helpful AI assistant with persistent memory. I remember our conversations."},
         ],
-        "model": brain_model,
+        # YSG-RISK-1xx (chat-path repair, 2026-07-27): llm_config (full
+        # object), not "model" (handle) — see _letta_llm_config() docstring.
+        "llm_config": _letta_llm_config(brain_model, llm_endpoint=_LETTA_STATIC_LLM_ENDPOINT),
         "embedding_config": embedding_cfg,
     })
 

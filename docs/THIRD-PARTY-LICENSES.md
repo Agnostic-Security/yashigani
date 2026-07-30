@@ -1,4 +1,4 @@
-<!-- Last-Updated: 2026-05-24T07:42:00+01:00 -->
+<!-- Last-Updated: 2026-07-28T00:00:00+01:00 (Open WebUI entry removed — OWUI removed in 4.0, no image shipped/referenced) -->
 
 # Third-Party Components — License Attribution
 
@@ -45,15 +45,7 @@ Each agent bundle is gated behind an explicit installer flag (`--agent-bundles` 
 | **Letta** | `0.16.7` | `Apache-2.0` | https://github.com/letta-ai/letta | Stateful agent runtime. |
 | **OpenClaw** | `2026.5.6` | `MIT` | https://github.com/openclaw/openclaw | MCP-adjacent agent tooling. |
 
-## 3. Open WebUI (optional, `--with-openwebui` flag)
-
-Open WebUI is shipped under a **modified BSD-3-Clause license** that imposes a non-standard branding restriction. This restriction is the basis for the platform's internal posture on Open WebUI handling.
-
-| Component | Version (pinned) | License | Upstream source | Notes |
-|---|---|---|---|---|
-| **Open WebUI** | `v0.9.2` | BSD-3-Clause with branding restriction | https://github.com/open-webui/open-webui | The Open WebUI license prohibits removal or alteration of "Open WebUI" branding except for deployments with fewer than 50 end users in 30 days, with explicit written permission from the upstream maintainers, or under an enterprise license. **Yashigani ships the upstream image unmodified, routes traffic via Caddy + forward_auth, and configures only via environment variables.** Yashigani does not patch the Open WebUI source, modify the image, alter or remove its branding, white-label it, or bypass any free-tier mechanism. Operators redistributing Yashigani in modified form must observe these branding restrictions themselves. |
-
-## 4. Build-time and CI-only third-party components
+## 3. Build-time and CI-only third-party components
 
 The following components are used by Yashigani's build, CI, or operator-side tooling but are not shipped as part of the runtime deployment artefact. They are listed for completeness; operators do not need to vendor them.
 
@@ -64,14 +56,14 @@ The following components are used by Yashigani's build, CI, or operator-side too
 - **Kyverno** (`Apache-2.0`) — admission-policy gate (Helm path). https://github.com/kyverno/kyverno
 - **Opengrep** (`LGPL-2.1`) — SAST scanning. https://github.com/opengrep/opengrep
 
-## 5. Trademark notice
+## 4. Trademark notice
 
 The names "Yashigani", "Agnostic Security", and the Yashigani logo are trademarks of Agnostic Security Ltd. The names and logos of all third-party components listed above are trademarks or registered trademarks of their respective owners; their appearance in this document is for attribution and identification purposes only and does not imply endorsement.
 
-## 6. Reporting attribution gaps
+## 5. Reporting attribution gaps
 
 If you spot a component used by Yashigani that is not attributed in this document, or a license identifier or restriction that has changed upstream since the `Last-Updated` header above, please open an issue at https://github.com/agnosticsec-com/yashigani/issues with the label `license-attribution`.
 
 ---
 
-**Note on scope.** This document attributes third-party components shipped or depended upon by Yashigani at runtime, plus the build-time / CI tooling listed in §4. It does not cover the transitive dependencies of those components (each upstream project maintains its own attribution); operators conducting their own license audits should consult each upstream project's own license documentation.
+**Note on scope.** This document attributes third-party components shipped or depended upon by Yashigani at runtime, plus the build-time / CI tooling listed in §3. It does not cover the transitive dependencies of those components (each upstream project maintains its own attribution); operators conducting their own license audits should consult each upstream project's own license documentation.

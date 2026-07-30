@@ -877,24 +877,28 @@ class TestServices:
         assert r.status_code == 200
         body = r.json()
         ids = {s["id"] for s in body["services"]}
-        assert ids == {"openwebui", "wazuh", "internal-ca", "langflow", "letta", "openclaw"}
+        # "openwebui" removed 2026-07-28, YSG-RISK-140 (OWUI removal) — the
+        # openwebui compose service/profile no longer exists; ui4 serves chat
+        # natively. See src/yashigani/backoffice/routes/services.py's
+        # _OPTIONAL_SERVICES for the current authoritative set.
+        assert ids == {"wazuh", "internal-ca", "langflow", "letta", "openclaw"}
         assert all(s["status"] == "stopped" for s in body["services"])
 
     def test_admin_reflects_enabled_profiles_env(self, admin_client, monkeypatch):
-        monkeypatch.setenv("YASHIGANI_ENABLED_PROFILES", "openwebui,wazuh")
+        monkeypatch.setenv("YASHIGANI_ENABLED_PROFILES", "langflow,wazuh")
         r = admin_client.get("/admin/services")
         by_id = {s["id"]: s for s in r.json()["services"]}
-        assert by_id["openwebui"]["status"] == "running"
+        assert by_id["langflow"]["status"] == "running"
         assert by_id["wazuh"]["status"] == "running"
         assert by_id["letta"]["status"] == "stopped"
 
     # GAP-CLOSED: POST /admin/services/{service_id}
     def test_manage_unauth_401(self, unauth_client):
-        r = unauth_client.post("/admin/services/openwebui", json={"action": "enable"})
+        r = unauth_client.post("/admin/services/wazuh", json={"action": "enable"})
         assert r.status_code == 401
 
     def test_manage_requires_stepup_not_just_admin(self, admin_client):
-        r = admin_client.post("/admin/services/openwebui", json={"action": "enable"})
+        r = admin_client.post("/admin/services/wazuh", json={"action": "enable"})
         assert r.status_code == 401
         assert r.json()["detail"]["error"] == "step_up_required"
 
@@ -904,7 +908,7 @@ class TestServices:
         assert r.json()["detail"]["error"] == "unknown_service"
 
     def test_manage_invalid_action_422(self, stepup_admin_client):
-        r = stepup_admin_client.post("/admin/services/openwebui", json={"action": "delete"})
+        r = stepup_admin_client.post("/admin/services/wazuh", json={"action": "delete"})
         assert r.status_code == 422  # Pydantic pattern validation
 
     def test_manage_known_service_is_informational_only(self, stepup_admin_client):
@@ -2087,26 +2091,65 @@ class TestAuditSiemConfigTestRouteCollisionFinding:
         # regardless of which one actually executes.
         assert unauth_client.post("/admin/audit/siem/config/test").status_code == 401
 
-    def test_starlette_resolves_to_audit_sinks_py_not_audit_py(self, bo_app):
+    def test_starlette_resolves_to_audit_sinks_py_not_audit_py(self, route_prefix_filter):
         """Direct proof against the live route table — no HTTP round-trip
         needed, this is the routing decision itself. YSG-RISK-142 CLOSED:
         audit_sinks_router is now registered before audit_router, so the
-        literal path wins."""
-        from starlette.routing import Match
+        literal path wins.
 
-        scope = {"type": "http", "method": "POST", "path": "/admin/audit/siem/config/test"}
-        for route in bo_app.router.routes:
-            match, _child_scope = route.matches(scope)
-            if match == Match.FULL:
-                assert route.name == "test_siem", (
-                    f"Expected the fixed registration order to resolve to "
-                    f"audit_sinks.py's test_siem (literal path) — got "
-                    f"{route.name!r} instead. If this assertion fails, the "
-                    f"routing order has regressed back to the pre-fix "
-                    f"collision; update this test, don't just delete it."
-                )
-                assert route.path == "/admin/audit/siem/config/test"
-                return
+        NOT an OWUI-removal issue (this test predates and is unrelated to
+        YSG-RISK-140) — this is a FastAPI-version drift fix. The installed
+        fastapi/starlette pin (1.3.1) no longer exposes a flat, walkable
+        `app.router.routes` list of plain `starlette.routing.Route`/`APIRoute`
+        objects with a working top-level `.matches(scope)`: every
+        `include_router()` call is now wrapped in an internal
+        `fastapi.routing._IncludedRouter` container whose own `.matches()`
+        requires ASGI-scope bookkeeping (`_get_scope_included_router`) set up
+        by an actual in-flight dispatch — calling `route.matches(scope)`
+        directly on a bare scope dict (as this test used to) raises
+        `AttributeError: '_IncludedRouter' object has no attribute 'name'`
+        the moment a FULL match is found, because `_IncludedRouter` itself has
+        no `.name`.
+
+        Fix: use the same `route_prefix_filter`/`enumerate_routes()` helper
+        the rest of this conformance suite already relies on (conftest.py) —
+        it recursively walks `_IncludedRouter.original_router.routes`,
+        accumulating the real prefix, and returns
+        `(method, absolute_path, APIRoute)` tuples in registration order.
+        Starlette/FastAPI still resolves a request to the FIRST route (in
+        registration order, recursively) whose path template fully matches —
+        so walking in that same order and returning the first template match
+        reproduces the real dispatch decision without needing a live request.
+        """
+        target_path = "/admin/audit/siem/config/test"
+        target_segments = target_path.strip("/").split("/")
+
+        def _template_matches(pattern: str) -> bool:
+            pat_segments = pattern.strip("/").split("/")
+            if len(pat_segments) != len(target_segments):
+                return False
+            for pat_seg, tgt_seg in zip(pat_segments, target_segments):
+                if pat_seg.startswith("{") and pat_seg.endswith("}"):
+                    continue  # path-parameter segment (e.g. "{name}") — wildcard
+                if pat_seg != tgt_seg:
+                    return False
+            return True
+
+        # Scoped to /admin/audit — both the literal (audit_sinks.py) and
+        # dynamic (audit.py) candidate routes live there; iteration order is
+        # preserved from the full-app registration-order walk.
+        for method, path, route in route_prefix_filter("/admin/audit"):
+            if method != "POST" or not _template_matches(path):
+                continue
+            assert route.name == "test_siem", (
+                f"Expected the fixed registration order to resolve to "
+                f"audit_sinks.py's test_siem (literal path) — got "
+                f"{route.name!r} instead. If this assertion fails, the "
+                f"routing order has regressed back to the pre-fix "
+                f"collision; update this test, don't just delete it."
+            )
+            assert path == target_path
+            return
         pytest.fail("No route matched POST /admin/audit/siem/config/test at all")
 
     def test_no_siem_backend_configured_400_not_config_lookup(self, admin_client, real_audit_writer):

@@ -113,7 +113,7 @@ test_dry_run_bundle_builder() {
 }
 
 # ---------------------------------------------------------------------------
-# T3: Dry-run for --profile full includes observability + openwebui
+# T3: Dry-run for --profile full includes observability
 # ---------------------------------------------------------------------------
 test_dry_run_full_profile() {
   printf "\nT3: prepare-airgap-bundle.sh --dry-run --profile full includes observability\n"
@@ -133,10 +133,12 @@ test_dry_run_full_profile() {
     _fail "T3a: grafana missing from full profile"
   fi
 
+  # T3b (open-webui in full profile) removed 2026-07-28 — OWUI removed in 4.0;
+  # the openwebui profile no longer exists in airgap/manifest.yml.
   if echo "$output" | grep -q "open-webui"; then
-    _pass "T3b: open-webui present in full profile"
+    _fail "T3b: open-webui unexpectedly present in full profile (OWUI removed in 4.0 — YSG-RISK-140)"
   else
-    _fail "T3b: open-webui missing from full profile"
+    _pass "T3b: open-webui correctly absent from full profile"
   fi
 }
 
@@ -164,7 +166,8 @@ if not re.search(r'^version:', content, re.M):
     fails.append("Missing top-level 'version:' field")
 
 # Check required profiles present
-for prof in ('core', 'observability', 'openwebui', 'agents', 'wazuh', 'spire'):
+# (openwebui profile removed 2026-07-28 — OWUI removed in 4.0)
+for prof in ('core', 'observability', 'agents', 'wazuh', 'spire'):
     if not re.search(rf'^\s+{prof}:', content, re.M):
         warns.append(f"Profile '{prof}' not found in manifest")
 

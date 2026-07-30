@@ -340,8 +340,8 @@ adminBootstrap:
 # ---------------------------------------------------------------------------
 # Internal Bearer Token (Captain Bucket-C — per-install, rotatable secret)
 # ---------------------------------------------------------------------------
-# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (open-webui,
-# langflow, letta) present as the OpenAI `Authorization: Bearer <token>` when
+# YASHIGANI_INTERNAL_BEARER is the shared token agent bundles (langflow,
+# letta) present as the OpenAI `Authorization: Bearer <token>` when
 # calling gateway:8081/v1. The gateway's AgentAuthMiddleware validates it at
 # the app layer. Previously hardcoded to "yashigani-internal"; now per-install.
 #
@@ -831,7 +831,7 @@ redis:
     enabled: false
 
 # ---------------------------------------------------------------------------
-# Ollama — local LLM inference (StatefulSet, 2 replicas for HA)
+# Ollama — local LLM inference (StatefulSet)
 # ---------------------------------------------------------------------------
 ollama:
   enabled: true
@@ -839,7 +839,36 @@ ollama:
     repository: ollama/ollama
     tag: "0.23.1@sha256:6077dbbd6508dce8973f8b91c30d8026b1279ab0483e15f0dfad469dba676c2f"
     pullPolicy: IfNotPresent
-  replicaCount: 2
+  # NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001 (found live by Ava's e2e against
+  # 4.1.2 k3s/Cilium, 2026-07-28): default was 2 (StatefulSet, "2 replicas for
+  # HA"), but ollama-init-job.yaml pulls the model via a single set of
+  # `ollama pull` calls against the `yashigani-ollama` Service — a normal
+  # ClusterIP Service picks ONE backend pod per connection, so the pull
+  # lands entirely on ONE replica (ollama-0's PVC). Every other replica's
+  # PVC (each StatefulSet replica gets its own PVC via
+  # volumeClaimTemplates) stays with an EMPTY model catalog. The Service
+  # then round-robins real inference traffic across replicas — roughly
+  # half of all chat/inference calls hit an empty-catalog replica and hang
+  # (Ava's exact @letta/@langflow/@openclaw/direct-model chat-blocking
+  # finding). Fixed at 1: this is also the functionally correct value for
+  # any single-GPU deployment (the common shape — see project sizing notes,
+  # ~50 users/RTX3060) — a second replica cannot usefully hold the SAME
+  # model concurrently in the SAME one GPU's VRAM; it only adds contention,
+  # never capacity. helm/yashigani/values.single-node.yaml already had this
+  # correct (replicaCount: 1) as an optional overlay, but install.sh's k8s
+  # path never layers it in, so every k8s install got the broken default.
+  # Made the chart's baseline default itself correct rather than relying on
+  # an overlay operators may not know to pass. RESIDUAL / follow-up (not
+  # fixed here): true multi-GPU multi-replica scale-out requires
+  # ollama-init-job.yaml to pull per-pod (e.g. iterate StatefulSet pod DNS
+  # names ollama-0.<headless-svc>, ollama-1.<headless-svc>, ... instead of
+  # the round-robin Service VIP) before replicaCount > 1 is safe again.
+  # ollama.hpa.* below is NOT wired to any live HorizontalPodAutoscaler
+  # object in this chart (grepped: no HPA template exists for ollama at
+  # all) — those values are currently inert/dead config, so no separate
+  # autoscale-reintroduces-the-bug risk exists today; flagged for whoever
+  # eventually wires HPA up to also gate it on the per-pod-pull fix above.
+  replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
   # LLM inference — high memory requirement, 2 CPUs to keep inference
   # from starving other services. Increase on GPU hosts.
@@ -877,9 +906,9 @@ ollama:
     home: "/data"
     ollamaModels: "/data/models"
   # initJob — one-shot Kubernetes Job to pull the default model on first deploy.
-  # Activated only when openWebui.enabled=true (no model needed for API-only).
-  # defaultModel: model to pull. Must match openWebui.env.defaultModels so the
-  #   chat surface shows it as an available backend.
+  # Activated only when an agent bundle needing it is enabled (no model needed
+  # for API-only). defaultModel: model to pull, so the ui4 chat surface shows
+  # it as an available backend.
   # modelDigest: short SHA prefix for supply-chain verification (SOL-SC-03).
   #   Default is "skip" — Ollama republishes models on upstream updates, which
   #   changes the manifest SHA and hard-fails every clean install if a stale
@@ -1304,6 +1333,20 @@ agentBundles:
       repository: ghcr.io/openclaw/openclaw
       tag: "2026.5.6@sha256:2ca86d6296fe2ae7111dac14843551340a4c5099e01566253b62c4d3e0a337fc"
       pullPolicy: IfNotPresent
+    # NEW-K8S-OPENCLAW-NONROOT-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28): the pinned openclaw image (Node.js base) runs as uid=1000
+    # with named user "node" (non-numeric USER directive) — confirmed via
+    # `docker run --rm --entrypoint sh <image> -c 'id node'` => uid=1000(node)
+    # gid=1000(node). K8s runAsNonRoot rejects non-numeric USER directives
+    # without an explicit runAsUser (kubelet error: "container has
+    # runAsNonRoot and image has non-numeric user (node), cannot verify user
+    # is non-root" — CreateContainerConfigError, every pod, every start).
+    # Identical root cause + fix already applied to the langflow bundle above
+    # (see its podSecurityContext comment) — openclaw never got the same
+    # treatment. Fix: pin the same numeric UID the image itself declares.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
     replicaCount: 1
     env:
       OPENCLAW_SERVER_MODE: "true"
@@ -1342,6 +1385,34 @@ agentBundles:
         memory: "1024Mi"
     tokenSecretName: "yashigani-openclaw-token"
     tokenSecretKey: "token"
+    # NEW-K8S-OPENCLAW-TMPDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation as the podSecurityContext fix above):
+    # with runAsNonRoot/runAsUser fixed, the container now actually starts —
+    # and immediately crashes: "[openclaw] Failed to start CLI: Error:
+    # Unable to create fallback OpenClaw temp dir: /tmp/openclaw-1000"
+    # (readOnlyRootFilesystem: true is the template default; nothing mounts
+    # a writable /tmp). Same class of fix already applied to langflow below
+    # (extraVolumeMounts/extraVolumes for a writable /tmp emptyDir).
+    # NEW-K8S-OPENCLAW-HOMEDIR-001 (found live during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28, same investigation): with /tmp fixed the container gets
+    # further, then crashes again: "Gateway failed to start: Error: EROFS:
+    # read-only file system, open '/home/node/.openclaw/openclaw.json.1....tmp'"
+    # — openclaw persists/atomically-rewrites its own config + state under
+    # its home directory (~/.openclaw), which also needs to be writable
+    # under readOnlyRootFilesystem: true.
+    extraVolumeMounts:
+      - name: openclaw-tmp
+        mountPath: /tmp
+      - name: openclaw-home
+        mountPath: /home/node/.openclaw
+    extraVolumes:
+      - name: openclaw-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
+      - name: openclaw-home
+        emptyDir:
+          sizeLimit: 64Mi
 
   # Langflow — Visual multi-agent workflow builder (MIT)
   # https://github.com/langflow-ai/langflow
@@ -1424,7 +1495,7 @@ agentBundles:
       # remaining GID 2002 consumer on Compose path (reads bearer as group).
       # In K8s, bearer is delivered via secretKeyRef env var — supplementalGroups
       # is not functionally required here but retained for documentation parity.
-      # All other services (postgres, redis, budget-redis, open-webui, letta)
+      # All other services (postgres, redis, budget-redis, letta)
       # have had supplementalGroups: [2002] removed.
       supplementalGroups: [2002]
     containerSecurityContext:
@@ -1569,11 +1640,62 @@ agentBundles:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 (found live during 4.1.2 k3s/Cilium
+    # e2e via Laura, 2026-07-28): letta CrashLoopBackOff — IsADirectoryError
+    # writing openapi_letta.json (app.py:162 writes this file RELATIVE to CWD
+    # /app at module import). Root cause: subPath mounts a path from an
+    # emptyDir that does NOT already contain that path as a real file — this
+    # is a well-known kubelet gotcha: when a subPath target does not already
+    # exist in the source volume, kubelet creates the MISSING path as a
+    # DIRECTORY (not a file), then bind-mounts that directory onto the
+    # intended file path in the container. So /app/openapi_letta.json became
+    # a directory, and Python's open(..., "w") raised IsADirectoryError.
+    # Fix: pre-seed the file into the SAME `letta-runtime` emptyDir via an
+    # initContainer that mounts the volume's ROOT (not via subPath) and
+    # `touch`es the file BEFORE the main container's subPath mount resolves
+    # — kubelet then correctly bind-mounts an existing FILE. Standard,
+    # documented K8s workaround for this exact class of gotcha.
+    extraInitContainers:
+      - name: pre-touch-letta-openapi-file
+        image: "docker.io/library/busybox:1.37"
+        imagePullPolicy: IfNotPresent
+        # NEW-K8S-LETTA-OPENAPI-SUBPATH-DIR-001 follow-up (found live during
+        # the SAME 4.1.2 k3s/Cilium e2e, immediately after the directory-vs-
+        # file fix above went live): fixing the directory-vs-file problem
+        # surfaced a SECOND, distinct error on the very next attempt:
+        # "PermissionError: [Errno 13] Permission denied: 'openapi_letta.json'".
+        # Root cause: letta's main container drops ALL capabilities
+        # (containerSecurityContext capabilities.drop: [ALL]), which
+        # includes CAP_DAC_OVERRIDE — the capability root normally uses to
+        # bypass file permission checks. Without it, letta's root (UID 0)
+        # process is subject to normal Unix permission bits like any other
+        # user. touch'ing the file as this initContainer's own UID 65534
+        # left it owned nobody:nogroup with the default umask (0644, no
+        # write for anyone but the owner) — root (UID 0, no DAC_OVERRIDE)
+        # cannot open it for writing. Fix: chmod the touched file to 0666
+        # (world-writable) so any UID, including capability-stripped root,
+        # can write it. Safe: this is a non-sensitive OpenAPI schema JSON
+        # file letta itself fully overwrites at every startup — no
+        # confidentiality/integrity concern from the permissive mode.
+        command: ["/bin/sh", "-c", "touch /letta-runtime-init/openapi_letta.json && chmod 0666 /letta-runtime-init/openapi_letta.json"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534
+          runAsGroup: 65534
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+          - name: letta-runtime
+            mountPath: /letta-runtime-init
     # Extra volumes for letta write paths that cannot go to the persistent /root/.letta PVC.
     extraVolumeMounts:
       # letta app.py:162 writes openapi_letta.json relative to CWD (/app) at module import.
       # emptyDir provides a writable inode at /app/openapi_letta.json without opening the
-      # rest of /app. subPath mounts the single file path only.
+      # rest of /app. subPath mounts the single file path only. The file is pre-created by
+      # the pre-touch-letta-openapi-file initContainer above (see that entry's comment for
+      # why — subPath-of-a-not-yet-existing-path silently becomes a directory otherwise).
       - name: letta-runtime
         mountPath: /app/openapi_letta.json
         subPath: openapi_letta.json
@@ -1741,84 +1863,14 @@ agentBundles:
         drop: ["ALL"]
 
 # ---------------------------------------------------------------------------
-# Open WebUI — optional integration with the open-source Open WebUI project (v2.1)
-# Image pulled unmodified from ghcr.io/open-webui/open-webui (upstream).
-# Open WebUI is governed by its own licence terms — review at
-# https://github.com/open-webui/open-webui/blob/main/LICENSE before enabling.
-# Yashigani orchestrates deployment via Helm; it does not redistribute Open
-# WebUI binaries. Internal only — all inference routes through the gateway.
-#
-# DEPRECATED (v2.23.2): Open WebUI integration is sunsetting. Yashigani's own
-# built-in UI ships in v2.24.0. Set enabled: false (the default) unless you
-# are running a v2.23.x install that previously opted in.
-# LU-7023360-001: default corrected from true → false.
+# Open WebUI — REMOVED in 4.0 (YSG-RISK-142). ui4, Yashigani's first-party
+# Lit-based chat/agents/builder/workflows SPA, is served directly by the
+# backoffice and replaces it. The helm/yashigani/templates/open-webui.yaml
+# Deployment/Service/PVC template, the openWebui-gated blocks in
+# secrets.yaml/networkpolicy.yaml/ollama.yaml, and this values block were all
+# removed together on 2026-07-28. Do not reintroduce without a design review —
+# see the risk register entry for what depended on it and why it was cut.
 # ---------------------------------------------------------------------------
-openWebui:
-  enabled: false
-  # B12 fix (TOM-K8S-001): existingSecretName for OWUI_SECRET_KEY injection
-  # into backoffice. Leave empty to use the chart-managed yashigani-open-webui-secrets.
-  # Set to a pre-created Secret name if managing the secret out-of-band.
-  existingSecretName: ""
-  image:
-    # Pinned to v0.9.1 to match docker-compose.yml (was floating :main — fixed
-    # in v2.23.2 image-pin sweep 2026-05-02).
-    repository: ghcr.io/open-webui/open-webui
-    tag: "v0.9.2@sha256:a7e4796ae894d1e2a0c1824860ade472f35c507608a01c3581377b5c19b0ed49"
-    pullPolicy: IfNotPresent
-  replicaCount: 1
-  # Retro #3ar — open-webui OOMKilled (exit 137) with 512Mi limit on K8s.
-  # The bundled SvelteKit + Python embedding + LangChain stack consistently
-  # peaks at ~1.2-1.5 GiB on first boot. 512Mi was guesswork carried over
-  # from the docker-compose default; insufficient for the K8s pod where
-  # there is no host page cache to lean on.
-  # Retro #3as — OOMKilled again at 2Gi limit. LangChain + sentence-transformers
-  # stack imports during startup push peak RSS above 2Gi even with
-  # HF_HUB_OFFLINE=1 (which eliminates download wait but not model-graph init).
-  # 3Gi limit gives stable headroom on Docker Desktop single-node cluster.
-  # YSG-RISK-005 #3av: requests = 50% of limit (risk register sizing: 3072m/1.0).
-  resources:
-    requests:
-      cpu: "500m"
-      memory: "1536Mi"
-    limits:
-      cpu: "1000m"
-      memory: "3072Mi"
-  service:
-    port: 8080
-    type: ClusterIP
-  env:
-    webuiAuth: "false"
-    webuiAuthTrustedEmailHeader: "X-Forwarded-User"
-    webuiAuthTrustedNameHeader: "X-Forwarded-Name"
-    # Phase 2 / 2.25.5-auth-ingress: OWUI served under /app/webui.
-    # See docker-compose.yml for full rationale.
-    webuiUrl: "/app/webui"
-    webuiBaseUrl: "/app/webui"
-    # Single-logout: OWUI signout redirects to /auth/logout-redirect which
-    # clears the Yashigani session cookie and redirects to /login.
-    webuiAuthSignoutRedirectUrl: "/auth/logout-redirect"
-    enableSignup: "true"
-    # Track C (F-B): forward the authenticated OWUI user to the gateway so OWUI
-    # emits X-OpenWebUI-User-Email/-Id/-Name/-Role on upstream calls. The
-    # gateway trusted-forwarder resolver maps the email -> per-user Yashigani
-    # identity so per-user/group/org RBAC applies (compose parity).
-    enableForwardUserInfoHeaders: "true"
-    webuiSecretKeySecretName: "yashigani-open-webui-secrets"
-    webuiSecretKeySecretKey: "secret_key"
-    # BUG-2 (v2.23.4): gateway:8080 is mTLS-only. Use the internal mesh port
-    # (8081, plain HTTP). Network isolation (K8s NetworkPolicy) is the transport
-    # guard; AgentAuthMiddleware enforces token auth at the app layer.
-    openaiApiBaseUrl: "http://yashigani-gateway:8081/v1"
-    # openaiApiKey is now wired via secretKeyRef (internalBearer Secret) in
-    # open-webui.yaml — Captain Bucket-C fix. This field is intentionally absent.
-    ollamaBaseUrl: ""
-    enableOllamaApi: "false"
-    defaultModels: "qwen2.5:3b"
-    webuiName: "Yashigani AI"
-  persistence:
-    enabled: true
-    size: 5Gi
-    storageClass: ""
 
 # ---------------------------------------------------------------------------
 # Budget Redis — dedicated Redis for token budget counters (v1.0)

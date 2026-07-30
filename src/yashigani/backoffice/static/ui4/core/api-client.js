@@ -148,7 +148,7 @@ export class ApiClient {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', 'X-Yashigani-Plane': this.sessionKind },
-          body: JSON.stringify({ totp: code }),
+          body: JSON.stringify({ totp_code: code }),
         });
         if (!stepup.ok) {
           return { ok: false, status: stepup.status, data: null, error: { code: 'step_up_failed', message: 'Step-up verification failed.' } };

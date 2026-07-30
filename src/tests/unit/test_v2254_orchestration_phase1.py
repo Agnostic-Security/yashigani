@@ -29,6 +29,21 @@ from yashigani.audit.schema import (
 )
 
 
+# YSG-RISK-113: orchestrator._inspect_result / _classify_sensitivity are now
+# async (offload the blocking classifier call via asyncio.to_thread) — every
+# fixture below substitutes an awaitable, not a plain sync callable.
+def _fake_inspect_result(verdict: str, confidence: float):
+    async def _fake(text, identity, rid):
+        return verdict, confidence, None
+    return _fake
+
+
+def _fake_classify_sensitivity(label: str):
+    async def _fake(text):
+        return label
+    return _fake
+
+
 # ── §1 schema additivity ─────────────────────────────────────────────────────
 
 
@@ -168,8 +183,7 @@ async def test_mcp_result_blocked_when_inspection_blocks(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", fake_ingress)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", fake_egress)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("BLOCKED", 0.97, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_result("BLOCKED", 0.97))
 
     captured = []
     monkeypatch.setattr(orchestrator, "_audit", lambda e: captured.append(e))
@@ -211,8 +225,7 @@ async def test_mcp_result_blocked_when_opa_egress_denies(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", fake_ingress)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", fake_egress)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("CLEAN", 1.0, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_result("CLEAN", 1.0))
     monkeypatch.setattr(orchestrator, "_audit", lambda e: None)
 
     import httpx
@@ -271,8 +284,7 @@ async def test_mcp_clean_result_passes_through(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", ok_ingress)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", ok_egress)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("CLEAN", 1.0, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_result("CLEAN", 1.0))
     monkeypatch.setattr(orchestrator, "_audit", lambda e: None)
 
     import httpx
@@ -326,14 +338,19 @@ def test_args_hash_is_stable_and_redacting():
     assert len(h1) == 32 and all(c in "0123456789abcdef" for c in h1)
 
 
-def test_inspection_failclosed_on_exception(monkeypatch):
-    """A pipeline exception on untrusted upstream content → treated as BLOCKED."""
+@pytest.mark.asyncio
+async def test_inspection_failclosed_on_exception(monkeypatch):
+    """A pipeline exception on untrusted upstream content → treated as BLOCKED.
+
+    YSG-RISK-113: _inspect_result is now async (offloads the blocking
+    classifier call via asyncio.to_thread) — await it here.
+    """
     class _Boom:
         def inspect(self, **k): raise RuntimeError("classifier down")
 
     from yashigani.gateway.openai_router import _state
     monkeypatch.setattr(_state, "response_inspection_pipeline", _Boom())
-    verdict, conf, _ = orchestrator._inspect_result("anything", {"identity_id": "u"}, "rq")
+    verdict, conf, _ = await orchestrator._inspect_result("anything", {"identity_id": "u"}, "rq")
     assert verdict == "BLOCKED" and conf == 0.0
 
 
@@ -375,7 +392,7 @@ async def test_exfil_via_tool_args_denied_on_egress(monkeypatch):
     from yashigani.audit.schema import OrchestrationExfilBlockedEvent
 
     # Args carry a credit-card-shaped secret → RESTRICTED.
-    monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda text: "RESTRICTED")
+    monkeypatch.setattr(orchestrator, "_classify_sensitivity", _fake_classify_sensitivity("RESTRICTED"))
 
     async def deny_egress(identity, args_sensitivity):
         return {"allow": False, "reason": "sensitivity_exceeds_egress_ceiling"}
@@ -406,7 +423,7 @@ async def test_exfil_via_tool_args_denied_on_egress(monkeypatch):
 @pytest.mark.asyncio
 async def test_public_args_not_egress_gated(monkeypatch):
     """PUBLIC outbound args do not trip the exfil guard (no false positive)."""
-    monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda text: "PUBLIC")
+    monkeypatch.setattr(orchestrator, "_classify_sensitivity", _fake_classify_sensitivity("PUBLIC"))
 
     async def boom_egress(identity, args_sensitivity):
         raise AssertionError("egress args check must not run for PUBLIC args")
@@ -435,7 +452,7 @@ async def test_mcp_result_sensitivity_passed_to_egress(monkeypatch):
     egress OPA call (so egress can deny on sensitivity-ceiling, not only verdict)."""
     seen = {}
 
-    monkeypatch.setattr(orchestrator, "_classify_sensitivity", lambda text: "RESTRICTED")
+    monkeypatch.setattr(orchestrator, "_classify_sensitivity", _fake_classify_sensitivity("RESTRICTED"))
 
     async def ok_ingress(identity, server, tool):
         return {"allow": True, "reason": "ok"}
@@ -446,8 +463,7 @@ async def test_mcp_result_sensitivity_passed_to_egress(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", ok_ingress)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", capture_egress)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("CLEAN", 1.0, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_result("CLEAN", 1.0))
     monkeypatch.setattr(orchestrator, "_audit", lambda e: None)
 
     import httpx

@@ -163,6 +163,30 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+              # NEW-K8S-EGRESS-CADDY-EXEC-001 (found live during 4.1.2 k3s/Cilium
+              # e2e, 2026-07-28): $img defaults to .Values.caddy.image — the SAME
+              # caddy:2.11.x image the main caddy container uses, whose binary
+              # carries a `cap_net_bind_service=ep` FILE CAPABILITY baked in
+              # (see docker/caddy/Dockerfile.caddy-broker's `setcap -r` comment
+              # block, which strips this same capability for the config-broker
+              # image precisely because THAT container doesn't need it and
+              # doesn't want the exec-time complication). Per kernel semantics,
+              # a process with no_new_privs=1 (allowPrivilegeEscalation: false)
+              # CANNOT gain a capability from a file's capability set unless the
+              # capability is already in the process's permitted set before
+              # exec — so `capabilities: drop: [ALL]` here made every exec of
+              # /usr/bin/caddy fail with EPERM ("operation not permitted"),
+              # CrashLoopBackOff on all 3 egress-forwarder pods, regardless of
+              # which port the forwarder actually binds (9400, unprivileged —
+              # this capability is NOT functionally needed, only kernel-required
+              # to satisfy the file capability check on exec). Same pattern/
+              # tradeoff already accepted for the main caddy container
+              # (caddy.yaml, YSG-RISK-008). Least-privilege follow-up: build a
+              # cap-stripped egress-forwarder image (mirroring
+              # Dockerfile.caddy-broker's `setcap -r`) so this add is never
+              # needed — not done here to keep this fix scoped to the
+              # confirmed, live-reproduced blocker.
+              add: ["NET_BIND_SERVICE"]
           livenessProbe:
             httpGet:
               path: /healthz
@@ -308,5 +332,5 @@ spec:
           port: 53
     # INTRA-ZONE-DENY marker (denied tuple, for audit + contract test 3c):
     # NO allow to pod {{ $system }} on port {{ $fwd.shimPort }} — deny-by-absence.
-{{- end }}
+{{ end -}}
 {{- end }}

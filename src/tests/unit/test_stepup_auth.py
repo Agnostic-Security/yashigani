@@ -583,3 +583,65 @@ class TestStepupEndpointStructure:
         assert fn_src.count("_make_stepup_event") >= 2, (
             "stepup_verify should call _make_stepup_event for both success and failure paths"
         )
+
+
+# ---------------------------------------------------------------------------
+# FIND-DOCKER-001 — frontend step-up client payload must match the server
+# contract (StepUpRequest.totp_code). A previous regression posted
+# {"totp": code} which FastAPI's pydantic validation 422s on, breaking the
+# step-up modal for ALL 22 admin modules that share the ApiClient.mutate()
+# write path, even with a correct code.
+# ---------------------------------------------------------------------------
+
+
+class TestStepUpClientPayloadContract:
+    """Every client-side POST to /auth/stepup must send {"totp_code": ...}."""
+
+    STATIC_UI4 = SRC / "backoffice" / "static" / "ui4"
+
+    def test_server_expects_totp_code_field(self):
+        """StepUpRequest (the server contract) requires `totp_code`, not `totp`."""
+        source = (ROUTES_DIR / "auth.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "StepUpRequest":
+                found = True
+                cls_src = ast.unparse(node)
+                assert "totp_code" in cls_src, (
+                    "StepUpRequest must declare a `totp_code` field (server contract)"
+                )
+        assert found, "StepUpRequest model not found in auth.py"
+
+    def test_api_client_posts_totp_code(self):
+        """api-client.js ApiClient.mutate() step-up retry must post totp_code."""
+        content = (self.STATIC_UI4 / "core" / "api-client.js").read_text(encoding="utf-8")
+        assert '{ totp_code: code }' in content, (
+            "api-client.js step-up POST must send {totp_code: code} (FIND-DOCKER-001)"
+        )
+        assert '{ totp: code }' not in content, (
+            "api-client.js still posts the stale {totp: code} shape (FIND-DOCKER-001)"
+        )
+
+    def test_iam_elevate_posts_totp_code(self):
+        """_iam.js elevate() client-enforced step-up helper must post totp_code."""
+        content = (self.STATIC_UI4 / "admin" / "modules" / "_iam.js").read_text(encoding="utf-8")
+        assert '{ totp_code: code }' in content, (
+            "_iam.js elevate() step-up POST must send {totp_code: code} (FIND-DOCKER-001)"
+        )
+        assert '{ totp: code }' not in content, (
+            "_iam.js elevate() still posts the stale {totp: code} shape (FIND-DOCKER-001)"
+        )
+
+    def test_no_client_posts_stale_totp_field_to_stepup(self):
+        """Repo-wide: no static JS may POST a bare `totp` field to /auth/stepup."""
+        offenders = []
+        for path in self.STATIC_UI4.rglob("*.js"):
+            content = path.read_text(encoding="utf-8")
+            if "auth/stepup" not in content:
+                continue
+            if "{ totp: code }" in content or "{totp: code}" in content:
+                offenders.append(str(path))
+        assert not offenders, (
+            f"Stale {{totp: code}} step-up payload found in: {offenders} (FIND-DOCKER-001)"
+        )

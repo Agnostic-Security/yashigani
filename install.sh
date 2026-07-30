@@ -274,7 +274,6 @@ TOTAL_STEPS=13
 WORK_DIR=""
 AGENT_BUNDLES=""          # comma-separated: langflow,letta,openclaw
 INSTALL_WAZUH=false       # opt-in: --wazuh flag
-INSTALL_OPENWEBUI=false   # opt-in: --with-openwebui flag
 INSTALL_INTERNAL_CA=false    # opt-in: --with-internal-ca flag
 INTERNAL_CA_CERT=""          # --internal-ca-cert path; empty = no BYO CA or deferred
 INTERNAL_CA_KEY=""           # --internal-ca-key path
@@ -406,11 +405,6 @@ OPTIONS
   --no-agents                             Exclude ALL agent bundles. Non-interactive shorthand for
                                           --agent-bundles none. Lean/minimal installs should pass this
                                           flag explicitly to suppress the langflow+letta defaults.
-  --with-openwebui                        Install Open WebUI chat surface (non-interactive explicit opt-in).
-                                          In interactive mode a wizard question is presented instead
-                                          ("Will Yashigani be used by humans with a web UI? [Y/n]").
-                                          Pulls image unmodified from ghcr.io/open-webui/open-webui;
-                                          Open WebUI is governed by its own licence terms.
   --with-internal-ca                      Enable BYO internal CA for service-to-service mTLS.
                                           Without --internal-ca-cert/--internal-ca-key, activates
                                           deferred mode (install runs with Yashigani-generated PKI;
@@ -703,7 +697,6 @@ parse_args() {
         DB_AES_KEY="${2:?'--db-aes-key requires a value (64-char hex or 44-char base64)'}"
         shift 2
         ;;
-      --with-openwebui)  INSTALL_OPENWEBUI=true;  shift ;;
       --with-internal-ca) INSTALL_INTERNAL_CA=true; shift ;;
       --internal-ca-cert)
         INTERNAL_CA_CERT="${2:?'--internal-ca-cert requires a path'}"
@@ -3494,7 +3487,7 @@ _write_aes_key_to_env() {
   # A4 (Laura BLOCKING / CWE-732 / ASVS V6.4.1): chmod 0600 IMMEDIATELY after
   # touch, before any credentials are written.  Without this, ambient umask 022
   # creates a 0644 file; secrets (YASHIGANI_DB_AES_KEY, POSTGRES_PASSWORD,
-  # REDIS_PASSWORD, OWUI_SECRET_KEY, TOTP material) land world-readable until a
+  # REDIS_PASSWORD, TOTP material) land world-readable until a
   # later chmod corrects it.  This also ensures A2's o+rX sweep cannot widen the
   # file: o+rX on a 0600 file would set 0604 (world-readable), which the explicit
   # 0600 here prevents because the sweep runs after this function.
@@ -3635,7 +3628,7 @@ _write_aes_key_to_env() {
   # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
   # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
   # model and enable response inspection so the egress block fires and renders in
-  # OWUI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
   # enterprise leave it OFF; demo turns it ON to showcase the injection block.
   if [[ "$DEPLOY_MODE" == "demo" ]]; then
     _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
@@ -5023,13 +5016,13 @@ check_existing_installation() {
   fi
 
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
-    # BUG-B+-002: additive re-run (--with-openwebui / --agent-bundles on a
+    # BUG-B+-002: additive re-run (--agent-bundles on a
     # running stack). The live project volumes are NOT contamination — they belong
     # to the running install and carry the current PKI CA. Mark REUSE_VOLUMES so
     # _check_contaminated_volumes skips the false-positive check on REUSE_VOLUMES=true.
     # The live project volumes belong to the running install (same PKI CA) — not contamination.
-    if [[ "$INSTALL_OPENWEBUI" == "true" || -n "$AGENT_BUNDLES" ]]; then
-      log_info "Additive re-run detected (--with-openwebui / --agent-bundles on running stack)"
+    if [[ -n "$AGENT_BUNDLES" ]]; then
+      log_info "Additive re-run detected (--agent-bundles on running stack)"
       # MI-4: add-component on a RUNNING stack mutates a live instance — gate it
       # with the shared step-up (auth/stepup.py via the API path; token/ack on the
       # host-shell path). Fail-closed if unattended without a step-up proof.
@@ -5117,7 +5110,9 @@ _INSTALL_CANONICAL_VOLUMES=(
     openclaw_data
     langflow_data
     letta_data
-    openwebui_data
+    openwebui_data  # legacy — OWUI service removed in 4.0; volume may still exist
+                    # on hosts upgrading from 3.x. Kept so upgrade backup/contamination
+                    # checks still see it. Do not reintroduce the service.
     budget_redis_data
     step_ca_data
     wazuh_api_configuration
@@ -5545,7 +5540,7 @@ select_agent_bundles() {
   printf "\n"
   printf "${C_YELLOW}╔═══════════════════════════════════════════════════════════╗${C_RESET}\n"
   printf "${C_YELLOW}║  THIRD-PARTY AGENT BUNDLES — COURTESY INTEGRATIONS        ║${C_RESET}\n"
-  printf "${C_YELLOW}║  Integrations: OpenWebUI, Wazuh, Langflow, Letta, OpenClaw║${C_RESET}\n"
+  printf "${C_YELLOW}║  Integrations: Wazuh, Langflow, Letta, OpenClaw           ║${C_RESET}\n"
   printf "${C_YELLOW}╠═══════════════════════════════════════════════════════════╣${C_RESET}\n"
   printf "${C_YELLOW}║  The following agents are provided AS IS by               ║${C_RESET}\n"
   printf "${C_YELLOW}║  Agnostic Security as a convenience.                      ║${C_RESET}\n"
@@ -7660,7 +7655,7 @@ DKRAUDIT
 # -----------------------------------------------------------------------------
 _ensure_agent_databases() {
   # Only meaningful when at least one agent bundle that needs a postgres DB is
-  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/openwebui/wazuh
+  # enabled. Today that is `letta` (langflow uses sqlite; openclaw/wazuh
   # carry no dedicated agent DB). We gate on COMPOSE_PROFILES containing `letta`
   # rather than hard-coding the DB name — if a future bundle adds a DB to the init
   # script, add its profile here and the init script remains the single source for
@@ -8339,44 +8334,56 @@ _podman_compose_letta_waitloop() {
   fi
 }
 
-compose_up() {
-  set_step "10" "compose up"
-  log_step "10/${TOTAL_STEPS}" "Starting services..."
+YSG_COMPOSE_FILE_ARGS=()
 
-  resolve_compose_cmd
+# _ysg_assemble_compose_files — SINGLE SOURCE OF TRUTH for the docker-compose
+# -f file list (YSG-RISK-177 fix). Populates the global array
+# YSG_COMPOSE_FILE_ARGS. Every compose operation that can recreate a
+# container — the initial `up` in compose_up(), the YSG-RISK-084 self-heal
+# re-converge (reuses compose_up()'s local `compose_files` via bash dynamic
+# scoping — unaffected by this change since it's the same call stack),
+# register_agent_bundles()'s post-registration restart, and the --onboard
+# gateway recreate in handle_onboard_subcommand() — MUST use the SAME
+# complete file set the container was originally created with. Compose
+# recomputes each service's desired config from whatever `-f` files are
+# given; a REDUCED set silently drops overlay-added fields (GPU device
+# reservations, wazuh mTLS mounts, egress-forwarder network attachments) the
+# next time `up`/recreate touches that service — and it can touch a service
+# you didn't name: compose also recreates dependencies whose computed config
+# drifted.
+#
+# Root cause of the live incident this fixes: an out-of-band
+# `docker compose -f docker/docker-compose.yml up -d` (base file only, run
+# manually while iterating on gateway/backoffice code for YSG-RISK-172..175)
+# recreated gateway + backoffice + ollama (ollama pulled in as gateway's
+# `depends_on: service_healthy` dependency whose config had drifted) —
+# computed against the reduced file set, ollama came back up with NO GPU
+# device (docker-compose.gpu.yml omitted). install.sh's own compose_up() was
+# NOT the source of that drop (it always built the full list correctly); the
+# gap was that register_agent_bundles() and the --onboard gateway recreate
+# each independently re-derived a SHORTER file list, so any future codified
+# call through those paths carried the identical latent bug. This function
+# closes that gap by giving all call sites one shared, always-current list.
+#
+# Covers: wazuh overlay, per-agent egress-forwarder overlays, the Docker
+# native NVIDIA GPU overlay, and the Podman rootless override + macOS
+# virtiofs override. Deliberately EXCLUDES the Podman-CDI-GPU-probe /
+# mac-metal / AMD-ROCm / Vulkan branches still inline in compose_up() below —
+# those run live provisioning/probing side effects (_setup_podman_cdi_gpu, a
+# throwaway `podman run` CDI probe, host-ollama-port resolution) that belong
+# only in the initial convergence, not in every later idempotent
+# re-converge. KNOWN GAP: those GPU types are not yet protected by this
+# shared list outside compose_up() itself. Docker Engine + NVIDIA (this box,
+# and the common case) is fully covered by every call site.
+_ysg_assemble_compose_files() {
+  YSG_COMPOSE_FILE_ARGS=("-f" "${WORK_DIR}/docker/docker-compose.yml")
 
-  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-
-  # Auto-apply Podman rootless override when running on Podman
-  local compose_files=("-f" "$compose_file")
-
-  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
-  # is active, provision the deploy-local mTLS material (git-ignored) and layer the overlay
-  # that adds caps/cont-init/securityadmin/healthchecks + the internal-CA HTTP listener.
-  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
   local _wazuh_overlay="${WORK_DIR}/docker/docker-compose.wazuh.yml"
   if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "$_wazuh_overlay" ]]; then
-    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
-    compose_files+=("-f" "$_wazuh_overlay")
+    YSG_COMPOSE_FILE_ARGS+=("-f" "$_wazuh_overlay")
     log_info "Applying Wazuh Docker-runtime + full-mTLS overlay (docker-compose.wazuh.yml)"
   fi
 
-  # v4.1 unified-sidecar (three-agent wrap, 2026-07-07): per-bundle
-  # egress-forwarder overlays. When a bundled agent (openclaw, langflow,
-  # letta) is enabled, layer the codegen-emitted override that stands up the
-  # egress-<agent> forwarder + the SPLIT ringfences
-  # (ringfence_<agent>_in = {<agent>, caddy}; ringfence_<agent>_eg =
-  # {<agent>, egress-<agent>} — design §2.6, 2-member invariant). Each
-  # agent's egress config dials its forwarder
-  # (http://egress-<agent>:9400/<prefix>) via that agent's REAL config
-  # mechanism (openclaw.json models.providers baseUrl + channels.telegram
-  # apiRoot; langflow/letta OPENAI_API_BASE), and the forwarder presents the
-  # agent's leaf to caddy:18790 → /egress/eval. The static caller/destination
-  # pins at :18790 remain in force (pin-AND-grant OVERLAP — synthesis
-  # must-fix #1; pin deletion is a later, Laura-gated step).
-  # Probe BOTH COMPOSE_PROFILES and AGENT_BUNDLES — the non-interactive
-  # --agent-bundles value is only pushed into COMPOSE_PROFILES at step 8
-  # (same defensive pattern as the YASHIGANI_OPENCLAW_EGRESS flag writer).
   local _fwd_agent _fwd_overlay _fwd_enabled _fwd_ab
   for _fwd_agent in openclaw langflow letta; do
     _fwd_overlay="${WORK_DIR}/docker/${_fwd_agent}-egress-forwarder.override.yml"
@@ -8391,7 +8398,7 @@ compose_up() {
     fi
     if [[ "$_fwd_enabled" == "true" ]]; then
       if [[ -f "$_fwd_overlay" ]]; then
-        compose_files+=("-f" "$_fwd_overlay")
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_fwd_overlay")
         log_info "Applying ${_fwd_agent} egress-forwarder overlay (unified-sidecar v4.1: egress-${_fwd_agent} + split ringfences)"
       else
         # Fail-closed: the agent's egress config points at the forwarder, so
@@ -8403,24 +8410,70 @@ compose_up() {
     fi
   done
 
-  # ── GPU overlay selection ─────────────────────────────────────────────────────
+  # Docker-native NVIDIA GPU overlay — file-existence check only, no probe/
+  # provisioning side effect, safe to re-evaluate on every call.
+  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
+  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
+    YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay")
+    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
+  fi
+
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
+    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
+    if [[ -f "$podman_override" ]]; then
+      YSG_COMPOSE_FILE_ARGS+=("-f" "$podman_override")
+      log_info "Applying Podman rootless override (security_opt + env overrides)"
+    else
+      log_warn "Podman rootless override not found at ${podman_override}"
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
+      if [[ -f "$podman_virtiofs_override" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$podman_virtiofs_override")
+        log_info "Applying Podman virtiofs :U override (macOS only)"
+      else
+        log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
+      fi
+    fi
+  fi
+}
+
+compose_up() {
+  set_step "10" "compose up"
+  log_step "10/${TOTAL_STEPS}" "Starting services..."
+
+  resolve_compose_cmd
+
+  local compose_file="${WORK_DIR}/docker/docker-compose.yml"
+
+  # v2.25.1: Wazuh Docker-runtime + full internal-CA mTLS overlay. When the wazuh profile
+  # is active, provision the deploy-local mTLS material (git-ignored) here — once, before
+  # the file list is assembled. _ysg_assemble_compose_files() below only checks for the
+  # overlay FILE; it does not (re-)provision the mTLS material.
+  # No manual steps — reproducible on every up (SOP: changes in code, not hand-applied).
+  if { [[ "${INSTALL_WAZUH:-false}" == "true" ]] || echo "${COMPOSE_PROFILES[*]+"${COMPOSE_PROFILES[*]}"}" | grep -q "wazuh"; } && [[ -f "${WORK_DIR}/docker/docker-compose.wazuh.yml" ]]; then
+    _provision_wazuh_mtls || { log_error "Wazuh mTLS provisioning failed — aborting before compose up (fail-closed)"; return 1; }
+  fi
+
+  # YSG-RISK-177: file list assembled by the shared _ysg_assemble_compose_files()
+  # (defined above compose_up()) — single source of truth, also used by
+  # register_agent_bundles() and the --onboard gateway recreate, so no compose
+  # operation ever recreates a container against a REDUCED file set. See that
+  # function's header comment for the full incident writeup (ollama silently
+  # losing its GPU device).
+  _ysg_assemble_compose_files || return 1
+  local compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
+
+  # ── GPU overlay selection (continued) ─────────────────────────────────────────
   # Supported types (source: docs.ollama.com/gpu):
-  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker) or CDI+devpath (Podman)
+  #   nvidia     — CUDA cc5.0+, driver 550+; CDI path (Docker, handled above via the
+  #                shared function) or CDI+devpath (Podman, handled below — this branch
+  #                runs a live provisioning/probe side effect so it stays compose_up-only)
   #   apple_metal— Metal via host-native ollama (Mac only; container ollama bypassed)
   #   amd_rocm   — ROCm v7 discrete (Radeon RX 5000+/6000+/7000+, Instinct); /dev/kfd+dri
   #   vulkan     — Vulkan backend (Intel Arc/iGPU, AMD APU gfx1150/1151); /dev/dri only
   #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
   # ─────────────────────────────────────────────────────────────────────────────
-
-  # GPU overlay (Docker runtime): wire the detected NVIDIA GPU into ollama. The base
-  # ollama service has its GPU reservation commented out and the nvidia runtime is not
-  # the daemon default, so without this ollama runs CPU-only. Pin a card with YSG_GPU_UUID
-  # (defaults to all). Podman uses CDI devices separately; K8s uses the device plugin.
-  local _gpu_overlay="${WORK_DIR}/docker/docker-compose.gpu.yml"
-  if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]] && [[ -f "$_gpu_overlay" ]]; then
-    compose_files+=("-f" "$_gpu_overlay")
-    log_info "Applying GPU overlay (docker-compose.gpu.yml) — ollama on NVIDIA device ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
-  fi
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
   # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
   # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
@@ -8759,23 +8812,11 @@ compose_up() {
     #      Linux: `podman unshare chown` sets per-file UIDs before containers start.
     #        Adding :U afterward overwrites those per-file UIDs, breaking services
     #        whose UID differs from the last container processed.
-    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
-    if [[ -f "$podman_override" ]]; then
-      compose_files+=("-f" "$podman_override")
-      log_info "Applying Podman rootless override (security_opt + env overrides)"
-    else
-      log_warn "Podman rootless override not found at ${podman_override}"
-    fi
-    # macOS virtiofs :U override — macOS Podman only
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
-      if [[ -f "$podman_virtiofs_override" ]]; then
-        compose_files+=("-f" "$podman_virtiofs_override")
-        log_info "Applying Podman virtiofs :U override (macOS only)"
-      else
-        log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
-      fi
-    fi
+    #
+    #    YSG-RISK-177: both overrides are now appended by the shared
+    #    _ysg_assemble_compose_files() call at the top of this function —
+    #    `compose_files` already includes them here. (Previously duplicated
+    #    inline; removed to avoid appending the same `-f` file twice.)
 
     # 5. Build images with podman build (compose build uses Docker buildx)
     #    Skip rebuild only when both version-tagged images exist AND their
@@ -8898,7 +8939,7 @@ compose_up() {
   # only written inside the `if podman` branch above, so on Docker they were never
   # set. Result: the backoffice Optional-Services panel read an empty
   # YASHIGANI_ENABLED_PROFILES and showed EVERY deployed optional service + agent
-  # (openwebui, wazuh, langflow, letta, openclaw) as "Not deployed"; external
+  # (wazuh, langflow, letta, openclaw) as "Not deployed"; external
   # sub-apps (Grafana/Wazuh) had no public-URL to self-reference. Recomputed here
   # (the in-branch `local`s never execute on docker) and written unconditionally.
   local _env_file_rt="${WORK_DIR}/docker/.env"
@@ -10374,23 +10415,52 @@ register_agent_bundles() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
   local compose_file="${WORK_DIR}/docker/docker-compose.yml"
 
-  # Rebuild compose file args (same logic as compose_up — keep in sync)
-  local compose_files=("-f" "$compose_file")
-  if [[ "$YSG_PODMAN_RUNTIME" == "true" ]]; then
-    local podman_override="${WORK_DIR}/docker/docker-compose.podman-override.yml"
-    [[ -f "$podman_override" ]] && compose_files+=("-f" "$podman_override")
-    # macOS virtiofs :U override — macOS Podman only (see compose_up for full rationale)
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      local podman_virtiofs_override="${WORK_DIR}/docker/docker-compose.podman-virtiofs-override.yml"
-      [[ -f "$podman_virtiofs_override" ]] && compose_files+=("-f" "$podman_virtiofs_override")
-    fi
-  fi
+  # YSG-RISK-177: use the shared _ysg_assemble_compose_files() (compose_up()'s
+  # single source of truth) instead of re-deriving a reduced copy here. The
+  # old inline copy only ever applied the Podman override — never the
+  # wazuh/egress-forwarder/GPU overlays — so the `restart` below (and any
+  # future call site added to this function) ran against a file list that
+  # had already drifted from how these containers were actually created.
+  _ysg_assemble_compose_files || return 1
+  local compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
 
   # Run the entire registration flow inside the backoffice container.
   # This avoids shell interpolation issues and timing problems with TOTP.
   # The Python script reads secrets from /run/secrets/, computes TOTP,
-  # authenticates, checks the live registry, registers each unregistered agent,
-  # and writes tokens to /run/secrets/.
+  # authenticates, checks the live registry, and registers each unregistered
+  # agent (Postgres + Redis db/3). The raw per-agent PSK is printed to stdout
+  # (OK: line) for HOST-SIDE capture — see YSG-RISK-133 below for why it is
+  # never written to a file from inside this container.
+  #
+  # YSG-RISK-133 (2026-07-27): this Python block used to also open()
+  # /run/secrets/<profile>_token for writing (a "3. Token file for gateway"
+  # step). FINDING-V412-RESTART-012 (2026-07-21) made backoffice's
+  # /run/secrets mount a PURE :ro bind — see docker-compose.yml — so that
+  # write was doomed on every runtime (Docker rootful, Podman rootless, and
+  # would be on k8s too, hence k8s_register_agent_bundles() below never
+  # attempts it). The write raised OSError: [Errno 30] Read-only file
+  # system, which is a BARE OSError (EROFS has no dedicated subclass) — NOT
+  # a PermissionError — so the old `except PermissionError: pass` guard
+  # never caught it. The exception propagated to the OUTER `except
+  # Exception as e` handler, which reported the whole agent as "FAIL" even
+  # though durable.upsert()/registry.restore_from_durable() had ALREADY
+  # committed the registration to Postgres+Redis. Every fresh compose
+  # install therefore logged "No agents were registered" and
+  # @letta/@langflow/@openclaw chat was 100% dead out-of-the-box, even
+  # though the registry itself was correct.
+  #
+  # Fix: this container makes ZERO write attempts against /run/secrets —
+  # preserves RESTART-012's guarantee completely (no reopened mount, no
+  # caught-and-swallowed write either). The raw token is included in the
+  # OK: result line unconditionally; the ALREADY-CORRECT host-side capture
+  # path (ISSUE-027, install.sh ~10520 below) persists it to
+  # ${secrets_dir}/${_profile}_token on the HOST filesystem (never through
+  # the RO container mount) with the same install-time-secret pattern used
+  # for every other generated secret (openclaw_gateway_token,
+  # license_key, admin_initial_password) — and the SAME pattern k8s already
+  # uses (yashigani-<agent>-token Helm Secret, provisioned before the pod
+  # starts, never written to by a running container — see
+  # k8s_register_agent_bundles() below).
   #
   # YSG-AGENT-REG-001 fix: skip decision moved into Python (registry-aware).
   # The old shell-side guard checked token file existence, which diverges from
@@ -10421,7 +10491,14 @@ register_agent_bundles() {
     # until that lands, dispatch through the front fails CLOSED at the TLS
     # handshake (no regression — the direct path had no L3 route at all).
     case "$_profile" in
-      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="openai"
+      # YSG-RISK-168 (chat-path repair, 2026-07-30): protocol MUST be
+      # "langflow", not "openai" — openai_router.py only routes through
+      # langflow_client.langflow_chat() (Langflow's real /api/v1/run/{flow_id}
+      # contract + self-heal) when protocol=="langflow". "openai" falls into
+      # the generic OpenAI-compat branch that POSTs {upstream}/v1/chat/
+      # completions, a path Langflow's own server does not implement —
+      # confirmed live 405 Method Not Allowed.
+      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="langflow"
                  # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
                  # agent__langflow is a P1-only callee: only the gateway can be its upstream
                  # (OPENAI_API_BASE=http://egress-langflow:9400/llm/v1 — enforced in compose/helm).
@@ -10528,18 +10605,15 @@ for agent_spec in agents_spec:
         durable.upsert(agent_data, token_hash=token_hash)
         # 2. Fast write (Redis db/3) — request-time source of truth
         registry.restore_from_durable(agent_data, token_hash)
-        # 3. Token file for gateway
-        token_path = os.path.join("/run/secrets", profile + "_token")
-        try:
-            with open(token_path, "w") as _tf:
-                _tf.write(raw_token)
-            try:
-                # BUG-WAVE1-P1-002: 0640 so gateway (GID 1001 group) can read
-                os.chmod(token_path, 0o640)
-            except OSError as _ce:
-                print(f"WARNING:chmod_640_failed:{token_path}:{_ce}", file=sys.stderr)
-        except PermissionError:
-            pass  # printed below for host-side capture
+        # 3. YSG-RISK-133: NO container-side write against /run/secrets here
+        # (see the register_agent_bundles() header comment above for the full
+        # RESTART-012 rationale). The backoffice /run/secrets mount is a pure
+        # :ro mount by design -- this container never attempts to write to
+        # it, not even inside a caught exception. The raw token is persisted
+        # HOST-SIDE by the OK: handler in register_agent_bundles() (bash),
+        # which writes ${secrets_dir}/${_profile}_token directly on the host
+        # filesystem and chmods it 0640 -- the same install-time-secret
+        # pattern used for every other generated credential.
         results.append("OK:" + aname + ":" + profile + ":" + raw_token)
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
@@ -12511,15 +12585,32 @@ generate_secrets() {
   else
     log_info "langflow_yashigani_token already present — preserving (upgrade path)"
   fi
-  # BUG-4.0-LANGFLOW-TOKEN-PERMS: langflow runs uid=1000 gid=0; the Docker
-  # named-secret mode: 0440 in compose is ignored by Podman (Podman inherits
-  # host file permissions for file secrets).  Fix: chown 0:0 + chmod 0440 so
-  # the file is root-group readable — langflow's gid=0 grants read access.
-  # Letta uses yashigani_internal_bearer (already handled); openclaw uses an
-  # env var — only langflow_yashigani_token has this uid mismatch.
-  _do_chown "0:0" "$_lf_token_file" "langflow_yashigani_token" "0440" "${secrets_dir}" || \
-    log_warn "BUG-4.0-LANGFLOW-TOKEN-PERMS: chown 0:0 failed for langflow_yashigani_token — langflow may fail to read its token (EACCES)"
-  log_info "langflow_yashigani_token → chown 0:0 chmod 0440 (gid=0 readable for langflow uid=1000 gid=0)"
+  # BUG-4.0-LANGFLOW-TOKEN-PERMS (YSG-RISK-172 fix, chat-path repair 2026-07-30):
+  # langflow runs uid=1000 gid=0; the Docker named-secret mode: 0440 in compose
+  # is ignored by Podman (Podman inherits host file permissions for file
+  # secrets). The ORIGINAL fix (chown 0:0 chmod 0440) only accounted for
+  # langflow's own read path (gid=0 group-read) — it did NOT account for the
+  # GATEWAY also needing to read this same host file directly (gateway bind-
+  # mounts the whole ./secrets dir read-only; it has no per-secret Docker
+  # `secrets:` stanza for this file, so host permissions govern its access on
+  # BOTH Docker and Podman). Gateway's fixed container UID/GID is 1001:1001
+  # (docker/Dockerfile.gateway) — root:root 0440 has a zero "other" bit, so
+  # gateway got EACCES reading the file, `_load_token_role_map()` silently
+  # loaded 0 p1_agent entries, and every langflow-originated call was resolved
+  # as anonymous → 401 at the deliver hop (RISK-172).
+  #
+  # Fix: chown 1001:0 (owner=gateway's fixed UID, group=langflow's fixed GID)
+  # + chmod 0640 (owner read via UID match, group read via GID match, no
+  # world-read — CWE-732 safe). Same symmetric owner-reads/group-reads pattern
+  # already used for pgbouncer_authenticator_password (70:999 0640) elsewhere
+  # in this function. Docker: langflow's OWN read is still governed by its
+  # compose `secrets:` stanza (mode: 0440, Docker-synthesized, unaffected by
+  # this host chmod) — unchanged. Podman: langflow reads via the GID-0 group
+  # bit (unchanged from before); gateway now ALSO reads via the UID-1001
+  # owner bit (new). Regression: src/tests/regression/v4.1.2/test_risk172_langflow_token_perms.py.
+  _do_chown "1001:0" "$_lf_token_file" "langflow_yashigani_token" "0640" "${secrets_dir}" || \
+    log_warn "YSG-RISK-172: chown 1001:0 failed for langflow_yashigani_token — gateway and/or langflow may fail to read the token (EACCES)"
+  log_info "langflow_yashigani_token → chown 1001:0 chmod 0640 (gateway UID-1001 owner-readable + langflow GID-0 group-readable)"
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
   # YSG-RISK-049 is now CLOSED by the auth_query design (v2.24.0).
@@ -13261,10 +13352,28 @@ _write_helm_values() {
     return 0
   fi
 
-  # Create with 0600 IMMEDIATELY (may contain license key — paid credential).
-  # umask 022 would produce 0644 which is world-readable; explicit chmod prevents
-  # that race between touch and chmod.
-  touch "$helm_values"
+  # Create/TRUNCATE with 0600 IMMEDIATELY (may contain license key — paid
+  # credential). umask 022 would produce 0644 which is world-readable;
+  # explicit chmod prevents that race between create and chmod.
+  #
+  # NEW-K8S-ENVHELM-APPEND-001 (found during 4.1.2 k3s/Cilium e2e,
+  # 2026-07-28): this used to be a bare `touch`, which does NOT truncate an
+  # existing file. Every re-run of install.sh against the same WORK_DIR (a
+  # normal operational scenario — retry after a failed/aborted attempt,
+  # re-running with different flags, etc.) APPENDED a fresh `global:` /
+  # `gateway:` / ... block on top of the previous run's, producing a .env.helm
+  # with multiple duplicate top-level YAML keys in one document. K8s/Helm's
+  # YAML decoder resolves duplicate top-level keys last-value-wins per KEY —
+  # so if a later run's `global:` block (written here) lacked the
+  # `imageRegistry`/`imageOwner` keys that k8s_ensure_fresh_local_images had
+  # appended in an EARLIER run's `global:` block further down the same file,
+  # the earlier registry values were silently discarded, and every pod
+  # image reference fell back to the bare unqualified name (e.g.
+  # "yashigani-gateway:4.1.2"), which Docker Hub resolves to a nonexistent
+  # library/ image — ErrImagePull on every pod, cluster-wide, on any re-run.
+  # Fix: truncate on every call so each install.sh invocation starts from a
+  # clean, single-`global:`-block .env.helm, same as a first-ever install.
+  : > "$helm_values"
   chmod 0600 "$helm_values"
 
   # Write YAML values override.
@@ -13284,9 +13393,26 @@ _write_helm_values() {
       printf "  tlsDomain: '%s'\n" "${DOMAIN}"
     fi
 
-    if [[ -n "${TLS_MODE:-}" ]]; then
-      printf "  tlsMode: '%s'\n" "${TLS_MODE}"
-    fi
+    # NEW-K8S-TLSMODE-COLLISION-001 (found during 4.1.2 k3s/Cilium e2e,
+    # 2026-07-28): TLS_MODE here is the install.sh CLI vocabulary
+    # (--tls-mode acme|ca|selfsigned — Caddyfile.acme/.ca/.selfsigned
+    # cert-PROVISIONING mode, compose-only; the k8s Caddy ConfigMap always
+    # mounts the internal mTLS mesh cert unconditionally, see
+    # templates/configmaps.yaml). global.tlsMode is a DIFFERENT, chart-native
+    # key with its own vocabulary (caddy|nginx — edge-INGRESS-MECHANISM
+    # selector; see values.yaml comment + docs/kubernetes_deployment.md
+    # "helm upgrade ... --set global.tlsMode=caddy"). Writing the CLI value
+    # here clobbered the chart default ("caddy") with "acme"/"selfsigned",
+    # which is neither "caddy" nor "nginx" — ingress.yaml's
+    # `{{- if ne .Values.global.tlsMode "caddy" }}` then rendered a stray
+    # nginx-class Ingress (no nginx-ingress-controller in most k8s clusters,
+    # e.g. k3s ships Traefik) while networkpolicy.yaml's nginx-allow rule
+    # (`eq .Values.global.tlsMode "nginx"`) stayed OFF — an inconsistent,
+    # half-configured state on every k8s install that passed --tls-mode.
+    # Fix: never propagate the compose-only CLI TLS_MODE into the k8s-only
+    # global.tlsMode key. Operators who want nginx-ingress on k8s set it
+    # directly via `--set global.tlsMode=nginx` per the documented path;
+    # --tls-mode has no k8s meaning and is intentionally NOT forwarded.
 
     if [[ -n "${ADMIN_EMAIL:-}" ]]; then
       # acmeEmail used by ACME/Let's Encrypt — also the primary admin contact.
@@ -13644,7 +13770,21 @@ _preflight_coredns_dnssec_dot() {
   local _ns="ysg-dnsprobe-$$"
   # shellcheck disable=SC2317
   _dnsprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
-  trap _dnsprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 (found live during 4.1.2 k3s/Cilium
+  # e2e, 2026-07-28): a bare `trap _fn RETURN` is NOT scoped to this one
+  # function call — bash keeps it armed for every subsequent function return
+  # at this call-stack depth for the REST OF SCRIPT EXECUTION unless
+  # explicitly cleared. This function's own $_ns goes out of scope the
+  # moment it returns, so the very next unrelated function return anywhere
+  # later in the script re-fires this stale trap and hits "_ns: unbound
+  # variable" under `set -u` — which happened to fire right after "Helm
+  # release deployed", aborting install.sh before it ever reached
+  # k8s_rollout_status / k8s_verify_image_provenance / k8s_print_access /
+  # credential output. This is the established, already-correct
+  # self-clearing pattern used elsewhere in this file (see _gate_cleanup
+  # ~line 16888): the trap handler clears itself as its last action.
+  # shellcheck disable=SC2064
+  trap "_dnsprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
     log_error "CoreDNS DNSSEC preflight (DNS-02) FAILED: could not create throwaway namespace ${_ns}"
@@ -13740,7 +13880,12 @@ _probe_cross_tenant_isolation() {
   _tenprobe_cleanup() {
     kubectl delete namespace "$_ns_a" "$_ns_b" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
   }
-  trap _tenprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 fix: self-clear (see
+  # _preflight_coredns_dnssec_dot's comment for the full mechanics — a bare
+  # `trap _fn RETURN` stays armed for every later function return in this
+  # script, not just this one call).
+  # shellcheck disable=SC2064
+  trap "_tenprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns_a" >/dev/null 2>&1 || ! kubectl create namespace "$_ns_b" >/dev/null 2>&1; then
     log_error "Cross-tenant probe: could not create throwaway namespaces"
@@ -13896,7 +14041,12 @@ _probe_networkpolicy_enforcement() {
   # Always tear down the throwaway namespace on return.
   # shellcheck disable=SC2317
   _npprobe_cleanup() { kubectl delete namespace "$_ns" --wait=false --ignore-not-found=true >/dev/null 2>&1 || true; }
-  trap _npprobe_cleanup RETURN
+  # NEW-INSTALLSH-TRAP-RETURN-LEAK-001 fix: self-clear (see
+  # _preflight_coredns_dnssec_dot's comment for the full mechanics — a bare
+  # `trap _fn RETURN` stays armed for every later function return in this
+  # script, not just this one call).
+  # shellcheck disable=SC2064
+  trap "_npprobe_cleanup; trap - RETURN" RETURN
 
   if ! kubectl create namespace "$_ns" >/dev/null 2>&1; then
     log_error "NetworkPolicy probe: could not create throwaway namespace ${_ns}"
@@ -14460,7 +14610,9 @@ k8s_register_agent_bundles() {
     case "$_agent" in
       # Phase 5 §C caps — mirror register_agent_bundles() (install.sh
       # ~10342-10357) exactly. Mesh ports match values-<agent>-ingress.yaml.
-      langflow)  _name="agent__langflow"  _proto="openai"  _mesh_port="9705"  _tenant="default"  _secret_name="yashigani-langflow-token"
+      # YSG-RISK-168: protocol="langflow" (not "openai") — see the compose
+      # register_agent_bundles() comment above for the full root-cause.
+      langflow)  _name="agent__langflow"  _proto="langflow"  _mesh_port="9705"  _tenant="default"  _secret_name="yashigani-langflow-token"
                  _lf_kind="agent"; _lf_ceiling="INTERNAL"
                  _lf_groups='["langflow_callee"]'
                  _lf_caller_groups='["admin","user"]'
@@ -16106,34 +16258,42 @@ _pki_chown_client_keys() {
   # Docker is not affected: Docker Compose creates an in-container tmpfs file
   # with the compose-spec mode regardless of host file permissions.
   #
-  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2):
+  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2,
+  # re-fixed for YSG-RISK-172, chat-path repair 2026-07-30):
   #
-  # generate_secrets() sets langflow_yashigani_token to root:root 0440 via
-  # _do_chown "0:0" ... "0440".  langflow runs uid=1000 gid=0 inside the
-  # container; the group bit (0440 group=0) should allow read access.
+  # generate_secrets() sets langflow_yashigani_token to 1001:0 0640 via
+  # _do_chown "1001:0" ... "0640" (owner=gateway's fixed UID 1001, group=
+  # langflow's fixed GID 0 — see that call site for the full RISK-172 root
+  # cause). langflow runs uid=1000 gid=0 inside the container (group-read via
+  # GID 0); the gateway runs uid=1001 gid=1001 (owner-read via UID 1001).
   #
-  # Root cause: _prepare_secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/"
-  # for rootful Podman (just before _pki_run_issuer).  This recursively clobbers
-  # ALL secret file ownership — including langflow_yashigani_token — to 1001:1001.
-  # After the sweep the file is maxine:ysgteam 0440 (uid=1001 != 1000, gid=1001 != 0):
-  # langflow gets EACCES.
+  # Root cause (unchanged from BUG-411-PODMAN-LANGFLOW-PERMS-V2): _prepare_
+  # secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/" for rootful Podman
+  # (just before _pki_run_issuer). This recursively clobbers ALL secret file
+  # ownership — including langflow_yashigani_token — to 1001:1001. After the
+  # sweep the file is uid=1001 gid=1001 0640: langflow (uid=1000, gid=0)
+  # matches neither owner nor group → EACCES (gateway's own read would still
+  # work post-sweep since 1001:1001 satisfies its owner match, but that is
+  # incidental — the sweep does not know about langflow's requirement at all).
   #
-  # Fix: re-apply chown 0:0 0440 here so the group-read path (langflow gid=0 ==
-  # file group 0) is restored AFTER _prepare_secrets_dir_for_pki's sweep and AFTER
-  # the PKI issuer's own writes.  Mode 0440 (NOT 0444) avoids CWE-732: world-read
-  # is not needed because gid=0 is sufficient for langflow's access path.
-  # _fix_config_perms() strips world-read (chmod o-rwx) — 0440 is unaffected.
+  # Fix: re-apply chown 1001:0 0640 here so BOTH read paths are restored AFTER
+  # _prepare_secrets_dir_for_pki's sweep and AFTER the PKI issuer's own writes:
+  # gateway (uid=1001) via the owner bit, langflow (gid=0) via the group bit.
+  # Mode 0640 (NOT 0644/0444) avoids CWE-732: world-read is not needed because
+  # the owner+group bits cover both real consumers. _fix_config_perms() strips
+  # world-read (chmod o-rwx) — 0640 is unaffected (already has no world bits).
   #
-  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from 1001:1001
-  # back to 0:0), not just the mode.  _do_chown handles all three dispatch modes
-  # (direct / unshare / podman_run) consistently across Podman rootful/rootless.
+  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from
+  # 1001:1001 back to 1001:0), not just the mode. _do_chown handles all three
+  # dispatch modes (direct / unshare / podman_run) consistently across Podman
+  # rootful/rootless.
   if [[ "$_effective_runtime" == "podman" ]]; then
     local _lf_tok_path="${_secrets_dir}/langflow_yashigani_token"
     if [[ -f "$_lf_tok_path" ]]; then
-      if _do_chown "0:0" "$_lf_tok_path" "langflow_yashigani_token" "0440" "${_secrets_dir}"; then
-        log_info "Podman: langflow_yashigani_token re-chown 0:0 0440 OK (restored after _prepare_secrets_dir_for_pki sweep)"
+      if _do_chown "1001:0" "$_lf_tok_path" "langflow_yashigani_token" "0640" "${_secrets_dir}"; then
+        log_info "Podman: langflow_yashigani_token re-chown 1001:0 0640 OK (restored after _prepare_secrets_dir_for_pki sweep)"
       else
-        log_warn "Podman: langflow_yashigani_token re-chown 0:0 0440 failed — langflow may EACCES on startup"
+        log_warn "Podman: langflow_yashigani_token re-chown 1001:0 0640 failed — gateway and/or langflow may EACCES on startup"
       fi
     fi
   fi
@@ -18425,22 +18585,34 @@ PYREPLACE
           if [[ ${#COMPOSE_CMD[@]} -eq 0 ]]; then
             resolve_compose_cmd 2>/dev/null || true
           fi
+          # YSG-RISK-177: recreate against the shared full file list (wazuh/
+          # egress-forwarder/GPU overlays), not just the base compose file — a
+          # single-file `up` here permanently strips gateway of every
+          # overlay-added field (mTLS mounts, ringfence network attachments,
+          # and any dependency — e.g. ollama's GPU device — whose config also
+          # drifts against the reduced set) the next time this recreate fires.
+          local _onboard_compose_files=("-f" "$_compose_file")
+          if _ysg_assemble_compose_files; then
+            _onboard_compose_files=("${YSG_COMPOSE_FILE_ARGS[@]}")
+          else
+            log_warn "Shape-C: could not assemble full compose file list — falling back to base file only (overlays may be dropped)"
+          fi
           log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
           if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
             local _gw_up_rc=0
-            "${COMPOSE_CMD[@]}" -f "$_compose_file" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
+            "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
             if [[ "$_gw_up_rc" -ne 0 ]]; then
               log_error "Gateway recreate failed (exit ${_gw_up_rc})."
               log_error "  The YASHIGANI_MCP_SERVERS env change requires a gateway restart to take effect."
               log_error "  Recovery:"
-              log_error "    ${COMPOSE_CMD[*]} -f ${_compose_file} up --no-deps -d gateway"
+              log_error "    ${COMPOSE_CMD[*]} ${_onboard_compose_files[*]} up --no-deps -d gateway"
               log_error "  If the gateway fails to start, check: docker compose logs gateway"
             else
               log_success "Gateway recreated with updated MCP server list."
             fi
           else
             log_warn "Shape-C: COMPOSE_CMD not resolved — cannot recreate gateway automatically."
-            log_warn "  Run manually: docker compose -f docker/docker-compose.yml up --no-deps -d gateway"
+            log_warn "  Run manually: docker compose ${_onboard_compose_files[*]} up --no-deps -d gateway"
           fi
         fi
       fi
@@ -19261,12 +19433,6 @@ main() {
       fi
     fi
 
-    # Step 8b: 4.0 — ui4 is built-in (no OWUI). --with-openwebui is accepted
-    # but silently ignored for backward-compat with existing operator scripts.
-    if [[ "${INSTALL_OPENWEBUI:-false}" == "true" ]]; then
-      log_info "--with-openwebui is a no-op in 4.0 (ui4 chat surface is built in — Open WebUI removed)"
-    fi
-
     # Step 8b-ii: Write OLLAMA_MODEL to .env for the gateway + ui4 chat inference.
     # ollama-init reads OLLAMA_MODEL and pulls the model when any agent bundle is active.
     # BUG-GPU-VRAM-001: pick a model appropriate for the SELECTED GPU's VRAM.
@@ -19335,7 +19501,7 @@ main() {
     # then falls back to `podman unshare tee` (rootless namespace) and finally
     # an ephemeral container write.
     # Covers every profile that may have been added in steps 8/8b/8c
-    # (langflow, letta, openclaw, openwebui, wazuh, ...).
+    # (langflow, letta, openclaw, wazuh, ...).
     local _tok_secrets_dir="${WORK_DIR}/docker/secrets"
     for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
       [[ -z "$_profile" ]] && continue

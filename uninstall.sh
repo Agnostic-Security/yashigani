@@ -234,7 +234,9 @@ _CANONICAL_VOLUMES=(
     openclaw_data
     langflow_data
     letta_data
-    openwebui_data
+    openwebui_data  # legacy — OWUI service removed in 4.0; volume may still exist
+                    # on hosts upgraded from 3.x. Kept here so --remove-volumes
+                    # still cleans it up. Do not reintroduce the service.
     budget_redis_data
     step_ca_data
     wazuh_api_configuration
@@ -1447,7 +1449,6 @@ YASHIGANI_TLS_DOMAIN=uninstall-stub.local
 PROMETHEUS_BASICAUTH_HASH=uninstall-stub-hash
 CADDY_INTERNAL_HMAC=uninstall-stub-hmac
 UPSTREAM_MCP_URL=http://uninstall-stub-upstream:9999
-OWUI_SECRET_KEY=uninstall-stub-owui-key
 YASHIGANI_DB_AES_KEY=uninstall-stub-aes-key
 UNINSTALL_STUB_EOF
       _STUB_ENV_CREATED="true"
@@ -2102,7 +2103,7 @@ echo ""
 #
 # Both were surfaced by live-verify on Mac and VM 2026-05-27 — prior to this
 # fix, uninstall.sh left them behind even on --remove-volumes. Result:
-#   1. Next install reads stale .env values (DB_AES_KEY, OWUI_SECRET_KEY,
+#   1. Next install reads stale .env values (DB_AES_KEY,
 #      FIPS_MODE, YASHIGANI_TLS_MODE, etc.) instead of regenerating.
 #   2. .yashigani-install-state misleads runtime-detection on a fresh install
 #      (especially the k8s mode flag — Su's refactor reads RUNTIME from here).

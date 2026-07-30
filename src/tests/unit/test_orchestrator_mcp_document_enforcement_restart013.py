@@ -149,6 +149,12 @@ async def _fake_egress_allow(identity, server, tool, verdict, response_sensitivi
     return {"allow": True, "reason": "ok"}
 
 
+# YSG-RISK-113: orchestrator._inspect_result is now async (offloads the
+# blocking classifier call via asyncio.to_thread).
+async def _fake_inspect_clean(text, identity, rid):
+    return "CLEAN", 1.0, None
+
+
 def _fake_decision_factory(action: str):
     async def _fake(opa_url, document_input, *, route="any", pseudonymize_mode="A",
                     identity_id="", timeout_s=5.0):
@@ -166,8 +172,7 @@ def _fake_decision_factory(action: str):
 def _wire_common(monkeypatch, pipeline, audit_writer, captured_posts):
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", _fake_ingress_allow)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", _fake_egress_allow)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("CLEAN", 1.0, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_clean)
 
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", _make_fake_client_factory(captured_posts))
@@ -315,8 +320,7 @@ async def test_r013_04_dark_when_pipeline_none_zero_behaviour_change(monkeypatch
     captured_posts: list = []
     monkeypatch.setattr(orchestrator, "_opa_ingress_for_mcp", _fake_ingress_allow)
     monkeypatch.setattr(orchestrator, "_opa_egress_for_mcp_result", _fake_egress_allow)
-    monkeypatch.setattr(orchestrator, "_inspect_result",
-                        lambda text, identity, rid: ("CLEAN", 1.0, None))
+    monkeypatch.setattr(orchestrator, "_inspect_result", _fake_inspect_clean)
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", _make_fake_client_factory(captured_posts))
     monkeypatch.setattr(oa_state, "document_pipeline", None)

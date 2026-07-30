@@ -71,6 +71,27 @@ spec:
         runAsUser: 999
         runAsGroup: 999
         fsGroup: 999
+        # NEW-K8S-POSTGRES-FSGROUP-SSLKEY-001 (found live during 4.1.2
+        # k3s/Cilium e2e, 2026-07-28): default fsGroupChangePolicy is
+        # "Always" — kubelet recursively re-chowns/re-chmods EVERY file on
+        # EVERY volume (Secret AND the PGDATA PVC) on EVERY pod (re)start to
+        # match fsGroup, which ADDS a group-read/write bit even to files
+        # already owned by the matching UID:GID. server.key is written by
+        # 05-enable-ssl.sh on first init with a strict chmod 0600 (required:
+        # postgres refuses to start if a key file OWNED BY THE RUNNING
+        # POSTGRES USER carries ANY group/other bits at all — stricter than
+        # the "owned by root, group-read OK" case). On every restart with an
+        # existing PGDATA (initdb.d scripts — including 05-enable-ssl.sh —
+        # are skipped by the postgres entrypoint once the data dir is
+        # non-empty, so nothing re-applies the 0600), the "Always" fsGroup
+        # walk silently widens server.key's mode, and postgres then FATALs:
+        # "private key file "server.key" has group or world access" —
+        # database refuses to start at all, every restart, forever, until
+        # PGDATA is wiped. Fix: fsGroupChangePolicy: OnRootMismatch — kubelet
+        # skips the recursive walk once the volume root's group ownership
+        # already matches fsGroup (true after the first start), so
+        # server.key's mode set by 05-enable-ssl.sh is never touched again.
+        fsGroupChangePolicy: OnRootMismatch
         # YSG-SECRETS-DIST-002 CLOSED: postgres_password delivered via secretKeyRef
         # env var in K8s. supplementalGroups: [2002] was vestigial (no file-read
         # path in K8s). Removed per Laura A1 amendment — GID 2002 narrowed to

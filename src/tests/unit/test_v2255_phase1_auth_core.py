@@ -257,177 +257,14 @@ class TestLogoutAnyTier:
 
 
 # ---------------------------------------------------------------------------
-# 3. /auth/verify-user accepts user-tier sessions
+# 3-6. /auth/verify-user removed in 4.0 (OWUI removal, fix/v412-e2e-x8x-20260725):
+# Caddy's /app/webui* handle is now a bare redirect to /chat with no
+# forward_auth — verify_user_session() was unreachable dead code and has
+# been deleted from src/yashigani/backoffice/routes/auth.py. The tests that
+# previously lived here (TestVerifyUserEndpoint, TestVerifyUserRejectsAdmin,
+# TestVerifyUserRejectsProvisioning, TestVerifyUserRejectsUnauthenticated)
+# exercised that endpoint directly and are removed with it.
 # ---------------------------------------------------------------------------
-
-class TestVerifyUserEndpoint:
-    """verify_user_session(): user-tier sessions accepted, others rejected."""
-
-    @pytest.mark.asyncio
-    async def test_verify_user_accepts_user_session_returns_200(self):
-        """User session → 200 with X-Forwarded-User header."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        user_session = _make_session("user-uuid", "user", token="tok-user")
-        user_record = _make_account("alice", "user", "alice@example.com")
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.auth_service.get_account_by_id = AsyncMock(return_value=user_record)
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=user_session)
-
-        request = _make_request({"__Host-yashigani_session": "tok-user"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            resp = await _auth_mod.verify_user_session(request)
-
-        assert resp.status_code == 200
-        assert "X-Forwarded-User" in resp.headers
-        assert resp.headers["X-Forwarded-User"] == "alice@example.com"
-        assert resp.headers["X-Forwarded-Name"] == "alice"
-
-    @pytest.mark.asyncio
-    async def test_verify_user_user_without_email_uses_synthetic(self):
-        """User with no email gets synthetic @yashigani.local email."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        user_session = _make_session("user-uuid", "user")
-        user_record = _make_account("bobsmith", "user", "")
-        user_record.email = ""  # no email
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.auth_service.get_account_by_id = AsyncMock(return_value=user_record)
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=user_session)
-
-        request = _make_request({"__Host-yashigani_session": "tok-user"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            resp = await _auth_mod.verify_user_session(request)
-
-        assert resp.status_code == 200
-        assert resp.headers["X-Forwarded-User"] == "bobsmith@yashigani.local"
-
-
-# ---------------------------------------------------------------------------
-# 4. /auth/verify-user rejects admin sessions with 403
-# ---------------------------------------------------------------------------
-
-class TestVerifyUserRejectsAdmin:
-    """verify-user endpoint must reject admin sessions (SoD preserved)."""
-
-    @pytest.mark.asyncio
-    async def test_verify_user_rejects_admin_session_with_403(self):
-        """Admin session → 403 from /auth/verify-user."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        admin_session = _make_session("admin-uuid", "admin", token="tok-admin")
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=admin_session)
-
-        request = _make_request({"__Host-yashigani_admin_session": "tok-admin"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 403
-        assert exc_info.value.detail["error"] == "admin_session_not_allowed_user_path"
-
-    @pytest.mark.asyncio
-    async def test_verify_user_rejects_admin_session_from_user_cookie(self):
-        """Admin session presented via user cookie → still 403."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        admin_session = _make_session("admin-uuid", "admin", token="tok-admin-misuse")
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=admin_session)
-
-        request = _make_request({"__Host-yashigani_session": "tok-admin-misuse"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 403
-
-
-# ---------------------------------------------------------------------------
-# 5. /auth/verify-user rejects totp_provisioning sessions
-# ---------------------------------------------------------------------------
-
-class TestVerifyUserRejectsProvisioning:
-
-    @pytest.mark.asyncio
-    async def test_verify_user_rejects_provisioning_session_with_403(self):
-        """totp_provisioning session → 403 from /auth/verify-user."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        prov_session = _make_session("user-uuid", "totp_provisioning", token="tok-prov")
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=prov_session)
-
-        request = _make_request({"__Host-yashigani_session": "tok-prov"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 403
-        assert exc_info.value.detail["error"] == "totp_provisioning_incomplete"
-
-
-# ---------------------------------------------------------------------------
-# 6. /auth/verify-user rejects unauthenticated
-# ---------------------------------------------------------------------------
-
-class TestVerifyUserRejectsUnauthenticated:
-
-    @pytest.mark.asyncio
-    async def test_verify_user_no_cookie_returns_401(self):
-        """No session cookie → 401."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-
-        request = _make_request({})  # no cookies
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 401
-
-    @pytest.mark.asyncio
-    async def test_verify_user_expired_session_returns_401(self):
-        """Expired/invalid session token → 401."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=None)  # expired
-
-        request = _make_request({"__Host-yashigani_session": "stale-token"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -498,23 +335,9 @@ class TestCrossPathSoDInvariants:
     This is the core of the split-verify architecture from auth-ingress-architecture-20260612.md.
     """
 
-    @pytest.mark.asyncio
-    async def test_admin_cannot_reach_user_path_via_verify_user(self):
-        """Admin session → 403 on /auth/verify-user (cannot access user path)."""
-        from yashigani.backoffice.routes import auth as _auth_mod
-
-        admin_session = _make_session("admin-uuid", "admin")
-        mock_state = MagicMock()
-        mock_state.auth_service = AsyncMock()
-        mock_state.session_store = MagicMock()
-        mock_state.session_store.get = MagicMock(return_value=admin_session)
-        request = _make_request({"__Host-yashigani_admin_session": "tok-admin"})
-
-        with patch.object(_auth_mod, "backoffice_state", mock_state):
-            with pytest.raises(HTTPException) as exc_info:
-                await _auth_mod.verify_user_session(request)
-
-        assert exc_info.value.status_code == 403
+    # test_admin_cannot_reach_user_path_via_verify_user removed —
+    # verify_user_session() was deleted (OWUI removal, 4.0); see note above
+    # TestVerifyAdminRegression.
 
     @pytest.mark.asyncio
     async def test_user_cannot_reach_admin_path_via_verify_admin(self):

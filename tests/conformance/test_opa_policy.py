@@ -1061,10 +1061,14 @@ class TestOpaAssistantApply:
         assert body["status"] == "applied"
         assert body["groups_applied"] == 1
         assert body["users_applied"] == 1
-        # push_rbac_data wraps the raw suggestion into the combined
-        # {"rbac": ..., "agents": ...} document (rbac/opa_push.py) — the
-        # pushed rbac sub-document is what must match the applied suggestion.
-        assert pushed["doc"]["rbac"] == _VALID_RBAC_DOC
+        # push_rbac_data (YSG-RISK-176) PUTs the raw suggestion straight to
+        # the /v1/data/yashigani/rbac sub-path — no combined {"rbac":...,
+        # "agents":...} wrapper anymore (that root-path PUT used to wipe
+        # sibling sub-documents like data.yashigani.mcp.egress_grants on
+        # every apply). apply_suggestion never passes agent_registry, so
+        # only the rbac sub-path is touched — confirmed by the URL.
+        assert pushed["url"].endswith("/v1/data/yashigani/rbac")
+        assert pushed["doc"] == _VALID_RBAC_DOC
         mock_audit_writer.write.assert_called_once()
 
 
