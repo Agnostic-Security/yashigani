@@ -1471,6 +1471,28 @@ def _encoded_payload_audit(
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
 
 
+def _normalize_alias(name: str) -> str:
+    """Derive the same @-handle slug backoffice/routes/user_agents.py does.
+
+    YSG-RISK-168 (chat-path repair): the mention-menu @-handle offered to
+    users is `_normalize_alias(agent.name)` (see
+    backoffice/routes/user_agents.py::_normalize_alias — CANONICAL definition,
+    kept identical here to compare handles on both sides of the global
+    agent-registry lookup below without a cross-package import). Lowercase,
+    collapses non-alphanumeric runs to a single underscore, strips leading/
+    trailing underscores, prepends 'a' if the result starts with a digit,
+    truncated to 63 chars. Any change here MUST be mirrored in
+    user_agents.py's copy (and vice versa) — they must stay byte-identical.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
+    slug = slug.strip("_")
+    if not slug:
+        slug = "agent"
+    if slug[0].isdigit():
+        slug = "a" + slug
+    return slug[:63]
+
+
 def _sse_from_completion(
     completion: dict,
     headers: dict,
@@ -2533,8 +2555,21 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         # Global registry lookup — only if per-user resolution did not resolve
         if not agent_upstream:
+            # YSG-RISK-168: compare NORMALIZED handles on both sides, not a raw
+            # exact match. backoffice/routes/user_agents.py::list_user_mentions()
+            # derives the mention-menu @-handle via _normalize_alias(agent.name)
+            # — e.g. registry name "agent__langflow" (double underscore) becomes
+            # the offered handle "agent_langflow" (single underscore, collapsed
+            # by the alphanumeric-run normaliser). A caller addressing the ONLY
+            # handle the UI ever offers them would exact-match-fail here and
+            # 404. Normalizing both sides lets either the mention-menu handle
+            # or the raw registry name resolve to the same agent.
+            _agent_name_norm = _normalize_alias(agent_name)
             for agent in _state.agent_registry.list_all():
-                if agent.get("name") == agent_name and agent.get("status") == "active":
+                if (
+                    _normalize_alias(agent.get("name", "")) == _agent_name_norm
+                    and agent.get("status") == "active"
+                ):
                     stored_url = agent.get("upstream_url", "")
                     agent_protocol = agent.get("protocol", "openai")
 

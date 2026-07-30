@@ -10367,7 +10367,14 @@ register_agent_bundles() {
     # until that lands, dispatch through the front fails CLOSED at the TLS
     # handshake (no regression — the direct path had no L3 route at all).
     case "$_profile" in
-      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="openai"
+      # YSG-RISK-168 (chat-path repair, 2026-07-30): protocol MUST be
+      # "langflow", not "openai" — openai_router.py only routes through
+      # langflow_client.langflow_chat() (Langflow's real /api/v1/run/{flow_id}
+      # contract + self-heal) when protocol=="langflow". "openai" falls into
+      # the generic OpenAI-compat branch that POSTs {upstream}/v1/chat/
+      # completions, a path Langflow's own server does not implement —
+      # confirmed live 405 Method Not Allowed.
+      langflow)  local _name="agent__langflow"  _url="https://caddy:9705/agents/default/langflow"  _proto="langflow"
                  # Phase 5 §C — Langflow callee registration caps (RISK-108 / §E.11)
                  # agent__langflow is a P1-only callee: only the gateway can be its upstream
                  # (OPENAI_API_BASE=http://egress-langflow:9400/llm/v1 — enforced in compose/helm).
@@ -14352,7 +14359,9 @@ k8s_register_agent_bundles() {
     case "$_agent" in
       # Phase 5 §C caps — mirror register_agent_bundles() (install.sh
       # ~10342-10357) exactly. Mesh ports match values-<agent>-ingress.yaml.
-      langflow)  _name="agent__langflow"  _proto="openai"  _mesh_port="9705"  _tenant="default"  _secret_name="yashigani-langflow-token"
+      # YSG-RISK-168: protocol="langflow" (not "openai") — see the compose
+      # register_agent_bundles() comment above for the full root-cause.
+      langflow)  _name="agent__langflow"  _proto="langflow"  _mesh_port="9705"  _tenant="default"  _secret_name="yashigani-langflow-token"
                  _lf_kind="agent"; _lf_ceiling="INTERNAL"
                  _lf_groups='["langflow_callee"]'
                  _lf_caller_groups='["admin","user"]'
