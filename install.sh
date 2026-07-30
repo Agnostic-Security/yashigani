@@ -16463,6 +16463,24 @@ _pki_detect_uri_san_drift() {
 # gate #ROOTLESS-3 fix (v2.23.1).
 _prepare_secrets_dir_for_pki() {
   local secrets_dir="${WORK_DIR}/docker/secrets"
+
+  # ORDERING (v4.1.2 podman-rootless install abort): the two agent-onboarding
+  # subdirs MUST be created here — BEFORE the chown block below — for exactly
+  # the reason this function exists at all (see the header comment): the
+  # installer can only write inside secrets_dir while it still OWNS it.
+  #
+  # On rootless Podman the chown below maps container UID 1001 through the user
+  # namespace onto a subuid-range HOST uid (165535+1001 = 166536 for a
+  # /etc/subuid start of 165536). After that chown the directory is host-owned
+  # by 166536 mode 0775, so the installer (host UID 1001) is neither owner nor
+  # in the group and a later `mkdir "${secrets_dir}/agents"` fails with
+  # EACCES — aborting the install under `set -euo pipefail` right after
+  # "secrets_dir + files chown 1001:1001 applied via podman unshare".
+  # Creating them first also means the `find -maxdepth 1` sweep below re-owns
+  # them in the same pass, so the _do_chown calls at the end of this function
+  # become idempotent no-ops rather than the thing that has to succeed.
+  mkdir -p "${secrets_dir}/agents" "${secrets_dir}/svid-init"
+
   if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     if [[ "$(id -u)" == "0" ]]; then
       # Rootful Podman running as root — plain chown works
@@ -16507,7 +16525,9 @@ _prepare_secrets_dir_for_pki() {
   # empty parents. Idempotent (mkdir -p / chown re-run safe) — runs on both
   # fresh install and upgrade (this function is the single funnel point for
   # both — see call sites in install() step 9b and handle_pki_subcommand).
-  mkdir -p "${secrets_dir}/agents" "${secrets_dir}/svid-init"
+  # NOTE: the `mkdir -p` for these two dirs is hoisted to the TOP of this
+  # function (see the ORDERING comment there) — it must run before the chown
+  # block, not here, or the installer has already lost write access.
   _do_chown "1001:1001" "${secrets_dir}/agents" "backoffice agent-cert write dir" \
     || log_warn "Could not chown ${secrets_dir}/agents to 1001:1001 — agent onboarding (mint SVID) will fail with EACCES until fixed manually"
   _do_chown "1001:1001" "${secrets_dir}/svid-init" "backoffice svid-init staging dir" \
