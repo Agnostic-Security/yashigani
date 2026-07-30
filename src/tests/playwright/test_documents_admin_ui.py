@@ -74,10 +74,15 @@ playwright_required = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 def _open_documents(page) -> None:
-    """Login and navigate to the Documents panel."""
+    """Login and navigate to the Documents panel.
+
+    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): same class of
+    stale-selector bug as test_pki_admin_ui.py -- 'button[data-param=...]' is
+    pre-ui4-nav-rewrite; the current nav renders `a[href='#module-id']`.
+    """
     playwright_login_admin(page)
     page.goto(f"{BASE_URL}/admin/")
-    page.click('button[data-param="documents"]')
+    page.click("a[href='#documents']")
     page.wait_for_selector("#page-documents.active", timeout=5000)
 
 
@@ -100,7 +105,7 @@ def test_pw_doc_01_nav_and_navigate():
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
-            assert page.is_visible('button[data-param="documents"]')
+            assert page.is_visible("a[href='#documents']")
             assert page.is_visible("#page-documents.active")
         finally:
             browser.close()

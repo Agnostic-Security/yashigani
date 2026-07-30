@@ -30,6 +30,9 @@ from tests.playwright.conftest import (
     STACK_RUNNING,
     _CA_CERT_PATH,
     get_admin_credentials,
+    get_admin_totp_code,
+    _wait_for_fresh_totp_window,
+    _api_totp_last_used,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -56,10 +59,23 @@ _TEST_KEY = "a1b2c3d4-e5f6-0000-abcd-000000000001"
 
 
 def _login(page, creds):
-    """Log in to the admin panel and return the page ready for admin UI."""
+    """Log in to the admin panel and return the page ready for admin UI.
+
+    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): TWO bugs --
+    (1) `creds["admin1_username"]`/`creds["admin1_password"]` dict-key access
+    on a TUPLE (get_admin_credentials() returns (username, password)) raised
+    TypeError immediately, before any request was ever sent; (2) even past
+    that, #totp_code was never filled (required by the server, Phase 13+).
+    Fixed to unpack the tuple correctly and fill TOTP via the shared, correct
+    (SHA-512/8-digit) helper, respecting the 62s replay window.
+    """
+    _wait_for_fresh_totp_window(admin=1)
+    username, password = creds
     page.goto(f"{BASE_URL}/admin/login")
-    page.fill('input[name="username"], input[type="text"]', creds["admin1_username"])
-    page.fill('input[name="password"], input[type="password"]', creds["admin1_password"])
+    page.fill('input[name="username"], input[type="text"]', username)
+    page.fill('input[name="password"], input[type="password"]', password)
+    page.fill("#totp_code", get_admin_totp_code())
+    _api_totp_last_used[1] = __import__("time").time()
     page.click('button[type="submit"], button:has-text("Login")')
     page.wait_for_url(f"{BASE_URL}/admin/")
     return page
@@ -69,14 +85,19 @@ def _login(page, creds):
 def browser_ctx():
     """Browser context with CA cert trust."""
     creds = get_admin_credentials()
-    ca_cert = _CA_CERT_PATH
 
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
-        ctx_args = {}
-        if ca_cert:
-            ctx_args["ignore_https_errors"] = True  # pragma: no cover
-        ctx = browser.new_context(**ctx_args)
+        # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): this
+        # previously only set ignore_https_errors when _CA_CERT_PATH was
+        # truthy -- backwards for a selfsigned-mode deployment, where
+        # _CA_CERT_PATH is correctly None (see conftest._resolve_ca_cert
+        # docstring: ca_root.crt does not validate Caddy's public listener
+        # cert here) and Chromium's real cert validation then fails outright
+        # with net::ERR_CERT_AUTHORITY_INVALID, failing every test in this
+        # file at fixture setup. Always accept the risk for local test
+        # traffic, matching every other Playwright fixture in this suite.
+        ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, creds)
         yield page, creds

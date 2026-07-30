@@ -25,6 +25,9 @@ from tests.playwright.conftest import (
     STACK_RUNNING,
     _CA_CERT_PATH,
     get_admin_credentials,
+    get_admin_totp_code,
+    _wait_for_fresh_totp_window,
+    _api_totp_last_used,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -48,9 +51,17 @@ _NAV_LABEL = "Permissions Policy"
 
 
 def _login(page, creds):
+    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): see the
+    # identical fix + rationale in test_permissions_ui.py -- this never
+    # filled the required #totp_code field, so login never completed and
+    # page.wait_for_url() always timed out, failing every test in this file.
+    import time as _time
+    _wait_for_fresh_totp_window(admin=1)
     page.goto(f"{BASE_URL}/admin/login")
     page.fill('input[name="username"], input[type="text"]', creds[0])
     page.fill('input[name="password"], input[type="password"]', creds[1])
+    page.fill("#totp_code", get_admin_totp_code())
+    _api_totp_last_used[1] = _time.time()
     page.click('button[type="submit"], button:has-text("Login")')
     page.wait_for_url(f"{BASE_URL}/admin/")
     return page
