@@ -1339,6 +1339,31 @@ def create_backoffice_app() -> FastAPI:
             )
             if not any(request.cookies.get(k) for k in _admin_cookies):
                 return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
+
+            # YSG-RISK-176(admin-shell): a session cookie's mere PRESENCE used
+            # to be sufficient to receive the 200 admin shell — including a
+            # perfectly valid USER-tier session. Every underlying /admin/*
+            # API call already correctly 403s for a non-admin caller
+            # (real per-action authz was never bypassed), but the SHELL
+            # itself 200'd for any authenticated session — enumeration-only,
+            # but still confirms the admin UI's existence/asset surface to a
+            # caller who should not be able to tell. Resolve the session and
+            # require admin tier BEFORE serving the shell, mirroring
+            # middleware.require_admin_session's tier check exactly (same
+            # account_tier == "admin" condition, including the
+            # admin_password_change_required tier, which is also correctly
+            # denied here since it is != "admin").
+            from yashigani.backoffice.middleware import _resolve_token, get_session_store
+
+            token = _resolve_token(request)
+            store = get_session_store()
+            session = store.get(token) if token else None
+            if session is None or session.account_tier != "admin":
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "insufficient_tier"},
+                )
+
             return HTMLResponse(_ui4_admin.read_text(encoding="utf-8"))
 
         @app.get("/admin4/", include_in_schema=False)

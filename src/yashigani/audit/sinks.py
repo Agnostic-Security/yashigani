@@ -198,17 +198,29 @@ class PostgresSink(AuditSink):
                     req_id = event.get("request_id")
 
                     # LU-AMEND-01 wave 2: compute hash-chain fields before INSERT.
-                    # The AuditChainService lock serialises these within the process;
-                    # the batch loop serialises them within this flush call.
-                    # LU-AMEND-01 wave 3: INSERTs are sequential within a single
-                    # transaction so the DB-assigned seq values are strictly
-                    # monotonic in insertion order — the same order in which
-                    # compute_hashes_for_event() is called here.
+                    # YSG-RISK-176 (2026-07-30): the AuditChainService in-process
+                    # lock ONLY serialises calls within this one worker process —
+                    # with multiple gunicorn/uvicorn workers (the gateway alone
+                    # runs two: mTLS :8080 + mesh :8081) each holding its own
+                    # AuditChainService instance, the old compute_hashes_for_event()
+                    # (in-memory _last_hash) diverged across workers — a live query
+                    # under normal concurrent traffic found 4/56 chain-link breaks,
+                    # zero tampering. compute_hashes_for_event_db() instead derives
+                    # prev_hash from the DB's own seq-ordered last row under a
+                    # transaction-scoped pg_advisory_xact_lock keyed on tenant_id,
+                    # which correctly serialises across ALL processes/connections —
+                    # this is the seq-authoritative prev_hash lookup migration 0014
+                    # specified but which compute_hashes_for_event() never actually
+                    # implemented. INSERTs remain sequential within a single
+                    # transaction so seq values stay strictly monotonic in
+                    # insertion order.
                     prev_hash: Optional[str] = None
                     event_hash: Optional[str] = None
                     if self._chain_service is not None:
                         try:
-                            prev_hash, event_hash = self._chain_service.compute_hashes_for_event(event)
+                            prev_hash, event_hash = await self._chain_service.compute_hashes_for_event_db(
+                                conn, tenant_uuid, event
+                            )
                         except Exception as exc:
                             # v2.25.2 (irrevocable chain): on the require_chain
                             # (production) path, a hash-computation failure must
