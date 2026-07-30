@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # tests/install/test_pick_ollama_model_for_vram.bats
 #
-# YSG-RISK-178 (product-correctness / default-model precedence, 2026-07-30):
+# YSG-RISK-183 (product-correctness / default-model precedence, 2026-07-30):
 # out-of-box default = LOCAL, and the SPECIFIC local model must be
 # auto-selected from the host's GPU/VRAM specs, not a hardcoded name.
 #

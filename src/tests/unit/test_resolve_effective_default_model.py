@@ -1,5 +1,5 @@
 """
-Unit tests — YSG-RISK-178 ``openai_router._resolve_effective_default_model()``.
+Unit tests — YSG-RISK-183 ``openai_router._resolve_effective_default_model()``.
 
 This is the gateway-side half of the admin-configurable default: the
 function consulted by ``chat_completions`` when a request carries NO

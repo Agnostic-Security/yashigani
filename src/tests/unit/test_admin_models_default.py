@@ -1,5 +1,5 @@
 """
-Unit tests — YSG-RISK-178 admin-configurable default model.
+Unit tests — YSG-RISK-183 admin-configurable default model.
 
 ``GET/PUT/DELETE /admin/models/default`` (src/yashigani/backoffice/routes/models.py).
 Uses fakeredis for the ModelAliasStore + a FastAPI TestClient with the

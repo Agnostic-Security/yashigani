@@ -242,7 +242,7 @@ class TestAllowedLocalDefaultSubstitution:
 
 
 class TestCloudDefaultKeyGating:
-    """YSG-RISK-178 — product-correctness / default-model precedence.
+    """YSG-RISK-183 — product-correctness / default-model precedence.
 
     Rule: the effective default model is ALWAYS local UNLESS a cloud model
     is BOTH configured with a valid API key AND set as default. The engine

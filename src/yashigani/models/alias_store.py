@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "model:alias:"
 
-# YSG-RISK-178 — admin-configurable DEFAULT model pointer. A single string
+# YSG-RISK-183 — admin-configurable DEFAULT model pointer. A single string
 # key (NOT under model:alias: so it never collides with the SCAN-based
 # list_all() alias enumeration) holding the alias name an admin has
 # explicitly set as the effective default. Absent (None) => the gateway
@@ -188,7 +188,7 @@ class ModelAliasStore:
         return result
 
     # ------------------------------------------------------------------
-    # Default-alias pointer (YSG-RISK-178 — admin-configurable default)
+    # Default-alias pointer (YSG-RISK-183 — admin-configurable default)
     # ------------------------------------------------------------------
 
     def get_default(self) -> Optional[str]:

@@ -414,7 +414,7 @@ def _build_app(mesh_mode: bool = False):
     # ── v1.0: Optimization Engine ─────────────────────────────────────────
     _default_cloud_provider = os.getenv("YASHIGANI_DEFAULT_CLOUD_PROVIDER", "anthropic")
 
-    # YSG-RISK-178 (product-correctness / default-model precedence): the
+    # YSG-RISK-183 (product-correctness / default-model precedence): the
     # engine's P1-trusted/P5/P6 rules substitute this DEFAULT cloud
     # provider/model for an ollama-resolved (i.e. no explicit model
     # requested) call. Per the design rule — "the default model is ALWAYS

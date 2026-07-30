@@ -81,7 +81,7 @@ class OptimizationEngine:
             model_aliases: {alias: (provider, model, force_local)} DB-driven aliases
             cloud_key_available: zero-arg callable returning True iff a valid API
                 key is actually configured for ``default_cloud_provider``.
-                YSG-RISK-178 (product-correctness / default-model precedence):
+                YSG-RISK-183 (product-correctness / default-model precedence):
                 the engine substitutes ``default_cloud_provider``/``default_cloud_model``
                 for an OLLAMA-resolved request in three places (P1 trusted-cloud,
                 P5 force_cloud, P6 complexity-HIGH) whenever the caller did not
@@ -122,7 +122,7 @@ class OptimizationEngine:
         silently substituted as an IMPLICIT default for an ollama-resolved
         request (P1 trusted-cloud / P5 / P6).
 
-        YSG-RISK-178: when ``cloud_key_available`` was not wired at
+        YSG-RISK-183: when ``cloud_key_available`` was not wired at
         construction time, legacy-permissive behaviour applies (assume
         usable) — unchanged for existing callers. When it WAS wired but
         raises, fail-closed to "not usable" — a broken checker must never be
@@ -216,7 +216,7 @@ class OptimizationEngine:
                 int(sensitivity.level), str(sensitivity.level)
             )
             trusted = self._trusted_cloud.get(_level_key)
-            # YSG-RISK-178: trusted-cloud substitutes the DEFAULT cloud model —
+            # YSG-RISK-183: trusted-cloud substitutes the DEFAULT cloud model —
             # never silently attempt it when no API key is actually configured
             # (falls through to the local decision below instead of a
             # downstream 503 the caller never asked to hit).
@@ -287,7 +287,7 @@ class OptimizationEngine:
             )
 
         # P5: Identity force_cloud + budget ok
-        # YSG-RISK-178: when the resolved model is already an EXPLICIT cloud
+        # YSG-RISK-183: when the resolved model is already an EXPLICIT cloud
         # pin (provider != "ollama"), always honour it — this is not the
         # engine choosing a default. Only the "ollama -> substitute the
         # DEFAULT cloud model" branch is gated on a configured API key; absent
@@ -313,7 +313,7 @@ class OptimizationEngine:
                 rule="P5-DEGRADED",
                 reason=(
                     "Identity force_cloud but default cloud model has no "
-                    "configured API key — local fallback (YSG-RISK-178)"
+                    "configured API key — local fallback (YSG-RISK-183)"
                 ),
                 sensitivity=sensitivity,
                 complexity=complexity,
@@ -322,7 +322,7 @@ class OptimizationEngine:
             )
 
         # P6: Complexity HIGH + budget ok -> PREFER CLOUD
-        # YSG-RISK-178: same guard as P5 — an implicit "prefer cloud" upgrade
+        # YSG-RISK-183: same guard as P5 — an implicit "prefer cloud" upgrade
         # of an ollama-resolved (i.e. no explicit model requested) request
         # must never silently pick the default cloud model when no API key
         # is configured for it. This was the concrete out-of-box bug: a
@@ -349,7 +349,7 @@ class OptimizationEngine:
                 rule="P6-DEGRADED",
                 reason=(
                     "Complexity HIGH would prefer cloud but default cloud model "
-                    "has no configured API key — local fallback (YSG-RISK-178)"
+                    "has no configured API key — local fallback (YSG-RISK-183)"
                 ),
                 sensitivity=sensitivity,
                 complexity=complexity,

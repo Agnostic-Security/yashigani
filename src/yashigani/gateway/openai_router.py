@@ -1197,7 +1197,7 @@ def _get_cloud_api_key(provider: str) -> Optional[str]:
 
 
 def _resolve_effective_default_model() -> str:
-    """YSG-RISK-178 — resolve the EFFECTIVE default model for a chat request
+    """YSG-RISK-183 — resolve the EFFECTIVE default model for a chat request
     that carries NO explicit ``model`` / no @mention.
 
     Rule: "the default model is ALWAYS the local model, UNLESS a cloud
@@ -1927,7 +1927,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         budget_state = BudgetState(identity_id=identity_id, provider="cloud", used=0, total=0, signal=BudgetSignal.NORMAL, pct=0)
 
     # ── 6. Route decision ──────────────────────────────────────────────
-    # YSG-RISK-178: no explicit model/mention -> the EFFECTIVE default,
+    # YSG-RISK-183: no explicit model/mention -> the EFFECTIVE default,
     # which is the admin-configured default when one is set AND usable
     # (local, or cloud with a configured key), else the spec-chosen LOCAL
     # model (_state.default_model / OLLAMA_MODEL). Never the literal string

@@ -14,7 +14,7 @@
 //   models.py      GET/POST/DELETE /admin/models[/{alias}]
 //                  GET /admin/models/available  POST /admin/models/pull
 //                  GET/POST/DELETE /admin/models/allocations[/{id}]
-//                  GET/PUT/DELETE /admin/models/default (YSG-RISK-178 —
+//                  GET/PUT/DELETE /admin/models/default (YSG-RISK-183 —
 //                    admin-configurable default: local always works
 //                    out-of-box; a cloud alias may be set as default only
 //                    when its provider has a configured API key — server
@@ -169,7 +169,7 @@ export class YsAdminBudgetModels extends LitElement {
     this._toast(res, 'Alias deleted.'); if (res.ok) await this._load();
   }
   async _setDefault(a) {
-    // YSG-RISK-178: server rejects (400 cloud_default_requires_api_key) a
+    // YSG-RISK-183: server rejects (400 cloud_default_requires_api_key) a
     // cloud alias with no configured API key — the toast surfaces that
     // message verbatim so the admin knows to configure the key first.
     const res = await this.api.mutate('/admin/models/default', { method: 'PUT', body: { alias: a.alias } });
@@ -299,7 +299,7 @@ export class YsAdminBudgetModels extends LitElement {
   _renderModels() {
     const availRows = this._available.map((m) => (typeof m === 'string' ? { name: m } : m));
     const dm = this._defaultModel || {};
-    // YSG-RISK-178: no admin default configured (dm.alias == null) means the
+    // YSG-RISK-183: no admin default configured (dm.alias == null) means the
     // gateway is using its spec-chosen LOCAL model (OLLAMA_MODEL, auto-picked
     // from the host's GPU/VRAM at install time) — the out-of-box behaviour.
     const defaultNote = dm.alias

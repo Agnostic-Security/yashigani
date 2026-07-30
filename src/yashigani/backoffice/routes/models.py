@@ -100,7 +100,7 @@ def _alias_is_local(cfg: ModelAlias) -> bool:
 
 
 def _cloud_key_configured(provider: str) -> bool:
-    """YSG-RISK-178 — is a valid API key actually configured for *provider*?
+    """YSG-RISK-183 — is a valid API key actually configured for *provider*?
 
     Mirrors gateway ``openai_router._get_cloud_api_key``'s KMS-then-env-var
     resolution (KMS first, env var fallback) so "is a key configured" means
@@ -173,7 +173,7 @@ async def create_alias(body: AliasRequest, session: StepUpAdminSession):
 
 @router.get("/default")
 async def get_default_model(session: AdminSession):
-    """YSG-RISK-178 — return the currently-EFFECTIVE default model.
+    """YSG-RISK-183 — return the currently-EFFECTIVE default model.
 
     ``alias is None`` means no admin default is configured — the gateway
     falls back to its spec-chosen LOCAL model (OLLAMA_MODEL, auto-selected
@@ -209,7 +209,7 @@ async def get_default_model(session: AdminSession):
 
 @router.put("/default")
 async def set_default_model(body: DefaultModelRequest, session: StepUpAdminSession):
-    """YSG-RISK-178 — admin sets the effective default model.
+    """YSG-RISK-183 — admin sets the effective default model.
 
     Rule enforced here (write-time): a CLOUD alias may be set as default
     ONLY when a valid API key is already configured for its provider —
@@ -247,7 +247,7 @@ async def set_default_model(body: DefaultModelRequest, session: StepUpAdminSessi
 
 @router.delete("/default")
 async def clear_default_model(session: StepUpAdminSession):
-    """YSG-RISK-178 — clear the admin-configured default, reverting to the
+    """YSG-RISK-183 — clear the admin-configured default, reverting to the
     spec-chosen local model (OLLAMA_MODEL)."""
     store = _alias_store()
     store.clear_default()

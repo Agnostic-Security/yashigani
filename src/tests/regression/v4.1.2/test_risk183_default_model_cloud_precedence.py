@@ -1,5 +1,5 @@
 """
-Regression tests — YSG-RISK-178 (default-model / cloud-precedence bug,
+Regression tests — YSG-RISK-183 (default-model / cloud-precedence bug,
 2026-07-30, product-correctness fix per Tiago's design rule).
 
 RULE: "the default model is ALWAYS the local model, UNLESS a cloud model is
@@ -97,7 +97,7 @@ class TestRisk178DefaultModelPrecedence:
             budget=_budget(),
         )
         assert d.is_local, (
-            "YSG-RISK-178 regression: a no-mention/no-explicit-model chat on "
+            "YSG-RISK-183 regression: a no-mention/no-explicit-model chat on "
             "a stack with NO cloud key configured must resolve LOCAL, never "
             "silently substitute the default cloud model."
         )
@@ -122,7 +122,7 @@ class TestRisk178DefaultModelPrecedence:
         ]
         for d in decisions:
             assert d.model != "claude-sonnet-4-6", (
-                f"YSG-RISK-178 regression: rule {d.rule} surfaced the unusable "
+                f"YSG-RISK-183 regression: rule {d.rule} surfaced the unusable "
                 f"cloud default with no key configured"
             )
             assert d.is_local
@@ -200,7 +200,7 @@ class TestRisk178ProductionWiring:
         with open(entrypoint_path, "r", encoding="utf-8") as fh:
             src = fh.read()
         assert "cloud_key_available=" in src, (
-            "YSG-RISK-178 regression: gateway/entrypoint.py must construct "
+            "YSG-RISK-183 regression: gateway/entrypoint.py must construct "
             "OptimizationEngine with a real cloud_key_available callable "
             "(not rely on the permissive None default) so a fresh install "
             "with no cloud key actually degrades P1/P5/P6 to local."

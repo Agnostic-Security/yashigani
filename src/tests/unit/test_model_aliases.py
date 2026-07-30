@@ -241,7 +241,7 @@ class TestModelAliasDataclass:
         assert a.sensitivity_ceiling is None
 
 
-# ── Default-alias pointer (YSG-RISK-178) ───────────────────────────────────
+# ── Default-alias pointer (YSG-RISK-183) ───────────────────────────────────
 
 class TestDefaultAliasPointer:
     def test_get_default_none_when_unset(self, store):
