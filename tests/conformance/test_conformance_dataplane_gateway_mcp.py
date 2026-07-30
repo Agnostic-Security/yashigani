@@ -721,7 +721,20 @@ def test_user_ui_get_route_admin_session_403_wrong_plane(user_ui_app, session_st
 def test_user_ui_get_route_user_session_2xx(user_ui_app, session_store, path):
     tc, _ = user_ui_app
     r = tc.get(path, cookies=_user_cookie(session_store))
-    assert r.status_code == 200, f"{path}: {r.status_code}: {r.text}"
+    if path == "/user/memory":
+        # YSG-RISK-156 CLOSED: /user/memory is a DECLARED stub (Phase 3 /
+        # RISK-107, needs the NHI/SVID mesh + per-user Letta container) —
+        # rewritten from a misleading 200 {"configured": false, "entries":
+        # []} to an honest 501 not_implemented. See
+        # test_tom_ysg_risk_156_157_honest_stub_endpoints.py and
+        # test_user_ui_memory_is_a_declared_stub below. Auth still gates
+        # BEFORE this 501 (proven by the unauth_401/wrong_plane_403 tests
+        # above using the same _USER_GET_ROUTES list), so it stays in this
+        # shared parametrization rather than a separate route list.
+        assert r.status_code == 501, f"{path}: {r.status_code}: {r.text}"
+        assert r.json()["detail"]["error"] == "not_implemented"
+    else:
+        assert r.status_code == 200, f"{path}: {r.status_code}: {r.text}"
 
 
 def test_user_ui_memory_is_a_declared_stub():
@@ -1208,19 +1221,39 @@ def test_v1_model_string_validation_accepts_good_input():
         assert _validate_model_string(good) is None, f"{good!r} should be accepted"
 
 
-def test_v1_model_string_agent_prefix_is_call_site_exempted_not_validator_accepted():
-    """@-prefixed agent-call model strings are EXEMPTED from
-    _validate_model_string at the chat_completions call site (source-level:
-    `if body.model and not is_agent_call and not brain_reasoning_leg:`) --
-    they are NEVER PASSED to the validator at all. Confirms the validator
-    itself rejects a bare leading '@' (it is not in the accepted-input set),
-    so the exemption is a call-site skip, not a validator special-case."""
+def test_v1_model_string_agent_prefix_is_validator_accepted_not_call_site_exempted():
+    """YSG-RISK-158 CLOSED: @-prefixed agent-call model strings used to be
+    EXEMPTED from _validate_model_string entirely at the chat_completions
+    call site (`if body.model and not is_agent_call and not
+    brain_reasoning_leg:`) -- so a malicious "@"-prefixed payload (URL
+    scheme, path traversal, null bytes) reached agent-routing code with
+    ZERO of the validator's defenses. Fix: the "@" exemption now lives
+    INSIDE _validate_model_string itself (_AGENT_CALL_VALID_RE) -- the call
+    site validates ALL body.model values, agent calls included; a
+    legitimate "@handle" is accepted by the validator, a malicious one is
+    rejected by it. Only the SEPARATE normalization/known-model-allowlist
+    gate below the validation call remains agent-call-exempt (an @-handle
+    is an agent identifier resolved via agent_registry, not an LLM model
+    name) -- confirmed by the second assertion below. See
+    test_ysg_risk_158_agent_call_validator_exemption.py."""
     from yashigani.gateway.openai_router import _validate_model_string
-    assert _validate_model_string("@my-agent") is not None
+
+    # A legitimate agent-call handle is now accepted BY THE VALIDATOR
+    # (not merely skipped by the call site).
+    assert _validate_model_string("@my-agent") is None
+    # A malicious agent-call payload is REJECTED by the validator itself.
+    assert _validate_model_string("@http://evil.example.com") is not None
+    assert _validate_model_string("@../../etc/passwd") is not None
+
+    # The normalization + known-model-allowlist gate (a DIFFERENT code path
+    # to validation, not applicable to agent identifiers) remains
+    # agent-call-exempt.
     import inspect as _inspect
     from yashigani.gateway import openai_router as _oa
     src = _inspect.getsource(_oa.chat_completions)
     assert "not is_agent_call and not brain_reasoning_leg" in src
+    # ...but the validation call itself is NO LONGER agent-call-exempt.
+    assert "if body.model and not brain_reasoning_leg:" in src
 
 
 def test_v1_model_rbac_granted_cloud_model_not_denied():

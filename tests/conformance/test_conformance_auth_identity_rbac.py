@@ -1330,14 +1330,18 @@ class TestMeApiKey:
         assert r.json()["detail"]["error"] == "key_not_owned_by_caller"
 
     # -----------------------------------------------------------------
-    # CRITICAL FINDING — cross-Redis-DB divergence (YSG-RISK-131/010-class).
-    # See conftest.py module docstring + findings.md for full root-cause.
-    # This test PINS the REAL (broken) behaviour — it is NOT a false
-    # negative or a badly-written test; it fails loudly if the underlying
-    # bug is ever silently "fixed" without updating this assertion, which
-    # is the correct behaviour for a conformance test recording a known gap.
+    # x8x-131 (LAURA-4.1.2-010) — cross-Redis-DB divergence — CLOSED.
+    # See conftest.py module docstring + findings.md AUTH-IDENTITY-RBAC-001
+    # for the full root-cause writeup. list_api_keys()/revoke_api_key() used
+    # to read via backoffice_state.session_store._redis (production DB1)
+    # while registry.rotate_key() wrote the key via the IdentityRegistry's
+    # own client (production DB3) — a just-issued key could never be listed
+    # or revoked. Fix: me.py's list_api_keys()/revoke_api_key() now route
+    # through registry.has_key()/the registry's own client (DB3) — the SAME
+    # store issue/rotate/verify use — instead of session_store._redis (DB1),
+    # which never held this key in the first place.
     # -----------------------------------------------------------------
-    def test_FINDING_issue_then_list_returns_empty_cross_db_bug(
+    def test_issue_then_list_returns_the_issued_key_x8x_131(
         self, fake_auth_service, identity_registry, seed_account, stepup_user_client,
     ):
         from yashigani.identity.registry import IdentityKind
@@ -1346,7 +1350,7 @@ class TestMeApiKey:
         seed_account(fake_auth_service, account_id=stepup_user_client.conformance_session.account_id,
                       username="crossdb1@x.com", tier="user", email="crossdb1@x.com")
         slug = email_to_slug("crossdb1@x.com")
-        identity_registry.register(kind=IdentityKind.HUMAN, name="crossdb1@x.com", slug=slug)
+        identity_id, _ = identity_registry.register(kind=IdentityKind.HUMAN, name="crossdb1@x.com", slug=slug)
 
         issue = stepup_user_client.post("/me/api-key")
         assert issue.status_code == 200, issue.text
@@ -1354,18 +1358,17 @@ class TestMeApiKey:
 
         listing = stepup_user_client.get("/me/api-keys")
         assert listing.status_code == 200
-        # FINDING: this SHOULD contain the just-issued key. It does not,
-        # because list_api_keys() reads via backoffice_state.session_store._redis
-        # (production DB1) while registry.rotate_key() wrote the key via the
-        # IdentityRegistry's own client (production DB3). Pinned here as the
-        # real, reproduced behaviour — see findings.md AUTH-IDENTITY-RBAC-001.
-        assert listing.json() == {"api_keys": []}, (
-            "If this assertion starts failing, the cross-DB bug has been fixed "
-            "upstream — update findings.md AUTH-IDENTITY-RBAC-001 to CLOSED and "
-            "flip this assertion to the correct (non-empty) expectation."
+        # x8x-131 REGRESSION check: the just-issued key MUST now be listed —
+        # list_api_keys() reads via the same registry (DB3) rotate_key() wrote to.
+        keys = listing.json()["api_keys"]
+        assert len(keys) == 1, (
+            f"x8x-131 REGRESSION: expected the just-issued key to be listed, "
+            f"got: {keys!r}"
         )
+        assert keys[0]["key_id"] == identity_id
+        assert keys[0]["last4"] == "****"
 
-    def test_FINDING_issue_then_revoke_404s_cross_db_bug(
+    def test_issue_then_revoke_succeeds_204_x8x_131(
         self, fake_auth_service, identity_registry, seed_account, stepup_user_client,
     ):
         from yashigani.identity.registry import IdentityKind
@@ -1380,14 +1383,12 @@ class TestMeApiKey:
         assert issue.status_code == 200, issue.text
 
         revoke = stepup_user_client.delete(f"/me/api-keys/{identity_id}")
-        # FINDING: this SHOULD be 204 (the caller's own, just-issued, valid
-        # key). It is 404 because revoke_api_key() also reads via
-        # backoffice_state.session_store._redis (DB1) instead of the
-        # registry's own client (DB3) where the key actually lives.
-        assert revoke.status_code == 404, (
-            "If this assertion starts failing (i.e. now returns 204), the "
-            "cross-DB bug has been fixed upstream — update findings.md "
-            "AUTH-IDENTITY-RBAC-001 to CLOSED."
+        # x8x-131 REGRESSION check: revoking the caller's own, just-issued,
+        # valid key MUST succeed — revoke_api_key() now reads via the same
+        # registry (DB3) the key actually lives in, not session_store._redis (DB1).
+        assert revoke.status_code == 204, (
+            f"x8x-131 REGRESSION: expected 204 for revoking the caller's own "
+            f"just-issued key, got {revoke.status_code}: {revoke.text}"
         )
 
 
