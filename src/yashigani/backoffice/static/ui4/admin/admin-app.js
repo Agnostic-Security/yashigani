@@ -38,6 +38,9 @@ import './modules/mcp.js';
 import './modules/budget-models.js';
 // Governance, Data & Workflows module group (Wave-2).
 import './modules/policies-opa.js';
+// YSG-RISK-163: capability-policy admin view existed since 3.0
+// (routes/capability_policy.py) but was never wired into the ui4 nav.
+import './modules/capability-policy.js';
 import './modules/workflows-admin.js';
 import './modules/audit.js';
 import './modules/sensitivity-pii.js';
