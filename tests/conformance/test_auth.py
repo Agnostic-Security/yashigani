@@ -2,11 +2,13 @@
 Conformance group: AUTH.
 
 Closes G1 (Lu audit YCS-20260723-v4.1.2-CONFORMANCE) for:
-  routes/auth.py         (25 endpoints) — /auth/*
+  routes/auth.py         (24 endpoints) — /auth/*  (/auth/verify-user removed
+                            2026-07-28, YSG-RISK-140 OWUI removal — endpoint
+                            no longer exists, was 25)
   routes/sso.py           (6 endpoints) — /auth/sso/*
   routes/webauthn.py      (6 endpoints) — /auth/webauthn/* + /admin/settings/webauthn/credentials*
   routes/webauthn_v1.py   (6 endpoints) — /api/v1/admin/webauthn/*
-Total: 43 endpoints.
+Total: 42 endpoints.
 
 Convention: see tests/conformance/conftest.py module docstring.
 
@@ -79,8 +81,9 @@ _GROUP_PREFIXES = ("/auth", "/admin/settings/webauthn", "/api/v1/admin/webauthn"
 def test_group_covers_all_declared_routes(route_prefix_filter):
     declared = route_prefix_filter(*_GROUP_PREFIXES)
     declared_set = {(m, p) for (m, p, _r) in declared}
-    assert len(declared_set) == 43, (
-        f"Expected 43 declared routes under {_GROUP_PREFIXES}, found "
+    # 43 -> 42: /auth/verify-user removed 2026-07-28, YSG-RISK-140 (OWUI removal).
+    assert len(declared_set) == 42, (
+        f"Expected 42 declared routes under {_GROUP_PREFIXES}, found "
         f"{len(declared_set)}: {sorted(declared_set)}"
     )
 
@@ -548,7 +551,12 @@ class TestAuthPasswordSelfReset:
 
 
 # ---------------------------------------------------------------------------
-# auth.py — /auth/verify, /auth/verify-admin, /auth/verify-user
+# auth.py — /auth/verify, /auth/verify-admin
+# (/auth/verify-user removed 2026-07-28, YSG-RISK-140 — OWUI removed in 4.0,
+#  Caddy's /app/webui* handle is now a bare redirect to /chat with no
+#  forward_auth leg, so the endpoint became unreachable dead code and was
+#  deleted. See TestAuthVerify / TestAuthVerifyAdmin below for the still-live
+#  verify endpoints.)
 # ---------------------------------------------------------------------------
 
 
@@ -593,25 +601,6 @@ class TestAuthVerifyAdmin:
         r = admin_client.get("/auth/verify-admin")
         assert r.status_code == 200
         assert r.headers["X-Forwarded-User"] == "verifyadmin-ok@example.com"
-
-
-class TestAuthVerifyUser:
-    # GAP-CLOSED: GET /auth/verify-user
-    def test_no_cookie_401(self, unauth_client, fake_auth_service):
-        assert unauth_client.get("/auth/verify-user").status_code == 401
-
-    def test_admin_session_403(self, admin_client, fake_auth_service):
-        r = admin_client.get("/auth/verify-user")
-        assert r.status_code == 403
-        assert r.json()["detail"]["error"] == "admin_session_not_allowed_user_path"
-
-    def test_user_session_no_rbac_owui_gate_200(self, user_client, fake_auth_service):
-        """rbac_store is unwired (None) by default in this group's fixtures —
-        the OWUI membership gate must skip-allow, never lock everyone out."""
-        _seed_provisioned_account(fake_auth_service, account_id="conformance-userA", username="verifyuser-ok@example.com", tier="user")
-        r = user_client.get("/auth/verify-user")
-        assert r.status_code == 200
-        assert r.headers["X-Forwarded-User"] == "verifyuser-ok@example.com"
 
 
 # ---------------------------------------------------------------------------
