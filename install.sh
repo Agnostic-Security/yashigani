@@ -12351,15 +12351,32 @@ generate_secrets() {
   else
     log_info "langflow_yashigani_token already present — preserving (upgrade path)"
   fi
-  # BUG-4.0-LANGFLOW-TOKEN-PERMS: langflow runs uid=1000 gid=0; the Docker
-  # named-secret mode: 0440 in compose is ignored by Podman (Podman inherits
-  # host file permissions for file secrets).  Fix: chown 0:0 + chmod 0440 so
-  # the file is root-group readable — langflow's gid=0 grants read access.
-  # Letta uses yashigani_internal_bearer (already handled); openclaw uses an
-  # env var — only langflow_yashigani_token has this uid mismatch.
-  _do_chown "0:0" "$_lf_token_file" "langflow_yashigani_token" "0440" "${secrets_dir}" || \
-    log_warn "BUG-4.0-LANGFLOW-TOKEN-PERMS: chown 0:0 failed for langflow_yashigani_token — langflow may fail to read its token (EACCES)"
-  log_info "langflow_yashigani_token → chown 0:0 chmod 0440 (gid=0 readable for langflow uid=1000 gid=0)"
+  # BUG-4.0-LANGFLOW-TOKEN-PERMS (YSG-RISK-172 fix, chat-path repair 2026-07-30):
+  # langflow runs uid=1000 gid=0; the Docker named-secret mode: 0440 in compose
+  # is ignored by Podman (Podman inherits host file permissions for file
+  # secrets). The ORIGINAL fix (chown 0:0 chmod 0440) only accounted for
+  # langflow's own read path (gid=0 group-read) — it did NOT account for the
+  # GATEWAY also needing to read this same host file directly (gateway bind-
+  # mounts the whole ./secrets dir read-only; it has no per-secret Docker
+  # `secrets:` stanza for this file, so host permissions govern its access on
+  # BOTH Docker and Podman). Gateway's fixed container UID/GID is 1001:1001
+  # (docker/Dockerfile.gateway) — root:root 0440 has a zero "other" bit, so
+  # gateway got EACCES reading the file, `_load_token_role_map()` silently
+  # loaded 0 p1_agent entries, and every langflow-originated call was resolved
+  # as anonymous → 401 at the deliver hop (RISK-172).
+  #
+  # Fix: chown 1001:0 (owner=gateway's fixed UID, group=langflow's fixed GID)
+  # + chmod 0640 (owner read via UID match, group read via GID match, no
+  # world-read — CWE-732 safe). Same symmetric owner-reads/group-reads pattern
+  # already used for pgbouncer_authenticator_password (70:999 0640) elsewhere
+  # in this function. Docker: langflow's OWN read is still governed by its
+  # compose `secrets:` stanza (mode: 0440, Docker-synthesized, unaffected by
+  # this host chmod) — unchanged. Podman: langflow reads via the GID-0 group
+  # bit (unchanged from before); gateway now ALSO reads via the UID-1001
+  # owner bit (new). Regression: src/tests/regression/v4.1.2/test_risk172_langflow_token_perms.py.
+  _do_chown "1001:0" "$_lf_token_file" "langflow_yashigani_token" "0640" "${secrets_dir}" || \
+    log_warn "YSG-RISK-172: chown 1001:0 failed for langflow_yashigani_token — gateway and/or langflow may fail to read the token (EACCES)"
+  log_info "langflow_yashigani_token → chown 1001:0 chmod 0640 (gateway UID-1001 owner-readable + langflow GID-0 group-readable)"
 
   # pgbouncer_userlist SCRAM verifier generation removed (Tiago directive 2026-05-21).
   # YSG-RISK-049 is now CLOSED by the auth_query design (v2.24.0).
@@ -16007,34 +16024,42 @@ _pki_chown_client_keys() {
   # Docker is not affected: Docker Compose creates an in-container tmpfs file
   # with the compose-spec mode regardless of host file permissions.
   #
-  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2):
+  # langflow_yashigani_token ownership recovery (BUG-411-PODMAN-LANGFLOW-PERMS-V2,
+  # re-fixed for YSG-RISK-172, chat-path repair 2026-07-30):
   #
-  # generate_secrets() sets langflow_yashigani_token to root:root 0440 via
-  # _do_chown "0:0" ... "0440".  langflow runs uid=1000 gid=0 inside the
-  # container; the group bit (0440 group=0) should allow read access.
+  # generate_secrets() sets langflow_yashigani_token to 1001:0 0640 via
+  # _do_chown "1001:0" ... "0640" (owner=gateway's fixed UID 1001, group=
+  # langflow's fixed GID 0 — see that call site for the full RISK-172 root
+  # cause). langflow runs uid=1000 gid=0 inside the container (group-read via
+  # GID 0); the gateway runs uid=1001 gid=1001 (owner-read via UID 1001).
   #
-  # Root cause: _prepare_secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/"
-  # for rootful Podman (just before _pki_run_issuer).  This recursively clobbers
-  # ALL secret file ownership — including langflow_yashigani_token — to 1001:1001.
-  # After the sweep the file is maxine:ysgteam 0440 (uid=1001 != 1000, gid=1001 != 0):
-  # langflow gets EACCES.
+  # Root cause (unchanged from BUG-411-PODMAN-LANGFLOW-PERMS-V2): _prepare_
+  # secrets_dir_for_pki() runs "chown -R 1001:1001 secrets/" for rootful Podman
+  # (just before _pki_run_issuer). This recursively clobbers ALL secret file
+  # ownership — including langflow_yashigani_token — to 1001:1001. After the
+  # sweep the file is uid=1001 gid=1001 0640: langflow (uid=1000, gid=0)
+  # matches neither owner nor group → EACCES (gateway's own read would still
+  # work post-sweep since 1001:1001 satisfies its owner match, but that is
+  # incidental — the sweep does not know about langflow's requirement at all).
   #
-  # Fix: re-apply chown 0:0 0440 here so the group-read path (langflow gid=0 ==
-  # file group 0) is restored AFTER _prepare_secrets_dir_for_pki's sweep and AFTER
-  # the PKI issuer's own writes.  Mode 0440 (NOT 0444) avoids CWE-732: world-read
-  # is not needed because gid=0 is sufficient for langflow's access path.
-  # _fix_config_perms() strips world-read (chmod o-rwx) — 0440 is unaffected.
+  # Fix: re-apply chown 1001:0 0640 here so BOTH read paths are restored AFTER
+  # _prepare_secrets_dir_for_pki's sweep and AFTER the PKI issuer's own writes:
+  # gateway (uid=1001) via the owner bit, langflow (gid=0) via the group bit.
+  # Mode 0640 (NOT 0644/0444) avoids CWE-732: world-read is not needed because
+  # the owner+group bits cover both real consumers. _fix_config_perms() strips
+  # world-read (chmod o-rwx) — 0640 is unaffected (already has no world bits).
   #
-  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from 1001:1001
-  # back to 0:0), not just the mode.  _do_chown handles all three dispatch modes
-  # (direct / unshare / podman_run) consistently across Podman rootful/rootless.
+  # Why _do_chown and not bare chmod: we need to change OWNERSHIP (from
+  # 1001:1001 back to 1001:0), not just the mode. _do_chown handles all three
+  # dispatch modes (direct / unshare / podman_run) consistently across Podman
+  # rootful/rootless.
   if [[ "$_effective_runtime" == "podman" ]]; then
     local _lf_tok_path="${_secrets_dir}/langflow_yashigani_token"
     if [[ -f "$_lf_tok_path" ]]; then
-      if _do_chown "0:0" "$_lf_tok_path" "langflow_yashigani_token" "0440" "${_secrets_dir}"; then
-        log_info "Podman: langflow_yashigani_token re-chown 0:0 0440 OK (restored after _prepare_secrets_dir_for_pki sweep)"
+      if _do_chown "1001:0" "$_lf_tok_path" "langflow_yashigani_token" "0640" "${_secrets_dir}"; then
+        log_info "Podman: langflow_yashigani_token re-chown 1001:0 0640 OK (restored after _prepare_secrets_dir_for_pki sweep)"
       else
-        log_warn "Podman: langflow_yashigani_token re-chown 0:0 0440 failed — langflow may EACCES on startup"
+        log_warn "Podman: langflow_yashigani_token re-chown 1001:0 0640 failed — gateway and/or langflow may EACCES on startup"
       fi
     fi
   fi
