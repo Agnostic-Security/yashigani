@@ -213,6 +213,20 @@ _CANONICAL_VOLUMES=(
     grafana_data
     caddy_data
     caddy_config
+    # YSG-RISK-172-class fix: these four were declared under docker-compose.yml's
+    # top-level `volumes:` but were never added to this canonical list, so
+    # named-volume removal + the retry pass both skipped them silently — they
+    # survived `--remove-volumes` every time. `caddy_admin_real_sock` +
+    # `caddy_broker_route_sock` + `caddy_broker_agents` back the Caddy admin API
+    # / config-broker socket contract (see docker-compose.yml comment block
+    # above their declaration); `promtail_positions` persists promtail's
+    # read-offset (B8). Verified against `grep -A60 '^volumes:' docker-compose.yml`
+    # — this is the complete top-level list (no other compose overlay declares
+    # a top-level `volumes:` section).
+    caddy_admin_real_sock
+    caddy_broker_route_sock
+    caddy_broker_agents
+    promtail_positions
     postgres_data
     alertmanager_data
     loki_data

@@ -749,6 +749,10 @@ parse_args() {
           log_info "--http-port flag (${_raw_http_port}) overrides env YASHIGANI_HTTP_PORT (${YASHIGANI_HTTP_PORT})"
         fi
         export YASHIGANI_HTTP_PORT="$_raw_http_port"
+        # YSG-RISK-169-class fix: mark ports as operator-explicit this run so the
+        # runtime-switch port reconciliation (below, "Runtime-agnostic .env writes")
+        # never clobbers a deliberate --http-port/--https-port choice.
+        YSG_PORT_EXPLICIT=true; export YSG_PORT_EXPLICIT
         shift 2
         ;;
       --https-port)
@@ -761,6 +765,7 @@ parse_args() {
           log_info "--https-port flag (${_raw_https_port}) overrides env YASHIGANI_HTTPS_PORT (${YASHIGANI_HTTPS_PORT})"
         fi
         export YASHIGANI_HTTPS_PORT="$_raw_https_port"
+        YSG_PORT_EXPLICIT=true; export YSG_PORT_EXPLICIT
         shift 2
         ;;
       --public-hostname)
@@ -4895,6 +4900,15 @@ PYEOF
   rm -f  "${backup_dir}/MANIFEST.sha256.sig" 2>/dev/null || true
   # agent-volumes/ tarballs are already inside bundle.enc; remove the plaintext dir.
   rm -rf "${backup_dir}/agent-volumes" 2>/dev/null || true
+  # CWE-312: secrets-caddy/ (caddy_client.key + hmac) and secrets-pki-attest/ were
+  # staged as plaintext above and are already inside bundle.enc (they existed under
+  # backup_dir before the tar-stream-into-container step ran). They were never being
+  # removed here, so the S1 assertion below correctly caught the leftover *.key file
+  # and aborted --upgrade every time. Remove the plaintext staging copies now that
+  # the encrypted bundle is confirmed on disk (bundle.enc existence + sha256 checked
+  # above, before this cleanup block runs).
+  rm -rf "${backup_dir}/secrets-caddy" 2>/dev/null || true
+  rm -rf "${backup_dir}/secrets-pki-attest" 2>/dev/null || true
 
   # Final permission check: backup_dir should contain ONLY bundle.enc + backup-meta.json.
   # bundle.enc = 0600 (owner-read-only); backup-meta.json = 0444 (cleartext, public).
@@ -8888,6 +8902,38 @@ compose_up() {
     fi
   fi
 
+  # --- Runtime-switch port reconciliation (docker AND podman parity) ---------
+  # YSG-RISK-169-class fix: docker/.env is the single source of truth compose
+  # reads for the published HTTPS/HTTP port ­— but it is NEVER re-derived from
+  # scratch on a re-run. If a prior install ran under Podman rootless (which
+  # defaults to high ports 8080/8443 — see the `_need_high_ports` block above),
+  # docker/.env carries YASHIGANI_HTTPS_PORT=8443 forward. A later
+  # `--runtime docker` install (Docker can bind 443 directly, no port issue)
+  # does NOT re-run that podman-only defaulting block, so the stale 8443 stays
+  # in docker/.env untouched — compose keeps publishing 8443 while every other
+  # signal (docs, admin expectation, a plain `--runtime docker` request) implies
+  # 443. Detect the runtime switch via CONTAINER_SOCKET (only ever written by
+  # the Podman branch above, line ~8622) and reset ports to the Docker default
+  # UNLESS the operator explicitly requested a port this run (YSG_PORT_EXPLICIT,
+  # set by --http-port/--https-port in parse_args).
+  if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" && "${YSG_PORT_EXPLICIT:-false}" != "true" ]]; then
+    local _rt_switch_env_file="${WORK_DIR}/docker/.env"
+    if [[ -f "$_rt_switch_env_file" ]] && grep -q "^CONTAINER_SOCKET=" "$_rt_switch_env_file" 2>/dev/null; then
+      log_info "Runtime switch detected (prior Podman state found, now Docker) — resetting ports to Docker defaults (80/443) and clearing stale CONTAINER_SOCKET (YSG-RISK-169)"
+      local _rt_tmp_env; _rt_tmp_env="$(mktemp)"
+      grep -v -E "^(YASHIGANI_HTTP_PORT|YASHIGANI_HTTPS_PORT|CONTAINER_SOCKET)=" \
+        "$_rt_switch_env_file" > "$_rt_tmp_env" 2>/dev/null || true
+      {
+        echo "YASHIGANI_HTTP_PORT=80"
+        echo "YASHIGANI_HTTPS_PORT=443"
+      } >> "$_rt_tmp_env"
+      mv "$_rt_tmp_env" "$_rt_switch_env_file"
+      unset YASHIGANI_HTTP_PORT YASHIGANI_HTTPS_PORT
+      export YASHIGANI_HTTP_PORT=80
+      export YASHIGANI_HTTPS_PORT=443
+    fi
+  fi
+
   # --- Runtime-agnostic .env writes (MUST run for docker AND podman) ----------
   # BUGFIX (2026-06-08): YASHIGANI_PUBLIC_URL and YASHIGANI_ENABLED_PROFILES were
   # only written inside the `if podman` branch above, so on Docker they were never
@@ -9615,7 +9661,23 @@ _verify_gateway_healthz() {
   # Warm-cache re-installs converge in <30s; the gate polls every 2s and exits as soon as healthy.
   # Override with YSG_HEALTHZ_TIMEOUT_S (e.g. set 300 in a warm-cache CI harness).
   local _poll_s="${YSG_HEALTHZ_POLL_S:-2}"
-  local _https_port="${YASHIGANI_HTTPS_PORT:-443}"
+  # YSG-RISK-169-class fix: single source of truth for the probe port, same
+  # resolution order as _ysg_onboard_stepup_gate() (line ~17158): (1) honour
+  # YASHIGANI_HTTPS_PORT if already exported this run (--https-port flag), else
+  # (2) read the actual mapped port compose will use from docker/.env — this is
+  # the ONLY value that matters on the Docker path, where YASHIGANI_HTTPS_PORT is
+  # never exported in-process (only the Podman branch exports it, or an explicit
+  # --https-port flag). Previously this defaulted straight to 443 even when
+  # docker/.env held a different port (e.g. 8443 carried over from a prior
+  # Podman install — see the runtime-switch reconciliation above), so the gate
+  # polled the wrong port for the full timeout while the stack was genuinely
+  # healthy. (3) fall back to 443 only if docker/.env has no entry either.
+  local _https_port="${YASHIGANI_HTTPS_PORT:-}"
+  if [[ -z "$_https_port" && -f "${WORK_DIR}/docker/.env" ]]; then
+    _https_port="$(grep '^YASHIGANI_HTTPS_PORT=' "${WORK_DIR}/docker/.env" \
+                     2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+  fi
+  _https_port="${_https_port:-443}"
   local _domain="${DOMAIN:-localhost}"
 
   if [[ "$DRY_RUN" == "true" ]]; then
