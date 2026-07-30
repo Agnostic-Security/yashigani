@@ -203,6 +203,9 @@ class TestRisk173RealSecretsStillBlock:
         assert scan("token: " + "ghp_" + "a" * 36).is_secret is True
 
     def test_slack_token_still_blocks(self):
+        # Built from split literals (like the "ghp_"+... case above) so the source
+        # never contains a scanner-matchable Slack-token literal; the detector still
+        # sees the full xoxb-… at runtime. (GitHub push-protection false-positive.)
         assert scan("bot token xox" "b-1234567890-abcdefghijklmno").is_secret is True
 
     def test_sk_style_token_still_blocks(self):
