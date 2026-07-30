@@ -1196,6 +1196,80 @@ def _get_cloud_api_key(provider: str) -> Optional[str]:
     return key
 
 
+def _resolve_effective_default_model() -> str:
+    """YSG-RISK-178 — resolve the EFFECTIVE default model for a chat request
+    that carries NO explicit ``model`` / no @mention.
+
+    Rule: "the default model is ALWAYS the local model, UNLESS a cloud
+    model is configured with an API key AND set as default."
+
+    1. If an admin has explicitly configured a default alias
+       (``ModelAliasStore.get_default()``) AND that alias is either LOCAL
+       (provider=="ollama" or force_local) OR a CLOUD alias with a
+       currently-configured API key -> return the ALIAS NAME (not the
+       resolved concrete model). Returning the alias name means the caller
+       flows through the exact same downstream machinery an EXPLICIT pin
+       of that alias would (normalisation, known-model check, cloud
+       permission-grant gate, key check) once ``body.model`` is set to it
+       by the caller in ``chat_completions`` — no bypass of RBAC/permission
+       gating for the admin-configured default.
+    2. Otherwise (no admin default configured, admin default alias missing,
+       or a configured cloud default lost its key after being set) ->
+       ``_state.default_model``, the spec-chosen LOCAL model
+       (``OLLAMA_MODEL``, auto-selected by install.sh from the host's
+       GPU/VRAM at install time — never a bare hardcoded model name).
+
+    Never raises; any store/lookup failure falls straight through to (2) —
+    fail-closed to LOCAL. This is intentionally a LIVE Redis read (not
+    cached): the admin-plane default-model change must take effect on the
+    very next chat request, and both this and the actual cloud-key TTL
+    cache below bound the cost.
+    """
+    store = _state.model_alias_store
+    if store is None:
+        return _state.default_model
+    try:
+        default_alias = store.get_default()
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: get_default() failed (%s) — "
+            "local fallback", exc,
+        )
+        return _state.default_model
+    if not default_alias:
+        return _state.default_model
+    try:
+        cfg = store.get(default_alias)
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: alias lookup failed for %r "
+            "(%s) — local fallback", default_alias, exc,
+        )
+        return _state.default_model
+    if cfg is None:
+        logger.warning(
+            "_resolve_effective_default_model: admin default alias %r no "
+            "longer exists — local fallback", default_alias,
+        )
+        return _state.default_model
+    provider = (getattr(cfg, "provider", "") or "").strip().lower()
+    is_local = provider == "ollama" or bool(getattr(cfg, "force_local", False))
+    if is_local:
+        return default_alias
+    # Cloud default — defense-in-depth re-check: the admin-set endpoint
+    # already refused to persist a cloud default without a key, but a key
+    # can be REMOVED afterwards. Never surface an unusable cloud default.
+    try:
+        if _get_cloud_api_key(provider):
+            return default_alias
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: cloud key check failed for "
+            "provider=%s (%s) — local fallback", provider, exc,
+        )
+    return _state.default_model
+
+
 def configure(
     identity_registry=None,
     sensitivity_classifier=None,
@@ -1853,7 +1927,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         budget_state = BudgetState(identity_id=identity_id, provider="cloud", used=0, total=0, signal=BudgetSignal.NORMAL, pct=0)
 
     # ── 6. Route decision ──────────────────────────────────────────────
-    selected_model = body.model or _state.default_model
+    # YSG-RISK-178: no explicit model/mention -> the EFFECTIVE default,
+    # which is the admin-configured default when one is set AND usable
+    # (local, or cloud with a configured key), else the spec-chosen LOCAL
+    # model (_state.default_model / OLLAMA_MODEL). Never the literal string
+    # "smart"/cloud-default unless an admin explicitly configured it AND a
+    # key is present — see _resolve_effective_default_model().
+    selected_model = body.model or _resolve_effective_default_model()
     # W3-007 (LAURA-V250-W3-007): resolved cloud target from alias pre-resolution.
     # Set inside the body.model validation block below; consumed by the Layer 2
     # extension and the LAURA-411-001 extension later in this function.

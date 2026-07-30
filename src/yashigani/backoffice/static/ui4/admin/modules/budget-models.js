@@ -14,6 +14,11 @@
 //   models.py      GET/POST/DELETE /admin/models[/{alias}]
 //                  GET /admin/models/available  POST /admin/models/pull
 //                  GET/POST/DELETE /admin/models/allocations[/{id}]
+//                  GET/PUT/DELETE /admin/models/default (YSG-RISK-178 —
+//                    admin-configurable default: local always works
+//                    out-of-box; a cloud alias may be set as default only
+//                    when its provider has a configured API key — server
+//                    rejects with 400 otherwise, see _setDefault below)
 //   cloud_keys.py  GET /admin/cloud-keys  PUT /admin/cloud-keys
 //   cloud_override GET /admin/cloud-override/status  POST propose|approve|revoke
 //
@@ -35,6 +40,7 @@ export class YsAdminBudgetModels extends LitElement {
     _indBudgets: { state: true },
     _tree: { state: true },
     _aliases: { state: true },
+    _defaultModel: { state: true },
     _available: { state: true },
     _allocations: { state: true },
     _cloudKeys: { state: true },
@@ -53,6 +59,7 @@ export class YsAdminBudgetModels extends LitElement {
     this._indBudgets = [];
     this._tree = null;
     this._aliases = [];
+    this._defaultModel = null;
     this._available = [];
     this._allocations = [];
     this._cloudKeys = [];
@@ -77,12 +84,13 @@ export class YsAdminBudgetModels extends LitElement {
   async _load() {
     if (!this.api) return;
     this._loading = true;
-    const [org, grp, ind, tree, aliases, avail, alloc, ckeys, ovr, localInv] = await Promise.all([
+    const [org, grp, ind, tree, aliases, defModel, avail, alloc, ckeys, ovr, localInv] = await Promise.all([
       this.api.get('/admin/budget/org-caps'),
       this.api.get('/admin/budget/groups'),
       this.api.get('/admin/budget/individuals'),
       this.api.get('/admin/budget/tree'),
       this.api.get('/admin/models'),
+      this.api.get('/admin/models/default'),
       this.api.get('/admin/models/available'),
       this.api.get('/admin/models/allocations'),
       this.api.get('/admin/cloud-keys'),
@@ -94,6 +102,7 @@ export class YsAdminBudgetModels extends LitElement {
     this._indBudgets = this._arr(ind, 'individuals');
     this._tree = tree || null;
     this._aliases = this._arr(aliases, 'aliases');
+    this._defaultModel = defModel || null;
     this._available = this._arr(avail, 'models');
     this._allocations = this._arr(alloc, 'allocations');
     this._cloudKeys = (ckeys && Array.isArray(ckeys.providers)) ? ckeys.providers : [];
@@ -158,6 +167,17 @@ export class YsAdminBudgetModels extends LitElement {
   async _delAlias(a) {
     const res = await this.api.mutate(`/admin/models/${encodeURIComponent(a.alias)}`, { method: 'DELETE' });
     this._toast(res, 'Alias deleted.'); if (res.ok) await this._load();
+  }
+  async _setDefault(a) {
+    // YSG-RISK-178: server rejects (400 cloud_default_requires_api_key) a
+    // cloud alias with no configured API key — the toast surfaces that
+    // message verbatim so the admin knows to configure the key first.
+    const res = await this.api.mutate('/admin/models/default', { method: 'PUT', body: { alias: a.alias } });
+    this._toast(res, `Default model set to ${a.alias}.`); if (res.ok) await this._load();
+  }
+  async _clearDefault() {
+    const res = await this.api.mutate('/admin/models/default', { method: 'DELETE' });
+    this._toast(res, 'Default reverted to the spec-chosen local model.'); if (res.ok) await this._load();
   }
   async _pullModel(v) {
     const res = await this.api.mutate('/admin/models/pull', { method: 'POST', body: { name: v.name } });
@@ -278,15 +298,32 @@ export class YsAdminBudgetModels extends LitElement {
 
   _renderModels() {
     const availRows = this._available.map((m) => (typeof m === 'string' ? { name: m } : m));
+    const dm = this._defaultModel || {};
+    // YSG-RISK-178: no admin default configured (dm.alias == null) means the
+    // gateway is using its spec-chosen LOCAL model (OLLAMA_MODEL, auto-picked
+    // from the host's GPU/VRAM at install time) — the out-of-box behaviour.
+    const defaultNote = dm.alias
+      ? html`Default model: <strong>${dm.alias}</strong> (${dm.provider || '—'}/${dm.model || '—'})
+          ${dm.usable === false ? html` <span class="ys-badge ys-badge-amber">unusable — no API key configured, falling back to local</span>` : nothing}`
+      : html`Default model: <strong>spec-chosen local model</strong> (no admin override configured — auto-selected from this host's GPU/VRAM at install time)`;
     return html`
       <div class="ys-panel">
         <div class="ys-panel-header">Model aliases &amp; allocations</div>
         <div class="ys-panel-body">
+          <div class="ys-txt-note ys-txt-note--mb">
+            ${defaultNote}
+            ${dm.alias ? html` &nbsp;<button class="ys-btn ys-btn-danger" data-act="clear-default" @click=${() => this._clearDefault()}>Clear default</button>` : nothing}
+          </div>
           <label class="ys-label">Aliases</label>
           ${this._table(
-            [{ key: 'alias', label: 'Alias' }, { key: 'provider', label: 'Provider' }, { key: 'model', label: 'Model' }],
+            [
+              { key: 'alias', label: 'Alias', get: (a) => (dm.alias === a.alias ? html`${a.alias} <span class="ys-badge ys-badge-blue">default</span>` : a.alias) },
+              { key: 'provider', label: 'Provider' }, { key: 'model', label: 'Model' },
+            ],
             this._aliases, 'No aliases.',
-            (a) => html`<button class="ys-btn ys-btn-danger" data-act="del-alias" @click=${() => this._delAlias(a)}>Delete</button>`,
+            (a) => html`
+              <button class="ys-btn" data-act="set-default" ?disabled=${dm.alias === a.alias} @click=${() => this._setDefault(a)}>Set as default</button>
+              <button class="ys-btn ys-btn-danger" data-act="del-alias" @click=${() => this._delAlias(a)}>Delete</button>`,
           )}
           <ys-form .fields=${[
               { name: 'alias', label: 'Alias', required: true },

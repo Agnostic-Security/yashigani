@@ -53,6 +53,10 @@ class AllocationRequest(BaseModel):
     target_id: str = Field(min_length=1)
 
 
+class DefaultModelRequest(BaseModel):
+    alias: str = Field(min_length=1, max_length=64)
+
+
 # ── Internal helper ───────────────────────────────────────────────────────
 
 def _alias_store():
@@ -87,6 +91,39 @@ def _alloc_store():
             detail={"error": "allocation_store_unavailable", "detail": "Redis db/3 not connected"},
         )
     return store
+
+
+def _alias_is_local(cfg: ModelAlias) -> bool:
+    """True iff *cfg* resolves to a LOCAL (ollama / force_local) model."""
+    provider = (getattr(cfg, "provider", "") or "").strip().lower()
+    return provider == "ollama" or bool(getattr(cfg, "force_local", False))
+
+
+def _cloud_key_configured(provider: str) -> bool:
+    """YSG-RISK-178 — is a valid API key actually configured for *provider*?
+
+    Mirrors gateway ``openai_router._get_cloud_api_key``'s KMS-then-env-var
+    resolution (KMS first, env var fallback) so "is a key configured" means
+    the SAME thing here as it does on the gateway's actual cloud call path.
+    No caching here — this only runs on the rare admin-plane
+    set-default/get-default calls, not a hot request path.
+    """
+    from yashigani.backoffice.routes.cloud_keys import _PROVIDERS as _CLOUD_KMS_KEYS
+
+    kms_key = _CLOUD_KMS_KEYS.get(provider)
+    if kms_key is None:
+        return False
+    kms = backoffice_state.kms_provider
+    if kms is not None:
+        try:
+            if kms.get_secret(kms_key):
+                return True
+        except Exception as exc:
+            logger.debug(
+                "_cloud_key_configured: KMS miss for provider=%s (%s)",
+                provider, type(exc).__name__,
+            )
+    return bool(os.environ.get(f"{provider.upper()}_API_KEY"))
 
 
 def _push_allocations_to_opa() -> None:
@@ -134,6 +171,95 @@ async def create_alias(body: AliasRequest, session: StepUpAdminSession):
     return {"status": "ok", "alias": body.alias}
 
 
+@router.get("/default")
+async def get_default_model(session: AdminSession):
+    """YSG-RISK-178 — return the currently-EFFECTIVE default model.
+
+    ``alias is None`` means no admin default is configured — the gateway
+    falls back to its spec-chosen LOCAL model (OLLAMA_MODEL, auto-selected
+    by install.sh from GPU/VRAM detection at install time; admin-overridable
+    via PUT below). When an admin default IS set, ``usable`` reports
+    whether it would actually be honoured right now (local is always
+    usable; a cloud default needs a currently-configured API key — if the
+    key was since removed, the gateway silently falls back to local rather
+    than surfacing a 422/503, and this reflects that live).
+    """
+    store = _alias_store()
+    alias_name = store.get_default()
+    if not alias_name:
+        return {"alias": None, "source": "system_spec_local"}
+    cfg = store.get(alias_name)
+    if cfg is None:
+        return {
+            "alias": alias_name, "source": "admin", "usable": False,
+            "warning": "configured default alias no longer exists — "
+                       "gateway falls back to the spec-chosen local model",
+        }
+    is_local = _alias_is_local(cfg)
+    usable = is_local or _cloud_key_configured(cfg.provider)
+    return {
+        "alias": alias_name,
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "is_local": is_local,
+        "usable": usable,
+        "source": "admin",
+    }
+
+
+@router.put("/default")
+async def set_default_model(body: DefaultModelRequest, session: StepUpAdminSession):
+    """YSG-RISK-178 — admin sets the effective default model.
+
+    Rule enforced here (write-time): a CLOUD alias may be set as default
+    ONLY when a valid API key is already configured for its provider —
+    otherwise reject with 400 rather than silently persisting a default
+    that would 422/503 on the next no-mention chat. A LOCAL alias (ollama
+    / force_local) is always acceptable as default. Defense-in-depth: the
+    gateway's read-time resolution (openai_router._resolve_effective_default_model)
+    re-checks the key at request time too, so even a key removed AFTER
+    being set as default degrades to local instead of erroring.
+    """
+    store = _alias_store()
+    cfg = store.get(body.alias)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail={"error": "alias_not_found"})
+    if not _alias_is_local(cfg) and not _cloud_key_configured(cfg.provider):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "cloud_default_requires_api_key",
+                "message": (
+                    f"'{body.alias}' resolves to cloud provider "
+                    f"'{cfg.provider}' with no configured API key. "
+                    "Configure the key via PUT /admin/cloud-keys first, "
+                    "then retry."
+                ),
+            },
+        )
+    store.set_default(body.alias)
+    logger.warning(
+        "Admin %s set default model to alias=%s (provider=%s, model=%s)",
+        session.account_id, body.alias, cfg.provider, cfg.model,
+    )
+    return {"status": "ok", "alias": body.alias}
+
+
+@router.delete("/default")
+async def clear_default_model(session: StepUpAdminSession):
+    """YSG-RISK-178 — clear the admin-configured default, reverting to the
+    spec-chosen local model (OLLAMA_MODEL)."""
+    store = _alias_store()
+    store.clear_default()
+    logger.warning("Admin %s cleared the default-model override", session.account_id)
+    return {"status": "ok"}
+
+
+# NOTE (route-ordering, FastAPI/Starlette matches in registration order):
+# this catch-all `/{alias}` DELETE must be registered AFTER the concrete
+# `/default` DELETE above, otherwise `DELETE /admin/models/default` would be
+# swallowed by this route (matching alias="default") before ever reaching
+# clear_default_model.
 @router.delete("/{alias}")
 async def delete_alias(alias: str, session: StepUpAdminSession):
     store = _alias_store()

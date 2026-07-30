@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "model:alias:"
 
+# YSG-RISK-178 — admin-configurable DEFAULT model pointer. A single string
+# key (NOT under model:alias: so it never collides with the SCAN-based
+# list_all() alias enumeration) holding the alias name an admin has
+# explicitly set as the effective default. Absent (None) => the gateway
+# falls back to its spec-chosen LOCAL model (OLLAMA_MODEL, auto-selected by
+# install.sh from GPU/VRAM detection at install time) — "local unless a
+# cloud model is configured with an API key AND set as default".
+_DEFAULT_KEY = "model:default_alias"
+
 # Seeded on first boot when the namespace is empty
 _DEFAULTS: list[dict] = [
     {
@@ -177,6 +186,44 @@ class ModelAliasStore:
         except Exception as exc:
             logger.error("ModelAliasStore.list_all() failed: %s", exc)
         return result
+
+    # ------------------------------------------------------------------
+    # Default-alias pointer (YSG-RISK-178 — admin-configurable default)
+    # ------------------------------------------------------------------
+
+    def get_default(self) -> Optional[str]:
+        """Return the alias name an admin has explicitly set as the
+        effective default, or None if never set / on any store error
+        (fail-closed to "no admin default" — callers then fall back to the
+        spec-chosen local model, never to an unusable state)."""
+        try:
+            raw = self._redis.get(_DEFAULT_KEY)
+            if raw is None:
+                return None
+            return raw.decode() if isinstance(raw, bytes) else str(raw)
+        except Exception as exc:
+            logger.error("ModelAliasStore.get_default() failed: %s", exc)
+            return None
+
+    def set_default(self, alias: str) -> None:
+        """Persist *alias* as the admin-configured default. Caller
+        (admin API) is responsible for validating the alias exists and,
+        when it resolves to a cloud provider, that a valid API key is
+        configured — this method only persists the pointer."""
+        try:
+            self._redis.set(_DEFAULT_KEY, alias)
+        except Exception as exc:
+            logger.error("ModelAliasStore.set_default(%r) failed: %s", alias, exc)
+            raise
+
+    def clear_default(self) -> None:
+        """Remove the admin-configured default pointer, reverting to the
+        spec-chosen local model."""
+        try:
+            self._redis.delete(_DEFAULT_KEY)
+        except Exception as exc:
+            logger.error("ModelAliasStore.clear_default() failed: %s", exc)
+            raise
 
     def seed_defaults(self) -> None:
         """

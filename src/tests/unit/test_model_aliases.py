@@ -239,3 +239,42 @@ class TestModelAliasDataclass:
         a = ModelAlias.from_dict(d)
         assert a.force_local is False
         assert a.sensitivity_ceiling is None
+
+
+# ── Default-alias pointer (YSG-RISK-178) ───────────────────────────────────
+
+class TestDefaultAliasPointer:
+    def test_get_default_none_when_unset(self, store):
+        assert store.get_default() is None
+
+    def test_set_then_get_default_roundtrips(self, seeded_store):
+        seeded_store.set_default("fast")
+        assert seeded_store.get_default() == "fast"
+
+    def test_set_default_overwrites(self, seeded_store):
+        seeded_store.set_default("fast")
+        seeded_store.set_default("smart")
+        assert seeded_store.get_default() == "smart"
+
+    def test_clear_default_reverts_to_none(self, seeded_store):
+        seeded_store.set_default("smart")
+        seeded_store.clear_default()
+        assert seeded_store.get_default() is None
+
+    def test_clear_default_when_never_set_is_a_noop(self, store):
+        store.clear_default()
+        assert store.get_default() is None
+
+    def test_default_pointer_does_not_appear_in_list_all(self, seeded_store):
+        """The default pointer lives under a DIFFERENT key prefix
+        (model:default_alias, not model:alias:*) so it must never leak into
+        the alias enumeration used by list_all()/seed_defaults()."""
+        seeded_store.set_default("smart")
+        aliases = seeded_store.list_all()
+        assert set(aliases.keys()) == {"fast", "smart", "secure", "balanced", "code"}
+
+    def test_default_pointer_persists_across_instances(self, redis):
+        store_a = ModelAliasStore(redis_client=redis)
+        store_a.set_default("fast")
+        store_b = ModelAliasStore(redis_client=redis)
+        assert store_b.get_default() == "fast"
