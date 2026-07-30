@@ -243,9 +243,8 @@ class AuditLogWriter:
         # write() path below no longer trusts them as the source of truth.
         self._chain_last_hash: Optional[str] = None   # hash of the most recent event
         self._chain_current_day: Optional[str] = None  # "YYYY-MM-DD" of last event
-        # YSG-RISK-176 — cross-process chain lock. A dedicated sidecar lock
-        # file (distinct from the rotatable audit.log itself, so rotation
-        # never invalidates the lock's identity) whose sole purpose is to
+        # YSG-RISK-177 (Iris integration audit, P1) — cross-process chain
+        # lock. A dedicated sidecar lock file whose sole purpose is to
         # serialise the read-true-prev-hash -> compute -> append critical
         # section across every worker process sharing this log directory, via
         # POSIX advisory locking (fcntl.flock — held on the file's inode, so
@@ -254,7 +253,20 @@ class AuditLogWriter:
         # WITHIN this process (flock does not itself block a second flock()
         # call issued by another thread of the SAME process against the same
         # open file description).
-        self._chain_lock_path = self._log_path.with_name(self._log_path.name + ".chainlock")
+        #
+        # Deliberately named OUTSIDE the "<log-name>.*" rotation namespace
+        # (leading dot + distinct name, e.g. ".audit.log.chainlock" for a
+        # "audit.log" log_path) — _delete_old_logs()'s retention prune globs
+        # "audit.log.*", which used to also match the OLD "audit.log.chainlock"
+        # name. On a long-lived deployment the lock file's mtime ages past
+        # retention_days, a size-triggered rotation fires _delete_old_logs(),
+        # the lock file is unlinked, and the NEXT process to open this path
+        # gets a fresh inode — silently un-serialising every writer sharing
+        # the volume and re-fragmenting the chain exactly as this finding
+        # describes. _delete_old_logs() below also explicitly skips this
+        # exact path as defence in depth (belt-and-suspenders — correct even
+        # if the naming convention is ever changed without updating the glob).
+        self._chain_lock_path = self._log_path.with_name("." + self._log_path.name + ".chainlock")
         self._chain_lock_fd = open(self._chain_lock_path, "a+")
         # v2.25.2 — optional DB audit sink (PostgresSink). Wired via
         # attach_db_sink() from the service lifespan AFTER the asyncpg pool is
@@ -551,10 +563,23 @@ class AuditLogWriter:
         self._delete_old_logs()
 
     def _delete_old_logs(self) -> None:
-        """Remove rotated logs older than retention_days."""
+        """Remove rotated logs older than retention_days.
+
+        YSG-RISK-177 (Iris integration audit, P1): the cross-process chain
+        lock sidecar (self._chain_lock_path) MUST NEVER be pruned here, even
+        if a future rename ever puts it back under the "audit.log.*" glob —
+        an explicit identity check, not just the current out-of-namespace
+        naming, so this stays correct regardless of naming convention drift.
+        Pruning it would let the lock file's inode be recycled: the NEXT
+        writer process to open the (now-different) inode at the same path
+        would no longer contend with processes still holding the OLD inode's
+        flock, silently un-serialising the cross-process critical section.
+        """
         cutoff = time.time() - (self._config.retention_days * 86400)
         parent = self._log_path.parent
         for p in parent.glob("audit.log.*"):
+            if p == self._chain_lock_path:
+                continue
             try:
                 if p.stat().st_mtime < cutoff:
                     p.unlink()
