@@ -42,6 +42,7 @@ import time as _time
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     playwright_login_admin,
@@ -95,7 +96,7 @@ def _inspect(page, *, content: str, action: str = "LOG", filename: str = "sample
 @playwright_required
 def test_pw_doc_01_nav_and_navigate():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -108,7 +109,7 @@ def test_pw_doc_01_nav_and_navigate():
 @playwright_required
 def test_pw_doc_02_status_cards_render():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -123,7 +124,7 @@ def test_pw_doc_02_status_cards_render():
 @playwright_required
 def test_pw_doc_03_supported_formats():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -138,7 +139,7 @@ def test_pw_doc_03_supported_formats():
 @playwright_required
 def test_pw_doc_04_policy_table_and_form_toggle():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -155,7 +156,7 @@ def test_pw_doc_04_policy_table_and_form_toggle():
 @playwright_required
 def test_pw_doc_05_inspect_shows_matches():
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -175,7 +176,7 @@ def test_pw_doc_07_xss_canary_escaped_in_viewer():
     node from the injected value)."""
     canary = '<img src=x onerror="window.__xss_fired=true">'
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         fired = {"v": False}
         page.on("dialog", lambda d: (fired.__setitem__("v", True), d.dismiss()))
@@ -204,7 +205,7 @@ def test_pw_doc_07_xss_canary_escaped_in_viewer():
 def test_pw_doc_09_status_requires_auth():
     """Unauthenticated API access is rejected (no session cookie)."""
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         try:
@@ -222,7 +223,7 @@ def test_pw_doc_09_status_requires_auth():
 def test_pw_doc_10_field_role_column_present():
     """The verdict viewer renders the Field-role column (Laura D1 surface)."""
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -238,7 +239,7 @@ def test_pw_doc_11_set_salt_control_present():
     """The set-scoped-salt control renders: security note + sets table + the
     per-file default option in the inspect dropdown."""
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
@@ -261,7 +262,7 @@ def test_pw_doc_12_set_create_and_salt_never_in_dom():
     import re as _re
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)

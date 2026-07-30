@@ -25,6 +25,7 @@ import os
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -71,7 +72,7 @@ def browser_ctx():
     ca_cert = _CA_CERT_PATH
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx_args = {}
         if ca_cert:
             ctx_args["ignore_https_errors"] = True  # pragma: no cover
