@@ -984,32 +984,33 @@ class TestInfrastructure:
 
 
 class TestInfrastructureAuditWriteSwallowedFinding:
-    """F4 (LOW): PUT /admin/infrastructure/topology writes the audit event
-    inside `try: assert audit_writer is not None; writer.write(...) except
-    Exception: logger.warning(...)` (infrastructure.py:75-85) — when
-    audit_writer is None (unwired), the AssertionError is caught by the bare
-    except and reduced to a generic "Audit write failed" log line. The
-    documented side effect (state mutation) STILL happens and the response
-    is STILL 200 — there is no signal to the caller, and no distinction in
-    the log between "audit writer never configured" and "audit writer threw
-    a genuine I/O error". Every sibling admin-config file in this group that
-    treats audit as best-effort (budget.py, alerts.py, models.py,
-    runtime_settings.py, hibp.py) uses an explicit `if audit_writer is not
-    None:` guard instead — infrastructure.py is the one outlier that relies
-    on an assert-then-catch pattern for the same intent."""
+    """YSG-RISK-154 (LOW) — CLOSED. PUT /admin/infrastructure/topology used
+    to write the audit event inside `try: assert audit_writer is not None;
+    writer.write(...) except Exception: logger.warning(...)` — when
+    audit_writer was None (unwired), the AssertionError (AssertionError IS
+    an Exception) was silently caught by the bare except and reduced to a
+    generic "Audit write failed" log line; the state mutation still
+    happened and the response was still 200 with zero signal to the
+    caller. Fix: audit_writer being completely UNSET is now checked
+    EXPLICITLY BEFORE the mutation and fails closed with 503 — a genuine
+    startup-invariant violation, not a transient write hiccup. A
+    transient write FAILURE (writer present, .write() itself raises) still
+    surfaces as `audit_recorded: false` in a 200 (fail-soft on the
+    mutation, per the codebase's existing convention) — see
+    test_tom_ysg_risk_153_154_audit_integrity.py."""
 
-    def test_put_topology_succeeds_and_silently_skips_audit_when_writer_unset(self, admin_client):
+    def test_put_topology_rejects_before_mutating_when_writer_unset(self, admin_client):
         from yashigani.backoffice.state import backoffice_state
 
         assert backoffice_state.audit_writer is None, "test precondition: audit_writer must be unwired"
         r = admin_client.put("/admin/infrastructure/topology", json={
             "zones": ["us-east-1a", "us-east-1b"], "spread_policy": "DoNotSchedule",
         })
-        # The mutation succeeds and is reported as success — no 5xx, no
-        # "audit_unavailable" flag anywhere in the response body.
-        assert r.status_code == 200
-        assert r.json()["az_count"] == 2
-        assert "audit" not in r.text.lower()
+        assert r.status_code == 503, (
+            f"YSG-RISK-154 REGRESSION: expected a fail-closed 503 when "
+            f"audit_writer is unset, got {r.status_code}: {r.text}"
+        )
+        assert r.json()["detail"]["error"] == "audit_writer_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -1299,11 +1300,13 @@ class TestBudgetUsageTreeInventory:
     def test_usage_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/usage/x").status_code == 401
 
-    # GAP-CLOSED: GET /admin/budget/tree
-    def test_tree_admin_200(self, admin_client):
+    # YSG-RISK-157 CLOSED: GET /admin/budget/tree is an honest 501, not a
+    # misleading 200/empty-tree stub — see test_tom_ysg_risk_156_157_honest_
+    # stub_endpoints.py.
+    def test_tree_admin_501_not_implemented(self, admin_client):
         r = admin_client.get("/admin/budget/tree")
-        assert r.status_code == 200
-        assert r.json()["tree"] == []
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
 
     def test_tree_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/tree").status_code == 401
@@ -1325,27 +1328,30 @@ class TestBudgetUsageTreeInventory:
 
 
 class TestBudgetTreeIsAStub:
-    """MEDIUM: GET /admin/budget/tree is a literal stub. budget.py:334
-    ('Placeholder — will be populated from Postgres in integration') always
-    returns tree=[] regardless of how many org caps / group budgets /
-    individual budgets are actually configured via the OTHER budget
-    endpoints in this exact file. The endpoint exists, is auth-gated
-    correctly, and does not error — but it never reflects real state. This
-    is a functional gap, not a security finding, and is called out
-    explicitly here (not papered over) per the dispatch brief."""
+    """YSG-RISK-157 (LOW) — CLOSED. GET /admin/budget/tree was a literal
+    stub (budget.py:334 'Placeholder — will be populated from Postgres in
+    integration') that always returned tree=[] regardless of configured
+    org caps / group budgets / individual budgets — a misleading 200/empty
+    response rather than an honest signal that the nested tree view isn't
+    built. A genuinely correct nested tree needs group->org /
+    identity->group membership linkage that does not exist in the budget
+    schema (deferred past 4.1.2). Fix: the endpoint now returns an honest
+    501 not_implemented regardless of configured caps — see
+    test_tom_ysg_risk_156_157_honest_stub_endpoints.py. GET
+    /admin/budget/{org-caps,groups,individuals} remain the flat
+    (non-nested) source of truth and are unaffected."""
 
-    def test_tree_ignores_configured_org_caps(self, admin_client, budget_state):
+    def test_tree_still_501_regardless_of_configured_org_caps(self, admin_client, budget_state):
         admin_client.post("/admin/budget/org-caps", json={
             "org_id": "acme", "provider": "anthropic", "token_cap": 1000, "period": "monthly",
         })
         r = admin_client.get("/admin/budget/tree")
-        assert r.status_code == 200
-        assert r.json()["tree"] == [], (
-            "GET /admin/budget/tree returned non-empty tree — if this "
-            "assertion ever fails, budget.py's tree stub has been "
-            "implemented; update this test's docstring/expectation, don't "
-            "just delete it."
-        )
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
+
+        # The flat, non-nested source of truth is NOT affected by the 501.
+        flat = admin_client.get("/admin/budget/org-caps")
+        assert flat.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -2057,39 +2063,23 @@ class TestAuditSiemConfig:
 
 
 class TestAuditSiemConfigTestRouteCollisionFinding:
-    """F0 (HIGH — NEW, not present in any prior conformance pass): POST
-    /admin/audit/siem/config/test is UNREACHABLE. audit.py registers
-    `POST /admin/audit/siem/{name}/test` (audit.py:357, mounted first —
-    app.py's include_router(audit_router, ...) runs at line ~1482) BEFORE
-    audit_sinks.py's literal `POST /admin/audit/siem/config/test` is
-    registered (app.py's include_router(audit_sinks_router, ...) at line
-    ~1492). Starlette resolves routes in REGISTRATION ORDER with no
-    literal-beats-dynamic precedence — a request to
-    "/admin/audit/siem/config/test" matches audit.py's dynamic
-    `{name}/test` template FIRST (binding name="config") and audit_sinks.py's
-    literal handler is NEVER reached. Verified directly against the live
-    Starlette route table (`route.matches(scope)` returns FULL for
-    audit.py's `test_siem_target`, not audit_sinks.py's `test_siem`).
+    """YSG-RISK-142 (HIGH) — CLOSED. POST /admin/audit/siem/config/test was
+    UNREACHABLE: audit.py registered `POST /admin/audit/siem/{name}/test`
+    (audit.py:357) BEFORE audit_sinks.py's literal `POST
+    /admin/audit/siem/config/test` was registered — Starlette resolves
+    routes in REGISTRATION ORDER with no literal-beats-dynamic precedence,
+    so a request to "/admin/audit/siem/config/test" matched audit.py's
+    dynamic `{name}/test` template FIRST (binding name="config") and
+    audit_sinks.py's literal handler was never reached.
 
-    This is the EXACT SAME bug class the audit_sinks.py module docstring
-    (lines 10-20) already documents as "fixed 2026-05-02" for its other 3
-    endpoints (GET/PUT /siem -> /siem/config, POST /siem/test ->
-    /siem/config/test) — but the fix for THIS 4th endpoint (the rename
-    target itself, /siem/config/test) collides with a route that did not
-    exist in that form at the time: audit.py's own POST /siem/{name}/test.
-    The rename moved the collision, it did not eliminate it.
-
-    Consequence: an admin who configures backend=splunk via PUT
-    /admin/audit/siem/config, then clicks "Test connection" in the admin
-    UI (which POSTs to /admin/audit/siem/config/test), never reaches
-    audit_sinks.py's `test_siem()` — a completely different, unrelated
-    named-SIEM-target-test code path executes instead, using "config" as a
-    literal target name. If no named target called "config" exists (the
-    common case), the admin sees 404 `siem_target_not_found` instead of a
-    connectivity test result — or, if an admin previously happened to
-    create a named target literally called "config" via POST
-    /admin/audit/siem, their "test my configured backend" click silently
-    tests THAT unrelated target instead."""
+    Fix (app.py, YSG-RISK-142 comment at the include_router call sites):
+    audit_sinks_router is now registered BEFORE audit_router, so the
+    literal `/admin/audit/siem/config/test` path wins the match and
+    audit_sinks.py's `test_siem()` is reached — regardless of whether a
+    named SIEM target literally called "config" exists. These tests were
+    written against the PRE-FIX behaviour (proving the bug); flipped here
+    to assert the CLOSED contract as permanent regression guards, per
+    test_tom_ysg_risk_142_siem_test_route_order.py."""
 
     def test_unauth_401(self, unauth_client):
         # Auth requirement happens to be identical on both handlers
@@ -2097,49 +2087,50 @@ class TestAuditSiemConfigTestRouteCollisionFinding:
         # regardless of which one actually executes.
         assert unauth_client.post("/admin/audit/siem/config/test").status_code == 401
 
-    def test_starlette_resolves_to_audit_py_not_audit_sinks_py(self, bo_app):
+    def test_starlette_resolves_to_audit_sinks_py_not_audit_py(self, bo_app):
         """Direct proof against the live route table — no HTTP round-trip
-        needed, this is the routing decision itself."""
+        needed, this is the routing decision itself. YSG-RISK-142 CLOSED:
+        audit_sinks_router is now registered before audit_router, so the
+        literal path wins."""
         from starlette.routing import Match
 
         scope = {"type": "http", "method": "POST", "path": "/admin/audit/siem/config/test"}
         for route in bo_app.router.routes:
             match, _child_scope = route.matches(scope)
             if match == Match.FULL:
-                assert route.name == "test_siem_target", (
-                    f"Expected the collision to resolve to audit.py's "
-                    f"test_siem_target (name='config' bound from the "
-                    f"dynamic segment) — got {route.name!r} instead. If "
-                    f"this assertion fails, the routing order has changed "
-                    f"and audit_sinks.py's endpoint may be reachable again; "
-                    f"update this finding, don't just delete it."
+                assert route.name == "test_siem", (
+                    f"Expected the fixed registration order to resolve to "
+                    f"audit_sinks.py's test_siem (literal path) — got "
+                    f"{route.name!r} instead. If this assertion fails, the "
+                    f"routing order has regressed back to the pre-fix "
+                    f"collision; update this test, don't just delete it."
                 )
-                assert route.path == "/admin/audit/siem/{name}/test"
+                assert route.path == "/admin/audit/siem/config/test"
                 return
         pytest.fail("No route matched POST /admin/audit/siem/config/test at all")
 
-    def test_no_named_target_called_config_404_not_400(self, admin_client, real_audit_writer):
-        """Observed end-to-end behaviour: with the collision in effect, the
-        request lands on audit.py's test_siem_target, which 404s
-        (siem_target_not_found) because no NAMED SIEM target called "config"
-        exists — NOT the 400 `no_alert_config`-shaped response
-        audit_sinks.py's own test_siem() would return for an unconfigured
-        backend. This is the observable symptom an admin actually sees."""
+    def test_no_siem_backend_configured_400_not_config_lookup(self, admin_client, real_audit_writer):
+        """Observed end-to-end behaviour post-fix: the request reaches
+        audit_sinks.py's test_siem(), which 400s ("No SIEM backend
+        configured") because no backend is wired via
+        backoffice_state.siem_backend — NOT audit.py's 404
+        siem_target_not_found (the old collision's symptom, which depended
+        on looking up a NAMED target called "config" that this test never
+        creates)."""
         r = admin_client.post("/admin/audit/siem/config/test")
-        assert r.status_code == 404
-        assert r.json()["detail"]["error"] == "siem_target_not_found"
+        assert r.status_code == 400
+        assert r.json()["detail"] == "No SIEM backend configured"
 
-    def test_a_named_target_literally_called_config_gets_silently_tested_instead(
+    def test_a_named_target_literally_called_config_is_no_longer_relevant(
         self, admin_client, real_audit_writer, monkeypatch,
     ):
-        """Worst-case demonstration: an admin creates an UNRELATED named SIEM
-        target called "config" (a plausible name — nothing stops it) via the
-        legitimate POST /admin/audit/siem endpoint. Their subsequent "test my
-        active backend" click (POST /admin/audit/siem/config/test) silently
-        tests THIS unrelated target instead of the configured backend —
-        audit_sinks.py's backend-config test is never invoked, and the admin
-        has no way to tell from the response that a different target was
-        tested."""
+        """YSG-RISK-142 CLOSED: an admin can create an UNRELATED named SIEM
+        target called "config" (a plausible name — nothing stops it) via
+        POST /admin/audit/siem without it having any bearing on POST
+        /admin/audit/siem/config/test any more — that route now
+        unconditionally reaches audit_sinks.py's test_siem(), which tests
+        the REAL configured backend (or 400s if none is configured), never
+        the named target. Proves the collision is gone, not just moved."""
         monkeypatch.setenv("YASHIGANI_TEST_MODE", "1")
         admin_client.post("/admin/audit/siem", json={
             "name": "config", "target_type": "webhook", "url": "https://unrelated-target.example.com/hook",
@@ -2150,12 +2141,15 @@ class TestAuditSiemConfigTestRouteCollisionFinding:
         monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _FakeHTTPResponse(200))
 
         r = admin_client.post("/admin/audit/siem/config/test")
-        assert r.status_code == 200
-        assert r.json() == {"status": "ok", "http_status": 200}, (
-            "This is audit.py's SiemTarget-test response shape "
-            "({'status': 'ok', 'http_status': N}), NOT audit_sinks.py's "
-            "backend-test response shape ({'status': 'test_sent', "
-            "'backend': ...}) — proof the wrong handler executed."
+        assert r.status_code == 400
+        assert r.json()["detail"] == "No SIEM backend configured", (
+            "This is audit_sinks.py's own unconfigured-backend response "
+            "({'detail': 'No SIEM backend configured'}), NOT audit.py's "
+            "SiemTarget-test response shape ({'status': 'ok', "
+            "'http_status': N}) that the OLD collision would have "
+            "produced from the unrelated named target called 'config' — "
+            "proof the fixed handler executed and the named target was "
+            "never consulted."
         )
 
     def test_sinks_handler_itself_is_correct_in_isolation(self, monkeypatch):
@@ -2202,24 +2196,32 @@ class TestAuditSiemConfigTestRouteCollisionFinding:
 
 
 class TestAuditSinksDocumentedButUnimplementedFinding:
-    """F2 (MEDIUM): the module docstring (audit_sinks.py:8) documents `DELETE
-    /admin/audit/sinks/queue — drain the audit queue (admin flush)` as one
-    of this file's 4 endpoints. It is NOT implemented — grepping every
-    `@audit_sinks_router.` decorator in the file (2026-07-29) finds exactly
-    4 routes and none of them is a DELETE on /admin/audit/sinks/queue. An
-    admin following the documented API surface (or an operator runbook
-    generated from it) would get a 404, not a queue drain. Either the
-    docstring is stale (endpoint removed, doc never updated) or the
-    endpoint was never shipped — either way this is a real, user-visible
-    conformance gap."""
+    """YSG-RISK-148 (MEDIUM) — CLOSED. The module docstring (audit_sinks.py:8)
+    documented `DELETE /admin/audit/sinks/queue — drain the audit queue
+    (admin flush)` since 2026-05-02 but it was never implemented (always
+    404). Fix: PostgresSink.drain_now() / SiemSink.drain_now() /
+    MultiSinkAuditWriter.drain_queues() plus the new
+    `DELETE /admin/audit/sinks/queue` route (routes/audit_sinks.py),
+    fail-closed 503 if audit_writer is unavailable. See
+    test_tom_ysg_risk_148_audit_queue_drain.py."""
 
-    def test_documented_queue_drain_endpoint_returns_404(self, admin_client):
+    def test_documented_queue_drain_endpoint_drains_and_returns_200(self, admin_client, real_audit_writer):
         r = admin_client.delete("/admin/audit/sinks/queue")
-        assert r.status_code == 404, (
-            "If this assertion ever fails, DELETE /admin/audit/sinks/queue "
-            "has been implemented — update audit_sinks.py's own docstring "
-            "accountability and this test, don't just delete it."
+        assert r.status_code == 200, (
+            f"YSG-RISK-148 REGRESSION: expected the now-implemented drain "
+            f"endpoint to succeed, got {r.status_code}: {r.text}"
         )
+        body = r.json()
+        assert body["status"] in ("drained", "no_queued_sinks")
+        assert "sinks" in body
+
+    def test_queue_drain_endpoint_503_when_audit_writer_unavailable(self, admin_client, monkeypatch):
+        from yashigani.backoffice.state import backoffice_state
+
+        monkeypatch.setattr(backoffice_state, "audit_writer", None, raising=False)
+        r = admin_client.delete("/admin/audit/sinks/queue")
+        assert r.status_code == 503
+        assert r.json()["detail"]["error"] == "audit_writer_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -2469,21 +2471,19 @@ class TestCacheList:
         assert r.status_code == 200
         assert r.json() == {"tenants": [], "cache_available": False}
 
-    def test_admin_with_response_cache_hits_postgres_and_fails_offline_500(self, admin_client, cache_state):
-        """SPEC-CONFORMANCE: with response_cache wired (rc is not None), the
-        handler takes the OTHER branch — it queries Postgres directly via
-        yashigani.db.postgres.get_pool() (cache.py:39-45), completely
-        ignoring the `cache_state` fixture's fakeredis-backed ResponseCache
-        instance. No Postgres is available offline, so get_pool() raises —
-        caught by the handler's own try/except into a safe_error_envelope
-        500 (not a crash, cache.py:46-52 IS a real graceful-ish degrade for
-        THIS specific failure. See F1 in the module docstring for why this
-        Postgres codepath existing here AT ALL, disconnected from the Redis
-        state PUT/GET-one/DELETE actually mutate, is the real finding."""
+    def test_admin_with_response_cache_reads_same_redis_store_as_put(self, admin_client, cache_state):
+        """YSG-RISK-143 CLOSED: with response_cache wired (rc is not None),
+        GET /admin/cache now reads from the SAME store (Redis, via
+        ResponseCache.list_tenant_configs()) that PUT/GET-one/DELETE
+        already use — it no longer queries the disconnected, always-empty
+        Postgres `cache_config` table. An empty ResponseCache genuinely has
+        no configured tenants yet, so the list is empty (not because of a
+        Postgres failure) — see the round-trip proof in
+        TestCacheListVsSingleTenantSplitBackendFinding below and
+        test_ysg_risk_143_admin_cache_store_split.py."""
         r = admin_client.get("/admin/cache")
-        assert r.status_code == 500
-        assert r.json()["cache_available"] is True
-        assert r.json()["tenants"] == []
+        assert r.status_code == 200
+        assert r.json() == {"tenants": [], "cache_available": True}
 
 
 class TestCacheSingleTenant:
@@ -2553,80 +2553,46 @@ class TestCacheSingleTenant:
 
 
 class TestCacheListVsSingleTenantSplitBackendFinding:
-    """F1 (HIGH): GET /admin/cache (list) and {GET,PUT,DELETE}
-    /admin/cache/{tenant_id} (single-tenant) present as ONE unified "tenant
-    cache configuration" resource in the API surface, but are backed by TWO
-    COMPLETELY SEPARATE persistence layers:
+    """YSG-RISK-143 (HIGH) — CLOSED. GET /admin/cache (list) and
+    {GET,PUT,DELETE} /admin/cache/{tenant_id} (single-tenant) present as
+    ONE unified "tenant cache configuration" resource in the API surface,
+    but were backed by TWO COMPLETELY SEPARATE persistence layers:
       - GET /admin/cache (list)         -> Postgres `cache_config` table
-                                            (cache.py:39-45)
+                                            (never written to by anything)
       - GET/PUT/DELETE .../{tenant_id}  -> Redis, via ResponseCache's
                                             rc:cfg:{tenant_id} hash key
-                                            (cache.py:56-83, response_cache.py)
 
-    Grepped the entire yashigani package (2026-07-29) for every write to the
-    `cache_config` Postgres table: the ONLY hits are cache.py's own read
-    (list handler) and the migration that creates the table
-    (0001_initial_schema.py). NOTHING ever INSERTs/UPDATEs `cache_config` —
-    it is permanently empty in every real deployment. Meanwhile PUT
-    /admin/cache/{tenant_id} genuinely persists (proven in
-    TestCacheSingleTenant.test_put_success_persists_and_reads_back above) —
-    to Redis, which the list endpoint never reads.
+    A config set via PUT was written to Redis but the list endpoint read
+    an unrelated, permanently-empty Postgres table — a PUT'd config could
+    never appear in the list. Fix: GET /admin/cache now reads from the
+    SAME store (Redis, via the new ResponseCache.list_tenant_configs())
+    that PUT/GET-one/DELETE already use — see
+    test_ysg_risk_143_admin_cache_store_split.py."""
 
-    Consequence: an admin who enables caching for a tenant via PUT
-    /admin/cache/{tenant_id}, then opens the "all tenants" cache-config list
-    view, will see that tenant as ABSENT — forever, structurally, not as a
-    transient bug. This directly matches the dispatch brief's "prove the
-    real path honours it" instruction for runtime-toggle endpoints (the
-    YSG-RISK-128 precedent): the toggle DOES apply (the gateway's
-    ResponseCache reads the same Redis keys PUT writes — see
-    response_cache.py:get/set), but the ADMIN'S OWN LIST VIEW of that same
-    toggle is disconnected from it."""
-
-    def test_put_tenant_config_never_appears_in_list_view(self, admin_client, cache_state, monkeypatch):
-        """Proves the split by making the Postgres side deterministically
-        return "no rows" (get_pool() unavailable offline is already the
-        natural state — this test just makes the mismatch explicit and
-        self-documenting rather than relying on an incidental 500)."""
-        # 1. PUT genuinely persists (Redis side) — proven again here inline
-        #    for a self-contained finding test.
+    def test_put_tenant_config_now_appears_in_list_view(self, admin_client, cache_state):
+        """YSG-RISK-143 core regression: a config set via PUT MUST appear
+        in the GET /admin/cache list — both read the same Redis-backed
+        store now."""
+        # 1. PUT genuinely persists (Redis side).
         r = admin_client.put("/admin/cache/acme-corp", json={"enabled": True, "ttl_seconds": 120})
         assert r.status_code == 200
 
         r2 = admin_client.get("/admin/cache/acme-corp")
         assert r2.json() == {"enabled": True, "ttl_seconds": 120}, (
             "PUT did not persist to the per-tenant store — re-verify the "
-            "premise of this finding before trusting the list-view assertion below."
+            "premise of this test before trusting the list-view assertion below."
         )
 
-        # 2. The list view (Postgres side) can NEVER see it — patch get_pool
-        #    to return a pool with zero rows (simulates the always-empty
-        #    real-world table without depending on this sandbox lacking
-        #    Postgres, which is incidental, not the actual mechanism).
-        class _EmptyPgConn:
-            async def fetch(self, *_a, **_kw):
-                return []
-
-        class _EmptyAcquireCtx:
-            async def __aenter__(self):
-                return _EmptyPgConn()
-
-            async def __aexit__(self, *_exc):
-                return False
-
-        class _EmptyPgPool:
-            def acquire(self):
-                return _EmptyAcquireCtx()
-
-        import yashigani.db.postgres as postgres_module
-        monkeypatch.setattr(postgres_module, "get_pool", lambda: _EmptyPgPool(), raising=False)
-
+        # 2. The list view MUST now see it — both endpoints read Redis.
         r3 = admin_client.get("/admin/cache")
         assert r3.status_code == 200
-        assert r3.json()["tenants"] == [], (
-            "If this assertion ever fails, cache.py's list endpoint has "
-            "been rewired onto the same backend PUT/GET-one/DELETE use — "
-            "update this finding's docstring, don't just delete the test."
+        tenants = {t["tenant_id"]: t for t in r3.json()["tenants"]}
+        assert "acme-corp" in tenants, (
+            f"YSG-RISK-143 REGRESSION: PUT'd tenant 'acme-corp' did not "
+            f"appear in GET /admin/cache list: {r3.json()['tenants']!r}"
         )
+        assert tenants["acme-corp"]["enabled"] is True
+        assert tenants["acme-corp"]["ttl_seconds"] == 120
 
 
 # ---------------------------------------------------------------------------
@@ -2747,21 +2713,19 @@ class TestRatelimitConfig:
 
 
 class TestRatelimitResetBucketAuditCrashFinding:
-    """F3 (MEDIUM): POST /admin/ratelimit/reset/{bucket_key} deletes the
-    Redis bucket key FIRST (ratelimit.py:166, `state.rate_limiter._redis.
-    delete(bucket_key)`), THEN does `assert state.audit_writer is not None`
-    with NO try/except (ratelimit.py:174) before writing the audit event.
-    When audit_writer is unset, the assert raises, propagates unhandled,
-    and the admin receives HTTP 500 — but the documented side effect (the
-    rate-limit bucket reset, e.g. unblocking a throttled client) ALREADY
-    happened and is NOT rolled back. The admin's mental model ("that reset
-    request failed, the client is still blocked") is wrong; the client was
-    actually unblocked. Contrast with this file's OWN update_ratelimit_config
-    handler two functions above (ratelimit.py:94: `if state.audit_writer is
-    not None:` — a correct best-effort guard) — the inconsistency is
-    within the SAME file, not just across files."""
+    """YSG-RISK-149 (MEDIUM) — CLOSED. POST /admin/ratelimit/reset/{bucket_key}
+    deleted the Redis bucket key FIRST, THEN did `assert state.audit_writer
+    is not None` with NO try/except before writing the audit event. When
+    audit_writer was unset, the assert raised, propagated unhandled (an
+    AssertionError is stripped entirely under python -O), and the admin
+    received an unhandled HTTP 500 — but the documented side effect (the
+    rate-limit bucket reset) had ALREADY happened and was not rolled back.
+    Fix: guard with `if state.audit_writer is not None:`; log a warning and
+    skip the (non-critical) audit write when absent, but always return the
+    2xx for the already-successful reset — see
+    test_ysg_risk_149_ratelimit_reset_assert_crash.py."""
 
-    def test_bucket_is_deleted_even_though_response_is_500(
+    def test_bucket_is_deleted_and_response_is_200_without_audit_writer(
         self, bo_app, session_store, caddy_headers, ratelimit_state,
     ):
         from fastapi.testclient import TestClient
@@ -2780,18 +2744,14 @@ class TestRatelimitResetBucketAuditCrashFinding:
         client.cookies.set(_ADMIN_SESSION_COOKIE, session.token)
 
         r = client.post("/admin/ratelimit/reset/yashigani:rl:ip:deadbeef")
-        assert r.status_code == 500, (
-            "If this assertion ever fails, ratelimit.py's reset_bucket() "
-            "has been fixed to guard the audit write — update this "
-            "finding's docstring and severity, don't just delete the test."
+        assert r.status_code == 200, (
+            f"YSG-RISK-149 REGRESSION: expected 200 for a successful reset "
+            f"with no audit_writer configured, got {r.status_code}: {r.text}"
         )
-        # The documented side effect happened anyway — this is the crux of
-        # the finding: the response LIES about the operation's outcome.
-        assert not ratelimit_state._redis.exists("yashigani:rl:ip:deadbeef"), (
-            "Expected the bucket to be deleted DESPITE the 500 response — "
-            "if this assertion fails, the finding's premise (partial "
-            "mutation before the crash) no longer holds."
-        )
+        assert r.json() == {"status": "ok", "bucket_key": "yashigani:rl:ip:deadbeef"}
+        # The bucket reset genuinely happened — the response no longer lies
+        # about the operation's outcome either way.
+        assert not ratelimit_state._redis.exists("yashigani:rl:ip:deadbeef")
 
 
 # ---------------------------------------------------------------------------
