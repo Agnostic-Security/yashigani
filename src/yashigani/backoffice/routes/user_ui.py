@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import math
 import os
@@ -45,7 +46,7 @@ from typing import Optional
 import httpx
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from yashigani.backoffice.middleware import (
@@ -1018,38 +1019,98 @@ async def user_chat_proxy(request: Request, session: UserSession):
         "Accept": "text/event-stream",
     }
 
-    async def _stream_gateway():
-        """Async generator: iterate gateway SSE chunks and yield to client."""
+    # RISK-167 (chat-path repair, 2026-07-30): the pre-fix version of this
+    # function ALWAYS returned StreamingResponse(..., media_type="text/event-
+    # stream") — which FastAPI/Starlette commits as HTTP 200 by default — even
+    # when the gateway responded 403/404/405/500/502/503. The non-2xx branch
+    # below re-encoded the real error body as a fake `data: {...}\n\n` SSE
+    # frame, but by the time that ran the outer response object had already
+    # promised the browser a 200. Live-confirmed: every agent-dispatch failure
+    # (@letta 502, @openclaw 500, @langflow 404/405), every PII block (403),
+    # and every "model not available" (503) all reached the browser as
+    # status=200 — sse.js's own `resp.ok` pre-stream branch (which correctly
+    # distinguishes 403/404/etc.) never even ran, because the proxy erased the
+    # distinction before the browser ever saw it.
+    #
+    # Fix: open the upstream connection and inspect its REAL status BEFORE
+    # deciding how to respond. Only a genuine 2xx becomes a StreamingResponse;
+    # everything else is forwarded as a JSONResponse carrying the gateway's own
+    # status code + body, so the browser's existing sse.js contract (403 →
+    # verdict banner, other 4xx/5xx → onError with the real message) works as
+    # designed instead of being masked.
+    client = httpx.AsyncClient(timeout=httpx.Timeout(
+        connect=10.0,
+        read=_GATEWAY_STREAM_TIMEOUT_S,
+        write=30.0,
+        pool=5.0,
+    ))
+    try:
+        upstream_request = client.build_request(
+            "POST", target_url, content=body_bytes, headers=forward_headers,
+        )
+        resp = await client.send(upstream_request, stream=True)
+    except httpx.ConnectError as exc:
+        await client.aclose()
+        logger.error("user_chat_proxy: gateway unreachable: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "message": "Could not connect to the governed gateway.",
+                    "type": "gateway_error",
+                    "code": "gateway_unreachable",
+                }
+            },
+        )
+    except Exception as exc:
+        await client.aclose()
+        logger.error("user_chat_proxy: request-send error: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "error": {
+                    "message": "Unexpected error contacting the gateway.",
+                    "type": "gateway_error",
+                    "code": "stream_error",
+                }
+            },
+        )
+
+    if resp.status_code not in (200, 201, 206):
+        error_bytes = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(
-                connect=10.0,
-                read=_GATEWAY_STREAM_TIMEOUT_S,
-                write=30.0,
-                pool=5.0,
-            )) as client:
-                async with client.stream(
-                    "POST",
-                    target_url,
-                    content=body_bytes,
-                    headers=forward_headers,
-                ) as resp:
-                    # Forward non-2xx as a synthetic SSE error event so the
-                    # browser's onBlocked / onError handlers fire correctly.
-                    if resp.status_code not in (200, 201, 206):
-                        error_body = await resp.aread()
-                        yield (
-                            f"data: {error_body.decode('utf-8', errors='replace')}\n\n"
-                        ).encode("utf-8")
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            yield chunk
-        except httpx.ConnectError as exc:
-            logger.error("user_chat_proxy: gateway unreachable: %s", exc)
-            yield b'data: {"error":"gateway_unreachable","message":"Could not connect to the governed gateway."}\n\n'
+            error_content = json.loads(error_bytes.decode("utf-8", errors="replace"))
+        except Exception:
+            error_content = {
+                "error": {
+                    "message": error_bytes.decode("utf-8", errors="replace")[:500]
+                    or f"Backend error (HTTP {resp.status_code}).",
+                    "type": "gateway_error",
+                    "code": "upstream_error",
+                }
+            }
+        return JSONResponse(status_code=resp.status_code, content=error_content)
+
+    async def _stream_gateway():
+        """Async generator: iterate the already-opened gateway SSE stream."""
+        try:
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
         except Exception as exc:
-            logger.error("user_chat_proxy: stream error: %s", exc)
-            yield b'data: {"error":"stream_error","message":"Unexpected error streaming from gateway."}\n\n'
+            # Genuinely mid-stream failure (headers already sent as 200) — no
+            # way to change the HTTP status now. sse.js's frame loop recognises
+            # this `error` shape (RISK-167) and surfaces it via onError.
+            logger.error("user_chat_proxy: mid-stream error: %s", exc)
+            yield (
+                b'data: {"error":{"message":"Unexpected error streaming from '
+                b'gateway.","type":"stream_error","code":"stream_error"}}\n\n'
+            )
+        finally:
+            await resp.aclose()
+            await client.aclose()
 
     return StreamingResponse(
         _stream_gateway(),

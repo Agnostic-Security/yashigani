@@ -21,6 +21,16 @@
 // (error.message / detail strings) is NEVER promoted to the verdict banner
 // (anti-spoofing). A 403 with no structured fields yields a generic
 // {blocked:true} tail so the trusted "request blocked" chrome still renders.
+//
+// RISK-167 (mid-stream error frame): a backend failure discovered AFTER the
+// 200/text-event-stream headers are already committed (e.g. an agent dispatch
+// error the trusted proxy re-encodes as SSE, or an upstream ConnectError mid-
+// generation) cannot change the HTTP status — it arrives as a plain
+// `data: {"error":{...}}` frame instead. This is recognised in the frame loop
+// below and routed to onError() with the plain message (NOT the verdict
+// banner — this is an operational/backend message, not a policy decision).
+// Previously it matched none of the recognised shapes and was silently
+// dropped, leaving the user with no signal at all that anything failed.
 
 const DEFAULT_IDLE_MS = 60000; // idle-token timeout; streams are long-lived (§4.1)
 
@@ -178,6 +188,30 @@ export function streamChat(path, opts) {
               evt = JSON.parse(trimmed);
             } catch {
               continue; // ignore non-JSON keep-alives
+            }
+            // RISK-167: a mid-stream error frame (`data: {"error":{...}}`).
+            // The backend can only say "200 text/event-stream" ONCE headers are
+            // committed — a failure discovered after that point (upstream
+            // ConnectError, agent dispatch failure surfaced by the trusted
+            // proxy, etc.) has no way to change the HTTP status, so it arrives
+            // as a plain error frame instead. Previously this matched NONE of
+            // the recognised shapes (delta / decision_codes / user_alert /
+            // blocked / yashigani) and was silently dropped — the stream ended
+            // with onMessageDone('', null) and the user saw nothing. Surface it
+            // via onError (plain error text, NOT the trusted verdict banner —
+            // this is an operational/backend message, not a policy verdict) and
+            // stop processing further frames.
+            if (evt && evt.error) {
+              const _msg = typeof evt.error === 'string'
+                ? evt.error
+                : (evt.error && evt.error.message) || 'stream error';
+              if (!done) {
+                done = true;
+                if (idleTimer) clearTimeout(idleTimer);
+                try { reader.cancel(); } catch { /* best-effort */ }
+                onError(new Error(_msg));
+              }
+              return;
             }
             // OpenAI-compatible delta.
             const delta = evt?.choices?.[0]?.delta?.content;
