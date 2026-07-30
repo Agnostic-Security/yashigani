@@ -2,8 +2,9 @@
 
 Pushes the client-binding document to OPA under the SEPARATE
 /v1/data/client_bindings namespace. This is deliberately disjoint from
-/v1/data/yashigani (which push_rbac_data replaces atomically) so the two pushes
-are independent and neither clobbers the other.
+/v1/data/yashigani (under which push_rbac_data now PUTs to its own
+/v1/data/yashigani/rbac and /v1/data/yashigani/agents sub-paths — YSG-RISK-176)
+so the two pushes are independent and neither clobbers the other.
 
 OPA holds data in memory only, so the backoffice re-pushes on startup (app.py
 lifespan) after the RBAC re-sync, using the same retry pattern.
@@ -24,7 +25,9 @@ def push_bindings_data(store: BindingStore | None, opa_url: str) -> None:
     """PUT the client-binding document to OPA at /v1/data/client_bindings.
 
     Does NOT touch /v1/data/yashigani — this namespace is owned solely by the
-    binding store, so push_rbac_data and this are independent.
+    binding store, so push_rbac_data (which itself only sub-path-PUTs
+    /v1/data/yashigani/rbac and /v1/data/yashigani/agents — YSG-RISK-176)
+    and this are independent.
 
     Raises:
         httpx.HTTPStatusError — OPA returned a non-2xx status.
