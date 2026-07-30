@@ -13,6 +13,7 @@ Last updated: 2026-05-03
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -227,9 +228,34 @@ class AuditLogWriter:
         self._log_path = Path(config.log_path)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self._open_log_file()
-        # Hash-chain state (protected by self._lock)
+        # Hash-chain state — YSG-RISK-176 (2026-07-30): these two fields used to
+        # be the SOLE source of truth for prev_event_hash, which only holds
+        # within a single process. In production the gateway alone runs TWO
+        # concurrent uvicorn processes (mTLS :8080 + mesh :8081, see
+        # docker/gateway-start.sh) sharing this same volume-mounted log file;
+        # each got its OWN AuditLogWriter instance and its OWN independent
+        # _chain_last_hash, so the interleaved appends produced a chain that
+        # only validates within one process's writes — a live query under
+        # normal concurrent traffic found 4/56 broken links (zero tampering).
+        # They are now written by _read_true_prev_hash_locked() (which derives
+        # the correct value fresh from disk, under self._chain_lock_fd, on
+        # every write) and are kept only as a debug/introspection cache — the
+        # write() path below no longer trusts them as the source of truth.
         self._chain_last_hash: Optional[str] = None   # hash of the most recent event
         self._chain_current_day: Optional[str] = None  # "YYYY-MM-DD" of last event
+        # YSG-RISK-176 — cross-process chain lock. A dedicated sidecar lock
+        # file (distinct from the rotatable audit.log itself, so rotation
+        # never invalidates the lock's identity) whose sole purpose is to
+        # serialise the read-true-prev-hash -> compute -> append critical
+        # section across every worker process sharing this log directory, via
+        # POSIX advisory locking (fcntl.flock — held on the file's inode, so
+        # it correctly contends across processes, unlike self._lock which is
+        # per-process/per-object). self._lock above still serialises threads
+        # WITHIN this process (flock does not itself block a second flock()
+        # call issued by another thread of the SAME process against the same
+        # open file description).
+        self._chain_lock_path = self._log_path.with_name(self._log_path.name + ".chainlock")
+        self._chain_lock_fd = open(self._chain_lock_path, "a+")
         # v2.25.2 — optional DB audit sink (PostgresSink). Wired via
         # attach_db_sink() from the service lifespan AFTER the asyncpg pool is
         # open.  The file sink above is and remains the canonical durability
@@ -267,30 +293,62 @@ class AuditLogWriter:
             object.__setattr__(event, "masking_applied", False) if dataclasses.is_dataclass(event) else setattr(event, "masking_applied", False)
 
         with self._lock:
-            # Compute and inject prev_event_hash before serialisation
-            event_dict = event.to_dict()
-            today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-            if self._chain_current_day != today or self._chain_last_hash is None:
-                # First event of the day (or first ever): anchor with day hash
-                prev_hash = _day_anchor(today)
-                self._chain_current_day = today
-            else:
-                prev_hash = self._chain_last_hash
-            event_dict["prev_event_hash"] = prev_hash
-
-            # Update in-memory chain pointer with this event's canonical hash
-            self._chain_last_hash = _sha384_hex(_canonical_json(event_dict))
-
-            record = json.dumps(event_dict, default=str)
+            # YSG-RISK-176: cross-process advisory lock around the entire
+            # read-true-prev-hash -> compute -> append critical section.
+            # Held for the whole block so no other process can observe a
+            # partially-written state or race the prev-hash read against our
+            # append. Released in the `finally` (also released automatically
+            # if this process dies while holding it — flock is tied to the
+            # open file description, not held past process exit).
+            fcntl.flock(self._chain_lock_fd.fileno(), fcntl.LOCK_EX)
             try:
-                self._rotate_if_needed()
-                self._file.write(record + "\n")
-                self._file.flush()
-            except OSError as exc:
-                raise AuditWriteError(
-                    f"Audit volume write failed: {exc}. "
-                    "The triggering operation must be aborted."
-                ) from exc
+                event_dict = event.to_dict()
+
+                # YSG-RISK-176: re-stamp ``timestamp`` to the moment of
+                # durable commit (right here, under the cross-process lock),
+                # overriding the construction-time value AuditEvent's
+                # default_factory set. audit_verify.py's verifier sorts ALL
+                # collected events by this field before walking the chain —
+                # so ordering correctness requires the timestamp to be
+                # assigned at the SAME serialisation point as the physical
+                # append, monotonically, across every writer (process or
+                # thread). The construction-time timestamp is assigned
+                # BEFORE the event ever reaches this lock, so two events
+                # constructed in one order can legitimately race the lock
+                # and append in the OPPOSITE order — under heavy concurrency
+                # (proven by src/tests/regression/v4.1.2/
+                # test_tom_ysg_risk_176_audit_chain_multiprocess.py, which
+                # reproduces this on BOTH multi-process and heavily-
+                # contended multi-thread single-process writers) that
+                # mismatch reads as a chain break to the verifier even
+                # though nothing was tampered with. Stamping here makes
+                # "timestamp" == "durable commit order" by construction, so
+                # the existing (unmodified) verifier's timestamp-sort always
+                # agrees with physical append order.
+                event_dict["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
+
+                # Compute and inject prev_event_hash before serialisation.
+                # Derived FRESH from disk (not from self._chain_last_hash) so
+                # it is correct regardless of which process wrote last.
+                prev_hash = self._read_true_prev_hash_locked()
+                event_dict["prev_event_hash"] = prev_hash
+
+                # Update in-memory chain pointer (debug/introspection cache only
+                # — see __init__ note; the NEXT write() re-derives from disk).
+                self._chain_last_hash = _sha384_hex(_canonical_json(event_dict))
+
+                record = json.dumps(event_dict, default=str)
+                try:
+                    self._rotate_if_needed()
+                    self._file.write(record + "\n")
+                    self._file.flush()
+                except OSError as exc:
+                    raise AuditWriteError(
+                        f"Audit volume write failed: {exc}. "
+                        "The triggering operation must be aborted."
+                    ) from exc
+            finally:
+                fcntl.flock(self._chain_lock_fd.fileno(), fcntl.LOCK_UN)
 
         # v2.25.2 — DB sink mirror (fire-and-forget, fully isolated).
         # Runs AFTER the canonical file write has succeeded and OUTSIDE the
@@ -342,6 +400,10 @@ class AuditLogWriter:
                 self._file.close()
             except OSError:
                 pass
+            try:
+                self._chain_lock_fd.close()
+            except OSError:
+                pass
 
     def add_siem_target(self, target: SiemTarget) -> None:
         self._siem_targets.append(target)
@@ -377,6 +439,95 @@ class AuditLogWriter:
             sink.enqueue_nowait(event_dict)
         except Exception as exc:  # noqa: BLE001 — defence in depth; must not propagate
             logger.warning("Audit DB sink mirror failed (dropped, file write intact): %s", exc)
+
+    # -- Hash-chain cross-process read (YSG-RISK-176) ------------------------
+
+    def _read_true_prev_hash_locked(self) -> str:
+        """
+        Determine the correct prev_event_hash for the event about to be
+        written, by reading the true last-written line of the ACTIVE log
+        file — i.e. whatever the physically most-recent writer (this process
+        or any other) actually appended — rather than trusting this
+        process's own in-memory bookkeeping.
+
+        MUST be called while holding self._chain_lock_fd's flock (so no
+        other process can append between this read and our own append).
+
+        Self-healing: state is derived live from disk on every call rather
+        than cached in a sidecar file, so a mid-write crash cannot leave a
+        stale chain pointer — the next writer (any process) simply re-derives
+        the correct value from what actually landed on disk.
+
+        Rotation-safe: called BEFORE _rotate_if_needed() in write(), so it
+        always reads the file that is about to receive (or be rotated ahead
+        of) the new record — the first event of a freshly-rotated file
+        still correctly chains to the last event of the file it replaced.
+        """
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        last_line = self._read_last_log_line()
+        if last_line is None:
+            self._chain_current_day = today
+            return _day_anchor(today)
+
+        try:
+            last_event = json.loads(last_line)
+        except json.JSONDecodeError:
+            # Corrupt/partial trailing line — fail safe to a fresh day-anchor
+            # rather than silently chaining off unparseable data. Logged so
+            # an operator can investigate (should not occur: O_APPEND writes
+            # are atomic per line on the local volume filesystems we target).
+            logger.error(
+                "Audit chain: could not parse the last log line while "
+                "computing prev_event_hash — anchoring a fresh chain segment "
+                "instead of chaining off unparseable data."
+            )
+            self._chain_current_day = today
+            return _day_anchor(today)
+
+        last_ts_raw = last_event.get("timestamp", "")
+        try:
+            last_day = datetime.fromisoformat(last_ts_raw).strftime("%Y-%m-%d")
+        except ValueError:
+            last_day = None
+
+        self._chain_current_day = today
+        if last_day != today:
+            return _day_anchor(today)
+        return _sha384_hex(_canonical_json(last_event))
+
+    def _read_last_log_line(self) -> Optional[str]:
+        """
+        Read the last non-empty line of the currently active log file.
+
+        Bounded tail read (grows exponentially from 8 KiB) so this stays
+        cheap even for a multi-MB file between rotations. Returns None if
+        the file does not exist or is empty. Must be called while holding
+        the chain lock (self._chain_lock_fd).
+        """
+        try:
+            size = self._log_path.stat().st_size
+        except FileNotFoundError:
+            return None
+        if size == 0:
+            return None
+
+        chunk = 8192
+        with self._log_path.open("rb") as fh:
+            data = b""
+            pos = size
+            while True:
+                read_size = min(chunk, pos)
+                pos -= read_size
+                fh.seek(pos)
+                data = fh.read(read_size) + data
+                if data.count(b"\n") >= 2 or pos == 0:
+                    break
+                chunk *= 2
+
+        lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        if not lines:
+            return None
+        return lines[-1].decode("utf-8")
 
     # -- Volume sink ---------------------------------------------------------
 

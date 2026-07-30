@@ -236,6 +236,62 @@ class AuditChainService:
 
         return prev, ev_hash
 
+    async def compute_hashes_for_event_db(
+        self, conn, tenant_id: uuid.UUID, event_dict: dict
+    ) -> tuple[str, str]:
+        """Cross-process-safe (YSG-RISK-176) variant of compute_hashes_for_event.
+
+        compute_hashes_for_event() above is single-process-safe only: its
+        threading.Lock + in-memory (_last_hash, _current_day) do not
+        coordinate across the multiple gunicorn/uvicorn WORKER PROCESSES that
+        share this Postgres pool in production (the gateway alone runs two —
+        mTLS :8080 + mesh :8081, docker/gateway-start.sh — each with its own
+        AuditChainService instance via build_postgres_audit_sink()).
+        Empirically: a live query against audit_events under normal
+        concurrent traffic found 4/56 chain-link breaks, zero tampering
+        (YSG-RISK-176, 2026-07-30).
+
+        Migration 0014 (LU-AMEND-01 wave-3) added the BIGSERIAL ``seq``
+        column specifically to be "the AUTHORITATIVE ordering for ... prev_hash
+        lookup" (see migration docstring) — this method is that lookup,
+        which compute_hashes_for_event() never actually implemented (it kept
+        using in-memory state even after wave-3 landed).
+
+        Derives prev_hash from the DATABASE's own seq-ordered last row under
+        a transaction-scoped PostgreSQL advisory lock keyed on tenant_id
+        (pg_advisory_xact_lock(hashtext(...))), serialising the
+        read-last-row -> compute -> INSERT critical section across every
+        process/connection writing this tenant's chain. The lock is
+        auto-released at COMMIT/ROLLBACK — no leak risk on pool/connection
+        reuse. MUST be called from inside the same transaction as the
+        subsequent INSERT (PostgresSink._flush_batch does this).
+
+        Returns:
+            (prev_hash, event_hash) — both SHA-384 hex strings.
+        """
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))", str(tenant_id)
+        )
+        row = await conn.fetchrow(
+            """
+            SELECT event_hash, created_at
+            FROM audit_events
+            WHERE tenant_id = $1 AND event_hash IS NOT NULL
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            tenant_id,
+        )
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        if row is None:
+            prev_hash = day_anchor(today)
+        else:
+            last_day = row["created_at"].astimezone(timezone.utc).strftime("%Y-%m-%d")
+            prev_hash = row["event_hash"] if last_day == today else day_anchor(today)
+
+        ev_hash = compute_event_hash(event_dict)
+        return prev_hash, ev_hash
+
     async def run_daily_checkpoint(
         self,
         target_date: date,
