@@ -5174,6 +5174,34 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     return nhi_identity
 
                 # p1_agent: resolve as a named agent identity from registry
+                #
+                # YSG-RISK-174 (chat-path repair, 2026-07-30): sensitivity_ceiling
+                # was hardcoded "INTERNAL" (rank 1) for EVERY p1_agent identity,
+                # including the agent's own reasoning self-call to gateway's
+                # /v1/chat/completions (the same "llm" egress class RISK-170
+                # already established deserves no artificial ceiling cap). This
+                # is the SAME misapplied-ceiling class as RISK-170, just at the
+                # response-delivery gate (_opa_response_check /
+                # v1_routing.rego response_decision) rather than the egress-eval
+                # gate. Live-confirmed: after fixing RISK-172 (langflow's token
+                # now resolves correctly as p1_agent/agent__langflow instead of
+                # anonymous), langflow's own self-call started 403ing with
+                # `OPA BLOCKED response delivery: identity=agent__langflow
+                # sensitivity=RESTRICTED reason=response_sensitivity_exceeds_ceiling`
+                # -- letta/openclaw do NOT hit this because they authenticate via
+                # the separate _INTERNAL_BEARER path below, which already resolves
+                # to sensitivity_ceiling="RESTRICTED" (rank 3) -- only langflow's
+                # dedicated per-agent P1 token (Phase 5 §C) took this INTERNAL-
+                # capped branch. Raised to RESTRICTED for parity: this only
+                # removes the artificial rank-based cap on the response_decision
+                # ceiling comparison (v1_routing.rego `_effective_sensitivity_rank
+                # <= _ceiling_rank(...)`); the SEPARATE, unconditional
+                # `_response_blocked_by_inspection` hard gate (verdict=="blocked")
+                # is untouched and still denies a genuinely blocked/PII-flagged
+                # response regardless of ceiling -- does NOT weaken real content
+                # inspection, only corrects a ceiling meant to distinguish
+                # privilege tiers that was never meant to cap an agent's own
+                # self-call below what an equivalent internal caller already gets.
                 if _state.agent_registry is not None:
                     try:
                         agent = _state.agent_registry.get(token_identity_id)
@@ -5185,7 +5213,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                                 "groups": agent.get("groups", []),
                                 "allowed_models": [],
                                 "allowed_paths": agent.get("allowed_paths", []),
-                                "sensitivity_ceiling": "INTERNAL",
+                                "sensitivity_ceiling": "RESTRICTED",
                             }
                     except Exception as exc:
                         logger.warning(
@@ -5195,7 +5223,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                 # Fallback: generic P1 agent identity (no elevated privilege)
                 return {"identity_id": token_identity_id, "kind": "agent",
                         "status": "active", "groups": [], "allowed_models": [],
-                        "sensitivity_ceiling": "INTERNAL"}
+                        "sensitivity_ceiling": "RESTRICTED"}
 
         # ── Shared _INTERNAL_BEARER path (backward compat) ─────────────────
         if hmac.compare_digest(key, _INTERNAL_BEARER):
