@@ -1359,7 +1359,7 @@ def create_backoffice_app() -> FastAPI:
             if not any(request.cookies.get(k) for k in _admin_cookies):
                 return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
 
-            # YSG-RISK-176(admin-shell): a session cookie's mere PRESENCE used
+            # YSG-RISK-177(admin-shell): a session cookie's mere PRESENCE used
             # to be sufficient to receive the 200 admin shell — including a
             # perfectly valid USER-tier session. Every underlying /admin/*
             # API call already correctly 403s for a non-admin caller
@@ -1368,16 +1368,39 @@ def create_backoffice_app() -> FastAPI:
             # but still confirms the admin UI's existence/asset surface to a
             # caller who should not be able to tell. Resolve the session and
             # require admin tier BEFORE serving the shell, mirroring
-            # middleware.require_admin_session's tier check exactly (same
-            # account_tier == "admin" condition, including the
-            # admin_password_change_required tier, which is also correctly
-            # denied here since it is != "admin").
+            # middleware.require_admin_session's semantics exactly (same
+            # branch structure and error bodies, not just the same final
+            # allow/deny outcome — Iris integration audit LOW #4):
+            #   - no session at all (cookie present but the store no longer
+            #     recognises the token — expired / invalidated) is treated
+            #     the SAME as "not logged in" -> friendly redirect to login,
+            #     not a bare 403 (require_admin_session itself raises 401
+            #     for this case, i.e. "please authenticate", never 403).
+            #   - a VALID session in the admin_password_change_required tier
+            #     gets the SAME actionable 403 body require_admin_session
+            #     returns for it (not the generic insufficient_tier message)
+            #     so the caller knows to POST /auth/password/change.
+            #   - any other VALID non-admin tier gets 403 insufficient_tier.
             from yashigani.backoffice.middleware import _resolve_token, get_session_store
 
             token = _resolve_token(request)
             store = get_session_store()
             session = store.get(token) if token else None
-            if session is None or session.account_tier != "admin":
+            if session is None:
+                return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
+            if session.account_tier == "admin_password_change_required":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "admin_password_change_required",
+                        "message": (
+                            "You must change your password before accessing "
+                            "admin functions. POST to /auth/password/change "
+                            "to set a new password."
+                        ),
+                    },
+                )
+            if session.account_tier != "admin":
                 return JSONResponse(
                     status_code=403,
                     content={"error": "insufficient_tier"},

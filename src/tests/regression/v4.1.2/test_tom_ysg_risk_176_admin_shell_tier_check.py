@@ -137,7 +137,12 @@ class TestAdminShellTierCheck:
 
     def test_expired_or_invalid_session_is_forbidden(self):
         """A session cookie is present but the store no longer recognises
-        the token (expired/invalidated) -- must not 200."""
+        the token (expired/invalidated) -- must not 200, and must be
+        treated the SAME as "not logged in" (friendly redirect to login,
+        NOT a bare 403 -- Iris integration audit LOW #4: require_admin_session
+        itself raises 401/"please re-authenticate" for this exact case, never
+        403, so the /admin/ shell preflight must mirror that, not diverge
+        into a confusing 403 for someone who simply needs to log back in)."""
         with _caddy_bypass() as secret:
             app, client = _make_backoffice_client(session_cookie="stale-token")
             mock_state, original = _inject_session_store("stale-token", tier=None)
@@ -147,8 +152,37 @@ class TestAdminShellTierCheck:
                     headers={"X-Caddy-Verified-Secret": secret},
                     follow_redirects=False,
                 )
-                assert response.status_code != 200
-                assert response.status_code in (401, 403)
+                assert response.status_code == 302, (
+                    f"YSG-RISK-177 LOW#4 regression: expired/invalid session "
+                    f"got {response.status_code} (expected 302 redirect to "
+                    f"login, mirroring require_admin_session's no-session "
+                    f"handling — 403 is reserved for a VALID non-admin "
+                    f"session)."
+                )
+                assert "/admin/login" in response.headers.get("location", "")
+            finally:
+                from yashigani.backoffice import state as _state_mod
+                _state_mod.backoffice_state = original
+
+    def test_admin_password_change_required_tier_gets_actionable_message(self):
+        """The admin_password_change_required tier must get the SAME
+        actionable error body require_admin_session returns for it (not the
+        generic insufficient_tier message) -- Iris LOW #4."""
+        with _caddy_bypass() as secret:
+            app, client = _make_backoffice_client(session_cookie="pwchange-token")
+            mock_state, original = _inject_session_store(
+                "pwchange-token", tier="admin_password_change_required"
+            )
+            try:
+                response = client.get(
+                    "/admin/",
+                    headers={"X-Caddy-Verified-Secret": secret},
+                    follow_redirects=False,
+                )
+                assert response.status_code == 403
+                body = response.json()
+                assert body.get("error") == "admin_password_change_required"
+                assert "password" in body.get("message", "").lower()
             finally:
                 from yashigani.backoffice import state as _state_mod
                 _state_mod.backoffice_state = original

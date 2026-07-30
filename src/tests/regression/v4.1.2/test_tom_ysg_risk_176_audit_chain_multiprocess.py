@@ -355,3 +355,85 @@ class TestAuditChainDbConcurrencyAlgorithm:
             f"seq-ordered links broken under {n_workers}-way concurrent "
             f"transactions (should be 0 post-fix)."
         )
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-177 P1 (Iris integration audit, 2026-07-30): the chainlock sidecar
+# must survive log retention pruning. writer.py:257 (pre-P1-fix) named the
+# lock "<log>.chainlock" -- e.g. "audit.log.chainlock" -- which matches
+# _delete_old_logs()'s hardcoded glob "audit.log.*". Once the lock file's
+# mtime aged past retention_days on a long-lived deployment, a size-triggered
+# rotation would fire _delete_old_logs(), unlink the lock, and the next
+# process to open the path (restart / redeploy / HPA scale-out) would get a
+# FRESH inode -- flock no longer serialises against processes still holding
+# the old inode's lock, silently undoing the whole YSG-RISK-176/177 fix over
+# time. Fix: the lock is now named OUTSIDE the "audit.log.*" namespace AND
+# _delete_old_logs() explicitly skips self._chain_lock_path by identity.
+# ---------------------------------------------------------------------------
+
+class TestChainLockSurvivesRetentionPrune:
+    def test_retention_prune_does_not_delete_chainlock(self, tmp_path: Path):
+        """A chainlock aged well past retention_days, sitting alongside a
+        rotated log that SHOULD be pruned, must survive _delete_old_logs()
+        while the genuinely-stale rotated log is still removed."""
+        import os
+        import time as _time
+
+        from yashigani.audit.config import AuditConfig
+        from yashigani.audit.scope import MaskingScopeConfig
+        from yashigani.audit.writer import AuditLogWriter
+
+        log_path = tmp_path / "audit.log"
+        config = AuditConfig(log_path=str(log_path), max_file_size_mb=1000, retention_days=1)
+        writer = AuditLogWriter(config=config, masking_scope=MaskingScopeConfig())
+        try:
+            chainlock_path = writer._chain_lock_path
+            assert chainlock_path.exists(), "chainlock sidecar must be created at __init__"
+
+            # A genuinely stale rotated log (mimics real rotation output).
+            stale_rotated = tmp_path / "audit.log.20260101-000000"
+            stale_rotated.write_text("{}\n")
+
+            # Age BOTH the chainlock and the stale rotated log well past the
+            # 1-day retention window configured above.
+            old_ts = _time.time() - (10 * 86400)
+            os.utime(chainlock_path, (old_ts, old_ts))
+            os.utime(stale_rotated, (old_ts, old_ts))
+
+            writer._delete_old_logs()
+
+            assert chainlock_path.exists(), (
+                "YSG-RISK-177 regression: the cross-process chain lock "
+                "sidecar was deleted by the retention prune -- the NEXT "
+                "process to open this path gets a fresh inode and silently "
+                "stops serialising against processes still holding the old "
+                "inode's flock, re-fragmenting the chain."
+            )
+            assert not stale_rotated.exists(), (
+                "retention pruning of genuinely stale rotated logs must "
+                "still work -- the fix must not just skip everything."
+            )
+        finally:
+            writer.close()
+
+    def test_chainlock_name_is_outside_audit_log_glob_namespace(self, tmp_path: Path):
+        """Defence-in-depth check on the naming convention itself: the
+        chainlock's filename must NOT match the "audit.log.*" glob pattern
+        _delete_old_logs() uses, independent of the explicit identity-skip
+        above (belt-and-suspenders per the Iris finding)."""
+        import fnmatch
+
+        from yashigani.audit.config import AuditConfig
+        from yashigani.audit.scope import MaskingScopeConfig
+        from yashigani.audit.writer import AuditLogWriter
+
+        log_path = tmp_path / "audit.log"
+        config = AuditConfig(log_path=str(log_path), max_file_size_mb=1000, retention_days=90)
+        writer = AuditLogWriter(config=config, masking_scope=MaskingScopeConfig())
+        try:
+            assert not fnmatch.fnmatch(writer._chain_lock_path.name, "audit.log.*"), (
+                f"chainlock name {writer._chain_lock_path.name!r} matches the "
+                f"retention-prune glob 'audit.log.*' -- naming regression."
+            )
+        finally:
+            writer.close()

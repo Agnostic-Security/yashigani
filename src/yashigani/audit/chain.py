@@ -212,6 +212,29 @@ class AuditChainService:
     def compute_hashes_for_event(self, event_dict: dict) -> tuple[str, str]:
         """Compute (prev_hash, event_hash) for an event about to be inserted.
 
+        DEAD IN PRODUCTION as of YSG-RISK-176/177 (2026-07-30) — superseded
+        by compute_hashes_for_event_db() below. This method's in-memory
+        (self._last_hash, self._current_day) state, protected only by a
+        per-INSTANCE threading.Lock, is single-process-safe ONLY: with
+        multiple gunicorn/uvicorn worker processes (the gateway alone runs
+        two — mTLS :8080 + mesh :8081 — each with its own AuditChainService
+        instance via build_postgres_audit_sink()), the chain diverged across
+        processes (a live query under normal concurrent traffic found 4/56
+        broken links, zero tampering). PostgresSink._flush_batch (the only
+        production caller) now calls compute_hashes_for_event_db() instead,
+        which derives prev_hash from the database's own seq-ordered last row
+        under a transaction-scoped pg_advisory_xact_lock — correct across
+        every process/connection.
+
+        Kept ONLY for the existing single-process unit/integration test
+        suite (src/tests/unit/test_lu_amend_01_*.py,
+        src/tests/integration/test_lu_amend_01_*.py,
+        src/tests/regression/v2.25.2/test_irrevocable_audit_chain.py) that
+        exercises the hashing algorithm itself without a DB connection. Do
+        NOT wire this into any new production call site — use
+        compute_hashes_for_event_db() for anything that writes to
+        audit_events.
+
         Returns:
             (prev_hash, event_hash) — both SHA-384 hex strings.
 
