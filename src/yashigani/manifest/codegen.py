@@ -876,6 +876,11 @@ def _ringfence_init_service_lines(
         "    environment:",
         "      RINGFENCE_CADDY_HOST: caddy",
         '      RINGFENCE_CADDY_PORT: "%d"' % caddy_port,
+        # YSG-RISK-166: FALLBACK ONLY — see the matching comment in the
+        # egress-forwarder's ringfence-init emission below, and
+        # docker/ringfence-init/ringfence-init.sh's _detect_dns_servers().
+        # Runtime auto-detection from /etc/resolv.conf is the real source of
+        # truth now; this literal is never authoritative on Podman.
         '      RINGFENCE_DNS_SERVER: "127.0.0.11"',
         '      RINGFENCE_RUNTIME: "%s"' % runtime,
         '      RINGFENCE_AGENT_NAME: "%s"' % agent_name,
@@ -2601,6 +2606,15 @@ def _gen_egress_forwarder_compose(
             "    environment:",
             "      RINGFENCE_CADDY_HOST: caddy",
             '      RINGFENCE_CADDY_PORT: "%d"' % _EGRESS_GATEWAY_PORT,
+            # YSG-RISK-166: this is a FALLBACK ONLY. ringfence-init.sh
+            # auto-detects the real per-netns resolver(s) live from
+            # /etc/resolv.conf before this value is ever consulted — Docker's
+            # 127.0.0.11 is stable and matches what detection finds anyway
+            # (no Docker behaviour change); Podman's per-network
+            # aardvark-dns/dnsname gateway IP is NOT 127.0.0.11 and varies
+            # per install/network, so it can only be correctly discovered at
+            # runtime, not baked in here. Do not "fix" this by hardcoding a
+            # different literal — see docker/ringfence-init/ringfence-init.sh.
             '      RINGFENCE_DNS_SERVER: "127.0.0.11"',
             '      RINGFENCE_RUNTIME: "%s"' % runtime,
             '      RINGFENCE_AGENT_NAME: "%s"' % fwd_svc,

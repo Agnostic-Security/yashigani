@@ -3170,6 +3170,25 @@ _apply_deploy_defaults() {
   case "$DEPLOY_MODE" in
     demo)
       [[ "$MODE_EXPLICIT" -eq 0 ]] && MODE="compose"
+      # YSG-RISK-165: on --upgrade, an operator who forgets to re-pass --domain
+      # must NOT have their TLS domain silently reset to "localhost" — Caddy's
+      # public vhost would then no longer match the real hostname and every
+      # route falls through to the empty-body 200 catch-all (silent breakage).
+      # Read the persisted YASHIGANI_TLS_DOMAIN back from the existing
+      # docker/.env FIRST (same pattern as provision_aes_key's DB_AES_KEY
+      # reuse, below) and only fall back to "localhost" when there is no
+      # persisted value — i.e. a genuine fresh install.
+      if [[ -z "$DOMAIN" && "${UPGRADE:-false}" == "true" ]]; then
+        local _persisted_domain=""
+        local _env_file="${WORK_DIR}/docker/.env"
+        if [[ -n "${WORK_DIR:-}" && -f "$_env_file" ]]; then
+          _persisted_domain="$(grep -m1 '^YASHIGANI_TLS_DOMAIN=' "$_env_file" 2>/dev/null | cut -d= -f2- || true)"
+        fi
+        if [[ -n "$_persisted_domain" ]]; then
+          DOMAIN="$_persisted_domain"
+          log_info "Domain: preserved '${DOMAIN}' from existing .env (--upgrade, no --domain passed)"
+        fi
+      fi
       DOMAIN="${DOMAIN:-localhost}"
       TLS_MODE="selfsigned"
       SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
@@ -10702,6 +10721,12 @@ run_health_check() {
   # agents return 404 "model not found". Non-fatal: the core stack is healthy;
   # the operator can re-run 'docker compose --profile <profile> run ollama-init'.
   _check_ollama_init_exit "${WORK_DIR}/docker"
+
+  # YSG-RISK-165/166: install-"healthy" previously passed while agent dispatch
+  # was silently broken (egress-forwarder DNS hardcoded to Docker's
+  # 127.0.0.11 — dead on Podman). FATAL, not a warning: a green install that
+  # cannot dispatch to any onboarded agent is a false green.
+  _check_agent_dispatch_smoke "${WORK_DIR}/docker"
 }
 
 # _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
@@ -10837,6 +10862,110 @@ _check_ollama_init_exit() {
     log_warn "################################################################"
   else
     log_success "ollama-init exited cleanly (models pulled successfully)"
+  fi
+}
+
+# _check_agent_dispatch_smoke — YSG-RISK-165/166.
+#
+# GAP THIS CLOSES: every check above (Gateway/Backoffice/Postgres/Redis/OPA/
+# Ollama healthz) proves each service's OWN listener answers. None of them
+# ever exercised the actual per-agent EGRESS DATA PATH: agent -> its
+# egress-forwarder (:9400) -> caddy:18790 -> /egress/eval. YSG-RISK-166
+# (egress-forwarder's ringfence-init DNS ACCEPT rule hardcoded to Docker's
+# 127.0.0.11 — dead on Podman, whose per-network aardvark-dns/dnsname
+# resolver lives at a different, per-install IP) broke exactly this path
+# while every one of the checks above still reported healthy — a silent,
+# install-"green" regression. This check closes that blind spot.
+#
+# SCOPE — a CONNECTIVITY probe, not a functional-dispatch probe. It proves
+# the forwarder's `reverse_proxy https://caddy:18790` hop can resolve DNS and
+# complete a TLS handshake to Caddy. It deliberately does NOT assert a 200
+# from a real agent payload — that requires a live OPA-approved manifest and
+# is the Tier-C live acceptance gate's job (design §8 item 4, Laura co-sign),
+# run against scripts/release_gate_probe.sh, not duplicated here.
+#
+# Verdict rule (per-agent, only for profiles actually selected):
+#   FATAL  — the forwarder's own reverse_proxy to caddy:18790 returned 502
+#            or 504 (Bad Gateway / Gateway Timeout — Caddy's own signal that
+#            IT could not reach ITS upstream), or curl could not complete
+#            the request at all (exit != 0, http_code 000). This is the
+#            exact signature of a broken forwarder-to-Caddy data path
+#            (YSG-RISK-166's failure mode) — hard-block, not a warning,
+#            because a green install with broken agent dispatch is a false
+#            green (YSG-RISK-165's other half of this finding).
+#   PASS   — any other HTTP status (2xx/3xx/4xx other than 502/504). Caddy
+#            successfully dialled its upstream and returned SOME response
+#            (even an OPA policy denial) — the data path is intact; the
+#            response content is a POLICY question, out of scope here.
+_check_agent_dispatch_smoke() {
+  local _compose_dir="${1:-${WORK_DIR}/docker}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "Agent-dispatch connectivity smoke (egress-forwarder -> caddy:18790) per active profile"
+    return 0
+  fi
+
+  # K8s uses the NetworkPolicy overlay for egress containment, not this
+  # compose-only forwarder sidecar — not applicable there.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+
+  local _rt="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _rt="podman"
+
+  local _p _checked=false _had_failure=false
+  for _p in "${COMPOSE_PROFILES[@]:-}"; do
+    case "$_p" in
+      langflow|letta|openclaw) ;;
+      *) continue ;;
+    esac
+    _checked=true
+
+    local _fwd_ctr
+    _fwd_ctr="$("$_rt" ps --filter "name=egress-${_p}" --format '{{.Names}}' 2>/dev/null | head -1 || true)"
+    if [[ -z "$_fwd_ctr" ]]; then
+      log_warn "Agent-dispatch smoke (${_p}): egress-${_p} container not found — skipping (not yet up)"
+      continue
+    fi
+
+    # curl (not wget) so the HTTP status code is captured cleanly — curl is
+    # already present in the forwarder's base caddy:alpine image (see
+    # docker/caddy/Dockerfile.caddy YSG-CVE-V412-028 comment). A synthetic
+    # path is used deliberately: /llm/* is handled (reverse_proxy to
+    # caddy:18790) regardless of what follows the prefix, and this check
+    # only cares whether THAT hop completed, not what OPA decides about it.
+    local _code
+    _code="$("$_rt" exec "$_fwd_ctr" curl -s -o /dev/null -w '%{http_code}' \
+      --max-time 5 "http://127.0.0.1:9400/llm/__ysg_dispatch_smoke__" 2>/dev/null || printf '000')"
+
+    case "$_code" in
+      000|502|504)
+        log_error "################################################################"
+        log_error "FATAL: YSG-RISK-166 regression — agent-dispatch smoke FAILED (${_p})"
+        log_error "  egress-${_p} -> caddy:18790 returned HTTP ${_code} (000 = no response/"
+        log_error "  connection failure; 502/504 = Caddy could not reach ITS upstream)."
+        log_error "  This is the signature of a broken egress-forwarder data path — most"
+        log_error "  likely the ringfence-init DNS ACCEPT rule does not match the resolver"
+        log_error "  this runtime actually uses (YSG-RISK-166). Agent dispatch (@${_p}) is"
+        log_error "  BROKEN even though every other health check above passed."
+        log_error "  Debug: ${_rt} logs egress-${_p}  /  ${_rt} logs ringfence-init-egress-${_p}"
+        log_error "################################################################"
+        _had_failure=true
+        ;;
+      *)
+        log_success "Agent-dispatch smoke (${_p}): egress-${_p} -> caddy:18790 reachable (HTTP ${_code})"
+        ;;
+    esac
+  done
+
+  if [[ "$_checked" == "false" ]]; then
+    log_info "Agent-dispatch smoke: no langflow/letta/openclaw profile active — skipped"
+    return 0
+  fi
+
+  if [[ "$_had_failure" == "true" ]]; then
+    exit 1
   fi
 }
 
