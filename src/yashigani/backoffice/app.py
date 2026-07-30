@@ -1252,6 +1252,28 @@ def create_backoffice_app() -> FastAPI:
     async def healthz():
         return {"status": "ok"}
 
+    # YSG-RISK-179 — dependency-checked readiness probe (backoffice leg).
+    # See gateway/proxy.py readyz for the full rationale: /healthz stays a
+    # shallow liveness probe; /readyz checks postgres + redis reachability
+    # and returns 503 when a configured dependency is unreachable.
+    @app.get("/readyz")
+    async def readyz():
+        from yashigani.backoffice.state import backoffice_state
+        from yashigani.net.readiness import dependency_readiness
+
+        _redis_client = None
+        for _dep in (backoffice_state.rate_limiter, backoffice_state.anomaly_detector):
+            _client = getattr(_dep, "_redis", None)
+            if _client is not None:
+                _redis_client = _client
+                break
+
+        ready, detail = await dependency_readiness(_redis_client)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "checks": detail},
+        )
+
     # Internal Prometheus metrics endpoint — Caddy-gated with SPIFFE URI ACL.
     # EX-231-08 (v2.23.1, zero-trust default): Prometheus scrapes via Caddy's
     # :8444 internal listener; Caddy validates the peer cert and sets
