@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -64,7 +65,7 @@ def perm_page():
     creds = get_admin_credentials()
     ctx_args = {"ignore_https_errors": True}
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(**ctx_args)
         page = ctx.new_page()
         _login(page, creds)

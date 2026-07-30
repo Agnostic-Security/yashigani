@@ -184,15 +184,22 @@ run_tier_b() {
 
   for mode in "${modes[@]}"; do
     _info "Playwright ${mode}: WebUI conformance (39 pages/34 forms/137 buttons, 2x2 admin+user x WebUI+API) + adversarial"
-    local headed_flag=""
-    [ "$mode" = "headed" ] && headed_flag="--headed"
+    # NOTE (2026-07-30, Ava): "--headed" is not a registered pytest CLI option
+    # in this suite (no pytest-playwright plugin, no pytest_addoption) -- it
+    # was previously being passed as a bare pytest arg and would raise a
+    # usage error (exit 4), not a real headed run. Every chromium.launch()
+    # call site now goes through conftest.launch_chromium(), which reads the
+    # YTF_HEADED env var instead. Fixed here to match.
+    local headed_env="0"
+    [ "$mode" = "headed" ] && headed_env="1"
     local mode_rc=0
     YASHIGANI_ADMIN_URL="$TARGET" \
     YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
     YTF_LEG="$leg" \
+    YTF_HEADED="$headed_env" \
     PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
       "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
-      -q --tb=short $headed_flag \
+      -q --tb=short \
       --junitxml="${evidence_dir}/pytest-junit-${mode}.xml" \
       | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=1
     if [ "$mode_rc" -eq 0 ]; then _pass "Playwright ${mode} — leg ${leg}"; else _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log)"; rc=1; fi

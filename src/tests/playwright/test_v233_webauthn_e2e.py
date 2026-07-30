@@ -77,6 +77,7 @@ from typing import Optional
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -488,7 +489,7 @@ def browser_page_with_va():
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
 

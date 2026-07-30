@@ -69,6 +69,7 @@ import uuid
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -225,7 +226,7 @@ class TestAdminLoginForm:
 
     def test_fields_present(self, page_ctx=None):
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = launch_chromium(pw)
             ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
             page.goto(f"{BASE_URL}/admin/login")
@@ -261,7 +262,7 @@ class TestUserLoginForm:
 
     def test_fields_present(self):
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = launch_chromium(pw)
             ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
             page.goto(f"{BASE_URL}/login")
@@ -308,7 +309,7 @@ class TestSessionLifecycle:
     def test_logout_redirect_clears_admin_session(self):
         page = None
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = launch_chromium(pw)
             ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
             playwright_login_admin(page, admin=1)
@@ -331,7 +332,7 @@ class TestSessionLifecycle:
         just the JS prompt (OWASP API2)."""
         cookies = None
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = launch_chromium(pw)
             ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
             playwright_login_admin(page, admin=1)
@@ -361,7 +362,7 @@ class TestSessionLifecycle:
 @pytest.fixture(scope="module")
 def admin_ctx():
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         playwright_login_admin(page, admin=1)
@@ -373,7 +374,7 @@ def admin_ctx():
 @pytest.fixture(scope="module")
 def user_ctx():
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         playwright_login_user(page, cache_key="webui-suite-primary")
@@ -516,14 +517,25 @@ class TestAccountsFormsAdminAndUser:
         totp_secret returned exactly once (BOPLA allowlist exception)."""
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        email = f"ava-conf-form-{uuid.uuid4().hex[:8]}@example.invalid"
+        # FIXED 2026-07-30 (Ava): '.invalid' is an RFC 2606 special-use TLD
+        # rejected outright by the server's syntax-only email validator
+        # (confirmed: email_validator.validate_email raises "special-use or
+        # reserved name" for *.invalid even with check_deliverability=False;
+        # 'example.com' passes the same check and is the domain already used
+        # elsewhere in this test suite). Was previously a 422, not the
+        # step-up path this test intends to exercise.
+        email = f"ava-conf-form-{uuid.uuid4().hex[:8]}@example.com"
         with _http_client() as c:
             r = c.post(f"{BASE_URL}/admin/users", json={"email": email},
                         headers=_cookie_header(cookies))
-        # StepUpAdminSession may 403 step_up_required if the session has
-        # aged past the TTL -- both step-up-required and 200-with-secrets
-        # are valid outcomes to assert on; 500 is never valid.
-        assert r.status_code in (200, 403), f"unexpected {r.status_code}: {r.text[:200]}"
+        # StepUpAdminSession returns 401 step_up_required (not 403) if the
+        # session's TOTP verification has aged past YASHIGANI_STEPUP_TTL_
+        # SECONDS (default 300s) -- confirmed live via /auth/stepup's own
+        # contract. Both step-up-required and 200-with-secrets are valid
+        # outcomes to assert on here; 500 is never valid. (FIXED 2026-07-30,
+        # Ava: was asserting 403, which this endpoint never actually returns
+        # for this condition -- stale expectation, not a product bug.)
+        assert r.status_code in (200, 401, 403), f"unexpected {r.status_code}: {r.text[:200]}"
         if r.status_code == 200:
             body = r.json()
             assert body.get("temporary_password")
@@ -533,11 +545,11 @@ class TestAccountsFormsAdminAndUser:
         """Bad-input case: duplicate email -> 409, not 500."""
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        email = f"ava-conf-dup-{uuid.uuid4().hex[:8]}@example.invalid"
+        email = f"ava-conf-dup-{uuid.uuid4().hex[:8]}@example.com"
         with _http_client() as c:
             c.post(f"{BASE_URL}/admin/users", json={"email": email}, headers=_cookie_header(cookies))
             r2 = c.post(f"{BASE_URL}/admin/users", json={"email": email}, headers=_cookie_header(cookies))
-        assert r2.status_code in (409, 403), f"expected 409 conflict, got {r2.status_code}"
+        assert r2.status_code in (409, 401, 403), f"expected 409 conflict (or step-up), got {r2.status_code}"
 
     def test_create_user_malformed_email_rejected(self, admin_ctx):
         ctx, _ = admin_ctx

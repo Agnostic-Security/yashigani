@@ -20,10 +20,70 @@ add TOTP helpers; F9: admin TOTP corrected to HMAC-SHA-512/8-digit)
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 from typing import Optional
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Domain-routed target support (added 2026-07-30, Ava, Tier-B leg
+# v412-ytf-podman-13033ff9): Caddy in this deployment routes by vhost
+# (e.g. https://yashigani.local:8443), and a bare-IP/bare-"localhost" Host
+# falls through to a default/catch-all 200 (see YTF status.md "Health gate"
+# finding) -- a false-green trap. The correct fix is DNS-level: keep the
+# Host header / TLS SNI as the real domain, only change *where* it resolves.
+# On a locked-down runner without sudo (no /etc/hosts edit permitted --
+# feedback_mac_max_no_sudo.md), this must happen in-process:
+#   - httpx/urllib3 (used by conftest's own health probes + API-plane
+#     assertions in the test files) resolve via socket.getaddrinfo --
+#     patched below, scoped to the exact YASHIGANI_TEST_DOMAIN hostname only.
+#   - Chromium is a separate process and does its own DNS resolution;
+#     it is NOT affected by the getaddrinfo patch. It needs the equivalent
+#     --host-resolver-rules launch flag, which is why every browser launch
+#     in this suite should go through launch_chromium() below instead of
+#     calling pw.chromium.launch() directly.
+# Both mechanisms are additive/reversible test-harness config -- no system
+# file is touched, no other hostname's resolution is altered.
+# ---------------------------------------------------------------------------
+
+YTF_TEST_DOMAIN = os.getenv("YASHIGANI_TEST_DOMAIN", "yashigani.local")
+YTF_TEST_TARGET_IP = os.getenv("YASHIGANI_TEST_TARGET_IP", "127.0.0.1")
+
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _patched_getaddrinfo(host, *args, **kwargs):
+    if host == YTF_TEST_DOMAIN:
+        host = YTF_TEST_TARGET_IP
+    return _real_getaddrinfo(host, *args, **kwargs)
+
+
+socket.getaddrinfo = _patched_getaddrinfo  # process-scoped, single hostname only
+
+# Chromium launch args: force DNS for YTF_TEST_DOMAIN to YTF_TEST_TARGET_IP
+# while leaving the Host header / TLS SNI as the original domain, so Caddy's
+# vhost routing sees the real hostname (this is what --resolve does for curl;
+# --host-resolver-rules is the Chromium-native equivalent).
+YTF_CHROMIUM_ARGS = [f"--host-resolver-rules=MAP {YTF_TEST_DOMAIN} {YTF_TEST_TARGET_IP}"]
+
+# Headed/headless mode: run-test-framework.sh's --browser-mode flag maps here
+# via YTF_HEADED=1 (see scripts/run-test-framework.sh Tier-B leg). Prior code
+# hardcoded headless=True in every fixture across all 8 playwright test files
+# -- "headed" mode never actually executed a headed browser regardless of any
+# CLI flag. Fixed 2026-07-30 (Ava): every chromium.launch() call site now
+# goes through launch_chromium() below.
+YTF_HEADLESS = os.getenv("YTF_HEADED", "0") != "1"
+
+
+def launch_chromium(pw_or_playwright):
+    """Shared Chromium launcher for every Tier-B test file. Honors YTF_HEADED
+    (headed/headless parity) and always injects --host-resolver-rules so
+    tests can target a domain-routed Caddy vhost without a privileged
+    /etc/hosts edit. Use this instead of calling `pw.chromium.launch()`
+    directly."""
+    return pw_or_playwright.chromium.launch(headless=YTF_HEADLESS, args=YTF_CHROMIUM_ARGS)
 
 
 # ---------------------------------------------------------------------------
@@ -32,16 +92,32 @@ import pytest
 
 
 def _resolve_ca_cert() -> Optional[str]:
+    """Return a CA cert path to verify httpx TLS connections against, or None
+    to mean "don't attempt cert-chain verification" (verify=False, mirroring
+    the already-accepted-risk posture every Playwright/Chromium test in this
+    suite takes via new_context(ignore_https_errors=True) for local test
+    traffic -- see test_backup_ui.py._tls_args docstring).
+
+    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): this
+    previously auto-discovered docker/secrets/ca_root.crt unconditionally.
+    For a `--tls-mode selfsigned` install (this deployment), Caddy's public
+    HTTPS listener presents a cert chain issued by Caddy's OWN internal local
+    CA ("Caddy Local Authority - ECC Intermediate"), NOT ca_root.crt (which is
+    "Yashigani Internal Root CA" -- a distinct CA used elsewhere, e.g.
+    mTLS/document-signing). Verified directly:
+      openssl s_client -connect 127.0.0.1:8443 -servername yashigani.local \\
+        -CAfile docker/secrets/ca_root.crt
+      -> Verify return code: 20 (unable to get local issuer certificate)
+    Auto-trusting ca_root.crt for the public listener therefore ALWAYS fails
+    verification on a selfsigned-mode deployment (this caused ~322
+    CERTIFICATE_VERIFY_FAILED / TLS-handshake failures across the httpx-based
+    portion of this suite, unrelated to any product defect or DNS/host-resolver
+    change). Only use an explicit CA when the caller KNOWS it matches (e.g. a
+    `--tls-mode ca` deployment with a real issued cert) via YASHIGANI_CA_CERT.
+    """
     explicit = os.getenv("YASHIGANI_CA_CERT")
     if explicit:
         return explicit
-    candidates = [
-        Path(__file__).parents[3] / "docker" / "secrets" / "ca_root.crt",
-        Path("/run/secrets/ca_root.crt"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return str(p)
     return None
 
 
@@ -67,7 +143,7 @@ def _resolve_base_url() -> str:
         import httpx
 
         for url in candidates:
-            verify: bool | str = _CA_CERT_PATH if url.startswith("https://") else False  # type: ignore[assignment]
+            verify: bool | str = (_CA_CERT_PATH or False) if url.startswith("https://") else False  # type: ignore[assignment]
             try:
                 r = httpx.get(f"{url}/healthz", verify=verify, timeout=3)
                 if r.status_code == 200:
@@ -101,7 +177,7 @@ def _stack_running() -> bool:
     ]
     for url in candidates:
         try:
-            verify: bool | str = _CA_CERT_PATH if url.startswith("https://") else False  # type: ignore[assignment]
+            verify: bool | str = (_CA_CERT_PATH or False) if url.startswith("https://") else False  # type: ignore[assignment]
             r = httpx.get(url, verify=verify, timeout=3)
             if r.status_code == 200:
                 return True
@@ -413,13 +489,25 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
         page.goto(f"{BASE_URL}/admin/")
         page.wait_for_timeout(3000)
 
-    # Confirm admin dashboard elements are present
+    # Confirm admin dashboard elements are present.
+    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the previous
+    # selector ("#page-dashboard, #nav-links, #health-cards") targeted the
+    # LEGACY 3.0-era dashboard.html template (backoffice/templates/dashboard.html).
+    # The currently-served /admin/ app is ui4 (backoffice/static/ui4/admin/admin.html
+    # -- root custom element <ys-admin-app>, module nav rendered as
+    # `a[href='#module-id']` per module-registry.js / admin-nav.js), which never
+    # renders those legacy IDs. This caused EVERY test depending on this shared
+    # login helper to fail immediately after an otherwise-successful login
+    # (confirmed: the server-side session was valid -- see the module's own
+    # test_nav_entry_present using `a[href='#{module_id}']`, and the direct
+    # curl-based 5-step bootstrap evidence in tier-b-ava/step5_relogin_final.json
+    # -- this was a stale test-helper assertion, not a product defect).
     assert "/admin/login" not in page.url, (
         f"Still on login page after admin{admin} login — URL: {page.url}\n"
         "Possible: TOTP replay, wrong credentials, throttle."
     )
-    assert page.locator("#page-dashboard, #nav-links, #health-cards").count() > 0, (
-        f"Admin dashboard elements not found — URL: {page.url}"
+    assert page.locator("ys-admin-app, a[href^='#']").count() > 0, (
+        f"Admin app shell not found — URL: {page.url}"
     )
 
 
@@ -491,7 +579,20 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     _api_totp_last_used[1] = _time.time()
 
     unique = _uuid.uuid4().hex[:10]
-    email = f"ava-conf-{unique}@example.invalid"
+    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the server's
+    # email validator (email-validator, syntax-only / check_deliverability=False)
+    # rejects the ".invalid" TLD outright as an RFC 2606 special-use reserved
+    # name ("value is not a valid email address ... special-use or reserved
+    # name") -- confirmed directly:
+    #   python3 -c "from email_validator import validate_email;
+    #     validate_email('a@example.invalid', check_deliverability=False)"
+    #   -> EmailNotValidError. The SAME check accepts 'example.com' (also
+    # RFC 2606-reserved, but not on email-validator's syntax-reject list) --
+    # matches the domain already used by other test suites (test_user_
+    # documents_gaps_3_4_5.py, test_per_user_ratelimit.py, etc). This was
+    # blocking every bootstrap_user_session() caller (BOLA probes, documents/
+    # sensitivity/chat user-plane tests) with a 422, not a product defect.
+    email = f"ava-conf-{unique}@example.com"
 
     with httpx.Client(verify=verify, cookies=admin_cookies, follow_redirects=False, timeout=10) as c:
         stepup_resp = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": stepup_code})

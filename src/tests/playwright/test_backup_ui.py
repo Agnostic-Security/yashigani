@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -139,7 +140,7 @@ class TestBackupUI:
     """
 
     def _get_page(self, playwright):
-        browser = playwright.chromium.launch(headless=True, **_tls_args(playwright.chromium))
+        browser = launch_chromium(playwright)
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
         return browser, context, page

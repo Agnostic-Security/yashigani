@@ -28,6 +28,7 @@ import pytest
 import time as _time
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
@@ -122,7 +123,7 @@ def _navigate_to_pki(page) -> None:
 def test_pki_nav_button_exists():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(
             ignore_https_errors=True,
             **({"extra_http_headers": {"X-CA-Cert": _CA_CERT_PATH}} if _CA_CERT_PATH else {}),
@@ -149,7 +150,7 @@ def test_pki_nav_button_exists():
 def test_pki_status_table_loads():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -174,7 +175,7 @@ def test_pki_status_table_loads():
 def test_pki_view_chain_shows_detail():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -200,7 +201,7 @@ def test_pki_view_chain_shows_detail():
 def test_pki_chain_shows_fingerprint():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -227,7 +228,7 @@ def test_pki_chain_shows_fingerprint():
 def test_pki_chain_shows_cn_fields():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -251,7 +252,7 @@ def test_pki_chain_shows_cn_fields():
 def test_pki_rotate_triggers_stepup():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -284,7 +285,7 @@ def test_pki_rotate_triggers_stepup():
 def test_pki_download_bundle_fires_download():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
