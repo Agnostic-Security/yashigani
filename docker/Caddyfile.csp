@@ -73,7 +73,14 @@
     # served with zero CSP. Both the exact path AND the wildcard are kept:
     # exact for the page as it exists today, wildcard in case a sub-route
     # (e.g. /agents/new) is added later without another matcher-parity bug.
-    @strict_tt path /admin/ /admin4/ /chat /chat/* /agents /agents/* /builder /builder/* /workflows /workflows/* /user/* /flow/*
+    #
+    # `/` added (YSG-RISK-172-class fix): the bare-root 302 (@root_path handler,
+    # "/" -> "/chat") previously matched none of the four matchers above, so the
+    # redirect response carried no CSP header at all — inconsistent with every
+    # other redirect on the site (e.g. the /admin/login 302s, which match
+    # @strict_legacy via their request path). `/` redirects into @strict_tt
+    # territory (/chat), so it gets the same strict+Trusted-Types policy.
+    @strict_tt path /admin/ /admin4/ / /chat /chat/* /agents /agents/* /builder /builder/* /workflows /workflows/* /user/* /flow/*
 
     # frame-src 'self': explicit (default-src 'self' already implies it, but
     # stated for clarity -- admin pages iframe /admin/grafana/, /admin/wazuh/,
