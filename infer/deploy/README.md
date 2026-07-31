@@ -17,7 +17,7 @@ Convergence into the main compose/Helm surfaces is a follow-up integration step,
 infer/deploy/
 ├── manifests/llama-cpp-build-manifest.md   pinned-tag + build-flag record, per backend
 ├── docker/
-│   ├── Dockerfile.infer-{cuda,rocm,vulkan,cpu}   lean per-backend serving images (item 1)
+│   ├── Dockerfile.kuroshio-{cuda,rocm,vulkan,cpu}   lean per-backend serving images (item 1)
 │   ├── Dockerfile.kuroshio-puller                    blob-write-path-only, NO llama-server binary
 │   ├── Dockerfile.kuroshio-first-parse-jail          C1 jail image (item 2)
 │   ├── entrypoint/{kuroshio-entrypoint.sh,first-parse-jail-entrypoint.sh}
@@ -35,7 +35,7 @@ infer/deploy/
 
 ## Mapping to the 8 dispatch deliverables
 
-1. **Per-backend Dockerfiles** — `docker/Dockerfile.infer-{cuda,rocm,vulkan,cpu}`. Lean (not
+1. **Per-backend Dockerfiles** — `docker/Dockerfile.kuroshio-{cuda,rocm,vulkan,cpu}`. Lean (not
    `GGML_BACKEND_DL`), digest-pinned base image FROM lines (placeholders — see "Deferred"),
    pinned llama.cpp tag/commit (placeholder — see "Deferred"), build flags recorded in
    `manifests/llama-cpp-build-manifest.md`.
@@ -336,6 +336,18 @@ anti-pattern those findings closed. With the value empty:
 Before enabling day-one auto-pull in a real deploy: choose a default model, produce its signed
 provenance manifest (Nico/catalog.py's `SignedCatalog` admission gate), THEN set
 `kuroshioInit.model` / `YSG_KUROSHIO_INIT_MODEL` to that model's name.
+
+**Default-model decision LANDED (Tiago 2026-07-31) — manifest still gated.** The day-one default
+CHAT model is **Qwen2.5-7B-Instruct Q4_K_M** (licence **Apache-2.0, verified** — note Qwen2.5
+licences are non-uniform within the family: 7B/1.5B/0.5B/14B/32B are Apache-2.0 but 3B/72B are
+Qwen License; bundle/default/catalog models must be recognised-commercial-free ONLY, client
+imports of anything else get a non-blocking licence alert — see `src/kuroshio/licensing.py`).
+The value stays EMPTY here because the second half of the gate — the model's **signed provenance
+manifest minted with a real production key** (signing-infra custody, `scripts/keygen_manifest.py`
+provisioning note) — has not landed. When it does: mint the manifest, then set
+`kuroshioInit.model` / `YSG_KUROSHIO_INIT_MODEL` to the model name. Do NOT set the model name
+without the manifest — that recreates the unsigned-default anti-pattern this section exists to
+block.
 
 **Known v1-foundation limitation, not hidden:** `entrypoint.py` hardwires `pull_resolver=None`
 regardless of role (see "Coordination gap" above) — no source adapter is wired into any deploy
