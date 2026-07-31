@@ -241,6 +241,28 @@ def _grant_to_dict(resource_id: str, grant: BooleanGrantValue) -> dict:
     }
 
 
+def _audit_declaration_self_approval_denied(
+    account_id: str, resource_type: ResourceType, resource_id: str,
+) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    approve_declaration()'s self-approval DENY (v4.1.2 bug 3 distinct-approver
+    check). Shares DistinctApproverViolationEvent with dp_weaken.py's
+    identical maker!=checker SoD violation class. Audit failure must NEVER
+    block the deny."""
+    writer = backoffice_state.audit_writer
+    if writer is None:
+        return
+    try:
+        from yashigani.audit.schema import DistinctApproverViolationEvent
+        writer.write(DistinctApproverViolationEvent(
+            domain="permission_declaration",
+            account_id=account_id,
+            request_id=f"{resource_type.value}:{resource_id}",
+        ))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("approve_declaration: self-approval audit write failed: %s", exc)
+
+
 def _emit_grant_audit(
     admin_account: str,
     resource_type: ResourceType,
@@ -728,6 +750,7 @@ async def approve_declaration(
         )
     declaring_account_id = pending.get("declaring_account_id")
     if declaring_account_id and declaring_account_id == session.account_id:
+        _audit_declaration_self_approval_denied(session.account_id, rt, resource_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

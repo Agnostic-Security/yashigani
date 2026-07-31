@@ -219,6 +219,7 @@ def assert_privileged_mutation(
             "privileged_mutation DENIED (not operator): reason=%s principal=%s target=%s",
             ctx.reason, ctx.principal, ctx.target,
         )
+        _emit_privileged_mutation_denied_event(ctx, audit_writer, "not_operator")
         raise NotAuthorisedForPrivilegedMutation(ctx.reason)
 
     # Gate 2 — fresh step-up TOTP (unconditional).
@@ -227,10 +228,38 @@ def assert_privileged_mutation(
             "privileged_mutation STEP-UP REQUIRED: reason=%s principal=%s target=%s",
             ctx.reason, ctx.principal, ctx.target,
         )
+        _emit_privileged_mutation_denied_event(ctx, audit_writer, "step_up_required")
         raise StepUpRequired()
 
     # Gate 3 — uniform audit event (both gates passed; mutation is authorised).
     _emit_privileged_mutation_event(ctx, audit_writer)
+
+
+def _emit_privileged_mutation_denied_event(
+    ctx: PrivilegedMutationContext,
+    audit_writer: Any,
+    reason: str,
+) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for a DENY gate
+    in assert_privileged_mutation(). Audit failure must NEVER block the deny
+    — the exception the caller raises right after this is the actual
+    security control; this is forensic trail only.
+    """
+    if audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import PrivilegedMutationDeniedEvent
+        audit_writer.write(PrivilegedMutationDeniedEvent(
+            reason=reason,
+            mutation_reason=ctx.reason,
+            principal=ctx.principal,
+            target=ctx.target,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error(
+            "privileged_mutation: denied-event audit write failed reason=%s target=%s: %s",
+            reason, ctx.target, exc,
+        )
 
 
 def _emit_privileged_mutation_event(

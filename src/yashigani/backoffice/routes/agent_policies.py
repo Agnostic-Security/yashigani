@@ -276,15 +276,19 @@ def _resolve_agent_spiffe(
 # Tenant-scope authz helper (Laura F8)
 # ---------------------------------------------------------------------------
 
-def _assert_tenant_scope(path_tenant: str) -> None:
+def _assert_tenant_scope(path_tenant: str, session: Optional[Any] = None) -> None:
     """Verify the path tenant matches the configured installation tenant.
 
     Laura F8: the admin session's tenant scope must equal {tenant}, not merely
     'is-admin'.  In a single-tenant install the configured tenant is the ONLY
     valid tenant.  Multi-tenant: extend by carrying tenant_id on Session.
+
+    ``session`` is optional (best-effort audit context only) so existing
+    call sites without a session in scope still work unchanged.
     """
     configured_tenant = os.environ.get("YASHIGANI_TENANT_ID", "default").strip() or "default"
     if path_tenant != configured_tenant:
+        _audit_tenant_scope_violation(path_tenant, configured_tenant, session)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -295,6 +299,25 @@ def _assert_tenant_scope(path_tenant: str) -> None:
                 ),
             },
         )
+
+
+def _audit_tenant_scope_violation(
+    path_tenant: str, configured_tenant: str, session: Optional[Any],
+) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    _assert_tenant_scope()'s deny. Audit failure must NEVER block the deny."""
+    try:
+        from yashigani.backoffice.state import backoffice_state
+        if backoffice_state.audit_writer is None:
+            return
+        from yashigani.audit.schema import TenantScopeViolationEvent
+        backoffice_state.audit_writer.write(TenantScopeViolationEvent(
+            account_id=getattr(session, "account_id", "") or "",
+            path_tenant=path_tenant,
+            configured_tenant=configured_tenant,
+        ))
+    except Exception:  # pragma: no cover — audit must never break the deny
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +629,7 @@ async def _run_apply(
       9. Push egress grants to OPA (post-commit; fail-closed on push failure)
     """
     # 1. Tenant-scope authz
-    _assert_tenant_scope(tenant)
+    _assert_tenant_scope(tenant, session)
 
     store = _registry_store()
     audit = backoffice_state.audit_writer
@@ -925,7 +948,7 @@ async def revoke_grant(
     (prevents seed suppression from dropping, which would allow a revoked
     grant to resurface from the transitional seed).
     """
-    _assert_tenant_scope(tenant)
+    _assert_tenant_scope(tenant, session)
 
     store = _registry_store()
     audit = backoffice_state.audit_writer

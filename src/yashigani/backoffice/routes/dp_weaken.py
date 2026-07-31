@@ -475,6 +475,16 @@ async def approve_weaken_request(
     # DISTINCT-ADMIN CHECK — server-side; must not trust any client header.
     requester_id = row["requester_id"]
     if session.account_id == requester_id:
+        # NDC-sweep-E (2026-07-31): audit the self-approval DENY — a maker
+        # attempting to check their own request is a genuine SoD-violation
+        # ATTEMPT signal, previously silent (only the SUCCESS path was
+        # audited via DataProtectionWeakenApprovedEvent below).
+        from yashigani.audit.schema import DistinctApproverViolationEvent
+        _write_audit(DistinctApproverViolationEvent(
+            domain="dp_weaken",
+            account_id=session.account_id,
+            request_id=request_id,
+        ))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

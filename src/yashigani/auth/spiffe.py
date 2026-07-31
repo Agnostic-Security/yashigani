@@ -254,6 +254,46 @@ def _reset_cache_for_tests() -> None:
         _LAST_GOOD_LOAD_AT = None
 
 
+def _audit_spiffe_denied(
+    *, path: str, reason: str, caller_spiffe: str = "", path_agent_id: str = "",
+) -> None:
+    """E2/NDC-sweep-E (2026-07-31): best-effort audit emission for a
+    require_spiffe_id() 403 deny. Audit failure must NEVER block the deny.
+
+    This module is shared by BOTH the gateway and backoffice apps (see
+    module docstring — /internal/metrics is gated from both, and
+    /admin/agent-policies, /admin/agents from backoffice only), so there is
+    no single state singleton to import at module scope without creating a
+    backwards/cross-app layering dependency. Best-effort local imports try
+    the backoffice state first (the common case — most require_spiffe_id
+    call sites are backoffice admin routes), falling back to the gateway
+    state. Neither being configured (e.g. a unit test harness) is a no-op.
+    """
+    try:
+        from yashigani.audit.schema import SpiffeAccessDeniedEvent
+        event = SpiffeAccessDeniedEvent(
+            caller_spiffe=caller_spiffe,
+            path=path,
+            reason=reason,
+            path_agent_id=path_agent_id,
+        )
+        try:
+            from yashigani.backoffice.state import backoffice_state
+            if backoffice_state.audit_writer is not None:
+                backoffice_state.audit_writer.write(event)
+                return
+        except Exception:
+            pass
+        try:
+            from yashigani.gateway.openai_router import _state as _gw_state
+            if _gw_state.audit_writer is not None:
+                _gw_state.audit_writer.write(event)
+        except Exception:
+            pass
+    except Exception:  # pragma: no cover — audit must never break the deny
+        pass
+
+
 def require_spiffe_id(path: str) -> Callable[[Request], Coroutine[Any, Any, str]]:
     """Return a FastAPI dependency that enforces the SPIFFE URI ACL for *path*.
 
@@ -277,6 +317,7 @@ def require_spiffe_id(path: str) -> Callable[[Request], Coroutine[Any, Any, str]
         allowed = acls.get(path)
         if not allowed:
             # Default-deny: no rule for this path.
+            _audit_spiffe_denied(path=path, reason="no_acl_for_path")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="no_acl_for_path",
@@ -364,11 +405,16 @@ def require_spiffe_id(path: str) -> Callable[[Request], Coroutine[Any, Any, str]
                 "(cross-agent rotation attempt or malformed agent SPIFFE)",
                 path, caller, path_agent_id,
             )
+            _audit_spiffe_denied(
+                path=path, reason="spiffe_id_agent_mismatch",
+                caller_spiffe=caller, path_agent_id=path_agent_id,
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="spiffe_id_agent_mismatch",
             )
 
+        _audit_spiffe_denied(path=path, reason="spiffe_id_not_allowed", caller_spiffe=caller)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="spiffe_id_not_allowed",

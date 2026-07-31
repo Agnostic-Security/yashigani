@@ -604,6 +604,7 @@ def _check_ip_access(client_ip: str) -> None:
 
     # 1. Check blocklist first (admin-managed manual bans — see docstring)
     if r.exists(f"auth:blocked:{client_ip}"):
+        _audit_login_ip_denied(client_ip, "ip_blocked")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -618,6 +619,7 @@ def _check_ip_access(client_ip: str) -> None:
         try:
             addr = ipaddress.ip_address(client_ip)
         except ValueError:
+            _audit_login_ip_denied(client_ip, "ip_not_allowed")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"error": "ip_not_allowed"})
         allowed = False
         for entry in allowlist:
@@ -634,10 +636,29 @@ def _check_ip_access(client_ip: str) -> None:
             except ValueError:
                 continue
         if not allowed:
+            _audit_login_ip_denied(client_ip, "ip_not_allowed")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": "ip_not_allowed", "message": "Login not permitted from this IP address."},
             )
+
+
+def _audit_login_ip_denied(client_ip: str, reason: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    _check_ip_access()'s deny. This runs BEFORE AUTH_LOGIN_ATTEMPT is
+    written in login() — without this event an IP-gated login attempt left
+    ZERO forensic trail at all. Audit failure must NEVER block the deny."""
+    if backoffice_state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import LoginIpAccessDeniedEvent
+        from yashigani.auth.session import _mask_ip
+        backoffice_state.audit_writer.write(LoginIpAccessDeniedEvent(
+            client_ip_prefix=_mask_ip(client_ip),
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error("_check_ip_access: audit write failed reason=%s: %s", reason, exc)
 
 
 def _real_client_ip(request: Request) -> str:
@@ -1521,6 +1542,29 @@ async def verify_session(request: Request):
     return resp
 
 
+def _audit_verify_admin_denied(session) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    verify_admin_session()'s tier-mismatch deny. Reuses
+    AdminAccessDeniedTierMismatchEvent (same semantic as its sibling
+    require_admin_session() middleware dependency — a non-admin-tier
+    session reaching an admin-only gate) rather than minting a new type.
+    Audit failure must NEVER block the deny."""
+    if backoffice_state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import AdminAccessDeniedTierMismatchEvent
+        from yashigani.auth.session import _mask_ip
+        backoffice_state.audit_writer.write(AdminAccessDeniedTierMismatchEvent(
+            account_id=session.account_id,
+            session_account_tier=session.account_tier,
+            reason="admin_session_required",
+            path="/auth/verify-admin",
+            method="GET",
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error("verify-admin: audit write failed: %s", exc)
+
+
 @router.get("/verify-admin")
 async def verify_admin_session(request: Request):
     """
@@ -1544,6 +1588,7 @@ async def verify_admin_session(request: Request):
     if session is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     if session.account_tier != "admin":
+        _audit_verify_admin_denied(session)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -1576,6 +1621,26 @@ async def verify_admin_session(request: Request):
             _log.debug("verify-admin: identity_registry lookup failed for %s: %s",
                        session.account_id, _idreg_a_exc)
     return resp
+
+
+def _audit_verify_user_denied(state, session, reason: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    verify_user_session()'s state/tier-gate denies (totp_provisioning_incomplete
+    | password_change_required | insufficient_tier | owui_access_required).
+    The admin-session branch of this same function reuses
+    AuthVerifyRejectedAdminSessionEvent instead (see call site above).
+    Audit failure must NEVER block the deny."""
+    if state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import VerifyUserAccessDeniedEvent
+        state.audit_writer.write(VerifyUserAccessDeniedEvent(
+            account_id=session.account_id,
+            session_account_tier=session.account_tier,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error("verify-user: audit write failed reason=%s: %s", reason, exc)
 
 
 @router.get("/verify-user")
@@ -1621,6 +1686,18 @@ async def verify_user_session(request: Request):
             "admins cannot access user paths (/app/webui)",
             session.account_id,
         )
+        # Reuses AuthVerifyRejectedAdminSessionEvent — identical SoD-003
+        # shape already audited at the sibling /auth/verify call site.
+        if state.audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
+                from yashigani.auth.session import _mask_ip
+                state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
+                    account_id=session.account_id,
+                    client_ip_prefix=_mask_ip(_real_client_ip(request)),
+                ))
+            except Exception as exc:  # noqa: BLE001
+                _log.error("verify-user: audit write failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -1634,6 +1711,7 @@ async def verify_user_session(request: Request):
 
     # Reject provisioning-state sessions (must finish TOTP enrolment first).
     if session.account_tier == "totp_provisioning":
+        _audit_verify_user_denied(state, session, "totp_provisioning_incomplete")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -1646,6 +1724,7 @@ async def verify_user_session(request: Request):
     # User must change their temporary/expired password via /auth/password/change
     # before accessing any data-plane resource.
     if session.account_tier == "password_change_required":
+        _audit_verify_user_denied(state, session, "password_change_required")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -1659,6 +1738,7 @@ async def verify_user_session(request: Request):
 
     # Only user-tier sessions proceed past this point.
     if session.account_tier != "user":
+        _audit_verify_user_denied(state, session, "insufficient_tier")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -1695,6 +1775,7 @@ async def verify_user_session(request: Request):
                     "OpenWebUI access (API-first; user has API access only)",
                     record.username,
                 )
+                _audit_verify_user_denied(state, session, "owui_access_required")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail={

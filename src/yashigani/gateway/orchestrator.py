@@ -238,6 +238,19 @@ def _audit(event):
         logger.warning("orchestration: audit write failed: %s", exc)
 
 
+def _seed_denied_event(request_id: str, reason: str, sensitivity_level: str, identity):
+    """NDC-sweep-E (2026-07-31): build the OrchestrationSeedDeniedEvent for
+    _seed_denied(). Import kept local to avoid a module-load-order
+    dependency at import time."""
+    from yashigani.audit.schema import OrchestrationSeedDeniedEvent
+    return OrchestrationSeedDeniedEvent(
+        request_id=request_id,
+        identity_id=_principal_id(identity),
+        sensitivity_level=sensitivity_level,
+        reason=reason,
+    )
+
+
 def _audit_step(*, root_rid, request_id, identity, tool_name, tool_kind, args,
                 depth, iteration, result: ToolResult):
     from yashigani.audit.schema import OrchestrationStepEvent
@@ -1225,7 +1238,7 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
             sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(_sens_result.level), "RESTRICTED")
         except Exception as exc:
             logger.error("orchestration seed: sensitivity classify failed: %s — denying", exc)
-            return _seed_denied(request_id, "seed_sensitivity_classify_failed", sensitivity_level)
+            return _seed_denied(request_id, "seed_sensitivity_classify_failed", sensitivity_level, identity)
 
     # ── LAURA-B1R-001 (orchestrate-seed model-RBAC) — THE CHOKE POINT ────────────
     # The /v1 handler delegated here BEFORE its own model-RBAC alloc-bind ran, so
@@ -1251,7 +1264,7 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
             orchestrator_model, _principal_id(identity),
             sorted(_seed_eff.allowed), sorted(_seed_eff.gated), _seed_eff.has_restriction,
         )
-        return _seed_denied(request_id, "model_not_allocated", sensitivity_level)
+        return _seed_denied(request_id, "model_not_allocated", sensitivity_level, identity)
 
     # 2) OPA ingress on the brain model choice.  The brain is a LOCAL model, so the
     #    provider is ollama; the caller must be OPA-allowed to use it at this
@@ -1294,7 +1307,7 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
         logger.warning(
             "orchestration seed: OPA DENIED brain model=%s identity=%s sensitivity=%s reason=%s",
             orchestrator_model, _principal_id(identity), sensitivity_level, seed_reason)
-        return _seed_denied(request_id, seed_reason, sensitivity_level)
+        return _seed_denied(request_id, seed_reason, sensitivity_level, identity)
 
     # 3) PII on the joined seed prompt.  process_decoded audits internally; in
     #    BLOCK mode we fail-closed before any brain call.
@@ -1306,18 +1319,29 @@ async def _adjudicate_seed_prompt(*, body, identity, request_id: str,
                 logger.warning(
                     "orchestration seed: PII detected (BLOCK mode) identity=%s — denying",
                     _principal_id(identity))
-                return _seed_denied(request_id, "seed_pii_blocked", sensitivity_level)
+                return _seed_denied(request_id, "seed_pii_blocked", sensitivity_level, identity)
         except Exception as exc:
             # Fail-closed: a PII-detector error on the seed prompt must not pass.
             logger.error("orchestration seed: PII detection failed: %s — denying", exc)
-            return _seed_denied(request_id, "seed_pii_check_failed", sensitivity_level)
+            return _seed_denied(request_id, "seed_pii_check_failed", sensitivity_level, identity)
 
     return None
 
 
-def _seed_denied(request_id: str, reason: str, sensitivity_level: str):
-    """Fail-closed 403 for a denied orchestration seed prompt (FIX M1)."""
+def _seed_denied(request_id: str, reason: str, sensitivity_level: str, identity=None):
+    """Fail-closed 403 for a denied orchestration seed prompt (FIX M1).
+
+    NDC-sweep-E (2026-07-31): this is the ONLY builder for the seed-gate's
+    403 response — ALL 5 call sites in _adjudicate_seed_prompt() route
+    through here, so auditing once here covers every deny reason
+    (seed_sensitivity_classify_failed | model_not_allocated | the OPA
+    policy_denied/brain_model_not_allowed/routing_unsafe/
+    sensitivity_ceiling_exceeded family | seed_pii_blocked |
+    seed_pii_check_failed). This gate denies the M1 brain-model-choice
+    BEFORE any brain call is made — previously zero audit trail.
+    """
     safe_reason = (reason or "policy_denied").encode("ascii", "replace").decode("ascii")
+    _audit(_seed_denied_event(request_id, safe_reason, sensitivity_level, identity))
     # Show the user a human-readable message; the raw reason code stays in the
     # `code` field + X-Yashigani-OPA-Reason header for support/automation (decode
     # via the reason map / decision-code-legend.yml). Deferred import avoids a

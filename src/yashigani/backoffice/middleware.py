@@ -99,6 +99,7 @@ def _enforce_csrf_origin(request: Request) -> None:
     if not origin:
         return
     if not _origin_is_same_site(origin):
+        _audit_csrf_origin_rejected(request, origin)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "csrf_origin_mismatch"},
@@ -143,6 +144,54 @@ def _mw_real_client_ip(request: Request) -> str:
     if xri:
         return xri.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _audit_csrf_origin_rejected(request: Request, origin: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    _enforce_csrf_origin()'s deny. Runs BEFORE session resolution (called
+    at the top of require_admin_session), so no account_id/session is
+    available yet — path/method/origin/client_ip is the available context.
+    Audit failure must NEVER block the deny.
+    """
+    try:
+        from yashigani.backoffice.state import backoffice_state
+        if backoffice_state.audit_writer is None:
+            return
+        from yashigani.audit.schema import CsrfOriginRejectedEvent
+        from yashigani.auth.session import _mask_ip
+        backoffice_state.audit_writer.write(CsrfOriginRejectedEvent(
+            path=request.url.path,
+            method=request.method,
+            rejected_origin=origin[:256],
+            client_ip_prefix=_mask_ip(_mw_real_client_ip(request)),
+        ))
+    except Exception:  # pragma: no cover — audit must never break the deny
+        pass
+
+
+def _audit_wrong_plane_admin_session(request: Request, session: Session) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    require_user_session()'s admin-session-on-user-plane deny (wrong_plane).
+
+    Reuses AuthVerifyRejectedAdminSessionEvent rather than minting a new
+    type — this is the SAME SoD-003 shape already audited at the sibling
+    /auth/verify (Caddy forward_auth) call site in routes/auth.py; this is
+    just the second enforcement point for the identical rule (an admin
+    session directly hitting a require_user_session-gated route, as opposed
+    to the forward_auth probe). Audit failure must NEVER block the deny.
+    """
+    try:
+        from yashigani.backoffice.state import backoffice_state
+        if backoffice_state.audit_writer is None:
+            return
+        from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
+        from yashigani.auth.session import _mask_ip
+        backoffice_state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
+            account_id=session.account_id,
+            client_ip_prefix=_mask_ip(_mw_real_client_ip(request)),
+        ))
+    except Exception:  # pragma: no cover — audit must never break the deny
+        pass
 
 
 def _audit_admin_access_denied_tier_mismatch(
@@ -328,6 +377,7 @@ def require_user_session(
         )
 
     if session.account_tier == "admin":
+        _audit_wrong_plane_admin_session(request, session)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

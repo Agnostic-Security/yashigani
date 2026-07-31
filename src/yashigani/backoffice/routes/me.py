@@ -78,12 +78,35 @@ def _get_auth_service():
     return svc
 
 
+def _audit_me_api_key_denied(reason: str, account_id: str = "", account_tier: str = "") -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for the me.py
+    self-service API-key issuance guards. Audit failure must NEVER block
+    the deny."""
+    writer = backoffice_state.audit_writer
+    if writer is None:
+        return
+    try:
+        from yashigani.audit.schema import MeApiKeyAccessDeniedEvent
+        writer.write(MeApiKeyAccessDeniedEvent(
+            account_id=account_id,
+            session_account_tier=account_tier,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error("me: audit write failed reason=%s: %s", reason, exc)
+
+
 def _assert_user_tier(session) -> None:
     """
     Reject non-user sessions with 403.
     account_tier must be exactly "user" — admin and totp_provisioning rejected.
     """
     if session.account_tier != "user":
+        _audit_me_api_key_denied(
+            "user_tier_required",
+            account_id=getattr(session, "account_id", ""),
+            account_tier=getattr(session, "account_tier", ""),
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -102,8 +125,12 @@ def _assert_account_ready(record) -> None:
     These guards prevent issuance to partially-provisioned accounts.
     """
     if record is None:
+        _audit_me_api_key_denied("account_not_found")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"error": "account_not_found"})
     if record.force_password_change:
+        _audit_me_api_key_denied(
+            "force_password_change_pending", account_id=getattr(record, "account_id", ""),
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -112,6 +139,9 @@ def _assert_account_ready(record) -> None:
             },
         )
     if record.force_totp_provision:
+        _audit_me_api_key_denied(
+            "force_totp_provision_pending", account_id=getattr(record, "account_id", ""),
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
