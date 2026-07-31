@@ -29,10 +29,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Response
 
 from yashigani.mcp._jwks import JWKS_CACHE_CONTROL, JWKS_PATH, JwksStore
+from yashigani.mcp._opa import _make_opa_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +51,17 @@ async def _opa_health_check(opa_url: str) -> bool:
     registered dict). The health probe must still report the feature as
     configured+healthy in that window instead of requiring a broker
     instance that may not exist yet.
+
+    LAURA-V50-019: this MUST use the same mesh-mTLS client every other
+    broker→OPA call site uses (``_make_opa_http_client`` — see
+    ``McpBroker.opa_health()`` in ``broker.py``). A bare, identity-less
+    ``httpx.AsyncClient()`` is refused at the TLS handshake by a mesh-mTLS
+    OPA (require_and_verify), which made this broker-less fallback path
+    report ``opa_unreachable`` even when OPA was healthy.
     """
     url = f"{opa_url.rstrip('/')}/health"
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with _make_opa_http_client(timeout=2.0) as client:
             resp = await client.get(url)
             return resp.status_code == 200
     except Exception as exc:
