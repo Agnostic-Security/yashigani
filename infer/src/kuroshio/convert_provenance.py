@@ -168,16 +168,28 @@ def measure_conversion_tuple(
     *,
     convert_tool_commit: str,
     quant: str,
+    source_sha256: str | None = None,
 ) -> ConversionMeasurement:
-    """Measure BOTH digests from the actual bytes on disk, at the point the
-    convert job produced them.
+    """Measure the convert tuple from actual bytes on disk.
 
     Call this INSIDE the same ephemeral job that ran the conversion,
     BEFORE the job tears down (finding #4's TOCTOU requirement) — never
-    accept either digest as a caller-supplied string, and never measure the
-    output from a blob-store path reached after the job has already
-    exited (that reopens exactly the substitution window the finding
-    describes).
+    accept either digest as an unmeasured caller-supplied string, and never
+    measure the output from a blob-store path reached after the job has
+    already exited (that reopens exactly the substitution window the
+    finding describes).
+
+    `source_sha256` (Laura KUROSHIO60-001, 2026-07-31): the source is
+    (deliberately) measured BEFORE the long-running conversion invocation,
+    not re-walked here at teardown — re-walking after `invoker.convert()`
+    would let a mid-conversion source swap write an attacker-chosen digest
+    into the signed record (the source bytes the tool actually consumed are
+    gone by then). The caller measures the source with `measure_source_digest`
+    immediately after the guard, holds it, and passes it in here; the OUTPUT
+    is still measured live from the just-produced bytes. When `source_sha256`
+    is None the source is measured here (kept only for callers that measure
+    source and output in one atomic step against an immutable input); pass
+    the pre-measured digest whenever a real conversion ran in between.
     """
     if not _CONVERT_TOOL_COMMIT_RE.match(convert_tool_commit):
         raise ValueError(
@@ -186,8 +198,12 @@ def measure_conversion_tuple(
         )
     if not _QUANT_RE.match(quant):
         raise ValueError(f"quant {quant!r} failed the allowlist guard")
+    if source_sha256 is None:
+        source_sha256 = measure_source_digest(source_path)
+    elif not _SHA256_HEX.match(source_sha256.lower()):
+        raise ValueError(f"pre-measured source_sha256 is not a 64-char hex digest: {source_sha256!r}")
     return ConversionMeasurement(
-        source_sha256=measure_source_digest(source_path),
+        source_sha256=source_sha256.lower(),
         convert_tool_commit=convert_tool_commit,
         quant=quant,
         output_sha256=measure_source_digest(output_path),

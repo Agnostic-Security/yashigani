@@ -45,7 +45,7 @@ from kuroshio.adapters.convert import (
     guard_convert_source_dir,
     guard_safetensors_only,
 )
-from kuroshio.convert_provenance import measure_conversion_tuple
+from kuroshio.convert_provenance import measure_conversion_tuple, measure_source_digest
 
 _ENV_CONVERT_SCRIPT = "YSG_KUROSHIO_CONVERT_SCRIPT"
 _ENV_QUANTIZE_BIN = "YSG_KUROSHIO_QUANTIZE_BIN"
@@ -117,6 +117,16 @@ def main(argv: list[str] | None = None) -> int:
     except (PickleRefusedError, UnsupportedSourceFormatError) as exc:
         return _fail(EXIT_REFUSED, str(exc))
 
+    # Laura KUROSHIO60-001 (TOCTOU): measure the source digest here, between
+    # guard and conversion — not re-walked at teardown — so a mid-conversion
+    # source swap cannot write a false `source_sha256` into the signed
+    # record. The job image's source mount must be read-only for the guard's
+    # symlink refusal to hold across the conversion (deploy/README.md).
+    try:
+        source_sha256 = measure_source_digest(source)
+    except ValueError as exc:
+        return _fail(EXIT_REFUSED, str(exc))
+
     # 2. Convert + 3. measure — same process, before teardown (finding #4).
     try:
         gguf_path = invoker.convert(source, out_dir=out_dir, quant=args.quant)
@@ -125,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             gguf_path,
             convert_tool_commit=invoker.tool_commit,
             quant=args.quant,
+            source_sha256=source_sha256,
         )
     except (ConversionFailedError, ValueError) as exc:
         return _fail(EXIT_CONVERSION_FAILED, str(exc))

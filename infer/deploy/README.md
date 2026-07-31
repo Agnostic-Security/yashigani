@@ -359,6 +359,18 @@ failure. Verified live this session (see below) against a stub server exercising
 `/healthz` + `/api/pull` contract `app.py` implements, in all three states (`200` success,
 `501` no-adapter, empty-model no-op) plus wait-for-ready.
 
+**Convert-job source mount MUST be read-only / single-writer (Laura KUROSHIO60-001, routed to
+Captain).** The safetensors→GGUF converter (`src/kuroshio/convert_job.py`,
+`adapters/convert.py`) measures the source digest between the guard and the conversion, which
+collapses the code-side TOCTOU window to microseconds. But the guard's SYMLINK refusal and the
+signed `source_sha256` only hold across the (minutes-to-hours) conversion if the source bytes
+cannot change underneath the tool. When the convert-job container is built, the model-source
+tree MUST be mounted **read-only** (or copied into an immutable snapshot inside the ephemeral
+job) — never a writable bind-mount shared with another writer. A writable shared mount reopens
+the window regardless of the code-side mitigation. This is the deploy-side half of the fix; the
+convert-job container spec itself is not in this tree yet (lands with the day-one/converter
+deploy work).
+
 **F1 convergence note (Iris Seam 3, line 48) — deliberately NOT built here:** `install.sh`'s
 healthcheck-exemption / one-shot-job handling for `ollama-init` will need a sibling entry for
 `kuroshio-init` in `_exempt_patterns` at convergence time. That is `release/5.0`-side wiring —

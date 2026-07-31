@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from kuroshio.adapters.base import SourceAdapter
-from kuroshio.convert_provenance import measure_conversion_tuple
+from kuroshio.convert_provenance import measure_conversion_tuple, measure_source_digest
 from kuroshio.models import Provenance, ProvenanceKind, ResolvedModel
 
 # Extensions that are refused outright (naming-discipline check — see
@@ -69,10 +69,29 @@ _ALLOWED_AUX_EXTENSIONS = frozenset({".json", ".txt", ".model", ".jinja", ".md"}
 _MAX_SOURCE_TREE_FILES = 4096
 
 # A `torch.save` pickle checkpoint is either:
-#   - a raw pickle stream, whose first byte is the pickle protocol opcode
-#     `\x80` (PROTOCOL) for protocol 2+, or an ASCII opcode for protocol 0;
+#   - a protocol-2+ pickle stream, whose first byte is the PROTO opcode
+#     `\x80` — an unambiguous non-text binary byte;
 #   - (modern default) a ZIP container (`torch.save` zipfile format), whose
 #     first bytes are the ZIP local-file-header magic `PK\x03\x04`.
+#
+# Laura KUROSHIO60-002 (2026-07-31): an EARLIER docstring here claimed this
+# sniff also covered "an ASCII opcode for protocol 0", which the code never
+# did. First-byte detection of protocol-0/1 pickle is fundamentally
+# ambiguous with legitimate text — a protocol-0 stream opens with a bare
+# ASCII opcode (`c`/`i`/`o`/`S`/`(`/…), and those same bytes open ordinary
+# aux files this guard must ACCEPT: a `.safetensors` file begins with an
+# 8-byte little-endian length prefix whose low byte is arbitrary, and
+# `merges.txt`/vocab files routinely start with letters like `c`/`i`/`d`.
+# Widening the sniff to those opcodes would false-refuse real model imports
+# while catching only a non-exploitable gap: `torch` is not a runtime dep,
+# nothing in this package or the HF config-load path unpickles the aux-file
+# classes (`.json/.txt/.model/.jinja/.md` + extension-less dotfiles), and
+# `.py`/executable extensions are already off the aux allowlist so no
+# custom-code path exists regardless. So the sniff stays on the two
+# unambiguous BINARY magics, and the two real controls — the structural
+# safetensors header check (layer 2) and the extension allowlist (layer 3)
+# — carry the file class that actually matters. The docstring below now
+# states exactly what is covered.
 _PICKLE_ZIP_MAGIC = b"PK\x03\x04"
 _PICKLE_PROTO_OPCODE = b"\x80"
 
@@ -437,6 +456,18 @@ class ConvertAdapter(SourceAdapter):
         else:
             raise FileNotFoundError(f"convert source not found: {source_path}")
 
+        # Laura KUROSHIO60-001 (TOCTOU): measure the source digest NOW —
+        # immediately after the guard, before the long-running conversion —
+        # not by re-walking the tree at teardown. Re-walking after
+        # `invoker.convert()` (minutes-to-hours) would let a mid-conversion
+        # source swap write an attacker-chosen `source_sha256` into the
+        # signed provenance record. Measuring here collapses the falsifiable
+        # window to the microseconds between guard and this call. (Deploy
+        # backstop, documented in deploy/README.md: the ephemeral job's
+        # source mount must be read-only / single-writer, which drives the
+        # window to zero and gives the guard's symlink refusal real meaning.)
+        source_sha256 = measure_source_digest(source_path)
+
         out_dir = self.blob_store.root / "scratch" / "convert"
         out_dir.mkdir(parents=True, exist_ok=True)
         gguf_path = Path(self._invoker.convert(source_path, out_dir=out_dir, quant=quant))
@@ -457,6 +488,7 @@ class ConvertAdapter(SourceAdapter):
                 gguf_path,
                 convert_tool_commit=self._invoker.tool_commit,
                 quant=quant,
+                source_sha256=source_sha256,
             )
             header = self._first_parse_gguf_header(gguf_path)
 

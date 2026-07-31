@@ -82,6 +82,45 @@ def test_source_dir_guard_refuses_disguised_pickle_regardless_of_name(tmp_path: 
         guard_convert_source_dir(root)
 
 
+def test_source_dir_guard_catches_binary_pickle_magic(tmp_path: Path) -> None:
+    # Laura KUROSHIO60-002: the two UNAMBIGUOUS binary pickle magics are
+    # caught in aux files regardless of their allowlisted extension.
+    for payload in (b"\x80\x04protocol-4-pickle", b"PK\x03\x04zip-torch-save"):
+        root = _make_model_dir(tmp_path / f"m{payload[:2].hex()}")
+        (root / "tokenizer_config.json").write_bytes(payload)
+        with pytest.raises(PickleRefusedError):
+            guard_convert_source_dir(root)
+
+
+def test_source_dir_guard_does_not_false_refuse_text_aux_files(tmp_path: Path) -> None:
+    # Laura KUROSHIO60-002 boundary: first-byte protocol-0 pickle detection
+    # is ambiguous with text, so it is deliberately NOT done — legitimate
+    # aux files starting with letters that happen to be protocol-0 opcodes
+    # (`c`/`i`/`d`/`S`/…) must still import. Over-refusing real models is
+    # worse than a non-exploitable defense-in-depth gap (nothing unpickles
+    # these extensions; `.py` is off the allowlist).
+    root = _make_model_dir(tmp_path / "model")
+    (root / "merges.txt").write_bytes(b"code fusion\ninput put\n")  # starts with 'c'
+    (root / "vocab.txt").write_bytes(b"idyllic\n")  # starts with 'i'
+    guard_convert_source_dir(root)
+
+
+def test_safetensors_guard_accepts_length_prefix_colliding_with_opcode(tmp_path: Path) -> None:
+    # A real safetensors file's first byte is the low byte of an 8-byte LE
+    # header length — it can equal a pickle opcode byte (e.g. 0x63 == 'c').
+    # The structural guard must accept it, not sniff-refuse it.
+    from kuroshio.adapters.convert import guard_safetensors_only
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    header = header + b" " * (0x63 - len(header))  # header length low byte == 0x63 ('c')
+    assert len(header) == 0x63
+    blob = struct.pack("<Q", len(header)) + header + b"\x00" * 8
+    assert blob[0] == 0x63  # first byte collides with a protocol-0 opcode
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(blob)
+    guard_safetensors_only(path)  # must not raise
+
+
 def test_source_dir_guard_refuses_unknown_extension(tmp_path: Path) -> None:
     root = _make_model_dir(tmp_path / "model")
     (root / "mystery.so").write_bytes(b"\x7fELF")
@@ -298,6 +337,45 @@ def test_convert_adapter_full_chain(tmp_blob_store: BlobStore, tmp_path: Path) -
     # Blob really ingested + scratch cleaned up.
     assert tmp_blob_store.get_path(resolved.sha256) is not None
     assert not list((tmp_blob_store.root / "scratch" / "convert").iterdir())
+
+
+def test_convert_adapter_source_digest_is_measured_before_conversion(tmp_blob_store: BlobStore, tmp_path: Path) -> None:
+    # Laura KUROSHIO60-001: a source swap DURING conversion must not
+    # falsify the signed source_sha256. An invoker that mutates the source
+    # tree mid-convert models the TOCTOU attacker; the recorded digest must
+    # reflect the pre-conversion (guarded) bytes, not the post-swap bytes.
+    source = _make_model_dir(tmp_path / "model-src")
+    pre_swap_digest = measure_source_digest(source)
+
+    class _SwappingInvoker(_FakeInvoker):
+        def convert(self, source_path: Path, *, out_dir: Path, quant: str) -> Path:
+            # Attacker overwrites the source content after the guard ran.
+            (source_path / "config.json").write_text('{"architectures": ["Swapped"]}')
+            return super().convert(source_path, out_dir=out_dir, quant=quant)
+
+    adapter = ConvertAdapter(tmp_blob_store, invoker=_SwappingInvoker(build_minimal_gguf()))
+    resolved = adapter.resolve(source_path=source, quant="Q4_K_M")
+
+    post_swap_digest = measure_source_digest(source)
+    assert pre_swap_digest != post_swap_digest  # the swap really happened
+    # The signed record carries the PRE-swap digest — the attacker's
+    # post-hoc bytes never make it into provenance.
+    assert resolved.provenance.extra["conversion"]["source_sha256"] == pre_swap_digest
+
+
+def test_measure_conversion_tuple_validates_precomputed_source_digest(tmp_path: Path) -> None:
+    from kuroshio.convert_provenance import measure_conversion_tuple
+
+    out = tmp_path / "out.gguf"
+    out.write_bytes(build_minimal_gguf())
+    with pytest.raises(ValueError, match="64-char hex"):
+        measure_conversion_tuple(
+            tmp_path / "src",
+            out,
+            convert_tool_commit=TOOL_COMMIT,
+            quant="Q4_K_M",
+            source_sha256="not-a-digest",
+        )
 
 
 def test_convert_adapter_refuses_artifact_outside_scratch(tmp_blob_store: BlobStore, tmp_path: Path) -> None:
