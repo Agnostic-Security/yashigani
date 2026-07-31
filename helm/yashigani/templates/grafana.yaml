@@ -13,9 +13,7 @@ metadata:
   name: yashigani-grafana
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-grafana
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-grafana") | nindent 4 }}
 spec:
   serviceName: yashigani-grafana
   replicas: {{ .Values.grafana.replicaCount }}
@@ -201,9 +199,7 @@ metadata:
   name: yashigani-grafana
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-grafana
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-grafana") | nindent 4 }}
 spec:
   type: {{ .Values.grafana.service.type }}
   clusterIP: None

@@ -17,9 +17,8 @@ metadata:
   name: yashigani-gateway-audit-log
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-gateway
     app.kubernetes.io/component: audit-log
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-gateway") | nindent 4 }}
   annotations:
     # Retain PVC on helm uninstall — audit logs must survive chart lifecycle
     # for compliance retention (NIST AU-11: organisation-defined retention period).
@@ -43,9 +42,8 @@ metadata:
   name: yashigani-backoffice-audit-log
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-backoffice
     app.kubernetes.io/component: audit-log
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-backoffice") | nindent 4 }}
   annotations:
     # Retain PVC on helm uninstall — audit logs must survive chart lifecycle.
     helm.sh/resource-policy: keep

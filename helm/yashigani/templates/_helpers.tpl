@@ -55,6 +55,39 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+yashigani.componentLabels — common resource labels (helm.sh/chart,
+app.kubernetes.io/{name,instance,version,managed-by}) for a resource whose
+own app.kubernetes.io/name is component-specific (e.g. "yashigani-jaeger")
+rather than the generic chart name that "yashigani.labels" emits.
+
+FIX (chart-wide duplicate-label defect, 2026-07-31): ~30 templates set
+app.kubernetes.io/name / app.kubernetes.io/instance explicitly in
+metadata.labels AND ALSO {{ include "yashigani.labels" . }}, which
+independently emits the same two keys with the generic chart-name value.
+YAML last-key-wins meant the generic value silently clobbered the
+component-specific one in every affected resource's own metadata.labels
+(selectors/pod-template labels were unaffected — they never included the
+shared helper). This helper replaces that pattern: callers pass their
+component name explicitly and get a single, non-duplicated set of keys
+back, with the component name preserved as the winning value.
+
+Call with a dict of: root (the top-level `.` context), name (the
+component's app.kubernetes.io/name value, e.g. "yashigani-jaeger").
+Usage: {{ include "yashigani.componentLabels" (dict "root" . "name" "yashigani-jaeger") | nindent 4 }}
+*/}}
+{{- define "yashigani.componentLabels" -}}
+{{- $root := index . "root" -}}
+{{- $name := index . "name" -}}
+helm.sh/chart: {{ include "yashigani.chart" $root }}
+app.kubernetes.io/name: {{ $name }}
+app.kubernetes.io/instance: {{ $root.Release.Name }}
+{{- if $root.Chart.AppVersion }}
+app.kubernetes.io/version: {{ $root.Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ $root.Release.Service }}
+{{- end }}
+
+{{/*
 ServiceAccount name — uses the chart's own SA unless overridden.
 */}}
 {{- define "yashigani.serviceAccountName" -}}

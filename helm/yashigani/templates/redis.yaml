@@ -7,9 +7,7 @@ metadata:
   name: yashigani-redis
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-redis
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-redis") | nindent 4 }}
 spec:
   serviceName: yashigani-redis
   replicas: {{ .Values.redis.replicaCount }}
@@ -194,9 +192,7 @@ metadata:
   name: yashigani-redis
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-redis
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-redis") | nindent 4 }}
 spec:
   type: {{ .Values.redis.service.type }}
   clusterIP: None

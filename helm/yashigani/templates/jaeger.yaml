@@ -10,9 +10,7 @@ metadata:
   name: yashigani-jaeger
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-jaeger
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-jaeger") | nindent 4 }}
 spec:
   replicas: {{ .Values.jaeger.replicaCount }}
   selector:
@@ -131,9 +129,7 @@ metadata:
   name: yashigani-jaeger
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-jaeger
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-jaeger") | nindent 4 }}
 spec:
   type: {{ .Values.jaeger.service.type }}
   selector:

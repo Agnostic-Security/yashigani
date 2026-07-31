@@ -52,9 +52,7 @@ metadata:
   name: yashigani-policy
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-policy
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-policy") | nindent 4 }}
 spec:
   replicas: {{ .Values.policy.replicaCount }}
   selector:
@@ -255,9 +253,7 @@ metadata:
   name: yashigani-policy
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-policy
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-policy") | nindent 4 }}
 spec:
   type: {{ .Values.policy.service.type }}
   selector:

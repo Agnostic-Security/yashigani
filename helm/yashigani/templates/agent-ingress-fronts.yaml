@@ -52,10 +52,8 @@ metadata:
   name: yashigani-caddy-mesh
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-caddy
-    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: agent-ingress-front
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-caddy") | nindent 4 }}
 spec:
   type: ClusterIP
   selector:

@@ -6,9 +6,7 @@ metadata:
   name: yashigani-alertmanager
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-alertmanager
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-alertmanager") | nindent 4 }}
 spec:
   replicas: {{ .Values.alertmanager.replicaCount }}
   selector:
@@ -85,9 +83,7 @@ metadata:
   name: yashigani-alertmanager-data
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-alertmanager
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-alertmanager") | nindent 4 }}
 spec:
   accessModes: ["ReadWriteOnce"]
   {{- if .Values.alertmanager.persistence.storageClass }}
@@ -103,9 +99,7 @@ metadata:
   name: yashigani-alertmanager
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-alertmanager
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-alertmanager") | nindent 4 }}
 spec:
   type: {{ .Values.alertmanager.service.type }}
   selector:

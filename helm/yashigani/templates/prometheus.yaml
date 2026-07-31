@@ -7,9 +7,7 @@ metadata:
   name: yashigani-prometheus-config
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-prometheus
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-prometheus") | nindent 4 }}
 data:
   # v2.23.1 EX-231-08 (+ #81): when caddy.internalMetricsListener.enabled=true
   # AND internalMetricsListenerBackoffice.enabled=true AND the mesh mTLS
@@ -101,9 +99,7 @@ metadata:
   name: yashigani-prometheus
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-prometheus
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-prometheus") | nindent 4 }}
 spec:
   serviceName: yashigani-prometheus
   replicas: {{ .Values.prometheus.replicaCount }}
@@ -248,9 +244,7 @@ metadata:
   name: yashigani-prometheus
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-prometheus
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-prometheus") | nindent 4 }}
 spec:
   type: {{ .Values.prometheus.service.type }}
   clusterIP: None

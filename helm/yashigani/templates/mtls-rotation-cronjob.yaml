@@ -19,9 +19,8 @@ metadata:
   name: yashigani-pki-rotate
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki-rotate
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
 spec:
   schedule: {{ .Values.mtls.rotation.schedule | quote }}
   timeZone: "UTC"

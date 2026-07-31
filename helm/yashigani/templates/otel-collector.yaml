@@ -14,9 +14,7 @@ metadata:
   name: otel-collector
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: otel-collector
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "otel-collector") | nindent 4 }}
 spec:
   replicas: {{ .Values.otelCollector.replicaCount }}
   selector:
@@ -131,9 +129,7 @@ metadata:
   name: otel-collector
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: otel-collector
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "otel-collector") | nindent 4 }}
 spec:
   type: {{ .Values.otelCollector.service.type }}
   selector:

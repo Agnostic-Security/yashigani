@@ -6,9 +6,7 @@ metadata:
   name: yashigani-postgres
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-postgres
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-postgres") | nindent 4 }}
 spec:
   serviceName: yashigani-postgres
   replicas: {{ .Values.postgres.replicaCount }}
@@ -288,9 +286,7 @@ metadata:
   name: yashigani-postgres
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-postgres
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-postgres") | nindent 4 }}
 spec:
   type: {{ .Values.postgres.service.type }}
   clusterIP: None

@@ -20,9 +20,8 @@ metadata:
   name: yashigani-pki
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
@@ -34,9 +33,8 @@ metadata:
   name: yashigani-pki
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
@@ -63,9 +61,8 @@ metadata:
   name: yashigani-pki
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
@@ -100,9 +97,8 @@ metadata:
   name: {{ .Values.mtls.secretName }}
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-9"
@@ -129,9 +125,8 @@ metadata:
   name: {{ .Values.mtls.caKeysSecretName }}
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-9"
@@ -155,9 +150,8 @@ metadata:
   name: {{ .Values.gateway.mcpSigningKey.secretName }}
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pki
     app.kubernetes.io/component: pki
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pki") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-9"
