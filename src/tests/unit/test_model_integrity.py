@@ -115,6 +115,36 @@ class TestVerifier:
         r = v.verify("qwen2.5:3b", observed_manifest_digest="M_GOOD")
         assert r.ok is False and r.reason == "store_unavailable"
 
+    def test_store_unavailable_audits(self):
+        """NDC follow-up (2026-07-31): the store_unavailable BLOCK path
+        previously had NO audit trail (unlike weights_mismatch/
+        manifest_mismatch/pin_unverifiable, which all emit ModelPinEvent).
+        This is the one remaining genuine gap the NDC sweep flagged on
+        _verify_ollama_pin() — now closed via
+        EventType.MODEL_PIN_STORE_UNAVAILABLE."""
+        audit = _CapAudit()
+        v = ModelIntegrityVerifier(ModelPinStore(_BoomRedis()), audit_writer=audit)
+        r = v.verify("qwen2.5:3b", observed_manifest_digest="M_GOOD", request_id="req-1")
+        assert r.ok is False and r.reason == "store_unavailable"
+        assert len(audit.events) == 1
+        assert audit.events[0].event_type == "MODEL_PIN_STORE_UNAVAILABLE"
+        assert audit.events[0].model == "qwen2.5:3b"
+        assert audit.events[0].request_id == "req-1"
+        assert audit.events[0].action_taken == "block"
+
+    def test_store_unavailable_audit_failure_never_blocks(self):
+        """Audit is best-effort — a broken audit_writer must never prevent
+        the fail-closed block itself."""
+        audit = _CapAudit(fail=True)
+        v = ModelIntegrityVerifier(ModelPinStore(_BoomRedis()), audit_writer=audit)
+        r = v.verify("qwen2.5:3b", observed_manifest_digest="M_GOOD")
+        assert r.ok is False and r.reason == "store_unavailable"
+
+    def test_store_unavailable_no_audit_writer_is_noop(self):
+        v = ModelIntegrityVerifier(ModelPinStore(_BoomRedis()), audit_writer=None)
+        r = v.verify("qwen2.5:3b", observed_manifest_digest="M_GOOD")
+        assert r.ok is False and r.reason == "store_unavailable"
+
 
 class TestVacuousPin:
     """LAURA-V50-004: a pin that compares NOTHING on either axis must never

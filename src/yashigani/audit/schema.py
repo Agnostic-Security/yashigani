@@ -148,6 +148,13 @@ class EventType(str, Enum):
     # LAURA-V50-004 — a pin exists but compared nothing on either axis (empty
     # digest(s) and/or unavailable observed side); never reported as "match"
     MODEL_PIN_UNVERIFIABLE = "MODEL_PIN_UNVERIFIABLE"
+    # NDC follow-up (2026-07-31, Tom) — inspection/model_integrity.py::
+    # ModelIntegrityVerifier.verify()'s pin-store-unreachable branch (fail-
+    # closed BLOCK, same as a genuine mismatch) previously had NO audit
+    # trail at all — only the weights/manifest-mismatch and pin_unverifiable
+    # outcomes emitted an event. Gateway/openai_router.py::_verify_ollama_pin()
+    # surfaces this as a 403 model_integrity_block either way.
+    MODEL_PIN_STORE_UNAVAILABLE = "MODEL_PIN_STORE_UNAVAILABLE"
     # 5.0 rug-pull — manifest delta must be re-approved before it goes active
     MANIFEST_DELTA_PENDING = "MANIFEST_DELTA_PENDING"
     MANIFEST_DELTA_APPROVED = "MANIFEST_DELTA_APPROVED"

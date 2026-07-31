@@ -1235,7 +1235,17 @@ async def sso_2fa_verify(request: Request):
 
     totp_secret = identity.get("totp_secret", "")
     if not totp_secret:
-        # Identity hasn't provisioned TOTP yet — they need to do that first
+        # Identity hasn't provisioned TOTP yet — they need to do that first.
+        # NDC follow-up (2026-07-31): this deny had NO audit trail — only the
+        # totp_verification_failed branch below called _write_sso_failure_audit.
+        # Reuses the same helper/event shape (idp_id, idp_name, reason,
+        # client_ip) that already covers every other deny in this function.
+        _write_sso_failure_audit(
+            pending.get("idp_id", ""),
+            pending.get("idp_name", ""),
+            "totp_not_provisioned",
+            pending.get("client_ip", "unknown"),
+        )
         r.delete(f"{_PENDING_2FA_PREFIX}{pending_token}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
