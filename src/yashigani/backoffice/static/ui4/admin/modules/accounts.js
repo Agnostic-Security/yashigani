@@ -218,6 +218,7 @@ export class YsAdminUsers extends LitElement {
     _new: { state: true },          // {email, username}
     _edit: { state: true },         // {username, email, disabled, sensitivity_ceiling}
     _reset: { state: true },        // {username, totp_code}
+    _bootstrap: { state: true },    // {username, temporary_password, totp_secret, totp_uri} — one-time reveal (RISK-189)
   };
 
   constructor() {
@@ -229,6 +230,7 @@ export class YsAdminUsers extends LitElement {
     this._new = { email: '', username: '' };
     this._edit = null;
     this._reset = null;
+    this._bootstrap = null;
   }
 
   createRenderRoot() { return this; }
@@ -255,8 +257,26 @@ export class YsAdminUsers extends LitElement {
     const res = await this.api.mutate('/admin/users', { method: 'POST', body });
     if (reportMutate(this.app, res, 'User created.')) {
       this._new = { email: '', username: '' };
+      // RISK-189: the API returns temporary_password/totp_secret/totp_uri ONCE
+      // (BOPLA allowlist exception, routes/users.py UserCreateResponse) — the
+      // admin has no other channel to retrieve these after this response, so
+      // surface them here for a one-time reveal/copy. Not persisted beyond
+      // this in-memory state; cleared on Dismiss and never logged.
+      const d = res.data || {};
+      if (d.temporary_password || d.totp_secret) {
+        this._bootstrap = {
+          username: d.username || u || email,
+          temporary_password: d.temporary_password || '',
+          totp_secret: d.totp_secret || '',
+          totp_uri: d.totp_uri || '',
+        };
+      }
       await this._load();
     }
+  }
+
+  _dismissBootstrap() {
+    this._bootstrap = null;
   }
 
   async _setDisabled(username, disabled) {
@@ -305,7 +325,9 @@ export class YsAdminUsers extends LitElement {
     const r = this._reset;
     if (!r) return;
     const code = (r.totp_code || '').trim();
-    if (!/^\d{6}$/.test(code)) { this.app && this.app.toast('A 6-digit admin TOTP code is required.', 'error'); return; }
+    // ADMIN tier TOTP is 8-digit/SHA-512; USER tier is 6-digit/SHA-256 (RISK-188).
+    // Mirror the shared step-up modal's acceptance range (ys-modal.js promptStepUp).
+    if (!/^\d{6,8}$/.test(code)) { this.app && this.app.toast('A 6 or 8-digit admin TOTP code is required.', 'error'); return; }
     const res = await this.api.mutate(
       `/admin/users/${encodeURIComponent(r.username)}/full-reset`,
       { method: 'POST', body: { totp_code: code } },
@@ -345,6 +367,30 @@ export class YsAdminUsers extends LitElement {
         </div>
         <button class="ys-btn" @click=${() => this._saveEdit()}>Save (step-up)</button>
         <button class="ys-btn ys-btn-secondary" @click=${() => { this._edit = null; }}>Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  _renderBootstrap() {
+    const b = this._bootstrap;
+    if (!b) return nothing;
+    return html`<div class="ys-panel">
+      <div class="ys-panel-header">Bootstrap credentials — ${b.username} (shown once)</div>
+      <div class="ys-panel-body">
+        <div class="ys-txt-note">These are shown ONCE and cannot be retrieved again — copy them now and hand them to the user out-of-band. Dismissing this panel discards them from the UI.</div>
+        <div class="ys-field">
+          <label class="ys-label">Temporary password</label>
+          <input class="ys-input" type="text" readonly .value=${b.temporary_password}>
+        </div>
+        <div class="ys-field">
+          <label class="ys-label">TOTP secret</label>
+          <input class="ys-input" type="text" readonly .value=${b.totp_secret}>
+        </div>
+        ${b.totp_uri ? html`<div class="ys-field">
+          <label class="ys-label">TOTP provisioning URI</label>
+          <input class="ys-input" type="text" readonly .value=${b.totp_uri}>
+        </div>` : nothing}
+        <button class="ys-btn" @click=${() => this._dismissBootstrap()}>Dismiss</button>
       </div>
     </div>`;
   }
@@ -410,6 +456,7 @@ export class YsAdminUsers extends LitElement {
           <button class="ys-btn" @click=${() => this._create()}>Create</button>
         </div>
       </div>
+      ${this._renderBootstrap()}
       ${this._renderEdit()}
       ${this._renderReset()}
       <div class="ys-panel">

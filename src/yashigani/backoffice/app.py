@@ -237,6 +237,13 @@ async def lifespan(app: FastAPI):
 
             await create_pool()
 
+            # YSG-RISK-190: mirror gateway/entrypoint.py's `_YASHIGANI_DB_READY=1`
+            # signal. net.readiness.postgres_ready() gates its actual SELECT-1
+            # check on this env var; without it, /readyz's postgres dep-check
+            # trivially reports "postgres_not_configured" (fail-OPEN) even
+            # though this DSN branch just ran migrations + opened a real pool.
+            os.environ["_YASHIGANI_DB_READY"] = "1"
+
             # --- v2.23.1 P0-2: bootstrap PostgresLocalAuthService -------------
             # Seed admin accounts from installer secrets ONLY if the DB has
             # zero admins. Previously the guard was `if not auth_service._accounts`
