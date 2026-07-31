@@ -276,6 +276,31 @@ class AuditLogWriter:
         # request path and from the file write.  Typed loosely to avoid an
         # import cycle (sinks.py imports nothing from writer at module load).
         self._db_sink = None  # type: ignore[var-annotated]
+        # Iris clue (YTF Tier-A, 2026-07-31): `_forward_to_siem` is spawned as
+        # a fire-and-forget daemon thread per write() call (below) with no
+        # lifecycle coordination against close(). Under a slow/unreachable
+        # SIEM target, `_send_with_retry`'s own backoff (_RETRY_DELAYS, up to
+        # 31s total) regularly outlives the request/test that triggered the
+        # write, so close() was closing self._file out from under a thread
+        # still retrying — its final failure-record write then raised
+        # `ValueError: I/O operation on closed file`, uncaught (only OSError
+        # was handled), crashing the daemon thread with an unhandled
+        # exception (PytestUnhandledThreadExceptionWarning in tests; a
+        # silently-dropped SiemDeliveryFailedEvent + swallowed-by-default
+        # threading.excepthook in production on any shutdown race). Track
+        # spawned threads so close() can join them with a bounded timeout —
+        # this is best-effort (a target can still legitimately take longer
+        # than the join budget), so _send_with_retry's own except clause
+        # below is ALSO widened to treat a post-close ValueError the same as
+        # OSError: log-and-swallow, never crash the thread unhandled.
+        self._siem_threads: list[threading.Thread] = []
+
+    # -- SIEM thread lifecycle -------------------------------------------
+
+    def _prune_and_track_siem_thread(self, thread: threading.Thread) -> None:
+        with self._lock:
+            self._siem_threads = [t for t in self._siem_threads if t.is_alive()]
+            self._siem_threads.append(thread)
 
     # -- Public API ----------------------------------------------------------
 
@@ -380,13 +405,18 @@ class AuditLogWriter:
         except Exception:  # noqa: BLE001 — metric must never fail the audit write
             pass
 
-        # SIEM forwarding is fire-and-forget (never blocks volume write)
+        # SIEM forwarding is fire-and-forget (never blocks volume write).
+        # Tracked (not truly detached) so close() can join outstanding
+        # forwarders with a bounded timeout instead of closing self._file
+        # out from under one — see _prune_and_track_siem_thread docstring.
         if self._siem_targets:
-            threading.Thread(
+            siem_thread = threading.Thread(
                 target=self._forward_to_siem,
                 args=(event, record),
                 daemon=True,
-            ).start()
+            )
+            siem_thread.start()
+            self._prune_and_track_siem_thread(siem_thread)
 
     def _write_raw(self, line: str) -> None:
         """
@@ -407,6 +437,18 @@ class AuditLogWriter:
                 ) from exc
 
     def close(self) -> None:
+        # Give outstanding SIEM-forward threads a bounded window to finish
+        # before the file they may still write a failure-record to is closed
+        # underneath them. Best-effort only: a target whose retry chain is
+        # still running past this budget (_RETRY_DELAYS totals up to 31s)
+        # is NOT waited on further — join() below is a lock-free read of
+        # thread state, so it doesn't contend with self._lock, and any
+        # straggler's eventual post-close write is caught (not crashed
+        # unhandled) by _send_with_retry's widened except clause.
+        with self._lock:
+            threads = list(self._siem_threads)
+        for thread in threads:
+            thread.join(timeout=2.0)
         with self._lock:
             try:
                 self._file.close()
@@ -624,7 +666,19 @@ class AuditLogWriter:
             with self._lock:
                 self._file.write(record + "\n")
                 self._file.flush()
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError covers "I/O operation on closed file" — this
+            # fire-and-forget thread's retry chain (up to 31s, _RETRY_DELAYS)
+            # can legitimately outlive close() being called on this writer
+            # (request/test completion, or process shutdown, racing ahead of
+            # a still-retrying SIEM target). close() joins outstanding SIEM
+            # threads with a bounded timeout precisely to make this rare, but
+            # it is best-effort, not a guarantee — treat a post-close write
+            # attempt the same as any other volume-write failure: log and
+            # swallow, never let it propagate as an unhandled exception out
+            # of a daemon thread (which used to crash silently/noisily
+            # depending on threading.excepthook, dropping this failure
+            # record instead of surfacing it here).
             logger.error(
                 "SIEM delivery failure AND volume write failure for event %s",
                 event.audit_event_id,
