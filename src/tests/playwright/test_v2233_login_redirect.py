@@ -70,11 +70,25 @@ _pw_required = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 def _wait_for_fresh_totp_window() -> str:
-    """Wait for a fresh TOTP time window and return a code."""
+    """Wait for a fresh TOTP time window and return a code.
+
+    QA-fix (Ava, 2026-07-31, Tier-B smoke): this helper previously built
+    `pyotp.TOTP(totp_secret)` with NO digits/digest args, i.e. the RFC 6238
+    DEFAULT (HMAC-SHA1, 6-digit). Admin TOTP is HMAC-SHA-512/8-digit (see
+    src/yashigani/auth/totp.py TOTP_ALGO_SHA512/TOTP_DIGITS_ADMIN; conftest.py
+    get_admin_totp_code() already does this correctly). The old code here was
+    submitting a STRUCTURALLY WRONG code on every single call -- every test
+    in this module (LR-01..07) was guaranteed to fail login with
+    'invalid_credentials', misleadingly self-diagnosed by _login_via_form()
+    as "likely TOTP replay". It was never a replay; the code was simply for
+    the wrong algorithm. Fixed to match conftest.py's SHA-512/8-digit.
+    """
+    import hashlib
+
     import pyotp
 
     totp_secret = _read_secret("admin1_totp_secret")
-    totp_obj = pyotp.TOTP(totp_secret)  # RFC 6238 default: HMAC-SHA1
+    totp_obj = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512)
 
     last = _api_totp_last_used.get(1, 0.0)
     now = time.time()
@@ -128,7 +142,17 @@ def _login_via_form(page, *, next_param: str | None = None) -> str:
         )
         page.fill("#new_password", new_pw)
         page.fill("#confirm_password", new_pw)
-        page.click("#pw-change-btn, button[type='submit']")
+        # QA-fix (Ava, 2026-07-31): the real password-change submit button is
+        # id="pw-btn" (src/yashigani/backoffice/templates/login.html:47) — the
+        # old selector "#pw-change-btn, button[type='submit']" referenced a
+        # nonexistent ID, so it silently fell back to the generic
+        # button[type='submit'] group selector, which ALSO matches the
+        # original (now-hidden but still in the DOM) #login-btn. Playwright
+        # resolves the ambiguous locator to the first (hidden) match and
+        # times out waiting for it to become visible/clickable, so the
+        # password-change step — and therefore every LR test that hits a
+        # fresh-bootstrap admin — never completed.
+        page.click("#pw-btn")
         page.wait_for_timeout(2000)
 
     final_url = page.url

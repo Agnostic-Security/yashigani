@@ -36,6 +36,8 @@ from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    _generate_strong_password,
+    _rotated_admin_password,
     get_admin_credentials,
     get_admin_totp_code,
     _wait_for_fresh_totp_window,
@@ -82,7 +84,19 @@ def _do_login(page, username: str, password: str) -> None:
     (off-by-one, same class of bug fixed in test_v233_webauthn_e2e.py).
     Net effect: login could never complete, so page.wait_for_url() always hit
     its 10s timeout, failing every test in this file. Now reuses the shared,
-    correct conftest helpers (also respects the 62s TOTP-replay window)."""
+    correct conftest helpers (also respects the 62s TOTP-replay window).
+
+    QA-fix (Ava, 2026-07-31): this docstring claimed the force-password-change
+    redirect was "handled ... only when it appears", but no such handling
+    existed in the code -- on a genuinely fresh stack (admin creds still
+    INITIAL, as this Tier-B environment is) login lands back on
+    /admin/login with #pw-form visible, and wait_for_url() below would
+    simply time out, failing every test in this file. Now actually detects
+    and drives the password-change form (using the real #pw-btn id, not the
+    stale-and-nonexistent #pw-change-btn from other files' pre-fix state),
+    and persists the rotated password into conftest._rotated_admin_password
+    so get_admin_credentials() returns the right value for every subsequent
+    test in this process."""
     _wait_for_fresh_totp_window(admin=1)
     page.goto(f"{BASE_URL}/admin/login")
     page.fill("input[name='username']", username)
@@ -90,6 +104,16 @@ def _do_login(page, username: str, password: str) -> None:
     page.fill("#totp_code", get_admin_totp_code())
     _api_totp_last_used[1] = time.time()
     page.click("button[type='submit']")
+    page.wait_for_timeout(3000)  # wait for fetch() to complete before checking for pw-form
+
+    if page.locator("#pw-form").is_visible():
+        new_pw = _generate_strong_password()
+        page.fill("#new_password", new_pw)
+        page.fill("#confirm_password", new_pw)
+        page.click("#pw-btn")
+        page.wait_for_timeout(2000)
+        _rotated_admin_password[1] = new_pw
+
     # Allow redirect to settle
     page.wait_for_url(re.compile(r"/admin/"), timeout=10_000)
     # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the ui4 SPA

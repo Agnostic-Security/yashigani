@@ -211,17 +211,15 @@ def _read_secret(name: str) -> str:
 def get_admin_credentials() -> tuple[str, str]:
     """Return (username, current_password) for admin1.
 
-    Prefers admin1_password (post-bootstrap rotated), falls back to
-    admin_initial_password if admin1_password matches initial (not yet rotated).
+    Prefers the in-process rotated password (_rotated_admin_password, set once
+    this suite has actually completed the forced-password-change step this
+    run) over the on-disk admin1_password secret, which stays stale for the
+    lifetime of the run since nothing writes rotations back to disk. Falls
+    back to admin_initial_password if admin1_password doesn't exist either
+    (not yet rotated by anything, on-disk or in-process).
     """
     username = _read_secret("admin1_username")
-    # After the mandatory first-login password change, admin1_password holds the
-    # rotated credential. admin_initial_password is the bootstrap value and may
-    # still match admin1_password on a fresh install before rotation.
-    try:
-        password = _read_secret("admin1_password")
-    except FileNotFoundError:
-        password = _read_secret("admin_initial_password")
+    password = _current_admin_password(1)
     return username, password
 
 
@@ -259,6 +257,48 @@ def get_admin2_totp_code() -> str:
 
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
 _api_totp_last_used: "dict[int, float]" = {}  # admin_number → time.time() of last API login
+
+# QA-fix (Ava, 2026-07-31, Tier-B v412 fresh-bootstrap smoke): on a genuinely
+# fresh stack (admin creds still INITIAL, force_password_change=True on first
+# login) BOTH playwright_login_admin() and the (now-removed) local duplicates
+# in test_v2233_login_redirect.py / test_backup_ui.py handled the forced
+# password-change step by generating a random new password and submitting it
+# -- but NEVER persisted that new password anywhere. get_admin_credentials()
+# (and every helper's own admin2 resolution) kept reading the stale value
+# from docker/secrets/, so the FIRST admin-dependent test to run would rotate
+# the live password out from under every other test in the same pytest
+# invocation, which would then fail with invalid_credentials. This process-
+# lifetime cache is the single source of truth for "what is admin{N}'s
+# CURRENT password right now" once this suite has rotated it; every login
+# helper below reads/writes through it instead of re-reading the stale
+# on-disk secret after first rotation.
+_rotated_admin_password: "dict[int, str]" = {}
+
+
+def _current_admin_password(admin: int = 1) -> str:
+    """Return admin{N}'s current password: the in-process rotated value if
+    this suite has already rotated it this run, else the on-disk secret."""
+    if admin in _rotated_admin_password:
+        return _rotated_admin_password[admin]
+    if admin == 1:
+        try:
+            return _read_secret("admin1_password")
+        except FileNotFoundError:
+            return _read_secret("admin_initial_password")
+    try:
+        return _read_secret(f"admin{admin}_password")
+    except FileNotFoundError:
+        return _read_secret("admin_initial_password")
+
+
+def _generate_strong_password() -> str:
+    import secrets as _secrets
+    import string as _string
+
+    return "".join(
+        _secrets.choice(_string.ascii_letters + _string.digits + "!*-._~,")
+        for _ in range(42)
+    )
 
 
 def clear_auth_throttle() -> int:
@@ -352,41 +392,38 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
     import pyotp
 
     if admin == 1:
-        username, password = get_admin_credentials()
+        username = _read_secret("admin1_username")
         totp_secret = _read_secret("admin1_totp_secret")
     else:
         username = _read_secret("admin2_username")
-        try:
-            password = _read_secret("admin2_password")
-        except FileNotFoundError:
-            password = _read_secret("admin_initial_password")
         totp_secret = _read_secret("admin2_totp_secret")
+    password = _current_admin_password(admin)
 
     # F9 correction (2026-07-29): admin tier is HMAC-SHA-512/8-digit
     # (src/yashigani/auth/totp.py TOTP_ALGO_SHA512/TOTP_DIGITS_ADMIN), not
     # pyotp's RFC 6238 default (SHA-1/6-digit). See get_admin_totp_code().
     totp_obj = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512)
 
+    def _wait_for_fresh_code() -> str:
+        last = _api_totp_last_used.get(admin, 0.0)
+        now = time.time()
+        elapsed = now - last
+        if elapsed < 62:
+            wait_for_replay = 62 - elapsed
+            secs_into = now % 30
+            wait_for_window = (30 - secs_into + 2) if secs_into >= 27 else 0
+            time.sleep(max(wait_for_replay, wait_for_window))
+        else:
+            secs_into = time.time() % 30
+            if secs_into >= 27:
+                time.sleep(32 - secs_into)
+        code = totp_obj.now()
+        _api_totp_last_used[admin] = time.time()
+        return code
+
     # Wait at least 62s since the last TOTP use for this admin to avoid replay.
     # Also wait until we're in the first 27s of a 30s window.
-    last = _api_totp_last_used.get(admin, 0.0)
-    now = time.time()
-    elapsed = now - last
-    if elapsed < 62:
-        wait_for_replay = 62 - elapsed
-        # Additionally align to a fresh window
-        secs_into = now % 30
-        wait_for_window = (30 - secs_into + 2) if secs_into >= 27 else 0
-        wait = max(wait_for_replay, wait_for_window)
-        time.sleep(wait)
-    else:
-        # Just make sure we're not at the window boundary
-        secs_into = time.time() % 30
-        if secs_into >= 27:
-            time.sleep(32 - secs_into)
-
-    totp_code = totp_obj.now()
-    _api_totp_last_used[admin] = time.time()
+    totp_code = _wait_for_fresh_code()
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
 
     with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
@@ -398,10 +435,50 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
                 "totp_code": totp_code,
             },
         )
-    assert r.status_code == 200, f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
-    data = r.json()
-    assert not data.get("force_password_change"), f"admin{admin}: force_password_change=True — complete bootstrap first"
-    result = dict(r.cookies)
+        assert r.status_code == 200, f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
+        data = r.json()
+
+        # QA-fix (Ava, 2026-07-31): self-heal the forced-password-change step
+        # instead of hard-asserting it already happened. On a genuinely fresh
+        # stack (this Tier-B smoke: admin creds still INITIAL) this branch is
+        # the FIRST and ONLY place the rotation actually happens; the result
+        # is cached in _rotated_admin_password so every other helper
+        # (get_admin_credentials, playwright_login_admin, this function
+        # itself on a later call) sees the rotated password for the rest of
+        # this pytest process.
+        if data.get("force_password_change"):
+            new_password = _generate_strong_password()
+            change_r = c.post(
+                f"{BASE_URL}/auth/password/change",
+                json={"current_password": password, "new_password": new_password},
+            )
+            assert change_r.status_code == 200, (
+                f"admin{admin} forced password-change failed: "
+                f"{change_r.status_code} {change_r.text[:200]}"
+            )
+            _rotated_admin_password[admin] = new_password
+            # Log out the restricted (password-change-required) session, then
+            # re-login fresh with the rotated password to get a full session
+            # and prove the rotation stuck (A2 step 4/5).
+            c.post(f"{BASE_URL}/auth/logout")
+            totp_code2 = _wait_for_fresh_code()
+            r = c.post(
+                f"{BASE_URL}/auth/login",
+                json={
+                    "username": username,
+                    "password": new_password,
+                    "totp_code": totp_code2,
+                },
+            )
+            assert r.status_code == 200, (
+                f"admin{admin} re-login after rotation failed: {r.status_code} {r.text[:200]}"
+            )
+            data = r.json()
+            assert not data.get("force_password_change"), (
+                f"admin{admin} still force_password_change=True after rotation — rotation did not stick"
+            )
+
+        result = dict(r.cookies)
     _session_cookie_cache[admin] = result
     return result
 
@@ -431,15 +508,12 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     import pyotp
 
     if admin == 1:
-        username, password = get_admin_credentials()
+        username = _read_secret("admin1_username")
         totp_secret = _read_secret("admin1_totp_secret")
     else:
         username = _read_secret("admin2_username")
-        try:
-            password = _read_secret("admin2_password")
-        except FileNotFoundError:
-            password = _read_secret("admin_initial_password")
         totp_secret = _read_secret("admin2_totp_secret")
+    password = _current_admin_password(admin)
 
     # F9 correction (2026-07-29): admin tier is HMAC-SHA-512/8-digit, not
     # pyotp's RFC 6238 default. See get_admin_totp_code() docstring.
@@ -475,14 +549,25 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
 
     # Handle forced password change if still needed
     if page.locator("#pw-form").is_visible():
-        import secrets as _secrets
-        import string as _string
-
-        new_pw = "".join(_secrets.choice(_string.ascii_letters + _string.digits + "!*-._~,") for _ in range(42))
+        new_pw = _generate_strong_password()
         page.fill("#new_password", new_pw)
         page.fill("#confirm_password", new_pw)
-        page.click("#pw-change-btn, button[type='submit']")
+        # QA-fix (Ava, 2026-07-31): the real submit button is id="pw-btn"
+        # (src/yashigani/backoffice/templates/login.html:47). The old
+        # selector "#pw-change-btn, button[type='submit']" referenced a
+        # nonexistent ID and silently fell back to the ambiguous group
+        # selector, which also matches the original (now-hidden but still
+        # in the DOM) #login-btn — Playwright resolves to that hidden match
+        # first and times out. Also: the randomly-generated new_pw was
+        # NEVER persisted anywhere, so every OTHER helper/test reading
+        # admin{N}'s password from docker/secrets/ would immediately start
+        # failing with invalid_credentials once this branch fired. Now
+        # cached in _rotated_admin_password so get_admin_credentials() /
+        # _api_get_session_cookies() / this function's own next call all
+        # see the current password for the rest of this pytest process.
+        page.click("#pw-btn")
         page.wait_for_timeout(2000)
+        _rotated_admin_password[admin] = new_pw
 
     # Belt-and-braces: if login didn't redirect to /admin/ (e.g. timing), navigate directly.
     if "/admin/" not in page.url or "login" in page.url:

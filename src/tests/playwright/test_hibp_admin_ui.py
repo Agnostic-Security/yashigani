@@ -29,6 +29,8 @@ from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    _generate_strong_password,
+    _rotated_admin_password,
     get_admin_credentials,
     get_admin_totp_code,
     _wait_for_fresh_totp_window,
@@ -68,6 +70,14 @@ def _login(page, creds):
     that, #totp_code was never filled (required by the server, Phase 13+).
     Fixed to unpack the tuple correctly and fill TOTP via the shared, correct
     (SHA-512/8-digit) helper, respecting the 62s replay window.
+
+    QA-fix (Ava, 2026-07-31): on a genuinely fresh stack (admin creds still
+    INITIAL) login redirects back to /admin/login with #pw-form visible
+    instead of /admin/ -- this had no handling for that at all, so
+    wait_for_url() below would simply time out, failing every test in this
+    file. Now drives the password-change form (real id="pw-btn") and
+    persists the rotated password so get_admin_credentials() stays correct
+    for the rest of this pytest process.
     """
     _wait_for_fresh_totp_window(admin=1)
     username, password = creds
@@ -77,6 +87,16 @@ def _login(page, creds):
     page.fill("#totp_code", get_admin_totp_code())
     _api_totp_last_used[1] = __import__("time").time()
     page.click('button[type="submit"], button:has-text("Login")')
+    page.wait_for_timeout(3000)
+
+    if page.locator("#pw-form").is_visible():
+        new_pw = _generate_strong_password()
+        page.fill("#new_password", new_pw)
+        page.fill("#confirm_password", new_pw)
+        page.click("#pw-btn")
+        page.wait_for_timeout(2000)
+        _rotated_admin_password[1] = new_pw
+
     page.wait_for_url(f"{BASE_URL}/admin/")
     return page
 

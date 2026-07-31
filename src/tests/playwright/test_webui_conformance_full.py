@@ -73,6 +73,7 @@ from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    _api_get_session_cookies,
     bootstrap_user_session,
     clear_auth_throttle,
     get_admin_credentials,
@@ -273,34 +274,44 @@ class TestUserLoginForm:
 
 
 class TestAdminBootstrapBothAdmins:
-    """A2: full 5-step bootstrap for BOTH admin1 and admin2 -- initial
-    login -> forced password change -> TOTP provision -> logout -> re-login
-    with rotated creds. This is the release-gate admin flow, re-verified here
-    because the webui suite is the first consumer of the corrected (F9)
-    HMAC-SHA-512/8-digit admin TOTP helpers."""
+    """A2: full bootstrap for BOTH admin1 and admin2 -- initial login (initial
+    password from docker/secrets) -> forced password change -> logout ->
+    re-login with rotated creds. (TOTP is pre-provisioned as an install-time
+    docker secret on this deployment -- confirmed live via
+    force_totp_provision=false on the first-login response -- so there is no
+    separate self-service TOTP-enrollment step to drive here; A2's step 3
+    doesn't apply to this install pattern.)
+
+    QA-fix (Ava, 2026-07-31, Tier-B v412 fresh-bootstrap smoke): this test
+    previously (a) never actually performed the rotation -- it just read
+    get_admin_credentials() and asserted force_password_change is False,
+    which on a genuinely fresh stack (admin creds still INITIAL, as this
+    environment is) is FALSE-guaranteed to fail, since nothing had rotated
+    the password yet; (b) unconditionally SKIPPED admin2 with a comment
+    deferring to release-gate-check.sh, which is a DIFFERENT harness not run
+    as part of this Tier-B pytest invocation -- a false PASS-by-omission per
+    retro A2 ('skipping this for either admin = false PASS. No exceptions.').
+    Now drives the real rotation for BOTH admins via
+    conftest._api_get_session_cookies(), which self-heals
+    force_password_change (login -> POST /auth/password/change -> logout ->
+    re-login) and persists the rotated password in-process so every other
+    admin-dependent test in this run picks it up too."""
 
     @pytest.mark.parametrize("admin_num", [1, 2])
     def test_relogin_after_rotation_proves_rotation_stuck(self, admin_num):
-        """Deterministic gate: re-login with the ROTATED password/session
-        succeeds and force_password_change is False. Does not re-run the
-        rotation itself (that is assumed already complete from install --
-        see release-gate-check.sh); this asserts the END STATE."""
-        with _http_client() as c:
-            username, password = get_admin_credentials() if admin_num == 1 else (None, None)
-        # admin2 credential resolution mirrors conftest._api_get_session_cookies;
-        # left to the existing admin-bootstrap release gate (out of scope for
-        # this WebUI suite to re-implement) -- this test asserts reachability
-        # of the login endpoint only when admin_num == 1 has real creds.
-        if admin_num == 2:
-            pytest.skip("admin2 rotation proof is covered by release-gate-check.sh C-series; "
-                        "this suite focuses on WebUI element conformance, not admin bootstrap itself")
-        totp_code = get_admin_totp_code()
-        with _http_client() as c:
-            r = c.post(f"{BASE_URL}/auth/login", json={
-                "username": username, "password": password, "totp_code": totp_code,
-            })
-        assert r.status_code == 200, f"admin1 login failed: {r.status_code} {r.text[:200]}"
-        assert not r.json().get("force_password_change")
+        """Deterministic gate: drive rotation (if not already done this run)
+        then assert the re-login with the ROTATED password succeeds and
+        force_password_change is False -- the actual end state, evidenced
+        live, not assumed."""
+        cookies = _api_get_session_cookies(admin=admin_num, force_fresh=True)
+        assert cookies, f"admin{admin_num}: no session cookies returned after bootstrap/rotation"
+        session_cookie_names = [
+            "__Host-yashigani_admin_session", "__Host-yashigani_session",
+        ]
+        assert any(name in cookies for name in session_cookie_names), (
+            f"admin{admin_num}: bootstrap completed but no recognised session "
+            f"cookie present — got {sorted(cookies.keys())}"
+        )
 
 
 class TestSessionLifecycle:
