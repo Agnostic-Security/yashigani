@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Callable, Iterator
 
+from kuroshio.licensing import licence_verdict_for_model_metadata
 from kuroshio.models import ResolvedModel
 from kuroshio.shim.framing import format_ndjson_line
 
@@ -34,6 +35,21 @@ def iter_pull_progress(resolve: Callable[[], ResolvedModel]) -> Iterator[bytes]:
         yield format_ndjson_line({"status": "error", "error": str(exc)})
         raise
     yield format_ndjson_line({"status": "verifying sha256 digest"})
+    # Licence-alert-on-import (Tiago 2026-07-31): warn-not-block. A model
+    # whose declared licence isn't recognised commercial-free (or that
+    # declares none) still imports, but the stream carries a non-blocking
+    # alert event ahead of the success line. Extra keys on a status event
+    # are shape-compatible with ollama's NDJSON progress contract —
+    # consumers key off `status` only.
+    verdict = licence_verdict_for_model_metadata(resolved.metadata)
+    if verdict.alert is not None:
+        yield format_ndjson_line(
+            {
+                "status": "licence alert",
+                "licence": verdict.raw or "",
+                "detail": verdict.alert,
+            }
+        )
     yield format_ndjson_line({"status": "writing manifest"})
     yield format_ndjson_line({"status": "success", "digest": resolved.sha256})
 

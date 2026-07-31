@@ -51,6 +51,10 @@ class LocalFileAdapter(SourceAdapter):
             # fail-closed guard (app.py::_require_chat_template) can check
             # it without re-parsing the GGUF header at request time.
             "chat_template": header.chat_template,
+            # Licence-alert-on-import (Tiago 2026-07-31): the declared
+            # licence id travels in normalized metadata so the pull path can
+            # emit the non-blocking alert and `/api/show` can surface it.
+            "license": header.license,
         }
 
         digest = sha256_file(path)

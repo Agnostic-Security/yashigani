@@ -95,6 +95,7 @@ class LMStudioStoreAdapter(SourceAdapter):
                 "quantization_level": header.quantization_level,
                 "gguf_version": header.version,
                 "chat_template": header.chat_template,
+                "license": header.license,
             }
             provenance = Provenance(
                 kind=ProvenanceKind.LOCAL_LMSTUDIO,

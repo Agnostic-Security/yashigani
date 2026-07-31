@@ -144,6 +144,20 @@ class GGUFHeader:
         return value if isinstance(value, str) and value.strip() else None
 
     @property
+    def license(self) -> str | None:
+        """`general.license` (fallback `general.license.name`) — the model's
+        self-declared licence id. Pure extraction, like `chat_template`: the
+        licence-alert policy (Tiago 2026-07-31, warn-not-block on imports
+        whose licence isn't recognised commercial-free) lives in
+        :mod:`kuroshio.licensing`, not here.
+        """
+        for key in ("general.license", "general.license.name"):
+            value = self.metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @property
     def total_parameters(self) -> int:
         """Sum of element counts across all tensors — an approximation of
         parameter count (real per-architecture accounting can differ

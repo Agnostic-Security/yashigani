@@ -45,6 +45,7 @@ def build_minimal_gguf(
     version: int = 3,
     tensors: list[tuple[str, tuple[int, ...], int]] | None = None,
     chat_template: str | None = DEFAULT_CHAT_TEMPLATE,
+    license: str | None = None,
 ) -> bytes:
     """Build a minimal, spec-valid GGUF byte blob (header + KV metadata + tensor
     info only — no tensor payload bytes, since the parser never reads those).
@@ -70,6 +71,8 @@ def build_minimal_gguf(
     ]
     if chat_template is not None:
         kv_entries.append(_pack_kv("tokenizer.chat_template", _T_STRING, _pack_string(chat_template)))
+    if license is not None:
+        kv_entries.append(_pack_kv("general.license", _T_STRING, _pack_string(license)))
     if file_type is not None:
         kv_entries.append(_pack_kv("general.file_type", _T_UINT32, struct.pack("<I", file_type)))
 

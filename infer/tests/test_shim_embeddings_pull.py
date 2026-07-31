@@ -43,7 +43,10 @@ def _fake_resolved_model() -> ResolvedModel:
     return ResolvedModel(
         sha256="a" * 64,
         blob_path=Path("/blobs/a.gguf"),
-        metadata={"name": "x"},
+        # Declared commercial-free licence — keeps this success-sequence
+        # test about the base progress shape; the licence-alert insertion
+        # (undeclared/unrecognised licences) is covered in test_licensing.py.
+        metadata={"name": "x", "license": "apache-2.0"},
         provenance=Provenance(kind=ProvenanceKind.HUGGINGFACE, origin="acme/x", sha256="a" * 64),
     )
 
