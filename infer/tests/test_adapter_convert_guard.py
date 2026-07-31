@@ -113,12 +113,14 @@ def test_convert_adapter_resolve_refuses_pickle_before_touching_invoker(tmp_blob
         adapter.resolve(source_path=path)
 
 
-def test_convert_adapter_resolve_raises_not_implemented_for_valid_safetensors(
-    tmp_blob_store: BlobStore, tmp_path
-) -> None:
+def test_convert_adapter_default_stub_refuses_in_serving_process(tmp_blob_store: BlobStore, tmp_path) -> None:
+    # The serving process never converts: ConvertAdapter's DEFAULT invoker
+    # stays the refusing stub; real conversions go through the ephemeral
+    # convert job (kuroshio.convert_job), which wires the subprocess
+    # invoker explicitly. Guard still runs first (pickle test above).
     path = _write(tmp_path / "model.safetensors", _fake_safetensors_bytes())
     adapter = ConvertAdapter(tmp_blob_store)
-    with pytest.raises(NotImplementedError, match="v2 feature"):
+    with pytest.raises(NotImplementedError, match="ephemeral convert job"):
         adapter.resolve(source_path=path)
 
 

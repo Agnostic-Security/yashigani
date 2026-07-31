@@ -47,9 +47,10 @@ provenance than a directly counter-signed HF pull, and that distinction is
 signed INTO the record, not left to a display-layer label.
 
 The actual conversion invocation (`convert_hf_to_gguf.py` + `llama-
-quantize`) remains a v2 stub in `adapters/convert.py` — this module defines
-the provenance contract that invocation MUST satisfy once it is wired in,
-and is fully unit-testable today against fixture files.
+quantize`) lives in `adapters/convert.py`'s `SubprocessConversionInvoker`
+(built 2026-07-31, Tiago's convert-BUILD decision) — this module defines
+the provenance contract that invocation satisfies, and is fully
+unit-testable against fixture files.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from kuroshio.blobstore.store import sha256_file
+from kuroshio.blobstore.store import sha256_bytes, sha256_file
 from kuroshio.catalog import ECDSA_P256_SHA256, RevocationSource, StaticRevocationSource
 from kuroshio.provenance_canon import canonical_json_bytes
 
@@ -98,14 +99,47 @@ def _parse_issued_at(value: str) -> datetime:
 
 
 def measure_source_digest(path: Path) -> str:
-    """Measure a file's sha256 from its actual bytes on disk.
+    """Measure a file's — or a source tree's — sha256 from actual bytes on disk.
 
-    Used for BOTH the convert pipeline's source-file digest and its
+    Used for BOTH the convert pipeline's source digest and its
     output-file digest (see `measure_conversion_tuple` and
     `verify_converted_manifest`) — the same measuring function on both
     sides of the conversion is the point: neither digest is ever an
     operator-asserted string, both come from actually reading the bytes.
+
+    A conversion SOURCE is usually a Hugging Face-style model directory
+    (config.json + one or more safetensors shards + tokenizer files), not a
+    single file. For a directory, the digest is a canonical tree digest:
+    sha256 over one line per regular file, sorted by path —
+    ``<per-file-sha256>  <json-escaped-posix-relpath>\\n`` (sha256sum
+    manifest style; the JSON string escaping makes a path containing
+    newlines or non-ASCII unambiguous). Deterministic across machines
+    (sorted paths, content digests only — no mtimes/sizes/owners), and any
+    byte change in any file changes the tree digest. Nested-container
+    canonical JSON is NOT used here on purpose: `provenance_canon` refuses
+    nesting for signed payloads, and this preimage never appears in a
+    signed payload — only its final hex digest does (as `source_sha256`).
+    Symlinks are refused outright — a symlinked source could smuggle bytes
+    from outside the measured tree, which is exactly the substitution class
+    finding #4 exists to close. Conversion OUTPUT is always a single GGUF
+    file, so `verify_converted_manifest`'s re-measure path is unaffected.
     """
+    if path.is_dir():
+        import json as _json
+
+        lines: list[str] = []
+        for candidate in sorted(path.rglob("*")):
+            if candidate.is_symlink():
+                raise ValueError(
+                    f"symlink {candidate} inside conversion source tree — refused; a symlink "
+                    "can point outside the measured tree (provenance finding #4 substitution class)"
+                )
+            if candidate.is_file():
+                relpath = _json.dumps(candidate.relative_to(path).as_posix(), ensure_ascii=True)
+                lines.append(f"{sha256_file(candidate)}  {relpath}\n")
+        if not lines:
+            raise ValueError(f"conversion source directory {path} contains no regular files to measure")
+        return sha256_bytes("".join(sorted(lines)).encode("ascii"))
     return sha256_file(path)
 
 
