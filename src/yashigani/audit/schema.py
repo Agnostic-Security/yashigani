@@ -330,6 +330,17 @@ class EventType(str, Enum):
     # because the session belongs to an admin — admins cannot bridge to data plane
     # (SoD-003). NIST AC-5 / OWASP ASVS V4.1.2.
     AUTH_VERIFY_REJECTED_ADMIN_SESSION = "AUTH_VERIFY_REJECTED_ADMIN_SESSION"
+    # ADMIN_ACCESS_DENIED_TIER_MISMATCH: backoffice/middleware.py::
+    # require_admin_session() — the single dependency every /admin/* route
+    # funnels through — rejected a validated (not missing/expired) session
+    # on the ADMIN-tier check itself: either a non-admin-tier session
+    # reaching an admin-only route (insufficient_tier — the mirror case of
+    # AUTH_VERIFY_REJECTED_ADMIN_SESSION), or an admin session still under
+    # a forced password-change restriction (admin_password_change_required,
+    # LAURA-411-003). E2 observability-SOP gap closure (2026-07-31): this
+    # central authz gate previously raised HTTPException with zero audit
+    # trail. NIST AC-5 / SOC 2 CC6.3 / OWASP ASVS V4.1.2.
+    ADMIN_ACCESS_DENIED_TIER_MISMATCH = "ADMIN_ACCESS_DENIED_TIER_MISMATCH"
     # IDENTITY_STORE_CONFLICT: cross-store conflict detected by daily cron audit
     # (SoD-005). Same username/email exists in both admin_accounts and
     # identity_registry. Operator must remediate manually.
@@ -3104,6 +3115,43 @@ class AuthVerifyRejectedAdminSessionEvent(AuditEvent):
     masking_applied: bool = True
     account_id: str = ""                # the admin account_id from the session
     client_ip_prefix: str = ""          # last-octet masked
+
+
+@dataclass
+class AdminAccessDeniedTierMismatchEvent(AuditEvent):
+    """Emitted by backoffice/middleware.py::require_admin_session() — the
+    single FastAPI dependency EVERY /admin/* route funnels through — when a
+    validated session (not missing/expired; that is an AUTHN failure and is
+    NOT audited here) fails the admin-tier check itself.
+
+    Two distinct causes, both HTTP 403, both a genuine AUTHORIZATION deny:
+      - insufficient_tier: a non-admin-tier session (typically "user")
+        reached an admin-only route — the mirror case of
+        AuthVerifyRejectedAdminSessionEvent (that one is "admin session on
+        the data plane"; this one is "non-admin session on the admin
+        plane"). A cross-tier privilege-escalation-ATTEMPT signal.
+      - admin_password_change_required: an admin session still under a
+        forced first-login/reset password-change restriction
+        (LAURA-411-003) attempted a full admin route before completing the
+        required rotation.
+
+    E2 (observability SOP, 2026-07-31): this dependency previously raised
+    HTTPException with NO audit trail at all — closing this is the highest
+    per-request-volume authorization-DENY gap in the backoffice, since
+    every admin request passes through it.
+
+    NIST AC-5 / SOC 2 CC6.3 / OWASP ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.ADMIN_ACCESS_DENIED_TIER_MISMATCH
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    account_id: str = ""                  # session.account_id (whatever tier it is)
+    session_account_tier: str = ""        # the session's ACTUAL tier value
+    reason: str = ""                      # insufficient_tier | admin_password_change_required
+    path: str = ""
+    method: str = ""
+    client_ip_prefix: str = ""            # last-octet masked
 
 
 @dataclass

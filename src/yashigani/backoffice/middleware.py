@@ -132,6 +132,46 @@ def _resolve_user_token(request: Request) -> Optional[str]:
     return request.cookies.get(_USER_SESSION_COOKIE)
 
 
+def _mw_real_client_ip(request: Request) -> str:
+    """Real client IP for audit keys — deliberately duplicates
+    routes/auth.py::_real_client_ip (same X-Real-IP-over-X-Forwarded-For
+    rationale, LAURA-3X-001) rather than importing it: routes/ imports FROM
+    backoffice/middleware.py, so the reverse import would be a backwards
+    layering dependency — same rationale as _configured_public_hosts above.
+    """
+    xri = request.headers.get("x-real-ip", "").strip()
+    if xri:
+        return xri.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _audit_admin_access_denied_tier_mismatch(
+    request: Request, session: Session, reason: str,
+) -> None:
+    """E2 (observability SOP): best-effort audit emission for a validated
+    session that failed require_admin_session()'s admin-tier check. Audit
+    failure must NEVER block the deny itself — the HTTPException the caller
+    raises right after this is the actual security control; this is
+    forensic trail only.
+    """
+    try:
+        from yashigani.backoffice.state import backoffice_state
+        if backoffice_state.audit_writer is None:
+            return
+        from yashigani.audit.schema import AdminAccessDeniedTierMismatchEvent
+        from yashigani.auth.session import _mask_ip
+        backoffice_state.audit_writer.write(AdminAccessDeniedTierMismatchEvent(
+            account_id=session.account_id,
+            session_account_tier=session.account_tier,
+            reason=reason,
+            path=request.url.path,
+            method=request.method,
+            client_ip_prefix=_mask_ip(_mw_real_client_ip(request)),
+        ))
+    except Exception:  # pragma: no cover — audit must never break the deny
+        pass
+
+
 def require_admin_session(
     request: Request,
     store: SessionStore = Depends(get_session_store),
@@ -144,6 +184,16 @@ def require_admin_session(
     TD-2026-07-25-04: also enforces the CSRF Origin check (see
     _enforce_csrf_origin) for state-changing methods. Cheap check, run
     before the session-store round trip.
+
+    E2 (observability SOP, 2026-07-31): this is the single dependency
+    EVERY /admin/* route funnels through, so its two 403 branches
+    (admin_password_change_required, insufficient_tier) are the
+    highest-per-request-volume authorization-DENY gap in the backoffice.
+    Both now emit AdminAccessDeniedTierMismatchEvent (best-effort, never
+    blocks the deny). The two 401 branches above (missing/expired token)
+    are AUTHENTICATION failures, not authorization denies, and are
+    deliberately NOT audited here — that is AUTH_LOGIN_ATTEMPT/
+    AUTH_THROTTLE_TRIGGERED territory, already covered on the login path.
     """
     _enforce_csrf_origin(request)
     token = _resolve_token(request)
@@ -164,6 +214,9 @@ def require_admin_session(
         # LAURA-411-003: a force-password-change admin session must not grant
         # full admin access.  Only /auth/password/change (require_any_session)
         # and /auth/logout (require_any_session) are reachable with this tier.
+        _audit_admin_access_denied_tier_mismatch(
+            request, session, "admin_password_change_required"
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -176,6 +229,9 @@ def require_admin_session(
         )
 
     if session.account_tier != "admin":
+        _audit_admin_access_denied_tier_mismatch(
+            request, session, "insufficient_tier"
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "insufficient_tier"},
