@@ -36,6 +36,17 @@ from yashigani.auth.caddy_verified import CaddyVerifiedMiddleware
 from yashigani.licensing.grace_period import LicenseEnforcementMiddleware
 
 logging.basicConfig(level=logging.INFO)
+
+# G1 (observability SOP, release-blocking): the audit path masks secrets
+# (yashigani.audit.masking.CredentialMasker) but the app-log path (stdout ->
+# promtail -> Loki) had no equivalent — attach the global redaction filter
+# to the root logger's handler(s) so every module logger's records are
+# scrubbed before they reach stdout. Must run after basicConfig() above so
+# the root logger's StreamHandler already exists.
+from yashigani.logging_redaction import install_log_redaction  # noqa: E402
+
+install_log_redaction()
+
 logger = logging.getLogger(__name__)
 
 
