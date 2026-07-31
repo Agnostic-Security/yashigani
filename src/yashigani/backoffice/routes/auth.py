@@ -3730,6 +3730,9 @@ def _register_human_identity_on_login(record, state) -> None:
             name=record.username,
             slug=slug,
             description=f"local-auth user; account_id={record.account_id}",
+            # LAURA-V412-010/009: persist the exact email `slug` was derived
+            # from so get_by_email() can verify an exact match later.
+            email=email,
         )
     except LicenseLimitExceeded as exc:
         _log.warning(

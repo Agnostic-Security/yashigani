@@ -521,6 +521,9 @@ def _resolve_or_create_identity(
             groups=groups,
             sensitivity_ceiling=default_sensitivity,
             org_id=org_id,
+            # LAURA-V412-010/009: persist the exact email `slug` was derived
+            # from so get_by_email() can verify an exact match later.
+            email=email,
         )
     except LicenseLimitExceeded as exc:
         logger.warning(
