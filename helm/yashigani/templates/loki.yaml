@@ -11,9 +11,7 @@ metadata:
   name: yashigani-loki
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-loki
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-loki") | nindent 4 }}
 spec:
   serviceName: yashigani-loki
   replicas: {{ .Values.loki.replicaCount }}
@@ -141,9 +139,7 @@ metadata:
   name: yashigani-loki
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-loki
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-loki") | nindent 4 }}
 spec:
   type: {{ .Values.loki.service.type }}
   clusterIP: None

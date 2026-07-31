@@ -51,9 +51,7 @@ metadata:
   name: {{ include "yashigani.fullname" . }}-caddy-acme-egress
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-caddy
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-caddy") | nindent 4 }}
   annotations:
     yashigani.io/risk-id: "YSG-RISK-061"
     yashigani.io/rationale: >-

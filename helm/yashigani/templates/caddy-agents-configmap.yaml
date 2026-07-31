@@ -33,10 +33,8 @@ metadata:
   name: yashigani-caddy-agents
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-caddy-agents
-    app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: caddy-agent-snippets
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-caddy-agents") | nindent 4 }}
   annotations:
     yashigani.io/s4-sentinel: "true"
     yashigani.io/p1-phase: "W3-P2a"

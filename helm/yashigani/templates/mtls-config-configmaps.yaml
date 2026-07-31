@@ -11,8 +11,7 @@ metadata:
   name: yashigani-postgres-init
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-postgres
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-postgres") | nindent 4 }}
 data:
   05-enable-ssl.sh: |
 {{ .Files.Get "files/postgres-05-enable-ssl.sh" | indent 4 }}
@@ -41,8 +40,7 @@ metadata:
   name: yashigani-pgbouncer-config
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pgbouncer
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pgbouncer") | nindent 4 }}
 data:
   # pgbouncer.ini: rendered with K8s service name substitution. The shipped
   # static file (helm/yashigani/files/pgbouncer.ini) declares `host=postgres`

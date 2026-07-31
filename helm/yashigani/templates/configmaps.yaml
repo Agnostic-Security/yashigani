@@ -1464,9 +1464,7 @@ metadata:
   name: yashigani-grafana-provisioning
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-grafana-provisioning
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-grafana-provisioning") | nindent 4 }}
 data:
   datasources_prometheus.yml: |
     # retro #83: Grafana → Prometheus datasource over mTLS (Pattern B).

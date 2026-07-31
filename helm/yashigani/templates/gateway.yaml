@@ -7,9 +7,7 @@ metadata:
   name: yashigani-gateway
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-gateway
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-gateway") | nindent 4 }}
 spec:
   replicas: {{ .Values.gateway.replicaCount }}
   selector:
@@ -594,9 +592,7 @@ metadata:
   name: yashigani-gateway
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-gateway
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-gateway") | nindent 4 }}
 spec:
   type: {{ .Values.gateway.service.type }}
   selector:

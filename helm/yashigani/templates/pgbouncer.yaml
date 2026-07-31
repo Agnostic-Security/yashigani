@@ -6,9 +6,7 @@ metadata:
   name: yashigani-pgbouncer
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pgbouncer
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pgbouncer") | nindent 4 }}
 spec:
   replicas: {{ .Values.pgbouncer.replicaCount }}
   selector:
@@ -168,9 +166,7 @@ metadata:
   name: yashigani-pgbouncer
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-pgbouncer
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-pgbouncer") | nindent 4 }}
 spec:
   type: {{ .Values.pgbouncer.service.type }}
   selector:

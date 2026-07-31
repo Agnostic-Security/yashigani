@@ -23,8 +23,7 @@ metadata:
   name: yashigani-letta-pgbouncer-ini
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-letta
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-letta") | nindent 4 }}
 data:
   pgbouncer-letta.ini: |
 {{ .Files.Get "files/pgbouncer-letta.ini" | replace "host=postgres " (printf "host=%s-postgres " (include "yashigani.fullname" .)) | indent 4 }}

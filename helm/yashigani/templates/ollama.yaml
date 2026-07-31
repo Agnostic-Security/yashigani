@@ -8,9 +8,7 @@ metadata:
   name: yashigani-ollama
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-ollama
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama") | nindent 4 }}
 spec:
   serviceName: yashigani-ollama
   replicas: {{ .Values.ollama.replicaCount }}
@@ -111,9 +109,7 @@ metadata:
   name: yashigani-ollama
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-ollama
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama") | nindent 4 }}
 spec:
   type: {{ .Values.ollama.service.type }}
   clusterIP: None
@@ -141,9 +137,7 @@ metadata:
   name: yashigani-ollama-init
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-ollama-init
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama-init") | nindent 4 }}
   annotations:
     helm.sh/chart-version: {{ .Chart.Version | quote }}
     yashigani/ollama-model: {{ .Values.ollama.initJob.defaultModel | quote }}

@@ -19,9 +19,7 @@ metadata:
   name: open-webui
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: open-webui
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "open-webui") | nindent 4 }}
 spec:
   replicas: {{ .Values.openWebui.replicaCount }}
   selector:
@@ -294,9 +292,7 @@ metadata:
   name: open-webui-data
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: open-webui
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "open-webui") | nindent 4 }}
 spec:
   accessModes: ["ReadWriteOnce"]
   {{- if .Values.openWebui.persistence.storageClass }}
@@ -313,9 +309,7 @@ metadata:
   name: open-webui
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: open-webui
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "open-webui") | nindent 4 }}
 spec:
   type: {{ .Values.openWebui.service.type }}
   selector:

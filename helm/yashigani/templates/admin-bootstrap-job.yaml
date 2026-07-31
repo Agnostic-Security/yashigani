@@ -31,9 +31,8 @@ metadata:
   name: yashigani-admin-bootstrap
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-admin-bootstrap
     app.kubernetes.io/component: bootstrap
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-admin-bootstrap") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-20"
@@ -45,9 +44,8 @@ metadata:
   name: yashigani-admin-bootstrap
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-admin-bootstrap
     app.kubernetes.io/component: bootstrap
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-admin-bootstrap") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-20"
@@ -64,9 +62,8 @@ metadata:
   name: yashigani-admin-bootstrap
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-admin-bootstrap
     app.kubernetes.io/component: bootstrap
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-admin-bootstrap") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-20"
@@ -89,9 +86,8 @@ metadata:
   name: {{ .Values.adminBootstrap.secretName }}
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-admin-bootstrap
     app.kubernetes.io/component: bootstrap
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-admin-bootstrap") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install
     "helm.sh/hook-weight": "-19"
@@ -105,9 +101,8 @@ metadata:
   name: yashigani-admin-bootstrap
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: yashigani-admin-bootstrap
     app.kubernetes.io/component: bootstrap
-    {{- include "yashigani.labels" . | nindent 4 }}
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-admin-bootstrap") | nindent 4 }}
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     # Run after RBAC + placeholder (-20/-19) but BEFORE the PKI bootstrap
