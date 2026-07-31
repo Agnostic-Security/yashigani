@@ -354,6 +354,18 @@ def build_principal_machinery(
     (``mcp/registry.py``, matching this docstring's "SAME store the MCP broker
     uses" — see module docstring lines 28-29/50).  ``REDIS_URL`` is no longer
     read.
+
+    Fail-closed prod guard (LAURA-411-002 / YSG-RISK-055): when
+    ``REDIS_HOST`` is unset this function previously fell back silently to
+    ``InMemoryNonceStore`` in EVERY environment, including production —
+    the exact silent-degrade class LAURA-V50-018 fixed for the
+    ``REDIS_URL`` read above. Mirrors the ``McpBroker.__init__`` guard
+    (``mcp/broker.py`` ~lines 297-313): ``YASHIGANI_ENV`` is read and
+    allow-listed to ``{"dev", "test", ""}``; any other value (qa, preprod,
+    staging, production, ...) with no ``REDIS_HOST`` raises
+    ``RuntimeError`` at startup instead of degrading to a non-crash-safe
+    in-memory nonce store. Set REDIS_HOST/REDIS_PORT/REDIS_USE_TLS to wire
+    the split Redis env in that environment.
     """
     import os
 
@@ -388,6 +400,25 @@ def build_principal_machinery(
                 f"{exc}"
             ) from exc
     else:
+        # LAURA-411-002 / YSG-RISK-055: InMemoryNonceStore is NOT crash-safe
+        # (a gateway restart loses the nonce store — replay of in-flight
+        # principal-claim tokens is possible within the TTL window).
+        # Accepted ONLY for explicit dev/test; refused for ANY other
+        # environment. Allow-listing safe envs (rather than deny-listing
+        # unsafe ones) ensures future env names fail-closed by default,
+        # matching McpBroker.__init__ (mcp/broker.py ~lines 297-313).
+        _env = os.environ.get("YASHIGANI_ENV", "").lower().strip()
+        _safe_envs = {"dev", "test", ""}
+        if _env not in _safe_envs:
+            raise RuntimeError(
+                "build_principal_machinery: REDIS_HOST is unset and "
+                f"InMemoryNonceStore is not suitable outside dev/test "
+                f"(YASHIGANI_ENV={_env!r}). A restart loses the nonce store "
+                "and allows replay of in-flight orchestration-principal "
+                "tokens within the TTL window. Set REDIS_HOST/REDIS_PORT/"
+                "REDIS_USE_TLS to wire the split Redis env for this "
+                "environment. LAURA-411-002 / YSG-RISK-055."
+            )
         from yashigani.mcp._nonce import InMemoryNonceStore
         nonce_store = InMemoryNonceStore()
 
