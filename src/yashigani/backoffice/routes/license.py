@@ -229,12 +229,15 @@ async def get_license_status(session=Depends(require_admin_session)):
 
     lic = get_license()
 
-    # Agent count
+    # Agent count — LAURA-V50-020: report ACTIVE agents only. count("all")
+    # includes deactivated agents, so the dashboard count never decreased
+    # after an agent was deactivated. Cap enforcement (elsewhere) is
+    # unaffected by this change — it is not touched here.
     current_agents = 0
     registry = backoffice_state.agent_registry
     if registry is not None:
         try:
-            current_agents = registry.count("all")
+            current_agents = registry.count("active")
         except Exception:
             current_agents = 0
 
