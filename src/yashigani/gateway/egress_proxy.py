@@ -172,6 +172,19 @@ async def egress_eval(
         logger.warning(
             "egress-eval: missing x-spiffe-id prefix=%s path=%s", prefix, path
         )
+        # NDC-sweep-E (2026-07-31): the rate-cap and OPA deny branches below
+        # already call _emit_deny_audit (idiom the sweep marker list
+        # misses); this branch was the one genuinely uncovered — the
+        # caller-identity-absent case is arguably the highest-value deny
+        # to audit here (a stripped-forge attempt or misconfigured sidecar).
+        _emit_deny_audit(
+            caller_spiffe="",
+            prefix=prefix,
+            result_sensitivity="PUBLIC",
+            pii_detected=False,
+            deny_reason="missing_caller_identity",
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
         return JSONResponse(
             status_code=403,
             content={

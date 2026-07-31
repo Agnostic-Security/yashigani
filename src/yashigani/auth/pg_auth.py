@@ -18,7 +18,7 @@ v2.23.3 — Password reuse history (CMMC L2 IA.L2-3.5.8):
   successful change. Emits PASSWORD_REUSE_REJECTED audit event on rejection.
 """
 
-# Last updated: 2026-05-09T00:00:00+00:00
+# Last updated: 2026-07-31T00:00:00+00:00
 from __future__ import annotations
 
 import hashlib
@@ -119,16 +119,22 @@ class PostgresLocalAuthService:
         normal human-admin posture (ASVS V2.1.x forced first-login rotation +
         TOTP enrolment).
 
-        The install-path bootstrap service account (see
-        backoffice.app._bootstrap_admin_accounts) passes both as False. That
-        account is NON-INTERACTIVE: it is never logged into by a human, its
-        credential lives only in docker/secrets/ (CSPRNG-generated), and it is
-        used solely by install.sh's programmatic admin-API operations (agent
-        registration, RBAC seeding). Because no human ever rotates it, the
-        on-disk secret never goes stale — making install/agent-registration
-        re-runs robust against the human admin's first-login rotation. This
-        does NOT weaken the human's forced rotation, which still applies to
-        every account created with the defaults.
+        V50-021 follow-up (2026-07-31): this docstring previously described a
+        NON-INTERACTIVE "install_svc" bootstrap service account that passed
+        both flags as False. That account (and its
+        backoffice.app._bootstrap_service_account() constructor) was DELETED
+        by SEC-001 (commit 832e4d4a, 2026-06-14) — it was a hidden,
+        non-rotating, full-admin-tier standing account that consumed the
+        "first admin" slot and prevented the real human admin1/admin2
+        accounts from ever being seeded on fresh install (LAURA-2255-001).
+        backoffice.app._bootstrap_admin_accounts() now calls create_admin()
+        for admin1/admin2 with NO override for either flag — every
+        installer-seeded admin account is a real, interactive human account
+        and gets the normal forced first-login password-rotation + TOTP
+        enrolment posture from the defaults above. install.sh's
+        register_agent_bundles() writes agents directly to the durable
+        store (AgentDurableStore.upsert / Redis restore_from_durable)
+        instead of logging in as a service account.
         """
         plaintext = plaintext_password or (generate_password(36) if auto_generate else None)
         if plaintext is None:

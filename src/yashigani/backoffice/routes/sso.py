@@ -521,6 +521,9 @@ def _resolve_or_create_identity(
             groups=groups,
             sensitivity_ceiling=default_sensitivity,
             org_id=org_id,
+            # LAURA-V412-010/009: persist the exact email `slug` was derived
+            # from so get_by_email() can verify an exact match later.
+            email=email,
         )
     except LicenseLimitExceeded as exc:
         logger.warning(
@@ -1232,7 +1235,17 @@ async def sso_2fa_verify(request: Request):
 
     totp_secret = identity.get("totp_secret", "")
     if not totp_secret:
-        # Identity hasn't provisioned TOTP yet — they need to do that first
+        # Identity hasn't provisioned TOTP yet — they need to do that first.
+        # NDC follow-up (2026-07-31): this deny had NO audit trail — only the
+        # totp_verification_failed branch below called _write_sso_failure_audit.
+        # Reuses the same helper/event shape (idp_id, idp_name, reason,
+        # client_ip) that already covers every other deny in this function.
+        _write_sso_failure_audit(
+            pending.get("idp_id", ""),
+            pending.get("idp_name", ""),
+            "totp_not_provisioned",
+            pending.get("client_ip", "unknown"),
+        )
         r.delete(f"{_PENDING_2FA_PREFIX}{pending_token}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

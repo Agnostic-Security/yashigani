@@ -44,6 +44,17 @@ from yashigani.backoffice.app import create_backoffice_app
 from yashigani.backoffice.state import backoffice_state
 
 logging.basicConfig(level=logging.INFO)
+
+# G1 (observability SOP, release-blocking): the audit path masks secrets
+# (yashigani.audit.masking.CredentialMasker) but the app-log path (stdout ->
+# promtail -> Loki) had no equivalent — attach the global redaction filter
+# to the root logger's handler(s) so every module logger's records are
+# scrubbed before they reach stdout. Must run after basicConfig() above so
+# the root logger's StreamHandler already exists.
+from yashigani.logging_redaction import install_log_redaction  # noqa: E402
+
+install_log_redaction()
+
 logger = logging.getLogger(__name__)
 
 

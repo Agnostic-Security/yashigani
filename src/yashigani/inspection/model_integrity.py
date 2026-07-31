@@ -186,6 +186,7 @@ class ModelIntegrityVerifier:
             logger.error(
                 "model-integrity: pin store unavailable — fail-closed block model=%s", model
             )
+            self._emit_store_unavailable(model, request_id)
             return VerifyResult(ok=False, model=model, reason="store_unavailable")
 
         if pin is None:
@@ -222,6 +223,23 @@ class ModelIntegrityVerifier:
             )
 
         return VerifyResult(ok=True, model=model, reason="match")
+
+    def _emit_store_unavailable(self, model: str, request_id: str) -> None:
+        """NDC follow-up (2026-07-31): the pin-store-unreachable branch fails
+        closed (BLOCK) just like a genuine mismatch, but previously had NO
+        audit trail — only the weights/manifest-mismatch and pin_unverifiable
+        outcomes emitted an event. Best-effort; never blocks the deny."""
+        if self._audit is None:
+            return
+        try:
+            from yashigani.audit.schema import ModelPinEvent, EventType
+            self._audit.write(ModelPinEvent(
+                event_type=EventType.MODEL_PIN_STORE_UNAVAILABLE,
+                request_id=request_id, model=model,
+                action_taken="block",
+            ))
+        except Exception:  # pragma: no cover
+            logger.exception("model-integrity: store-unavailable audit emit failed")
 
     def _emit_mismatch(self, model, exp_w, obs_w, exp_m, obs_m, request_id) -> None:
         logger.error(

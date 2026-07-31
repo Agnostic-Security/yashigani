@@ -888,6 +888,20 @@ _GATEWAY_STREAM_TIMEOUT_S = 300  # 5-minute timeout for streaming responses
 _YASHIGANI_IDENTITY_ID_HEADER = "X-Yashigani-Identity-Id"
 
 
+def _audit_chat_proxy_identity_denied(account_id: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    user_chat_proxy()'s identity_not_found deny (FIND-4.0-CHAT-001 /
+    AUDIT-GAP). Audit failure must NEVER block the deny."""
+    writer = backoffice_state.audit_writer
+    if writer is None:
+        return
+    try:
+        from yashigani.audit.schema import ChatProxyIdentityDeniedEvent
+        writer.write(ChatProxyIdentityDeniedEvent(account_id=account_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("user_chat_proxy: audit write failed: %s", exc)
+
+
 @router.post("/user/chat/completions")
 async def user_chat_proxy(request: Request, session: UserSession):
     """FIND-4.0-CHAT-001 — Trusted-forwarder chat proxy.
@@ -962,6 +976,7 @@ async def user_chat_proxy(request: Request, session: UserSession):
             "or identity:account index is not yet populated for this user)",
             session.account_id,
         )
+        _audit_chat_proxy_identity_denied(session.account_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={

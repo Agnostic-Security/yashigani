@@ -148,6 +148,13 @@ class EventType(str, Enum):
     # LAURA-V50-004 — a pin exists but compared nothing on either axis (empty
     # digest(s) and/or unavailable observed side); never reported as "match"
     MODEL_PIN_UNVERIFIABLE = "MODEL_PIN_UNVERIFIABLE"
+    # NDC follow-up (2026-07-31, Tom) — inspection/model_integrity.py::
+    # ModelIntegrityVerifier.verify()'s pin-store-unreachable branch (fail-
+    # closed BLOCK, same as a genuine mismatch) previously had NO audit
+    # trail at all — only the weights/manifest-mismatch and pin_unverifiable
+    # outcomes emitted an event. Gateway/openai_router.py::_verify_ollama_pin()
+    # surfaces this as a 403 model_integrity_block either way.
+    MODEL_PIN_STORE_UNAVAILABLE = "MODEL_PIN_STORE_UNAVAILABLE"
     # 5.0 rug-pull — manifest delta must be re-approved before it goes active
     MANIFEST_DELTA_PENDING = "MANIFEST_DELTA_PENDING"
     MANIFEST_DELTA_APPROVED = "MANIFEST_DELTA_APPROVED"
@@ -330,6 +337,86 @@ class EventType(str, Enum):
     # because the session belongs to an admin — admins cannot bridge to data plane
     # (SoD-003). NIST AC-5 / OWASP ASVS V4.1.2.
     AUTH_VERIFY_REJECTED_ADMIN_SESSION = "AUTH_VERIFY_REJECTED_ADMIN_SESSION"
+    # ADMIN_ACCESS_DENIED_TIER_MISMATCH: backoffice/middleware.py::
+    # require_admin_session() — the single dependency every /admin/* route
+    # funnels through — rejected a validated (not missing/expired) session
+    # on the ADMIN-tier check itself: either a non-admin-tier session
+    # reaching an admin-only route (insufficient_tier — the mirror case of
+    # AUTH_VERIFY_REJECTED_ADMIN_SESSION), or an admin session still under
+    # a forced password-change restriction (admin_password_change_required,
+    # LAURA-411-003). E2 observability-SOP gap closure (2026-07-31): this
+    # central authz gate previously raised HTTPException with zero audit
+    # trail. NIST AC-5 / SOC 2 CC6.3 / OWASP ASVS V4.1.2.
+    ADMIN_ACCESS_DENIED_TIER_MISMATCH = "ADMIN_ACCESS_DENIED_TIER_MISMATCH"
+    # NDC sweep-E residue (2026-07-31, Tom) — 22-site authorization-DENY
+    # audit-coverage closure. Each new type below closes one clear-cut gap
+    # (see the finding JSON: testing_runs/yashigani/ytf/ndc/sweep-e-findings.json).
+    #
+    # SPIFFE_ACCESS_DENIED: auth/spiffe.py::require_spiffe_id() — internal
+    # mesh service-to-service ACL deny (no_acl_for_path | spiffe_id_not_allowed
+    # | spiffe_id_agent_mismatch). Fail-closed internal authz gate; the
+    # missing-header 401 case is authentication, not audited here.
+    SPIFFE_ACCESS_DENIED = "SPIFFE_ACCESS_DENIED"
+    # PRIVILEGED_MUTATION_DENIED: auth/stepup.py::assert_privileged_mutation()
+    # DENY branches (not_operator | step_up_required) — the SUCCESS path
+    # already writes PrivilegedMutationEvent; the two DENY gates that
+    # precede it had zero audit trail.
+    PRIVILEGED_MUTATION_DENIED = "PRIVILEGED_MUTATION_DENIED"
+    # CSRF_ORIGIN_REJECTED: backoffice/middleware.py::_enforce_csrf_origin()
+    # — a state-changing request presented a cross-site Origin header
+    # (CWE-352 defence-in-depth, TD-2026-07-25-04). Runs before session
+    # resolution, so no account_id is available yet.
+    CSRF_ORIGIN_REJECTED = "CSRF_ORIGIN_REJECTED"
+    # TENANT_SCOPE_VIOLATION: backoffice/routes/agent_policies.py::
+    # _assert_tenant_scope() (Laura F8) — an admin session's path tenant did
+    # not match this installation's configured tenant.
+    TENANT_SCOPE_VIOLATION = "TENANT_SCOPE_VIOLATION"
+    # LOGIN_IP_ACCESS_DENIED: backoffice/routes/auth.py::_check_ip_access() —
+    # a login attempt was rejected by the admin-managed IP block/allowlist
+    # BEFORE AUTH_LOGIN_ATTEMPT is written (that emission happens later in
+    # login()), so without this event an IP-gated login attempt left ZERO
+    # forensic trail at all.
+    LOGIN_IP_ACCESS_DENIED = "LOGIN_IP_ACCESS_DENIED"
+    # VERIFY_USER_ACCESS_DENIED: backoffice/routes/auth.py::verify_user_session()
+    # (Caddy forward_auth for /app/webui) — session failed a state/tier gate
+    # (totp_provisioning_incomplete | password_change_required |
+    # insufficient_tier | owui_access_required). The admin-session branch of
+    # this same function reuses AUTH_VERIFY_REJECTED_ADMIN_SESSION instead
+    # (identical SoD-003 shape to /auth/verify).
+    VERIFY_USER_ACCESS_DENIED = "VERIFY_USER_ACCESS_DENIED"
+    # BREAK_GLASS_APPROVAL_DENIED: backoffice/routes/break_glass.py::
+    # break_glass_approve() — emergency root-equivalent access approval
+    # rejected (approval_expired | no_pending_session | self_approval_rejected).
+    BREAK_GLASS_APPROVAL_DENIED = "BREAK_GLASS_APPROVAL_DENIED"
+    # DISTINCT_APPROVER_VIOLATION: shared maker!=checker SoD violation class —
+    # an admin attempted to approve/complete their OWN pending request.
+    # Reused across dp_weaken.py::approve_weaken_request() and
+    # permissions.py::approve_declaration() (same shape, different domain).
+    DISTINCT_APPROVER_VIOLATION = "DISTINCT_APPROVER_VIOLATION"
+    # ME_API_KEY_ACCESS_DENIED: backoffice/routes/me.py self-service API-key
+    # issuance guards (_assert_user_tier / _assert_account_ready) —
+    # user_tier_required | force_password_change_pending |
+    # force_totp_provision_pending | account_not_found.
+    ME_API_KEY_ACCESS_DENIED = "ME_API_KEY_ACCESS_DENIED"
+    # CHAT_PROXY_IDENTITY_DENIED: backoffice/routes/user_ui.py::user_chat_proxy()
+    # — the caller's session has no linked Yashigani identity_id (fail-closed
+    # 403; account has not completed identity onboarding).
+    CHAT_PROXY_IDENTITY_DENIED = "CHAT_PROXY_IDENTITY_DENIED"
+    # TRUSTED_FORWARDER_IDENTITY_REJECTED: gateway/openai_router.py::
+    # _resolve_yashigani_identity_id_header() — the X-Yashigani-Identity-Id
+    # header was present on the TRUSTED internal-bearer path but malformed or
+    # unresolvable (IDENTITY_ID_MALFORMED | IDENTITY_REGISTRY_UNAVAILABLE |
+    # IDENTITY_REGISTRY_ERROR | IDENTITY_NOT_FOUND). Fail-closed by design
+    # (LAURA-4.0-S1-001) — never falls back to a lower-privilege path.
+    TRUSTED_FORWARDER_IDENTITY_REJECTED = "TRUSTED_FORWARDER_IDENTITY_REJECTED"
+    # NHI_IDENTITY_RESOLUTION_DENIED: gateway/openai_router.py::_resolve_identity()
+    # p1_nhi branch — an NHI token resolved to no approved identity
+    # (nhi_pending_approval).
+    NHI_IDENTITY_RESOLUTION_DENIED = "NHI_IDENTITY_RESOLUTION_DENIED"
+    # ORCHESTRATION_SEED_DENIED: gateway/orchestrator.py::_seed_denied() — the
+    # M1 brain-model-choice seed gate denied (OPA policy | brain model not
+    # allowed | routing unsafe | sensitivity ceiling exceeded | PII blocked).
+    ORCHESTRATION_SEED_DENIED = "ORCHESTRATION_SEED_DENIED"
     # IDENTITY_STORE_CONFLICT: cross-store conflict detected by daily cron audit
     # (SoD-005). Same username/email exists in both admin_accounts and
     # identity_registry. Operator must remediate manually.
@@ -3104,6 +3191,300 @@ class AuthVerifyRejectedAdminSessionEvent(AuditEvent):
     masking_applied: bool = True
     account_id: str = ""                # the admin account_id from the session
     client_ip_prefix: str = ""          # last-octet masked
+
+
+@dataclass
+class AdminAccessDeniedTierMismatchEvent(AuditEvent):
+    """Emitted by backoffice/middleware.py::require_admin_session() — the
+    single FastAPI dependency EVERY /admin/* route funnels through — when a
+    validated session (not missing/expired; that is an AUTHN failure and is
+    NOT audited here) fails the admin-tier check itself.
+
+    Two distinct causes, both HTTP 403, both a genuine AUTHORIZATION deny:
+      - insufficient_tier: a non-admin-tier session (typically "user")
+        reached an admin-only route — the mirror case of
+        AuthVerifyRejectedAdminSessionEvent (that one is "admin session on
+        the data plane"; this one is "non-admin session on the admin
+        plane"). A cross-tier privilege-escalation-ATTEMPT signal.
+      - admin_password_change_required: an admin session still under a
+        forced first-login/reset password-change restriction
+        (LAURA-411-003) attempted a full admin route before completing the
+        required rotation.
+      - admin_session_required: (NDC-sweep-E, 2026-07-31) the SAME shape,
+        reused at the sibling routes/auth.py::verify_admin_session()
+        Caddy forward_auth gate (operator dashboards — Grafana / Wazuh /
+        Prometheus under /admin/*) — a non-admin-tier session reached that
+        gate.
+
+    E2 (observability SOP, 2026-07-31): this dependency previously raised
+    HTTPException with NO audit trail at all — closing this is the highest
+    per-request-volume authorization-DENY gap in the backoffice, since
+    every admin request passes through it.
+
+    NIST AC-5 / SOC 2 CC6.3 / OWASP ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.ADMIN_ACCESS_DENIED_TIER_MISMATCH
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    account_id: str = ""                  # session.account_id (whatever tier it is)
+    session_account_tier: str = ""        # the session's ACTUAL tier value
+    reason: str = ""                      # insufficient_tier | admin_password_change_required | admin_session_required
+    path: str = ""
+    method: str = ""
+    client_ip_prefix: str = ""            # last-octet masked
+
+
+# ---------------------------------------------------------------------------
+# NDC sweep-E residue (2026-07-31, Tom) — authorization-DENY audit coverage
+# for the 22-site finding set. See EventType comments above for provenance.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SpiffeAccessDeniedEvent(AuditEvent):
+    """auth/spiffe.py::require_spiffe_id() — internal mesh service-to-service
+    ACL deny. Caller identity here is ALWAYS the Caddy/peer-cert-verified
+    X-SPIFFE-ID (forge-proof by construction — see spiffe.py module
+    docstring), never a client-supplied claim.
+
+    reason: no_acl_for_path | spiffe_id_not_allowed | spiffe_id_agent_mismatch
+    (the missing-header 401 case is an AUTHENTICATION failure and is
+    deliberately NOT audited here).
+
+    ASVS v5 V8.3.3 / NIST AC-5.
+    """
+
+    event_type: str = EventType.SPIFFE_ACCESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = False   # SPIFFE URIs only, no PII
+    caller_spiffe: str = ""
+    path: str = ""                  # the ACL key (require_spiffe_id(path) argument)
+    reason: str = ""
+    path_agent_id: str = ""         # {agent_id} path param, when relevant (mismatch case)
+
+
+@dataclass
+class PrivilegedMutationDeniedEvent(AuditEvent):
+    """auth/stepup.py::assert_privileged_mutation() DENY branches. The
+    SUCCESS path already writes PrivilegedMutationEvent (both gates passed);
+    this covers the two gates that FAIL:
+      - not_operator: a non-admin session attempted a privileged mutation
+        (a privilege-escalation-ATTEMPT signal).
+      - step_up_required: an admin session without a fresh TOTP step-up.
+
+    ASVS V6.8.4 / V2.4.x.
+    """
+
+    event_type: str = EventType.PRIVILEGED_MUTATION_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    reason: str = ""            # not_operator | step_up_required
+    mutation_reason: str = ""   # ctx.reason, e.g. "mcp.envelope.reapprove"
+    principal: str = ""         # ctx.principal
+    target: str = ""            # ctx.target
+
+
+@dataclass
+class CsrfOriginRejectedEvent(AuditEvent):
+    """backoffice/middleware.py::_enforce_csrf_origin() — a state-changing,
+    cookie-authenticated request presented an Origin header that does not
+    match this deployment's configured host allowlist (CWE-352
+    defence-in-depth, TD-2026-07-25-04).
+
+    Runs BEFORE session resolution in require_admin_session(), so no
+    account_id is available at this point — path/method/origin/client_ip
+    are the available forensic context.
+
+    CWE-352 / ASVS V4.2.2.
+    """
+
+    event_type: str = EventType.CSRF_ORIGIN_REJECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    path: str = ""
+    method: str = ""
+    rejected_origin: str = ""
+    client_ip_prefix: str = ""
+
+
+@dataclass
+class TenantScopeViolationEvent(AuditEvent):
+    """backoffice/routes/agent_policies.py::_assert_tenant_scope() (Laura F8)
+    — an admin session's path tenant did not match this installation's
+    single configured tenant. A cross-tenant access attempt signal.
+    """
+
+    event_type: str = EventType.TENANT_SCOPE_VIOLATION
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    account_id: str = ""
+    path_tenant: str = ""
+    configured_tenant: str = ""
+    path: str = ""
+    method: str = ""
+
+
+@dataclass
+class LoginIpAccessDeniedEvent(AuditEvent):
+    """backoffice/routes/auth.py::_check_ip_access() — a login attempt was
+    rejected by the admin-managed IP block/allowlist. Runs BEFORE
+    AUTH_LOGIN_ATTEMPT is written in login() — without this event, an
+    IP-gated login attempt left ZERO forensic trail (username is not yet
+    known to be genuine at this point, so it is intentionally NOT logged
+    here — only the client_ip and the specific gate reason).
+
+    LAURA-412-CRITICAL / ASVS V7.2.1.
+    """
+
+    event_type: str = EventType.LOGIN_IP_ACCESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    client_ip_prefix: str = ""   # last-octet masked
+    reason: str = ""             # ip_blocked | ip_not_allowed
+
+
+@dataclass
+class VerifyUserAccessDeniedEvent(AuditEvent):
+    """backoffice/routes/auth.py::verify_user_session() (Caddy forward_auth
+    for /app/webui) — session failed a state/tier gate. The admin-session
+    branch of this same function reuses AuthVerifyRejectedAdminSessionEvent
+    instead (identical SoD-003 shape to /auth/verify).
+
+    reason: totp_provisioning_incomplete | password_change_required |
+            insufficient_tier | owui_access_required
+
+    NIST AC-5 / ASVS V4.1.2.
+    """
+
+    event_type: str = EventType.VERIFY_USER_ACCESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    account_id: str = ""
+    session_account_tier: str = ""
+    reason: str = ""
+    client_ip_prefix: str = ""
+
+
+@dataclass
+class BreakGlassApprovalDeniedEvent(AuditEvent):
+    """backoffice/routes/break_glass.py::break_glass_approve() — emergency
+    root-equivalent access approval rejected. YSG-RISK-150/132.
+
+    reason: approval_expired | no_pending_session | self_approval_rejected
+    """
+
+    event_type: str = EventType.BREAK_GLASS_APPROVAL_DENIED
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    account_id: str = ""   # the admin who attempted /approve
+    reason: str = ""
+
+
+@dataclass
+class DistinctApproverViolationEvent(AuditEvent):
+    """Shared maker!=checker SoD violation class — an admin attempted to
+    approve/complete their OWN pending request. Reused across:
+      - dp_weaken.py::approve_weaken_request() (domain="dp_weaken")
+      - permissions.py::approve_declaration() (domain="permission_declaration")
+
+    Both routes already audit the SUCCESS path (DataProtectionWeakenApprovedEvent
+    / PermissionGrantChangedEvent via _emit_grant_audit); this closes the
+    self-approval DENY, which previously had zero audit trail on either site.
+
+    NIST AC-5 (SoD) / EU AI Act Art.14.
+    """
+
+    event_type: str = EventType.DISTINCT_APPROVER_VIOLATION
+    account_tier: str = AccountTier.ADMIN
+    masking_applied: bool = True
+    domain: str = ""          # "dp_weaken" | "permission_declaration"
+    account_id: str = ""      # the admin who attempted self-approval
+    request_id: str = ""      # request_id / (resource_type, resource_id) key
+
+
+@dataclass
+class MeApiKeyAccessDeniedEvent(AuditEvent):
+    """backoffice/routes/me.py self-service API-key issuance guards
+    (_assert_user_tier / _assert_account_ready).
+
+    reason: user_tier_required | force_password_change_pending |
+            force_totp_provision_pending | account_not_found
+    """
+
+    event_type: str = EventType.ME_API_KEY_ACCESS_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    account_id: str = ""
+    session_account_tier: str = ""
+    reason: str = ""
+
+
+@dataclass
+class ChatProxyIdentityDeniedEvent(AuditEvent):
+    """backoffice/routes/user_ui.py::user_chat_proxy() — the caller's
+    session has no linked Yashigani identity_id (fail-closed 403; account
+    has not completed identity onboarding, or the identity:account index is
+    not yet populated). FIND-4.0-CHAT-001 / AUDIT-GAP.
+    """
+
+    event_type: str = EventType.CHAT_PROXY_IDENTITY_DENIED
+    account_tier: str = AccountTier.USER
+    masking_applied: bool = True
+    account_id: str = ""
+    reason: str = "identity_not_found"
+
+
+@dataclass
+class TrustedForwarderIdentityRejectedEvent(AuditEvent):
+    """gateway/openai_router.py::_resolve_yashigani_identity_id_header() —
+    the X-Yashigani-Identity-Id header was present on the TRUSTED
+    internal-bearer path but malformed or unresolvable. Fail-closed by
+    design (LAURA-4.0-S1-001) — never falls back to a lower-privilege path,
+    so this is a genuine deny, not a degraded-mode continuation.
+
+    reason: identity_id_malformed | identity_registry_unavailable |
+            identity_registry_error | identity_not_found
+    """
+
+    event_type: str = EventType.TRUSTED_FORWARDER_IDENTITY_REJECTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    presented_identity_id: str = ""
+    reason: str = ""
+
+
+@dataclass
+class NhiIdentityResolutionDeniedEvent(AuditEvent):
+    """gateway/openai_router.py::_resolve_identity() p1_nhi branch — an NHI
+    token resolved to no approved identity (nhi_pending_approval | not
+    found in registry).
+    """
+
+    event_type: str = EventType.NHI_IDENTITY_RESOLUTION_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    token_identity_id: str = ""
+    reason: str = "nhi_pending_approval"
+
+
+@dataclass
+class OrchestrationSeedDeniedEvent(AuditEvent):
+    """gateway/orchestrator.py::_seed_denied() — the M1 brain-model-choice
+    seed gate denied before any brain call was made.
+
+    reason: the OPA/PII deny_reason (policy_denied | brain_model_not_allowed
+            | routing_unsafe | sensitivity_ceiling_exceeded |
+            seed_pii_blocked | seed_pii_check_failed | ...)
+    """
+
+    event_type: str = EventType.ORCHESTRATION_SEED_DENIED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    request_id: str = ""
+    identity_id: str = ""
+    sensitivity_level: str = ""
+    reason: str = ""
 
 
 @dataclass

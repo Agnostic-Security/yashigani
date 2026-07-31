@@ -30,8 +30,66 @@ class OllamaPool(ClassifierBackend):
     """
     Round-robin pool across multiple Ollama replicas.
 
-    Emits GPU_UNAVAILABLE signal when all active pool members are CPU-only.
-    The BackendRegistry reads this signal and applies the configured gpu_failover_policy.
+    # NDC-SWEEP-C (2026-07-31, Tom): STATUS = DEFERRED-PENDING-PREREQUISITE,
+    # NOT dead code, NOT currently wired anywhere.
+    #
+    # Investigated per the NDC (No-Dead-Controls) gate — this class is never
+    # instantiated (grep confirms zero non-docstring, non-test call sites of
+    # OllamaPool(...) or .from_env() across the whole repo). All 3 real
+    # entrypoints (gateway/entrypoint.py, backoffice/entrypoint.py,
+    # backoffice/routes/inspection_backend.py) construct a single
+    # OllamaBackend(base_url=..., model=...) and wire it into
+    # inspection/backend_registry.py::BackendRegistry as the sole "ollama"
+    # entry — a DIFFERENT, actually-live HA/fallback mechanism (named
+    # fallback chain + circuit breaker + audit events + metrics), not this
+    # class's endpoint-list round-robin.
+    #
+    # This is NOT a silent rug-pull of a control that was supposed to be
+    # protecting something today. It is a half-built SCALE-OUT feature for a
+    # Kubernetes topology (StatefulSet + `ollama-headless` per-pod DNS —
+    # helm/charts/ollama/templates/service.yaml + statefulset.yaml) that DOES
+    # exist in Helm, but whose `replicaCount` was deliberately pinned to 1 by
+    # a live incident fix (NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001, Ava,
+    # 2026-07-28 — see helm/yashigani/values.yaml `ollama:` block): the model
+    # pull (helm/yashigani/templates/ollama.yaml Job `yashigani-ollama-init`)
+    # only ever pulls via the round-robin ClusterIP Service, landing the
+    # model on ONE replica's PVC while a 2nd+ replica's PVC stays empty —
+    # multi-replica is UNSAFE until that init job is made per-pod-aware
+    # (iterating ollama-0.<headless>, ollama-1.<headless>, ...). That values.yaml
+    # comment explicitly documents this as the prerequisite for
+    # `replicaCount > 1` ever being safe again.
+    #
+    # Wiring OllamaPool in NOW would be both unsafe (no live topology has
+    # >1 healthy-with-model replica to round-robin over) and pointless
+    # (replicaCount is 1). Retiring/deleting it would throw away a correctly
+    # hardened (v0.9.3 fixed a thread-unsafe iterator + an infinite-recursion
+    # bug in this exact class), ready-to-wire consumption-side half of the
+    # eventual multi-GPU scale-out story once the init-job prerequisite
+    # lands — Petra/Tiago's deletion policy (never delete without explicit
+    # instruction) applies regardless.
+    #
+    # ACTION TAKEN: docstring below corrected — the previous text claimed
+    # "The BackendRegistry reads this [GPU_UNAVAILABLE] signal and applies
+    # the configured gpu_failover_policy." That is FALSE today: grep confirms
+    # ZERO references to `_GPU_UNAVAILABLE_SIGNAL` or `gpu_failover_policy`
+    # anywhere outside this file — BackendRegistry has no such read, and no
+    # `gpu_failover_policy` config surface exists anywhere in the codebase.
+    # Left AS INERT rather than wired, per the safety argument above.
+    #
+    # RECOMMENDATION for whoever picks up the scale-out ticket: (1) make
+    # ollama.yaml's init Job per-pod-aware, (2) THEN either wire OllamaPool
+    # into BackendRegistry as a named backend (its ClassifierBackend
+    # interface already fits — see backend_registry.py's all_backends dict
+    # shape) or fold its round-robin+health-check logic directly into
+    # BackendRegistry's existing fallback-chain model rather than running
+    # two independent HA mechanisms side by side.
+
+    Round-robin pool across multiple Ollama replicas (K8s StatefulSet +
+    headless-Service per-pod DNS topology). Automatically removes unhealthy
+    members and re-adds them after recovery. Sets an internal
+    GPU_UNAVAILABLE threading.Event when ALL active pool members go offline
+    (see _mark_inactive) — currently observed by NOTHING outside this file;
+    do not assume any consumer reacts to it.
     """
     name = "ollama_pool"
 

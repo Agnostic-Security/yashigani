@@ -1052,6 +1052,28 @@ _YASHIGANI_IDENTITY_ID_HEADER = "x-yashigani-identity-id"
 _YASHIGANI_SESSION_ID_HEADER = "x-yashigani-session-id"
 
 
+def _audit_trusted_forwarder_identity_rejected(identity_id: str, reason: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    _resolve_yashigani_identity_id_header() denies. This is the TRUSTED
+    internal-bearer path (LAURA-4.0-S1-001 fail-closed by design) — a
+    malformed/unresolvable identity here is a genuine forensic signal
+    (forwarder bug or a probe against the trusted boundary), previously
+    silent. Audit failure must NEVER block the deny."""
+    if _state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import TrustedForwarderIdentityRejectedEvent
+        _state.audit_writer.write(TrustedForwarderIdentityRejectedEvent(
+            presented_identity_id=identity_id,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "_resolve_yashigani_identity_id_header: audit write failed reason=%s: %s",
+            reason, exc,
+        )
+
+
 def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]":
     """Resolve identity from X-Yashigani-Identity-Id header on the trusted path.
 
@@ -1087,6 +1109,7 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
             "expected idnt_ prefix; rejecting (fail-closed)",
             identity_id,
         )
+        _audit_trusted_forwarder_identity_rejected(identity_id, "identity_id_malformed")
         raise _HTTPException(
             status_code=403,
             detail={
@@ -1104,6 +1127,7 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
             "identity_registry is unavailable — fail-closed 503",
             identity_id,
         )
+        _audit_trusted_forwarder_identity_rejected(identity_id, "identity_registry_unavailable")
         raise _HTTPException(
             status_code=503,
             detail={
@@ -1120,6 +1144,7 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
             "fail-closed 503",
             identity_id, exc,
         )
+        _audit_trusted_forwarder_identity_rejected(identity_id, "identity_registry_error")
         raise _HTTPException(
             status_code=503,
             detail={
@@ -1134,6 +1159,7 @@ def _resolve_yashigani_identity_id_header(request: "Request") -> "Optional[dict]
             "fail-closed 403 (no fallback to email/anonymous path)",
             identity_id,
         )
+        _audit_trusted_forwarder_identity_rejected(identity_id, "identity_not_found")
         raise _HTTPException(
             status_code=403,
             detail={
@@ -6213,6 +6239,21 @@ def _resolve_nhi_identity(nhi_id: str) -> Optional[dict]:
         return None
 
 
+def _audit_nhi_identity_resolution_denied(token_identity_id: str) -> None:
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    _resolve_identity()'s p1_nhi NHI_PENDING_APPROVAL deny. Audit failure
+    must NEVER block the deny."""
+    if _state.audit_writer is None:
+        return
+    try:
+        from yashigani.audit.schema import NhiIdentityResolutionDeniedEvent
+        _state.audit_writer.write(NhiIdentityResolutionDeniedEvent(
+            token_identity_id=token_identity_id,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("_resolve_identity: NHI-denied audit write failed: %s", exc)
+
+
 def _resolve_identity(request: Request) -> Optional[dict]:
     """
     Resolve identity from request.
@@ -6305,6 +6346,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     nhi_identity = _resolve_nhi_identity(token_identity_id)
                     if nhi_identity is None:
                         # NHI pending approval or not found — fail-closed
+                        _audit_nhi_identity_resolution_denied(token_identity_id)
                         raise HTTPException(
                             status_code=403,
                             detail={"error": "NHI_PENDING_APPROVAL",

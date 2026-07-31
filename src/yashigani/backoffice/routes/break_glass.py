@@ -96,6 +96,25 @@ async def break_glass_activate(body: ActivateBreakGlassRequest, session: StepUpA
     return {"status": "pending_approval", "state": state}
 
 
+def _audit_break_glass_approval_denied(session: "StepUpAdminSession", reason: str) -> None:  # type: ignore[name-defined]
+    """NDC-sweep-E (2026-07-31): best-effort audit emission for
+    break_glass_approve() denies. This is emergency ROOT-EQUIVALENT access
+    — a self-approval attempt or an expired/absent pending session on this
+    gate is a genuine forensic signal, not just an operational hiccup.
+    Audit failure must NEVER block the deny."""
+    aw = backoffice_state.audit_writer
+    if aw is None:
+        return
+    try:
+        from yashigani.audit.schema import BreakGlassApprovalDeniedEvent
+        aw.write(BreakGlassApprovalDeniedEvent(
+            account_id=session.account_id,
+            reason=reason,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        _log.error("break_glass_approve: audit write failed reason=%s: %s", reason, exc)
+
+
 @router.post("/approve")
 async def break_glass_approve(session: StepUpAdminSession):
     """Admin 2 approves -> ACTIVE. Must be a DIFFERENT admin from the one who
@@ -105,12 +124,15 @@ async def break_glass_approve(session: StepUpAdminSession):
     try:
         state = _mgr().approve_break_glass(session.account_id)
     except ApprovalExpiredError as exc:
+        _audit_break_glass_approval_denied(session, "approval_expired")
         raise HTTPException(status_code=409, detail={"error": "approval_expired", "message": str(exc)})
     except NotActiveError as exc:
+        _audit_break_glass_approval_denied(session, "no_pending_session")
         raise HTTPException(status_code=409, detail={"error": "no_pending_session", "message": str(exc)})
     except BreakGlassError as exc:
         # Same-admin self-approval reject (distinct-admin check,
         # auth/break_glass.py:~203).
+        _audit_break_glass_approval_denied(session, "self_approval_rejected")
         raise HTTPException(status_code=403, detail={"error": "self_approval_rejected", "message": str(exc)})
     _log.warning("Admin %s APPROVED break-glass (now ACTIVE)", session.account_id)
     return {"status": "active", "state": state}

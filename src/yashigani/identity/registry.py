@@ -136,6 +136,12 @@ class IdentityRecord:
     kind: IdentityKind
     name: str
     slug: str
+    # LAURA-V412-010/009: the exact (normalized: strip+lower) email that was
+    # used to derive `slug` at registration time. "" for SERVICE-kind
+    # identities and for pre-fix HUMAN records registered before this field
+    # existed (legacy — get_by_email() falls back to slug-only matching for
+    # those, with a WARNING log; see get_by_email() docstring).
+    email: str = ""
     description: str = ""
     expertise: list[str] = field(default_factory=list)
     system_prompt: str = ""
@@ -306,6 +312,7 @@ return {suspended_count, reactivated_count}
         allowed_cidrs: list[str] | None = None,
         org_id: str = "",
         spiffe_uri: str = "",
+        email: str = "",
     ) -> tuple[str, str]:
         """
         Register a new identity.
@@ -316,9 +323,17 @@ return {suspended_count, reactivated_count}
 
         For SERVICE kind: uses the regular Redis pipeline (no per-kind limit).
 
+        ``email``: LAURA-V412-010/009. For HUMAN-kind registrations, callers
+        SHOULD pass the exact email `slug` was derived from (via
+        `identity.slug.email_to_slug`) — it is persisted (normalized:
+        strip+lower) so get_by_email() can later verify an exact match
+        instead of trusting the (lossy, many-to-one) slug collapse alone.
+        Optional / "" for SERVICE-kind identities, which have no email.
+
         Returns (identity_id, plaintext_api_key).
         The plaintext key is shown once — caller must deliver it securely.
         """
+        normalized_email = (email or "").strip().lower()
         from yashigani.licensing.enforcer import LicenseLimitExceeded, get_license
 
         # Check slug uniqueness (non-atomic pre-check; slug key SET is part of
@@ -341,6 +356,7 @@ return {suspended_count, reactivated_count}
             "kind",                kind.value,
             "name",                name,
             "slug",                slug,
+            "email",                normalized_email,
             "description",         description,
             "expertise",           json.dumps(expertise or []),
             "system_prompt",       system_prompt,
@@ -441,6 +457,19 @@ return {suspended_count, reactivated_count}
             try:
                 # Build a minimal decoded dict for the durable upsert.
                 # api_key_hash is the bcrypt hash (never the plaintext key).
+                # LAURA-V412-010/009: `email` is intentionally NOT included here.
+                # The `identities` Postgres table (identity/durable_store.py
+                # upsert()) has a hard-coded column list with no `email` column
+                # — adding it to this dict would be silently dropped by
+                # upsert(), giving false confidence it's durable. `email` is
+                # Redis-only today (the hot-path get_by_email() reads Redis,
+                # never Postgres, so the live security fix works regardless) —
+                # a Redis-volume loss + durable-store restore would come back
+                # with email="" for these identities until next login
+                # re-registers/backfills it. RESIDUAL FOLLOW-UP: add an
+                # `email` column + Alembic migration if the durable copy needs
+                # to survive a full Redis loss without a re-login — needs a
+                # schema-change decision, out of scope for this fix.
                 durable_record = {
                     "identity_id":              identity_id,
                     "kind":                     kind.value,
@@ -508,17 +537,89 @@ return {suspended_count, reactivated_count}
         Derives the slug from the email using email_to_slug, then delegates to
         get_by_slug.  Returns None for malformed or unregistered emails.
 
+        LAURA-V412-010/009 (2026-07-31, Tom): email_to_slug() is a LOSSY,
+        many-to-one canonicalisation — it case-folds and replaces every
+        character outside [a-z0-9-] with "-", so distinct emails such as
+        "a.b@x.com", "a+b@x.com", and "a_b@x.com" ALL collapse to the exact
+        same slug "a-b-x-com". Before this fix, get_by_slug()'s result was
+        returned unconditionally with no check that the record actually
+        belongs to the presented email — a caller resolving a DIFFERENT
+        (never-registered, colliding) email would silently be handed
+        whichever identity happened to win the race to register that slug.
+        Security-load-bearing callers: backoffice/routes/rbac.py (RBAC
+        grant/member resolution) and gateway/uid_migrations.py (re-keying
+        legacy email-keyed RBAC members + permission grants to identity_id)
+        — a collision there could hand privilege/group membership meant for
+        one person to a different, already-registered person.
+
+        FIX: after get_by_slug() returns a candidate record, verify its
+        stored `email` field (persisted by register(), normalized
+        strip+lower — see IdentityRecord.email) equals the (same-normalized)
+        input email.  On mismatch: return None (the caller's existing
+        None-handling in both rbac.py and uid_migrations.py already treats
+        this as "identity not found" / "unmapped member", both already
+        fail-closed — see call sites).
+
+        LEGACY FALLBACK: HUMAN identities registered BEFORE this fix (or any
+        record written by a caller that omitted `email` to register()) have
+        no stored email — for those the record's `email` field decodes to
+        "". There is no way to verify a collision-free match for these
+        records (the original email was never persisted), so — to avoid a
+        retroactive regression for every currently-registered real user —
+        the slug match is trusted as before, but a WARNING is logged so
+        operators have visibility that this identity is running on the
+        unverified legacy path. RESIDUAL FOLLOW-UP: a backfill migration
+        that populates `email` for existing HUMAN identities (e.g. by
+        joining identity:account:{account_id} → the auth-accounts table's
+        real email) would close this gap retroactively; not done here
+        (a live-data migration decision, not a code-only fix).
+
         4.1 SEC-GAP-1: used by uid_migrations.py to resolve legacy email-keyed
         RBAC members and permission grants to their identity_id (idnt_) PK.
         """
         if not email or "@" not in email:
             return None
+        normalized_email = email.strip().lower()
         try:
             from yashigani.identity.slug import email_to_slug
             slug = email_to_slug(email)
         except (ValueError, Exception):
             return None
-        return self.get_by_slug(slug)
+        record = self.get_by_slug(slug)
+        if record is None:
+            return None
+
+        stored_email = (record.get("email") or "").strip().lower()
+        if not stored_email:
+            # Legacy record (pre-fix, or SERVICE-kind) — no stored email to
+            # verify against. Trust the slug match (pre-fix behaviour), but
+            # make the unverified state operator-visible.
+            logger.warning(
+                "get_by_email: slug %r matched identity_id=%s with NO stored "
+                "email (legacy record) — trusting the slug match unverified. "
+                "Collision with a different email is possible for this "
+                "identity until it is re-registered/backfilled with an "
+                "email. input_email_hash=%s",
+                slug, record.get("identity_id", ""),
+                hashlib.sha256(normalized_email.encode()).hexdigest()[:12],
+            )
+            return record
+
+        if stored_email != normalized_email:
+            logger.warning(
+                "get_by_email: SLUG COLLISION rejected — slug %r resolves to "
+                "identity_id=%s whose stored email does NOT match the "
+                "presented email (different real identities collapsed to "
+                "the same slug via email_to_slug). Returning None "
+                "(fail-closed) rather than the wrong identity. "
+                "input_email_hash=%s stored_email_hash=%s",
+                slug, record.get("identity_id", ""),
+                hashlib.sha256(normalized_email.encode()).hexdigest()[:12],
+                hashlib.sha256(stored_email.encode()).hexdigest()[:12],
+            )
+            return None
+
+        return record
 
     def get_by_api_key(self, plaintext_key: str) -> Optional[dict]:
         """Look up identity by API key. Checks current key + grace key."""
@@ -845,6 +946,9 @@ return {suspended_count, reactivated_count}
             "kind": _s("kind"),
             "name": _s("name"),
             "slug": _s("slug"),
+            # LAURA-V412-010/009: "" for SERVICE-kind identities and for
+            # HUMAN identities registered before this field existed (legacy).
+            "email": _s("email"),
             "description": _s("description"),
             "expertise": _j("expertise"),
             "system_prompt": _s("system_prompt"),
