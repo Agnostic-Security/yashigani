@@ -959,6 +959,37 @@ on_error() {
 
 trap on_error ERR
 
+# =============================================================================
+# EXIT-trap registry (FIND-1-B / SF-012 hardening, 2026-07-31)
+# =============================================================================
+# `trap CMD EXIT` is a single-slot registration in bash — a LATER call to
+# `trap ... EXIT` silently OVERWRITES (does not chain onto) any EARLIER one.
+# This file previously had THREE independent call sites doing a raw
+# `trap "..." EXIT` (download_tarball()'s .ysg_work cleanup, the air-gap
+# bundle loader's temp-dir cleanup, and — added by this fix — the install-log
+# tee-drain). If a second one fires after the first is already armed, the
+# first's cleanup (or the tee drain) is silently dropped — exactly the kind
+# of "no diagnostic, no error, cleanup just doesn't happen" bug this file's
+# threat model exists to catch. Route every EXIT-time cleanup through this
+# registry instead of a bare `trap ... EXIT` so cleanups always chain,
+# regardless of registration order.
+_YSG_EXIT_HOOKS=()
+
+_ysg_register_exit_trap() {
+  _YSG_EXIT_HOOKS+=("$1")
+}
+
+_ysg_run_exit_hooks() {
+  # LIFO: most-recently-registered cleanup runs first (matches the
+  # acquire/release ordering convention of nested cleanup stacks).
+  local _i
+  for (( _i=${#_YSG_EXIT_HOOKS[@]}-1; _i>=0; _i-- )); do
+    eval "${_YSG_EXIT_HOOKS[_i]}" || true
+  done
+}
+
+trap _ysg_run_exit_hooks EXIT
+
 set_step() {
   CURRENT_STEP="$1"
   CURRENT_STEP_NAME="$2"
@@ -1976,7 +2007,15 @@ download_tarball() {
   local _dl_work_dir
   _dl_work_dir="${YSG_INSTALL_DIR}/.ysg_work"
   mkdir -p "$_dl_work_dir"
-  trap 'rm -rf "${YSG_INSTALL_DIR}/.ysg_work"' EXIT
+  # FIND-1-B: chain through the EXIT-hook registry (see trap on_error ERR /
+  # trap _ysg_run_exit_hooks EXIT above) instead of a raw `trap ... EXIT` —
+  # a raw call here would silently clobber a later cleanup hook (or be
+  # clobbered by one) since bash's `trap ... EXIT` is a single overwrite slot.
+  # Single-quoted deliberately (matches the original `trap '...' EXIT` this
+  # replaces): _ysg_run_exit_hooks() evals this string at EXIT time, so
+  # YSG_INSTALL_DIR is resolved then, not now.
+  # shellcheck disable=SC2016
+  _ysg_register_exit_trap 'rm -rf "${YSG_INSTALL_DIR}/.ysg_work"'
 
   local tmp_tar
   tmp_tar="$(mktemp "${_dl_work_dir}/yashigani-XXXXXX.tar.gz")"
@@ -6439,9 +6478,16 @@ load_airgap_bundle() {
   # Use WORK_DIR if available, otherwise HOME.
   local _tmp_base="${WORK_DIR:-${HOME:-$(pwd)}}"
   work_dir="$(mktemp -d "${_tmp_base}/yashigani-airgap-load-XXXXXX")"
-  # Trap: clean up on exit
+  # Trap: clean up on exit.
+  # FIND-1-B: chain through the EXIT-hook registry instead of a raw
+  # `trap ... EXIT` — this function runs from inside main()'s install flow,
+  # AFTER the install-log tee-drain hook is registered (see main(), tee
+  # setup); a raw trap here would silently clobber that hook (and vice
+  # versa on re-run), dropping either the temp-dir cleanup or the log flush
+  # with no error. shellcheck disable=SC2064 (intentional early expansion of
+  # work_dir — same as before, just routed through the registrar).
   # shellcheck disable=SC2064
-  trap "rm -rf '${work_dir}'" EXIT
+  _ysg_register_exit_trap "rm -rf '${work_dir}'"
 
   log_info "Unpacking bundle ..."
   tar -C "${work_dir}" -x --zstd -f "${AIR_GAP_BUNDLE}" 2>/dev/null \
@@ -9570,20 +9616,39 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       return 1
     fi
 
-    log_info "Waiting for prometheus /-/ready..."
-    local _ready_host="127.0.0.1"
-    local _ready_port="9090"
+    # FIND-1 lead #3 (2026-07-31): retro #83 (Pattern B mTLS) put prometheus's
+    # web listener behind TLS with client_auth_type: RequireAndVerifyClientCert
+    # (config/prometheus-web-config.yml) — a connection-level requirement that
+    # applies to EVERY path on :9090, not just scrape/federate routes. A plain
+    # `wget -qO- http://localhost:9090/-/ready` (no TLS at all) hits a TLS-only
+    # listener; Go's net/http server detects a plaintext request on the TLS
+    # port and replies with a literal "400 Bad Request: ... sent an HTTP
+    # request to an HTTPS server" — reproduced identically on /-/healthy,
+    # confirming it's a protocol-layer mismatch, not an endpoint issue. This
+    # probe was therefore permanently red on every install since retro #83
+    # shipped (v2.23.2) and its failure was merely swallowed as a non-fatal
+    # warn. Switching to `wget --https` doesn't fix it either: BusyBox wget
+    # (the only wget available inside the prometheus image) has no
+    # --certificate/--private-key flags, so it cannot present the required
+    # client cert — the EXACT constraint already solved for the container's
+    # own HEALTHCHECK (RETRO-V233-001, see docker-compose.yml prometheus
+    # healthcheck comment) by dropping to a TCP-liveness probe instead of an
+    # HTTP one. Apply the same fix here: promtool (above, BLOCKING) already
+    # verifies the config is scrape-valid; this probe only ever added
+    # "is the process up and listening", which `nc -z` proves just as well
+    # without a guaranteed-permanent false negative.
+    log_info "Waiting for prometheus to accept connections on :9090..."
     local _ready_ok=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
-      if "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T prometheus wget -qO- "http://localhost:9090/-/ready" 2>/dev/null | grep -q "Ready"; then
+      if "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T prometheus nc -z localhost 9090 2>/dev/null; then
         _ready_ok=1; break
       fi
       sleep 2
     done
     if [[ "$_ready_ok" -eq 1 ]]; then
-      log_success "prometheus /-/ready OK"
+      log_success "prometheus listening on :9090"
     else
-      log_warn "prometheus /-/ready not green after 20s — check 'docker compose logs prometheus' if /targets is empty"
+      log_warn "prometheus not listening on :9090 after 20s — check 'docker compose logs prometheus'"
     fi
   fi
 
@@ -9674,8 +9739,26 @@ _verify_gateway_healthz() {
   # healthy. (3) fall back to 443 only if docker/.env has no entry either.
   local _https_port="${YASHIGANI_HTTPS_PORT:-}"
   if [[ -z "$_https_port" && -f "${WORK_DIR}/docker/.env" ]]; then
+    # FIND-1 root cause (2026-07-31): on a fresh --runtime docker install with
+    # no --https-port flag, docker/.env NEVER gets a YASHIGANI_HTTPS_PORT=
+    # line written (that write only happens on the Podman branch or an
+    # explicit CLI port override — see compose_up() above). grep then finds
+    # zero matches and exits 1; under `pipefail` that propagates through
+    # head/cut/tr as the pipeline's exit status; this bare assignment
+    # statement is not inside an if/while/&&/|| condition, so `set -e` treats
+    # the whole statement as a failing command and aborts the script HERE —
+    # silently: no log_error, nothing written to stdout/stderr at the point
+    # of failure. compose_up() (and everything after it: bootstrap_postgres,
+    # register_agent_bundles, run_health_check, print_completion_summary)
+    # never runs, even though every container is healthy and the bootstrap
+    # fully succeeded. `|| true` (the same pattern already used at the
+    # equivalent YASHIGANI_DB_AES_KEY reads, install.sh ~L3315/~L4440)
+    # makes "no match" a legitimate, silent miss instead of a fatal error —
+    # the existing `_https_port="${_https_port:-443}"` fallback below
+    # already handles that case correctly. Same bug, same fix, sibling call
+    # site: _ysg_onboard_stepup_gate() (grep for this comment marker).
     _https_port="$(grep '^YASHIGANI_HTTPS_PORT=' "${WORK_DIR}/docker/.env" \
-                     2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+                     2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
   fi
   _https_port="${_https_port:-443}"
   local _domain="${DOMAIN:-localhost}"
@@ -17390,8 +17473,14 @@ _ysg_onboard_stepup_gate() {
   # 3. Fall back to 443.
   local _port="${YASHIGANI_HTTPS_PORT:-}"
   if [[ -z "$_port" && -f "${WORK_DIR}/docker/.env" ]]; then
+    # FIND-1 sibling site (2026-07-31): same pipefail/set-e trap as
+    # _verify_gateway_healthz() above (grep for this comment marker there
+    # for the full writeup) — a fresh docker install with no line for this
+    # key in .env makes grep exit 1, and under pipefail+set -e this bare
+    # assignment aborts the script silently. `|| true` restores the
+    # documented "fall back to 443" behaviour on line below.
     _port="$(grep '^YASHIGANI_HTTPS_PORT=' "${WORK_DIR}/docker/.env" \
-               2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+               2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
   fi
   _port="${_port:-443}"
 
@@ -18915,6 +19004,39 @@ handle_pki_subcommand() {
   esac
 }
 
+# =============================================================================
+# _ysg_flush_install_log_tee — SF-012 / FIND-1-B (2026-07-31)
+# =============================================================================
+# Drains the `exec > >(tee -a install.log) 2>&1` coprocess (see main(), Step 1
+# logging setup) so the last buffered lines are guaranteed to reach both
+# install.log and the terminal before the process exits. Registered via
+# _ysg_register_exit_trap so it runs on EVERY exit path (normal completion,
+# `exit N`, or a `set -e`-triggered abort routed through on_error's `exit 1`)
+# — not just the happy-path fall-through at the end of main(). See the
+# registration comment at tee setup for the full incident writeup.
+#
+# do_wait-HANG FIX (YSG retro 2026-06-25): `wait "$_tee_pid"` with stdout still
+# open blocks FOREVER — the tee coprocess only exits when it receives EOF on
+# the pipe, which never happens while our fd 1/2 (the pipe's write end) stay
+# open. Fix: reassign fd 1/2 to /dev/null first (closes the pipe's write end
+# -> tee gets EOF -> flushes -> exits), then reap with a bounded backstop so
+# this can NEVER hang again even if tee misbehaves.
+_ysg_flush_install_log_tee() {
+  if [[ -n "${_tee_pid:-}" ]]; then
+    exec >/dev/null 2>&1
+    local _i
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$_tee_pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill "$_tee_pid" 2>/dev/null || true
+    wait "$_tee_pid" 2>/dev/null || true
+    # Idempotency guard: a second invocation (should not happen — EXIT traps
+    # fire once — but cheap insurance) must not re-attempt the drain.
+    _tee_pid=""
+  fi
+}
+
 main() {
   parse_args "$@"
 
@@ -19018,12 +19140,31 @@ main() {
     # in the log (they do not affect file readability and strip cleanly with
     # `cat -v` or `sed 's/\x1b\[[0-9;]*m//g'`).
     exec > >(tee -a "$_log_file") 2>&1
-    # Capture the tee coprocess PID immediately after exec.  This is used at
-    # the very end of main() to drain buffered output before exit (SF-012:
-    # final lines dropped when the outer tee/calling shell closes before the
-    # inner tee subprocess flushes).  NOTE: do NOT use bare `wait` — that
-    # includes the tee coprocess and causes a deadlock (see L2782 comment).
+    # Capture the tee coprocess PID immediately after exec (SF-012: drains
+    # buffered output before exit — see _ysg_flush_install_log_tee below).
+    # NOTE: do NOT use bare `wait` — that includes the tee coprocess and
+    # causes a deadlock (see L2782 comment).
     _tee_pid=$!
+    # FIND-1-B (2026-07-31): the SF-012 drain used to be plain sequential
+    # code at the tail of main()'s normal fall-through path ONLY. It was
+    # NEVER reached on the error path: on_error() (the `trap ... ERR`
+    # handler, see above) calls `exit 1` directly, which unwinds the shell
+    # immediately — every statement after the point of failure, including
+    # that tail-of-main drain block, is skipped. Net effect: on ANY install
+    # failure (including a genuinely-successful bootstrap being mis-reported
+    # as a failure by a later bug — see the register_agent_bundles /
+    # _verify_gateway_healthz class of bug this release cycle), on_error()'s
+    # own diagnostic output ("Installation failed at Step N", exit code,
+    # last 10 compose log lines) was written into the tee pipe but the
+    # coprocess was NEVER drained before the process died — so install.log
+    # AND the terminal both silently truncated right before the real error,
+    # leaving only whatever had already reached disk via tee's own internal
+    # buffering. This is why a repro always showed the log stopping at an
+    # unrelated benign log_warn several lines before the actual failure.
+    # Fix: register the drain as an EXIT hook (fires on EVERY exit path —
+    # normal completion, `exit N`, or a `set -e`-triggered abort routed
+    # through on_error) instead of relying on normal fall-through.
+    _ysg_register_exit_trap "_ysg_flush_install_log_tee"
     log_info "Install log: ${_log_file}"
   fi
 
@@ -19857,27 +19998,10 @@ main() {
     print_completion_summary
   fi
 
-  # SF-012: drain the tee coprocess so the final log lines ([12/13] and [13/13])
-  # are flushed to install.log before the process exits.  Wait on the specific
-  # PID only — bare `wait` would deadlock (see L2782 comment on coprocess + wait).
-  #
-  # do_wait-HANG FIX (YSG retro 2026-06-25): `wait "$_tee_pid"` with stdout still
-  # open blocks FOREVER — the tee coprocess only exits when it receives EOF on the
-  # pipe, which never happens while our fd 1/2 (the pipe's write end) stay open.
-  # That left install.sh hung in do_wait after printing the completion banner,
-  # accumulating zombie installers that collided on the compose project. Fix:
-  # reassign fd 1/2 to /dev/null first (closes the pipe's write end -> tee gets
-  # EOF -> flushes -> exits), then reap with a bounded backstop so this can NEVER
-  # hang again even if tee misbehaves.
-  if [[ -n "${_tee_pid:-}" ]]; then
-    exec >/dev/null 2>&1
-    for _i in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$_tee_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    kill "$_tee_pid" 2>/dev/null || true
-    wait "$_tee_pid" 2>/dev/null || true
-  fi
+  # SF-012 drain now runs unconditionally as a registered EXIT hook (see
+  # _ysg_flush_install_log_tee, defined above main(), and its registration
+  # at tee setup, Step 1 above) — it fires on this normal-completion path
+  # AND on any error-triggered exit. No inline call needed here.
 }
 
 main "$@"

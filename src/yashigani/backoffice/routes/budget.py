@@ -575,11 +575,27 @@ async def get_local_model_inventory():
 
     Admin-gated (via router-level require_admin_session dependency).
     """
-    ollama_base = os.environ.get("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    # YSG-RISK-191: this route previously hardcoded YASHIGANI_OLLAMA_URL (never
+    # set by any deployment config — see docker-compose.yml / helm templates /
+    # gateway+backoffice entrypoints, which all wire OLLAMA_BASE_URL) with a
+    # bare-httpx.AsyncClient, so it silently fell back to plain
+    # http://ollama:11434 and bypassed the Caddy mesh front entirely — a hard
+    # 502 wherever Ollama is only reachable via https://caddy:11435/ollama.
+    # Fixed to mirror routes/models.py's _ollama_base()/ollama_async_client()
+    # pattern: the SAME env-var chain (YASHIGANI_OLLAMA_URL override ->
+    # OLLAMA_BASE_URL, the actual mesh-wired var -> hardcoded dev default) and
+    # the SAME mesh-mTLS-aware transport (inspection/_ollama_transport.py —
+    # the single transport documented for every OLLAMA_BASE_URL consumer).
+    ollama_base = (
+        os.environ.get("YASHIGANI_OLLAMA_URL")
+        or os.environ.get("OLLAMA_BASE_URL")
+        or "http://ollama:11434"
+    ).rstrip("/")
 
     # --- Query Ollama ---
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        from yashigani.inspection._ollama_transport import ollama_async_client
+        async with ollama_async_client(ollama_base, timeout=10.0) as client:
             resp = await client.get(f"{ollama_base}/api/tags")
             resp.raise_for_status()
             raw = resp.json()

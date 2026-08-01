@@ -400,6 +400,33 @@ def create_gateway_app(
     async def healthz():
         return {"status": "ok"}
 
+    # YSG-RISK-179 — dependency-checked readiness probe. /readyz is already
+    # referenced in every rate-limit / DDoS exemption allowlist
+    # (endpoint_ratelimit.py, ddos.py, auth/caddy_verified.py) but had no
+    # route — probes hit a 404. Unlike /healthz (shallow liveness — process
+    # is up), /readyz checks postgres + redis reachability and returns 503
+    # when a configured dependency is unreachable, so Caddy/k8s can pull a
+    # not-yet-ready (or degraded) instance out of rotation instead of
+    # routing traffic at it.
+    @app.get("/readyz")
+    async def readyz():
+        from fastapi.responses import JSONResponse
+        from yashigani.net.readiness import dependency_readiness
+
+        _redis_client = None
+        for _key in ("rate_limiter", "ddos_protector", "endpoint_rate_limiter"):
+            _dep = _state.get(_key)
+            _client = getattr(_dep, "_redis", None)
+            if _client is not None:
+                _redis_client = _client
+                break
+
+        ready, detail = await dependency_readiness(_redis_client)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "checks": detail},
+        )
+
     # Internal Prometheus metrics endpoint — Caddy-gated with SPIFFE URI ACL.
     # EX-231-08 (v2.23.1): Prometheus must scrape via Caddy's :8444 internal
     # listener; Caddy validates the peer cert and sets X-SPIFFE-ID from the

@@ -237,6 +237,13 @@ async def lifespan(app: FastAPI):
 
             await create_pool()
 
+            # YSG-RISK-190: mirror gateway/entrypoint.py's `_YASHIGANI_DB_READY=1`
+            # signal. net.readiness.postgres_ready() gates its actual SELECT-1
+            # check on this env var; without it, /readyz's postgres dep-check
+            # trivially reports "postgres_not_configured" (fail-OPEN) even
+            # though this DSN branch just ran migrations + opened a real pool.
+            os.environ["_YASHIGANI_DB_READY"] = "1"
+
             # --- v2.23.1 P0-2: bootstrap PostgresLocalAuthService -------------
             # Seed admin accounts from installer secrets ONLY if the DB has
             # zero admins. Previously the guard was `if not auth_service._accounts`
@@ -1251,6 +1258,28 @@ def create_backoffice_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
+
+    # YSG-RISK-179 — dependency-checked readiness probe (backoffice leg).
+    # See gateway/proxy.py readyz for the full rationale: /healthz stays a
+    # shallow liveness probe; /readyz checks postgres + redis reachability
+    # and returns 503 when a configured dependency is unreachable.
+    @app.get("/readyz")
+    async def readyz():
+        from yashigani.backoffice.state import backoffice_state
+        from yashigani.net.readiness import dependency_readiness
+
+        _redis_client = None
+        for _dep in (backoffice_state.rate_limiter, backoffice_state.anomaly_detector):
+            _client = getattr(_dep, "_redis", None)
+            if _client is not None:
+                _redis_client = _client
+                break
+
+        ready, detail = await dependency_readiness(_redis_client)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "checks": detail},
+        )
 
     # Internal Prometheus metrics endpoint — Caddy-gated with SPIFFE URI ACL.
     # EX-231-08 (v2.23.1, zero-trust default): Prometheus scrapes via Caddy's

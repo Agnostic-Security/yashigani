@@ -139,8 +139,12 @@ async def _resolve_default_model(ollama_url: str) -> tuple[str, list[str]]:
     pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
     _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
     ollama_reachable = False
+    # YSG-RISK-193: mesh-mTLS-aware transport (was a bare httpx.AsyncClient,
+    # which fails CERTIFICATE_VERIFY_FAILED / bypasses the Caddy mesh front
+    # for https://caddy:11435/ollama deployments).
+    from yashigani.inspection._ollama_transport import ollama_async_client
     try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
+        async with ollama_async_client(ollama_url, timeout=10.0) as c:
             tags_resp = await c.get(ollama_url + "/api/tags")
             tags_resp.raise_for_status()
             avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
@@ -409,10 +413,15 @@ async def simulate_policy(body: SimulateRequest, session: AdminSession):  # noqa
 
     ai_explanation: Optional[str] = None
     if body.ai_explain:
-        ollama_url = str(
-            getattr(backoffice_state, "ollama_url", None)
-            or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+        # YSG-RISK-193: getattr(backoffice_state, "ollama_url", ...) was
+        # always truthy (dataclass default — never actually assigned),
+        # making the YASHIGANI_OLLAMA_URL/OLLAMA_BASE_URL fallback dead code
+        # and pinning this route to the hardcoded literal, bypassing the
+        # Caddy mesh. Mirrors routes/models.py's _ollama_base() precedence.
+        ollama_url = (
+            os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
         ).rstrip("/")
+        from yashigani.inspection._ollama_transport import ollama_async_client
         try:
             model, _ = await _resolve_default_model(ollama_url)
             prompt = (
@@ -423,7 +432,7 @@ async def simulate_policy(body: SimulateRequest, session: AdminSession):  # noqa
                 f"Decision: allow={allow}, deny={deny!r}, obligations={obligations!r}\n\n"
                 "Plain-English explanation:"
             )
-            async with httpx.AsyncClient(timeout=45.0) as c:
+            async with ollama_async_client(ollama_url, timeout=45.0) as c:
                 llm_resp = await c.post(
                     ollama_url + "/api/generate",
                     json={"model": model, "prompt": prompt, "stream": False},
@@ -1043,17 +1052,20 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
     draft is NOT auto-applied. (LLM loop/over-block sanity checks are a follow-up.)
     """
     name = re.sub(r"[^a-z0-9_]", "", (body.name or "generated").strip().lower()) or "generated"
-    ollama_url = str(
-        getattr(backoffice_state, "ollama_url", None)
-        or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    # YSG-RISK-193: see the identical fix + rationale on the ai_explain branch
+    # of simulate_policy() above — getattr(backoffice_state, "ollama_url", ...)
+    # was dead-code cover for a hardcoded-literal mesh bypass.
+    ollama_url = (
+        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
     ).rstrip("/")
+    from yashigani.inspection._ollama_transport import ollama_async_client
     model, _ = await _resolve_default_model(ollama_url)
     prompt = (
         _REGO_GEN_SYSTEM.replace("{name}", name)
         + f"\n\nRequirement: {body.prompt}\n\nRego policy (package clients.{name}):\n"
     )
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with ollama_async_client(ollama_url, timeout=90.0) as client:
             resp = await client.post(
                 ollama_url + "/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
@@ -1082,7 +1094,7 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
 
     async def _regenerate(err_text: str) -> str:
         rprompt = prompt + f"\n\nThe previous attempt failed to compile with this OPA error:\n{err_text}\nReturn ONLY corrected Rego.\n"
-        async with httpx.AsyncClient(timeout=90.0) as c:
+        async with ollama_async_client(ollama_url, timeout=90.0) as c:
             rr = await c.post(ollama_url + "/api/generate", json={"model": model, "prompt": rprompt, "stream": False})
             rr.raise_for_status()
             fixed = (rr.json().get("response") or "").strip()
