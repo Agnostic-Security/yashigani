@@ -7,33 +7,59 @@ SANDBOX available (Podman/Docker).  Tests skip automatically when the stack is
 not reachable or Playwright is not installed — they never false-PASS.
 
 Coverage:
-  PW-DOC-01  Documents nav button exists and navigates to the page
-  PW-DOC-02  Status cards render the feature-flag state (not "Loading…")
-  PW-DOC-03  Supported-formats table shows the 6 committed formats
-  PW-DOC-04  Policy table renders + the add-policy form toggles
-  PW-DOC-05  Inspect a CSV with PII → verdict viewer shows DataMatch rows
+  PW-DOC-01  Documents nav entry exists and navigates to the page
+  PW-DOC-02  Status panel renders the feature-flag state (not "Loading…")
+  PW-DOC-03  Supported-formats note lists the 6 committed formats
+  PW-DOC-04  Policy list + add-policy form both render (the form is always
+             visible — see 2026-08-02 note, no toggle exists in the real UI)
+  PW-DOC-05  Inspect a CSV with PII → result JSON shows a PII.EMAIL match
   PW-DOC-07  XSS-ESCAPING: a doc whose content carries an XSS canary renders the
              value ESCAPED in the viewer — no handler fires, no <img> node is
              created from the injected value (match value is attacker-controlled).
   PW-DOC-09  Unauthenticated GET /admin/documents/status → 401
-  PW-DOC-10  2.26 verdict viewer renders the Field-role column header
-  PW-DOC-11  2.26 set-scoped-salt control renders (security note + set dropdown)
-  PW-DOC-12  2.26 set create → the new set appears in the table + inspect dropdown
-             and NO 64-hex salt value is ever present in the rendered DOM
-  PW-DOC-13  2.26 PSEUDONYMIZE verdict shows the salt-scope + opaque-token note;
-             field-role cell renders (reference-only / operate-on). Needs sandbox.
-
-  (The METADATA-hidden-row "wow row", the RBAC-deny gate, the integrity/splice
-  verdict, field-role + salt-scope surfacing, and the salt-never-leaks property
-  are proven deterministically in src/tests/unit/test_documents_routes.py
-  (DOC-RT-05/07/10/12-17, DOC-SET-01-05) + test_document_set_store.py, which do
-  not depend on the container sandbox.)
+  PW-DOC-10/11/12  SEE 2026-08-02 NOTE BELOW — SKIPPED, evidenced gap, not a
+             selector bug.
 
 ASVS: V4.1 (BOLA / access control on table retrieval), V5.3.3 (output encoding),
 V6.2 (crypto material custody — set salt redacted), V6.8.4 (step-up on
 mutation).  OWASP: A01, A02, A03.  API: API1 (BOLA).
 
-Author: Ava (QA). Last updated: 2026-06-10.
+Author: Ava (QA). Last updated: 2026-08-02 (Tier-B triage on run
+ytf-docker-macos-29d9c9d8-20260731) — rewritten against the real ui4 module
+(src/yashigani/backoffice/static/ui4/admin/modules/documents-docopa.js,
+component <ys-admin-documents>, module id 'documents'):
+
+  - Auth: `_open_documents()` already called the shared `playwright_login_admin()`
+    helper, which had its own instance of the two-step forced-password-change
+    bug (see conftest.py's playwright_login_admin() docstring — now fixed to
+    delegate to the assert-verified httpx cookie-injection path). No change
+    needed in THIS file for that part once conftest was fixed.
+  - Selectors: none of `#page-documents`, `#doc-status-cards`,
+    `#doc-formats-tbody`, `#doc-policies-tbody`, `#doc-add-policy-form`,
+    `button[data-action="docToggleForm"]`, `#doc-pol-class`,
+    `#doc-matches-tbody` exist anywhere in the real module (confirmed reading
+    the full render() tree). The panel is a generic `.ys-admin-content-pad`;
+    status is a `.ys-panel-header`/`.ys-txt-note` pair; supported formats are
+    a plain-text note (no table); the add-policy form (`_renderCreate()`) has
+    NO hide/show state at all — it always renders side-by-side with the
+    policy list; inspect result renders as `#doc-inspect-result`
+    (`<pre>{JSON.stringify(r, null, 2)}</pre>`, Lit-escaped), not a table of
+    match rows.
+  - PW-DOC-10/11/12 (Field-role column, set-scoped-salt control, set
+    create+salt-never-leaks): the module's `connectedCallback`/`_load()`
+    DOES fetch `/admin/documents/sets` and stores it in `this._sets`, but
+    `render()` NEVER reads `this._sets` anywhere — no sets table, no
+    "Field role" text, no `#doc-set-*` ids exist anywhere in this file. This
+    is a genuine, evidenced UI gap (backend data fetched, never surfaced),
+    not a stale-selector problem — same "wired-but-not-surfaced" family
+    already tracked as YSG-RISK-163 for a different module
+    (`AgnosticSecurity/Risk Management/yashigani-risks.md`). Flagged as a
+    candidate finding for Iris/Tom, not self-numbered here. Rewritten to
+    SKIP with that evidence rather than assert against markup that isn't
+    there (retro rule A1: absence of artefact = SKIP, never PASS/FAIL-blind).
+    Deterministic coverage for the underlying salt-custody property already
+    exists and does not depend on this UI gap: src/tests/unit/
+    test_documents_routes.py (DOC-SET-01..05) + test_document_set_store.py.
 """
 from __future__ import annotations
 
@@ -45,6 +71,7 @@ from tests.playwright.conftest import (
     launch_chromium,
     BASE_URL,
     STACK_RUNNING,
+    capture_screenshot,
     playwright_login_admin,
     _api_totp_last_used,
 )
@@ -68,30 +95,34 @@ playwright_required = pytest.mark.skipif(
     not HAVE_PLAYWRIGHT, reason="playwright not installed"
 )
 
+_SETS_GAP_REASON = (
+    "documents-docopa.js fetches /admin/documents/sets into this._sets but "
+    "render() never reads it -- no sets table, no 'Field role' column, no "
+    "#doc-set-* controls exist anywhere in the module. Evidenced UI gap, "
+    "same family as YSG-RISK-163; see module docstring. Deterministic "
+    "coverage for the underlying salt-custody property lives in "
+    "src/tests/unit/test_documents_routes.py + test_document_set_store.py."
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _open_documents(page) -> None:
-    """Login and navigate to the Documents panel.
-
-    FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): same class of
-    stale-selector bug as test_pki_admin_ui.py -- 'button[data-param=...]' is
-    pre-ui4-nav-rewrite; the current nav renders `a[href='#module-id']`.
-    """
+    """Login and navigate to the Documents panel."""
     playwright_login_admin(page)
     page.goto(f"{BASE_URL}/admin/")
+    page.wait_for_selector("a[href='#documents']", timeout=15000)
     page.click("a[href='#documents']")
-    page.wait_for_selector("#page-documents.active", timeout=5000)
+    page.wait_for_selector(".ys-panel-header:has-text('Document enforcement')", timeout=8000)
+    capture_screenshot(page, "documents_panel_loaded")
 
 
-def _inspect(page, *, content: str, action: str = "LOG", filename: str = "sample.csv") -> None:
-    page.fill("#doc-insp-name", filename)
-    page.select_option("#doc-insp-action", action)
-    page.fill("#doc-insp-content", content)
-    page.click('button[data-action="docInspect"]')
-    page.wait_for_selector("#doc-insp-result .badge", timeout=8000)
+def _inspect(page, *, content: str) -> None:
+    page.fill("#doc-sample", content)
+    page.click("#doc-inspect")
+    page.wait_for_selector("#doc-inspect-result", timeout=8000)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +137,7 @@ def test_pw_doc_01_nav_and_navigate():
         try:
             _open_documents(page)
             assert page.is_visible("a[href='#documents']")
-            assert page.is_visible("#page-documents.active")
+            assert page.is_visible(".ys-panel-header:has-text('Document enforcement')")
         finally:
             browser.close()
 
@@ -118,10 +149,10 @@ def test_pw_doc_02_status_cards_render():
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
-            page.wait_for_selector("#doc-status-cards .badge", timeout=5000)
-            text = page.inner_text("#doc-status-cards")
+            header = page.locator(".ys-panel-header:has-text('Document enforcement')")
+            text = header.inner_text() or ""
             assert "Loading" not in text
-            assert ("ENABLED" in text) or ("DISABLED" in text)
+            assert ("enabled" in text) or ("disabled" in text)
         finally:
             browser.close()
 
@@ -133,27 +164,30 @@ def test_pw_doc_03_supported_formats():
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
-            page.wait_for_selector("#doc-formats-tbody code", timeout=5000)
-            body = page.inner_text("#doc-formats-tbody")
+            page.wait_for_selector(".ys-txt-note:has-text('Supported formats')", timeout=8000)
+            body = page.inner_text(".ys-txt-note")
             for ext in ("docx", "xlsx", "pptx", "pdf", "csv", "txt"):
-                assert ext in body
+                assert ext in body, f"expected format {ext!r} in supported-formats note"
         finally:
             browser.close()
 
 
 @playwright_required
-def test_pw_doc_04_policy_table_and_form_toggle():
+def test_pw_doc_04_policy_list_and_add_form_render():
+    """PW-DOC-04: policy list renders and the add-policy form's fields are
+    present. The real UI has no hide/show toggle for this form -- it always
+    renders alongside the policy list (see module docstring)."""
     with sync_playwright() as p:
         browser = launch_chromium(p)
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
-            page.wait_for_selector("#doc-policies-tbody tr", timeout=5000)
-            # The add-policy form is hidden until toggled.
-            form = page.query_selector("#doc-add-policy-form")
-            assert form is not None
-            page.click('button[data-action="docToggleForm"]')
-            assert page.is_visible("#doc-pol-class")
+            page.wait_for_selector(".ys-panel-header:has-text('Verdict policies')", timeout=8000)
+            assert page.is_visible(".ys-panel-header:has-text('Add verdict policy')")
+            assert page.is_visible("#doc-pid")
+            assert page.is_visible("#doc-code")
+            assert page.is_visible("#doc-msg")
+            assert page.is_visible("#doc-create")
         finally:
             browser.close()
 
@@ -165,11 +199,11 @@ def test_pw_doc_05_inspect_shows_matches():
         page = browser.new_page(ignore_https_errors=True)
         try:
             _open_documents(page)
-            _inspect(page, content="name,email\nJane Doe,jane@example.com\n", action="LOG")
-            page.wait_for_selector("#doc-matches-tbody tr", timeout=5000)
-            rows = page.inner_text("#doc-matches-tbody")
-            # The email is enumerated (masked) — PII.EMAIL class present.
-            assert "PII.EMAIL" in rows
+            _inspect(page, content="name,email\nJane Doe,jane@example.com\n")
+            result = page.inner_text("#doc-inspect-result")
+            assert "PII" in result and "EMAIL" in result.upper(), (
+                f"expected a PII/EMAIL match in the inspect result JSON, got: {result[:300]!r}"
+            )
         finally:
             browser.close()
 
@@ -177,8 +211,10 @@ def test_pw_doc_05_inspect_shows_matches():
 @playwright_required
 def test_pw_doc_07_xss_canary_escaped_in_viewer():
     """The match value is attacker-controlled document content.  If a canary
-    reaches the viewer it MUST be escaped (no script execution, no <script> DOM
-    node from the injected value)."""
+    reaches the viewer it MUST be escaped (no script execution, no <img> DOM
+    node from the injected value). The result renders as
+    `${JSON.stringify(r,null,2)}` inside a Lit `<pre>` -- text-interpolated,
+    not innerHTML, so the payload should surface as an inert escaped string."""
     canary = '<img src=x onerror="window.__xss_fired=true">'
     with sync_playwright() as p:
         browser = launch_chromium(p)
@@ -187,21 +223,11 @@ def test_pw_doc_07_xss_canary_escaped_in_viewer():
         page.on("dialog", lambda d: (fired.__setitem__("v", True), d.dismiss()))
         try:
             _open_documents(page)
-            # Put the canary next to a PII value so the row renders attacker text.
-            _inspect(
-                page,
-                content=f"note,email\n{canary},jane@example.com\n",
-                action="LOG",
-            )
-            page.wait_for_selector("#doc-matches-tbody tr", timeout=5000)
-            # No onerror handler fired (the canary was escaped, not parsed as HTML).
+            _inspect(page, content=f"note,email\n{canary},jane@example.com\n")
             assert page.evaluate("() => window.__xss_fired === true") is False
             assert fired["v"] is False
-            # And there is no injected <img onerror> node inside the matches body.
-            imgs = page.eval_on_selector_all(
-                "#doc-matches-tbody img", "els => els.length"
-            )
-            assert imgs == 0
+            imgs = page.eval_on_selector_all("#doc-inspect-result img", "els => els.length")
+            assert imgs == 0, "an <img> DOM node was created from injected content — XSS not escaped"
         finally:
             browser.close()
 
@@ -221,70 +247,21 @@ def test_pw_doc_09_status_requires_auth():
 
 
 # ---------------------------------------------------------------------------
-# 2.26 NEW SURFACES — field-role column, set-scoped-salt control, salt-never-leaks
+# 2.26 NEW SURFACES — field-role column, set-scoped-salt control
+# NOT RENDERED in the current ui4 module (see file docstring) — SKIPPED with
+# evidence, not asserted against markup that doesn't exist.
 # ---------------------------------------------------------------------------
 
 @playwright_required
 def test_pw_doc_10_field_role_column_present():
-    """The verdict viewer renders the Field-role column (Laura D1 surface)."""
-    with sync_playwright() as p:
-        browser = launch_chromium(p)
-        page = browser.new_page(ignore_https_errors=True)
-        try:
-            _open_documents(page)
-            headers = page.inner_text("#doc-matches-tbody")  # body exists
-            # The column header lives in the table head; assert it is present.
-            assert "Field role" in page.inner_text("#page-documents")
-        finally:
-            browser.close()
+    pytest.skip(_SETS_GAP_REASON)
 
 
 @playwright_required
 def test_pw_doc_11_set_salt_control_present():
-    """The set-scoped-salt control renders: security note + sets table + the
-    per-file default option in the inspect dropdown."""
-    with sync_playwright() as p:
-        browser = launch_chromium(p)
-        page = browser.new_page(ignore_https_errors=True)
-        try:
-            _open_documents(page)
-            page.wait_for_selector("#doc-sets-tbody", timeout=5000)
-            page.wait_for_selector("#doc-set-security-note", timeout=5000)
-            note = page.inner_text("#doc-set-security-note")
-            assert "isolation" in note.lower()
-            # The inspect dropdown carries the per-file default option.
-            assert page.is_visible("#doc-insp-set")
-            opts = page.inner_text("#doc-insp-set")
-            assert "Per-file" in opts
-        finally:
-            browser.close()
+    pytest.skip(_SETS_GAP_REASON)
 
 
 @playwright_required
 def test_pw_doc_12_set_create_and_salt_never_in_dom():
-    """Create a set via step-up; it appears in the table + inspect dropdown, and
-    NO 64-hex salt value is ever present in the rendered DOM (A02 custody)."""
-    import re as _re
-
-    with sync_playwright() as p:
-        browser = launch_chromium(p)
-        page = browser.new_page(ignore_https_errors=True)
-        try:
-            _open_documents(page)
-            page.wait_for_selector("#doc-sets-tbody", timeout=5000)
-            page.click('button[data-action="docToggleForm"][data-form-id="doc-add-set-form"]')
-            page.fill("#doc-set-name", "PW correlation set")
-            page.click('button[data-action="docCreateSet"]')
-            # Step-up TOTP may be prompted; the result badge appears either way.
-            page.wait_for_selector("#doc-set-result .badge", timeout=10000)
-            page.wait_for_timeout(1000)
-            body = page.inner_text("#page-documents")
-            # If the set was created (step-up satisfied), it shows in the table.
-            # Regardless, assert NO 64-char hex salt ever leaks into the DOM.
-            full_html = page.content()
-            assert not _re.search(r"[0-9a-f]{64}", full_html), (
-                "a 64-hex salt-shaped value appeared in the DOM — set salt must "
-                "never reach the client"
-            )
-        finally:
-            browser.close()
+    pytest.skip(_SETS_GAP_REASON)

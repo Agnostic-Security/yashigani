@@ -95,10 +95,20 @@ pytestmark = _SKIP_NO_STACK
 _REPO_ROOT = Path(__file__).parents[3]
 _CLAUDE_ROOT = _REPO_ROOT.parent.parent
 
+
+# QA-fix (Ava, Tier-B triage 2026-08-02): this fallback hardcoded
+# ".../ytf/docker-linux/screenshots" regardless of which runtime/platform leg
+# is actually under test (this run was docker-macos) — harmless whenever
+# run-test-framework.sh's Tier-B leg sets YTF_SCREENSHOT_DIR (the normal
+# path, always does), but wrong/misleading for a direct/manual invocation of
+# this file without the env var. Falls back to a leg-agnostic path derived
+# from YTF_LEG (also exported by run_tier_b()) when available, "manual" when
+# not, rather than silently mislabelling the evidence.
+_leg = __import__("os").environ.get("YTF_LEG", "manual")
 SHOT_DIR = Path(
     __import__("os").environ.get(
         "YTF_SCREENSHOT_DIR",
-        str(_CLAUDE_ROOT / "testing_runs" / "yashigani" / "ytf" / "docker-linux" / "screenshots"),
+        str(_CLAUDE_ROOT / "testing_runs" / "yashigani" / "ytf" / _leg / "screenshots"),
     )
 ) / "chat_live_e2e"
 SHOT_DIR.mkdir(parents=True, exist_ok=True)

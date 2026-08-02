@@ -87,6 +87,61 @@ def launch_chromium(pw_or_playwright):
 
 
 # ---------------------------------------------------------------------------
+# Screenshot capture — shared across every Tier-B Playwright file
+# ---------------------------------------------------------------------------
+#
+# QA-fix (Ava, Tier-B triage 2026-08-02): run-test-framework.sh's Tier-B leg
+# (`run_tier_b()`) exports YTF_SCREENSHOT_DIR per-mode and treats ZERO
+# captured screenshots as a leg failure ("Zero screenshots captured — leg
+# WebUI Tier-B is NOT complete per pass-criteria"). Before this fix, exactly
+# ONE file in this entire suite (test_chat_live_e2e.py) ever called
+# page.screenshot() at all — every other Playwright UI-feature file (backup,
+# documents, capability-policy, hibp, permissions, pki, the conformance
+# sweep) captured nothing, ever, regardless of pass/fail. On the
+# ytf-docker-macos-29d9c9d8-20260731 run that one file's tests ALL failed at
+# fixture setup (the auth cascade fixed elsewhere this session) before ever
+# reaching a _shot() call, producing the reported "1 screenshot, essentially
+# zero" result. Two independent problems, both fixed:
+#   1. test_chat_live_e2e.py's own SHOT_DIR fallback hardcoded
+#      ".../ytf/docker-linux/screenshots" regardless of the ACTUAL runtime/
+#      platform leg being tested (this run was docker-macos) — harmless when
+#      YTF_SCREENSHOT_DIR is set (the normal run-test-framework.sh path
+#      always sets it), but actively misleading for anyone running this file
+#      directly without the env var, or auditing evidence paths.
+#   2. No shared, low-friction screenshot helper existed for the other
+#      Playwright files to adopt, so nobody did — capture_screenshot() below
+#      is that helper, now wired into the newly-fixed
+#      get_authed_context()-based fixtures (capability-policy, hibp, backup,
+#      documents, pki, permissions) at their key state-transition points
+#      (post-login, post-nav-click) so this Tier-B leg produces real,
+#      per-module evidence going forward, not just from one chat-specific file.
+YTF_SCREENSHOT_DIR = os.environ.get("YTF_SCREENSHOT_DIR")
+
+
+def capture_screenshot(page, name: str) -> Optional[str]:
+    """Capture a full-page screenshot to YTF_SCREENSHOT_DIR/<name>.png.
+
+    No-ops (returns None) if YTF_SCREENSHOT_DIR is not set — this keeps ad
+    hoc/local test runs (outside run-test-framework.sh) from littering the
+    repo with screenshot files nobody asked for, while still guaranteeing
+    real evidence whenever the Tier-B runner (which always sets the env var)
+    drives the suite. Never raises: a screenshot failure must never fail the
+    test it's evidencing.
+    """
+    if not YTF_SCREENSHOT_DIR:
+        return None
+    try:
+        d = Path(YTF_SCREENSHOT_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        p = str(d / f"{name}.png")
+        page.screenshot(path=p, full_page=True)
+        return p
+    except Exception as exc:  # pragma: no cover — evidence capture must never break a test
+        print(f"[conftest] capture_screenshot({name!r}) failed (non-fatal): {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CA cert resolution (mirrors e2e/conftest.py Pattern A)
 # ---------------------------------------------------------------------------
 
@@ -291,6 +346,47 @@ def _current_admin_password(admin: int = 1) -> str:
         return _read_secret("admin_initial_password")
 
 
+def _persist_rotated_password(admin: int, new_password: str) -> None:
+    """Write admin{N}'s freshly-rotated password back to
+    docker/secrets/admin{N}_password (docker/secrets/admin1_password for
+    admin1, matching _current_admin_password()'s on-disk fallback naming).
+
+    FIND-8 (Tier-B triage 2026-08-02): every rotation this suite performs was
+    previously cached ONLY in the in-process _rotated_admin_password dict —
+    nothing ever wrote it back to disk. That's fine within a single pytest
+    process (every helper reads the shared dict), but it means the FIRST
+    successful bootstrap of any given install PERMANENTLY invalidates the
+    on-disk admin{N}_password secret for every subsequent, independent
+    process (a fresh `pytest` invocation, a diagnostic curl/httpx script, a
+    human operator) — the account is not "burned" from the server's
+    perspective (the new password is real and works), only from the
+    perspective of anything reading the stale on-disk file. Confirmed live
+    against the still-running Tier-B stack on this run
+    (ytf-docker-macos-29d9c9d8-20260731): the on-disk admin1_password
+    (identical to admin_initial_password — never rotated) is now REJECTED
+    with 401 invalid_credentials by the live server, while the in-process
+    cache from whichever test happened to perform the real rotation still
+    has the correct value, orphaned once that process exits.
+
+    Best-effort: a permission error or read-only secrets mount should not
+    fail the test run (the in-process cache is still authoritative for the
+    rest of THIS process either way) — logged via print() since this module
+    has no logger of its own, loud enough to show up in pytest -s output
+    without needing one.
+    """
+    try:
+        repo_root = Path(__file__).parents[3]
+        secret_name = "admin1_password" if admin == 1 else f"admin{admin}_password"
+        p = repo_root / "docker" / "secrets" / secret_name
+        p.write_text(new_password, encoding="utf-8")
+        try:
+            p.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        print(f"[conftest] FIND-8: could not persist rotated admin{admin} password to disk: {exc}")
+
+
 def _generate_strong_password() -> str:
     import secrets as _secrets
     import string as _string
@@ -477,119 +573,113 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
             assert not data.get("force_password_change"), (
                 f"admin{admin} still force_password_change=True after rotation — rotation did not stick"
             )
+            # FIND-8: only persist to disk once the re-login above has PROVEN
+            # the new password actually works server-side — never persist an
+            # unverified write.
+            _persist_rotated_password(admin, new_password)
 
         result = dict(r.cookies)
     _session_cookie_cache[admin] = result
     return result
 
 
+def get_authed_context(pw_or_playwright, *, admin: int = 1, ignore_https_errors: bool = True,
+                        force_fresh: bool = False):
+    """New browser + context pre-authenticated via API session-cookie injection.
+
+    QA-fix (Ava, Tier-B triage 2026-08-02): promoted from
+    test_pentest_webui_adversarial.py's local `_authed_context()` (same
+    pattern, same rationale -- see that file's module docstring "CONFTEST
+    HAZARD FOUND") into a single shared conftest helper, so every Playwright
+    UI-feature test file can authenticate WITHOUT re-driving the browser
+    login form.
+
+    Root cause this fixes (Tier-B triage, run
+    ytf-docker-macos-29d9c9d8-20260731): test_capability_policy_ui.py,
+    test_hibp_admin_ui.py, test_permissions_ui.py and test_backup_ui.py each
+    hand-rolled their own browser-driven `_login()`/`_do_login()` that filled
+    the login form, then -- on a genuinely fresh stack needing the forced
+    password-change step -- filled and submitted #pw-form and IMMEDIATELY
+    called page.wait_for_url(BASE_URL + "/admin/"). Per the real client flow
+    (src/yashigani/backoffice/static/js/login.js "Step 2: Password Change"
+    handler), a successful password change does NOT navigate anywhere -- it
+    just re-displays #login-form with a success message and REQUIRES a
+    second, fresh login submission with the new password. Since none of
+    those four helpers performed that second submission, wait_for_url()
+    always hit its full 30s timeout on the very first bootstrap login of the
+    run (confirmed: test_capability_policy_ui.py is first in this suite's
+    collection order and its ENTIRE file setup-errored on this). Worse: each
+    of those helpers ALSO unconditionally wrote `_rotated_admin_password[1] =
+    new_pw` right after clicking #pw-btn, with no check that the change
+    actually succeeded server-side -- so a bad write there silently poisons
+    the ONE shared, process-global credential cache that every OTHER test
+    file in the whole 41-minute run reads from, producing the exact
+    401-invalid_credentials -> 429-too-many-requests cascade seen across
+    test_v233_webauthn_e2e.py and the stepup 401s in
+    bootstrap_user_session()'s callers (test_chat_live_e2e.py,
+    TestConversationBOLA, TestUserAgentBOLA).
+
+    _api_get_session_cookies() already implements the correct, ASSERT-VERIFIED
+    version of this dance over plain HTTP (no browser, no DOM race): it logs
+    in, and if force_password_change is set, changes the password, LOGS OUT
+    the restricted session, and re-logs-in with the new password -- only then
+    does it cache _rotated_admin_password. Authenticating the browser by
+    injecting THAT httpx-obtained cookie is strictly safer than re-doing the
+    same dance a second time by clicking through the DOM, and matches the
+    precedent already established by test_pki_admin_ui.py's `_login()` and
+    test_pentest_webui_adversarial.py's `_authed_context()`.
+
+    force_fresh=True bypasses _session_cookie_cache -- use this for any
+    module that runs late in a long suite (a session cached at the START of
+    a 40-minute run may have aged past the server's session TTL by the time
+    a LATE-running file tries to reuse it; confirmed candidate cause of
+    test_pki_admin_ui.py's "nav link not found at all" failures, since that
+    file's own `_login()` is otherwise correct).
+    """
+    cookies = _api_get_session_cookies(admin=admin, force_fresh=force_fresh)
+    browser = launch_chromium(pw_or_playwright)
+    ctx = browser.new_context(ignore_https_errors=ignore_https_errors)
+    ctx.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+    return browser, ctx
+
+
 def playwright_login_admin(page, *, admin: int = 1) -> None:
     """
     Full Playwright login for admin1 (or admin2 if admin=2).
 
-    Fills the login form with the admin's credentials and HMAC-SHA1 TOTP code.
-    Waits for a fresh TOTP window if one was used recently (within 62s) to
-    prevent TOTP replay rejection across multiple Playwright tests.
-
-    After login, navigates to /admin/. BUG-LOGIN-REDIRECT-01 was fixed in
-    v2.23.3: `(next && safeNext(next)) || '/admin/'` at the call site means
-    login without a ?next= param now correctly lands on /admin/ directly.
-    The direct navigate below is retained as a belt-and-braces guard in case
-    of Playwright timing on the fetch() completion.
+    QA-fix (Ava, Tier-B triage 2026-08-02): this used to drive the raw login
+    <form> directly, including a hand-rolled forced-password-change step
+    that clicked #pw-btn and then immediately asserted the browser had
+    navigated to /admin/. Per the real client flow (static/js/login.js
+    "Step 2: Password Change" handler), a successful password change does
+    NOT navigate anywhere -- it just re-shows #login-form with a success
+    message and requires a SECOND, fresh login submission with the new
+    password. That made this helper's correctness order-dependent: it only
+    ever worked because some OTHER file happened to run first and complete
+    the rotation via a different path first. Delegates to
+    _api_get_session_cookies() (assert-verified: login, and if
+    force_password_change, change password, log out the restricted session,
+    re-login with the new password, confirm force_password_change is now
+    False) and injects the resulting cookie into this SAME page's browser
+    context, then navigates to /admin/ -- removing the fragile browser-DOM
+    password-change dance and its order-dependency entirely. Matches
+    get_authed_context()'s pattern (same underlying helper).
 
     Raises AssertionError if admin dashboard is not reached.
-
-    Last updated: 2026-07-29 (F9: admin TOTP corrected to HMAC-SHA-512/8-digit;
-    previously v2.23.3: BUG-LOGIN-REDIRECT-01 fixed)
     """
-    import hashlib
-    import time
+    cookies = _api_get_session_cookies(admin=admin)
+    page.context.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+    page.goto(f"{BASE_URL}/admin/")
+    page.wait_for_timeout(1000)
 
-    import pyotp
-
-    if admin == 1:
-        username = _read_secret("admin1_username")
-        totp_secret = _read_secret("admin1_totp_secret")
-    else:
-        username = _read_secret("admin2_username")
-        totp_secret = _read_secret("admin2_totp_secret")
-    password = _current_admin_password(admin)
-
-    # F9 correction (2026-07-29): admin tier is HMAC-SHA-512/8-digit, not
-    # pyotp's RFC 6238 default. See get_admin_totp_code() docstring.
-    totp_obj = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512)
-
-    # Wait for a fresh TOTP window if we used a code for this admin recently.
-    # Server TTL for used codes is 60s. We wait until at least 62s have passed
-    # since the last login for this admin to guarantee a fresh code.
-    # Shares _api_totp_last_used with _api_get_session_cookies.
-    last = _api_totp_last_used.get(admin, 0.0)
-    now = time.time()
-    elapsed = now - last
-    if elapsed < 62:
-        wait = 62 - elapsed
-        secs_into = now % 30
-        window_wait = (30 - secs_into + 2) if secs_into >= 25 else 0
-        wait = max(wait, window_wait)
-        time.sleep(wait)
-    else:
-        secs_into = time.time() % 30
-        if secs_into >= 27:
-            time.sleep(32 - secs_into)
-
-    totp_code = totp_obj.now()
-    _api_totp_last_used[admin] = time.time()
-
-    page.goto(f"{BASE_URL}/admin/login")
-    page.fill("#username", username)
-    page.fill("#password", password)
-    page.fill("#totp_code", totp_code)
-    page.click("button[type='submit'], #login-btn")
-    page.wait_for_timeout(3000)  # wait for fetch() to complete
-
-    # Handle forced password change if still needed
-    if page.locator("#pw-form").is_visible():
-        new_pw = _generate_strong_password()
-        page.fill("#new_password", new_pw)
-        page.fill("#confirm_password", new_pw)
-        # QA-fix (Ava, 2026-07-31): the real submit button is id="pw-btn"
-        # (src/yashigani/backoffice/templates/login.html:47). The old
-        # selector "#pw-change-btn, button[type='submit']" referenced a
-        # nonexistent ID and silently fell back to the ambiguous group
-        # selector, which also matches the original (now-hidden but still
-        # in the DOM) #login-btn — Playwright resolves to that hidden match
-        # first and times out. Also: the randomly-generated new_pw was
-        # NEVER persisted anywhere, so every OTHER helper/test reading
-        # admin{N}'s password from docker/secrets/ would immediately start
-        # failing with invalid_credentials once this branch fired. Now
-        # cached in _rotated_admin_password so get_admin_credentials() /
-        # _api_get_session_cookies() / this function's own next call all
-        # see the current password for the rest of this pytest process.
-        page.click("#pw-btn")
-        page.wait_for_timeout(2000)
-        _rotated_admin_password[admin] = new_pw
-
-    # Belt-and-braces: if login didn't redirect to /admin/ (e.g. timing), navigate directly.
-    if "/admin/" not in page.url or "login" in page.url:
-        page.goto(f"{BASE_URL}/admin/")
-        page.wait_for_timeout(3000)
-
-    # Confirm admin dashboard elements are present.
-    # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the previous
-    # selector ("#page-dashboard, #nav-links, #health-cards") targeted the
-    # LEGACY 3.0-era dashboard.html template (backoffice/templates/dashboard.html).
-    # The currently-served /admin/ app is ui4 (backoffice/static/ui4/admin/admin.html
-    # -- root custom element <ys-admin-app>, module nav rendered as
-    # `a[href='#module-id']` per module-registry.js / admin-nav.js), which never
-    # renders those legacy IDs. This caused EVERY test depending on this shared
-    # login helper to fail immediately after an otherwise-successful login
-    # (confirmed: the server-side session was valid -- see the module's own
-    # test_nav_entry_present using `a[href='#{module_id}']`, and the direct
-    # curl-based 5-step bootstrap evidence in tier-b-ava/step5_relogin_final.json
-    # -- this was a stale test-helper assertion, not a product defect).
+    # Confirm admin dashboard elements are present. The current /admin/ app
+    # is ui4 (backoffice/static/ui4/admin/admin.html -- root custom element
+    # <ys-admin-app>, module nav rendered as `a[href='#module-id']` per
+    # module-registry.js / admin-nav.js).
     assert "/admin/login" not in page.url, (
         f"Still on login page after admin{admin} login — URL: {page.url}\n"
-        "Possible: TOTP replay, wrong credentials, throttle."
+        "Possible: TOTP replay, wrong credentials, throttle, or a stale/expired "
+        "cached session cookie (see _api_get_session_cookies force_fresh)."
     )
     assert page.locator("ys-admin-app, a[href^='#']").count() > 0, (
         f"Admin app shell not found — URL: {page.url}"

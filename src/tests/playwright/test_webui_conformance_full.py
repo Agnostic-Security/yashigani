@@ -371,27 +371,50 @@ class TestSessionLifecycle:
 # ===========================================================================
 
 @pytest.fixture(scope="module")
-def admin_ctx():
+def _pw_driver():
+    """Shared Playwright driver connection for this module.
+
+    QA-fix (Ava, Tier-B triage 2026-08-02): admin_ctx and user_ctx previously
+    EACH opened their own top-level `with sync_playwright() as pw:` block at
+    module scope. Both fixtures are used within the same test module
+    (TestAdminModuleSweep.test_endpoint_rejects_user_session needs user_ctx
+    while admin_ctx -- opened earlier for test_nav_entry_present et al -- is
+    still alive for the rest of the module's lifetime), so two concurrent
+    sync_playwright() driver connections ended up live in the same thread.
+    Playwright's sync API does not support this and raises "It looks like you
+    are using Playwright Sync API inside the asyncio loop" -- confirmed this
+    is exactly what killed all 38 tests depending on user_ctx (27x
+    test_endpoint_rejects_user_session + TestUserPageSweep +
+    TestDocumentsAdversarial + TestAgentGeneratePromptInjection), all "failed
+    on setup" with that exact message, in the same run where admin_ctx-only
+    tests in the same classes passed cleanly. One shared driver, two
+    independent browser/context pairs on top of it, fixes this without
+    changing any test body.
+    """
     with sync_playwright() as pw:
-        browser = launch_chromium(pw)
-        ctx = browser.new_context(ignore_https_errors=True)
-        page = ctx.new_page()
-        playwright_login_admin(page, admin=1)
-        yield ctx, page
-        ctx.close()
-        browser.close()
+        yield pw
 
 
 @pytest.fixture(scope="module")
-def user_ctx():
-    with sync_playwright() as pw:
-        browser = launch_chromium(pw)
-        ctx = browser.new_context(ignore_https_errors=True)
-        page = ctx.new_page()
-        playwright_login_user(page, cache_key="webui-suite-primary")
-        yield ctx, page
-        ctx.close()
-        browser.close()
+def admin_ctx(_pw_driver):
+    browser = launch_chromium(_pw_driver)
+    ctx = browser.new_context(ignore_https_errors=True)
+    page = ctx.new_page()
+    playwright_login_admin(page, admin=1)
+    yield ctx, page
+    ctx.close()
+    browser.close()
+
+
+@pytest.fixture(scope="module")
+def user_ctx(_pw_driver):
+    browser = launch_chromium(_pw_driver)
+    ctx = browser.new_context(ignore_https_errors=True)
+    page = ctx.new_page()
+    playwright_login_user(page, cache_key="webui-suite-primary")
+    yield ctx, page
+    ctx.close()
+    browser.close()
 
 
 class TestAdminModuleSweep:
