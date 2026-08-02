@@ -81,6 +81,9 @@ from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    _current_admin_password,
+    _generate_strong_password,
+    _rotated_admin_password,
 )
 
 pytestmark = pytest.mark.playwright_ui
@@ -131,16 +134,36 @@ def _admin1_initial_password() -> str:
     return _read_secret("admin_initial_password")
 
 
+def _admin1_current_password() -> str:
+    """QA-fix (Ava, 2026-07-31): use the shared in-process rotated-password
+    cache (conftest._current_admin_password) instead of always re-reading
+    the on-disk admin_initial_password secret, which stays stale once this
+    suite (or any other file in the same pytest run) has actually rotated
+    admin1's password via the forced-password-change flow."""
+    return _current_admin_password(1)
+
+
 def _admin1_totp_secret() -> str:
     """Return admin1 TOTP seed (base32). Raises FileNotFoundError if absent."""
     return _read_secret("admin1_totp_secret")
 
 
 def _current_totp(totp_secret: str) -> str:
-    """Generate a current TOTP code from the base32 seed."""
+    """Generate a current admin-tier TOTP code from the base32 seed.
+
+    QA-fix (Ava, 2026-07-31, Tier-B smoke): admin TOTP is HMAC-SHA-512/
+    8-digit (src/yashigani/auth/totp.py TOTP_ALGO_SHA512/TOTP_DIGITS_ADMIN;
+    see project_totp_uses_sha256_not_sha1.md). Both call sites in this file
+    (_get_authed_client's login, _delete_credential's step-up) are admin1-
+    only, so this previously used pyotp's RFC 6238 default (HMAC-SHA1,
+    6-digit) — a structurally wrong code, guaranteed to be rejected as
+    invalid_credentials on every call. Never a replay; wrong algorithm.
+    """
     try:
+        import hashlib
+
         import pyotp
-        return pyotp.TOTP(totp_secret).now()
+        return pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512).now()
     except ImportError as exc:
         raise RuntimeError(
             "pyotp not installed — required for step-up TOTP in WebAuthn e2e tests. "
@@ -157,13 +180,26 @@ def _get_authed_client():
     Return an httpx.Client with a valid admin1 session cookie.
 
     Uses password+TOTP login.  Raises AssertionError if login fails.
-    The caller must have admin1 credentials fully provisioned (password changed,
-    TOTP set up) — this precondition is met by the admin bootstrap in install.sh.
+
+    QA-fix (Ava, 2026-07-31), two bugs:
+      (1) Posted to f"{BASE_URL}/login", which is the GET-only user-facing
+          login PAGE route (app.py: @app.get("/login")) — admin login is
+          POST /auth/login (auth_router mounted with prefix="/auth" in
+          app.py). This would 404/405, not authenticate.
+      (2) Always read admin_initial_password and asserted force_password_change
+          wasn't checked at all -- on a genuinely fresh stack (admin creds
+          still INITIAL, as this Tier-B environment is) the docstring's
+          precondition ("admin1 has already completed bootstrap") does not
+          hold. Now self-heals: performs the forced password-change inline
+          if needed and persists the rotation via conftest's shared
+          _rotated_admin_password cache, so get_admin_credentials() and
+          every other file's login helper stay in sync for the rest of
+          this pytest process.
     """
     import httpx
 
     username = _admin1_username()
-    password = _admin1_initial_password()
+    password = _admin1_current_password()
     totp_secret = _admin1_totp_secret()
     verify = _verify_param()
 
@@ -172,12 +208,40 @@ def _get_authed_client():
     # Attempt login with TOTP — admin1 has already completed bootstrap.
     totp_code = _current_totp(totp_secret)
     r = client.post(
-        f"{BASE_URL}/login",
+        f"{BASE_URL}/auth/login",
         json={"username": username, "password": password, "totp_code": totp_code},
     )
     assert r.status_code in (200, 302, 307, 308), (
         f"Admin1 login failed: HTTP {r.status_code} — {r.text[:200]}"
     )
+
+    if r.status_code == 200 and r.json().get("force_password_change"):
+        new_password = _generate_strong_password()
+        change_r = client.post(
+            f"{BASE_URL}/auth/password/change",
+            json={"current_password": password, "new_password": new_password},
+        )
+        assert change_r.status_code == 200, (
+            f"admin1 forced password-change failed: {change_r.status_code} {change_r.text[:200]}"
+        )
+        _rotated_admin_password[1] = new_password
+        client.post(f"{BASE_URL}/auth/logout")
+        # Avoid TOTP replay: wait for a fresh 30s window before the second
+        # code (server rejects the same code twice within its 60s cache).
+        _secs_into = time.time() % 30
+        if _secs_into < 28:
+            time.sleep(30 - _secs_into + 1)
+        totp_code2 = _current_totp(totp_secret)
+        r = client.post(
+            f"{BASE_URL}/auth/login",
+            json={"username": username, "password": new_password, "totp_code": totp_code2},
+        )
+        assert r.status_code == 200, (
+            f"admin1 re-login after rotation failed: {r.status_code} {r.text[:200]}"
+        )
+        assert not r.json().get("force_password_change"), (
+            "admin1 still force_password_change=True after rotation — rotation did not stick"
+        )
 
     # Verify we actually got a session cookie.
     session_cookie = None
