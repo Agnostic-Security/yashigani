@@ -115,3 +115,54 @@ _cluster_available() {
   [ "$status" -eq 0 ]
   rm -rf "$tmp"
 }
+
+# --- DNS resolver mode (host vs internet) ----------------------------------
+# Tiago 2026-08-02: "just ask if the system is going to be set in a system with
+# host resolver or internet resolver". install.sh cannot infer it — a plaintext
+# Corefile forward is either a misconfiguration (internet) or entirely correct
+# (host, where the node resolver does the encrypted upstream).
+
+@test "install.sh exposes --dns-resolver-mode" {
+  grep -q -- "--dns-resolver-mode)" "${REPO_ROOT}/install.sh"
+}
+
+@test "the wizard asks the topology instead of assuming" {
+  grep -q "_prompt_dns_resolver_mode()" "${REPO_ROOT}/install.sh"
+  grep -q "host resolver" "${REPO_ROOT}/install.sh"
+  grep -q "internet resolver" "${REPO_ROOT}/install.sh"
+}
+
+@test "the prompt is invoked before the DNS gate, not after" {
+  prompt_line=$(grep -n "^  _prompt_dns_resolver_mode$" "${REPO_ROOT}/install.sh" | cut -d: -f1)
+  gate_line=$(grep -n "if ! _preflight_coredns_dnssec_dot; then" "${REPO_ROOT}/install.sh" | cut -d: -f1)
+  [ -n "$prompt_line" ] && [ -n "$gate_line" ]
+  [ "$prompt_line" -lt "$gate_line" ]
+}
+
+@test "host mode bypasses the Corefile tls:// string check" {
+  grep -q 'DNS_RESOLVER_MODE:-internet}" == "host"' "${REPO_ROOT}/install.sh"
+}
+
+@test "internet mode remains the default (no silent weakening)" {
+  grep -q 'DNS_RESOLVER_MODE:-internet' "${REPO_ROOT}/install.sh"
+}
+
+@test "host mode still records an operator attestation" {
+  grep -q "OPERATOR ATTESTATION" "${REPO_ROOT}/install.sh"
+}
+
+@test "resolver mode is persisted to the install state file" {
+  grep -q "DNS_RESOLVER_MODE=%s" "${REPO_ROOT}/install.sh"
+}
+
+@test "DNS-02 live resolution is NOT skipped in host mode" {
+  # host mode must only bypass the DNS-01 string check; the live probe stands
+  block=$(sed -n '/host-resolver topology/,/elif ! grep -qE/p' "${REPO_ROOT}/install.sh")
+  [[ "$block" != *"return 0"* ]]
+}
+
+@test "non-interactive without the flag defaults to internet, not host" {
+  block=$(sed -n '/_prompt_dns_resolver_mode()/,/^}/p' "${REPO_ROOT}/install.sh")
+  [[ "$block" == *'NON_INTERACTIVE:-false}" == "true"'* ]]
+  [[ "$block" == *'DNS_RESOLVER_MODE="internet"'* ]]
+}
