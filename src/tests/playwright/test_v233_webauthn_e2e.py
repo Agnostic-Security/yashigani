@@ -113,8 +113,14 @@ _REPO_ROOT = Path(__file__).parents[3]
 
 
 def _read_secret(name: str) -> str:
-    p = _REPO_ROOT / "docker" / "secrets" / name
-    return p.read_text(encoding="utf-8").strip()
+    # Single source of truth: delegate to conftest so YTF_SECRETS_DIR (and any
+    # future change to secret resolution) applies here too. This file previously
+    # duplicated the logic, which is why it kept the parents[4] bug after
+    # conftest was fixed, and why it still raised PermissionError on rootless
+    # podman after YTF_SECRETS_DIR was added to conftest only (19 errors).
+    from tests.playwright.conftest import _read_secret as _conftest_read_secret
+
+    return _conftest_read_secret(name)
 
 
 def _verify_param():

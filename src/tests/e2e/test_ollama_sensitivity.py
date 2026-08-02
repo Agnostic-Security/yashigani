@@ -9,6 +9,16 @@ is correctly classified and would be routed locally.
 
 Requires: running Yashigani stack with Ollama healthy.
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import json
@@ -20,7 +30,7 @@ from tests.e2e.conftest import runtime_exec, runtime_run, container_running, RUN
 
 def _ollama_query(prompt: str) -> str:
     """Send a prompt to Ollama directly (bypassing gateway auth) for testing."""
-    result = runtime_run("docker-gateway-1", f"""
+    result = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", f"""
 import urllib.request, json
 data = json.dumps({{"model": "qwen2.5:3b", "messages": [{{"role": "user", "content": {repr(prompt)}}}], "stream": False}}).encode()
 req = urllib.request.Request("http://ollama:11434/api/chat", data=data, headers={{"Content-Type": "application/json"}})
@@ -36,7 +46,7 @@ except Exception as e:
 
 def _classify_via_gateway(text: str) -> dict:
     """Classify text using the sensitivity classifier inside the gateway."""
-    output = runtime_run("docker-gateway-1", f"""
+    output = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", f"""
 from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
 c = SensitivityClassifier(enable_fasttext=False, enable_ollama=False)
 r = c.classify({repr(text)})
@@ -89,7 +99,7 @@ class TestOllamaLive:
 
     def test_gateway_healthz(self):
         # Post-mTLS: gateway listens on HTTPS only — use ssl context with gateway cert.
-        result = runtime_run("docker-gateway-1",
+        result = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1",
             "import ssl, urllib.request; "
             "c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); "
             "c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); "
@@ -100,7 +110,7 @@ class TestOllamaLive:
     def test_ollama_model_loaded(self):
         """Verify qwen2.5:3b is loaded in Ollama."""
         for _ in range(12):
-            result = runtime_exec("docker-ollama-1", "ollama", "list", timeout=10)
+            result = runtime_exec(f"{_YTF_PROJ}{_YTF_SEP}ollama{_YTF_SEP}1", "ollama", "list", timeout=10)
             if "qwen2.5" in result.stdout:
                 break
             time.sleep(10)
@@ -108,7 +118,7 @@ class TestOllamaLive:
 
     def test_simple_prompt_gets_response(self):
         """Send a simple prompt directly to Ollama and verify response."""
-        if not container_running("docker-ollama-1"):
+        if not container_running(f"{_YTF_PROJ}{_YTF_SEP}ollama{_YTF_SEP}1"):
             pytest.skip("Ollama not running")
         output = _ollama_query("Say hello in exactly 3 words.")
         assert "ERROR" not in output, f"Ollama query failed: {output}"

@@ -32,6 +32,16 @@ Control references:
 
 Last updated: 2026-05-24T00:00:00+00:00
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import json
@@ -97,7 +107,7 @@ def _runtime_run(container: str, python_code: str,
 def _stack_running() -> bool:
     """Quick check: is any Yashigani gateway container running?"""
     runtime = _detect_runtime()
-    for name in ("docker-gateway-1", "yashigani-gateway-1"):
+    for name in (f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", "yashigani-gateway-1"):
         if _container_running(name, runtime):
             return True
     return False
@@ -137,7 +147,7 @@ class TestAgentDispatchLive:
 
     def _gateway_name(self) -> str:
         runtime = _detect_runtime()
-        for name in ("docker-gateway-1", "yashigani-gateway-1"):
+        for name in (f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", "yashigani-gateway-1"):
             if _container_running(name, runtime):
                 return name
         pytest.skip("gateway container not found")
@@ -192,7 +202,7 @@ class TestAgentDispatchLive:
 
         Regression for BUG-V241-LANGFLOW-LETTA-BASE-URL.
         """
-        if not _container_running("docker-langflow-1", _detect_runtime()):
+        if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}langflow{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("langflow container not running (not in active profiles)")
 
         result = self._dispatch_via_gateway_internal("@langflow")
@@ -235,7 +245,7 @@ class TestAgentDispatchLive:
 
         Regression for BUG-V241-LANGFLOW-LETTA-BASE-URL.
         """
-        if not _container_running("docker-letta-1", _detect_runtime()):
+        if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}letta{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("letta container not running (not in active profiles)")
 
         result = self._dispatch_via_gateway_internal("@letta")
@@ -277,7 +287,7 @@ class TestAgentDispatchLive:
         is unaffected by BUG-V241-LANGFLOW-LETTA-BASE-URL (different routing
         architecture: gateway->openclaw, not openclaw->gateway).
         """
-        if not _container_running("docker-openclaw-1", _detect_runtime()):
+        if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}openclaw{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("openclaw container not running (not in active profiles)")
 
         result = self._dispatch_via_gateway_internal("@openclaw")
@@ -320,7 +330,7 @@ class TestAgentDispatchLive:
         It reads the value from the running container environment to
         ground the assertion against ops evidence, not just the compose file.
         """
-        if not _container_running("docker-langflow-1", _detect_runtime()):
+        if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}langflow{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("langflow container not running")
 
         runtime = _detect_runtime()
@@ -339,7 +349,7 @@ class TestAgentDispatchLive:
             "except Exception as exc:\n"
             "    print(f'ERROR:{exc}')\n"
         )
-        output = _runtime_run("docker-langflow-1", code, runtime=runtime, timeout=15)
+        output = _runtime_run(f"{_YTF_PROJ}{_YTF_SEP}langflow{_YTF_SEP}1", code, runtime=runtime, timeout=15)
 
         configured_base = ""
         base_match = re.search(r'CONFIGURED_BASE_URL:(.*)', output)
@@ -365,7 +375,7 @@ class TestAgentDispatchLive:
         From INSIDE the letta container: verify gateway:MESH_PORT is reachable.
         Same as langflow round-trip test above.
         """
-        if not _container_running("docker-letta-1", _detect_runtime()):
+        if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}letta{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("letta container not running")
 
         runtime = _detect_runtime()
@@ -384,7 +394,7 @@ class TestAgentDispatchLive:
             "except Exception as exc:\n"
             "    print(f'ERROR:{exc}')\n"
         )
-        output = _runtime_run("docker-letta-1", code, runtime=runtime, timeout=15)
+        output = _runtime_run(f"{_YTF_PROJ}{_YTF_SEP}letta{_YTF_SEP}1", code, runtime=runtime, timeout=15)
 
         configured_base = ""
         base_match = re.search(r'CONFIGURED_BASE_URL:(.*)', output)

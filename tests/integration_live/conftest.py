@@ -23,6 +23,16 @@ is a scaffold in the sense that per-category DEPTH (more scenarios per
 category) is expected to grow as each leg is actually exercised live; it is
 NOT a scaffold in the sense of "TODO: write test" stubs — there are none.
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import os
@@ -84,7 +94,7 @@ def _detect_runtime_binary() -> str:
         try:
             r = subprocess.run(["podman", "ps", "--format", "{{.Names}}"],
                                 capture_output=True, text=True, timeout=5)
-            if "docker-gateway-1" in r.stdout:
+            if f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1" in r.stdout:
                 return "podman"
         except Exception:
             pass

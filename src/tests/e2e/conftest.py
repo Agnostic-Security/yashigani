@@ -8,6 +8,16 @@ Run with: pytest src/tests/e2e/ -v
 
 Last updated: 2026-04-27T21:53:12+01:00
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import os
@@ -74,7 +84,7 @@ def _detect_runtime() -> str:
                 ["podman", "ps", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if "docker-gateway-1" in result.stdout:
+            if f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1" in result.stdout:
                 return "podman"
         except Exception:
             pass
@@ -86,7 +96,7 @@ def _detect_runtime() -> str:
                 ["docker", "ps", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if "docker-gateway-1" in result.stdout:
+            if f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1" in result.stdout:
                 return "docker"
         except Exception:
             pass
@@ -208,7 +218,7 @@ def _stack_running() -> bool:
 
     # Last-resort: exec into the gateway container if one exists under
     # any of the common name variants.
-    for name in ("docker-gateway-1", "docker_gateway_1", "yashigani-gateway-1"):
+    for name in (f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", "docker_gateway_1", "yashigani-gateway-1"):
         try:
             result = runtime_exec(
                 name, "python3", "-c",

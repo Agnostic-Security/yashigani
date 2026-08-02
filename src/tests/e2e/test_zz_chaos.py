@@ -10,6 +10,16 @@ Kill containers while the system is running. Verify:
 
 Requires: running Yashigani stack.
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import time
@@ -35,7 +45,7 @@ def _wait_for_healthy(name: str, timeout: int = 90) -> bool:
 
 def _gateway_healthz() -> bool:
     # Post-mTLS: gateway listens on HTTPS only — use ssl context with gateway cert.
-    result = runtime_run("docker-gateway-1",
+    result = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1",
         "import ssl, urllib.request; "
         "c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); "
         "c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); "
@@ -49,13 +59,13 @@ class TestChaosOllama:
     """Kill Ollama and verify recovery."""
 
     def test_ollama_recovers_after_kill(self):
-        assert container_running("docker-ollama-1"), "Ollama not running before test"
+        assert container_running(f"{_YTF_PROJ}{_YTF_SEP}ollama{_YTF_SEP}1"), "Ollama not running before test"
 
-        container_kill("docker-ollama-1")
+        container_kill(f"{_YTF_PROJ}{_YTF_SEP}ollama{_YTF_SEP}1")
         time.sleep(5)
 
         # Ollama needs extra time on ARM/CPU-only systems — model reload is slow
-        recovered = _wait_for_healthy("docker-ollama-1", timeout=300)
+        recovered = _wait_for_healthy(f"{_YTF_PROJ}{_YTF_SEP}ollama{_YTF_SEP}1", timeout=300)
         assert recovered, "Ollama did not recover within 300 seconds"
 
     def test_gateway_stays_healthy_during_ollama_restart(self):
@@ -67,10 +77,10 @@ class TestChaosRedis:
     """Kill Redis and verify recovery."""
 
     def test_redis_recovers_after_kill(self):
-        assert container_healthy("docker-redis-1")
-        container_kill("docker-redis-1")
+        assert container_healthy(f"{_YTF_PROJ}{_YTF_SEP}redis{_YTF_SEP}1")
+        container_kill(f"{_YTF_PROJ}{_YTF_SEP}redis{_YTF_SEP}1")
         time.sleep(2)
-        recovered = _wait_for_healthy("docker-redis-1", timeout=60)
+        recovered = _wait_for_healthy(f"{_YTF_PROJ}{_YTF_SEP}redis{_YTF_SEP}1", timeout=60)
         assert recovered, "Redis did not recover within 60 seconds"
 
 
@@ -78,10 +88,10 @@ class TestChaosBudgetRedis:
     """Kill budget-redis and verify recovery."""
 
     def test_budget_redis_recovers_after_kill(self):
-        assert container_running("docker-budget-redis-1")
-        container_kill("docker-budget-redis-1")
+        assert container_running(f"{_YTF_PROJ}{_YTF_SEP}budget-redis{_YTF_SEP}1")
+        container_kill(f"{_YTF_PROJ}{_YTF_SEP}budget-redis{_YTF_SEP}1")
         time.sleep(2)
-        recovered = _wait_for_healthy("docker-budget-redis-1", timeout=60)
+        recovered = _wait_for_healthy(f"{_YTF_PROJ}{_YTF_SEP}budget-redis{_YTF_SEP}1", timeout=60)
         assert recovered, "Budget-redis did not recover within 60 seconds"
 
 
@@ -89,8 +99,8 @@ class TestChaosPostgres:
     """Kill Postgres and verify recovery."""
 
     def test_postgres_recovers_after_kill(self):
-        assert container_healthy("docker-postgres-1")
-        container_kill("docker-postgres-1")
+        assert container_healthy(f"{_YTF_PROJ}{_YTF_SEP}postgres{_YTF_SEP}1")
+        container_kill(f"{_YTF_PROJ}{_YTF_SEP}postgres{_YTF_SEP}1")
         time.sleep(2)
-        recovered = _wait_for_healthy("docker-postgres-1", timeout=60)
+        recovered = _wait_for_healthy(f"{_YTF_PROJ}{_YTF_SEP}postgres{_YTF_SEP}1", timeout=60)
         assert recovered, "Postgres did not recover within 60 seconds"

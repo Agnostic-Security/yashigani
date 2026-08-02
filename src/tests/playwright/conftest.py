@@ -77,13 +77,99 @@ YTF_CHROMIUM_ARGS = [f"--host-resolver-rules=MAP {YTF_TEST_DOMAIN} {YTF_TEST_TAR
 YTF_HEADLESS = os.getenv("YTF_HEADED", "0") != "1"
 
 
+# ---------------------------------------------------------------------------
+# YTF screenshot evidence (restored 2026-08-01).
+#
+# docs/testing/YTF.md §2 makes "screenshot of every state transition" a HARD
+# Tier-B requirement, and run-test-framework.sh fails a leg whose screenshot
+# dir is empty. The capability previously existed ONLY in uncommitted scratch
+# scripts (podman/ava/pw_sweep*.py) and was not carried across when the six
+# ad-hoc suites were consolidated into YTF, so YTF has never produced one.
+#
+# Implemented centrally here rather than per-test: launch_chromium() is the
+# single funnel every Tier-B file uses, so instrumenting pages created through
+# it covers the whole suite. Capture is best-effort and never fails a test.
+# ---------------------------------------------------------------------------
+import itertools as _ytf_it
+import re as _ytf_re
+
+_YTF_SHOT_SEQ = _ytf_it.count(1)
+_YTF_SHOT_ACTIONS = ("goto", "click", "fill", "press", "check", "select_option", "set_checked")
+
+
+def _ytf_shot_dir() -> str:
+    return os.environ.get("YTF_SCREENSHOT_DIR", "")
+
+
+def _ytf_capture(page, label: str) -> None:
+    """Write one screenshot for the current test+step. Never raises."""
+    d = _ytf_shot_dir()
+    if not d:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        cur = os.environ.get("PYTEST_CURRENT_TEST", "unknown").split(" ")[0]
+        cur = _ytf_re.sub(r"[^A-Za-z0-9_.=\[\]-]", "_", cur)[-110:]
+        page.screenshot(path=f"{d}/{next(_YTF_SHOT_SEQ):05d}__{cur}__{label}.png",
+                        full_page=True)
+    except Exception:
+        pass  # evidence capture must never turn a passing test red
+
+
+def _ytf_instrument_page(page):
+    """Wrap state-changing page methods so each transition leaves an image."""
+    for _m in _YTF_SHOT_ACTIONS:
+        _orig = getattr(page, _m, None)
+        if _orig is None:
+            continue
+
+        def _make(meth_name, orig_fn):
+            def _wrapped(*a, **k):
+                result = orig_fn(*a, **k)
+                _ytf_capture(page, meth_name)
+                return result
+            return _wrapped
+
+        try:
+            setattr(page, _m, _make(_m, _orig))
+        except Exception:
+            pass
+    return page
+
+
+def _ytf_instrument_factory(obj):
+    """Patch new_page/new_context on a Browser or BrowserContext."""
+    for _factory in ("new_page", "new_context"):
+        _orig = getattr(obj, _factory, None)
+        if _orig is None:
+            continue
+
+        def _make(name, orig_fn):
+            def _wrapped(*a, **k):
+                made = orig_fn(*a, **k)
+                if name == "new_page":
+                    return _ytf_instrument_page(made)
+                return _ytf_instrument_factory(made)
+            return _wrapped
+
+        try:
+            setattr(obj, _factory, _make(_factory, _orig))
+        except Exception:
+            pass
+    return obj
+
+
 def launch_chromium(pw_or_playwright):
     """Shared Chromium launcher for every Tier-B test file. Honors YTF_HEADED
     (headed/headless parity) and always injects --host-resolver-rules so
     tests can target a domain-routed Caddy vhost without a privileged
     /etc/hosts edit. Use this instead of calling `pw.chromium.launch()`
-    directly."""
-    return pw_or_playwright.chromium.launch(headless=YTF_HEADLESS, args=YTF_CHROMIUM_ARGS)
+    directly.
+
+    Pages created through this launcher are instrumented for YTF screenshot
+    evidence (see above)."""
+    browser = pw_or_playwright.chromium.launch(headless=YTF_HEADLESS, args=YTF_CHROMIUM_ARGS)
+    return _ytf_instrument_factory(browser)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +289,25 @@ def _read_secret(name: str) -> str:
     """Read a secret from docker/secrets/. Raises FileNotFoundError if absent."""
     # __file__ = .../yashigani/src/tests/playwright/conftest.py
     # parents[3] = .../yashigani (repo root)
+    # YTF_SECRETS_DIR: point the harness at a READABLE COPY of docker/secrets.
+    # Needed because the live secrets dir is unreadable by the test user on BOTH
+    # runtimes -- root-owned under rootful Docker, and chowned to a subuid under
+    # rootless Podman (container uid 1000 maps through /etc/subuid, e.g. 166536),
+    # mode 0600, so the test user is neither owner nor in the group.
+    #
+    # Deliberately a COPY, not a chmod: widening the mode on the live files would
+    # destroy the very posture the pentest asserts (S1/CWE-732 -- no group- or
+    # world-readable file under docker/secrets). Make the copy with
+    #   podman unshare cat docker/secrets/<f>   (rootless podman)
+    #   sudo cat docker/secrets/<f>             (rootful docker)
+    #
+    # This override has now been rebuilt from scratch by three separate sessions
+    # because it only ever existed as an uncommitted working-tree change; the
+    # risk register records it as "UNCOMMITTED ... Must be committed" after two
+    # full 3.5h Tier-B runs produced 224 identical credential-read errors.
+    _override = os.environ.get("YTF_SECRETS_DIR", "")
+    if _override:
+        return (Path(_override) / name).read_text(encoding="utf-8").strip()
     repo_root = Path(__file__).parents[3]
     p = repo_root / "docker" / "secrets" / name
     return p.read_text(encoding="utf-8").strip()
