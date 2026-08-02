@@ -264,6 +264,20 @@ SKIP_COREDNS_DNSSEC_PROBE=false
 # resource, not owned by this Helm release; mutating it without explicit
 # operator consent on a BYO cluster is not a safe default.
 APPLY_COREDNS_HARDENING=false
+# Pass-through config for scripts/coredns-hardening-apply.sh. Both options are
+# supported by that script but were previously unreachable from install.sh,
+# which invoked it with no arguments at all: an operator was pinned to the
+# Cloudflare upstream AND to the root-owned default backup dir, so a non-root
+# k8s install died on "Permission denied" writing the pre-patch backup and the
+# error steered them to --skip-coredns-dnssec-probe (which disables the DNS-01
+# check entirely -- the outcome the design least wants). k3s-bootstrap.sh:537
+# already passed the provider through via COREDNS_UPSTREAM_PROVIDER, so the two
+# callers of the single-source-of-truth script had drifted (SOP 0).
+# Empty => let the script apply its own documented defaults.
+COREDNS_UPSTREAM_PROVIDER="${COREDNS_UPSTREAM_PROVIDER:-}"
+COREDNS_UPSTREAM_ADDR="${COREDNS_UPSTREAM_ADDR:-}"
+COREDNS_TLS_SERVERNAME="${COREDNS_TLS_SERVERNAME:-}"
+COREDNS_BACKUP_DIR="${COREDNS_BACKUP_DIR:-}"
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
@@ -534,6 +548,17 @@ OPTIONS
   --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
                                           Corefile with the DNSSEC-delegated/DoT forward block
                                           (scripts/coredns-hardening-apply.sh) before the
+  --coredns-upstream-provider P            cloudflare (default) | quad9 | custom.
+                                          'custom' names an INTERNALLY-CONTROLLED validating
+                                          resolver (keeps DNS metadata inside the estate);
+                                          requires --coredns-upstream-addr and
+                                          --coredns-tls-servername. The tls:// + pinned
+                                          servername requirement is unchanged.
+  --coredns-upstream-addr ADDR             (custom) resolver IP, or "ip1,ip2" for failover.
+  --coredns-tls-servername NAME            (custom) pinned TLS server name for the forward hop.
+  --coredns-backup-dir DIR                 Where the pre-patch Corefile backup is written.
+                                          Defaults to a user-writable path when not root
+                                          (the script's own default is root-owned).
                                           preflight probe runs. Off by default — kube-system's
                                           CoreDNS is a shared cluster resource; this mutates it.
   --upgrade                               Upgrade an existing installation
@@ -784,6 +809,14 @@ parse_args() {
       --skip-kernel-ebpf-probe)   SKIP_KERNEL_EBPF_PROBE=true;   shift ;;
       --skip-coredns-dnssec-probe) SKIP_COREDNS_DNSSEC_PROBE=true; shift ;;
       --apply-coredns-hardening)  APPLY_COREDNS_HARDENING=true;  shift ;;
+      --coredns-upstream-provider)
+        COREDNS_UPSTREAM_PROVIDER="${2:?--coredns-upstream-provider requires a value}"; shift 2 ;;
+      --coredns-upstream-addr)
+        COREDNS_UPSTREAM_ADDR="${2:?--coredns-upstream-addr requires a value}"; shift 2 ;;
+      --coredns-tls-servername)
+        COREDNS_TLS_SERVERNAME="${2:?--coredns-tls-servername requires a value}"; shift 2 ;;
+      --coredns-backup-dir)
+        COREDNS_BACKUP_DIR="${2:?--coredns-backup-dir requires a value}"; shift 2 ;;
       --skip-k8s-image-build)    SKIP_K8S_IMAGE_BUILD=true;      shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
@@ -13765,8 +13798,26 @@ _apply_coredns_hardening() {
     log_error "--apply-coredns-hardening requested but ${_script} not found"
     exit 1
   fi
+  # SOP 0 / drift fix: pass the operator's choices through. Previously this
+  # called `bash "$_script"` with no arguments, making --upstream-provider and
+  # --backup-dir unreachable via install.sh even though the script supports
+  # both and k3s-bootstrap.sh already forwarded the provider.
+  local -a _hardening_args=()
+  [[ -n "${COREDNS_UPSTREAM_PROVIDER:-}" ]] && _hardening_args+=("--upstream-provider" "$COREDNS_UPSTREAM_PROVIDER")
+  [[ -n "${COREDNS_UPSTREAM_ADDR:-}" ]]     && _hardening_args+=("--upstream-addr" "$COREDNS_UPSTREAM_ADDR")
+  [[ -n "${COREDNS_TLS_SERVERNAME:-}" ]]    && _hardening_args+=("--tls-servername" "$COREDNS_TLS_SERVERNAME")
+
+  # Default the backup dir to a user-writable location when we are not root.
+  # The script's own default (/var/lib/yashigani/coredns-backups) is root-owned,
+  # which aborted the whole k8s install for a non-root operator.
+  if [[ -z "${COREDNS_BACKUP_DIR:-}" && "$(id -u)" != "0" ]]; then
+    COREDNS_BACKUP_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/yashigani/coredns-backups"
+    log_info "Non-root install: defaulting CoreDNS backup dir to ${COREDNS_BACKUP_DIR}"
+  fi
+  [[ -n "${COREDNS_BACKUP_DIR:-}" ]] && _hardening_args+=("--backup-dir" "$COREDNS_BACKUP_DIR")
+
   log_info "Applying CoreDNS DNSSEC/DoT hardening (kube-system, design doc §1)..."
-  if ! bash "$_script"; then
+  if ! bash "$_script" ${_hardening_args[@]+"${_hardening_args[@]}"}; then
     log_error "CoreDNS hardening patch failed — see output above. Aborting k8s install."
     exit 1
   fi

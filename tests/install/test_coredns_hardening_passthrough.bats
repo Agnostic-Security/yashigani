@@ -1,0 +1,117 @@
+#!/usr/bin/env bats
+# Regression tests for the CoreDNS hardening pass-through (FIND-YTF412-011).
+#
+# Defect being locked down: install.sh::_apply_coredns_hardening invoked
+# scripts/coredns-hardening-apply.sh with NO arguments, so --upstream-provider
+# and --backup-dir (both supported by the script) were unreachable from the
+# installer. A non-root operator therefore hit "Permission denied" writing the
+# pre-patch backup into the root-owned default dir, the k8s install aborted,
+# and the error text steered them to --skip-coredns-dnssec-probe, which
+# disables the DNS-01 check entirely.
+#
+# Design invariant these tests must NOT relax (yashigani-k8s-dns-hardening-design
+# -20260719.md §1, Nico, ratified): the forward hop MUST be tls:// with a pinned
+# tls_servername. 'custom' changes WHO the trusted validating upstream is
+# (internal rather than public) -- never WHETHER the hop is authenticated.
+
+setup() {
+  REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/../.." && pwd)"
+  SCRIPT="${REPO_ROOT}/scripts/coredns-hardening-apply.sh"
+}
+
+# --- argument surface ------------------------------------------------------
+
+@test "install.sh exposes the four coredns pass-through flags" {
+  for f in --coredns-upstream-provider --coredns-upstream-addr \
+           --coredns-tls-servername --coredns-backup-dir; do
+    grep -q -- "$f)" "${REPO_ROOT}/install.sh"
+  done
+}
+
+@test "install.sh no longer calls the hardening script with zero arguments" {
+  # the original defect line
+  ! grep -qE 'if ! bash "\$_script"; then' "${REPO_ROOT}/install.sh"
+  grep -q '_hardening_args' "${REPO_ROOT}/install.sh"
+}
+
+@test "install.sh defaults the backup dir to a user-writable path when non-root" {
+  grep -q 'XDG_STATE_HOME' "${REPO_ROOT}/install.sh"
+}
+
+# --- provider resolution ---------------------------------------------------
+
+@test "custom provider requires both addr and servername" {
+  run bash "$SCRIPT" --upstream-provider custom --upstream-addr 10.1.2.3 --dry-run
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires BOTH --upstream-addr and --tls-servername"* ]]
+}
+
+@test "custom provider rejects a bare servername with no address" {
+  run bash "$SCRIPT" --upstream-provider custom --tls-servername dns.internal.example --dry-run
+  [ "$status" -ne 0 ]
+}
+
+@test "unknown provider is rejected and lists custom" {
+  run bash "$SCRIPT" --upstream-provider nope --dry-run
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cloudflare|quad9|custom"* ]]
+}
+
+# --- Corefile rendering (requires a cluster with CoreDNS; skipped otherwise) --
+
+_cluster_available() {
+  command -v kubectl >/dev/null 2>&1 &&
+    kubectl -n kube-system get configmap coredns >/dev/null 2>&1
+}
+
+@test "custom single upstream renders exactly one tls:// entry" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  run bash "$SCRIPT" --upstream-provider custom --upstream-addr 10.1.2.3 \
+        --tls-servername dns.internal.example --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"forward . tls://10.1.2.3 {"* ]]
+  # regression: an empty second upstream must never render a bare "tls://"
+  [[ "$output" != *"tls:// {"* ]]
+}
+
+@test "custom dual upstream renders both tls:// entries" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  run bash "$SCRIPT" --upstream-provider custom --upstream-addr 10.1.2.3,10.1.2.4 \
+        --tls-servername dns.internal.example --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"forward . tls://10.1.2.3 tls://10.1.2.4 {"* ]]
+}
+
+@test "custom still pins tls_servername (design invariant)" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  run bash "$SCRIPT" --upstream-provider custom --upstream-addr 10.1.2.3 \
+        --tls-servername dns.internal.example --dry-run
+  [[ "$output" == *"tls_servername dns.internal.example"* ]]
+}
+
+@test "cloudflare default is unchanged (no regression)" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  run bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"forward . tls://1.1.1.1 tls://1.0.0.1 {"* ]]
+  [[ "$output" == *"tls_servername cloudflare-dns.com"* ]]
+}
+
+@test "no plaintext fallback forward is ever emitted (design doc §1)" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  run bash "$SCRIPT" --upstream-provider custom --upstream-addr 10.1.2.3 \
+        --tls-servername dns.internal.example --dry-run
+  # every external forward must be tls://; a bare "forward . <ip>" is the
+  # spoofable path the design explicitly forbids adding "for resilience"
+  ! [[ "$output" =~ forward\ \.\ [0-9] ]]
+}
+
+# --- backup dir ------------------------------------------------------------
+
+@test "backup dir is honoured and writable under a normal user" {
+  _cluster_available || skip "no CoreDNS configmap reachable"
+  tmp="$(mktemp -d)"
+  run bash "$SCRIPT" --backup-dir "$tmp" --dry-run
+  [ "$status" -eq 0 ]
+  rm -rf "$tmp"
+}
