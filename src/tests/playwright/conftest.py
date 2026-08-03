@@ -418,6 +418,25 @@ def get_admin2_totp_code() -> str:
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
 _api_totp_last_used: "dict[int, float]" = {}  # admin_number → time.time() of last API login
 
+# QA-fix (Ava, Tier-B tierb-on-unified consolidation): per-identity "when was
+# this session actually established server-side" ledger, distinct from
+# _session_cookie_cache (which never expires in-process once populated).
+# The server's session idle-timeout is 900s (src/yashigani/auth/session.py
+# _IDLE_TIMEOUT_SECONDS) -- a cookie cached once at the START of a long file
+# (test_webui_conformance_full.py's admin_ctx/user_ctx are module-scoped,
+# shared across ~15 test classes and every TOTP-replay wait those classes
+# incur) can silently outlive that 900s window mid-file, producing "Still on
+# login page" only once some LATER test happens to hit it -- exactly the
+# measured 111+45-error cascade this consolidation fixes. These ledgers let
+# refresh_admin_context_if_stale()/refresh_user_context_if_stale() (below)
+# proactively re-authenticate BEFORE that happens, from one shared per-test
+# autouse guard, instead of each fixture/file inventing its own staleness
+# check (test_pki_admin_ui.py's unconditional force_fresh=True is the
+# unconditional/expensive special case of the same idea).
+_admin_session_established_at: "dict[int, float]" = {}  # admin_number → time.time() of last real (non-cache-hit) login
+_user_session_established_at: "dict[str, float]" = {}  # cache_key → time.time() of last real (non-cache-hit) bootstrap
+_SESSION_REFRESH_THRESHOLD_SECONDS = 600  # safety margin under the server's 900s/15-min idle timeout
+
 # QA-fix (Ava, 2026-07-31, Tier-B v412 fresh-bootstrap smoke): on a genuinely
 # fresh stack (admin creds still INITIAL, force_password_change=True on first
 # login) BOTH playwright_login_admin() and the (now-removed) local duplicates
@@ -797,6 +816,11 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
 
         result = dict(r.cookies)
     _session_cookie_cache[admin] = result
+    # Tierb-on-unified consolidation: record establishment time for THIS real
+    # login (never touched on the early cache-hit return above), so
+    # refresh_admin_context_if_stale() can detect idle-timeout staleness
+    # later without re-deriving it from scratch.
+    _admin_session_established_at[admin] = time.time()
     return result
 
 
@@ -860,7 +884,155 @@ def get_authed_context(pw_or_playwright, *, admin: int = 1, ignore_https_errors:
     return browser, ctx
 
 
-def playwright_login_admin(page, *, admin: int = 1) -> None:
+def get_authed_user_context(pw_or_playwright, *, cache_key: str = "default",
+                             ignore_https_errors: bool = True, force_fresh: bool = False):
+    """User-tier equivalent of get_authed_context(): new browser + context
+    pre-authenticated via bootstrap_user_session()'s cookie injection (no
+    browser form-login, no re-provisioning if cache_key is already warm).
+
+    Tierb-on-unified consolidation: promoted so admin_ctx/user_ctx (the
+    two conformance-suite fixtures previously the biggest source of the
+    153-error auth-setup cascade -- see admin_ctx/user_ctx docstrings in
+    test_webui_conformance_full.py) share the SAME "new browser + context,
+    cookie-injected, never a browser form-login" shape for both tiers,
+    instead of admin_ctx using get_authed_context() while user_ctx hand-rolled
+    its own browser/context/cookie-injection inline.
+    """
+    creds = bootstrap_user_session(cache_key=cache_key, force_fresh=force_fresh)
+    browser = launch_chromium(pw_or_playwright)
+    ctx = browser.new_context(ignore_https_errors=ignore_https_errors)
+    domain = BASE_URL.split("://", 1)[-1].split(":")[0]
+    ctx.add_cookies([
+        {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "secure": BASE_URL.startswith("https://"),
+        }
+        for name, value in creds["cookies"].items()
+    ])
+    return browser, ctx
+
+
+def assert_admin_dashboard_reached(page, *, admin: int = 1) -> None:
+    """Single source of truth for 'is this page an authenticated admin
+    dashboard'. Factored out of playwright_login_admin() so admin_ctx (and
+    any other caller) asserts the identical condition instead of each
+    call site re-deriving its own (subtly different) check."""
+    assert "/admin/login" not in page.url, (
+        f"Still on login page after admin{admin} login — URL: {page.url}\n"
+        "Possible: TOTP replay, wrong credentials, throttle, or a stale/expired "
+        "cached session cookie (see _api_get_session_cookies force_fresh)."
+    )
+    assert page.locator("ys-admin-app, a[href^='#']").count() > 0, (
+        f"Admin app shell not found — URL: {page.url}"
+    )
+
+
+def assert_user_chat_reached(page) -> None:
+    """Single source of truth for 'is this page an authenticated user
+    session' (checked via the /chat SPA landing, not bounced to /login)."""
+    assert "/login" not in page.url, (
+        f"user session cookie injection did not authenticate — URL: {page.url}"
+    )
+
+
+def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
+                                    threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """If admin{N}'s tracked session is older than `threshold` seconds
+    (default 600s, safely under the server's 900s/15-min idle timeout --
+    src/yashigani/auth/session.py _IDLE_TIMEOUT_SECONDS), force a fresh
+    login and re-inject the new cookies into `ctx` (a long-lived Playwright
+    BrowserContext), overwriting the old ones in place. No-ops (returns
+    False) if the session is still fresh.
+
+    This is the mid-file counterpart to admin_ctx/get_authed_context's
+    force_fresh=True at CREATION time: a long-running file (e.g.
+    test_webui_conformance_full.py, ~15 test classes sharing one
+    module-scoped admin_ctx) can sit idle on that session for over 900s
+    between two tests purely from OTHER tests' TOTP-replay waits — this
+    catches that case from a shared per-test autouse guard instead of
+    every test file inventing its own staleness check.
+    """
+    import time as _t
+
+    if _t.time() - _admin_session_established_at.get(admin, 0.0) <= threshold:
+        return False
+    cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
+    try:
+        ctx.clear_cookies()
+    except Exception:
+        pass
+    ctx.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+    return True
+
+
+def refresh_user_context_if_stale(ctx, *, cache_key: str = "default",
+                                   threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """User-tier equivalent of refresh_admin_context_if_stale()."""
+    import time as _t
+
+    if _t.time() - _user_session_established_at.get(cache_key, 0.0) <= threshold:
+        return False
+    creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
+    try:
+        ctx.clear_cookies()
+    except Exception:
+        pass
+    domain = BASE_URL.split("://", 1)[-1].split(":")[0]
+    ctx.add_cookies([
+        {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "secure": BASE_URL.startswith("https://"),
+        }
+        for name, value in creds["cookies"].items()
+    ])
+    return True
+
+
+def user_login_cookies(username: str, password: str, totp_secret: str, *,
+                        identity_key: "str | None" = None,
+                        digits: int = 6, digest=None) -> dict:
+    """Shared user-tier fresh-login primitive: POST /auth/login (with the
+    shared per-identity anti-replay guard -- wait_for_fresh_totp/
+    mark_totp_used) for an ALREADY-bootstrapped user account, returning the
+    resulting session cookies.
+
+    Tierb-on-unified consolidation: this is the single path for any caller
+    that needs a brand-new per-test user session for an existing account
+    (e.g. test_chat_live_e2e.py's chat_page fixture previously inlined this
+    exact POST + anti-replay dance itself instead of calling a shared
+    helper -- same underlying mechanism, but duplicated rather than unified,
+    the one remaining divergent path this consolidation removes).
+    """
+    import hashlib
+    import httpx
+    import pyotp
+
+    digest = digest or hashlib.sha256
+    key = identity_key or f"user:{username}"
+    totp = pyotp.TOTP(totp_secret, digits=digits, digest=digest)
+    wait_for_fresh_totp(key)
+    code = totp.now()
+    mark_totp_used(key)
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    with httpx.Client(verify=verify, follow_redirects=False, timeout=15) as c:
+        r = c.post(
+            f"{BASE_URL}/auth/login",
+            json={"username": username, "password": password, "totp_code": code},
+        )
+        assert r.status_code == 200, f"user login failed for {username}: {r.status_code} {r.text[:300]}"
+        assert not r.json().get("force_password_change"), (
+            f"user {username} unexpectedly still force_password_change=True"
+        )
+        return dict(r.cookies)
+
+
+def playwright_login_admin(page, *, admin: int = 1, force_fresh: bool = False) -> None:
     """
     Full Playwright login for admin1 (or admin2 if admin=2).
 
@@ -883,8 +1055,14 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     get_authed_context()'s pattern (same underlying helper).
 
     Raises AssertionError if admin dashboard is not reached.
+
+    force_fresh=True (added tierb-on-unified consolidation): bypass
+    _session_cookie_cache entirely for this call, guaranteeing a session
+    provably fresh at the moment of THIS call, not inherited from whatever
+    an earlier fixture/file cached hours before. Use for any fixture
+    (e.g. admin_ctx) that is the FIRST thing to authenticate in a long file.
     """
-    cookies = _api_get_session_cookies(admin=admin)
+    cookies = _api_get_session_cookies(admin=admin, force_fresh=force_fresh)
     page.context.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
     page.goto(f"{BASE_URL}/admin/")
     page.wait_for_timeout(1000)
@@ -893,14 +1071,7 @@ def playwright_login_admin(page, *, admin: int = 1) -> None:
     # is ui4 (backoffice/static/ui4/admin/admin.html -- root custom element
     # <ys-admin-app>, module nav rendered as `a[href='#module-id']` per
     # module-registry.js / admin-nav.js).
-    assert "/admin/login" not in page.url, (
-        f"Still on login page after admin{admin} login — URL: {page.url}\n"
-        "Possible: TOTP replay, wrong credentials, throttle, or a stale/expired "
-        "cached session cookie (see _api_get_session_cookies force_fresh)."
-    )
-    assert page.locator("ys-admin-app, a[href^='#']").count() > 0, (
-        f"Admin app shell not found — URL: {page.url}"
-    )
+    assert_admin_dashboard_reached(page, admin=admin)
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1165,48 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
             create_resp = c.post(f"{BASE_URL}/admin/users", json={"email": email})
             return stepup_resp, create_resp
 
+    def _free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
+        """Delete the oldest throwaway 'ava-conf-*@example.com' end-user
+        accounts (this suite's own test-created marker -- every email this
+        file/class generates uses this prefix) to free up license capacity,
+        via the real DELETE /admin/users/{username} endpoint
+        (StepUpAdminSession-gated -- reuses the stepup elevation already
+        present on `cookies` from the immediately-preceding successful
+        /auth/stepup call, valid for YASHIGANI_STEPUP_TTL_SECONDS).
+
+        Test-environment hygiene, not a product workaround: repeated pytest
+        invocations against the SAME long-lived podman stack accumulate
+        throwaway end-user accounts (this function creates a new one on
+        every force_fresh call / every fresh process, never deletes them) --
+        confirmed live: 402 end_user_limit_exceeded (limit=5, current=5) on
+        a stack that had been up ~10h across many prior test invocations.
+        Only ever touches accounts whose email matches this suite's own
+        'ava-conf-...@example.com' marker -- never a real user account.
+        Returns the number of accounts actually deleted.
+        """
+        with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
+            r = c.get(f"{BASE_URL}/admin/users")
+            if r.status_code != 200:
+                return 0
+            users = r.json().get("users", [])
+            throwaway = [
+                u for u in users
+                if (u.get("email") or "").startswith("ava-conf-")
+                and (u.get("email") or "").endswith("@example.com")
+            ]
+            throwaway.sort(key=lambda u: u.get("created_at") or "")
+            deleted = 0
+            for u in throwaway:
+                if deleted >= min_free:
+                    break
+                target_username = u.get("username")
+                if not target_username:
+                    continue
+                dr = c.delete(f"{BASE_URL}/admin/users/{target_username}")
+                if dr.status_code == 200:
+                    deleted += 1
+            return deleted
+
     stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
 
     # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): _api_get_session_cookies
@@ -1010,6 +1223,16 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     if stepup_resp.status_code == 401:
         admin_cookies = _api_get_session_cookies(admin=1, force_fresh=True)
         stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
+
+    # Test-environment hygiene (see _free_end_user_capacity docstring): a
+    # long-lived stack accumulates this suite's own throwaway end-users
+    # across many pytest invocations until the license's end-user cap is
+    # hit (402 end_user_limit_exceeded) -- free capacity by deleting the
+    # OLDEST throwaway 'ava-conf-*@example.com' accounts (never a real
+    # user), then retry the create once.
+    if create_resp is not None and create_resp.status_code == 402:
+        if _free_end_user_capacity(admin_cookies, min_free=1):
+            stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
 
     assert stepup_resp.status_code == 200, (
         f"stepup failed (even after forcing a fresh admin1 session): "
@@ -1125,6 +1348,10 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
         "cookies": final_cookies,
     }
     _user_session_cache[cache_key] = result
+    # Tierb-on-unified consolidation: record establishment time for THIS real
+    # bootstrap (never touched on the early cache-hit return above), so
+    # refresh_user_context_if_stale() can detect idle-timeout staleness later.
+    _user_session_established_at[cache_key] = _time.time()
     return result
 
 
@@ -1225,10 +1452,136 @@ def playwright_login_user(page, *, cache_key: str = "default", force_fresh: bool
     ])
     page.goto(f"{BASE_URL}/chat")
     page.wait_for_timeout(1500)
-    assert "/login" not in page.url, (
-        f"user session cookie injection did not authenticate — URL: {page.url}"
-    )
+    assert_user_chat_reached(page)
     return creds
+
+
+# ---------------------------------------------------------------------------
+# Real admin step-up (Tiago correction, 2026-08-03): stepup-gated mutation
+# endpoints (StepUpAdminSession, YASHIGANI_STEPUP_TTL_SECONDS default 300s)
+# must be exercised with a GENUINE step-up -- a freshly computed, never-
+# replayed TOTP code POSTed to /auth/stepup -- not tolerated as "either
+# outcome is fine" by the calling test. This is the single shared primitive
+# for that: any test needing a real step-up before a mutation call should use
+# this instead of hand-rolling its own TOTP-compute + /auth/stepup POST.
+# ---------------------------------------------------------------------------
+
+
+def do_admin_stepup(cookies: dict, *, admin: int = 1) -> dict:
+    """Perform a REAL admin step-up against an existing admin{N} session:
+    compute a fresh HMAC-SHA-512/8-digit TOTP code (waiting, via the shared
+    per-identity anti-replay ledger, for a new 30s window that has not
+    already been used for this identity) and POST it to /auth/stepup using
+    the given session cookies. Returns the parsed JSON response.
+
+    Raises AssertionError if the server rejects the step-up (never silently
+    tolerated by this helper -- callers that need to assert on a
+    NOT-stepped-up state should simply not call this, as
+    TestSessionLifecycle.test_stepup_required_endpoint_rejects_without_fresh_stepup
+    already does).
+    """
+    import hashlib
+
+    import httpx
+    import pyotp
+
+    totp_secret = _read_secret("admin1_totp_secret" if admin == 1 else f"admin{admin}_totp_secret")
+    key = f"stepup:admin{admin}"
+    wait_for_fresh_totp(key)
+    code = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512).now()
+    mark_totp_used(key)
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
+        r = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": code})
+        assert r.status_code == 200, f"admin{admin} stepup failed: {r.status_code} {r.text[:200]}"
+        return r.json()
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped shared identities (Tiago correction, 2026-08-03)
+# ---------------------------------------------------------------------------
+#
+# Cookie-injection-as-shortcut is NOT the answer here, and force_fresh at
+# every fixture-creation is NOT either (that just trades one problem --
+# staleness -- for another: MORE real logins, i.e. more TOTP-replay/
+# rate-limit exposure). The actual fix: log in via the REAL /auth/login (or
+# bootstrap) flow, with a REAL freshly-computed OTP, exactly ONCE per
+# identity for the WHOLE pytest run, and reuse that ONE authenticated
+# session for every test that needs it. pytest's ordinary scope="session"
+# fixture caching gives us that for free: the fixture body below runs once
+# no matter how many test files/classes across the whole invocation request
+# it, and its result (a live browser context carrying that one real session
+# cookie) is handed to every one of them.
+#
+# playwright_login_admin()/playwright_login_user() ARE the real-login
+# primitives (real POST /auth/login, real computed TOTP code from the actual
+# secret, no DOM form-fill) -- these fixtures call them exactly once each for
+# the whole run via session scope, then every dependent test reuses the
+# resulting context. Mutation endpoints gated by StepUpAdminSession still
+# require their own genuine step-up (do_admin_stepup() above) -- reusing the
+# base login session does not and must not imply step-up is pre-satisfied.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def _shared_pw():
+    """ONE Playwright driver for the entire pytest session/invocation."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        yield pw
+
+
+@pytest.fixture(scope="session")
+def admin_ctx(_shared_pw):
+    """ONE real admin1 session (real login, real freshly-computed TOTP),
+    reused by every test in every file that requests this fixture for the
+    whole pytest run. See module docstring above."""
+    browser = launch_chromium(_shared_pw)
+    ctx = browser.new_context(ignore_https_errors=True)
+    page = ctx.new_page()
+    playwright_login_admin(page, admin=1)
+    yield ctx, page
+    ctx.close()
+    browser.close()
+
+
+@pytest.fixture(scope="session")
+def user_ctx(_shared_pw):
+    """ONE real throwaway user-tier session (real bootstrap: provision,
+    forced password change, real freshly-computed TOTP code, re-login),
+    reused by every test in every file that requests this fixture for the
+    whole pytest run. See module docstring above."""
+    browser = launch_chromium(_shared_pw)
+    ctx = browser.new_context(ignore_https_errors=True)
+    page = ctx.new_page()
+    playwright_login_user(page, cache_key="webui-suite-primary")
+    yield ctx, page
+    ctx.close()
+    browser.close()
+
+
+@pytest.fixture(autouse=True)
+def _keep_shared_sessions_fresh(request):
+    """Idle-timeout safety net for the two session-scoped fixtures above.
+    The server's session idle-timeout is 900s (src/yashigani/auth/session.py
+    _IDLE_TIMEOUT_SECONDS) -- across a genuinely long full-suite run there
+    can be legitimate multi-hundred-second gaps between two tests that both
+    happen to need the SAME identity (e.g. a long stretch of user-only
+    tests while the shared admin session sits untouched). Rather than a
+    routine re-login (which would reintroduce the "many logins" problem this
+    whole consolidation removes), this only forces a fresh re-login when the
+    tracked session is ALREADY past a 600s safety margin -- a rare safety
+    net, not a routine behaviour -- and re-injects the refreshed cookies into
+    the SAME long-lived context in place, so no browser/page identity
+    changes underneath any test."""
+    if "admin_ctx" in request.fixturenames:
+        ctx, _ = request.getfixturevalue("admin_ctx")
+        refresh_admin_context_if_stale(ctx, admin=1)
+    if "user_ctx" in request.fixturenames:
+        ctx, _ = request.getfixturevalue("user_ctx")
+        refresh_user_context_if_stale(ctx, cache_key="webui-suite-primary")
+    yield
 
 
 # ---------------------------------------------------------------------------

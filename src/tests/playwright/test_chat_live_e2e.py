@@ -81,12 +81,10 @@ import pytest
 
 from tests.playwright.conftest import (
     BASE_URL,
-    _CA_CERT_PATH,
     _SKIP_NO_STACK,
     bootstrap_user_session,
     launch_chromium,
-    mark_totp_used,
-    wait_for_fresh_totp,
+    user_login_cookies,
 )
 
 pytestmark = _SKIP_NO_STACK
@@ -203,24 +201,23 @@ def chat_user_creds():
 
 @pytest.fixture()
 def chat_page(chat_user_creds):
-    import hashlib
-
-    import httpx
-    import pyotp
-
-    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
-    totp = pyotp.TOTP(chat_user_creds["totp_secret"], digits=6, digest=hashlib.sha256)
-
     # Fresh login via the API (not cookie-cache) so every test in this module
     # gets a live, non-replayed session -- chat_page is function-scoped
     # deliberately (each test sends real chat turns; sharing one session
     # across parametrized targets is fine for cookies, but re-login per test
     # keeps TOTP replay windows unambiguous in the evidence log).
     #
-    # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously only
-    # checked "am I in the first ~25s of a 30s window?" with no memory of
-    # whether THIS username's TOTP secret had already produced a code in the
-    # CURRENT window -- confirmed as the first domino in this run's 172-error
+    # QA-fix (Ava, Tier-B tierb-on-unified consolidation): this previously
+    # inlined its own httpx POST /auth/login + TOTP-compute here instead of
+    # calling the shared conftest primitive -- same real login, same
+    # wait_for_fresh_totp/mark_totp_used anti-replay guard, but duplicated
+    # rather than unified (the one remaining divergent login path this
+    # consolidation removes). user_login_cookies() is that shared primitive:
+    # real POST /auth/login with a real, freshly-computed, never-replayed
+    # TOTP code for an already-bootstrapped user account.
+    #
+    # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): the anti-replay guard
+    # itself fixes the confirmed first domino in this run's 172-error
     # cascade: test_chat_page_loads_authenticated and
     # test_direct_model_no_mention (the first two parametrized tests in this
     # module's collection order) ran back-to-back, landed in the same 30s
@@ -229,26 +226,12 @@ def chat_page(chat_user_creds):
     # After _THROTTLE_ACCOUNT_THRESHOLD (3) such accumulated failures the
     # account-level auth throttle tripped, turning every subsequent login for
     # the rest of the module (then, via IP severity, much of the rest of the
-    # 2h24m run) into 429 too_many_requests. wait_for_fresh_totp/mark_totp_used
-    # (shared conftest helper, keyed per-identity) replaces the local
-    # window-position-only check with the same "≥62s since THIS identity's
-    # last use" guard already proven correct for admin-tier logins.
-    identity_key = f"user:{chat_user_creds['username']}"
-    wait_for_fresh_totp(identity_key)
-    code = totp.now()
-    mark_totp_used(identity_key)
-    with httpx.Client(verify=verify, follow_redirects=False, timeout=15) as c:
-        r = c.post(
-            f"{BASE_URL}/auth/login",
-            json={
-                "username": chat_user_creds["username"],
-                "password": chat_user_creds["password"],
-                "totp_code": code,
-            },
-        )
-        assert r.status_code == 200, f"chat_page login failed: {r.status_code} {r.text[:300]}"
-        assert not r.json().get("force_password_change")
-        cookies = dict(r.cookies)
+    # 2h24m run) into 429 too_many_requests.
+    cookies = user_login_cookies(
+        chat_user_creds["username"],
+        chat_user_creds["password"],
+        chat_user_creds["totp_secret"],
+    )
 
     with __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright() as pw:
         browser = launch_chromium(pw)
