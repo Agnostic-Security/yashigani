@@ -56,6 +56,15 @@ export PATH
 # Defaults / flags
 # ---------------------------------------------------------------------------
 UPSTREAM_PROVIDER="${COREDNS_UPSTREAM_PROVIDER:-cloudflare}"
+# --upstream-provider custom: name an INTERNALLY-CONTROLLED validating resolver
+# instead of a public one. The ratified design (yashigani-k8s-dns-hardening-design
+# §1) requires "(a) the upstream is a validating resolver we trust, and (b) the
+# forward hop is authenticated+encrypted with a pinned server name" -- it does NOT
+# require the upstream be public. An internal DoT resolver satisfies both, and
+# keeps query metadata (incl. agent/MCP egress targets) inside the estate.
+# The tls:// + pinned tls_servername requirement is UNCHANGED and non-negotiable.
+UPSTREAM_ADDR="${COREDNS_UPSTREAM_ADDR:-}"
+TLS_SERVERNAME_ARG="${COREDNS_TLS_SERVERNAME:-}"
 BACKUP_DIR="${COREDNS_BACKUP_DIR:-/var/lib/yashigani/coredns-backups}"
 DRY_RUN=false
 NAMESPACE="kube-system"
@@ -71,7 +80,9 @@ DNSSEC-delegated-validation over DoT. cluster.local resolution (the
 unchanged, in place.
 
 Options:
-  --upstream-provider PROVIDER   cloudflare (default) | quad9
+  --upstream-provider PROVIDER   cloudflare (default) | quad9 | custom
+  --upstream-addr ADDR            (custom) resolver IP, or "ip1,ip2" for failover
+  --tls-servername NAME           (custom) pinned TLS server name for the hop
   --backup-dir DIR                Where to write the pre-patch Corefile backup
                                    (default: /var/lib/yashigani/coredns-backups)
   --dry-run                       Print the resulting Corefile, apply nothing
@@ -86,6 +97,8 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --upstream-provider) UPSTREAM_PROVIDER="${2:?--upstream-provider requires a value}"; shift 2 ;;
+    --upstream-addr)     UPSTREAM_ADDR="${2:?--upstream-addr requires a value}"; shift 2 ;;
+    --tls-servername)    TLS_SERVERNAME_ARG="${2:?--tls-servername requires a value}"; shift 2 ;;
     --backup-dir)        BACKUP_DIR="${2:?--backup-dir requires a value}"; shift 2 ;;
     --dry-run)            DRY_RUN=true; shift ;;
     --help|-h)             _usage; exit 0 ;;
@@ -116,14 +129,27 @@ case "$UPSTREAM_PROVIDER" in
     UPSTREAM_2="149.112.112.112"
     TLS_SERVERNAME="dns.quad9.net"
     ;;
+  custom)
+    if [[ -z "$UPSTREAM_ADDR" || -z "$TLS_SERVERNAME_ARG" ]]; then
+      _log_err "--upstream-provider custom requires BOTH --upstream-addr and --tls-servername"
+      _log_err "  e.g. --upstream-provider custom --upstream-addr 10.1.2.3 \\"
+      _log_err "       --tls-servername dns.internal.example"
+      _log_err "  (the pinned servername is what authenticates the hop -- design doc §1)"
+      exit 1
+    fi
+    # Accept "ip" or "ip1,ip2" for forward's built-in failover.
+    UPSTREAM_1="${UPSTREAM_ADDR%%,*}"
+    if [[ "$UPSTREAM_ADDR" == *,* ]]; then UPSTREAM_2="${UPSTREAM_ADDR##*,}"; else UPSTREAM_2=""; fi
+    TLS_SERVERNAME="$TLS_SERVERNAME_ARG"
+    ;;
   *)
-    _log_err "Unknown --upstream-provider '${UPSTREAM_PROVIDER}' (use: cloudflare|quad9)"
+    _log_err "Unknown --upstream-provider '${UPSTREAM_PROVIDER}' (use: cloudflare|quad9|custom)"
     exit 1
     ;;
 esac
 
 _log_info "Target: configmap/${CONFIGMAP_NAME} -n ${NAMESPACE}"
-_log_info "Upstream: ${UPSTREAM_PROVIDER} (tls://${UPSTREAM_1} tls://${UPSTREAM_2}, tls_servername=${TLS_SERVERNAME})"
+_log_info "Upstream: ${UPSTREAM_PROVIDER} (tls://${UPSTREAM_1}${UPSTREAM_2:+ tls://${UPSTREAM_2}}, tls_servername=${TLS_SERVERNAME})"
 
 # ---------------------------------------------------------------------------
 # Read the existing Corefile
@@ -236,14 +262,19 @@ def find_directive(body, name):
     return ws_start, name_start, end, indent
 
 
+# u2 is optional: --upstream-provider custom may name a single internal
+# resolver. Emitting a bare "tls://" for an empty u2 would render an invalid
+# Corefile, so build the upstream list from the non-empty entries only.
+_upstreams = " ".join("tls://%s" % _u for _u in (u1, u2) if _u)
+
 NEW_FORWARD = (
-    "forward . tls://%s tls://%s {\n"
+    "forward . %s {\n"
     "        tls_servername %s\n"
     "        health_check 5s\n"
     "        max_fails 2\n"
     "        expire 10s\n"
     "    }"
-) % (u1, u2, servername)
+) % (_upstreams, servername)
 
 NEW_CACHE = "cache 30 {\n        success 9984\n        denial 9984\n    }"
 

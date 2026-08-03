@@ -264,6 +264,32 @@ SKIP_COREDNS_DNSSEC_PROBE=false
 # resource, not owned by this Helm release; mutating it without explicit
 # operator consent on a BYO cluster is not a safe default.
 APPLY_COREDNS_HARDENING=false
+# Pass-through config for scripts/coredns-hardening-apply.sh. Both options are
+# supported by that script but were previously unreachable from install.sh,
+# which invoked it with no arguments at all: an operator was pinned to the
+# Cloudflare upstream AND to the root-owned default backup dir, so a non-root
+# k8s install died on "Permission denied" writing the pre-patch backup and the
+# error steered them to --skip-coredns-dnssec-probe (which disables the DNS-01
+# check entirely -- the outcome the design least wants). k3s-bootstrap.sh:537
+# already passed the provider through via COREDNS_UPSTREAM_PROVIDER, so the two
+# callers of the single-source-of-truth script had drifted (SOP 0).
+# Empty => let the script apply its own documented defaults.
+# DNS-01 topology. Two supported shapes, and the installer must ASK rather than
+# assume (Tiago, 2026-08-02) — it cannot tell a misconfiguration from a
+# deliberate host-resolver design by inspecting the Corefile alone:
+#   internet : CoreDNS forwards straight out; the hop MUST be tls:// with a
+#              pinned tls_servername (design doc §1). Default = today's behaviour.
+#   host     : the NODE's resolver (e.g. stubby) terminates DNS and performs the
+#              encrypted upstream. CoreDNS reaching it is a LOCAL hop that never
+#              touches the wire, so tls:// in the Corefile is neither required nor
+#              meaningful; query metadata also never reaches a third party.
+# In BOTH modes DNS-02 (live resolution actually works) is still enforced — it is
+# the stronger assertion and today it is discarded whenever anyone skips DNS-01.
+DNS_RESOLVER_MODE="${DNS_RESOLVER_MODE:-}"
+COREDNS_UPSTREAM_PROVIDER="${COREDNS_UPSTREAM_PROVIDER:-}"
+COREDNS_UPSTREAM_ADDR="${COREDNS_UPSTREAM_ADDR:-}"
+COREDNS_TLS_SERVERNAME="${COREDNS_TLS_SERVERNAME:-}"
+COREDNS_BACKUP_DIR="${COREDNS_BACKUP_DIR:-}"
 UPGRADE=false
 DRY_RUN=false
 OFFLINE=false
@@ -534,6 +560,25 @@ OPTIONS
   --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
                                           Corefile with the DNSSEC-delegated/DoT forward block
                                           (scripts/coredns-hardening-apply.sh) before the
+  --dns-resolver-mode MODE                 host | internet. 'host' = the NODE's resolver
+                                          (e.g. stubby) terminates DNS and performs the
+                                          encrypted upstream, so CoreDNS talks to it over a
+                                          local hop and tls:// in the Corefile is not
+                                          required. 'internet' (default) = CoreDNS forwards
+                                          straight out and the hop MUST be DoT with a pinned
+                                          servername. Asked interactively if omitted; live
+                                          resolution (DNS-02) is verified in BOTH modes.
+  --coredns-upstream-provider P            cloudflare (default) | quad9 | custom.
+                                          'custom' names an INTERNALLY-CONTROLLED validating
+                                          resolver (keeps DNS metadata inside the estate);
+                                          requires --coredns-upstream-addr and
+                                          --coredns-tls-servername. The tls:// + pinned
+                                          servername requirement is unchanged.
+  --coredns-upstream-addr ADDR             (custom) resolver IP, or "ip1,ip2" for failover.
+  --coredns-tls-servername NAME            (custom) pinned TLS server name for the forward hop.
+  --coredns-backup-dir DIR                 Where the pre-patch Corefile backup is written.
+                                          Defaults to a user-writable path when not root
+                                          (the script's own default is root-owned).
                                           preflight probe runs. Off by default — kube-system's
                                           CoreDNS is a shared cluster resource; this mutates it.
   --upgrade                               Upgrade an existing installation
@@ -784,6 +829,16 @@ parse_args() {
       --skip-kernel-ebpf-probe)   SKIP_KERNEL_EBPF_PROBE=true;   shift ;;
       --skip-coredns-dnssec-probe) SKIP_COREDNS_DNSSEC_PROBE=true; shift ;;
       --apply-coredns-hardening)  APPLY_COREDNS_HARDENING=true;  shift ;;
+      --dns-resolver-mode)
+        DNS_RESOLVER_MODE="${2:?--dns-resolver-mode requires host|internet}"; shift 2 ;;
+      --coredns-upstream-provider)
+        COREDNS_UPSTREAM_PROVIDER="${2:?--coredns-upstream-provider requires a value}"; shift 2 ;;
+      --coredns-upstream-addr)
+        COREDNS_UPSTREAM_ADDR="${2:?--coredns-upstream-addr requires a value}"; shift 2 ;;
+      --coredns-tls-servername)
+        COREDNS_TLS_SERVERNAME="${2:?--coredns-tls-servername requires a value}"; shift 2 ;;
+      --coredns-backup-dir)
+        COREDNS_BACKUP_DIR="${2:?--coredns-backup-dir requires a value}"; shift 2 ;;
       --skip-k8s-image-build)    SKIP_K8S_IMAGE_BUILD=true;      shift ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
@@ -3994,6 +4049,43 @@ SSO_EOF
 # =============================================================================
 # STEP 6: Configuration wizard
 # =============================================================================
+# _prompt_dns_resolver_mode — ASK the operator which DNS topology this cluster
+# uses. install.sh cannot infer it: a plaintext `forward` in the Corefile is
+# either a misconfiguration (internet mode, spoofable) or entirely correct (host
+# mode, where the node's resolver terminates DNS and does the encrypted
+# upstream). Guessing wrong either blocks a valid install or silently accepts a
+# spoofable resolution path, so the question is asked rather than assumed.
+# k8s path only; non-interactive requires --dns-resolver-mode.
+_prompt_dns_resolver_mode() {
+  [[ -n "${DNS_RESOLVER_MODE:-}" ]] && return 0
+  if [[ "${NON_INTERACTIVE:-false}" == "true" ]]; then
+    DNS_RESOLVER_MODE="internet"
+    log_warn "Non-interactive: --dns-resolver-mode not given; assuming 'internet'"
+    log_warn "  (CoreDNS must forward over tls://). Pass --dns-resolver-mode host if the"
+    log_warn "  node's resolver (e.g. stubby) performs the encrypted upstream."
+    return 0
+  fi
+  printf "\n"
+  printf "  %bHow does this cluster resolve external DNS?%b\n" "${C_BOLD}" "${C_RESET}"
+  printf "\n"
+  printf "    1) host resolver     — the NODE's resolver (e.g. stubby/dnscrypt) terminates\n"
+  printf "                           DNS and performs the encrypted upstream. CoreDNS talks\n"
+  printf "                           to it over a LOCAL hop; queries never reach a third party.\n"
+  printf "    2) internet resolver — CoreDNS forwards straight out to a public resolver.\n"
+  printf "                           The hop MUST then be DoT with a pinned tls_servername.\n"
+  printf "\n"
+  local _choice
+  printf "  Choice [1]: "
+  read -r _choice </dev/tty 2>/dev/null || _choice=""
+  case "${_choice:-1}" in
+    1|host|HOST)         DNS_RESOLVER_MODE="host" ;;
+    2|internet|INTERNET) DNS_RESOLVER_MODE="internet" ;;
+    *) log_warn "Unrecognised choice '${_choice}' — defaulting to host resolver."
+       DNS_RESOLVER_MODE="host" ;;
+  esac
+  log_info "DNS resolver mode: ${DNS_RESOLVER_MODE}"
+}
+
 run_wizard() {
   set_step "6" "Configuration wizard"
 
@@ -13816,8 +13908,26 @@ _apply_coredns_hardening() {
     log_error "--apply-coredns-hardening requested but ${_script} not found"
     exit 1
   fi
+  # SOP 0 / drift fix: pass the operator's choices through. Previously this
+  # called `bash "$_script"` with no arguments, making --upstream-provider and
+  # --backup-dir unreachable via install.sh even though the script supports
+  # both and k3s-bootstrap.sh already forwarded the provider.
+  local -a _hardening_args=()
+  [[ -n "${COREDNS_UPSTREAM_PROVIDER:-}" ]] && _hardening_args+=("--upstream-provider" "$COREDNS_UPSTREAM_PROVIDER")
+  [[ -n "${COREDNS_UPSTREAM_ADDR:-}" ]]     && _hardening_args+=("--upstream-addr" "$COREDNS_UPSTREAM_ADDR")
+  [[ -n "${COREDNS_TLS_SERVERNAME:-}" ]]    && _hardening_args+=("--tls-servername" "$COREDNS_TLS_SERVERNAME")
+
+  # Default the backup dir to a user-writable location when we are not root.
+  # The script's own default (/var/lib/yashigani/coredns-backups) is root-owned,
+  # which aborted the whole k8s install for a non-root operator.
+  if [[ -z "${COREDNS_BACKUP_DIR:-}" && "$(id -u)" != "0" ]]; then
+    COREDNS_BACKUP_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/yashigani/coredns-backups"
+    log_info "Non-root install: defaulting CoreDNS backup dir to ${COREDNS_BACKUP_DIR}"
+  fi
+  [[ -n "${COREDNS_BACKUP_DIR:-}" ]] && _hardening_args+=("--backup-dir" "$COREDNS_BACKUP_DIR")
+
   log_info "Applying CoreDNS DNSSEC/DoT hardening (kube-system, design doc §1)..."
-  if ! bash "$_script"; then
+  if ! bash "$_script" ${_hardening_args[@]+"${_hardening_args[@]}"}; then
     log_error "CoreDNS hardening patch failed — see output above. Aborting k8s install."
     exit 1
   fi
@@ -13869,7 +13979,16 @@ _preflight_coredns_dnssec_dot() {
     return 1
   fi
 
-  if ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
+  # host-resolver topology: the encrypted hop is performed by the NODE's resolver,
+  # one step beyond the Corefile, so a tls:// string check cannot see it and would
+  # reject a compliant (indeed stronger) deployment. DNS-02 below still runs.
+  if [[ "${DNS_RESOLVER_MODE:-internet}" == "host" ]]; then
+    log_info "DNS-01: host-resolver mode — CoreDNS forwards to the node resolver, which"
+    log_info "  performs the authenticated/encrypted upstream. Corefile tls:// not required;"
+    log_info "  live resolution (DNS-02) is still verified below."
+    log_warn "  OPERATOR ATTESTATION: the node resolver must be DoT/DoH-backed (e.g. stubby)."
+    log_warn "  This is recorded in the install state file; it is not machine-verifiable here."
+  elif ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
     log_error "=============================================================="
     log_error "FINDING (DNS-01): CoreDNS's external-zone 'forward' block does NOT use tls://."
     log_error "DNSSEC-delegated-validation (design doc §1) requires the upstream forward to be"
@@ -14417,6 +14536,9 @@ k8s_helm_install() {
   # CoreDNS is not forwarding over tls:// with a pinned tls_servername, or if
   # live external resolution through cluster DNS fails. Skippable with
   # --skip-coredns-dnssec-probe (risk-register exception).
+  # Ask the topology BEFORE gating on it — install.sh cannot infer whether a
+  # plaintext Corefile forward is a misconfiguration or a host-resolver design.
+  _prompt_dns_resolver_mode
   if ! _preflight_coredns_dnssec_dot; then
     log_error "Aborting k8s install: CoreDNS DNSSEC/DoT hardening not verified (design doc §1)."
     exit 1
@@ -19348,6 +19470,7 @@ main() {
         # cluster-wide resource other namespaces/orgs may depend on).
         printf 'COREDNS_HARDENING_APPLIED=%s\n' "${APPLY_COREDNS_HARDENING:-false}"
         printf 'COREDNS_BACKUP_DIR=%s\n'  "${COREDNS_BACKUP_DIR:-/var/lib/yashigani/coredns-backups}"
+        printf 'DNS_RESOLVER_MODE=%s\n'   "${DNS_RESOLVER_MODE:-internet}"
       } > "$_k8s_state_path"
       chmod 0644 "$_k8s_state_path"
       log_info "Install state written: ${_k8s_state_path}"
