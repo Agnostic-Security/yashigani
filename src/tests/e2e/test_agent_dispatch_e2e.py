@@ -32,6 +32,8 @@ Control references:
 
 Last updated: 2026-05-24T00:00:00+00:00
 """
+from __future__ import annotations
+
 import os as _ytf_os
 
 # FIND-YTF412-009: container names were hardcoded to the compose project
@@ -42,7 +44,6 @@ import os as _ytf_os
 # 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
 _YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
 _YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
-from __future__ import annotations
 
 import json
 import re
