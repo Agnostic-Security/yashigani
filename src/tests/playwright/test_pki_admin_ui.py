@@ -208,6 +208,26 @@ def test_pki_status_table_loads():
 # ---------------------------------------------------------------------------
 
 def test_pki_view_chain_shows_detail():
+    """
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+    clicked `view_buttons.first` -- in THIS deployment's service manifest
+    the FIRST row is always "caddy", whose cert file is a documented,
+    DELIBERATE local-test-env stub mountpoint (kms-pki module's own
+    GET /api/v1/admin/pki/status response: `"error":"No PEM certificate
+    block found in the cert file."`, matching the on-disk comment
+    "# YSG-RISK-053 mountpoint stub — real secret lives in
+    docker/secrets-caddy/"). Clicking View for a service in an error state
+    correctly renders kms-pki.js's `_renderChainDetail()` error branch (a
+    plain `.ys-txt-note` "Could not load chain for caddy"), NOT the
+    `.ys-panel-header:has-text('Chain —')` panel this test (correctly)
+    expects for a HEALTHY certificate -- this is why the locator was never
+    found. LIVE-CONFIRMED: clicking View on the "gateway" row (this file's
+    OWN _PKI_CHAIN_API constant already targets "gateway" for the
+    API-level PW-PKI-09 test, for the same reason) renders the full chain
+    detail panel correctly (Subject CN, Issuer CN, SHA-256 fingerprint, DNS
+    SANs, etc). Targets the "gateway" row explicitly instead of blindly
+    picking the first service.
+    """
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
@@ -218,10 +238,10 @@ def test_pki_view_chain_shows_detail():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        view_buttons = page.locator("button:has-text('View')")
-        if view_buttons.count() == 0:
-            pytest.skip("PW-PKI-03 SKIPPED: no services in the certificate manifest.")
-        view_buttons.first.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-03 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
         # Chain detail renders as its own .ys-panel with header "Chain — {service}"
@@ -236,6 +256,10 @@ def test_pki_view_chain_shows_detail():
 # ---------------------------------------------------------------------------
 
 def test_pki_chain_shows_fingerprint():
+    """QA-fix (Ava, 2026-08-03): see test_pki_view_chain_shows_detail's
+    docstring -- targets the "gateway" row (healthy cert) instead of
+    `view_buttons.first` (always "caddy" in this deployment, a documented
+    stub mountpoint whose chain fetch always errors)."""
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
@@ -246,10 +270,10 @@ def test_pki_chain_shows_fingerprint():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        view_buttons = page.locator("button:has-text('View')")
-        if view_buttons.count() == 0:
-            pytest.skip("PW-PKI-04 SKIPPED: no services in the certificate manifest.")
-        view_buttons.first.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-04 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
         detail = page.locator(".ys-panel-header:has-text('Chain —')").locator("xpath=..")
@@ -266,6 +290,10 @@ def test_pki_chain_shows_fingerprint():
 # ---------------------------------------------------------------------------
 
 def test_pki_chain_shows_cn_fields():
+    """QA-fix (Ava, 2026-08-03): see test_pki_view_chain_shows_detail's
+    docstring -- targets the "gateway" row (healthy cert) instead of
+    `view_buttons.first` (always "caddy" in this deployment, a documented
+    stub mountpoint whose chain fetch always errors)."""
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
@@ -276,10 +304,10 @@ def test_pki_chain_shows_cn_fields():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        view_buttons = page.locator("button:has-text('View')")
-        if view_buttons.count() == 0:
-            pytest.skip("PW-PKI-05 SKIPPED: no services in the certificate manifest.")
-        view_buttons.first.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-05 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
         detail_text = page.locator(".ys-panel-header:has-text('Chain —')").locator("xpath=..").inner_text()
@@ -337,6 +365,20 @@ def test_pki_rotate_triggers_stepup():
 # ---------------------------------------------------------------------------
 
 def test_pki_download_bundle_fires_download():
+    """
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+    clicked `download_btns.first` -- the FIRST service row in this
+    deployment's manifest is always "caddy", a documented stub mountpoint
+    (see test_pki_view_chain_shows_detail's docstring: "# YSG-RISK-053
+    mountpoint stub — real secret lives in docker/secrets-caddy/") whose
+    cert FILE contains that placeholder comment instead of a real PEM --
+    LIVE-CONFIRMED: the downloaded bundle's bytes were literally that
+    comment string, not `-----BEGIN CERTIFICATE-----`, hence the
+    `assert b"BEGIN CERTIFICATE" in pem_bytes` failure. Targets the
+    "gateway" row explicitly (this file's own _PKI_BUNDLE_API constant
+    already uses "gateway" for the equivalent API-level test, for the
+    same reason) instead of blindly picking the first service.
+    """
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
         browser = launch_chromium(pw)
@@ -347,13 +389,14 @@ def test_pki_download_bundle_fires_download():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        download_btns = page.locator("button", has_text="Download")
-        if download_btns.count() == 0:
-            pytest.skip("No Download buttons found — no services in manifest?")
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("No 'gateway' service row found — no services in manifest?")
+        download_btn = gateway_row.locator("button", has_text="Download")
 
         # Expect a download event, not navigation
         with page.expect_download(timeout=8000) as dl_info:
-            download_btns.first.click()
+            download_btn.click()
 
         dl = dl_info.value
         assert dl.suggested_filename.endswith("_cert_bundle.pem")

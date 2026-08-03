@@ -81,9 +81,10 @@ from tests.playwright.conftest import (
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    _api_get_session_cookies,
+    _api_totp_last_used,
     _current_admin_password,
-    _generate_strong_password,
-    _rotated_admin_password,
+    _wait_for_fresh_totp_window,
 )
 
 pytestmark = pytest.mark.playwright_ui
@@ -120,6 +121,30 @@ def _read_secret(name: str) -> str:
 def _verify_param():
     """Return httpx 'verify' parameter: CA cert path or False."""
     return _CA_CERT_PATH if _CA_CERT_PATH else False  # type: ignore[return-value]
+
+
+def _parse_wire_options(raw):
+    """Return `raw` as a dict, JSON-decoding it first if it's a string.
+
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): py_webauthn's
+    `options_to_json()` (called by every /register/start and /login/start
+    route -- src/yashigani/auth/webauthn.py, pg_webauthn.py) returns a
+    JSON-ENCODED STRING by design, not a nested dict -- every route in
+    src/yashigani/backoffice/routes/webauthn.py + webauthn_v1.py returns
+    {"status": "ok", "options": <that string>}. The real admin UI
+    (static/js/webauthn_login.js line 75) is explicitly defensive about
+    this: `(typeof optionsJson === 'string') ? JSON.parse(optionsJson) :
+    optionsJson`. Every extraction site in this file previously assumed
+    `body["options"]` was already a dict -- NEWLY EXPOSED by the 2026-08-03
+    auth-cascade fix (this file's fixtures always 401'd/429'd at setup
+    before, so no test here had ever actually reached this assertion in a
+    real run to catch the mismatch). Confirmed live: WA-REG-01's own
+    `isinstance(options, dict)` assertion failed on a real, correctly-
+    formed 200 response the moment the auth harness was fixed.
+    """
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -179,80 +204,53 @@ def _get_authed_client():
     """
     Return an httpx.Client with a valid admin1 session cookie.
 
-    Uses password+TOTP login.  Raises AssertionError if login fails.
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously did
+    its OWN raw password+TOTP login on EVERY call, with no anti-replay wait
+    and no shared session cache. This fixture is function-scoped and ~15
+    tests in this file consume it (authed_client/clean_authed_client), so
+    across a multi-hour run this both (a) risked TOTP-code replay whenever
+    two calls (in this file, or racing another file also logging in as
+    admin1) landed in the same 30s window -- the server's 60s single-use
+    TOTP cache rejects the repeat as invalid_credentials -- and (b) threw
+    away a perfectly good, already-established admin1 session on every
+    single call instead of reusing it, for no functional reason (this file
+    never needs a NEW admin1 identity, only a valid admin1 session).
+    Confirmed as the dominant contributor to the 2026-08-03 172-error
+    cascade: replay -> 3 consecutive fails trips the account-level auth
+    throttle -> 429 too_many_requests for every subsequent admin1 login
+    attempt, in this file and every other file sharing admin1, for the rest
+    of the 2h24m run.
 
-    QA-fix (Ava, 2026-07-31), two bugs:
-      (1) Posted to f"{BASE_URL}/login", which is the GET-only user-facing
-          login PAGE route (app.py: @app.get("/login")) — admin login is
-          POST /auth/login (auth_router mounted with prefix="/auth" in
-          app.py). This would 404/405, not authenticate.
-      (2) Always read admin_initial_password and asserted force_password_change
-          wasn't checked at all -- on a genuinely fresh stack (admin creds
-          still INITIAL, as this Tier-B environment is) the docstring's
-          precondition ("admin1 has already completed bootstrap") does not
-          hold. Now self-heals: performs the forced password-change inline
-          if needed and persists the rotation via conftest's shared
-          _rotated_admin_password cache, so get_admin_credentials() and
-          every other file's login helper stay in sync for the rest of
-          this pytest process.
+    Now delegates to conftest._api_get_session_cookies(admin=1) -- the SAME
+    cached, anti-replay-guarded, self-healing (force-password-change-aware)
+    session every other Playwright file in the suite already reuses --
+    verifies it against a real protected admin endpoint, and force-refreshes
+    ONCE if the cached session has expired (401) instead of raising
+    immediately. Still raises AssertionError if the session is invalid even
+    after a refresh.
     """
     import httpx
 
-    username = _admin1_username()
-    password = _admin1_current_password()
-    totp_secret = _admin1_totp_secret()
     verify = _verify_param()
 
-    client = httpx.Client(verify=verify, follow_redirects=False, timeout=15)
+    def _client_with(force_fresh: bool):
+        cookies = _api_get_session_cookies(admin=1, force_fresh=force_fresh)
+        c = httpx.Client(verify=verify, follow_redirects=False, timeout=15, cookies=cookies)
+        return c
 
-    # Attempt login with TOTP — admin1 has already completed bootstrap.
-    totp_code = _current_totp(totp_secret)
-    r = client.post(
-        f"{BASE_URL}/auth/login",
-        json={"username": username, "password": password, "totp_code": totp_code},
-    )
-    assert r.status_code in (200, 302, 307, 308), (
-        f"Admin1 login failed: HTTP {r.status_code} — {r.text[:200]}"
-    )
+    client = _client_with(force_fresh=False)
+    probe = client.get(f"{BASE_URL}/api/v1/admin/webauthn/credentials")
+    if probe.status_code == 401:
+        # Cached admin1 session (process-lifetime cache in
+        # _api_get_session_cookies) expired mid-run -- force a fresh login
+        # and retry once rather than erroring this test's setup.
+        client.close()
+        client = _client_with(force_fresh=True)
+        probe = client.get(f"{BASE_URL}/api/v1/admin/webauthn/credentials")
 
-    if r.status_code == 200 and r.json().get("force_password_change"):
-        new_password = _generate_strong_password()
-        change_r = client.post(
-            f"{BASE_URL}/auth/password/change",
-            json={"current_password": password, "new_password": new_password},
-        )
-        assert change_r.status_code == 200, (
-            f"admin1 forced password-change failed: {change_r.status_code} {change_r.text[:200]}"
-        )
-        _rotated_admin_password[1] = new_password
-        client.post(f"{BASE_URL}/auth/logout")
-        # Avoid TOTP replay: wait for a fresh 30s window before the second
-        # code (server rejects the same code twice within its 60s cache).
-        _secs_into = time.time() % 30
-        if _secs_into < 28:
-            time.sleep(30 - _secs_into + 1)
-        totp_code2 = _current_totp(totp_secret)
-        r = client.post(
-            f"{BASE_URL}/auth/login",
-            json={"username": username, "password": new_password, "totp_code": totp_code2},
-        )
-        assert r.status_code == 200, (
-            f"admin1 re-login after rotation failed: {r.status_code} {r.text[:200]}"
-        )
-        assert not r.json().get("force_password_change"), (
-            "admin1 still force_password_change=True after rotation — rotation did not stick"
-        )
-
-    # Verify we actually got a session cookie.
-    session_cookie = None
-    for name in ("__Host-yashigani_admin_session", "__Host-yashigani_session"):
-        if name in client.cookies:
-            session_cookie = client.cookies[name]
-            break
-
-    assert session_cookie is not None, (
-        "Admin1 login HTTP: 200 but no session cookie received — "
-        "admin1 bootstrap may not be complete."
+    assert probe.status_code == 200, (
+        f"Admin1 session invalid even after a forced refresh: "
+        f"HTTP {probe.status_code} — {probe.text[:200]}"
     )
     return client
 
@@ -270,11 +268,33 @@ def _delete_credential(client, credential_id: str, totp_secret: str) -> int:
     """
     Revoke a WebAuthn credential (step-up required — ASVS V6.8.4).
     Returns the HTTP status code.
+
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage), two bugs:
+      (1) Previously generated the stepup TOTP code with no anti-replay
+          wait at all. admin1's TOTP replay-cache is account-scoped, not
+          endpoint-scoped (verify_totp() keys on the matched time-window
+          slot per account -- see src/yashigani/auth/totp.py), so a stepup
+          code minted in the same 30s window as a login (or another test's
+          stepup) call anywhere else in the suite for admin1 would be
+          silently rejected as a replay. Shares conftest's admin-tier
+          _wait_for_fresh_totp_window/_api_totp_last_used guard (same
+          identity, same ledger used by every admin1 login in the suite)
+          instead of a separate, ungoverned code generation here.
+      (2) Posted to f"{BASE_URL}/stepup" -- the real route is
+          POST /auth/stepup (auth_router mounted with prefix="/auth" in
+          app.py; src/yashigani/backoffice/routes/auth.py line 2326:
+          @router.post("/stepup") under that prefix). The bare /stepup path
+          404s. NEWLY EXPOSED by the auth-cascade fix: every WA-REG-03+
+          test that reaches this cleanup call previously never got past
+          fixture setup at all, so this dead path was never exercised in a
+          real run.
     """
     # Perform step-up first.
+    _wait_for_fresh_totp_window(admin=1)
     totp_code = _current_totp(totp_secret)
+    _api_totp_last_used[1] = time.time()
     su = client.post(
-        f"{BASE_URL}/stepup",
+        f"{BASE_URL}/auth/stepup",
         json={"totp_code": totp_code},
     )
     assert su.status_code == 200, (
@@ -405,7 +425,7 @@ def _do_webauthn_register_via_api(client, credential_name: str = "E2E Test Key")
     )
     body_start = r_start.json()
     assert body_start.get("status") == "ok", f"register/start not ok: {body_start}"
-    options = body_start["options"]
+    options = _parse_wire_options(body_start["options"])
 
     # The options dict contains a base64url-encoded challenge and rp/user data.
     # We return it so callers can drive the browser to complete the ceremony.
@@ -640,7 +660,7 @@ def test_wa_reg_01_register_start_returns_options(authed_client):
     )
     body = r.json()
     assert body.get("status") == "ok", f"WA-REG-01 FAIL: status not 'ok': {body}"
-    options = body.get("options")
+    options = _parse_wire_options(body.get("options"))
     assert isinstance(options, dict), f"WA-REG-01 FAIL: options not a dict: {body}"
     assert "challenge" in options, "WA-REG-01 FAIL: options missing 'challenge' field"
     # Verify challenge is at least 32 bytes when decoded.
@@ -803,7 +823,7 @@ def test_wa_login_01_login_start_returns_options(clean_authed_client, browser_pa
         assert body.get("status") == "ok", f"WA-LOGIN-01 FAIL: status not ok: {body}"
         assert "options" in body, "WA-LOGIN-01 FAIL: options missing from login/start response"
         assert "user_id" in body, "WA-LOGIN-01 FAIL: user_id missing from login/start response"
-        options = body["options"]
+        options = _parse_wire_options(body["options"])
         assert "challenge" in options, "WA-LOGIN-01 FAIL: challenge missing from options"
         assert "allowCredentials" in options, (
             "WA-LOGIN-01 FAIL: allowCredentials missing — enrolled credential not returned"
@@ -851,7 +871,7 @@ def test_wa_login_02_login_finish_issues_session_cookie(
         assert r_start.status_code == 200, (
             f"WA-LOGIN-02 FAIL: login/start returned {r_start.status_code}"
         )
-        auth_options = r_start.json()["options"]
+        auth_options = _parse_wire_options(r_start.json()["options"])
 
         # Drive browser authentication using virtual authenticator.
         assertion = _browser_complete_authentication(page, auth_options)
@@ -918,7 +938,7 @@ def test_wa_login_03_session_grants_authenticated_access(
             f"{BASE_URL}/api/v1/admin/webauthn/login/start",
             json={"username": _admin1_username()},
         )
-        auth_options = r_start.json()["options"]
+        auth_options = _parse_wire_options(r_start.json()["options"])
         assertion = _browser_complete_authentication(page, auth_options)
 
         r_finish = anon_client.post(
@@ -983,7 +1003,7 @@ def test_wa_login_04_audit_event_webauthn_login_success(
             json={"username": _admin1_username()},
         )
         assert r_start.status_code == 200
-        auth_options = r_start.json()["options"]
+        auth_options = _parse_wire_options(r_start.json()["options"])
         assertion = _browser_complete_authentication(page, auth_options)
 
         r_finish = anon_client.post(
@@ -1175,7 +1195,7 @@ def test_wa_fail_03_replayed_challenge_returns_401(
             json={"username": _admin1_username()},
         )
         assert r_start1.status_code == 200
-        auth_options1 = r_start1.json()["options"]
+        auth_options1 = _parse_wire_options(r_start1.json()["options"])
 
         # Create assertion from first challenge.
         assertion = _browser_complete_authentication(page, auth_options1)
@@ -1536,7 +1556,7 @@ def test_wa_multi_02_03_both_credentials_usable(
             assert r_start.status_code == 200, (
                 f"WA-MULTI-0{attempt+2} FAIL: login/start returned {r_start.status_code}"
             )
-            auth_options = r_start.json()["options"]
+            auth_options = _parse_wire_options(r_start.json()["options"])
             assertion = _browser_complete_authentication(page, auth_options)
             r_finish = anon_client.post(
                 f"{BASE_URL}/api/v1/admin/webauthn/login/finish",
@@ -1611,7 +1631,7 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
         assert r_start.status_code == 200, (
             f"WA-MULTI-04 FAIL: login/start after revoking A returned {r_start.status_code}"
         )
-        auth_options = r_start.json()["options"]
+        auth_options = _parse_wire_options(r_start.json()["options"])
         assertion = _browser_complete_authentication(page, auth_options)
         r_finish = anon_client.post(
             f"{BASE_URL}/api/v1/admin/webauthn/login/finish",

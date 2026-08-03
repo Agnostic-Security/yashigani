@@ -397,20 +397,133 @@ def _generate_strong_password() -> str:
     )
 
 
-def clear_auth_throttle() -> int:
-    """Delete per-IP and global auth throttle/fail keys from Redis.
+def _detect_container_runtime() -> Optional[str]:
+    """Return 'podman' or 'docker' -- whichever has a live container list
+    right now -- or None if neither is reachable.
 
-    Returns the number of keys deleted. No-ops gracefully if Redis is
-    unreachable (tests can still run, throttle just won't be reset).
+    Mirrors src/tests/e2e/conftest.py's _detect_runtime(), generalised: that
+    helper's liveness probe hardcodes the exact container name
+    "docker-gateway-1", which never matches THIS deployment's actual
+    compose project name (confirmed live, 2026-08-03 Tier-B triage:
+    `podman ps` on this podman-macos run returns "localhost_redis_1",
+    "localhost_gateway_1", etc -- never "docker-*"), so it silently falls
+    through to a "default to docker" branch every time. This helper instead
+    just asks "does this runtime have ANY running containers right now",
+    which works regardless of compose project-naming convention.
+    """
+    import shutil
+    import subprocess
 
-    Last updated: 2026-05-09 (v2.23.3: new helper)
+    for runtime in ("podman", "docker"):
+        if not shutil.which(runtime):
+            continue
+        try:
+            result = subprocess.run(
+                [runtime, "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return runtime
+        except Exception:
+            continue
+    return None
+
+
+def _find_redis_container(runtime: str) -> Optional[str]:
+    """Return the name of the running redis container under `runtime`, or
+    None.
+
+    QA-fix (Ava, 2026-08-03): an earlier version of this matched by bare
+    substring ("redis" in name.lower()), which on THIS deployment picked
+    "localhost_budget-redis_1" (a SEPARATE redis instance used for budget
+    tracking -- see docker-compose service list) instead of the actual
+    auth-throttle redis, "localhost_redis_1" -- confirmed live: the
+    substring version silently drained the wrong container's keys every
+    time (0 auth:fail/auth:throttle keys ever actually touched). Now
+    requires an EXACT compose service-name segment match ("redis"), tried
+    against both "_"  (this deployment's separator -- "localhost_redis_1")
+    and "-" (docker-compose v2's default separator) split conventions,
+    before falling back to a broad substring match as a last resort.
     """
     import subprocess
 
     try:
-        # Read Redis password from the backoffice container's secret
+        result = subprocess.run(
+            [runtime, "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        candidates = [n.strip() for n in result.stdout.splitlines() if n.strip()]
+    except Exception:
+        return None
+
+    for sep in ("_", "-"):
+        for name in candidates:
+            if any(seg.lower() == "redis" for seg in name.split(sep)):
+                return name
+    for name in candidates:
+        if "redis" in name.lower():
+            return name
+    return None
+
+
+def clear_auth_throttle() -> int:
+    """Delete every LIVE auth-throttle Redis key (per-IP and per-account
+    fail-count + throttle-level buckets) so a burst-login test (or any test
+    that trips the account/IP gate) doesn't leak elevated severity into the
+    rest of a long-running suite.
+
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+    (a) hardcoded `docker exec docker-redis-1 ...` unconditionally -- on
+    THIS run (podman-macos) the `docker` CLI binary is present (Docker
+    Desktop client) but its daemon is NOT running ("Cannot connect to the
+    Docker daemon at unix:///Users/max/.docker/run/docker.sock"), so every
+    call failed at the FIRST subprocess step and silently returned 0, every
+    single time, on every podman-only deployment -- and (b) even when a
+    docker daemon IS reachable, deleted a STALE key set (auth:fail:global, a
+    single hardcoded auth:fail:ip:172.23.0.2) that does not match the live
+    scheme actually written by
+    src/yashigani/backoffice/routes/auth.py::_apply_auth_throttle /
+    _reset_auth_failures: auth:fail:ip:{client_ip}, auth:throttle:ip:{ip},
+    auth:fail:acct:{bucket}, auth:throttle:acct:{bucket} -- bucket is
+    "id:{account_id}" or "unk:{sha256(username)[:16]}", never a fixed
+    value -- so even on a genuine docker deployment this was a no-op
+    against the keys that actually matter.
+
+    Confirmed live root-cause contributor to the 2026-08-03 172-error
+    cascade: TestRateLimitLoginBurst's 20-attempt burst legitimately
+    escalates auth:throttle:ip:127.0.0.1 (the real test-client IP, not the
+    hardcoded 172.23.0.2); this no-op meant that elevated IP severity was
+    NEVER actually cleared and persisted for the rest of the 2h24m run,
+    compounding the account-level throttle hit by the chat_page/webauthn
+    TOTP-replay bugs fixed alongside this.
+
+    Now: (1) detects whichever runtime (podman or docker) actually has live
+    containers right now instead of assuming docker: (2) finds the redis
+    container by name-substring match instead of a hardcoded compose-project
+    name; (3) SCANs for the live `auth:fail:*` / `auth:throttle:*` key
+    patterns and deletes whatever actually exists, instead of a fixed stale
+    list. Never touches `auth:blocked:*` (admin-managed manual IP block --
+    intentionally NOT auto-cleared by this helper).
+
+    Returns the number of keys deleted. No-ops gracefully (returns 0) if no
+    container runtime / redis container / redis auth is reachable -- tests
+    can still run, throttle just won't be reset.
+
+    Last updated: 2026-08-03 (Ava, Tier-B 172-error triage: podman support +
+    live key scheme; was 2026-05-09 v2.23.3 original).
+    """
+    import subprocess
+
+    runtime = _detect_container_runtime()
+    if runtime is None:
+        return 0
+    redis_container = _find_redis_container(runtime)
+    if redis_container is None:
+        return 0
+
+    try:
         pw_result = subprocess.run(
-            ["docker", "exec", "docker-redis-1", "cat", "/run/secrets/redis_password"],
+            [runtime, "exec", redis_container, "cat", "/run/secrets/redis_password"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -419,45 +532,44 @@ def clear_auth_throttle() -> int:
             return 0
         redis_pw = pw_result.stdout.strip()
 
-        del_result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                "docker-redis-1",
-                "redis-cli",
-                "-p",
-                "6380",
-                "--tls",
-                "--cert",
-                "/run/secrets/redis_client.crt",
-                "--key",
-                "/run/secrets/redis_client.key",
-                "--cacert",
-                "/run/secrets/ca_root.crt",
-                "--user",
-                "default",
-                "--pass",
-                redis_pw,
-                "-n",
-                "1",
-                "DEL",
-                "auth:fail:global",
-                "auth:fail:ip:172.23.0.2",
-                "auth:throttle:global",
-                "auth:throttle:ip:172.23.0.2",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        output = (
-            del_result.stdout.strip()
-            .replace(
-                "Warning: Using a password with '-a' or '-u' option on the command line interface may not be safe.", ""
+        def _redis_cli(*args: str) -> "subprocess.CompletedProcess":
+            return subprocess.run(
+                [
+                    runtime, "exec", redis_container, "redis-cli",
+                    "-p", "6380",
+                    "--tls",
+                    "--cert", "/run/secrets/redis_client.crt",
+                    "--key", "/run/secrets/redis_client.key",
+                    "--cacert", "/run/secrets/ca_root.crt",
+                    "--user", "default",
+                    "--pass", redis_pw,
+                    "-n", "1",
+                    *args,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
-            .strip()
+
+        _warning_line = (
+            "Warning: Using a password with '-a' or '-u' option on the "
+            "command line interface may not be safe."
         )
-        return int(output) if output.isdigit() else 0
+
+        deleted = 0
+        for pattern in ("auth:fail:*", "auth:throttle:*"):
+            scan_result = _redis_cli("--scan", "--pattern", pattern)
+            keys = [
+                k.strip() for k in scan_result.stdout.splitlines()
+                if k.strip() and _warning_line not in k
+            ]
+            if not keys:
+                continue
+            del_result = _redis_cli("DEL", *keys)
+            output = del_result.stdout.strip().replace(_warning_line, "").strip()
+            if output.isdigit():
+                deleted += int(output)
+        return deleted
     except Exception:
         return 0
 
@@ -746,12 +858,7 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
 
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
     admin_cookies = _api_get_session_cookies(admin=1)
-
-    # Fresh TOTP window for the /auth/stepup call required by StepUpAdminSession.
-    _wait_for_fresh_totp_window(admin=1)
     admin_totp_secret = _read_secret("admin1_totp_secret")
-    stepup_code = pyotp.TOTP(admin_totp_secret, digits=8, digest=_hashlib.sha512).now()
-    _api_totp_last_used[1] = _time.time()
 
     unique = _uuid.uuid4().hex[:10]
     # FIXED 2026-07-30 (Ava, Tier-B leg v412-ytf-podman-13033ff9): the server's
@@ -769,17 +876,45 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     # sensitivity/chat user-plane tests) with a 422, not a product defect.
     email = f"ava-conf-{unique}@example.com"
 
-    with httpx.Client(verify=verify, cookies=admin_cookies, follow_redirects=False, timeout=10) as c:
-        stepup_resp = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": stepup_code})
-        assert stepup_resp.status_code == 200, (
-            f"stepup failed: {stepup_resp.status_code} {stepup_resp.text[:200]}"
-        )
+    def _attempt_stepup_and_create(cookies: dict):
+        """One stepup + create-user round-trip against a (possibly stale)
+        cached admin1 session. Returns (stepup_resp, create_resp_or_None)."""
+        _wait_for_fresh_totp_window(admin=1)
+        code = pyotp.TOTP(admin_totp_secret, digits=8, digest=_hashlib.sha512).now()
+        _api_totp_last_used[1] = _time.time()
+        with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
+            stepup_resp = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": code})
+            if stepup_resp.status_code != 200:
+                return stepup_resp, None
+            create_resp = c.post(f"{BASE_URL}/admin/users", json={"email": email})
+            return stepup_resp, create_resp
 
-        create_resp = c.post(f"{BASE_URL}/admin/users", json={"email": email})
-        assert create_resp.status_code == 200, (
-            f"POST /admin/users failed: {create_resp.status_code} {create_resp.text[:300]}"
-        )
-        created = create_resp.json()
+    stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
+
+    # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): _api_get_session_cookies
+    # caches admin1's session cookie for the lifetime of the pytest process
+    # (unless a caller explicitly passes force_fresh=True). Over a multi-hour
+    # run, that cached session's server-side TTL can expire before this
+    # function is next called -- confirmed live this run: "stepup failed: 401
+    # session_expired_or_invalid" errored EVERY Conversation/UserAgent BOLA
+    # test's setup for the rest of the suite, once the cache went stale, even
+    # though the underlying admin1 credentials/TOTP were completely fine and
+    # BOLA itself was separately live-proven to hold (Laura, Tier-C). Rather
+    # than erroring on a stale cache, force a fresh admin1 login (bypasses the
+    # cache) and retry ONCE with a brand-new TOTP code before giving up.
+    if stepup_resp.status_code == 401:
+        admin_cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+        stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
+
+    assert stepup_resp.status_code == 200, (
+        f"stepup failed (even after forcing a fresh admin1 session): "
+        f"{stepup_resp.status_code} {stepup_resp.text[:200]}"
+    )
+    assert create_resp is not None and create_resp.status_code == 200, (
+        f"POST /admin/users failed: "
+        f"{getattr(create_resp, 'status_code', None)} {getattr(create_resp, 'text', '')[:300]}"
+    )
+    created = create_resp.json()
 
     username = created["username"]
     temp_password = created["temporary_password"]
@@ -855,6 +990,18 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
             f"{BASE_URL}/auth/login",
             json={"username": username, "password": new_password, "totp_code": totp.now()},
         )
+        # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): record THIS
+        # account's TOTP use in the same shared per-identity ledger that
+        # wait_for_fresh_totp()/mark_totp_used() (see below) exposes to every
+        # OTHER caller -- e.g. test_chat_live_e2e.py's chat_page fixture,
+        # which runs its OWN fresh login for this exact username immediately
+        # after bootstrap_user_session() returns. Without this, chat_page's
+        # guard had no memory of the code JUST consumed here and could
+        # generate the IDENTICAL window's code a few seconds later -- a
+        # replay, surfaced generically as 401 invalid_credentials. Marked
+        # regardless of outcome (a used code is used whether or not the
+        # server accepted it).
+        mark_totp_used(f"user:{username}")
         assert relogin_resp.status_code == 200, (
             f"user re-login after password rotation failed: "
             f"{relogin_resp.status_code} {relogin_resp.text[:300]}"
@@ -892,6 +1039,63 @@ def _wait_for_fresh_totp_window(*, admin: int = 1) -> None:
         secs_into = _time.time() % 30
         if secs_into >= 27:
             _time.sleep(32 - secs_into)
+
+
+# ---------------------------------------------------------------------------
+# Generic per-identity TOTP anti-replay guard (any tier, any file)
+# ---------------------------------------------------------------------------
+#
+# QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): _wait_for_fresh_totp_window
+# above only ever guarded admin-tier logins (keyed by an int admin number,
+# backed by _api_totp_last_used). Several OTHER per-test-fresh-login call
+# sites across the suite (test_chat_live_e2e.py's chat_page fixture is the
+# confirmed first domino in this run's cascade) instead hand-rolled their own
+# WEAKER check -- "am I in the first ~25s of a 30s window?" -- with no memory
+# of whether THIS identity's TOTP secret had already produced a code in the
+# current window. Two back-to-back parametrized tests landing in the same
+# window each pass that check independently, then both submit the IDENTICAL
+# code: the second is rejected as a replay (401 invalid_credentials, not
+# obviously TOTP-shaped -- surfaced generically for anti-enumeration), and
+# after _THROTTLE_ACCOUNT_THRESHOLD (3) such failures accumulate the
+# account-level auth throttle trips (429 too_many_requests) for the REST of
+# the run, since nothing else about the login was ever wrong.
+#
+# wait_for_fresh_totp(key)/mark_totp_used(key) below generalise the same
+# "≥62s since last use of THIS EXACT identity" guard to any string key, so
+# every fresh-login call site in the suite can share one process-wide replay
+# ledger instead of each getting its own subtly-insufficient local check.
+# Admin-tier code keeps using _wait_for_fresh_totp_window/_api_totp_last_used
+# unchanged (established, working, cross-referenced by multiple call sites);
+# this is additive, for every OTHER identity (chat/user-tier logins keyed by
+# username, etc).
+# ---------------------------------------------------------------------------
+
+_generic_totp_last_used: "dict[str, float]" = {}  # identity key -> time.time() of last use
+
+
+def wait_for_fresh_totp(key: str) -> None:
+    """Block until at least 62s have passed since the last TOTP code was
+    consumed for identity `key` AND we're in the first ~27s of a 30s window.
+    Caller MUST call mark_totp_used(key) immediately after generating (and
+    submitting) the code."""
+    last = _generic_totp_last_used.get(key, 0.0)
+    now = _time.time()
+    elapsed = now - last
+    if elapsed < 62:
+        wait_for_replay = 62 - elapsed
+        secs_into = now % 30
+        wait_for_window = (30 - secs_into + 2) if secs_into >= 27 else 0
+        _time.sleep(max(wait_for_replay, wait_for_window))
+    else:
+        secs_into = _time.time() % 30
+        if secs_into >= 27:
+            _time.sleep(32 - secs_into)
+
+
+def mark_totp_used(key: str) -> None:
+    """Record that identity `key` just consumed a TOTP code, for
+    wait_for_fresh_totp()'s next caller (any identity, any file)."""
+    _generic_totp_last_used[key] = _time.time()
 
 
 def playwright_login_user(page, *, cache_key: str = "default", force_fresh: bool = False) -> dict:

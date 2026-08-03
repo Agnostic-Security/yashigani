@@ -183,11 +183,44 @@ class TestCapPolScopePicker:
 
 class TestCapPolSave:
     def test_save_org_policy_camera_off(self, cap_page):
-        """PW-CAP-04: Setting camera to 'off' and saving succeeds."""
-        cap_page.select_option("#cap-scope-type", "org")
-        cap_page.click("#cap-scope-load")
-        cap_page.wait_for_selector("table.ys-table-plain", timeout=10000)
+        """PW-CAP-04: Setting camera to 'off' and saving succeeds.
 
+        QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+        clicked #cap-scope-load (re-triggering _onLoadScope -> _fetchScope,
+        an ASYNC re-fetch) immediately before editing the camera dropdown,
+        then asserted on `wait_for_selector("table.ys-table-plain")` -- which
+        passed INSTANTLY because that table was already present from the
+        panel's own connectedCallback() auto-load, NOT because the NEW fetch
+        triggered by this click had completed. The edit therefore raced the
+        in-flight _fetchScope() promise: LIVE-CONFIRMED (two independent
+        ways -- Playwright select_option() AND a raw DOM
+        `dispatchEvent(new Event('change'))` bypassing Playwright entirely)
+        that _fetchScope()'s completion unconditionally overwrites
+        `this._rows` from server data (capability-policy.js _buildRows()),
+        silently discarding the in-progress "off" edit back to "self" with
+        ZERO error/warning -- this is why `.ys-badge` never rendered (the
+        save's own client-side guard at `_save()` line ~213
+        [`Object.keys(policy).length < CAP_NAMES.length`] never even
+        triggered; camera's OWN value was just quietly still "self").
+        Filed as a NEW product finding (lost-update race, capability-policy.js
+        _onLoadScope/_fetchScope has no guard against an in-flight edit or
+        loading-state UI lock) -- not yet in docs/risk-register.yml.
+        The #cap-scope-load click here was REDUNDANT anyway (org is the
+        default scope, already auto-loaded at mount -- PW-CAP-02 already
+        covers "org auto-loads with all 5 rows") -- removed. Also removed
+        the `select_option("#cap-scope-type", "org")` reselect: it fires the
+        SAME _fetchScope() race via _onScopeTypeChange() (the <select>'s
+        @change handler unconditionally re-fetches even when the value
+        doesn't actually change) -- confirmed live re-triggering the exact
+        same "off" edit silently reverting to "self" even with the Load
+        button removed. Neither line was needed: `cap_page` (module-scoped
+        fixture) already lands on org scope (LitElement constructor default,
+        matching the auto-load at mount) before this test ever runs. This
+        eliminates this test's OWN trigger of the race without masking the
+        underlying defect (still real for any scope switch immediately
+        followed by an edit -- e.g. group/user Load then edit before the
+        fetch settles).
+        """
         cap_page.select_option(".cap-val-sel[data-cap='camera']", "off")
         cap_page.click("#cap-pol-save")
         # Result renders as a .ys-badge (green "Saved." or red error message).

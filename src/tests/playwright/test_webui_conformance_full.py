@@ -175,11 +175,21 @@ ADMIN_GET_ENDPOINTS = sorted({
     "/admin/sensitivity/status", "/admin/sensitivity/taxonomy",
     "/admin/services", "/admin/users", "/admin/version", "/admin/workflows",
     "/api/v1/admin/auth/hibp/status", "/api/v1/admin/pki/status",
-    "/api/v1/admin/webauthn/credentials", "/auth/sso/select",
+    "/api/v1/admin/webauthn/credentials",
     "/dashboard/budget-summary", "/dashboard/security-metrics",
     "/dashboard/services-health", "/dashboard/traffic-metrics",
     "/scim/v2/Groups", "/scim/v2/Users",
 })
+# QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): "/auth/sso/select" was
+# REMOVED from ADMIN_GET_ENDPOINTS above -- it is a DELIBERATELY public,
+# unauthenticated endpoint (routes/sso.py list_idps(): "Unauthenticated --
+# shown to anonymous users on the login page", returning only a BOPLA-safe
+# allowlisted IdPPublic projection -- id/name/protocol/email_domains, no
+# secrets -- per fix #90). It was miscategorised into the "every admin GET
+# endpoint must reject unauthenticated access" sweep, which asserted a real,
+# correct 200 was a failure. This is analogous to /admin/login or /login
+# itself being public by design -- not every endpoint under an "admin-ish"
+# path requires a session.
 
 USER_GET_ENDPOINTS = sorted({
     "/user/agents", "/user/budget", "/user/conversations", "/user/memories",

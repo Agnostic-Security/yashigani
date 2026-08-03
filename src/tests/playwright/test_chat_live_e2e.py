@@ -85,6 +85,8 @@ from tests.playwright.conftest import (
     _SKIP_NO_STACK,
     bootstrap_user_session,
     launch_chromium,
+    mark_totp_used,
+    wait_for_fresh_totp,
 )
 
 pytestmark = _SKIP_NO_STACK
@@ -214,10 +216,27 @@ def chat_page(chat_user_creds):
     # deliberately (each test sends real chat turns; sharing one session
     # across parametrized targets is fine for cookies, but re-login per test
     # keeps TOTP replay windows unambiguous in the evidence log).
-    secs_into = time.time() % 30
-    if secs_into >= 25:
-        time.sleep(32 - secs_into)
+    #
+    # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously only
+    # checked "am I in the first ~25s of a 30s window?" with no memory of
+    # whether THIS username's TOTP secret had already produced a code in the
+    # CURRENT window -- confirmed as the first domino in this run's 172-error
+    # cascade: test_chat_page_loads_authenticated and
+    # test_direct_model_no_mention (the first two parametrized tests in this
+    # module's collection order) ran back-to-back, landed in the same 30s
+    # window, and the second submitted the IDENTICAL code the first had just
+    # used -- 401 invalid_credentials (replay, not a real credential problem).
+    # After _THROTTLE_ACCOUNT_THRESHOLD (3) such accumulated failures the
+    # account-level auth throttle tripped, turning every subsequent login for
+    # the rest of the module (then, via IP severity, much of the rest of the
+    # 2h24m run) into 429 too_many_requests. wait_for_fresh_totp/mark_totp_used
+    # (shared conftest helper, keyed per-identity) replaces the local
+    # window-position-only check with the same "≥62s since THIS identity's
+    # last use" guard already proven correct for admin-tier logins.
+    identity_key = f"user:{chat_user_creds['username']}"
+    wait_for_fresh_totp(identity_key)
     code = totp.now()
+    mark_totp_used(identity_key)
     with httpx.Client(verify=verify, follow_redirects=False, timeout=15) as c:
         r = c.post(
             f"{BASE_URL}/auth/login",

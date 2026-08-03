@@ -71,6 +71,10 @@ from tests.playwright.conftest import (
     launch_chromium,
     BASE_URL,
     STACK_RUNNING,
+    _CA_CERT_PATH,
+    _api_get_session_cookies,
+    _read_secret,
+    _wait_for_fresh_totp_window,
     capture_screenshot,
     playwright_login_admin,
     _api_totp_last_used,
@@ -119,7 +123,66 @@ def _open_documents(page) -> None:
     capture_screenshot(page, "documents_panel_loaded")
 
 
+_enforcement_ensured = False
+
+
+def _ensure_enforcement_enabled() -> None:
+    """Self-heal a documents-enforcement-disabled deployment (idempotent,
+    per-process cache).
+
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this test file's own
+    module docstring documents the precondition "requires ... the feature
+    flag ON (YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true)" -- but THIS
+    deployment was not started with that env var set, so /admin/documents/
+    inspect (and therefore PW-DOC-05/PW-DOC-07) returned "Document
+    enforcement is disabled. Enable it via PUT /admin/documents/enforcement
+    or set YASHIGANI_DOCUMENT_ENFORCEMENT_ENABLED=true" instead of a real
+    match result -- confirmed live, not a selector/product bug. The route
+    itself documents a live, in-process toggle (routes/documents.py
+    set_enforcement(): STRENGTHEN direction i.e. enabled=True applies
+    IMMEDIATELY with single-admin step-up, no dual-admin approval needed,
+    unlike the WEAKEN/disable direction) -- self-heals by checking
+    GET /admin/documents/enforcement and, if disabled, performing a fresh
+    step-up + PUT enabled=true before the test proceeds, rather than
+    silently accepting the deployment's default and reporting a false
+    product-bug against a pure environment-config gap.
+    """
+    global _enforcement_ensured
+    if _enforcement_ensured:
+        return
+
+    import hashlib
+
+    import httpx
+    import pyotp
+
+    verify = _CA_CERT_PATH if _CA_CERT_PATH else False
+    cookies = _api_get_session_cookies(admin=1)
+    with httpx.Client(verify=verify, cookies=cookies, timeout=10) as c:
+        status = c.get(f"{BASE_URL}/admin/documents/enforcement")
+        if status.status_code == 200 and status.json().get("enabled"):
+            _enforcement_ensured = True
+            return
+
+        _wait_for_fresh_totp_window(admin=1)
+        totp_secret = _read_secret("admin1_totp_secret")
+        code = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512).now()
+        _api_totp_last_used[1] = _time.time()
+        su = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": code})
+        assert su.status_code == 200, (
+            f"stepup before enabling document enforcement failed: "
+            f"{su.status_code} {su.text[:200]}"
+        )
+        put = c.put(f"{BASE_URL}/admin/documents/enforcement", json={"enabled": True})
+        assert put.status_code == 200, (
+            f"PUT /admin/documents/enforcement enabled=True failed: "
+            f"{put.status_code} {put.text[:300]}"
+        )
+    _enforcement_ensured = True
+
+
 def _inspect(page, *, content: str) -> None:
+    _ensure_enforcement_enabled()
     page.fill("#doc-sample", content)
     page.click("#doc-inspect")
     page.wait_for_selector("#doc-inspect-result", timeout=8000)
