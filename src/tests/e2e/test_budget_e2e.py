@@ -8,6 +8,16 @@ Requires: running Yashigani stack with budget-redis healthy.
 
 Last updated: 2026-04-24T22:45:00+01:00
 """
+import os as _ytf_os
+
+# FIND-YTF412-009: container names were hardcoded to the compose project
+# "docker" (e.g. f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1"), but install.sh DERIVES the project from
+# --domain (documented multi-instance behaviour), and podman-compose separates
+# with "_" where docker compose uses "-". A whole tier therefore reported
+# per-test product failures while never finding a single container to act on --
+# 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
+_YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
+_YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 from __future__ import annotations
 
 import pytest
@@ -22,11 +32,11 @@ def _exec_in_budget_redis(cmd: str) -> str:
     We use redis-cli --tls with the budget-redis client cert.
     """
     pw_result = runtime_exec(
-        "docker-budget-redis-1", "cat", "/run/secrets/redis_password", timeout=5,
+        f"{_YTF_PROJ}{_YTF_SEP}budget-redis{_YTF_SEP}1", "cat", "/run/secrets/redis_password", timeout=5,
     )
     pw = pw_result.stdout.strip()
     result = runtime_exec(
-        "docker-budget-redis-1",
+        f"{_YTF_PROJ}{_YTF_SEP}budget-redis{_YTF_SEP}1",
         "redis-cli",
         "--tls",
         "--cert", "/run/secrets/budget-redis_client.crt",
@@ -59,7 +69,7 @@ class TestBudgetEnforcement:
 
     def test_record_and_check_budget(self):
         """Record usage and verify budget state changes."""
-        output = runtime_run("docker-gateway-1", """
+        output = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", """
 import redis, os, json, ssl
 from urllib.parse import quote
 
@@ -116,7 +126,7 @@ print("cleanup:done")
 
     def test_three_tier_recording(self):
         """Verify usage recorded at identity, group, and org levels."""
-        output = runtime_run("docker-gateway-1", """
+        output = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", """
 import redis, os, ssl
 from urllib.parse import quote
 
