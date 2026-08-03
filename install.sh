@@ -10020,6 +10020,15 @@ _setup_auto_start_podman_rootful() {
   local unit_file="/etc/systemd/system/yashigani.service"
   local compose_cmd_str="${COMPOSE_CMD[*]}"
 
+  # FIND-PODMAN-MAC-1 pattern-sweep (2026-08-03): same class of bug as the
+  # macOS LaunchAgent (see _setup_auto_start_macos()) — this unit used to
+  # hardcode `-f docker-compose.yml` only, dropping the Podman rootless
+  # override + any enabled overlay (wazuh/egress-forwarder/GPU) on every real
+  # reboot. Use the shared single-source-of-truth file list (YSG-RISK-177)
+  # instead of re-deriving a reduced one here.
+  _ysg_assemble_compose_files || return 1
+  local _autostart_compose_files_str="${YSG_COMPOSE_FILE_ARGS[*]}"
+
   # Write unit file (rootful install runs as root — no sudo needed)
   cat > "$unit_file" <<EOF
 [Unit]
@@ -10033,8 +10042,8 @@ Requires=podman.socket
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${WORK_DIR}
-ExecStart=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d
-ExecStop=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml stop
+ExecStart=${compose_cmd_str} ${_autostart_compose_files_str} up -d
+ExecStop=${compose_cmd_str} ${_autostart_compose_files_str} stop
 TimeoutStartSec=300
 TimeoutStopSec=120
 Restart=no
@@ -10113,6 +10122,15 @@ _setup_auto_start_podman_rootless() {
   local unit_file="${unit_dir}/yashigani.service"
   local compose_cmd_str="${COMPOSE_CMD[*]}"
 
+  # FIND-PODMAN-MAC-1 pattern-sweep (2026-08-03): same class of bug as the
+  # macOS LaunchAgent (see _setup_auto_start_macos()) — this unit used to
+  # hardcode `-f docker-compose.yml` only, dropping the Podman rootless
+  # override + any enabled overlay (wazuh/egress-forwarder/GPU) on every real
+  # reboot/login. Use the shared single-source-of-truth file list
+  # (YSG-RISK-177) instead of re-deriving a reduced one here.
+  _ysg_assemble_compose_files || return 1
+  local _autostart_compose_files_str="${YSG_COMPOSE_FILE_ARGS[*]}"
+
   cat > "$unit_file" <<EOF
 [Unit]
 Description=Yashigani MCP Security Gateway
@@ -10125,8 +10143,8 @@ Requires=podman.socket
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${WORK_DIR}
-ExecStart=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d
-ExecStop=${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml stop
+ExecStart=${compose_cmd_str} ${_autostart_compose_files_str} up -d
+ExecStop=${compose_cmd_str} ${_autostart_compose_files_str} stop
 TimeoutStartSec=300
 TimeoutStopSec=120
 Restart=no
@@ -10226,6 +10244,18 @@ _setup_auto_start_macos() {
   local plist="${launch_agents_dir}/io.yashigani.autostart.plist"
   local compose_cmd_str="${COMPOSE_CMD[*]}"
 
+  # FIND-PODMAN-MAC-1 (2026-08-03): the embedded compose invocation below MUST
+  # use the SAME full -f file list every other compose call site uses (YSG-RISK-177
+  # single source of truth) — a plist/unit generator is exactly the kind of call
+  # site that function's header comment warns about ("register_agent_bundles()
+  # and the --onboard gateway recreate each independently re-derived a SHORTER
+  # file list"). This LaunchAgent previously hardcoded `-f docker-compose.yml`
+  # only — dropping the Podman rootless override, the macOS virtiofs :U override,
+  # and every enabled overlay (wazuh/egress-forwarder/GPU). See
+  # _ysg_assemble_compose_files() header for the full incident this pattern fixes.
+  _ysg_assemble_compose_files || return 1
+  local _autostart_compose_files_str="${YSG_COMPOSE_FILE_ARGS[*]}"
+
   # Resolve full path to compose binary — LaunchAgent env may lack PATH entries
   # present in the user's interactive shell (e.g. Homebrew prefix not in PATH)
   local _compose_bin
@@ -10246,7 +10276,7 @@ _setup_auto_start_macos() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>podman machine start 2&gt;/dev/null; ${compose_cmd_str} -f ${WORK_DIR}/docker/docker-compose.yml up -d</string>
+    <string>podman machine start 2&gt;/dev/null; ${compose_cmd_str} ${_autostart_compose_files_str} up -d</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${WORK_DIR}</string>
@@ -10271,9 +10301,30 @@ EOF
 
   chmod 644 "$plist"
 
-  # Load immediately so it is registered for this login session
-  launchctl load "$plist" 2>/dev/null || true
-
+  # FIND-PODMAN-MAC-1 ROOT CAUSE (2026-08-03): this used to call
+  # `launchctl load "$plist"` here, immediately, "so it is registered for this
+  # login session". On macOS, `launchctl load` on a job with RunAtLoad=true
+  # does not just REGISTER the job — it EXECUTES it immediately. That fired a
+  # SECOND, uncoordinated `<compose> up -d` in the background, racing the
+  # install's own in-flight bring-up (still mid bootstrap_postgres/
+  # register_agent_bundles at this point in main()). Live-reproduced 3/3 on
+  # podman-rootless-macOS (test/v412-tierb-on-unified @ 1ea9fae2,
+  # yashigani-v412-final worktree, install.log lines ~34655-34697):
+  # ~/.yashigani/logs/autostart-error.log shows the LaunchAgent's own
+  # podman_compose.py hitting "container name already in use" / "has dependent
+  # containers which must be removed before it" against the SAME container IDs
+  # the primary install flow had just brought healthy — gateway received
+  # SIGTERM (exit 143) ~5s after its own healthcheck went green, and
+  # backoffice's replacement container was left stuck in "Created" (never
+  # started), producing register_agent_bundles's "could not find a running
+  # container for service 'gateway'/'backoffice'" and a hard install failure.
+  #
+  # Fix: do NOT call `launchctl load` during install. macOS launchd already
+  # auto-loads every plist under ~/Library/LaunchAgents/ at each real user
+  # login — that mechanism alone delivers the documented "start on next
+  # login" behaviour (every log/comment in this function already says that,
+  # not "start now"). Writing the plist file is sufficient; no explicit load
+  # step is needed, and skipping it removes the self-inflicted race entirely.
   log_success "Auto-start: LaunchAgent installed at ${plist}"
   log_info "  Services will auto-start on next login."
   log_info "  Logs: ${HOME}/.yashigani/logs/autostart.log"
