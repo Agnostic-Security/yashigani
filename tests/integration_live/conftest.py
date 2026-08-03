@@ -23,6 +23,8 @@ is a scaffold in the sense that per-category DEPTH (more scenarios per
 category) is expected to grow as each leg is actually exercised live; it is
 NOT a scaffold in the sense of "TODO: write test" stubs — there are none.
 """
+from __future__ import annotations
+
 import os as _ytf_os
 
 # FIND-YTF412-009: container names were hardcoded to the compose project
@@ -33,7 +35,6 @@ import os as _ytf_os
 # 23 failed / 11 passed in 2m00s with the stack untouched at 26/26 up.
 _YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
 _YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
-from __future__ import annotations
 
 import os
 import shutil
