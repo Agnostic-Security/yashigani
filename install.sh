@@ -8558,8 +8558,10 @@ compose_up() {
   # Container ollama cannot access Apple Metal (Docker Desktop = Linux VM, no Metal).
   # Route caddy's ollama-front upstream to the host-native ollama (library=metal) via
   # extra_hosts[ollama:host-gateway] + YASHIGANI_CADDY_EGRESS_ALLOWLIST.
-  # Container ollama is disabled (no-op entrypoint; gateway.depends_on overridden to
-  # service_started). ollama-init is also a no-op (models managed on host).
+  # Container ollama is EXCLUDED from the active service set (FIND-OLLAMA-MAC
+  # fix: profiles: [mac-metal-host-ollama-only], never created — not a no-op
+  # entrypoint that still starts a container). ollama-init is excluded the
+  # same way (models managed on host).
   # HOST-EGRESS SURFACE: caddy→127.0.0.1:<PORT> via VPNKit (TCP only). Laura C3: CLOSED.
   # PREREQUISITE: host-native ollama bound to 127.0.0.1 with models pre-pulled.
   #   OLLAMA_HOST=127.0.0.1:11434 ollama serve   (standard port — auto-detected)
@@ -8600,8 +8602,8 @@ compose_up() {
     compose_files+=("-f" "$_gpu_overlay_mac_metal")
     log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml)"
     log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:host-gateway]"
-    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
-    log_info "  ollama-init disabled (models managed on host)"
+    log_info "  container ollama excluded (FIND-OLLAMA-MAC: profiles: [mac-metal-host-ollama-only] — not created, not merely no-op'd)"
+    log_info "  ollama-init excluded (models managed on host)"
     log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via VPNKit (Laura C3: CLOSED — loopback only)"
   fi
 
@@ -8622,8 +8624,8 @@ compose_up() {
     compose_files+=("-f" "$_gpu_overlay_mac_metal_podman")
     log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml)"
     log_info "  caddy routes /ollama/* to host ollama (Metal, port ${YASHIGANI_HOST_OLLAMA_PORT}) via extra_hosts[ollama:192.168.127.254]"
-    log_info "  container ollama disabled (no-op; depends_on overridden to service_started)"
-    log_info "  ollama-init disabled (models managed on host)"
+    log_info "  container ollama excluded (FIND-OLLAMA-MAC: profiles: [mac-metal-host-ollama-only] — not created, not merely no-op'd)"
+    log_info "  ollama-init excluded (models managed on host)"
     log_warn "  HOST-EGRESS: caddy→127.0.0.1:${YASHIGANI_HOST_OLLAMA_PORT} via gvproxy 192.168.127.254 (loopback only)"
   fi
 

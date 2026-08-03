@@ -48,13 +48,24 @@
 #            no host-gateway token needed). EGRESS uses host.containers.internal.
 #   Services changed (caddy, ollama, gateway, ollama-init): IDENTICAL behaviour.
 #
-# C4 — CONTAINER OLLAMA DISABLED (same as Docker path):
-#   1. services.ollama: entrypoint no-op (["true"]) — starts and exits immediately.
-#   2. services.gateway.depends_on.ollama.condition: service_started
-#      (merged over base service_healthy) — gateway no longer waits for ollama
-#      healthcheck, which never fires since the container exits immediately.
-#   3. services.ollama-init: also no-op (models are pre-pulled on the host).
-#   Frees ~4 GB VRAM / VM RAM.
+# C4 — CONTAINER OLLAMA EXCLUDED (FIND-OLLAMA-MAC fix, 2026-08-03; same
+# mechanism as the Docker path):
+#   1. services.ollama: profiles: [mac-metal-host-ollama-only] — a profile
+#      value never passed via --profile, so the service is entirely absent
+#      from the merged compose model (not merely started-and-neutralised —
+#      supersedes the earlier FINDING-V412-RESTART-005 `sleep infinity`
+#      workaround; see the inline comment on the `ollama:` block below for
+#      why this also resolves that finding's original podman-wait-hang
+#      concern more cleanly, by removing the wait target instead of making
+#      it trivially satisfiable).
+#   2. services.gateway.depends_on.ollama: required: false added — the
+#      dependency can never be satisfied once ollama is absent; the
+#      podman-compose-ysg fork's AS-FIX-3 check_dep_conditions() explicitly
+#      skips (no `podman wait` issued) for required:false + absent.
+#   3. services.ollama-init: same sentinel profile (models are pre-pulled on
+#      the host; never runs on Mac Metal regardless of agent bundle).
+#   Frees ~4 GB VRAM / VM RAM AND removes the lingering running container
+#   entirely.
 #
 # HOST-EGRESS SURFACE (mirrors LAURA-METAL-01 constraints):
 #   Path opened:  caddy container → 192.168.127.254:11434 via gvproxy
@@ -132,66 +143,57 @@ services:
       # {$YASHIGANI_HOST_OLLAMA_PORT:11434} to the correct port at Caddy startup.
       YASHIGANI_HOST_OLLAMA_PORT: "${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
 
-  # C4: disable container ollama. gateway.depends_on.ollama is overridden below
-  # to service_started so gateway does not wait for a healthcheck that will
-  # never fire (host-native ollama is what actually serves inference here —
-  # see FINDING-V412-RESTART-003, health-check.sh branches on
-  # YASHIGANI_HOST_OLLAMA_PORT and never inspects this container's status).
+  # FIND-OLLAMA-MAC fix (2026-08-03): genuinely EXCLUDE the container from
+  # the active service set instead of neutralising its entrypoint.
   #
-  # FINDING-V412-RESTART-005 fix (2026-07-18, option (b) chosen — see
-  # testing_runs/yashigani/v412-fork-build-20260718/FINDING-V412-RESTART-005.md
-  # for full root-cause + option analysis):
-  #   entrypoint was previously ["true"] (starts, exits 0 within
-  #   milliseconds). On Podman, gateway's `depends_on: ollama: condition:
-  #   service_started` compiles to `podman wait --condition=running ollama`,
-  #   which blocks FOREVER once the target has already exited before the wait
-  #   is issued (reproduces independently of podman-compose entirely — a
-  #   podman wait/compose-lifecycle semantics gap, not a podman-compose-ysg
-  #   fork defect; confirmed pre-existing by Captain's fork review,
-  #   ae45c678). Docker's compose implementation does not exhibit this hang
-  #   for the identical override (docker-compose.gpu-mac-metal.yml is
-  #   intentionally NOT touched by this fix — no regression there to fix).
+  # Prior behaviour (FINDING-V412-RESTART-005, `entrypoint: ["sleep",
+  # "infinity"]`) chose to keep a no-op container genuinely RUNNING forever
+  # (rather than exit-0-immediately) specifically so `podman wait
+  # --condition=running` — which gateway's `depends_on: ollama: condition:
+  # service_started` compiles to under the podman-compose-ysg fork — would
+  # be satisfied without hanging. That fix WORKED for the hang, but it also
+  # meant a real, permanently-running docker.io/ollama/ollama container
+  # (CPU-only, no models) sat idle on every Mac/Podman install — exactly the
+  # FIND-OLLAMA-MAC defect (install.sh:465 documents "Container ollama
+  # bypassed", not "container ollama runs a permanent no-op sleep").
   #
-  #   Option (a) (drop the depends_on wait) was rejected: compose merge
-  #   semantics only ADD/merge depends_on keys per-key; there is no portable,
-  #   engine-agnostic way to DELETE a base-file depends_on entry from an
-  #   override that both `podman compose` v2 and the podman-compose-ysg
-  #   fork's parser are guaranteed to honor identically (compose-spec's
-  #   `!reset` merge tag is a newer Docker Compose v2.24+ extension, not
-  #   confirmed supported by the fork's podman-compose-1.5.0 lineage —
-  #   relying on it here would risk an unknown-YAML-tag failure on the fork).
-  #
-  #   Option (b) (this fix): keep the no-op container genuinely RUNNING
-  #   instead of exit-0-immediately, so `podman wait --condition=running`
-  #   (and Docker's equivalent `service_started` check) is satisfied
-  #   trivially and permanently — no engine-specific behaviour relied upon.
-  #   `sleep infinity` is a true no-op: it never starts the real `ollama`
-  #   binary (identical functional surface to the old `["true"]`), consumes
-  #   negligible CPU/RAM, exposes no new listener, and needs no restart
-  #   policy change (a process that never exits never needs restarting).
-  #   Healthcheck stays disabled — FINDING-003 already means nothing probes
-  #   this container's health; only its "is it running" state now matters,
-  #   and that state is now permanently true instead of racing an instant exit.
+  # This fix removes the target of the wait instead of making it trivially
+  # satisfiable: `profiles: [mac-metal-host-ollama-only]` — a profile value
+  # never passed via --profile anywhere in install.sh — drops the service
+  # from the merged compose model entirely (confirmed empirically against
+  # both `docker compose config --services`, list-field REPLACE semantics,
+  # and the vendored podman-compose-ysg fork's own `_resolve_profiles()`).
+  # With ollama absent from the model, the original RESTART-005 hang cannot
+  # occur in the first place: gateway.depends_on.ollama is marked
+  # required:false below, and the fork's check_dep_conditions()
+  # (podman_compose.py:3254-3262, AS-FIX-3) explicitly skips — no
+  # `podman wait` call is ever issued — for a required:false dependency
+  # whose name is absent from container_names_by_service (the fork's own
+  # documented mechanism for "excluded by --profile", already exercised
+  # elsewhere for ollama-init/demo-mcp). container_to_args()'s --requires=
+  # builder (podman_compose.py:1182) independently no-ops the same way
+  # (`.get(dep_srv.name, [])` on an absent service yields nothing to add).
   ollama:
-    entrypoint: ["sleep", "infinity"]
-    restart: "no"
-    healthcheck:
-      disable: true
+    profiles:
+      - mac-metal-host-ollama-only
 
-  # C4: override gateway depends_on — ollama condition service_healthy → service_started.
-  # Docker/podman-compose merges depends_on by key; this changes only the ollama entry.
-  # gateway.depends_on.redis/pgbouncer/extractor-svc (from base) remain unchanged.
+  # gateway.depends_on.ollama must be marked required:false — ollama is no
+  # longer a defined service once excluded above, so the dependency can
+  # never be satisfied. condition stays service_started (harmless, never
+  # evaluated once required:false + absent — see rationale above).
   gateway:
     depends_on:
       ollama:
         condition: service_started
+        required: false
 
-  # C4 (partial): neutralise ollama-init — models are managed on the host ollama.
-  # ollama-init runs when agent-bundle profiles (langflow/letta/openclaw) are active.
-  # On Mac Metal it would wastefully pull models to the container volume (unused).
-  # Override to a no-op so it exits 0 without pulling. healthcheck disabled.
+  # ollama-init is already profile-gated in the base file to
+  # [langflow, letta, openclaw] (SF-011). On Mac Metal, models are managed
+  # on the host ollama, so ollama-init must never run regardless of which
+  # agent bundle is active. `profiles:` here REPLACES the base list (same
+  # mechanism as above), so the same sentinel unconditionally excludes
+  # ollama-init from every Mac-Metal Podman install — agent bundle active
+  # or not.
   ollama-init:
-    entrypoint: ["true"]
-    restart: "no"
-    healthcheck:
-      disable: true
+    profiles:
+      - mac-metal-host-ollama-only
