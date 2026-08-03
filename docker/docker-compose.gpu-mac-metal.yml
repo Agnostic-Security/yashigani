@@ -34,14 +34,24 @@
 #   Verified: inference flow confirmed with host ollama on 127.0.0.1:11434,
 #   library=Metal (Apple M4), 61 tok/sec eval rate.
 #
-# C4 — CONTAINER OLLAMA DISABLED:
-#   This overlay disables the container ollama entirely:
-#   1. services.ollama: entrypoint no-op (["true"]) — starts and exits immediately.
-#   2. services.gateway.depends_on.ollama.condition: service_started
-#      (merged over base service_healthy) — gateway no longer waits for ollama
-#      healthcheck, which never fires since the container exits immediately.
-#   3. services.ollama-init: also no-op (models are pre-pulled on the host).
-#   Frees ~4 GB VRAM / VM RAM. No longer a v4.1 limitation.
+# C4 — CONTAINER OLLAMA EXCLUDED (FIND-OLLAMA-MAC fix, 2026-08-03):
+#   This overlay excludes the container ollama from the active service set
+#   entirely — it is never created, not merely started-and-neutralised:
+#   1. services.ollama: profiles: [mac-metal-host-ollama-only] — a profile
+#      value never passed via --profile, so Compose's profile resolution
+#      drops the service from the merged model (list-field REPLACE
+#      semantics — base file has no `profiles:` on ollama, so this is
+#      unambiguous under either replace or append merge rules).
+#   2. services.gateway.depends_on.ollama: required: false added (condition
+#      stays service_started) — the dependency can never be satisfied once
+#      ollama is absent from the model; required:false makes that a no-op
+#      instead of a "depends on undefined service" failure.
+#   3. services.ollama-init: same sentinel profile — always excluded on Mac
+#      Metal regardless of which agent-bundle profile (langflow/letta/
+#      openclaw) is active; models are pre-pulled on the host.
+#   Frees ~4 GB VRAM / VM RAM AND removes the lingering exited/idle
+#   container entirely (prior `entrypoint: ["true"]` no-op still created and
+#   started a real container — FIND-OLLAMA-MAC).
 #
 # HOST-EGRESS SURFACE (LAURA-METAL-01 — GO-WITH-CONSTRAINTS; C3 CLOSED):
 #   Path opened:  caddy container → host.docker.internal:11434 via VPNKit
@@ -109,29 +119,50 @@ services:
       # {$YASHIGANI_HOST_OLLAMA_PORT:11434} to the correct port at Caddy startup.
       YASHIGANI_HOST_OLLAMA_PORT: "${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
 
-  # C4: disable container ollama. Starts as no-op and exits immediately (exit 0).
-  # gateway.depends_on.ollama is overridden below to service_started so gateway
-  # does not wait for a healthcheck that will never fire.
+  # FIND-OLLAMA-MAC fix (2026-08-03): genuinely EXCLUDE the container from
+  # the active service set instead of neutralising its entrypoint.
+  #
+  # Prior behaviour (C4, `entrypoint: ["true"]`) still created and STARTED a
+  # real container (docker.io/ollama/ollama, CPU-only, no models) which
+  # exited 0 immediately but left a lingering exited `localhost_ollama_1`
+  # entry — install.sh:465 documents "Container ollama bypassed; host ollama
+  # must be pre-installed" as the intended behaviour on Apple Metal, which
+  # this profile exclusion now actually delivers (no container created at
+  # all, not merely one that starts-and-exits).
+  #
+  # Mechanism: `profiles:` is a compose-spec list field with REPLACE (not
+  # append/merge) override semantics — confirmed empirically against Docker
+  # Compose v5.3.1 (`docker compose ... config --services`) — see
+  # FIND-OLLAMA-MAC static-validation evidence. A profile value that is
+  # NEVER passed via `--profile` anywhere in install.sh (only
+  # langflow/letta/openclaw/wazuh/internal-ca are ever activated — grepped)
+  # means Compose's profile resolution treats this service as entirely
+  # absent from the merged model on every Mac-Metal install.
   ollama:
-    entrypoint: ["true"]
-    restart: "no"
-    healthcheck:
-      disable: true
+    profiles:
+      - mac-metal-host-ollama-only
 
-  # C4: override gateway depends_on — ollama condition service_healthy → service_started.
-  # Docker Compose merges depends_on by key; this changes only the ollama entry.
-  # gateway.depends_on.redis/pgbouncer/extractor-svc (from base) remain unchanged.
+  # gateway.depends_on.ollama must be marked required:false — ollama is no
+  # longer a defined service once excluded above, so the dependency can
+  # never be satisfied. `required: false` is standard compose-spec
+  # (docker-compose.yml v3.9+ / compose-spec depends_on.required) — Docker
+  # Compose v5.3.1 accepts a `required: false` dependency on an absent
+  # service silently (tested: `config` succeeds, service list unaffected).
+  # condition stays service_started — harmless, never evaluated once
+  # required:false + absent.
   gateway:
     depends_on:
       ollama:
         condition: service_started
+        required: false
 
-  # C4 (partial): neutralise ollama-init — models are managed on the host ollama.
-  # ollama-init runs when agent-bundle profiles (langflow/letta/openclaw) are active.
-  # On Mac Metal it would wastefully pull models to the container volume (unused).
-  # Override to a no-op so it exits 0 without pulling. healthcheck disabled.
+  # ollama-init is already profile-gated in the base file to
+  # [langflow, letta, openclaw] (SF-011). On Mac Metal, models are managed
+  # on the host ollama, so ollama-init must never run regardless of which
+  # agent bundle is active. `profiles:` here REPLACES the base list
+  # (confirmed empirically, same mechanism as above), so the same sentinel
+  # unconditionally excludes ollama-init from every Mac-Metal Docker
+  # install — agent bundle active or not.
   ollama-init:
-    entrypoint: ["true"]
-    restart: "no"
-    healthcheck:
-      disable: true
+    profiles:
+      - mac-metal-host-ollama-only

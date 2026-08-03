@@ -76,10 +76,10 @@ from tests.playwright.conftest import (
     _api_get_session_cookies,
     bootstrap_user_session,
     clear_auth_throttle,
+    do_admin_stepup,
     get_admin_credentials,
     get_admin_totp_code,
     playwright_login_admin,
-    playwright_login_user,
 )
 
 try:
@@ -305,9 +305,29 @@ class TestAdminBootstrapBothAdmins:
     conftest._api_get_session_cookies(), which self-heals
     force_password_change (login -> POST /auth/password/change -> logout ->
     re-login) and persists the rotated password in-process so every other
-    admin-dependent test in this run picks it up too."""
+    admin-dependent test in this run picks it up too.
 
-    @pytest.mark.parametrize("admin_num", [1, 2])
+    IDENTITY PARTITION (Tiago, 2026-08-03): this functional Tier-B lane is
+    admin1(azalea)/user1 ONLY -- admin2(violet)/user2 are reserved for
+    Laura's pentest lane so it can run CONCURRENTLY against admin2 without
+    ever contending with this suite's admin2 logins/TOTP-replay window/
+    password rotation for the SAME account. Parametrizing this test over
+    admin2 as well as admin1 (as it did before this partition) would race
+    Laura's lane for admin2's session/TOTP/password state whenever both
+    lanes run at once.
+
+    COMPLIANCE FLAG, not silently dropped: retro v2.23.1 A2 ('Admin
+    bootstrap: BOTH admins, full 5-step, every sweep... skipping this for
+    either admin = false PASS. No exceptions.') is NOT satisfied by
+    admin1-only coverage here. admin2's own bootstrap/rotation still needs
+    to be exercised somewhere -- either by Laura's pentest lane (which DOES
+    touch admin2) explicitly asserting the same rotation contract, or by a
+    separate serialized run of this test with admin_num=2 BEFORE/AFTER the
+    concurrent lanes (never during). Flagging for Tiago/Maxine to assign
+    that coverage explicitly rather than assume it still happens here.
+    """
+
+    @pytest.mark.parametrize("admin_num", [1])
     def test_relogin_after_rotation_proves_rotation_stuck(self, admin_num):
         """Deterministic gate: drive rotation (if not already done this run)
         then assert the re-login with the ROTATED password succeeds and
@@ -380,51 +400,18 @@ class TestSessionLifecycle:
 # 1/2. Admin module sweep (parametrized over all 27 nav modules)
 # ===========================================================================
 
-@pytest.fixture(scope="module")
-def _pw_driver():
-    """Shared Playwright driver connection for this module.
-
-    QA-fix (Ava, Tier-B triage 2026-08-02): admin_ctx and user_ctx previously
-    EACH opened their own top-level `with sync_playwright() as pw:` block at
-    module scope. Both fixtures are used within the same test module
-    (TestAdminModuleSweep.test_endpoint_rejects_user_session needs user_ctx
-    while admin_ctx -- opened earlier for test_nav_entry_present et al -- is
-    still alive for the rest of the module's lifetime), so two concurrent
-    sync_playwright() driver connections ended up live in the same thread.
-    Playwright's sync API does not support this and raises "It looks like you
-    are using Playwright Sync API inside the asyncio loop" -- confirmed this
-    is exactly what killed all 38 tests depending on user_ctx (27x
-    test_endpoint_rejects_user_session + TestUserPageSweep +
-    TestDocumentsAdversarial + TestAgentGeneratePromptInjection), all "failed
-    on setup" with that exact message, in the same run where admin_ctx-only
-    tests in the same classes passed cleanly. One shared driver, two
-    independent browser/context pairs on top of it, fixes this without
-    changing any test body.
-    """
-    with sync_playwright() as pw:
-        yield pw
-
-
-@pytest.fixture(scope="module")
-def admin_ctx(_pw_driver):
-    browser = launch_chromium(_pw_driver)
-    ctx = browser.new_context(ignore_https_errors=True)
-    page = ctx.new_page()
-    playwright_login_admin(page, admin=1)
-    yield ctx, page
-    ctx.close()
-    browser.close()
-
-
-@pytest.fixture(scope="module")
-def user_ctx(_pw_driver):
-    browser = launch_chromium(_pw_driver)
-    ctx = browser.new_context(ignore_https_errors=True)
-    page = ctx.new_page()
-    playwright_login_user(page, cache_key="webui-suite-primary")
-    yield ctx, page
-    ctx.close()
-    browser.close()
+# QA-fix (Ava, Tiago correction 2026-08-03): admin_ctx/user_ctx used to be
+# defined HERE at module scope (one real login per FILE) -- that was still
+# too many real logins/browser-contexts across a long multi-file run and the
+# root cause of the "Still on login page" setup cascade whenever this
+# module-scoped session outlived the server's 900s idle timeout mid-file.
+# They are now session-scoped fixtures in conftest.py: ONE real login per
+# identity (real POST /auth/login, real freshly-computed TOTP, no DOM
+# form-fill, no cookie-injection-as-bypass) for the WHOLE pytest run, reused
+# by every test in every file that requests them -- see conftest.py's
+# "Session-scoped shared identities" section for the full rationale. Nothing
+# in this file needs to change to pick them up; pytest resolves fixture names
+# against conftest.py automatically.
 
 
 class TestAdminModuleSweep:
@@ -558,9 +545,21 @@ class TestAccountsFormsAdminAndUser:
 
     def test_create_user_form_happy_path(self, admin_ctx):
         """POST /admin/users happy path: create, assert temp_password +
-        totp_secret returned exactly once (BOPLA allowlist exception)."""
+        totp_secret returned exactly once (BOPLA allowlist exception).
+
+        Tiago correction (2026-08-03): previously tolerated 401
+        step_up_required as an acceptable outcome instead of actually
+        performing the step-up -- that under-tests the real
+        StepUpAdminSession-gated mutation path (admin_ctx is now a
+        session-scoped, reused-for-the-whole-run session, so its last real
+        step-up is very likely past YASHIGANI_STEPUP_TTL_SECONDS by the time
+        any single test runs). do_admin_stepup() performs a GENUINE step-up
+        with a freshly computed, never-replayed TOTP code first, so the
+        mutation is now provably tested against a real, current step-up.
+        """
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+        do_admin_stepup(cookies, admin=1)
         # FIXED 2026-07-30 (Ava): '.invalid' is an RFC 2606 special-use TLD
         # rejected outright by the server's syntax-only email validator
         # (confirmed: email_validator.validate_email raises "special-use or
@@ -572,32 +571,33 @@ class TestAccountsFormsAdminAndUser:
         with _http_client() as c:
             r = c.post(f"{BASE_URL}/admin/users", json={"email": email},
                         headers=_cookie_header(cookies))
-        # StepUpAdminSession returns 401 step_up_required (not 403) if the
-        # session's TOTP verification has aged past YASHIGANI_STEPUP_TTL_
-        # SECONDS (default 300s) -- confirmed live via /auth/stepup's own
-        # contract. Both step-up-required and 200-with-secrets are valid
-        # outcomes to assert on here; 500 is never valid. (FIXED 2026-07-30,
-        # Ava: was asserting 403, which this endpoint never actually returns
-        # for this condition -- stale expectation, not a product bug.)
-        assert r.status_code in (200, 401, 403), f"unexpected {r.status_code}: {r.text[:200]}"
-        if r.status_code == 200:
-            body = r.json()
-            assert body.get("temporary_password")
-            assert body.get("totp_secret")
+        assert r.status_code == 200, (
+            f"expected success after a genuine fresh step-up, got {r.status_code}: {r.text[:200]}"
+        )
+        body = r.json()
+        assert body.get("temporary_password")
+        assert body.get("totp_secret")
 
     def test_create_user_duplicate_email_rejected(self, admin_ctx):
-        """Bad-input case: duplicate email -> 409, not 500."""
+        """Bad-input case: duplicate email -> 409, not 500. Real fresh
+        step-up first (see test_create_user_form_happy_path docstring)."""
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+        do_admin_stepup(cookies, admin=1)
         email = f"ava-conf-dup-{uuid.uuid4().hex[:8]}@example.com"
         with _http_client() as c:
-            c.post(f"{BASE_URL}/admin/users", json={"email": email}, headers=_cookie_header(cookies))
+            r1 = c.post(f"{BASE_URL}/admin/users", json={"email": email}, headers=_cookie_header(cookies))
+            assert r1.status_code == 200, f"first create (post-stepup) should succeed, got {r1.status_code}: {r1.text[:200]}"
             r2 = c.post(f"{BASE_URL}/admin/users", json={"email": email}, headers=_cookie_header(cookies))
-        assert r2.status_code in (409, 401, 403), f"expected 409 conflict (or step-up), got {r2.status_code}"
+        assert r2.status_code == 409, f"expected 409 conflict, got {r2.status_code}: {r2.text[:200]}"
 
     def test_create_user_malformed_email_rejected(self, admin_ctx):
+        """Real fresh step-up first (see test_create_user_form_happy_path
+        docstring), then confirm malformed input is 422, not a step-up gate
+        or a 500."""
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+        do_admin_stepup(cookies, admin=1)
         with _http_client() as c:
             r = c.post(f"{BASE_URL}/admin/users", json={"email": "not-an-email"},
                         headers=_cookie_header(cookies))
