@@ -175,13 +175,164 @@ _cluster_available() {
 }
 
 @test "DNS-02 live resolution is NOT skipped in host mode" {
-  # host mode must only bypass the DNS-01 string check; the live probe stands
-  block=$(sed -n '/host-resolver topology/,/elif ! grep -qE/p' "${REPO_ROOT}/install.sh")
-  [[ "$block" != *"return 0"* ]]
+  # host mode must only bypass the DNS-01 shape checks; the live probe stands.
+  # Behavioral (was a sed-window text grep, which Su's 2026-08-03 review
+  # flagged as fake-green): run the REAL function in host mode with the
+  # cluster boundary stubbed dead — it must attempt DNS-02 and FAIL, never
+  # return 0 on attestation alone.
+  local corefile='.:53 {
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    forward . 127.0.0.1:5353
+    cache 30
+}'
+  local fn
+  fn="$(awk '/^_preflight_coredns_dnssec_dot\(\)/{f=1} f{print} f&&/^}$/{exit}' "${REPO_ROOT}/install.sh")"
+  run env FN_BODY="$fn" SYNTH_COREFILE="$corefile" DNS_MODE=host bash -c '
+    log_info(){ echo "INFO: $*"; }; log_warn(){ echo "WARN: $*"; }
+    log_error(){ echo "ERROR: $*"; }; log_success(){ echo "OK: $*"; }
+    dry_print(){ :; }; require_cmd(){ :; }
+    kubectl() {
+      if [ "${1:-}" = "-n" ] && [ "${3:-}" = "get" ]; then printf "%s" "$SYNTH_COREFILE"; else return 1; fi
+    }
+    DNS_RESOLVER_MODE="$DNS_MODE"
+    eval "$FN_BODY"
+    _preflight_coredns_dnssec_dot
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"(DNS-02) FAILED"* ]]
 }
 
 @test "non-interactive without the flag defaults to internet, not host" {
   block=$(sed -n '/_prompt_dns_resolver_mode()/,/^}/p' "${REPO_ROOT}/install.sh")
   [[ "$block" == *'NON_INTERACTIVE:-false}" == "true"'* ]]
   [[ "$block" == *'DNS_RESOLVER_MODE="internet"'* ]]
+}
+
+# --- behavioral DNS-01 tests (stitch review 2026-08-03) --------------------
+# Su's review flagged every resolver-mode test above as a static grep (a
+# presence-of-string check can pass while the live function fails). These
+# tests execute the REAL _preflight_coredns_dnssec_dot body with kubectl
+# stubbed at its only boundary, and assert the actual DNS-01 verdict.
+
+_run_dns01() {
+  # $1 = DNS_RESOLVER_MODE, $2 = synthetic Corefile
+  local fn
+  fn="$(awk '/^_preflight_coredns_dnssec_dot\(\)/{f=1} f{print} f&&/^}$/{exit}' "${REPO_ROOT}/install.sh")"
+  [ -n "$fn" ]
+  SYNTH_COREFILE="$2" DNS_MODE="$1" bash -c '
+    log_info(){ echo "INFO: $*"; }
+    log_warn(){ echo "WARN: $*"; }
+    log_error(){ echo "ERROR: $*"; }
+    log_success(){ echo "OK: $*"; }
+    dry_print(){ :; }
+    require_cmd(){ :; }
+    kubectl() {
+      if [ "${1:-}" = "-n" ] && [ "${3:-}" = "get" ]; then
+        printf "%s" "$SYNTH_COREFILE"
+      else
+        # any other kubectl call is DNS-02 territory — fail loudly so the
+        # test can distinguish "passed DNS-01, reached DNS-02" from a
+        # DNS-01 rejection
+        echo "DNS02-BOUNDARY-REACHED" >&2
+        return 1
+      fi
+    }
+    DNS_RESOLVER_MODE="$DNS_MODE"
+    eval "$FN_BODY"
+    _preflight_coredns_dnssec_dot
+  ' 2>&1 || true
+}
+
+@test "behavioral: host-mode Corefile (plain node-resolver forward, no tls://) PASSES DNS-01" {
+  local corefile='.:53 {
+    errors
+    health
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    forward . 127.0.0.1:5353
+    cache 30
+    loop
+    reload
+}'
+  local fn
+  fn="$(awk '/^_preflight_coredns_dnssec_dot\(\)/{f=1} f{print} f&&/^}$/{exit}' "${REPO_ROOT}/install.sh")"
+  run env FN_BODY="$fn" SYNTH_COREFILE="$corefile" DNS_MODE=host bash -c '
+    log_info(){ echo "INFO: $*"; }; log_warn(){ echo "WARN: $*"; }
+    log_error(){ echo "ERROR: $*"; }; log_success(){ echo "OK: $*"; }
+    dry_print(){ :; }; require_cmd(){ :; }
+    kubectl() {
+      if [ "${1:-}" = "-n" ] && [ "${3:-}" = "get" ]; then printf "%s" "$SYNTH_COREFILE"; else echo "DNS02-BOUNDARY-REACHED" >&2; return 1; fi
+    }
+    DNS_RESOLVER_MODE="$DNS_MODE"
+    eval "$FN_BODY"
+    _preflight_coredns_dnssec_dot
+  '
+  # DNS-01 must PASS in host mode (the whole point of the mode); the run then
+  # proceeds to DNS-02 and fails only at the stubbed cluster boundary.
+  [[ "$output" == *"DNS-01 PASS (host mode)"* ]]
+  [[ "$output" != *"FINDING (DNS-01)"* ]]
+  # proof the run got PAST DNS-01: it must fail at the stubbed DNS-02
+  # cluster boundary (namespace create), not at a DNS-01 rejection
+  [[ "$output" == *"(DNS-02) FAILED"* ]]
+}
+
+@test "behavioral: internet-mode hardened Corefile (tls:// + tls_servername) PASSES DNS-01" {
+  local corefile='.:53 {
+    errors
+    health
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    forward . tls://1.1.1.1 tls://1.0.0.1 {
+      tls_servername cloudflare-dns.com
+      health_check 5s
+    }
+    cache 30
+}'
+  local fn
+  fn="$(awk '/^_preflight_coredns_dnssec_dot\(\)/{f=1} f{print} f&&/^}$/{exit}' "${REPO_ROOT}/install.sh")"
+  run env FN_BODY="$fn" SYNTH_COREFILE="$corefile" DNS_MODE=internet bash -c '
+    log_info(){ echo "INFO: $*"; }; log_warn(){ echo "WARN: $*"; }
+    log_error(){ echo "ERROR: $*"; }; log_success(){ echo "OK: $*"; }
+    dry_print(){ :; }; require_cmd(){ :; }
+    kubectl() {
+      if [ "${1:-}" = "-n" ] && [ "${3:-}" = "get" ]; then printf "%s" "$SYNTH_COREFILE"; else echo "DNS02-BOUNDARY-REACHED" >&2; return 1; fi
+    }
+    DNS_RESOLVER_MODE="$DNS_MODE"
+    eval "$FN_BODY"
+    _preflight_coredns_dnssec_dot
+  '
+  [[ "$output" == *"DNS-01 PASS: CoreDNS external-zone forward uses tls://"* ]]
+  [[ "$output" == *"(DNS-02) FAILED"* ]]
+}
+
+@test "behavioral: internet-mode PLAINTEXT Corefile is REJECTED at DNS-01 (never reaches DNS-02)" {
+  local corefile='.:53 {
+    errors
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    forward . /etc/resolv.conf
+    cache 30
+}'
+  local fn
+  fn="$(awk '/^_preflight_coredns_dnssec_dot\(\)/{f=1} f{print} f&&/^}$/{exit}' "${REPO_ROOT}/install.sh")"
+  run env FN_BODY="$fn" SYNTH_COREFILE="$corefile" DNS_MODE=internet bash -c '
+    log_info(){ echo "INFO: $*"; }; log_warn(){ echo "WARN: $*"; }
+    log_error(){ echo "ERROR: $*"; }; log_success(){ echo "OK: $*"; }
+    dry_print(){ :; }; require_cmd(){ :; }
+    kubectl() {
+      if [ "${1:-}" = "-n" ] && [ "${3:-}" = "get" ]; then printf "%s" "$SYNTH_COREFILE"; else echo "DNS02-BOUNDARY-REACHED" >&2; return 1; fi
+    }
+    DNS_RESOLVER_MODE="$DNS_MODE"
+    eval "$FN_BODY"
+    _preflight_coredns_dnssec_dot
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FINDING (DNS-01)"* ]]
+  [[ "$output" != *"(DNS-02) FAILED"* ]]
 }

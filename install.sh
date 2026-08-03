@@ -13995,36 +13995,44 @@ _preflight_coredns_dnssec_dot() {
     log_info "  live resolution (DNS-02) is still verified below."
     log_warn "  OPERATOR ATTESTATION: the node resolver must be DoT/DoH-backed (e.g. stubby)."
     log_warn "  This is recorded in the install state file; it is not machine-verifiable here."
-  elif ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
-    log_error "=============================================================="
-    log_error "FINDING (DNS-01): CoreDNS's external-zone 'forward' block does NOT use tls://."
-    log_error "DNSSEC-delegated-validation (design doc §1) requires the upstream forward to be"
-    log_error "over DoT with a pinned tls_servername — a plaintext forward is spoofable on-path"
-    log_error "and silently defeats every toFQDNs egress-allowlist rule that trusts it (§3)."
-    log_error ""
-    log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
-    log_error "--apply-coredns-hardening) to patch CoreDNS's Corefile."
-    log_error ""
-    log_error "To proceed WITHOUT this verified (records a risk-register exception):"
-    log_error "  re-run with --skip-coredns-dnssec-probe"
-    log_error "=============================================================="
-    return 1
+    log_success "DNS-01 PASS (host mode): operator-attested node-resolver topology; live resolution verified below."
+  else
+    # internet mode: the Corefile itself must carry the encrypted hop, so ALL
+    # THREE shape checks below apply. In host mode none of them can apply — the
+    # encrypted hop is one step beyond the Corefile (tls:// absent by design,
+    # tls_servername meaningless, and an IP-literal forward to the node
+    # resolver is exactly the expected shape, not the anti-pattern).
+    if ! grep -qE 'forward[[:space:]]+\.[[:space:]]+tls://' <<< "$_root_block"; then
+      log_error "=============================================================="
+      log_error "FINDING (DNS-01): CoreDNS's external-zone 'forward' block does NOT use tls://."
+      log_error "DNSSEC-delegated-validation (design doc §1) requires the upstream forward to be"
+      log_error "over DoT with a pinned tls_servername — a plaintext forward is spoofable on-path"
+      log_error "and silently defeats every toFQDNs egress-allowlist rule that trusts it (§3)."
+      log_error ""
+      log_error "REMEDIATION: run scripts/coredns-hardening-apply.sh (or install.sh"
+      log_error "--apply-coredns-hardening) to patch CoreDNS's Corefile."
+      log_error ""
+      log_error "To proceed WITHOUT this verified (records a risk-register exception):"
+      log_error "  re-run with --skip-coredns-dnssec-probe"
+      log_error "=============================================================="
+      return 1
+    fi
+    if ! grep -qE 'tls_servername[[:space:]]+\S+' <<< "$_root_block"; then
+      log_error "FINDING (DNS-01): CoreDNS forward uses tls:// but has no 'tls_servername' pinned —"
+      log_error "  DoT without a pinned server name does not authenticate the upstream. Fix the"
+      log_error "  Corefile (scripts/coredns-hardening-apply.sh) or --skip-coredns-dnssec-probe."
+      return 1
+    fi
+    # Anti-pattern guard: a plaintext IP-literal fallback forward anywhere in the
+    # file (documented anti-pattern in the design doc — never add "forward . 8.8.8.8").
+    if printf '%s\n' "$_corefile" | grep -qE 'forward[[:space:]]+\.[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}([[:space:]]|$)'; then
+      log_error "FINDING (DNS-01): a plaintext IP-literal 'forward' stanza was found in the Corefile"
+      log_error "  in addition to the DoT block. This is a documented anti-pattern (design doc §1) —"
+      log_error "  a 'resilience' plaintext fallback silently defeats the DNSSEC/DoT control. Remove it."
+      return 1
+    fi
+    log_success "DNS-01 PASS: CoreDNS external-zone forward uses tls:// with tls_servername pinned, no plaintext fallback."
   fi
-  if ! grep -qE 'tls_servername[[:space:]]+\S+' <<< "$_root_block"; then
-    log_error "FINDING (DNS-01): CoreDNS forward uses tls:// but has no 'tls_servername' pinned —"
-    log_error "  DoT without a pinned server name does not authenticate the upstream. Fix the"
-    log_error "  Corefile (scripts/coredns-hardening-apply.sh) or --skip-coredns-dnssec-probe."
-    return 1
-  fi
-  # Anti-pattern guard: a plaintext IP-literal fallback forward anywhere in the
-  # file (documented anti-pattern in the design doc — never add "forward . 8.8.8.8").
-  if printf '%s\n' "$_corefile" | grep -qE 'forward[[:space:]]+\.[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}([[:space:]]|$)'; then
-    log_error "FINDING (DNS-01): a plaintext IP-literal 'forward' stanza was found in the Corefile"
-    log_error "  in addition to the DoT block. This is a documented anti-pattern (design doc §1) —"
-    log_error "  a 'resilience' plaintext fallback silently defeats the DNSSEC/DoT control. Remove it."
-    return 1
-  fi
-  log_success "DNS-01 PASS: CoreDNS external-zone forward uses tls:// with tls_servername pinned, no plaintext fallback."
 
   # ---- DNS-02: live resolution probe (throwaway pod) ----
   local _ns="ysg-dnsprobe-$$"
