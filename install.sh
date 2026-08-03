@@ -4075,13 +4075,20 @@ _prompt_dns_resolver_mode() {
   printf "                           The hop MUST then be DoT with a pinned tls_servername.\n"
   printf "\n"
   local _choice
-  printf "  Choice [1]: "
+  printf "  Choice [2]: "
   read -r _choice </dev/tty 2>/dev/null || _choice=""
-  case "${_choice:-1}" in
+  # Default (empty input, no tty) AND unrecognised input both land on
+  # 'internet' — the mode whose tls:// Corefile gate is actually VERIFIED.
+  # 'host' weakens that gate to an unverified operator attestation, so it
+  # must only ever be reached by an explicit choice, never by fallthrough.
+  # This matches the documented default (usage text + non-interactive branch
+  # above); the previous [1]/host default silently bypassed the DNS-01 check
+  # on a bare Enter.
+  case "${_choice:-2}" in
     1|host|HOST)         DNS_RESOLVER_MODE="host" ;;
     2|internet|INTERNET) DNS_RESOLVER_MODE="internet" ;;
-    *) log_warn "Unrecognised choice '${_choice}' — defaulting to host resolver."
-       DNS_RESOLVER_MODE="host" ;;
+    *) log_warn "Unrecognised choice '${_choice}' — defaulting to internet resolver (verified tls:// gate)."
+       DNS_RESOLVER_MODE="internet" ;;
   esac
   log_info "DNS resolver mode: ${DNS_RESOLVER_MODE}"
 }

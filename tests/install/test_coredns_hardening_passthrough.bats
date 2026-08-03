@@ -147,6 +147,25 @@ _cluster_available() {
   grep -q 'DNS_RESOLVER_MODE:-internet' "${REPO_ROOT}/install.sh"
 }
 
+@test "interactive wizard default (bare Enter / no tty / bad input) is internet, not host" {
+  # Regression lock for the 4.1.2 stitch CRITICAL: the interactive branch of
+  # _prompt_dns_resolver_mode() used to default to 'host' on empty input AND
+  # on unrecognised input, silently bypassing the DNS-01 tls:// gate that
+  # only 'internet' mode verifies. Assert against the LIVE function body,
+  # not a dead fallback expression elsewhere in the file.
+  local fn
+  fn="$(awk '/^_prompt_dns_resolver_mode\(\)/,/^}/' "${REPO_ROOT}/install.sh")"
+  [ -n "$fn" ]
+  # empty input must expand to the internet menu option
+  echo "$fn" | grep -q 'case "\${_choice:-2}"'
+  # the advertised default in the prompt must match
+  echo "$fn" | grep -q 'Choice \[2\]'
+  # the unrecognised-input arm must land on internet, never host
+  echo "$fn" | awk '/\*\)/{f=1} f&&/DNS_RESOLVER_MODE=/{print; exit}' | grep -q '"internet"'
+  # host must be reachable ONLY via the explicit menu arm
+  [ "$(echo "$fn" | grep -c 'DNS_RESOLVER_MODE="host"')" -eq 1 ]
+}
+
 @test "host mode still records an operator attestation" {
   grep -q "OPERATOR ATTESTATION" "${REPO_ROOT}/install.sh"
 }
