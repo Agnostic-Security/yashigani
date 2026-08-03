@@ -530,7 +530,15 @@ return 1
                     )
 
     def suspend(self, identity_id: str) -> None:
-        """Suspend an identity (temporary disable)."""
+        """Suspend an identity (temporary disable).
+
+        FIND-SEAT-LEAK: suspend is a HOLD, not a release — the identity stays
+        in identity:index:kind:{kind} so its seat remains occupied while
+        suspended. Only reactivate() (which re-adds identity:index:active)
+        or deactivate() (permanent, frees the seat) change that. Do not add
+        a kind-set SREM here — that would let an admin free a seat via
+        suspend/reactivate cycling without ever actually removing the user.
+        """
         self._r.hset(f"identity:reg:{identity_id}", "status", "suspended")
         self._r.srem("identity:index:active", identity_id)
         logger.info("IdentityRegistry: suspended %s", identity_id)
@@ -555,7 +563,23 @@ return 1
                 logger.warning("IdentityRegistry: durable reactivate FAILED for %s: %s", identity_id, exc)
 
     def deactivate(self, identity_id: str) -> None:
-        """Permanently deactivate an identity."""
+        """Permanently deactivate an identity.
+
+        FIND-SEAT-LEAK (HIGH): deactivate is a RELEASE — this is the only
+        lifecycle op that frees the identity's seat, by SREM-ing it from
+        identity:index:kind:{kind} (the set the registration Lua script
+        SCARDs against for the max_end_users / seat-limit check). Prior to
+        this fix, no lifecycle op ever removed an identity from its kind
+        index, so every HUMAN identity ever registered permanently consumed
+        a seat even after deactivation — Community deployments (max_end_users
+        =5) would permanently exhaust all 5 seats after 5 cumulative
+        registrations, regardless of how many were still active.
+        Safe to do here specifically: deactivate() already deletes the slug
+        and key material (above), and reactivate() only re-enables identities
+        that are *suspended* (status transition within the active-eligible
+        flow) — there is no reactivate-from-deactivated path, so removing
+        the kind-set membership here can never orphan a recoverable identity.
+        """
         reg = self.get(identity_id)
         if not reg:
             return
@@ -565,6 +589,7 @@ return 1
             "updated_at": _now_iso(),
         })
         pipe.srem("identity:index:active", identity_id)
+        pipe.srem(f"identity:index:kind:{reg['kind']}", identity_id)
         pipe.delete(f"identity:key:{identity_id}")
         pipe.delete(f"identity:key:grace:{identity_id}")
         pipe.delete(f"identity:slug:{reg['slug']}")
