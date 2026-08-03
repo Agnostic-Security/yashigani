@@ -1102,6 +1102,38 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
                     deleted += 1
             return deleted
 
+    def _free_seat_capacity_with_fresh_admin(*, min_free: int = 1) -> int:
+        """Same hygiene as _free_end_user_capacity, but for the LOGIN-time
+        ACTIVE-SEAT gate (403 seat_limit_exceeded) -- confirmed live
+        2026-08-03 (Tier-B tierb-on-unified consolidation) to be a DIFFERENT
+        accounting bucket from the CREATE-time 402 end_user_limit_exceeded
+        gate _free_end_user_capacity already handles: 5 pre-existing
+        'ava-conf-*@example.com' throwaway accounts from many prior pytest
+        invocations against this same long-lived stack had already exhausted
+        the licence's 5-seat cap, so a BRAND NEW account (itself created
+        successfully -- account creation and seat activation are checked
+        against different limits) failed 403 on its post-rotation re-login
+        with {"error":"seat_limit_exceeded","current":5,"max":5}.
+
+        Forces a fresh admin1 login + fresh step-up before deleting: the
+        step-up taken at the very start of this bootstrap (in
+        _attempt_stepup_and_create above) has, by the time a seat-limit
+        retry is needed here, gone through the ~62s+ TOTP-freshness waits
+        this function's caller already performed and may have aged past
+        YASHIGANI_STEPUP_TTL_SECONDS -- DELETE /admin/users/{username} is
+        itself StepUpAdminSession-gated, so a stale step-up would silently
+        no-op this hygiene rather than actually freeing a seat.
+        """
+        fresh_admin_cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+        _wait_for_fresh_totp_window(admin=1)
+        stepup_code = pyotp.TOTP(admin_totp_secret, digits=8, digest=_hashlib.sha512).now()
+        _api_totp_last_used[1] = _time.time()
+        with httpx.Client(verify=verify, cookies=fresh_admin_cookies, follow_redirects=False, timeout=10) as c:
+            stepup_resp = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": stepup_code})
+            if stepup_resp.status_code != 200:
+                return 0
+        return _free_end_user_capacity(fresh_admin_cookies, min_free=min_free)
+
     stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
 
     # QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): _api_get_session_cookies
@@ -1225,15 +1257,42 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
         # regardless of outcome (a used code is used whether or not the
         # server accepted it).
         mark_totp_used(f"user:{username}")
-        assert relogin_resp.status_code == 200, (
-            f"user re-login after password rotation failed: "
-            f"{relogin_resp.status_code} {relogin_resp.text[:300]}"
-        )
-        relogin_data = relogin_resp.json()
-        assert not relogin_data.get("force_password_change"), (
-            "user still force_password_change=True after completing the change flow"
-        )
-        final_cookies = dict(relogin_resp.cookies)
+
+    # Test-environment hygiene (see _free_seat_capacity_with_fresh_admin
+    # docstring, tierb-on-unified consolidation): the licence's ACTIVE-SEAT
+    # cap is checked at THIS re-login/activation step -- a DIFFERENT
+    # accounting bucket from the end-user-record cap _free_end_user_capacity
+    # already handles at create time. A long-lived stack accumulates this
+    # suite's own throwaway accounts until 403 seat_limit_exceeded blocks
+    # even a freshly created account's first real activation. Free capacity
+    # by deleting the OLDEST throwaway 'ava-conf-*@example.com' accounts
+    # (oldest-first -- never this brand-new one), wait for a fresh TOTP
+    # window for THIS account (the failed attempt's code must not be
+    # replayed on retry), and retry the re-login exactly once.
+    if relogin_resp.status_code == 403:
+        try:
+            _is_seat_limit = relogin_resp.json().get("detail", {}).get("error") == "seat_limit_exceeded"
+        except Exception:
+            _is_seat_limit = False
+        if _is_seat_limit and _free_seat_capacity_with_fresh_admin(min_free=1):
+            wait_for_fresh_totp(f"user:{username}")
+            with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
+                relogin_resp = c.post(
+                    f"{BASE_URL}/auth/login",
+                    json={"username": username, "password": new_password, "totp_code": totp.now()},
+                )
+                mark_totp_used(f"user:{username}")
+
+    assert relogin_resp.status_code == 200, (
+        f"user re-login after password rotation failed (even after freeing "
+        f"seat capacity if seat-limited): "
+        f"{relogin_resp.status_code} {relogin_resp.text[:300]}"
+    )
+    relogin_data = relogin_resp.json()
+    assert not relogin_data.get("force_password_change"), (
+        "user still force_password_change=True after completing the change flow"
+    )
+    final_cookies = dict(relogin_resp.cookies)
 
     result = {
         "username": username,
