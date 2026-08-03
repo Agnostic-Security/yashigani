@@ -467,7 +467,15 @@ async def update_user(username: str, body: UpdateUserRequest, session: StepUpAdm
 
 @router.delete("/{username}")
 async def delete_user(username: str, session: StepUpAdminSession):
-    """Delete a user. Blocked if last user (USER_MINIMUM_VIOLATION)."""
+    """Delete a user. Blocked if last user (USER_MINIMUM_VIOLATION).
+
+    FIND-SEAT-LEAK (HIGH): deleting the account row alone never touches the
+    HUMAN identity in identity_registry, so the seat it holds in
+    identity:index:kind:human was never freed. This deactivates the matching
+    HUMAN identity (fail-soft — see _deactivate_identity_registry_for_account)
+    so the seat is reclaimed on account delete, mirroring the disable path's
+    _suspend_identity_registry_for_account.
+    """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
     assert state.session_store is not None  # set unconditionally at startup
@@ -487,6 +495,8 @@ async def delete_user(username: str, session: StepUpAdminSession):
 
     await state.auth_service.delete_account(username)
     state.session_store.invalidate_all_for_account(record.account_id)
+    # FIND-SEAT-LEAK: free the HUMAN identity's seat on account delete.
+    _deactivate_identity_registry_for_account(record)
     state.audit_writer.write(_config_event(session.account_id, "user_account_deleted", username, "", account_tier=session.account_tier))
     return {"status": "ok"}
 
@@ -833,6 +843,64 @@ def _suspend_identity_registry_for_account(account_id: str) -> None:
             "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
             account_id,
             exc,
+        )
+
+
+def _deactivate_identity_registry_for_account(record) -> None:
+    """Permanently deactivate the HUMAN identity matching *record*, freeing its seat.
+
+    FIND-SEAT-LEAK (HIGH): delete_user previously only deleted the
+    admin_accounts row (auth_service.delete_account) and never touched
+    identity_registry, so the deleted user's HUMAN identity — and the seat
+    it held in identity:index:kind:human — was never released. Deactivation
+    is the only lifecycle op that frees a seat (see IdentityRegistry.deactivate
+    docstring), so this must run on every account-deletion path, not just
+    disable.
+
+    Resolution note: unlike _suspend_identity_registry_for_account (which
+    uses suspend_owned_by(account_id) via the identity:index:org:{org_id}
+    index), local-auth HUMAN identities registered on login
+    (auth.py:_register_human_identity_on_login) are registered with
+    org_id="" — that index is never populated for them, so org_id-based
+    lookup would silently find nothing here. This mirrors the working
+    email->slug->get_by_slug resolution used by reactivate_user /
+    admin_issue_user_api_key instead.
+
+    Fail-soft: if identity_registry is unavailable (community tier) or no
+    HUMAN identity was ever registered for this user (never logged in),
+    log and continue — the account row is already deleted either way.
+    """
+    state = backoffice_state
+    registry = getattr(state, "identity_registry", None)
+    if registry is None:
+        _log.warning(
+            "FIND-SEAT-LEAK: identity_registry not available — HUMAN identity "
+            "for account %s NOT deactivated (seat may remain held)",
+            record.account_id,
+        )
+        return
+    try:
+        from yashigani.backoffice.routes.auth import _auth_email_to_slug
+        email = record.email or f"{record.username}@yashigani.local"
+        slug = _auth_email_to_slug(email)
+        identity = registry.get_by_slug(slug)
+        if identity is None:
+            _log.info(
+                "FIND-SEAT-LEAK: no HUMAN identity found for deleted account %s "
+                "(slug=%s) — nothing to deactivate (user may never have logged in)",
+                record.username, slug,
+            )
+            return
+        registry.deactivate(identity["identity_id"])
+        _log.info(
+            "FIND-SEAT-LEAK: deactivated HUMAN identity %s for deleted account %s — seat freed",
+            identity["identity_id"], record.username,
+        )
+    except Exception as exc:
+        _log.error(
+            "FIND-SEAT-LEAK: failed to deactivate identity-registry entry for "
+            "deleted account %s: %s — seat may remain held",
+            record.username, exc,
         )
 
 
