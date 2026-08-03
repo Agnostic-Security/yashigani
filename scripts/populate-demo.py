@@ -20,11 +20,16 @@ GUARDRAILS (enforced in code):
 What this script creates:
   Groups  : data-team, finance-team, compliance-team
   Users   : ana@agnosticsec.com / paul@agnosticsec.com / mia@agnosticsec.com / noah / sara
-            each in a different group
+            each in a different group, PLUS an OPTIONAL 6th (kai, "api-only"
+            journey B/B+) seeded only when the licence has end-user headroom
+            beyond the 5-seat Community tier (see step7_create_users()).
   Agents  : configures (never creates) the install.sh-bundled langflow/letta/openclaw
-            agents (groups: [owui-users, users])
-  Policies: 10 self-describing client OPA policies (saved + bound)
-  Probes  : one allow + one deny via /admin/inspection/simulate (if available)
+            agents (groups: [owui-users, users] for the human-tier RBAC gate;
+            allowed_caller_groups is per-team ONLY — see AGENTS below, G5).
+  Policies: 10 self-describing client OPA policies (saved + bound; POL-004
+            now emits a pseudonymize obligation branch too — see G4/G8)
+  Probes  : allow/deny via /admin/policies/simulate + a service-scope
+            differential probe for POL-008 (if available)
   MCP     : demo-mcp reachability probe
 
 Usage:
@@ -32,6 +37,48 @@ Usage:
 
 All credential output -> CREDENTIALS-4.1.2-CLEAN.txt (updated in-place).
 Scratch state saved to populate-4.1.2-clean-state.json (same dir).
+
+---------------------------------------------------------------------------
+SEED-COVERAGE ENHANCEMENT — §4.17 DIFFERENTIAL testing, gaps G1-G6
+(testing_runs/yashigani/ytf-docker-macos-29d9c9d8-20260731/populate-coverage-map.md)
+---------------------------------------------------------------------------
+  G1 — POL-001/002/009/010 rebound from a single pinned human to wildcard
+       `human:""` (BINDINGS below) so the SAME probe run as different users
+       diverges by their group/ceiling attributes, not by whether they
+       happen to be the one bound subject (closes map G1/G6/G7/G11).
+       Verified against policy_bindings/store.py:scope_key() +
+       policy/clients_aggregate.rego:_scope_keys — scope_id="" resolves to
+       "<kind>:*" and is UNIONED with the specific "<kind>:<id>" key, so a
+       wildcard bind is strictly additive (never narrows an existing bind).
+  G2 — POL-008 (EU AI Act) was already bound wildcard `service:""`, but no
+       seeded identity is `service`-kind, so it was never differentially
+       exercised. See step11b_service_identity_probe() for what could and
+       could NOT be closed here (a real product gap was found: there is no
+       admin-API path to mint a persistent, externally-drivable SERVICE
+       identity — see that function's docstring).
+  G3 — optional 6th user `kai` models install-test journey B (API-only) /
+       B+ (add-agents-later): onboarded via API key only, never driven
+       through the persona/agent/workflow (13d/13e) steps. NOTE: OWUI and
+       the `owui-users` RBAC gate were REMOVED in 4.0 (YSG-RISK-140) — see
+       step7e_grant_owui_access() — so "API-only" here models the
+       onboarding journey, not an RBAC-enforced chat block (that gate no
+       longer exists in this architecture).
+  G4 — pseudonymize obligation added to pii_redaction_policy (POL-004):
+       compliance-team humans now get `pseudonymize_pii` instead of a bare
+       allow, a genuine 3-way differential (deny+redact / allow+pseudonymize)
+       on the SAME PII probe. paul's ceiling changed INTERNAL -> PUBLIC to
+       complete the PUBLIC->INTERNAL->CONFIDENTIAL->RESTRICTED ceiling
+       ladder (noah/sara stay INTERNAL). PCI-marking differential is closed
+       by G1 (POL-009 now wildcard, so ana's high ceiling no longer exempts
+       her from the PCI/RESTRICTED deny branch).
+  G5 — AGENTS[*]["allowed_caller_groups"] no longer includes owui-users/
+       users — only the agent's own team — so cross-group agent-caller
+       isolation is actually testable (verified against
+       gateway/tool_catalog.py:_agent_allowed_for_caller — caller_groups &
+       allowed_caller_groups intersection).
+  G6 — STEP13b's ana-ceiling comments said "CONFIDENTIAL"; the authoritative
+       USERS[0]["ceiling"] is (and was) RESTRICTED. Comments fixed to match.
+---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -416,7 +463,7 @@ def step6_create_groups() -> dict[str, str]:
 # STEP 7 — Create users + add to groups
 # ---------------------------------------------------------------------------
 
-USERS = [
+USERS: list[dict] = [
     # ana drives the cloud-9 MCP-injection demo. Ceiling RESTRICTED so a BENIGN
     # cloud9-orchestrate echo passes the egress ceiling (demo narrative: "safe call
     # works"), while the INJECTION leg is still blocked by ResponseInspection
@@ -424,7 +471,11 @@ USERS = [
     # ceiling. With a lower ceiling both legs block on the ceiling and the
     # benign-vs-malicious contrast is lost (Ava INFO-SCEN-A-001).
     {"email": "ana@agnosticsec.com", "group": "data-team", "ceiling": "RESTRICTED"},
-    {"email": "paul@agnosticsec.com", "group": "finance-team", "ceiling": "INTERNAL"},
+    # G4/G9: PUBLIC ceiling (was INTERNAL) — completes the PUBLIC->INTERNAL->
+    # CONFIDENTIAL->RESTRICTED ladder (noah/sara stay INTERNAL so that rung
+    # keeps 2 representatives). paul's finance_read_only (POL-002) demo does
+    # not depend on ceiling value, so this is a safe reassignment.
+    {"email": "paul@agnosticsec.com", "group": "finance-team", "ceiling": "PUBLIC"},
     {"email": "mia@agnosticsec.com", "group": "compliance-team", "ceiling": "CONFIDENTIAL"},
     # Data-protection demo scenarios:
     # noah — cannot send PCI data (ceiling INTERNAL + pci_data_block; PCI classifies RESTRICTED).
@@ -433,6 +484,51 @@ USERS = [
     # only (ceiling INTERNAL + classified_marking_local + local-only model allocation).
     {"email": "sara@agnosticsec.com", "group": "compliance-team", "ceiling": "INTERNAL", "scenario": "classified-local"},
 ]
+
+# G3 — OPTIONAL 6th identity: install-test journey B (API-only) / B+
+# (add-agents-later). Community tier = 5 end-user seats (already fully used
+# by the 5 USERS above), so this is gated on live licence headroom
+# (step7_create_users() calls _license_end_user_headroom() before attempting
+# creation) — a default Community-tier run stays at exactly 5 seats and
+# never 402s; a tier with more headroom gets a genuine 6th differential
+# identity. "optional_seat": True is the gate step7_create_users() checks.
+API_ONLY_USER = {
+    "email": "kai@agnosticsec.com", "group": "finance-team", "ceiling": "INTERNAL",
+    "scenario": "api-only", "optional_seat": True,
+}
+USERS.append(API_ONLY_USER)
+
+
+def _license_end_user_headroom() -> bool:
+    """G3: True if the current licence has room for one more end-user seat.
+
+    Reads GET /admin/license (limits.end_users.{current,maximum,unlimited} —
+    see backoffice/routes/license.py:_limit_block()). Fail-CLOSED on any
+    error/unexpected shape — if we cannot positively confirm headroom, do
+    NOT attempt the optional seat (avoids a 402 mid-run on a Community-tier
+    install, which would otherwise be the only fatal path in this script for
+    a seat that isn't required for the core 5-user demo).
+    """
+    try:
+        r = S.get(f"{BASE_URL}/admin/license")
+    except Exception as exc:
+        print(f"  [seat-check] /admin/license unreachable ({exc}) — assuming no headroom")
+        return False
+    if r.status_code != 200:
+        print(f"  [seat-check] /admin/license HTTP {r.status_code} — assuming no headroom")
+        return False
+    try:
+        eu = r.json()["limits"]["end_users"]
+    except Exception:
+        print("  [seat-check] /admin/license response missing limits.end_users — assuming no headroom")
+        return False
+    if eu.get("unlimited"):
+        return True
+    current = eu.get("current", 0)
+    maximum = eu.get("maximum")
+    if maximum is None:
+        return True
+    return current < maximum
 
 
 def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
@@ -449,11 +545,27 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
         email = udef["email"]
         group_name = udef["group"]
         gid = group_ids[group_name]
+        scenario = udef.get("scenario", "")
 
         if email in existing_emails:
             print(f"  user '{email}' already exists — skipping creation")
-            user_creds[email] = {"username": existing_emails[email].get("username", ""), "group": group_name}
+            user_creds[email] = {
+                "username": existing_emails[email].get("username", ""),
+                "group": group_name,
+                "scenario": scenario,
+            }
         else:
+            # G3: the optional 6th (API-only) seat is gated on live licence
+            # headroom — never attempted (and never hits the fatal _ok()
+            # path) if the Community-tier 5-seat budget is already spent.
+            if udef.get("optional_seat") and not _license_end_user_headroom():
+                print(
+                    f"  '{email}': SKIPPED — optional seat, no licence headroom "
+                    f"(Community tier = 5 end-user seats, already used by the "
+                    f"core 5 demo users). Needs a higher tier to seed this "
+                    f"identity — see USERS/API_ONLY_USER comment (G3)."
+                )
+                continue
             r = S.post(f"{BASE_URL}/admin/users", json={"email": email})
             body = _ok(r, f"create-user-{email}", allow=(201,))
             temp_pw = body.get("temporary_password", "")
@@ -465,6 +577,7 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
                 "temp_pw": temp_pw,
                 "totp_secret": totp_secret,
                 "group": group_name,
+                "scenario": scenario,
             }
 
         # Add to group (idempotent — server may 409 if already member, which is OK)
@@ -515,26 +628,39 @@ def step7b_save_user_creds(user_creds: dict[str, dict]) -> None:
 # send upstream_url on PUT. It only discovers the real agent_id by name and
 # PUTs the demo-specific groups/allowed_caller_groups/allowed_paths.
 
+# G5: allowed_caller_groups is PER-TEAM ONLY (owui-users/users deliberately
+# REMOVED). Previously every agent also allowed owui-users+users, and since
+# every demo user is a member of both, ANY user could call ANY agent —
+# nullifying the per-team caller-isolation the demo claims to show
+# (coverage-map G5). Verified against gateway/tool_catalog.py:
+# _agent_allowed_for_caller() — caller_groups & allowed_caller_groups must
+# intersect (empty allowed_caller_groups = unrestricted; a non-empty list
+# with no overlap = denied). With this list per-team only:
+#   langflow  -> data-team only        (ana allowed; paul/mia/noah/sara/kai denied)
+#   letta     -> finance-team only     (paul/noah/kai allowed; ana/mia/sara denied)
+#   openclaw  -> compliance-team only  (mia/sara allowed; ana/paul/noah/kai denied)
+# "groups" (the agent's OWN RBAC membership, for the agent's own resource
+# scoping) is UNCHANGED — this only narrows who may CALL each agent.
 AGENTS = [
     {
         "local_key": "langflow",
         "real_names": ("agent__langflow",),
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["data-team", "owui-users", "users"],
+        "allowed_caller_groups": ["data-team"],
         "allowed_paths": [],
     },
     {
         "local_key": "letta",
         "real_names": ("letta",),
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["finance-team", "owui-users", "users"],
+        "allowed_caller_groups": ["finance-team"],
         "allowed_paths": [],
     },
     {
         "local_key": "openclaw",
         "real_names": ("openclaw",),
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["compliance-team", "owui-users", "users"],
+        "allowed_caller_groups": ["compliance-team"],
         "allowed_paths": [],
     },
 ]
@@ -755,14 +881,25 @@ def step9e_allocate_local_model_to_sara() -> None:
 
 
 def step7e_grant_owui_access(user_creds: dict[str, dict]) -> None:
-    """Add demo users to the `owui-users` group so they can sign in to OpenWebUI.
+    """Add demo users to the `owui-users` RBAC group.
 
-    Yashigani is API-first: creating a user provisions API access only (the `users`
-    caller group). OpenWebUI (the human chat surface at /app/webui) is a separate
-    opt-in grant via membership of `owui-users` — without it the user can only use
-    the API, not the chat UI. See docs/operator-guide.md §5.6.
+    HISTORICAL NOTE (G3 finding, verified against docs/operator-guide.md §7 +
+    install.sh:5251/10973): the standalone OpenWebUI container and its
+    `owui-users` forward_auth gate were REMOVED in 4.0 (YSG-RISK-140). The
+    chat surface is now the native `ui4` SPA served by the backoffice at
+    `/chat/*`, gated by ordinary session validity like every other user-tier
+    route — NOT by `owui-users` membership. This group/step is kept for
+    backward-compat RBAC shape (it still grants `/**` resource access, same
+    as the `users` group) but is no longer a real chat on/off switch.
+
+    G3 (API-only user): `kai` (scenario == "api-only") is deliberately
+    EXCLUDED from this grant and from persona/agent/workflow seeding
+    (STEP 13d/13e) — modelling the install-test "B: API-only" journey as an
+    onboarding-flow distinction (minted an API key, never driven through any
+    session/chat-surface step in this script), since there is no remaining
+    RBAC gate that would make this a hard technical block.
     """
-    print("\n=== STEP 7e: Grant OpenWebUI access (owui-users group) ===")
+    print("\n=== STEP 7e: Grant OpenWebUI access (owui-users group; vestigial post-4.0, see docstring) ===")
     r = S.get(f"{BASE_URL}/admin/rbac/groups")
     groups = _ok(r, "list-groups").get("groups", [])
     owui = next((g for g in groups if str(g.get("display_name", "")).lower() == "owui-users"), None)
@@ -771,7 +908,10 @@ def step7e_grant_owui_access(user_creds: dict[str, dict]) -> None:
         return
     gid = owui.get("id")
     _do_stepup_inline()
-    for email in user_creds:
+    for email, info in user_creds.items():
+        if info.get("scenario") == "api-only":
+            print(f"  {email}: SKIPPED (G3 api-only journey — no chat-surface onboarding)")
+            continue
         r = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
         if r.status_code in (200, 201):
             print(f"  granted OWUI access: {email} -> owui-users")
@@ -898,6 +1038,13 @@ import rego.v1
 # Policy: PII Redaction Enforcement
 # policy_id: POL-004
 # user_message: Personally Identifiable Information must be redacted before transmission to AI models.
+# G4/G8 (populate-demo seed-coverage enhancement): compliance-team is exempt
+# from the deny, but previously got the SAME "redact_pii" obligation as
+# everyone else -- no pseudonymize verdict existed anywhere in the seed.
+# compliance-team now gets "pseudonymize_pii" instead: a genuine 3-way
+# differential on the SAME pii-tagged probe (deny+redact for data/finance
+# humans vs allow+pseudonymize for compliance-team), using the policy's
+# EXISTING wildcard human:"" binding -- no new binding or user required.
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
@@ -910,6 +1057,12 @@ deny contains "POL-004:pii_transmission_blocked" if {
 
 obligations contains "redact_pii" if {
     input.data_tags[_] == "pii"
+    not "compliance-team" in input.identity.groups
+}
+
+obligations contains "pseudonymize_pii" if {
+    input.data_tags[_] == "pii"
+    "compliance-team" in input.identity.groups
 }
 """,
     },
@@ -1141,11 +1294,24 @@ def step9_save_policies() -> list[str]:
 # binding — hardcoding "langflow" here would bind to a non-existent agent
 # identity, since the real registered name is "agent__langflow".
 
+# G1 (seed-coverage enhancement): POL-001/002/009/010 rebound from a single
+# pinned human to wildcard human:"" (scope_id=""). Verified against
+# policy_bindings/store.py:PolicyBinding.scope_key() (scope_id="" ->
+# "<kind>:*") and policy/clients_aggregate.rego:_scope_keys (the wildcard key
+# is UNIONED with the caller's specific key) -- a wildcard bind only ADDS
+# subjects, it cannot narrow or break the existing single-subject behaviour.
+# Each of these 4 rego bodies already branches on input.identity.groups /
+# routing_decision, not on WHO is bound, so wildcarding them makes the SAME
+# probe diverge correctly by the caller's own attributes (closes
+# coverage-map G1/G6/G7/G11): data-team vs non-data-team (POL-001),
+# finance-team vs not (POL-002, now also covers noah/kai, closing G11),
+# PCI/RESTRICTED tag regardless of ceiling (POL-009, now also covers ana,
+# closing G7), classified-marking regardless of who sent it (POL-010).
 BINDINGS = [
-    # POL-001: data access control -> all human callers, ingress
-    {"policy_name": "data_access_control", "scope_kind": "human", "scope_id": "ana@agnosticsec.com", "direction": "ingress"},
-    # POL-002: finance read-only -> paul (finance-team human), ingress
-    {"policy_name": "finance_read_only", "scope_kind": "human", "scope_id": "paul@agnosticsec.com", "direction": "ingress"},
+    # POL-001: data access control -> ALL human callers (wildcard), ingress
+    {"policy_name": "data_access_control", "scope_kind": "human", "scope_id": "", "direction": "ingress"},
+    # POL-002: finance read-only -> ALL human callers (wildcard), ingress
+    {"policy_name": "finance_read_only", "scope_kind": "human", "scope_id": "", "direction": "ingress"},
     # POL-003: compliance audit -> mia (compliance-team), both directions
     {"policy_name": "compliance_audit_log", "scope_kind": "human", "scope_id": "mia@agnosticsec.com", "direction": "both"},
     # POL-004: PII redaction -> all humans (wildcard), ingress
@@ -1158,10 +1324,10 @@ BINDINGS = [
     {"policy_name": "agent_tool_restriction", "scope_kind": "agent", "scope_id": "langflow", "direction": "egress"},
     # POL-008: EU AI Act -> all service callers, egress
     {"policy_name": "eu_ai_act_human_review", "scope_kind": "service", "scope_id": "", "direction": "egress"},
-    # POL-009: PCI block -> noah (no-PCI demo user), both directions
-    {"policy_name": "pci_data_block", "scope_kind": "human", "scope_id": "noah@agnosticsec.com", "direction": "both"},
-    # POL-010: classified-marking local-only -> sara (classified-local demo user), egress
-    {"policy_name": "classified_marking_local", "scope_kind": "human", "scope_id": "sara@agnosticsec.com", "direction": "egress"},
+    # POL-009: PCI block -> ALL human callers (wildcard), both directions
+    {"policy_name": "pci_data_block", "scope_kind": "human", "scope_id": "", "direction": "both"},
+    # POL-010: classified-marking local-only -> ALL human callers (wildcard), egress
+    {"policy_name": "classified_marking_local", "scope_kind": "human", "scope_id": "", "direction": "egress"},
 ]
 
 
@@ -1225,14 +1391,47 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
 # STEP 11 — Allow/deny probe
 # ---------------------------------------------------------------------------
 
+def _simulate_policy(policy_id: str, input_scenario: dict, label: str) -> dict | None:
+    """POST /admin/policies/simulate (R12 dry-run — routes/policies.py:simulate_policy).
+
+    Returns the parsed body dict, or None if the endpoint/policy is
+    unavailable on this deployment tier (404/503/422 are all treated as
+    "not available here", not a hard failure — mirrors the original probe's
+    tolerance for missing tiers, just against the endpoint that actually
+    exists).
+    """
+    r = S.post(f"{BASE_URL}/admin/policies/simulate",
+               json={"policy_id": policy_id, "input_scenario": input_scenario, "ai_explain": False})
+    if r.status_code == 404:
+        print(f"  {label}: policy/endpoint not available on this deployment tier (404, not a failure)")
+        return None
+    if r.status_code == 503:
+        print(f"  {label}: HTTP 503 (OPA unreachable — expected on this deployment tier)")
+        return None
+    body = _ok(r, label, allow=(422,))
+    if r.status_code == 422:
+        print(f"  {label}: HTTP 422 (bad input schema — expected on this deployment tier)")
+        return None
+    return body
+
+
 def step11_allow_deny_probe() -> None:
     """
-    Fire one allow and one deny probe via /admin/inspection/simulate.
-    If the endpoint doesn't exist on this deployment tier, skip gracefully.
-    """
-    print("\n=== STEP 11: Allow/deny OPA probe ===")
+    Fire one allow and one deny probe via POST /admin/policies/simulate.
 
-    # Allow probe: data-team user, /v1/data path (should pass POL-001)
+    FINDING (discovered while implementing G2): the previous version of this
+    step posted to `/admin/inspection/simulate`, which does not exist in this
+    codebase (routes/inspection.py has no `/simulate` route — the real
+    dry-run endpoint is `/admin/policies/simulate`, routes/policies.py
+    `SimulateRequest{policy_id, input_scenario, ai_explain}`). Every prior run
+    of this step therefore hit a 404 and was silently "skipped gracefully" —
+    this probe never actually executed. Fixed to call the real endpoint with
+    an explicit policy_id per probe (the same two input shapes as before,
+    matched to the policy they were originally written to exercise).
+    """
+    print("\n=== STEP 11: Allow/deny OPA probe (via /admin/policies/simulate) ===")
+
+    # Allow probe: data-team user, /v1/data path -> POL-001 data_access_control (allow)
     allow_input = {
         "identity": {"role": "user", "groups": ["data-team"], "agent": "", "clearance": ""},
         "request": {"purpose": "data_query", "lawful_basis": "consent"},
@@ -1242,6 +1441,7 @@ def step11_allow_deny_probe() -> None:
         "data_tags": [],
         "tool": "",
     }
+    # Deny probe: finance-team user, non-GET /v1/finance -> POL-002 finance_read_only (deny)
     deny_input = {
         "identity": {"role": "user", "groups": ["finance-team"], "agent": "", "clearance": ""},
         "request": {"purpose": "policy_promotion", "lawful_basis": ""},
@@ -1252,20 +1452,78 @@ def step11_allow_deny_probe() -> None:
         "tool": "email.delete",
     }
 
-    for label, payload in [("allow-probe", allow_input), ("deny-probe", deny_input)]:
-        r = S.post(f"{BASE_URL}/admin/inspection/simulate", json={"input": payload})
-        if r.status_code == 404:
-            print(f"  {label}: /admin/inspection/simulate not available on this deployment tier (expected 404, not a failure)")
-            continue
-        if r.status_code == 405:
-            print(f"  {label}: 405 Method Not Allowed — endpoint may be GET-only, skipping")
-            continue
-        body = _ok(r, label, allow=(200, 201, 422, 503))
-        if r.status_code in (422, 503):
-            print(f"  {label}: HTTP {r.status_code} (OPA unavailable or bad input schema — expected on this deployment tier)")
-        else:
-            decision = body.get("decision") or body.get("result") or body
-            print(f"  {label}: {json.dumps(decision, default=str)[:200]}")
+    for label, policy_id, payload in [
+        ("allow-probe", "clients/data_access_control", allow_input),
+        ("deny-probe", "clients/finance_read_only", deny_input),
+    ]:
+        body = _simulate_policy(policy_id, payload, label)
+        if body is not None:
+            print(f"  {label} ({policy_id}): verdict={body.get('verdict')} "
+                  f"deny={body.get('deny')} obligations={body.get('obligations')}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 11b — G2: service-scope differential probe (POL-008 EU AI Act)
+# ---------------------------------------------------------------------------
+
+def step11b_service_identity_probe() -> None:
+    """
+    G2 (populate-demo seed-coverage enhancement): POL-008 (eu_ai_act_human_review)
+    is bound wildcard `service:""` (BINDINGS above) but no seeded identity is
+    `service`-kind, so it was never differentially exercised.
+
+    PRODUCT-GAP FINDING (verified by direct code search, not assumed):
+    there is NO admin API to mint a persistent, externally-drivable
+    `service`-kind identity.
+      - identity/registry.py:IdentityRegistry.register() IS called with an
+        explicit kind in exactly two places in the whole tree
+        (backoffice/routes/auth.py:3442, backoffice/routes/sso.py:270) —
+        BOTH hardcode kind=IdentityKind.HUMAN.
+      - GET /admin/identities (backoffice/routes/agents.py:1140) is
+        READ-ONLY (list only; no POST).
+      - The only LIVE `service`-kind principal in this deployment is the
+        synthetic in-mesh identity gateway/openai_router.py resolves for the
+        per-install YASHIGANI_INTERNAL_BEARER secret
+        (identity_id="internal", kind="service", openai_router.py:1783-1785,
+        5283) — a container-internal secret this external, admin-API-only
+        demo script has no legitimate way to read or drive traffic as
+        (breaking that boundary would defeat the point of the isolation).
+    This is a genuine capability gap (no admin-facing way to onboard an
+    additional/independent SERVICE identity), not something a seed script
+    can close alone -- flagged for Maxine/Tiago rather than silently
+    worked around. See populate-coverage-map G2 + this docstring.
+
+    What CAN be closed here without touching product code: POL-008's own
+    decision rule (data.clients.eu_ai_act_human_review.decision) is
+    evaluated directly via /admin/policies/simulate (bypasses the
+    scope/binding-resolution layer, same as STEP 11 above) with two
+    service-shaped scenarios that differ ONLY in human_approved -- a genuine
+    allow-vs-deny differential for the one policy already bound to
+    `service:*`.
+    """
+    print("\n=== STEP 11b: Service-identity differential probe (POL-008, via simulate) ===")
+    print(
+        "  NOTE: no admin API exists to mint a persistent 'service'-kind identity "
+        "(verified: only auth.py/sso.py register kind=HUMAN; GET /admin/identities "
+        "is read-only) -- the live differential below runs directly against POL-008's "
+        "decision rule, not through a real service-scope gateway call. See docstring."
+    )
+
+    base_identity = {"role": "service", "kind": "service", "groups": [], "agent": "", "clearance": ""}
+    deny_input = {
+        "identity": base_identity,
+        "request": {"purpose": "policy_promotion", "human_approved": False},
+    }
+    allow_input = {
+        "identity": base_identity,
+        "request": {"purpose": "policy_promotion", "human_approved": True},
+    }
+
+    for label, payload in [("service-deny-probe", deny_input), ("service-allow-probe", allow_input)]:
+        body = _simulate_policy("clients/eu_ai_act_human_review", payload, label)
+        if body is not None:
+            print(f"  {label}: verdict={body.get('verdict')} "
+                  f"deny={body.get('deny')} obligations={body.get('obligations')}")
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1546,8 @@ def step12_verify_user_logins(user_creds: dict[str, dict]) -> None:
             u = user_map[email]
             print(f"  user '{email}': username={u.get('username')}, disabled={u.get('disabled')}, "
                   f"force_pw_change={u.get('force_password_change')}")
+        elif udef.get("optional_seat"):
+            print(f"  '{email}': not present — expected (G3 optional seat, no licence headroom)")
         else:
             print(f"  WARN: user '{email}' not found in users list")
 
@@ -1361,7 +1621,10 @@ def step13b_cloud9_demo_wire() -> None:
        This is the OWUI model picker entry the demo user selects.
 
     2. Benign orchestration call (no digit 9 in the middle of text) → 200, CLEAN.
-       Uses ana's API key (owui-users member, ceiling CONFIDENTIAL).
+       Uses ana's API key (owui-users member, ceiling RESTRICTED — G6: this
+       comment previously said CONFIDENTIAL, a stale mismatch against the
+       authoritative USERS[0]["ceiling"] = "RESTRICTED" / STEP7d's actual
+       write; RESTRICTED is what makes the benign echo pass egress here).
 
     3. Cloud-9 injection call (digit 9 in middle of text arg) → 200, BLOCKED.
        The demo-mcp returns INJECTION_PAYLOAD for this input; the gateway
@@ -1379,7 +1642,8 @@ def step13b_cloud9_demo_wire() -> None:
     """
     print("\n=== STEP 13b: cloud-9 MCP-injection demo wiring verification ===")
 
-    # Use ana's API key for the wiring check (user-tier, ceiling CONFIDENTIAL).
+    # Use ana's API key for the wiring check (user-tier, ceiling RESTRICTED — G6 fix,
+    # was stale "CONFIDENTIAL"; see USERS[0] and STEP7d).
     # ana key is stored in the user-api-keys file written by step7c.
     api_key_file = DEMO_DIR / "user-api-keys-clean.txt"
     ana_key = ""
@@ -2162,6 +2426,9 @@ def main() -> None:
 
     # Step 11: allow/deny probe
     step11_allow_deny_probe()
+
+    # Step 11b: G2 — service-scope differential probe (POL-008)
+    step11b_service_identity_probe()
 
     # Step 12: verify user accounts exist
     step12_verify_user_logins(user_creds)
