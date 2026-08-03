@@ -8511,15 +8511,19 @@ YSG_COMPOSE_FILE_ARGS=()
 # closes that gap by giving all call sites one shared, always-current list.
 #
 # Covers: wazuh overlay, per-agent egress-forwarder overlays, the Docker
-# native NVIDIA GPU overlay, and the Podman rootless override + macOS
-# virtiofs override. Deliberately EXCLUDES the Podman-CDI-GPU-probe /
-# mac-metal / AMD-ROCm / Vulkan branches still inline in compose_up() below —
-# those run live provisioning/probing side effects (_setup_podman_cdi_gpu, a
-# throwaway `podman run` CDI probe, host-ollama-port resolution) that belong
-# only in the initial convergence, not in every later idempotent
-# re-converge. KNOWN GAP: those GPU types are not yet protected by this
-# shared list outside compose_up() itself. Docker Engine + NVIDIA (this box,
-# and the common case) is fully covered by every call site.
+# native NVIDIA GPU overlay, the Podman rootless override + macOS virtiofs
+# override, and (as of FIND-OLLAMA-MAC-2, 2026-08-03) the Mac/Metal overlay
+# (file-existence check only — see the dedicated block at the end of this
+# function for why the live host-ollama-port resolution stays compose_up()-
+# only while the overlay FILE itself is now reconverge-safe). Deliberately
+# STILL EXCLUDES the Podman-CDI-GPU-probe / AMD-ROCm / Vulkan branches still
+# inline in compose_up() below — those run live provisioning/probing side
+# effects (_setup_podman_cdi_gpu, a throwaway `podman run` CDI probe) that
+# belong only in the initial convergence, not in every later idempotent
+# re-converge. KNOWN GAP: those GPU types (Podman+NVIDIA-CDI, AMD-ROCm,
+# Vulkan) are not yet protected by this shared list outside compose_up()
+# itself. Docker Engine + NVIDIA, and Mac/Metal (Docker and Podman), are now
+# fully covered by every call site.
 _ysg_assemble_compose_files() {
   YSG_COMPOSE_FILE_ARGS=("-f" "${WORK_DIR}/docker/docker-compose.yml")
 
@@ -8578,6 +8582,42 @@ _ysg_assemble_compose_files() {
         log_info "Applying Podman virtiofs :U override (macOS only)"
       else
         log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
+      fi
+    fi
+  fi
+
+  # FIND-OLLAMA-MAC-2 (2026-08-03, Iris integration-audit): Mac/Metal overlay
+  # file-existence check ONLY — no live provisioning side effect — so every
+  # reconverge path through this shared function (register_agent_bundles(),
+  # the --onboard gateway recreate, the macOS-Podman LaunchAgent, the Linux
+  # systemd auto-start units) keeps ollama/ollama-init EXCLUDED
+  # (profiles: [mac-metal-host-ollama-only], see FIND-OLLAMA-MAC) instead of
+  # resurrecting them on any recreate that doesn't go through compose_up()'s
+  # own inline mac-metal block. This function deliberately does NOT call
+  # _resolve_host_ollama_port() (that stays compose_up()-only — it is a live
+  # probe/prompt/abort chain, not safe to re-run on every idempotent
+  # reconverge). The overlay's ${YASHIGANI_HOST_OLLAMA_PORT:-11434}
+  # interpolation is satisfied from ${WORK_DIR}/docker/.env instead, which
+  # compose_up() persists on first run (both Docker Compose v2 and the
+  # vendored podman-compose-ysg fork derive project-dir / .env location from
+  # the directory of the FIRST -f file — always ${WORK_DIR}/docker — so this
+  # resolves correctly regardless of the caller's cwd; confirmed by reading
+  # podman_compose.py:_parse_compose_file, `dirname = dirname(files[0])`).
+  # Static validation only, on this integration head — live re-verify on the
+  # macOS-Metal leg of the 3-runtime office retest (this is the exact path
+  # FIND-PODMAN-MAC-1's LaunchAgent race was found on).
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && [[ "$(uname -s)" == "Darwin" ]] && [[ "${MODE:-}" != "k8s" ]]; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
+      if [[ -f "$_gpu_overlay_mac_metal" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal")
+        log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
+      fi
+    else
+      local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
+      if [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal_podman")
+        log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
       fi
     fi
   fi
