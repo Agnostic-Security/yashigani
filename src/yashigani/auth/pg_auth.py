@@ -134,6 +134,22 @@ class PostgresLocalAuthService:
         if plaintext is None:
             raise ValueError("Must provide password or set auto_generate=True")
 
+        # FIND-P-EMAIL (2026-08-04): install.sh generates random-word bootstrap
+        # admin usernames (e.g. "wolf" — see install.sh:_gen_admin_usernames),
+        # which are NOT email-shaped. Defaulting email=username verbatim seeded
+        # the admin_accounts.email column (documented as "used as the Grafana
+        # alert contact") with a bare word, AND made it impossible to later
+        # revert the email column back to that seed value once edited — the
+        # admin-email-shape validator (accounts.py UpdateAdminRequest) rejects
+        # anything without an "@"+TLD, including the account's own original
+        # value. Fall back to the same synthetic "<username>@yashigani.local"
+        # convention already used by auth.py:_register_human_identity_on_login
+        # for accounts with no real email, but ONLY when username itself isn't
+        # already email-shaped — admin accounts created via POST /admin/accounts
+        # (CreateAdminRequest.username, which itself requires an email pattern)
+        # keep email=username unchanged, exactly as before.
+        email = username if "@" in username else f"{username}@yashigani.local"
+
         record = AccountRecord(
             account_id=str(uuid.uuid4()),
             username=username,
@@ -143,7 +159,7 @@ class PostgresLocalAuthService:
             totp_secret="",
             recovery_codes=None,
             account_tier="admin",
-            email=username,
+            email=email,
             force_password_change=force_password_change,
             force_totp_provision=force_totp_provision,
         )

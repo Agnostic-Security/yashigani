@@ -261,13 +261,24 @@ function capPolAddOrigin(cap) {
 
     if (errEl) errEl.textContent = '';
 
-    var raw    = (inputEl.value || '').trim();
-    var origin = _capNormalizeOrigin(raw);
+    var raw = (inputEl.value || '').trim();
 
-    if (!_capValidateOrigin(origin)) {
+    // FIND-B-F (2026-08-04): validate the RAW input first, THEN normalise.
+    // The previous order (normalise, then validate the normalised value)
+    // let _capNormalizeOrigin() silently reconstruct a bare "scheme://host"
+    // from ANY successfully-parsed URL before _capValidateOrigin() ever saw
+    // the original string — so "https://example.com/some/path" parsed fine,
+    // _capNormalizeOrigin() rebuilt it as "https://example.com" (path
+    // silently dropped), and THAT clean value passed validation with no
+    // error shown: a path-bearing (or query/hash/credentials-bearing)
+    // origin was silently accepted-with-correction instead of rejected.
+    // Mirrors the same fix in the ui4 module (static/ui4/admin/modules/
+    // capability-policy.js _addOrigin()).
+    if (!_capValidateOrigin(raw)) {
         if (errEl) errEl.textContent = 'Must be https://hostname[:port] — no path, no wildcard.';
         return;
     }
+    var origin = _capNormalizeOrigin(raw);
 
     var existing = _capGetOrigins(cap);
     if (existing.indexOf(origin) !== -1) {
