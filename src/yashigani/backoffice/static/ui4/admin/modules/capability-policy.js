@@ -37,7 +37,11 @@ const CAP_LABELS = {
 };
 const CAP_MAX_ORIGINS = 10;
 
-function isValidOrigin(s) {
+// Exported (in addition to being used internally below) so a standalone
+// Node test can import and exercise the real validation logic directly —
+// see src/tests/regression/v4.1.2/test_find_b_f_capability_policy_origin_validation.py
+// (FIND-B-F, 2026-08-04).
+export function isValidOrigin(s) {
   s = (s || '').trim();
   if (!s || s.indexOf('*') !== -1 || s.indexOf('https://') !== 0) return false;
   try {
@@ -51,7 +55,7 @@ function isValidOrigin(s) {
   }
 }
 
-function normaliseOrigin(s) {
+export function normaliseOrigin(s) {
   s = (s || '').trim();
   try {
     const url = new URL(s);
@@ -173,11 +177,25 @@ export class YsAdminCapabilityPolicy extends LitElement {
 
   _addOrigin(cap) {
     const row = this._rows[cap];
-    const origin = normaliseOrigin(row.input);
-    if (!isValidOrigin(origin)) {
+    // FIND-B-F (2026-08-04): validate the RAW input first, THEN normalise.
+    // The previous order (normalise, then validate the normalised value)
+    // let normaliseOrigin() silently reconstruct a bare "scheme://host"
+    // from ANY successfully-parsed URL before isValidOrigin() ever saw the
+    // original string — so "https://example.com/some/path" parsed fine,
+    // normaliseOrigin() rebuilt it as "https://example.com" (path silently
+    // dropped), and THAT clean value passed isValidOrigin() with no error
+    // shown at all: a path-bearing (or query/hash/credentials-bearing)
+    // origin was silently accepted-with-correction instead of rejected,
+    // even though isValidOrigin() itself correctly rejects a path when given
+    // the raw string. Validating raw-then-normalising closes this without
+    // weakening isValidOrigin() itself (wildcard rejection was already
+    // correct either way — '*' survives URL parsing into the host and is
+    // explicitly checked for).
+    if (!isValidOrigin(row.input)) {
       this._rows = { ...this._rows, [cap]: { ...row, error: 'Must be https://hostname[:port] — no path, no wildcard.' } };
       return;
     }
+    const origin = normaliseOrigin(row.input);
     if (row.origins.includes(origin)) {
       this._rows = { ...this._rows, [cap]: { ...row, error: 'Origin already in the list.' } };
       return;
