@@ -100,6 +100,15 @@ ORCHID_USER = _PU
 ORCHID_INITIAL_PW = _PP
 ORCHID_TOTP_SECRET = _PT
 ORCHID_NEW_PW = "Yg8#" + _PT + "!Kv9$mNpXqR7wLsZtYa1B"  # >=36 chars
+# FIND-SEED-BOOTSTRAP-COLLISION: the password this script ACTUALLY ends up
+# authenticated with, once step1_login_initial() has run — normally equal to
+# ORCHID_NEW_PW (this script's own derived value), but overwritten with
+# whatever's on disk if step1 discovers the Playwright harness already
+# rotated the account to a DIFFERENT password before this script ran. Every
+# downstream step that needs "orchid's current password" (creds-file save,
+# shared-secret persist, final summary) reads THIS, not ORCHID_NEW_PW
+# directly, so those steps record the truth even on that collision path.
+_CURRENT_ORCHID_PW = ORCHID_NEW_PW
 ASPEN_USER = _BU
 ASPEN_TOTP_SECRET = _BT
 PRISM_PW = _BP
@@ -110,6 +119,91 @@ print(f"  [creds] primary={ORCHID_USER} backup={ASPEN_USER} (parsed from install
 # ---------------------------------------------------------------------------
 S = requests.Session()
 S.verify = False
+
+
+# ---------------------------------------------------------------------------
+# FIND-SEED-BOOTSTRAP-COLLISION (4.1.2 3-runtime retest, 2026-08-04)
+#
+# This script and the Playwright harness (src/tests/playwright/conftest.py)
+# each independently derive/rotate admin1 ("orchid")'s password with no
+# shared source of truth — whichever tool bootstraps the admin FIRST on a
+# given stack silently locks the other out (confirmed both orderings
+# collide). conftest.py's own _persist_rotated_password() already documents
+# and implements the fix on ITS side: best-effort write the rotated password
+# to docker/secrets/admin1_password (falling back to no-op on a read-only/
+# permission-denied mount) so a LATER, independent process can read the
+# CURRENT password from disk instead of assuming the stale on-disk secret.
+# This script now does the SAME on both ends:
+#   (a) WRITE side (_persist_admin1_password_to_shared_secret, called from
+#       step4_save_creds below): after
+#       ORCHID_NEW_PW is proven live (step3's round-trip re-login), best-
+#       effort write it to docker/secrets/admin1_password (+ the
+#       YTF_SECRETS_DIR readable-copy location, if set) — so the Playwright
+#       harness, running AFTER this script, picks it up for free via its
+#       existing _current_admin_password() on-disk fallback (zero conftest
+#       changes needed there — it already reads that exact file).
+#   (b) READ side (_read_disk_admin_password, used inside
+#       step1_login_initial): if BOTH the derived ORCHID_NEW_PW and
+#       ORCHID_INITIAL_PW logins 401, try whatever password is CURRENTLY on
+#       disk — covering the case where the Playwright harness bootstrapped
+#       (and rotated to its own random password) BEFORE this script ran.
+# Together, docker/secrets/admin1_password becomes the single, bidirectional
+# source of truth for "what is orchid's password right now", regardless of
+# which tool rotated it last or which tool runs first.
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    # scripts/populate-demo.py -> repo root is parent.parent, independent of
+    # DEMO_DIR (which is a separate, script-configurable OUTPUT dir and may
+    # not be the repo at all).
+    return Path(__file__).resolve().parent.parent
+
+
+def _admin1_secret_paths() -> list[Path]:
+    """Every location that might hold the CURRENT on-disk admin1 password,
+    in read-preference order: an explicit YTF_SECRETS_DIR override first
+    (matches conftest._read_secret's own override precedence — a readable
+    COPY of docker/secrets/ on runtimes where the live mount is root/subuid-
+    owned and unreadable by the user running this script), then the repo's
+    own docker/secrets/."""
+    paths = []
+    override = os.environ.get("YTF_SECRETS_DIR", "").strip()
+    if override:
+        paths.append(Path(override) / "admin1_password")
+    paths.append(_repo_root() / "docker" / "secrets" / "admin1_password")
+    return paths
+
+
+def _read_disk_admin_password() -> str | None:
+    """Best-effort read of the CURRENT on-disk admin1 password. Returns None
+    if no readable copy exists anywhere (never fails the run)."""
+    for p in _admin1_secret_paths():
+        try:
+            val = p.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except OSError:
+            continue
+    return None
+
+
+def _persist_admin1_password_to_shared_secret(password: str) -> None:
+    """Best-effort write `password` to every location _admin1_secret_paths()
+    names, so an independent process (the Playwright harness, a diagnostic
+    script, a human operator) reads the SAME current password this script
+    just proved live. Mirrors conftest._persist_rotated_password()'s own
+    best-effort/never-fail-the-run contract exactly."""
+    for p in _admin1_secret_paths():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(password, encoding="utf-8")
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
+            print(f"  [seed-single-source] wrote current orchid password to {p}")
+        except OSError as exc:
+            print(f"  [seed-single-source] could not persist orchid password to {p}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +363,35 @@ def step1_login_initial() -> bool:
             "totp_code": code3,
         })
 
+    if r2.status_code == 401:
+        # FIND-SEED-BOOTSTRAP-COLLISION: both this script's derived
+        # ORCHID_NEW_PW AND the pristine ORCHID_INITIAL_PW were rejected —
+        # the account has already been rotated to a THIRD value by some
+        # OTHER tool this run (the Playwright harness's
+        # _api_get_session_cookies(), which rotates to its own random
+        # password on a fresh stack and best-effort persists it to
+        # docker/secrets/admin1_password via _persist_rotated_password()).
+        # Try that on-disk value as a last resort before giving up.
+        disk_pw = _read_disk_admin_password()
+        if disk_pw and disk_pw not in (ORCHID_NEW_PW, ORCHID_INITIAL_PW):
+            print("  401 on both derived + initial pw — trying the current on-disk "
+                  "docker/secrets/admin1_password (may have been rotated by the "
+                  "Playwright harness this run)...")
+            _wait_next_totp_window("orchid-disk-pw-retry")
+            code4 = _totp(ORCHID_TOTP_SECRET)
+            r3 = S.post(f"{BASE_URL}/auth/login", json={
+                "username": ORCHID_USER,
+                "password": disk_pw,
+                "totp_code": code4,
+            })
+            if r3.status_code == 200 and r3.json().get("status") == "ok":
+                global _CURRENT_ORCHID_PW
+                _CURRENT_ORCHID_PW = disk_pw
+                body = r3.json()
+                print(f"  Login OK with on-disk (harness-rotated) password: "
+                      f"force_password_change={body.get('force_password_change')}")
+                return True  # already rotated (by the OTHER tool) — skip step 2/3
+
     body = _ok(r2, "orchid-initial-login")
     print(f"  Login OK with INITIAL password: status={body.get('status')}, "
           f"force_password_change={body.get('force_password_change')}")
@@ -324,17 +447,29 @@ def step4_save_creds() -> None:
     print("\n=== STEP 4: Save updated credentials to creds file ===")
     # Read existing creds file, update orchid line
     existing = CREDS_FILE.read_text() if CREDS_FILE.exists() else ""
-    # Append/replace the orchid new-password record
+    # Append/replace the orchid new-password record. Uses _CURRENT_ORCHID_PW
+    # (not ORCHID_NEW_PW directly) so this is correct even on the
+    # FIND-SEED-BOOTSTRAP-COLLISION disk-fallback path in step1, where the
+    # account was actually rotated by the OTHER tool (Playwright harness) to
+    # a value this script never derived itself.
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     new_entry = (
         f"\n# orchid NEW password (set {timestamp}, round-trip-verified)\n"
-        f"orchid  {ORCHID_NEW_PW}  {ORCHID_TOTP_SECRET}  (pw-changed; TOTP unchanged)\n"
+        f"orchid  {_CURRENT_ORCHID_PW}  {ORCHID_TOTP_SECRET}  (pw-changed; TOTP unchanged)\n"
     )
     updated = existing.rstrip() + "\n" + new_entry
     CREDS_FILE.write_text(updated)
     CREDS_FILE.chmod(0o600)
     print(f"  Saved to {CREDS_FILE}")
-    print(f"  orchid new pw (full, {len(ORCHID_NEW_PW)} chars): {ORCHID_NEW_PW}")
+    print(f"  orchid new pw (full, {len(_CURRENT_ORCHID_PW)} chars): {_CURRENT_ORCHID_PW}")
+
+    # FIND-SEED-BOOTSTRAP-COLLISION: also write-through to the shared
+    # single-source-of-truth location(s) so the Playwright harness (running
+    # BEFORE or AFTER this script on the same stack) reads the SAME current
+    # password via its existing _current_admin_password() on-disk fallback —
+    # no conftest.py changes needed, it already reads docker/secrets/
+    # admin1_password. Best-effort; never fails this script's run.
+    _persist_admin1_password_to_shared_secret(_CURRENT_ORCHID_PW)
 
 
 # ---------------------------------------------------------------------------
@@ -2083,8 +2218,8 @@ def step15_summary(
     print("POPULATE-DEMO (4.1.2) — COMPLETE")
     print("=" * 70)
 
-    print(f"\nOrchid new password ({len(ORCHID_NEW_PW)} chars, round-trip verified):")
-    print(f"  {ORCHID_NEW_PW}")
+    print(f"\nOrchid current password ({len(_CURRENT_ORCHID_PW)} chars, round-trip verified):")
+    print(f"  {_CURRENT_ORCHID_PW}")
     print(f"  Saved to: {CREDS_FILE}")
 
     print("\nGroups created/verified:")

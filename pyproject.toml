@@ -105,6 +105,12 @@ dev     = [
     "ruff>=0.4",
     "mypy>=1.10",
     "pytest-mock>=3.14",
+    # 4.1.2 3-runtime retest (item 8, 2026-08-04): a hung Playwright test
+    # (FIND-B-USERAGENTBOLA-HANG) previously had nothing to kill it and
+    # orphaned a pytest process for 45 minutes. Pinned so `pip install
+    # -e ".[dev]"` always brings this in; src/tests/playwright/conftest.py's
+    # pytest_collection_modifyitems() wires a default 300s per-test ceiling.
+    "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools.packages.find]

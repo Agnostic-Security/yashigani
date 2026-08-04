@@ -19,18 +19,38 @@
 # Usage:
 #   scripts/run-test-framework.sh --tier a
 #   scripts/run-test-framework.sh --tier b --target https://localhost:8443 \
-#       --runtime docker --version 4.1.2 --platform macos \
+#       --runtime podman --version 4.1.2 --platform macos \
 #       [--browser-mode both|headed|headless]
+#   scripts/run-test-framework.sh --tier b --target https://localhost \
+#       --runtime docker --version 4.1.2 --platform macos
 #   scripts/run-test-framework.sh --tier c --target https://localhost:8443 \
 #       --runtime k8s --version 4.1.2 --platform linux
 #   scripts/run-test-framework.sh --full --target ... --runtime ... \
 #       --version ... --platform ...     # Tier-A + Tier-B + Tier-C
 #
-# Exit codes: 0 = all requested tiers GREEN. 1 = any tier reported a failure.
-# 2 = usage error. Tier-A always runs offline; Tier-B/Tier-C REQUIRE --target
-# (a live, reachable stack) and are skipped (exit 2) without one.
+# FIND-B-TARGET (4.1.2 3-runtime retest, 2026-08-04): --target is a per-leg
+# PORT, not a fixed constant -- podman's rootless compose profile exposes
+# Caddy's HTTPS vhost on :8443, while docker's rootful profile binds :443
+# directly. Pasting the SAME example (":8443") next to both --runtime docker
+# and --runtime podman (as this banner used to) is misleading: a docker leg
+# run with ":8443" hits nothing (connection refused) and a docker leg run
+# with the WRONG vhost port silently 200s against Caddy's empty catch-all
+# instead of the real admin app -- a false-green trap. src/tests/playwright/
+# conftest.py's own _resolve_base_url() already auto-probes
+# https://localhost:8443, https://localhost, then http://localhost:8080 (in
+# that order) and only trusts YASHIGANI_ADMIN_URL as an override when one is
+# actually set -- so --target below is now OPTIONAL for Tier-B/Tier-C: omit
+# it and the harness resolves the correct URL for whichever leg is actually
+# running (confirmed live, 2026-08-04 docker leg: omitting --target/
+# YASHIGANI_ADMIN_URL still auto-resolved to :443 correctly). Pass --target
+# explicitly only to pin a NON-default port/host.
 #
-# Last updated: 2026-07-29 (Iris, YTF build).
+# Exit codes: 0 = all requested tiers GREEN. 1 = any tier reported a failure.
+# 2 = usage error. Tier-A always runs offline; Tier-B/Tier-C REQUIRE
+# --runtime/--version/--platform (evidence-path labelling) but --target is
+# now optional -- see FIND-B-TARGET note above.
+#
+# Last updated: 2026-08-04 (Ava, 4.1.2 3-runtime retest batch-fix: FIND-B-TARGET).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,12 +87,17 @@ Usage: run-test-framework.sh [--tier a|b|c] [--full]
                               [--browser-mode both|headed|headless]
 
   --tier a               Run Tier-A (in-process, no stack, runtime-invariant).
-  --tier b               Run Tier-B (live WebUI Playwright). Requires --target.
+  --tier b               Run Tier-B (live WebUI Playwright). Requires
+                         --runtime/--version/--platform.
   --tier c               Run Tier-C (live integration/lifecycle/chaos/parity).
-                         Requires --target.
-  --full                 Run Tier-A + Tier-B + Tier-C. Requires --target for
-                         B/C legs.
+                         Requires --runtime/--version/--platform.
+  --full                 Run Tier-A + Tier-B + Tier-C. Requires
+                         --runtime/--version/--platform for B/C legs.
   --target URL           Base URL of a running Yashigani stack (Tier-B/C).
+                         OPTIONAL — if omitted, the harness auto-resolves it
+                         (conftest.py probes :8443 then :443 then :8080;
+                         see FIND-B-TARGET note above the usage banner).
+                         Pass explicitly only to pin a non-default port/host.
   --runtime NAME          docker | podman | k8s   (evidence-path labelling)
   --version VER           e.g. 4.1.2                (evidence-path labelling)
   --platform NAME         macos | linux             (evidence-path labelling)
@@ -165,9 +190,16 @@ run_tier_a() {
 # ---------------------------------------------------------------------------
 run_tier_b() {
   printf "\n%b=== Tier-B: live WebUI Playwright (conformance + adversarial) ===%b\n\n" "$BOLD" "$RESET"
-  if [ -z "$TARGET" ] || [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
-    _fail "Tier-B requires --target, --runtime, --version, --platform"
+  # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
+  # --version/--platform are still mandatory (evidence-path labelling).
+  if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
+    _fail "Tier-B requires --runtime, --version, --platform (--target is optional — auto-resolved if omitted)"
     return 2
+  fi
+  if [ -n "$TARGET" ]; then
+    _info "--target explicitly set: ${TARGET}"
+  else
+    _info "--target not set — conftest.py will auto-resolve (probes :8443, :443, :8080 in order)"
   fi
   local leg="${RUNTIME}-${PLATFORM}"
   local evidence_dir="${EVIDENCE_ROOT}/${leg}/tier-b"
@@ -193,6 +225,15 @@ run_tier_b() {
     local headed_env="0"
     [ "$mode" = "headed" ] && headed_env="1"
     local mode_rc=0
+    # FIND-B-TARGET: TARGET may be empty (--target now optional). Exporting
+    # YASHIGANI_ADMIN_URL="" is safe here (NOT an array, so no bash-3.2
+    # "unbound variable" pitfall under set -u): conftest.py's
+    # _resolve_base_url() does `override = os.getenv("YASHIGANI_ADMIN_URL")`
+    # then `if override: return ...` -- an empty string is falsy in Python,
+    # so it falls straight through to the auto-probe (:8443/:443/:8080)
+    # exactly as if the var were unset. Verified: macOS ships bash 3.2
+    # (/usr/bin/env bash), which mishandles `"${empty_array[@]}"` under
+    # `set -u` -- a plain empty-string scalar has no such issue.
     YASHIGANI_ADMIN_URL="$TARGET" \
     YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
     YTF_LEG="$leg" \
@@ -225,9 +266,16 @@ run_tier_b() {
 # ---------------------------------------------------------------------------
 run_tier_c() {
   printf "\n%b=== Tier-C: live integration / lifecycle / chaos / parity ===%b\n\n" "$BOLD" "$RESET"
-  if [ -z "$TARGET" ] || [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
-    _fail "Tier-C requires --target, --runtime, --version, --platform"
+  # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
+  # --version/--platform are still mandatory (evidence-path labelling).
+  if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
+    _fail "Tier-C requires --runtime, --version, --platform (--target is optional — auto-resolved if omitted)"
     return 2
+  fi
+  if [ -n "$TARGET" ]; then
+    _info "--target explicitly set: ${TARGET}"
+  else
+    _info "--target not set — conftest.py will auto-resolve (probes :8443, :443, :8080 in order)"
   fi
   local leg="${RUNTIME}-${PLATFORM}"
   local evidence_dir="${EVIDENCE_ROOT}/${leg}/tier-c"
@@ -235,6 +283,9 @@ run_tier_c() {
   local rc=0
 
   _info "pytest: src/tests/e2e/ (lifecycle + failure_injection_chaos + data_flow_seam — pre-existing, absorbed not duplicated) + tests/integration_live/ (the other 6 categories — see docs/testing/YTF.md Tier-C)"
+  # FIND-B-TARGET: see the matching comment in run_tier_b() — empty-string
+  # YASHIGANI_ADMIN_URL is safe (falsy in conftest.py's override check) and
+  # avoids the bash-3.2 empty-array/set-u pitfall on macOS's default bash.
   YASHIGANI_ADMIN_URL="$TARGET" \
   YTF_RUNTIME="$RUNTIME" YTF_VERSION="$VERSION" YTF_PLATFORM="$PLATFORM" \
   PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
