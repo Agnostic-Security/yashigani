@@ -89,6 +89,12 @@ cloud-inspection = [
     "google-generativeai>=0.7",
 ]
 sbom    = ["cyclonedx-bom>=4.0"]
+# QA-SOP §4.17 authonce pentest harness (tests/security/pentest_harness/):
+# ZAP python API client. PyPI package name is `zaproxy`; the importable
+# module is `zapv2` (verified this session: `from zapv2 import ZAPv2`).
+# Pinned to the version verified against in this session's self-check
+# suite (tests/security/test_authonce_harness_selfcheck.py).
+pentest = ["zaproxy==0.6.0"]
 dev     = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
