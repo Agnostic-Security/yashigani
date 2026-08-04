@@ -1134,6 +1134,101 @@ def create_backoffice_app() -> FastAPI:
                 )
         return response
 
+    # FIND-P-CSRF (MED, 2026-08-04, defense-in-depth): server-side Origin/
+    # Referer validation on state-changing admin/auth routes.
+    #
+    # Laura's admin-surface pentest proved POST /admin/rbac/groups succeeded
+    # with a foreign Origin header and no CSRF token — the server performed
+    # ZERO Origin/Referer validation, relying solely on the admin session
+    # cookie's SameSite=strict attribute to prevent cross-site request
+    # forgery. SameSite=strict IS a real, browser-enforced mitigation, but a
+    # single client-side-honoured cookie attribute should not be the only
+    # control for a state-changing admin action — this adds an independent
+    # server-side check (the same technique Django's CsrfViewMiddleware and
+    # the OWASP CSRF cheatsheet's "Verifying Origin" pattern use): reject a
+    # state-changing, cookie-authenticated request whose declared Origin (or
+    # Referer, if Origin is absent) does not reflect this server's own
+    # host/scheme.
+    #
+    # Scope decisions:
+    #   - Only cookie-authenticated requests are checked (has an admin/user
+    #     session cookie present) — Bearer/API-key auth is not
+    #     CSRF-exploitable (a cross-site <form> POST cannot forge an
+    #     Authorization header), so those requests are left untouched.
+    #   - Only checked when Origin or Referer IS PRESENT. Per OWASP CSRF
+    #     cheatsheet guidance, a request with NEITHER header is not treated
+    #     as an automatic reject here (some legitimate proxies/older clients
+    #     omit both) — SameSite=strict remains the primary control for that
+    #     case. This also avoids breaking non-browser, cookie-based internal
+    #     tooling/test harnesses that never set Origin/Referer at all. What
+    #     this closes is exactly what Laura proved: an ATTACKER-CONTROLLED,
+    #     PRESENT, foreign Origin sailing through unchecked.
+    #   - The expected origin is derived by REFLECTION from the request's
+    #     own Host/X-Forwarded-Host + scheme/X-Forwarded-Proto (mirroring
+    #     Django's request.get_host() comparison) — not the WebAuthn
+    #     TLS-domain allowlist (webauthn_v1._expected_origin), which is a
+    #     different, stricter invariant (WebAuthn relying-party origin) that
+    #     would 403 legitimate requests in test/TestClient contexts whose
+    #     Host header ("testserver") is never in that allowlist.
+    _CSRF_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+    _CSRF_CHECKED_PREFIXES = ("/admin/", "/auth/")
+    _CSRF_SESSION_COOKIES = (
+        "__Host-yashigani_admin_session",
+        "__Host-yashigani_session",
+    )
+
+    def _csrf_normalize_origin(proto: str, host: str) -> str:
+        hostname, _, port = host.partition(":")
+        hostname = hostname.lower()
+        default_port = "443" if proto == "https" else "80"
+        if port and port != default_port:
+            return f"{proto}://{hostname}:{port}"
+        return f"{proto}://{hostname}"
+
+    def _csrf_expected_origin(request: Request) -> str:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host") or request.headers.get(
+            "host", request.url.netloc
+        )
+        return _csrf_normalize_origin(proto, host)
+
+    def _csrf_origin_from_header_value(value: str) -> str:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(value)
+        if parts.scheme and parts.netloc:
+            return _csrf_normalize_origin(parts.scheme, parts.netloc)
+        # Malformed/opaque value (e.g. "null", a bare string) — never equals
+        # a well-formed expected origin, so this safely falls through to reject.
+        return value.strip().rstrip("/").lower()
+
+    @app.middleware("http")
+    async def csrf_origin_referer_check(request: Request, call_next):
+        if (
+            request.method in _CSRF_STATE_CHANGING_METHODS
+            and request.url.path.startswith(_CSRF_CHECKED_PREFIXES)
+        ):
+            has_session_cookie = any(
+                request.cookies.get(k) for k in _CSRF_SESSION_COOKIES
+            )
+            if has_session_cookie:
+                candidate_raw = request.headers.get("origin") or request.headers.get("referer")
+                if candidate_raw:
+                    expected = _csrf_expected_origin(request)
+                    candidate = _csrf_origin_from_header_value(candidate_raw)
+                    if candidate != expected:
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "csrf_origin_mismatch",
+                                "message": (
+                                    "Request Origin/Referer does not match this server "
+                                    "— request rejected (CSRF protection)."
+                                ),
+                            },
+                        )
+        return await call_next(request)
+
     # Per-endpoint body-size limits (ASVS 4.3.1).
     #
     # The global 4 MB app limit + 10 MB Caddy limit covers everything, but
