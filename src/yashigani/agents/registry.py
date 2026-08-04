@@ -678,10 +678,36 @@ return 1
 
     @staticmethod
     def _decode_agent(agent_id: str, raw: dict) -> dict:
-        """Decode Redis hash (bytes keys/values) into a Python dict."""
+        """Decode a Redis HGETALL hash into a Python dict.
+
+        FIND-IRIS-DUP-AGENT (2026-08-04): this used to look up ``raw`` with
+        bytes-literal keys only (``raw.get(b"name", b"")``), which silently
+        returned the empty-string default for EVERY field whenever the
+        redis-py client was constructed with ``decode_responses=True`` (that
+        client returns str keys/values from HGETALL, so a bytes-key lookup
+        never matches). install.sh's inline agent-bootstrap script used
+        exactly such a client to call ``AgentRegistry(...).list_all()`` for
+        its "already registered by name?" idempotency check — every existing
+        agent decoded with ``name=""``, so the name-membership check always
+        missed and ``--upgrade`` re-registered langflow/letta with a brand
+        new agent_id + fresh token on every run (2 -> 4 -> 6 ... active rows,
+        old tokens never revoked). Root-caused live via
+        ``docker/secrets/{langflow,letta}_token`` sha256 diffs across an
+        upgrade. Fixed here (not in the decode_responses=True call site)
+        so every caller of this registry is correct regardless of which
+        redis-py decode_responses setting it happens to use — normalise
+        ``raw``'s keys to str up front, tolerating both bytes-keyed
+        (decode_responses=False, the historical/majority convention) and
+        str-keyed (decode_responses=True) hashes transparently.
+        """
+        _norm: dict = {
+            (k.decode("utf-8") if isinstance(k, bytes) else k): v
+            for k, v in raw.items()
+        }
 
         def _b(key: bytes) -> str:
-            val = raw.get(key, b"")
+            name = key.decode("utf-8") if isinstance(key, bytes) else key
+            val = _norm.get(name, "")
             return val.decode("utf-8") if isinstance(val, bytes) else val
 
         def _j(key: bytes) -> list:
