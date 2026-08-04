@@ -1338,18 +1338,48 @@ echo ""
 #   * interactive TTY without --yes                    → prompt for the ack inline,
 #   * unattended (--yes) with neither token nor ack    → REFUSE (fail-closed).
 #
-# DEPENDENCY FLAG: Tom's shared gate is to expose a named `privileged_mutation`
-# entry point + a token-mint/verify contract. Until that lands, this validates
-# *presence* of a step-up proof (not its cryptographic freshness). When the gate
-# lands, wire token verification here (verify the token against the running
-# instance's step-up secret) — do NOT duplicate the gate logic.
+# YSG-RISK-195 (2026-08-04): this used to validate *presence* only
+# (`--stepup-token=anything` passed), diverging from install.sh's
+# `_verify_stepup_proof_token` which CRYPTOGRAPHICALLY verifies the same
+# proof (signature + freshness + purpose + op-binding) against the shared
+# gate (src/yashigani/auth/stepup.py, Tom's surface — the single source of
+# truth; NOT duplicated here). Fixed: uninstall.sh now execs the identical
+# `python3 -m yashigani.auth.stepup --verify-proof --op uninstall` shim
+# inside the backoffice container that install.sh's verifier calls — same
+# gate, same op-binding semantics, just invoked from this script's own
+# already-resolved $COMPOSE/$COMPOSE_FILE instead of install.sh's
+# $COMPOSE_CMD array (uninstall.sh has no install.sh-style array/WORK_DIR;
+# COMPOSE/COMPOSE_FILE are this script's equivalents, already resolved by
+# the time this function is called — see COMPOSE="$RUNTIME compose" above).
+# A forged/stale/wrong-op token, or a token when backoffice isn't reachable
+# (e.g. teardown-of-a-dead-stack), is REJECTED fail-closed — same as install.
 # ===========================================================================
-_require_stepup_mi4() {
-    # Token supplied (API-minted or operator-provided) → accept. Cryptographic
-    # verification is deferred to Tom's gate (flagged above); presence is enforced.
-    if [ -n "${STEPUP_TOKEN:-}" ]; then
-        log_info "MI-4: step-up token supplied — privileged mutation authorised."
+_verify_stepup_proof_token() {
+    _tok="$1"; _op_label="$2"
+    if [ -z "${COMPOSE:-}" ] || [ -z "${COMPOSE_FILE:-}" ] || [ ! -f "$COMPOSE_FILE" ]; then
+        log_error "YSG-RISK-195: cannot verify step-up proof — no compose runtime / compose file."
+        return 1
+    fi
+    # Pass the token via env, never argv (never lands in `ps`/container argv).
+    # -T disables TTY alloc (non-interactive exec), matching install.sh's verifier.
+    if $COMPOSE -f "$COMPOSE_FILE" exec -T \
+        -e "YASHIGANI_STEPUP_TOKEN=${_tok}" \
+        backoffice \
+        python3 -m yashigani.auth.stepup --verify-proof --op "${_op_label}" 2>/dev/null; then
         return 0
+    fi
+    return 1
+}
+_require_stepup_mi4() {
+    # Token supplied (API-minted or operator-provided) → cryptographically
+    # verify against the shared gate (YSG-RISK-195 fix — was presence-only).
+    if [ -n "${STEPUP_TOKEN:-}" ]; then
+        if _verify_stepup_proof_token "${STEPUP_TOKEN}" "uninstall"; then
+            log_info "MI-4: step-up proof VERIFIED (op=uninstall) — privileged mutation authorised."
+            return 0
+        fi
+        log_error "MI-4: step-up proof FAILED verification (op=uninstall) — refusing destructive lifecycle op."
+        exit 1
     fi
     # Interactive operator acknowledgement (only on a real TTY — never honoured in
     # an unattended pipeline where stdin is not a terminal).
