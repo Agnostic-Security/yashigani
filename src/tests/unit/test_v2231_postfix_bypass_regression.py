@@ -471,16 +471,126 @@ class TestDisableUserSuspendsIdentityRegistry:
                 f"LF-DISABLE-PARTIAL: _suspend_identity_registry_for_account not found in {filename}"
             )
 
-    def test_suspend_helper_uses_org_id_for_account_matching(self):
-        """The suspend helper must check org_id == account_id for identity matching."""
+    def test_suspend_helper_uses_account_id_link_for_matching(self):
+        """FIND-IRIS-SUSPEND-ORGID (2026-08-04): the suspend helper must resolve
+        the target identity via the account_id link (get_by_account_id), not
+        via org_id (suspend_owned_by) — org_id is always "" for local-auth
+        HUMAN identities (see auth.py:_register_human_identity_on_login),
+        so an org_id-keyed lookup was a silent no-op. Regression for the
+        original (now-fixed) bug this suite previously codified."""
         source = (ROUTES_DIR / "users.py").read_text(encoding="utf-8")
-        # The helper iterates identities and checks org_id == account_id
-        assert "org_id" in source, (
-            "LF-DISABLE-PARTIAL: suspend helper must use org_id to match identities"
+        fn_node = None
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_suspend_identity_registry_for_account":
+                fn_node = node
+                break
+        assert fn_node is not None, "_suspend_identity_registry_for_account not found in users.py"
+        disable_fn = ast.unparse(fn_node)
+
+        # Collect actual Call nodes (excluding the docstring's prose, which may
+        # legitimately name the old broken call for explanatory purposes).
+        called_attrs = {
+            n.func.attr
+            for n in ast.walk(fn_node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+
+        assert "get_by_account_id" in disable_fn, (
+            "FIND-IRIS-SUSPEND-ORGID: suspend helper must resolve the identity via "
+            "the account_id link (get_by_account_id), not the org_id index"
         )
-        assert 'registry.suspend' in source, (
+        assert "suspend_owned_by" not in called_attrs, (
+            "FIND-IRIS-SUSPEND-ORGID: suspend helper must no longer CALL the "
+            "org_id-keyed suspend_owned_by() bulk op for single-account disable "
+            "(mentioning it in the docstring explanation is fine)"
+        )
+        assert "suspend" in called_attrs, (
             "LF-DISABLE-PARTIAL: suspend helper must call registry.suspend()"
         )
+
+
+class TestSuspendIdentityRegistryOrgIdFixBehavioural:
+    """FIND-IRIS-SUSPEND-ORGID (2026-08-04) — behavioural (not just AST) proof.
+
+    disable_user's identity-registry suspend side-effect must actually take
+    effect for local-auth HUMAN identities, which always register with
+    org_id="" (auth.py:_register_human_identity_on_login never sets org_id).
+    Pre-fix, _suspend_identity_registry_for_account() delegated to
+    registry.suspend_owned_by(account_id) — a lookup keyed on
+    identity:index:org:{org_id} — which is unconditionally a no-op for
+    org_id="" (registry.suspend_owned_by() returns 0 immediately; see
+    IdentityRegistry.suspend_owned_by()'s `if not org_id: return 0` guard).
+    This test fails on the pre-fix implementation (identity stays "active")
+    and passes on the fix (identity becomes "suspended" via the account_id
+    link, IdentityRegistry.get_by_account_id()).
+    """
+
+    def test_disable_suspends_local_auth_identity_with_empty_org_id(self):
+        import fakeredis
+        from yashigani.identity.registry import IdentityRegistry, IdentityKind
+        from yashigani.backoffice.routes import users as _users_mod
+
+        redis = fakeredis.FakeRedis()
+        registry = IdentityRegistry(redis)
+
+        # Register exactly as auth.py:_register_human_identity_on_login does
+        # for a local-auth user: org_id is never passed, so it defaults to "".
+        identity_id, _ = registry.register(
+            kind=IdentityKind.HUMAN, name="alice", slug="alice-example-com",
+        )
+        registry.link_account_id("acct-alice-001", identity_id)
+        assert registry.get(identity_id)["org_id"] == ""
+
+        mock_state = MagicMock()
+        mock_state.identity_registry = registry
+
+        with patch.object(_users_mod, "backoffice_state", mock_state):
+            _users_mod._suspend_identity_registry_for_account("acct-alice-001")
+
+        after = registry.get(identity_id)
+        assert after["status"] == "suspended", (
+            "FIND-IRIS-SUSPEND-ORGID: disable must actually suspend the "
+            "identity for local-auth (org_id='') users, not silently no-op"
+        )
+
+    def test_no_linked_identity_is_a_safe_noop(self):
+        """Account that never logged in has no account_id link — fail-soft,
+        no exception, nothing to suspend."""
+        import fakeredis
+        from yashigani.identity.registry import IdentityRegistry
+        from yashigani.backoffice.routes import users as _users_mod
+
+        redis = fakeredis.FakeRedis()
+        registry = IdentityRegistry(redis)
+        mock_state = MagicMock()
+        mock_state.identity_registry = registry
+
+        with patch.object(_users_mod, "backoffice_state", mock_state):
+            _users_mod._suspend_identity_registry_for_account("acct-never-logged-in")
+        # No exception raised — that's the assertion.
+
+    def test_disable_admin_path_mirrors_fix_in_accounts_py(self):
+        """accounts.py's twin helper must use the same account_id-link
+        mechanism (parity with users.py)."""
+        import fakeredis
+        from yashigani.identity.registry import IdentityRegistry, IdentityKind
+        from yashigani.backoffice.routes import accounts as _accounts_mod
+
+        redis = fakeredis.FakeRedis()
+        registry = IdentityRegistry(redis)
+        identity_id, _ = registry.register(
+            kind=IdentityKind.HUMAN, name="carol", slug="carol-example-com",
+        )
+        registry.link_account_id("acct-carol-001", identity_id)
+
+        mock_state = MagicMock()
+        mock_state.identity_registry = registry
+
+        with patch.object(_accounts_mod, "backoffice_state", mock_state):
+            _accounts_mod._suspend_identity_registry_for_account("acct-carol-001")
+
+        assert registry.get(identity_id)["status"] == "suspended"
 
 
 # ---------------------------------------------------------------------------
