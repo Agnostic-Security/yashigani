@@ -907,7 +907,24 @@ def test_wa_login_02_login_finish_issues_session_cookie(
             "ASVS V3.3 requires session establishment on successful auth."
         )
     finally:
-        _delete_credential(client, credential_id, _admin1_totp_secret())
+        # FIND-B-G (4.1.2 3-runtime retest): cleanup previously reused
+        # `client` -- the SAME clean_authed_client fixture object captured
+        # at TEST-SETUP time, whose session cookie is the process-wide
+        # cached admin1 session (conftest._session_cookie_cache /
+        # _api_get_session_cookies). If ANYTHING ELSE in this pytest
+        # process (this file or another, e.g. test_webui_conformance_full.py
+        # TestSessionLifecycle's deliberate logout test — see FIND-B-A) has
+        # since invalidated that shared session, `client`'s cookie is dead
+        # and the step-up call inside _delete_credential() 401s with
+        # session_expired_or_invalid, masking the actual test verdict
+        # (registration/login already asserted above by this point).
+        # _get_authed_client() re-verifies its session against a real
+        # protected endpoint and force-refreshes once on 401 before
+        # returning, so cleanup here is guaranteed to run against a LIVE
+        # admin1 session regardless of what happened to `client` earlier in
+        # this test or in an unrelated one sharing the same process.
+        cleanup_client = _get_authed_client()
+        _delete_credential(cleanup_client, credential_id, _admin1_totp_secret())
 
 
 @skip_no_stack

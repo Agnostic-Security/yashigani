@@ -79,6 +79,7 @@ from tests.playwright.conftest import (
     do_admin_stepup,
     get_admin_credentials,
     get_admin_totp_code,
+    invalidate_cached_session,
     playwright_login_admin,
 )
 
@@ -357,6 +358,24 @@ class TestSessionLifecycle:
             cookies_before = {c["name"]: c["value"] for c in ctx.cookies()}
             page.goto(f"{BASE_URL}/auth/logout-redirect")
             page.wait_for_timeout(1000)
+            # FIND-B-A (4.1.2 3-runtime retest, HIGH-impact cascade): this is
+            # the ONLY test in the suite that deliberately kills admin1's
+            # session server-side. playwright_login_admin() above injected
+            # the SAME cookie value that _session_cookie_cache[1] holds
+            # (cache-hit, since this test doesn't force_fresh) -- the exact
+            # cookie value the session-scoped admin_ctx fixture was ALSO
+            # seeded from. Without invalidating the shared cache here, every
+            # other test/fixture in this process that reuses admin1's cached
+            # session (directly, or via admin_ctx) would silently run
+            # against a server-dead session for up to
+            # _SESSION_REFRESH_THRESHOLD_SECONDS (600s) -- this was the
+            # confirmed root cause of the ~110/~108-error same-process
+            # cascade (podman + docker), and of the "identical root cause"
+            # FIND-B-G cascade in test_v233_webauthn_e2e.py. Must run BEFORE
+            # the replay assertion below is irrelevant to ordering; placed
+            # here so it happens unconditionally regardless of the replay
+            # assertion's outcome.
+            invalidate_cached_session(admin=1)
             # Replay the pre-logout admin session cookie against an admin API.
             with _http_client() as c:
                 r = c.get(f"{BASE_URL}/admin/accounts", headers=_cookie_header(cookies_before))
@@ -799,8 +818,18 @@ class TestUserAgentBOLA:
                 "description": "conformance BOLA probe agent",
             }, headers=_cookie_header(user_a["cookies"]))
         assert create_resp.status_code in (200, 201), f"setup failed: {create_resp.status_code} {create_resp.text[:200]}"
-        agent_id = create_resp.json().get("id") or create_resp.json().get("agent_id")
-        assert agent_id, f"no agent id in response: {create_resp.text[:200]}"
+        # FIND-B-C (4.1.2 3-runtime retest): POST /user/agents serialises the
+        # new agent's identifier as "ua_id" (src/yashigani/backoffice/routes/
+        # user_agents.py create_user_agent() -> _serialise_agent(): {"ua_id":
+        # ua_id, ...}), NEVER "id" or "agent_id" -- those two keys never
+        # existed in this endpoint's response schema (conversation objects
+        # use "id"; this is a DIFFERENT resource). The old
+        # `.get("id") or .get("agent_id")` always evaluated to None here, so
+        # the `assert agent_id` below always failed at setup and the actual
+        # cross-user-delete BOLA probe was never reached -- this test was
+        # unproven, not passing.
+        agent_id = create_resp.json().get("ua_id")
+        assert agent_id, f"no ua_id in response: {create_resp.text[:200]}"
 
         with _http_client() as c:
             r = c.delete(f"{BASE_URL}/user/agents/{agent_id}",
