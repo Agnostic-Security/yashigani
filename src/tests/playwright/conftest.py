@@ -498,17 +498,50 @@ def _persist_rotated_password(admin: int, new_password: str) -> None:
     has no logger of its own, loud enough to show up in pytest -s output
     without needing one.
     """
-    try:
-        repo_root = Path(__file__).parents[3]
-        secret_name = "admin1_password" if admin == 1 else f"admin{admin}_password"
-        p = repo_root / "docker" / "secrets" / secret_name
-        p.write_text(new_password, encoding="utf-8")
+    secret_name = "admin1_password" if admin == 1 else f"admin{admin}_password"
+
+    # FIND-0805-002 (ytf-412-20260805): the original FIND-8 fix wrote ONLY to
+    # Path(__file__).parents[3]/docker/secrets, while _read_secret() above prefers
+    # YTF_SECRETS_DIR whenever it is set. YTF_SECRETS_DIR is set on every correctly
+    # configured run (docker/secrets is unreadable to the test user on BOTH runtimes —
+    # that is the whole reason the override exists), so the write always landed
+    # somewhere the harness never reads back: the persist was a no-op exactly when it
+    # mattered. Proven live on the docker-linux leg — after the headed pytest process
+    # rotated admin1, the on-disk credential returned 401 invalid_credentials while
+    # untouched admin2 returned 200, and no file on disk had been updated.
+    #
+    # Consequence: run_tier_b() runs headed and headless as two SEPARATE pytest
+    # processes against one stack and a leg is GREEN only if BOTH pass, so the
+    # mandatory double run could never pass (YTF §2 / QA SOP §4.17 Rule 4).
+    #
+    # Write to every location the read path might use, not just one: the override copy
+    # (what _read_secret returns when set) AND the real repo secrets dir (the fallback,
+    # and what a human operator or diagnostic script reads). Best-effort per target —
+    # the real dir is often unwritable by the test user, which must not fail the run,
+    # since the in-process cache stays authoritative for the rest of THIS process.
+    targets = []
+    _override = os.environ.get("YTF_SECRETS_DIR", "")
+    if _override:
+        targets.append(Path(_override) / secret_name)
+    targets.append(Path(__file__).parents[3] / "docker" / "secrets" / secret_name)
+
+    persisted = 0
+    for p in targets:
         try:
-            p.chmod(0o600)
-        except OSError:
-            pass
-    except OSError as exc:
-        print(f"[conftest] FIND-8: could not persist rotated admin{admin} password to disk: {exc}")
+            p.write_text(new_password, encoding="utf-8")
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
+            persisted += 1
+        except OSError as exc:
+            print(f"[conftest] FIND-8: could not persist rotated admin{admin} password to {p}: {exc}")
+    if persisted == 0:
+        print(
+            f"[conftest] FIND-0805-002: rotated admin{admin} password persisted to NO target "
+            f"({[str(t) for t in targets]}) — the next pytest process will read a stale "
+            f"credential and fail at fixture setup."
+        )
 
 
 def _generate_strong_password() -> str:
