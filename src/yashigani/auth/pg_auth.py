@@ -269,6 +269,7 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
+                purpose="login",
             )
 
             if not totp_ok:
@@ -339,6 +340,7 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
+                purpose="totp_provision",
             ):
                 return False, "invalid_totp_code"
             record.force_totp_provision = False
@@ -385,6 +387,7 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
+                purpose="change_password",
             ):
                 return False, "invalid_totp"
 
@@ -519,6 +522,7 @@ class PostgresLocalAuthService:
                 admin_totp_code,
                 algorithm=admin_totp_algorithm,
                 digits=admin_totp_digits,
+                purpose="admin_reset",
             ):
                 return False, "invalid_admin_totp"
 
@@ -915,6 +919,7 @@ class PostgresLocalAuthService:
         totp_code: str,
         algorithm: str = LEGACY_TOTP_ALGO,
         digits: int = 6,
+        purpose: str = "default",
     ) -> bool:
         """
         Wrap verify_totp() with a Postgres-backed replay cache.
@@ -922,6 +927,15 @@ class PostgresLocalAuthService:
         algorithm / digits — must match the algorithm and digit count stored on
         the AccountRecord.  Callers must pass these explicitly; the defaults are
         conservative legacy values for the migration window.
+
+        purpose — FIND-B-STEPUP-FIRST-ATTEMPT (2026-08-05): distinct
+        verification events (login / stepup / change_password / ...) MUST
+        pass a distinct, stable purpose string. This is threaded straight
+        into verify_totp()'s replay-cache key so a code consumed for one
+        purpose (e.g. login) does not poison the SAME still-valid window's
+        use for a different purpose (e.g. an immediate stepup) — see
+        verify_totp() docstring for the full root-cause. Callers MUST NOT
+        share a purpose across semantically distinct verification points.
 
         Loads the set of code_hashes that are still within the replay
         window, invokes verify_totp() with that local set, and if the set
@@ -956,7 +970,9 @@ class PostgresLocalAuthService:
 
         proxy = _HashingSet()
         before = len(cache)
-        ok = verify_totp(secret_b32, totp_code, proxy, algorithm=algorithm, digits=digits)
+        ok = verify_totp(
+            secret_b32, totp_code, proxy, algorithm=algorithm, digits=digits, purpose=purpose
+        )
         if ok and len(cache) > before:
             # Insert only the newly consumed hash(es) — expiration is
             # short (60s) which covers the full valid-window set of three
