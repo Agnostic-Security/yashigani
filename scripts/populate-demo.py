@@ -16,6 +16,14 @@ GUARDRAILS (enforced in code):
      PUTs demo-specific groups/allowed_caller_groups/allowed_paths. Sending
      upstream_url here reintroduced a duplicate-agent-with-wrong-upstream bug
      that broke chat (LAURA-4.1.2-related finding) — see step8_register_agents().
+  7. langflow/letta are REQUIRED bundles (install.sh --deploy demo ships them by
+     default); openclaw is OPTIONAL (opt-in via install.sh --agent-bundles). A
+     missing REQUIRED bundle is a real deploy bug and still FATALs. A missing
+     OPTIONAL bundle is expected on a default install — WARN and continue, do
+     NOT fatal (FIND-SEED-OPENCLAW-MISMATCH); STEP 9 (the 10 OPA client
+     policies) must always complete on a default demo install regardless of
+     which optional agent bundles were enabled — see step8_register_agents()/
+     step10_bind_policies().
 
 What this script creates:
   Groups  : data-team, finance-team, compliance-team
@@ -780,6 +788,7 @@ AGENTS = [
     {
         "local_key": "langflow",
         "real_names": ("agent__langflow",),
+        "required": True,   # install.sh --deploy demo ships this BY DEFAULT
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["data-team"],
         "allowed_paths": [],
@@ -787,6 +796,7 @@ AGENTS = [
     {
         "local_key": "letta",
         "real_names": ("letta",),
+        "required": True,   # install.sh --deploy demo ships this BY DEFAULT
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["finance-team"],
         "allowed_paths": [],
@@ -794,11 +804,16 @@ AGENTS = [
     {
         "local_key": "openclaw",
         "real_names": ("openclaw",),
+        "required": False,  # OPTIONAL — install.sh only enables via --agent-bundles
         "groups": ["owui-users", "users"],
         "allowed_caller_groups": ["compliance-team"],
         "allowed_paths": [],
     },
 ]
+
+# Local keys of OPTIONAL agent bundles (used by step8/step10 to decide WARN
+# vs FATAL on a missing/unbound agent — FIND-SEED-OPENCLAW-MISMATCH).
+_OPTIONAL_AGENT_LOCAL_KEYS = {a["local_key"] for a in AGENTS if not a.get("required", True)}
 
 
 # ---------------------------------------------------------------------------
@@ -862,13 +877,23 @@ def step8_register_agents() -> dict[str, dict]:
     demo keys for langflow — see AGENTS comment above) and PUT only the
     demo-specific groups/allowed_caller_groups/allowed_paths onto them.
 
-    CONFIG-ONLY / FAIL LOUD (Tiago hard constraint): if a bundled agent is
-    missing from GET /admin/agents, that means install.sh's
-    register_agent_bundles() did not run or did not complete for this
-    deployment — a real product/deploy issue. This script does NOT paper
-    over that with a hardcoded upstream_url fallback; it exits non-zero.
+    CONFIG-ONLY / FAIL LOUD (Tiago hard constraint): if a REQUIRED bundled
+    agent (langflow/letta — install.sh ships these by default) is missing
+    from GET /admin/agents, that means install.sh's register_agent_bundles()
+    did not run or did not complete for this deployment — a real
+    product/deploy issue. This script does NOT paper over that with a
+    hardcoded upstream_url fallback; it exits non-zero.
 
-    Returns local_key -> {agent_id, name, token}.
+    An OPTIONAL bundled agent (openclaw — install.sh only enables it via
+    --agent-bundles) being absent is EXPECTED on a default demo install and
+    is NOT a fatal condition (FIND-SEED-OPENCLAW-MISMATCH): a default
+    install ships only langflow+letta, so hard-FATALing on openclaw here
+    used to kill STEP 9 (the 10 OPA client policies) on every default
+    install. We WARN and continue instead — the optional agent's demo
+    config/policy-binding is simply skipped for this run.
+
+    Returns local_key -> {agent_id, name, token} (only for agents actually
+    present this deployment).
     """
     print("\n=== STEP 8: Discover + configure bundled agents (step-up gated) ===")
 
@@ -877,12 +902,16 @@ def step8_register_agents() -> dict[str, dict]:
     by_name = {a["name"]: a for a in existing}
 
     agent_info: dict[str, dict] = {}
-    missing: list[str] = []
+    missing_required: list[str] = []
+    skipped_optional: list[str] = []
     for adef in AGENTS:
         local_key = adef["local_key"]
         match = next((by_name[n] for n in adef["real_names"] if n in by_name), None)
         if match is None:
-            missing.append(f"{local_key} (expected real name in {adef['real_names']})")
+            if adef.get("required", True):
+                missing_required.append(f"{local_key} (expected real name in {adef['real_names']})")
+            else:
+                skipped_optional.append(local_key)
             continue
         agent_info[local_key] = {
             "agent_id": match["agent_id"],
@@ -895,10 +924,21 @@ def step8_register_agents() -> dict[str, dict]:
                      "token lives in /run/secrets/<profile>_token)",
         }
 
-    if missing:
+    if skipped_optional:
         print(
-            f"  FATAL: bundled agent(s) not found via GET /admin/agents: {missing}\n"
-            f"  This means install.sh's register_agent_bundles() did not run or did "
+            f"  WARNING: optional bundled agent(s) not present this deployment, "
+            f"skipping (not fatal — install.sh only enables these via "
+            f"--agent-bundles): {sorted(skipped_optional)}\n"
+            f"  Demo config + policy bindings for these agents are skipped this "
+            f"run; STEP 9 (OPA client policies) still runs in full."
+        )
+
+    if missing_required:
+        print(
+            f"  FATAL: REQUIRED bundled agent(s) not found via GET /admin/agents: "
+            f"{missing_required}\n"
+            f"  langflow/letta are shipped BY DEFAULT by install.sh --deploy demo — "
+            f"this means install.sh's register_agent_bundles() did not run or did "
             f"not complete for this deployment (real product/deploy issue) — not "
             f"something this script papers over with a hardcoded upstream_url.\n"
             f"  Currently registered agent names: {sorted(by_name.keys())}",
@@ -908,6 +948,8 @@ def step8_register_agents() -> dict[str, dict]:
 
     for adef in AGENTS:
         local_key = adef["local_key"]
+        if local_key not in agent_info:
+            continue  # optional bundle not present this deployment — already warned above
         info = agent_info[local_key]
         agent_id = info["agent_id"]
         # upstream_url is deliberately OMITTED — install.sh owns the caddy-front
@@ -1476,6 +1518,14 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
     agent name (e.g. "agent__langflow") before binding. Hardcoding the local
     key as the scope_id would silently bind to a non-existent agent identity
     for langflow (LAURA-4.1.2 populate-demo fix, POL-005/006/007).
+
+    FIND-SEED-OPENCLAW-MISMATCH: if the referenced local_key is an OPTIONAL
+    agent bundle (e.g. openclaw) that step8 skipped because it isn't present
+    this deployment, that specific binding is WARNED and skipped (the policy
+    itself was still saved in STEP 9) rather than FATALing the whole run. A
+    missing REQUIRED agent (langflow/letta) still FATALs here — step8 would
+    already have exited before reaching STEP 10 in that case, so this is a
+    defensive backstop, not the primary guard.
     """
     print("\n=== STEP 10: Bind policies (step-up gated) ===")
     # List existing bindings to avoid duplicates
@@ -1493,6 +1543,13 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
             local_key = bdef["scope_id"]
             info = agent_info.get(local_key)
             if not info or not info.get("name"):
+                if local_key in _OPTIONAL_AGENT_LOCAL_KEYS:
+                    print(
+                        f"  WARNING: skipping binding '{bdef['policy_name']}' -> "
+                        f"agent:{local_key} — optional bundled agent not present "
+                        f"this deployment (policy itself was still saved in STEP 9)."
+                    )
+                    continue
                 print(
                     f"  FATAL: cannot bind '{bdef['policy_name']}' — agent local_key "
                     f"'{local_key}' was not discovered in STEP 8 (see FATAL above).",
