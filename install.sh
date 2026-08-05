@@ -10811,6 +10811,33 @@ register_agent_bundles() {
   # portability gate, S6/test_bash_compat): NOT an associative array.
   # Comma-delimited membership string, same convention already used for
   # AGENT_BUNDLES membership checks above (_fwd_ab=",${AGENT_BUNDLES...},").
+  # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05) — FAIL-OPEN INVARIANT, do not
+  # weaken: on query failure, `_ysg_agent_pre_existing` MUST remain exactly
+  # "," (no name ever added to it below), which structurally guarantees the
+  # per-profile membership test at the "already registered" guard below
+  # (`[[ "$_ysg_agent_pre_existing" == *",${_name}," ]]`) can NEVER match for
+  # ANY profile — i.e. a durable-query failure skips NOBODY, it only means
+  # this belt-and-braces pre-check couldn't PROACTIVELY exclude an
+  # already-registered name before offering it to the container-side step
+  # (Tom's registry-side idempotency, registry.py/durable_store.py, is the
+  # authoritative skip decision either way). Never rewrite this to populate
+  # `_ysg_agent_pre_existing` with anything on the failure path, and never
+  # change the membership test to treat an empty/failed pre-check as
+  # "everything pre-existing" — that would silently regress every fresh
+  # install back to zero agents registered. Verified in
+  # tests/invariants/test_i_agent_bundle_precheck_fail_open.sh.
+  #
+  # Root cause of the ACTUAL "zero agents registered" regression this guards
+  # against is NOT a bug in this fail-open logic (it was already correct) —
+  # it was AS-FIX-5 (vendor/podman-compose-ysg/CHANGES.agnostic.md): a
+  # compose-merge bug crashed EVERY exec call below (this one AND the
+  # container-side registration further down) whenever the GPU-mac-metal
+  # overlay was in the assembled -f list, before either ever reached its
+  # target container. Fixed at the source (the vendored fork). The
+  # `_any_recognized_line` loud-failure guard further down this function is
+  # the belt-and-braces catch for the NEXT time an exec call fails
+  # catastrophically for some other reason — it must never look identical
+  # to a legitimate "already registered" no-op.
   local _ysg_agent_pre_existing=","
   local _existing_names_raw=""
   if _existing_names_raw="$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
@@ -11033,7 +11060,26 @@ for r in results:
 ' 2>&1)" || reg_exit=$?
 
   # Parse results
+  #
+  # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05, loud-failure hardening): the
+  # compose-exec call above (both this python3 payload AND the durable-
+  # Postgres pre-check further up this function) can fail CATASTROPHICALLY —
+  # i.e. crash before the container-side script ever runs a single line —
+  # for reasons that have nothing to do with any agent already being
+  # registered (AS-FIX-5, vendor/podman-compose-ysg: a compose-merge bug
+  # made every `compose exec` call that included the GPU-mac-metal overlay
+  # crash with a Python traceback during file parsing, on EVERY fresh Podman
+  # install, before backoffice was ever reached). `$reg_output` in that case
+  # is a traceback — no line matches OK:/SKIP:/FAIL:/ERROR: — so the loop
+  # below silently falls through to `any_registered=false` and the SAME
+  # "No agents were registered — register manually" warning a genuine
+  # "everything already registered, nothing new to do" no-op would produce.
+  # That is a swallowed infrastructure failure wearing a legitimate no-op's
+  # clothing — never fail closed on registration ambiguously. Track whether
+  # ANY line was recognised at all; if the exec exited non-zero AND nothing
+  # was recognised, this was not a no-op — it never reached the container.
   local any_registered=false
+  local _any_recognized_line=false
   while IFS= read -r line; do
     case "$line" in
       OK:*)
@@ -11095,27 +11141,33 @@ for r in results:
         fi
         log_success "  ${_agent_name}: registered"
         any_registered=true
+        _any_recognized_line=true
         ;;
       SKIP:*)
         # YSG-AGENT-REG-001: agent already in registry — no re-registration needed.
         local _skip_parts="${line#SKIP:}"
         local _skip_name="${_skip_parts%%:*}"
         log_info "  ${_skip_name}: already registered — skipping"
+        _any_recognized_line=true
         ;;
       FAIL:*)
         local _fail_detail="${line#FAIL:}"
         log_warn "  ${_fail_detail}"
+        _any_recognized_line=true
         ;;
       ERROR:*)
         log_warn "Agent registration: ${line#ERROR:}"
+        _any_recognized_line=true
         ;;
       ENVELOPE_MINTED:*)
         # SEC-ENVELOPE-001: capability envelope minted for this bundled agent front.
         log_success "  envelope minted: ${line#ENVELOPE_MINTED:}"
+        _any_recognized_line=true
         ;;
       ENVELOPE_WARN:*)
         # Non-fatal: fail-closed (verify-mcp denies until next boot retries).
         log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
+        _any_recognized_line=true
         ;;
     esac
   done <<< "$reg_output"
@@ -11130,6 +11182,22 @@ for r in results:
     log_success "Agent bundle registration complete"
 
     # 4.0: OWUI removed — agent sync via /admin/agents UI or API.
+  elif [[ "${reg_exit}" -ne 0 && "${_any_recognized_line}" == "false" ]]; then
+    # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05): the compose-exec call
+    # failed before the container-side script produced a single recognisable
+    # OK/SKIP/FAIL/ERROR/ENVELOPE line — this is NOT "everything was already
+    # registered, nothing to do" (that case DOES produce SKIP: lines and is
+    # handled by the plain else branch below). This is an infrastructure
+    # failure (compose/exec/network/parsing — see AS-FIX-5 for the exact
+    # class this closes) that never reached the target container at all.
+    # Fail loud and distinct so an operator/CI gate cannot mistake this for
+    # a benign no-op.
+    log_error "Agent bundle registration FAILED before reaching the backoffice container (exec exit ${reg_exit}, no recognised result — NOT the same as 'already registered')."
+    log_error "Raw compose-exec output:"
+    while IFS= read -r _raw_line; do
+      log_error "    ${_raw_line}"
+    done <<< "$reg_output"
+    log_error "This is an infrastructure failure, not a no-op — agents were NOT registered. Fix the underlying compose/exec failure and re-run, or register manually via /admin/agents."
   else
     log_warn "No agents were registered — register manually via /admin/agents"
   fi

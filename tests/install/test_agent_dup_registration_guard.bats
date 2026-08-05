@@ -197,3 +197,142 @@ _extract_fn() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"UNEXPECTED"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05) — the "zero agents" regression.
+#
+# RCA: the durable-Postgres pre-check's fail-open behaviour was ALREADY
+# correct (see the two tests immediately below, which prove the invariant
+# structurally) — the actual "zero agents registered" bug was AS-FIX-5
+# (vendor/podman-compose-ysg/CHANGES.agnostic.md): a compose-merge bug
+# crashed EVERY `compose exec` call this function makes whenever the
+# GPU-mac-metal overlay was in the assembled -f list (docker-compose.
+# gpu-mac-metal-podman.yml's `profiles: !override [...]` on `ollama`, the
+# first -f file to introduce that key), before either exec call (the
+# pre-check itself, or the container-side registration script) ever reached
+# its target container. See vendor/podman-compose-ysg/tests/test_as_fixes.py
+# ::TestRecMergeFirstIntroducedOverrideReset for that fix's own regression
+# tests. This file's job is the install.sh-side belt-and-braces guard: a
+# catastrophic exec failure of this class must never look identical to a
+# legitimate "everything already registered" no-op.
+# ---------------------------------------------------------------------------
+
+@test "G-SYNTAX: pre-check comment documents the fail-open invariant explicitly" {
+  local count
+  count="$(_extract_fn | grep -c 'FAIL-OPEN INVARIANT' || true)"
+  [ "${count:-0}" -ge 1 ]
+}
+
+@test "G-LOGIC: a durable-query FAILURE (nonzero exit) skips NOBODY — pre-existing string stays empty" {
+  # Reproduces the exact bash shape at install.sh's register_agent_bundles():
+  # `if _existing_names_raw="$(...)"; then ... else log_warn ...; fi` — on a
+  # nonzero exit from the query, `_ysg_agent_pre_existing` must never be
+  # populated (it must stay exactly ","), which structurally guarantees the
+  # per-profile membership test can't match ANY name.
+  run bash -c '
+    set -euo pipefail
+    log_warn() { echo "WARN: $1"; }
+    _ysg_agent_pre_existing=","
+    _existing_names_raw=""
+    # simulate the psql exec crashing (AS-FIX-5 class: compose parse error,
+    # nonzero exit, output on stderr only) — command substitution captures
+    # nothing useful on stdout and the command genuinely fails.
+    _fake_failing_query() { return 1; }
+    if _existing_names_raw="$(_fake_failing_query 2>/dev/null)"; then
+      echo "UNEXPECTED: query reported success"
+    else
+      log_warn "FIND-IRIS-DUP-AGENT pre-check: could not query durable agent_registry (non-fatal — falling back to the in-container skip check only)"
+    fi
+    echo "PRE_EXISTING=${_ysg_agent_pre_existing}"
+    for _name in agent__langflow letta openclaw; do
+      if [[ "$_ysg_agent_pre_existing" == *",${_name},"* ]]; then
+        echo "UNEXPECTED SKIP: ${_name}"
+      fi
+    done
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"could not query durable agent_registry"* ]]
+  [[ "$output" == *"PRE_EXISTING=,"* ]]
+  [[ "$output" != *"UNEXPECTED"* ]]
+}
+
+@test "G-LOGIC: a compose-exec crash (nonzero exit, no recognised OK/SKIP/FAIL/ERROR line) is flagged loud and distinct from a genuine no-op" {
+  # Reproduces the register_agent_bundles() result-parsing loop in isolation
+  # with reg_output = a Python traceback (AS-FIX-5's exact pre-fix failure
+  # mode) and reg_exit=1, and proves the loud-failure branch fires instead
+  # of the silent "No agents were registered" warning a genuine
+  # all-already-registered no-op would (correctly) produce.
+  run bash -c '
+    set -euo pipefail
+    log_error() { echo "ERROR: $1"; }
+    log_warn()  { echo "WARN: $1"; }
+    log_success() { echo "OK: $1"; }
+    log_info()  { echo "INFO: $1"; }
+
+    reg_exit=1
+    reg_output="Traceback (most recent call last):
+  File \"podman_compose.py\", line 2661, in _resolve_profiles
+    service_profiles = set(config.get(\"profiles\", []))
+TypeError: '"'"'OverrideTag'"'"' object is not iterable"
+
+    any_registered=false
+    _any_recognized_line=false
+    while IFS= read -r line; do
+      case "$line" in
+        OK:*) any_registered=true; _any_recognized_line=true ;;
+        SKIP:*) _any_recognized_line=true ;;
+        FAIL:*) _any_recognized_line=true ;;
+        ERROR:*) _any_recognized_line=true ;;
+      esac
+    done <<< "$reg_output"
+
+    if $any_registered; then
+      log_success "Agent bundle registration complete"
+    elif [[ "${reg_exit}" -ne 0 && "${_any_recognized_line}" == "false" ]]; then
+      log_error "Agent bundle registration FAILED before reaching the backoffice container (exec exit ${reg_exit}, no recognised result — NOT the same as '"'"'already registered'"'"')."
+    else
+      log_warn "No agents were registered — register manually via /admin/agents"
+    fi
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FAILED before reaching the backoffice container"* ]]
+  [[ "$output" != *"No agents were registered — register manually"* ]]
+}
+
+@test "G-LOGIC: a genuine all-already-registered no-op (SKIP lines, exit 0) still produces the plain warning, not the loud-failure path" {
+  # Sanity: the loud-failure branch must NOT fire for the legitimate,
+  # everyday no-op case (e.g. re-running install --upgrade with nothing new
+  # to register) — only for a catastrophic, unrecognised exec failure.
+  run bash -c '
+    set -euo pipefail
+    log_error() { echo "ERROR: $1"; }
+    log_warn()  { echo "WARN: $1"; }
+    log_success() { echo "OK: $1"; }
+
+    reg_exit=0
+    reg_output="SKIP:agent__langflow:langflow
+SKIP:letta:letta"
+
+    any_registered=false
+    _any_recognized_line=false
+    while IFS= read -r line; do
+      case "$line" in
+        OK:*) any_registered=true; _any_recognized_line=true ;;
+        SKIP:*) _any_recognized_line=true ;;
+        FAIL:*) _any_recognized_line=true ;;
+        ERROR:*) _any_recognized_line=true ;;
+      esac
+    done <<< "$reg_output"
+
+    if $any_registered; then
+      log_success "Agent bundle registration complete"
+    elif [[ "${reg_exit}" -ne 0 && "${_any_recognized_line}" == "false" ]]; then
+      log_error "Agent bundle registration FAILED before reaching the backoffice container"
+    else
+      log_warn "No agents were registered — register manually via /admin/agents"
+    fi
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No agents were registered — register manually"* ]]
+  [[ "$output" != *"FAILED before reaching"* ]]
+}
