@@ -250,6 +250,7 @@ def verify_totp(
     used_codes_cache: "set[str]",
     algorithm: str = TOTP_ALGO_SHA1,
     digits: int = 6,
+    purpose: str = "default",
 ) -> bool:
     """
     Verify a TOTP code. Returns True on valid, unused code.
@@ -263,6 +264,22 @@ def verify_totp(
     success.  AVA-A006 / ASVS V2.8.3: window_key is derived from the
     timestamp of the MATCHED offset window, not always the current wall-clock
     window, so cross-window replays are correctly blocked.
+
+    purpose — FIND-B-STEPUP-FIRST-ATTEMPT (2026-08-05): the replay-cache key
+    is scoped by ``purpose`` (e.g. "login", "stepup", "change_password") in
+    addition to secret + window slot. Root cause: a single global
+    secret+window key meant a code consumed at LOGIN was indistinguishable
+    from the SAME still-displayed code presented moments later to
+    POST /auth/stepup (a distinct re-authentication *event*, ASVS V6.8.4) —
+    a legitimate admin/user who steps up within the same 30s window as their
+    login always had their first attempt rejected as a "replay" of the
+    login's own consumption, even though no attacker replay occurred. Each
+    purpose now gets its own replay namespace: a code is still blocked from
+    being replayed *within* the same purpose (real anti-replay preserved),
+    but a login's consumption of window N no longer poisons a stepup
+    verification against that same window N. Callers MUST pass a stable,
+    distinct purpose per verification call-site — see call sites in
+    pg_auth.py / local_auth.py / backoffice/routes/auth.py.
 
     Algorithm isolation: a code computed with the wrong algorithm or wrong
     digit count will NOT match (distinct HMAC functions / distinct moduli
@@ -278,10 +295,11 @@ def verify_totp(
         candidate_ts = now_ts + offset * 30
         expected = _totp_at(secret_b32, candidate_ts, algo_upper, digits)
         if _constant_time_otp_check(expected, code):
-            # Derive the replay-cache key from the matched window's slot.
-            matched_window_key = f"{secret_b32}:{candidate_ts // 30}"
+            # Derive the replay-cache key from the matched window's slot,
+            # scoped per purpose (FIND-B-STEPUP-FIRST-ATTEMPT).
+            matched_window_key = f"{secret_b32}:{purpose}:{candidate_ts // 30}"
             if matched_window_key in used_codes_cache:
-                return False  # replay of this specific window slot
+                return False  # replay of this specific window slot + purpose
             used_codes_cache.add(matched_window_key)
             return True
     return False

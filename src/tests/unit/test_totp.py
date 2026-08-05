@@ -152,6 +152,122 @@ class TestVerifyTotp:
         assert verify_totp(secret_b32=secret, code="", used_codes_cache=set()) is False
 
 
+class TestStepupFirstAttemptReplayScoping:
+    """
+    FIND-B-STEPUP-FIRST-ATTEMPT (2026-08-05) regression.
+
+    Root cause: verify_totp()'s replay-cache key was `secret:window_slot`,
+    shared globally regardless of WHY the code was being verified. A code
+    consumed at LOGIN and the SAME still-displayed code presented moments
+    later to POST /auth/stepup (a distinct ASVS V6.8.4 re-authentication
+    event) collided on the identical key — so the FIRST stepup attempt in a
+    fresh admin session, submitted within the same 30s window as login,
+    was always rejected as a "replay" even though no attacker replay
+    occurred. The fix scopes the replay key by an explicit `purpose`
+    parameter so login/stepup/change_password/etc. each get an independent
+    replay namespace, while still blocking a genuine replay WITHIN one
+    purpose.
+
+    This test reproduces the exact collision at the verify_totp() level
+    (the pure function both pg_auth._verify_totp_with_replay and
+    local_auth.LocalAuthService feed into) using a SHARED cache — mirroring
+    the Postgres used_totp_codes table, which is loaded and checked in full
+    on every call regardless of caller. Fails before the purpose-scoping
+    fix (login consumes the window, stepup's identical code is then wrongly
+    rejected); passes after.
+    """
+
+    def test_login_then_stepup_same_code_no_longer_cross_purpose_replay(self):
+        try:
+            import pyotp
+        except ImportError:
+            pytest.skip("pyotp not installed")
+
+        (_, _, _, _, _, generate_totp_secret, _, _, verify_totp, *_) = _import_totp()
+        secret = generate_totp_secret()
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+
+        # One shared cache, exactly as the Postgres-backed replay cache is
+        # shared across every _verify_totp_with_replay() call for an
+        # account (it loads ALL non-expired used_totp_codes rows on every
+        # invocation, regardless of which route is calling).
+        shared_cache: set = set()
+
+        # First verification event: LOGIN consumes this window's code.
+        login_ok = verify_totp(
+            secret_b32=secret, code=code, used_codes_cache=shared_cache,
+            purpose="login",
+        )
+        assert login_ok is True, "sanity: login's own TOTP submission must succeed"
+
+        # Second verification event: STEPUP, same session, same still-valid
+        # code, same 30s window (e.g. 2-9s after login, per the live
+        # reproduction). Before the fix this returned False (401
+        # invalid_totp_code on the FIRST stepup attempt). After the fix,
+        # stepup has its own replay namespace and accepts it.
+        stepup_ok = verify_totp(
+            secret_b32=secret, code=code, used_codes_cache=shared_cache,
+            purpose="stepup",
+        )
+        assert stepup_ok is True, (
+            "FIND-B-STEPUP-FIRST-ATTEMPT regression: a code already consumed "
+            "for 'login' must not poison the FIRST 'stepup' verification of "
+            "the same window — purpose scoping must isolate the two events."
+        )
+
+    def test_replay_within_same_purpose_still_blocked(self):
+        """
+        The fix must NOT weaken anti-replay: submitting the SAME code twice
+        for the SAME purpose (e.g. two stepup calls back-to-back with the
+        identical code) must still be rejected as a genuine replay.
+        """
+        try:
+            import pyotp
+        except ImportError:
+            pytest.skip("pyotp not installed")
+
+        (_, _, _, _, _, generate_totp_secret, _, _, verify_totp, *_) = _import_totp()
+        secret = generate_totp_secret()
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+        shared_cache: set = set()
+
+        first = verify_totp(
+            secret_b32=secret, code=code, used_codes_cache=shared_cache,
+            purpose="stepup",
+        )
+        second = verify_totp(
+            secret_b32=secret, code=code, used_codes_cache=shared_cache,
+            purpose="stepup",
+        )
+        assert first is True
+        assert second is False, (
+            "Real same-purpose replay must still be rejected — purpose "
+            "scoping must not weaken anti-replay within one purpose."
+        )
+
+    def test_default_purpose_preserves_prior_behaviour(self):
+        """
+        Callers that don't pass `purpose` (legacy call sites / existing
+        tests) must see byte-identical behaviour to pre-fix: a code is
+        still blocked from replay when purpose is omitted both times.
+        """
+        try:
+            import pyotp
+        except ImportError:
+            pytest.skip("pyotp not installed")
+
+        (_, _, _, _, _, generate_totp_secret, _, _, verify_totp, *_) = _import_totp()
+        secret = generate_totp_secret()
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+        cache: set = set()
+
+        assert verify_totp(secret_b32=secret, code=code, used_codes_cache=cache) is True
+        assert verify_totp(secret_b32=secret, code=code, used_codes_cache=cache) is False
+
+
 class TestVerifyRecoveryCode:
     def test_valid_code_accepted(self):
         (_, _, _, _, _generate_recovery_codes, _, _, generate_recovery_code_set, _, verify_recovery_code, codes_remaining) = _import_totp()
