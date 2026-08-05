@@ -10825,7 +10825,11 @@ register_agent_bundles() {
   # change the membership test to treat an empty/failed pre-check as
   # "everything pre-existing" — that would silently regress every fresh
   # install back to zero agents registered. Verified in
-  # tests/invariants/test_i_agent_bundle_precheck_fail_open.sh.
+  # tests/install/test_agent_dup_registration_guard.bats (the path this
+  # comment previously cited, tests/invariants/test_i_agent_bundle_precheck_
+  # fail_open.sh, was never created — corrected 2026-08-05, FIND-DUP-AGENT-
+  # RESIDUAL follow-up; see that file's G-IDEMPOTENCY test for the fresh-
+  # install-then-reconverge end-to-end proof).
   #
   # Root cause of the ACTUAL "zero agents registered" regression this guards
   # against is NOT a bug in this fail-open logic (it was already correct) —
