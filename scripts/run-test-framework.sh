@@ -149,6 +149,10 @@ if [ ! -x "$VENV_PY" ]; then
 fi
 
 OVERALL_RC=0
+# VERDICT.txt files produced by THIS run (truncated at tier start so stale
+# lines from a previous run in the same evidence root can never satisfy or
+# poison this run's summary).
+YTF_VERDICT_FILES=""
 
 # ---------------------------------------------------------------------------
 # Tier-A — in-process, matrix-invariant. Runs ONCE regardless of runtime/
@@ -160,22 +164,45 @@ run_tier_a() {
   local rc=0
   local evidence_dir="${EVIDENCE_ROOT}/tier-a"
   mkdir -p "$evidence_dir"
+  : > "${evidence_dir}/VERDICT.txt"
+  YTF_VERDICT_FILES="${YTF_VERDICT_FILES} ${evidence_dir}/VERDICT.txt"
 
   _info "pytest: tests/conformance/ + tests/security/ (API conformance, OPA-adjacent wiring audit, static/authored-live pentest)"
+  local _prc=0
   PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
     "$VENV_PY" -m pytest "${REPO_DIR}/tests/conformance" "${REPO_DIR}/tests/security" \
     -q --tb=short --junitxml="${evidence_dir}/pytest-junit.xml" \
-    | tee "${evidence_dir}/pytest.log" || rc=1
+    | tee "${evidence_dir}/pytest.log" || _prc=$?
 
-  if [ "$rc" -eq 0 ]; then _pass "tests/conformance + tests/security"; else _fail "tests/conformance + tests/security (see ${evidence_dir}/pytest.log)"; fi
+  # YSG-RISK-206: the verdict comes from the junit XML via ytf-verdict.sh —
+  # exit 0 with zero executed tests is a FAIL, not a PASS.
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit.xml" \
+       --rc "$_prc" --tier a --suite conformance-security \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "tests/conformance + tests/security"
+  else
+    _fail "tests/conformance + tests/security (see ${evidence_dir}/pytest.log + VERDICT.txt)"
+    rc=1
+  fi
 
   _info "opa test: policy/ (in-process rego unit tests for every live-loaded template + system policy)"
   local opa_rc=0
   if command -v opa >/dev/null 2>&1; then
     opa test "${REPO_DIR}/policy/" -v > "${evidence_dir}/opa-test.log" 2>&1 || opa_rc=1
-    if [ "$opa_rc" -eq 0 ]; then _pass "opa test policy/"; else _fail "opa test policy/ (see ${evidence_dir}/opa-test.log)"; rc=1; fi
+    # Same zero-executed guard for opa: executed count comes from the raw -v
+    # log (one ': PASS'/': FAIL' line per test), never from opa's exit alone.
+    local _opa_executed
+    _opa_executed="$(grep -cE ': (PASS|FAIL)' "${evidence_dir}/opa-test.log" || true)"
+    local _opa_verdict="PASS" _opa_reason="-"
+    if [ "$opa_rc" -ne 0 ]; then _opa_verdict="FAIL"; _opa_reason="runner-rc-${opa_rc}"
+    elif [ "${_opa_executed}" -lt 1 ]; then _opa_verdict="FAIL"; _opa_reason="zero-or-below-min-executed"; fi
+    echo "YTF-VERDICT: tier=a suite=opa leg=- mode=- rc=${opa_rc} collected=${_opa_executed} executed=${_opa_executed} passed=$(grep -cE ': PASS' "${evidence_dir}/opa-test.log" || true) failed=$(grep -cE ': FAIL' "${evidence_dir}/opa-test.log" || true) errors=0 skipped=0 min_executed=1 verdict=${_opa_verdict} reason=${_opa_reason}" \
+      | tee -a "${evidence_dir}/VERDICT.txt"
+    if [ "${_opa_verdict}" = "PASS" ]; then _pass "opa test policy/ (${_opa_executed} executed)"; else _fail "opa test policy/ (see ${evidence_dir}/opa-test.log + VERDICT.txt)"; rc=1; fi
   else
     _warn "opa binary not found on PATH — opa test SKIPPED, not counted as pass"
+    echo "YTF-VERDICT: tier=a suite=opa leg=- mode=- rc=127 collected=0 executed=0 passed=0 failed=0 errors=0 skipped=0 min_executed=1 verdict=FAIL reason=opa-binary-missing" \
+      | tee -a "${evidence_dir}/VERDICT.txt"
     rc=1
   fi
 
@@ -205,6 +232,8 @@ run_tier_b() {
   local evidence_dir="${EVIDENCE_ROOT}/${leg}/tier-b"
   local shots_dir="${EVIDENCE_ROOT}/${leg}/screenshots"
   mkdir -p "$evidence_dir" "$shots_dir"
+  : > "${evidence_dir}/VERDICT.txt"
+  YTF_VERDICT_FILES="${YTF_VERDICT_FILES} ${evidence_dir}/VERDICT.txt"
   local rc=0
 
   local modes=()
@@ -242,8 +271,18 @@ run_tier_b() {
       "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
       -q --tb=short \
       --junitxml="${evidence_dir}/pytest-junit-${mode}.xml" \
-      | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=1
-    if [ "$mode_rc" -eq 0 ]; then _pass "Playwright ${mode} — leg ${leg}"; else _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log)"; rc=1; fi
+      | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=$?
+    # YSG-RISK-206: verdict derived from the junit XML, not the exit code —
+    # an all-skipped run (unreachable stack, YSG-RISK-207) exits 0 but
+    # executes nothing and must FAIL here.
+    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-${mode}.xml" \
+         --rc "$mode_rc" --tier b --suite playwright --leg "$leg" --mode "$mode" \
+         --out "${evidence_dir}/VERDICT.txt"; then
+      _pass "Playwright ${mode} — leg ${leg}"
+    else
+      _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log + VERDICT.txt)"
+      rc=1
+    fi
   done
 
   local shot_count
@@ -280,20 +319,34 @@ run_tier_c() {
   local leg="${RUNTIME}-${PLATFORM}"
   local evidence_dir="${EVIDENCE_ROOT}/${leg}/tier-c"
   mkdir -p "$evidence_dir"
+  : > "${evidence_dir}/VERDICT.txt"
+  YTF_VERDICT_FILES="${YTF_VERDICT_FILES} ${evidence_dir}/VERDICT.txt"
   local rc=0
 
   _info "pytest: src/tests/e2e/ (lifecycle + failure_injection_chaos + data_flow_seam — pre-existing, absorbed not duplicated) + tests/integration_live/ (the other 6 categories — see docs/testing/YTF.md Tier-C)"
   # FIND-B-TARGET: see the matching comment in run_tier_b() — empty-string
   # YASHIGANI_ADMIN_URL is safe (falsy in conftest.py's override check) and
   # avoids the bash-3.2 empty-array/set-u pitfall on macOS's default bash.
+  local _prc=0
   YASHIGANI_ADMIN_URL="$TARGET" \
   YTF_RUNTIME="$RUNTIME" YTF_VERSION="$VERSION" YTF_PLATFORM="$PLATFORM" \
   PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
     "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/e2e" "${REPO_DIR}/tests/integration_live" \
     -q --tb=short --junitxml="${evidence_dir}/pytest-junit.xml" \
-    | tee "${evidence_dir}/pytest.log" || rc=1
+    | tee "${evidence_dir}/pytest.log" || _prc=$?
 
-  if [ "$rc" -eq 0 ]; then _pass "src/tests/e2e + tests/integration_live — leg ${leg}"; else _fail "src/tests/e2e + tests/integration_live — leg ${leg} (see ${evidence_dir}/pytest.log)"; fi
+  # YSG-RISK-206 (the original instance was THIS tier): every Tier-C test
+  # skips cleanly when no stack is reachable, so pytest exits 0 having
+  # executed nothing and the old exit-code-only check printed PASS. The
+  # verdict now requires executed >= 1 from the junit XML.
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit.xml" \
+       --rc "$_prc" --tier c --suite e2e-integration --leg "$leg" \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "src/tests/e2e + tests/integration_live — leg ${leg}"
+  else
+    _fail "src/tests/e2e + tests/integration_live — leg ${leg} (see ${evidence_dir}/pytest.log + VERDICT.txt)"
+    rc=1
+  fi
   printf "\nTier-C evidence (leg %s): %s\n" "$leg" "$evidence_dir"
   return "$rc"
 }
@@ -312,10 +365,39 @@ if [ "$RUN_C" -eq 1 ]; then
 fi
 
 printf "\n%b=== YTF summary ===%b\n" "$BOLD" "$RESET"
+
+# YSG-RISK-206 belt-and-braces: the summary is DERIVED from the YTF-VERDICT
+# lines written by ytf-verdict.sh, cross-checked against the accumulated rc.
+# Every requested tier must have >=1 verdict line, zero FAIL lines, and a
+# nonzero total executed count — otherwise the run is FAIL regardless of rc.
+_summary_fail_reason=""
+_tiers_requested=""
+[ "$RUN_A" -eq 1 ] && _tiers_requested="${_tiers_requested}a"
+[ "$RUN_B" -eq 1 ] && _tiers_requested="${_tiers_requested}b"
+[ "$RUN_C" -eq 1 ] && _tiers_requested="${_tiers_requested}c"
+_total_executed=0
+for _t in a b c; do
+  case "$_tiers_requested" in *"$_t"*) ;; *) continue ;; esac
+  _t_lines="$(cat $YTF_VERDICT_FILES 2>/dev/null | grep "tier=${_t} " || true)"
+  _t_count="$(printf '%s' "$_t_lines" | grep -c 'YTF-VERDICT:' || true)"
+  _t_fails="$(printf '%s' "$_t_lines" | grep -c 'verdict=FAIL' || true)"
+  _t_exec="$(printf '%s\n' "$_t_lines" | sed -n 's/.* executed=\([0-9]*\) .*/\1/p' | awk '{s+=$1} END {print s+0}')"
+  _total_executed=$((_total_executed + _t_exec))
+  if [ "$_t_count" -eq 0 ]; then
+    _summary_fail_reason="tier-${_t}-has-no-verdict-lines"; OVERALL_RC=1
+  elif [ "$_t_fails" -ne 0 ]; then
+    _summary_fail_reason="tier-${_t}-has-FAIL-verdicts"; OVERALL_RC=1
+  fi
+done
+if [ "$OVERALL_RC" -eq 0 ] && [ "$_total_executed" -lt 1 ]; then
+  _summary_fail_reason="zero-tests-executed-across-run"; OVERALL_RC=1
+fi
+
+echo "YTF-SUMMARY: tiers=${_tiers_requested} total_executed=${_total_executed} rc=${OVERALL_RC} verdict=$([ "$OVERALL_RC" -eq 0 ] && echo GREEN || echo FAIL) reason=${_summary_fail_reason:--}"
 if [ "$OVERALL_RC" -eq 0 ]; then
-  _pass "All requested tiers GREEN"
+  _pass "All requested tiers GREEN (${_total_executed} tests executed, verdict-line derived)"
 else
-  _fail "One or more requested tiers reported a failure — see evidence paths above"
+  _fail "FAIL — ${_summary_fail_reason:-tier failure} (see evidence paths + VERDICT.txt files above)"
 fi
 
 exit "$OVERALL_RC"
