@@ -93,6 +93,13 @@ export class YsAdminCapabilityPolicy extends LitElement {
     this._result = null;
     this._effUser = '';
     this._effResult = null;
+    // FIND-B-E (v4.1.2 retest, lost-update race): monotonic token bumped at
+    // the START of every _fetchScope() call. A response is only applied if
+    // its token still matches _fetchSeq when the await resolves — any older,
+    // still-in-flight fetch that resolves LATER (out of order) is a no-op
+    // instead of clobbering whatever a newer scope-type/scope-id selection
+    // already rendered.
+    this._fetchSeq = 0;
   }
 
   createRenderRoot() { return this; }
@@ -118,13 +125,28 @@ export class YsAdminCapabilityPolicy extends LitElement {
 
   async _fetchScope() {
     this._result = null;
-    if (this._scopeType !== 'org' && !this._scopeId) {
+    // FIND-B-E (v4.1.2 retest, lost-update race): capture the scope this
+    // call is FOR before the await — a rapid scope-type change (e.g. org
+    // -> group -> user in quick succession) previously re-read
+    // this._scopeType/_scopeId AFTER the network round-trip, which could
+    // (a) apply an older response using the label/branch of a NEWER,
+    // unrelated scope (wrong "overrides" vs "org" key parsing), and
+    // (b) let responses that resolve out of order clobber each other with
+    // no ordering guarantee at all.
+    const scopeType = this._scopeType;
+    const scopeId = this._scopeId;
+    const seq = ++this._fetchSeq;
+    if (scopeType !== 'org' && !scopeId) {
       this._policy = {};
       this._rows = {};
       return;
     }
     const data = await this.api.get(this._scopeUrl());
-    const key = this._scopeType === 'org' ? 'org' : 'overrides';
+    // In-flight guard: a newer _fetchScope() call (bumping _fetchSeq again)
+    // started while this one was awaiting the network. Discard this now-
+    // stale response instead of applying it.
+    if (seq !== this._fetchSeq) return;
+    const key = scopeType === 'org' ? 'org' : 'overrides';
     this._policy = (data && data[key]) ? data[key] : {};
     this._rows = this._buildRows(this._policy);
   }
