@@ -26,9 +26,11 @@ v1.0: Buffered responses only (Decision 13). Full response collected
 before delivery to enable response inspection and token counting.
 
 v2.2: Streaming support added. When ``body.stream == True`` and
-``YASHIGANI_STREAMING_ENABLED=true`` (default), requests are forwarded
-to Ollama with ``stream=true`` and responses are yielded as SSE chunks
-via FastAPI ``StreamingResponse``.
+``YASHIGANI_STREAMING_ENABLED=true`` (default), requests were forwarded
+to Ollama with ``stream=true`` and responses were yielded as SSE chunks
+via FastAPI ``StreamingResponse``. SEC-FIX-YSG-STREAM-INSPECTION-BYPASS
+(2026-08-06) removed the ability for this incremental-token branch to be
+selected for governed (non-agent) chat completions — see below.
 
 v2.2: PII detection wired into both the request path (before forwarding)
 and the response path (before delivery). PII filtering is ON by default
@@ -45,12 +47,26 @@ Streaming limitations
 - Agent routing (``@agent`` model prefix) always uses the buffered path
   regardless of the ``stream`` flag, because agent upstreams may not
   support SSE.
-- PII mode=log: streaming responses are allowed (request-path PII only).
-  PII mode=block|redact: streaming is force-disabled to enable full
-  response-path inspection. This adds ~2-3s latency but ensures PII
-  cannot leak through streamed responses.
+- SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL): a
+  ``stream:true`` request for a non-agent chat completion is now ALWAYS
+  answered as buffer-then-emit SSE, unconditionally — the response is
+  generated, put through the identical four response-side inspection
+  layers the buffered (``stream:false``) path uses (7b response inspection
+  pipeline, 7b-ii always-on I5 injection/PCI-exfil regex scan, 7c PII
+  detector, 8c OPA response-decision ceiling check), and only then wrapped
+  as a single-chunk ``text/event-stream`` (see ``_sse_from_completion``) —
+  or denied with the same 403 envelope as ``stream:false`` if inspection
+  blocks it. This decision no longer depends on whether OPA / PII-mode
+  happen to be configured (previously, `_state.opa_url` truthiness was the
+  only thing forcing buffered mode in practice, which meant an explicit
+  YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log could
+  reach the raw incremental-streaming branch (`StreamingInspector` in
+  `gateway/streaming.py`), which enforces only a coarse sensitivity-rank
+  ceiling and skips the other three controls entirely). The raw
+  incremental-streaming code path is retained (for future incremental-
+  inspection work) but is no longer reachable from this endpoint.
 """
-# Last updated: 2026-06-09T00:00:00+00:00
+# Last updated: 2026-08-06T00:00:00+00:00
 from __future__ import annotations
 
 import asyncio
@@ -3456,19 +3472,52 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         and not is_agent_call
     )
 
-    # OPA enforcement: stream=false when OPA policies are active.
-    # All response content must be inspected before delivery to the user
-    # (human or non-human). Streaming bypasses response-path OPA checks.
-    if use_streaming and _state.opa_url:
+    # SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL):
+    # Response-side inspection for /v1|/user chat completions is FOUR
+    # independent layers, all of which live ONLY in the buffered code path
+    # below (7b response_inspection_pipeline / 7b-ii always-on I5 injection+
+    # PCI-exfil regex scan / 7c PII detector / 8c OPA response_decision
+    # ceiling+verdict check). The raw incremental-streaming branch (7a,
+    # StreamingInspector) enforces ONLY a coarse sensitivity-rank ceiling —
+    # it never runs the I5 scan, the ML ResponseInspectionPipeline, the PII
+    # detector, or the OPA response check.
+    #
+    # The previous guard only forced buffering when `_state.opa_url`
+    # happened to be truthy (or PII mode was BLOCK/REDACT) — i.e. response
+    # inspection was DE FACTO mandatory in every production deployment
+    # (OPA is required to start in production, and is the default even in
+    # dev), but was NOT an INTRINSIC guarantee: the 7b-ii comment claims the
+    # I5 gate is "ALWAYS-ON... MANDATORY", yet in an explicit
+    # YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log (the
+    # default), a stream:true request took the raw-streaming branch and
+    # bypassed all four controls — a caller could receive raw PII/PCI or
+    # injection-flagged content verbatim over SSE that the IDENTICAL
+    # stream:false request would have blocked or redacted (LAURA/Iris
+    # verified — response-side controls MUST apply identically to API and
+    # web-UI callers regardless of the ``stream`` flag AND regardless of
+    # which optional policy layers happen to be configured).
+    #
+    # Fix: full response-side inspection is unconditionally mandatory for
+    # every non-agent chat completion — the decision no longer depends on
+    # `_state.opa_url` / PII-mode config state. This is NOT "disabling
+    # streaming": a stream:true request is still answered with a genuine
+    # ``text/event-stream`` response (see `_sse_from_completion` / the
+    # F-STREAM wrap below) — the client-visible streaming contract is
+    # unchanged. Only the raw token-by-token incremental delivery (which
+    # cannot be un-sent once flushed, so it cannot be reconciled with
+    # "inspect the full response before delivery") is removed. The upstream
+    # response is generated, fully inspected exactly as the buffered path
+    # already does, and only then emitted — a BLOCKED verdict returns the
+    # same 403 envelope as the non-streaming path, before any content bytes
+    # reach the client.
+    if use_streaming:
         use_streaming = False
-        logger.info("Streaming disabled: OPA policies active — response inspection required")
-
-    # PII block/redact modes require full response inspection — force buffered
-    if use_streaming and _state.pii_detector is not None:
-        from yashigani.pii.detector import PiiMode
-        if _state.pii_detector.mode in (PiiMode.BLOCK, PiiMode.REDACT):
-            use_streaming = False
-            logger.info("Streaming disabled: PII mode=%s requires buffered response inspection", _state.pii_detector.mode.value)
+        logger.debug(
+            "Streaming answered as buffer-then-emit SSE: full response-side "
+            "inspection (I5 injection/PCI-exfil scan, response inspection "
+            "pipeline, PII detector, OPA response ceiling) is mandatory and "
+            "config-independent for every governed chat completion."
+        )
 
     # YSG-RISK-129: assistant_content/backend_body are only ever assigned
     # inside individual success-path branches of the try block below (agent
