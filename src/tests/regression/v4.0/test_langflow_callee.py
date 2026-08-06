@@ -507,10 +507,20 @@ class TestInstallShPhase5Caps:
             "install.sh must generate langflow_yashigani_token secret"
         )
 
-    def test_langflow_proto_openai_in_case(self):
-        """Protocol for langflow case must be openai (OpenAI-compat endpoint)."""
+    def test_langflow_proto_langflow_in_case(self):
+        """Protocol for langflow case must be "langflow" (YSG-RISK-168).
+
+        FLIPPED 2026-07-30 (chat-path repair): this test previously asserted
+        `_proto == "openai"`, encoding the actual bug as expected behaviour.
+        openai_router.py only routes through langflow_client.langflow_chat()
+        (Langflow's real /api/v1/run/{flow_id} contract + self-heal) when
+        protocol=="langflow" — "openai" falls into the generic OpenAI-compat
+        branch that POSTs {upstream}/v1/chat/completions, a path Langflow's
+        own server does not implement (confirmed live: 405 Method Not
+        Allowed). Live-verified after the fix: @agent__langflow chat succeeds.
+        """
         sh = _read_install_sh()
-        # Find the langflow case block — expect _proto="openai"
+        # Find the langflow case block — expect _proto="langflow"
         match = re.search(
             r'langflow\)[^\n]*_name="agent__langflow"[^\n]*_proto="(\w+)"',
             sh,
@@ -523,6 +533,6 @@ class TestInstallShPhase5Caps:
                 re.DOTALL,
             )
         assert match is not None, "Cannot find langflow case _proto in install.sh"
-        assert match.group(1) == "openai", (
-            f"langflow _proto must be 'openai', got: {match.group(1)}"
+        assert match.group(1) == "langflow", (
+            f"langflow _proto must be 'langflow' (YSG-RISK-168), got: {match.group(1)}"
         )

@@ -250,3 +250,103 @@ class TestIdentityRegistry:
         result = registry.get(identity_id)
         assert "qwen2.5:3b" in result["allowed_models"]
         assert "claude-opus-4-6" in result["allowed_models"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIND-SEAT-LEAK (HIGH) regression — end-user seat is never reclaimed
+#
+# Root cause: the HUMAN registration Lua script (_REGISTER_HUMAN_LUA) enforces
+# max_end_users by SCARD-ing identity:index:kind:human, and SADDs every new
+# HUMAN identity_id to that set. No lifecycle op (suspend/reactivate/
+# deactivate) ever SREM'd from identity:index:kind:*, so a deactivated
+# identity permanently held its seat — Community (max_end_users=5) would
+# permanently exhaust all 5 seats after 5 cumulative registrations regardless
+# of how many were still active. Fixed by deactivate() SREM-ing the identity
+# from identity:index:kind:{kind}; suspend() intentionally does NOT (a
+# suspended user still holds their seat until admin reactivate or deactivate).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSeatLeakRegression:
+    @pytest.fixture(autouse=True)
+    def _license_seats(self):
+        """Cap max_end_users at 2 for these tests; restore original after."""
+        from yashigani.licensing.enforcer import get_license, set_license
+        from yashigani.licensing.model import LicenseState, LicenseTier
+        import datetime as _dt
+        import uuid as _uuid
+
+        original = get_license()
+        capped = LicenseState(
+            tier=LicenseTier.PROFESSIONAL,
+            org_domain="example.com",
+            max_agents=500,
+            max_end_users=2,
+            max_admin_seats=50,
+            max_orgs=1,
+            features=frozenset(),
+            issued_at=_dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc),
+            expires_at=_dt.datetime(2027, 1, 1, tzinfo=_dt.timezone.utc),
+            license_id=str(_uuid.uuid4()),
+            valid=True,
+            error=None,
+        )
+        set_license(capped)
+        yield
+        set_license(original)
+
+    def test_seat_limit_enforced_at_registration(self, registry):
+        """Fills the 2-seat license; the 3rd HUMAN registration must raise."""
+        from yashigani.licensing.enforcer import LicenseLimitExceeded
+
+        registry.register(kind=IdentityKind.HUMAN, name="U1", slug="seat-u1")
+        registry.register(kind=IdentityKind.HUMAN, name="U2", slug="seat-u2")
+        with pytest.raises(LicenseLimitExceeded) as exc_info:
+            registry.register(kind=IdentityKind.HUMAN, name="U3", slug="seat-u3")
+        assert exc_info.value.limit_name == "max_end_users"
+        assert exc_info.value.current == 2
+        assert exc_info.value.max_val == 2
+
+    def test_deactivate_frees_seat_for_new_registration(self, registry, redis):
+        """FIND-SEAT-LEAK: deactivating one identity must free its seat so a
+        fresh HUMAN registration succeeds without raising, and the kind-set
+        SCARD must drop by exactly one."""
+        id1, _ = registry.register(kind=IdentityKind.HUMAN, name="U1", slug="seat-u1")
+        id2, _ = registry.register(kind=IdentityKind.HUMAN, name="U2", slug="seat-u2")
+        assert redis.scard("identity:index:kind:human") == 2
+
+        registry.deactivate(id1)
+        assert redis.scard("identity:index:kind:human") == 1
+
+        # Pre-fix, this raised LicenseLimitExceeded even though only 1 of 2
+        # seats was actually occupied — the deactivated identity never left
+        # the kind set.
+        id3, _ = registry.register(kind=IdentityKind.HUMAN, name="U3", slug="seat-u3")
+        assert redis.scard("identity:index:kind:human") == 2
+        assert registry.get(id3) is not None
+        # The deactivated identity is gone from the kind set, not just "active".
+        assert not redis.sismember("identity:index:kind:human", id1)
+        assert redis.sismember("identity:index:kind:human", id2)
+        assert redis.sismember("identity:index:kind:human", id3)
+
+    def test_suspend_does_not_free_seat(self, registry, redis):
+        """suspend() is a HOLD: a suspended identity must still count against
+        the seat limit — only deactivate() releases it."""
+        from yashigani.licensing.enforcer import LicenseLimitExceeded
+
+        id1, _ = registry.register(kind=IdentityKind.HUMAN, name="U1", slug="seat-u1")
+        registry.register(kind=IdentityKind.HUMAN, name="U2", slug="seat-u2")
+        assert redis.scard("identity:index:kind:human") == 2
+
+        registry.suspend(id1)
+        # Still 2 members of the kind set — suspend does not release the seat.
+        assert redis.scard("identity:index:kind:human") == 2
+        assert redis.sismember("identity:index:kind:human", id1)
+
+        # A 3rd registration must still be rejected while suspended.
+        with pytest.raises(LicenseLimitExceeded):
+            registry.register(kind=IdentityKind.HUMAN, name="U3", slug="seat-u3")
+
+        # Reactivating keeps the seat consistent: still 2 members, id1 active again.
+        registry.reactivate(id1)
+        assert redis.scard("identity:index:kind:human") == 2
+        assert registry.count(status="active") == 2

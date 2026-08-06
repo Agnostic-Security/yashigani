@@ -21,13 +21,40 @@
 #                          DNS dependency when CoreDNS is the only nameserver
 #                          and the DROP rule is applied first).
 #   RINGFENCE_CADDY_PORT   TCP port for the ACCEPT rule. Default: 443.
-#   RINGFENCE_DNS_SERVER   DNS server IP for resolver ACCEPT rule.
+#   RINGFENCE_DNS_SERVER   FALLBACK ONLY (YSG-RISK-166). DNS server IP for the
+#                          resolver ACCEPT rule, used ONLY when live
+#                          /etc/resolv.conf detection (below) finds nothing.
 #                          Default: 127.0.0.11 (Docker embedded DNS).
 #                          Set to kube-dns ClusterIP on K8s.
 #   RINGFENCE_RUNTIME      Runtime hint for diagnostics. One of:
 #                          docker | podman-rootful | podman-rootless | k8s
 #                          Injected by codegen from YSG_RUNTIME at onboard time.
 #   RINGFENCE_AGENT_NAME   Agent name for log prefix (informational only).
+#
+# YSG-RISK-166 — DNS resolver ACCEPT rule is runtime-detected, not hardcoded.
+#   Docker's embedded per-container resolver is stable at 127.0.0.11 for every
+#   compose deployment, which is why RINGFENCE_DNS_SERVER's hardcoded default
+#   worked for Docker. Podman has NO equivalent fixed address: rootful Podman
+#   (netavark/aardvark-dns, or the older CNI dnsname plugin) binds the
+#   resolver to THAT NETWORK's bridge gateway IP, which is allocated per
+#   subnet at network-creation time and therefore differs per install, per
+#   network, and potentially per multi-homed container (this sidecar's own
+#   agent/forwarder is attached to two networks — the ringfence net and
+#   caddy_internal — each with its own resolver on Podman). A single
+#   hardcoded IP can never be correct for Podman.
+#
+#   Fix: read the ACTUAL nameserver(s) the container runtime already wrote to
+#   /etc/resolv.conf for this network namespace — same CRIT-02 timing
+#   discipline as the Caddy-IP resolution below (read BEFORE the DROP policy
+#   is applied, so this is a read of already-resolved config, not a fresh
+#   query that could be blocked). This self-detects correctly under BOTH
+#   Docker (resolv.conf already says 127.0.0.11 — output identical to the old
+#   hardcoded behaviour, zero Docker regression risk) and Podman (resolv.conf
+#   says whatever aardvark-dns/dnsname actually bound to for this namespace).
+#   ALL nameserver lines found are allow-listed (handles the multi-homed
+#   ringfence+caddy_internal case). RINGFENCE_DNS_SERVER is used only as a
+#   fallback if resolv.conf is empty/unreadable (e.g. hardened base images
+#   that manage DNS a different way) — same failure-mode as before this fix.
 #
 # DESIGN NOTES — CADDY IP RESOLUTION (CRIT-02)
 #   getent hosts is called BEFORE the DROP policy is set so DNS resolution
@@ -70,11 +97,15 @@ set -eu
 # ── Configuration ─────────────────────────────────────────────────────────────
 CADDY_HOST="${RINGFENCE_CADDY_HOST:-caddy}"
 CADDY_PORT="${RINGFENCE_CADDY_PORT:-443}"
-DNS_SERVER="${RINGFENCE_DNS_SERVER:-127.0.0.11}"
+DNS_SERVER_FALLBACK="${RINGFENCE_DNS_SERVER:-127.0.0.11}"
 RUNTIME="${RINGFENCE_RUNTIME:-unknown}"
 AGENT_NAME="${RINGFENCE_AGENT_NAME:-agent}"
 READINESS_DIR="/run/ringfence"
 READINESS_FILE="${READINESS_DIR}/ready"
+# Populated by _detect_dns_servers() (YSG-RISK-166) — space-separated list of
+# IPv4 nameserver addresses to allow-list. Never empty after detection runs:
+# falls back to DNS_SERVER_FALLBACK if resolv.conf yields nothing.
+DNS_SERVERS=""
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _log() {
@@ -105,6 +136,64 @@ _check_rootless_gap() {
         # WARNING in the generated artifact."
         _write_gap_marker "podman-rootless"
         exit 0
+    fi
+}
+
+# ── DNS resolver detection (YSG-RISK-166) ─────────────────────────────────────
+# Must happen BEFORE any DROP policy is applied — this reads config the
+# runtime already wrote to /etc/resolv.conf for this network namespace, it
+# does not perform a fresh DNS query, so CRIT-02's "no DROP rule active yet"
+# constraint is satisfied trivially (no query goes out on the wire here).
+#
+# Docker: resolv.conf already contains "nameserver 127.0.0.11" (the embedded
+# per-container resolver) for every container on a user-defined bridge
+# network — detection returns exactly the old hardcoded default, so Docker
+# behaviour is provably unchanged by this fix.
+#
+# Podman (rootful, netavark/aardvark-dns or the older CNI dnsname plugin):
+# resolv.conf contains one "nameserver <bridge-gateway-ip>" line PER attached
+# network (this sidecar's netns is multi-homed — the ringfence network AND
+# caddy_internal), each allocated at network-creation time and therefore
+# different per install/network. There is no fixed IP to hardcode; only a
+# live read of resolv.conf inside the actual netns gives the correct value.
+_detect_dns_servers() {
+    _log "Detecting DNS resolver(s) from /etc/resolv.conf (netns-local, pre-DROP read)"
+
+    _found=""
+    if [ -r /etc/resolv.conf ]; then
+        # `|| [ -n "${_line}" ]` handles the classic `while read` footgun: if
+        # the file's last line has no trailing newline, a bare `read -r _line`
+        # still populates _line but returns non-zero, which would silently
+        # DROP that final line from the loop (proven live in this fix's own
+        # trace-test harness — a resolv.conf without a trailing newline on
+        # its last nameserver line lost that nameserver entirely). Some
+        # container runtimes write resolv.conf without a final newline, so
+        # this is a real correctness risk, not a hypothetical one.
+        while IFS= read -r _line || [ -n "${_line}" ]; do
+            case "${_line}" in
+                nameserver*)
+                    _ns="$(printf '%s' "${_line}" | awk '{print $2}')"
+                    case "${_ns}" in
+                        *:*) continue ;;   # IPv6 nameserver — skip (IPv6 disabled/DROP'd anyway)
+                        *.*.*.*) _found="${_found} ${_ns}" ;;
+                        *) continue ;;     # unrecognised format — skip
+                    esac
+                    ;;
+                *) continue ;;
+            esac
+        done < /etc/resolv.conf
+    fi
+
+    # Trim leading/trailing whitespace.
+    _found="$(printf '%s' "${_found}" | awk '{$1=$1};1')"
+
+    if [ -n "${_found}" ]; then
+        DNS_SERVERS="${_found}"
+        _log "DNS resolver(s) detected from resolv.conf: ${DNS_SERVERS}"
+    else
+        DNS_SERVERS="${DNS_SERVER_FALLBACK}"
+        _warn "No usable nameserver found in /etc/resolv.conf — falling back to" \
+              "RINGFENCE_DNS_SERVER default: ${DNS_SERVERS}"
     fi
 }
 
@@ -178,12 +267,19 @@ _apply_ipv4_rules() {
     iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     _log "ipv4 allow: ESTABLISHED,RELATED (response packets for inbound MCP from Caddy)"
 
-    # Rule 3: DNS to the Docker embedded resolver / kube-dns.
-    # Required for the agent to resolve service names (e.g. letta-pgbouncer).
-    # UDP + TCP both covered (TCP fallback for large responses).
-    iptables -A OUTPUT -p udp --dport 53 -d "${DNS_SERVER}" -j ACCEPT
-    iptables -A OUTPUT -p tcp --dport 53 -d "${DNS_SERVER}" -j ACCEPT
-    _log "ipv4 allow: DNS -> ${DNS_SERVER}:53"
+    # Rule 3: DNS to every resolver detected for this netns (YSG-RISK-166 —
+    # runtime-detected via _detect_dns_servers(), NOT a hardcoded Docker-only
+    # IP; see that function's header for why a single hardcoded address can
+    # never be correct on Podman). One ACCEPT pair per resolver — the
+    # ringfence+caddy_internal multi-homed netns can have more than one on
+    # Podman. Required for the agent to resolve service names (e.g.
+    # letta-pgbouncer). UDP + TCP both covered (TCP fallback for large
+    # responses).
+    for _dns in ${DNS_SERVERS}; do
+        iptables -A OUTPUT -p udp --dport 53 -d "${_dns}" -j ACCEPT
+        iptables -A OUTPUT -p tcp --dport 53 -d "${_dns}" -j ACCEPT
+        _log "ipv4 allow: DNS -> ${_dns}:53"
+    done
 
     # Rule 4: ACCEPT to Caddy IP:port (the ONLY permitted outbound destination).
     # This is the sole egress: Agent -> Caddy -> OPA -> external.
@@ -240,10 +336,11 @@ _write_ready_marker() {
     mkdir -p "${READINESS_DIR}" 2>/dev/null || true
     # SC2312: capture date separately to avoid masking exit code
     _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
-    if printf '%s caddy_ip=%s caddy_port=%s runtime=%s\n' \
+    if printf '%s caddy_ip=%s caddy_port=%s dns_servers=%s runtime=%s\n' \
         "${_ts}" \
         "${CADDY_IP:-unknown}" \
         "${CADDY_PORT}" \
+        "${DNS_SERVERS:-unknown}" \
         "${RUNTIME}" \
         > "${READINESS_FILE}" 2>/dev/null; then
         _log "Readiness marker written: ${READINESS_FILE}"
@@ -271,16 +368,21 @@ _log "ringfence-init starting (YSG-RISK-URF-L1) agent=${AGENT_NAME} runtime=${RU
 # Step 1: Check for rootless Podman gap before attempting iptables.
 _check_rootless_gap
 
-# Step 2: Resolve Caddy IP (before any DROP rule is active — CRIT-02).
+# Step 2: Detect the real DNS resolver(s) for this netns (YSG-RISK-166 —
+# runtime-aware, replaces the old Docker-only hardcoded default). Must run
+# before any DROP rule is active, same as Caddy IP resolution below.
+_detect_dns_servers
+
+# Step 3: Resolve Caddy IP (before any DROP rule is active — CRIT-02).
 _resolve_caddy_ip
 
-# Step 3: Apply IPv4 default-deny + Caddy ACCEPT.
+# Step 4: Apply IPv4 default-deny + Caddy ACCEPT.
 _apply_ipv4_rules
 
-# Step 4: Apply IPv6 default-deny (defence-in-depth — CRIT-03).
+# Step 5: Apply IPv6 default-deny (defence-in-depth — CRIT-03).
 _apply_ipv6_rules
 
-# Step 5: Write readiness marker for Pool Manager sequencing (L12).
+# Step 6: Write readiness marker for Pool Manager sequencing (L12).
 _write_ready_marker
 
 _log "ringfence-init complete. Agent network namespace: default-deny OUTPUT, Caddy ACCEPT only."

@@ -102,8 +102,21 @@ ENV_SECRET = "YASHIGANI_DOCUMENT_PSEUDONYMIZE_SECRET"
 ENV_SECRET_FILE = "YASHIGANI_DOCUMENT_PSEUDONYMIZE_SECRET_FILE"
 
 #: Default native-secrets path (Docker/Podman/K8s secret mount), consistent with
-#: the rest of the gateway (``/run/secrets/<key>``).
-_DEFAULT_SECRET_FILE = "/run/secrets/document_pseudonymize_secret"
+#: the rest of the gateway (``{YASHIGANI_SECRETS_DIR}/<key>``, default
+#: ``/run/secrets``).
+_DEFAULT_SECRET_FILENAME = "document_pseudonymize_secret"
+
+
+def _default_secret_file() -> Path:
+    """YSG-RISK-160: resolve the default native-secret mount via
+    YASHIGANI_SECRETS_DIR (default /run/secrets) — was a bare
+    "/run/secrets/document_pseudonymize_secret" literal with no fallback to
+    the env var, the same convention-bypass class as YSG-RISK-150. Resolved
+    at call time (not import time) so tests can monkeypatch
+    YASHIGANI_SECRETS_DIR without a module reload."""
+    return Path(
+        os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    ) / _DEFAULT_SECRET_FILENAME
 
 
 def load_deployment_secret() -> Optional[bytes]:
@@ -114,7 +127,8 @@ def load_deployment_secret() -> Optional[bytes]:
 
       1. ``YASHIGANI_DOCUMENT_PSEUDONYMIZE_SECRET`` (the secret value directly);
       2. the file named by ``YASHIGANI_DOCUMENT_PSEUDONYMIZE_SECRET_FILE``;
-      3. the default native-secret mount ``/run/secrets/document_pseudonymize_secret``.
+      3. the default native-secret mount
+         ``{YASHIGANI_SECRETS_DIR}/document_pseudonymize_secret``.
 
     Returns the secret bytes, or ``None`` when none is provisioned (the scheme
     then falls back to salt-only keying — see module docstring).  Never logs the
@@ -128,7 +142,7 @@ def load_deployment_secret() -> Optional[bytes]:
     file_env = os.environ.get(ENV_SECRET_FILE)
     if file_env:
         candidates.append(Path(file_env))
-    candidates.append(Path(_DEFAULT_SECRET_FILE))
+    candidates.append(_default_secret_file())
 
     for path in candidates:
         try:

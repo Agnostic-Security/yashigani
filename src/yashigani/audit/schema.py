@@ -2230,6 +2230,7 @@ class WebAuthnCredentialRevokedEvent(AuditEvent):
     masking_applied: bool = True
     admin_account: str = ""
     credential_uuid: str = ""
+    outcome: str = "success"  # success | failure — ASVS V7.1.2 (FIND-WEBAUTHN-REVOKE-AUDIT-OUTCOME)
 
 
 # ---------------------------------------------------------------------------

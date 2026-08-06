@@ -333,8 +333,12 @@ class TestUpdateAdmin:
 
     def test_update_email(self):
         auth = MagicMock()
+        # FIND-P-EMAIL (2026-08-04): update_admin() now also reads
+        # record.username (to allow reverting email back to the account's
+        # own username verbatim) — every real AccountRecord always has this
+        # field; this mock previously omitted it.
         rec = SimpleNamespace(account_id="a1", account_tier="admin",
-                              email="old@x.com", disabled=False)
+                              username="bob@x.com", email="old@x.com", disabled=False)
         auth.get_account = AsyncMock(return_value=rec)
         auth.get_account_by_email = AsyncMock(return_value=None)
         auth.set_email = AsyncMock(return_value=True)
@@ -353,7 +357,7 @@ class TestUpdateAdmin:
         """SoD-001: cannot point an admin at an email already used by a user."""
         auth = MagicMock()
         rec = SimpleNamespace(account_id="a1", account_tier="admin",
-                              email="old@x.com", disabled=False)
+                              username="bob@x.com", email="old@x.com", disabled=False)
         auth.get_account = AsyncMock(return_value=rec)
         auth.get_account_by_email = AsyncMock(return_value=SimpleNamespace(account_tier="user"))
         auth.set_email = AsyncMock()

@@ -722,3 +722,34 @@ async def maybe_selfheal(app_state: dict) -> None:
                     sched.start()
                 except Exception as exc:
                     logger.warning("WorkflowScheduler self-heal start() failed: %s", exc)
+        elif tag == "rbac_agent_stack" and ok:
+            # YSG-RISK-141 — ensure_rbac_agent_stack() (above) rebuilds a
+            # BRAND NEW AgentRegistry wrapping whatever is CURRENTLY in Redis
+            # db/3. If Redis db/3 lost its data mid-life (the connection
+            # itself recovered — e.g. a `redis-cli FLUSHDB` / volume-less
+            # recreate that completed fast enough that agent_registry never
+            # actually went `None` between requests, or simply the window
+            # between the connection dropping and this self-heal firing) the
+            # rebuilt registry is EMPTY even though the durable Postgres
+            # mirror (agent_registry table) still holds every registration.
+            # proxy.py's lifespan reconcile (ISSUE-AGENT-REG-DURABILITY) only
+            # runs ONCE, before uvicorn starts accepting connections — it
+            # never re-fires after this lazy self-heal path reconnects, so a
+            # mid-life Redis wipe would leave every @agent permanently
+            # `agent_not_found` until the gateway container itself restarts.
+            # Must run HERE, back on the event loop (not inside the
+            # to_thread worker above) — reconcile_agents_from_durable() reads
+            # the asyncpg pool, which is bound to the loop it was created on.
+            _agent_reg = _oai._state.agent_registry
+            if _agent_reg is not None:
+                try:
+                    from yashigani.agents.durable_store import AgentDurableStore
+                    from yashigani.agents.reconciler import reconcile_agents_from_durable
+
+                    await reconcile_agents_from_durable(_agent_reg, AgentDurableStore())
+                except Exception as exc:
+                    logger.error(
+                        "Gateway self-heal: agent reconcile from durable store "
+                        "FAILED (%s) — @agent routes may return agent_not_found "
+                        "until the registry is restored", exc,
+                    )

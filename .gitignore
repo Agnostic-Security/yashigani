@@ -16,6 +16,10 @@ env/
 .coverage
 htmlcov/
 
+# YTF harness cross-process state (FIND-B-TOTP-CROSSPROC) — machine-local,
+# never shipped/reviewed content, same class as .pytest_cache/.
+.ytf-state/
+
 # Yashigani runtime data
 docker/secrets/
 # YSG-RISK-053: Caddy-scoped secrets (caddy_client.{key,crt} + caddy_internal_hmac).

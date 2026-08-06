@@ -10,9 +10,8 @@
 ## Overview
 
 Yashigani makes outbound HTTP requests on behalf of the gateway operator: HIBP
-password-breach checks, OIDC/SSO token exchange, Open WebUI model pushes, OPA
-policy evaluation, SIEM event forwarding, and alert sinks (Slack, Teams,
-PagerDuty).
+password-breach checks, OIDC/SSO token exchange, OPA policy evaluation, SIEM
+event forwarding, and alert sinks (Slack, Teams, PagerDuty).
 
 Every outbound call is routed through the centralised `HttpClient`
 (`yashigani.net.HttpClient`), which enforces:
@@ -124,9 +123,12 @@ log-level override map.
 
 ## Protected Call Sites
 
-| Call site | Current guard | Pinned resolver? | Rationale |
-|---|---|---|---|
-| **Open WebUI model push** | `HttpClient` pre-flight + `pinned_resolver` | **Yes** (v2.23.3, extend-pr-112-owui-wrap) | OWUI hostnames are admin-configurable **per agent** and can be influenced by licence-key compromise or admin-account takeover (TA-3 insider). Highest rebinding risk. |
+> **2026-07-28:** The former highest-risk entry here — the OWUI model push
+> (`HttpClient` pre-flight + `pinned_resolver`, v2.23.3, extend-pr-112-owui-wrap)
+> — was removed along with `_push_openwebui_model()`/`_owui_http_client()` in
+> `src/yashigani/backoffice/routes/agents.py` when OWUI was removed in 4.0
+> (YSG-RISK-140). No admin-configurable-per-agent outbound call site remains
+> at this time; see Remaining Attack Surface below for everything that does.
 
 ## Remaining Attack Surface
 
@@ -139,10 +141,9 @@ log-level override map.
 | Alert sinks (Slack/Teams/PagerDuty) | `HttpClient` | No | Webhook URLs are operator-configured at deploy time. |
 | Gateway upstream proxy | Admin-configured allowlist, `_assert_safe_upstream_url` | No | Admin-controlled and validated at agent registration. |
 
-The OWUI model push is the highest-risk surface because the OWUI hostname is
-admin-configurable per-agent. All other surfaces use URLs that are fully
-hardcoded or operator-configured at deploy time and validated at startup —
-not computed at request time from attacker-influenceable inputs.
+All current surfaces use URLs that are fully hardcoded or operator-configured
+at deploy time and validated at startup — not computed at request time from
+attacker-influenceable inputs.
 
 `pinned_resolver` is available for any future call site where the URL target is
 computed at request time and the hostname could be influenced by external data.

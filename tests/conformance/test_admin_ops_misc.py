@@ -373,24 +373,24 @@ class TestServices:
         assert r.status_code == 200
         body = r.json()
         ids = {s["id"] for s in body["services"]}
-        assert ids == {"openwebui", "wazuh", "internal-ca", "langflow", "letta", "openclaw"}
+        assert ids == {"wazuh", "internal-ca", "langflow", "letta", "openclaw"}
         assert all(s["status"] == "stopped" for s in body["services"])
 
     def test_admin_reflects_enabled_profiles_env(self, admin_client, monkeypatch):
-        monkeypatch.setenv("YASHIGANI_ENABLED_PROFILES", "openwebui,wazuh")
+        monkeypatch.setenv("YASHIGANI_ENABLED_PROFILES", "langflow,wazuh")
         r = admin_client.get("/admin/services")
         by_id = {s["id"]: s for s in r.json()["services"]}
-        assert by_id["openwebui"]["status"] == "running"
+        assert by_id["langflow"]["status"] == "running"
         assert by_id["wazuh"]["status"] == "running"
         assert by_id["letta"]["status"] == "stopped"
 
     # GAP-CLOSED: POST /admin/services/{service_id}
     def test_manage_unauth_401(self, unauth_client):
-        r = unauth_client.post("/admin/services/openwebui", json={"action": "enable"})
+        r = unauth_client.post("/admin/services/wazuh", json={"action": "enable"})
         assert r.status_code == 401
 
     def test_manage_requires_stepup_not_just_admin(self, admin_client):
-        r = admin_client.post("/admin/services/openwebui", json={"action": "enable"})
+        r = admin_client.post("/admin/services/wazuh", json={"action": "enable"})
         assert r.status_code == 401
         assert r.json()["detail"]["error"] == "step_up_required"
 
@@ -400,7 +400,7 @@ class TestServices:
         assert r.json()["detail"]["error"] == "unknown_service"
 
     def test_manage_invalid_action_422(self, stepup_admin_client):
-        r = stepup_admin_client.post("/admin/services/openwebui", json={"action": "delete"})
+        r = stepup_admin_client.post("/admin/services/wazuh", json={"action": "delete"})
         assert r.status_code == 422  # Pydantic pattern validation
 
     def test_manage_known_service_is_informational_only(self, stepup_admin_client):

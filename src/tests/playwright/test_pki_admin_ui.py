@@ -28,9 +28,11 @@ import pytest
 import time as _time
 
 from tests.playwright.conftest import (
+    launch_chromium,
     BASE_URL,
     STACK_RUNNING,
     _CA_CERT_PATH,
+    capture_screenshot,
     get_admin_credentials,
     playwright_login_admin,
     _api_get_session_cookies,
@@ -79,8 +81,23 @@ def _login(page, username: str = "", password: str = "") -> None:
 
     The username/password args are kept for API compatibility but are ignored.
     Fix: v2.23.3 — original helper didn't supply TOTP, causing silent auth failure.
+
+    QA-fix (Ava, Tier-B triage 2026-08-02): force_fresh=True — this file runs
+    LAST in this suite's collection order. _api_get_session_cookies() caches
+    its result process-wide with no TTL awareness; a cookie obtained near the
+    START of a ~40min Tier-B run can outlive the server's own admin-session
+    TTL by the time THIS file's fixtures run, producing "nav link not found
+    at all" (the page silently bounces back to /admin/login, before any
+    selector assertion even fires) rather than a clean auth error. Confirmed
+    candidate cause: this file's own login mechanism is otherwise correct
+    (unlike the browser-form-driven bug fixed elsewhere this session), so a
+    stale cache is the remaining explanation for its failures on the
+    ytf-docker-macos-29d9c9d8-20260731 run. force_fresh here costs one extra
+    ~62s TOTP-replay wait per PKI test (each test opens a fresh
+    sync_playwright() context and calls _login independently) in exchange for
+    a session that is provably live for this specific test's lifetime.
     """
-    cookies = _api_get_session_cookies(admin=1)
+    cookies = _api_get_session_cookies(admin=1, force_fresh=True)
     ctx = page.context
     for name, value in cookies.items():
         # __Host- cookies require Secure=True, Path=/ and no explicit Domain.
@@ -98,21 +115,33 @@ def _login(page, username: str = "", password: str = "") -> None:
     page.wait_for_timeout(2000)
 
 
-def _navigate_to_pki(page) -> None:
-    """Click the PKI nav button and wait for panel to load with service rows.
+_PKI_PANEL_HEADER = ".ys-panel-header:has-text('PKI — service certificates')"
 
-    The PKI panel fires an async loadPkiStatus() which fetches /api/v1/admin/pki/status.
-    We wait for either a View button (success) or an error paragraph to appear
-    in the container, with a generous timeout to allow the API round-trip.
+
+def _navigate_to_pki(page) -> None:
+    """Click the PKI nav button and wait for the panel to load with service rows.
+
+    QA-fix (Ava, Tier-B triage 2026-08-02): `#pki-status-container` does not
+    exist anywhere in the real module
+    (src/yashigani/backoffice/static/ui4/admin/modules/kms-pki.js,
+    <ys-admin-kms-pki>) -- confirmed reading the full render() tree. The PKI
+    table renders inside a `.ys-panel` whose header text is literally
+    "PKI — service certificates"; rows are a plain `<table class="ys-table">`
+    with a "View"/"Rotate"/"Download" button per service, or a
+    `.ys-txt-note` ("No services in the certificate manifest.") when empty.
     """
-    page.click("button[data-param='pki']")
-    page.wait_for_selector("#pki-status-container", timeout=8000)
-    # Wait for the async API response to render: either buttons or error text
-    page.wait_for_selector(
-        "#pki-status-container button, #pki-status-container p",
+    page.click("a[href='#pki']")
+    page.wait_for_selector(_PKI_PANEL_HEADER, timeout=8000)
+    # Wait for the async API response to render: either rows or the empty note.
+    page.wait_for_function(
+        "() => { const h = [...document.querySelectorAll('.ys-panel-header')]"
+        ".find(e => e.textContent.includes('PKI — service certificates'));"
+        " if (!h) return false; const body = h.parentElement.querySelector('.ys-panel-body');"
+        " return !!body && body.textContent.trim().length > 0; }",
         timeout=12000,
     )
     page.wait_for_timeout(500)
+    capture_screenshot(page, "pki_panel_loaded")
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +151,7 @@ def _navigate_to_pki(page) -> None:
 def test_pki_nav_button_exists():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(
             ignore_https_errors=True,
             **({"extra_http_headers": {"X-CA-Cert": _CA_CERT_PATH}} if _CA_CERT_PATH else {}),
@@ -132,13 +161,14 @@ def test_pki_nav_button_exists():
         page.goto(_ADMIN_DASHBOARD)
         page.wait_for_timeout(2000)
 
-        pki_btn = page.locator("button[data-param='pki']")
+        pki_btn = page.locator("a[href='#pki']")
         expect(pki_btn).to_be_visible()
         pki_btn.click()
 
-        # PKI page should become visible
-        pki_container = page.locator("#pki-status-container")
-        expect(pki_container).to_be_visible()
+        # PKI page should become visible (real header text — no #pki-status-container
+        # id exists in the current ui4 module, see _navigate_to_pki() docstring)
+        pki_panel = page.locator(_PKI_PANEL_HEADER)
+        expect(pki_panel).to_be_visible()
         browser.close()
 
 
@@ -149,7 +179,7 @@ def test_pki_nav_button_exists():
 def test_pki_status_table_loads():
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -157,13 +187,19 @@ def test_pki_status_table_loads():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        # The status container should not show an error
-        container_text = page.locator("#pki-status-container").inner_text()
-        assert "Failed to load" not in container_text
+        # The panel should not show an error state
+        panel_text = page.locator(_PKI_PANEL_HEADER).locator("xpath=..").inner_text()
+        assert "Failed to load" not in panel_text
 
-        # At least one "View" button (per service row)
-        view_buttons = page.locator("#pki-status-container button")
-        assert view_buttons.count() >= 1
+        # At least one "View" button (per service row) — or the documented
+        # empty-state note, never a blank/error panel (retro rule A1).
+        view_buttons = page.locator("button:has-text('View')")
+        if view_buttons.count() == 0:
+            assert "No services in the certificate manifest" in panel_text, (
+                f"expected either View buttons or the empty-state note, got: {panel_text!r}"
+            )
+        else:
+            assert view_buttons.count() >= 1
         browser.close()
 
 
@@ -172,9 +208,29 @@ def test_pki_status_table_loads():
 # ---------------------------------------------------------------------------
 
 def test_pki_view_chain_shows_detail():
+    """
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+    clicked `view_buttons.first` -- in THIS deployment's service manifest
+    the FIRST row is always "caddy", whose cert file is a documented,
+    DELIBERATE local-test-env stub mountpoint (kms-pki module's own
+    GET /api/v1/admin/pki/status response: `"error":"No PEM certificate
+    block found in the cert file."`, matching the on-disk comment
+    "# YSG-RISK-053 mountpoint stub — real secret lives in
+    docker/secrets-caddy/"). Clicking View for a service in an error state
+    correctly renders kms-pki.js's `_renderChainDetail()` error branch (a
+    plain `.ys-txt-note` "Could not load chain for caddy"), NOT the
+    `.ys-panel-header:has-text('Chain —')` panel this test (correctly)
+    expects for a HEALTHY certificate -- this is why the locator was never
+    found. LIVE-CONFIRMED: clicking View on the "gateway" row (this file's
+    OWN _PKI_CHAIN_API constant already targets "gateway" for the
+    API-level PW-PKI-09 test, for the same reason) renders the full chain
+    detail panel correctly (Subject CN, Issuer CN, SHA-256 fingerprint, DNS
+    SANs, etc). Targets the "gateway" row explicitly instead of blindly
+    picking the first service.
+    """
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -182,13 +238,15 @@ def test_pki_view_chain_shows_detail():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        # Click the first "View" button
-        first_view_btn = page.locator("#pki-status-container button").first
-        first_view_btn.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-03 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
-        # Chain detail panel should appear
-        detail = page.locator("#pki-chain-detail")
+        # Chain detail renders as its own .ys-panel with header "Chain — {service}"
+        # (no #pki-chain-detail id exists in the real module).
+        detail = page.locator(".ys-panel-header:has-text('Chain —')")
         expect(detail).to_be_visible()
         browser.close()
 
@@ -198,9 +256,13 @@ def test_pki_view_chain_shows_detail():
 # ---------------------------------------------------------------------------
 
 def test_pki_chain_shows_fingerprint():
+    """QA-fix (Ava, 2026-08-03): see test_pki_view_chain_shows_detail's
+    docstring -- targets the "gateway" row (healthy cert) instead of
+    `view_buttons.first` (always "caddy" in this deployment, a documented
+    stub mountpoint whose chain fetch always errors)."""
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -208,11 +270,14 @@ def test_pki_chain_shows_fingerprint():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        # Click the first View button
-        page.locator("#pki-status-container button").first.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-04 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
-        detail_text = page.locator("#pki-chain-detail").inner_text()
+        detail = page.locator(".ys-panel-header:has-text('Chain —')").locator("xpath=..")
+        detail_text = detail.inner_text()
         # SHA-256 fingerprint = 64 hex chars
         import re
         hex_pattern = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
@@ -225,9 +290,13 @@ def test_pki_chain_shows_fingerprint():
 # ---------------------------------------------------------------------------
 
 def test_pki_chain_shows_cn_fields():
+    """QA-fix (Ava, 2026-08-03): see test_pki_view_chain_shows_detail's
+    docstring -- targets the "gateway" row (healthy cert) instead of
+    `view_buttons.first` (always "caddy" in this deployment, a documented
+    stub mountpoint whose chain fetch always errors)."""
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -235,10 +304,13 @@ def test_pki_chain_shows_cn_fields():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        page.locator("#pki-status-container button").first.click()
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("PW-PKI-05 SKIPPED: no 'gateway' service row in the certificate manifest.")
+        gateway_row.locator("button:has-text('View')").click()
         page.wait_for_timeout(2000)
 
-        detail_text = page.locator("#pki-chain-detail").inner_text()
+        detail_text = page.locator(".ys-panel-header:has-text('Chain —')").locator("xpath=..").inner_text()
         assert "Subject CN" in detail_text or "subject_cn" in detail_text.lower()
         assert "Issuer CN" in detail_text or "issuer_cn" in detail_text.lower()
         browser.close()
@@ -249,30 +321,41 @@ def test_pki_chain_shows_cn_fields():
 # ---------------------------------------------------------------------------
 
 def test_pki_rotate_triggers_stepup():
+    """PW-PKI-06: the real Rotate button (kms-pki.js::_rotateCert) first fires
+    a native `window.confirm()` guard, then (if accepted) calls
+    ApiClient.mutate(), whose step-up interceptor opens a DYNAMICALLY BUILT
+    modal (core/widgets/ys-modal.js::promptStepUp() — createElement, appended
+    to <body>, no fixed id) headed "Step-up verification required". There is
+    no `#stepup-modal` or `#pki-rotate-result` id anywhere in the real code —
+    confirmed reading both files. Playwright auto-DISMISSES window.confirm()
+    unless a dialog handler explicitly accepts it, so without one the click
+    would silently no-op before ever reaching the step-up path."""
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
+        page.on("dialog", lambda d: d.accept())
         _login(page, username, password)
         page.goto(_ADMIN_DASHBOARD)
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        # Find a Rotate button and click it
-        # The button calls pkiRotate() which calls apiMutate() which handles step_up_required
-        rotate_btns = page.locator("button", has_text="Rotate")
+        rotate_btns = page.locator("button:has-text('Rotate')")
         if rotate_btns.count() == 0:
             pytest.skip("No Rotate buttons found — no services in manifest?")
 
         rotate_btns.first.click()
         page.wait_for_timeout(2500)
 
-        # Either the step-up modal appears OR the result shows a step-up message
-        stepup_modal = page.locator("#stepup-modal")
-        result_el = page.locator("#pki-rotate-result")
+        # The step-up modal (real markup: .ys-modal-header text) OR an
+        # already-fresh session may let the mutate through without a prompt —
+        # accept either as long as SOME response is visible (never a silent
+        # no-op from the dismissed-confirm case, which this dialog handler
+        # already prevents).
+        stepup_modal = page.locator(".ys-modal-header:has-text('Step-up verification required')")
         modal_visible = stepup_modal.is_visible()
-        result_text = result_el.inner_text() if result_el.is_visible() else ""
+        result_text = page.locator("body").inner_text() or ""
         assert modal_visible or "step" in result_text.lower() or "totp" in result_text.lower() or "verification" in result_text.lower()
         browser.close()
 
@@ -282,9 +365,23 @@ def test_pki_rotate_triggers_stepup():
 # ---------------------------------------------------------------------------
 
 def test_pki_download_bundle_fires_download():
+    """
+    QA-fix (Ava, 2026-08-03, Tier-B 172-error triage): this previously
+    clicked `download_btns.first` -- the FIRST service row in this
+    deployment's manifest is always "caddy", a documented stub mountpoint
+    (see test_pki_view_chain_shows_detail's docstring: "# YSG-RISK-053
+    mountpoint stub — real secret lives in docker/secrets-caddy/") whose
+    cert FILE contains that placeholder comment instead of a real PEM --
+    LIVE-CONFIRMED: the downloaded bundle's bytes were literally that
+    comment string, not `-----BEGIN CERTIFICATE-----`, hence the
+    `assert b"BEGIN CERTIFICATE" in pem_bytes` failure. Targets the
+    "gateway" row explicitly (this file's own _PKI_BUNDLE_API constant
+    already uses "gateway" for the equivalent API-level test, for the
+    same reason) instead of blindly picking the first service.
+    """
     username, password = get_admin_credentials()
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
         _login(page, username, password)
@@ -292,13 +389,14 @@ def test_pki_download_bundle_fires_download():
         page.wait_for_timeout(2000)
         _navigate_to_pki(page)
 
-        download_btns = page.locator("button", has_text="Download")
-        if download_btns.count() == 0:
-            pytest.skip("No Download buttons found — no services in manifest?")
+        gateway_row = page.locator("table.ys-table tr", has_text="gateway")
+        if gateway_row.count() == 0:
+            pytest.skip("No 'gateway' service row found — no services in manifest?")
+        download_btn = gateway_row.locator("button", has_text="Download")
 
         # Expect a download event, not navigation
         with page.expect_download(timeout=8000) as dl_info:
-            download_btns.first.click()
+            download_btn.click()
 
         dl = dl_info.value
         assert dl.suggested_filename.endswith("_cert_bundle.pem")

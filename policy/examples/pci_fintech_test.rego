@@ -62,3 +62,31 @@ test_decision_contract_shape if {
 	d.policy_id == "clients.pci.pci-dss"
 	d.code == 403
 }
+
+# --- Additive against-spec coverage (Lu conf/v412-opa-templates) -------------
+# Req 10 / redact obligations had no assertion in 2d582105's G2 tests.
+
+# Req 10 — any CHD access carries the audit obligation (even when allowed).
+test_obligation_audit_chd_access if {
+	i := object.union(_base_input, {"data_tags": ["PAN"]})
+	d := data.clients.pci.decision with data.clients.pci.compliant_providers as _compliant_providers
+		with input as i
+	"audit_chd_access" in d.obligations
+}
+
+# Req 3.4.1 — an unmasked PAN in the response raises the redact obligation.
+test_obligation_redact_pan if {
+	i := object.union(_base_input, {"response_pan_detected": true, "response_pan_masked": false})
+	d := data.clients.pci.decision with data.clients.pci.compliant_providers as _compliant_providers
+		with input as i
+	"redact_pan" in d.obligations
+	not d.allow # unmasked PAN also denies
+}
+
+# Negative: a masked PAN raises no redact obligation.
+test_no_redact_obligation_when_masked if {
+	i := object.union(_base_input, {"response_pan_detected": true, "response_pan_masked": true})
+	d := data.clients.pci.decision with data.clients.pci.compliant_providers as _compliant_providers
+		with input as i
+	not "redact_pan" in d.obligations
+}

@@ -69,6 +69,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 
@@ -850,6 +851,31 @@ def _xml_escape(text: str) -> str:
     )
 
 
+# YSG-RISK-145 (recurrence of YSG-RISK-010 — CWE-1236 CSV/formula injection):
+# _render_text_like's csv branch re-emits every cell from the SOURCE document
+# (redacted cells excepted) verbatim. A non-redacted cell in the uploaded file
+# can carry an untouched formula-trigger payload (e.g. "=cmd|'/c calc'!A1")
+# that a reviewer/downloader later opens in Excel/LibreOffice/Google Sheets.
+# This worker is a dependency-free sandboxed jail process by design (see
+# module docstring) — it deliberately does NOT import the main yashigani
+# package, so the canonical escape_csv_cell (yashigani.audit.export) is
+# duplicated here rather than imported. Keep in sync with that function.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "﻿=", "﻿+", "﻿-", "﻿@")
+_CSV_LEADING_WHITESPACE_RE = re.compile(r"^[\s﻿]+")
+
+
+def _escape_csv_cell(v) -> str:
+    """Sanitise a single CSV cell — mirrors yashigani.audit.export.escape_csv_cell
+    (leading-whitespace-safe per LF-CSV-BYPASS: the trigger check runs on a
+    stripped copy so "\\r=cmd..." cannot bypass startswith("=") after the \\r
+    normalisation below)."""
+    s = str(v).replace("\n", " ").replace("\r", " ")
+    s_stripped = _CSV_LEADING_WHITESPACE_RE.sub("", s)
+    if s_stripped.startswith(_CSV_FORMULA_TRIGGERS):
+        return "'" + s
+    return s
+
+
 def _zip_out(parts: dict[str, bytes]) -> bytes:
     """Write a fresh OOXML zip from cleaned parts (regenerate, not edit-in-place)."""
     buf = io.BytesIO()
@@ -1256,7 +1282,10 @@ def _render_text_like(data: bytes, plan: dict, fmt: str) -> bytes:
             loc = f"row={row_idx},col={col_idx}"
             if loc in by_seg:
                 cell = _apply_transforms(cell, by_seg[loc])
-            new_row.append(cell)
+            # YSG-RISK-145: escape every cell (not just transformed ones) —
+            # a non-redacted cell can carry an untouched formula-trigger
+            # payload from the source document.
+            new_row.append(_escape_csv_cell(cell))
         writer.writerow(new_row)
     return out_buf.getvalue().encode("utf-8")
 

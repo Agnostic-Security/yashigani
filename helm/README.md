@@ -61,7 +61,6 @@ templates reference these literal key names via `secretKeyRef.key`.
 | `yashigani-gateway-secrets`       | `jwt_secret`, `hmac_secret`                     | `gateway.existingSecretName`       |
 | `yashigani-backoffice-secrets`    | `jwt_secret`, `hmac_secret`                     | `backoffice.existingSecretName`    |
 | `yashigani-grafana-secrets`       | `grafana_admin_password`                        | `grafana.existingSecretName`       |
-| `yashigani-open-webui-secrets`    | `secret_key`                                    | `openWebui.existingSecretName`     |
 
 The mTLS plane and admin bootstrap have dedicated lifecycles — DO NOT
 pre-create these unless you are running the issuer / minter out of band:
@@ -113,7 +112,6 @@ GATEWAY_HMAC=$(openssl rand -hex 32)
 BACKOFFICE_JWT=$(openssl rand -hex 32)
 BACKOFFICE_HMAC=$(openssl rand -hex 32)
 GRAFANA_PASS=$(openssl rand -base64 27 | tr -d '=+/' | head -c 36)
-WEBUI_KEY=$(openssl rand -hex 32)
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -141,10 +139,6 @@ kubectl -n "$NAMESPACE" create secret generic yashigani-backoffice-secrets \
 
 kubectl -n "$NAMESPACE" create secret generic yashigani-grafana-secrets \
   --from-literal=grafana_admin_password="$GRAFANA_PASS" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl -n "$NAMESPACE" create secret generic yashigani-open-webui-secrets \
-  --from-literal=secret_key="$WEBUI_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 

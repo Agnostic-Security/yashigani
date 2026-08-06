@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-A single release line is actively maintained on the `main` branch. Open WebUI is an optional flag (`--with-openwebui`), not a separate branch.
+A single release line is actively maintained on the `main` branch.
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
@@ -53,7 +53,6 @@ The following are **out of scope** — report directly to the respective maintai
 - Vulnerabilities in third-party dependencies (unless Yashigani misconfigures them)
 - Optional agent bundle containers: Lala (Langflow), Julietta (Letta), Scout (OpenClaw)
 - Upstream MCP tool servers
-- Open WebUI (when enabled via `--with-openwebui`)
 - Wazuh, Grafana, Prometheus (when enabled via compose profiles)
 
 ## Disclosure Policy

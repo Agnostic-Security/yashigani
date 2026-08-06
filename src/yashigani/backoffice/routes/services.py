@@ -4,7 +4,7 @@ Yashigani Backoffice — Optional service management.
 Admins can enable/disable optional compose-profile services from the
 admin panel without SSH access or re-running the installer.
 
-Services: openwebui, wazuh, internal-ca, langflow, letta, openclaw.
+Services: wazuh, internal-ca, langflow, letta, openclaw.
 
 All operations are API calls that exec podman/docker compose commands.
 
@@ -33,11 +33,6 @@ _log = logging.getLogger("yashigani.services")
 
 # Known optional services and their compose profiles
 _OPTIONAL_SERVICES = {
-    "openwebui": {
-        "profile": "openwebui",
-        "name": "Open WebUI",
-        "description": "Browser-based AI chat interface for end users",
-    },
     "wazuh": {
         "profile": "wazuh",
         "name": "Wazuh SIEM",

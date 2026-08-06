@@ -190,6 +190,64 @@ wait-loop was a install.sh-level workaround for the identical class of
 failure; it now verifies real container state instead of assuming success
 from a non-checked `podman start` return code.
 
+## 2026-08-05 — AS-FIX-5: `rec_merge_one()` unwraps `!override`/`!reset` on first-introduced keys
+
+**File:** `podman_compose.py`, `rec_merge_one()`, ~line 2004.
+
+**Root cause (source-verified, live-repro against `docker-compose.yml` +
+`docker-compose.gpu-mac-metal-podman.yml` on the exact commit that shipped
+FIND-IRIS-DUP-AGENT-REGRESSION, `d2ed22b0`):** `rec_merge_one()`'s first loop
+(introducing keys that exist in `source` but not yet in `target`) did
+`target[key] = clone(value)` unconditionally. When `value` is a raw
+`OverrideTag`/`ResetTag` (the compose-spec `!override`/`!reset` YAML merge
+tags), the SECOND loop a few lines below already unwraps them correctly —
+but only for the opposite case (key exists in `target`, absent from
+`source`). The first-introduction case was never handled: a raw `OverrideTag`
+object survived into the merged compose dict for any key whose FIRST
+`-f` file to define it used `!override`.
+
+Yashigani's `docker-compose.gpu-mac-metal-podman.yml` does exactly this —
+`profiles: !override [...]` on its `ollama` service, the first (and only)
+`-f` file in install.sh's assembled overlay chain to give that service a
+`profiles:` key at all. Every `podman-compose-ysg` invocation that included
+this overlay (which install.sh's `_ysg_assemble_compose_files()` always
+does on macOS/Mac-Metal Podman) therefore crashed inside
+`_parse_compose_file()` -> `_resolve_profiles()` -> `set(config.get
+("profiles", []))` with `TypeError: 'OverrideTag' object is not iterable`,
+**before any container was ever reached** — this broke `compose exec`,
+`compose up`, everything, identically.
+
+**Live-verified 2026-08-05:** this crash is the true root cause of
+FIND-IRIS-DUP-AGENT-REGRESSION (Yashigani `install.sh`'s
+`register_agent_bundles()` reporting both "could not query durable
+agent_registry" AND "No agents were registered" on every fresh Podman
+install with the GPU-mac-metal overlay active) — both `register_agent_
+bundles()` exec calls that assemble the full overlay set (the durable-
+Postgres pre-check AND the container-side agent-registration script) hit
+this exact crash and never reached their target container at all.
+Reproduced standalone (no Yashigani code involved) by invoking
+`podman_compose.py exec` with `-f docker-compose.yml -f docker-compose.
+gpu-mac-metal-podman.yml` against a live stack on the same commit;
+confirmed the crash disappears and `compose exec` reaches the target
+container after this fix.
+
+**Fix:** mirror the second loop's ResetTag/OverrideTag unwrap logic in the
+first loop. A first-introduced `!reset` is a genuine no-op (nothing exists
+yet to reset) — skipped entirely, not stored. A first-introduced `!override`
+is unwrapped to its `.value` (same "unneeded but harmless" info-log the
+second loop already uses), so downstream consumers of the merged dict
+(`_resolve_profiles()`, and any future caller) see a plain list/dict/scalar,
+never a raw tag object.
+
+**Yashigani-side companion fix:** `register_agent_bundles()` (install.sh)
+additionally hardens its result-parsing loop to treat "the compose-exec
+call itself produced zero recognised OK/SKIP/FAIL/ERROR lines" as a loud,
+distinct error — not the same silent "No agents were registered" warning
+used for the (legitimate) "everything was already registered" case — so a
+future regression in this class fails loudly instead of looking identical
+to a no-op success. See Yashigani `AgnosticSecurity/Operations/Compliance/
+yashigani/4.1.2/` retro for the full incident writeup.
+
 ## Version string
 
 `__version__` changed from `"1.5.0"` to `"1.5.0+ysg.1"` (GPL-2.0 fork-naming

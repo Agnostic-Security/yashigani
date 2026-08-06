@@ -26,7 +26,9 @@ def push_bindings_data(store: BindingStore | None, opa_url: str) -> None:
     """PUT the client-binding document to OPA at /v1/data/client_bindings.
 
     Does NOT touch /v1/data/yashigani — this namespace is owned solely by the
-    binding store, so push_rbac_data and this are independent.
+    binding store, so push_rbac_data (which itself only sub-path-PUTs
+    /v1/data/yashigani/rbac and /v1/data/yashigani/agents — YSG-RISK-176)
+    and this are independent.
 
     Raises:
         httpx.HTTPStatusError — OPA returned a non-2xx status.

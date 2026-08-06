@@ -18,9 +18,9 @@
 #   ./scripts/prepare-airgap-bundle.sh [OPTIONS]
 #
 # OPTIONS
-#   --profile   core|full|observability|agents|wazuh|spire|openwebui
+#   --profile   core|full|observability|agents|wazuh|spire
 #               Can be repeated: --profile core --profile observability
-#               Alias 'full' expands to: core observability openwebui
+#               Alias 'full' expands to: core observability
 #               Default: core
 #   --runtime   podman|docker   (default: podman if available, else docker)
 #   --output    PATH            Directory to write the bundle into (default: .)
@@ -92,7 +92,7 @@ Builds a Yashigani air-gap bundle from pinned image manifests.
 Run on a CONNECTED host before transferring to an isolated environment.
 
 Options:
-  --profile    core|full|observability|agents|wazuh|spire|openwebui
+  --profile    core|full|observability|agents|wazuh|spire
                Can be repeated. Default: core
   --runtime    podman|docker  (auto-detected if not set)
   --output     DIR            Write bundle + sidecar to DIR (default: .)
@@ -297,7 +297,7 @@ expand_profiles() {
   EXPANDED_PROFILES=()
   for prof in "${PROFILES[@]}"; do
     case "$prof" in
-      full) EXPANDED_PROFILES+=(core observability openwebui) ;;
+      full) EXPANDED_PROFILES+=(core observability) ;;
       *) EXPANDED_PROFILES+=("$prof") ;;
     esac
   done

@@ -487,6 +487,12 @@ async def revoke_credential(
         credential_uuid=credential_id,
     )
     if not deleted:
+        _write_audit(
+            session.account_id,
+            "WEBAUTHN_CREDENTIAL_REVOKED",
+            outcome="failure",
+            detail=f"credential_id={credential_id}",
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": "credential_not_found"},
@@ -689,6 +695,7 @@ def _write_audit(
         elif event_label == "WEBAUTHN_CREDENTIAL_REVOKED":
             event = WebAuthnCredentialRevokedEvent(
                 admin_account=account_id,
+                outcome=outcome,
                 credential_uuid=detail.replace("credential_id=", ""),
             )
         else:

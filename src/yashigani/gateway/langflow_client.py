@@ -48,30 +48,48 @@ _INTERNAL_BEARER: str = _load_internal_bearer()
 # ---------------------------------------------------------------------------
 # LLM routing for the default "Yashigani Chat" flow
 #
-# Langflow runs on the `langflow_isolated` compose network and CANNOT reach the
-# Ollama container directly (ollama lives on `data`/`edge`; they share no
-# network — see YSG-RISK-055 UA-10, which moved langflow off `data`).  The only
-# LLM surface langflow can reach is the Yashigani gateway's internal mesh port
-# (gateway:8081/v1), which the gateway also joins on `langflow_isolated`.
+# YSG-RISK-171 (chat-path repair, 2026-07-30): the v4.1 unified-sidecar
+# split-ringfence migration moved langflow OFF `langflow_isolated` (which used
+# to co-locate it with the gateway) onto {ringfence_langflow_in,
+# ringfence_langflow_eg} ONLY — it can reach ONLY egress-langflow:9400 (its
+# LLM egress-forwarder), NOT gateway:8081 directly. docker-compose's own
+# OPENAI_API_BASE for the langflow container was updated to
+# http://egress-langflow:9400/llm/v1 accordingly — but this Python constant,
+# baked directly into the persisted flow's OpenAIModel component
+# (_configure_openai_component's "openai_api_base" field), was left pointing
+# at the now-unreachable gateway:8081/v1. Every flow run therefore failed
+# inside Langflow itself with "Error building Component OpenAI: Connection
+# error." (confirmed live via `docker logs langflow`), surfaced to users as a
+# masked HTTP 500 (compounding YSG-RISK-167) — the exact same network-
+# topology-drift bug class as YSG-RISK-169 (Letta), just baked into a
+# Langflow flow node instead of a Letta llm_config.
+#
+# The self-heal path (_repair_flow_data / _lm_node_is_healthy, below) already
+# detects and rewrites a stale/broken model node on every _ensure_initialized()
+# call — fixing this constant is enough; no manual flow surgery is needed,
+# the next @langflow dispatch self-heals the persisted flow.
 #
 # That mesh port speaks the OpenAI-compatible protocol (/v1/chat/completions)
 # and is authed with the per-install internal bearer, which the langflow
 # container's entrypoint exports as OPENAI_API_KEY (and OPENAI_API_BASE points
-# at the same gateway mesh endpoint).
+# at the same egress-forwarder endpoint).
 #
 # Therefore the default flow MUST use langflow's OpenAIModel component pointing
-# at the gateway mesh endpoint — NOT the LanguageModelComponent with the Ollama
-# provider, which has no reachable upstream and which (with no provider set)
-# fails at run time with HTTP 500 "Unknown API key is required when using
-# Unknown provider".  Verified end-to-end against langflow 1.9.2 (2026-06-10):
-# OpenAIModel(model_name=qwen2.5:3b, openai_api_base=gateway:8081/v1,
-# api_key=OPENAI_API_KEY) returns a real chat completion.
+# at the reachable egress-forwarder endpoint — NOT the LanguageModelComponent
+# with the Ollama provider, which has no reachable upstream and which (with no
+# provider set) fails at run time with HTTP 500 "Unknown API key is required
+# when using Unknown provider". Verified end-to-end against langflow 1.9.2
+# (2026-06-10, pre-split-ringfence): OpenAIModel(model_name=qwen2.5:3b,
+# openai_api_base=<reachable mesh endpoint>, api_key=OPENAI_API_KEY) returns a
+# real chat completion.
 # ---------------------------------------------------------------------------
 
-# Gateway internal mesh endpoint (plain HTTP, OpenAI-compatible, reachable from
-# langflow_isolated). Overridable for non-compose topologies.
+# Egress-forwarder endpoint (plain HTTP, OpenAI-compatible, reachable from
+# langflow's ringfence_langflow_eg membership — matches docker-compose's own
+# OPENAI_API_BASE for the langflow service). Overridable for non-compose
+# topologies.
 _GATEWAY_MESH_BASE_URL: str = os.environ.get(
-    "YASHIGANI_LANGFLOW_LLM_BASE_URL", "http://gateway:8081/v1"
+    "YASHIGANI_LANGFLOW_LLM_BASE_URL", "http://egress-langflow:9400/llm/v1"
 )
 # Default model served by the gateway mesh endpoint.
 _DEFAULT_MODEL: str = os.environ.get("YASHIGANI_LANGFLOW_MODEL", "qwen2.5:3b")

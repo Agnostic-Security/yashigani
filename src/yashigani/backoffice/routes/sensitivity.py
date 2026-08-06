@@ -598,11 +598,16 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     FIND-003 hardening: retries once with stricter prompt on empty response;
     returns actionable error instead of silent empty pattern.
     """
-    from yashigani.backoffice.state import backoffice_state as _state
-
-    ollama_url = str(
-        getattr(_state, "ollama_url", None)
-        or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    # YSG-RISK-193: getattr(backoffice_state, "ollama_url", ...) was always
+    # truthy (dataclass default "http://ollama:11434" — the attribute is
+    # never actually assigned anywhere in the backoffice codebase), so the
+    # YASHIGANI_OLLAMA_URL/OLLAMA_BASE_URL env-var fallback below it was dead
+    # code and this route was permanently pinned to the hardcoded literal,
+    # bypassing the Caddy mesh front. Mirrors routes/models.py's
+    # _ollama_base() precedence: YASHIGANI_OLLAMA_URL -> OLLAMA_BASE_URL ->
+    # hardcoded dev default.
+    ollama_url = (
+        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
     ).rstrip("/")
 
     # FIND-003 (fix/medlow-findings): resolve model for structured-output tasks.
@@ -614,8 +619,9 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
     _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
     ollama_reachable = False
+    from yashigani.inspection._ollama_transport import ollama_async_client
     try:
-        async with _httpx.AsyncClient(timeout=10.0) as c:
+        async with ollama_async_client(ollama_url, timeout=10.0) as c:
             tags_resp = await c.get(ollama_url + "/api/tags")
             tags_resp.raise_for_status()
             avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
@@ -647,7 +653,7 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     # description is the user message — not concatenated into the system prompt.
     # FIND-003: helper to call the chat API once; used for initial attempt + retry.
     async def _call_llm(system_msg: str) -> str:
-        async with _httpx.AsyncClient(timeout=60.0) as client:
+        async with ollama_async_client(ollama_url, timeout=60.0) as client:
             r = await client.post(
                 ollama_url + "/api/chat",
                 json={

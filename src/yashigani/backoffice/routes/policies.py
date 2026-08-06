@@ -139,8 +139,12 @@ async def _resolve_default_model(ollama_url: str) -> tuple[str, list[str]]:
     pref = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL")
     _STRUCTURED_OUTPUT_DEFAULT = "qwen2.5:3b"
     ollama_reachable = False
+    # YSG-RISK-193: mesh-mTLS-aware transport (was a bare httpx.AsyncClient,
+    # which fails CERTIFICATE_VERIFY_FAILED / bypasses the Caddy mesh front
+    # for https://caddy:11435/ollama deployments).
+    from yashigani.inspection._ollama_transport import ollama_async_client
     try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
+        async with ollama_async_client(ollama_url, timeout=10.0) as c:
             tags_resp = await c.get(ollama_url + "/api/tags")
             tags_resp.raise_for_status()
             avail = [m.get("name") for m in tags_resp.json().get("models", []) if m.get("name")]
@@ -409,10 +413,15 @@ async def simulate_policy(body: SimulateRequest, session: AdminSession):  # noqa
 
     ai_explanation: Optional[str] = None
     if body.ai_explain:
-        ollama_url = str(
-            getattr(backoffice_state, "ollama_url", None)
-            or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+        # YSG-RISK-193: getattr(backoffice_state, "ollama_url", ...) was
+        # always truthy (dataclass default — never actually assigned),
+        # making the YASHIGANI_OLLAMA_URL/OLLAMA_BASE_URL fallback dead code
+        # and pinning this route to the hardcoded literal, bypassing the
+        # Caddy mesh. Mirrors routes/models.py's _ollama_base() precedence.
+        ollama_url = (
+            os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
         ).rstrip("/")
+        from yashigani.inspection._ollama_transport import ollama_async_client
         try:
             model, _ = await _resolve_default_model(ollama_url)
             prompt = (
@@ -423,7 +432,7 @@ async def simulate_policy(body: SimulateRequest, session: AdminSession):  # noqa
                 f"Decision: allow={allow}, deny={deny!r}, obligations={obligations!r}\n\n"
                 "Plain-English explanation:"
             )
-            async with httpx.AsyncClient(timeout=45.0) as c:
+            async with ollama_async_client(ollama_url, timeout=45.0) as c:
                 llm_resp = await c.post(
                     ollama_url + "/api/generate",
                     json={"model": model, "prompt": prompt, "stream": False},
@@ -503,6 +512,13 @@ async def duplicate_template(body: DuplicateTemplateRequest, session: StepUpAdmi
     rego = re.sub(r"(?m)^\s*package\s+[A-Za-z0-9_.]+", f"package clients.{new_name}", raw_rego, count=1)
     if "package" not in rego:
         rego = f"package clients.{new_name}\n\nimport rego.v1\n\n" + rego
+
+    # YSG-RISK-141: belt-and-suspenders — the rewrite above should always force
+    # package clients.<new_name>, but assert it explicitly rather than trust the
+    # regex substitution silently (e.g. if the template had an unusual package
+    # statement layout the substitution failed to match).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(rego, new_name)
 
     # Save as clients/<new_name>
     pol_id = f"clients/{new_name}"
@@ -591,6 +607,9 @@ async def edit_custom_policy_rego(
             detail={"error": "missing_package",
                     "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
         )
+    # YSG-RISK-141: reject cross-namespace package declarations (see save_policy).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(body.rego, name)
 
     from yashigani.opa_assistant.sanity import static_sanity_check
     sanity = await static_sanity_check(body.rego, name)
@@ -728,6 +747,12 @@ async def edit_core_policy(
             status_code=400,
             detail={"error": "missing_package", "message": "policy must declare a package"},
         )
+    # YSG-RISK-141: a core-policy edit must stay within the core (yashigani)
+    # package tree — reject a submitted package that escapes into clients.*
+    # or any other namespace, even though this endpoint is already gated by
+    # confirm_danger + step-up.
+    from yashigani.opa_assistant.rego_package import assert_core_package_scope
+    assert_core_package_scope(body.rego)
 
     # Sanity check before touching a core policy
     from yashigani.opa_assistant.sanity import static_sanity_check
@@ -869,6 +894,13 @@ async def save_policy(body: SavePolicyRequest, session: StepUpAdminSession):  # 
             detail={"error": "missing_package",
                     "message": f"policy must declare a package (e.g. 'package clients.{name}')"},
         )
+    # YSG-RISK-141: the package DECLARED inside the Rego source must exactly
+    # match clients.<name> — OPA keys the evaluated data document by the
+    # package statement, not by the module id used in the PUT path. Without
+    # this check a caller could save under their own name while declaring a
+    # package that shadows another tenant's namespace (or a core namespace).
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(body.rego, name)
 
     # #17 (OPA Phase 3a): behavioural sanity check in a throwaway sandbox BEFORE
     # the live PUT. Compile error -> 400 invalid_rego. HIGH warnings (deny-all /
@@ -1020,17 +1052,20 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
     draft is NOT auto-applied. (LLM loop/over-block sanity checks are a follow-up.)
     """
     name = re.sub(r"[^a-z0-9_]", "", (body.name or "generated").strip().lower()) or "generated"
-    ollama_url = str(
-        getattr(backoffice_state, "ollama_url", None)
-        or os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    # YSG-RISK-193: see the identical fix + rationale on the ai_explain branch
+    # of simulate_policy() above — getattr(backoffice_state, "ollama_url", ...)
+    # was dead-code cover for a hardcoded-literal mesh bypass.
+    ollama_url = (
+        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
     ).rstrip("/")
+    from yashigani.inspection._ollama_transport import ollama_async_client
     model, _ = await _resolve_default_model(ollama_url)
     prompt = (
         _REGO_GEN_SYSTEM.replace("{name}", name)
         + f"\n\nRequirement: {body.prompt}\n\nRego policy (package clients.{name}):\n"
     )
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with ollama_async_client(ollama_url, timeout=90.0) as client:
             resp = await client.post(
                 ollama_url + "/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False},
@@ -1059,7 +1094,7 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
 
     async def _regenerate(err_text: str) -> str:
         rprompt = prompt + f"\n\nThe previous attempt failed to compile with this OPA error:\n{err_text}\nReturn ONLY corrected Rego.\n"
-        async with httpx.AsyncClient(timeout=90.0) as c:
+        async with ollama_async_client(ollama_url, timeout=90.0) as c:
             rr = await c.post(ollama_url + "/api/generate", json={"model": model, "prompt": rprompt, "stream": False})
             rr.raise_for_status()
             fixed = (rr.json().get("response") or "").strip()

@@ -227,6 +227,22 @@ def _deny_message(reason: str) -> str:
     return _DENY_MESSAGES.get(reason, _GENERIC_DENY)
 
 
+def _agent_token_secrets_root():
+    """Root directory for per-bundled-agent gateway token files
+    (V232-CSCAN-01a resolve-and-confine guard). Returns a pathlib.Path.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare ``Path("/run/secrets")`` literal with no override, the same
+    convention-bypass class as YSG-RISK-150 (and inconsistent with
+    ``_load_token_role_map``'s ``_secrets_dir`` in this same module, which
+    already honoured the env var). Resolved at call time (not import time)
+    so tests can monkeypatch YASHIGANI_SECRETS_DIR without a module reload.
+    """
+    from pathlib import Path as _Path
+
+    return _Path(os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")).resolve()
+
+
 # ---------------------------------------------------------------------------
 # LAURA-411-002 / Ava FINDING-1: model input validation + normalization helpers
 # ---------------------------------------------------------------------------
@@ -241,9 +257,22 @@ def _deny_message(reason: str) -> str:
 # re.ASCII ensures the char-class [a-zA-Z0-9] is strictly 7-bit ASCII; no
 # Unicode letter/digit will match.  \Z (not $) anchors the end to prevent
 # a trailing \n from slipping through (Python's $ matches before a terminal \n).
-# Callers with @-prefix (agent calls) are exempted BEFORE _validate_model_string
-# is invoked, so @ appears in the allowlist only for digest formats (model@sha256:…).
+# @ appears in the allowlist for digest formats (model@sha256:…) and — since
+# YSG-RISK-158 — as the FIRST character for agent-call handles, validated
+# below by _AGENT_CALL_VALID_RE (see _validate_model_string).
 _MODEL_VALID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
+
+# YSG-RISK-158: agent-call handles ("@agent-name") were previously EXEMPTED
+# from _validate_model_string entirely at the call site (openai_router.py,
+# `if body.model and not is_agent_call ...`), because _MODEL_VALID_RE anchors
+# the first character to [a-zA-Z0-9] — an "@"-prefixed string always failed
+# that regex. Skipping validation for ANY string starting with "@" let a
+# caller smuggle URL-scheme forms, path-traversal sequences, null-sentinel
+# literals, or Unicode Cf/control chars past every LAURA-412-002 defense —
+# agent-call spoofing. Fix: validate the @-prefixed form HERE, in the
+# validator, with the same charset applied to the remainder after "@"
+# (non-empty), instead of bypassing validation at the call site.
+_AGENT_CALL_VALID_RE = re.compile(r"^@[a-zA-Z0-9][a-zA-Z0-9._:/@-]*\Z", re.ASCII)
 
 
 def _validate_model_string(model: str) -> Optional[str]:
@@ -285,6 +314,17 @@ def _validate_model_string(model: str) -> Optional[str]:
         return "path_traversal_not_allowed"
     if s_lower in ("null", "none", "undefined"):
         return "null_not_allowed"
+    # YSG-RISK-158: agent-call handles ("@agent-name") go through the SAME
+    # gate — the URL-scheme/path-traversal/null-sentinel checks above already
+    # ran unconditionally against the full string (including the "@"), so an
+    # agent-call payload like "@http://evil" or "@../../etc/passwd" is caught
+    # above exactly like an ordinary model string would be. Only the final
+    # charset check needs an @-aware branch, because _MODEL_VALID_RE anchors
+    # the first character to alnum.
+    if s.startswith("@"):
+        if not _AGENT_CALL_VALID_RE.match(s):
+            return "invalid_model"
+        return None
     # LAURA-412-002 (layer 1): positive allowlist — reject anything outside
     # the ASCII-safe model-name charset.
     if not _MODEL_VALID_RE.match(s):
@@ -1235,6 +1275,83 @@ def _service_account_full_list_enabled() -> bool:
     _SA_FULL_LIST_CACHE["ts"] = now
     return value
 
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-162 — admin-visible runtime toggle for the local-model "strict
+# dial" (gateway.permissions.strict_mode).
+#
+# permission_strict was previously ONLY an env var (YASHIGANI_PERMISSION_
+# STRICT), read once at configure() time -- invisible to any admin surface
+# and requiring a container restart to change. This mirrors the DB-backed,
+# TTL-cached, fail-open-to-configured-value pattern already used for
+# gateway.models.service_account_full_list above, so the setting is
+# discoverable and toggleable from the Admin Runtime Settings panel without
+# a restart.
+#
+# The DEFAULT VALUE stays False (unchanged) -- see runtime_settings/keys.py
+# KEY_PERMISSION_STRICT_MODE docstring / the v4.1.2 YSG-RISK-162 commit body
+# for the full rationale: cloud providers are ALREADY deny-by-default
+# (INV-1) independent of this dial, and local models already get full
+# detect+audit (PII/sensitivity/response-inspection, unconditional of
+# provider -- YSG-RISK-164). Flipping the DEFAULT to strict=True would 403
+# every local chat request on every fresh/community install with no grants
+# configured, which is a breaking change to the intentional local-detect-
+# only design, not a security fix -- so only the ADMIN TOGGLE ships here,
+# not a default flip.
+# ---------------------------------------------------------------------------
+_PERMISSION_STRICT_CACHE: dict = {"value": None, "ts": 0.0}
+_PERMISSION_STRICT_TTL = 30.0
+
+
+def _permission_strict_mode_enabled() -> bool:
+    """Live (DB-backed, 30s-cached) read of gateway.permissions.strict_mode.
+
+    Falls back to ``_state.permission_strict`` (the YASHIGANI_PERMISSION_
+    STRICT env value captured at configure() time) whenever no DB row
+    exists yet, the DB is unreachable, or the DSN is not configured --
+    fail-OPEN to the operator's already-configured value, matching the
+    established convention for this settings layer (gateway/entrypoint.py
+    _sync_read_setting: "fail-open for the settings layer, not the auth
+    layer"). This is deliberately NOT "fail-secure to True": forcing strict
+    mode on during a transient DB outage would 403 every local chat request
+    with no grants configured, which is an availability regression, not a
+    security improvement, for a setting whose insecure direction is
+    "permissive local access" (already accepted-by-design, YSG-RISK-164),
+    not "silently unenforced cloud egress" (INV-1 handles that
+    independently of this toggle).
+    """
+    import time as _t
+    now = _t.monotonic()
+    if now - _PERMISSION_STRICT_CACHE["ts"] < _PERMISSION_STRICT_TTL and _PERMISSION_STRICT_CACHE["value"] is not None:
+        return bool(_PERMISSION_STRICT_CACHE["value"])
+    value = bool(_state.permission_strict)
+    try:
+        import psycopg2, json as _json
+        from yashigani.runtime_settings.keys import KEY_PERMISSION_STRICT_MODE as _K
+        dsn = os.getenv("YASHIGANI_DB_DSN", "")
+        if dsn and "${POSTGRES_PASSWORD}" not in dsn:
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM runtime_settings WHERE key = %s", (_K,))
+                    row = cur.fetchone()
+                if row:
+                    raw = row[0]
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode()
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw)
+                    value = bool(raw)
+            finally:
+                conn.close()
+    except Exception as _exc:  # fail-open to the configured (env) value
+        logger.debug("permission_strict_mode read failed (%s) — using configured value %s", _exc, value)
+    _PERMISSION_STRICT_CACHE["value"] = value
+    _PERMISSION_STRICT_CACHE["ts"] = now
+    return value
+
+
 def is_orchestration_self_call(request) -> bool:
     """True when this request is an in-flight orchestration sub-hop.
 
@@ -1798,6 +1915,80 @@ def _get_cloud_api_key(provider: str) -> Optional[str]:
     return key
 
 
+def _resolve_effective_default_model() -> str:
+    """YSG-RISK-183 — resolve the EFFECTIVE default model for a chat request
+    that carries NO explicit ``model`` / no @mention.
+
+    Rule: "the default model is ALWAYS the local model, UNLESS a cloud
+    model is configured with an API key AND set as default."
+
+    1. If an admin has explicitly configured a default alias
+       (``ModelAliasStore.get_default()``) AND that alias is either LOCAL
+       (provider=="ollama" or force_local) OR a CLOUD alias with a
+       currently-configured API key -> return the ALIAS NAME (not the
+       resolved concrete model). Returning the alias name means the caller
+       flows through the exact same downstream machinery an EXPLICIT pin
+       of that alias would (normalisation, known-model check, cloud
+       permission-grant gate, key check) once ``body.model`` is set to it
+       by the caller in ``chat_completions`` — no bypass of RBAC/permission
+       gating for the admin-configured default.
+    2. Otherwise (no admin default configured, admin default alias missing,
+       or a configured cloud default lost its key after being set) ->
+       ``_state.default_model``, the spec-chosen LOCAL model
+       (``OLLAMA_MODEL``, auto-selected by install.sh from the host's
+       GPU/VRAM at install time — never a bare hardcoded model name).
+
+    Never raises; any store/lookup failure falls straight through to (2) —
+    fail-closed to LOCAL. This is intentionally a LIVE Redis read (not
+    cached): the admin-plane default-model change must take effect on the
+    very next chat request, and both this and the actual cloud-key TTL
+    cache below bound the cost.
+    """
+    store = _state.model_alias_store
+    if store is None:
+        return _state.default_model
+    try:
+        default_alias = store.get_default()
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: get_default() failed (%s) — "
+            "local fallback", exc,
+        )
+        return _state.default_model
+    if not default_alias:
+        return _state.default_model
+    try:
+        cfg = store.get(default_alias)
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: alias lookup failed for %r "
+            "(%s) — local fallback", default_alias, exc,
+        )
+        return _state.default_model
+    if cfg is None:
+        logger.warning(
+            "_resolve_effective_default_model: admin default alias %r no "
+            "longer exists — local fallback", default_alias,
+        )
+        return _state.default_model
+    provider = (getattr(cfg, "provider", "") or "").strip().lower()
+    is_local = provider == "ollama" or bool(getattr(cfg, "force_local", False))
+    if is_local:
+        return default_alias
+    # Cloud default — defense-in-depth re-check: the admin-set endpoint
+    # already refused to persist a cloud default without a key, but a key
+    # can be REMOVED afterwards. Never surface an unusable cloud default.
+    try:
+        if _get_cloud_api_key(provider):
+            return default_alias
+    except Exception as exc:
+        logger.warning(
+            "_resolve_effective_default_model: cloud key check failed for "
+            "provider=%s (%s) — local fallback", provider, exc,
+        )
+    return _state.default_model
+
+
 def configure(
     identity_registry=None,
     sensitivity_classifier=None,
@@ -2102,6 +2293,28 @@ def _encoded_payload_audit(
         )
     except Exception as exc:
         logger.warning("Encoded-payload audit write failed (request_id=%s): %s", request_id, exc)
+
+
+def _normalize_alias(name: str) -> str:
+    """Derive the same @-handle slug backoffice/routes/user_agents.py does.
+
+    YSG-RISK-168 (chat-path repair): the mention-menu @-handle offered to
+    users is `_normalize_alias(agent.name)` (see
+    backoffice/routes/user_agents.py::_normalize_alias — CANONICAL definition,
+    kept identical here to compare handles on both sides of the global
+    agent-registry lookup below without a cross-package import). Lowercase,
+    collapses non-alphanumeric runs to a single underscore, strips leading/
+    trailing underscores, prepends 'a' if the result starts with a digit,
+    truncated to 63 chars. Any change here MUST be mirrored in
+    user_agents.py's copy (and vice versa) — they must stay byte-identical.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
+    slug = slug.strip("_")
+    if not slug:
+        slug = "agent"
+    if slug[0].isdigit():
+        slug = "a" + slug
+    return slug[:63]
 
 
 def _sse_from_completion(
@@ -2517,8 +2730,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if _state.budget_enforcer and identity:
         from yashigani.billing.budget_enforcer import BudgetState
         allocation = _state.budget_enforcer.get_allocation(identity_id, "cloud")
-        budget_state = _state.budget_enforcer.check(
+        # YSG-RISK-144: check_hierarchy (not check) — the documented
+        # individual<=group<=org invariant was never enforced because the
+        # per-request path only ever checked the identity's OWN allocation.
+        # An identity within its own budget but over its group/org cap was
+        # never denied/degraded. group_ids/org_id come straight off the
+        # already-resolved identity dict (identity registry populates both).
+        budget_state = _state.budget_enforcer.check_hierarchy(
             identity_id, "cloud", budget_total=allocation,
+            group_ids=identity.get("groups") or [],
+            org_id=identity.get("org_id", "") or "",
         )
         budget_signal = budget_state.signal.value
         budget_pct = budget_state.pct
@@ -2529,7 +2750,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         budget_state = BudgetState(identity_id=identity_id, provider="cloud", used=0, total=0, signal=BudgetSignal.NORMAL, pct=0)
 
     # ── 6. Route decision ──────────────────────────────────────────────
-    selected_model = body.model or _state.default_model
+    # YSG-RISK-183: no explicit model/mention -> the EFFECTIVE default,
+    # which is the admin-configured default when one is set AND usable
+    # (local, or cloud with a configured key), else the spec-chosen LOCAL
+    # model (_state.default_model / OLLAMA_MODEL). Never the literal string
+    # "smart"/cloud-default unless an admin explicitly configured it AND a
+    # key is present — see _resolve_effective_default_model().
+    selected_model = body.model or _resolve_effective_default_model()
     # W3-007 (LAURA-V250-W3-007): resolved cloud target from alias pre-resolution.
     # Set inside the body.model validation block below; consumed by the Layer 2
     # extension and the LAURA-411-001 extension later in this function.
@@ -2541,10 +2768,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── LAURA-411-002 / Ava FINDING-1: model input validation + normalization ──
     # Runs BEFORE RBAC deny and optimisation so URL/path/null variants cannot
     # bypass the deny check by triggering the silent local-default fallback.
-    # Exempt: agent calls (start with @), brain-reasoning leg (server-minted,
-    # no alloc), and calls where body.model is absent (explicit default-model
-    # path — preserved per brief).
-    if body.model and not is_agent_call and not brain_reasoning_leg:
+    #
+    # YSG-RISK-158: agent calls (@-prefix) are NO LONGER exempted from
+    # _validate_model_string itself — the @-prefix exemption now lives INSIDE
+    # the validator (see _validate_model_string / _AGENT_CALL_VALID_RE), so an
+    # agent-call payload gets the SAME positive-validation gate (URL-scheme,
+    # path-traversal, null-sentinel, ASCII charset) as any other model string.
+    # Only brain-reasoning-leg (server-minted, no user-supplied value) and an
+    # absent body.model (explicit default-model path — preserved per brief)
+    # skip validation entirely.
+    if body.model and not brain_reasoning_leg:
         _mv_err = _validate_model_string(body.model)
         if _mv_err is not None:
             logger.warning(
@@ -2561,6 +2794,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     }
                 },
             )
+    # Normalization + known-model gating stay agent-call-exempt: an @-handle
+    # is an agent identifier resolved via agent_registry, not an LLM model
+    # name, so provider/model normalization and the alias/installed-model
+    # allowlist check below do not apply to it.
+    if body.model and not is_agent_call and not brain_reasoning_leg:
         # Normalize: lowercase + provider/model → provider:model.
         # The normalized form flows through optimisation and RBAC;
         # body.model (original) is retained for audit/logging.
@@ -3280,8 +3518,21 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
         # Global registry lookup — only if per-user resolution did not resolve
         if not agent_upstream:
+            # YSG-RISK-168: compare NORMALIZED handles on both sides, not a raw
+            # exact match. backoffice/routes/user_agents.py::list_user_mentions()
+            # derives the mention-menu @-handle via _normalize_alias(agent.name)
+            # — e.g. registry name "agent__langflow" (double underscore) becomes
+            # the offered handle "agent_langflow" (single underscore, collapsed
+            # by the alphanumeric-run normaliser). A caller addressing the ONLY
+            # handle the UI ever offers them would exact-match-fail here and
+            # 404. Normalizing both sides lets either the mention-menu handle
+            # or the raw registry name resolve to the same agent.
+            _agent_name_norm = _normalize_alias(agent_name)
             for agent in _state.agent_registry.list_all():
-                if agent.get("name") == agent_name and agent.get("status") == "active":
+                if (
+                    _normalize_alias(agent.get("name", "")) == _agent_name_norm
+                    and agent.get("status") == "active"
+                ):
                     stored_url = agent.get("upstream_url", "")
                     agent_protocol = agent.get("protocol", "openai")
 
@@ -3526,7 +3777,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         not is_agent_call
         and not brain_reasoning_leg
         and _state.permission_store is not None
-        and (_perm_is_cloud or _state.permission_strict)
+        and (_perm_is_cloud or _permission_strict_mode_enabled())
     )
 
     if _perm_needs_check:
@@ -4088,10 +4339,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 _total = pt + ct
                 if _state.budget_enforcer and selected_provider != "ollama" and identity:
                     try:
+                        # YSG-RISK-144: pass group_ids/org_id so the group and
+                        # org counters actually accumulate usage — previously
+                        # omitted, meaning check_hierarchy's group/org lookups
+                        # would always read 0 usage regardless of configured caps.
                         _state.budget_enforcer.record(
                             identity_id=identity_id,
                             provider=selected_provider,
                             tokens=_total,
+                            group_ids=identity.get("groups") or [],
+                            org_id=identity.get("org_id", "") or "",
                         )
                     except Exception as _exc:
                         logger.warning("Streaming budget recording failed: %s", _exc)
@@ -4361,7 +4618,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
                 # Read agent auth token from env var or secrets file
                 import os
-                from pathlib import Path as _Path
                 agent_headers: dict[str, str] = {"Content-Type": "application/json"}
                 # Check env var first (e.g., OPENCLAW_GATEWAY_TOKEN), then secrets file
                 env_token = os.getenv(f"{agent_name_lower.upper()}_GATEWAY_TOKEN", "")
@@ -4371,7 +4627,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     # constrained by AgentRegisterRequest.name pattern='^[a-z][a-z0-9_-]{0,63}$',
                     # but we guard here too as defence-in-depth against pre-existing registry
                     # entries that predate the pattern constraint (CWE-22).
-                    _secrets_root = _Path("/run/secrets").resolve()
+                    # YSG-RISK-160: secrets root now honours YASHIGANI_SECRETS_DIR
+                    # (see _agent_token_secrets_root() docstring).
+                    _secrets_root = _agent_token_secrets_root()
                     _token_path = (_secrets_root / f"{agent_name_lower}_token").resolve()
                     if not _token_path.is_relative_to(_secrets_root):
                         logger.warning(
@@ -4399,32 +4657,33 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if _dc_token:
                     agent_headers["X-Yashigani-Session-Id"] = _dc_token
 
-                # YSG-GATE-V50-A: bundled/mesh-fronted "openai"-protocol agents
-                # (currently openclaw; langflow when mis-registered) dispatch
-                # through this generic branch too. Their registered upstream
-                # is the Caddy INGRESS front (https://caddy:<port>/agents/...),
-                # which terminates mTLS require_and_verify against the
-                # internal mesh CA (_dispatch_client.py). A bare
-                # httpx.AsyncClient() presents no client leaf and trusts only
-                # system roots, so it fails CERTIFICATE_VERIFY_FAILED against
-                # that front. Admin-registered EXTERNAL agents (arbitrary
-                # https://agent.example.com upstreams) are NOT behind our
-                # mesh CA and must keep using the bare client — mirrors the
-                # closed-allowlist shape in
-                # backoffice/bundled_envelopes.py::_FRONT_UPSTREAM_RE
-                # (duplicated here rather than imported, same layering
-                # rationale as pki/ssl_context.py::_extract_spiffe_uris).
-                _mesh_front_re = re.compile(
-                    r"^https://caddy:\d{4,5}/agents/[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}"
-                    r"/[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}/?$"
-                )
+                # YSG-RISK-139 (DIVERGENT-resolution per catch-up audit PR #108:
+                # "generalise 139 regex" — the 4.1.2 path-signature detection
+                # REPLACES 5.0's YSG-GATE-V50-A hostname-anchored regex, which
+                # only matched the compose hostname `caddy:` and broke on k8s
+                # where the front is yashigani-caddy-mesh:<port>): registered
+                # upstreams under the v4.1 unified-sidecar dispatch repoint
+                # (§2.5) are the agent's Caddy INGRESS front. That front
+                # terminates mTLS require_and_verify with a leaf signed by the
+                # INTERNAL CA — a bare httpx.AsyncClient only trusts the
+                # public/certifi bundle and fails CERTIFICATE_VERIFY_FAILED.
+                # Detect a mesh ingress front by the portable
+                # /agents/<tenant>/<system> path signature (hostname differs
+                # between compose and k8s; the path does not) and present the
+                # internal-PKI mesh leaf via the SAME single-source client the
+                # letta/langflow branches use. Genuine externally-deployed
+                # OpenAI-compatible agents (AgentRegisterRequest.upstream_url,
+                # no /agents/ path) keep the public-CA-trusting bare client.
+                from urllib.parse import urlparse as _urlparse
+                _is_mesh_agent_front = _urlparse(agent_upstream or "").path.startswith("/agents/")
+                if _is_mesh_agent_front:
+                    from yashigani.gateway._dispatch_client import agent_dispatch_client
+                    _agent_http_client_cm = agent_dispatch_client(timeout=120.0)
+                else:
+                    _agent_http_client_cm = httpx.AsyncClient(timeout=120.0)
+
                 try:
-                    if _mesh_front_re.match(agent_upstream or ""):
-                        from yashigani.gateway._dispatch_client import agent_dispatch_client
-                        _agent_client_cm = agent_dispatch_client(timeout=120.0)
-                    else:
-                        _agent_client_cm = httpx.AsyncClient(timeout=120.0)
-                    async with _agent_client_cm as client:
+                    async with _agent_http_client_cm as client:
                         resp = await client.post(
                             f"{agent_upstream}/v1/chat/completions",
                             json=agent_body,
@@ -4977,10 +5236,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # Record token usage in budget system
     if _state.budget_enforcer and selected_provider != "ollama":
         try:
+            # YSG-RISK-144: pass group_ids/org_id — see streaming _usage_callback
+            # above for why (group/org counters were never incremented before).
             _state.budget_enforcer.record(
                 identity_id=identity_id,
                 provider=selected_provider,
                 tokens=total_tokens,
+                group_ids=(identity.get("groups") or []) if identity else [],
+                org_id=(identity.get("org_id", "") or "") if identity else "",
             )
         except Exception as exc:
             logger.warning("Budget recording failed: %s", exc)
@@ -6362,6 +6625,34 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                     return nhi_identity
 
                 # p1_agent: resolve as a named agent identity from registry
+                #
+                # YSG-RISK-174 (chat-path repair, 2026-07-30): sensitivity_ceiling
+                # was hardcoded "INTERNAL" (rank 1) for EVERY p1_agent identity,
+                # including the agent's own reasoning self-call to gateway's
+                # /v1/chat/completions (the same "llm" egress class RISK-170
+                # already established deserves no artificial ceiling cap). This
+                # is the SAME misapplied-ceiling class as RISK-170, just at the
+                # response-delivery gate (_opa_response_check /
+                # v1_routing.rego response_decision) rather than the egress-eval
+                # gate. Live-confirmed: after fixing RISK-172 (langflow's token
+                # now resolves correctly as p1_agent/agent__langflow instead of
+                # anonymous), langflow's own self-call started 403ing with
+                # `OPA BLOCKED response delivery: identity=agent__langflow
+                # sensitivity=RESTRICTED reason=response_sensitivity_exceeds_ceiling`
+                # -- letta/openclaw do NOT hit this because they authenticate via
+                # the separate _INTERNAL_BEARER path below, which already resolves
+                # to sensitivity_ceiling="RESTRICTED" (rank 3) -- only langflow's
+                # dedicated per-agent P1 token (Phase 5 §C) took this INTERNAL-
+                # capped branch. Raised to RESTRICTED for parity: this only
+                # removes the artificial rank-based cap on the response_decision
+                # ceiling comparison (v1_routing.rego `_effective_sensitivity_rank
+                # <= _ceiling_rank(...)`); the SEPARATE, unconditional
+                # `_response_blocked_by_inspection` hard gate (verdict=="blocked")
+                # is untouched and still denies a genuinely blocked/PII-flagged
+                # response regardless of ceiling -- does NOT weaken real content
+                # inspection, only corrects a ceiling meant to distinguish
+                # privilege tiers that was never meant to cap an agent's own
+                # self-call below what an equivalent internal caller already gets.
                 if _state.agent_registry is not None:
                     try:
                         agent = _state.agent_registry.get(token_identity_id)
@@ -6378,7 +6669,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                                 "groups": agent.get("groups", []),
                                 "allowed_models": [],
                                 "allowed_paths": agent.get("allowed_paths", []),
-                                "sensitivity_ceiling": "INTERNAL",
+                                "sensitivity_ceiling": "RESTRICTED",
                             }
                     except Exception as exc:
                         logger.warning(
@@ -6388,7 +6679,7 @@ def _resolve_identity(request: Request) -> Optional[dict]:
                 # Fallback: generic P1 agent identity (no elevated privilege)
                 return {"identity_id": token_identity_id, "kind": "agent",
                         "status": "active", "groups": [], "allowed_models": [],
-                        "sensitivity_ceiling": "INTERNAL"}
+                        "sensitivity_ceiling": "RESTRICTED"}
 
         # ── Shared _INTERNAL_BEARER path (backward compat) ─────────────────
         if hmac.compare_digest(key, _INTERNAL_BEARER):

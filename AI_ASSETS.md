@@ -72,9 +72,9 @@ Yashigani provides an agent registry: a persistent store of registered agent ide
 | `letta` | Letta (MemGPT) stateful agent. Native Letta REST API, response translated to OpenAI shape. | `src/yashigani/gateway/letta_client.py` |
 | `langflow` | Langflow visual workflow. Auto-login, API key creation, flow run; response translated to OpenAI shape. | `src/yashigani/gateway/langflow_client.py` |
 
-### 2.3 Open WebUI integration
+### 2.3 Chat surface model visibility
 
-When an agent is registered via the admin API, Yashigani optionally registers the agent as a selectable model in Open WebUI (`OWUI_API_URL` env var). Open WebUI is an operator-deployed chat interface; it is not bundled in the Yashigani image.
+Registered agents become selectable models via the gateway's `/v1/models` listing, consumed by Yashigani's own `ui4` chat surface (native, served by the backoffice — OpenWebUI was removed in 4.0). See `docs/yashigani_install_config.md` §21 for the `gateway.models.service_account_full_list` runtime setting controlling picker visibility.
 
 ---
 

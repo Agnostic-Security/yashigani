@@ -11,8 +11,9 @@
 #     removed prometheus direct scrape)
 #   - prometheus egress: via Caddy :8444/:8445 ONLY (when metrics listeners
 #     enabled); direct pod-scrape egress only when listeners explicitly disabled
-#   - open-webui egress: via Caddy :443 only
 #   - helm test pods: via Caddy only (test connects to caddy, not direct)
+#   (open-webui ingress/egress NetworkPolicies removed 2026-07-28 — OWUI
+#    removed in 4.0, YSG-RISK-140.)
 #
 # NOTE: Pod selectors use app.kubernetes.io/name labels, which match the
 # labels emitted by every Deployment and StatefulSet in this chart.
@@ -195,9 +196,10 @@ spec:
 ---
 # Gateway — ingress rules (EX-231-10 + BUG-2 v2.23.4 + A4 v2.25.0-P2):
 #   Port 8080 (mTLS): Caddy ONLY — Caddy is the sole external ingress.
-#   Port 8081 (mesh): open-webui + agent bundle pods — internal mesh port, plain HTTP.
-#     open-webui and agent bundles cannot reach port 8080 (mTLS+CaddyVerified blocks it).
+#   Port 8081 (mesh): agent bundle pods — internal mesh port, plain HTTP.
+#     Agent bundles cannot reach port 8080 (mTLS+CaddyVerified blocks it).
 #     Port 8081 never serves Caddy-proxied traffic; it has no CaddyVerified gate.
+#     (open-webui was also a port 8081 mesh caller pre-4.0; removed 2026-07-28.)
 # A4 fix: agent bundle pods (langflow/letta/openclaw) connect to gateway:8081 for
 # LLM dispatch (values.yaml configures them with OPENAI_API_BASE=http://gateway:8081/v1).
 # Without this rule, default-deny-ingress drops all agent LLM calls silently in K8s.
@@ -239,15 +241,7 @@ spec:
     # Internal mesh port — agent bundle pods (BUG-2 fix v2.23.4; A4 v2.25.0-P2)
     # A4: agent bundles route LLM calls to gateway:8081 (OPENAI_API_BASE in values.yaml).
     # Council finding A4: Laura F-001 + Iris DRIFT-009 + Tom indirect.
-    {{- if .Values.openWebui.enabled }}
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: open-webui
-      ports:
-        - protocol: TCP
-          port: 8081
-    {{- end }}
+    # (open-webui ingress rule removed 2026-07-28 — OWUI removed in 4.0.)
     - from:
         {{- if .Values.agentBundles.langflow.enabled }}
         - podSelector:
@@ -734,7 +728,9 @@ spec:
 # its egress policy is absent → default-deny-egress blocks it → ollama-init hangs
 # forever on "waiting for yashigani-ollama:11434" → helm --atomic times out and
 # rolls back the whole release. Keep this condition identical to the Job's.
-{{- if and .Values.ollama.enabled (or .Values.openWebui.enabled .Values.agentBundles.langflow.enabled .Values.agentBundles.letta.enabled .Values.agentBundles.openclaw.enabled) }}
+# openWebui.enabled removed from this OR (2026-07-28) — OWUI removed in 4.0;
+# ollama.yaml's gate was updated in the SAME commit — keep them identical.
+{{- if and .Values.ollama.enabled (or .Values.agentBundles.langflow.enabled .Values.agentBundles.letta.enabled .Values.agentBundles.openclaw.enabled) }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -967,62 +963,8 @@ spec:
         - protocol: TCP
           port: 5432
 
-{{- if .Values.openWebui.enabled }}
----
-# Open WebUI — accept ingress from caddy / nginx-ingress only
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-open-webui-ingress
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "yashigani.labels" . | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: open-webui
-  policyTypes:
-    - Ingress
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: yashigani-caddy
-        # B10 fix (M-LIOR-001): AND semantics — namespace + pod selector combined.
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ingress-nginx
-      ports:
-        - protocol: TCP
-          port: 8080
-
----
-# Open WebUI egress
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-open-webui-egress
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "yashigani.labels" . | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: open-webui
-  policyTypes:
-    - Egress
-  egress:
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: yashigani-gateway
-      ports:
-        - protocol: TCP
-          port: 8081
-{{- end }}
+# Open WebUI ingress/egress NetworkPolicies removed 2026-07-28 — OWUI removed
+# in 4.0 (see helm/yashigani/values.yaml openWebui comment for the full removal note).
 
 ---
 # Prometheus — accept ingress from grafana and from caddy / nginx-ingress
@@ -1731,7 +1673,7 @@ spec:
 # Upstreams (mirrors helm/yashigani/templates/configmaps.yaml :443 site):
 #   - yashigani-gateway:8080      (mTLS, /v1/* + /health)
 #   - yashigani-backoffice:8443   (mTLS, /admin/* + /api/admin/*)
-#   - open-webui:8080             (plain, only when openWebui.enabled — disabled in 4.0)
+#   (open-webui:8080 egress rule removed 2026-07-28 — OWUI removed in 4.0.)
 #
 # DNS (UDP/TCP 53) is already covered by allow-dns-egress for all pods.
 # The :8444 / :8445 SPIFFE-gated metrics listeners are *ingress* on Caddy
@@ -1764,15 +1706,6 @@ spec:
       ports:
         - protocol: TCP
           port: 8443
-    {{- if .Values.openWebui.enabled }}
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: open-webui
-      ports:
-        - protocol: TCP
-          port: 8080
-    {{- end }}
     # Observability services — Caddy proxies /admin/grafana/* and /admin/prometheus/*
     # via handle_path blocks (Caddyfile obs-network upstreams).
     # These were absent from the original allow-caddy-egress, causing 502s when

@@ -267,6 +267,22 @@ def verify_totp(
     Algorithm isolation: a code computed with the wrong algorithm or wrong
     digit count will NOT match (distinct HMAC functions / distinct moduli
     produce different code strings; constant-time comparison rejects them).
+
+    GLOBAL single-use, by design — DO NOT scope this cache key by caller
+    purpose (login / stepup / change_password / ...). FIND-B-STEPUP-REPLAY-
+    REGRESSION-20260806: a purpose-scoped key (`secret:purpose:window`) was
+    tried to solve a UX complaint (a fresh admin session's first /auth/stepup
+    call, submitted within the login TOTP code's still-valid 30s window, was
+    rejected as a "replay"). That "fix" was reverted — it made a code
+    captured/observed during login independently replayable at stepup (and
+    every other purpose) because each purpose got its own replay namespace.
+    RFC 6238 / ASVS V2.8.3 / V6.8.4 require single-use to be GLOBAL: once a
+    code is consumed for ANY verification event, it must be rejected for
+    EVERY subsequent verification event against that secret, regardless of
+    purpose. The correct fix for "first stepup attempt rejected" lives at
+    the CLIENT: wait for a fresh (next-window) code before submitting a
+    step-up verification rather than reusing the code just used at login —
+    see src/tests/unit/test_totp.py::TestStepupReplayIsGlobalNotPerPurpose.
     """
     if not secret_b32 or not code:
         return False

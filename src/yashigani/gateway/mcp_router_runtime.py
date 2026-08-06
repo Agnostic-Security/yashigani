@@ -92,7 +92,7 @@ def _mesh_caller_is_internal(request: Request) -> bool:
     YSG-RISK-108 / T-3 + T-4 trust gate.
 
     The per-install YASHIGANI_INTERNAL_BEARER is present on ALL legitimate
-    mesh callers (orchestrator self-calls, OWUI, 4.0 native chat path).
+    mesh callers (orchestrator self-calls, the 4.0 native ui4 chat path).
     Only when this token is verified should identity-forwarding headers
     (X-Yashigani-Identity-Id, X-Yashigani-Orchestration-Depth/Principal)
     be trusted.  4.1 SEC-GAP-1: X-Forwarded-User removed from the trusted set.
@@ -340,7 +340,7 @@ async def _handle_mcp_call_inner(
     # 4.1 SEC-GAP-1: X-Forwarded-User removed; X-Yashigani-Identity-Id is the
     # canonical identity rail.
     #   (a) YASHIGANI_INTERNAL_BEARER — present on ALL legitimate mesh callers
-    #       (orchestrator self-calls, OWUI, 4.0 native chat path), OR
+    #       (orchestrator self-calls, the 4.0 native ui4 chat path), OR
     #   (b) X-Caddy-Verified-Secret — present on requests proxied through Caddy
     #       (SSO/API path via port 8080; Caddy strips inbound copies at the edge).
     #
@@ -498,6 +498,22 @@ async def _handle_mcp_call_inner(
         return JSONResponse(
             status_code=400,
             content={"error": "INVALID_JSON"},
+        )
+
+    # YSG-RISK-146: a JSON-RPC message MUST be a JSON object. A syntactically
+    # valid but non-object top-level value (e.g. `42`, `null`, `"x"`, `[1,2]`)
+    # parses fine via json.loads() but crashes below with an unhandled
+    # AttributeError/TypeError (msg.get(...) on a list/int/str/None) — an
+    # unauthenticated malformed-body 500 instead of a 400. Reject fail-fast.
+    if not isinstance(msg, dict):
+        logger.warning(
+            "mcp-runtime: malformed JSON-RPC body (not a JSON object) agent=%r "
+            "type=%s",
+            agent_name, type(msg).__name__,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"error": "INVALID_JSON_RPC_MESSAGE", "detail": "JSON-RPC message must be a JSON object"},
         )
 
     method = msg.get("method", "")

@@ -212,6 +212,29 @@ class AuditChainService:
     def compute_hashes_for_event(self, event_dict: dict) -> tuple[str, str]:
         """Compute (prev_hash, event_hash) for an event about to be inserted.
 
+        DEAD IN PRODUCTION as of YSG-RISK-176/177 (2026-07-30) — superseded
+        by compute_hashes_for_event_db() below. This method's in-memory
+        (self._last_hash, self._current_day) state, protected only by a
+        per-INSTANCE threading.Lock, is single-process-safe ONLY: with
+        multiple gunicorn/uvicorn worker processes (the gateway alone runs
+        two — mTLS :8080 + mesh :8081 — each with its own AuditChainService
+        instance via build_postgres_audit_sink()), the chain diverged across
+        processes (a live query under normal concurrent traffic found 4/56
+        broken links, zero tampering). PostgresSink._flush_batch (the only
+        production caller) now calls compute_hashes_for_event_db() instead,
+        which derives prev_hash from the database's own seq-ordered last row
+        under a transaction-scoped pg_advisory_xact_lock — correct across
+        every process/connection.
+
+        Kept ONLY for the existing single-process unit/integration test
+        suite (src/tests/unit/test_lu_amend_01_*.py,
+        src/tests/integration/test_lu_amend_01_*.py,
+        src/tests/regression/v2.25.2/test_irrevocable_audit_chain.py) that
+        exercises the hashing algorithm itself without a DB connection. Do
+        NOT wire this into any new production call site — use
+        compute_hashes_for_event_db() for anything that writes to
+        audit_events.
+
         Returns:
             (prev_hash, event_hash) — both SHA-384 hex strings.
 
@@ -235,6 +258,62 @@ class AuditChainService:
             self._last_hash = ev_hash
 
         return prev, ev_hash
+
+    async def compute_hashes_for_event_db(
+        self, conn, tenant_id: uuid.UUID, event_dict: dict
+    ) -> tuple[str, str]:
+        """Cross-process-safe (YSG-RISK-176) variant of compute_hashes_for_event.
+
+        compute_hashes_for_event() above is single-process-safe only: its
+        threading.Lock + in-memory (_last_hash, _current_day) do not
+        coordinate across the multiple gunicorn/uvicorn WORKER PROCESSES that
+        share this Postgres pool in production (the gateway alone runs two —
+        mTLS :8080 + mesh :8081, docker/gateway-start.sh — each with its own
+        AuditChainService instance via build_postgres_audit_sink()).
+        Empirically: a live query against audit_events under normal
+        concurrent traffic found 4/56 chain-link breaks, zero tampering
+        (YSG-RISK-176, 2026-07-30).
+
+        Migration 0014 (LU-AMEND-01 wave-3) added the BIGSERIAL ``seq``
+        column specifically to be "the AUTHORITATIVE ordering for ... prev_hash
+        lookup" (see migration docstring) — this method is that lookup,
+        which compute_hashes_for_event() never actually implemented (it kept
+        using in-memory state even after wave-3 landed).
+
+        Derives prev_hash from the DATABASE's own seq-ordered last row under
+        a transaction-scoped PostgreSQL advisory lock keyed on tenant_id
+        (pg_advisory_xact_lock(hashtext(...))), serialising the
+        read-last-row -> compute -> INSERT critical section across every
+        process/connection writing this tenant's chain. The lock is
+        auto-released at COMMIT/ROLLBACK — no leak risk on pool/connection
+        reuse. MUST be called from inside the same transaction as the
+        subsequent INSERT (PostgresSink._flush_batch does this).
+
+        Returns:
+            (prev_hash, event_hash) — both SHA-384 hex strings.
+        """
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))", str(tenant_id)
+        )
+        row = await conn.fetchrow(
+            """
+            SELECT event_hash, created_at
+            FROM audit_events
+            WHERE tenant_id = $1 AND event_hash IS NOT NULL
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            tenant_id,
+        )
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        if row is None:
+            prev_hash = day_anchor(today)
+        else:
+            last_day = row["created_at"].astimezone(timezone.utc).strftime("%Y-%m-%d")
+            prev_hash = row["event_hash"] if last_day == today else day_anchor(today)
+
+        ev_hash = compute_event_hash(event_dict)
+        return prev_hash, ev_hash
 
     async def run_daily_checkpoint(
         self,
@@ -299,21 +378,37 @@ class AuditChainService:
                 event_count = len(rows)
                 hashes = [r["event_hash"] for r in rows]
 
-                # Count chain breaks: a break occurs when a row's prev_hash does
-                # not match the event_hash of the immediately preceding row.
-                chain_breaks = 0
-                for i in range(1, len(rows)):
-                    expected_prev = rows[i - 1]["event_hash"]
-                    actual_prev = rows[i]["prev_hash"]
-                    if actual_prev != expected_prev:
-                        chain_breaks += 1
-                        logger.warning(
-                            "audit-chain: chain break detected at event index %d "
-                            "for tenant %s on %s (expected prev=%s, got %s)",
-                            i, tenant_id, date_str,
-                            expected_prev[:16] + "...",
-                            (actual_prev or "NULL")[:16] + "...",
-                        )
+                # Chain-break detection wired into verify_chain_segment()
+                # (Iris finding, v4.1.2 retest: verify_event()/
+                # verify_chain_segment() had zero production call sites --
+                # the daily checkpoint is the natural production home for
+                # verify_chain_segment since it already has the ordered
+                # (prev_hash, event_hash) pairs in hand at no extra query
+                # cost). This also fixes a real gap in the old inline loop
+                # below (kept in history only): it started at index 1 and
+                # never checked the FIRST event of the day against the day
+                # anchor, so a corrupted prev_hash on day-event-zero was
+                # silently missed. verify_chain_segment() checks index 0
+                # against day_anchor(date_str) like every other index.
+                events_for_verify = [dict(r) for r in rows]
+                _chain_ok, break_indices = self.verify_chain_segment(
+                    events_for_verify, date_str
+                )
+                chain_breaks = len(break_indices)
+                for i in break_indices:
+                    expected_prev = (
+                        day_anchor(date_str)
+                        if i == 0
+                        else events_for_verify[i - 1]["event_hash"]
+                    )
+                    actual_prev = events_for_verify[i]["prev_hash"]
+                    logger.warning(
+                        "audit-chain: chain break detected at event index %d "
+                        "for tenant %s on %s (expected prev=%s, got %s)",
+                        i, tenant_id, date_str,
+                        expected_prev[:16] + "...",
+                        (actual_prev or "NULL")[:16] + "...",
+                    )
 
                 root = _merkle_root(hashes)
 
@@ -383,6 +478,22 @@ class AuditChainService:
     def verify_event(self, event_dict: dict, stored_event_hash: str) -> bool:
         """Verify that an event's stored event_hash matches the computed hash.
 
+        Intentionally library-only (no production call site as of v4.1.2 --
+        Iris finding, retest 2026-08-03): this is a per-event content-hash
+        recompute, so a production caller needs the event's FULL payload
+        columns, not just (prev_hash, event_hash). The daily checkpoint
+        (run_daily_checkpoint(), above) deliberately fetches ONLY the two
+        hash columns for every event of the day -- pulling full payloads for
+        every row, every day, at scale, to re-verify content that a tamper-
+        evident hash chain (verify_chain_segment(), now wired into the
+        checkpoint) already protects structurally, is not worth the cost.
+        verify_event() remains the primitive for TARGETED forensic
+        re-verification of one specific event (e.g. an "verify this event"
+        admin/CLI action investigating a single audit_events row) --
+        exercised today by the unit suite (test_lu_amend_01_audit_chain.py)
+        and left as a ready-to-wire building block for that future
+        single-event admin action, which is out of scope for this fix.
+
         Args:
             event_dict — the event as stored (may include prev_hash/event_hash
                 columns; they are excluded from the canonical form).
@@ -398,6 +509,11 @@ class AuditChainService:
         self, events: list[dict], date_str: str
     ) -> tuple[bool, list[int]]:
         """Verify the hash chain for a sequence of events.
+
+        Production call site (v4.1.2, Iris finding fixed 2026-08-06):
+        run_daily_checkpoint(), above, calls this against the (prev_hash,
+        event_hash) pairs it already fetched for the merkle root, replacing
+        an inline duplicate of this same break-detection loop.
 
         Args:
             events — list of event dicts ordered by seq (LU-AMEND-01 wave-3

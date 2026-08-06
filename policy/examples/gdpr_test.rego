@@ -121,3 +121,52 @@ test_decision_contract_shape if {
 	d.policy_id == "clients.gdpr.gdpr"
 	d.code == 403
 }
+
+# --- Additive against-spec coverage (Lu conf/v412-opa-templates) -------------
+# The two documented Art 30 / Art 5(1)(c) obligations had no assertion in
+# 2d582105's G2 tests.
+
+# Art 30 — processing personal data carries a record-of-processing obligation.
+test_obligation_record_processing_activity if {
+	d := data.clients.gdpr.decision with data.clients.gdpr.eu_region_providers as _eu_providers
+		with data.clients.gdpr.restricted_subjects as ["sub-blocked"]
+		with input as {
+			"personal_data_present": true,
+			"special_category": false,
+			"request": {"lawful_basis": "consent", "purpose": "support", "art9_condition": ""},
+			"transfer_safeguard": "",
+			"data": {"permitted_purposes": ["support"], "subject_id": "", "pii_categories": ["name"], "purpose_max_categories": 5},
+			"routing_decision": {"route": "local", "provider": "ollama-local"},
+		}
+	"record_processing_activity" in d.obligations
+}
+
+# Art 5(1)(c) — more PII categories present than the purpose needs => minimisation review.
+test_obligation_review_data_minimisation if {
+	d := data.clients.gdpr.decision with data.clients.gdpr.eu_region_providers as _eu_providers
+		with data.clients.gdpr.restricted_subjects as ["sub-blocked"]
+		with input as {
+			"personal_data_present": true,
+			"special_category": false,
+			"request": {"lawful_basis": "consent", "purpose": "support", "art9_condition": ""},
+			"transfer_safeguard": "",
+			"data": {"permitted_purposes": ["support"], "subject_id": "", "pii_categories": ["name", "email", "phone"], "purpose_max_categories": 1},
+			"routing_decision": {"route": "local", "provider": "ollama-local"},
+		}
+	"review_data_minimisation" in d.obligations
+}
+
+# Negative: within-budget category count does NOT raise the minimisation obligation.
+test_no_minimisation_obligation_within_budget if {
+	d := data.clients.gdpr.decision with data.clients.gdpr.eu_region_providers as _eu_providers
+		with data.clients.gdpr.restricted_subjects as ["sub-blocked"]
+		with input as {
+			"personal_data_present": true,
+			"special_category": false,
+			"request": {"lawful_basis": "consent", "purpose": "support", "art9_condition": ""},
+			"transfer_safeguard": "",
+			"data": {"permitted_purposes": ["support"], "subject_id": "", "pii_categories": ["name"], "purpose_max_categories": 5},
+			"routing_decision": {"route": "local", "provider": "ollama-local"},
+		}
+	not "review_data_minimisation" in d.obligations
+}

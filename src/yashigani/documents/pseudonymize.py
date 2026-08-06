@@ -518,9 +518,22 @@ class CorrespondenceTable:
         The mapping-file HEADER carries the per-file salt (``# doc_hash=…``) so
         the table is bound to its source document (integrity / splice rejection).
         This is the user's key — the pipeline delivers it over the RBAC'd channel
-        and never writes it to an audit/log line."""
+        and never writes it to an audit/log line.
+
+        YSG-RISK-145 (recurrence of YSG-RISK-010 — CWE-1236 CSV/formula
+        injection): ``original`` values come straight from the source
+        document's de-tokenized content, which is attacker-influenced (the
+        document owner does not control what a submitted document contains).
+        A cell such as ``=cmd|'/c calc'!A1`` written unescaped would execute
+        as a formula when the exported CSV is opened in Excel/LibreOffice/
+        Google Sheets. Every cell is passed through the same
+        ``escape_csv_cell`` used by the audit CSV exporters (single
+        source of truth — leading-whitespace-safe per LF-CSV-BYPASS)."""
         import csv
         import io
+
+        from yashigani.audit.export import escape_csv_cell
+
         buf = io.StringIO()
         if self.doc_hash:
             # Comment header binds the table to the document it re-identifies.
@@ -528,7 +541,7 @@ class CorrespondenceTable:
         w = csv.writer(buf)
         w.writerow(["token", "original"])
         for tok, val in self.rows.items():
-            w.writerow([tok, val])
+            w.writerow([escape_csv_cell(tok), escape_csv_cell(val)])
         return buf.getvalue()
 
 

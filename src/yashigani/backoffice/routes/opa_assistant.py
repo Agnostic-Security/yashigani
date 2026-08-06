@@ -464,6 +464,14 @@ async def apply_rego(
     policy_name = body.policy_name.strip()
     _validate_policy_name(policy_name)
 
+    # YSG-RISK-141: the docstring/field description both claim policy_name
+    # "must match the package declaration" but that was never enforced —
+    # a caller could pass policy_name="my_own_slug" (clean per _validate_policy_name)
+    # while the Rego body declared package clients.<some_other_tenant>, silently
+    # shadowing another tenant's decision document. Enforce it before validate/apply.
+    from yashigani.opa_assistant.rego_package import assert_client_package_scope
+    assert_client_package_scope(body.rego, policy_name)
+
     opa_url = getattr(backoffice_state, "opa_url", None) or "https://policy:8181"
 
     # Re-validate server-side — never trust client-supplied Rego

@@ -3,7 +3,7 @@
 #
 # Starts two uvicorn processes:
 #   Port 8080 (mTLS) — external-facing, Caddy ingress only (caddy_internal network)
-#   Port 8081 (HTTP) — internal mesh, Open WebUI ingress only (data network)
+#   Port 8081 (HTTP) — internal mesh, agent-bundle + ui4 native-chat ingress only (data network)
 #
 # The mTLS port requires ssl.CERT_REQUIRED + CaddyVerifiedMiddleware.
 # The mesh port is plain HTTP, protected by Docker/K8s network isolation only.

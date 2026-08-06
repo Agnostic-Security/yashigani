@@ -50,3 +50,23 @@ test_decision_contract_shape if {
 	d.policy_id == "clients.aiact.eu-ai-act"
 	d.code == 403
 }
+
+# --- Additive against-spec coverage (Lu conf/v412-opa-templates) -------------
+# The log_high_risk_decision obligation had no assertion in 2d582105's G2 tests.
+
+# Art 14/records — a permitted high-risk use still carries the logging obligation.
+test_obligation_log_high_risk_decision if {
+	d := data.clients.aiact.decision with input as {
+		"ai_use": {"risk_class": "high", "human_oversight": true, "transparency_notice": true},
+	}
+	d.allow
+	"log_high_risk_decision" in d.obligations
+}
+
+# Negative: a minimal-risk use raises no high-risk logging obligation.
+test_no_high_risk_obligation_for_minimal if {
+	d := data.clients.aiact.decision with input as {
+		"ai_use": {"risk_class": "minimal", "human_oversight": false, "transparency_notice": false},
+	}
+	not "log_high_risk_decision" in d.obligations
+}

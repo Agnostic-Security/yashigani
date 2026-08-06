@@ -13,7 +13,10 @@ the NL->Rego generator. Everything here is ADVISORY except the deny-all/never-al
 HIGH warnings the caller may gate on; nothing is auto-applied.
 
 Pure async functions, no FastAPI deps — unit-testable. All OPA traffic uses the
-internal mTLS client; the LLM uses the plain-http ollama pattern.
+internal mTLS client; the LLM is reached via the mesh-mTLS-aware
+inspection/_ollama_transport.ollama_async_client (YSG-RISK-193 — previously a
+bare httpx.AsyncClient against a hardcoded/env-only URL that bypassed the
+Caddy mesh front).
 """
 from __future__ import annotations
 
@@ -159,9 +162,18 @@ async def static_sanity_check(rego: str, name: str, samples: Optional[list[dict]
 async def llm_review(rego: str) -> list[dict]:
     """Optional advisory LLM review (ollama). Returns a list of INFO warnings.
     Degrades to a single advisory note if the LLM is unavailable — never raises,
-    never blocks. Reuses the plain-http ollama pattern used by generate_policy."""
-    import httpx
-    ollama_url = os.getenv("YASHIGANI_OLLAMA_URL", "http://ollama:11434").rstrip("/")
+    never blocks.
+
+    YSG-RISK-193: previously read only YASHIGANI_OLLAMA_URL (never set by any
+    deployment config) with a bare httpx.AsyncClient, so it silently bypassed
+    the Caddy mesh front. Now mirrors routes/models.py's _ollama_base()
+    pattern (YASHIGANI_OLLAMA_URL -> OLLAMA_BASE_URL -> hardcoded dev
+    default) and routes through the mesh-mTLS-aware ollama_async_client.
+    """
+    from yashigani.inspection._ollama_transport import ollama_async_client
+    ollama_url = (
+        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
+    ).rstrip("/")
     model = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL") or "gemma3:4b"
     prompt = (
         "You are reviewing an OPA Rego authorization policy for risky logic. In 1-3 short "
@@ -170,7 +182,7 @@ async def llm_review(rego: str) -> list[dict]:
         f"Policy:\n{rego[:6000]}\n"
     )
     try:
-        async with httpx.AsyncClient(timeout=60.0) as c:
+        async with ollama_async_client(ollama_url, timeout=60.0) as c:
             r = await c.post(ollama_url + "/api/generate",
                              json={"model": model, "prompt": prompt, "stream": False})
             r.raise_for_status()

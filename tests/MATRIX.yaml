@@ -1,0 +1,214 @@
+# Yashigani Test Framework (YTF) — full runtime matrix manifest.
+#
+# This is the single source of truth for "which tier runs on which leg, and
+# what GREEN means for that leg." It is designed to survive the 4.1.2 -> 5.0
+# rebase unchanged in shape (new 5.0 endpoints slot into the SAME Tier-A
+# enumeration; new 5.0 surfaces get new rows here, not a new file).
+#
+# Maps onto:
+#   - AgnosticSecurity/Operations/Compliance/yashigani/<version>/matrix-evidence.md
+#     (the `MATRIX <leg>: <STATUS>` / `AVA E2E:` / `LAURA PENTEST:` /
+#     `CONFORMANCE COVERAGE:` / `CONTROLS <name>:` lines release-gate-check.sh
+#     C5/C8 greps).
+#   - AgnosticSecurity/Operations/Releases/scripts/release-gate-check.sh
+#     RUNTIME_MATRIX array (release-gate-check.sh:44-49).
+#
+# KNOWN DRIFT (flagged, not fixed here — framework-build only, route to
+# Su/Lu): release-gate-check.sh's RUNTIME_MATRIX today enumerates ONLY the 8
+# {docker,podman-4.9,podman-5,podman-6} x {macos,linux} legs — k8s is tracked
+# in matrix-evidence.md ("MATRIX k8s LIFECYCLE (docker-desktop): ...") but is
+# NOT in the bash array C5 iterates, so a k8s regression does not currently
+# hard-block C5. This manifest below lists k8s as a real leg regardless;
+# closing the gate-script gap is a separate, small PR for whoever owns
+# release-gate-check.sh next.
+
+version_scope: "4.1.2+ (travels into 5.0 — see docs/testing/YTF.md §2)"
+last_updated: "2026-07-29"
+owner: "Iris (integration audit) — framework build; per-tier content owned by Tom/Su/Captain/Ava/Laura"
+
+# ---------------------------------------------------------------------------
+# Tier-A: IN-PROCESS, matrix-INVARIANT. Runs ONCE per code head (no stack).
+# The result applies identically to EVERY leg below — a leg's Tier-A cell is
+# never re-run per-leg; it inherits the single head-level result.
+# ---------------------------------------------------------------------------
+tier_a:
+  description: >
+    Conformance API (auth/identity/rbac, admin/config/observability,
+    dataplane/gateway/mcp, + pre-existing 12-group suite), OPA policy-template
+    tests (opa test policy/), mechanical wiring/config audit, and static +
+    authored-live pentest. No live Postgres/Redis/OPA/Ollama/browser required.
+  invocation: "scripts/run-test-framework.sh --tier a"
+  paths:
+    - tests/conformance/            # API conformance (12-group + 3 consolidated groups + wiring audit)
+    - tests/security/                # pentest: static analysis + authored-live in-process attacks
+    - policy/ (opa test)              # OPA template + system policy tests
+  pass_criteria: >
+    pytest exit 0 across tests/conformance/ + tests/security/, AND
+    `opa test policy/` exit 0. Every 2xx/4xx assertion is EFFECT-verified
+    (real datastore mutation observed via its own read/verify path), not just
+    response-code-verified (see docs/testing/YTF.md "effect-verified, not
+    response-verified"). Every field enumerated in Ava's webui-inventory.md +
+    the API conformance route lists has >=1 positive + >=1 negative case.
+  maps_to_matrix_evidence:
+    - "CONFORMANCE COVERAGE: COMPLETE"
+    - "CONTROLS opa-policy: PASS"
+    - "CONTROLS pentest: PASS  (static/authored-live half; live DAST half is Tier-C)"
+  runtime_invariant: true
+
+# ---------------------------------------------------------------------------
+# Tier-B: LIVE, per-deployment. WebUI Playwright — conformance + adversarial.
+# Both headed AND headless; a leg's WebUI cell is not GREEN until both modes
+# pass AND the full screenshot set exists for that leg.
+# ---------------------------------------------------------------------------
+tier_b:
+  description: >
+    Full 2x2 per surface ({admin, user} x {WebUI, API}) WebUI Playwright pass
+    over the 39 pages / 34 forms / 137 buttons / 118 endpoints inventoried in
+    Ava's webui-inventory.md, PLUS the WebUI-adversarial suite (91 forms,
+    OWASP-mapped). Feature-driven: every enumerated form field gets >=1
+    positive + >=1 negative case, both roles, both browser modes.
+  invocation: >
+    scripts/run-test-framework.sh --tier b --target <url> --runtime <runtime>
+    --version <ver> --platform <platform> [--browser-mode both|headed|headless]
+  paths:
+    - src/tests/playwright/   # canonical name "tests/playwright" — see docs/testing/YTF.md
+                                # canonical-name-vs-physical-path note (root tests/ and
+                                # src/tests/ are two same-named "tests" Python packages;
+                                # the WebUI conformance suite's absolute
+                                # `from tests.playwright.conftest import ...` import only
+                                # resolves at the src/tests/ location — moving it to a
+                                # root tests/playwright/ breaks that import. Physical path
+                                # stays src/tests/playwright/; MATRIX/runner/docs use the
+                                # canonical name "tests/playwright" throughout.)
+  browser_modes: [headed, headless]
+  screenshot_evidence:
+    required: true
+    path_template: "testing_runs/yashigani/ytf/<runtime>-<platform>/screenshots/<mode>/"
+    naming: "<test-name>__<step>.png (one per page/panel load, each form before-submit + after-result, each button before + after, every error state)"
+  pass_criteria: >
+    BOTH headed AND headless pytest runs exit 0 for src/tests/playwright/,
+    AND the screenshot evidence directory for that leg is non-empty with a
+    file per enumerated state-transition. Every toggle/field/button assertion
+    is effect-verified (the downstream real-path behaviour is proven changed,
+    not just the UI/API response code).
+  maps_to_matrix_evidence:
+    - "AVA E2E: GREEN"
+
+# ---------------------------------------------------------------------------
+# Tier-C: LIVE, per-deployment. Integration/data-flow seam + full lifecycle +
+# failure-injection/chaos + cross-runtime parity + egress ring-fence &
+# prompt-injection (both legs) + audit/observability integrity + data-plane
+# byte-proof + multi-tenant isolation + licensing lifecycle.
+# ---------------------------------------------------------------------------
+tier_c:
+  description: >
+    The bug-class this tier exists for: value written on service A, read/
+    verified on service B's OWN read path (not assumed) — the 112/128/131/
+    cache-vs-store class that Tier-A/B structurally cannot see because they
+    each look at one service's surface at a time. ABSORBS the pre-existing
+    src/tests/e2e/ live suite (lifecycle self-heal chaos + real agent-dispatch
+    data-path + budget-degradation data-path) rather than duplicating it — see
+    "reconcile, don't duplicate." The 6 categories NOT already covered by
+    src/tests/e2e/ are authored now as a real, running (skip-if-no-stack)
+    scaffold per category in tests/integration_live/; full per-category depth
+    lands as each category is exercised live (see docs/testing/YTF.md
+    "Tier-C status").
+  invocation: >
+    scripts/run-test-framework.sh --tier c --target <url> --runtime <runtime>
+    --version <ver> --platform <platform>
+  paths:
+    - src/tests/e2e/          # ABSORBED: lifecycle (test_zz_chaos.py self-heal),
+                                # failure_injection_chaos (test_zz_chaos.py),
+                                # data_flow_seam (test_agent_dispatch_e2e.py real
+                                # OpenWebUI->gateway->langflow/letta->Ollama path,
+                                # test_budget_e2e.py real budget-redis degradation)
+    - tests/integration_live/  # NEW: the other 6 categories (scaffold)
+  categories:
+    - data_flow_seam            # write-on-A, read/verify-on-B, real values
+    - lifecycle                 # install -> upgrade N-1->N -> uninstall/partial-nuke/full-nuke -> reinstall; migrations fresh+populated
+    - failure_injection_chaos   # kill redis/postgres/OPA mid-run + boot-with-deps-not-ready; fail-CLOSED + self-heal
+    - cross_runtime_parity      # same security control, same behaviour, docker == podman == k8s
+    - egress_ringfence_injection # agent -> Caddy -> OPA -> external; allowed/disallowed FQDN; injection ingress AND egress
+    - audit_observability_integrity # events emitted + immutable/Merkle + SIEM-forward; no swallowed failures
+    - dataplane_byte_proof      # real transformed bytes (redact/pseudonymize/block), both channels
+    - multitenant_licensing     # tenant isolation + activate/tier/restrain/offline licence lifecycle
+  pass_criteria: >
+    pytest exit 0 across tests/integration_live/ for that leg. Every
+    data-flow-seam case asserts the value on BOTH ends (write path AND
+    independent read/verify path) — a test that only checks the write
+    response is not a seam test.
+  maps_to_matrix_evidence:
+    - "LAURA PENTEST: GREEN  (live DAST + chaos/fail-closed half)"
+    - "CONTROLS dast: PASS"
+
+# ---------------------------------------------------------------------------
+# The full runtime matrix. One row per leg. Tier-A is listed for completeness
+# but is NEVER re-run per-leg (see tier_a.runtime_invariant above) — its
+# single head-level result is inherited by every row.
+# ---------------------------------------------------------------------------
+legs:
+  - runtime: docker
+    platform: macos
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "Primary dev/test rig."
+  - runtime: docker
+    platform: linux
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "x8x."
+
+  - runtime: podman-4.9
+    platform: macos
+    tiers: [tier_a]
+    status: EX
+    notes: >
+      Podman-mac is 6.x ONLY (Tiago decision, feedback_podman_strategic_commitment.md) —
+      podman-4.9/5.x on macOS share the same vendored-fork compose path as 6.x
+      and are not separately installable on this host. EX exception, not a
+      gap: compensating evidence = podman-6 macos GREEN.
+  - runtime: podman-4.9
+    platform: linux
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "x8x — genuinely distinct engine version, must run for real (no EX on Linux)."
+
+  - runtime: podman-5
+    platform: macos
+    tiers: [tier_a]
+    status: EX
+    notes: "Same compose-path as podman-6 macOS — EX, compensating evidence = podman-6 macos GREEN."
+  - runtime: podman-5
+    platform: linux
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "x8x."
+
+  - runtime: podman-6
+    platform: macos
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "The one podman-mac leg that actually runs (per Tiago's podman-mac=6-only decision)."
+  - runtime: podman-6
+    platform: linux
+    tiers: [tier_a, tier_b, tier_c]
+    notes: "x8x."
+
+  - runtime: k8s
+    platform: linux
+    tiers: [tier_a, tier_b, tier_c]
+    status: "x8x-only, Cilium-gated"
+    notes: >
+      k3s + Cilium CNI. Cilium-SPECIFIC runtime enforcement (NetworkPolicy
+      actual enforcement, CoreDNS DoT runtime, emptyDir-secrets writability)
+      cannot be tested on vanilla Docker-Desktop k8s — x8x is the only rig
+      with the real CNI. NOT currently in release-gate-check.sh's
+      RUNTIME_MATRIX array (see KNOWN DRIFT note at top of this file) —
+      tracked here and in matrix-evidence.md regardless.
+
+# ---------------------------------------------------------------------------
+# Release-gate C5 wiring (release-gate-check.sh:185-203)
+# ---------------------------------------------------------------------------
+release_gate_c5_mapping:
+  - "release-gate-check.sh reads AgnosticSecurity/Operations/Compliance/yashigani/<ver>/matrix-evidence.md"
+  - "Each `legs[]` row above (docker/podman-4.9/5/6 x macos/linux) -> one `MATRIX <runtime> <platform>: GREEN|EX-<id>` line"
+  - "tier_b pass -> `AVA E2E: GREEN` line"
+  - "tier_c live-DAST/pentest half + tests/security/ static half -> `LAURA PENTEST: GREEN` line (must carry a clean-round attestation)"
+  - "tier_a pass (whole-suite, matrix-invariant) -> `CONFORMANCE COVERAGE: COMPLETE` line"
+  - "C5 FAILS the gate if any leg is ABSENT or not GREEN/EX-<id>, or if AVA/LAURA/CONFORMANCE lines are missing"
+  - "A leg is GREEN in this manifest's sense only when: tier_a (head-level, inherited) PASS + that leg's own tier_b PASS (both browser modes + full screenshot set) + that leg's own tier_c PASS"

@@ -46,22 +46,77 @@ class _FakeTxn:
 
 
 class _FakeConn:
+    """Minimal asyncpg-connection-shaped fake.
+
+    YSG-RISK-177 (Iris integration audit, P2, 2026-07-30): PostgresSink
+    ._flush_batch now issues an EXTRA fetchrow per event —
+    AuditChainService.compute_hashes_for_event_db()'s seq-ordered "last row"
+    SELECT (see audit/chain.py), run BEFORE the INSERT, inside the same
+    transaction. The fake previously treated every fetchrow() call as an
+    INSERT (recording it + returning a bare {"seq": n} with no created_at),
+    so the new SELECT was mis-recorded as a second insert (doubling the
+    recorded-insert count) AND its {"seq": n} return value made
+    compute_hashes_for_event_db() raise KeyError on row["created_at"] --
+    silently caught by the require_chain=False fallback in _flush_batch,
+    which then wrote the row with NULL hashes instead of a real chain.
+    Fixed by branching on the SQL text: the chain SELECT ("FROM
+    audit_events", no "INSERT") reads a tiny in-memory table this fake
+    maintains (self._table) and returns a realistic {"event_hash",
+    "created_at"} row (or None for the first event of a tenant); the INSERT
+    ("INSERT INTO audit_events") is recorded exactly as before AND appends
+    to self._table so the NEXT event's chain SELECT sees it -- this is what
+    makes the continuity assertions in
+    test_chain_hashes_populated_and_continuous meaningful again.
+    """
+
     def __init__(self, recorder: list):
         self._rec = recorder
         self._seq = 0
+        self._table: list[dict] = []  # simulated audit_events rows, insertion order
 
     def transaction(self):
         return _FakeTxn()
 
     async def execute(self, sql, *args):
-        # set_config(...) — no-op for the fake.
+        # set_config(...) and pg_advisory_xact_lock(...) — both no-ops for
+        # this single-fake-connection model. The real cross-process
+        # pg_advisory_xact_lock serialisation semantics are Postgres-native
+        # and are NOT exercised here; that is the DB-chain algorithm proof
+        # in src/tests/regression/v4.1.2/
+        # test_tom_ysg_risk_176_audit_chain_multiprocess.py
+        # (TestAuditChainDbConcurrencyAlgorithm), and ultimately a live
+        # Postgres round-trip at the Iris/Tier-A gate.
         return "OK"
 
     async def fetchrow(self, sql, *args):
-        # Record the INSERT params; return a row with a monotonic seq.
-        self._seq += 1
-        self._rec.append(args)
-        return {"seq": self._seq}
+        if "INSERT INTO audit_events" in sql:
+            # Record the INSERT params exactly as before (existing test
+            # assertions index into pool.inserts[i][...]).
+            self._seq += 1
+            self._rec.append(args)
+            # INSERT_AUDIT_EVENT column order: tenant_id, event_type,
+            # request_id, session_id, agent_id, action, reason,
+            # upstream_status, elapsed_ms, confidence_score, client_ip_hash,
+            # prev_hash, event_hash — prev_hash=args[11], event_hash=args[12].
+            import datetime as _dt
+            self._table.append({
+                "tenant_id": args[0],
+                "prev_hash": args[11],
+                "event_hash": args[12],
+                "created_at": _dt.datetime.now(_dt.timezone.utc),
+            })
+            return {"seq": self._seq}
+
+        if "FROM audit_events" in sql:
+            # AuditChainService.compute_hashes_for_event_db()'s seq-ordered
+            # "last row for this tenant" lookup — args[0] is tenant_id.
+            tenant_id = args[0]
+            for row in reversed(self._table):
+                if row["tenant_id"] == tenant_id and row["event_hash"] is not None:
+                    return {"event_hash": row["event_hash"], "created_at": row["created_at"]}
+            return None
+
+        raise AssertionError(f"_FakeConn.fetchrow: unexpected query: {sql!r}")
 
 
 class _FakeAcquire:

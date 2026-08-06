@@ -40,7 +40,7 @@ from typing import Optional
 
 import pytest
 
-from tests.playwright.conftest import BASE_URL, STACK_RUNNING, _CA_CERT_PATH
+from tests.playwright.conftest import BASE_URL, STACK_RUNNING, _CA_CERT_PATH, _api_get_session_cookies
 
 pytestmark = pytest.mark.api_contract
 
@@ -83,35 +83,34 @@ def _admin_session_cookie(username: str, password: str) -> Optional[str]:
 
 
 def _read_admin_creds() -> tuple[str, str]:
-    repo_root = Path(__file__).parents[4]
+    repo_root = Path(__file__).parents[3]
     username = (repo_root / "docker" / "secrets" / "admin1_username").read_text().strip()
     password = (repo_root / "docker" / "secrets" / "admin_initial_password").read_text().strip()
     return username, password
 
 
 def _authed_client():
-    """Return an httpx.Client with a valid admin session cookie."""
+    """Return an httpx.Client with a valid admin session cookie.
+
+    QA-fix (Ava, 2026-07-31): this previously (a) posted to f"{BASE_URL}/login"
+    -- a GET-only user-facing page route (app.py: @app.get("/login")); admin
+    login is POST /auth/login (auth_router mounted with prefix="/auth"); (b)
+    never submitted totp_code at all, which the server requires on every
+    login; (c) never handled force_password_change, so on a genuinely fresh
+    stack (admin creds still INITIAL) no valid session cookie was ever
+    obtainable -- all 12 tests in this file depending on _authed_client()
+    would see 401s that looked like product bugs but were actually a broken
+    test harness. Now delegates to conftest._api_get_session_cookies(), which
+    already has the correct SHA-512/8-digit TOTP, self-heals the forced
+    password-change step, and persists the rotated password so every other
+    file's login helper in this pytest run stays in sync.
+    """
     import httpx
 
-    username, password = _read_admin_creds()
+    cookies = _api_get_session_cookies(admin=1)
     verify = _verify_param()
-
     client = httpx.Client(verify=verify, follow_redirects=False, timeout=15)
-    # Full login flow — some installs may require TOTP or password change;
-    # we accept a 200 OR a redirect/auth challenge here and check for cookie.
-    r = client.post(
-        f"{BASE_URL}/login",
-        json={"username": username, "password": password},
-    )
-    # If we got a session cookie we're done
-    for name in ("__Host-yashigani_admin_session", "__Host-yashigani_session"):
-        if name in client.cookies:
-            return client
-    # Some deployments return the cookie on the redirect target
-    if r.status_code in (302, 307, 308):
-        location = r.headers.get("location", "")
-        if location:
-            client.get(location)
+    client.cookies.update(cookies)
     return client
 
 

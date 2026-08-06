@@ -42,6 +42,13 @@ class CacheConfigRequest(BaseModel):
 
 @cache_router.get("/admin/cache")
 async def list_cache_configs(session=Depends(require_admin_session)):
+    """List every per-tenant cache config.
+
+    YSG-RISK-143: this MUST read from the same store that PUT/GET/DELETE
+    write to (Redis, via ResponseCache) — it previously queried a Postgres
+    ``cache_config`` table that no code path ever wrote to, so a config set
+    via PUT never appeared here. See ResponseCache.list_tenant_configs().
+    """
     from yashigani.backoffice.state import backoffice_state
     rc = getattr(backoffice_state, "response_cache", None)
     if rc is None:

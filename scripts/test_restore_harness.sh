@@ -389,7 +389,7 @@ if [[ "${SKIP_INSTALL}" == "false" ]]; then
     # preserves the name:tag, making 'podman image exists <compose-ref>' succeed.
     #
     # Only images for always-active services (no profile) are saved. Profile-only
-    # images (wazuh, langflow, letta, openclaw, keycloak, vault, open-webui,
+    # images (wazuh, langflow, letta, openclaw, keycloak, vault,
     # step-ca) are skipped to avoid exhausting disk space (~10 GB of optional images).
     # The install.sh --skip-pull check uses the same profile-aware filter.
     #

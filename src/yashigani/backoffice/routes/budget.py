@@ -6,7 +6,7 @@ CRUD for the three-tier budget hierarchy:
   POST/GET/PUT/DELETE  /admin/budget/groups             — Group budgets
   POST/GET/PUT/DELETE  /admin/budget/individuals        — Individual budgets
   GET                  /admin/budget/usage/{identity_id} — Usage summary
-  GET                  /admin/budget/tree               — Full budget tree view
+  GET                  /admin/budget/tree               — YSG-RISK-157: 501 Not Implemented (nested tree view — needs RBAC/identity join, deferred)
   GET                  /admin/budget/models/local-inventory
                        — Installed Ollama models + GPU VRAM fit analysis
 
@@ -164,6 +164,12 @@ async def create_org_cap(body: OrgCapRequest):
             "00000000-0000-0000-0000-000000000000",
             body.org_id, body.provider, body.token_cap, body.period,
         )
+    # YSG-RISK-144: sync to Redis so the per-request hierarchy check
+    # (BudgetEnforcer.check_hierarchy) can enforce the org cap without a DB
+    # round-trip on the hot path. Previously never synced — the org tier of
+    # the documented individual<=group<=org invariant was unenforceable.
+    if _state.budget_enforcer:
+        _state.budget_enforcer.set_org_allocation(body.org_id, body.provider, body.token_cap)
     return OrgCapResponse(
         org_id=body.org_id,
         provider=body.provider,
@@ -189,6 +195,14 @@ async def create_group_budget(body: GroupBudgetRequest):
             "00000000-0000-0000-0000-000000000000",
             body.group_id, body.provider, body.token_budget, body.period,
         )
+    # YSG-RISK-144: sync to Redis so the per-request hierarchy check
+    # (BudgetEnforcer.check_hierarchy) can enforce the group budget without a
+    # DB round-trip on the hot path. Previously never synced — the group
+    # tier of the documented individual<=group<=org invariant was
+    # unenforceable (only list_group_utilisation's Grafana metric read this
+    # key, and nothing ever wrote it).
+    if _state.budget_enforcer:
+        _state.budget_enforcer.set_group_allocation(body.group_id, body.provider, body.token_budget)
     return GroupBudgetResponse(
         group_id=body.group_id,
         provider=body.provider,
@@ -327,14 +341,37 @@ async def get_usage(identity_id: str, period: str = "monthly"):
 @router.get("/tree")
 async def get_budget_tree():
     """
-    Full budget tree view: org -> groups -> identities.
-    Shows total, used, remaining at every level.
+    Full budget tree view: org -> groups -> identities — NOT IMPLEMENTED in 4.1.2.
+
+    YSG-RISK-157: this previously returned a plain 200 with an empty
+    ``tree: []`` — a caller checking only the HTTP status would read that as
+    "success, no budgets configured" rather than "feature not built".
+
+    A genuinely correct nested org->group->identity tree needs group->org and
+    identity->group membership linkage that does not exist in the budget
+    schema today: ``group_budgets``/``individual_budgets`` (migration 0005)
+    carry no ``org_id``/``group_id`` foreign keys to each other — that
+    membership lives in the RBAC group store, a separate service boundary.
+    Building the nesting correctly means joining budget config against RBAC
+    group membership + identity.org_id, which is a real feature (schema
+    and/or cross-service join), not a point-fix — deferred past 4.1.2.
+    GET /admin/budget/org-caps, /groups, and /individuals already return the
+    flat (non-nested) configuration and remain the source of truth until
+    then. Returns an honest 501 rather than a misleading empty tree.
     """
-    # Placeholder — will be populated from Postgres in integration
-    return {
-        "tree": [],
-        "message": "Budget tree — populated after org caps and groups are configured",
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "message": (
+                "The nested org->group->identity budget tree view is not yet "
+                "implemented — it requires group/identity membership linkage "
+                "that does not exist in the current budget schema. Use "
+                "GET /admin/budget/org-caps, /admin/budget/groups, and "
+                "/admin/budget/individuals for the flat configuration."
+            ),
+        },
+    )
 
 
 # ===========================================================================
@@ -538,11 +575,27 @@ async def get_local_model_inventory():
 
     Admin-gated (via router-level require_admin_session dependency).
     """
-    ollama_base = os.environ.get("YASHIGANI_OLLAMA_URL", "http://ollama:11434")
+    # YSG-RISK-191: this route previously hardcoded YASHIGANI_OLLAMA_URL (never
+    # set by any deployment config — see docker-compose.yml / helm templates /
+    # gateway+backoffice entrypoints, which all wire OLLAMA_BASE_URL) with a
+    # bare-httpx.AsyncClient, so it silently fell back to plain
+    # http://ollama:11434 and bypassed the Caddy mesh front entirely — a hard
+    # 502 wherever Ollama is only reachable via https://caddy:11435/ollama.
+    # Fixed to mirror routes/models.py's _ollama_base()/ollama_async_client()
+    # pattern: the SAME env-var chain (YASHIGANI_OLLAMA_URL override ->
+    # OLLAMA_BASE_URL, the actual mesh-wired var -> hardcoded dev default) and
+    # the SAME mesh-mTLS-aware transport (inspection/_ollama_transport.py —
+    # the single transport documented for every OLLAMA_BASE_URL consumer).
+    ollama_base = (
+        os.environ.get("YASHIGANI_OLLAMA_URL")
+        or os.environ.get("OLLAMA_BASE_URL")
+        or "http://ollama:11434"
+    ).rstrip("/")
 
     # --- Query Ollama ---
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        from yashigani.inspection._ollama_transport import ollama_async_client
+        async with ollama_async_client(ollama_base, timeout=10.0) as client:
             resp = await client.get(f"{ollama_base}/api/tags")
             resp.raise_for_status()
             raw = resp.json()

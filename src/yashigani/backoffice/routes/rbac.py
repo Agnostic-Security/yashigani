@@ -157,6 +157,27 @@ def _push(store, admin_account: str) -> None:
         except Exception:
             pass
 
+    # YSG-RISK-154: this helper is explicitly documented as fire-and-forget
+    # ("never raises") — it runs AFTER the RBAC group/member mutation has
+    # already committed, so raising here would turn an already-successful
+    # RBAC change into a misleading 503 for the caller. Unlike
+    # infrastructure.py / capability_policy.py (where the audit_writer-unset
+    # check now runs BEFORE the mutation and fails the request closed), this
+    # site cannot adopt the same fail-closed-503 unification without breaking
+    # its documented contract. What WAS a bug: `assert audit_writer is not
+    # None` sat INSIDE the same try/except that also caught write failures,
+    # so the assert's own AssertionError was silently swallowed and
+    # indistinguishable from a transient write error in the logs. Split the
+    # unset-writer case into its own explicit, distinctly-logged branch so
+    # ops/SIEM can tell "audit subsystem never wired up" apart from "a write
+    # attempt failed" — still never raises, per contract.
+    if backoffice_state.audit_writer is None:
+        logger.error(
+            "RBAC push audit SKIPPED — audit_writer is unavailable (startup-invariant "
+            "violation, not a transient error): groups=%d users=%d outcome=%s",
+            groups_count, users_count, outcome,
+        )
+        return
     try:
         event = RBACPolicyPushEvent(
             event_type=EventType.RBAC_POLICY_PUSHED,
@@ -166,7 +187,6 @@ def _push(store, admin_account: str) -> None:
             outcome=outcome,
             error=error,
         )
-        assert backoffice_state.audit_writer is not None  # set unconditionally at startup
         backoffice_state.audit_writer.write(event)
     except Exception as exc:
         logger.error("RBAC push audit write failed: %s", exc)

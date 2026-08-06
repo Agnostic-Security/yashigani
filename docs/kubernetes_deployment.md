@@ -141,11 +141,6 @@ kubectl create secret generic yashigani-db-credentials \
 kubectl create secret generic yashigani-grafana-secrets \
   -n yashigani \
   --from-literal=grafana_admin_password="$(openssl rand -hex 24)"
-
-# Open WebUI
-kubectl create secret generic yashigani-open-webui-secrets \
-  -n yashigani \
-  --from-literal=secret_key="$(openssl rand -hex 32)"
 ```
 
 ### 2. Install the chart

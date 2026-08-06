@@ -27,11 +27,11 @@ Yashigani is structured as a two-plane system: a **data plane** that handles the
 ### 1.1 Request Flow
 
 ```
-AI Agent / Human (via Open WebUI or API)
+AI Agent / Human (via ui4 chat surface or API)
         |
         v
 [ Caddy TLS Edge ]          <-- ACME / CA-signed / self-signed
-        |                       /chat/* → Open WebUI
+        |                       /chat/* → Backoffice (ui4, native)
         |                       /admin/* → Backoffice
         |                       /v1/*, /agents/*, /* → Gateway
         v
@@ -91,7 +91,7 @@ AI Agent / Human (response)
 |---|---|
 | **Gateway (data plane)** | Reverse proxy, TLS, auth, inspection, rate limiting, routing, Optimization Engine |
 | **Backoffice (control plane)** | Admin UI/API, identity management, policy editor, license validation, budget admin |
-| **Open WebUI** | Chat interface at /chat/*, internal network only, all LLM calls through gateway (since v2.0) |
+| **ui4 (chat surface)** | Native Lit-based chat/agents/builder/workflows SPA at /chat/*, served directly by the backoffice, all LLM calls through gateway (replaced Open WebUI in v4.0) |
 | **Optimization Engine** | Four-dimensional routing: sensitivity + complexity + budget + cost; P1-P9 priority matrix (since v2.0) |
 | **Identity Broker** | Multi-IdP identity broker: OIDC + SAML v2; Caddy delegates auth (since v2.0) |
 | **Pool Manager** | Per-identity container lifecycle: create, route, health, replace, scale, postmortem forensics (since v2.0) |
@@ -569,12 +569,12 @@ The initial release established the core security envelope. Yashigani began as a
   - **Julietta** — Letta (port 8283) — Stateful agent with persistent memory (formerly MemGPT)
   - **Scout** — OpenClaw (port 18789) — personal AI with 30+ messaging integrations; `OPENCLAW_CONFIG_JSON` routes through gateway
 - **Agent chaining (since v2.22)** — invoke multiple agents in a single prompt (`@Scout` -> `@Julietta` -> `@qwen`); `@`-prefixed model strings are resolved via the agent registry
-- **Open WebUI integration (since v2.0)** — optional chat interface at `/chat/*` (`--with-openwebui`), internal Docker network only (no external port), all LLM calls through gateway, Caddy forwards trusted headers
+- **`ui4` native chat surface (since v4.0, replaced Open WebUI)** — chat/agents/builder/workflows SPA at `/chat/*`, served directly by the backoffice (no separate container), internal Docker network only (no external port), all LLM calls through gateway
 - **Container Pool Manager (since v2.0)** — per-identity container isolation; universal lifecycle: create, route, health check, replace, scale, postmortem; self-healing (replace, don't fix); postmortem forensics (logs, inspect, filesystem diff preserved before kill); Ollama horizontal scaling on load
 - **Dynamic per-identity containers (since v2.0)** — managed by Pool Manager; license tier gates container limits
-- **17 always-on core services + 10 optional services via compose profiles (since v2.23)** — up from 18 in v1.09.5; plus dynamic per-identity containers managed by the Pool Manager
+- **17 always-on core services + 9 optional services via compose profiles (since v2.23)** — up from 18 in v1.09.5; plus dynamic per-identity containers managed by the Pool Manager
 - **548 tests passing (since v2.20)** — 523 unit + 25 e2e
-- **Optional services via compose profiles (since v2.23)** — openwebui, wazuh, internal-ca, langflow, letta, openclaw; controlled by installer flags
+- **Optional services via compose profiles (since v2.23)** — wazuh, internal-ca, langflow, letta, openclaw; controlled by installer flags
 - **Admin service management (since v2.23)** — enable/disable any optional service from the admin panel without SSH
 - **Optional ACME runtime CA (since v2.23)** — Smallstep step-ca compose service (`--with-internal-ca`) for deployments that want runtime ACME cert management; in-tree two-tier PKI issuer at install time provides default-on mTLS without it
 - **Strict CSP (since v2.23)** — `script-src 'self'; style-src 'self'`, zero `unsafe-inline`, `object-src none`, `base-uri none`, `cross-origin-opener-policy: same-origin`
@@ -604,7 +604,7 @@ The initial release established the core security envelope. Yashigani began as a
 
 ### 6.1 Docker Compose — Single Node
 
-The simplest production-capable deployment. The universal installer generates a `docker-compose.yml` with all services pre-configured. The full stack comprises **17 always-on core services** plus **10 optional services** activated via compose profiles or installer flags, plus dynamic per-identity containers managed by the Pool Manager.
+The simplest production-capable deployment. The universal installer generates a `docker-compose.yml` with all services pre-configured. The full stack comprises **17 always-on core services** plus **9 optional services** activated via compose profiles or installer flags, plus dynamic per-identity containers managed by the Pool Manager.
 
 ```
 docker-compose.yml — 17 always-on core services
@@ -626,8 +626,7 @@ docker-compose.yml — 17 always-on core services
 ├── otel-collector          # OpenTelemetry receiver (mTLS)
 └── jaeger                  # Distributed tracing UI / OTLP exporter
 
-10 optional services — activated via compose profile / installer flag
-├── open-webui              # Chat interface, port 3000 (--with-openwebui)
+9 optional services — activated via compose profile / installer flag
 ├── keycloak                # Test IdP for SSO development (test-idp profile)
 ├── vault                   # HashiCorp Vault KMS backend (vault profile)
 ├── step-ca                 # Smallstep step-ca runtime ACME (--with-internal-ca)

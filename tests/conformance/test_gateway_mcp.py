@@ -255,16 +255,31 @@ class TestLivezReadyz:
         assert r.status_code == 403
 
     # GAP-CLOSED: GET /readyz
-    def test_readyz_not_a_declared_route(self, gw_app):
+    #
+    # 2026-07-31 (Tom, YTF Tier-A truly-green gate): YSG-RISK-179 (commit
+    # 046b11ce) gave /readyz its OWN dedicated handler (gateway/proxy.py) --
+    # a public, unauthenticated dependency-checked readiness probe, exactly
+    # mirroring /livez/healthz's existing shallow-liveness pattern above, NOT
+    # something that falls through to the auth catch-all. These two tests
+    # asserted the PRE-179 behaviour (no route -> catch-all -> OPA 403) and
+    # are updated here to match the new, intended dedicated-handler contract
+    # -- see src/tests/regression/v4.1.2/test_tom_ysg_risk_179_readyz_dep_check.py
+    # for the readiness-logic coverage (dep-up->200, dep-down->503,
+    # not-configured->trivially-ready).
+    def test_readyz_is_a_declared_route(self, gw_app):
         declared = {p for (_m, p) in _enumerate_gw_routes(gw_app)}
-        assert "/readyz" not in declared, (
-            "FINDING-GW-1 regression: /readyz is now a real route — update "
-            "this test's assertions to match the new dedicated handler."
+        assert "/readyz" in declared, (
+            "FINDING-GW-1 regression: /readyz should have its own dedicated "
+            "handler (YSG-RISK-179), not fall through to the catch-all."
         )
 
-    def test_readyz_falls_through_catchall_opa_denies_403(self, gw_client):
+    def test_readyz_unauth_200_when_no_deps_configured(self, gw_client):
+        """No Postgres/redis wired in this offline conformance app -> every
+        dependency is trivially ready -> 200, unauthenticated (a readiness
+        probe must be reachable by an orchestrator with no credentials)."""
         r = gw_client.get("/readyz")
-        assert r.status_code == 403
+        assert r.status_code == 200
+        assert r.json()["status"] == "ready"
 
 
 # ---------------------------------------------------------------------------

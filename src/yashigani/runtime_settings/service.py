@@ -271,6 +271,9 @@ class RuntimeSettingsService:
 
         meta = KNOWN_SETTINGS_BY_KEY[key]
         value = _coerce_value(value, meta.allowed_type)
+        # YSG-RISK-155: reject an out-of-range numeric value BEFORE it is
+        # persisted (previously only type-coerced — no bounds at all).
+        _validate_bounds(key, value, meta)
 
         value_json = json.dumps(value)
         default_json = json.dumps(meta.class_default)
@@ -423,3 +426,22 @@ def _coerce_value(value: Any, allowed_type: str) -> Any:
             return value
         return str(value).lower() in ("1", "true", "yes")
     return str(value)
+
+
+def _validate_bounds(key: str, value: Any, meta: Any) -> None:
+    """YSG-RISK-155: enforce SettingMeta.min_value/max_value on numeric settings.
+
+    Raises ValueError (caller — the admin PUT route — maps this to HTTP 422)
+    on an out-of-range value. Non-numeric settings (bool/string) or settings
+    with no configured bound are a no-op.
+    """
+    if meta.allowed_type not in ("int", "float"):
+        return
+    if meta.min_value is not None and value < meta.min_value:
+        raise ValueError(
+            f"{key}: value {value!r} is below the minimum allowed ({meta.min_value!r})"
+        )
+    if meta.max_value is not None and value > meta.max_value:
+        raise ValueError(
+            f"{key}: value {value!r} exceeds the maximum allowed ({meta.max_value!r})"
+        )

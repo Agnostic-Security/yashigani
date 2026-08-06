@@ -1061,10 +1061,14 @@ class TestOpaAssistantApply:
         assert body["status"] == "applied"
         assert body["groups_applied"] == 1
         assert body["users_applied"] == 1
-        # push_rbac_data wraps the raw suggestion into the combined
-        # {"rbac": ..., "agents": ...} document (rbac/opa_push.py) — the
-        # pushed rbac sub-document is what must match the applied suggestion.
-        assert pushed["doc"]["rbac"] == _VALID_RBAC_DOC
+        # push_rbac_data (YSG-RISK-176) PUTs the raw suggestion straight to
+        # the /v1/data/yashigani/rbac sub-path — no combined {"rbac":...,
+        # "agents":...} wrapper anymore (that root-path PUT used to wipe
+        # sibling sub-documents like data.yashigani.mcp.egress_grants on
+        # every apply). apply_suggestion never passes agent_registry, so
+        # only the rbac sub-path is touched — confirmed by the URL.
+        assert pushed["url"].endswith("/v1/data/yashigani/rbac")
+        assert pushed["doc"] == _VALID_RBAC_DOC
         mock_audit_writer.write.assert_called_once()
 
 
@@ -1174,10 +1178,44 @@ class TestOpaAssistantApplyRego:
         assert r.status_code == 401
         assert r.json()["detail"]["error"] == "step_up_required"
 
-    def test_compile_error_422(self, stepup_admin_client, fake_opa):
+    def test_no_package_declaration_400_before_compile_check(self, stepup_admin_client, fake_opa):
+        """YSG-RISK-141: assert_client_package_scope() now runs BEFORE
+        validate_rego_module()'s OPA compile check — a Rego body with no
+        `package` declaration at all is rejected 400 missing_package
+        up front (a malformed/incomplete submission), never reaching the
+        422 compile-check path. See
+        test_tom_ysg_risk_141_opa_package_namespace.py::
+        TestAssertClientPackageScope::test_missing_package_rejected."""
         r = stepup_admin_client.post(
             "/admin/opa-assistant/apply-rego",
             json={"rego": "this has no valid module declaration at all, ten chars+", "policy_name": "badpol"},
+        )
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"] == "missing_package"
+
+    def test_package_scoped_but_uncompilable_rego_still_422(self, stepup_admin_client, fake_opa, monkeypatch):
+        """Distinguishes the two paths: a Rego body that DOES declare a
+        correctly-scoped `package clients.<policy_name>` (so it clears
+        YSG-RISK-141's package-scope guard) but is otherwise uncompilable
+        must still surface as 422 rego_compile_error — the compile-check
+        path is not simply gone, it now runs strictly AFTER the
+        package-scope guard rather than before it."""
+        import yashigani.opa_assistant.rego_validator as rego_validator_mod
+
+        # apply_rego() does `from yashigani.opa_assistant.rego_validator import
+        # validate_rego_module` INSIDE the function body (re-imported per
+        # call), so patching the source module's attribute (rather than a
+        # backoffice.routes.opa_assistant-level name) is what's actually
+        # observed at call time.
+        monkeypatch.setattr(
+            rego_validator_mod,
+            "validate_rego_module",
+            AsyncMock(return_value=(False, "rego_parse_error: unexpected token")),
+        )
+        r = stepup_admin_client.post(
+            "/admin/opa-assistant/apply-rego",
+            json={"rego": "package clients.badpol\nimport rego.v1\nthis is not valid rego syntax\n",
+                  "policy_name": "badpol"},
         )
         assert r.status_code == 422
         assert r.json()["detail"]["error"] == "rego_compile_error"

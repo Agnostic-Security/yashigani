@@ -6,7 +6,6 @@ GET  /auth/logout-redirect         — browser-navigable single-logout (Phase 2:
 GET  /auth/status                  — check session validity
 GET  /auth/verify                  — Caddy forward_auth for data-plane (user sessions only)
 GET  /auth/verify-admin            — Caddy forward_auth for /admin/* (admin sessions only)
-GET  /auth/verify-user             — Caddy forward_auth for /app/webui and user paths (user sessions only; rejects admin)
 POST /auth/password/change         — forced change on first login
 POST /auth/totp/provision          — TOTP + recovery codes provisioning
 POST /auth/stepup                  — V6.8.4 step-up TOTP verification for high-value flows
@@ -18,8 +17,13 @@ Phase 1 changes (2026-06-12, feat/2.25.5-auth-ingress):
   - logout() changed from AdminSession → AnySession: user-tier sessions were trapped
     because the admin-only guard prevented logout (the "no end-user logout" bug).
   - verify-user endpoint added: accepts user-tier sessions, explicitly rejects admin
-    sessions.  Caddy uses it for the /app/webui forward_auth leg.
-  - Both /auth/verify and /auth/verify-user reject admin sessions (SoD-003 preserved).
+    sessions.  Caddy used it for the /app/webui forward_auth leg.
+  - /auth/verify rejects admin sessions (SoD-003 preserved).
+
+4.0 removal note (fix/v412-e2e-x8x-20260725):
+  - /auth/verify-user removed. Caddy's /app/webui* handle is now a bare
+    redirect to /chat (no forward_auth) — Open WebUI was replaced by the
+    native ui4 chat SPA and this endpoint became unreachable dead code.
 
 Phase 2 changes (2026-06-13, feat/2.25.5-auth-ingress):
   - logout-redirect endpoint added: GET version of logout for browser navigation.
@@ -1623,195 +1627,6 @@ async def verify_admin_session(request: Request):
     return resp
 
 
-def _audit_verify_user_denied(state, session, reason: str) -> None:
-    """NDC-sweep-E (2026-07-31): best-effort audit emission for
-    verify_user_session()'s state/tier-gate denies (totp_provisioning_incomplete
-    | password_change_required | insufficient_tier | owui_access_required).
-    The admin-session branch of this same function reuses
-    AuthVerifyRejectedAdminSessionEvent instead (see call site above).
-    Audit failure must NEVER block the deny."""
-    if state.audit_writer is None:
-        return
-    try:
-        from yashigani.audit.schema import VerifyUserAccessDeniedEvent
-        state.audit_writer.write(VerifyUserAccessDeniedEvent(
-            account_id=session.account_id,
-            session_account_tier=session.account_tier,
-            reason=reason,
-        ))
-    except Exception as exc:  # noqa: BLE001
-        _log.error("verify-user: audit write failed reason=%s: %s", reason, exc)
-
-
-@router.get("/verify-user")
-async def verify_user_session(request: Request):
-    """
-    Caddy forward_auth endpoint for USER paths (/app/webui and its sub-paths).
-
-    Phase 1 / 2.25.5-auth-ingress.  The split-verify pattern:
-      /auth/verify-admin → admin sessions only  (for /admin/*)
-      /auth/verify       → user sessions only   (existing data-plane / OWUI catch-all)
-      /auth/verify-user  → user sessions only   (this endpoint, for /app/webui)
-
-    Accepts any authenticated SESSION with account_tier == "user".
-    Rejects admin sessions with HTTP 403 (SoD preserved — admins never reach the
-    user/OWUI path, even if they have a valid session).
-    Rejects unauthenticated or expired sessions with HTTP 401.
-
-    On 200: sets X-Forwarded-User/Name/Email headers for OWUI trusted-header auth.
-    On 401: Caddy redirects to /login?next=<path>.
-    On 403: Caddy surfaces an authorization error (not a login redirect).
-
-    NIST AC-5 / ASVS V4.1.2 / design: auth-ingress-architecture-20260612.md
-    """
-    state = backoffice_state
-    assert state.auth_service is not None  # set unconditionally at startup
-    assert state.session_store is not None  # set unconditionally at startup
-
-    # Accept both user cookie and admin cookie names for flexibility; the tier
-    # check below enforces the actual restriction.
-    token = request.cookies.get(_USER_SESSION_COOKIE) or request.cookies.get(_SESSION_COOKIE)
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-
-    session = state.session_store.get(token)
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-
-    # Admin sessions MUST NOT access user paths.
-    # This is the /app/webui-side mirror of SoD-003 (which blocks admin on /auth/verify).
-    if session.account_tier == "admin":
-        _log.warning(
-            "verify-user: rejected admin session account_id=%s — "
-            "admins cannot access user paths (/app/webui)",
-            session.account_id,
-        )
-        # Reuses AuthVerifyRejectedAdminSessionEvent — identical SoD-003
-        # shape already audited at the sibling /auth/verify call site.
-        if state.audit_writer is not None:
-            try:
-                from yashigani.audit.schema import AuthVerifyRejectedAdminSessionEvent
-                from yashigani.auth.session import _mask_ip
-                state.audit_writer.write(AuthVerifyRejectedAdminSessionEvent(
-                    account_id=session.account_id,
-                    client_ip_prefix=_mask_ip(_real_client_ip(request)),
-                ))
-            except Exception as exc:  # noqa: BLE001
-                _log.error("verify-user: audit write failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "admin_session_not_allowed_user_path",
-                "message": (
-                    "Admin accounts cannot access user paths. "
-                    "Use your admin console at /admin/."
-                ),
-            },
-        )
-
-    # Reject provisioning-state sessions (must finish TOTP enrolment first).
-    if session.account_tier == "totp_provisioning":
-        _audit_verify_user_denied(state, session, "totp_provisioning_incomplete")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "totp_provisioning_incomplete",
-                "message": "Complete TOTP enrolment before accessing this resource.",
-            },
-        )
-
-    # LAURA-V400-NEW-002: reject password_change_required sessions.
-    # User must change their temporary/expired password via /auth/password/change
-    # before accessing any data-plane resource.
-    if session.account_tier == "password_change_required":
-        _audit_verify_user_denied(state, session, "password_change_required")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "password_change_required",
-                "message": (
-                    "You must change your password before accessing this resource. "
-                    "POST to /auth/password/change to set a new password."
-                ),
-            },
-        )
-
-    # Only user-tier sessions proceed past this point.
-    if session.account_tier != "user":
-        _audit_verify_user_denied(state, session, "insufficient_tier")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "insufficient_tier",
-                "message": "This path requires a user-tier session.",
-            },
-        )
-
-    record = await state.auth_service.get_account_by_id(session.account_id)
-    if record is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-
-    # OWUI access is OPT-IN (Yashigani is API-first). A user-tier session is
-    # provisioned for the API by default (the `users` caller group); reaching
-    # OpenWebUI (served at root) additionally requires membership of the
-    # `owui-users` RBAC group. Membership lives in the RBAC store
-    # (group.members = emails), NOT identity_registry.groups (empty for RBAC
-    # members). Skip-allow when the RBAC store or owui-users group is absent
-    # (community/non-standard deploy) — never lock everyone out. (YSG 2.25.5
-    # a64331e + c751e15; see docs/operator-guide.md §5.6.)
-    _rbac = getattr(state, "rbac_store", None)
-    if _rbac is not None:
-        _email = (record.email or f"{record.username}@yashigani.local").strip().lower()
-        _owui_grp = next(
-            (grp for grp in _rbac.list_groups()
-             if str(getattr(grp, "display_name", "")).lower() == "owui-users"),
-            None,
-        )
-        if _owui_grp is not None:
-            _members = {str(m).strip().lower() for m in (_owui_grp.members or set())}
-            if _email not in _members:
-                _log.info(
-                    "verify-user: user %s not in owui-users RBAC group — denying "
-                    "OpenWebUI access (API-first; user has API access only)",
-                    record.username,
-                )
-                _audit_verify_user_denied(state, session, "owui_access_required")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail={
-                        "error": "owui_access_required",
-                        "message": (
-                            "Your account does not have OpenWebUI access. Ask an "
-                            "administrator to add you to the owui-users group."
-                        ),
-                    },
-                    headers={"X-Authz-Reason": "owui_access_required"},
-                )
-
-    from starlette.responses import Response as StarletteResponse
-
-    resp = StarletteResponse(status_code=200)
-    email = record.email or f"{record.username}@yashigani.local"
-    resp.headers["X-Forwarded-User"] = email
-    resp.headers["X-Forwarded-Name"] = record.username
-    resp.headers["X-Forwarded-Email"] = email
-    # 4.1 SEC-GAP-1: inject identity_id for forward_auth copy_headers propagation.
-    # LAURA-V50-008 (2026-07-26): get_by_account_id() returns the FULL identity
-    # dict, not the identity_id string — see verify_session() above for the
-    # full explanation. Extract the identity_id field explicitly.
-    _idreg_u = getattr(state, "identity_registry", None)
-    if _idreg_u is not None:
-        try:
-            _identity_u = _idreg_u.get_by_account_id(session.account_id)
-            _iid_u = _identity_u.get("identity_id", "") if _identity_u else ""
-            if _iid_u:
-                resp.headers["X-Yashigani-Identity-Id"] = _iid_u
-        except Exception as _idreg_u_exc:
-            _log.debug("verify-user: identity_registry lookup failed for %s: %s",
-                       session.account_id, _idreg_u_exc)
-    return resp
-
-
 # ---------------------------------------------------------------------------
 # v4.1 Phase 1c — /auth/verify-mcp: forward_auth gate for the per-MCP wrap
 # ---------------------------------------------------------------------------
@@ -2055,7 +1870,21 @@ _WEBHOOK_RATE_IP_LIMIT = 60        # per-IP per 60s
 _WEBHOOK_RATE_GLOBAL_LIMIT = 300   # global per 60s
 _WEBHOOK_RATE_WINDOW = 60          # seconds
 _WEBHOOK_REPLAY_TTL = 600          # Slack sig replay-dedup window (seconds)
-_TELEGRAM_SECRET_PATH = "/run/secrets/openclaw_telegram_webhook_secret"
+
+
+def _telegram_secret_path() -> str:
+    """Path to the Telegram webhook shared-secret mount.
+
+    YSG-RISK-160: resolved via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    was a bare "/run/secrets/openclaw_telegram_webhook_secret" literal with no
+    override, the same convention-bypass class as YSG-RISK-150 (same file).
+    Resolved at call time (not import time) so tests can monkeypatch
+    YASHIGANI_SECRETS_DIR without a module reload.
+    """
+    return os.path.join(
+        os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+        "openclaw_telegram_webhook_secret",
+    )
 
 
 def _webhook_audit_deny(provider: str, reason: str, client_ip: str) -> None:
@@ -2217,13 +2046,14 @@ async def verify_webhook_ingress(request: Request, provider: str = ""):
         presented = request.headers.get("x-telegram-bot-api-secret-token", "")
         if not presented:
             _webhook_deny(401, "telegram_token_missing", provider, client_ip)
+        _telegram_secret_file = _telegram_secret_path()
         try:
-            expected = open(_TELEGRAM_SECRET_PATH).read().strip()  # noqa: WPS515
+            expected = open(_telegram_secret_file).read().strip()  # noqa: WPS515
         except OSError as exc:
             _log.error(
                 "verify-webhook: cannot read Telegram webhook secret at %r: %s — "
                 "denying (fail-closed; mount the secret in install.sh)",
-                _TELEGRAM_SECRET_PATH, exc,
+                _telegram_secret_file, exc,
             )
             from fastapi import HTTPException as _HTTPException
             raise _HTTPException(
@@ -2862,7 +2692,13 @@ async def issue_operator_token(
 
     # Signing key: reuse caddy_internal_hmac (already a 32+ byte secret at runtime).
     # Fail closed if the secret file is not readable.
-    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    # YSG-RISK-150: resolve via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    # matches the convention used everywhere else in the codebase (e.g.
+    # yashigani/auth/caddy_verified.py load_caddy_secret()). A hardcoded
+    # "/run/secrets/..." path breaks on any install with a non-default
+    # secrets mount.
+    _secrets_dir = os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    _hmac_path = os.path.join(_secrets_dir, "caddy_internal_hmac")
     try:
         with open(_hmac_path) as _f:
             _signing_key = _f.read().strip()
@@ -2951,7 +2787,10 @@ async def verify_operator_token(
         )
     _raw_token = auth_header[len("Bearer "):].strip()
 
-    _hmac_path = "/run/secrets/caddy_internal_hmac"
+    # YSG-RISK-150: resolve via YASHIGANI_SECRETS_DIR (default /run/secrets) —
+    # same convention as the issuance endpoint above and the rest of the codebase.
+    _secrets_dir = os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets")
+    _hmac_path = os.path.join(_secrets_dir, "caddy_internal_hmac")
     try:
         with open(_hmac_path) as _f:
             _signing_key = _f.read().strip()

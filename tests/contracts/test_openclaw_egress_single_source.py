@@ -54,6 +54,27 @@ _MIRROR = _REPO / "helm" / "yashigani" / "files" / "Caddyfile.openclaw-egress"
 _CONFIGMAPS = _REPO / "helm" / "yashigani" / "templates" / "configmaps.yaml"
 _CHART = _REPO / "helm" / "yashigani"
 _SYNC_SCRIPT = "scripts/sync-caddyfile-egress-helm.sh"
+_COMPOSE = _REPO / "docker" / "docker-compose.yml"
+
+# The five caller-gate SPIFFE identities the :18790 listener's static gates
+# (openclaw-egress-caller-gate, llm-egress-caller-gate,
+# gateway-egress-deliver-gate) resolve via Caddy parse-time `{$VAR:default}`
+# substitution.  Every one of these MUST be composed from the per-instance
+# YASHIGANI_SPIFFE_TRUST_DOMAIN in the compose caddy service env block —
+# the Caddyfile's inline default literal (`spiffe://yashigani.internal/<name>`)
+# is UN-qualified and only matches a leaf's real URI SAN on a legacy
+# single-instance install where the trust domain happens to be the bare
+# default.  A missing entry here silently falls back to the bare literal and
+# 403s every caller whose leaf carries the per-instance-qualified SAN.
+_REQUIRED_CALLER_GATE_SPIFFE_ENV_VARS = (
+    "YASHIGANI_CADDY_SPIFFE_ID",
+    "YASHIGANI_OPENCLAW_SPIFFE_ID",
+    "YASHIGANI_LANGFLOW_SPIFFE_ID",
+    "YASHIGANI_LETTA_SPIFFE_ID",
+    # YSG-RISK-142: gateway is the caller on ALL FOUR /deliver/* routes
+    # (llm/slack/slack-hooks/telegram) — this was the missing one.
+    "YASHIGANI_GATEWAY_SPIFFE_ID",
+)
 
 # Markers of the listener INTERNALS.  If any of these appear in
 # configmaps.yaml the hand-coded duplicate has been re-inlined — the exact
@@ -191,6 +212,61 @@ def test_configmap_documents_all_four_k8s_deltas() -> None:
         + "\n\nAll four documented deltas (service name, trust anchor, SPIFFE "
         "trust domain, telegram bot-ID default) are load-bearing for the K8s "
         "render of the single-source :18790 listener."
+    )
+
+
+def test_compose_caddy_service_declares_all_caller_gate_spiffe_ids() -> None:
+    """YSG-RISK-142 regression: docker/docker-compose.yml's ``caddy`` service
+    ``environment:`` block must compose ALL FIVE :18790 caller-gate SPIFFE
+    identities (caddy, openclaw, langflow, letta, gateway) from
+    ``YASHIGANI_SPIFFE_TRUST_DOMAIN`` — never leave one to the Caddyfile's
+    un-qualified inline default.
+
+    Root cause this guards: ``YASHIGANI_GATEWAY_SPIFFE_ID`` was absent from
+    the compose env block while the other four were present.
+    ``gateway-egress-deliver-gate`` therefore fell back to the bare literal
+    ``spiffe://yashigani.internal/gateway``, which never matches
+    ``gateway_client.crt``'s real (trust-domain-qualified) URI SAN on any
+    install whose ``YASHIGANI_SPIFFE_TRUST_DOMAIN`` differs from the bare
+    default (e.g. ``localhost.yashigani.internal`` — every per-instance
+    install). Every ``/deliver/{llm,slack,slack-hooks,telegram}/*`` call —
+    the ONLY path from egress/eval back out to Slack/Telegram/the inference
+    surface — 403'd, confirmed live on the v4.1.2 Docker e2e stack (caddy
+    access log: client_common_name=gateway, mTLS handshake succeeded, static
+    ``respond ... 403`` fired anyway because the stamped
+    X-Yashigani-Verified-Spiffe compared unequal to the un-qualified default).
+
+    K8s is NOT covered by this test — it is structurally immune: the Helm
+    render (configmaps.yaml Delta 3) string-replaces the bare
+    ``spiffe://yashigani.internal/`` prefix across the WHOLE egress Caddyfile
+    at template time, before Caddy ever parses the inline default literal
+    (see ``test_configmap_documents_all_four_k8s_deltas`` above).
+    """
+    text = _COMPOSE.read_text(encoding="utf-8")
+
+    # Scope to the `caddy:` service block only — a false-positive match
+    # against an unrelated service's env would defeat the point of the test.
+    caddy_block_match = re.search(r"^  caddy:\n(?:^ {4}.*\n|^\n)*", text, re.MULTILINE)
+    assert caddy_block_match, (
+        "docker-compose.yml: could not locate the `caddy:` service block "
+        "(top-level indentation drifted? update the regex in this test)."
+    )
+    caddy_block = caddy_block_match.group(0)
+
+    missing = [
+        var
+        for var in _REQUIRED_CALLER_GATE_SPIFFE_ENV_VARS
+        if f"{var}: spiffe://${{YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}}/"
+        not in caddy_block
+    ]
+    assert not missing, (
+        "\ndocker-compose.yml `caddy:` service is missing per-instance-domain "
+        "composition for :18790 caller-gate SPIFFE ID(s):\n"
+        + "\n".join(f"  - {v}" for v in missing)
+        + "\n\nEach MUST be set as "
+        "`<VAR>: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/<name>` "
+        "in the caddy service environment block (mirrors the other caller-gate "
+        "IDs) — YSG-RISK-142."
     )
 
 

@@ -311,51 +311,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# TEST (9): ISSUE-027-followup — Python-wrote token (Podman-rootless path)
-#           ends at 0600 after both os.chmod() in Python and host-side chmod.
+# TEST (9): YSG-RISK-133 — no container-side write against /run/secrets;
+#           token persistence is HOST-SIDE only.
 #
-# Regression for the defect reported by Tom pair-review (2026-05-19):
-#   install.sh:4847 open(token_path, "w") with default umask 0022 →
-#   file mode 0644 → host-side chmod branch NOT taken (echo fails EACCES) →
-#   token world-readable in 0755 dir.
+# RELEASE-BLOCKER regression (2026-07-27, confirmed live by Ava on a fresh
+# Docker install and previously on k8s): the Python block used to open()
+# /run/secrets/<profile>_token for writing. FINDING-V412-RESTART-012
+# (2026-07-21) made backoffice's /run/secrets a PURE :ro mount, so that write
+# always raised OSError: [Errno 30] Read-only file system. EROFS has no
+# dedicated Python exception subclass (it is a bare OSError, NOT a
+# PermissionError), so the old `except PermissionError: pass` guard never
+# caught it — the exception propagated to the OUTER `except Exception`
+# handler and the agent was reported "FAIL" even though
+# durable.upsert()/registry.restore_from_durable() had ALREADY committed the
+# registration. Every fresh compose install logged "No agents were
+# registered" and @letta/@langflow/@openclaw chat was 100% dead.
 #
-# Fix: os.chmod(token_path, 0o600) in Python (always runs as file owner).
-#      Host-side else-branch also attempts chmod 600 (may fail on owner
-#      mismatch but is belt-and-suspenders).
+# Fix: remove the container-side write entirely (ISSUE-027's host-side
+# capture path — install.sh ~10520 OK:*) case — already does the real
+# persistence correctly and unconditionally). This preserves
+# FINDING-V412-RESTART-012 fully: the container makes ZERO write attempts
+# against /run/secrets, not even inside a caught exception.
 #
-# Strategy: simulate the scenario statically —
-#   (9.1) Assert os.chmod() call exists in install.sh Python block.
-#   (9.2) Assert host-side chmod 600 in the Podman-rootless else-branch.
-#   (9.3) Simulate the Podman-rootless host path: file at 0644 owned by
-#         current user, host echo → file, chmod 600 applied → assert 0600.
+# Strategy: static source checks —
+#   (9.1) The Python block must NOT contain an open(token_path, "w") call.
+#   (9.2) The Python block must NOT reference /run/secrets as a WRITE target
+#         for the per-agent token (no os.path.join("/run/secrets", ...)
+#         feeding an open(...,"w")).
+#   (9.3) The OK: result line must unconditionally include raw_token (not
+#         gated behind a try/except around a file write) so the host-side
+#         capture path always receives it.
 # ---------------------------------------------------------------------------
-_section "TEST (9): ISSUE-027-followup — Python os.chmod + Podman-rootless host chmod"
+_section "TEST (9): YSG-RISK-133 — no container-side /run/secrets write for agent tokens"
 
-# (9.1) Assert os.chmod(token_path, 0o600) is in the Python block
-if grep -A5 'with open(token_path' "$INSTALL_SH" | grep -q 'os\.chmod(token_path, 0o600)'; then
-    _pass "(9.1) os.chmod(token_path, 0o600) present in Python token-write block"
+# Extract the register_agent_bundles Python heredoc body (between the
+# `python3 -c '` that follows the AGENTS_JSON exec and the closing `' 2>&1`).
+# Use a -v-passed quote char so awk's own regex escaping doesn't get in the way.
+_py_block="$(awk -v q="'" '
+    index($0, "python3 -c " q) > 0 {if (!started) {started=1; capture=1; next}}
+    capture && index($0, q " 2>&1") == 1 {capture=0}
+    capture{print}
+' "$INSTALL_SH" 2>/dev/null)"
+
+if [[ -z "$_py_block" ]]; then
+    _fail "(9.extract) Could not extract register_agent_bundles Python heredoc — pattern may have changed"
 else
-    _fail "(9.1) os.chmod(token_path, 0o600) MISSING from Python token-write block — ISSUE-027-followup not fixed"
+    _pass "(9.extract) Extracted register_agent_bundles Python heredoc body"
 fi
 
-# (9.2) Assert host-side chmod 600 in the Podman-rootless else-branch
-# The structure after ISSUE-027-followup fix:
-#   if ! echo ... > token 2>/dev/null; then
-#     if [[ ! -s token ]]; then log_warn; else chmod 600 ...; fi
-#   else
-#     chmod 600 ...
-#   fi
-_podman_chmod="$(awk '/if \[\[ ! -s .*.secrets_dir.*_profile.*_token/{found=1} found{print; if (/chmod 600/) {count++} if (/;;/) exit} END{print count}' "$INSTALL_SH" 2>/dev/null | grep -c 'chmod 600' || true)"
-if [[ "$_podman_chmod" -ge 1 ]]; then
-    _pass "(9.2) chmod 600 present in Podman-rootless else-branch (file-already-written path)"
+# (9.1) No open(token_path, "w") in the extracted block
+if echo "$_py_block" | grep -q 'open(token_path'; then
+    _fail "(9.1) open(token_path, ...) STILL present in Python block — YSG-RISK-133 not fixed (container-side write reintroduced)"
 else
-    # Simpler grep — accept if two chmod 600 calls exist inside the OK: handler block
-    _ok_block_chmods="$(awk '/OK:\*\)/{found=1} found{print} found && /;;/{exit}' "$INSTALL_SH" | grep -c 'chmod 600' || true)"
-    if [[ "$_ok_block_chmods" -ge 2 ]]; then
-        _pass "(9.2) Two chmod 600 calls in OK: handler — Docker-rootful and Podman-rootless paths both covered"
-    else
-        _fail "(9.2) Podman-rootless chmod 600 missing — host-side hardening incomplete for Python-wrote-file path"
-    fi
+    _pass "(9.1) No open(token_path, ...) in Python block — container-side write removed"
+fi
+
+# (9.2) No token_path assigned from /run/secrets at all
+if echo "$_py_block" | grep -q 'token_path = os.path.join("/run/secrets"'; then
+    _fail "(9.2) token_path still derived from /run/secrets in Python block — YSG-RISK-133 regression"
+else
+    _pass "(9.2) Python block does not derive a /run/secrets token_path — no doomed :ro write path"
+fi
+
+# (9.3) OK: result line unconditionally includes raw_token (no try/except gating it)
+if echo "$_py_block" | grep -q 'results.append("OK:" + aname + ":" + profile + ":" + raw_token)'; then
+    _pass "(9.3) OK: result line unconditionally includes raw_token for host-side capture"
+else
+    _fail "(9.3) OK: result line does not unconditionally include raw_token — host-side capture (ISSUE-027) may not fire"
 fi
 
 # (9.3) Simulate the Podman-rootless host path end-to-end
@@ -395,8 +417,8 @@ fi
 # ---------------------------------------------------------------------------
 printf "\n=== RESULTS: PASS=%d FAIL=%d SKIP=%d ===\n" "$PASS" "$FAIL" "$SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
-    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001 + ISSUE-024 + ISSUE-027-followup)\n" "$FAIL"
+    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-133)\n" "$FAIL"
     exit 1
 fi
-printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001 + ISSUE-024 + ISSUE-027-followup)\n" "$PASS" "$SKIP"
+printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-133)\n" "$PASS" "$SKIP"
 exit 0

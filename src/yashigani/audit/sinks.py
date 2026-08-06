@@ -198,17 +198,29 @@ class PostgresSink(AuditSink):
                     req_id = event.get("request_id")
 
                     # LU-AMEND-01 wave 2: compute hash-chain fields before INSERT.
-                    # The AuditChainService lock serialises these within the process;
-                    # the batch loop serialises them within this flush call.
-                    # LU-AMEND-01 wave 3: INSERTs are sequential within a single
-                    # transaction so the DB-assigned seq values are strictly
-                    # monotonic in insertion order — the same order in which
-                    # compute_hashes_for_event() is called here.
+                    # YSG-RISK-176 (2026-07-30): the AuditChainService in-process
+                    # lock ONLY serialises calls within this one worker process —
+                    # with multiple gunicorn/uvicorn workers (the gateway alone
+                    # runs two: mTLS :8080 + mesh :8081) each holding its own
+                    # AuditChainService instance, the old compute_hashes_for_event()
+                    # (in-memory _last_hash) diverged across workers — a live query
+                    # under normal concurrent traffic found 4/56 chain-link breaks,
+                    # zero tampering. compute_hashes_for_event_db() instead derives
+                    # prev_hash from the DB's own seq-ordered last row under a
+                    # transaction-scoped pg_advisory_xact_lock keyed on tenant_id,
+                    # which correctly serialises across ALL processes/connections —
+                    # this is the seq-authoritative prev_hash lookup migration 0014
+                    # specified but which compute_hashes_for_event() never actually
+                    # implemented. INSERTs remain sequential within a single
+                    # transaction so seq values stay strictly monotonic in
+                    # insertion order.
                     prev_hash: Optional[str] = None
                     event_hash: Optional[str] = None
                     if self._chain_service is not None:
                         try:
-                            prev_hash, event_hash = self._chain_service.compute_hashes_for_event(event)
+                            prev_hash, event_hash = await self._chain_service.compute_hashes_for_event_db(
+                                conn, tenant_uuid, event
+                            )
                         except Exception as exc:
                             # v2.25.2 (irrevocable chain): on the require_chain
                             # (production) path, a hash-computation failure must
@@ -312,6 +324,25 @@ class PostgresSink(AuditSink):
 
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
+
+    async def drain_now(self) -> int:
+        """Force-drain whatever is currently queued (admin flush — YSG-RISK-148,
+        DELETE /admin/audit/sinks/queue). Only drains what is already queued at
+        call time (does not wait for new arrivals); the background
+        ``_drain_loop`` keeps running independently and both consumers pull
+        safely from the same ``asyncio.Queue`` within the same event loop.
+
+        Returns the number of events flushed.
+        """
+        batch: list[dict] = []
+        while True:
+            try:
+                batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if batch:
+            await self._flush_batch(batch)
+        return len(batch)
 
 
 def _inc_siem_delivery_metric(*, outcome: str, target_name: str) -> None:
@@ -446,6 +477,38 @@ class SiemSink(AuditSink):
 
     async def last_write_ts(self) -> Optional[datetime]:
         return self._last_write
+
+    async def drain_now(self, max_events: int = 10_000) -> int:
+        """Force-drain the Redis queue now (admin flush — YSG-RISK-148,
+        DELETE /admin/audit/sinks/queue). Delivers each popped event directly
+        (no exponential-backoff retry loop — that pipeline belongs to the
+        background SiemWorker; this is a best-effort one-shot admin flush).
+        A delivery failure here is logged and counted but the event is NOT
+        re-queued or DLQ'd by this path — it has already been popped.
+
+        Bounded by max_events per call so a pathological queue depth cannot
+        make this request run unboundedly; call again to continue draining.
+        Returns the number of events popped (attempted, not necessarily
+        successfully delivered).
+        """
+        if self._redis is None:
+            return 0
+        count = 0
+        for _ in range(max_events):
+            raw = self._redis.lpop(self._queue_key)
+            if raw is None:
+                break
+            count += 1
+            try:
+                event = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                await self._deliver_direct(event)
+            except Exception as exc:  # noqa: BLE001 — one popped event must not abort the drain loop
+                logger.warning(
+                    "SiemSink(%s) drain_now: failed to deliver popped event — %s",
+                    self._sink_name, exc,
+                )
+        self._update_queue_gauge()
+        return count
 
 
 # ---------------------------------------------------------------------------
@@ -743,4 +806,24 @@ class MultiSinkAuditWriter:
             result[sink.name] = {
                 "last_write": ts.isoformat() if ts else None,
             }
+        return result
+
+    async def drain_queues(self) -> dict:
+        """Force-drain every sink's pending queue now (admin flush —
+        YSG-RISK-148, DELETE /admin/audit/sinks/queue). Returns
+        {sink.name: events_drained} for sinks that expose a queue to drain
+        (PostgresSink, SiemSink); sinks with no queue (FileSink writes
+        synchronously) are simply omitted from the result — never fabricated
+        as a 0.
+        """
+        result: dict[str, int] = {}
+        for sink in self._sinks:
+            drain = getattr(sink, "drain_now", None)
+            if drain is None:
+                continue
+            try:
+                result[sink.name] = await drain()
+            except Exception as exc:  # noqa: BLE001 — one sink failing must not abort the fan-out
+                logger.error("Sink %s drain_now error: %s", sink.name, exc)
+                result[sink.name] = -1
         return result

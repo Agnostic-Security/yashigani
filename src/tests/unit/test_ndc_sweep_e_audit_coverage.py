@@ -391,54 +391,16 @@ class TestVerifyAdminSessionDeniedAudited:
 
 
 # ---------------------------------------------------------------------------
-# 7. backoffice/routes/auth.py::verify_user_session() —
-#    VerifyUserAccessDeniedEvent (+ reused AuthVerifyRejectedAdminSessionEvent)
+# 7. backoffice/routes/auth.py::verify_user_session() — REMOVED 2026-08-06.
+#    The /auth/verify-user endpoint (OWUI forward-auth) and its
+#    _audit_verify_user_denied helper were deleted with the Open WebUI sunset
+#    (gone 4.x-forward, Tiago 2026-07-31; carried into 5.0 by the 4.1.2-final
+#    merge). VerifyUserAccessDeniedEvent stays in audit/schema.py as append-only
+#    history. TestVerifyUserSessionDeniedAudited (2 tests) removed with it.
 # ---------------------------------------------------------------------------
 
-class TestVerifyUserSessionDeniedAudited:
-    @pytest.mark.asyncio
-    async def test_totp_provisioning_incomplete_audited(self):
-        from yashigani.backoffice.routes import auth as auth_routes
-        aw = _CountingAuditWriter()
-        session = _session(account_id="user-1", account_tier="totp_provisioning")
-        store = MagicMock()
-        store.get = MagicMock(return_value=session)
-        with patch.object(auth_routes, "backoffice_state") as mock_bs:
-            mock_bs.audit_writer = aw
-            mock_bs.auth_service = MagicMock()
-            mock_bs.session_store = store
-            req = MagicMock()
-            req.cookies = {auth_routes._USER_SESSION_COOKIE: "tok-abc123"}
-            from fastapi import HTTPException
-            with pytest.raises(HTTPException) as exc:
-                await auth_routes.verify_user_session(req)
-            assert exc.value.status_code == 403
-        assert len(aw.events) == 1
-        assert type(aw.events[0]).__name__ == "VerifyUserAccessDeniedEvent"
-        assert aw.events[0].reason == "totp_provisioning_incomplete"
-
-    @pytest.mark.asyncio
-    async def test_admin_session_reuses_auth_verify_event(self):
-        from yashigani.backoffice.routes import auth as auth_routes
-        aw = _CountingAuditWriter()
-        session = _session(account_id="admin-1", account_tier="admin")
-        store = MagicMock()
-        store.get = MagicMock(return_value=session)
-        with patch.object(auth_routes, "backoffice_state") as mock_bs:
-            mock_bs.audit_writer = aw
-            mock_bs.auth_service = MagicMock()
-            mock_bs.session_store = store
-            req = MagicMock()
-            req.cookies = {auth_routes._USER_SESSION_COOKIE: "tok-abc123"}
-            from fastapi import HTTPException
-            with pytest.raises(HTTPException) as exc:
-                await auth_routes.verify_user_session(req)
-            assert exc.value.status_code == 403
-        assert len(aw.events) == 1
-        assert type(aw.events[0]).__name__ == "AuthVerifyRejectedAdminSessionEvent"
-
-
 # ---------------------------------------------------------------------------
+
 # 8. backoffice/routes/break_glass.py::break_glass_approve() —
 #    BreakGlassApprovalDeniedEvent
 # ---------------------------------------------------------------------------

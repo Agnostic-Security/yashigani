@@ -67,6 +67,11 @@ _NOT_OUR_GROUP = {
     ("GET", "/admin/audit/siem/config"),
     ("PUT", "/admin/audit/siem/config"),
     ("POST", "/admin/audit/siem/config/test"),
+    # YSG-RISK-148 (queue-drain implementation, merged v4.1.2 integrated
+    # fixbatch 2026-07-30): audit_sinks.py gained a 5th own-route since this
+    # exclusion set was last updated (2026-07-23) — DELETE /admin/audit/sinks/queue
+    # (audit_sinks.py:159). Same no-prefix-mount collision as the other 4.
+    ("DELETE", "/admin/audit/sinks/queue"),
 }
 
 

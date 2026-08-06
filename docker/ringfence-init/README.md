@@ -44,12 +44,13 @@ ringfence-init-<agent>:
 
 Sequence:
 1. `ringfence-init-<agent>` starts, shares `<agent>`'s network namespace.
-2. Resolves `caddy` → Caddy container IP (DNS works before DROP is applied).
-3. Applies `iptables OUTPUT DROP` + `ACCEPT to <caddy-ip>:443` + `ACCEPT DNS`.
-4. Writes `/run/ringfence/ready`.
-5. Exits 0.
-6. `<agent>` starts (depends_on `service_completed_successfully`).
-7. Agent network namespace now has L1 enforcement: only Caddy-egress allowed.
+2. Detects the real DNS resolver(s) for this netns from `/etc/resolv.conf` (YSG-RISK-166 — runtime-aware, not a Docker-only hardcoded IP; see the `RINGFENCE_DNS_SERVER` row below).
+3. Resolves `caddy` → Caddy container IP (DNS works before DROP is applied).
+4. Applies `iptables OUTPUT DROP` + `ACCEPT to <caddy-ip>:443` + `ACCEPT DNS` (to every detected resolver).
+5. Writes `/run/ringfence/ready`.
+6. Exits 0.
+7. `<agent>` starts (depends_on `service_completed_successfully`).
+8. Agent network namespace now has L1 enforcement: only Caddy-egress allowed.
 
 ### K8s path
 
@@ -85,7 +86,7 @@ On K8s, `RINGFENCE_CADDY_HOST` is set to the **stable Caddy ClusterIP** (from `h
 |---|---|---|
 | `RINGFENCE_CADDY_HOST` | `caddy` | Caddy hostname or IPv4 address. K8s: use ClusterIP. |
 | `RINGFENCE_CADDY_PORT` | `443` | TCP port for the Caddy ACCEPT rule. |
-| `RINGFENCE_DNS_SERVER` | `127.0.0.11` | DNS server ACCEPT (Docker embedded DNS / kube-dns ClusterIP). |
+| `RINGFENCE_DNS_SERVER` | `127.0.0.11` | **Fallback only** (YSG-RISK-166). At runtime the script reads the ACTUAL nameserver(s) already configured for this netns from `/etc/resolv.conf` (pre-DROP, so this is a config read, not a fresh query) and allow-lists every IPv4 nameserver found — this value is used only if resolv.conf yields nothing usable. Docker's resolv.conf already says `127.0.0.11`, so Docker behaviour is unchanged. Podman's per-network aardvark-dns/dnsname resolver is bound to that network's bridge-gateway IP (allocated per subnet, differs per install/network — NOT `127.0.0.11`), so a single hardcoded value can never be correct there; live detection is the only correct mechanism. Set kube-dns ClusterIP here for K8s ONLY if this script is ever wired into a K8s initContainer path (currently K8s uses the NetworkPolicy overlay instead — see "K8s path" above). |
 | `RINGFENCE_RUNTIME` | `unknown` | Runtime hint injected by codegen from `YSG_RUNTIME`. |
 | `RINGFENCE_AGENT_NAME` | `agent` | Agent name for log prefix (informational). |
 

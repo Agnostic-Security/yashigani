@@ -3851,13 +3851,32 @@ risks:
     Moot on k8s: YSG-RISK-130's k8s_register_agent_bundles() reads
     each agent's token from its existing Helm-managed K8s Secret rather than
     writing a token file, so this class does not reach k8s.
-    NEEDS-LIVE-CONFIRM: the 2026-07-27 run's Docker leg deployed with agents
-    up and chat reachable via a manual workaround (AgentRegistry.rotate_token()
-    + writing the plaintext token to docker/secrets/<profile>_token on the
-    HOST, the same mechanism every other secret in that directory already
-    uses) -- Ava's chat e2e test against a stock (non-workaround) fresh
-    compose install is the pending confirmation that this actually blocks
-    bundled-agent auth end-to-end as described.
+    CONFIRMED (2026-07-27/28): Ava reproduced this live on a fresh Docker
+    install (and previously on k8s) -- install.sh logs "No agents were
+    registered" and @letta/@langflow/@openclaw chat is 100% dead
+    out-of-the-box. Root cause refined after live confirm: the token-file
+    open() raises OSError errno=30 (EROFS) -- a BARE OSError, NOT a
+    PermissionError (EROFS has no dedicated Python exception subclass) --
+    so the code's own `except PermissionError: pass` guard never catches
+    it. The exception propagates to the outer `except Exception` handler,
+    which reports the agent registration as FAIL even though
+    durable.upsert()/registry.restore_from_durable() already committed the
+    registration to Postgres+Redis. Fixed (Su, YSG-RISK-133) by removing the
+    doomed container-side write entirely rather than reopening
+    RESTART-012's :ro mount or adding a new shadow-mount: the token is
+    always included in the Python script's OK: result line, and the
+    ALREADY-CORRECT host-side capture path (ISSUE-027, install.sh
+    register_agent_bundles()) persists it to
+    docker/secrets/<profile>_token on the HOST filesystem -- the exact
+    workaround mechanism below, now made the PERMANENT code path instead of
+    a manual fallback. Verified via a logic-level harness reproducing the
+    real errno.EROFS exception semantics (bash -n + python3 ast.parse clean;
+    updated tests/install/test_agent_bundle_registration.sh TEST (9) now
+    asserts no open(token_path,...) / no /run/secrets token_path derivation
+    / unconditional OK:+raw_token). Live fresh-compose-install re-verify
+    (Ava e2e chat against the CODE fix, not the manual workaround) is still
+    pending -- not run in this pass because the live docker-leg stack is
+    owned by Maxine (YSG-STACK-OWNER) and was not rebuilt.
   severity: high
   controls_impacted:
   - Availability / Authentication -- bundled-agent (langflow/letta/openclaw)
@@ -3865,37 +3884,47 @@ risks:
     compose install, defeating gateway-side agent-token authentication for
     that dispatch path.
   compensating_controls:
-  - No security boundary WEAKENED -- the failure mode is fail-closed-shaped
-    (no token means the agent call is unauthenticated and gateway-side
-    checks should reject it, not silently authenticate as anyone); the
-    residual risk is availability (bundled-agent chat broken), pending
-    NEEDS-LIVE-CONFIRM above on whether an unauthenticated agent call is
-    rejected or allowed through.
-  - A host-side workaround exists using the SAME mechanism every other
-    secret in docker/secrets/ already uses (write the token to
-    docker/secrets/<profile>_token on the host; both backoffice and gateway
-    already bind-mount ./secrets:/run/secrets:ro from the host) -- no
-    container restart or hand-edit needed, verified live in the 2026-07-27
-    run.
-  status: open
+  - No security boundary WEAKENED -- the fix makes ZERO write attempts
+    against /run/secrets from inside the backoffice container (stronger
+    than before -- previously there was at least an attempted-then-caught
+    write; now there is no attempt at all), fully preserving
+    FINDING-V412-RESTART-012's guarantee that a compromised backoffice
+    cannot write into that mount.
+  - Token persistence now happens via the SAME mechanism every other secret
+    in docker/secrets/ already uses (host-side write to
+    docker/secrets/<profile>_token; both backoffice and gateway bind-mount
+    ./secrets:/run/secrets:ro from the host) -- and matches the pattern k8s
+    already uses (Helm-managed K8s Secret, provisioned before the pod
+    starts, never written to by a running container).
+  status: mitigated_pending_verify
   accepted_by: null
   accepted_at: null
   review_by: '2026-08-11'
-  fix_in_version: null
+  fix_in_version: 4.1.2
   last_threat_model_review: '2026-07-28'
   classification: regression
   bug_reference: FINDING-V412-SVID-WRITE-PATH
   residuals:
   - >-
-      Fix not yet implemented -- RELEASE-BLOCKING for compose fresh-installs
-      pending Ava's live confirmation. Recommended fix (Tom/Su): write the
-      token to a proper shadow-mounted /run/secrets-rw/agents/ path readable
-      by gateway too, or add a dedicated <profile>_token shadow mount
-      matching the existing 4-file pattern (admin_initial_password,
-      grafana_admin_password, redis_password, license_key). Pattern-sweep
-      follow-up (S2): add an invariant test asserting every /run/secrets
-      write path performed by install.sh has a corresponding writable
-      shadow-mount, so a 4th instance of this class cannot ship silently.
+      Code fix implemented (install.sh register_agent_bundles(), commit on
+      fix/v412-e2e-x8x-20260725): container-side write to
+      /run/secrets/<profile>_token removed entirely; the Python script's
+      OK: result line always includes the raw token; the pre-existing
+      ISSUE-027 host-side capture path in install.sh (unchanged) persists it
+      to docker/secrets/<profile>_token with chmod 0640. k8s path
+      (k8s_register_agent_bundles(), YSG-RISK-130) was never affected --
+      it already reads the token from a Helm-managed Secret and makes no
+      filesystem write. Pending: a live fresh-compose-install run (Ava)
+      confirming register_agent_bundles() emits "Agent bundle registration
+      complete" (not "No agents were registered") with no [Errno 30] in the
+      install log, and that @letta/@langflow/@openclaw chat works
+      end-to-end against the CODE fix. Pattern-sweep (S2): grepped
+      install.sh, k8s_register_agent_bundles(), mcp_onboard.py, and
+      pki/issuer.py for other open(...,"w")-against-/run/secrets sites --
+      no other instance of this class found; the two prior instances
+      (FINDING-V412-F1 mint_agent_leaf, FINDING-V412-SVID-WRITE-PATH
+      svid-init staging) already use the /run/secrets-rw shadow-mount
+      pattern correctly.
   source_grep: >-
     testing_runs/yashigani/v412-e2e-latest-20260727/FINDINGS.md (agent-bundle
     token :ro, "Bonus finding") +
@@ -4037,3 +4066,570 @@ risks:
   source_grep: >-
     backoffice/routes/license.py:417-502 -- Laura Docker pentest pass,
     finding LAURA-412-D01 (2026-07-28)
+
+- id: YSG-RISK-137
+  description: >-
+    Admin step-up (ASVS V6.8.4) is universally broken from the browser: the
+    ApiClient.mutate() step-up interceptor in
+    backoffice/static/ui4/core/api-client.js:151 POSTed
+    {"totp": code} to POST /auth/stepup, but the server's StepUpRequest model
+    (backoffice/routes/auth.py:2451-2453) requires field name totp_code
+    (min_length=6, max_length=8, pattern ^\d{6,8}$). FastAPI 422-rejects any
+    body missing the required totp_code field before the handler even runs,
+    so /auth/stepup ALWAYS returns non-2xx from the browser modal -- with a
+    100% correct TOTP code -- for every one of the 22 admin modules that
+    route mutations through ApiClient.mutate()'s shared step-up-retry path.
+    A second, independent instance of the identical bug was found in
+    backoffice/static/ui4/admin/modules/_iam.js:41 (elevate()) -- the
+    client-enforced step-up helper used by RBAC policy force-push, RBAC
+    group/member mutations, and SCIM interactive writes (routes that carry a
+    plain AdminSession server-side, so ApiClient's own interceptor never
+    fires for them). elevate() posts the step-up request directly (not via
+    ApiClient) and had the same stale {"totp": code} shape, so those
+    specific dangerous mutations could NEVER be step-up-elevated from the UI
+    at all -- not even via retry.
+    The legacy static/js/dashboard.js:715 step-up submit handler (3.0 UI)
+    already used the CORRECT {"totp_code": code} shape, confirming the
+    server contract and that this was a frontend regression isolated to the
+    ui4 admin shell, not a server-side change.
+    Root cause of why this was missed on k8s (FIND-DOCKER-001, Docker e2e,
+    2026-07-27/28): step-up was previously verified via direct API curl
+    calls against /auth/stepup with the correct field name, never by
+    driving the actual browser modal end-to-end -- a test-gap in UI
+    exercise coverage, not a k8s-specific defect (the bug is platform
+    agnostic; it is a static-JS bug served identically on Docker, Podman,
+    and k8s).
+  severity: high
+  controls_impacted:
+  - ASVS V6.8.4 (Re-authentication before critical operations) -- the
+    control exists and is enforced server-side, but is completely
+    unusable from the browser, meaning every step-up-gated admin
+    mutation across all 22 admin modules is either permanently blocked
+    (false negative -- an operationally severe availability/functionality
+    break) for retry-based flows, or entirely unreachable (never
+    step-up-elevated) for the client-enforced RBAC/SCIM subset.
+  compensating_controls:
+  - No authorization bypass -- the failure mode is fail-closed (mutations
+    that require step-up simply cannot complete via the UI at all), not a
+    control that silently passes without verification.
+  - Server-side contract (StepUpRequest.totp_code) is unaffected and
+    correct; the API remains directly callable (curl/Postman) with the
+    right field name, so no server-side regression exists.
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  residuals:
+  - >-
+      Fixed: api-client.js:151 and _iam.js:41 both now POST
+      {"totp_code": code}, matching the server's StepUpRequest field name.
+      Repo-wide grep confirmed no other static JS posts a bare {totp: ...}
+      body to /auth/stepup. Regression coverage added:
+      src/tests/unit/test_stepup_auth.py::TestStepUpClientPayloadContract
+      (4 new tests: server-contract field assertion, both fixed call
+      sites individually, and a repo-wide static-JS sweep guarding against
+      a third instance of the stale shape).
+  source_grep: >-
+    grep -rn 'totp:' src/yashigani/backoffice/static --include=*.js (found
+    2 offenders pre-fix: api-client.js:151, _iam.js:41; dashboard.js:715
+    already correct) -- FIND-DOCKER-001, Docker e2e 2026-07-27/28
+
+- id: YSG-RISK-138
+  description: >-
+    @letta chat fails on every install (Docker and k8s) with
+    "Handle openai-proxy/qwen2.5:3b not found" even when Ollama has
+    qwen2.5:3b pulled and the gateway<->Ollama mesh path is independently
+    reachable (verified: direct-model chat reaches Ollama with HTTP 200).
+    Root cause: Letta 0.16.7's POST /v1/agents "model" field is documented
+    as a *handle* ("format: provider/model-name") that Letta resolves
+    against its OWN internal provider catalog -- it is NOT a free-form
+    endpoint string. Yashigani deliberately never registers an
+    "openai-proxy" provider with Letta (LETTA_DEFAULT_LLM_HANDLE is
+    intentionally left unset per the docker-compose.yml comment: "the
+    gateway, not the Letta server defaults, owns the routing decision"),
+    so any create-agent call that sent a bare
+    "model": "openai-proxy/qwen2.5:3b" 404s with exactly this error at
+    THREE independent call sites: letta_client.py's _ensure_agent()
+    (legacy/deprecated 3.0 path), _ensure_agent_for_user() (the ACTIVE 4.0
+    LettaClientPool per-user path), and letta_brain.py's
+    _create_brain_agent() (ORCH-PHASE2 letta-as-orchestrating-brain path,
+    Design A). This is despite SC-AGENT-003 (3.1) already having solved
+    the exact same class of problem for embeddings -- explicit
+    embedding_config full-object payload replacing the unreachable
+    "letta/letta-free" cloud handle -- but that fix was never mirrored to
+    the LLM side, which kept sending "model": <handle> instead of an
+    explicit llm_config object.
+  severity: high
+  controls_impacted:
+  - Availability -- @letta is one of Yashigani's three bundled default
+    agents (langflow/letta/openclaw); its chat path is completely
+    non-functional on every fresh install (Docker and k8s) regardless of
+    Ollama/mesh health, model pull status, or the YSG-RISK-133 agent-token
+    registration fix (independent root cause -- fixing 133 alone does NOT
+    unblock @letta; this bug still 404s the agent-creation call before any
+    token is even used).
+  compensating_controls:
+  - No security-boundary weakening -- pure availability defect (feature
+    completely non-functional, not partially/insecurely functional).
+  - langflow and openclaw bundled-agent chat paths are unaffected (separate
+    upstreams, no Letta-handle dependency).
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  bug_reference: SC-AGENT-003
+  residuals:
+  - >-
+      Fixed: added letta_client._letta_llm_config(), mirroring the existing
+      _letta_embedding_config() pattern -- builds an explicit LLMConfig
+      object (model_endpoint_type="openai", model_endpoint pointing at the
+      gateway's /v1, context_window from a small per-model table defaulting
+      to 8192 for unlisted models) and passes it as "llm_config" (Letta's
+      deprecated-but-functional full-object field) instead of "model"
+      (handle). Applied at all three call sites:
+      letta_client.py _ensure_agent_for_user() and _ensure_agent(), and
+      letta_brain.py _create_brain_agent(). NEEDS-LIVE-CONFIRM: fix is
+      unit-tested (mocked httpx) but not yet verified against a live Letta
+      0.16.7 container end-to-end -- Ava/Iris to confirm on next e2e pass.
+      Also NOTE: this fix is independent of, and does not depend on,
+      Su's YSG-RISK-133 agent-token registration fix in progress on this
+      same branch -- both must land for @letta chat to be fully functional
+      end-to-end (133 gates the auth token being present; 138 gates the
+      Letta agent being creatable at all).
+  source_grep: >-
+    grep -n '"model": brain_model' src/yashigani/gateway/letta_client.py
+    src/yashigani/gateway/letta_brain.py (3 hits pre-fix, all now
+    "llm_config": _letta_llm_config(brain_model)) -- reported chat-path
+    repair investigation, 2026-07-27/28
+
+- id: YSG-RISK-139
+  description: >-
+    @openclaw chat fails on every install (Docker confirmed live; same code
+    path on k8s) with httpx.ConnectError wrapping
+    ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+    certificate verify failed: unable to get local issuer certificate,
+    logged as "Agent @openclaw unreachable" (gateway container, Docker e2e
+    2026-07-28). This is a THIRD independent root cause on the
+    @openclaw/@letta/@langflow/direct-model chat quartet -- distinct from
+    Su's YSG-RISK-133 (agent-token registration) and Tom's YSG-RISK-138
+    (Letta model-handle 404); YSG-RISK-138's residuals note ("langflow and
+    openclaw bundled-agent chat paths are unaffected") is superseded by this
+    finding for openclaw.
+    Root cause: the generic OpenAI-compatible dispatch branch in
+    gateway/openai_router.py (~line 3465, the "else" branch handling any
+    agent whose registry protocol is not "letta"/"langflow" -- openclaw's
+    registered protocol per install.sh register_agent_bundles() /
+    k8s_register_agent_bundles()) opened a bare httpx.AsyncClient(timeout=
+    120.0) with NO verify= override, i.e. default public/certifi CA trust,
+    to dial agent_upstream directly. Under the v4.1 unified-sidecar dispatch
+    repoint (§2.5), openclaw's registered upstream is its Caddy INGRESS
+    front -- https://caddy:9671/agents/default/openclaw (compose) /
+    https://yashigani-caddy-mesh:9671/agents/default/openclaw (k8s),
+    docker/caddy/agents/openclaw-ingress.caddy:13-20 -- which presents
+    caddy_client.crt (signed by the Yashigani INTERNAL intermediate CA, NOT
+    a public CA) and requires client_auth mode require_and_verify. A client
+    trusting only the public CA bundle cannot build a chain to that leaf's
+    issuer -> "unable to get local issuer certificate" at the client's own
+    verify step (server-side require_and_verify never even reached; this is
+    the CLIENT failing to verify the SERVER'S cert, not the reverse). The
+    cert chain, SANs, and trust anchor are all correctly configured
+    (verified: docker/service_identities.yaml:54-58 caddy dns_sans includes
+    both "caddy" and "yashigani-caddy-mesh") -- this is a call-site bug, not
+    a PKI/cert-content defect. The sibling letta/langflow dispatch branches
+    (openai_router.py ~3373-3426) already call letta_client.letta_chat() /
+    langflow_client.langflow_chat(), both of which go through
+    gateway/_dispatch_client.py::agent_dispatch_client() -- the SINGLE
+    documented place for mesh-ingress-front dispatch clients, wired with
+    the internal-PKI ServiceIdentity leaf + internal CA trust
+    (pki/ssl_context.py::client_ssl_context(), per the internal-mTLS
+    convention) -- so only this third, generic branch was left on a bare
+    client.
+  severity: high
+  controls_impacted:
+  - Availability -- @openclaw is one of Yashigani's three bundled default
+    agents; its chat path is completely non-functional on every fresh
+    install (Docker confirmed; k8s shares the identical code path so is
+    assessed equally affected) regardless of the YSG-RISK-133 token fix
+    (independent root cause -- fixing 133 alone does NOT unblock @openclaw;
+    this bug ConnectErrors before the bearer token is even checked
+    server-side).
+  compensating_controls:
+  - No security-boundary weakening, and no weakening applied by this fix --
+    the mesh front's require_and_verify + SPIFFE caller-gate is untouched;
+    the fix only corrects which CLIENT-side trust store the gateway uses
+    when the upstream is recognised as one of our own mesh ingress fronts.
+  - Genuinely externally-deployed custom OpenAI-compatible agents
+    (AgentRegisterRequest.upstream_url without an /agents/ path -- an
+    intentional, tested, non-mesh feature, backoffice/routes/agents.py:151-
+    203) are unaffected -- the fix only routes upstreams whose URL path
+    matches the mesh ingress signature (/agents/<tenant>/<system>) onto the
+    internal-PKI client; everything else keeps the existing public-CA-
+    trusting bare client unchanged.
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-27'
+  fix_in_version: 4.1.2
+  last_threat_model_review: '2026-07-28'
+  classification: regression
+  residuals:
+  - >-
+      Fixed: gateway/openai_router.py generic agent-dispatch branch now
+      detects a mesh ingress front by URL path prefix "/agents/" (portable
+      across compose "caddy" and k8s "yashigani-caddy-mesh" hostnames -- the
+      path is identical on both runtimes, the hostname is not) and, when
+      matched, opens the client via
+      gateway/_dispatch_client.py::agent_dispatch_client() -- the same
+      internal-PKI mesh client already used by the letta/langflow dispatch
+      branches -- instead of a bare httpx.AsyncClient. Non-mesh upstreams
+      (no /agents/ path) are unchanged. NEEDS-LIVE-CONFIRM: fix verified by
+      static code-path tracing + confirmed cert chain/SAN correctness
+      (service_identities.yaml) against the live Docker CERTIFICATE_VERIFY_
+      FAILED error, but the live mTLS handshake itself was not re-exercised
+      against a redeployed gateway image in this pass -- Captain does not
+      own the shared stack's redeploy (owner: Maxine/Tiago verification
+      pass). Needs image rebuild + redeploy to confirm handshake succeeds
+      end-to-end.
+  source_grep: >-
+    docker logs <gateway> | grep -i "openclaw\|CERTIFICATE_VERIFY" (Docker
+    e2e 2026-07-28): "ERROR:yashigani.gateway.openai_router:Agent @openclaw
+    unreachable" / "httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED]
+    certificate verify failed: unable to get local issuer certificate";
+    grep -n "httpx.AsyncClient(timeout=120.0)" src/yashigani/gateway/
+    openai_router.py (pre-fix bare client at the openclaw dispatch call
+    site).
+- id: YSG-RISK-140
+  description: >-
+    Cleanup (Tiago directive, 2026-07-28): OpenWebUI (OWUI) was replaced by
+    the native ui4 chat/agents/builder/workflows SPA in 4.0, but the
+    `--with-openwebui` install.sh flag and a substantial amount of
+    OWUI-shaped dead plumbing remained in the tree — a no-op CLI option that
+    still appeared in --help, a full optional Helm Deployment/Service/PVC
+    (helm/yashigani/templates/open-webui.yaml) + values block + three
+    openWebui.enabled-gated NetworkPolicy blocks + a gated Secret template,
+    and four `request_header -X-OpenWebUI-User-*` Caddyfile strip lines
+    across all four Caddyfile-family renders (docker/Caddyfile.selfsigned,
+    .ca, .acme, docker/caddy/Caddyfile.waf, helm/yashigani/templates/
+    configmaps.yaml). Confirmed via openai_router.py's own SEC-GAP-1
+    comments + regression tests (test_track_c_owui_identity.py,
+    test_identity_id_header_forwarding.py, test_p1p2_header_strip.py,
+    test_4_0_gate_fixes.py) that X-OpenWebUI-User-Email/-Id/-Name/-Role is
+    NEVER read by the gateway in 4.1 — the Caddyfile strip lines defended
+    a header nothing consumes. Separately, src/yashigani/backoffice/
+    routes/auth.py's `/auth/verify-user` endpoint (owui-users RBAC gate)
+    was confirmed unreachable — no Caddyfile forward_auth block calls it;
+    `/app/webui*` is now a bare `redir * /chat 302` — and
+    _push_openwebui_model()/_owui_http_client() in routes/agents.py POSTed
+    agent configs into a container that has not existed since 4.0.
+  severity: low
+  controls_impacted:
+  - CWE-1164 (Irrelevant Code) — dead CLI option + dead Helm resources +
+    dead Caddy header-strip rules presented as live/usable surface
+  - Maintainability / attack-surface hygiene — every dead code path is a
+    future misconfiguration or reintroduction risk
+  compensating_controls:
+  - None needed — this is a removal of already-inert functionality, not a
+    live control being weakened. Nothing security-relevant depended on any
+    of the removed pieces (verified per description above).
+  status: closed
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  closure_evidence:
+  - rationale: >-
+      REMOVED: install.sh --with-openwebui flag (arg parse, help text,
+      INSTALL_OPENWEBUI var, no-op handler, additive-re-run check,
+      Integrations banner line) — now falls through to the standard
+      "Unknown option" + exit 1 error, same as any other retired flag.
+      helm/yashigani/templates/open-webui.yaml deleted whole (329 lines:
+      Deployment + Service + PVC). helm/yashigani/values.yaml openWebui:
+      block (~80 lines) replaced with a removal-note comment; matching
+      override blocks dropped from values.single-node.yaml. Three
+      openWebui.enabled-gated blocks removed from helm/yashigani/templates/
+      networkpolicy.yaml (gateway:8081 ingress rule, allow-open-webui-
+      ingress/egress NetworkPolicy pair, allow-caddy-egress open-webui
+      rule) and the matching gate in ollama.yaml's ollama-init Job —
+      kept the two gate conditions byte-identical to each other per the
+      pre-existing F-K8S-OLLAMA-INIT-NETPOL finding (a prior LIVE bug from
+      the two gates drifting). The openWebui-gated yashigani-open-webui-
+      secrets Secret template removed from secrets.yaml (a pre-existing
+      Secret of that name from an old release may linger in-cluster,
+      helm.sh/resource-policy: keep — harmless orphan, not recreated/read
+      by anything). Four `request_header -X-OpenWebUI-User-*` lines
+      removed from each of the five Caddyfile-family renders (both /v1/*
+      and /mcp/* handles where present); X-Forwarded-User strip left
+      in place (distinct, still-checked header). `helm lint` and
+      `helm template` both verified clean post-removal (0 chart failures,
+      full render succeeds). install.sh/uninstall.sh's own
+      `openwebui_data` legacy-volume entries in the canonical volume list
+      were DELIBERATELY KEPT + comment-annotated — a real docker volume by
+      that name may still exist on hosts upgraded from 3.x, and both
+      install.sh's upgrade-backup path and uninstall.sh's --remove-volumes
+      cleanup path need to keep managing it. Docs sweep (install_config.md
+      §21, preflight_check.md, THIRD-PARTY-LICENSES.md, README-adjacent
+      manuals) tracked separately in the same change.
+  - rationale: >-
+      DELIBERATELY KEPT (guardrail, not removed): X-Forwarded-User strip
+      in all Caddyfiles (distinct header from X-OpenWebUI-User-*, still
+      consulted); the Caddy `/app/webui*` -> `/chat` 302 back-compat
+      redirect (serves old bookmarks, does not depend on OWUI); the
+      X-Yashigani-Identity-Id / X-Yashigani-User-Id trusted-header identity
+      rail and YASHIGANI_INTERNAL_BEARER mesh-trust gate (live, unrelated
+      mechanism, name predates OWUI removal but the mechanism itself is
+      current — not renamed, per explicit instruction). Python-side dead
+      code (_push_openwebui_model, _owui_http_client, the unreachable
+      /auth/verify-user endpoint, the openwebui optional-service admin
+      panel entry) removed separately in commit da0a9e93 (Tom).
+  last_threat_model_review: '2026-07-28'
+  classification: cleanup
+  source_grep: >-
+    grep -rniE "openwebui|open.?webui|--with-openwebui" install.sh docker/
+    helm/ — pre-change: 47 matches across install.sh/docker-compose.yml/
+    Caddyfile family/helm templates+values; post-change: only historical/
+    removal-note comments and the deliberately-kept X-Forwarded-User +
+    legacy-volume-list entries remain.
+
+- id: YSG-RISK-141
+  description: >-
+    Dispatched as "the reconciler queries a different tenant" chat-blocker
+    theory (v4.1.2 x8x Docker e2e, 2026-07-29) — DISPROVEN by live evidence,
+    but investigation surfaced a real, distinct, still-open durability gap
+    in the exact same code area (ISSUE-AGENT-REG-DURABILITY /
+    YSG-RISK-131's self-heal).
+
+    What was hypothesized: `AgentDurableStore.list_all()` (the Postgres
+    read side of the agent-registry reconciler) queries a different
+    tenant/org than the all-zeros `_PLATFORM_TENANT_ID` sentinel
+    `register_agent_bundles()` persists agents under, so the reconciler
+    would never find the durable rows and Redis db/3 would stay empty
+    forever.
+
+    What live evidence actually showed (live Docker stack, compose project
+    `localhost`, 2026-07-29): `docker exec` into `localhost-postgres-1`
+    confirmed 3 `agent_registry` rows under tenant_id
+    `00000000-0000-0000-0000-000000000000` (openclaw/letta/agent__langflow).
+    A raw-SQL replay of the EXACT query `AgentDurableStore.list_all()` runs
+    (`SET LOCAL app.tenant_id = <same sentinel>; SELECT ... FROM
+    agent_registry WHERE agent_id IS NOT NULL`), executed as the actual
+    runtime role `yashigani_app` (no RLS bypass — `\du` confirms only
+    `yashigani_admin` has BYPASSRLS), returned all 3 rows. A live
+    in-container Python repro
+    (`AgentDurableStore().list_all()` against the gateway's own real asyncpg
+    pool) also returned all 3 rows correctly. `docker exec` into
+    `localhost-redis-1` (TLS + password required — `redis-server --tls-port
+    6380 --requirepass ...`; the naive `redis-cli -n 3 DBSIZE` on the
+    default port/no-TLS that produced the original "Redis db/3 is EMPTY"
+    read was itself a connection-refused false read, the exact same mistake
+    the wrong port/no-TLS attempt makes) showed `agent:index:all` /
+    `agent:index:active` each holding all 3 agent_ids, status `active`,
+    correct bcrypt `token_hash`. `AgentDurableStore.upsert()` and
+    `.list_all()` (`src/yashigani/agents/durable_store.py`) both hard-code
+    the identical `_PLATFORM_TENANT_ID` constant — there is no org/tenant
+    resolution divergence in this file. The gateway's ONE-SHOT lifespan
+    reconcile (`gateway/proxy.py`) DID log "durable store empty and no
+    Redis agents to back-fill" at boot (`docker logs localhost-gateway-1`)
+    — but this is the expected, harmless, first-boot branch: the reconcile
+    runs at gateway startup (18:14:14), roughly 29s BEFORE `install.sh`'s
+    `register_agent_bundles()` step registered the 3 bundle agents
+    (Postgres `created_at` ~18:14:43) — at reconcile time Postgres genuinely
+    had 0 rows. Registration itself dual-writes directly into the SAME live
+    Redis db/3 connection the gateway already holds (`AgentRegistry.
+    register()`'s Lua HSET/SADD, via backoffice), so no reconcile was ever
+    needed for the fresh-install case — corroborated by the direct Redis
+    read above showing all 3 agents present and active right now.
+
+    The REAL, still-open gap found during this investigation: YSG-RISK-131 /
+    122's lazy, cooldown-gated, REQUEST-TIME self-heal reconnect
+    (`gateway/redis_selfheal.py::ensure_rbac_agent_stack`,
+    `backoffice/redis_selfheal.py::ensure_rbac_stack`) rebuilds a BRAND NEW
+    `AgentRegistry` wrapping whatever is CURRENTLY in Redis db/3 whenever
+    the in-process registry object is found `None` — but neither call-site
+    ever re-ran `reconcile_agents_from_durable()` afterward. If Redis db/3
+    loses its agent data mid-life (`FLUSHDB`, a fast recreate that
+    reconnects before the in-process object goes `None` between requests,
+    etc.) WITHOUT the whole gateway/backoffice process restarting (which
+    would re-run the one-shot lifespan reconcile), the self-heal path
+    "recovers" into a permanently-empty registry — every `@agent` stays
+    `agent_not_found` indefinitely, with no further recovery path short of
+    a manual process restart. `docs/risk-register.yml`'s own YSG-RISK-131
+    entry names this exact interaction explicitly: "`proxy.py`'s lifespan
+    agent-reconcile ... cannot recover this state either — it only refills
+    an EXISTING registry object, and is a no-op when `agent_registry is
+    None`" — describing the boot-race case, not the mid-life-data-loss case
+    this finding closes.
+  severity: medium
+  controls_impacted:
+  - Availability — the agent-registry durability guarantee
+    (ISSUE-AGENT-REG-DURABILITY) is incomplete, since it only self-heals
+    across a full process restart, not across a mid-life Redis data-loss +
+    fast reconnect, which is exactly the scenario YSG-RISK-131's self-heal
+    primitive was built to cover for every OTHER Redis-dependent subsystem.
+  compensating_controls:
+  - No auth/authz boundary crossed — the failure mode is `agent_not_found`
+    (fail-closed unavailability), never a silent authorization bypass.
+  - A full gateway/backoffice process restart always recovers (re-runs the
+    one-shot lifespan reconcile), so operators are not permanently stuck —
+    just unaware a targeted restart is required absent this fix.
+  - The originally-hypothesized tenant-mismatch failure mode does not
+    reproduce at all on the current codebase — this entry exists for the
+    genuinely-found gap, not the disproven theory.
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-29'
+  closure_evidence:
+  - rationale: >-
+      Fixed: `gateway/redis_selfheal.py::maybe_selfheal()` now re-runs
+      `reconcile_agents_from_durable()` immediately after
+      `ensure_rbac_agent_stack()` reports a successful reconnect — back on
+      the event loop (in the per-tag follow-up loop alongside the existing
+      `workflow_scheduler.start()` follow-up), never inside the
+      `asyncio.to_thread` builder worker, since `reconcile_agents_from_
+      durable()` reads the loop-bound asyncpg pool.
+      `backoffice/redis_selfheal.py::maybe_selfheal()` gets the identical
+      fix after `ensure_rbac_stack()` succeeds. Both call sites use a fresh
+      `AgentDurableStore()`, matching `gateway/proxy.py`'s existing lifespan
+      call exactly. Failure is caught and logged (never raised) — matches
+      `reconcile_agents_from_durable()`'s own existing "never raises"
+      contract, so a transient DB blip during self-heal cannot block the
+      request.
+
+      New regression suite:
+      `src/tests/regression/v4.1.2/test_ysg_risk_141_agent_reconcile_selfheal.py`
+      (7 tests): (1-3) direct unit tests of `reconcile_agents_from_durable()`
+      proving N durable rows + empty Redis-view backfills all N, proving
+      already-present rows are skipped, and proving a genuinely-empty
+      durable store (first boot) is a harmless no-op distinct from a
+      tenant-mismatch bug; (4-5) gateway `maybe_selfheal()` wiring — proves
+      the reconcile fires after a successful `ensure_rbac_agent_stack()`
+      reconnect and is skipped when already healthy; (6-7) the identical
+      pair for backoffice's `maybe_selfheal()`. All 7 pass; full existing
+      `src/tests/regression/v4.1.2/` suite (444 tests, 2 pre-existing skips)
+      green, zero regressions. ruff (full default ruleset, not just
+      `--select G`) clean on both touched source files + the new test file.
+      mypy clean-diff on `gateway/redis_selfheal.py`,
+      `backoffice/redis_selfheal.py`, `agents/reconciler.py`,
+      `agents/durable_store.py` (0 new errors).
+  fix_in_version: v4.1.2
+- id: YSG-RISK-142
+  description: >-
+    Chat-egress final hop 403 (v4.1.2 x8x Docker e2e, 2026-07-29): the
+    gateway → caddy `/deliver/{llm,slack,slack-hooks,telegram}/*` egress
+    delivery hop (Caddyfile.openclaw-egress `gateway-egress-deliver-gate`,
+    `:18790` listener) returned 403 Forbidden for every call, on a fully
+    valid mTLS handshake (`client_common_name=gateway`).  `/deliver/llm/*`
+    is the ONLY path from `/egress/eval` back out to the real inference
+    surface — this broke chat end-to-end for every wrapped system
+    (openclaw, langflow, letta), confirmed live: `docker compose exec
+    egress-langflow curl ... https://caddy:18790/llm/v1/models` passed the
+    `llm-egress-caller-gate`, reached `gateway:8080/egress/eval/llm/v1/models`
+    (gateway log: `egress-eval: ALLOW caller=spiffe://localhost.yashigani.internal/langflow
+    ... upstream_status=403`), and gateway's own onward call
+    (`POST https://caddy:18790/deliver/llm/v1/models`) got the 403 from
+    Caddy's static `respond ... 403` in `gateway-egress-deliver-gate` —
+    relayed verbatim back through `/egress/eval` to the original caller.
+
+    Root cause: `docker/docker-compose.yml`'s `caddy` service `environment:`
+    block composed `YASHIGANI_CADDY_SPIFFE_ID`, `YASHIGANI_OPENCLAW_SPIFFE_ID`,
+    `YASHIGANI_LANGFLOW_SPIFFE_ID` and `YASHIGANI_LETTA_SPIFFE_ID` from the
+    per-instance `YASHIGANI_SPIFFE_TRUST_DOMAIN`
+    (`spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/<name>`)
+    but never set the fifth, `YASHIGANI_GATEWAY_SPIFFE_ID` — the identity
+    `gateway-egress-deliver-gate` checks. Caddy's parse-time
+    `{$YASHIGANI_GATEWAY_SPIFFE_ID:spiffe://yashigani.internal/gateway}`
+    substitution therefore always fell back to the BARE, un-qualified
+    literal default. `gateway_client.crt`'s real URI SAN
+    (`service_identities.yaml` `gateway` entry, minted with the same
+    per-instance trust domain as every other mesh leaf) is
+    `spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN}/gateway` — on this install
+    `spiffe://localhost.yashigani.internal/gateway` — which never equals
+    the bare default, so `gateway-egress-deliver-gate`'s `not header`
+    matcher fired 403 on every single `/deliver/*` call, for every wrapped
+    system, on every install whose trust domain differs from the bare
+    default (i.e. every per-instance install — this is not a legacy-only
+    edge case).
+
+    K8s/Helm is NOT affected by this defect class: `helm/yashigani/templates/
+    configmaps.yaml`'s Delta 3 string-replaces the bare
+    `spiffe://yashigani.internal/` prefix across the WHOLE mirrored egress
+    Caddyfile at Helm template-render time — before Caddy ever parses the
+    inline default literal — so the K8s render's default is always correctly
+    domain-qualified regardless of whether a `YASHIGANI_GATEWAY_SPIFFE_ID`
+    pod env var is set. Verified via `helm template` + a live `caddy adapt`
+    + `caddy validate` against the rendered ConfigMap
+    (`test_helm_rendered_caddyfile_adapts_and_validates`).
+  severity: high
+  controls_impacted:
+  - Availability — chat/inference delivery for every bundled agent
+    (openclaw, langflow, letta) was completely broken on Docker compose
+    installs; the deliver hop is a single point of failure for all
+    egress-wrapped LLM traffic.
+  - ASVS V10.3.5 / mesh mTLS identity propagation parity (compose vs K8s
+    must present the SAME caller-gate posture; compose silently regressed
+    to relying on an unqualified default it does not actually satisfy).
+  compensating_controls:
+  - Fail-closed, not fail-open — the missing env var caused an over-strict
+    403 deny, never a bypass. No unauthorised caller was ever admitted;
+    the defect is availability-only.
+  - K8s/Helm deployments were never exposed to this defect class (template-time
+    substitution, not a Caddy parse-time env fallback).
+  status: mitigated
+  accepted_by: null
+  accepted_at: null
+  review_by: null
+  last_threat_model_review: '2026-07-29'
+  closure_evidence:
+  - rationale: >-
+      Fixed: `docker/docker-compose.yml` `caddy` service environment block
+      now also composes `YASHIGANI_GATEWAY_SPIFFE_ID: spiffe://${YASHIGANI_SPIFFE_TRUST_DOMAIN:-yashigani.internal}/gateway`,
+      mirroring the four existing caller-gate SPIFFE-ID lines byte-for-byte
+      in pattern. No Caddyfile change required (Caddyfile is single-sourced
+      to Helm and was already correct/documented — only the compose env
+      wiring was incomplete) — `docker/Caddyfile.openclaw-egress` /
+      `helm/yashigani/files/Caddyfile.openclaw-egress` remain byte-identical,
+      untouched.
+
+      New regression test:
+      `tests/contracts/test_openclaw_egress_single_source.py::
+      test_compose_caddy_service_declares_all_caller_gate_spiffe_ids` —
+      asserts all five `:18790` caller-gate SPIFFE-ID env vars are present
+      and per-instance-domain-composed in the compose `caddy:` service
+      block. Mutation-guard verified: reverting the fix makes this test
+      fail with the exact missing var named. Full existing
+      `tests/contracts/test_openclaw_egress_single_source.py` suite (8
+      tests, including the two `caddy adapt`/`caddy validate` C10 gates
+      against both the compose-shim canonical file and the Helm-rendered
+      ConfigMap) green — zero regressions, K8s render unaffected as
+      expected.
+
+      Live reproduction + fix-mechanism proof (v4.1.2 x8x Docker e2e stack,
+      compose project `localhost`, 2026-07-29, read-only diagnosis —
+      redeploy + end-to-end chat re-verification is Maxine's / stack
+      owner's next step, not run from this dispatch): confirmed
+      `gateway_client.crt`'s live URI SAN is
+      `spiffe://localhost.yashigani.internal/gateway`
+      (`openssl x509 -text` on the live secret) while `docker compose exec
+      caddy env` showed `YASHIGANI_CADDY_SPIFFE_ID`,
+      `YASHIGANI_OPENCLAW_SPIFFE_ID`, `YASHIGANI_LANGFLOW_SPIFFE_ID`,
+      `YASHIGANI_LETTA_SPIFFE_ID` all present and correctly
+      domain-qualified, `YASHIGANI_GATEWAY_SPIFFE_ID` ABSENT. Caddy's own
+      live compiled config (`GET /config/` on `caddy-admin/admin.sock`)
+      showed the `gateway-egress-deliver-gate` matcher's stamped value as
+      the un-qualified `spiffe://yashigani.internal/gateway` literal on
+      all four `/deliver/*` routes, while the `llm-egress-caller-gate` /
+      `openclaw-egress-caller-gate` matchers correctly showed the
+      domain-qualified values — the one asymmetry pinpointed the exact
+      missing var. `docker compose logs caddy`/`gateway` around a live
+      natural chat attempt and a manual `curl` repro from
+      `egress-langflow` both captured the full failure chain: caller-gate
+      pass → `egress-eval: ALLOW` → onward `POST
+      https://caddy:18790/deliver/llm/v1/models` → 403 → relayed verbatim
+      back to the original caller.
+  fix_in_version: v4.1.2

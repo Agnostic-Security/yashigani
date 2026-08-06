@@ -273,6 +273,32 @@ def mock_audit_writer(monkeypatch):
     return writer
 
 
+@pytest.fixture(autouse=True)
+def _reset_cluster_az_count():
+    """Autouse cross-file isolation guard (YTF consolidation, 2026-07-29,
+    Iris). `POST /admin/infrastructure/topology` sets
+    `backoffice_state.cluster_az_count` via a bare, unconditional attribute
+    assignment on the process-wide `backoffice_state` singleton
+    (routes/infrastructure.py:72) — there is no dataclass field/default for
+    it (`GET` reads it via `getattr(state, "cluster_az_count", 1)`, i.e. the
+    TRUE pristine state is "attribute absent", not "attribute == 1"). Any
+    test that POSTs a topology with >=2 zones leaves this set for the REST
+    of the pytest process — confirmed: test_budget_models_inspection.py's
+    own az_count==2 case (pre-existing 12-group suite) collided with
+    test_conformance_admin_config_obs.py's "defaults to 1" test once both
+    ran in the same process (test_budget < test_conformance alphabetically,
+    so it runs first and leaks). Deletes the attribute before EVERY test in
+    this shared directory, restoring true pristine state regardless of
+    what any earlier test in the same process did."""
+    from yashigani.backoffice.state import backoffice_state
+
+    if hasattr(backoffice_state, "cluster_az_count"):
+        delattr(backoffice_state, "cluster_az_count")
+    yield
+    if hasattr(backoffice_state, "cluster_az_count"):
+        delattr(backoffice_state, "cluster_az_count")
+
+
 # ---------------------------------------------------------------------------
 # Auth-tier TestClient fixtures
 # ---------------------------------------------------------------------------

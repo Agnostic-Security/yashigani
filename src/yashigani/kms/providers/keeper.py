@@ -63,8 +63,15 @@ class KeeperKSMProvider(KSMProvider):
         Load the KSM one-time access token.
         Priority: Docker Secret file → environment variable.
         Never logs the token value.
+
+        YSG-RISK-160: the Docker Secret file path is resolved via
+        YASHIGANI_SECRETS_DIR (default /run/secrets) — was a bare literal
+        with no override, the same convention-bypass class as YSG-RISK-150.
         """
-        docker_secret_path = "/run/secrets/KSM_KEEPER_ONE_TIME_TOKEN"
+        docker_secret_path = os.path.join(
+            os.environ.get("YASHIGANI_SECRETS_DIR", "/run/secrets"),
+            "KSM_KEEPER_ONE_TIME_TOKEN",
+        )
         if os.path.exists(docker_secret_path):
             with open(docker_secret_path, encoding="utf-8") as f:
                 return f.read().strip()

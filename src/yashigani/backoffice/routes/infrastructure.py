@@ -68,13 +68,38 @@ async def update_topology(
                 "detail": f"DoNotSchedule requires >=2 zones; detected {az_count}",
             },
         )
+
+    # YSG-RISK-154: audit_writer being completely UNSET is a startup-invariant
+    # violation (every sibling comment claims "set unconditionally at
+    # startup"), not a transient write hiccup. Previously this was an
+    # `assert` INSIDE the same try/except that also caught write failures —
+    # AssertionError IS an Exception, so the "fail-fast" assert was silently
+    # swallowed by its own surrounding except, and the mutation below still
+    # completed with a 200 and zero audit trail. Check BEFORE mutating state
+    # so an unavailable audit subsystem rejects the change outright rather
+    # than silently enacting an unaudited one.
+    if backoffice_state.audit_writer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "audit_writer_unavailable",
+                "message": "Topology change rejected: the audit subsystem is not available.",
+            },
+        )
+
     # Persist to state (would trigger helm upgrade in full implementation)
     backoffice_state.cluster_az_count = az_count  # type: ignore[attr-defined]
     backoffice_state.topology_spread_policy = body.spread_policy  # type: ignore[attr-defined]
 
+    # YSG-RISK-153: a TRANSIENT write failure (writer present, .write() itself
+    # raised) must not silently vanish into a clean 200 with no trace — surface
+    # it in the response (audit_recorded=false) so the caller/admin knows the
+    # audit trail may be incomplete for this change. The mutation itself still
+    # stands (consistent with the rest of the codebase's fail-soft-on-write
+    # convention); only the writer-unset case above is fail-closed.
+    audit_recorded = True
     try:
         from yashigani.audit.schema import ConfigChangedEvent
-        assert backoffice_state.audit_writer is not None  # set unconditionally at startup
         backoffice_state.audit_writer.write(ConfigChangedEvent(
             admin_account=session.account_id,
             setting="topology",
@@ -83,12 +108,14 @@ async def update_topology(
         ))
     except Exception as exc:
         logger.warning("Audit write failed: %s", exc)
+        audit_recorded = False
 
     return {
         "zones": body.zones,
         "az_count": az_count,
         "spread_policy": body.spread_policy,
         "max_skew": body.max_skew,
+        "audit_recorded": audit_recorded,
     }
 
 

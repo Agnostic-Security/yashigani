@@ -107,9 +107,25 @@ def _collect_log_files(log_path: Path) -> list[Path]:
     return all_files
 
 
-def _parse_events_from_file(path: Path, from_dt: datetime) -> list[dict]:
-    """Read NDJSON from a single file, return events at or after from_dt."""
-    events = []
+def _parse_events_from_file(path: Path, from_dt: datetime) -> list[tuple[datetime, dict]]:
+    """Read NDJSON from a single file, return (parsed_timestamp, event) pairs
+    at or after from_dt.
+
+    YSG-RISK-177 (Iris integration audit, LOW #5): callers used to discard
+    the already-parsed ``ts`` datetime and re-sort on the RAW timestamp
+    STRING instead (see main(), pre-fix). datetime.isoformat() omits the
+    microsecond component entirely when it is exactly zero (e.g.
+    "...T10:15:22+00:00" vs "...T10:15:22.500000+00:00"), and any future/
+    legacy record with a differently-formatted timestamp (naive, "Z" suffix,
+    different precision) would sort incorrectly against isoformat()'s
+    "+00:00" convention under pure string comparison. Returning the parsed
+    ``datetime`` here (already computed for the from_dt cutoff filter below)
+    lets the caller sort on well-defined datetime comparison instead of
+    format-fragile string comparison — equal-second records order
+    deterministically by their real chronological value, not by which ISO
+    variant happened to serialise them.
+    """
+    events: list[tuple[datetime, dict]] = []
     with path.open("r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
             line = line.strip()
@@ -130,7 +146,7 @@ def _parse_events_from_file(path: Path, from_dt: datetime) -> list[dict]:
                 continue
             if ts < from_dt:
                 continue
-            events.append(event)
+            events.append((ts, event))
     return events
 
 
@@ -260,13 +276,19 @@ def main() -> int:
 
     logger.info("Scanning %d log file(s) from %s onward...", len(log_files), args.from_date)
 
-    all_events: list[dict] = []
+    timestamped_events: list[tuple[datetime, dict]] = []
     for lf in log_files:
         logger.debug("Reading %s", lf)
-        all_events.extend(_parse_events_from_file(lf, from_dt))
+        timestamped_events.extend(_parse_events_from_file(lf, from_dt))
 
-    # Sort by timestamp to handle cross-file ordering
-    all_events.sort(key=lambda e: e.get("timestamp", ""))
+    # YSG-RISK-177 (Iris integration audit, LOW #5): sort on the PARSED
+    # datetime, not the raw timestamp string — see _parse_events_from_file's
+    # docstring. Stable sort (Python's sort() guarantee) preserves each
+    # file's on-disk order for any exact datetime tie, which is the correct
+    # tie-break (physical append order within a file is itself
+    # chronological — see writer.py's cross-process lock).
+    timestamped_events.sort(key=lambda pair: pair[0])
+    all_events: list[dict] = [event for _ts, event in timestamped_events]
 
     logger.info("Loaded %d event(s) to verify.", len(all_events))
 

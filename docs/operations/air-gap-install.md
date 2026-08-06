@@ -67,7 +67,7 @@ Run the bundle builder. Choose a profile:
 # Core + observability (Grafana, Loki, Prometheus, Jaeger, OTel)
 ./scripts/prepare-airgap-bundle.sh --profile core --profile observability
 
-# Full bundle: core + observability + Open WebUI
+# Full bundle: core + observability
 ./scripts/prepare-airgap-bundle.sh --profile full
 
 # Core + Wazuh SIEM
@@ -190,18 +190,6 @@ passwords via the admin API once network access is available:
 # Then via the admin API or backoffice UI:
 POST /api/v1/admin/rotate-secret  {"secret": "all"}
 ```
-
----
-
-## Open WebUI in air-gap mode
-
-Open WebUI is included in the `full` profile bundle. If you use `--profile core`,
-Open WebUI is not bundled and `--with-openwebui` will fail (no image).
-
-Options:
-- Include it in the bundle: `--profile full` or `--profile core --profile openwebui`
-- Ship a separate Open WebUI bundle under your own supply-chain process and load
-  it manually before running `install.sh --air-gap`
 
 ---
 

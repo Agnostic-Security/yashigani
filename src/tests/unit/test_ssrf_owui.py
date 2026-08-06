@@ -65,7 +65,8 @@ def _load_agents_module():
 
 _agents = _load_agents_module()
 # d76dddb renamed _assert_safe_owui_url → _assert_safe_upstream_url.
-# All OWUI outbound calls now go through _owui_http_client()._check_policy().
+# The OWUI-specific outbound push (_push_openwebui_model / _owui_http_client)
+# was removed in 4.0 (Open WebUI replaced by the native ui4 chat SPA).
 # Agent upstream_url registration still validates through this function.
 _assert_safe_upstream_url = _agents._assert_safe_upstream_url
 

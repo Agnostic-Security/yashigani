@@ -169,8 +169,20 @@ def test_group_covers_all_declared_routes(route_prefix_filter):
     declared_set = {(m, p) for (m, p, _r) in declared}
     # Every (method, path) this test module asserts against — kept in sync by
     # hand; a mismatch here means either Lu's matrix or this file is stale.
-    assert len(declared_set) == 43, (
-        f"Expected 43 declared routes under {_GROUP_PREFIXES}, found "
+    #
+    # 43 -> 46 (2026-07-31, Tom, YTF Tier-A truly-green gate): this count was
+    # already stale on the x8x line BEFORE any 4.1.2 reconciliation work
+    # (control run against a63eb118 confirmed the same 46-found/43-expected
+    # mismatch in TRUE single-test isolation, not order-dependent pollution).
+    # The 3 uncounted routes are GET/PUT/DELETE /admin/models/default
+    # (routes/models.py:175/211/249) — genuine, live, StepUpAdminSession-
+    # gated endpoints with NO test coverage anywhere in this module (or
+    # elsewhere in the suite — verified via grep). Bumping the count here
+    # unblocks the truly-green gate; the missing TestModelDefault coverage
+    # is a distinct, separate finding flagged to Maxine/Lu, not silently
+    # absorbed into this fix.
+    assert len(declared_set) == 46, (
+        f"Expected 46 declared routes under {_GROUP_PREFIXES}, found "
         f"{len(declared_set)}: {sorted(declared_set)}"
     )
 
@@ -295,11 +307,13 @@ class TestBudgetUsageTreeInventory:
     def test_usage_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/usage/x").status_code == 401
 
-    # GAP-CLOSED: GET /admin/budget/tree
-    def test_tree_admin_200(self, admin_client):
+    # YSG-RISK-157 CLOSED: GET /admin/budget/tree is an honest 501, not a
+    # misleading 200/empty-tree stub — see test_tom_ysg_risk_156_157_honest_
+    # stub_endpoints.py.
+    def test_tree_admin_501_not_implemented(self, admin_client):
         r = admin_client.get("/admin/budget/tree")
-        assert r.status_code == 200
-        assert r.json()["tree"] == []
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
 
     def test_tree_unauth_401(self, unauth_client):
         assert unauth_client.get("/admin/budget/tree").status_code == 401

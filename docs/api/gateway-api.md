@@ -88,17 +88,17 @@ Full pipeline:
 
 **List Models**
 
-List available models (for Open WebUI model picker).
+List available models (for the `ui4` chat surface's model picker).
 
 AUTH REQUIRED. QA #59 / FINDING-59-01 (2026-04-29): unauthenticated
 callers were receiving the full Ollama model list + every active service
 identity slug + every active agent slug — internal-topology disclosure
 (OWASP API9 Improper Inventory Management, A01 Broken Access Control).
 Caddy's `/v1/*` block does not gate via `forward_auth`; the gate is here.
-Open WebUI carries the admin session cookie (it lives at /chat/* behind
-the same Caddy auth) so the picker still populates after login. MCP
-clients that hit `/v1/models` directly must present a valid Bearer
-token or X-Forwarded-User header to enumerate.
+The `ui4` chat surface (served by the backoffice at /chat/*, behind the
+same Caddy auth) carries the session cookie so the picker still populates
+after login. MCP clients that hit `/v1/models` directly must present a
+valid Bearer token or X-Forwarded-User header to enumerate.
 
 **Auth required:** Authorization: Bearer <api-key>
 

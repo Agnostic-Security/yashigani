@@ -15,9 +15,10 @@ The UI consumes this to surface "you must add a second admin" banners.
 All mutation guards (delete, disable, PUT disable) are also wired here.
 """
 
-# Last updated: 2026-06-13T00:00:00+01:00
+# Last updated: 2026-08-04T00:00:00+01:00
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
@@ -29,13 +30,21 @@ from yashigani.backoffice.schemas.bopla import AdminAccountPublic, AdminCreateRe
 
 router = APIRouter()
 
+# Shared admin-email/username shape (v0.2.0: "admin usernames are emails" —
+# used as the Grafana alert contact). Reused by CreateAdminRequest.username's
+# Pydantic pattern AND by update_admin()'s handler-level validation below —
+# see FIND-P-EMAIL for why UpdateAdminRequest.email itself no longer enforces
+# this at the Pydantic field level.
+_ADMIN_EMAIL_PATTERN = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+_ADMIN_EMAIL_RE = re.compile(_ADMIN_EMAIL_PATTERN)
+
 
 class CreateAdminRequest(BaseModel):
     # v0.2.0: admin username must be an email address — used as Grafana alert contact
     username: str = Field(
         min_length=5,
         max_length=254,
-        pattern=r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
+        pattern=_ADMIN_EMAIL_PATTERN,
     )
 
 
@@ -56,12 +65,27 @@ class UpdateAdminRequest(BaseModel):
     collision guards in create_admin/create_user); flipping a tier in place would
     collapse that boundary. A tier change must go through delete + recreate in the
     correct store. Flagged for design review if in-place role change is wanted.
+
+    FIND-P-EMAIL (LOW, 2026-08-04): the `email` field used to enforce the
+    strict admin-email-shape pattern (and a 5-char minimum) directly at the
+    Pydantic level. install.sh's random-word bootstrap admin usernames
+    (e.g. "wolf" — see install.sh:_gen_admin_usernames) are NOT email-shaped,
+    and PostgresLocalAuthService.create_admin() historically defaulted the
+    email column to that same bare username — so a bootstrap admin's own
+    ORIGINAL seed value could never pass this field's own pattern, making it
+    impossible for an operator to revert the email back to its pre-edit
+    state (Laura's pentest: admin2 edited admin1's email, then a revert to
+    "wolf" 422'd). The strict shape check now happens in the route handler
+    below, which ALSO permits reverting to the account's own current
+    username verbatim (the exact bootstrap-default state) even when that
+    username isn't email-shaped — this is additive (still rejects any OTHER
+    non-email garbage), not a general loosening. See also: create_admin()'s
+    synthetic "<username>@yashigani.local" seed (pg_auth.py) which prevents
+    this from recurring for FRESH bootstraps going forward.
     """
     email: Optional[str] = Field(
         default=None,
-        min_length=5,
         max_length=254,
-        pattern=r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
     )
     disabled: Optional[bool] = None
 
@@ -400,6 +424,22 @@ async def update_admin(username: str, body: UpdateAdminRequest, session: StepUpA
     # Email update — guard against colliding with an existing user-tier identity
     # (SoD-001: admin/user identities must stay disjoint).
     if body.email is not None and body.email != getattr(record, "email", None):
+        # FIND-P-EMAIL: enforce the admin-email shape here (moved off the
+        # Pydantic field so we can also allow reverting to the account's OWN
+        # current username verbatim — the exact bootstrap-default state for
+        # install.sh's random-word admin usernames, which are not
+        # email-shaped). Anything else must still be a well-formed email.
+        if body.email != record.username and not _ADMIN_EMAIL_RE.fullmatch(body.email):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "invalid_email",
+                    "message": (
+                        "email must be a valid email address, or exactly match "
+                        "this account's own username (to revert to its default)."
+                    ),
+                },
+            )
         try:
             collision = await state.auth_service.get_account_by_email(body.email)
         except Exception:
@@ -449,36 +489,63 @@ async def update_admin(username: str, body: UpdateAdminRequest, session: StepUpA
 
 
 def _suspend_identity_registry_for_account(account_id: str) -> None:
-    """Suspend all identity-registry entries owned by account_id.
+    """Suspend the identity-registry entry linked to account_id.
 
     LF-DISABLE-PARTIAL (2026-04-27): mirrors users.py equivalent.
-    SEC-240-7: now uses suspend_owned_by() — O(1) index lookup instead of
-    full registry scan.
-    Fail-soft on registry unavailability.
+
+    FIND-IRIS-SUSPEND-ORGID (2026-08-04): previously delegated to
+    registry.suspend_owned_by(account_id) (SEC-240-7) — a BULK op keyed on
+    identity:index:org:{org_id} ("suspend every identity under this org"),
+    not on account_id. org_id and account_id are different axes: local-auth
+    HUMAN identities always register with org_id="" (never populated for
+    account_tier="admin" in the first place — admins never register a HUMAN
+    identity at all, per auth.py:_register_human_identity_on_login), so this
+    call was a no-op regardless. Fixed to resolve the account's own identity
+    via the account_id link (identity:account:{account_id} -> identity_id,
+    IdentityRegistry.link_account_id()) and suspend just that one identity —
+    see users.py's twin function for the full root-cause writeup. For admin
+    accounts specifically this remains a no-op in practice (no HUMAN identity
+    is ever registered for admin-tier accounts), same observable behaviour as
+    before, just for the documented, correct reason instead of a broken
+    org_id lookup.
+
+    Fail-soft on registry unavailability or no linked identity.
     """
+    import logging as _log
+
     registry = backoffice_state.identity_registry
     if registry is None:
-        import logging as _log
-
         _log.getLogger(__name__).warning(
             "LF-DISABLE-PARTIAL: identity_registry not available — API keys for account %s NOT suspended",
             account_id,
         )
         return
     try:
-        suspended = registry.suspend_owned_by(account_id)
-        import logging as _log
-
-        _log.getLogger(__name__).info(
-            "LF-DISABLE-PARTIAL: suspended %d identity-registry entries for account %s",
-            suspended,
-            account_id,
-        )
+        identity = registry.get_by_account_id(account_id)
+        if identity is None:
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: no identity-registry entry linked to account %s "
+                "— nothing to suspend",
+                account_id,
+            )
+            return
+        identity_id = identity["identity_id"]
+        if identity.get("status") == "active":
+            registry.suspend(identity_id)
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: suspended identity %s for account %s "
+                "(FIND-IRIS-SUSPEND-ORGID fix — account_id link, not org_id)",
+                identity_id, account_id,
+            )
+        else:
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: identity %s for account %s already non-active "
+                "(status=%s) — no change",
+                identity_id, account_id, identity.get("status"),
+            )
     except Exception as exc:
-        import logging as _log
-
         _log.getLogger(__name__).error(
-            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
+            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entry for account %s: %s",
             account_id,
             exc,
         )

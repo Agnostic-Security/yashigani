@@ -951,12 +951,17 @@ class TestUserMemory:
         r = admin_client_with_user_cookie.get("/user/memory")
         assert r.status_code == 403
 
-    def test_user_phase3_stub(self, user_client):
+    def test_user_phase3_stub_honest_501(self, user_client):
+        """YSG-RISK-156 CLOSED: /user/memory (per-user Letta memory, Phase 3
+        / RISK-107) was a plain 200 with `entries: []` + a "not yet
+        configured" note — a caller checking only the HTTP status would
+        read that as "success, zero entries", not "not built yet". Deferred
+        past 4.1.2 (needs the Phase-3 NHI/SVID mesh + per-user Letta
+        container) — now an honest 501. See
+        test_tom_ysg_risk_156_157_honest_stub_endpoints.py."""
         r = user_client.get("/user/memory")
-        assert r.status_code == 200
-        body = r.json()
-        assert body["configured"] is False
-        assert body["entries"] == []
+        assert r.status_code == 501
+        assert r.json()["detail"]["error"] == "not_implemented"
 
 
 class TestUserDocumentsUpload:
@@ -1084,26 +1089,36 @@ class TestUserChatProxy:
         assert r.status_code == 403
         assert r.json()["detail"]["error"] == "identity_not_found"
 
-    def test_user_linked_identity_gateway_unreachable_degraded_sse_200(
+    def test_user_linked_identity_gateway_unreachable_real_503(
         self, user_client, identity_registry_state, fake_redis_client
     ):
         """Past all auth/identity guards: streams from
         YASHIGANI_GATEWAY_MESH_URL (default http://gateway:8081/v1),
-        unreachable offline. httpx.ConnectError is caught INSIDE the SSE
-        generator (user_ui.py:1041-1043) so the OUTER HTTP status is 200
-        with a synthetic gateway_unreachable SSE error event in the body —
-        this is the documented degrade contract, exercised as genuine
-        behaviour (mirrors the Ollama-unreachable pattern proven elsewhere
-        in this suite), not a stub."""
+        unreachable offline.
+
+        2026-07-31 (Tom, YTF Tier-A truly-green gate): RISK-167 (chat-path
+        repair, 2026-07-30, user_ui.py:1019-1046) deliberately REMOVED the
+        masked-200-SSE degrade contract this test used to assert. The
+        pre-fix proxy ALWAYS returned StreamingResponse(...) — which
+        Starlette commits as HTTP 200 — even when the upstream never
+        answered at all; every real failure (agent-dispatch 502/500,
+        PII-block 403, model-unavailable 503, and this ConnectError case)
+        reached the browser as status=200, silently defeating sse.js's own
+        resp.ok pre-stream branch. The fix (this head) opens the upstream
+        connection and inspects its REAL status/exception BEFORE deciding
+        how to respond: httpx.ConnectError is now caught OUTSIDE the SSE
+        generator and returned as a genuine JSONResponse(503), never
+        wrapped in a fake SSE frame behind a 200. This test now asserts
+        that real, non-masked contract instead of the one RISK-167 fixed."""
         account_id = user_client.conformance_session.account_id
         _seed_identity(fake_redis_client, account_id, "idnt_chattest0001")
         r = user_client.post(
             "/user/chat/completions",
             json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
         )
-        assert r.status_code == 200
-        assert r.headers["content-type"].startswith("text/event-stream")
-        assert "gateway_unreachable" in r.text
+        assert r.status_code == 503
+        assert r.headers["content-type"].startswith("application/json")
+        assert r.json()["error"]["code"] == "gateway_unreachable"
 
 
 # ===========================================================================

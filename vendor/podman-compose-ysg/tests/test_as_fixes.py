@@ -1,5 +1,5 @@
 """
-Regression tests for the 4 Agnostic Security patches (AS-FIX-1/2/3/4) applied
+Regression tests for the 5 Agnostic Security patches (AS-FIX-1/2/3/4/5) applied
 to vendored podman-compose 1.5.0 -> podman-compose-ysg 1.5.0+ysg.1.
 
 Scope note (GPL-2.0 boundary hygiene, Petra memo §2.3): these tests import
@@ -23,6 +23,7 @@ import os
 import sys
 
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -354,6 +355,76 @@ class TestOneShotDepsExcludedFromRequires:
         assert len(requires) == 1
         requires_names = set(requires[0][len("--requires="):].split(","))
         assert requires_names == {"proj_postgres_1", "proj_gateway_1"}
+
+
+
+# ---------------------------------------------------------------------------
+# AS-FIX-5: rec_merge_one() unwraps !override/!reset on first-introduced keys
+# ---------------------------------------------------------------------------
+
+
+class TestRecMergeFirstIntroducedOverrideReset:
+    def test_first_introduced_override_key_is_unwrapped_not_raw_tag(self):
+        """
+        Reproduces FIND-IRIS-DUP-AGENT-REGRESSION's true root cause exactly:
+        Yashigani's docker-compose.gpu-mac-metal-podman.yml is the FIRST (and
+        only) -f overlay to define `profiles:` for its `ollama` service —
+        `target` (the merge accumulator from earlier -f files) has no
+        'profiles' key yet when this overlay's `profiles: !override [...]`
+        is merged in.
+
+        Pre-fix: rec_merge_one()'s first loop stored the raw OverrideTag
+        object verbatim (`target[key] = clone(value)`), which crashed
+        `_resolve_profiles()`'s `set(config.get("profiles", []))` with
+        `TypeError: 'OverrideTag' object is not iterable` on every
+        podman-compose invocation that included this overlay — before any
+        container was ever reached (compose exec, compose up, everything).
+        """
+        target = {"image": "docker.io/library/ollama:latest"}
+        source = yaml.safe_load("profiles: !override [mac-metal-host-ollama-only]")
+
+        merged = pc.rec_merge_one(target, source)
+
+        assert not isinstance(merged["profiles"], pc.OverrideTag), (
+            "AS-FIX-5: a first-introduced !override-tagged key must be "
+            "unwrapped to its plain value, not left as a raw OverrideTag "
+            "object — downstream consumers like _resolve_profiles() do not "
+            "understand OverrideTag and crash with "
+            "`TypeError: 'OverrideTag' object is not iterable`"
+        )
+        assert merged["profiles"] == ["mac-metal-host-ollama-only"]
+
+        # Exact downstream operation that crashed pre-fix (_resolve_profiles()
+        # shape): `set(config.get("profiles", []))` must not raise.
+        resolved = set(merged.get("profiles", []))
+        assert resolved == {"mac-metal-host-ollama-only"}
+
+    def test_first_introduced_reset_key_is_a_no_op_not_stored(self):
+        """A first-introduced `!reset` has nothing to reset — must be
+        skipped entirely, not leave a raw ResetTag object in the merged
+        dict (which would be equally unconsumable by downstream code)."""
+        target = {"image": "x"}
+        source = yaml.safe_load("some_new_key: !reset")
+
+        merged = pc.rec_merge_one(target, source)
+
+        assert "some_new_key" not in merged, (
+            "AS-FIX-5: !reset on a key with no prior value in target is a "
+            "true no-op — it must not appear in the merged dict at all, "
+            "raw ResetTag or otherwise"
+        )
+
+    def test_existing_key_override_behaviour_unchanged(self):
+        """Sanity: this fix must not regress the ALREADY-correct case (key
+        exists in target, absent from source, tagged !override in target)
+        — that unwrap path (the second loop) is untouched by this patch."""
+        _tagged = yaml.safe_load("profiles: !override [a]")
+        target = {"profiles": _tagged["profiles"]}
+        source: dict = {}
+
+        merged = pc.rec_merge_one(target, source)
+
+        assert merged["profiles"] == ["a"]
 
 
 if __name__ == "__main__":

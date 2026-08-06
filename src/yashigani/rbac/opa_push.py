@@ -101,9 +101,22 @@ def push_rbac_data(
         assert store is not None, "push_rbac_data: store is required when raw_document is None"
         opa_doc = store.to_opa_document()
 
-    # Build agents sub-document from registry (active agents only)
-    agent_doc: dict = {}
+    rbac_url = opa_url.rstrip("/") + _OPA_DATA_PATH_RBAC
+    # v2.23.2: OPA serves mTLS; use internal_httpx_sync_client (EX-231-01).
+    with internal_httpx_sync_client(timeout=10.0) as client:
+        response = client.put(
+            rbac_url,
+            json=opa_doc,
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+
+    # Build + push the agents sub-document ONLY when a registry was supplied
+    # — an absent registry means "this caller has no agents view to offer",
+    # NOT "wipe the agents document" (YSG-RISK-176 bonus fix).
+    agent_count = 0
     if agent_registry is not None:
+        agent_doc: dict = {}
         try:
             for agent in agent_registry.list_all():
                 if agent.get("status") == "active":
@@ -139,7 +152,6 @@ def push_rbac_data(
 
     group_count = len(opa_doc.get("groups", {}))
     user_count = len(opa_doc.get("user_groups", {}))
-    agent_count = len(agent_doc)
     logger.info(
         "OPA rbac+agents data pushed (scoped sub-paths, V50-022): %d groups, "
         "%d users with group assignments, %d active agents",

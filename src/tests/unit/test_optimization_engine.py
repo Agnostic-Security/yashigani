@@ -239,3 +239,118 @@ class TestAllowedLocalDefaultSubstitution:
         assert d.rule == "P6"
         assert not d.is_local
         assert d.model != "phi3.5"
+
+
+class TestCloudDefaultKeyGating:
+    """YSG-RISK-183 — product-correctness / default-model precedence.
+
+    Rule: the effective default model is ALWAYS local UNLESS a cloud model
+    is BOTH configured with a valid API key AND set as default. The engine
+    must never silently substitute default_cloud_provider/default_cloud_model
+    for an ollama-resolved (implicit/no-explicit-model) request when no key
+    is actually configured for that provider — P1 (trusted-cloud), P5
+    (force_cloud) and P6 (complexity HIGH) are the three implicit-default
+    substitution points.
+
+    cloud_key_available=None (not wired) preserves legacy-permissive
+    behaviour — covered by the existing P1/P5/P6 tests above (constructed
+    without the callable). This class wires it explicitly both ways.
+    """
+
+    def _engine(self, key_available: bool):
+        return OptimizationEngine(
+            default_model="qwen2.5:3b",
+            default_cloud_provider="anthropic",
+            default_cloud_model="claude-sonnet-4-6",
+            trusted_cloud_providers={"CONFIDENTIAL": "anthropic"},
+            model_aliases={
+                "fast": ("ollama", "qwen2.5:3b", True),
+                "smart": ("anthropic", "claude-sonnet-4-6", False),
+            },
+            cloud_key_available=lambda: key_available,
+        )
+
+    # ── (1) no explicit model, no cloud key → local, no error ──────────
+
+    def test_p6_no_key_degrades_to_local(self):
+        engine = self._engine(key_available=False)
+        d = engine.route("qwen2.5:3b", _sens(), _comp(ComplexityLevel.HIGH), _budget())
+        assert d.rule == "P6-DEGRADED"
+        assert d.is_local
+        assert d.provider == "ollama"
+        assert d.model == "qwen2.5:3b"
+
+    def test_p5_no_key_degrades_to_local(self):
+        engine = self._engine(key_available=False)
+        d = engine.route("qwen2.5:3b", _sens(), _comp(), _budget(), force_cloud=True)
+        assert d.rule == "P5-DEGRADED"
+        assert d.is_local
+        assert d.provider == "ollama"
+
+    def test_p1_trusted_no_key_falls_through_to_local(self):
+        engine = self._engine(key_available=False)
+        d = engine.route("qwen2.5:3b", _sens(SensitivityLevel.CONFIDENTIAL), _comp(), _budget())
+        assert d.rule == "P1"
+        assert d.is_local
+
+    # ── (2) cloud configured default WITH key → uses cloud (unchanged) ──
+
+    def test_p6_with_key_still_prefers_cloud(self):
+        engine = self._engine(key_available=True)
+        d = engine.route("qwen2.5:3b", _sens(), _comp(ComplexityLevel.HIGH), _budget())
+        assert d.rule == "P6"
+        assert not d.is_local
+        assert d.provider == "anthropic"
+        assert d.model == "claude-sonnet-4-6"
+
+    def test_p5_with_key_still_routes_cloud(self):
+        engine = self._engine(key_available=True)
+        d = engine.route("qwen2.5:3b", _sens(), _comp(), _budget(), force_cloud=True)
+        assert d.rule == "P5"
+        assert not d.is_local
+
+    def test_p1_trusted_with_key_still_routes_cloud(self):
+        engine = self._engine(key_available=True)
+        d = engine.route("qwen2.5:3b", _sens(SensitivityLevel.CONFIDENTIAL), _comp(), _budget())
+        assert d.rule == "P1"
+        assert not d.is_local
+        assert d.provider == "anthropic"
+
+    # ── explicit cloud pin is NEVER gated by the default-key check ──────
+
+    def test_explicit_cloud_pin_unaffected_by_missing_key(self):
+        # "smart" resolves to an EXPLICIT anthropic pin (not the implicit
+        # ollama->default substitution) — the engine must still hand back
+        # that explicit choice; the actual API-key gate lives downstream in
+        # openai_router (a clear 503), not silently re-routed to local here.
+        engine = self._engine(key_available=False)
+        d = engine.route("smart", _sens(), _comp(ComplexityLevel.HIGH), _budget())
+        assert d.rule == "P6"
+        assert d.provider == "anthropic"
+        assert d.model == "claude-sonnet-4-6"
+
+    # ── legacy behaviour when the callable is not wired at all ─────────
+
+    def test_no_callable_wired_is_legacy_permissive(self):
+        engine = OptimizationEngine(
+            default_model="qwen2.5:3b",
+            default_cloud_provider="anthropic",
+            default_cloud_model="claude-sonnet-4-6",
+        )
+        d = engine.route("qwen2.5:3b", _sens(), _comp(ComplexityLevel.HIGH), _budget())
+        assert d.rule == "P6"
+        assert not d.is_local
+
+    def test_broken_callable_fails_closed_to_local(self):
+        def _boom():
+            raise RuntimeError("kms unreachable")
+
+        engine = OptimizationEngine(
+            default_model="qwen2.5:3b",
+            default_cloud_provider="anthropic",
+            default_cloud_model="claude-sonnet-4-6",
+            cloud_key_available=_boom,
+        )
+        d = engine.route("qwen2.5:3b", _sens(), _comp(ComplexityLevel.HIGH), _budget())
+        assert d.rule == "P6-DEGRADED"
+        assert d.is_local

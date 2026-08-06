@@ -24,24 +24,37 @@ test_deny_data_region_missing_key_absent if {
 		}
 }
 
-# KNOWN GAP (found while writing this test, flagged for Lu — NOT silently
-# fixed here): the rule is `deny contains "data_region_missing" if not
-# input.data.region`. In Rego, `not X` is true only when X is UNDEFINED, not
-# when X is a defined-but-falsy value — an empty string ("") is a DEFINED
-# value, so `not input.data.region` does NOT fire when region is present but
-# empty, only when the `region` key is entirely ABSENT from the input
-# object. The doc comment's "Fail-closed: an unlabelled region cannot be
-# placed safely" claim only holds for the omitted-key shape; an upstream
-# caller that serialises "no region set" as `"region": ""` (at least as
-# likely in practice as omitting the key) silently bypasses this guard. This
-# test PINS the current (arguably buggy) behaviour so a future accidental
-# "fix" doesn't slip through unnoticed either way — it does not endorse it.
-test_KNOWN_GAP_empty_string_region_not_caught if {
-	not "data_region_missing" in data.clients.residency.decision.deny with data.clients.residency.allowed_providers as _allowed_providers
+# YSG-RISK-151 (fixed): previously `deny contains "data_region_missing" if
+# not input.data.region` only caught an ABSENT region key — `not X` in Rego
+# is true only when X is undefined, not when X is a defined-but-falsy value.
+# An empty string ("") is a DEFINED value, so a caller serialising "no
+# region set" as `"region": ""` silently bypassed the guard (for a "local"
+# route, which has no other region check, this meant a fully-unlabelled
+# request was allowed). Fixed via _region_blank (missing OR blank/whitespace
+# after trim_space). These tests now assert the closed behaviour.
+test_deny_data_region_missing_empty_string if {
+	"data_region_missing" in data.clients.residency.decision.deny with data.clients.residency.allowed_providers as _allowed_providers
 		with input as {
 			"data": {"region": ""},
 			"routing_decision": {"route": "local", "provider": "ollama-local"},
 		}
+}
+
+test_deny_data_region_missing_whitespace_only if {
+	"data_region_missing" in data.clients.residency.decision.deny with data.clients.residency.allowed_providers as _allowed_providers
+		with input as {
+			"data": {"region": "   "},
+			"routing_decision": {"route": "local", "provider": "ollama-local"},
+		}
+}
+
+test_deny_data_region_missing_empty_string_blocks_overall_allow if {
+	d := data.clients.residency.decision with data.clients.residency.allowed_providers as _allowed_providers
+		with input as {
+			"data": {"region": ""},
+			"routing_decision": {"route": "local", "provider": "ollama-local"},
+		}
+	d.allow == false
 }
 
 test_deny_cross_region_egress if {

@@ -210,25 +210,6 @@ async def lifespan(app: FastAPI):
 
     _load_caddy_secret()
 
-    # Iris FIX-1 (v2.25.0 P2 wave 2 B12 follow-up): operator-visibility gap.
-    # When openWebui.existingSecretName is a BYO Secret that lacks the
-    # 'secret_key' key, the env var resolves to empty string and agent
-    # provisioning to Open WebUI silently fails at runtime.  The chart cannot
-    # detect this at template time, so we warn here at startup.
-    # Threat-model: OWUI_API_URL is operator-supplied; use %s parameterised
-    # logging (not f-string) to prevent log-injection.
-    _owui_api_url = os.environ.get("OWUI_API_URL", "").strip()
-    _owui_secret_key = os.environ.get("OWUI_SECRET_KEY", "").strip()
-    if _owui_api_url and not _owui_secret_key:
-        _log.warning(
-            "OWUI_API_URL is set (%s) but OWUI_SECRET_KEY is empty or absent. "
-            "Open WebUI agent provisioning will fail silently at runtime. "
-            "Either unset OWUI_API_URL to disable Open WebUI integration, or set "
-            "OWUI_SECRET_KEY (via Helm openWebui.existingSecretName containing key "
-            "'secret_key', or via docker/.env OWUI_SECRET_KEY for compose).",
-            _owui_api_url,
-        )
-
     db_dsn = os.getenv("YASHIGANI_DB_DSN", "")
     if db_dsn and "${POSTGRES_PASSWORD}" not in db_dsn:
         try:
@@ -255,6 +236,13 @@ async def lifespan(app: FastAPI):
             await _asyncio.to_thread(run_migrations)
 
             await create_pool()
+
+            # YSG-RISK-190: mirror gateway/entrypoint.py's `_YASHIGANI_DB_READY=1`
+            # signal. net.readiness.postgres_ready() gates its actual SELECT-1
+            # check on this env var; without it, /readyz's postgres dep-check
+            # trivially reports "postgres_not_configured" (fail-OPEN) even
+            # though this DSN branch just ran migrations + opened a real pool.
+            os.environ["_YASHIGANI_DB_READY"] = "1"
 
             # --- v2.23.1 P0-2: bootstrap PostgresLocalAuthService -------------
             # Seed admin accounts from installer secrets ONLY if the DB has
@@ -1170,6 +1158,101 @@ def create_backoffice_app() -> FastAPI:
                 )
         return response
 
+    # FIND-P-CSRF (MED, 2026-08-04, defense-in-depth): server-side Origin/
+    # Referer validation on state-changing admin/auth routes.
+    #
+    # Laura's admin-surface pentest proved POST /admin/rbac/groups succeeded
+    # with a foreign Origin header and no CSRF token — the server performed
+    # ZERO Origin/Referer validation, relying solely on the admin session
+    # cookie's SameSite=strict attribute to prevent cross-site request
+    # forgery. SameSite=strict IS a real, browser-enforced mitigation, but a
+    # single client-side-honoured cookie attribute should not be the only
+    # control for a state-changing admin action — this adds an independent
+    # server-side check (the same technique Django's CsrfViewMiddleware and
+    # the OWASP CSRF cheatsheet's "Verifying Origin" pattern use): reject a
+    # state-changing, cookie-authenticated request whose declared Origin (or
+    # Referer, if Origin is absent) does not reflect this server's own
+    # host/scheme.
+    #
+    # Scope decisions:
+    #   - Only cookie-authenticated requests are checked (has an admin/user
+    #     session cookie present) — Bearer/API-key auth is not
+    #     CSRF-exploitable (a cross-site <form> POST cannot forge an
+    #     Authorization header), so those requests are left untouched.
+    #   - Only checked when Origin or Referer IS PRESENT. Per OWASP CSRF
+    #     cheatsheet guidance, a request with NEITHER header is not treated
+    #     as an automatic reject here (some legitimate proxies/older clients
+    #     omit both) — SameSite=strict remains the primary control for that
+    #     case. This also avoids breaking non-browser, cookie-based internal
+    #     tooling/test harnesses that never set Origin/Referer at all. What
+    #     this closes is exactly what Laura proved: an ATTACKER-CONTROLLED,
+    #     PRESENT, foreign Origin sailing through unchecked.
+    #   - The expected origin is derived by REFLECTION from the request's
+    #     own Host/X-Forwarded-Host + scheme/X-Forwarded-Proto (mirroring
+    #     Django's request.get_host() comparison) — not the WebAuthn
+    #     TLS-domain allowlist (webauthn_v1._expected_origin), which is a
+    #     different, stricter invariant (WebAuthn relying-party origin) that
+    #     would 403 legitimate requests in test/TestClient contexts whose
+    #     Host header ("testserver") is never in that allowlist.
+    _CSRF_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+    _CSRF_CHECKED_PREFIXES = ("/admin/", "/auth/")
+    _CSRF_SESSION_COOKIES = (
+        "__Host-yashigani_admin_session",
+        "__Host-yashigani_session",
+    )
+
+    def _csrf_normalize_origin(proto: str, host: str) -> str:
+        hostname, _, port = host.partition(":")
+        hostname = hostname.lower()
+        default_port = "443" if proto == "https" else "80"
+        if port and port != default_port:
+            return f"{proto}://{hostname}:{port}"
+        return f"{proto}://{hostname}"
+
+    def _csrf_expected_origin(request: Request) -> str:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host") or request.headers.get(
+            "host", request.url.netloc
+        )
+        return _csrf_normalize_origin(proto, host)
+
+    def _csrf_origin_from_header_value(value: str) -> str:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(value)
+        if parts.scheme and parts.netloc:
+            return _csrf_normalize_origin(parts.scheme, parts.netloc)
+        # Malformed/opaque value (e.g. "null", a bare string) — never equals
+        # a well-formed expected origin, so this safely falls through to reject.
+        return value.strip().rstrip("/").lower()
+
+    @app.middleware("http")
+    async def csrf_origin_referer_check(request: Request, call_next):
+        if (
+            request.method in _CSRF_STATE_CHANGING_METHODS
+            and request.url.path.startswith(_CSRF_CHECKED_PREFIXES)
+        ):
+            has_session_cookie = any(
+                request.cookies.get(k) for k in _CSRF_SESSION_COOKIES
+            )
+            if has_session_cookie:
+                candidate_raw = request.headers.get("origin") or request.headers.get("referer")
+                if candidate_raw:
+                    expected = _csrf_expected_origin(request)
+                    candidate = _csrf_origin_from_header_value(candidate_raw)
+                    if candidate != expected:
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "csrf_origin_mismatch",
+                                "message": (
+                                    "Request Origin/Referer does not match this server "
+                                    "— request rejected (CSRF protection)."
+                                ),
+                            },
+                        )
+        return await call_next(request)
+
     # Per-endpoint body-size limits (ASVS 4.3.1).
     #
     # The global 4 MB app limit + 10 MB Caddy limit covers everything, but
@@ -1295,6 +1378,28 @@ def create_backoffice_app() -> FastAPI:
     async def healthz():
         return {"status": "ok"}
 
+    # YSG-RISK-179 — dependency-checked readiness probe (backoffice leg).
+    # See gateway/proxy.py readyz for the full rationale: /healthz stays a
+    # shallow liveness probe; /readyz checks postgres + redis reachability
+    # and returns 503 when a configured dependency is unreachable.
+    @app.get("/readyz")
+    async def readyz():
+        from yashigani.backoffice.state import backoffice_state
+        from yashigani.net.readiness import dependency_readiness
+
+        _redis_client = None
+        for _dep in (backoffice_state.rate_limiter, backoffice_state.anomaly_detector):
+            _client = getattr(_dep, "_redis", None)
+            if _client is not None:
+                _redis_client = _client
+                break
+
+        ready, detail = await dependency_readiness(_redis_client)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "checks": detail},
+        )
+
     # Internal Prometheus metrics endpoint — Caddy-gated with SPIFFE URI ACL.
     # EX-231-08 (v2.23.1, zero-trust default): Prometheus scrapes via Caddy's
     # :8444 internal listener; Caddy validates the peer cert and sets
@@ -1382,6 +1487,54 @@ def create_backoffice_app() -> FastAPI:
             )
             if not any(request.cookies.get(k) for k in _admin_cookies):
                 return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
+
+            # YSG-RISK-177(admin-shell): a session cookie's mere PRESENCE used
+            # to be sufficient to receive the 200 admin shell — including a
+            # perfectly valid USER-tier session. Every underlying /admin/*
+            # API call already correctly 403s for a non-admin caller
+            # (real per-action authz was never bypassed), but the SHELL
+            # itself 200'd for any authenticated session — enumeration-only,
+            # but still confirms the admin UI's existence/asset surface to a
+            # caller who should not be able to tell. Resolve the session and
+            # require admin tier BEFORE serving the shell, mirroring
+            # middleware.require_admin_session's semantics exactly (same
+            # branch structure and error bodies, not just the same final
+            # allow/deny outcome — Iris integration audit LOW #4):
+            #   - no session at all (cookie present but the store no longer
+            #     recognises the token — expired / invalidated) is treated
+            #     the SAME as "not logged in" -> friendly redirect to login,
+            #     not a bare 403 (require_admin_session itself raises 401
+            #     for this case, i.e. "please authenticate", never 403).
+            #   - a VALID session in the admin_password_change_required tier
+            #     gets the SAME actionable 403 body require_admin_session
+            #     returns for it (not the generic insufficient_tier message)
+            #     so the caller knows to POST /auth/password/change.
+            #   - any other VALID non-admin tier gets 403 insufficient_tier.
+            from yashigani.backoffice.middleware import _resolve_token, get_session_store
+
+            token = _resolve_token(request)
+            store = get_session_store()
+            session = store.get(token) if token else None
+            if session is None:
+                return RedirectResponse(url="/admin/login?next=/admin/", status_code=302)
+            if session.account_tier == "admin_password_change_required":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "admin_password_change_required",
+                        "message": (
+                            "You must change your password before accessing "
+                            "admin functions. POST to /auth/password/change "
+                            "to set a new password."
+                        ),
+                    },
+                )
+            if session.account_tier != "admin":
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "insufficient_tier"},
+                )
+
             return HTMLResponse(_ui4_admin.read_text(encoding="utf-8"))
 
         @app.get("/admin4/", include_in_schema=False)
@@ -1503,6 +1656,20 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(accounts_router, prefix="/admin/accounts", tags=["admin-accounts"])
     app.include_router(users_router, prefix="/admin/users", tags=["user-accounts"])
     app.include_router(kms_router, prefix="/admin/kms", tags=["kms"])
+    # YSG-RISK-142: audit_sinks_router MUST be registered BEFORE audit_router.
+    # audit_sinks_router carries literal full paths (e.g.
+    # POST /admin/audit/siem/config/test); audit.py's audit_router (mounted
+    # with prefix /admin/audit) registers a path-PARAM route
+    # POST /siem/{name}/test that is the same segment depth. Starlette/FastAPI
+    # matches routes in registration order across the whole app, so whichever
+    # router is added first "wins" a same-depth collision — with audit_router
+    # first, POST /admin/audit/siem/config/test silently resolved to
+    # test_siem_target(name="config") instead of the intended test_siem()
+    # handler, making the SIEM-backend-config test endpoint unreachable.
+    # Registering the literal-path router first restores the intended match;
+    # the /siem/{name}/test named-target-test route in audit.py still matches
+    # for every OTHER name value.
+    app.include_router(audit_sinks_router, tags=["audit-sinks"])
     app.include_router(audit_router, prefix="/admin/audit", tags=["audit"])
     app.include_router(inspection_router, prefix="/admin/inspection", tags=["inspection"])
     app.include_router(inspection_backend_router, prefix="/admin/inspection", tags=["inspection-backend"])
@@ -1513,7 +1680,6 @@ def create_backoffice_app() -> FastAPI:
     app.include_router(infrastructure_router, prefix="/admin/infrastructure", tags=["infrastructure"])
     app.include_router(jwt_config_router, tags=["jwt-config"])
     app.include_router(cache_router, tags=["cache"])
-    app.include_router(audit_sinks_router, tags=["audit-sinks"])
     app.include_router(kms_vault_router, tags=["kms-vault"])
     app.include_router(license_router, prefix="/admin/license", tags=["license"])
 
