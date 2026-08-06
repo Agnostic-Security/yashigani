@@ -123,8 +123,25 @@ export class YsAdminCapabilityPolicy extends LitElement {
     return `/admin/api/capability-policy/users/${encodeURIComponent(this._scopeId)}`;
   }
 
-  async _fetchScope() {
-    this._result = null;
+  async _fetchScope(clearResult = true) {
+    // FIND-CAPPOLICY-RACE-NOT-FIXED (2026-08-06): this reset used to run
+    // UNCONDITIONALLY. _save()/_delete() set `this._result` to the
+    // success/error badge and then `await` this same method to refresh the
+    // row data from the server — but the `this._result = null` below ran
+    // SYNCHRONOUSLY, before the `await` a few lines down ever yields to the
+    // event loop. Lit batches synchronous reactive-property writes into a
+    // single microtask render, so the render that actually painted only
+    // ever saw the LATER value (null) — the "Saved."/"Override removed."
+    // badge never appeared, not even briefly. The in-flight sequence-token
+    // guard a few lines below (`seq !== this._fetchSeq`) is a SEPARATE
+    // mechanism protecting `_rows`/`_policy` correctness on out-of-order
+    // responses and is unaffected by this — it still fires unconditionally.
+    // Callers that are refreshing data AFTER already setting `_result`
+    // themselves (_save, _delete) now pass clearResult=false to preserve
+    // their own badge; callers starting a fresh, user-initiated scope load
+    // (_onScopeTypeChange, _onLoadScope, initial _load()) keep the default
+    // `true` so a stale badge from a previous scope doesn't linger.
+    if (clearResult) this._result = null;
     // FIND-B-E (v4.1.2 retest, lost-update race): capture the scope this
     // call is FOR before the await — a rapid scope-type change (e.g. org
     // -> group -> user in quick succession) previously re-read
@@ -262,7 +279,9 @@ export class YsAdminCapabilityPolicy extends LitElement {
     if (res.ok) {
       this._result = { ok: true, message: 'Saved.' };
       this.app?.toast('Capability policy saved.', 'success');
-      await this._fetchScope();
+      // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — this refresh must
+      // not wipe the "Saved." badge we just set (see _fetchScope() comment).
+      await this._fetchScope(false);
     } else {
       this._result = { ok: false, message: res.error ? res.error.message : 'Save failed.' };
     }
@@ -282,7 +301,9 @@ export class YsAdminCapabilityPolicy extends LitElement {
     if (res.ok) {
       this._result = { ok: true, message: 'Override removed.' };
       this.app?.toast('Capability policy override removed.', 'success');
-      await this._fetchScope();
+      // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+      // "Override removed." badge through the refresh (see _fetchScope()).
+      await this._fetchScope(false);
     } else {
       this._result = { ok: false, message: res.error ? res.error.message : 'Delete failed.' };
     }

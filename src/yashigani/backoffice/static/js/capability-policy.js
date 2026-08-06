@@ -93,7 +93,19 @@ async function capPolLoad() {
 // ---------------------------------------------------------------------------
 // Fetch current scope policy and render the rows
 // ---------------------------------------------------------------------------
-async function _capFetchAndRender() {
+async function _capFetchAndRender(clearResult) {
+    // FIND-CAPPOLICY-RACE-NOT-FIXED (2026-08-06): default true — a fresh,
+    // user-initiated scope load (loadCapabilityPolicy(), capPolLoad()) should
+    // clear any stale badge from a previous scope/action. But capPolSave()
+    // and capPolDelete() call this SAME function to refresh row data right
+    // after they've already written their OWN "Saved."/"Override removed."
+    // badge via _capSetResult() -- the two unconditional _capSetResult()
+    // calls below ("Loading…" then '') used to run regardless of caller,
+    // clobbering that badge to "Loading…" and then to nothing at all before
+    // the user ever saw it (mirrors the same defect fixed in the ui4 port's
+    // _fetchScope()). Those callers now pass clearResult=false.
+    if (clearResult === undefined) clearResult = true;
+
     // FIND-B-E: capture the scope this call is FOR, and claim a fresh
     // sequence token, before the network round-trip. Two overlapping calls
     // (double-clicked "Load", or a scope switch fired while a previous
@@ -104,7 +116,7 @@ async function _capFetchAndRender() {
     var scopeId   = _capScopeId;
     var seq       = ++_capFetchSeq;
 
-    _capSetResult('<span class="loading">Loading…</span>');
+    if (clearResult) _capSetResult('<span class="loading">Loading…</span>');
 
     var data      = null;
     var policyKey = 'org';
@@ -125,7 +137,7 @@ async function _capFetchAndRender() {
     // Discard this now-stale response instead of clobbering the DOM with it.
     if (seq !== _capFetchSeq) return;
 
-    _capSetResult('');
+    if (clearResult) _capSetResult('');
 
     var policy = (data && data[policyKey]) ? data[policyKey] : {};
     _capRenderRows(policy);
@@ -395,7 +407,10 @@ async function capPolSave() {
     }
 
     _capSetResult('<span class="badge badge-green">Saved.</span>');
-    await _capFetchAndRender();   // reload to show canonical server state
+    // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+    // "Saved." badge just set above through this refresh (see
+    // _capFetchAndRender() comment).
+    await _capFetchAndRender(false);   // reload to show canonical server state
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +443,9 @@ async function capPolDelete() {
     }
 
     _capSetResult('<span class="badge badge-green">Override removed.</span>');
-    await _capFetchAndRender();
+    // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+    // "Override removed." badge just set above through this refresh.
+    await _capFetchAndRender(false);
 }
 
 // ---------------------------------------------------------------------------
