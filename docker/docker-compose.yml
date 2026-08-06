@@ -2708,6 +2708,60 @@ services:
   # Agnostic Security. Direct issues to the upstream project teams.
   # ---------------------------------------------------------------------------
 
+  # langflow-init — idempotent ownership fix for the langflow_data named volume.
+  # FIND-IRIS-LANGFLOW-UPGRADE-CRASHLOOP (root cause 1, live-reproduced 2026-08-06):
+  # an earlier langflow image in this deployment's history ran as root; files it
+  # created under /app/langflow (config/secret_key mode 0600, per-flow UUID dirs,
+  # profile_pictures/) persisted root-owned in the langflow_data named volume.
+  # The currently-pinned langflow:1.9.2 image runs as uid=1000 gid=0 (see
+  # `langflow:` below, no root step anywhere in its lifecycle) — so on container
+  # recreate (install.sh --upgrade bumping the pinned digest across a Yashigani
+  # release, or any restart against an already-contaminated volume) the non-root
+  # process gets EACCES reading its own secret_key and crash-loops forever
+  # (confirmed live: RestartCount climbing unbounded, `PermissionError: [Errno 13]
+  # Permission denied: '/app/langflow/config/secret_key'`).
+  # Fix: a one-shot root helper (same "-init" pattern as ollama-init above)
+  # chowns the whole tree to 1000:0 before langflow starts. A chown to the
+  # already-correct owner is a no-op — safe to run every time.
+  # compose_up() in install.sh runs `compose down` (no -v) before EVERY
+  # `up -d`, on both the fresh-install and --upgrade paths — so this
+  # container is destroyed and recreated on every deploy, not just the
+  # first. No extra "force re-run" plumbing needed.
+  # network_mode: none — this is a filesystem-only helper; it makes no
+  # network calls and joining any bridge (including an implicit default
+  # network) would be unused attack surface.
+  # cap_add: [CHOWN] — cap_drop: [ALL] strips CAP_CHOWN even from uid 0
+  # ("unprivileged root"); chown(2) on files owned by a different uid
+  # requires it back explicitly. No other capability is needed.
+  # :Z on the volume mount — see `langflow:` below for the SELinux
+  # relabel rationale (root cause 2). Applied here too: the chown/setattr
+  # itself is a write-class operation that MCS enforcement can deny
+  # independently of the read-class dominance rule that covers plain reads.
+  langflow-init:
+    image: docker.io/langflowai/langflow:1.9.2@sha256:45238e614ce42bf93fea36a56316d3ebafdaf70c4df4425aeb2c90b035ec4a14
+    user: "0:0"
+    restart: "no"
+    network_mode: "none"
+    mem_limit: 128m
+    cpus: 0.25
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "[langflow-init] normalising /app/langflow ownership to 1000:0 (idempotent)"
+        mkdir -p /app/langflow
+        chown -R 1000:0 /app/langflow
+        echo "[langflow-init] done"
+    volumes:
+      - langflow_data:/app/langflow:Z
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    profiles:
+      - langflow
+
   # Langflow — Visual multi-agent workflow builder (MIT)
   # https://github.com/langflow-ai/langflow
   # Single container, embedded SQLite. OpenAI-compatible API on port 7860.
@@ -2763,7 +2817,21 @@ services:
       # redirect to stdout — identical output, no file needed.
       LANGFLOW_ALEMBIC_LOG_TO_STDOUT: "true"
     volumes:
-      - langflow_data:/app/langflow
+      # FIND-IRIS-LANGFLOW-UPGRADE-CRASHLOOP (root cause 2, live-verified 2026-08-06):
+      # rootless Podman on SELinux-Enforcing hosts (Fedora CoreOS) does NOT
+      # automatically relabel named-volume content to match each container's
+      # unique MCS category (verified live: langflow_data content sits at bare
+      # `s0`, the langflow container process runs `s0:c166,c561`). `:Z` asks
+      # the container engine to privately relabel the volume to the starting
+      # container's own category on every start — correct here since exactly
+      # one container (this one) is ever the active writer at a time (the
+      # langflow-init handoff above is strictly sequential, never concurrent).
+      # Docker ignores `:Z` on hosts without SELinux (verified: `docker compose
+      # config` on this file resolves the mount with the flag intact and
+      # `docker compose up` on a non-SELinux Docker host starts the container
+      # normally — Docker's SELinux relabel step is a no-op when SELinux is
+      # absent/disabled, per Docker's own volume-mount SELinux label handling).
+      - langflow_data:/app/langflow:Z
     # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
     # Phase 5 §C: langflow uses langflow_yashigani_token (per-agent P1 token) instead
     # of the shared yashigani_internal_bearer for its OPENAI_API_KEY outbound shim.
@@ -2781,6 +2849,10 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+      # FIND-IRIS-LANGFLOW-UPGRADE-CRASHLOOP: wait for the ownership-fix
+      # helper (same gating pattern as ollama depends_on: ollama-init above).
+      langflow-init:
+        condition: service_completed_successfully
     read_only: true
     tmpfs:
       # YSG-RISK-008 (v2.23.4): langflow_data:/app/langflow is a named volume.
