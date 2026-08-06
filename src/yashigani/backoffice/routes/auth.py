@@ -1359,7 +1359,6 @@ async def self_service_password_reset(body: SelfServiceResetRequest):
             body.totp_code,
             algorithm=record.totp_algorithm,
             digits=_self_reset_digits,
-            purpose="self_service_reset",
         ):
             raise generic_error
 
@@ -2415,7 +2414,6 @@ async def stepup_verify(
             body.totp_code,
             algorithm=admin_record.totp_algorithm,
             digits=_stepup_digits,
-            purpose="stepup",
         )
 
     if not ok:

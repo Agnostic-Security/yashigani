@@ -269,7 +269,6 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
-                purpose="login",
             )
 
             if not totp_ok:
@@ -340,7 +339,6 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
-                purpose="totp_provision",
             ):
                 return False, "invalid_totp_code"
             record.force_totp_provision = False
@@ -387,7 +385,6 @@ class PostgresLocalAuthService:
                 totp_code,
                 algorithm=record.totp_algorithm,
                 digits=role_digits,
-                purpose="change_password",
             ):
                 return False, "invalid_totp"
 
@@ -522,7 +519,6 @@ class PostgresLocalAuthService:
                 admin_totp_code,
                 algorithm=admin_totp_algorithm,
                 digits=admin_totp_digits,
-                purpose="admin_reset",
             ):
                 return False, "invalid_admin_totp"
 
@@ -919,7 +915,6 @@ class PostgresLocalAuthService:
         totp_code: str,
         algorithm: str = LEGACY_TOTP_ALGO,
         digits: int = 6,
-        purpose: str = "default",
     ) -> bool:
         """
         Wrap verify_totp() with a Postgres-backed replay cache.
@@ -928,14 +923,12 @@ class PostgresLocalAuthService:
         the AccountRecord.  Callers must pass these explicitly; the defaults are
         conservative legacy values for the migration window.
 
-        purpose — FIND-B-STEPUP-FIRST-ATTEMPT (2026-08-05): distinct
-        verification events (login / stepup / change_password / ...) MUST
-        pass a distinct, stable purpose string. This is threaded straight
-        into verify_totp()'s replay-cache key so a code consumed for one
-        purpose (e.g. login) does not poison the SAME still-valid window's
-        use for a different purpose (e.g. an immediate stepup) — see
-        verify_totp() docstring for the full root-cause. Callers MUST NOT
-        share a purpose across semantically distinct verification points.
+        GLOBAL single-use across ALL call sites (login/stepup/change_password/
+        totp_provision/admin_reset/self_service_reset/sso_2fa) — the same
+        used_totp_codes table backs every caller, deliberately. A per-purpose
+        replay namespace was tried and reverted (FIND-B-STEPUP-REPLAY-
+        REGRESSION-20260806) — see verify_totp()'s docstring for the full RCA.
+        Do not add a purpose/scope dimension to this cache.
 
         Loads the set of code_hashes that are still within the replay
         window, invokes verify_totp() with that local set, and if the set
@@ -970,9 +963,7 @@ class PostgresLocalAuthService:
 
         proxy = _HashingSet()
         before = len(cache)
-        ok = verify_totp(
-            secret_b32, totp_code, proxy, algorithm=algorithm, digits=digits, purpose=purpose
-        )
+        ok = verify_totp(secret_b32, totp_code, proxy, algorithm=algorithm, digits=digits)
         if ok and len(cache) > before:
             # Insert only the newly consumed hash(es) — expiration is
             # short (60s) which covers the full valid-window set of three

@@ -1005,10 +1005,7 @@ async def sso_2fa_verify(request: Request):
     _sso_totp_digits = 8 if _sso_totp_algo == "SHA512" else 6
 
     used_codes: set = set()  # Recovery codes not applicable here
-    if not verify_totp(
-        totp_secret, totp_code, used_codes,
-        algorithm=_sso_totp_algo, digits=_sso_totp_digits, purpose="sso_2fa",
-    ):
+    if not verify_totp(totp_secret, totp_code, used_codes, algorithm=_sso_totp_algo, digits=_sso_totp_digits):
         # Don't consume the pending token on TOTP failure — let them retry
         _write_sso_failure_audit(
             pending.get("idp_id", ""),

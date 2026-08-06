@@ -250,7 +250,6 @@ def verify_totp(
     used_codes_cache: "set[str]",
     algorithm: str = TOTP_ALGO_SHA1,
     digits: int = 6,
-    purpose: str = "default",
 ) -> bool:
     """
     Verify a TOTP code. Returns True on valid, unused code.
@@ -265,25 +264,25 @@ def verify_totp(
     timestamp of the MATCHED offset window, not always the current wall-clock
     window, so cross-window replays are correctly blocked.
 
-    purpose — FIND-B-STEPUP-FIRST-ATTEMPT (2026-08-05): the replay-cache key
-    is scoped by ``purpose`` (e.g. "login", "stepup", "change_password") in
-    addition to secret + window slot. Root cause: a single global
-    secret+window key meant a code consumed at LOGIN was indistinguishable
-    from the SAME still-displayed code presented moments later to
-    POST /auth/stepup (a distinct re-authentication *event*, ASVS V6.8.4) —
-    a legitimate admin/user who steps up within the same 30s window as their
-    login always had their first attempt rejected as a "replay" of the
-    login's own consumption, even though no attacker replay occurred. Each
-    purpose now gets its own replay namespace: a code is still blocked from
-    being replayed *within* the same purpose (real anti-replay preserved),
-    but a login's consumption of window N no longer poisons a stepup
-    verification against that same window N. Callers MUST pass a stable,
-    distinct purpose per verification call-site — see call sites in
-    pg_auth.py / local_auth.py / backoffice/routes/auth.py.
-
     Algorithm isolation: a code computed with the wrong algorithm or wrong
     digit count will NOT match (distinct HMAC functions / distinct moduli
     produce different code strings; constant-time comparison rejects them).
+
+    GLOBAL single-use, by design — DO NOT scope this cache key by caller
+    purpose (login / stepup / change_password / ...). FIND-B-STEPUP-REPLAY-
+    REGRESSION-20260806: a purpose-scoped key (`secret:purpose:window`) was
+    tried to solve a UX complaint (a fresh admin session's first /auth/stepup
+    call, submitted within the login TOTP code's still-valid 30s window, was
+    rejected as a "replay"). That "fix" was reverted — it made a code
+    captured/observed during login independently replayable at stepup (and
+    every other purpose) because each purpose got its own replay namespace.
+    RFC 6238 / ASVS V2.8.3 / V6.8.4 require single-use to be GLOBAL: once a
+    code is consumed for ANY verification event, it must be rejected for
+    EVERY subsequent verification event against that secret, regardless of
+    purpose. The correct fix for "first stepup attempt rejected" lives at
+    the CLIENT: wait for a fresh (next-window) code before submitting a
+    step-up verification rather than reusing the code just used at login —
+    see src/tests/unit/test_totp.py::TestStepupReplayIsGlobalNotPerPurpose.
     """
     if not secret_b32 or not code:
         return False
@@ -295,11 +294,10 @@ def verify_totp(
         candidate_ts = now_ts + offset * 30
         expected = _totp_at(secret_b32, candidate_ts, algo_upper, digits)
         if _constant_time_otp_check(expected, code):
-            # Derive the replay-cache key from the matched window's slot,
-            # scoped per purpose (FIND-B-STEPUP-FIRST-ATTEMPT).
-            matched_window_key = f"{secret_b32}:{purpose}:{candidate_ts // 30}"
+            # Derive the replay-cache key from the matched window's slot.
+            matched_window_key = f"{secret_b32}:{candidate_ts // 30}"
             if matched_window_key in used_codes_cache:
-                return False  # replay of this specific window slot + purpose
+                return False  # replay of this specific window slot
             used_codes_cache.add(matched_window_key)
             return True
     return False

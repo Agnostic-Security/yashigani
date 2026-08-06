@@ -256,7 +256,6 @@ class LocalAuthService:
             self._used_totp_codes,
             algorithm=record.totp_algorithm,
             digits=role_digits,
-            purpose="login",
         ):
             record.totp_failed_attempts += 1
             n = record.totp_failed_attempts
@@ -340,7 +339,6 @@ class LocalAuthService:
             self._used_totp_codes,
             algorithm=record.totp_algorithm,
             digits=role_digits,
-            purpose="totp_provision",
         ):
             return False, "invalid_totp_code"
         record.force_totp_provision = False
@@ -394,7 +392,6 @@ class LocalAuthService:
             self._used_totp_codes,
             algorithm=record.totp_algorithm,
             digits=role_digits,
-            purpose="change_password",
         ):
             return False, "invalid_totp"
 
@@ -450,7 +447,6 @@ class LocalAuthService:
             self._used_totp_codes,
             algorithm=admin_totp_algorithm,
             digits=admin_totp_digits,
-            purpose="admin_reset",
         ):
             return False, "invalid_admin_totp"
 
