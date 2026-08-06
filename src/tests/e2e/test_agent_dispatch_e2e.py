@@ -46,6 +46,7 @@ _YTF_PROJ = _ytf_os.getenv("YTF_COMPOSE_PROJECT", "docker")
 _YTF_SEP = _ytf_os.getenv("YTF_NAME_SEP", "-")
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -97,12 +98,70 @@ def _container_running(name: str, runtime: str = "docker") -> bool:
 
 def _runtime_run(container: str, python_code: str,
                  runtime: str = "docker", timeout: int = 30) -> str:
-    """Execute Python code inside a container, return stdout."""
+    """Execute Python code inside a container, returning stdout AND stderr.
+
+    2026-08-06: previously returned `r.stdout.strip()` only. Any exception
+    raised by the injected snippet went to stderr and was silently dropped, so
+    a harness fault (e.g. PermissionError on a secret file) presented as an
+    empty string and every downstream assertion failed against `''` with no
+    diagnostic. Four tests were mis-reported as product failures on two
+    runtimes because of it. stderr is now surfaced, prefixed so it can never be
+    mistaken for program output.
+    """
     r = subprocess.run(
         [runtime, "exec", container, "python3", "-c", python_code],
         capture_output=True, text=True, timeout=timeout,
     )
-    return r.stdout.strip()
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    if err:
+        out = f"{out}\nSTDERR:{err}".strip() if out else f"STDERR:{err}"
+    if r.returncode != 0 and "STDERR:" not in out:
+        out = f"{out}\nEXIT:{r.returncode}".strip()
+    return out
+
+
+# --- real-user pathway primitives (shared with the framework's login helper) ---
+
+_USER_SESSION_CACHE: dict = {}
+
+
+def _base_url() -> str:
+    return (os.getenv("YASHIGANI_ADMIN_URL")
+            or os.getenv("YASHIGANI_HEALTH_URL", "https://localhost:8443").replace("/healthz", ""))
+
+
+def _user_client():
+    """An httpx client carrying a REAL, freshly-issued user session cookie.
+
+    Uses the framework's canonical primitives (`bootstrap_user_session` /
+    `user_login_cookies`) so there is exactly one login path in the tree — the
+    divergent-login consolidation in the Playwright conftest exists to stop
+    modules re-inventing this.
+    """
+    import sys
+    from pathlib import Path
+
+    import httpx
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "playwright"))
+    from conftest import (  # type: ignore
+        _CA_CERT_PATH, bootstrap_user_session, user_login_cookies,
+    )
+
+    creds = _USER_SESSION_CACHE.get("creds")
+    if creds is None:
+        creds = bootstrap_user_session(cache_key="e2e_agent_dispatch")
+        _USER_SESSION_CACHE["creds"] = creds
+    cookies = user_login_cookies(
+        creds["username"], creds["password"], creds["totp_secret"],
+        identity_key=f"user:{creds['username']}",
+    )
+    return httpx.Client(
+        base_url=_base_url(), cookies=cookies,
+        verify=_CA_CERT_PATH if _CA_CERT_PATH else False,
+        timeout=180, follow_redirects=False,
+    )
 
 
 def _stack_running() -> bool:
@@ -155,41 +214,51 @@ class TestAgentDispatchLive:
 
     def _dispatch_via_gateway_internal(
         self, model: str, prompt: str = "Say hello in exactly two words.",
-        timeout: int = 90,
+        timeout: int = 180,
     ) -> dict:
-        """
-        Send a POST /v1/chat/completions to gateway:8081 from inside the
-        gateway container (avoids external TLS and auth complexity).
+        """Dispatch one chat turn down the REAL USER PATHWAY.
 
-        Returns dict with 'raw' key containing raw stdout output.
+        2026-08-06 — replaces a container-exec bypass. The previous version did:
+
+            docker exec <gateway> python3 -c "
+                bearer = open('/run/secrets/yashigani_internal_bearer').read()
+                urlopen('http://localhost:8081/v1/chat/completions', ...)"
+
+        Three faults, compounding:
+
+        1. **It bypassed the user pathway.** Posting to the gateway's own mesh
+           port from inside the gateway with the INTERNAL bearer skips
+           authentication, the session layer, the backoffice chat proxy and the
+           caller-identity resolution a real request goes through. It cannot see
+           any defect that lives in those layers, which is most of them.
+        2. **It could not run at all.** `/run/secrets/yashigani_internal_bearer`
+           is `root:2002 0640`; the container user is `1001:1001` with no
+           supplementary groups, so `open()` raised PermissionError — *outside*
+           the try block, so nothing was printed.
+        3. **The error was invisible.** `_runtime_run` returns stdout only and
+           discards stderr, so the PermissionError surfaced as an empty string
+           and every assertion failed against `''` with no clue why. Four tests
+           reported as product failures on two runtimes for a harness bug.
+
+        Now: a real user session (fresh, never-replayed TOTP) posting to
+        `/user/chat/completions` — the same path the browser uses; direct
+        `/v1/chat/completions` from a browser 401s by design (user_ui.py:888).
+        Returns the real HTTP status and body, so a failure names itself.
         """
-        runtime = _detect_runtime()
-        gw = self._gateway_name()
-        code = (
-            "import json, urllib.request, urllib.error\n"
-            f"body = json.dumps({{'model': {json.dumps(model)},"
-            f" 'messages': [{{'role': 'user', 'content': {json.dumps(prompt)}}}],"
-            f" 'stream': False}}).encode()\n"
-            "bearer = open('/run/secrets/yashigani_internal_bearer').read().strip()\n"
-            "req = urllib.request.Request(\n"
-            "    'http://localhost:8081/v1/chat/completions',\n"
-            "    data=body,\n"
-            "    headers={'Content-Type': 'application/json',\n"
-            "             'Authorization': f'Bearer {bearer}'},\n"
-            "    method='POST',\n"
-            ")\n"
-            "try:\n"
-            f"    resp = urllib.request.urlopen(req, timeout={timeout - 10})\n"
-            "    print('STATUS:200')\n"
-            "    print('BODY:' + resp.read().decode())\n"
-            "except urllib.error.HTTPError as e:\n"
-            "    print(f'STATUS:{e.code}')\n"
-            "    print('BODY:' + e.read().decode())\n"
-            "except Exception as exc:\n"
-            "    print(f'ERROR:{exc}')\n"
+        client = _user_client()
+        resp = client.post(
+            "/user/chat/completions",
+            json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                  "stream": False},
+            timeout=timeout,
         )
-        output = _runtime_run(gw, code, runtime=runtime, timeout=timeout)
-        return {"raw": output}
+        return {
+            "status": resp.status_code,
+            "body": resp.text,
+            # Kept for assertion compatibility with the existing tests, but now
+            # built from a REAL HTTP exchange rather than scraped container stdout.
+            "raw": f"STATUS:{resp.status_code}\nBODY:{resp.text}",
+        }
 
     @_SKIP_NO_STACK
     def test_langflow_dispatch_real_llm_response(self):
@@ -206,7 +275,11 @@ class TestAgentDispatchLive:
         if not _container_running(f"{_YTF_PROJ}{_YTF_SEP}langflow{_YTF_SEP}1", _detect_runtime()):
             pytest.skip("langflow container not running (not in active profiles)")
 
-        result = self._dispatch_via_gateway_internal("@langflow")
+        # 2026-08-06: was "@langflow", which is NOT a registered handle — install.sh
+        # registers the bundle as `agent__langflow` and the mention menu offers
+        # `@agent_langflow` (YSG-RISK-168). The test was asserting against a name the
+        # product never had, so its 404 was CORRECT behaviour being read as a defect.
+        result = self._dispatch_via_gateway_internal("@agent_langflow")
         raw = result["raw"]
 
         assert "STATUS:200" in raw, (
