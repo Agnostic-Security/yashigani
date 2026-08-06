@@ -342,9 +342,22 @@ class SensitivityClassifier:
                 layer_results["ollama"] = SensitivityLevel.PUBLIC
                 ollama_unavailable = True
 
-        # Take the highest (most conservative) result
+        # FIND-INSPECTION-NONDETERMINISTIC (2026-08-07): regex (Layer 1) is the
+        # ONLY deterministic layer in this ensemble — sklearn is deterministic
+        # given fixed model weights, but ollama (Layer 3) is an LLM and is NOT
+        # guaranteed bit-for-bit deterministic even at temperature 0 (GPU/CPU
+        # batched-inference reduction order). The merge below is an explicit,
+        # test-covered invariant: sklearn/ollama may only ADD sensitivity on
+        # top of the regex floor, NEVER clear or downgrade a regex hit. Do NOT
+        # replace this with a vote/average/"2-of-3" scheme — that would let a
+        # noisy ML layer silently downgrade a deterministic PII/PCI/injection
+        # regex match. See test_sensitivity_classifier_regex_authoritative.py.
         all_levels = [regex_level, sklearn_level, ollama_level]
         final_level: int = max(all_levels)
+        assert final_level >= regex_level, (
+            "FIND-INSPECTION-NONDETERMINISTIC invariant violated: an ensemble "
+            "member downgraded below the deterministic regex floor"
+        )
 
         # Fail-closed: if ollama is unavailable AND sklearn is uncertain, floor at level 5.
         # Both ML layers have failed to produce a definitive SAFE signal — the conservative
@@ -416,6 +429,18 @@ class SensitivityClassifier:
         that ollama was genuinely unavailable and apply fail-closed logic.
         A clean PUBLIC response (ollama reachable, text classified as non-sensitive)
         returns SensitivityLevel.PUBLIC without raising.
+
+        FIND-INSPECTION-NONDETERMINISTIC (2026-08-07): temperature is pinned
+        to 0.0 to minimise run-to-run label drift for identical input text —
+        this mirrors the pattern already used by
+        yashigani.inspection.classifier.PromptInjectionClassifier._call_model
+        (which sets ``options: {temperature: 0.0}``); this call previously
+        did not, and was the one ollama-backed classifier in the codebase
+        left at the backend's sampling default. Pinning temperature reduces,
+        but does not eliminate, LLM-layer non-determinism (batched-inference
+        floating-point reduction order is not bit-exact even at temp 0) —
+        the regex floor in classify() is the actual determinism guarantee;
+        this is defence-in-depth on top of it.
         """
         # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport — presents the
         # gateway leaf to the Caddy :11435 Ollama front on https URLs.
@@ -440,7 +465,12 @@ class SensitivityClassifier:
         with ollama_sync_client(self._ollama_url, timeout=10.0) as _client:
             resp = _client.post(
                 f"{self._ollama_url}/api/generate",
-                json={"model": self._ollama_model, "prompt": prompt, "stream": False},
+                json={
+                    "model": self._ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.0},
+                },
             )
         if resp.status_code == 200:
             body = resp.json()

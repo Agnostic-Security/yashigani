@@ -108,8 +108,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
-    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+def _client_enforce_input(
+    identity, request_path, route_reason="", provider="", model="",
+    sensitivity="", data_tags=None,
+):
+    """Build the clients-contract input doc shared by ingress + egress (#16).
+
+    FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): ``sensitivity`` and
+    ``data_tags`` were previously ALWAYS omitted from this contract — every
+    seeded client policy keyed on ``input.routing_decision.sensitivity`` or
+    ``input.data_tags`` (POL-009 pci_data_block, POL-010
+    classified_marking_local) evaluated against undefined input fields, so
+    their ``deny`` rule bodies could structurally never produce a result and
+    ``count(deny) == 0`` (allow) regardless of actual content. Both fields
+    are now populated by the caller from the SAME regex-authoritative
+    sensitivity/PII detection the ingress/egress gates already compute —
+    never solely from the sklearn/ollama ensemble members (see
+    sensitivity_classifier.classify()'s regex floor and
+    FIND-INSPECTION-NONDETERMINISTIC).
+    """
     ident = identity or {}
     return {
         "identity": {
@@ -119,8 +136,43 @@ def _client_enforce_input(identity, request_path, route_reason="", provider="", 
             "groups": ident.get("groups", []),
         },
         "request": {"path": request_path, "method": "POST"},
-        "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+        "routing_decision": {
+            "route": route_reason, "provider": provider, "model": model,
+            "sensitivity": sensitivity,
+        },
+        "data_tags": list(data_tags or []),
     }
+
+
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): trigger-string -> data_tags
+# vocabulary mapping. Deliberately restricted to Layer-1 REGEX triggers
+# (the "regex:" prefix _scan_regex adds) — never sklearn:/ollama: triggers —
+# so a client-policy data_tag ("pci") can only ever be asserted by the
+# deterministic layer, matching the regex-authoritative invariant enforced
+# in sensitivity_classifier.classify().
+#
+# Deliberately narrow: this does NOT emit a generic "pii"/"sensitive"/
+# "classified" tag for every RESTRICTED/SENSITIVE regex hit (SSN, phone,
+# IBAN, admin-defined classification markers) — only "pci", which is what
+# POL-009 (pci_data_block) is precisely scoped to. Emitting a broader tag
+# here would make wildcard-bound (all-humans) client policies newly fire on
+# ordinary RESTRICTED content that a caller's sensitivity_ceiling already
+# legitimately governs. (POL-010 classified_marking_local's OWN
+# `data_tags[_] == "classified"` branch remains unpopulated/no-op — same as
+# before this fix; its admin-defined marking patterns have no data_tags
+# vocabulary today, a separate, pre-existing gap out of scope here. Its
+# bare `sensitivity == "RESTRICTED"` branch was narrowed away in
+# scripts/populate-demo.py for the same reason POL-009's was: it is no
+# longer PCI/classified-specific post-R14/R15 and would have started firing
+# broadly the moment `routing_decision.sensitivity` stopped being always-"".)
+def _derive_pci_data_tags(sensitivity_triggers) -> list[str]:
+    tags: list[str] = []
+    for trig in sensitivity_triggers or []:
+        low = str(trig).lower()
+        if low.startswith("regex:") and "credit/debit card" in low:
+            tags.append("pci")
+            break
+    return tags
 
 
 def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
@@ -3335,7 +3387,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _ce_in = await evaluate_client_policies(
         _state, _ce_scope_kind, identity_id, "ingress",
         _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
-                              provider=selected_provider, model=selected_model),
+                              provider=selected_provider, model=selected_model,
+                              # FIND-PCI-EGRESS-CEILING-BYPASS: wire the request's own
+                              # regex-authoritative sensitivity/data_tags — POL-009
+                              # ("cardholder data must not be sent") and POL-010 both
+                              # key on these fields and previously always saw them
+                              # undefined (structurally could never fire).
+                              sensitivity=sensitivity_level,
+                              data_tags=_derive_pci_data_tags(sensitivity_triggers)),
     )
     if not _ce_in.get("allow", False):
         _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -4353,10 +4412,30 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
     # the caller has no bound egress policies.
+    #
+    # FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the "pci" data_tag is
+    # derived from an ALWAYS-ON, config-independent Luhn-valid PAN scan
+    # (yashigani.pii.contains_pci_pan) — NOT from the optional
+    # response_inspection_pipeline / pii_detector toggles (YSG-RISK-057).
+    # POL-009 (pci_data_block, bound wildcard to every human, both
+    # directions) must block a PAN in the response for EVERY human caller
+    # regardless of their sensitivity_ceiling — a RESTRICTED ceiling
+    # legitimately permits other RESTRICTED content (SSN/phone/IBAN); it
+    # must never permit cardholder data. ``sensitivity`` is passed through
+    # for observability/other client policies but POL-009 itself keys only
+    # on the precise "pci" tag (see scripts/populate-demo.py POL-009 —
+    # narrowed to drop the overbroad bare-"RESTRICTED" branch that used to
+    # collide with the R14/R15 SENSITIVE(5)->legacy-"RESTRICTED" mapping).
+    from yashigani.pii import contains_pci_pan  # noqa: PLC0415
     _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_eg_data_tags = ["pci"] if contains_pci_pan(assistant_content) else []
     _ce_eg = await evaluate_client_policies(
         _state, _ce_eg_kind, identity_id, "egress",
-        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+        _client_enforce_input(
+            identity, "/v1/chat/completions", model=selected_model,
+            sensitivity=response_content_sensitivity or sensitivity_level,
+            data_tags=_ce_eg_data_tags,
+        ),
     )
     if not _ce_eg.get("allow", False):
         _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")

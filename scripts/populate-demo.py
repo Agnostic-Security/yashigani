@@ -1299,19 +1299,34 @@ import rego.v1
 # policy_id: POL-009
 # user_message: Cardholder (PCI) data must not be sent to AI models. Request blocked.
 # code: pci_data_block
-# Demo scenario: the bound user cannot send PCI data. The built-in credit/debit-card
-# sensitivity pattern classifies cardholder data as RESTRICTED (level 4); this client
-# policy denies on the PCI/RESTRICTED tag, and the user's low sensitivity_ceiling
-# (INTERNAL) blocks RESTRICTED egress at the gateway regardless (defence in depth).
+# Demo scenario: the bound user cannot send OR receive PCI (cardholder) data,
+# regardless of their sensitivity_ceiling — bound wildcard (scope_id="") to
+# EVERY human, both directions. The "pci" data_tag is asserted by the
+# deterministic regex+Luhn PAN scan (Layer 1 in
+# yashigani.optimization.sensitivity_classifier / yashigani.pii.contains_pci_pan)
+# — the sklearn/ollama ensemble layers can only ADD sensitivity on top of
+# that signal, never clear it (FIND-INSPECTION-NONDETERMINISTIC).
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the second deny rule below
+# used to read `input.routing_decision.sensitivity == "RESTRICTED"`. That
+# was written under the pre-R14/R15 4-level model, where RESTRICTED was the
+# TOP level and cardholder data classified there. R14/R15 added a 5th
+# SENSITIVE level ABOVE RESTRICTED specifically for credit-card/API-key/
+# classified content; the legacy string mapping folds BOTH level 4
+# (SSN/phone/IBAN — genuinely NOT PCI) and level 5 (PCI) down to the same
+# "RESTRICTED" string for OPA back-compat. Keeping the bare
+# `sensitivity == "RESTRICTED"` rule made this wildcard-bound policy deny
+# ANY RESTRICTED response for ANY human — silently defeating a caller's
+# legitimately-granted RESTRICTED ceiling for non-PCI content, which is a
+# regression, not a security improvement (the ceiling gate is the correct,
+# separate control for non-PCI RESTRICTED content). Removed: POL-009 now
+# denies ONLY on the precise "pci" data_tag.
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
 
 deny contains "POL-009:pci_data_present" if {
     input.data_tags[_] == "pci"
-}
-deny contains "POL-009:pci_data_present" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
 }
 
 obligations contains "audit_pci_block" if {
@@ -1333,6 +1348,21 @@ import rego.v1
 # This policy denies any NON-local (cloud) model for such content -> the request must
 # be served by a local Ollama model (e.g. summarise the text locally). The bound user
 # is also allocated local-only models so local handling works while cloud is blocked.
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the bare
+# `input.routing_decision.sensitivity == "RESTRICTED"` branch below was
+# removed (same reasoning as POL-009's — see that policy's comment). This
+# policy is bound wildcard `human:""` (every human, egress); leaving the
+# bare-RESTRICTED branch in would make it start denying every RESTRICTED-
+# classified cloud response for every human the moment
+# `routing_decision.sensitivity` stopped being always-"" (a gateway
+# input-contract gap fixed the same day, see
+# yashigani.gateway.openai_router._client_enforce_input) — i.e. a genuine
+# over-block regression, not the classified-marking-specific control this
+# policy documents. The `data_tags[_] == "classified"` branch is the
+# policy's real, precisely-scoped signal; it remains a no-op today because
+# no data_tags vocabulary exists yet for admin-defined classification-
+# marking patterns (a separate, pre-existing gap, out of scope here).
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
@@ -1340,16 +1370,12 @@ decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations
 _local_models := {"gemma3:4b", "phi4-mini", "llama3.1:8b", "qwen2.5:3b"}
 
 deny contains "POL-010:classified_requires_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
-    not input.routing_decision.model in _local_models
-}
-deny contains "POL-010:classified_requires_local" if {
     input.data_tags[_] == "classified"
     not input.routing_decision.model in _local_models
 }
 
 obligations contains "route_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
+    input.data_tags[_] == "classified"
 }
 """,
     },
