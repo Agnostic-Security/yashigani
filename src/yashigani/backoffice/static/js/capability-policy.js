@@ -18,6 +18,13 @@ var CAP_LABELS = {
 var CAP_MAX_ORIGINS = 10;
 var _capScopeType = 'org';
 var _capScopeId   = '';
+// FIND-B-E (v4.1.2 retest, lost-update race): monotonic token bumped at the
+// START of every _capFetchAndRender() call. A response is only applied if
+// its token still matches _capFetchSeq when the await resolves -- an older,
+// still-in-flight fetch (e.g. two rapid "Load" clicks, or a scope switch
+// while a previous fetch is still in flight) that resolves out of order is
+// a no-op instead of clobbering whatever the newer call already rendered.
+var _capFetchSeq = 0;
 
 // Convert capability name to a safe element id segment (display-capture → display_capture)
 function _capId(cap) { return cap.replace(/-/g, '_'); }
@@ -87,21 +94,36 @@ async function capPolLoad() {
 // Fetch current scope policy and render the rows
 // ---------------------------------------------------------------------------
 async function _capFetchAndRender() {
+    // FIND-B-E: capture the scope this call is FOR, and claim a fresh
+    // sequence token, before the network round-trip. Two overlapping calls
+    // (double-clicked "Load", or a scope switch fired while a previous
+    // fetch is still in flight) can resolve out of order; only the call
+    // holding the LATEST token when its response arrives is allowed to
+    // touch the DOM.
+    var scopeType = _capScopeType;
+    var scopeId   = _capScopeId;
+    var seq       = ++_capFetchSeq;
+
     _capSetResult('<span class="loading">Loading…</span>');
 
     var data      = null;
     var policyKey = 'org';
 
-    if (_capScopeType === 'org') {
+    if (scopeType === 'org') {
         data = await api('/admin/api/capability-policy');
         policyKey = 'org';
-    } else if (_capScopeType === 'group') {
-        data = await api('/admin/api/capability-policy/groups/' + encodeURIComponent(_capScopeId));
+    } else if (scopeType === 'group') {
+        data = await api('/admin/api/capability-policy/groups/' + encodeURIComponent(scopeId));
         policyKey = 'overrides';
     } else {
-        data = await api('/admin/api/capability-policy/users/' + encodeURIComponent(_capScopeId));
+        data = await api('/admin/api/capability-policy/users/' + encodeURIComponent(scopeId));
         policyKey = 'overrides';
     }
+
+    // In-flight guard: a newer _capFetchAndRender() call (bumping
+    // _capFetchSeq again) started while this one was awaiting the network.
+    // Discard this now-stale response instead of clobbering the DOM with it.
+    if (seq !== _capFetchSeq) return;
 
     _capSetResult('');
 
@@ -111,15 +133,15 @@ async function _capFetchAndRender() {
     // Update the scope label in the panel header
     var labelEl = document.getElementById('cap-pol-scope-label');
     if (labelEl) {
-        if (_capScopeType === 'org')        labelEl.textContent = 'Organisation (default)';
-        else if (_capScopeType === 'group') labelEl.textContent = 'Group: ' + _capScopeId;
-        else                                labelEl.textContent = 'User: ' + _capScopeId;
+        if (scopeType === 'org')        labelEl.textContent = 'Organisation (default)';
+        else if (scopeType === 'group') labelEl.textContent = 'Group: ' + scopeId;
+        else                            labelEl.textContent = 'User: ' + scopeId;
     }
 
     // Show / hide "inherits from parent" note for group / user overrides
     var noteEl = document.getElementById('cap-pol-partial-note');
     if (noteEl) {
-        if (_capScopeType !== 'org') noteEl.classList.remove('is-hidden');
+        if (scopeType !== 'org') noteEl.classList.remove('is-hidden');
         else noteEl.classList.add('is-hidden');
     }
 
@@ -127,9 +149,9 @@ async function _capFetchAndRender() {
     var delBtn = document.getElementById('cap-pol-delete-btn');
     if (delBtn) {
         delBtn.classList.remove('is-hidden');
-        delBtn.textContent = (_capScopeType === 'org')
+        delBtn.textContent = (scopeType === 'org')
             ? 'Reset org to baseline'
-            : 'Delete ' + _capScopeType + ' override';
+            : 'Delete ' + scopeType + ' override';
     }
 }
 

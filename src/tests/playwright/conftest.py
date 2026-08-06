@@ -992,6 +992,27 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
     # refresh_admin_context_if_stale() can detect idle-timeout staleness
     # later without re-deriving it from scratch.
     _admin_session_established_at[admin] = time.time()
+    # FIND-B-CANARY-401 fix (2026-08-06, Ava, Tier-B consolidated retest):
+    # ANY real login reaching this point (force_fresh=True, or the very
+    # first population of the cache) evicts every OTHER already-live
+    # session for this admin number server-side (single-active-session
+    # policy, src/yashigani/auth/session.py SessionStore.create()) --
+    # including a long-lived Playwright BrowserContext (e.g. admin_ctx)
+    # that was seeded from an earlier call to this same function. Before
+    # this fix, only invalidate_cached_session() (the deliberate-logout
+    # path) set _admin_session_dirty, so a force_fresh=True re-login
+    # elsewhere (e.g. test_relogin_after_rotation_proves_rotation_stuck's
+    # own re-login) silently evicted admin_ctx's cookie without flagging
+    # it dirty -- refresh_admin_context_if_stale()'s time-based check then
+    # saw a falsely-fresh timestamp (this call just bumped it) and skipped
+    # refreshing admin_ctx, so the NEXT test to use admin_ctx (observed
+    # live: test_canary_loads_for_admin) got a 401 on the server-evicted
+    # cookie. Marking dirty here closes that gap the same way the
+    # deliberate-logout path already does -- the next
+    # refresh_admin_context_if_stale() call for ANY long-lived context for
+    # this admin number will now force one real refresh instead of trusting
+    # the timestamp alone.
+    _admin_session_dirty.add(admin)
     return result
 
 
