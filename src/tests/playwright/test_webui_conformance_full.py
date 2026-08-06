@@ -679,6 +679,19 @@ class TestDocumentsAdversarial:
                 "content_type": "text/plain",
                 "content_base64": "aGVsbG8=",
             }, headers=_cookie_header(cookies))
+        # 2026-08-06: was a bare `== 422`. On the demo profile document
+        # enforcement is OFF, so the upload is refused with 409
+        # document_enforcement_disabled BEFORE filename handling is ever
+        # reached — the traversal defence is never exercised and the test
+        # reports a product failure for a feature that is switched off. A
+        # disabled feature must SKIP (absence of the code path is not evidence
+        # of a defect), and when enabled the traversal MUST be rejected.
+        if r.status_code == 409 and "document_enforcement_disabled" in r.text:
+            pytest.skip(
+                "document enforcement disabled on this deployment profile — "
+                "filename handling is not reachable, so this control cannot be "
+                "exercised here (not a pass, not a failure)"
+            )
         assert r.status_code == 422, (
             f"path-traversal filename {bad_filename!r} not rejected: {r.status_code} {r.text[:200]}"
         )
@@ -693,6 +706,8 @@ class TestDocumentsAdversarial:
                 "filename": "big.txt", "content_type": "text/plain",
                 "content_base64": oversized_b64,
             }, headers=_cookie_header(cookies))
+        if r.status_code == 409 and "document_enforcement_disabled" in r.text:
+            pytest.skip("document enforcement disabled on this deployment profile")
         assert r.status_code == 413, f"oversized upload not rejected with 413: {r.status_code}"
 
     def test_user_upload_bad_mime_rejected(self, user_ctx):
@@ -703,6 +718,11 @@ class TestDocumentsAdversarial:
                 "filename": "evil.exe", "content_type": "application/x-msdownload",
                 "content_base64": "aGVsbG8=",
             }, headers=_cookie_header(cookies))
+        if r.status_code == 409 and "document_enforcement_disabled" in r.text:
+            pytest.skip(
+                "document enforcement disabled on this deployment profile — "
+                "MIME validation is not reachable (not a pass, not a failure)"
+            )
         assert r.status_code == 422, f"disallowed MIME not rejected: {r.status_code}"
 
 
@@ -799,14 +819,37 @@ class TestUserAgentBOLA:
                 "description": "conformance BOLA probe agent",
             }, headers=_cookie_header(user_a["cookies"]))
         assert create_resp.status_code in (200, 201), f"setup failed: {create_resp.status_code} {create_resp.text[:200]}"
-        agent_id = create_resp.json().get("id") or create_resp.json().get("agent_id")
-        assert agent_id, f"no agent id in response: {create_resp.text[:200]}"
+        # 2026-08-06: the id lookup was `.get("id") or .get("agent_id")`, but this
+        # endpoint returns the identifier as `ua_id`. Neither key matched, so
+        # `agent_id` was always None and the test died on the SETUP assertion —
+        # meaning the BOLA assertion below had NEVER ONCE EXECUTED. A test that
+        # cannot fail is not a test; worse, this one reported as a failure on
+        # every leg, so the real access-control check was hidden behind noise.
+        # `ua_id` first, with the historical keys kept as fallbacks so the test
+        # survives a future rename instead of silently going blind again.
+        payload = create_resp.json()
+        agent_id = payload.get("ua_id") or payload.get("id") or payload.get("agent_id")
+        assert agent_id, (
+            f"no agent id in create response — keys were {sorted(payload)}; "
+            f"expected one of ua_id/id/agent_id: {create_resp.text[:200]}"
+        )
 
         with _http_client() as c:
             r = c.delete(f"{BASE_URL}/user/agents/{agent_id}",
                         headers=_cookie_header(user_b["cookies"]))
         assert r.status_code in (403, 404), (
             f"user B deleted user A's agent: {r.status_code} (BOLA)"
+        )
+
+        # Effect-verified (YTF §5.3): a 403/404 response is not proof the object
+        # survived — assert the owner can still see it. Response-verification
+        # alone would pass if the delete succeeded but returned the wrong code.
+        with _http_client() as c:
+            still = c.get(f"{BASE_URL}/user/agents", headers=_cookie_header(user_a["cookies"]))
+        assert still.status_code == 200, f"owner list failed: {still.status_code}"
+        assert str(agent_id) in still.text, (
+            "user B's rejected DELETE still removed the object — the denial was "
+            "cosmetic (response-verified only). This is the BOLA."
         )
 
 
