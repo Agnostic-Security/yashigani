@@ -11,12 +11,33 @@ The scheduler is managed by the service lifespan; fail-closed per SOP 1:
   - job failure is logged + Prometheus-counted but does NOT stop the scheduler
     (one failed checkpoint is recoverable; a crashed service is not)
 
+FIND-IRIS-CHECKPOINT-EVENTLOOP (v4.1.2 retest, fixed 2026-08-06):
+  BackgroundScheduler runs jobs in its own worker thread, which has NO
+  asyncio event loop of its own. asyncpg Pool/Connection objects are bound
+  for their whole lifetime to the event loop that was running when the pool
+  was created (backoffice/app.py's lifespan `await create_pool()`, i.e. the
+  application's own uvicorn event loop) -- asyncpg's internal
+  queues/futures assert the calling loop matches the creation loop and raise
+  a cross-event-loop RuntimeError otherwise. The previous implementation
+  span up a *brand-new* `asyncio.new_event_loop()` per job fire and ran the
+  checkpoint coroutine there -- always the wrong loop relative to the pool
+  -- so every fire failed with that RuntimeError, was caught by the
+  per-tenant try/except in `_run_checkpoint_async`, logged, and counted as a
+  failure. Net effect: `audit_chain_checkpoints` never received a row on
+  this stack. Fix: capture the application's running loop in `start()`
+  (called synchronously from within the async lifespan, so
+  `asyncio.get_running_loop()` correctly resolves to the uvicorn loop the
+  pool lives on) and hand the job coroutine to THAT loop via
+  `asyncio.run_coroutine_threadsafe()`, blocking the APScheduler worker
+  thread on the result (bounded by `job_timeout_s`) so failures remain
+  observable via the exact same logging/Prometheus path as before.
+
 Compliance:
     ASVS V7.3.3   — audit log integrity (tamper-evident)
     NIST AU-9/AU-10 — protection of audit information + non-repudiation
     SOC 2 CC7.2/CC7.3 — monitoring + evaluation of security events
 
-Last updated: 2026-05-24T00:00:00+01:00
+Last updated: 2026-08-06T00:00:00+01:00
 """
 from __future__ import annotations
 
@@ -41,22 +62,30 @@ class AuditCheckpointScheduler:
     """
     Wraps APScheduler 3.x BackgroundScheduler to run the daily checkpoint job.
 
-    Usage (in a service lifespan)::
+    Usage (in the async service lifespan, AFTER the asyncpg pool is created)::
 
-        scheduler = AuditCheckpointScheduler(
-            chain_service=audit_chain_svc,
-            pool_getter=lambda: app_state.db_pool,
-            tenant_ids=["00000000-0000-0000-0000-000000000000"],
-            signing_key_path=Path("/run/secrets/hermes_client.key"),
-            signing_spiffe_id="spiffe://yashigani.internal/hermes",
-        )
-        scheduler.start()
-        # ... service runs ...
-        scheduler.stop()
+        async def lifespan(app):
+            await create_pool()
+            ...
+            # MUST be called synchronously from this running event loop --
+            # start() captures it via asyncio.get_running_loop() so the
+            # scheduler's worker thread can hand its job coroutine back to
+            # the same loop the pool lives on (FIND-IRIS-CHECKPOINT-EVENTLOOP).
+            scheduler = AuditCheckpointScheduler(
+                chain_service=audit_chain_svc,
+                pool_getter=lambda: app_state.db_pool,
+                tenant_ids=["00000000-0000-0000-0000-000000000000"],
+                signing_key_path=Path("/run/secrets/hermes_client.key"),
+                signing_spiffe_id="spiffe://yashigani.internal/hermes",
+            )
+            scheduler.start()
+            yield
+            scheduler.stop()
 
     The job runs at 00:05 UTC by default (configurable via hour/minute kwargs)
-    and checkpoints *yesterday's* events.  Idempotent: re-running for the same
-    date updates the existing row (ON CONFLICT DO UPDATE in the service).
+    and checkpoints *yesterday's* events.  Idempotent: re-running for an
+    already-checkpointed date is a no-op (ON CONFLICT DO NOTHING in the
+    service -- checkpoints are immutable once written, v2.25.2).
     """
 
     def __init__(
@@ -69,6 +98,7 @@ class AuditCheckpointScheduler:
         signing_spiffe_id: str = "",
         hour: int = 0,
         minute: int = 5,
+        job_timeout_s: float = 300.0,
     ) -> None:
         """
         Args:
@@ -80,6 +110,9 @@ class AuditCheckpointScheduler:
                 If None, checkpoints are written unsigned.
             signing_spiffe_id: SPIFFE URI of the signing identity.
             hour/minute: UTC hour/minute to run the job (default 00:05).
+            job_timeout_s: max seconds to wait for one day's checkpoint run
+                (across all tenants) when it is handed to the app loop from
+                the APScheduler worker thread (FIND-IRIS-CHECKPOINT-EVENTLOOP).
         """
         self._chain_service = chain_service
         self._pool_getter = pool_getter
@@ -88,20 +121,51 @@ class AuditCheckpointScheduler:
         self._signing_spiffe_id = signing_spiffe_id
         self._hour = hour
         self._minute = minute
+        self._job_timeout_s = job_timeout_s
         self._scheduler = None
+        # FIND-IRIS-CHECKPOINT-EVENTLOOP: the event loop the asyncpg pool was
+        # created on (captured in start()). The APScheduler worker thread has
+        # no loop of its own; job coroutines MUST run on this loop, never a
+        # freshly-created one, or every asyncpg call raises a cross-loop
+        # RuntimeError.
+        self._app_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the background scheduler.  Raises RuntimeError on failure (SOP 1)."""
+        """Start the background scheduler.  Raises RuntimeError on failure (SOP 1).
+
+        MUST be called synchronously from within the application's running
+        event loop (e.g. from inside the async lifespan, the same context
+        `create_pool()` was awaited in) -- FIND-IRIS-CHECKPOINT-EVENTLOOP.
+        `asyncio.get_running_loop()` below resolves to that loop precisely
+        because `start()` executes on it; capturing it here is what lets the
+        APScheduler worker thread hand its job coroutine back to the correct
+        loop later instead of spinning up an unrelated one.
+        """
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
             from apscheduler.triggers.cron import CronTrigger
         except ImportError as exc:
             raise RuntimeError(
                 "AuditCheckpointScheduler: apscheduler is required but not installed"
+            ) from exc
+
+        try:
+            self._app_loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            # Fail-closed (SOP 1): a checkpoint scheduler with no known app
+            # loop cannot ever run its DB work correctly -- refuse to start
+            # rather than silently building a scheduler that will fail every
+            # job forever (the exact FIND-IRIS-CHECKPOINT-EVENTLOOP bug).
+            raise RuntimeError(
+                "AuditCheckpointScheduler.start() must be called from within "
+                "the application's running event loop (e.g. the async "
+                "lifespan, after create_pool()) so the checkpoint job can "
+                "run its asyncpg work on the same loop the pool was created "
+                "on."
             ) from exc
 
         scheduler = BackgroundScheduler(timezone="UTC")
@@ -131,6 +195,7 @@ class AuditCheckpointScheduler:
                 logger.warning("AuditCheckpointScheduler shutdown error: %s", exc)
             finally:
                 self._scheduler = None
+        self._app_loop = None
         logger.info("AuditCheckpointScheduler stopped")
 
     # ------------------------------------------------------------------
@@ -138,17 +203,37 @@ class AuditCheckpointScheduler:
     # ------------------------------------------------------------------
 
     def _run_checkpoint_sync(self) -> None:
-        """Sync wrapper called by APScheduler BackgroundScheduler."""
+        """Sync wrapper called by APScheduler BackgroundScheduler.
+
+        FIND-IRIS-CHECKPOINT-EVENTLOOP: this runs in APScheduler's own worker
+        thread, which has no event loop of its own. Do NOT spin up a fresh
+        `asyncio.new_event_loop()` here -- the asyncpg pool from
+        `pool_getter()` is permanently bound to the application's event loop
+        (captured in `start()` as `self._app_loop`) and raises a cross-loop
+        RuntimeError if driven from any other loop. Instead, hand the job
+        coroutine to the app loop via `run_coroutine_threadsafe()` and block
+        this worker thread on the result (bounded by `_job_timeout_s`) so a
+        stuck checkpoint can't wedge the scheduler thread forever.
+        """
         yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).date()
-        # Run in a fresh event loop (BackgroundScheduler thread has no loop)
-        loop = asyncio.new_event_loop()
+        app_loop = self._app_loop
+        if app_loop is None or not app_loop.is_running():
+            logger.error(
+                "AuditCheckpointScheduler: application event loop unavailable "
+                "— skipping checkpoint for %s (was start() called from the "
+                "app's running event loop?)",
+                yesterday,
+            )
+            _inc_checkpoint_failure()
+            return
         try:
-            loop.run_until_complete(self._run_checkpoint_async(yesterday))
+            future = asyncio.run_coroutine_threadsafe(
+                self._run_checkpoint_async(yesterday), app_loop
+            )
+            future.result(timeout=self._job_timeout_s)
         except Exception as exc:
             logger.error("AuditCheckpointScheduler job failed for %s: %s", yesterday, exc)
             _inc_checkpoint_failure()
-        finally:
-            loop.close()
 
     async def _run_checkpoint_async(self, target_date: date) -> None:
         """Compute and persist checkpoints for all tenants for target_date."""
