@@ -125,6 +125,76 @@ fi
 
 OVERALL_RC=0
 
+
+
+# ---------------------------------------------------------------------------
+# _leg_preflight — YSG-RISK-207 gate (2026-08-07)
+#
+# A leg must PROVE it can reach AND authenticate to its target before it is
+# allowed to generate evidence. Four separate times this campaign, harness state
+# pointed at a deployment that no longer existed and the tier produced hours of
+# meaningless output:
+#   * Tier-C resolved the CA against the TEST checkout, not the deployment ->
+#     41/41 skipped "no live stack" while the stack answered healthz 200.
+#   * YTF_SECRETS_DIR still held the previous stack's credentials after a
+#     destroy-and-reinstall -> 6 of the first 9 Tier-B tests failed on login.
+#     That failure is VISUALLY IDENTICAL to the real IP-throttle lane-bleed, so
+#     rig artefact and genuine SOP gap cannot be told apart after the fact.
+#   * FIND-0805-002 (rotated password written to the wrong dir).
+#   * RIG-002 (podman prefix unusable after reboot; the product's own error for
+#     it is invisible, see YSG-RISK-203).
+#
+# Distinct abort reasons per cause so the two are never confused again.
+# ---------------------------------------------------------------------------
+_leg_preflight() {
+  local target="$1"
+  local pf_script="${REPO_DIR}/../ytf-preflight.sh"
+  [ -f "$pf_script" ] || pf_script="${YTF_PREFLIGHT:-}"
+  if [ -z "$pf_script" ] || [ ! -f "$pf_script" ]; then
+    _warn "leg pre-flight script not found — proceeding WITHOUT an auth proof (YSG-RISK-207)."
+    _warn "  Set YTF_PREFLIGHT=/path/to/ytf-preflight.sh to enforce it."
+    return 0
+  fi
+  YTF_TARGET="$target" YTF_SECRETS_DIR="${YTF_SECRETS_DIR:-}" bash "$pf_script" || {
+    _fail "leg pre-flight FAILED — refusing to generate evidence against an unusable target"
+    return 1
+  }
+}
+
+# ---------------------------------------------------------------------------
+# _assert_executed — YSG-RISK-206 gate (2026-08-07)
+#
+# pytest exits 0 when EVERY test skips, so "everything skipped" and "everything
+# passed" were the same signal to this runner. Tier-C reported
+# "PASS / All requested tiers GREEN" on 41 collected / 41 skipped / 0 EXECUTED,
+# against a live, healthy stack. Tier-C is the tier carrying lifecycle,
+# failure-injection, egress ring-fence, prompt-injection, audit integrity,
+# data-plane byte-proof and multi-tenant licensing — a leg could be declared
+# GREEN having verified none of them.
+#
+# Ava A1 / Lu L1: absence of an artefact is SKIPPED, never PASS. A tier that
+# executed nothing is not GREEN; it is NOT RUN, which gates treat as FAIL.
+#
+# Usage: _assert_executed <junit.xml> <label>   -> 0 if it genuinely ran
+# ---------------------------------------------------------------------------
+_assert_executed() {
+  local xml="$1" label="$2"
+  [ -f "$xml" ] || { _fail "${label}: no junit XML at ${xml} — cannot prove anything ran"; return 1; }
+  local tests skipped errors failures executed
+  tests=$(grep -o 'tests="[0-9]*"'    "$xml" | head -1 | tr -dc '0-9'); tests=${tests:-0}
+  skipped=$(grep -o 'skipped="[0-9]*"' "$xml" | head -1 | tr -dc '0-9'); skipped=${skipped:-0}
+  errors=$(grep -o 'errors="[0-9]*"'   "$xml" | head -1 | tr -dc '0-9'); errors=${errors:-0}
+  failures=$(grep -o 'failures="[0-9]*"' "$xml" | head -1 | tr -dc '0-9'); failures=${failures:-0}
+  executed=$(( tests - skipped ))
+  printf "  ....  %s: collected=%s executed=%s skipped=%s failed=%s errors=%s\n" \
+    "$label" "$tests" "$executed" "$skipped" "$failures" "$errors"
+  if [ "$executed" -le 0 ]; then
+    _fail "${label}: 0 tests EXECUTED (${skipped} skipped) — NOT RUN, not GREEN (YSG-RISK-206)"
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Tier-A — in-process, matrix-invariant. Runs ONCE regardless of runtime/
 # platform/version legs requested — the result applies to every leg in
@@ -142,6 +212,7 @@ run_tier_a() {
     -q --tb=short --junitxml="${evidence_dir}/pytest-junit.xml" \
     | tee "${evidence_dir}/pytest.log" || rc=1
 
+  _assert_executed "${evidence_dir}/pytest-junit.xml" "Tier-A pytest" || rc=1
   if [ "$rc" -eq 0 ]; then _pass "tests/conformance + tests/security"; else _fail "tests/conformance + tests/security (see ${evidence_dir}/pytest.log)"; fi
 
   _info "opa test: policy/ (in-process rego unit tests for every live-loaded template + system policy)"
@@ -176,10 +247,21 @@ run_tier_b() {
   local rc=0
 
   local modes=()
+  # YTF §2 hard requirement: "Headed AND headless, both. A leg's WebUI Tier-B
+  # cell is not GREEN until BOTH modes pass." Nothing previously enforced that —
+  # a leg run with --browser-mode headless produced an exit code that looked
+  # identical to a full two-mode run, and one was declared on that basis this
+  # campaign. Single-mode runs are still allowed (useful for triage) but they can
+  # no longer report GREEN: the leg is marked INCOMPLETE and the runner exits
+  # non-zero, so a gate cannot mistake partial coverage for a pass.
+  # (The "rig cannot do headed" belief that motivated single-mode runs was false:
+  # xvfb-run works — 8 headed navigations in 0.7s, then a full 494-test headed
+  # sweep in 3h03 with 110 errors, identical to headless.)
+  local mode_coverage_incomplete=0
   case "$BROWSER_MODE" in
     both) modes=(headed headless) ;;
-    headed) modes=(headed) ;;
-    headless) modes=(headless) ;;
+    headed) modes=(headed); mode_coverage_incomplete=1 ;;
+    headless) modes=(headless); mode_coverage_incomplete=1 ;;
   esac
 
   for mode in "${modes[@]}"; do
@@ -202,6 +284,8 @@ run_tier_b() {
       -q --tb=short \
       --junitxml="${evidence_dir}/pytest-junit-${mode}.xml" \
       | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=1
+    # YSG-RISK-206: a mode that executed nothing is NOT RUN, not GREEN.
+    _assert_executed "${evidence_dir}/pytest-junit-${mode}.xml" "Tier-B ${mode} (leg ${leg})" || mode_rc=1
     if [ "$mode_rc" -eq 0 ]; then _pass "Playwright ${mode} — leg ${leg}"; else _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log)"; rc=1; fi
   done
 
@@ -213,6 +297,12 @@ run_tier_b() {
     rc=1
   fi
 
+  if [ "$mode_coverage_incomplete" -eq 1 ]; then
+    _fail "Tier-B leg ${leg}: browser-mode coverage INCOMPLETE (ran '${BROWSER_MODE}' only)."
+    _fail "  YTF §2: a leg's WebUI cell is not GREEN until BOTH headed and headless pass."
+    _fail "  Headed is runnable here — wrap the runner in: xvfb-run -a --server-args=\"-screen 0 1920x1080x24\""
+    rc=1
+  fi
   printf "\nTier-B evidence (leg %s): %s\n" "$leg" "$evidence_dir"
   return "$rc"
 }
@@ -242,6 +332,7 @@ run_tier_c() {
     -q --tb=short --junitxml="${evidence_dir}/pytest-junit.xml" \
     | tee "${evidence_dir}/pytest.log" || rc=1
 
+  _assert_executed "${evidence_dir}/pytest-junit.xml" "Tier-C pytest (leg ${leg})" || rc=1
   if [ "$rc" -eq 0 ]; then _pass "src/tests/e2e + tests/integration_live — leg ${leg}"; else _fail "src/tests/e2e + tests/integration_live — leg ${leg} (see ${evidence_dir}/pytest.log)"; fi
   printf "\nTier-C evidence (leg %s): %s\n" "$leg" "$evidence_dir"
   return "$rc"
