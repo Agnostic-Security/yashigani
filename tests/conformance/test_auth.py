@@ -1583,11 +1583,23 @@ class TestWebauthnCredentialsDelete:
     def test_unauth_401(self, unauth_client):
         assert unauth_client.delete("/admin/settings/webauthn/credentials/abc").status_code == 401
 
-    def test_default_503(self, admin_client):
-        assert admin_client.delete("/admin/settings/webauthn/credentials/abc").status_code == 503
+    def test_plain_admin_session_is_rejected_without_stepup(self, admin_client):
+        """YSG-RISK-201: the legacy delete route took a plain AdminSession while
+        the hardened v1 route required step-up, so a hijacked-but-not-step-upped
+        admin session could strip a target's passkeys (ASVS V6.8.4). Now
+        StepUpAdminSession. This test previously asserted 503 here — i.e. it
+        asserted that a plain admin session REACHED the handler, which was the
+        vulnerability. It now pins the fix."""
+        r = admin_client.delete("/admin/settings/webauthn/credentials/abc")
+        assert r.status_code in (401, 403), (
+            f"legacy webauthn revoke reachable without step-up: {r.status_code}"
+        )
 
-    def test_with_legacy_service_not_found_404(self, admin_client, legacy_webauthn_service):
-        r = admin_client.delete("/admin/settings/webauthn/credentials/does-not-exist")
+    def test_default_503(self, stepup_admin_client):
+        assert stepup_admin_client.delete("/admin/settings/webauthn/credentials/abc").status_code == 503
+
+    def test_with_legacy_service_not_found_404(self, stepup_admin_client, legacy_webauthn_service):
+        r = stepup_admin_client.delete("/admin/settings/webauthn/credentials/does-not-exist")
         assert r.status_code == 404
         assert r.json()["detail"]["error"] == "credential_not_found"
 
