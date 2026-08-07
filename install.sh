@@ -3157,15 +3157,45 @@ _is_existing_yashigani_running() {
   # Label filter: works even without compose CLI installed.
   # Multi-instance (3.0): scope the label filter to THIS install's project, not a
   # hardcoded "docker" — otherwise a 2nd named instance false-matches the first.
-  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
-  if docker ps --filter "label=com.docker.compose.project=${_proj}" \
-       --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    return 0
+  # YSG-RISK-204 (fixed 2026-08-07). This resolved COMPOSE_PROJECT_NAME with a
+  # "docker" fallback, but check_installer_preflight() (install.sh:19551) runs
+  # BEFORE `export COMPOSE_PROJECT_NAME="$PROJECT"` (install.sh:19590). So on any
+  # install whose project is DERIVED from --domain (i.e. every multi-instance and
+  # every non-default-domain deployment), _proj was literally "docker" here, the
+  # label filter matched nothing, this function returned 1, and BUG-B+-001's
+  # --skip-ports carve-out never fired — making `install.sh --upgrade` fail its own
+  # preflight on the ports its own running deployment was holding.
+  #
+  # Fix: resolve the project the same way the rest of the installer does
+  # (COMPOSE_PROJECT_NAME -> PROJECT -> the tree's own .env), and additionally match
+  # on the compose working_dir label, which identifies THIS install tree
+  # unambiguously regardless of project naming.
+  local _proj="${COMPOSE_PROJECT_NAME:-${PROJECT:-}}"
+  if [[ -z "$_proj" && -f "${WORK_DIR}/docker/.env" ]]; then
+    _proj="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2-)"
   fi
-  if podman ps --filter "label=io.podman.compose.project=${_proj}" \
-       --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    return 0
-  fi
+  _proj="${_proj:-docker}"
+
+  local _rt
+  for _rt in docker podman; do
+    command -v "$_rt" >/dev/null 2>&1 || continue
+    # Project label — docker compose and podman-compose both emit the
+    # com.docker.compose.* set; podman-compose additionally emits io.podman.*.
+    if "$_rt" ps --filter "label=com.docker.compose.project=${_proj}" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    if "$_rt" ps --filter "label=io.podman.compose.project=${_proj}" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    # Working-dir label — project-name-independent, so it still identifies this
+    # tree's stack when the project has not been resolved yet.
+    if "$_rt" ps --filter "label=com.docker.compose.project.working_dir=${WORK_DIR}/docker" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  done
   # Compose ps fallback (slower — requires parsing the compose file)
   if docker compose -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
     return 0
@@ -8583,7 +8613,31 @@ _ysg_assemble_compose_files() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# _release_install_lock — YSG-RISK-203 (2026-08-07)
+#
+# The install lock must NOT survive into the container runtime's long-lived
+# daemons. Rootless podman starts slirp4netns / aardvark-dns / rootlessport as
+# children of the compose invocation; any fd still open here is inherited by
+# them and held for the lifetime of the STACK, not the install. That made
+# `flock -n` fail forever and `install.sh --upgrade` unusable on any host with a
+# running podman stack (verified with lsof hours after a completed install).
+#
+# Called immediately before compose hand-off. The critical section the lock
+# actually protects (secret generation, PKI, state-file writes) is already done
+# by then.
+# ---------------------------------------------------------------------------
+_release_install_lock() {
+  if [[ -n "${YSG_INSTALL_LOCK_FD:-}" ]]; then
+    flock -u "$YSG_INSTALL_LOCK_FD" 2>/dev/null || true
+    exec {YSG_INSTALL_LOCK_FD}>&- 2>/dev/null || true
+    unset YSG_INSTALL_LOCK_FD
+    log_info "Install lock released before container hand-off (YSG-RISK-203)."
+  fi
+}
+
 compose_up() {
+  _release_install_lock
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
 
@@ -19290,9 +19344,30 @@ main() {
     local _lockdir="/run/lock"; [[ -w "$_lockdir" ]] || _lockdir="${YSG_INSTALL_DIR:-$HOME}"
     local _lockfile="${_lockdir}/yashigani-install.lock"
     local _lock_fd
-    # {_lock_fd} auto-assigns a high fd WITH FD_CLOEXEC — children never inherit it.
-    # Held for the lifetime of this process; released on exit (or exec).
-    if exec {_lock_fd}>"$_lockfile" 2>/dev/null; then
+    # YSG-RISK-203 (fixed 2026-08-07). TWO bugs lived on the next line, one hiding
+    # the other:
+    #
+    #  (1) `exec {_lock_fd}>"$_lockfile" 2>/dev/null` has NO command word, so ALL of
+    #      its redirections — including `2>/dev/null` — were applied to the SHELL,
+    #      permanently. That discarded every stderr diagnostic in the remaining
+    #      ~4,000 lines of this script. Measured cost: three separate failures in one
+    #      campaign (inherited lock fd, preflight port check, podman runtime
+    #      unreachable) each presenting as a bare `exit 1` with no output, each
+    #      needing a different excavation technique to recover the real message.
+    #      Repro: bash -c 'exec {fd}>/x.lock 2>/dev/null; echo hi >&2; ls /nope'
+    #      -> prints nothing.
+    #      Fix: scope the suppression to a subshell probe; never redirect the shell.
+    #
+    #  (2) The comment below claimed "children never inherit it". They do. `lsof` on
+    #      a box where the install finished HOURS earlier showed slirp4netns,
+    #      aardvark-dns and rootlessport — the long-lived rootless-podman network
+    #      daemons this installer itself starts — all holding the lock fd, so
+    #      `flock -n` failed for the lifetime of the stack and `--upgrade` could
+    #      never run again. Fix: close the fd before handing off to compose (see
+    #      _release_install_lock below), so the lock covers the critical section
+    #      rather than the process lifetime.
+    if ( exec {_lock_fd}>"$_lockfile" ) 2>/dev/null && exec {_lock_fd}>"$_lockfile"; then
+      YSG_INSTALL_LOCK_FD="$_lock_fd"
       if ! flock -n "$_lock_fd"; then
         log_error "Another Yashigani install/uninstall already holds the lock:"
         log_error "  ${_lockfile}"
