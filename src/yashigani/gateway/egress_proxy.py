@@ -167,6 +167,81 @@ def configure(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# _inspectable_payload — YSG-RISK-200 (2026-08-07)
+#
+# The egress inspector scanned the WHOLE transport envelope. Every
+# OpenAI-compatible response carries a random correlation id (`chatcmpl-<hex>`),
+# and `entropy_blob` fires on it once the drawn characters push Shannon entropy
+# past the floor. Measured false-positive rate on synthetic ids: 10.2% at 12 hex,
+# 30.8% at 17, 79.8% at uuid length. The consequence was a per-request coin flip:
+# `pii_detected` -> result_sensitivity=RESTRICTED -> OPA deny
+# `pii_detected_in_result` -> the agent's LLM backend 403s -> 500 -> gateway
+# reports 502 `agent_unreachable`. That presented as flaky networking and outran
+# three campaigns; `@letta` (uuid-style ids) failed 3/3 while `@agent_langflow`
+# (short ids) mostly worked.
+#
+# Fix: inspect what a human wrote or a model produced — message content — not the
+# structural envelope the transport generated. Structural identifiers, timestamps
+# and token counters carry no user data by construction, so excluding them cannot
+# lose a real secret; a secret that appears ONLY in a `chatcmpl-` id and nowhere in
+# any content field is not a data path that exists.
+#
+# Deliberately NOT done: raising the entropy threshold. That would weaken real
+# secret detection everywhere to paper over one field. Nor a fourth per-shape
+# guard — YSG-RISK-173 already added three (slash-enumeration, word-check,
+# reassembly windowing) and this is the second shape to slip past them in one
+# release; guarding shapes one at a time does not converge.
+#
+# Fail-closed: anything that is not a recognisable envelope is scanned whole.
+# ---------------------------------------------------------------------------
+_ENVELOPE_STRUCTURAL_KEYS = frozenset({
+    "id", "object", "created", "model", "system_fingerprint", "request_id",
+    "trace_id", "span_id", "index", "finish_reason", "usage", "logprobs",
+    "prompt_tokens", "completion_tokens", "total_tokens", "role", "type",
+})
+
+
+def _inspectable_payload(body_text: str) -> str:
+    """Return the user/model-authored text from an OpenAI-shaped body.
+
+    Falls back to the full body whenever the shape is not recognised, so an
+    unexpected payload is never inspected LESS than before this change.
+    """
+    if not body_text:
+        return body_text
+    try:
+        import json as _json
+
+        doc = _json.loads(body_text)
+    except Exception:
+        return body_text
+    if not isinstance(doc, (dict, list)):
+        return body_text
+
+    parts: list[str] = []
+
+    def _walk(node: object, key: "str | None" = None) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _walk(v, k)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v, key)
+        elif isinstance(node, str):
+            # Structural envelope fields are transport metadata, not content.
+            if key in _ENVELOPE_STRUCTURAL_KEYS:
+                return
+            parts.append(node)
+
+    _walk(doc)
+    if not parts:
+        # Nothing content-shaped found — inspect the original rather than
+        # silently inspecting nothing.
+        return body_text
+    return "\n".join(parts)
+
+
 @router.api_route(
     "/egress/eval/{prefix}/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
@@ -272,7 +347,7 @@ async def egress_eval(
     injection_detected: bool = False
 
     try:
-        secret_verdict = scan_secrets(body_text)
+        secret_verdict = scan_secrets(_inspectable_payload(body_text))
         pii_detected = bool(secret_verdict.is_secret)
     except Exception as exc:
         logger.error("egress-eval: secret_detector failed: %s — treating as PII", exc)
