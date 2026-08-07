@@ -235,6 +235,121 @@ class TestCapPolSave:
 
 
 # ---------------------------------------------------------------------------
+# PW-CAP-04b: Regression tests, Tom fix/v412-tom-210-211
+#
+# YSG-RISK-210 (lost-update race) and FIND-0805-003 (dead success badge) were
+# both fixed in capability-policy.js (_fetchScope() no longer unconditionally
+# overwrites `_rows` from server data, and no longer nulls `_result`). These
+# two tests pin the fixed behaviour down directly rather than relying on
+# real network timing (Ava's 2026-08-03 triage on test_save_org_policy_
+# camera_off notes the real race is too timing-sensitive to hit reliably via
+# Playwright's own action queue -- that's why THAT test no longer tries to
+# trigger it). Here we get a deterministic repro of the exact race window by
+# holding the capability-policy GET open with page.route() and editing while
+# it's held, instead of racing real timing.
+#
+# NOTE: at authoring time (2026-08-07) these will FAIL against the currently
+# deployed backoffice image -- confirmed live, see
+# Compliance/yashigani/4.1.2/prepush-review-20260807/tom-fix-210-211.md.
+# There is no bind-mount of static/ into the backoffice container (image:
+# yashigani/backoffice:${YASHIGANI_VERSION}, built, not volume-mounted), so
+# the fix in this branch only lands in the running stack on the next image
+# rebuild. That is expected and is NOT this test being wrong -- do not
+# "repair" it to pass against the stale image.
+# ---------------------------------------------------------------------------
+
+class TestCapPolLostUpdateRaceRegression:
+    def test_inflight_edit_not_silently_discarded(self, cap_page):
+        """
+        YSG-RISK-210 regression. Prior art: filed 2026-08-06 from Ava's
+        2026-08-03 in-file triage above (test_save_org_policy_camera_off);
+        root cause was `_fetchScope()`'s completion unconditionally
+        overwriting `this._rows` from server data, live-confirmed two
+        independent ways (Playwright select_option() and a raw DOM
+        dispatchEvent bypassing Playwright entirely).
+
+        Repro: hold the org-scope GET open (page.route), trigger a fresh
+        fetch cycle (#cap-scope-load -> _onLoadScope -> _fetchScope), edit
+        camera to 'off' WHILE the GET is held, then release it. Before the
+        fix this always silently reverted camera back to 'self' with no
+        error. After the fix the edit must survive and the UI must say so
+        (Silent data loss is the defect -- if an edit is ever dropped, the
+        user has to be told; this fix instead never drops it, see
+        capability-policy.js _fetchScope()).
+        """
+        held = {}
+
+        def _hold(route):
+            held["route"] = route  # deliberately do not fulfil/continue yet
+
+        cap_page.route("**/admin/api/capability-policy", _hold)
+        try:
+            # route.continue_() only releases the request; the actual network
+            # round trip to the real backend still has to complete before the
+            # component's `await this.api.get(...)` resolves and its
+            # continuation (the clobber, pre-fix) runs. Wrap the click+release
+            # in expect_response() so we synchronise on the REAL response
+            # landing, not a fixed sleep -- a fixed sleep here would risk a
+            # false pass (checking before the old buggy continuation had even
+            # run yet, not because it was fixed).
+            with cap_page.expect_response("**/admin/api/capability-policy", timeout=15000):
+                cap_page.click("#cap-scope-load")
+                for _ in range(50):
+                    if "route" in held:
+                        break
+                    cap_page.wait_for_timeout(20)
+                assert "route" in held, "Expected capability-policy GET to be intercepted"
+
+                # Edit lands while the fetch is still in flight.
+                cap_page.select_option(".cap-val-sel[data-cap='camera']", "off")
+
+                # Now let the (stale, camera='self') server response through.
+                held["route"].continue_()
+        finally:
+            cap_page.unroute("**/admin/api/capability-policy")
+
+        # One extra tick for Lit's microtask-batched re-render to flush.
+        cap_page.wait_for_timeout(300)
+        value = cap_page.locator(".cap-val-sel[data-cap='camera']").input_value()
+        assert value == "off", (
+            f"YSG-RISK-210 regression: in-flight edit was silently discarded "
+            f"(camera reverted to {value!r} instead of staying 'off')"
+        )
+
+        # Restore camera to 'self' so subsequent tests aren't affected. Not
+        # asserted on the badge -- that's FIND-0805-003's own test's job, and
+        # coupling this cleanup to it would mask this test's own result if
+        # only one of the two fixes were present.
+        cap_page.select_option(".cap-val-sel[data-cap='camera']", "self")
+        cap_page.click("#cap-pol-save")
+        cap_page.wait_for_timeout(500)
+
+
+class TestCapPolSaveBadgeRegression:
+    def test_save_shows_saved_text_not_dead_badge(self, cap_page):
+        """
+        FIND-0805-003 regression: `_save()` used to set `_result` to the
+        success message, then immediately call `_fetchScope()`, which
+        unconditionally nulled `_result` again in the same Lit update batch
+        -- "Saved." could never paint. Stricter than PW-CAP-04's `len(...)
+        > 0` check: pins the exact green "Saved." badge, not just "some
+        badge text appeared" (which a red error badge would also satisfy).
+        """
+        cap_page.select_option(".cap-val-sel[data-cap='camera']", "off")
+        cap_page.click("#cap-pol-save")
+        cap_page.wait_for_selector(".ys-badge-green:has-text('Saved.')", timeout=8000)
+        assert cap_page.locator(".ys-badge-green:has-text('Saved.')").count() >= 1, (
+            "FIND-0805-003 regression: 'Saved.' badge did not render after a "
+            "successful save"
+        )
+
+        # Restore camera to 'self' so subsequent tests aren't affected.
+        cap_page.select_option(".cap-val-sel[data-cap='camera']", "self")
+        cap_page.click("#cap-pol-save")
+        cap_page.wait_for_selector(".ys-badge", timeout=8000)
+
+
+# ---------------------------------------------------------------------------
 # PW-CAP-05: Allow-list origin validation (scoped to the camera row —
 # always tbody tr:nth(0), see _camera_row())
 # ---------------------------------------------------------------------------
