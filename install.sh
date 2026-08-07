@@ -8648,6 +8648,14 @@ _ysg_assemble_compose_files() {
         YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal")
         log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
       fi
+      # FIND-DEMO-MCP-AMD64-ON-ARM64: on Apple Silicon, force demo-mcp to build
+      # native-arm64 instead of consuming the prebuilt amd64 image (which runs
+      # under Rosetta2/QEMU — a Docker Desktop crash aggravator, 2026-08-07).
+      local _demo_mcp_native="${WORK_DIR}/docker/docker-compose.demo-mcp-native.yml"
+      if [[ -f "$_demo_mcp_native" ]] && [[ "$(uname -m)" == "arm64" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_demo_mcp_native")
+        log_info "Applying Apple-Silicon demo-mcp native-arm64 build overlay (docker-compose.demo-mcp-native.yml) — avoids amd64/Rosetta emulation (FIND-DEMO-MCP-AMD64-ON-ARM64)"
+      fi
     else
       local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
       if [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then

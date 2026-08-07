@@ -1,0 +1,35 @@
+# docker-compose.demo-mcp-native.yml
+# ---------------------------------------------------------------------------
+# Apple Silicon (arm64) override for the demo-mcp upstream.
+#
+# WHY: the prebuilt `yashigani/demo-mcp:3.0.0` image shipped as linux/amd64. On an
+# Apple-Silicon Mac (M-series, arm64) that runs under Rosetta 2 / QEMU emulation
+# inside Docker Desktop's VM. Forensics on the 2026-08-07 Docker Desktop crashes
+# (findings-ledger.md: FIND-DEMO-MCP-AMD64-ON-ARM64) flagged this emulated
+# container as an aggravator alongside the 100%-RAM VM allocation.
+#
+# Dockerfile.demo-mcp is already multi-arch (python-amd64 / python-arm64 stages,
+# FROM python-${TARGETARCH}); this override just forces a LOCAL native build for
+# the host architecture instead of consuming the prebuilt amd64 image:
+#   - pull_policy: build  -> always build locally, never use a prebuilt image
+#   - platform + TARGETARCH: linux/arm64 -> unambiguous arm64 on Apple Silicon
+#
+# USAGE: layer AFTER the base compose + the mac-metal override, e.g.
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.gpu-mac-metal.yml \
+#                  -f docker/docker-compose.demo-mcp-native.yml \
+#                  --profile demo-mcp up -d --build
+# (install.sh: include this file in the Mac compose-file list.)
+#
+# Non-Mac / amd64 hosts: do NOT layer this file — the base compose is correct
+# there. This is the Apple-Silicon "local architecture" build (Tiago 2026-08-07).
+
+services:
+  demo-mcp:
+    pull_policy: build
+    platform: linux/arm64
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.demo-mcp
+      args:
+        TARGETARCH: arm64
