@@ -5224,7 +5224,7 @@ check_existing_installation() {
       _backup_existing_data
       log_info "Fresh install: stopping existing containers..."
       local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-      "${COMPOSE_CMD[@]}" -f "$compose_file" down -v 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" -f "$compose_file" down -v 2>/dev/null || true
       log_success "Previous deployment stopped and volumes removed"
       ;;
     3|*)
@@ -6292,7 +6292,7 @@ except Exception:
         _bo_ok=$(docker image inspect yashigani/backoffice:latest >/dev/null 2>&1 && echo yes || echo no)
         if [[ "$_gw_ok" == "no" || "$_bo_ok" == "no" ]]; then
           log_warn "--skip-pull + Docker: gateway/backoffice absent — building from source"
-          "${COMPOSE_CMD[@]}" -f "${WORK_DIR}/docker/docker-compose.yml" build gateway backoffice || {
+          _compose "${COMPOSE_CMD[@]}" -f "${WORK_DIR}/docker/docker-compose.yml" build gateway backoffice || {
             log_error "Build failed — cannot continue with --skip-pull and missing images"
             exit 1
           }
@@ -6503,9 +6503,9 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
     fi
   else
     log_info "Pulling remote container images..."
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-buildable 2>/dev/null || \
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-pull-failures 2>/dev/null || \
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-buildable 2>/dev/null || \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-pull-failures 2>/dev/null || \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull 2>/dev/null || true
     log_success "Container images ready"
   fi
 }
@@ -8614,25 +8614,30 @@ _ysg_assemble_compose_files() {
 }
 
 # ---------------------------------------------------------------------------
-# _release_install_lock — YSG-RISK-203 (2026-08-07)
+# _compose — YSG-RISK-203b (2026-08-07, after pre-push review)
 #
-# The install lock must NOT survive into the container runtime's long-lived
-# daemons. Rootless podman starts slirp4netns / aardvark-dns / rootlessport as
-# children of the compose invocation; any fd still open here is inherited by
-# them and held for the lifetime of the STACK, not the install. That made
-# `flock -n` fail forever and `install.sh --upgrade` unusable on any host with a
-# running podman stack (verified with lsof hours after a completed install).
+# Runs a compose command with the install-lock fd CLOSED for that command only.
 #
-# Called immediately before compose hand-off. The critical section the lock
-# actually protects (secret generation, PKI, state-file writes) is already done
-# by then.
+# Why not "release the lock before compose": three reviewers converged on the
+# same objection, and the code proves them right. compose_up() interleaves
+# container starts with secret/PKI work — `up -d postgres` at ~9438, then
+# postgres cert injection and chowns at ~9454-9499, then the real
+# `up -d --remove-orphans` at ~9672. There is therefore NO placement that both
+# (a) precedes every container start and (b) follows every secret/PKI write.
+# Any release point leaves one of the two unprotected.
+#
+# So the lock stays held for the whole install — the critical section is fully
+# covered — and the fd is closed per-command for compose invocations only, so
+# rootless podman's slirp4netns / aardvark-dns / rootlessport cannot inherit it
+# and pin it for the lifetime of the stack. (Confirmed by Su: bash 5.2's
+# {var}> assignment does NOT set FD_CLOEXEC, so a child does inherit it —
+# validating the original diagnosis while invalidating the original fix.)
 # ---------------------------------------------------------------------------
-_release_install_lock() {
+_compose() {
   if [[ -n "${YSG_INSTALL_LOCK_FD:-}" ]]; then
-    flock -u "$YSG_INSTALL_LOCK_FD" 2>/dev/null || true
-    exec {YSG_INSTALL_LOCK_FD}>&- 2>/dev/null || true
-    unset YSG_INSTALL_LOCK_FD
-    log_info "Install lock released before container hand-off (YSG-RISK-203)."
+    "$@" {YSG_INSTALL_LOCK_FD}>&-
+  else
+    "$@"
   fi
 }
 
@@ -9402,7 +9407,7 @@ compose_up() {
   # Clean up any stale containers/networks from failed previous runs.
   # NEVER use -v (--volumes) — that destroys user data (Postgres, Redis, audit logs).
   log_info "Stopping any existing containers (preserving data volumes)..."
-  "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} down 2>/dev/null || true
+  _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} down 2>/dev/null || true
 
   if [[ "$UPGRADE" == "true" ]]; then
     # V232-SMOKE-004 (2026-05-03): podman-compose 1.5.x implements depends_on
@@ -9424,18 +9429,7 @@ compose_up() {
     # only applies to the Podman path.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       log_info "Upgrade + Podman: pre-starting postgres for SSL injection (V232-SMOKE-004)..."
-      # YSG-RISK-203b (Laura pre-push review, 2026-08-07): release the install
-      # lock HERE — immediately before the first container start — not at the top
-      # of compose_up(). The first version released it on entry, but this same
-      # function then performs the secrets_dir stale-install wipe, the chown to
-      # 1001 and the placeholder-secret writes (#ROOTLESS-5 block, ~9179-9339)
-      # BEFORE any container starts. Releasing on entry therefore reopened a
-      # concurrent-install race against secrets/PKI writes — the exact critical
-      # section the lock exists to protect. The commit rationale ("secret
-      # gen/PKI/state writes already done by then") was contradicted by the code
-      # in its own function body.
-      _release_install_lock
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
       # Wait up to 60s for postgres to accept connections.
       local _pg_ready=0 _pg_i
       for _pg_i in $(seq 1 30); do
@@ -9524,7 +9518,7 @@ compose_up() {
         rm -f "$_tmp_bundle"
 
         # chown + chmod the copied files to postgres:postgres (UID 70 in pgvector image)
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 chown postgres:postgres \"\$PGDATA/server.crt\" \"\$PGDATA/server.key\" \"\$PGDATA/root.crt\"
@@ -9539,7 +9533,7 @@ echo '[postgres-ssl-upgrade] certs injected via podman cp + chown'
         # Append ssl settings + pg_hba.conf + restart postgres
         # (same steps 2-4 from _upgrade_postgres_ssl, but skipping step 1 since
         # we already placed the certs in PGDATA via podman cp above)
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 if grep -q '^ssl = on' \"\$PGDATA/postgresql.conf\" 2>/dev/null; then
@@ -9550,7 +9544,7 @@ printf \"\n# Yashigani internal mTLS (added by install.sh --upgrade)\nssl = on\n
 echo '[postgres-ssl-upgrade] ssl settings appended to postgresql.conf'
 " 2>&1 || { log_error "postgresql.conf update failed"; return 1; }
 
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 cat > \"\$PGDATA/pg_hba.conf\" << 'HBAEOF'
@@ -9569,7 +9563,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 " 2>&1 || { log_error "pg_hba.conf update failed"; return 1; }
 
         log_info "  Restarting postgres to activate SSL config (cp path)..."
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" restart postgres 2>&1 || true
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" restart postgres 2>&1 || true
         # Wait for postgres to come back with SSL on
         local _ssl_ok=0 _ssl_i
         for _ssl_i in $(seq 1 30); do
@@ -9593,7 +9587,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
                     "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
         if [[ -n "$_pg_pass" ]]; then
-          "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
+          _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
               psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
               -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>/dev/null || true
           log_info "  SCRAM re-hash applied (cp path)"
@@ -9669,7 +9663,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose")"
     fi
-    "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
+    _compose "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
     # Clean up temp compose file if it was created
     if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose:-}" 2>/dev/null || true
@@ -9714,7 +9708,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
     fi
-    "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
+    _compose "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
     if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
     fi
@@ -9976,7 +9970,7 @@ _verify_gateway_healthz() {
       _sh_profile_args+=("--profile" "$_p")
     done
     log_warn "Convergence gate: gateway not healthy yet — one self-heal re-converge (YSG-RISK-084)"
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
     local _deadline_sh=$(( $(date +%s) + _timeout_s ))
     while [[ "$(date +%s)" -lt "$_deadline_sh" ]]; do
       # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
@@ -10000,9 +9994,9 @@ _verify_gateway_healthz() {
     log_error "  - Caddy TLS certificate not yet provisioned"
     log_error ""
     log_error "=== Last 50 lines: gateway logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 gateway 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 gateway 2>/dev/null || true
     log_error "=== Last 50 lines: postgres logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
     exit 1
   fi
 
@@ -10030,9 +10024,9 @@ _verify_gateway_healthz() {
     log_error "Convergence gate FAILED: backoffice /login did not return 200 within ${_timeout_s}s"
     log_error "Backoffice may have failed to connect to the database."
     log_error "=== Last 50 lines: backoffice logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 backoffice 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 backoffice 2>/dev/null || true
     log_error "=== Last 50 lines: postgres logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
     exit 1
   fi
 
@@ -10549,7 +10543,7 @@ _upgrade_postgres_ssl() {
   log_info "  PGDATA: ${_pgdata_path}"
 
   # Step 1: Install server cert + key into PGDATA.
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt \"\$PGDATA/server.crt\"
@@ -10565,7 +10559,7 @@ echo '[postgres-ssl-upgrade] Server cert + trust bundle installed'
   }
 
   # Step 2: Append ssl settings to postgresql.conf (only if not already present).
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 if grep -q '^ssl = on' \"\$PGDATA/postgresql.conf\" 2>/dev/null; then
@@ -10580,7 +10574,7 @@ echo '[postgres-ssl-upgrade] ssl settings appended to postgresql.conf'
   }
 
   # Step 3: Overwrite pg_hba.conf to require TLS + clientcert (same as 05-enable-ssl.sh).
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 cat > \"\$PGDATA/pg_hba.conf\" << 'HBAEOF'
@@ -10608,7 +10602,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 
   # Step 4: Restart postgres to pick up new config.
   log_info "  Restarting postgres to activate SSL config..."
-  "${COMPOSE_CMD[@]}" -f "$compose_file" restart postgres 2>&1 || {
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" restart postgres 2>&1 || {
     log_error "postgres SSL upgrade: failed to restart postgres"
     return 1
   }
@@ -10643,7 +10637,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   if [[ -z "$_pg_pass" ]]; then
     log_warn "postgres SSL upgrade: could not read postgres_password — skipping SCRAM re-hash"
   else
-    "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
         psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
         -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>&1 || {
       log_warn "postgres SSL upgrade: SCRAM re-hash failed — pgbouncer auth may fail"
@@ -10686,7 +10680,7 @@ bootstrap_postgres() {
   done
 
   # Run Alembic migrations + seed data via the backoffice container
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T backoffice python -m alembic upgrade head 2>&1 || {
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T backoffice python -m alembic upgrade head 2>&1 || {
     log_warn "Alembic migrations failed — database may already be bootstrapped"
   }
 
@@ -11032,7 +11026,7 @@ for r in results:
     log_info "Restarting agent containers with new tokens..."
     for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
       [[ -z "$_profile" ]] && continue
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" --profile "$_profile" restart "$_profile" 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" --profile "$_profile" restart "$_profile" 2>/dev/null || true
     done
     log_success "Agent bundle registration complete"
 
@@ -18963,7 +18957,7 @@ PYREPLACE
           log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
           if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
             local _gw_up_rc=0
-            "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
+            _compose "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
             if [[ "$_gw_up_rc" -ne 0 ]]; then
               log_error "Gateway recreate failed (exit ${_gw_up_rc})."
               log_error "  The YASHIGANI_MCP_SERVERS env change requires a gateway restart to take effect."
