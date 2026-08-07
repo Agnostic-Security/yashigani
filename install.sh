@@ -8979,12 +8979,19 @@ _ysg_verify_inference_backend_effect() {
     return 0
   fi
 
-  if [[ "$_lib" == "cuda" ]]; then
-    log_success "Inference-backend effect check: ollama reports library=cuda — GPU acceleration confirmed live"
+  # Case-insensitive: ollama emits `library=CUDA` (uppercase) on 0.23.x, while
+  # earlier builds emitted `cuda`. The first version of this check compared
+  # case-sensitively and FAILED a correctly GPU-accelerated install — the live
+  # line was `library=CUDA compute=8.6 name=CUDA0 ... RTX 3060`, i.e. the very
+  # state the check exists to confirm. Fail-closed was the right default, but a
+  # check that rejects the healthy case is a false alarm, not a guard.
+  local _lib_lc="${_lib,,}"
+  if [[ "$_lib_lc" == "cuda" || "$_lib_lc" == rocm* || "$_lib_lc" == "vulkan" || "$_lib_lc" == "metal" ]]; then
+    log_success "Inference-backend effect check: ollama reports library=${_lib} — GPU acceleration confirmed live"
     return 0
   fi
 
-  log_error "YSG-RISK-205 inference-backend effect check FAILED: GPU detected (${YSG_GPU_TYPE}) but ollama reports library=${_lib} (expected cuda) — running WITHOUT GPU acceleration despite an apparently-green install."
+  log_error "YSG-RISK-205 inference-backend effect check FAILED: GPU detected (${YSG_GPU_TYPE}) but ollama reports library=${_lib} (expected a GPU backend: cuda/rocm/vulkan/metal, case-insensitive) — running WITHOUT GPU acceleration despite an apparently-green install."
   if [[ "${YSG_ALLOW_CPU_INFERENCE:-false}" != "true" ]]; then
     log_error "Aborting: pass --allow-cpu-inference to accept this, or investigate why the GPU config did not take effect (YSG-RISK-205: container may not have been recreated)."
     return 1
