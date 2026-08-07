@@ -345,6 +345,15 @@ YASHIGANI_HOST_OLLAMA_PORT="${YASHIGANI_HOST_OLLAMA_PORT:-}"
 # The function never breaks an install — errors warn + point at the doc and continue.
 SECURE_BACKEND_FIREWALL=false
 
+# YSG-RISK-202 — mandatory-LLM-on-CPU fail-closed gate.
+# Default false: a GPU-DETECTED host (YSG_GPU_TYPE != none) whose GPU cannot be
+# PROVEN live in the inference container (CDI probe, Podman /etc/cdi shadow check,
+# or the post-deploy library=cuda effect check) FAILS the install/upgrade instead
+# of silently degrading to CPU-only ollama. See _setup_podman_cdi_gpu,
+# compose_up()'s CDI-probe branch, and _verify_inference_backend_effect().
+# --allow-cpu-inference flips this to warn-and-continue (explicit operator opt-in).
+YSG_ALLOW_CPU_INFERENCE=false
+
 # P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
 ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
 OFFBOARD_AGENT=""         # --offboard <agent-name>
@@ -504,6 +513,21 @@ OPTIONS
                        Auto-detected via lspci when native GPU drivers absent.
                        Overlay: docker-compose.gpu-vulkan.yml [untested on hardware here].
     CPU-only         — Default when no GPU detected. ollama logs library=cpu.
+  --allow-cpu-inference                   YSG-RISK-202: on a GPU-DETECTED host, the
+                                          installer FAILS CLOSED (non-zero exit) if the
+                                          GPU device cannot be proven live in the ollama
+                                          container (CDI probe fail, Podman /etc/cdi
+                                          shadow, or the inference-backend effect check
+                                          reporting library=cpu) — the mandatory LLM
+                                          layer running on CPU is a silent-degrade
+                                          product-policy violation
+                                          (project_yashigani_llm_is_mandatory), not an
+                                          acceptable default. Pass this flag to
+                                          explicitly accept CPU-only inference and let
+                                          the install proceed with a WARN instead of a
+                                          hard failure. No effect on hosts with no GPU
+                                          detected (YSG_GPU_TYPE=none) — nothing to fail
+                                          closed on.
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -901,6 +925,13 @@ parse_args() {
         # LAURA-411-001: non-interactive consent gate for inference-backend firewall.
         # In interactive mode the operator is prompted; this flag forces apply without prompt.
         SECURE_BACKEND_FIREWALL=true
+        shift
+        ;;
+      --allow-cpu-inference)
+        # YSG-RISK-202: explicit operator opt-in to accept CPU-only inference on a
+        # GPU-detected host. Without this flag, a GPU-detected host whose GPU cannot
+        # be proven live in the ollama container fails the install/upgrade closed.
+        YSG_ALLOW_CPU_INFERENCE=true
         shift
         ;;
       --help|-h)         usage; exit 0 ;;
@@ -2395,43 +2426,62 @@ _format_gpu_vram_mb() {
 # =============================================================================
 # Podman GPU CDI provisioning — no host sudo (ROOTLESS-CDI-001)
 # =============================================================================
-# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0. Podman 4.9.3 (Ubuntu)
-# hardcodes /etc/cdi as its ONLY CDI scan directory — cdi_spec_dirs in
-# containers.conf is NOT effective on this version (empirically verified: even
-# with cdi_spec_dirs pointing only to ~/.config/cdi, podman still reads /etc/cdi
-# and ignores the user dir). No /etc/cdi scan means no CDI device resolution.
+# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0.
 #
-# Two blockers from the prior broken attempt:
-#   A. The minimal 0.5.0 spec had no library mounts → ollama sees library=cpu.
-#      A working CDI spec MUST include the containerEdits that mount libcuda.so,
-#      libnvidia-ml.so etc. — what nvidia-ctk normally discovers and emits.
-#   B. /etc/cdi/nvidia.yaml was written 0600 (root-only) → rootless podman
-#      gets EACCES on the CDI registry refresh → all CDI devices unresolvable.
+# YSG-RISK-202 (2026-08-05/07 campaign) ADJUDICATED a contradiction this file used
+# to carry in two places: an early note here said podman 4.9.3 hardcodes /etc/cdi
+# as its ONLY scan directory and ignores cdi_spec_dirs; the shipping design below
+# (_setup_podman_cdi_gpu) claimed the opposite — that user-space cdi_spec_dirs
+# alone was "proven" sufficient, no /etc/cdi involvement. Both were half-right:
+# commit 4f3858d0 (2026-06-27) verified user-space cdi_spec_dirs works live on
+# 4.9.3 with NO /etc/cdi/nvidia.yaml present at all. The 2026-08 campaign then hit
+# a HOST with a STALE root-owned /etc/cdi/nvidia.yaml left over from an earlier
+# manual/older-design install, dated before an NVIDIA driver upgrade removed the
+# libcuda.so version it referenced. With that stale file present, podman 4.9.3's
+# CDI probe failed even though the correct spec existed at ~/.config/cdi/nvidia.yaml
+# and cdi_spec_dirs pointed at it. Adjudication: cdi_spec_dirs DOES work on 4.9.3
+# when /etc/cdi/nvidia.yaml is absent; a stale /etc/cdi/nvidia.yaml SHADOWS it
+# (podman's default scan list is /etc/cdi + /var/run/cdi + configured dirs; a
+# device name defined in more than one spec resolves to whichever is found first,
+# and /etc/cdi apparently wins on 4.9.3 regardless of cdi_spec_dirs ordering).
+# Podman 5.x/6.x CDI directory-scan precedence is UNTESTED by Agnostic Security —
+# do not assume it matches 4.9.3; the runtime CDI probe in compose_up() is the
+# authoritative arbiter on every version, this comment documents the mechanism,
+# not a promise of behaviour on versions we have not tested.
 #
-# Correct fix (no interactive sudo):
-#   1. Run nvidia-ctk cdi generate to produce the COMPLETE 0.7.0 spec including
-#      all CUDA library mounts and hooks. This is the only reliable source for
-#      the correct host library paths and device nodes.
-#   2. Transform 0.7.0 → 0.6.0 in-process (Python3, no extra deps):
-#        - set cdiVersion: "0.6.0"
-#        - strip per-device additionalGids: blocks (0.7.0 addition)
-#        - strip gid: fields from deviceNodes (0.7.0 addition)
-#        - KEEP all hooks, mounts, library containerEdits intact
-#      Podman 4.9.3 accepts 0.6.0 (confirmed via binary string scan: v0.6.0
-#      present; v0.7.0 absent). The stripped fields are display/GID-namespace
-#      features not needed for headless CUDA compute.
-#   3. Write the 0.6.0 spec to /etc/cdi/nvidia.yaml with chmod 0644 via the
-#      Docker Engine daemon (rootful — no interactive user sudo). Without 0644,
-#      rootless podman cannot read the spec and the CDI registry refresh fails.
-#      /etc/cdi/ is created via Docker if it does not exist.
+# _setup_podman_cdi_gpu therefore does two things, in order:
+#   1. Provision the CORRECT transformed spec into the USER CDI dir
+#      (~/.config/cdi/nvidia.yaml) via cdi_spec_dirs in the user containers.conf —
+#      no /etc/cdi write, no Docker daemon, no sudo (ROOTLESS-CDI-001 original
+#      design; kept — this is what makes rootless-Podman GPU work with zero host
+#      privilege on a clean host).
+#   2. Call _check_stale_etc_cdi_shadow to detect whether a PRE-EXISTING
+#      /etc/cdi/nvidia.yaml (root-owned, predating this install run, NOT written
+#      by step 1) references a driver library that no longer exists on disk. If
+#      so, this is the YSG-RISK-202 shadow bug: WARN/refresh if writable
+#      (uncommon — /etc/cdi is normally root:root), otherwise FAIL LOUD with the
+#      exact `sudo install -m 0644 ...` remediation rather than letting the
+#      runtime CDI probe fail silently into an unexplained CPU-only fallback.
 #
-# Podman ≥5.0 accepts cdiVersion 0.7.0 natively → skip the transform and
-# write the raw nvidia-ctk output directly to /etc/cdi/nvidia.yaml (still with
-# 0644 via Docker, so rootless podman can read it).
+# Older prior-broken-attempt blockers this design also fixes (unchanged from the
+# original ROOTLESS-CDI-001 fix, commit 4f3858d0):
+#   A. A minimal 0.5.0 spec had no library mounts → ollama saw library=cpu even
+#      when the CDI probe itself passed. A working spec MUST include the
+#      containerEdits that mount libcuda.so, libnvidia-ml.so etc. — nvidia-ctk's
+#      generated output has these; a hand-rolled minimal spec does not.
+#   B. A previous /etc/cdi/nvidia.yaml written 0600 (root-only) gave rootless
+#      podman EACCES on the CDI registry refresh — hence the 0644 requirement
+#      whenever /etc/cdi is the effective target.
+#
+# The 0.7.0 → 0.6.0 transform (podman <5.0 cannot parse 0.7.0; confirmed via
+# binary string scan: v0.6.0 present, v0.7.0 absent) is LOAD-BEARING regardless
+# of which directory ends up being the effective one — keep it. Podman ≥5.0
+# accepts cdiVersion 0.7.0 natively; skip the transform on that branch.
 #
 # If nvidia-ctk is missing: WARN loudly and return (CDI unavailable; the
-# install.sh CDI probe will fail → devpath fallback WARNS that GPU is CPU-only).
-# If Docker daemon unavailable: same — WARN and return; do not silently proceed.
+# install.sh CDI probe will fail). Whether that failure then aborts the install
+# or degrades to CPU-only depends on --allow-cpu-inference / YSG_ALLOW_CPU_INFERENCE
+# — see compose_up()'s CDI-probe branch. Default is fail-closed (YSG-RISK-202).
 
 # _transform_cdi_spec_060 <input-070-path> <output-060-path>
 # Read a cdiVersion 0.7.0 spec and write a 0.6.0-compatible version by:
@@ -2493,8 +2543,13 @@ PYEOF
 # Generate a complete podman-compatible CDI spec via nvidia-ctk, transform it
 # to cdiVersion 0.6.0 (podman <5.0 compatible) and deploy it to the USER CDI dir
 # (~/.config/cdi), wiring podman to it via cdi_spec_dirs in the USER containers.conf.
-# NO /etc/cdi, NO Docker daemon, NO sudo — pure user-space (proven on podman 4.9.3:
-# libcuda + nvidia-smi visible in-container via cdi_spec_dirs alone).
+# NO /etc/cdi write, NO Docker daemon, NO sudo for THIS step — pure user-space, and
+# sufficient on a clean host (verified live on podman 4.9.3 with no pre-existing
+# /etc/cdi/nvidia.yaml: commit 4f3858d0). YSG-RISK-202 (2026-08 campaign) proved a
+# pre-existing /etc/cdi/nvidia.yaml can shadow this and must be separately
+# reconciled — see _check_stale_etc_cdi_shadow, called at the end of this function.
+# Podman ≥5.0 CDI precedence is untested; the runtime probe in compose_up() is the
+# real arbiter on every version — this function only provisions inputs to it.
 # MUST be called before the CDI probe in compose_up() so the probe passes.
 _setup_podman_cdi_gpu() {
   if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
@@ -2560,7 +2615,86 @@ _setup_podman_cdi_gpu() {
     printf '[engine]\ncdi_spec_dirs = ["%s"]\n' "${_cdi_dir}" >> "${_cc}"
     log_info "  wrote [engine] cdi_spec_dirs to ${_cc}"
   fi
-  log_success "Podman GPU CDI ready — user-space spec, no /etc/cdi, no docker, no sudo"
+  # NOTE: this is NOT the final success signal — the runtime CDI probe in
+  # compose_up() is the actual arbiter (YSG-RISK-202: this line used to be
+  # log_success and printed BEFORE the probe that then disproved it).
+  log_info "Podman GPU CDI spec provisioned (user-space) — pending runtime probe"
+
+  # YSG-RISK-202: reconcile/detect a stale pre-existing /etc/cdi/nvidia.yaml
+  # that would shadow the correct spec above. Exports YSG_CDI_ETC_SHADOW_STALE
+  # for the CDI-probe branch in compose_up() to reference in its remediation.
+  _check_stale_etc_cdi_shadow "${_cdi_out}" "${_podman_major:-4}"
+}
+
+# _check_stale_etc_cdi_shadow <correct-user-space-spec-path> <podman-major-version>
+# YSG-RISK-202: podman's default CDI scan list includes /etc/cdi regardless of
+# cdi_spec_dirs. A pre-existing, root-owned /etc/cdi/nvidia.yaml — left over from
+# an earlier install attempt, an older installer design, or a manual operator
+# step — can reference a driver library (libcuda.so.<version>) that a subsequent
+# NVIDIA driver upgrade removed. When that happens the CDI probe fails with an
+# error naming the STALE version, while the correct, freshly-generated spec sits
+# unused in the user CDI dir. This function detects that specific condition and:
+#   - does nothing if /etc/cdi/nvidia.yaml does not exist (nothing to shadow)
+#   - refreshes it in place if writable by the current user (uncommon — /etc/cdi
+#     is normally root:root 0755; this covers hosts where an operator has
+#     deliberately relaxed that)
+#   - otherwise FAILS LOUD with the exact non-interactive remediation command,
+#     and exports YSG_CDI_ETC_SHADOW_STALE=true so the CDI-probe branch in
+#     compose_up() can name this specific, operator-fixable cause instead of a
+#     generic "GPU unavailable" message
+# Never touches /etc/cdi if the referenced libraries all resolve — a valid,
+# current /etc/cdi/nvidia.yaml (e.g. hand-provisioned by an operator, or written
+# by a prior run of this same function on a host where /etc/cdi IS writable) is
+# left alone.
+_check_stale_etc_cdi_shadow() {
+  local _correct_spec="$1" _podman_major="${2:-4}"
+  # Test hook only — unset in every real install path (bats regression tests
+  # inject a scratch path here so this function never touches the real
+  # /etc/cdi in CI/dev; production behaviour is unchanged).
+  local _etc_spec="${YSG_CDI_ETC_SPEC_OVERRIDE:-/etc/cdi/nvidia.yaml}"
+  YSG_CDI_ETC_SHADOW_STALE=false
+
+  [[ -f "$_etc_spec" ]] || { log_info "  ${_etc_spec} does not exist — no shadow risk"; return 0; }
+
+  # Extract every host library path referenced by hostPath: entries pointing at
+  # a libcuda/libnvidia shared object, and stat each. Any that fails to stat is
+  # a stale reference (the file the spec depends on no longer exists on disk).
+  local _missing=()
+  local _line _path
+  while IFS= read -r _line; do
+    _path="$(printf '%s' "$_line" | sed -E 's/^[[:space:]]*-?[[:space:]]*hostPath:[[:space:]]*//')"
+    [[ -n "$_path" ]] || continue
+    [[ -e "$_path" ]] || _missing+=("$_path")
+  done < <(grep -E 'hostPath:.*lib(cuda|nvidia)[^[:space:]]*\.so' "$_etc_spec" 2>/dev/null || true)
+
+  if [[ ${#_missing[@]} -eq 0 ]]; then
+    log_info "  ${_etc_spec} present and all referenced libraries resolve — not stale"
+    return 0
+  fi
+
+  # Stale — the file is a shadow risk. Version-aware framing: confirmed-broken
+  # on podman <5 (YSG-RISK-202); untested (not "known safe") on podman >=5.
+  if [[ "$_podman_major" -lt 5 ]]; then
+    log_warn "STALE ${_etc_spec}: references missing driver librar$([[ ${#_missing[@]} -eq 1 ]] && echo y || echo ies): ${_missing[*]}"
+    log_warn "podman ${_podman_major}.x's CDI scan includes /etc/cdi regardless of cdi_spec_dirs (YSG-RISK-202) — this WILL shadow the correct spec at ${_correct_spec}"
+  else
+    log_warn "STALE ${_etc_spec}: references missing driver librar$([[ ${#_missing[@]} -eq 1 ]] && echo y || echo ies): ${_missing[*]}"
+    log_warn "podman ${_podman_major}.x CDI directory-scan precedence is UNTESTED by Agnostic Security — treating this defensively as a shadow risk"
+  fi
+
+  if [[ -w "$_etc_spec" ]]; then
+    if install -m 0644 "$_correct_spec" "$_etc_spec" 2>/dev/null; then
+      log_success "  refreshed ${_etc_spec} from the current spec (writable — no sudo needed)"
+      return 0
+    fi
+    log_warn "  ${_etc_spec} appeared writable but the refresh write failed — treating as unresolved"
+  fi
+
+  log_error "Stale ${_etc_spec} is NOT writable by this user and could not be auto-refreshed."
+  log_error "Remediation (run once, outside this installer): sudo install -m 0644 \"${_correct_spec}\" \"${_etc_spec}\""
+  log_error "Until that runs, the CDI probe below will likely fail and ollama will run CPU-only unless --allow-cpu-inference is set."
+  YSG_CDI_ETC_SHADOW_STALE=true
+  return 0
 }
 
 # =============================================================================
@@ -8654,6 +8788,211 @@ _compose() {
   fi
 }
 
+# =============================================================================
+# YSG-RISK-205 — container-recreation-effect convergence helpers
+# =============================================================================
+# install.sh --upgrade reported SUCCESS for a container-level config change it
+# never applied: the CDI probe passed, the overlay was SELECTED, both existing
+# convergence probes were GREEN, and exit code was 0 — but `podman inspect`
+# showed the ollama container Created at the PREVIOUS install with no GPU
+# devices wired. `compose up` selected the new config but did not recreate the
+# container to apply it. Isolated by controlled comparison: a fresh install
+# (uninstall --remove-volumes + install) with the identical spec DID work —
+# proving the overlay/spec were correct and the bug is upgrade-path-specific
+# (the container-recreation decision, not the config itself).
+#
+# The class is broader than GPU: any upgrade changing devices, seccomp,
+# capabilities, resource limits or mounts can get a false green with the old
+# container still running, including SECURITY config. These helpers are
+# runtime/service-agnostic — they hash the FULL resolved compose config per
+# service and assert recreation for ANY service whose hash changed, not just
+# ollama. See compose_up() for the call sites (snapshot before down/up,
+# assertion before "Services started").
+#
+# Portability: install.sh must run on bash 3.2 (macOS default — see
+# scripts/test-installer.sh test_bash_compat) — NO bash-4-only associative
+# arrays, so state is plain "service hash" lines in a file, looked up with
+# awk/grep rather than a hash-map variable. Timestamp parsing goes through
+# python3 (_ysg_iso_to_epoch) rather than `date -d`/`date -j` — GNU and BSD
+# date flags are incompatible and this check must work on both.
+# =============================================================================
+
+# _ysg_compose_service_hashes <compose-file-args...>
+# Prints "<service> <sha256>" one per line, sorted by service name. Renders the
+# full resolved compose config via the ALREADY-SELECTED compose tool (docker
+# compose or the podman-compose-ysg fork — both print YAML to stdout for a bare
+# `config` subcommand, so this is runtime-agnostic) and hashes each service's
+# resolved definition (image, devices, cap_add/drop, security_opt, resource
+# limits, volumes/mounts, environment — everything compose config resolves).
+# Any change to any of those changes the hash. Returns non-zero (prints
+# nothing) if compose config fails or PyYAML is unavailable — callers must
+# treat empty output as "cannot verify this run", not as "nothing changed".
+_ysg_compose_service_hashes() {
+  local _raw
+  _raw="$(_compose "${COMPOSE_CMD[@]}" "$@" config 2>/dev/null)" || return 1
+  [[ -n "$_raw" ]] || return 1
+  printf '%s' "$_raw" | python3 -c '
+import sys, hashlib, json
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(1)
+
+try:
+    doc = yaml.safe_load(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+
+services = (doc or {}).get("services") or {}
+lines = []
+for name, spec in sorted(services.items()):
+    canon = json.dumps(spec, sort_keys=True, default=str)
+    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    lines.append("%s %s" % (name, digest))
+if lines:
+    sys.stdout.write("\n".join(lines) + "\n")
+' 2>/dev/null
+}
+
+# _ysg_iso_to_epoch <RFC3339-timestamp>
+# Converts a container-inspect Created timestamp (RFC3339, arbitrary fractional-
+# second precision, Z or +HH:MM offset — both podman and docker inspect emit
+# this shape) to a Unix epoch integer. Pure python3 — no `date -d` (GNU-only)
+# or `date -j` (BSD-only) — this runs identically on Linux and macOS.
+# Prints nothing and returns non-zero on any parse failure.
+_ysg_iso_to_epoch() {
+  local _ts="$1"
+  [[ -n "$_ts" ]] || return 1
+  python3 -c '
+import sys, re, datetime
+
+s = sys.argv[1].strip()
+if not s:
+    sys.exit(1)
+if s.endswith("Z"):
+    s = s[:-1] + "+00:00"
+m = re.match(r"^(.*?\.)(\d+)(([+-]\d{2}:\d{2})?)$", s)
+if m:
+    s = m.group(1) + m.group(2)[:6] + m.group(3)
+try:
+    dt = datetime.datetime.fromisoformat(s)
+except ValueError:
+    sys.exit(1)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int(dt.timestamp()))
+' "$_ts" 2>/dev/null
+}
+
+# _ysg_verify_compose_recreation_effect <start_epoch> <state_file> <current_hashes>
+# <current_hashes> is the multi-line "service hash" output of
+# _ysg_compose_service_hashes, captured BEFORE down/up ran. Loads the PREVIOUS
+# run's hashes from <state_file> (if any — first run after this feature ships
+# has no baseline, so nothing to compare and nothing is asserted, avoiding a
+# false failure on the very first upgrade after this ships); for every service
+# present in both with a DIFFERENT hash, asserts its container's Created
+# timestamp is newer than <start_epoch>. Fails loud (return 1) on the first
+# service that fails this — no downgrade to warn, this is a false-green class
+# bug per the header comment above. On success, persists <current_hashes> as
+# the new baseline for the next run.
+_ysg_verify_compose_recreation_effect() {
+  local _start_epoch="$1" _state_file="$2" _current="$3"
+  local _changed=""
+
+  if [[ -f "$_state_file" ]]; then
+    local _svc _hash _old
+    while IFS=' ' read -r _svc _hash; do
+      [[ -n "$_svc" ]] || continue
+      _old="$(awk -v s="$_svc" '$1==s {print $2; exit}' "$_state_file" 2>/dev/null)"
+      if [[ -n "$_old" && "$_old" != "$_hash" ]]; then
+        _changed="${_changed}${_svc}
+"
+      fi
+    done <<< "$_current"
+  fi
+
+  local _fail=0
+  if [[ -z "$_changed" ]]; then
+    log_info "Convergence check (YSG-RISK-205): no service's effective compose definition changed since the last recorded run"
+  else
+    log_info "Convergence check (YSG-RISK-205): verifying container recreation for changed service(s):$(printf '%s' "$_changed" | tr '\n' ' ')"
+    local _inspect_bin="docker"
+    [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _inspect_bin="podman"
+    local _svc3 _cid _created _created_epoch
+    while IFS= read -r _svc3; do
+      [[ -n "$_svc3" ]] || continue
+      _cid="$(_compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ps -q "$_svc3" 2>/dev/null | head -1)"
+      if [[ -z "$_cid" ]]; then
+        log_error "YSG-RISK-205: service '${_svc3}' changed config this run but has NO container after compose up"
+        _fail=1
+        continue
+      fi
+      _created="$("$_inspect_bin" inspect -f '{{.Created}}' "$_cid" 2>/dev/null)"
+      _created_epoch="$(_ysg_iso_to_epoch "$_created")"
+      if [[ -z "$_created_epoch" ]] || [[ "$_created_epoch" -le "$_start_epoch" ]]; then
+        log_error "YSG-RISK-205 FAIL: service '${_svc3}' effective compose config changed (devices/seccomp/capabilities/resource-limits/mounts/image) but its container was NOT recreated (Created=${_created:-unknown}, upgrade started at epoch ${_start_epoch}). The new config was never applied to a running container."
+        _fail=1
+      else
+        log_success "  ${_svc3}: recreated (Created=${_created})"
+      fi
+    done <<< "$_changed"
+  fi
+
+  if [[ "$_fail" -eq 1 ]]; then
+    log_error "Aborting: at least one service's changed compose config was not applied to a fresh container — false-green upgrade (YSG-RISK-205)."
+    return 1
+  fi
+
+  # Persist this run's hashes as the baseline for the next run — only after a
+  # clean check, so a failed run never poisons the next comparison.
+  printf '%s' "$_current" > "$_state_file" 2>/dev/null || true
+  chmod 600 "$_state_file" 2>/dev/null || true
+  return 0
+}
+
+# _ysg_verify_inference_backend_effect
+# YSG-RISK-205 (d): post-deploy effect check specific to the inference backend.
+# The hash-based check above proves the CONTAINER was recreated when config
+# changed; it does not prove the new config took effect FUNCTIONALLY. This is
+# the exact signal (ollama's own "library=cuda" vs "library=cpu" startup log
+# line) the campaign used to isolate YSG-RISK-205 in the first place — check it
+# directly. Scoped to nvidia/CUDA (the documented regression); other GPU types
+# (amd_rocm, vulkan, apple_metal) do not have an established library= log
+# convention verified in this codebase and are intentionally left for a
+# follow-up rather than guessed at here.
+_ysg_verify_inference_backend_effect() {
+  [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] || return 0
+  [[ "$DRY_RUN" != "true" ]] || return 0
+
+  local _lib="" _tries=0
+  while [[ "$_tries" -lt 15 ]]; do
+    _lib="$(_compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --no-color --tail=300 ollama 2>/dev/null \
+             | grep -oE 'library=[a-zA-Z0-9_]+' | tail -1 | cut -d= -f2)"
+    [[ -n "$_lib" ]] && break
+    _tries=$((_tries + 1))
+    sleep 2
+  done
+
+  if [[ -z "$_lib" ]]; then
+    log_warn "Inference-backend effect check: no library= line seen in ollama logs after 30s — cannot confirm GPU state (probe timeout, not a pass)"
+    return 0
+  fi
+
+  if [[ "$_lib" == "cuda" ]]; then
+    log_success "Inference-backend effect check: ollama reports library=cuda — GPU acceleration confirmed live"
+    return 0
+  fi
+
+  log_error "YSG-RISK-205 inference-backend effect check FAILED: GPU detected (${YSG_GPU_TYPE}) but ollama reports library=${_lib} (expected cuda) — running WITHOUT GPU acceleration despite an apparently-green install."
+  if [[ "${YSG_ALLOW_CPU_INFERENCE:-false}" != "true" ]]; then
+    log_error "Aborting: pass --allow-cpu-inference to accept this, or investigate why the GPU config did not take effect (YSG-RISK-205: container may not have been recreated)."
+    return 1
+  fi
+  log_warn "--allow-cpu-inference set — accepting CPU-only ollama despite GPU detection (explicit operator opt-in)"
+  return 0
+}
+
 compose_up() {
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
@@ -8691,10 +9030,13 @@ compose_up() {
   #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
   # ─────────────────────────────────────────────────────────────────────────────
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
-  # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
-  # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
-  # transformed 0.7.0 → 0.6.0 for podman 4.9.3, then written to /etc/cdi/nvidia.yaml
-  # with 0644 perms via Docker daemon (no interactive sudo). See _setup_podman_cdi_gpu.
+  # ROOTLESS-CDI-001 / YSG-RISK-202: provision a user-space CDI spec (no /etc/cdi
+  # write, no Docker daemon, no sudo) via _setup_podman_cdi_gpu BEFORE the probe.
+  # That same call also runs _check_stale_etc_cdi_shadow, which detects (and, where
+  # writable, refreshes) a pre-existing root-owned /etc/cdi/nvidia.yaml that would
+  # otherwise shadow the correct spec (see the ROOTLESS-CDI-001 block comment near
+  # _setup_podman_cdi_gpu's definition for the full adjudication). The probe below
+  # is the actual arbiter — provisioning success here does not guarantee it passes.
   if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     _setup_podman_cdi_gpu
   fi
@@ -8710,17 +9052,36 @@ compose_up() {
     if [[ "$_cdi_probe_ok" == "true" ]] && [[ -f "$_gpu_overlay_podman" ]]; then
       compose_files+=("-f" "$_gpu_overlay_podman")
       log_info "CDI probe OK — applying Podman CDI GPU overlay (docker-compose.gpu-podman.yml) — ollama on ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
-    elif [[ -f "$_gpu_overlay_podman_devpath" ]]; then
-      # CDI unavailable (probe failed or _setup_podman_cdi_gpu returned early).
-      # devpath overlay passes device nodes only — NO library mounts.
-      # ollama WILL run CPU-only on this path: library=cpu, not library=cuda.
-      log_warn "WARN: CDI probe failed — falling back to device-path passthrough (#ROOTLESS-CDI-001)"
-      log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
-      log_warn "WARN: GPU acceleration NOT active. Fix: ensure nvidia-ctk + Docker daemon are available."
-      log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
-      compose_files+=("-f" "$_gpu_overlay_podman_devpath")
     else
-      log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+      # CDI unavailable (probe failed, or neither overlay file was found).
+      # devpath overlay passes device nodes only — NO library mounts — ollama
+      # WILL run CPU-only on that path: library=cpu, not library=cuda.
+      #
+      # YSG-RISK-202: this used to warn and silently fall through to devpath
+      # (or to no overlay at all) and still exit 0. A GPU was DETECTED on this
+      # host — the mandatory LLM layer running CPU-only here is a silent
+      # product-policy violation (project_yashigani_llm_is_mandatory), not an
+      # acceptable default. Fail closed unless the operator explicitly opted
+      # in via --allow-cpu-inference / YSG_ALLOW_CPU_INFERENCE.
+      log_warn "WARN: CDI probe failed — GPU acceleration NOT active for ollama (#ROOTLESS-CDI-001 / YSG-RISK-202)"
+      if [[ "${YSG_CDI_ETC_SHADOW_STALE:-false}" == "true" ]]; then
+        log_error "Cause: a stale /etc/cdi/nvidia.yaml is shadowing the correct spec — see the remediation command logged above by _check_stale_etc_cdi_shadow."
+      else
+        log_warn "Fix: confirm nvidia-ctk is installed and the NVIDIA driver matches the CDI spec (check /etc/cdi/nvidia.yaml is absent or current, and ~/.config/cdi/nvidia.yaml + cdi_spec_dirs in ~/.config/containers/containers.conf)."
+      fi
+      if [[ "${YSG_ALLOW_CPU_INFERENCE:-false}" != "true" ]]; then
+        log_error "Aborting: GPU detected but not provable live in ollama, and --allow-cpu-inference was not passed."
+        log_error "Re-run with --allow-cpu-inference to explicitly accept CPU-only inference instead."
+        return 1
+      fi
+      log_warn "--allow-cpu-inference set — proceeding with degraded inference backend (explicit operator opt-in)"
+      if [[ -f "$_gpu_overlay_podman_devpath" ]]; then
+        log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
+        log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
+        compose_files+=("-f" "$_gpu_overlay_podman_devpath")
+      else
+        log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+      fi
     fi
   fi
 
@@ -9417,6 +9778,25 @@ compose_up() {
     return 0
   fi
 
+  # ---------------------------------------------------------------------------
+  # YSG-RISK-205: snapshot the effective per-service compose config BEFORE
+  # down/up, so we can prove after up that any service whose EFFECTIVE config
+  # changed (devices, seccomp, cap_add/drop, resource limits, mounts, image —
+  # anything compose config resolves) actually got a fresh container. Compare
+  # against the previous run's persisted snapshot (this run's snapshot is only
+  # persisted after a clean check, at the bottom of this function). Captured
+  # here — with the FULLY assembled compose_files array — not deferred, so the
+  # "start" timestamp genuinely precedes down/up.
+  # ---------------------------------------------------------------------------
+  local _ysg_state_file="${WORK_DIR}/docker/.ysg_service_config_hashes"
+  local _ysg_pre_up_hashes
+  _ysg_pre_up_hashes="$(_ysg_compose_service_hashes "${compose_files[@]}" 2>/dev/null || true)"
+  if [[ -z "$_ysg_pre_up_hashes" ]]; then
+    log_warn "YSG-RISK-205: could not resolve per-service compose config this run — recreation-effect convergence check will be skipped"
+  fi
+  local _ysg_upgrade_start_epoch
+  _ysg_upgrade_start_epoch="$(date -u +%s)"
+
   # Clean up any stale containers/networks from failed previous runs.
   # NEVER use -v (--volumes) — that destroys user data (Postgres, Redis, audit logs).
   log_info "Stopping any existing containers (preserving data volumes)..."
@@ -9753,6 +10133,38 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     log_error "LETTA TIER FAILED TO START — see 'Letta wait-loop' errors above for the exact stage that failed"
     log_error "Core services (gateway/backoffice/postgres/etc.) are unaffected; re-run with --letta or retry 'podman start ${COMPOSE_PROJECT_NAME:-docker}_letta_1' after investigating"
   fi
+
+  # ---------------------------------------------------------------------------
+  # YSG-RISK-205: container-recreation-effect convergence gate.
+  #
+  # install.sh --upgrade was observed to log "CDI probe OK — applying Podman CDI
+  # GPU overlay", both existing convergence probes GREEN, and exit 0 — while
+  # `podman inspect` showed the ollama container Created at the PREVIOUS install,
+  # HostConfig.Devices empty, still library=cpu. The overlay was SELECTED but
+  # never APPLIED: `compose up` did not recreate the container. The class is
+  # broader than GPU — any upgrade changing devices, seccomp, capabilities,
+  # resource limits or mounts can get a false green with the old container still
+  # running, including security config.
+  #
+  # This asserts every service whose EFFECTIVE resolved compose config changed
+  # since the last recorded run (via _ysg_pre_up_hashes, snapshotted before
+  # down/up above) now has a container Created timestamp newer than
+  # _ysg_upgrade_start_epoch. FAILS the upgrade (non-zero, no downgrade to warn)
+  # if any changed service was not actually recreated — this is a false-green
+  # class bug, not a candidate for a soft warning. Runs BEFORE "Services
+  # started" so a real convergence failure is never reported as success.
+  # ---------------------------------------------------------------------------
+  if [[ -n "$_ysg_pre_up_hashes" ]]; then
+    _ysg_verify_compose_recreation_effect "$_ysg_upgrade_start_epoch" "$_ysg_state_file" "$_ysg_pre_up_hashes" || return 1
+  fi
+
+  # YSG-RISK-205 (d): post-deploy effect check for the inference backend
+  # specifically. The hash-based check above proves the CONTAINER was
+  # recreated; it does not prove the NEW config took effect functionally. This
+  # is the exact signal (ollama's own library=cuda|cpu startup log line) the
+  # campaign used to isolate YSG-RISK-205 in the first place — check it
+  # directly rather than trusting that "recreated" implies "GPU active".
+  _ysg_verify_inference_backend_effect || return 1
 
   log_success "Services started"
 
