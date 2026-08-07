@@ -3142,6 +3142,19 @@ run_preflight() {
 # NOTE: do NOT use this for the onboard/offboard AUTH gate — use
 # _is_installed_or_running() instead (residuals-based, fail-closed).
 _is_existing_yashigani_running() {
+  # YSG-RISK-204b (Iris pre-push review, 2026-08-07): this helper is reachable
+  # from the k8s branch of main() (run_preflight -> check_installer_preflight)
+  # BEFORE any project-name resolution — that logic is compose-only and runs
+  # later. On k8s the project therefore fell back to the literal "docker" and
+  # this function probed `docker ps` / `podman ps` on the HOST, which has
+  # nothing to do with a k8s deployment. A stray host compose stack named
+  # "docker" would match, return 0, and silently suppress the port-80/443
+  # preflight for a FRESH k8s install — exactly the check that must not be
+  # skipped there. Compose-container evidence is meaningless on k8s: answer NO
+  # and let the port check run.
+  if [[ "${MODE:-}" == "k8s" ]]; then
+    return 1
+  fi
   local _secrets_dir="${WORK_DIR}/docker/secrets"
   # Secrets dir must exist and contain the root CA cert (written by PKI bootstrap;
   # indicates a completed prior install, not just a partial one).

@@ -16,18 +16,15 @@ import json
 
 import pytest
 
-_SRC = "src/yashigani/gateway/egress_proxy.py"
-
-
 def _load():
-    """Load the helper without importing the gateway package (which requires a
-    live internal-bearer secret at import time)."""
-    src = open(_SRC).read()
-    i = src.find("_OPENAI_TOP_STRUCTURAL")
-    j = src.find("@router.api_route", i)
-    ns: dict = {}
-    exec(src[i:j], ns)  # noqa: S102 - test-only, reads our own source
-    return ns["_inspectable_payload"]
+    """Import the helper directly.
+
+    Was an exec-of-a-source-slice, because `gateway.egress_proxy` needs a live
+    internal-bearer secret at import time. Tom flagged that as fragile in the
+    2026-08-07 pre-push review and it broke on the next edit, so the helper now
+    lives in its own importable module."""
+    from yashigani.inspection.egress_payload import _inspectable_payload
+    return _inspectable_payload
 
 
 # Ids PINNED from the live failure, not generated.
