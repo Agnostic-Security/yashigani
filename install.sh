@@ -8637,7 +8637,6 @@ _release_install_lock() {
 }
 
 compose_up() {
-  _release_install_lock
   set_step "10" "compose up"
   log_step "10/${TOTAL_STEPS}" "Starting services..."
 
@@ -9425,6 +9424,17 @@ compose_up() {
     # only applies to the Podman path.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       log_info "Upgrade + Podman: pre-starting postgres for SSL injection (V232-SMOKE-004)..."
+      # YSG-RISK-203b (Laura pre-push review, 2026-08-07): release the install
+      # lock HERE — immediately before the first container start — not at the top
+      # of compose_up(). The first version released it on entry, but this same
+      # function then performs the secrets_dir stale-install wipe, the chown to
+      # 1001 and the placeholder-secret writes (#ROOTLESS-5 block, ~9179-9339)
+      # BEFORE any container starts. Releasing on entry therefore reopened a
+      # concurrent-install race against secrets/PKI writes — the exact critical
+      # section the lock exists to protect. The commit rationale ("secret
+      # gen/PKI/state writes already done by then") was contradicted by the code
+      # in its own function body.
+      _release_install_lock
       "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
       # Wait up to 60s for postgres to accept connections.
       local _pg_ready=0 _pg_i

@@ -195,49 +195,86 @@ def configure(
 #
 # Fail-closed: anything that is not a recognisable envelope is scanned whole.
 # ---------------------------------------------------------------------------
-_ENVELOPE_STRUCTURAL_KEYS = frozenset({
-    "id", "object", "created", "model", "system_fingerprint", "request_id",
-    "trace_id", "span_id", "index", "finish_reason", "usage", "logprobs",
-    "prompt_tokens", "completion_tokens", "total_tokens", "role", "type",
-})
+_OPENAI_TOP_STRUCTURAL = frozenset({"id", "object", "created", "model", "system_fingerprint"})
+_OPENAI_CHOICE_STRUCTURAL = frozenset({"index", "finish_reason", "logprobs"})
+_OPENAI_MESSAGE_STRUCTURAL = frozenset({"role"})
 
 
-def _inspectable_payload(body_text: str) -> str:
-    """Return the user/model-authored text from an OpenAI-shaped body.
+def _inspectable_payload(body_text: str, prefix: str = "") -> str:
+    """Return the inspectable text for an outbound body.
 
-    Falls back to the full body whenever the shape is not recognised, so an
-    unexpected payload is never inspected LESS than before this change.
+    YSG-RISK-200: the egress inspector scanned the whole transport envelope, so
+    the random ``chatcmpl-<hex>`` correlation id tripped ``entropy_blob`` on
+    10-80% of responses (by id length) and denied the agent's own LLM call.
+
+    SCOPE (Tom, pre-push review 2026-08-07 — this is the fix to the first fix):
+    the first version excluded a set of key NAMES at ANY depth, for EVERY egress
+    prefix. That was a genuine new DLP bypass: a secret nested under one of those
+    names in a Slack/Telegram-bound body skipped the scanner entirely. Proven:
+    ``{"metadata": {"id": "AKIA..."}}`` scanned is_secret=True on the raw body and
+    False through the helper.
+
+    Now: stripping applies ONLY to the ``llm`` prefix (the agent's own internal
+    self-call, the only class with the id false-positive) AND only at the exact
+    POSITIONS the OpenAI envelope defines — top level, ``choices[*]``,
+    ``choices[*].message`` role, and numeric ``usage``. A key called ``id``
+    anywhere else is inspected like any other content. Every other prefix
+    (slack, slack-hooks, telegram, and any future external destination) is
+    scanned verbatim, exactly as before this change.
+
+    Fail-closed everywhere: unknown prefix, unparseable body, unexpected shape,
+    or nothing extracted -> return the full body.
     """
-    if not body_text:
+    if prefix != "llm" or not body_text:
         return body_text
     try:
-        import json as _json
+        import json
 
-        doc = _json.loads(body_text)
+        doc = json.loads(body_text)
     except Exception:
         return body_text
-    if not isinstance(doc, (dict, list)):
+    if not isinstance(doc, dict):
+        return body_text
+    # Only a recognisable OpenAI-shaped envelope qualifies.
+    if "choices" not in doc or not isinstance(doc.get("choices"), list):
         return body_text
 
     parts: list[str] = []
 
-    def _walk(node: object, key: "str | None" = None) -> None:
-        if isinstance(node, dict):
-            for k, v in node.items():
-                _walk(v, k)
-        elif isinstance(node, list):
-            for v in node:
-                _walk(v, key)
-        elif isinstance(node, str):
-            # Structural envelope fields are transport metadata, not content.
-            if key in _ENVELOPE_STRUCTURAL_KEYS:
-                return
-            parts.append(node)
+    def _emit(value: object) -> None:
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict):
+            for v in value.values():
+                _emit(v)
+        elif isinstance(value, list):
+            for v in value:
+                _emit(v)
 
-    _walk(doc)
+    for k, v in doc.items():
+        if k in _OPENAI_TOP_STRUCTURAL:
+            continue
+        if k == "usage":
+            continue  # numeric counters only
+        if k == "choices":
+            for choice in v:
+                if not isinstance(choice, dict):
+                    _emit(choice)
+                    continue
+                for ck, cv in choice.items():
+                    if ck in _OPENAI_CHOICE_STRUCTURAL:
+                        continue
+                    if ck in ("message", "delta") and isinstance(cv, dict):
+                        for mk, mv in cv.items():
+                            if mk in _OPENAI_MESSAGE_STRUCTURAL:
+                                continue
+                            _emit(mv)
+                    else:
+                        _emit(cv)
+            continue
+        _emit(v)
+
     if not parts:
-        # Nothing content-shaped found — inspect the original rather than
-        # silently inspecting nothing.
         return body_text
     return "\n".join(parts)
 
@@ -347,7 +384,7 @@ async def egress_eval(
     injection_detected: bool = False
 
     try:
-        secret_verdict = scan_secrets(_inspectable_payload(body_text))
+        secret_verdict = scan_secrets(_inspectable_payload(body_text, prefix))
         pii_detected = bool(secret_verdict.is_secret)
     except Exception as exc:
         logger.error("egress-eval: secret_detector failed: %s — treating as PII", exc)
