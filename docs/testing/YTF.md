@@ -181,6 +181,48 @@ This applies in both tiers: Tier-A verifies state in-process (real fakeredis-bac
 reads, not just the HTTP response body); Tier-B verifies state via headed+headless +
 screenshot of each resulting state.
 
+## 5.4 NO TEST MAY BYPASS THE USER PATHWAY (added 2026-08-07 — Tiago directive)
+
+**Every test reaches the product the way a user reaches it.** No `docker exec` /
+`kubectl exec` into a container to call an internal port, no direct instantiation of a
+product class, no internal service bearer, no reading a secret off a host path to skip
+authentication.
+
+This is not a style preference. §5.3 already required *effect-verified*, but nothing forbade
+producing that effect by reaching past the layers under test — so tests did, and they were
+green while the product was broken:
+
+| module | what it did | what it reported | truth |
+|---|---|---|---|
+| `test_ollama_sensitivity.py` | `docker exec` gateway → `SensitivityClassifier().classify()` | **9 passed** | every real request on that path was failing |
+| `test_agent_dispatch_e2e.py` | internal bearer → gateway's own mesh port from inside the gateway | 4 failures with **empty output** | a harness `PermissionError`, mistaken for a product defect on two runtimes |
+| `test_egress_ringfence_injection.py` | unauthenticated probe; `GET /healthz == 200` under a prompt-injection name | pass | the named security category verified **nothing** |
+
+A test that bypasses a layer cannot see any defect in that layer — which is most of them. It
+also produces *false information*, which is worse than no test, because a gate consumes it.
+
+**Required shape:** real account → real `POST /auth/login` with a fresh, never-replayed TOTP →
+the same endpoint the browser calls (`/user/chat/completions`; direct `/v1/chat/completions`
+from a browser 401s by design) → assert the EFFECT.
+
+**Permitted exceptions, both narrow:**
+1. **Verification by observation.** The ACTION goes through the user pathway; the EVIDENCE may
+   come from the product's own record (audit chain, decision log, DB row). Nothing there drives
+   the product.
+2. **Properties with no user-plane surface.** L1 netns default-deny is a network-namespace fact.
+   Assert it directly, and SKIP with a reason where it cannot be read — never pass by inference.
+
+**When a control cannot be exercised from the user plane on a given profile, SKIP with the
+reason.** Never assert a weaker property and report it as the stronger one.
+
+## 5.5 Deploy-mode coverage (added 2026-08-07)
+
+The matrix must state the deploy mode per leg, and must not be satisfied entirely by
+`--deploy demo`. `install.sh` sets `YASHIGANI_ENV=dev` for demo and `production` otherwise, and
+several controls only engage in production — the pool manager runs `backend=stub` under demo, so
+per-identity container isolation is never exercised. A matrix of demo-only legs proves those
+paths by code-reading, not by runtime. At least one leg per runtime family must be non-demo.
+
 ## 6. Findings register (this build — routed, not fixed)
 
 Framework-build discipline: Iris builds and runs the framework, does not fix product code
