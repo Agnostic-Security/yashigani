@@ -155,6 +155,13 @@ class LocalAuthService:
         if plaintext is None:
             raise ValueError("Must provide password or set auto_generate=True")
 
+        # FIND-P-EMAIL (2026-08-04): install.sh generates random-word bootstrap
+        # admin usernames (e.g. "wolf") which are NOT email-shaped. Mirrors the
+        # PostgresLocalAuthService.create_admin() fix — see that docstring for
+        # the full root-cause. Only synthesise when username isn't already
+        # email-shaped; API-created admins keep email=username unchanged.
+        email = username if "@" in username else f"{username}@yashigani.local"
+
         record = AccountRecord(
             account_id=_new_id(),
             username=username,
@@ -164,7 +171,7 @@ class LocalAuthService:
             totp_secret="",  # set at first login via provisioning
             recovery_codes=None,
             account_tier="admin",
-            email=username,  # admin usernames are already emails
+            email=email,
             force_password_change=True,
             force_totp_provision=True,
         )

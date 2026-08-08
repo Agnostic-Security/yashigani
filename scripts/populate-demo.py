@@ -16,15 +16,28 @@ GUARDRAILS (enforced in code):
      PUTs demo-specific groups/allowed_caller_groups/allowed_paths. Sending
      upstream_url here reintroduced a duplicate-agent-with-wrong-upstream bug
      that broke chat (LAURA-4.1.2-related finding) — see step8_register_agents().
+  7. langflow/letta are REQUIRED bundles (install.sh --deploy demo ships them by
+     default); openclaw is OPTIONAL (opt-in via install.sh --agent-bundles). A
+     missing REQUIRED bundle is a real deploy bug and still FATALs. A missing
+     OPTIONAL bundle is expected on a default install — WARN and continue, do
+     NOT fatal (FIND-SEED-OPENCLAW-MISMATCH); STEP 9 (the 10 OPA client
+     policies) must always complete on a default demo install regardless of
+     which optional agent bundles were enabled — see step8_register_agents()/
+     step10_bind_policies().
 
 What this script creates:
   Groups  : data-team, finance-team, compliance-team
   Users   : ana@agnosticsec.com / paul@agnosticsec.com / mia@agnosticsec.com / noah / sara
-            each in a different group
+            each in a different group, PLUS an OPTIONAL 6th (kai, "api-only"
+            journey B/B+) seeded only when the licence has end-user headroom
+            beyond the 5-seat Community tier (see step7_create_users()).
   Agents  : configures (never creates) the install.sh-bundled langflow/letta/openclaw
-            agents (groups: [owui-users, users])
-  Policies: 10 self-describing client OPA policies (saved + bound)
-  Probes  : one allow + one deny via /admin/inspection/simulate (if available)
+            agents (groups: [owui-users, users] for the human-tier RBAC gate;
+            allowed_caller_groups is per-team ONLY — see AGENTS below, G5).
+  Policies: 10 self-describing client OPA policies (saved + bound; POL-004
+            now emits a pseudonymize obligation branch too — see G4/G8)
+  Probes  : allow/deny via /admin/policies/simulate + a service-scope
+            differential probe for POL-008 (if available)
   MCP     : demo-mcp reachability probe
 
 Usage:
@@ -32,6 +45,48 @@ Usage:
 
 All credential output -> CREDENTIALS-4.1.2-CLEAN.txt (updated in-place).
 Scratch state saved to populate-4.1.2-clean-state.json (same dir).
+
+---------------------------------------------------------------------------
+SEED-COVERAGE ENHANCEMENT — §4.17 DIFFERENTIAL testing, gaps G1-G6
+(testing_runs/yashigani/ytf-docker-macos-29d9c9d8-20260731/populate-coverage-map.md)
+---------------------------------------------------------------------------
+  G1 — POL-001/002/009/010 rebound from a single pinned human to wildcard
+       `human:""` (BINDINGS below) so the SAME probe run as different users
+       diverges by their group/ceiling attributes, not by whether they
+       happen to be the one bound subject (closes map G1/G6/G7/G11).
+       Verified against policy_bindings/store.py:scope_key() +
+       policy/clients_aggregate.rego:_scope_keys — scope_id="" resolves to
+       "<kind>:*" and is UNIONED with the specific "<kind>:<id>" key, so a
+       wildcard bind is strictly additive (never narrows an existing bind).
+  G2 — POL-008 (EU AI Act) was already bound wildcard `service:""`, but no
+       seeded identity is `service`-kind, so it was never differentially
+       exercised. See step11b_service_identity_probe() for what could and
+       could NOT be closed here (a real product gap was found: there is no
+       admin-API path to mint a persistent, externally-drivable SERVICE
+       identity — see that function's docstring).
+  G3 — optional 6th user `kai` models install-test journey B (API-only) /
+       B+ (add-agents-later): onboarded via API key only, never driven
+       through the persona/agent/workflow (13d/13e) steps. NOTE: OWUI and
+       the `owui-users` RBAC gate were REMOVED in 4.0 (YSG-RISK-140) — see
+       step7e_grant_owui_access() — so "API-only" here models the
+       onboarding journey, not an RBAC-enforced chat block (that gate no
+       longer exists in this architecture).
+  G4 — pseudonymize obligation added to pii_redaction_policy (POL-004):
+       compliance-team humans now get `pseudonymize_pii` instead of a bare
+       allow, a genuine 3-way differential (deny+redact / allow+pseudonymize)
+       on the SAME PII probe. paul's ceiling changed INTERNAL -> PUBLIC to
+       complete the PUBLIC->INTERNAL->CONFIDENTIAL->RESTRICTED ceiling
+       ladder (noah/sara stay INTERNAL). PCI-marking differential is closed
+       by G1 (POL-009 now wildcard, so ana's high ceiling no longer exempts
+       her from the PCI/RESTRICTED deny branch).
+  G5 — AGENTS[*]["allowed_caller_groups"] no longer includes owui-users/
+       users — only the agent's own team — so cross-group agent-caller
+       isolation is actually testable (verified against
+       gateway/tool_catalog.py:_agent_allowed_for_caller — caller_groups &
+       allowed_caller_groups intersection).
+  G6 — STEP13b's ana-ceiling comments said "CONFIDENTIAL"; the authoritative
+       USERS[0]["ceiling"] is (and was) RESTRICTED. Comments fixed to match.
+---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -100,6 +155,15 @@ ORCHID_USER = _PU
 ORCHID_INITIAL_PW = _PP
 ORCHID_TOTP_SECRET = _PT
 ORCHID_NEW_PW = "Yg8#" + _PT + "!Kv9$mNpXqR7wLsZtYa1B"  # >=36 chars
+# FIND-SEED-BOOTSTRAP-COLLISION: the password this script ACTUALLY ends up
+# authenticated with, once step1_login_initial() has run — normally equal to
+# ORCHID_NEW_PW (this script's own derived value), but overwritten with
+# whatever's on disk if step1 discovers the Playwright harness already
+# rotated the account to a DIFFERENT password before this script ran. Every
+# downstream step that needs "orchid's current password" (creds-file save,
+# shared-secret persist, final summary) reads THIS, not ORCHID_NEW_PW
+# directly, so those steps record the truth even on that collision path.
+_CURRENT_ORCHID_PW = ORCHID_NEW_PW
 ASPEN_USER = _BU
 ASPEN_TOTP_SECRET = _BT
 PRISM_PW = _BP
@@ -110,6 +174,91 @@ print(f"  [creds] primary={ORCHID_USER} backup={ASPEN_USER} (parsed from install
 # ---------------------------------------------------------------------------
 S = requests.Session()
 S.verify = False
+
+
+# ---------------------------------------------------------------------------
+# FIND-SEED-BOOTSTRAP-COLLISION (4.1.2 3-runtime retest, 2026-08-04)
+#
+# This script and the Playwright harness (src/tests/playwright/conftest.py)
+# each independently derive/rotate admin1 ("orchid")'s password with no
+# shared source of truth — whichever tool bootstraps the admin FIRST on a
+# given stack silently locks the other out (confirmed both orderings
+# collide). conftest.py's own _persist_rotated_password() already documents
+# and implements the fix on ITS side: best-effort write the rotated password
+# to docker/secrets/admin1_password (falling back to no-op on a read-only/
+# permission-denied mount) so a LATER, independent process can read the
+# CURRENT password from disk instead of assuming the stale on-disk secret.
+# This script now does the SAME on both ends:
+#   (a) WRITE side (_persist_admin1_password_to_shared_secret, called from
+#       step4_save_creds below): after
+#       ORCHID_NEW_PW is proven live (step3's round-trip re-login), best-
+#       effort write it to docker/secrets/admin1_password (+ the
+#       YTF_SECRETS_DIR readable-copy location, if set) — so the Playwright
+#       harness, running AFTER this script, picks it up for free via its
+#       existing _current_admin_password() on-disk fallback (zero conftest
+#       changes needed there — it already reads that exact file).
+#   (b) READ side (_read_disk_admin_password, used inside
+#       step1_login_initial): if BOTH the derived ORCHID_NEW_PW and
+#       ORCHID_INITIAL_PW logins 401, try whatever password is CURRENTLY on
+#       disk — covering the case where the Playwright harness bootstrapped
+#       (and rotated to its own random password) BEFORE this script ran.
+# Together, docker/secrets/admin1_password becomes the single, bidirectional
+# source of truth for "what is orchid's password right now", regardless of
+# which tool rotated it last or which tool runs first.
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    # scripts/populate-demo.py -> repo root is parent.parent, independent of
+    # DEMO_DIR (which is a separate, script-configurable OUTPUT dir and may
+    # not be the repo at all).
+    return Path(__file__).resolve().parent.parent
+
+
+def _admin1_secret_paths() -> list[Path]:
+    """Every location that might hold the CURRENT on-disk admin1 password,
+    in read-preference order: an explicit YTF_SECRETS_DIR override first
+    (matches conftest._read_secret's own override precedence — a readable
+    COPY of docker/secrets/ on runtimes where the live mount is root/subuid-
+    owned and unreadable by the user running this script), then the repo's
+    own docker/secrets/."""
+    paths = []
+    override = os.environ.get("YTF_SECRETS_DIR", "").strip()
+    if override:
+        paths.append(Path(override) / "admin1_password")
+    paths.append(_repo_root() / "docker" / "secrets" / "admin1_password")
+    return paths
+
+
+def _read_disk_admin_password() -> str | None:
+    """Best-effort read of the CURRENT on-disk admin1 password. Returns None
+    if no readable copy exists anywhere (never fails the run)."""
+    for p in _admin1_secret_paths():
+        try:
+            val = p.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except OSError:
+            continue
+    return None
+
+
+def _persist_admin1_password_to_shared_secret(password: str) -> None:
+    """Best-effort write `password` to every location _admin1_secret_paths()
+    names, so an independent process (the Playwright harness, a diagnostic
+    script, a human operator) reads the SAME current password this script
+    just proved live. Mirrors conftest._persist_rotated_password()'s own
+    best-effort/never-fail-the-run contract exactly."""
+    for p in _admin1_secret_paths():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(password, encoding="utf-8")
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
+            print(f"  [seed-single-source] wrote current orchid password to {p}")
+        except OSError as exc:
+            print(f"  [seed-single-source] could not persist orchid password to {p}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +418,35 @@ def step1_login_initial() -> bool:
             "totp_code": code3,
         })
 
+    if r2.status_code == 401:
+        # FIND-SEED-BOOTSTRAP-COLLISION: both this script's derived
+        # ORCHID_NEW_PW AND the pristine ORCHID_INITIAL_PW were rejected —
+        # the account has already been rotated to a THIRD value by some
+        # OTHER tool this run (the Playwright harness's
+        # _api_get_session_cookies(), which rotates to its own random
+        # password on a fresh stack and best-effort persists it to
+        # docker/secrets/admin1_password via _persist_rotated_password()).
+        # Try that on-disk value as a last resort before giving up.
+        disk_pw = _read_disk_admin_password()
+        if disk_pw and disk_pw not in (ORCHID_NEW_PW, ORCHID_INITIAL_PW):
+            print("  401 on both derived + initial pw — trying the current on-disk "
+                  "docker/secrets/admin1_password (may have been rotated by the "
+                  "Playwright harness this run)...")
+            _wait_next_totp_window("orchid-disk-pw-retry")
+            code4 = _totp(ORCHID_TOTP_SECRET)
+            r3 = S.post(f"{BASE_URL}/auth/login", json={
+                "username": ORCHID_USER,
+                "password": disk_pw,
+                "totp_code": code4,
+            })
+            if r3.status_code == 200 and r3.json().get("status") == "ok":
+                global _CURRENT_ORCHID_PW
+                _CURRENT_ORCHID_PW = disk_pw
+                body = r3.json()
+                print(f"  Login OK with on-disk (harness-rotated) password: "
+                      f"force_password_change={body.get('force_password_change')}")
+                return True  # already rotated (by the OTHER tool) — skip step 2/3
+
     body = _ok(r2, "orchid-initial-login")
     print(f"  Login OK with INITIAL password: status={body.get('status')}, "
           f"force_password_change={body.get('force_password_change')}")
@@ -324,17 +502,29 @@ def step4_save_creds() -> None:
     print("\n=== STEP 4: Save updated credentials to creds file ===")
     # Read existing creds file, update orchid line
     existing = CREDS_FILE.read_text() if CREDS_FILE.exists() else ""
-    # Append/replace the orchid new-password record
+    # Append/replace the orchid new-password record. Uses _CURRENT_ORCHID_PW
+    # (not ORCHID_NEW_PW directly) so this is correct even on the
+    # FIND-SEED-BOOTSTRAP-COLLISION disk-fallback path in step1, where the
+    # account was actually rotated by the OTHER tool (Playwright harness) to
+    # a value this script never derived itself.
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     new_entry = (
         f"\n# orchid NEW password (set {timestamp}, round-trip-verified)\n"
-        f"orchid  {ORCHID_NEW_PW}  {ORCHID_TOTP_SECRET}  (pw-changed; TOTP unchanged)\n"
+        f"orchid  {_CURRENT_ORCHID_PW}  {ORCHID_TOTP_SECRET}  (pw-changed; TOTP unchanged)\n"
     )
     updated = existing.rstrip() + "\n" + new_entry
     CREDS_FILE.write_text(updated)
     CREDS_FILE.chmod(0o600)
     print(f"  Saved to {CREDS_FILE}")
-    print(f"  orchid new pw (full, {len(ORCHID_NEW_PW)} chars): {ORCHID_NEW_PW}")
+    print(f"  orchid new pw (full, {len(_CURRENT_ORCHID_PW)} chars): {_CURRENT_ORCHID_PW}")
+
+    # FIND-SEED-BOOTSTRAP-COLLISION: also write-through to the shared
+    # single-source-of-truth location(s) so the Playwright harness (running
+    # BEFORE or AFTER this script on the same stack) reads the SAME current
+    # password via its existing _current_admin_password() on-disk fallback —
+    # no conftest.py changes needed, it already reads docker/secrets/
+    # admin1_password. Best-effort; never fails this script's run.
+    _persist_admin1_password_to_shared_secret(_CURRENT_ORCHID_PW)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +606,7 @@ def step6_create_groups() -> dict[str, str]:
 # STEP 7 — Create users + add to groups
 # ---------------------------------------------------------------------------
 
-USERS = [
+USERS: list[dict] = [
     # ana drives the cloud-9 MCP-injection demo. Ceiling RESTRICTED so a BENIGN
     # cloud9-orchestrate echo passes the egress ceiling (demo narrative: "safe call
     # works"), while the INJECTION leg is still blocked by ResponseInspection
@@ -424,7 +614,11 @@ USERS = [
     # ceiling. With a lower ceiling both legs block on the ceiling and the
     # benign-vs-malicious contrast is lost (Ava INFO-SCEN-A-001).
     {"email": "ana@agnosticsec.com", "group": "data-team", "ceiling": "RESTRICTED"},
-    {"email": "paul@agnosticsec.com", "group": "finance-team", "ceiling": "INTERNAL"},
+    # G4/G9: PUBLIC ceiling (was INTERNAL) — completes the PUBLIC->INTERNAL->
+    # CONFIDENTIAL->RESTRICTED ladder (noah/sara stay INTERNAL so that rung
+    # keeps 2 representatives). paul's finance_read_only (POL-002) demo does
+    # not depend on ceiling value, so this is a safe reassignment.
+    {"email": "paul@agnosticsec.com", "group": "finance-team", "ceiling": "PUBLIC"},
     {"email": "mia@agnosticsec.com", "group": "compliance-team", "ceiling": "CONFIDENTIAL"},
     # Data-protection demo scenarios:
     # noah — cannot send PCI data (ceiling INTERNAL + pci_data_block; PCI classifies RESTRICTED).
@@ -433,6 +627,51 @@ USERS = [
     # only (ceiling INTERNAL + classified_marking_local + local-only model allocation).
     {"email": "sara@agnosticsec.com", "group": "compliance-team", "ceiling": "INTERNAL", "scenario": "classified-local"},
 ]
+
+# G3 — OPTIONAL 6th identity: install-test journey B (API-only) / B+
+# (add-agents-later). Community tier = 5 end-user seats (already fully used
+# by the 5 USERS above), so this is gated on live licence headroom
+# (step7_create_users() calls _license_end_user_headroom() before attempting
+# creation) — a default Community-tier run stays at exactly 5 seats and
+# never 402s; a tier with more headroom gets a genuine 6th differential
+# identity. "optional_seat": True is the gate step7_create_users() checks.
+API_ONLY_USER = {
+    "email": "kai@agnosticsec.com", "group": "finance-team", "ceiling": "INTERNAL",
+    "scenario": "api-only", "optional_seat": True,
+}
+USERS.append(API_ONLY_USER)
+
+
+def _license_end_user_headroom() -> bool:
+    """G3: True if the current licence has room for one more end-user seat.
+
+    Reads GET /admin/license (limits.end_users.{current,maximum,unlimited} —
+    see backoffice/routes/license.py:_limit_block()). Fail-CLOSED on any
+    error/unexpected shape — if we cannot positively confirm headroom, do
+    NOT attempt the optional seat (avoids a 402 mid-run on a Community-tier
+    install, which would otherwise be the only fatal path in this script for
+    a seat that isn't required for the core 5-user demo).
+    """
+    try:
+        r = S.get(f"{BASE_URL}/admin/license")
+    except Exception as exc:
+        print(f"  [seat-check] /admin/license unreachable ({exc}) — assuming no headroom")
+        return False
+    if r.status_code != 200:
+        print(f"  [seat-check] /admin/license HTTP {r.status_code} — assuming no headroom")
+        return False
+    try:
+        eu = r.json()["limits"]["end_users"]
+    except Exception:
+        print("  [seat-check] /admin/license response missing limits.end_users — assuming no headroom")
+        return False
+    if eu.get("unlimited"):
+        return True
+    current = eu.get("current", 0)
+    maximum = eu.get("maximum")
+    if maximum is None:
+        return True
+    return current < maximum
 
 
 def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
@@ -449,11 +688,27 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
         email = udef["email"]
         group_name = udef["group"]
         gid = group_ids[group_name]
+        scenario = udef.get("scenario", "")
 
         if email in existing_emails:
             print(f"  user '{email}' already exists — skipping creation")
-            user_creds[email] = {"username": existing_emails[email].get("username", ""), "group": group_name}
+            user_creds[email] = {
+                "username": existing_emails[email].get("username", ""),
+                "group": group_name,
+                "scenario": scenario,
+            }
         else:
+            # G3: the optional 6th (API-only) seat is gated on live licence
+            # headroom — never attempted (and never hits the fatal _ok()
+            # path) if the Community-tier 5-seat budget is already spent.
+            if udef.get("optional_seat") and not _license_end_user_headroom():
+                print(
+                    f"  '{email}': SKIPPED — optional seat, no licence headroom "
+                    f"(Community tier = 5 end-user seats, already used by the "
+                    f"core 5 demo users). Needs a higher tier to seed this "
+                    f"identity — see USERS/API_ONLY_USER comment (G3)."
+                )
+                continue
             r = S.post(f"{BASE_URL}/admin/users", json={"email": email})
             body = _ok(r, f"create-user-{email}", allow=(201,))
             temp_pw = body.get("temporary_password", "")
@@ -465,17 +720,18 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
                 "temp_pw": temp_pw,
                 "totp_secret": totp_secret,
                 "group": group_name,
+                "scenario": scenario,
             }
 
-        # Add to group (idempotent — server may 409 if already member, which is OK)
-        r = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
-        if r.status_code in (200, 201):
-            print(f"  added '{email}' to group '{group_name}'")
-        elif r.status_code == 409:
-            print(f"  '{email}' already in group '{group_name}' (409 idempotent)")
-        else:
-            # Non-fatal — log and continue
-            print(f"  WARN: add member {email} -> {group_name}: HTTP {r.status_code}: {r.text[:200]}")
+        # FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY: group membership is added
+        # AFTER first-login in step7c_onboard_users, NOT here. The HUMAN identity
+        # is not in the RBAC registry until first-login (register_human_identity_
+        # on_login), so POSTing /rbac/groups/{gid}/members here returns
+        # 422 identity_not_found and was silently never retried — leaving every
+        # demo user in NO group and collapsing the per-team differential
+        # (langflow->data-team, letta->finance-team) to a uniform deny.
+        # gid/group_name are recorded on user_creds above; the real add happens
+        # post-registration in step7c.
 
     return user_creds
 
@@ -515,37 +771,59 @@ def step7b_save_user_creds(user_creds: dict[str, dict]) -> None:
 # send upstream_url on PUT. It only discovers the real agent_id by name and
 # PUTs the demo-specific groups/allowed_caller_groups/allowed_paths.
 
+# G5: allowed_caller_groups is PER-TEAM ONLY (owui-users/users deliberately
+# REMOVED). Previously every agent also allowed owui-users+users, and since
+# every demo user is a member of both, ANY user could call ANY agent —
+# nullifying the per-team caller-isolation the demo claims to show
+# (coverage-map G5). Verified against gateway/tool_catalog.py:
+# _agent_allowed_for_caller() — caller_groups & allowed_caller_groups must
+# intersect (empty allowed_caller_groups = unrestricted; a non-empty list
+# with no overlap = denied). With this list per-team only:
+#   langflow  -> data-team only        (ana allowed; paul/mia/noah/sara/kai denied)
+#   letta     -> finance-team only     (paul/noah/kai allowed; ana/mia/sara denied)
+#   openclaw  -> compliance-team only  (mia/sara allowed; ana/paul/noah/kai denied)
+# "groups" (the agent's OWN RBAC membership, for the agent's own resource
+# scoping) is UNCHANGED — this only narrows who may CALL each agent.
 AGENTS = [
     {
         "local_key": "langflow",
         "real_names": ("agent__langflow",),
+        "required": True,   # install.sh --deploy demo ships this BY DEFAULT
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["data-team", "owui-users", "users"],
+        "allowed_caller_groups": ["data-team"],
         "allowed_paths": [],
     },
     {
         "local_key": "letta",
         "real_names": ("letta",),
+        "required": True,   # install.sh --deploy demo ships this BY DEFAULT
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["finance-team", "owui-users", "users"],
+        "allowed_caller_groups": ["finance-team"],
         "allowed_paths": [],
     },
     {
         "local_key": "openclaw",
         "real_names": ("openclaw",),
+        "required": False,  # OPTIONAL — install.sh only enables via --agent-bundles
         "groups": ["owui-users", "users"],
-        "allowed_caller_groups": ["compliance-team", "owui-users", "users"],
+        "allowed_caller_groups": ["compliance-team"],
         "allowed_paths": [],
     },
 ]
+
+# Local keys of OPTIONAL agent bundles (used by step8/step10 to decide WARN
+# vs FATAL on a missing/unbound agent — FIND-SEED-OPENCLAW-MISMATCH).
+_OPTIONAL_AGENT_LOCAL_KEYS = {a["local_key"] for a in AGENTS if not a.get("required", True)}
 
 
 # ---------------------------------------------------------------------------
 # STEP 7c — Onboard users: first-login (register identity) + mint API key
 # ---------------------------------------------------------------------------
-def step7c_onboard_users(user_creds: dict) -> dict:
+def step7c_onboard_users(user_creds: dict, group_ids: dict[str, str]) -> dict:
     """For each created user: complete forced first-login (registers HUMAN
-    identity), then admin-issue a gateway API key. Returns email->api_key."""
+    identity), add them to their RBAC group (now that the identity exists —
+    see FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY in step7), then admin-issue
+    a gateway API key. Returns email->api_key."""
     print("\n=== STEP 7c: Onboard users (first-login + API key) ===")
     import requests as _rq
     api_keys = {}
@@ -587,6 +865,28 @@ def step7c_onboard_users(user_creds: dict) -> dict:
             print(f"  {email}: API key issued (...{key[-6:]})")
         else:
             print(f"  {email}: API-key issue {rk.status_code}: {rk.text[:160]}")
+
+        # FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY: add to RBAC group NOW that
+        # the identity is registered in the RBAC registry (step7's pre-login add
+        # would return 422 identity_not_found). Without this the per-team
+        # differential (agent allowed_caller_groups: langflow->data-team,
+        # letta->finance-team) never engages and every user gets a uniform deny.
+        group_name = creds.get("group", "")
+        gid = group_ids.get(group_name)
+        if gid:
+            _do_stepup_inline()
+            rg = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
+            if rg.status_code == 403 and "step_up_required" in rg.text:
+                _do_stepup_inline()
+                rg = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
+            if rg.status_code in (200, 201):
+                print(f"  {email}: added to group '{group_name}' (post-registration)")
+            elif rg.status_code == 409:
+                print(f"  {email}: already in group '{group_name}' (409 idempotent)")
+            else:
+                print(f"  {email}: WARN group-add {rg.status_code}: {rg.text[:160]}")
+        elif group_name:
+            print(f"  {email}: WARN no gid for group '{group_name}' — membership NOT added")
     # Save api keys
     out = DEMO_DIR / "user-api-keys-clean.txt"
     out.write_text("".join(f"{e}  {k}\n" for e, k in api_keys.items()))
@@ -601,13 +901,23 @@ def step8_register_agents() -> dict[str, dict]:
     demo keys for langflow — see AGENTS comment above) and PUT only the
     demo-specific groups/allowed_caller_groups/allowed_paths onto them.
 
-    CONFIG-ONLY / FAIL LOUD (Tiago hard constraint): if a bundled agent is
-    missing from GET /admin/agents, that means install.sh's
-    register_agent_bundles() did not run or did not complete for this
-    deployment — a real product/deploy issue. This script does NOT paper
-    over that with a hardcoded upstream_url fallback; it exits non-zero.
+    CONFIG-ONLY / FAIL LOUD (Tiago hard constraint): if a REQUIRED bundled
+    agent (langflow/letta — install.sh ships these by default) is missing
+    from GET /admin/agents, that means install.sh's register_agent_bundles()
+    did not run or did not complete for this deployment — a real
+    product/deploy issue. This script does NOT paper over that with a
+    hardcoded upstream_url fallback; it exits non-zero.
 
-    Returns local_key -> {agent_id, name, token}.
+    An OPTIONAL bundled agent (openclaw — install.sh only enables it via
+    --agent-bundles) being absent is EXPECTED on a default demo install and
+    is NOT a fatal condition (FIND-SEED-OPENCLAW-MISMATCH): a default
+    install ships only langflow+letta, so hard-FATALing on openclaw here
+    used to kill STEP 9 (the 10 OPA client policies) on every default
+    install. We WARN and continue instead — the optional agent's demo
+    config/policy-binding is simply skipped for this run.
+
+    Returns local_key -> {agent_id, name, token} (only for agents actually
+    present this deployment).
     """
     print("\n=== STEP 8: Discover + configure bundled agents (step-up gated) ===")
 
@@ -616,12 +926,16 @@ def step8_register_agents() -> dict[str, dict]:
     by_name = {a["name"]: a for a in existing}
 
     agent_info: dict[str, dict] = {}
-    missing: list[str] = []
+    missing_required: list[str] = []
+    skipped_optional: list[str] = []
     for adef in AGENTS:
         local_key = adef["local_key"]
         match = next((by_name[n] for n in adef["real_names"] if n in by_name), None)
         if match is None:
-            missing.append(f"{local_key} (expected real name in {adef['real_names']})")
+            if adef.get("required", True):
+                missing_required.append(f"{local_key} (expected real name in {adef['real_names']})")
+            else:
+                skipped_optional.append(local_key)
             continue
         agent_info[local_key] = {
             "agent_id": match["agent_id"],
@@ -634,10 +948,21 @@ def step8_register_agents() -> dict[str, dict]:
                      "token lives in /run/secrets/<profile>_token)",
         }
 
-    if missing:
+    if skipped_optional:
         print(
-            f"  FATAL: bundled agent(s) not found via GET /admin/agents: {missing}\n"
-            f"  This means install.sh's register_agent_bundles() did not run or did "
+            f"  WARNING: optional bundled agent(s) not present this deployment, "
+            f"skipping (not fatal — install.sh only enables these via "
+            f"--agent-bundles): {sorted(skipped_optional)}\n"
+            f"  Demo config + policy bindings for these agents are skipped this "
+            f"run; STEP 9 (OPA client policies) still runs in full."
+        )
+
+    if missing_required:
+        print(
+            f"  FATAL: REQUIRED bundled agent(s) not found via GET /admin/agents: "
+            f"{missing_required}\n"
+            f"  langflow/letta are shipped BY DEFAULT by install.sh --deploy demo — "
+            f"this means install.sh's register_agent_bundles() did not run or did "
             f"not complete for this deployment (real product/deploy issue) — not "
             f"something this script papers over with a hardcoded upstream_url.\n"
             f"  Currently registered agent names: {sorted(by_name.keys())}",
@@ -647,6 +972,8 @@ def step8_register_agents() -> dict[str, dict]:
 
     for adef in AGENTS:
         local_key = adef["local_key"]
+        if local_key not in agent_info:
+            continue  # optional bundle not present this deployment — already warned above
         info = agent_info[local_key]
         agent_id = info["agent_id"]
         # upstream_url is deliberately OMITTED — install.sh owns the caddy-front
@@ -755,14 +1082,25 @@ def step9e_allocate_local_model_to_sara() -> None:
 
 
 def step7e_grant_owui_access(user_creds: dict[str, dict]) -> None:
-    """Add demo users to the `owui-users` group so they can sign in to OpenWebUI.
+    """Add demo users to the `owui-users` RBAC group.
 
-    Yashigani is API-first: creating a user provisions API access only (the `users`
-    caller group). OpenWebUI (the human chat surface at /app/webui) is a separate
-    opt-in grant via membership of `owui-users` — without it the user can only use
-    the API, not the chat UI. See docs/operator-guide.md §5.6.
+    HISTORICAL NOTE (G3 finding, verified against docs/operator-guide.md §7 +
+    install.sh:5251/10973): the standalone OpenWebUI container and its
+    `owui-users` forward_auth gate were REMOVED in 4.0 (YSG-RISK-140). The
+    chat surface is now the native `ui4` SPA served by the backoffice at
+    `/chat/*`, gated by ordinary session validity like every other user-tier
+    route — NOT by `owui-users` membership. This group/step is kept for
+    backward-compat RBAC shape (it still grants `/**` resource access, same
+    as the `users` group) but is no longer a real chat on/off switch.
+
+    G3 (API-only user): `kai` (scenario == "api-only") is deliberately
+    EXCLUDED from this grant and from persona/agent/workflow seeding
+    (STEP 13d/13e) — modelling the install-test "B: API-only" journey as an
+    onboarding-flow distinction (minted an API key, never driven through any
+    session/chat-surface step in this script), since there is no remaining
+    RBAC gate that would make this a hard technical block.
     """
-    print("\n=== STEP 7e: Grant OpenWebUI access (owui-users group) ===")
+    print("\n=== STEP 7e: Grant OpenWebUI access (owui-users group; vestigial post-4.0, see docstring) ===")
     r = S.get(f"{BASE_URL}/admin/rbac/groups")
     groups = _ok(r, "list-groups").get("groups", [])
     owui = next((g for g in groups if str(g.get("display_name", "")).lower() == "owui-users"), None)
@@ -771,7 +1109,10 @@ def step7e_grant_owui_access(user_creds: dict[str, dict]) -> None:
         return
     gid = owui.get("id")
     _do_stepup_inline()
-    for email in user_creds:
+    for email, info in user_creds.items():
+        if info.get("scenario") == "api-only":
+            print(f"  {email}: SKIPPED (G3 api-only journey — no chat-surface onboarding)")
+            continue
         r = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
         if r.status_code in (200, 201):
             print(f"  granted OWUI access: {email} -> owui-users")
@@ -898,6 +1239,13 @@ import rego.v1
 # Policy: PII Redaction Enforcement
 # policy_id: POL-004
 # user_message: Personally Identifiable Information must be redacted before transmission to AI models.
+# G4/G8 (populate-demo seed-coverage enhancement): compliance-team is exempt
+# from the deny, but previously got the SAME "redact_pii" obligation as
+# everyone else -- no pseudonymize verdict existed anywhere in the seed.
+# compliance-team now gets "pseudonymize_pii" instead: a genuine 3-way
+# differential on the SAME pii-tagged probe (deny+redact for data/finance
+# humans vs allow+pseudonymize for compliance-team), using the policy's
+# EXISTING wildcard human:"" binding -- no new binding or user required.
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
@@ -910,6 +1258,12 @@ deny contains "POL-004:pii_transmission_blocked" if {
 
 obligations contains "redact_pii" if {
     input.data_tags[_] == "pii"
+    not "compliance-team" in input.identity.groups
+}
+
+obligations contains "pseudonymize_pii" if {
+    input.data_tags[_] == "pii"
+    "compliance-team" in input.identity.groups
 }
 """,
     },
@@ -969,19 +1323,34 @@ import rego.v1
 # policy_id: POL-009
 # user_message: Cardholder (PCI) data must not be sent to AI models. Request blocked.
 # code: pci_data_block
-# Demo scenario: the bound user cannot send PCI data. The built-in credit/debit-card
-# sensitivity pattern classifies cardholder data as RESTRICTED (level 4); this client
-# policy denies on the PCI/RESTRICTED tag, and the user's low sensitivity_ceiling
-# (INTERNAL) blocks RESTRICTED egress at the gateway regardless (defence in depth).
+# Demo scenario: the bound user cannot send OR receive PCI (cardholder) data,
+# regardless of their sensitivity_ceiling — bound wildcard (scope_id="") to
+# EVERY human, both directions. The "pci" data_tag is asserted by the
+# deterministic regex+Luhn PAN scan (Layer 1 in
+# yashigani.optimization.sensitivity_classifier / yashigani.pii.contains_pci_pan)
+# — the sklearn/ollama ensemble layers can only ADD sensitivity on top of
+# that signal, never clear it (FIND-INSPECTION-NONDETERMINISTIC).
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the second deny rule below
+# used to read `input.routing_decision.sensitivity == "RESTRICTED"`. That
+# was written under the pre-R14/R15 4-level model, where RESTRICTED was the
+# TOP level and cardholder data classified there. R14/R15 added a 5th
+# SENSITIVE level ABOVE RESTRICTED specifically for credit-card/API-key/
+# classified content; the legacy string mapping folds BOTH level 4
+# (SSN/phone/IBAN — genuinely NOT PCI) and level 5 (PCI) down to the same
+# "RESTRICTED" string for OPA back-compat. Keeping the bare
+# `sensitivity == "RESTRICTED"` rule made this wildcard-bound policy deny
+# ANY RESTRICTED response for ANY human — silently defeating a caller's
+# legitimately-granted RESTRICTED ceiling for non-PCI content, which is a
+# regression, not a security improvement (the ceiling gate is the correct,
+# separate control for non-PCI RESTRICTED content). Removed: POL-009 now
+# denies ONLY on the precise "pci" data_tag.
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
 
 deny contains "POL-009:pci_data_present" if {
     input.data_tags[_] == "pci"
-}
-deny contains "POL-009:pci_data_present" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
 }
 
 obligations contains "audit_pci_block" if {
@@ -1003,6 +1372,21 @@ import rego.v1
 # This policy denies any NON-local (cloud) model for such content -> the request must
 # be served by a local Ollama model (e.g. summarise the text locally). The bound user
 # is also allocated local-only models so local handling works while cloud is blocked.
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the bare
+# `input.routing_decision.sensitivity == "RESTRICTED"` branch below was
+# removed (same reasoning as POL-009's — see that policy's comment). This
+# policy is bound wildcard `human:""` (every human, egress); leaving the
+# bare-RESTRICTED branch in would make it start denying every RESTRICTED-
+# classified cloud response for every human the moment
+# `routing_decision.sensitivity` stopped being always-"" (a gateway
+# input-contract gap fixed the same day, see
+# yashigani.gateway.openai_router._client_enforce_input) — i.e. a genuine
+# over-block regression, not the classified-marking-specific control this
+# policy documents. The `data_tags[_] == "classified"` branch is the
+# policy's real, precisely-scoped signal; it remains a no-op today because
+# no data_tags vocabulary exists yet for admin-defined classification-
+# marking patterns (a separate, pre-existing gap, out of scope here).
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
@@ -1010,16 +1394,12 @@ decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations
 _local_models := {"gemma3:4b", "phi4-mini", "llama3.1:8b", "qwen2.5:3b"}
 
 deny contains "POL-010:classified_requires_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
-    not input.routing_decision.model in _local_models
-}
-deny contains "POL-010:classified_requires_local" if {
     input.data_tags[_] == "classified"
     not input.routing_decision.model in _local_models
 }
 
 obligations contains "route_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
+    input.data_tags[_] == "classified"
 }
 """,
     },
@@ -1141,11 +1521,24 @@ def step9_save_policies() -> list[str]:
 # binding — hardcoding "langflow" here would bind to a non-existent agent
 # identity, since the real registered name is "agent__langflow".
 
+# G1 (seed-coverage enhancement): POL-001/002/009/010 rebound from a single
+# pinned human to wildcard human:"" (scope_id=""). Verified against
+# policy_bindings/store.py:PolicyBinding.scope_key() (scope_id="" ->
+# "<kind>:*") and policy/clients_aggregate.rego:_scope_keys (the wildcard key
+# is UNIONED with the caller's specific key) -- a wildcard bind only ADDS
+# subjects, it cannot narrow or break the existing single-subject behaviour.
+# Each of these 4 rego bodies already branches on input.identity.groups /
+# routing_decision, not on WHO is bound, so wildcarding them makes the SAME
+# probe diverge correctly by the caller's own attributes (closes
+# coverage-map G1/G6/G7/G11): data-team vs non-data-team (POL-001),
+# finance-team vs not (POL-002, now also covers noah/kai, closing G11),
+# PCI/RESTRICTED tag regardless of ceiling (POL-009, now also covers ana,
+# closing G7), classified-marking regardless of who sent it (POL-010).
 BINDINGS = [
-    # POL-001: data access control -> all human callers, ingress
-    {"policy_name": "data_access_control", "scope_kind": "human", "scope_id": "ana@agnosticsec.com", "direction": "ingress"},
-    # POL-002: finance read-only -> paul (finance-team human), ingress
-    {"policy_name": "finance_read_only", "scope_kind": "human", "scope_id": "paul@agnosticsec.com", "direction": "ingress"},
+    # POL-001: data access control -> ALL human callers (wildcard), ingress
+    {"policy_name": "data_access_control", "scope_kind": "human", "scope_id": "", "direction": "ingress"},
+    # POL-002: finance read-only -> ALL human callers (wildcard), ingress
+    {"policy_name": "finance_read_only", "scope_kind": "human", "scope_id": "", "direction": "ingress"},
     # POL-003: compliance audit -> mia (compliance-team), both directions
     {"policy_name": "compliance_audit_log", "scope_kind": "human", "scope_id": "mia@agnosticsec.com", "direction": "both"},
     # POL-004: PII redaction -> all humans (wildcard), ingress
@@ -1158,10 +1551,10 @@ BINDINGS = [
     {"policy_name": "agent_tool_restriction", "scope_kind": "agent", "scope_id": "langflow", "direction": "egress"},
     # POL-008: EU AI Act -> all service callers, egress
     {"policy_name": "eu_ai_act_human_review", "scope_kind": "service", "scope_id": "", "direction": "egress"},
-    # POL-009: PCI block -> noah (no-PCI demo user), both directions
-    {"policy_name": "pci_data_block", "scope_kind": "human", "scope_id": "noah@agnosticsec.com", "direction": "both"},
-    # POL-010: classified-marking local-only -> sara (classified-local demo user), egress
-    {"policy_name": "classified_marking_local", "scope_kind": "human", "scope_id": "sara@agnosticsec.com", "direction": "egress"},
+    # POL-009: PCI block -> ALL human callers (wildcard), both directions
+    {"policy_name": "pci_data_block", "scope_kind": "human", "scope_id": "", "direction": "both"},
+    # POL-010: classified-marking local-only -> ALL human callers (wildcard), egress
+    {"policy_name": "classified_marking_local", "scope_kind": "human", "scope_id": "", "direction": "egress"},
 ]
 
 
@@ -1175,6 +1568,14 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
     agent name (e.g. "agent__langflow") before binding. Hardcoding the local
     key as the scope_id would silently bind to a non-existent agent identity
     for langflow (LAURA-4.1.2 populate-demo fix, POL-005/006/007).
+
+    FIND-SEED-OPENCLAW-MISMATCH: if the referenced local_key is an OPTIONAL
+    agent bundle (e.g. openclaw) that step8 skipped because it isn't present
+    this deployment, that specific binding is WARNED and skipped (the policy
+    itself was still saved in STEP 9) rather than FATALing the whole run. A
+    missing REQUIRED agent (langflow/letta) still FATALs here — step8 would
+    already have exited before reaching STEP 10 in that case, so this is a
+    defensive backstop, not the primary guard.
     """
     print("\n=== STEP 10: Bind policies (step-up gated) ===")
     # List existing bindings to avoid duplicates
@@ -1192,6 +1593,13 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
             local_key = bdef["scope_id"]
             info = agent_info.get(local_key)
             if not info or not info.get("name"):
+                if local_key in _OPTIONAL_AGENT_LOCAL_KEYS:
+                    print(
+                        f"  WARNING: skipping binding '{bdef['policy_name']}' -> "
+                        f"agent:{local_key} — optional bundled agent not present "
+                        f"this deployment (policy itself was still saved in STEP 9)."
+                    )
+                    continue
                 print(
                     f"  FATAL: cannot bind '{bdef['policy_name']}' — agent local_key "
                     f"'{local_key}' was not discovered in STEP 8 (see FATAL above).",
@@ -1225,14 +1633,47 @@ def step10_bind_policies(agent_info: dict[str, dict]) -> None:
 # STEP 11 — Allow/deny probe
 # ---------------------------------------------------------------------------
 
+def _simulate_policy(policy_id: str, input_scenario: dict, label: str) -> dict | None:
+    """POST /admin/policies/simulate (R12 dry-run — routes/policies.py:simulate_policy).
+
+    Returns the parsed body dict, or None if the endpoint/policy is
+    unavailable on this deployment tier (404/503/422 are all treated as
+    "not available here", not a hard failure — mirrors the original probe's
+    tolerance for missing tiers, just against the endpoint that actually
+    exists).
+    """
+    r = S.post(f"{BASE_URL}/admin/policies/simulate",
+               json={"policy_id": policy_id, "input_scenario": input_scenario, "ai_explain": False})
+    if r.status_code == 404:
+        print(f"  {label}: policy/endpoint not available on this deployment tier (404, not a failure)")
+        return None
+    if r.status_code == 503:
+        print(f"  {label}: HTTP 503 (OPA unreachable — expected on this deployment tier)")
+        return None
+    body = _ok(r, label, allow=(422,))
+    if r.status_code == 422:
+        print(f"  {label}: HTTP 422 (bad input schema — expected on this deployment tier)")
+        return None
+    return body
+
+
 def step11_allow_deny_probe() -> None:
     """
-    Fire one allow and one deny probe via /admin/inspection/simulate.
-    If the endpoint doesn't exist on this deployment tier, skip gracefully.
-    """
-    print("\n=== STEP 11: Allow/deny OPA probe ===")
+    Fire one allow and one deny probe via POST /admin/policies/simulate.
 
-    # Allow probe: data-team user, /v1/data path (should pass POL-001)
+    FINDING (discovered while implementing G2): the previous version of this
+    step posted to `/admin/inspection/simulate`, which does not exist in this
+    codebase (routes/inspection.py has no `/simulate` route — the real
+    dry-run endpoint is `/admin/policies/simulate`, routes/policies.py
+    `SimulateRequest{policy_id, input_scenario, ai_explain}`). Every prior run
+    of this step therefore hit a 404 and was silently "skipped gracefully" —
+    this probe never actually executed. Fixed to call the real endpoint with
+    an explicit policy_id per probe (the same two input shapes as before,
+    matched to the policy they were originally written to exercise).
+    """
+    print("\n=== STEP 11: Allow/deny OPA probe (via /admin/policies/simulate) ===")
+
+    # Allow probe: data-team user, /v1/data path -> POL-001 data_access_control (allow)
     allow_input = {
         "identity": {"role": "user", "groups": ["data-team"], "agent": "", "clearance": ""},
         "request": {"purpose": "data_query", "lawful_basis": "consent"},
@@ -1242,6 +1683,7 @@ def step11_allow_deny_probe() -> None:
         "data_tags": [],
         "tool": "",
     }
+    # Deny probe: finance-team user, non-GET /v1/finance -> POL-002 finance_read_only (deny)
     deny_input = {
         "identity": {"role": "user", "groups": ["finance-team"], "agent": "", "clearance": ""},
         "request": {"purpose": "policy_promotion", "lawful_basis": ""},
@@ -1252,20 +1694,78 @@ def step11_allow_deny_probe() -> None:
         "tool": "email.delete",
     }
 
-    for label, payload in [("allow-probe", allow_input), ("deny-probe", deny_input)]:
-        r = S.post(f"{BASE_URL}/admin/inspection/simulate", json={"input": payload})
-        if r.status_code == 404:
-            print(f"  {label}: /admin/inspection/simulate not available on this deployment tier (expected 404, not a failure)")
-            continue
-        if r.status_code == 405:
-            print(f"  {label}: 405 Method Not Allowed — endpoint may be GET-only, skipping")
-            continue
-        body = _ok(r, label, allow=(200, 201, 422, 503))
-        if r.status_code in (422, 503):
-            print(f"  {label}: HTTP {r.status_code} (OPA unavailable or bad input schema — expected on this deployment tier)")
-        else:
-            decision = body.get("decision") or body.get("result") or body
-            print(f"  {label}: {json.dumps(decision, default=str)[:200]}")
+    for label, policy_id, payload in [
+        ("allow-probe", "clients/data_access_control", allow_input),
+        ("deny-probe", "clients/finance_read_only", deny_input),
+    ]:
+        body = _simulate_policy(policy_id, payload, label)
+        if body is not None:
+            print(f"  {label} ({policy_id}): verdict={body.get('verdict')} "
+                  f"deny={body.get('deny')} obligations={body.get('obligations')}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 11b — G2: service-scope differential probe (POL-008 EU AI Act)
+# ---------------------------------------------------------------------------
+
+def step11b_service_identity_probe() -> None:
+    """
+    G2 (populate-demo seed-coverage enhancement): POL-008 (eu_ai_act_human_review)
+    is bound wildcard `service:""` (BINDINGS above) but no seeded identity is
+    `service`-kind, so it was never differentially exercised.
+
+    PRODUCT-GAP FINDING (verified by direct code search, not assumed):
+    there is NO admin API to mint a persistent, externally-drivable
+    `service`-kind identity.
+      - identity/registry.py:IdentityRegistry.register() IS called with an
+        explicit kind in exactly two places in the whole tree
+        (backoffice/routes/auth.py:3442, backoffice/routes/sso.py:270) —
+        BOTH hardcode kind=IdentityKind.HUMAN.
+      - GET /admin/identities (backoffice/routes/agents.py:1140) is
+        READ-ONLY (list only; no POST).
+      - The only LIVE `service`-kind principal in this deployment is the
+        synthetic in-mesh identity gateway/openai_router.py resolves for the
+        per-install YASHIGANI_INTERNAL_BEARER secret
+        (identity_id="internal", kind="service", openai_router.py:1783-1785,
+        5283) — a container-internal secret this external, admin-API-only
+        demo script has no legitimate way to read or drive traffic as
+        (breaking that boundary would defeat the point of the isolation).
+    This is a genuine capability gap (no admin-facing way to onboard an
+    additional/independent SERVICE identity), not something a seed script
+    can close alone -- flagged for Maxine/Tiago rather than silently
+    worked around. See populate-coverage-map G2 + this docstring.
+
+    What CAN be closed here without touching product code: POL-008's own
+    decision rule (data.clients.eu_ai_act_human_review.decision) is
+    evaluated directly via /admin/policies/simulate (bypasses the
+    scope/binding-resolution layer, same as STEP 11 above) with two
+    service-shaped scenarios that differ ONLY in human_approved -- a genuine
+    allow-vs-deny differential for the one policy already bound to
+    `service:*`.
+    """
+    print("\n=== STEP 11b: Service-identity differential probe (POL-008, via simulate) ===")
+    print(
+        "  NOTE: no admin API exists to mint a persistent 'service'-kind identity "
+        "(verified: only auth.py/sso.py register kind=HUMAN; GET /admin/identities "
+        "is read-only) -- the live differential below runs directly against POL-008's "
+        "decision rule, not through a real service-scope gateway call. See docstring."
+    )
+
+    base_identity = {"role": "service", "kind": "service", "groups": [], "agent": "", "clearance": ""}
+    deny_input = {
+        "identity": base_identity,
+        "request": {"purpose": "policy_promotion", "human_approved": False},
+    }
+    allow_input = {
+        "identity": base_identity,
+        "request": {"purpose": "policy_promotion", "human_approved": True},
+    }
+
+    for label, payload in [("service-deny-probe", deny_input), ("service-allow-probe", allow_input)]:
+        body = _simulate_policy("clients/eu_ai_act_human_review", payload, label)
+        if body is not None:
+            print(f"  {label}: verdict={body.get('verdict')} "
+                  f"deny={body.get('deny')} obligations={body.get('obligations')}")
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1788,8 @@ def step12_verify_user_logins(user_creds: dict[str, dict]) -> None:
             u = user_map[email]
             print(f"  user '{email}': username={u.get('username')}, disabled={u.get('disabled')}, "
                   f"force_pw_change={u.get('force_password_change')}")
+        elif udef.get("optional_seat"):
+            print(f"  '{email}': not present — expected (G3 optional seat, no licence headroom)")
         else:
             print(f"  WARN: user '{email}' not found in users list")
 
@@ -1361,7 +1863,10 @@ def step13b_cloud9_demo_wire() -> None:
        This is the OWUI model picker entry the demo user selects.
 
     2. Benign orchestration call (no digit 9 in the middle of text) → 200, CLEAN.
-       Uses ana's API key (owui-users member, ceiling CONFIDENTIAL).
+       Uses ana's API key (owui-users member, ceiling RESTRICTED — G6: this
+       comment previously said CONFIDENTIAL, a stale mismatch against the
+       authoritative USERS[0]["ceiling"] = "RESTRICTED" / STEP7d's actual
+       write; RESTRICTED is what makes the benign echo pass egress here).
 
     3. Cloud-9 injection call (digit 9 in middle of text arg) → 200, BLOCKED.
        The demo-mcp returns INJECTION_PAYLOAD for this input; the gateway
@@ -1379,7 +1884,8 @@ def step13b_cloud9_demo_wire() -> None:
     """
     print("\n=== STEP 13b: cloud-9 MCP-injection demo wiring verification ===")
 
-    # Use ana's API key for the wiring check (user-tier, ceiling CONFIDENTIAL).
+    # Use ana's API key for the wiring check (user-tier, ceiling RESTRICTED — G6 fix,
+    # was stale "CONFIDENTIAL"; see USERS[0] and STEP7d).
     # ana key is stored in the user-api-keys file written by step7c.
     api_key_file = DEMO_DIR / "user-api-keys-clean.txt"
     ana_key = ""
@@ -2083,8 +2589,8 @@ def step15_summary(
     print("POPULATE-DEMO (4.1.2) — COMPLETE")
     print("=" * 70)
 
-    print(f"\nOrchid new password ({len(ORCHID_NEW_PW)} chars, round-trip verified):")
-    print(f"  {ORCHID_NEW_PW}")
+    print(f"\nOrchid current password ({len(_CURRENT_ORCHID_PW)} chars, round-trip verified):")
+    print(f"  {_CURRENT_ORCHID_PW}")
     print(f"  Saved to: {CREDS_FILE}")
 
     print("\nGroups created/verified:")
@@ -2143,7 +2649,7 @@ def main() -> None:
 
     # Step 7: users + group membership
     user_creds = step7_create_users(group_ids)
-    api_keys = step7c_onboard_users(user_creds)
+    api_keys = step7c_onboard_users(user_creds, group_ids)
     step7b_save_user_creds(user_creds)  # FIND-DEMO-CREDS: save AFTER onboarding so the file has the rotated new_pw
     step7d_set_sensitivity_ceilings(user_creds)
     step7e_grant_owui_access(user_creds)
@@ -2162,6 +2668,9 @@ def main() -> None:
 
     # Step 11: allow/deny probe
     step11_allow_deny_probe()
+
+    # Step 11b: G2 — service-scope differential probe (POL-008)
+    step11b_service_identity_probe()
 
     # Step 12: verify user accounts exist
     step12_verify_user_logins(user_creds)

@@ -249,6 +249,16 @@ SKIP_NETWORKPOLICY_PROBE=false
 # their OWN pre-built, registry-hosted, immutable-digest images via
 # --set global.imageRegistry=... (real CI/CD pipeline owns freshness there).
 SKIP_K8S_IMAGE_BUILD=false
+# FIND-K8S-NO-VALUES-OVERLAY (2026-08-04): before this, the only way to layer
+# extra helm values on the k8s path was to run install.sh through PKI/secrets/
+# preflights and then issue a SEPARATE, manual `helm upgrade` (documented
+# workaround in leg3-kind LAUNCH.md — install.sh itself had no CLI for it).
+# --helm-values <file> (repeatable) passes each file straight through to
+# k8s_helm_install()'s helm_args as an additional `-f`, applied AFTER every
+# overlay install.sh adds itself (agent-bundle egress/ingress overlays) so an
+# operator-supplied file can override install.sh's own defaults, and BEFORE
+# helm's own --set precedence (still highest, unaffected by this flag).
+HELM_VALUES_EXTRA=()
 # Cilium ratified as the k8s CNI standard (2026-07-19 design). These two gates
 # are cheap/fast, static-ish checks that fail fast BEFORE the wizard runs.
 # Kernel check is skippable (soft heuristic, node kernels can legitimately
@@ -581,6 +591,15 @@ OPTIONS
                                           what was just built. Use this flag only when you supply
                                           your own pre-built, registry-hosted images via
                                           --set global.imageRegistry=... .
+  --helm-values FILE                       (k8s) Layer an additional helm values file onto the
+                                          k8s deploy (repeatable). Passed as -f FILE to
+                                          k8s_helm_install's helm invocation, AFTER every
+                                          overlay install.sh adds itself (agent-bundle egress/
+                                          ingress overlays) so this can override install.sh's
+                                          own defaults; helm's own --set precedence is
+                                          unaffected. Previously the only way to do this was a
+                                          separate manual `helm upgrade` after install.sh
+                                          finished (FIND-K8S-NO-VALUES-OVERLAY).
   --apply-coredns-hardening                (k8s) Patch this cluster's kube-system CoreDNS
                                           Corefile with the DNSSEC-delegated/DoT forward block
                                           (scripts/coredns-hardening-apply.sh) before the
@@ -864,6 +883,22 @@ parse_args() {
       --coredns-backup-dir)
         COREDNS_BACKUP_DIR="${2:?--coredns-backup-dir requires a value}"; shift 2 ;;
       --skip-k8s-image-build)    SKIP_K8S_IMAGE_BUILD=true;      shift ;;
+      --helm-values)
+        # FIND-K8S-NO-VALUES-OVERLAY: repeatable — each occurrence appends
+        # another -f to k8s_helm_install's helm invocation (helm's own
+        # last-file-wins-per-key merge order applies across repeats, same as
+        # native `helm -f a -f b`).
+        local _hv="${2:?--helm-values requires a file path}"
+        [[ -f "$_hv" ]] || { log_error "--helm-values: file not found: ${_hv}"; exit 1; }
+        HELM_VALUES_EXTRA+=("$_hv")
+        shift 2
+        ;;
+      --helm-values=*)
+        local _hv2="${1#*=}"
+        [[ -f "$_hv2" ]] || { log_error "--helm-values: file not found: ${_hv2}"; exit 1; }
+        HELM_VALUES_EXTRA+=("$_hv2")
+        shift
+        ;;
       --upgrade)         UPGRADE=true;           shift ;;
       --reuse-volumes)   REUSE_VOLUMES=true;     shift ;;
       --dry-run)         DRY_RUN=true;           shift ;;
@@ -8688,15 +8723,19 @@ YSG_COMPOSE_FILE_ARGS=()
 # closes that gap by giving all call sites one shared, always-current list.
 #
 # Covers: wazuh overlay, per-agent egress-forwarder overlays, the Docker
-# native NVIDIA GPU overlay, and the Podman rootless override + macOS
-# virtiofs override. Deliberately EXCLUDES the Podman-CDI-GPU-probe /
-# mac-metal / AMD-ROCm / Vulkan branches still inline in compose_up() below —
-# those run live provisioning/probing side effects (_setup_podman_cdi_gpu, a
-# throwaway `podman run` CDI probe, host-ollama-port resolution) that belong
-# only in the initial convergence, not in every later idempotent
-# re-converge. KNOWN GAP: those GPU types are not yet protected by this
-# shared list outside compose_up() itself. Docker Engine + NVIDIA (this box,
-# and the common case) is fully covered by every call site.
+# native NVIDIA GPU overlay, the Podman rootless override + macOS virtiofs
+# override, and (as of FIND-OLLAMA-MAC-2, 2026-08-03) the Mac/Metal overlay
+# (file-existence check only — see the dedicated block at the end of this
+# function for why the live host-ollama-port resolution stays compose_up()-
+# only while the overlay FILE itself is now reconverge-safe). Deliberately
+# STILL EXCLUDES the Podman-CDI-GPU-probe / AMD-ROCm / Vulkan branches still
+# inline in compose_up() below — those run live provisioning/probing side
+# effects (_setup_podman_cdi_gpu, a throwaway `podman run` CDI probe) that
+# belong only in the initial convergence, not in every later idempotent
+# re-converge. KNOWN GAP: those GPU types (Podman+NVIDIA-CDI, AMD-ROCm,
+# Vulkan) are not yet protected by this shared list outside compose_up()
+# itself. Docker Engine + NVIDIA, and Mac/Metal (Docker and Podman), are now
+# fully covered by every call site.
 _ysg_assemble_compose_files() {
   YSG_COMPOSE_FILE_ARGS=("-f" "${WORK_DIR}/docker/docker-compose.yml")
 
@@ -8755,6 +8794,50 @@ _ysg_assemble_compose_files() {
         log_info "Applying Podman virtiofs :U override (macOS only)"
       else
         log_warn "Podman virtiofs override not found at ${podman_virtiofs_override} — :U mounts will not apply (macOS virtiofs may fail)"
+      fi
+    fi
+  fi
+
+  # FIND-OLLAMA-MAC-2 (2026-08-03, Iris integration-audit): Mac/Metal overlay
+  # file-existence check ONLY — no live provisioning side effect — so every
+  # reconverge path through this shared function (register_agent_bundles(),
+  # the --onboard gateway recreate, the macOS-Podman LaunchAgent, the Linux
+  # systemd auto-start units) keeps ollama/ollama-init EXCLUDED
+  # (profiles: [mac-metal-host-ollama-only], see FIND-OLLAMA-MAC) instead of
+  # resurrecting them on any recreate that doesn't go through compose_up()'s
+  # own inline mac-metal block. This function deliberately does NOT call
+  # _resolve_host_ollama_port() (that stays compose_up()-only — it is a live
+  # probe/prompt/abort chain, not safe to re-run on every idempotent
+  # reconverge). The overlay's ${YASHIGANI_HOST_OLLAMA_PORT:-11434}
+  # interpolation is satisfied from ${WORK_DIR}/docker/.env instead, which
+  # compose_up() persists on first run (both Docker Compose v2 and the
+  # vendored podman-compose-ysg fork derive project-dir / .env location from
+  # the directory of the FIRST -f file — always ${WORK_DIR}/docker — so this
+  # resolves correctly regardless of the caller's cwd; confirmed by reading
+  # podman_compose.py:_parse_compose_file, `dirname = dirname(files[0])`).
+  # Static validation only, on this integration head — live re-verify on the
+  # macOS-Metal leg of the 3-runtime office retest (this is the exact path
+  # FIND-PODMAN-MAC-1's LaunchAgent race was found on).
+  if [[ "${YSG_GPU_TYPE:-none}" == "apple_metal" ]] && [[ "$(uname -s)" == "Darwin" ]] && [[ "${MODE:-}" != "k8s" ]]; then
+    if [[ "${YSG_PODMAN_RUNTIME:-false}" != "true" ]]; then
+      local _gpu_overlay_mac_metal="${WORK_DIR}/docker/docker-compose.gpu-mac-metal.yml"
+      if [[ -f "$_gpu_overlay_mac_metal" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal")
+        log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
+      fi
+      # FIND-DEMO-MCP-AMD64-ON-ARM64: on Apple Silicon, force demo-mcp to build
+      # native-arm64 instead of consuming the prebuilt amd64 image (which runs
+      # under Rosetta2/QEMU — a Docker Desktop crash aggravator, 2026-08-07).
+      local _demo_mcp_native="${WORK_DIR}/docker/docker-compose.demo-mcp-native.yml"
+      if [[ -f "$_demo_mcp_native" ]] && [[ "$(uname -m)" == "arm64" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_demo_mcp_native")
+        log_info "Applying Apple-Silicon demo-mcp native-arm64 build overlay (docker-compose.demo-mcp-native.yml) — avoids amd64/Rosetta emulation (FIND-DEMO-MCP-AMD64-ON-ARM64)"
+      fi
+    else
+      local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
+      if [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal_podman")
+        log_info "Applying Mac/Metal GPU overlay — Podman path (docker-compose.gpu-mac-metal-podman.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
       fi
     fi
   fi
@@ -11194,6 +11277,84 @@ register_agent_bundles() {
   # agents skipped, registry stays empty). The Python script now calls
   # GET /admin/agents after login to get the live registry state and skips
   # only agents that are ACTUALLY registered — not agents with stale token files.
+  #
+  # FIND-IRIS-DUP-AGENT (2026-08-04, install.sh-side guard — SEAM CONTRACT):
+  # the in-container Python step below decides "skip vs register" by reading
+  # Redis db/3 (AgentRegistry.list_all()) — a store that runs `appendonly no`
+  # / `save ""` (registry.py + durable_store.py header comments) and is wiped
+  # on any redis recreate. If that Python-side check races the startup
+  # reconciler (reconcile_agents_from_durable, agents/reconciler.py) on THIS
+  # --upgrade's freshly-recreated backoffice/redis containers, it can see an
+  # empty Redis view, decide "not registered", and register a SECOND agent
+  # under the same name — the DB permits this by design (migration 0017
+  # deliberately dropped the agent_name UNIQUE constraint; agent_id is the
+  # only unique key), so no constraint stops a duplicate active row.
+  #
+  # SEAM OWNERSHIP (documented, do not re-litigate without re-reading this):
+  #   - Tom (fix/v412-batch-product-20260804) owns the actual registry
+  #     idempotency fix inside yashigani.agents.{registry,durable_store,
+  #     reconciler} — i.e. making the SKIP decision race-proof against a
+  #     just-wiped Redis (query durable Postgres, not just the fast layer).
+  #   - Su (this branch) owns the install.sh/bash orchestration seam: (1) a
+  #     belt-and-braces PRE-CHECK against durable Postgres directly, so a
+  #     profile already durably registered is never even offered to the
+  #     Python step, independent of whatever Tom's Redis-side fix ends up
+  #     doing; (2) never silently overwriting an existing host-side token
+  #     file when the container-side step unexpectedly still returns OK for
+  #     an already-known name (handled below in the OK: result parser).
+  # This is intentionally NOT a rewrite of the Python skip-check itself —
+  # that stays Tom's, so the fix lands once there, not divergently in two
+  # places reading two different sources.
+  # bash-3.2-safe (macOS system bash — see scripts/test-installer.sh
+  # portability gate, S6/test_bash_compat): NOT an associative array.
+  # Comma-delimited membership string, same convention already used for
+  # AGENT_BUNDLES membership checks above (_fwd_ab=",${AGENT_BUNDLES...},").
+  # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05) — FAIL-OPEN INVARIANT, do not
+  # weaken: on query failure, `_ysg_agent_pre_existing` MUST remain exactly
+  # "," (no name ever added to it below), which structurally guarantees the
+  # per-profile membership test at the "already registered" guard below
+  # (`[[ "$_ysg_agent_pre_existing" == *",${_name}," ]]`) can NEVER match for
+  # ANY profile — i.e. a durable-query failure skips NOBODY, it only means
+  # this belt-and-braces pre-check couldn't PROACTIVELY exclude an
+  # already-registered name before offering it to the container-side step
+  # (Tom's registry-side idempotency, registry.py/durable_store.py, is the
+  # authoritative skip decision either way). Never rewrite this to populate
+  # `_ysg_agent_pre_existing` with anything on the failure path, and never
+  # change the membership test to treat an empty/failed pre-check as
+  # "everything pre-existing" — that would silently regress every fresh
+  # install back to zero agents registered. Verified in
+  # tests/install/test_agent_dup_registration_guard.bats (the path this
+  # comment previously cited, tests/invariants/test_i_agent_bundle_precheck_
+  # fail_open.sh, was never created — corrected 2026-08-05, FIND-DUP-AGENT-
+  # RESIDUAL follow-up; see that file's G-IDEMPOTENCY test for the fresh-
+  # install-then-reconverge end-to-end proof).
+  #
+  # Root cause of the ACTUAL "zero agents registered" regression this guards
+  # against is NOT a bug in this fail-open logic (it was already correct) —
+  # it was AS-FIX-5 (vendor/podman-compose-ysg/CHANGES.agnostic.md): a
+  # compose-merge bug crashed EVERY exec call below (this one AND the
+  # container-side registration further down) whenever the GPU-mac-metal
+  # overlay was in the assembled -f list, before either ever reached its
+  # target container. Fixed at the source (the vendored fork). The
+  # `_any_recognized_line` loud-failure guard further down this function is
+  # the belt-and-braces catch for the NEXT time an exec call fails
+  # catastrophically for some other reason — it must never look identical
+  # to a legitimate "already registered" no-op.
+  local _ysg_agent_pre_existing=","
+  local _existing_names_raw=""
+  if _existing_names_raw="$("${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
+      psql -U yashigani_admin -d yashigani -h 127.0.0.1 -tAc \
+      "SELECT agent_name FROM agent_registry WHERE tenant_id = '00000000-0000-0000-0000-000000000000' AND status = 'active' AND agent_name <> '';" \
+      2>/dev/null)"; then
+    local _en_line
+    while IFS= read -r _en_line; do
+      _en_line="$(printf '%s' "$_en_line" | tr -d ' \r')"
+      [[ -n "$_en_line" ]] && _ysg_agent_pre_existing="${_ysg_agent_pre_existing}${_en_line},"
+    done <<< "$_existing_names_raw"
+  else
+    log_warn "FIND-IRIS-DUP-AGENT pre-check: could not query durable agent_registry (non-fatal — falling back to the in-container skip check only)"
+  fi
+
   local agents_json='['
   local first=true
   for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
@@ -11240,6 +11401,15 @@ register_agent_bundles() {
       openclaw)  local _name="openclaw"  _url="https://caddy:9671/agents/default/openclaw"  _proto="openai" ;;
       *) continue ;;
     esac
+
+    # FIND-IRIS-DUP-AGENT pre-check (Su seam, see header comment above):
+    # already durably registered under this canonical name — never even
+    # offer it to the container-side registration step.
+    if [[ "$_ysg_agent_pre_existing" == *",${_name},"* ]]; then
+      log_info "  ${_name}: already registered (durable Postgres) — skipping (FIND-IRIS-DUP-AGENT guard)"
+      continue
+    fi
+
     $first || agents_json+=','
     agents_json+="{\"profile\":\"${_profile}\",\"name\":\"${_name}\",\"url\":\"${_url}\",\"protocol\":\"${_proto}\",\"groups\":${_lf_groups},\"allowed_caller_groups\":${_lf_caller_groups},\"allowed_paths\":${_lf_paths},\"kind\":\"${_lf_kind}\",\"sensitivity_ceiling\":\"${_lf_ceiling}\"}"
     first=false
@@ -11392,7 +11562,26 @@ for r in results:
 ' 2>&1)" || reg_exit=$?
 
   # Parse results
+  #
+  # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05, loud-failure hardening): the
+  # compose-exec call above (both this python3 payload AND the durable-
+  # Postgres pre-check further up this function) can fail CATASTROPHICALLY —
+  # i.e. crash before the container-side script ever runs a single line —
+  # for reasons that have nothing to do with any agent already being
+  # registered (AS-FIX-5, vendor/podman-compose-ysg: a compose-merge bug
+  # made every `compose exec` call that included the GPU-mac-metal overlay
+  # crash with a Python traceback during file parsing, on EVERY fresh Podman
+  # install, before backoffice was ever reached). `$reg_output` in that case
+  # is a traceback — no line matches OK:/SKIP:/FAIL:/ERROR: — so the loop
+  # below silently falls through to `any_registered=false` and the SAME
+  # "No agents were registered — register manually" warning a genuine
+  # "everything already registered, nothing new to do" no-op would produce.
+  # That is a swallowed infrastructure failure wearing a legitimate no-op's
+  # clothing — never fail closed on registration ambiguously. Track whether
+  # ANY line was recognised at all; if the exec exited non-zero AND nothing
+  # was recognised, this was not a no-op — it never reached the container.
   local any_registered=false
+  local _any_recognized_line=false
   while IFS= read -r line; do
     case "$line" in
       OK:*)
@@ -11403,6 +11592,32 @@ for r in results:
         local _profile="${_rest%%:*}"
         local _token="${_rest#*:}"
         if [[ -n "$_profile" && -n "$_token" && "$_token" != "$_profile" ]]; then
+          # FIND-IRIS-DUP-AGENT safety net (Su, defense-in-depth): the
+          # container-side step returned OK (new registration) for a name our
+          # bash-side pre-check above believed was ALREADY durably registered,
+          # or a token file for this profile already exists on disk from a
+          # prior run. Either signal means the container just created a
+          # SECOND active agent row under the same name (migration 0017 does
+          # not enforce name-uniqueness at the DB level, so this succeeds
+          # silently unless we catch it here) — OR, less alarmingly, a fresh
+          # reinstall wiped the Docker volumes while the secrets dir survived
+          # (the exact scenario YSG-AGENT-REG-001's header comment above
+          # documents). Either way: never blindly clobber a pre-existing
+          # token — preserve it and warn loudly so an operator can tell the
+          # two cases apart via /admin/agents, instead of silently losing
+          # access to whichever agent_id the old token pointed at.
+          if [[ -s "${secrets_dir}/${_profile}_token" ]]; then
+            local _dup_backup
+            _dup_backup="${secrets_dir}/${_profile}_token.dup-$(date -u +%Y%m%dT%H%M%SZ)"
+            if cp -p "${secrets_dir}/${_profile}_token" "${_dup_backup}" 2>/dev/null; then
+              chmod 0640 "${_dup_backup}" 2>/dev/null || true
+              log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed. Old token preserved at ${_dup_backup} — NOT overwritten silently. Check /admin/agents for duplicate active rows named '${_agent_name}' (either deactivate the stale one, or confirm this was an intentional full-volume reinstall) before relying on @${_agent_name} chat dispatch."
+            else
+              log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} re-registered with an existing token file present, but the pre-registration backup copy FAILED — proceeding to overwrite anyway (old token content is now unrecoverable). Check /admin/agents for duplicate active rows named '${_agent_name}'."
+            fi
+          elif [[ "$_ysg_agent_pre_existing" == *",${_agent_name},"* ]]; then
+            log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
+          fi
           # ISSUE-027 (2026-05-19): Docker-rootful fallback — Python inside the
           # container may fail to write the token (EACCES) and fall through to
           # printing it for host-side capture.  On Podman rootless the Python step
@@ -11428,27 +11643,33 @@ for r in results:
         fi
         log_success "  ${_agent_name}: registered"
         any_registered=true
+        _any_recognized_line=true
         ;;
       SKIP:*)
         # YSG-AGENT-REG-001: agent already in registry — no re-registration needed.
         local _skip_parts="${line#SKIP:}"
         local _skip_name="${_skip_parts%%:*}"
         log_info "  ${_skip_name}: already registered — skipping"
+        _any_recognized_line=true
         ;;
       FAIL:*)
         local _fail_detail="${line#FAIL:}"
         log_warn "  ${_fail_detail}"
+        _any_recognized_line=true
         ;;
       ERROR:*)
         log_warn "Agent registration: ${line#ERROR:}"
+        _any_recognized_line=true
         ;;
       ENVELOPE_MINTED:*)
         # SEC-ENVELOPE-001: capability envelope minted for this bundled agent front.
         log_success "  envelope minted: ${line#ENVELOPE_MINTED:}"
+        _any_recognized_line=true
         ;;
       ENVELOPE_WARN:*)
         # Non-fatal: fail-closed (verify-mcp denies until next boot retries).
         log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
+        _any_recognized_line=true
         ;;
     esac
   done <<< "$reg_output"
@@ -11463,6 +11684,22 @@ for r in results:
     log_success "Agent bundle registration complete"
 
     # 4.0: OWUI removed — agent sync via /admin/agents UI or API.
+  elif [[ "${reg_exit}" -ne 0 && "${_any_recognized_line}" == "false" ]]; then
+    # FIND-IRIS-DUP-AGENT-REGRESSION (2026-08-05): the compose-exec call
+    # failed before the container-side script produced a single recognisable
+    # OK/SKIP/FAIL/ERROR/ENVELOPE line — this is NOT "everything was already
+    # registered, nothing to do" (that case DOES produce SKIP: lines and is
+    # handled by the plain else branch below). This is an infrastructure
+    # failure (compose/exec/network/parsing — see AS-FIX-5 for the exact
+    # class this closes) that never reached the target container at all.
+    # Fail loud and distinct so an operator/CI gate cannot mistake this for
+    # a benign no-op.
+    log_error "Agent bundle registration FAILED before reaching the backoffice container (exec exit ${reg_exit}, no recognised result — NOT the same as 'already registered')."
+    log_error "Raw compose-exec output:"
+    while IFS= read -r _raw_line; do
+      log_error "    ${_raw_line}"
+    done <<< "$reg_output"
+    log_error "This is an infrastructure failure, not a no-op — agents were NOT registered. Fix the underlying compose/exec failure and re-run, or register manually via /admin/agents."
   else
     log_warn "No agents were registered — register manually via /admin/agents"
   fi
@@ -13911,7 +14148,28 @@ k8s_ensure_fresh_local_images() {
   fi
 
   log_step "7b/${TOTAL_STEPS}" "Building + pushing first-party k8s images (YSG-RISK-123)..."
-  require_cmd "docker"   # k8s path is Docker-only today (no podman-k8s support upstream)
+  # FIND-K8S-INSTALL-DOCKER-ONLY (2026-08-04, Podman-strategic parity): this
+  # step used to hard-require `docker` specifically (require_cmd "docker" +
+  # every build/tag/push/run/ps/start/inspect call below spelled "docker"
+  # literally), forcing a --skip-k8s-image-build + manual `podman build` +
+  # `kind load` workaround on every Podman/kind host (reproduced live, Leg 3
+  # of the 3-runtime retest, kind-on-podman). Podman is CLI-compatible with
+  # every verb this function uses (build/tag/push/run -d/ps/start/inspect)
+  # and speaks the same registry push/pull protocol, so the fix is to resolve
+  # the engine binary the same way the rest of install.sh already does —
+  # _ysg_compose_engine_bin() (install.sh ~1741) — instead of hardcoding
+  # "docker". No behaviour change on Docker hosts (still resolves to
+  # "docker"); on Podman hosts this now runs the identical ephemeral-
+  # registry-push flow via `podman`.
+  # KNOWN REMAINING GAP (not this fix's scope — tracked separately): whether
+  # a kind-on-podman NODE container can reach localhost:5000 on the host
+  # depends on kind's own network wiring (host-gateway / same-network
+  # reachability), which this fix does not change — it only removes the
+  # docker-only hard-require so a podman-built image at least lands in the
+  # local registry via the correct engine.
+  local _runtime_bin
+  _runtime_bin="$(_ysg_compose_engine_bin)"
+  require_cmd "$_runtime_bin"
 
   local _reg="${YASHIGANI_K8S_LOCAL_REGISTRY:-localhost:5000}"
   local _owner="local"
@@ -13919,17 +14177,17 @@ k8s_ensure_fresh_local_images() {
 
   # 1) Ensure a local registry is reachable at $_reg — start an ephemeral one
   #    (named so re-runs are idempotent) if nothing is listening there yet.
-  if ! docker ps --filter "name=^yashigani-k8s-local-registry$" --filter "status=running" \
+  if ! "$_runtime_bin" ps --filter "name=^yashigani-k8s-local-registry$" --filter "status=running" \
        --format '{{.Names}}' | grep -q .; then
-    if docker ps -a --filter "name=^yashigani-k8s-local-registry$" --format '{{.Names}}' | grep -q .; then
-      docker start yashigani-k8s-local-registry >/dev/null
+    if "$_runtime_bin" ps -a --filter "name=^yashigani-k8s-local-registry$" --format '{{.Names}}' | grep -q .; then
+      "$_runtime_bin" start yashigani-k8s-local-registry >/dev/null
     else
-      docker run -d --name yashigani-k8s-local-registry \
+      "$_runtime_bin" run -d --name yashigani-k8s-local-registry \
         --restart unless-stopped \
         -p "${_reg_port}:5000" \
         registry:2 >/dev/null
     fi
-    log_success "Ephemeral local registry running at ${_reg}"
+    log_success "Ephemeral local registry running at ${_reg} (via ${_runtime_bin})"
   else
     log_info "Reusing existing local registry at ${_reg}"
   fi
@@ -13963,8 +14221,8 @@ IMGLIST
     _local_tag="${_repo}:${YASHIGANI_VERSION}"
     _remote_tag="${_reg}/${_owner}/${_repo}:${YASHIGANI_VERSION}"
 
-    log_info "Building ${_local_tag} (SHA ${YASHIGANI_GIT_SHA}) from ${_dockerfile}..."
-    docker build \
+    log_info "Building ${_local_tag} (SHA ${YASHIGANI_GIT_SHA}) from ${_dockerfile}, engine=${_runtime_bin}..."
+    "$_runtime_bin" build \
       -f "${WORK_DIR}/${_dockerfile}" \
       -t "${_local_tag}" \
       --build-arg "GIT_SHA=${YASHIGANI_GIT_SHA}" \
@@ -13974,8 +14232,8 @@ IMGLIST
         exit 1
       }
 
-    docker tag "${_local_tag}" "${_remote_tag}"
-    docker push "${_remote_tag}" >/dev/null || {
+    "$_runtime_bin" tag "${_local_tag}" "${_remote_tag}"
+    "$_runtime_bin" push "${_remote_tag}" >/dev/null || {
       log_error "Failed to push ${_remote_tag} to local registry ${_reg}"
       exit 1
     }
@@ -13984,7 +14242,7 @@ IMGLIST
     # Capture the just-pushed content digest for gateway/backoffice so
     # k8s_verify_image_provenance can prove the DEPLOYED pod runs THIS exact
     # content, not merely a same-tag image (YSG-RISK-123 — the whole point).
-    _pushed_digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${_remote_tag}" 2>/dev/null \
+    _pushed_digest="$("$_runtime_bin" inspect --format='{{index .RepoDigests 0}}' "${_remote_tag}" 2>/dev/null \
       | awk -F@ '{print $2}' || true)"
     case "$_repo" in
       yashigani-gateway)    export _YSG_K8S_EXPECTED_DIGEST_GATEWAY="${_pushed_digest}" ;;
@@ -14937,10 +15195,15 @@ k8s_helm_install() {
   local helm_values="${WORK_DIR}/.env.helm"
 
   if [[ "$DRY_RUN" == "true" ]]; then
+    local _dry_hv_suffix=""
+    local _dry_hv
+    for _dry_hv in "${HELM_VALUES_EXTRA[@]+"${HELM_VALUES_EXTRA[@]}"}"; do
+      _dry_hv_suffix+=" -f ${_dry_hv}"
+    done
     if [[ -f "$helm_values" ]]; then
-      dry_print "helm upgrade --install yashigani $chart_dir -n $NAMESPACE --create-namespace -f $helm_values"
+      dry_print "helm upgrade --install yashigani $chart_dir -n $NAMESPACE --create-namespace -f $helm_values${_dry_hv_suffix}"
     else
-      dry_print "helm upgrade --install yashigani $chart_dir -n $NAMESPACE --create-namespace"
+      dry_print "helm upgrade --install yashigani $chart_dir -n $NAMESPACE --create-namespace${_dry_hv_suffix}"
     fi
     return 0
   fi
@@ -15149,6 +15412,22 @@ k8s_helm_install() {
       helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay" -f "$_hb_ingress_overlay")
       log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-130 / unified-sidecar v4.1)"
     fi
+  done
+
+  # FIND-K8S-NO-VALUES-OVERLAY: operator-supplied --helm-values file(s), layered
+  # LAST (highest -f precedence, still below --set) so they can override every
+  # overlay install.sh added above. Existence was already checked at parse time
+  # (parse_args --helm-values); re-check here too — fail closed rather than
+  # silently deploy without an override the operator explicitly asked for, in
+  # case the file was removed between arg-parsing and this step.
+  local _hv_extra
+  for _hv_extra in "${HELM_VALUES_EXTRA[@]+"${HELM_VALUES_EXTRA[@]}"}"; do
+    if [[ ! -f "$_hv_extra" ]]; then
+      log_error "--helm-values file no longer present: ${_hv_extra}"
+      exit 1
+    fi
+    helm_args+=(-f "$_hv_extra")
+    log_info "Layering operator-supplied helm values (--helm-values): ${_hv_extra}"
   done
 
   helm "${helm_args[@]}"
@@ -17143,8 +17422,32 @@ _ysg_ensure_gid_2002() {
 # Last updated: 2026-04-24T13:45:00+01:00
 # ---------------------------------------------------------------------------
 _pki_detect_uri_san_drift() {
-  local manifest="${WORK_DIR}/docker/service_identities.yaml"
+  # FIND-IRIS-SAN-DRIFT (2026-08-04): compare against the per-instance RUNTIME
+  # manifest (docker/var/runtime/service_identities.yaml), NOT the git-tracked
+  # canonical template (docker/service_identities.yaml). The canonical file
+  # hardcodes the default trust domain (spiffe://yashigani.internal/<svc>);
+  # _apply_trust_domain_to_runtime_manifest() (install.sh ~1281) rewrites the
+  # RUNTIME copy's authority to spiffe://<instance>.yashigani.internal/<svc>
+  # for any non-default-domain / multi-instance deployment (MI-6) — the actual
+  # leaf certs are minted against that rewritten runtime value. Reading the
+  # canonical here compared live certs (correct, instance-scoped) against the
+  # UN-rewritten default domain, so every service on every non-default-domain
+  # deployment "mismatched" on every single --upgrade → forced full 29-leaf
+  # rotation + 7-service restart, every time, even with zero real drift.
+  #
+  # The runtime manifest is seeded by _pki_run_issuer() (install.sh ~15900)
+  # the first time PKI runs, and this function is only ever reached once
+  # ca_root.crt already exists (see call site guard) — i.e. after at least
+  # one successful PKI issuance — so the runtime manifest is expected to
+  # exist. Fall back to canonical (prior behaviour) with a loud warning if it
+  # doesn't, rather than skip the drift check outright.
+  local manifest="${WORK_DIR}/docker/var/runtime/service_identities.yaml"
   local secrets_dir="${WORK_DIR}/docker/secrets"
+
+  if [[ ! -f "$manifest" ]]; then
+    log_warn "FIND-IRIS-SAN-DRIFT: runtime manifest missing at ${manifest} (expected once PKI has run) — falling back to the canonical template; this may false-positive on a non-default trust domain"
+    manifest="${WORK_DIR}/docker/service_identities.yaml"
+  fi
 
   if [[ ! -f "$manifest" ]]; then
     log_warn "service_identities.yaml missing at ${manifest} — skipping URI SAN drift check"
@@ -17479,7 +17782,9 @@ bootstrap_internal_pki() {
 
     # Manifest-aware drift check — v2.23.1 retro #82. Rotates leaves even if
     # they are still time-valid when the URI SAN doesn't match the manifest.
-    log_info "Checking leaf URI SANs against docker/service_identities.yaml"
+    # FIND-IRIS-SAN-DRIFT: compares against the per-instance runtime manifest
+    # (docker/var/runtime/service_identities.yaml), not the canonical template.
+    log_info "Checking leaf URI SANs against docker/var/runtime/service_identities.yaml"
     if ! _pki_detect_uri_san_drift; then
       log_warn "URI SAN drift detected — forcing leaf rotation"
       needs_rotation=true

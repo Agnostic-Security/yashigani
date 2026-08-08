@@ -45,7 +45,12 @@ Contents (2,667 assertions at time of writing: 2,134 pytest + 533 `opa test`):
 Invocation: `scripts/run-test-framework.sh --tier a`
 
 ### Tier-B — LIVE, per-deployment (WebUI Playwright)
-Requires `--target <url> --runtime <docker|podman|k8s> --version <ver> --platform <macos|linux>`.
+Requires `--runtime <docker|podman|k8s> --version <ver> --platform <macos|linux>`. `--target
+<url>` is OPTIONAL (FIND-B-TARGET, 4.1.2 3-runtime retest, 2026-08-04) — if omitted,
+`src/tests/playwright/conftest.py`'s `_resolve_base_url()` auto-probes `https://localhost:8443`
+(podman leg), then `https://localhost` (docker leg), then `http://localhost:8080`, in that
+order, and uses whichever answers `/healthz` with 200. Pass `--target` explicitly only to pin
+a non-default port/host.
 
 Contents (491 pytest test IDs, run in **both** browser modes = 982 executions per leg):
 - WebUI conformance (`test_webui_conformance_full.py`) — the 39 pages / 34 forms / 137
@@ -63,13 +68,20 @@ criteria):**
    screenshots is **not** a complete Tier-B pass regardless of exit code (the runner checks
    the directory is non-empty and fails the leg if not).
 
-Invocation: `scripts/run-test-framework.sh --tier b --target https://localhost:8443 --runtime docker --version 4.1.2 --platform macos --browser-mode both`
+Invocation (podman leg, Caddy on :8443): `scripts/run-test-framework.sh --tier b --target https://localhost:8443 --runtime podman --version 4.1.2 --platform macos --browser-mode both`
+
+Invocation (docker leg, Caddy on :443 — **note the different port**, FIND-B-TARGET):
+`scripts/run-test-framework.sh --tier b --target https://localhost --runtime docker --version 4.1.2 --platform macos --browser-mode both`
+
+Invocation (either leg, `--target` omitted, auto-resolved):
+`scripts/run-test-framework.sh --tier b --runtime docker --version 4.1.2 --platform macos --browser-mode both`
 
 Physical path note: the WebUI suite lives at `src/tests/playwright/`, **not** a root
 `tests/playwright/` — see §7 "canonical name vs physical path."
 
 ### Tier-C — LIVE, per-deployment (integration/lifecycle/chaos/parity)
-Requires the same `--target/--runtime/--version/--platform` quartet. The bug-class this tier
+Requires the same `--runtime/--version/--platform` triple as Tier-B; `--target` is likewise
+optional (see FIND-B-TARGET note above). The bug-class this tier
 targets: **a value written on service A, silently trusted (not re-verified) on service B's
 own read path** — the shape of 112 (audit-events-registered-not-emitted), 128 (toggle
 returned 200/"on", downstream path unaffected), 131 (DB1/DB3 divergence),

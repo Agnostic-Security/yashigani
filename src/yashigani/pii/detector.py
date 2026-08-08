@@ -556,3 +556,33 @@ class PiiDetector:
             result = result[: finding.start] + placeholder + result[finding.end :]
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07) — always-on, config-independent
+# PAN detector for the absolute PCI egress block (POL-009 pci_data_block).
+#
+# This is a THIN wrapper around the existing Luhn-validated CREDIT_CARD
+# pattern set — it does not invent new regex/validation logic. It exists so
+# that "does this response contain a Luhn-valid card number" can be answered
+# WITHOUT depending on whether an operator has ``PiiDetector``
+# (``_state.pii_detector``) or the optional ``ResponseInspectionPipeline``
+# (``_state.response_inspection_pipeline`` — a performance toggle, see
+# YSG-RISK-057) configured/enabled. "Absolute" per the PCI DSS control means
+# this check cannot be turned off by an unrelated admin config toggle.
+# Decode-before-scan (``detect_decoded``) so an encoded PAN is caught too.
+# ---------------------------------------------------------------------------
+_PCI_PAN_SCANNER = PiiDetector(mode=PiiMode.LOG, enabled_types={PiiType.CREDIT_CARD})
+
+
+def contains_pci_pan(text: str) -> bool:
+    """Return True if *text* contains a Luhn-valid card number (any view).
+
+    Always-on: does not depend on any ``PiiDetector``/``ResponseInspectionPipeline``
+    instance being configured or enabled. Used by the gateway's absolute PCI
+    egress block (POL-009) so a caller's sensitivity ceiling can never permit
+    a cardholder data number to reach a human response body.
+    """
+    if not text:
+        return False
+    return _PCI_PAN_SCANNER.detect_decoded(text).detected

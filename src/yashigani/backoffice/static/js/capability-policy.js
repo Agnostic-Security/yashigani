@@ -18,6 +18,13 @@ var CAP_LABELS = {
 var CAP_MAX_ORIGINS = 10;
 var _capScopeType = 'org';
 var _capScopeId   = '';
+// FIND-B-E (v4.1.2 retest, lost-update race): monotonic token bumped at the
+// START of every _capFetchAndRender() call. A response is only applied if
+// its token still matches _capFetchSeq when the await resolves -- an older,
+// still-in-flight fetch (e.g. two rapid "Load" clicks, or a scope switch
+// while a previous fetch is still in flight) that resolves out of order is
+// a no-op instead of clobbering whatever the newer call already rendered.
+var _capFetchSeq = 0;
 
 // Convert capability name to a safe element id segment (display-capture → display_capture)
 function _capId(cap) { return cap.replace(/-/g, '_'); }
@@ -86,24 +93,51 @@ async function capPolLoad() {
 // ---------------------------------------------------------------------------
 // Fetch current scope policy and render the rows
 // ---------------------------------------------------------------------------
-async function _capFetchAndRender() {
-    _capSetResult('<span class="loading">Loading…</span>');
+async function _capFetchAndRender(clearResult) {
+    // FIND-CAPPOLICY-RACE-NOT-FIXED (2026-08-06): default true — a fresh,
+    // user-initiated scope load (loadCapabilityPolicy(), capPolLoad()) should
+    // clear any stale badge from a previous scope/action. But capPolSave()
+    // and capPolDelete() call this SAME function to refresh row data right
+    // after they've already written their OWN "Saved."/"Override removed."
+    // badge via _capSetResult() -- the two unconditional _capSetResult()
+    // calls below ("Loading…" then '') used to run regardless of caller,
+    // clobbering that badge to "Loading…" and then to nothing at all before
+    // the user ever saw it (mirrors the same defect fixed in the ui4 port's
+    // _fetchScope()). Those callers now pass clearResult=false.
+    if (clearResult === undefined) clearResult = true;
+
+    // FIND-B-E: capture the scope this call is FOR, and claim a fresh
+    // sequence token, before the network round-trip. Two overlapping calls
+    // (double-clicked "Load", or a scope switch fired while a previous
+    // fetch is still in flight) can resolve out of order; only the call
+    // holding the LATEST token when its response arrives is allowed to
+    // touch the DOM.
+    var scopeType = _capScopeType;
+    var scopeId   = _capScopeId;
+    var seq       = ++_capFetchSeq;
+
+    if (clearResult) _capSetResult('<span class="loading">Loading…</span>');
 
     var data      = null;
     var policyKey = 'org';
 
-    if (_capScopeType === 'org') {
+    if (scopeType === 'org') {
         data = await api('/admin/api/capability-policy');
         policyKey = 'org';
-    } else if (_capScopeType === 'group') {
-        data = await api('/admin/api/capability-policy/groups/' + encodeURIComponent(_capScopeId));
+    } else if (scopeType === 'group') {
+        data = await api('/admin/api/capability-policy/groups/' + encodeURIComponent(scopeId));
         policyKey = 'overrides';
     } else {
-        data = await api('/admin/api/capability-policy/users/' + encodeURIComponent(_capScopeId));
+        data = await api('/admin/api/capability-policy/users/' + encodeURIComponent(scopeId));
         policyKey = 'overrides';
     }
 
-    _capSetResult('');
+    // In-flight guard: a newer _capFetchAndRender() call (bumping
+    // _capFetchSeq again) started while this one was awaiting the network.
+    // Discard this now-stale response instead of clobbering the DOM with it.
+    if (seq !== _capFetchSeq) return;
+
+    if (clearResult) _capSetResult('');
 
     var policy = (data && data[policyKey]) ? data[policyKey] : {};
     _capRenderRows(policy);
@@ -111,15 +145,15 @@ async function _capFetchAndRender() {
     // Update the scope label in the panel header
     var labelEl = document.getElementById('cap-pol-scope-label');
     if (labelEl) {
-        if (_capScopeType === 'org')        labelEl.textContent = 'Organisation (default)';
-        else if (_capScopeType === 'group') labelEl.textContent = 'Group: ' + _capScopeId;
-        else                                labelEl.textContent = 'User: ' + _capScopeId;
+        if (scopeType === 'org')        labelEl.textContent = 'Organisation (default)';
+        else if (scopeType === 'group') labelEl.textContent = 'Group: ' + scopeId;
+        else                            labelEl.textContent = 'User: ' + scopeId;
     }
 
     // Show / hide "inherits from parent" note for group / user overrides
     var noteEl = document.getElementById('cap-pol-partial-note');
     if (noteEl) {
-        if (_capScopeType !== 'org') noteEl.classList.remove('is-hidden');
+        if (scopeType !== 'org') noteEl.classList.remove('is-hidden');
         else noteEl.classList.add('is-hidden');
     }
 
@@ -127,9 +161,9 @@ async function _capFetchAndRender() {
     var delBtn = document.getElementById('cap-pol-delete-btn');
     if (delBtn) {
         delBtn.classList.remove('is-hidden');
-        delBtn.textContent = (_capScopeType === 'org')
+        delBtn.textContent = (scopeType === 'org')
             ? 'Reset org to baseline'
-            : 'Delete ' + _capScopeType + ' override';
+            : 'Delete ' + scopeType + ' override';
     }
 }
 
@@ -261,13 +295,24 @@ function capPolAddOrigin(cap) {
 
     if (errEl) errEl.textContent = '';
 
-    var raw    = (inputEl.value || '').trim();
-    var origin = _capNormalizeOrigin(raw);
+    var raw = (inputEl.value || '').trim();
 
-    if (!_capValidateOrigin(origin)) {
+    // FIND-B-F (2026-08-04): validate the RAW input first, THEN normalise.
+    // The previous order (normalise, then validate the normalised value)
+    // let _capNormalizeOrigin() silently reconstruct a bare "scheme://host"
+    // from ANY successfully-parsed URL before _capValidateOrigin() ever saw
+    // the original string — so "https://example.com/some/path" parsed fine,
+    // _capNormalizeOrigin() rebuilt it as "https://example.com" (path
+    // silently dropped), and THAT clean value passed validation with no
+    // error shown: a path-bearing (or query/hash/credentials-bearing)
+    // origin was silently accepted-with-correction instead of rejected.
+    // Mirrors the same fix in the ui4 module (static/ui4/admin/modules/
+    // capability-policy.js _addOrigin()).
+    if (!_capValidateOrigin(raw)) {
         if (errEl) errEl.textContent = 'Must be https://hostname[:port] — no path, no wildcard.';
         return;
     }
+    var origin = _capNormalizeOrigin(raw);
 
     var existing = _capGetOrigins(cap);
     if (existing.indexOf(origin) !== -1) {
@@ -362,7 +407,10 @@ async function capPolSave() {
     }
 
     _capSetResult('<span class="badge badge-green">Saved.</span>');
-    await _capFetchAndRender();   // reload to show canonical server state
+    // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+    // "Saved." badge just set above through this refresh (see
+    // _capFetchAndRender() comment).
+    await _capFetchAndRender(false);   // reload to show canonical server state
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +443,9 @@ async function capPolDelete() {
     }
 
     _capSetResult('<span class="badge badge-green">Override removed.</span>');
-    await _capFetchAndRender();
+    // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+    // "Override removed." badge just set above through this refresh.
+    await _capFetchAndRender(false);
 }
 
 // ---------------------------------------------------------------------------

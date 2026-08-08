@@ -79,6 +79,7 @@ from tests.playwright.conftest import (
     do_admin_stepup,
     get_admin_credentials,
     get_admin_totp_code,
+    invalidate_cached_session,
     playwright_login_admin,
 )
 
@@ -357,6 +358,24 @@ class TestSessionLifecycle:
             cookies_before = {c["name"]: c["value"] for c in ctx.cookies()}
             page.goto(f"{BASE_URL}/auth/logout-redirect")
             page.wait_for_timeout(1000)
+            # FIND-B-A (4.1.2 3-runtime retest, HIGH-impact cascade): this is
+            # the ONLY test in the suite that deliberately kills admin1's
+            # session server-side. playwright_login_admin() above injected
+            # the SAME cookie value that _session_cookie_cache[1] holds
+            # (cache-hit, since this test doesn't force_fresh) -- the exact
+            # cookie value the session-scoped admin_ctx fixture was ALSO
+            # seeded from. Without invalidating the shared cache here, every
+            # other test/fixture in this process that reuses admin1's cached
+            # session (directly, or via admin_ctx) would silently run
+            # against a server-dead session for up to
+            # _SESSION_REFRESH_THRESHOLD_SECONDS (600s) -- this was the
+            # confirmed root cause of the ~110/~108-error same-process
+            # cascade (podman + docker), and of the "identical root cause"
+            # FIND-B-G cascade in test_v233_webauthn_e2e.py. Must run BEFORE
+            # the replay assertion below is irrelevant to ordering; placed
+            # here so it happens unconditionally regardless of the replay
+            # assertion's outcome.
+            invalidate_cached_session(admin=1)
             # Replay the pre-logout admin session cookie against an admin API.
             with _http_client() as c:
                 r = c.get(f"{BASE_URL}/admin/accounts", headers=_cookie_header(cookies_before))
@@ -819,14 +838,21 @@ class TestUserAgentBOLA:
                 "description": "conformance BOLA probe agent",
             }, headers=_cookie_header(user_a["cookies"]))
         assert create_resp.status_code in (200, 201), f"setup failed: {create_resp.status_code} {create_resp.text[:200]}"
-        # 2026-08-06: the id lookup was `.get("id") or .get("agent_id")`, but this
-        # endpoint returns the identifier as `ua_id`. Neither key matched, so
-        # `agent_id` was always None and the test died on the SETUP assertion —
-        # meaning the BOLA assertion below had NEVER ONCE EXECUTED. A test that
-        # cannot fail is not a test; worse, this one reported as a failure on
-        # every leg, so the real access-control check was hidden behind noise.
-        # `ua_id` first, with the historical keys kept as fallbacks so the test
-        # survives a future rename instead of silently going blind again.
+        # 2026-08-06 / FIND-B-C (independently found by both v4.1.2 sessions,
+        # same root cause, 4.1.2 3-runtime retest): the id lookup was
+        # `.get("id") or .get("agent_id")`, but POST /user/agents serialises
+        # the new agent's identifier as "ua_id" (src/yashigani/backoffice/
+        # routes/user_agents.py create_user_agent() -> _serialise_agent():
+        # {"ua_id": ua_id, ...}) -- "id"/"agent_id" never existed in this
+        # endpoint's response schema (conversation objects use "id"; this is
+        # a DIFFERENT resource). Neither key matched, so `agent_id` was
+        # always None and the test died on the SETUP assertion -- meaning the
+        # BOLA assertion below had NEVER ONCE EXECUTED. A test that cannot
+        # fail is not a test; worse, this one reported as a failure on every
+        # leg, so the real access-control check was hidden behind noise.
+        # `ua_id` first, with the historical keys kept as fallbacks so the
+        # test survives a future rename instead of silently going blind
+        # again.
         payload = create_resp.json()
         agent_id = payload.get("ua_id") or payload.get("id") or payload.get("agent_id")
         assert agent_id, (

@@ -416,7 +416,197 @@ def get_admin2_totp_code() -> str:
 
 
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
-_api_totp_last_used: "dict[int, float]" = {}  # admin_number → time.time() of last API login
+
+
+# ---------------------------------------------------------------------------
+# FIND-B-TOTP-CROSSPROC (4.1.2 3-runtime retest, 2026-08-04): the admin-tier
+# anti-replay ledger below used to be a plain in-process dict, which resets
+# to empty on every fresh pytest process. run-test-framework.sh's Tier-B leg
+# invokes pytest ONCE PER FILE (run_tier_b() in scripts/run-test-framework.sh
+# runs `pytest src/tests/playwright/test_X.py` per file, not the whole
+# directory in one process), so a file that starts within 60s of the PRIOR
+# file's last real admin1 TOTP submission has zero in-process memory of that
+# submission and can regenerate/resubmit a code from the SAME 30s window —
+# the server's real 60s single-use TOTP replay cache correctly rejects the
+# repeat with 401, which is a harness false-negative, not a product bug
+# (confirmed manually this retest: an identical on-disk password + a fresh
+# real TOTP code got 200 immediately afterward; a bare re-run of the same
+# test 65s later passed clean).
+#
+# Fix: back the SAME dict[int, float] interface with a lock-guarded JSON
+# file under YTF_STATE_DIR (default: <repo>/.ytf-state/), so a fresh process
+# picks up the PRIOR process's last real submission instead of starting from
+# 0.0. Subclassing dict (rather than converting the 6 test files that
+# `from conftest import _api_totp_last_used` and mutate it directly via
+# `_api_totp_last_used[1] = ...` / `.get(admin, 0.0)` / `1 not in ...`) keeps
+# every existing call site correct with zero changes there. Cross-platform
+# (fcntl works on both macOS and Linux, the two supported test platforms —
+# feedback_local_test_must_work_on_macos_and_linux.md).
+# ---------------------------------------------------------------------------
+
+import fcntl as _fcntl
+import json as _json
+
+_TOTP_LEDGER_STATE_DIR = Path(
+    os.environ.get("YTF_STATE_DIR", str(Path(__file__).resolve().parents[3] / ".ytf-state"))
+)
+_TOTP_LEDGER_STATE_FILE = _TOTP_LEDGER_STATE_DIR / "admin_totp_last_used.json"
+
+
+class _PersistentTotpLedger(dict):
+    """dict[int, float] (admin_number -> time.time() of last real TOTP
+    submission) that also persists every write to, and consults on every
+    read, a shared lock-guarded JSON file — see FIND-B-TOTP-CROSSPROC above.
+    Best-effort: any filesystem error degrades silently to in-process-only
+    behaviour (the pre-fix status quo) rather than failing a test."""
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self._persist(key, value)
+
+    def get(self, key, default=None):
+        self._sync(key)
+        return super().get(key, default)
+
+    def __contains__(self, key) -> bool:
+        self._sync(key)
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        self._sync(key)
+        return super().__getitem__(key)
+
+    @staticmethod
+    def _load() -> dict:
+        try:
+            with open(_TOTP_LEDGER_STATE_FILE, "r", encoding="utf-8") as f:
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_SH)
+                try:
+                    raw = f.read()
+                finally:
+                    _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
+            return _json.loads(raw) if raw.strip() else {}
+        except (FileNotFoundError, ValueError, OSError):
+            return {}
+
+    def _sync(self, key) -> None:
+        """Pull the persisted value for `key` into this dict if it is newer
+        than whatever this process already has in memory (0.0 on a fresh
+        process) — so a fresh process sees the PRIOR process's last real
+        submission instead of assuming none ever happened."""
+        try:
+            persisted = self._load().get(str(key))
+        except Exception:
+            return
+        if persisted is not None and float(persisted) > dict.get(self, key, 0.0):
+            dict.__setitem__(self, key, float(persisted))
+
+    def _persist(self, key, value) -> None:
+        try:
+            _TOTP_LEDGER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(_TOTP_LEDGER_STATE_FILE, "a+", encoding="utf-8") as f:
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    raw = f.read()
+                    try:
+                        data = _json.loads(raw) if raw.strip() else {}
+                    except ValueError:
+                        data = {}
+                    data[str(key)] = value
+                    f.seek(0)
+                    f.truncate()
+                    f.write(_json.dumps(data))
+                    f.flush()
+                finally:
+                    _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
+        except OSError as exc:
+            print(f"[conftest] FIND-B-TOTP-CROSSPROC: could not persist TOTP ledger to disk: {exc}")
+
+
+_api_totp_last_used: "dict[int, float]" = _PersistentTotpLedger()  # admin_number → time.time() of last API login (cross-process persistent, see above)
+
+# QA-fix (Ava, Tier-B tierb-on-unified consolidation): per-identity "when was
+# this session actually established server-side" ledger, distinct from
+# _session_cookie_cache (which never expires in-process once populated).
+# The server's session idle-timeout is 900s (src/yashigani/auth/session.py
+# _IDLE_TIMEOUT_SECONDS) -- a cookie cached once at the START of a long file
+# (test_webui_conformance_full.py's admin_ctx/user_ctx are module-scoped,
+# shared across ~15 test classes and every TOTP-replay wait those classes
+# incur) can silently outlive that 900s window mid-file, producing "Still on
+# login page" only once some LATER test happens to hit it -- exactly the
+# measured 111+45-error cascade this consolidation fixes. These ledgers let
+# refresh_admin_context_if_stale()/refresh_user_context_if_stale() (below)
+# proactively re-authenticate BEFORE that happens, from one shared per-test
+# autouse guard, instead of each fixture/file inventing its own staleness
+# check (test_pki_admin_ui.py's unconditional force_fresh=True is the
+# unconditional/expensive special case of the same idea).
+_admin_session_established_at: "dict[int, float]" = {}  # admin_number → time.time() of last real (non-cache-hit) login
+_user_session_established_at: "dict[str, float]" = {}  # cache_key → time.time() of last real (non-cache-hit) bootstrap
+_SESSION_REFRESH_THRESHOLD_SECONDS = 600  # safety margin under the server's 900s/15-min idle timeout
+
+# FIND-B-A (4.1.2 3-runtime retest, 2026-08-03/04, HIGH-impact cascade):
+# _session_cookie_cache had NO invalidation path at all. The suite's one
+# deliberate destructive-logout test (test_webui_conformance_full.py
+# TestSessionLifecycle::test_logout_redirect_clears_admin_session) injects
+# the SAME cached cookie value that the session-scoped admin_ctx fixture was
+# ALSO seeded from (both ultimately come from _api_get_session_cookies'
+# cache), then kills that session server-side via a real browser navigation
+# to /auth/logout-redirect. Nothing told the cache the session was now dead:
+# _session_cookie_cache[admin] and _admin_session_established_at[admin]
+# both kept their pre-logout values, so refresh_admin_context_if_stale()'s
+# purely time-based staleness check (below) saw a "recently established"
+# session and skipped refreshing admin_ctx's own long-lived browser
+# context -- every subsequent test sharing admin_ctx then ran against a
+# server-dead session for up to the full 600s safety margin. Reproduced
+# byte-for-byte on BOTH podman and docker legs: TestSessionLifecycle's
+# logout test PASSES, the very next test FAILS, then every test from
+# TestAdminModuleSweep onward ERRORs for the rest of the process (~110
+# podman / ~108 docker). This is also the confirmed root cause of the
+# separately-logged FIND-B-G (test_v233_webauthn_e2e.py's clean_authed_client
+# fixture calls the exact same cached-cookie path).
+#
+# Fix: a real, deliberate logout (or any other auth-state transition that
+# kills a session out from under the shared caches -- e.g. a future
+# password-reset-for-value test) must call invalidate_cached_session()/
+# invalidate_cached_user_session() below. Popping _session_cookie_cache
+# forces the NEXT _api_get_session_cookies(force_fresh=False) caller to do
+# a real login instead of returning dead cookies. Popping
+# _*_session_established_at alone is not sufficient to force admin_ctx's/
+# user_ctx's OWN long-lived browser context to pick up fresh cookies --
+# some OTHER, unrelated caller can re-populate _admin_session_established_at
+# moments later (its own real login), which would make the plain time-based
+# check in refresh_admin_context_if_stale() see a falsely-fresh timestamp
+# and skip refreshing THIS context. The _admin_session_dirty/
+# _user_session_dirty sets are a separate, explicit "force at least one real
+# refresh" flag that persists until refresh_admin_context_if_stale()/
+# refresh_user_context_if_stale() actually runs and clears it, closing that
+# race regardless of what else touches the shared timestamp in the meantime.
+_admin_session_dirty: "set[int]" = set()
+_user_session_dirty: "set[str]" = set()
+
+
+def invalidate_cached_session(admin: int = 1) -> None:
+    """Invalidate admin{N}'s cached session state after a REAL, deliberate
+    server-side logout performed OUTSIDE _api_get_session_cookies()'s own
+    internal rotate-then-relogin dance (that internal logout is always
+    immediately followed by a fresh login before the cache is (re)written,
+    so it never needs this). Call this right after any browser navigation
+    to /auth/logout-redirect or any API POST /auth/logout that is meant to
+    kill the session for good this run. See FIND-B-A note above."""
+    _session_cookie_cache.pop(admin, None)
+    _admin_session_established_at.pop(admin, None)
+    _admin_session_dirty.add(admin)
+
+
+def invalidate_cached_user_session(cache_key: str = "default") -> None:
+    """User-tier equivalent of invalidate_cached_session(). Not currently
+    exercised by any test (no deliberate user-tier logout test exists yet),
+    added so a future one is safe by construction rather than reintroducing
+    FIND-B-A for the user tier."""
+    _user_session_cache.pop(cache_key, None)
+    _user_session_established_at.pop(cache_key, None)
+    _user_session_dirty.add(cache_key)
 
 # QA-fix (Ava, Tier-B tierb-on-unified consolidation): per-identity "when was
 # this session actually established server-side" ledger, distinct from
@@ -854,6 +1044,27 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
     # refresh_admin_context_if_stale() can detect idle-timeout staleness
     # later without re-deriving it from scratch.
     _admin_session_established_at[admin] = time.time()
+    # FIND-B-CANARY-401 fix (2026-08-06, Ava, Tier-B consolidated retest):
+    # ANY real login reaching this point (force_fresh=True, or the very
+    # first population of the cache) evicts every OTHER already-live
+    # session for this admin number server-side (single-active-session
+    # policy, src/yashigani/auth/session.py SessionStore.create()) --
+    # including a long-lived Playwright BrowserContext (e.g. admin_ctx)
+    # that was seeded from an earlier call to this same function. Before
+    # this fix, only invalidate_cached_session() (the deliberate-logout
+    # path) set _admin_session_dirty, so a force_fresh=True re-login
+    # elsewhere (e.g. test_relogin_after_rotation_proves_rotation_stuck's
+    # own re-login) silently evicted admin_ctx's cookie without flagging
+    # it dirty -- refresh_admin_context_if_stale()'s time-based check then
+    # saw a falsely-fresh timestamp (this call just bumped it) and skipped
+    # refreshing admin_ctx, so the NEXT test to use admin_ctx (observed
+    # live: test_canary_loads_for_admin) got a 401 on the server-evicted
+    # cookie. Marking dirty here closes that gap the same way the
+    # deliberate-logout path already does -- the next
+    # refresh_admin_context_if_stale() call for ANY long-lived context for
+    # this admin number will now force one real refresh instead of trusting
+    # the timestamp alone.
+    _admin_session_dirty.add(admin)
     return result
 
 
@@ -987,10 +1198,19 @@ def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
     between two tests purely from OTHER tests' TOTP-replay waits — this
     catches that case from a shared per-test autouse guard instead of
     every test file inventing its own staleness check.
+
+    FIND-B-A fix (2026-08-04): ALSO forces a refresh if `admin` is in
+    _admin_session_dirty (set by invalidate_cached_session() after a
+    deliberate logout elsewhere in the run), even if the plain elapsed-time
+    check below would otherwise say "still fresh". See the
+    _admin_session_dirty module-level comment for why the timestamp alone
+    is not race-safe against a concurrent unrelated real login for the same
+    admin number.
     """
     import time as _t
 
-    if _t.time() - _admin_session_established_at.get(admin, 0.0) <= threshold:
+    is_dirty = admin in _admin_session_dirty
+    if not is_dirty and _t.time() - _admin_session_established_at.get(admin, 0.0) <= threshold:
         return False
     cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
     try:
@@ -998,15 +1218,18 @@ def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
     except Exception:
         pass
     ctx.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+    _admin_session_dirty.discard(admin)
     return True
 
 
 def refresh_user_context_if_stale(ctx, *, cache_key: str = "default",
                                    threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
-    """User-tier equivalent of refresh_admin_context_if_stale()."""
+    """User-tier equivalent of refresh_admin_context_if_stale(). Also
+    dirty-flag aware (see invalidate_cached_user_session())."""
     import time as _t
 
-    if _t.time() - _user_session_established_at.get(cache_key, 0.0) <= threshold:
+    is_dirty = cache_key in _user_session_dirty
+    if not is_dirty and _t.time() - _user_session_established_at.get(cache_key, 0.0) <= threshold:
         return False
     creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
     try:
@@ -1024,6 +1247,7 @@ def refresh_user_context_if_stale(ctx, *, cache_key: str = "default",
         }
         for name, value in creds["cookies"].items()
     ])
+    _user_session_dirty.discard(cache_key)
     return True
 
 
@@ -1707,3 +1931,21 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "playwright" in str(item.fspath):
                 item.add_marker(skip)
+
+    # Item 8 / FIND-B-USERAGENTBOLA-HANG (4.1.2 3-runtime retest, 2026-08-04):
+    # pytest-timeout was not installed in this harness's venv at all, so a
+    # genuinely hung test (confirmed this retest: TestAgentGeneratePrompt
+    # Injection's real-LLM-dependent canary blocked with ZERO output for
+    # 2min then 4min, no traceback, no crash, no orphaned process visible)
+    # had nothing to kill it — the class of bug that orphaned a whole
+    # pytest process for 45 minutes on a prior run. Apply a default 300s
+    # (5-minute) per-test ceiling to every item collected in this suite that
+    # doesn't already carry an explicit @pytest.mark.timeout(...) --
+    # generous enough for the slowest legitimate real-LLM round-trips + TOTP
+    # anti-replay waits (up to ~90s) observed here, but bounded instead of
+    # unbounded. method="thread" (not the Unix default "signal") so it
+    # reliably interrupts alongside Playwright's own I/O/event-loop use on
+    # both macOS and Linux — see pyproject.toml's pinned pytest-timeout dep.
+    for item in items:
+        if not any(m.name == "timeout" for m in item.iter_markers()):
+            item.add_marker(pytest.mark.timeout(300, method="thread"))

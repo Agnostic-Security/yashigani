@@ -89,6 +89,12 @@ cloud-inspection = [
     "google-generativeai>=0.7",
 ]
 sbom    = ["cyclonedx-bom>=4.0"]
+# QA-SOP §4.17 authonce pentest harness (tests/security/pentest_harness/):
+# ZAP python API client. PyPI package name is `zaproxy`; the importable
+# module is `zapv2` (verified this session: `from zapv2 import ZAPv2`).
+# Pinned to the version verified against in this session's self-check
+# suite (tests/security/test_authonce_harness_selfcheck.py).
+pentest = ["zaproxy==0.6.0"]
 dev     = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -105,6 +111,12 @@ dev     = [
     "ruff>=0.4",
     "mypy>=1.10",
     "pytest-mock>=3.14",
+    # 4.1.2 3-runtime retest (item 8, 2026-08-04): a hung Playwright test
+    # (FIND-B-USERAGENTBOLA-HANG) previously had nothing to kill it and
+    # orphaned a pytest process for 45 minutes. Pinned so `pip install
+    # -e ".[dev]"` always brings this in; src/tests/playwright/conftest.py's
+    # pytest_collection_modifyitems() wires a default 300s per-test ceiling.
+    "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools.packages.find]

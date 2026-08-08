@@ -37,7 +37,11 @@ const CAP_LABELS = {
 };
 const CAP_MAX_ORIGINS = 10;
 
-function isValidOrigin(s) {
+// Exported (in addition to being used internally below) so a standalone
+// Node test can import and exercise the real validation logic directly —
+// see src/tests/regression/v4.1.2/test_find_b_f_capability_policy_origin_validation.py
+// (FIND-B-F, 2026-08-04).
+export function isValidOrigin(s) {
   s = (s || '').trim();
   if (!s || s.indexOf('*') !== -1 || s.indexOf('https://') !== 0) return false;
   try {
@@ -51,7 +55,7 @@ function isValidOrigin(s) {
   }
 }
 
-function normaliseOrigin(s) {
+export function normaliseOrigin(s) {
   s = (s || '').trim();
   try {
     const url = new URL(s);
@@ -74,7 +78,9 @@ export class YsAdminCapabilityPolicy extends LitElement {
     _result: { state: true },        // {ok, message} | null
     _effUser: { state: true },
     _effResult: { state: true },     // {ok, message, effective} | null
-    // YSG-RISK-210: lost-update race guard state (see _fetchScope() below).
+    // YSG-RISK-210 / FIND-B-E: lost-update race guard state (see
+    // _fetchScope() below — two independently-found and complementary
+    // guards against the same class of race, both kept).
     _dirty: { state: true },         // true if _rows has an unsaved edit since the last fetch/save
     _fetchInFlight: { state: true }, // true while a _fetchScope() GET is pending
   };
@@ -94,6 +100,15 @@ export class YsAdminCapabilityPolicy extends LitElement {
     this._effResult = null;
     this._dirty = false;
     this._fetchInFlight = false;
+    // FIND-B-E (v4.1.2 retest, lost-update race): monotonic token bumped at
+    // the START of every _fetchScope() call. A response is only applied if
+    // its token still matches _fetchSeq when the await resolves — any older,
+    // still-in-flight fetch that resolves LATER (out of order) is a no-op
+    // instead of clobbering whatever a newer scope-type/scope-id selection
+    // already rendered. Kept alongside the _fetchInFlight guard above (which
+    // normally prevents overlap at entry) as defence-in-depth, and because
+    // it also protects against the DOM-mutation ordering gap described below.
+    this._fetchSeq = 0;
   }
 
   createRenderRoot() { return this; }
@@ -117,12 +132,11 @@ export class YsAdminCapabilityPolicy extends LitElement {
     return `/admin/api/capability-policy/users/${encodeURIComponent(this._scopeId)}`;
   }
 
-  // YSG-RISK-210 (lost-update race, root-caused by Ava 2026-08-03 in
-  // test_capability_policy_ui.py::test_save_org_policy_camera_off; live-confirmed
-  // two independent ways, incl. a raw DOM dispatchEvent bypassing Playwright):
-  // this used to unconditionally overwrite `_rows` from server data on
-  // completion, silently discarding any edit made while the GET was in
-  // flight. Two guards now apply:
+  // YSG-RISK-210 / FIND-B-E (lost-update race, root-caused by Ava 2026-08-03
+  // in test_capability_policy_ui.py::test_save_org_policy_camera_off;
+  // live-confirmed two independent ways, incl. a raw DOM dispatchEvent
+  // bypassing Playwright — independently re-found in the v4.1.2 retest as
+  // FIND-B-E). Guards now applied, all kept together (union, not either/or):
   //   1. `_fetchInFlight` — a second overlapping call (e.g. a rapid
   //      double-click on Load, or a scope-type change firing while a prior
   //      fetch for a different scope hasn't settled) is dropped rather than
@@ -134,23 +148,41 @@ export class YsAdminCapabilityPolicy extends LitElement {
   //      current draft (_onScopeTypeChange on an actual change, _onLoadScope)
   //      clear `_dirty` synchronously before starting the new fetch cycle, so
   //      only edits racing THIS fetch are protected.
-  // Also: this no longer touches `_result` (FIND-0805-003 — `_save()`/`_delete()`
-  // set a success/error `_result` then call this to refresh rows; nulling
-  // `_result` here made the "Saved." badge dead code, since Lit batches both
-  // writes into the same update and only the null survived). Callers that
-  // want a fresh scope load to clear a stale `_result` (Load button, scope
-  // switch) now clear it themselves before calling this.
-  async _fetchScope() {
+  //   3. Local `scopeType`/`scopeId`/`seq` capture + `_fetchSeq` monotonic
+  //      token (FIND-B-E) — closes a gap the `_fetchInFlight` guard alone
+  //      does NOT cover: `_onScopeTypeChange` mutates `this._scopeType` /
+  //      `this._scopeId` synchronously and unconditionally (it doesn't wait
+  //      on `_fetchInFlight`), so an in-flight fetch that re-read
+  //      `this._scopeType` AFTER its await could apply an old response using
+  //      a NEW scope's label/branch (wrong "overrides" vs "org" key
+  //      parsing). Capturing locals before the `await`, and bailing if
+  //      `_fetchSeq` moved on, makes stale responses a no-op regardless of
+  //      how they went stale.
+  // Also: this does not unconditionally null `_result` (FIND-CAPPOLICY-RACE-
+  // NOT-FIXED, 2026-08-06 — `_save()`/`_delete()` set a success/error
+  // `_result` then call this to refresh rows; an unconditional
+  // `this._result = null` here ran SYNCHRONOUSLY before the `await` yielded,
+  // so Lit's microtask-batched render only ever saw the later null and the
+  // "Saved."/"Override removed." badge never painted). `clearResult`
+  // defaults to `true` for fresh, user-initiated loads (_onScopeTypeChange,
+  // _onLoadScope, initial _load()); `_save()`/`_delete()` pass `false` to
+  // preserve the badge they just set.
+  async _fetchScope(clearResult = true) {
     if (this._fetchInFlight) return;
     this._fetchInFlight = true;
+    if (clearResult) this._result = null;
+    const scopeType = this._scopeType;
+    const scopeId = this._scopeId;
+    const seq = ++this._fetchSeq;
     try {
-      if (this._scopeType !== 'org' && !this._scopeId) {
+      if (scopeType !== 'org' && !scopeId) {
         this._policy = {};
         this._rows = {};
         this._dirty = false;
         return;
       }
       const data = await this.api.get(this._scopeUrl());
+      if (seq !== this._fetchSeq) return; // superseded by a newer fetch — stale response, no-op
       if (this._dirty) {
         // An edit landed while this GET was in flight. Do not clobber it —
         // keep `_rows` exactly as the user left them and say so.
@@ -160,7 +192,7 @@ export class YsAdminCapabilityPolicy extends LitElement {
         };
         return;
       }
-      const key = this._scopeType === 'org' ? 'org' : 'overrides';
+      const key = scopeType === 'org' ? 'org' : 'overrides';
       this._policy = (data && data[key]) ? data[key] : {};
       this._rows = this._buildRows(this._policy);
       this._dirty = false;
@@ -230,7 +262,8 @@ export class YsAdminCapabilityPolicy extends LitElement {
 
   _addOrigin(cap) {
     const row = this._rows[cap];
-    // YSG-RISK-211: this used to call normaliseOrigin(row.input) BEFORE
+    // YSG-RISK-211 / FIND-B-F (independently found by both v4.1.2 sessions,
+    // same root cause): this used to call normaliseOrigin(row.input) BEFORE
     // validating, then validate the *normalised* value. That's backwards and
     // let both invalid shapes through:
     //   - "https://example.com/some/path" -> normaliseOrigin() rebuilds the
@@ -304,7 +337,9 @@ export class YsAdminCapabilityPolicy extends LitElement {
       // nulls `_result` itself, so this "Saved." badge actually paints).
       this._dirty = false;
       this.app?.toast('Capability policy saved.', 'success');
-      await this._fetchScope();
+      // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — this refresh must
+      // not wipe the "Saved." badge we just set (see _fetchScope() comment).
+      await this._fetchScope(false);
     } else {
       this._result = { ok: false, message: res.error ? res.error.message : 'Save failed.' };
     }
@@ -325,7 +360,9 @@ export class YsAdminCapabilityPolicy extends LitElement {
       this._result = { ok: true, message: 'Override removed.' };
       this._dirty = false; // FIND-0805-003 / YSG-RISK-210 — see _save() above
       this.app?.toast('Capability policy override removed.', 'success');
-      await this._fetchScope();
+      // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
+      // "Override removed." badge through the refresh (see _fetchScope()).
+      await this._fetchScope(false);
     } else {
       this._result = { ok: false, message: res.error ? res.error.message : 'Delete failed.' };
     }
