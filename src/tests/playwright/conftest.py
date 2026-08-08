@@ -613,13 +613,39 @@ def _find_redis_container(runtime: str) -> Optional[str]:
     except Exception:
         return None
 
+    # YSG-RISK-209 (2026-08-08): the segment match above was still ambiguous.
+    # On a "-"-separated project, "yashigani-demo-internal-budget-redis-1"
+    # splits to [...,'budget','redis','1'] — which CONTAINS an exact "redis"
+    # segment — so the BUDGET redis matched whenever docker listed it first.
+    # Confirmed live: this returned "…-budget-redis-1", so clear_auth_throttle()
+    # drained the wrong instance and reported 0 keys every time. That is why the
+    # 110-error auth lane-bleed survived even though the primitive existed and
+    # was being called.
+    #
+    # Match the compose SERVICE LABEL instead — exact, unambiguous, and
+    # independent of project name and separator convention.
+    for name in candidates:
+        try:
+            svc = subprocess.run(
+                [runtime, "inspect", name, "--format",
+                 "{{index .Config.Labels \"com.docker.compose.service\"}}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            continue
+        if svc == "redis":
+            return name
+
+    # Fallbacks, narrowed: never accept a name whose service segment is a
+    # *-redis sibling (budget-redis, letta-redis, …).
     for sep in ("_", "-"):
         for name in candidates:
-            if any(seg.lower() == "redis" for seg in name.split(sep)):
+            segs = [x.lower() for x in name.split(sep)]
+            if "redis" in segs:
+                i = segs.index("redis")
+                if i > 0 and segs[i - 1] in ("budget", "session", "cache"):
+                    continue
                 return name
-    for name in candidates:
-        if "redis" in name.lower():
-            return name
     return None
 
 
@@ -800,6 +826,30 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
                 "totp_code": totp_code,
             },
         )
+        # YSG-RISK-209 (built 2026-08-08): the functional lane was being banned
+        # by the ADVERSARIAL lane. The product's auth throttle is keyed on
+        # account AND source IP (correct anti-enumeration design); QA SOP §4.17
+        # Rule 5 previously separated lanes by identity only, so the pentest
+        # suite's deliberate bogus-credential probes drove the shared-IP counter
+        # and every subsequent legitimate admin login failed. Measured cost: 110
+        # errors per leg, identical on all four runs (docker headless/headed,
+        # podman headless) — and that noise is what hid a genuine HIGH finding
+        # (YSG-RISK-201) for the whole campaign. "Expected errors" in a gate are
+        # not acceptable: they either get fixed or they mask the real signal.
+        #
+        # Fix at source: on a throttle response, clear the TEST-RUN throttle
+        # state and retry ONCE. This does not weaken the control — it clears
+        # counters our own adversarial lane created, in a test deployment. A
+        # 429 that survives the retry is still a hard failure.
+        if r.status_code == 429:
+            cleared = clear_auth_throttle()
+            print(f"auth throttle hit for admin{admin} — cleared {cleared} key(s), retrying once "
+                  f"(YSG-RISK-209 lane-bleed)", flush=True)
+            totp_code = _wait_for_fresh_code()
+            r = c.post(
+                f"{BASE_URL}/auth/login",
+                json={"username": username, "password": password, "totp_code": totp_code},
+            )
         assert r.status_code == 200, f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
         data = r.json()
 
