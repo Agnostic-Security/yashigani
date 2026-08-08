@@ -276,9 +276,21 @@ def test_lr04_open_redirect_backslash_bypass_rejected():
         assert "attacker.com" not in final_url, (
             f"LR-04 FAIL: open-redirect backslash bypass not blocked! landed at '{final_url}'"
         )
-        # Must land somewhere admin (not root, not external)
-        assert "localhost" in final_url or "127.0.0.1" in final_url, (
-            f"LR-04 FAIL: redirected off-origin to '{final_url}'"
+        # Must land somewhere admin (not root, not external).
+        #
+        # 2026-08-08: this asserted the literals "localhost"/"127.0.0.1", so on
+        # ANY deployment with a real domain it reported a correct, same-origin
+        # redirect as an off-origin escape — live: landed at
+        # 'https://yashigani-demo.internal/admin/#accounts', flagged as a
+        # failure. The open-redirect control was working; the allowlist was two
+        # hardcoded defaults. Same class as the @langflow handle and the
+        # budget-redis match: a test assuming a default deployment shape.
+        # Derive the expected origin from the target under test instead.
+        from urllib.parse import urlparse
+        expected_host = urlparse(BASE_URL).hostname or ""
+        assert expected_host and urlparse(final_url).hostname == expected_host, (
+            f"LR-04 FAIL: redirected off-origin to '{final_url}' "
+            f"(expected host '{expected_host}')"
         )
         browser.close()
 

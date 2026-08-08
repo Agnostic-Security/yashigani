@@ -1421,6 +1421,24 @@ def test_wa_revoke_03_audit_event_credential_revoked(
 
 
 @skip_no_stack
+
+def _expire_stepup(client) -> None:
+    """Drop any fresh step-up on this session so a 'without step-up' probe is honest.
+
+    Preferred: an explicit invalidation endpoint if the product exposes one.
+    Fallback: wait out YASHIGANI_STEPUP_TTL_SECONDS. The wait is bounded and is
+    only paid by the handful of tests that genuinely need a stepped-down session
+    — far cheaper than an assertion that silently cannot fail.
+    """
+    import os
+    import time
+
+    r = client.post(f"{BASE_URL}/auth/stepup/expire")
+    if r.status_code in (200, 204):
+        return
+    ttl = int(os.getenv("YASHIGANI_STEPUP_TTL_SECONDS", "300"))
+    time.sleep(min(ttl + 5, 310))
+
 def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_page_with_va):
     """
     WA-REVOKE-04 (additional security probe): DELETE /credentials/{id} without
@@ -1431,6 +1449,22 @@ def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_pa
     """
     client = clean_authed_client
     page, cdp, auth_id = browser_page_with_va
+
+    # 2026-08-08 — THE PREMISE OF THIS TEST WAS INVALIDATED BY ITS OWN FIXTURE.
+    #
+    # `clean_authed_client` revokes leftover 'E2E*' credentials during setup via
+    # `_delete_credential()`, and that helper performs a REAL step-up to do it.
+    # Step-up TTL is 300s (YASHIGANI_STEPUP_TTL_SECONDS), so by the time this
+    # test asserted "DELETE *without* step-up returns 401", the session it had
+    # been handed carried a step-up seconds old. The route returned 200 because
+    # step-up IS enforced and WAS satisfied — the test was asserting something
+    # its own setup had made untrue, and it stayed red through a fix to a
+    # different route entirely.
+    #
+    # The control being probed (ASVS V6.8.4) is real and worth probing, so this
+    # is NOT relaxed — instead the step-up is explicitly expired first, so
+    # "without step-up" is true when the assertion runs.
+    _expire_stepup(client)
 
     # Register credential.
     options_reg = _do_webauthn_register_via_api(client, "E2E WA-REVOKE-04")
