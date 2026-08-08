@@ -1147,6 +1147,28 @@ def playwright_login_admin(page, *, admin: int = 1, force_fresh: bool = False) -
     """
     cookies = _api_get_session_cookies(admin=admin, force_fresh=force_fresh)
     page.context.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+
+    # SameSite=Strict priming navigation (2026-08-08).
+    #
+    # The admin session cookie is set SameSite=Strict
+    # (backoffice/routes/auth.py::_set_session_cookie). Chromium does NOT send
+    # Strict cookies on a navigation with no same-site initiator — and a
+    # page.goto() straight from about:blank is exactly that. So the very first
+    # goto after add_cookies arrived WITHOUT the session, the server redirected
+    # to /admin/login?next=/admin/, and assert_admin_dashboard_reached failed.
+    #
+    # This produced 110 fixture ERRORS per leg — 81 of them from admin_ctx
+    # alone (27 modules x 3 tests) — identically on docker and podman, headed
+    # and headless, on every run of the 4.1.2 campaign. It was repeatedly
+    # mis-attributed to the auth throttle; a throttle fix was written and fired
+    # ZERO times while the 110 stayed put. It is a browser cookie-policy rule,
+    # not a product fault and not a throttle: fixtures that happened to
+    # navigate to the origin first (e.g. browser_page_with_va -> /admin/login)
+    # never showed it.
+    #
+    # One cheap same-origin navigation establishes the site context; the next
+    # navigation is then same-site and carries the Strict cookie.
+    page.goto(f"{BASE_URL}/admin/login", wait_until="domcontentloaded")
     page.goto(f"{BASE_URL}/admin/")
     page.wait_for_timeout(1000)
 
