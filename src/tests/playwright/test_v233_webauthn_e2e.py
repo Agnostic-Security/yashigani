@@ -303,6 +303,24 @@ def _delete_credential(client, credential_id: str, totp_secret: str) -> int:
         f"{BASE_URL}/auth/stepup",
         json={"totp_code": totp_code},
     )
+    # 2026-08-08: this hard-asserted 200 and produced
+    # "Step-up failed before revocation: 401 session_expired_or_invalid" on 4
+    # tests in the long (3h) Tier-B run. _get_authed_client() already
+    # self-heals an expired session on ACQUISITION, but a session can expire
+    # between acquisition and this call, and this helper had no such handling —
+    # so a session-lifetime artefact of a long suite was reported as a test
+    # failure. Refresh once and retry, exactly as the acquisition path does.
+    # A 401 that survives the refresh is still a hard failure.
+    if su.status_code == 401:
+        cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+        client.cookies.update(cookies)
+        _wait_for_fresh_totp_window(admin=1)
+        totp_code = _current_totp(totp_secret)
+        _api_totp_last_used[1] = time.time()
+        su = client.post(
+            f"{BASE_URL}/auth/stepup",
+            json={"totp_code": totp_code},
+        )
     assert su.status_code == 200, (
         f"Step-up failed before revocation: {su.status_code} {su.text[:200]}"
     )
