@@ -327,7 +327,23 @@ class TestAdminBootstrapBothAdmins:
     that coverage explicitly rather than assume it still happens here.
     """
 
-    @pytest.mark.parametrize("admin_num", [1])
+    # 2026-08-08: was `[1]`. The docstring above correctly states that
+    # admin1-only coverage does NOT satisfy retro v2.23.1 A2 ("BOTH admins,
+    # full 5-step, every sweep ... skipping this for either admin = false
+    # PASS. No exceptions."), and then dropped admin2 anyway and flagged it
+    # for someone else. It stayed green on half the required coverage.
+    #
+    # admin2 is the break-glass account (dual-admin recovery): if its forced
+    # change / TOTP provision / rotation is broken, NOTHING in this suite
+    # would notice — and the one scenario it exists for is the one where
+    # admin1 is already unusable.
+    #
+    # The stated reason for dropping it was the lane partition (admin2
+    # reserved for the pentest lane). That is handled by ORDER, not by
+    # omission: this is a serialized, deterministic gate that runs as part of
+    # the functional sweep. If the pentest lane is running concurrently
+    # against admin2, run this before/after it — never drop the coverage.
+    @pytest.mark.parametrize("admin_num", [1, 2])
     def test_relogin_after_rotation_proves_rotation_stuck(self, admin_num):
         """Deterministic gate: drive rotation (if not already done this run)
         then assert the re-login with the ROTATED password succeeds and
