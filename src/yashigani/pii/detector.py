@@ -189,6 +189,23 @@ def _normalize_with_span_map(text: str) -> tuple[str, list[int]]:
     return "".join(out_chars), index_map
 
 
+def normalize_for_pattern_matching(text: str) -> str:
+    """Public wrapper: return the NFKC + Cf/zero-width-stripped view of *text*.
+
+    FIND-LAURA-412-CRIT-001 (2026-08-08): this is the SAME normalization
+    :func:`_scan` applies internally (and that :func:`contains_pci_pan` /
+    the egress absolute-PCI block already benefit from). Exposed publicly
+    so other regex-based detectors in the codebase — notably the INGRESS
+    ``yashigani.optimization.sensitivity_classifier._scan_regex`` layer that
+    gates POL-009 ``pci_data_present`` — can normalize BEFORE matching
+    instead of maintaining a second, divergent (and previously un-hardened)
+    normalization implementation. Discards the index map; callers that need
+    span translation back to the original text should use
+    :func:`_normalize_with_span_map` directly.
+    """
+    return _normalize_with_span_map(text)[0]
+
+
 def _map_normalized_span_to_original(
     norm_start: int, norm_end: int, index_map: list[int], orig_len: int,
 ) -> tuple[int, int]:

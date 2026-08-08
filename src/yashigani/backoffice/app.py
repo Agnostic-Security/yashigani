@@ -1170,8 +1170,22 @@ def create_backoffice_app() -> FastAPI:
     #     different, stricter invariant (WebAuthn relying-party origin) that
     #     would 403 legitimate requests in test/TestClient contexts whose
     #     Host header ("testserver") is never in that allowlist.
+    # FIND-LAURA-412-CSRF-USER-PLANE (MED, 2026-08-08): the check above was
+    # scoped to "/admin/" and "/auth/" only — "/user/*" (chat, conversations,
+    # agents, workflows, documents, memory) was excluded, so a cross-origin
+    # POST /user/conversations with a valid __Host-yashigani_session cookie
+    # and no CSRF token sailed through 201, same shape as the original
+    # FIND-P-CSRF admin bypass. Every /user/* route in this app
+    # (user_conversations.py, user_ui.py, user_agents.py, user_workflows.py)
+    # is cookie-only auth (require_user_session reads ONLY
+    # __Host-yashigani_session — see middleware._resolve_user_token; there is
+    # no Bearer/API-key path into backoffice /user/*), so adding "/user/" here
+    # is a straight scope extension of the SAME check with NO new branch: it
+    # only fires when has_session_cookie is True (line below), so a
+    # hypothetical future bearer-authenticated /user/* caller that sends no
+    # session cookie is still exempt, exactly like /admin/ and /auth/ today.
     _CSRF_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-    _CSRF_CHECKED_PREFIXES = ("/admin/", "/auth/")
+    _CSRF_CHECKED_PREFIXES = ("/admin/", "/auth/", "/user/")
     _CSRF_SESSION_COOKIES = (
         "__Host-yashigani_admin_session",
         "__Host-yashigani_session",

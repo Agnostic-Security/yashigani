@@ -390,10 +390,58 @@ class SensitivityClassifier:
         )
 
     def _scan_regex(self, text: str, triggers: list[str]) -> int:
-        """Layer 1: Regex pattern matching. Cannot be disabled. Returns int level."""
+        """Layer 1: Regex pattern matching. Cannot be disabled. Returns int level.
+
+        FIND-LAURA-412-CRIT-001 (2026-08-08 — Laura, independently confirmed
+        live 5/5 and 3/3): a Luhn-valid PAN with a Unicode zero-width
+        character (U+200B ZERO WIDTH SPACE, and siblings U+200C/U+200D/
+        U+FEFF/other category-Cf format chars) inserted between every digit
+        evaded EVERY pattern below, because this layer matched raw text with
+        no normalization while a hardened NFKC + Cf-strip normalizer already
+        existed at ``yashigani.pii.detector`` (wired only to the EGRESS
+        absolute-PCI block, ``contains_pci_pan``, added in the prior
+        FIND-PCI-EGRESS-CEILING-BYPASS session). Two un-synced PAN detectors
+        — one hardened (egress), one not (this ingress layer that gates
+        POL-009 ``pci_data_present``) — is the root cause, not a
+        per-character regex patch.
+
+        Root fix, unified onto the ONE hardened detector (no second,
+        divergent normalization/PAN-matching implementation):
+          1. Every pattern below (SSN, email, phone, API key, classification
+             marker, IBAN) is matched against ``normalize_for_pattern_matching()``
+             — the SAME NFKC + Cf-strip routine ``contains_pci_pan`` uses —
+             instead of the raw, unnormalized text. This also closes the
+             analogous fullwidth-digit (U+FF10 etc.) and zero-width evasion
+             for SSN/phone/IBAN, not just credit cards.
+          2. Credit/debit card detection no longer uses a local, Luhn-blind
+             13-19-digit regex at all. It delegates to
+             ``yashigani.pii.detector.contains_pci_pan()`` — the exact
+             function the egress block calls — so ingress and egress agree
+             byte-for-byte on what counts as cardholder data (NFKC + Cf-strip
+             + network-prefix pattern + Luhn validation). This also removes
+             false positives on Luhn-invalid 13-19-digit runs (e.g. long
+             reference/tracking numbers) that the old bare digit-run regex
+             would have flagged.
+
+        See src/tests/regression/v4.1.2/test_find_laura_412_crit_001_pan_zerowidth.py.
+        """
+        from yashigani.pii.detector import (  # noqa: PLC0415
+            contains_pci_pan,
+            normalize_for_pattern_matching,
+        )
+
         highest: int = SensitivityLevel.PUBLIC
+        norm_text = normalize_for_pattern_matching(text)
+
+        if contains_pci_pan(text):
+            triggers.append("regex:Credit/debit card")
+            highest = int(SensitivityLevel.SENSITIVE)
+
         for pattern, level, desc in self._patterns:
-            if pattern.search(text):
+            if desc == "Credit/debit card":
+                # Handled above via contains_pci_pan (unified, Luhn-validated).
+                continue
+            if pattern.search(norm_text):
                 triggers.append(f"regex:{desc}")
                 if int(level) > highest:
                     highest = int(level)
