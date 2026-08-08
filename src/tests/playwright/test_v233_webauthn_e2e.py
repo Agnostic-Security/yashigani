@@ -399,6 +399,35 @@ def _add_extra_virtual_authenticator(cdp_session) -> str:
     return result["authenticatorId"]
 
 
+
+class _AuthenticatorRotator:
+    """Give each credential registration its own virtual authenticator.
+
+    WebAuthn does not allow one authenticator to hold two credentials for the
+    same user: the RP lists existing credentials in `excludeCredentials` and the
+    authenticator refuses. A real hardware key refuses identically. Every
+    multi-credential test in this module registered two credentials against ONE
+    authenticator and had therefore been failing since the suite was written —
+    mis-triaged for the whole 4.1.2 campaign as "virtual authenticator not
+    provisioned".
+
+    Rotating one authenticator per key models what the test is actually about:
+    a user enrolling a laptop AND a phone.
+    """
+
+    def __init__(self, cdp_session, initial_auth_id: str) -> None:
+        self._cdp = cdp_session
+        self._current = initial_auth_id
+
+    def next_key(self, index: int) -> str:
+        """Ensure registration `index` is answered by a distinct authenticator."""
+        if index == 0:
+            return self._current
+        _disable_virtual_authenticator(self._cdp, self._current)
+        self._current = _add_extra_virtual_authenticator(self._cdp)
+        return self._current
+
+
 def _enable_virtual_authenticator(cdp_session) -> str:
     """
     Enable the WebAuthn virtual environment on the CDP session and add a
@@ -1567,15 +1596,9 @@ def test_wa_multi_01_register_two_credentials_both_listed(
     registered_ids = []
 
     try:
-        # One authenticator per credential — see _add_extra_virtual_authenticator.
-        extra_auth_ids = []
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
-            if i > 0:
-                # Retire the previous authenticator from the browser so the new
-                # registration is answered by a DIFFERENT key, mirroring a user
-                # enrolling a second device.
-                _disable_virtual_authenticator(cdp, extra_auth_ids[-1] if extra_auth_ids else auth_id)
-                extra_auth_ids.append(_add_extra_virtual_authenticator(cdp))
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-01 Key {i+1}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1626,8 +1649,10 @@ def test_wa_multi_02_03_both_credentials_usable(
     registered_ids = []
 
     try:
-        # Register both credentials.
+        # Register both credentials — one authenticator each (_AuthenticatorRotator).
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-0{i+2}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1690,7 +1715,9 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
 
     try:
         # Register two credentials.
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-04 Key {i+1}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1765,7 +1792,9 @@ def test_wa_multi_05_revoke_all_leaves_empty_list(
     registered_ids = []
 
     # Register two credentials.
+    _rotator = _AuthenticatorRotator(cdp, auth_id)
     for i in range(2):
+        _rotator.next_key(i)
         options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-05 Key {i+1}")
         cred_resp = _browser_complete_registration(page, cdp, options_reg)
         r_reg = client.post(
