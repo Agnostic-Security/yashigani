@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from yashigani.documents.pseudonymize import is_pseudonymization_token
 from yashigani.documents.segment import Segment, SegmentKind
+from yashigani.pii.detector import normalize_for_pattern_matching
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +121,22 @@ _NAME_SHAPED = re.compile(r"^[^@\d]*[A-Za-z][^@]*$")
 
 def _value_plausible(data_class: str, value: str) -> bool:
     """Whether ``value`` plausibly belongs to ``data_class`` (guard against
-    mis-tagging a stray non-conforming cell under a classified header)."""
+    mis-tagging a stray non-conforming cell under a classified header).
+
+    FIND-LAURA-412-CRIT-001 sweep (2026-08-08): the shape regexes below are
+    plain ``\\d``/literal-anchored patterns with no zero-width/compatibility-
+    form tolerance — exactly the class of pattern that a Unicode zero-width
+    character (U+200B et al, category Cf) or a fullwidth-digit (NFKC-foldable)
+    substitution defeats. A DOB/CVV/expiry cell value with a zero-width char
+    interleaved would silently fail ``_value_plausible`` and the column-driven
+    QI/PCI tag would never be applied, even though the header already matched.
+    Matching is now done against the SAME NFKC + Cf-strip normalized view
+    (``yashigani.pii.detector.normalize_for_pattern_matching``) the unified
+    PAN/PII detector uses elsewhere — one normalization routine, not a second
+    divergent one. Only the MATCH decision uses the normalized value; the
+    caller still tags the whole ORIGINAL cell span (``header_driven_matches``
+    uses ``len(seg.text)``), so no index-mapping is needed here.
+    """
     v = value.strip()
     if not v:
         return False
@@ -132,15 +148,16 @@ def _value_plausible(data_class: str, value: str) -> bool:
     # literally equal to ``[PERSON_NAME_1]`` is not a plausible class value either.
     if is_pseudonymization_token(v):
         return False
+    norm_v = normalize_for_pattern_matching(v)
     if data_class == "PII.DATE_OF_BIRTH":
-        return bool(_DATE_SHAPED.match(v))
+        return bool(_DATE_SHAPED.match(norm_v))
     if data_class == "PCI.CVV":
-        return bool(_CVV_SHAPED.match(v))
+        return bool(_CVV_SHAPED.match(norm_v))
     if data_class == "PCI.CARD_EXPIRY":
-        return bool(_EXPIRY_SHAPED.match(v))
+        return bool(_EXPIRY_SHAPED.match(norm_v))
     if data_class in ("PII.PERSON_NAME", "PCI.CARDHOLDER_NAME"):
         # A name: contains letters, isn't an email, and is short (a few words).
-        return bool(_NAME_SHAPED.match(v)) and len(v) <= 80 and len(v.split()) <= 6
+        return bool(_NAME_SHAPED.match(norm_v)) and len(norm_v) <= 80 and len(norm_v.split()) <= 6
     # Address / salary / title / PAN: any non-empty cell under the header.
     return True
 
@@ -212,7 +229,13 @@ def classify_columns(segments: list[Segment]) -> dict[tuple[str, str], _ColumnCl
         sheet, col, row = key
         if row != min_row.get(sheet):
             continue  # not a header cell
-        header = seg.text
+        # FIND-LAURA-412-CRIT-001 sweep (2026-08-08): normalize the header
+        # text before matching (NFKC + Cf/zero-width strip) — a header like
+        # "SSN​" or "Card​Number" would otherwise silently fail
+        # every _COLUMN_CLASSES pattern and the whole column (which, per this
+        # module's own docstring, has NO distinctive per-value form for
+        # DOB/CVV/name classes) would go completely unclassified.
+        header = normalize_for_pattern_matching(seg.text)
         for cc in _COLUMN_CLASSES:
             if cc.matcher.search(header):
                 classes[(sheet, col)] = cc
