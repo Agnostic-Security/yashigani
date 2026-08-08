@@ -366,6 +366,39 @@ def _wait_for_audit_event(
 # CDP / virtual authenticator helpers (Playwright-based)
 # ---------------------------------------------------------------------------
 
+
+def _add_extra_virtual_authenticator(cdp_session) -> str:
+    """Add a SECOND virtual authenticator to an existing CDP session.
+
+    Multi-credential tests register two credentials for the SAME user. A single
+    authenticator cannot satisfy that: the RP sends the first credential in
+    `excludeCredentials` on the second registration, and the authenticator
+    correctly refuses with "the user attempted to register an authenticator that
+    contains one of the credentials already registered with the relying party".
+    That is WebAuthn behaving to spec — a real hardware key would refuse
+    identically — so the tests, not the product, were wrong. They had been
+    failing for the whole 4.1.2 campaign, mis-attributed to "virtual
+    authenticator not provisioned".
+
+    Two credentials means two authenticators, exactly as a user registering a
+    laptop and a phone would have.
+    """
+    result = cdp_session.send(
+        "WebAuthn.addVirtualAuthenticator",
+        {
+            "options": {
+                "protocol": "ctap2",
+                "transport": "usb",
+                "hasResidentKey": True,
+                "hasUserVerification": True,
+                "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }
+        },
+    )
+    return result["authenticatorId"]
+
+
 def _enable_virtual_authenticator(cdp_session) -> str:
     """
     Enable the WebAuthn virtual environment on the CDP session and add a
@@ -1534,7 +1567,15 @@ def test_wa_multi_01_register_two_credentials_both_listed(
     registered_ids = []
 
     try:
+        # One authenticator per credential — see _add_extra_virtual_authenticator.
+        extra_auth_ids = []
         for i in range(2):
+            if i > 0:
+                # Retire the previous authenticator from the browser so the new
+                # registration is answered by a DIFFERENT key, mirroring a user
+                # enrolling a second device.
+                _disable_virtual_authenticator(cdp, extra_auth_ids[-1] if extra_auth_ids else auth_id)
+                extra_auth_ids.append(_add_extra_virtual_authenticator(cdp))
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-01 Key {i+1}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
