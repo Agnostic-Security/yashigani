@@ -223,6 +223,45 @@ several controls only engage in production — the pool manager runs `backend=st
 per-identity container isolation is never exercised. A matrix of demo-only legs proves those
 paths by code-reading, not by runtime. At least one leg per runtime family must be non-demo.
 
+## 5.6 A tier must PROVE its target, and never invent one (added 2026-08-09)
+
+**Rule:** a tier that cannot resolve the stack it was told to test must FAIL, naming what it
+tried. It must never fall back to a default address, and it must never accept a bare status
+code as proof of life.
+
+This rule exists because its absence cost an entire campaign. `run_tier_b()` validated
+`--target` and then never exported it to the tests. `_resolve_base_url()` therefore probed
+`localhost:8443` → `localhost` → `localhost:8080` and, when none was the stack, **returned the
+hardcoded default anyway**. Two things answered `200` on those ports — a leftover
+`rootlessport` from a torn-down leg, and Caddy itself, which routes by Host and returns an
+empty `200` catch-all for `localhost` — so the probe "succeeded".
+
+Consequences, measured:
+* Every Tier-B test on every leg ran against an endpoint that returns `200` with an empty body
+  to everything, including `/healthz`.
+* Login returned `200`, zero-length, no `Set-Cookie`; the browser never got a session; every
+  `admin_ctx` fixture landed on `/admin/login`.
+* **110 fixture errors per leg**, identical on docker and podman, headed and headless, across
+  ~6 full runs ≈ 660 phantom failures and ~18 hours of browser wall-clock.
+* Three successive wrong diagnoses (auth throttle, `SameSite=Strict`, HTTP client), each with a
+  fix that changed nothing. `curl` "worked" and `httpx` "failed" because they were pointed at
+  different hosts.
+
+**Required of every tier:**
+1. The runner MUST export the resolved target to the tests (`YASHIGANI_ADMIN_URL`). Accepting
+   `--target` and not passing it on is a defect, not an omission.
+2. Liveness MUST be content-verified — a non-empty `/healthz` body that identifies the product.
+   A status code alone proves only that *something* is listening.
+3. On failure, RAISE and list every candidate tried. Silence plus a default is how a suite
+   spends 18 hours testing nothing.
+4. The leg pre-flight (§YSG-RISK-207) checks the SAME resolution path the tests use. A
+   pre-flight that passes while the suite resolves elsewhere — which is exactly what happened
+   here — provides false assurance.
+
+**Corollary for triage:** when many tests fail identically across runtimes AND browser modes,
+suspect the shared input (target, credentials, fixture) before any product subsystem. A defect
+that is invariant across every axis you vary is not in the thing you are varying.
+
 ## 6. Findings register (this build — routed, not fixed)
 
 Framework-build discipline: Iris builds and runs the framework, does not fix product code
