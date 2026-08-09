@@ -271,15 +271,41 @@ _CA_CERT_PATH: str | None = _resolve_ca_cert()
 
 
 def _resolve_base_url() -> str:
+    """Resolve the target stack URL.
+
+    2026-08-09 — THIS FUNCTION CAUSED THE 110 FIXTURE ERRORS PER LEG, ALL CAMPAIGN.
+
+    `run_tier_b()` validates `--target` and then never exports it, so
+    YASHIGANI_ADMIN_URL was unset and this fell through to probing
+    localhost:8443 / localhost / localhost:8080. Nothing answers there, and the
+    old code then RETURNED THE HARDCODED DEFAULT ANYWAY. Every request went to a
+    dead address that replies 200 with an empty body to everything — including
+    /healthz — so:
+      * login returned 200, length 0, no Set-Cookie
+      * r.json() raised JSONDecodeError, or the browser got no session
+      * every admin_ctx fixture landed on /admin/login  -> 110 ERRORS
+    It was blamed on the auth throttle, then SameSite, then the HTTP client.
+    curl "worked" and httpx "failed" because they were pointed at DIFFERENT HOSTS.
+
+    Three fixes:
+      1. honour YASHIGANI_TEST_DOMAIN when no explicit URL is given, so the
+         runner's --target reaches the tests (see run-test-framework.sh, which
+         now exports YASHIGANI_ADMIN_URL);
+      2. verify a probe candidate is really our stack — a 200 with an empty body
+         is NOT a healthy stack;
+      3. FAIL LOUD instead of returning a default nothing is listening on. A
+         suite that cannot find its target must not invent one.
+    """
     override = os.getenv("YASHIGANI_ADMIN_URL")
     if override:
         return override.rstrip("/")
-    # Prefer HTTPS; fall back to common installer ports
-    candidates = [
-        "https://localhost:8443",
-        "https://localhost",
-        "http://localhost:8080",
-    ]
+
+    candidates = []
+    domain = os.getenv("YASHIGANI_TEST_DOMAIN", "").strip()
+    if domain:
+        candidates += [f"https://{domain}", f"https://{domain}:8443"]
+    candidates += ["https://localhost:8443", "https://localhost", "http://localhost:8080"]
+
     try:
         import httpx
 
@@ -287,13 +313,22 @@ def _resolve_base_url() -> str:
             verify: bool | str = (_CA_CERT_PATH or False) if url.startswith("https://") else False  # type: ignore[assignment]
             try:
                 r = httpx.get(f"{url}/healthz", verify=verify, timeout=3)
-                if r.status_code == 200:
-                    return url
             except Exception:
                 continue
+            # A live Yashigani /healthz returns a non-empty JSON body. An empty
+            # 200 is something else answering on that port.
+            if r.status_code == 200 and r.content and b"ok" in r.content.lower():
+                return url
     except ImportError:
         pass
-    return "https://localhost:8443"
+
+    raise RuntimeError(
+        "YTF: cannot resolve a live Yashigani stack. Tried: "
+        + ", ".join(candidates)
+        + ". Set YASHIGANI_ADMIN_URL (the runner's --target) or YASHIGANI_TEST_DOMAIN. "
+        "Refusing to fall back to a default address — that is what produced 110 "
+        "phantom fixture errors per leg for an entire campaign."
+    )
 
 
 BASE_URL: str = _resolve_base_url()
