@@ -1739,7 +1739,17 @@ def admin_ctx(_shared_pw):
     browser = launch_chromium(_shared_pw)
     ctx = browser.new_context(ignore_https_errors=True)
     page = ctx.new_page()
-    playwright_login_admin(page, admin=1)
+    # force_fresh=True — 2026-08-10. playwright_login_admin's OWN docstring says:
+    # "Use for any fixture (e.g. admin_ctx) that is the FIRST thing to
+    # authenticate in a long file." admin_ctx did not, so it reused the
+    # process-cached session. Any earlier test that logs out
+    # (TestSessionLifecycle::test_logout_redirect_clears_admin_session)
+    # invalidates that shared cookie server-side, and EVERY admin_ctx setup
+    # afterwards then injects a dead cookie and lands on /admin/login.
+    # That is the 110 fixture errors per leg: they run contiguously from the
+    # logout test to the end of the file, on every runtime and both browser
+    # modes, because the cache is process-global and the logout is real.
+    playwright_login_admin(page, admin=1, force_fresh=True)
     yield ctx, page
     ctx.close()
     browser.close()
