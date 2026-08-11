@@ -210,11 +210,11 @@ PROMPT_INJECTION_CANARIES = [
 PATH_TRAVERSAL_CANARIES = ["../../etc/passwd", "..\\..\\windows\\win.ini", "..%2f..%2fetc%2fpasswd"]
 
 
-def _http_client():
+def _http_client(timeout: float = 10):
     import httpx
 
     verify = _CA_CERT_PATH or False
-    return httpx.Client(verify=verify, follow_redirects=False, timeout=10)
+    return httpx.Client(verify=verify, follow_redirects=False, timeout=timeout)
 
 
 def _cookie_header(cookies: dict) -> dict:
@@ -887,7 +887,9 @@ class TestAgentGeneratePromptInjection:
     def test_agent_generate_prompt_injection_canary(self, user_ctx, canary):
         ctx, _ = user_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        with _http_client() as c:
+        # LLM agent-generate is real inference (model load + generation) -> allow
+        # a generous read timeout; the default 10s races the first cold inference.
+        with _http_client(timeout=60) as c:
             r = c.post(f"{BASE_URL}/user/agents/generate", json={"description": canary},
                        headers=_cookie_header(cookies))
         assert r.status_code in (200, 422, 403), f"unexpected {r.status_code}"
