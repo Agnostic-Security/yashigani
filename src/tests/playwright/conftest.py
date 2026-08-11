@@ -1362,6 +1362,80 @@ def _admin_headers(admin: int = 1) -> dict:
     return {"X-Yashigani-Plane": "admin"}
 
 
+_seeded_users_cache: "list | None" = None
+_seeded_key_assignment: dict = {}
+
+
+def _load_seeded_users() -> list:
+    """Parse populate-demo's demo-user-creds file (path in env
+    YASHIGANI_SEEDED_CREDS) into a list of pre-seeded @agnosticsec.com
+    user-tier identities. Empty when the env is unset/missing -> callers
+    fall back to self-provisioning. Cached for the process."""
+    global _seeded_users_cache
+    if _seeded_users_cache is not None:
+        return _seeded_users_cache
+    users: list = []
+    path = os.environ.get("YASHIGANI_SEEDED_CREDS")
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8", errors="ignore"):
+            m = _ytf_re.match(
+                r"(\S+@agnosticsec\.com)\s+username=(\S+)\s+pw=(\S+)\s+totp=(\S+)", line
+            )
+            if m:
+                email, uname, pw, totp = m.groups()
+                users.append(
+                    {"email": email, "username": uname, "password": pw, "totp_secret": totp}
+                )
+    _seeded_users_cache = users
+    return users
+
+
+def _maybe_seeded_user_session(cache_key: str) -> "dict | None":
+    """PROTOCOL (coherent-methodology): reuse a pre-seeded differential
+    identity instead of self-provisioning a throwaway 'ava-conf-*' user.
+
+    Self-provisioning POST /admin/users 402s under a capped (Community, 5-seat)
+    licence whose seats are already filled by the differential seed -- which
+    silently starved the ENTIRE live user-plane security sweep (BOLA / path-
+    traversal / injection / admin-reject / ring-fence) on both runtimes. The
+    seeded @agnosticsec.com users ARE real user-tier identities (already through
+    first-login + rotation by populate-demo), so reusing them -- one real login
+    per identity, real OTP -- lets those tests actually execute under Community.
+    Distinct cache_keys deterministically get DISTINCT seeded users (BOLA needs
+    two). Returns None (-> fall back to provisioning) when no seeded creds file
+    is configured, preserving the historical behaviour for uncapped tiers.
+    """
+    import httpx
+    import pyotp
+
+    users = _load_seeded_users()
+    if not users:
+        return None
+    if cache_key not in _seeded_key_assignment:
+        _seeded_key_assignment[cache_key] = len(_seeded_key_assignment) % len(users)
+    u = users[_seeded_key_assignment[cache_key]]
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    totp = pyotp.TOTP(u["totp_secret"], digits=6, digest=_hashlib.sha256)
+    wait_for_fresh_totp(f"user:{u['username']}")
+    with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
+        r = c.post(
+            f"{BASE_URL}/auth/login",
+            json={"username": u["username"], "password": u["password"], "totp_code": totp.now()},
+        )
+        mark_totp_used(f"user:{u['username']}")
+    assert r.status_code == 200, (
+        f"seeded user reuse: login for {u['username']!r} failed: "
+        f"{r.status_code} {r.text[:200]} (YASHIGANI_SEEDED_CREDS stale?)"
+    )
+    return {
+        "username": u["username"],
+        "email": u["email"],
+        "password": u["password"],
+        "totp_secret": u["totp_secret"],
+        "cookies": dict(r.cookies),
+    }
+
+
 def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = False) -> dict:
     """
     Provision a throwaway user-tier account and complete the full 5-step
@@ -1385,6 +1459,15 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     global _user_session_cache
     if not force_fresh and cache_key in _user_session_cache:
         return _user_session_cache[cache_key]
+
+    # PROTOCOL: under a capped licence, reuse a seeded differential identity
+    # rather than self-provisioning (which 402s once the seed fills the seats).
+    # No-op (returns None) when YASHIGANI_SEEDED_CREDS is unset -> provisioning.
+    _seeded = _maybe_seeded_user_session(cache_key)
+    if _seeded is not None:
+        _user_session_cache[cache_key] = _seeded
+        _user_session_established_at[cache_key] = _time.time()
+        return _seeded
 
     import httpx
     import pyotp
