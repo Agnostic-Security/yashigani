@@ -1245,6 +1245,49 @@ def _admin_headers(admin: int = 1) -> dict:
     return {"X-Yashigani-Plane": "admin"}
 
 
+# --- end-user quota hygiene (module level so TESTS can use it, not just
+# bootstrap_user_session) -------------------------------------------------
+# 2026-08-11, FIND-0805-015a: this logic already existed as a CLOSURE inside
+# bootstrap_user_session, where no test could reach it, so the create-user
+# tests could not free a slot and failed with 402 end_user_limit_exceeded once
+# populate-demo.py had seeded its 5 users against the 5-user Community cap
+# (licensing/enforcer.py:95). Promoted rather than duplicated -- the nested
+# version now delegates here, so there is exactly one implementation.
+# Only ever touches this suite's own throwaway markers, never a real account.
+_THROWAWAY_EMAIL_PREFIXES = ("ava-conf-", "ava-quota-", "ava-dup-")
+
+
+def delete_end_user(client, username: str) -> bool:
+    """DELETE /admin/users/{username} (StepUpAdminSession-gated -- the caller's
+    cookies must already carry a fresh step-up). True if it was deleted."""
+    if not username:
+        return False
+    return client.delete(f"{BASE_URL}/admin/users/{username}").status_code == 200
+
+
+def free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
+    """Delete up to `min_free` of this suite's throwaway end users to free
+    licence capacity. Returns how many were actually deleted."""
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
+        r = c.get(f"{BASE_URL}/admin/users")
+        if r.status_code != 200:
+            return 0
+        throwaway = [
+            u for u in r.json().get("users", [])
+            if (u.get("email") or "").startswith(_THROWAWAY_EMAIL_PREFIXES)
+            and (u.get("email") or "").endswith("@example.com")
+        ]
+        throwaway.sort(key=lambda u: u.get("created_at") or "")
+        deleted = 0
+        for u in throwaway:
+            if deleted >= min_free:
+                break
+            if delete_end_user(c, u.get("username")):
+                deleted += 1
+        return deleted
+
+
 def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = False) -> dict:
     """
     Provision a throwaway user-tier account and complete the full 5-step
@@ -1306,46 +1349,15 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
             return stepup_resp, create_resp
 
     def _free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
-        """Delete the oldest throwaway 'ava-conf-*@example.com' end-user
-        accounts (this suite's own test-created marker -- every email this
-        file/class generates uses this prefix) to free up license capacity,
-        via the real DELETE /admin/users/{username} endpoint
-        (StepUpAdminSession-gated -- reuses the stepup elevation already
-        present on `cookies` from the immediately-preceding successful
-        /auth/stepup call, valid for YASHIGANI_STEPUP_TTL_SECONDS).
-
-        Test-environment hygiene, not a product workaround: repeated pytest
-        invocations against the SAME long-lived podman stack accumulate
-        throwaway end-user accounts (this function creates a new one on
-        every force_fresh call / every fresh process, never deletes them) --
-        confirmed live: 402 end_user_limit_exceeded (limit=5, current=5) on
-        a stack that had been up ~10h across many prior test invocations.
-        Only ever touches accounts whose email matches this suite's own
-        'ava-conf-...@example.com' marker -- never a real user account.
-        Returns the number of accounts actually deleted.
+        """Delegates to the module-level free_end_user_capacity() (promoted
+        2026-08-11, FIND-0805-015a, so tests can reach it too). Kept as a thin
+        alias because several call sites inside this function use the old name.
+        Behaviour is unchanged: delete this suite's throwaway
+        'ava-*@example.com' end users via the real DELETE
+        /admin/users/{username}, reusing the step-up already on `cookies`.
+        Confirmed live: 402 end_user_limit_exceeded (limit=5, current=5).
         """
-        with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
-            r = c.get(f"{BASE_URL}/admin/users")
-            if r.status_code != 200:
-                return 0
-            users = r.json().get("users", [])
-            throwaway = [
-                u for u in users
-                if (u.get("email") or "").startswith("ava-conf-")
-                and (u.get("email") or "").endswith("@example.com")
-            ]
-            throwaway.sort(key=lambda u: u.get("created_at") or "")
-            deleted = 0
-            for u in throwaway:
-                if deleted >= min_free:
-                    break
-                target_username = u.get("username")
-                if not target_username:
-                    continue
-                dr = c.delete(f"{BASE_URL}/admin/users/{target_username}")
-                if dr.status_code == 200:
-                    deleted += 1
-            return deleted
+        return free_end_user_capacity(cookies, min_free=min_free)
 
     def _free_seat_capacity_with_fresh_admin(*, min_free: int = 1) -> int:
         """Same hygiene as _free_end_user_capacity, but for the LOGIN-time

@@ -76,7 +76,9 @@ from tests.playwright.conftest import (
     _api_get_session_cookies,
     bootstrap_user_session,
     clear_auth_throttle,
+    delete_end_user,
     do_admin_stepup,
+    free_end_user_capacity,
     get_admin_credentials,
     get_admin_totp_code,
     playwright_login_admin,
@@ -587,12 +589,66 @@ class TestAccountsFormsAdminAndUser:
         with _http_client() as c:
             r = c.post(f"{BASE_URL}/admin/users", json={"email": email},
                         headers=_cookie_header(cookies))
-        assert r.status_code == 200, (
-            f"expected success after a genuine fresh step-up, got {r.status_code}: {r.text[:200]}"
-        )
-        body = r.json()
-        assert body.get("temporary_password")
-        assert body.get("totp_secret")
+            # FIND-0805-015a (2026-08-11): this asserted 200 unconditionally and so
+            # FAILED with 402 end_user_limit_exceeded once the users installer
+            # (populate-demo.py) seeded its 5 users -- the Community/no-licence tier
+            # caps end users at 5 (licensing/enforcer.py:95), so current==limit==5 and
+            # the enforcer CORRECTLY refuses a 6th. That is the licence control working,
+            # not a defect. Freeing a slot first keeps the happy path honest without
+            # weakening the control, and the quota case is asserted as a control in
+            # test_create_user_at_quota_is_refused_402 below.
+            if r.status_code == 402:
+                freed = free_end_user_capacity(cookies, min_free=1)
+                assert freed, (
+                    "at end-user quota and could not free a slot to test the happy path; "
+                    f"402 body: {r.text[:200]}"
+                )
+                r = c.post(f"{BASE_URL}/admin/users", json={"email": email},
+                           headers=_cookie_header(cookies))
+            assert r.status_code == 200, (
+                f"expected success after a genuine fresh step-up, got {r.status_code}: {r.text[:200]}"
+            )
+            body = r.json()
+            assert body.get("temporary_password")
+            assert body.get("totp_secret")
+            # leave the quota as we found it -- otherwise this test breaks every
+            # later create-user test in the run (the failure mode it just fixed).
+            delete_end_user(c, body.get("username") or email)
+
+    def test_create_user_at_quota_is_refused_402(self, admin_ctx):
+        """The licence control ITSELF, which was previously untested: at the tier's
+        end-user cap, creating one more must be refused with 402
+        end_user_limit_exceeded -- not 200, and not 500.
+
+        Added 2026-08-11 (FIND-0805-015a). The suite only ever asserted the happy
+        path, so a regression that silently stopped enforcing the cap would have
+        been invisible; the cap being hit was surfacing only as a test failure.
+        """
+        ctx, _ = admin_ctx
+        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+        do_admin_stepup(cookies, admin=1)
+        created: list[str] = []
+        with _http_client() as c:
+            # fill to the cap, then assert the next one is refused
+            for _ in range(12):  # bounded: cap is small on every tier we ship
+                em = f"ava-quota-{uuid.uuid4().hex[:8]}@example.com"
+                r = c.post(f"{BASE_URL}/admin/users", json={"email": em},
+                           headers=_cookie_header(cookies))
+                if r.status_code == 402:
+                    detail = r.json().get("detail", {})
+                    assert detail.get("error") == "end_user_limit_exceeded", (
+                        f"402 for the wrong reason: {r.text[:200]}")
+                    assert detail.get("current") == detail.get("limit"), (
+                        f"refused while under the cap: {r.text[:200]}")
+                    break
+                assert r.status_code == 200, f"unexpected {r.status_code}: {r.text[:200]}"
+                created.append(r.json().get("username") or em)
+            else:
+                raise AssertionError(
+                    "end-user cap was never enforced after 12 creates — the licence "
+                    "control is NOT enforcing (this is the regression this test exists for)")
+            for u in created:
+                delete_end_user(c, u)
 
     def test_create_user_duplicate_email_rejected(self, admin_ctx):
         """Bad-input case: duplicate email -> 409, not 500. Real fresh
