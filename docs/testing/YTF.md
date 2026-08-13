@@ -499,3 +499,47 @@ The UI path is the one that has repeatedly shipped broken.
 **populate-demo.py stays the demo seeder** (Tiago, 2026-08-12: "keep the populate script
 for demos don't erase it"). This test provisions users for TEST runs; it does not replace
 demo seeding.
+
+## 5.12 ONE login session per run; brute-force and injection lanes run LAST (added 2026-08-13 — Tiago directive)
+
+**Rule, verbatim:** *"login once, test it all, no more login again and again and again. One
+login session you run all but the brute force testing or injections."*
+
+1. **Authenticate ONCE per identity per run** and reuse that session for the entire functional
+   sweep. Session-scoped auth fixtures, not function-scoped. Refresh ONLY on genuine
+   expiry/server-side eviction — never on a timer, never per test/class/file.
+2. **Brute-force, auth-abuse and injection lanes run LAST**, as their own stage, after the
+   functional sweep has completed and its evidence is captured. Never interleaved.
+
+### Why — both halves are measured, not theoretical (4.1.2 docker leg, 2026-08-13)
+
+**Cost of re-login.** Every fresh login pays the TOTP anti-replay wait — up to **62s**
+(`conftest.py:1910-1913`, `max(62 - elapsed, …)`) under the one-code-per-identity-per-window
+rule (§5.10). A test doing ~5 fresh logins burns ~310s in sleeps alone. That is what blew the
+300s per-test ceiling and killed the headed leg at 17% (FIND-0813-011), and it is why Tier-B
+takes ~1h17m per browser mode.
+
+**Cost of interleaving.** The auth throttle is keyed on account **AND source IP** (correct
+anti-enumeration design). The adversarial lane's deliberate bad-credential probes drove
+`ip_level=5 delay=900s`, and because the delay served is `max(acct_level, ip_level)`
+(`auth.py:710`), a single legitimate account failure in the functional lane inherited the full
+IP-driven severity. Measured: interleaved → ~50% F/E by 42%; same suite with the adversarial
+lane split out → **365/378 clean**. Those failures were self-inflicted, not product defects —
+the exact class of false signal this framework exists to eliminate.
+
+### How this interacts with rules already in force
+- **§4.17 Rule 5 (lane separation by identity AND source IP)** still applies to the adversarial
+  stage — running it last does not remove the requirement that it come from a different source
+  IP (a container/netns), because `_real_client_ip()` resolves to the TCP peer, so every
+  host-originated request shares one address regardless of process.
+- **§5.10 (one TOTP secret = one window record)** becomes largely moot for the functional sweep
+  once there is only one login: the wait is paid once, not per test.
+- **§5.4 (no bypass)** is unaffected — one session still reaches the product the way a user does.
+
+### Conformance gap in the CURRENT suite (action item, not yet fixed)
+`src/tests/playwright/` re-authenticates extensively (`_api_get_session_cookies`,
+`playwright_login_admin`, `bootstrap_user_session`, per-fixture `force_fresh=True`,
+`refresh_*_context_if_stale`). Bringing it to this rule means session-scoped auth reused across
+files, with refresh driven by the `_admin_session_dirty`/`_user_session_dirty` eviction flags
+rather than elapsed time. Until that lands, Tier-B legs must at minimum run the adversarial
+suite as a separate final stage — which is what the 4.1.2 Linux legs now do.
