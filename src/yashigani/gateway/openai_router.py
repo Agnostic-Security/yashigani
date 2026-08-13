@@ -26,9 +26,11 @@ v1.0: Buffered responses only (Decision 13). Full response collected
 before delivery to enable response inspection and token counting.
 
 v2.2: Streaming support added. When ``body.stream == True`` and
-``YASHIGANI_STREAMING_ENABLED=true`` (default), requests are forwarded
-to Ollama with ``stream=true`` and responses are yielded as SSE chunks
-via FastAPI ``StreamingResponse``.
+``YASHIGANI_STREAMING_ENABLED=true`` (default), requests were forwarded
+to Ollama with ``stream=true`` and responses were yielded as SSE chunks
+via FastAPI ``StreamingResponse``. SEC-FIX-YSG-STREAM-INSPECTION-BYPASS
+(2026-08-06) removed the ability for this incremental-token branch to be
+selected for governed (non-agent) chat completions — see below.
 
 v2.2: PII detection wired into both the request path (before forwarding)
 and the response path (before delivery). PII filtering is ON by default
@@ -45,12 +47,26 @@ Streaming limitations
 - Agent routing (``@agent`` model prefix) always uses the buffered path
   regardless of the ``stream`` flag, because agent upstreams may not
   support SSE.
-- PII mode=log: streaming responses are allowed (request-path PII only).
-  PII mode=block|redact: streaming is force-disabled to enable full
-  response-path inspection. This adds ~2-3s latency but ensures PII
-  cannot leak through streamed responses.
+- SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL): a
+  ``stream:true`` request for a non-agent chat completion is now ALWAYS
+  answered as buffer-then-emit SSE, unconditionally — the response is
+  generated, put through the identical four response-side inspection
+  layers the buffered (``stream:false``) path uses (7b response inspection
+  pipeline, 7b-ii always-on I5 injection/PCI-exfil regex scan, 7c PII
+  detector, 8c OPA response-decision ceiling check), and only then wrapped
+  as a single-chunk ``text/event-stream`` (see ``_sse_from_completion``) —
+  or denied with the same 403 envelope as ``stream:false`` if inspection
+  blocks it. This decision no longer depends on whether OPA / PII-mode
+  happen to be configured (previously, `_state.opa_url` truthiness was the
+  only thing forcing buffered mode in practice, which meant an explicit
+  YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log could
+  reach the raw incremental-streaming branch (`StreamingInspector` in
+  `gateway/streaming.py`), which enforces only a coarse sensitivity-rank
+  ceiling and skips the other three controls entirely). The raw
+  incremental-streaming code path is retained (for future incremental-
+  inspection work) but is no longer reachable from this endpoint.
 """
-# Last updated: 2026-06-09T00:00:00+00:00
+# Last updated: 2026-08-06T00:00:00+00:00
 from __future__ import annotations
 
 import asyncio
@@ -92,8 +108,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
-    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+def _client_enforce_input(
+    identity, request_path, route_reason="", provider="", model="",
+    sensitivity="", data_tags=None,
+):
+    """Build the clients-contract input doc shared by ingress + egress (#16).
+
+    FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): ``sensitivity`` and
+    ``data_tags`` were previously ALWAYS omitted from this contract — every
+    seeded client policy keyed on ``input.routing_decision.sensitivity`` or
+    ``input.data_tags`` (POL-009 pci_data_block, POL-010
+    classified_marking_local) evaluated against undefined input fields, so
+    their ``deny`` rule bodies could structurally never produce a result and
+    ``count(deny) == 0`` (allow) regardless of actual content. Both fields
+    are now populated by the caller from the SAME regex-authoritative
+    sensitivity/PII detection the ingress/egress gates already compute —
+    never solely from the sklearn/ollama ensemble members (see
+    sensitivity_classifier.classify()'s regex floor and
+    FIND-INSPECTION-NONDETERMINISTIC).
+    """
     ident = identity or {}
     return {
         "identity": {
@@ -103,8 +136,43 @@ def _client_enforce_input(identity, request_path, route_reason="", provider="", 
             "groups": ident.get("groups", []),
         },
         "request": {"path": request_path, "method": "POST"},
-        "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+        "routing_decision": {
+            "route": route_reason, "provider": provider, "model": model,
+            "sensitivity": sensitivity,
+        },
+        "data_tags": list(data_tags or []),
     }
+
+
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): trigger-string -> data_tags
+# vocabulary mapping. Deliberately restricted to Layer-1 REGEX triggers
+# (the "regex:" prefix _scan_regex adds) — never sklearn:/ollama: triggers —
+# so a client-policy data_tag ("pci") can only ever be asserted by the
+# deterministic layer, matching the regex-authoritative invariant enforced
+# in sensitivity_classifier.classify().
+#
+# Deliberately narrow: this does NOT emit a generic "pii"/"sensitive"/
+# "classified" tag for every RESTRICTED/SENSITIVE regex hit (SSN, phone,
+# IBAN, admin-defined classification markers) — only "pci", which is what
+# POL-009 (pci_data_block) is precisely scoped to. Emitting a broader tag
+# here would make wildcard-bound (all-humans) client policies newly fire on
+# ordinary RESTRICTED content that a caller's sensitivity_ceiling already
+# legitimately governs. (POL-010 classified_marking_local's OWN
+# `data_tags[_] == "classified"` branch remains unpopulated/no-op — same as
+# before this fix; its admin-defined marking patterns have no data_tags
+# vocabulary today, a separate, pre-existing gap out of scope here. Its
+# bare `sensitivity == "RESTRICTED"` branch was narrowed away in
+# scripts/populate-demo.py for the same reason POL-009's was: it is no
+# longer PCI/classified-specific post-R14/R15 and would have started firing
+# broadly the moment `routing_decision.sensitivity` stopped being always-"".)
+def _derive_pci_data_tags(sensitivity_triggers) -> list[str]:
+    tags: list[str] = []
+    for trig in sensitivity_triggers or []:
+        low = str(trig).lower()
+        if low.startswith("regex:") and "credit/debit card" in low:
+            tags.append("pci")
+            break
+    return tags
 
 
 def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
@@ -3319,7 +3387,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _ce_in = await evaluate_client_policies(
         _state, _ce_scope_kind, identity_id, "ingress",
         _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
-                              provider=selected_provider, model=selected_model),
+                              provider=selected_provider, model=selected_model,
+                              # FIND-PCI-EGRESS-CEILING-BYPASS: wire the request's own
+                              # regex-authoritative sensitivity/data_tags — POL-009
+                              # ("cardholder data must not be sent") and POL-010 both
+                              # key on these fields and previously always saw them
+                              # undefined (structurally could never fire).
+                              sensitivity=sensitivity_level,
+                              data_tags=_derive_pci_data_tags(sensitivity_triggers)),
     )
     if not _ce_in.get("allow", False):
         _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -3456,19 +3531,52 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         and not is_agent_call
     )
 
-    # OPA enforcement: stream=false when OPA policies are active.
-    # All response content must be inspected before delivery to the user
-    # (human or non-human). Streaming bypasses response-path OPA checks.
-    if use_streaming and _state.opa_url:
+    # SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL):
+    # Response-side inspection for /v1|/user chat completions is FOUR
+    # independent layers, all of which live ONLY in the buffered code path
+    # below (7b response_inspection_pipeline / 7b-ii always-on I5 injection+
+    # PCI-exfil regex scan / 7c PII detector / 8c OPA response_decision
+    # ceiling+verdict check). The raw incremental-streaming branch (7a,
+    # StreamingInspector) enforces ONLY a coarse sensitivity-rank ceiling —
+    # it never runs the I5 scan, the ML ResponseInspectionPipeline, the PII
+    # detector, or the OPA response check.
+    #
+    # The previous guard only forced buffering when `_state.opa_url`
+    # happened to be truthy (or PII mode was BLOCK/REDACT) — i.e. response
+    # inspection was DE FACTO mandatory in every production deployment
+    # (OPA is required to start in production, and is the default even in
+    # dev), but was NOT an INTRINSIC guarantee: the 7b-ii comment claims the
+    # I5 gate is "ALWAYS-ON... MANDATORY", yet in an explicit
+    # YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log (the
+    # default), a stream:true request took the raw-streaming branch and
+    # bypassed all four controls — a caller could receive raw PII/PCI or
+    # injection-flagged content verbatim over SSE that the IDENTICAL
+    # stream:false request would have blocked or redacted (LAURA/Iris
+    # verified — response-side controls MUST apply identically to API and
+    # web-UI callers regardless of the ``stream`` flag AND regardless of
+    # which optional policy layers happen to be configured).
+    #
+    # Fix: full response-side inspection is unconditionally mandatory for
+    # every non-agent chat completion — the decision no longer depends on
+    # `_state.opa_url` / PII-mode config state. This is NOT "disabling
+    # streaming": a stream:true request is still answered with a genuine
+    # ``text/event-stream`` response (see `_sse_from_completion` / the
+    # F-STREAM wrap below) — the client-visible streaming contract is
+    # unchanged. Only the raw token-by-token incremental delivery (which
+    # cannot be un-sent once flushed, so it cannot be reconciled with
+    # "inspect the full response before delivery") is removed. The upstream
+    # response is generated, fully inspected exactly as the buffered path
+    # already does, and only then emitted — a BLOCKED verdict returns the
+    # same 403 envelope as the non-streaming path, before any content bytes
+    # reach the client.
+    if use_streaming:
         use_streaming = False
-        logger.info("Streaming disabled: OPA policies active — response inspection required")
-
-    # PII block/redact modes require full response inspection — force buffered
-    if use_streaming and _state.pii_detector is not None:
-        from yashigani.pii.detector import PiiMode
-        if _state.pii_detector.mode in (PiiMode.BLOCK, PiiMode.REDACT):
-            use_streaming = False
-            logger.info("Streaming disabled: PII mode=%s requires buffered response inspection", _state.pii_detector.mode.value)
+        logger.debug(
+            "Streaming answered as buffer-then-emit SSE: full response-side "
+            "inspection (I5 injection/PCI-exfil scan, response inspection "
+            "pipeline, PII detector, OPA response ceiling) is mandatory and "
+            "config-independent for every governed chat completion."
+        )
 
     # YSG-RISK-129: assistant_content/backend_body are only ever assigned
     # inside individual success-path branches of the try block below (agent
@@ -4304,10 +4412,30 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
     # the caller has no bound egress policies.
+    #
+    # FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the "pci" data_tag is
+    # derived from an ALWAYS-ON, config-independent Luhn-valid PAN scan
+    # (yashigani.pii.contains_pci_pan) — NOT from the optional
+    # response_inspection_pipeline / pii_detector toggles (YSG-RISK-057).
+    # POL-009 (pci_data_block, bound wildcard to every human, both
+    # directions) must block a PAN in the response for EVERY human caller
+    # regardless of their sensitivity_ceiling — a RESTRICTED ceiling
+    # legitimately permits other RESTRICTED content (SSN/phone/IBAN); it
+    # must never permit cardholder data. ``sensitivity`` is passed through
+    # for observability/other client policies but POL-009 itself keys only
+    # on the precise "pci" tag (see scripts/populate-demo.py POL-009 —
+    # narrowed to drop the overbroad bare-"RESTRICTED" branch that used to
+    # collide with the R14/R15 SENSITIVE(5)->legacy-"RESTRICTED" mapping).
+    from yashigani.pii import contains_pci_pan  # noqa: PLC0415
     _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_eg_data_tags = ["pci"] if contains_pci_pan(assistant_content) else []
     _ce_eg = await evaluate_client_policies(
         _state, _ce_eg_kind, identity_id, "egress",
-        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+        _client_enforce_input(
+            identity, "/v1/chat/completions", model=selected_model,
+            sensitivity=response_content_sensitivity or sensitivity_level,
+            data_tags=_ce_eg_data_tags,
+        ),
     )
     if not _ce_eg.get("allow", False):
         _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")

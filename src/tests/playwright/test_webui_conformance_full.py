@@ -212,11 +212,11 @@ PROMPT_INJECTION_CANARIES = [
 PATH_TRAVERSAL_CANARIES = ["../../etc/passwd", "..\\..\\windows\\win.ini", "..%2f..%2fetc%2fpasswd"]
 
 
-def _http_client():
+def _http_client(timeout: float = 10):
     import httpx
 
     verify = _CA_CERT_PATH or False
-    return httpx.Client(verify=verify, follow_redirects=False, timeout=10)
+    return httpx.Client(verify=verify, follow_redirects=False, timeout=timeout)
 
 
 def _cookie_header(cookies: dict) -> dict:
@@ -910,20 +910,21 @@ class TestUserAgentBOLA:
                 "description": "conformance BOLA probe agent",
             }, headers=_cookie_header(user_a["cookies"]))
         assert create_resp.status_code in (200, 201), f"setup failed: {create_resp.status_code} {create_resp.text[:200]}"
-        # FIND-B-C / 2026-08-06 (both heads found this independently; merged
-        # here on integ/v412-unified-20260813): POST /user/agents serialises the
-        # new agent's identifier as "ua_id" (backoffice/routes/user_agents.py
-        # create_user_agent() -> _serialise_agent()). "id" and "agent_id" NEVER
-        # existed in this endpoint's schema -- conversation objects use "id";
-        # this is a different resource. The old `.get("id") or .get("agent_id")`
-        # therefore always yielded None, the `assert agent_id` below always died
-        # at SETUP, and the cross-user-delete BOLA probe was never once reached:
-        # this test was unproven, not passing.
-        #
-        # Reading "ua_id" ONLY is deliberate: a fallback chain onto keys that
-        # never existed cannot help, and would let a future rename silently
-        # select a wrong key instead of failing loudly. The diagnostic message
-        # (carried over from the x8x side) names the keys actually returned.
+        # 2026-08-06 / FIND-B-C (independently found by both v4.1.2 sessions,
+        # same root cause, 4.1.2 3-runtime retest): the id lookup was
+        # `.get("id") or .get("agent_id")`, but POST /user/agents serialises
+        # the new agent's identifier as "ua_id" (src/yashigani/backoffice/
+        # routes/user_agents.py create_user_agent() -> _serialise_agent():
+        # {"ua_id": ua_id, ...}) -- "id"/"agent_id" never existed in this
+        # endpoint's response schema (conversation objects use "id"; this is
+        # a DIFFERENT resource). Neither key matched, so `agent_id` was
+        # always None and the test died on the SETUP assertion -- meaning the
+        # BOLA assertion below had NEVER ONCE EXECUTED. A test that cannot
+        # fail is not a test; worse, this one reported as a failure on every
+        # leg, so the real access-control check was hidden behind noise.
+        # `ua_id` first, with the historical keys kept as fallbacks so the
+        # test survives a future rename instead of silently going blind
+        # again.
         payload = create_resp.json()
         agent_id = payload.get("ua_id")
         assert agent_id, (
@@ -958,7 +959,9 @@ class TestAgentGeneratePromptInjection:
     def test_agent_generate_prompt_injection_canary(self, user_ctx, canary):
         ctx, _ = user_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        with _http_client() as c:
+        # LLM agent-generate is real inference (model load + generation) -> allow
+        # a generous read timeout; the default 10s races the first cold inference.
+        with _http_client(timeout=60) as c:
             r = c.post(f"{BASE_URL}/user/agents/generate", json={"description": canary},
                        headers=_cookie_header(cookies))
         assert r.status_code in (200, 422, 403), f"unexpected {r.status_code}"

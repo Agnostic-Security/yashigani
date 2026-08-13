@@ -259,6 +259,64 @@ def _normalise_classification(classification: str) -> str:
     return classification  # pass through (should be rejected by validator)
 
 
+# ── Helper: build the SAME unified sensitivity classifier the runtime uses ──
+#
+# FIND-LAURA-412-CRIT-001 sweep (2026-08-08): POST /admin/sensitivity/test
+# previously ran ONLY `backoffice_state.inspection_pipeline.process()` — the
+# prompt-injection / credential-exfil classifier (yashigani.inspection.pipeline
+# .InspectionPipeline) — never the sensitivity/PII/PCI classifier
+# (yashigani.optimization.sensitivity_classifier.SensitivityClassifier) that
+# gateway ingress/egress actually enforce PAN/PII detection with. An admin
+# pasting a Luhn-valid PAN into the "test" box got back an injection verdict
+# only, with NO signal about whether the SAME text would trip POL-009
+# pci_data_present / the PCI egress ceiling in production — admin test results
+# did not match enforcement, exactly the failure mode this sweep closes.
+#
+# Backoffice and gateway are separate processes/containers — the literal
+# SensitivityClassifier object cannot be shared across them. "Unify" here
+# means: construct an instance of the SAME class, using the SAME
+# `_DEFAULT_PATTERNS` + the SAME `_scan_regex()` method (which normalizes
+# every non-card pattern via `normalize_for_pattern_matching` and delegates
+# card detection to the Luhn-validated `contains_pci_pan`) — so the
+# deterministic regex floor (the ONLY layer guaranteed identical between the
+# two processes; sklearn/ollama depend on per-process backend availability)
+# agrees byte-for-byte with what gateway enforcement would flag. Rebuilt on
+# every call (cheap: a handful of `re.compile`s) so a just-created/-deleted
+# admin pattern is reflected immediately, with no cache-invalidation surface.
+def _regex_only_test_patterns() -> list:
+    """Default patterns + any admin-created custom regex patterns, as the
+    ``(pattern, SensitivityLevel, description)`` tuples ``SensitivityClassifier``
+    expects."""
+    from yashigani.optimization.sensitivity_classifier import (
+        SensitivityLevel,
+        _DEFAULT_PATTERNS,
+    )
+
+    merged = list(_DEFAULT_PATTERNS)
+    for p in _patterns:
+        if p.get("type") != "regex":
+            continue
+        try:
+            level = SensitivityLevel(int(p["classification"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+        merged.append((p["pattern"], level, p.get("description") or p["pattern"]))
+    return merged
+
+
+def _build_test_sensitivity_classifier():
+    """Regex-only ``SensitivityClassifier`` (Layer 1 only — no sklearn/ollama
+    backend, which are process-local and would not reflect gateway state
+    anyway) over the merged default + custom pattern set."""
+    from yashigani.optimization.sensitivity_classifier import SensitivityClassifier
+
+    return SensitivityClassifier(
+        patterns=_regex_only_test_patterns(),
+        enable_sklearn=False,
+        enable_ollama=False,
+    )
+
+
 # ── Request / Response models ─────────────────────────────────────────────
 
 class PatternRequest(BaseModel):
@@ -403,10 +461,38 @@ async def pipeline_status(session: AdminSession):
 
 @router.post("/test")
 async def test_classify(body: TestClassifyRequest, session: AdminSession):
-    """Test the sensitivity classifier against a text sample."""
+    """Test the sensitivity classifier against a text sample.
+
+    Returns TWO independent verdicts over the same sample:
+      - is_injection/confidence/action/classification: the prompt-injection /
+        credential-exfil pipeline (yashigani.inspection.pipeline.InspectionPipeline).
+      - sensitivity_level/sensitivity_label/sensitivity_triggers: the
+        PAN/PII/PCI sensitivity regex floor (yashigani.optimization
+        .sensitivity_classifier.SensitivityClassifier) — the SAME unified,
+        NFKC+Cf-normalized, Luhn-validated detection path gateway ingress/
+        egress enforce POL-009 pci_data_present with (FIND-LAURA-412-CRIT-001
+        sweep, 2026-08-08). Previously this endpoint ran ONLY the injection
+        pipeline, so admin test results for a pasted card/SSN/PII sample did
+        not reflect what production enforcement would actually do with it.
+    """
+    from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
+
     pipeline = backoffice_state.inspection_pipeline
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Inspection pipeline not available")
+
+    # Regex-floor sensitivity/PAN/PII classification — deterministic, no
+    # external backend dependency, never allowed to break this endpoint.
+    sensitivity_level: int | None = None
+    sensitivity_label: str | None = None
+    sensitivity_triggers: list[str] = []
+    try:
+        sens_result = _build_test_sensitivity_classifier().classify_decoded(body.text)
+        sensitivity_level = sens_result.level
+        sensitivity_label = _LEVEL_TO_LEGACY_STRING.get(sens_result.level)
+        sensitivity_triggers = sens_result.triggers
+    except Exception as exc:
+        logger.warning("sensitivity regex-floor test failed: %s", exc)
 
     try:
         result = pipeline.process(
@@ -421,6 +507,9 @@ async def test_classify(body: TestClassifyRequest, session: AdminSession):
             "confidence": result.confidence,
             "action": result.action,
             "classification": result.classification,
+            "sensitivity_level": sensitivity_level,
+            "sensitivity_label": sensitivity_label,
+            "sensitivity_triggers": sensitivity_triggers,
         }
     except Exception as exc:
         # V232-CSCAN-01e: log full exception server-side; safe envelope to client.
@@ -431,6 +520,9 @@ async def test_classify(body: TestClassifyRequest, session: AdminSession):
             "action": "error",
             "error": envelope["error"],
             "request_id": envelope["request_id"],
+            "sensitivity_level": sensitivity_level,
+            "sensitivity_label": sensitivity_label,
+            "sensitivity_triggers": sensitivity_triggers,
         }
 
 

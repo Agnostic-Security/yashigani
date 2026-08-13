@@ -723,15 +723,15 @@ def step7_create_users(group_ids: dict[str, str]) -> dict[str, dict]:
                 "scenario": scenario,
             }
 
-        # Add to group (idempotent — server may 409 if already member, which is OK)
-        r = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
-        if r.status_code in (200, 201):
-            print(f"  added '{email}' to group '{group_name}'")
-        elif r.status_code == 409:
-            print(f"  '{email}' already in group '{group_name}' (409 idempotent)")
-        else:
-            # Non-fatal — log and continue
-            print(f"  WARN: add member {email} -> {group_name}: HTTP {r.status_code}: {r.text[:200]}")
+        # FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY: group membership is added
+        # AFTER first-login in step7c_onboard_users, NOT here. The HUMAN identity
+        # is not in the RBAC registry until first-login (register_human_identity_
+        # on_login), so POSTing /rbac/groups/{gid}/members here returns
+        # 422 identity_not_found and was silently never retried — leaving every
+        # demo user in NO group and collapsing the per-team differential
+        # (langflow->data-team, letta->finance-team) to a uniform deny.
+        # gid/group_name are recorded on user_creds above; the real add happens
+        # post-registration in step7c.
 
     return user_creds
 
@@ -819,9 +819,11 @@ _OPTIONAL_AGENT_LOCAL_KEYS = {a["local_key"] for a in AGENTS if not a.get("requi
 # ---------------------------------------------------------------------------
 # STEP 7c — Onboard users: first-login (register identity) + mint API key
 # ---------------------------------------------------------------------------
-def step7c_onboard_users(user_creds: dict) -> dict:
+def step7c_onboard_users(user_creds: dict, group_ids: dict[str, str]) -> dict:
     """For each created user: complete forced first-login (registers HUMAN
-    identity), then admin-issue a gateway API key. Returns email->api_key."""
+    identity), add them to their RBAC group (now that the identity exists —
+    see FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY in step7), then admin-issue
+    a gateway API key. Returns email->api_key."""
     print("\n=== STEP 7c: Onboard users (first-login + API key) ===")
     import requests as _rq
     api_keys = {}
@@ -863,6 +865,28 @@ def step7c_onboard_users(user_creds: dict) -> dict:
             print(f"  {email}: API key issued (...{key[-6:]})")
         else:
             print(f"  {email}: API-key issue {rk.status_code}: {rk.text[:160]}")
+
+        # FIND-DIFF-RBAC-GROUP-ADD-PRELOGIN-NO-RETRY: add to RBAC group NOW that
+        # the identity is registered in the RBAC registry (step7's pre-login add
+        # would return 422 identity_not_found). Without this the per-team
+        # differential (agent allowed_caller_groups: langflow->data-team,
+        # letta->finance-team) never engages and every user gets a uniform deny.
+        group_name = creds.get("group", "")
+        gid = group_ids.get(group_name)
+        if gid:
+            _do_stepup_inline()
+            rg = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
+            if rg.status_code == 403 and "step_up_required" in rg.text:
+                _do_stepup_inline()
+                rg = S.post(f"{BASE_URL}/admin/rbac/groups/{gid}/members", json={"email": email})
+            if rg.status_code in (200, 201):
+                print(f"  {email}: added to group '{group_name}' (post-registration)")
+            elif rg.status_code == 409:
+                print(f"  {email}: already in group '{group_name}' (409 idempotent)")
+            else:
+                print(f"  {email}: WARN group-add {rg.status_code}: {rg.text[:160]}")
+        elif group_name:
+            print(f"  {email}: WARN no gid for group '{group_name}' — membership NOT added")
     # Save api keys
     out = DEMO_DIR / "user-api-keys-clean.txt"
     out.write_text("".join(f"{e}  {k}\n" for e, k in api_keys.items()))
@@ -1299,19 +1323,34 @@ import rego.v1
 # policy_id: POL-009
 # user_message: Cardholder (PCI) data must not be sent to AI models. Request blocked.
 # code: pci_data_block
-# Demo scenario: the bound user cannot send PCI data. The built-in credit/debit-card
-# sensitivity pattern classifies cardholder data as RESTRICTED (level 4); this client
-# policy denies on the PCI/RESTRICTED tag, and the user's low sensitivity_ceiling
-# (INTERNAL) blocks RESTRICTED egress at the gateway regardless (defence in depth).
+# Demo scenario: the bound user cannot send OR receive PCI (cardholder) data,
+# regardless of their sensitivity_ceiling — bound wildcard (scope_id="") to
+# EVERY human, both directions. The "pci" data_tag is asserted by the
+# deterministic regex+Luhn PAN scan (Layer 1 in
+# yashigani.optimization.sensitivity_classifier / yashigani.pii.contains_pci_pan)
+# — the sklearn/ollama ensemble layers can only ADD sensitivity on top of
+# that signal, never clear it (FIND-INSPECTION-NONDETERMINISTIC).
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the second deny rule below
+# used to read `input.routing_decision.sensitivity == "RESTRICTED"`. That
+# was written under the pre-R14/R15 4-level model, where RESTRICTED was the
+# TOP level and cardholder data classified there. R14/R15 added a 5th
+# SENSITIVE level ABOVE RESTRICTED specifically for credit-card/API-key/
+# classified content; the legacy string mapping folds BOTH level 4
+# (SSN/phone/IBAN — genuinely NOT PCI) and level 5 (PCI) down to the same
+# "RESTRICTED" string for OPA back-compat. Keeping the bare
+# `sensitivity == "RESTRICTED"` rule made this wildcard-bound policy deny
+# ANY RESTRICTED response for ANY human — silently defeating a caller's
+# legitimately-granted RESTRICTED ceiling for non-PCI content, which is a
+# regression, not a security improvement (the ceiling gate is the correct,
+# separate control for non-PCI RESTRICTED content). Removed: POL-009 now
+# denies ONLY on the precise "pci" data_tag.
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
 
 deny contains "POL-009:pci_data_present" if {
     input.data_tags[_] == "pci"
-}
-deny contains "POL-009:pci_data_present" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
 }
 
 obligations contains "audit_pci_block" if {
@@ -1333,6 +1372,21 @@ import rego.v1
 # This policy denies any NON-local (cloud) model for such content -> the request must
 # be served by a local Ollama model (e.g. summarise the text locally). The bound user
 # is also allocated local-only models so local handling works while cloud is blocked.
+#
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the bare
+# `input.routing_decision.sensitivity == "RESTRICTED"` branch below was
+# removed (same reasoning as POL-009's — see that policy's comment). This
+# policy is bound wildcard `human:""` (every human, egress); leaving the
+# bare-RESTRICTED branch in would make it start denying every RESTRICTED-
+# classified cloud response for every human the moment
+# `routing_decision.sensitivity` stopped being always-"" (a gateway
+# input-contract gap fixed the same day, see
+# yashigani.gateway.openai_router._client_enforce_input) — i.e. a genuine
+# over-block regression, not the classified-marking-specific control this
+# policy documents. The `data_tags[_] == "classified"` branch is the
+# policy's real, precisely-scoped signal; it remains a no-op today because
+# no data_tags vocabulary exists yet for admin-defined classification-
+# marking patterns (a separate, pre-existing gap, out of scope here).
 
 default decision := {"allow": false, "deny": set(), "obligations": set()}
 decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations}
@@ -1340,16 +1394,12 @@ decision := {"allow": count(deny) == 0, "deny": deny, "obligations": obligations
 _local_models := {"gemma3:4b", "phi4-mini", "llama3.1:8b", "qwen2.5:3b"}
 
 deny contains "POL-010:classified_requires_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
-    not input.routing_decision.model in _local_models
-}
-deny contains "POL-010:classified_requires_local" if {
     input.data_tags[_] == "classified"
     not input.routing_decision.model in _local_models
 }
 
 obligations contains "route_local" if {
-    input.routing_decision.sensitivity == "RESTRICTED"
+    input.data_tags[_] == "classified"
 }
 """,
     },
@@ -2599,7 +2649,7 @@ def main() -> None:
 
     # Step 7: users + group membership
     user_creds = step7_create_users(group_ids)
-    api_keys = step7c_onboard_users(user_creds)
+    api_keys = step7c_onboard_users(user_creds, group_ids)
     step7b_save_user_creds(user_creds)  # FIND-DEMO-CREDS: save AFTER onboarding so the file has the rotated new_pw
     step7d_set_sensitivity_ceilings(user_creds)
     step7e_grant_owui_access(user_creds)

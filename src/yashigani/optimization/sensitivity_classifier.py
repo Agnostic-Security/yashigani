@@ -342,9 +342,22 @@ class SensitivityClassifier:
                 layer_results["ollama"] = SensitivityLevel.PUBLIC
                 ollama_unavailable = True
 
-        # Take the highest (most conservative) result
+        # FIND-INSPECTION-NONDETERMINISTIC (2026-08-07): regex (Layer 1) is the
+        # ONLY deterministic layer in this ensemble — sklearn is deterministic
+        # given fixed model weights, but ollama (Layer 3) is an LLM and is NOT
+        # guaranteed bit-for-bit deterministic even at temperature 0 (GPU/CPU
+        # batched-inference reduction order). The merge below is an explicit,
+        # test-covered invariant: sklearn/ollama may only ADD sensitivity on
+        # top of the regex floor, NEVER clear or downgrade a regex hit. Do NOT
+        # replace this with a vote/average/"2-of-3" scheme — that would let a
+        # noisy ML layer silently downgrade a deterministic PII/PCI/injection
+        # regex match. See test_sensitivity_classifier_regex_authoritative.py.
         all_levels = [regex_level, sklearn_level, ollama_level]
         final_level: int = max(all_levels)
+        assert final_level >= regex_level, (
+            "FIND-INSPECTION-NONDETERMINISTIC invariant violated: an ensemble "
+            "member downgraded below the deterministic regex floor"
+        )
 
         # Fail-closed: if ollama is unavailable AND sklearn is uncertain, floor at level 5.
         # Both ML layers have failed to produce a definitive SAFE signal — the conservative
@@ -377,10 +390,58 @@ class SensitivityClassifier:
         )
 
     def _scan_regex(self, text: str, triggers: list[str]) -> int:
-        """Layer 1: Regex pattern matching. Cannot be disabled. Returns int level."""
+        """Layer 1: Regex pattern matching. Cannot be disabled. Returns int level.
+
+        FIND-LAURA-412-CRIT-001 (2026-08-08 — Laura, independently confirmed
+        live 5/5 and 3/3): a Luhn-valid PAN with a Unicode zero-width
+        character (U+200B ZERO WIDTH SPACE, and siblings U+200C/U+200D/
+        U+FEFF/other category-Cf format chars) inserted between every digit
+        evaded EVERY pattern below, because this layer matched raw text with
+        no normalization while a hardened NFKC + Cf-strip normalizer already
+        existed at ``yashigani.pii.detector`` (wired only to the EGRESS
+        absolute-PCI block, ``contains_pci_pan``, added in the prior
+        FIND-PCI-EGRESS-CEILING-BYPASS session). Two un-synced PAN detectors
+        — one hardened (egress), one not (this ingress layer that gates
+        POL-009 ``pci_data_present``) — is the root cause, not a
+        per-character regex patch.
+
+        Root fix, unified onto the ONE hardened detector (no second,
+        divergent normalization/PAN-matching implementation):
+          1. Every pattern below (SSN, email, phone, API key, classification
+             marker, IBAN) is matched against ``normalize_for_pattern_matching()``
+             — the SAME NFKC + Cf-strip routine ``contains_pci_pan`` uses —
+             instead of the raw, unnormalized text. This also closes the
+             analogous fullwidth-digit (U+FF10 etc.) and zero-width evasion
+             for SSN/phone/IBAN, not just credit cards.
+          2. Credit/debit card detection no longer uses a local, Luhn-blind
+             13-19-digit regex at all. It delegates to
+             ``yashigani.pii.detector.contains_pci_pan()`` — the exact
+             function the egress block calls — so ingress and egress agree
+             byte-for-byte on what counts as cardholder data (NFKC + Cf-strip
+             + network-prefix pattern + Luhn validation). This also removes
+             false positives on Luhn-invalid 13-19-digit runs (e.g. long
+             reference/tracking numbers) that the old bare digit-run regex
+             would have flagged.
+
+        See src/tests/regression/v4.1.2/test_find_laura_412_crit_001_pan_zerowidth.py.
+        """
+        from yashigani.pii.detector import (  # noqa: PLC0415
+            contains_pci_pan,
+            normalize_for_pattern_matching,
+        )
+
         highest: int = SensitivityLevel.PUBLIC
+        norm_text = normalize_for_pattern_matching(text)
+
+        if contains_pci_pan(text):
+            triggers.append("regex:Credit/debit card")
+            highest = int(SensitivityLevel.SENSITIVE)
+
         for pattern, level, desc in self._patterns:
-            if pattern.search(text):
+            if desc == "Credit/debit card":
+                # Handled above via contains_pci_pan (unified, Luhn-validated).
+                continue
+            if pattern.search(norm_text):
                 triggers.append(f"regex:{desc}")
                 if int(level) > highest:
                     highest = int(level)
@@ -416,6 +477,18 @@ class SensitivityClassifier:
         that ollama was genuinely unavailable and apply fail-closed logic.
         A clean PUBLIC response (ollama reachable, text classified as non-sensitive)
         returns SensitivityLevel.PUBLIC without raising.
+
+        FIND-INSPECTION-NONDETERMINISTIC (2026-08-07): temperature is pinned
+        to 0.0 to minimise run-to-run label drift for identical input text —
+        this mirrors the pattern already used by
+        yashigani.inspection.classifier.PromptInjectionClassifier._call_model
+        (which sets ``options: {temperature: 0.0}``); this call previously
+        did not, and was the one ollama-backed classifier in the codebase
+        left at the backend's sampling default. Pinning temperature reduces,
+        but does not eliminate, LLM-layer non-determinism (batched-inference
+        floating-point reduction order is not bit-exact even at temp 0) —
+        the regex floor in classify() is the actual determinism guarantee;
+        this is defence-in-depth on top of it.
         """
         # v4.1 Phase 1c (LAURA-I1-01 seam): mesh-aware transport — presents the
         # gateway leaf to the Caddy :11435 Ollama front on https URLs.
@@ -440,7 +513,12 @@ class SensitivityClassifier:
         with ollama_sync_client(self._ollama_url, timeout=10.0) as _client:
             resp = _client.post(
                 f"{self._ollama_url}/api/generate",
-                json={"model": self._ollama_model, "prompt": prompt, "stream": False},
+                json={
+                    "model": self._ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.0},
+                },
             )
         if resp.status_code == 200:
             body = resp.json()
