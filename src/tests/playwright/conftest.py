@@ -435,8 +435,17 @@ def get_admin_totp_code() -> str:
 
     import pyotp
 
+    # 2026-08-12: admin logins previously bypassed the anti-replay ledger entirely
+    # (only user logins and do_admin_stepup used it), so a browser login spent a code
+    # WITHOUT recording it. do_admin_stepup then found an empty ledger, proceeded in
+    # the SAME 30s window, and the server correctly rejected the replay:
+    # 401 invalid_totp_code. The ledger must be keyed on the IDENTITY (one TOTP
+    # secret = one window), never on the purpose.
     secret = _read_secret("admin1_totp_secret")
-    return pyotp.TOTP(secret, digits=8, digest=hashlib.sha512).now()
+    wait_for_fresh_totp("admin1")
+    code = pyotp.TOTP(secret, digits=8, digest=hashlib.sha512).now()
+    mark_totp_used("admin1")
+    return code
 
 
 def get_admin2_totp_code() -> str:
@@ -845,10 +854,18 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
                 time.sleep(32 - secs_into)
         code = totp_obj.now()
         _api_totp_last_used[admin] = time.time()
+        # 2026-08-12: this path kept its OWN freshness state (_api_totp_last_used) and
+        # never touched the SHARED ledger, so do_admin_stepup() — which waits on the
+        # shared ledger — saw no record of the code this login had just spent, ran in
+        # the same 30s window, and the server rejected the replay
+        # (401 invalid_totp_code). One TOTP secret must have ONE window record; publish
+        # this use to the shared ledger under the same identity key step-up uses.
+        mark_totp_used(f"admin{admin}")
         return code
 
     # Wait at least 62s since the last TOTP use for this admin to avoid replay.
     # Also wait until we're in the first 27s of a 30s window.
+    wait_for_fresh_totp(f"admin{admin}")   # shared ledger (2026-08-12), then local guard
     totp_code = _wait_for_fresh_code()
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
 
@@ -1257,6 +1274,76 @@ def _admin_headers(admin: int = 1) -> dict:
 _THROWAWAY_EMAIL_PREFIXES = ("ava-conf-", "ava-quota-", "ava-dup-")
 
 
+def _seeded_user_credentials() -> "list[dict]":
+    """Read the identities populate-demo.py (the users installer) seeded.
+
+    File: $YASHIGANI_DEMO_OUT_DIR/demo-user-creds-*.txt, one user per line:
+      <email>  username=<u>  pw=<p>  totp=<base32>  group=<g>
+
+    Returns [] when the users installer has not run, so callers fall back to
+    creating an account. Added 2026-08-12 (FIND-0805-016): run-users-installer.sh
+    states the suite should "consume real seeded identities instead of each test
+    inventing its own", and QA SOP 4.17 Rule 6 forbids bypassing the user
+    pathway -- a seeded user logging in IS that pathway, whereas minting an
+    account over the admin API is not.
+    """
+    import glob as _glob
+    out_dir = os.getenv("YASHIGANI_DEMO_OUT_DIR") or os.path.join(
+        os.getenv("YTF_RUN_DIR", ""), "demo-out")
+    files = sorted(_glob.glob(os.path.join(out_dir, "demo-user-creds-*.txt")),
+                   key=os.path.getmtime, reverse=True)
+    for path in files:
+        users = []
+        try:
+            for line in open(path):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = dict(
+                    part.split("=", 1) for part in line.split() if "=" in part
+                )
+                if fields.get("username") and fields.get("pw") and fields.get("totp"):
+                    users.append({
+                        "email": line.split()[0],
+                        "username": fields["username"],
+                        "password": fields["pw"],
+                        "totp_secret": fields["totp"],
+                    })
+        except OSError:
+            continue
+        if users:
+            return users
+    return []
+
+
+def _login_seeded_user(candidates: "list[dict]") -> "dict | None":
+    """Log a seeded user in and return the bootstrap_user_session shape.
+
+    User tier is HMAC-SHA-256 / 6-digit (admin tier is SHA-512/8 -- do not
+    confuse them). Tries each candidate so one wedged account cannot strand a
+    whole leg. Returns None if none authenticate, leaving the caller's original
+    402 assertion to fire with its real message rather than masking it.
+    """
+    for user in candidates:
+        try:
+            # user_login_cookies() is the single shared user-tier login primitive
+            # (SHA-256/6-digit + the per-identity anti-replay guard). Do not inline
+            # the POST here -- inlining it is the exact duplication the
+            # tierb-on-unified consolidation removed.
+            cookies = user_login_cookies(
+                user["username"], user["password"], user["totp_secret"])
+        except Exception:
+            continue  # try the next seeded identity; one wedged account must not strand a leg
+        return {
+            "username": user["username"],
+            "email": user["email"],
+            "password": user["password"],
+            "totp_secret": user["totp_secret"],
+            "cookies": cookies,
+        }
+    return None
+
+
 def delete_end_user(client, username: str) -> bool:
     """DELETE /admin/users/{username} (StepUpAdminSession-gated -- the caller's
     cookies must already carry a fresh step-up). True if it was deleted."""
@@ -1268,6 +1355,7 @@ def delete_end_user(client, username: str) -> bool:
 def free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
     """Delete up to `min_free` of this suite's throwaway end users to free
     licence capacity. Returns how many were actually deleted."""
+    import httpx  # module-scope import does not exist in this file — import locally
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
     with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
         r = c.get(f"{BASE_URL}/admin/users")
@@ -1417,6 +1505,27 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     if create_resp is not None and create_resp.status_code == 402:
         if _free_end_user_capacity(admin_cookies, min_free=1):
             stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
+
+    # 2026-08-12, FIND-0805-016: freeing capacity CANNOT work when the users
+    # installer has run. populate-demo.py seeds exactly 5 end users and the
+    # Community/no-licence tier caps end users at 5 (licensing/enforcer.py:95),
+    # so current==limit==5 with ZERO throwaway 'ava-conf-*' accounts to delete --
+    # every slot is a real seeded identity. That produced 43 setup ERRORs on the
+    # podman-4.9 leg and 2 failures on docker, all with the same 402.
+    #
+    # The correct fix is not to free a slot but to stop inventing an account at
+    # all: run-users-installer.sh's own header states it runs "before the test
+    # tiers, so the suite consumes real seeded identities instead of each test
+    # inventing its own". The suite never implemented that half. It does now --
+    # a seeded user is used when one is available, and creation stays as the
+    # fallback for stacks where the users installer has not run.
+    if create_resp is not None and create_resp.status_code == 402:
+        seeded = _seeded_user_credentials()
+        if seeded:
+            session = _login_seeded_user(seeded)
+            if session is not None:
+                _user_session_cache[cache_key] = session
+                return session
 
     assert stepup_resp.status_code == 200, (
         f"stepup failed (even after forcing a fresh admin1 session): "
@@ -1697,7 +1806,7 @@ def do_admin_stepup(cookies: dict, *, admin: int = 1) -> dict:
     import pyotp
 
     totp_secret = _read_secret("admin1_totp_secret" if admin == 1 else f"admin{admin}_totp_secret")
-    key = f"stepup:admin{admin}"
+    key = f"admin{admin}"  # identity-keyed: shared with get_admin_totp_code (2026-08-12)
     wait_for_fresh_totp(key)
     code = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512).now()
     mark_totp_used(key)
