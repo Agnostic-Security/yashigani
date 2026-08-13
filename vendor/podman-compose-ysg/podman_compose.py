@@ -18,7 +18,7 @@
 # not relicense any part of this work. The Yashigani proprietary EULA does
 # NOT apply to this file or this directory; see NOTICE.md.
 #
-# Four upstream defects are patched below, each root-caused from this exact
+# Five upstream defects are patched below, each root-caused from this exact
 # source (not assumed from behaviour). Full rationale + dates:
 # see ./CHANGES.agnostic.md. Patch sites are individually marked
 # "# AS-FIX-<n> (<date>):" at the point of change:
@@ -32,6 +32,14 @@
 #             has no equivalent for "ran to completion once"; walking it
 #             through an exited one-shot whose own dep is already running
 #             hits a podman dependency-graph-construction bug.
+#   AS-FIX-5 (2026-08-05): rec_merge_one() unwraps ResetTag/OverrideTag for a
+#             key introduced for the FIRST time by a later -f file (the
+#             symmetric case to the already-handled "key exists in target,
+#             absent from source" case) — a raw OverrideTag object otherwise
+#             survives into the final merged compose dict and crashes
+#             _resolve_profiles() with `TypeError: 'OverrideTag' object is
+#             not iterable` on every invocation (compose up, compose exec,
+#             everything) that includes such an overlay.
 # AS-FIX-2 and AS-FIX-3 ship together and are tested together — a bare
 # except-KeyError guard for AS-FIX-3 without AS-FIX-2's real topological sort
 # would silently mask genuine required-dependency ordering failures.
@@ -2010,6 +2018,34 @@ def rec_merge_one(target: dict[str, Any], source: dict[str, Any]) -> dict[str, A
 
     for key, value in source.items():
         if key in target:
+            continue
+        # AS-FIX-5 (2026-08-05): a key introduced for the FIRST time (not yet
+        # present in `target`) whose value is itself a raw ResetTag/OverrideTag
+        # was, pre-fix, stored verbatim (`target[key] = clone(value)`) instead
+        # of being unwrapped — the SECOND loop below already unwraps
+        # ResetTag/OverrideTag correctly, but only for keys that pre-exist in
+        # `target`. Root-caused via Yashigani's
+        # docker-compose.gpu-mac-metal-podman.yml, the only -f overlay
+        # defining `profiles: !override [...]` on its `ollama` service where
+        # no earlier-merged file had a `profiles:` key for that service yet:
+        # the raw OverrideTag object survived into the final merged dict and
+        # `_resolve_profiles()`'s `set(config.get("profiles", []))` crashed
+        # with `TypeError: 'OverrideTag' object is not iterable` on EVERY
+        # invocation that included this overlay — `compose up`, `compose
+        # exec`, everything, before any container was ever reached.
+        if isinstance(value, ResetTag):
+            # Nothing exists yet in target to reset — a true no-op. Do not
+            # leave a raw ResetTag sitting in the merged dict.
+            log.info("Unneeded !reset found for [%s] (no prior value to reset)", key)
+            done.add(key)
+            continue
+        if isinstance(value, OverrideTag):
+            log.info(
+                "Unneeded !override found for [%s] with value '%s' "
+                "(no prior value to override)", key, value.value,
+            )
+            target[key] = clone(value.value)
+            done.add(key)
             continue
         target[key] = clone(value)
         done.add(key)

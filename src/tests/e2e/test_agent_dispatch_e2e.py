@@ -190,7 +190,8 @@ class TestAgentDispatchLive:
         -> gateway identifies model=@langflow|@letta
         -> gateway calls langflow:7860 or letta:8283
         -> agent calls back to gateway:8081/v1 (OPENAI_API_BASE)
-        -> gateway calls ollama:11434
+        -> gateway calls ollama via the mediated mesh path (YASHIGANI_OLLAMA_URL;
+           direct ollama:11434 is ring-fence-CLOSED per YSG-RISK-193)
         -> response arrives back through the chain
         -> test asserts choices[0].message.content is non-empty
 

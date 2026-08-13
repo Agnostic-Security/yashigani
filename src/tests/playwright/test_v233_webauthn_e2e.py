@@ -987,7 +987,24 @@ def test_wa_login_02_login_finish_issues_session_cookie(
             "ASVS V3.3 requires session establishment on successful auth."
         )
     finally:
-        _delete_credential(client, credential_id, _admin1_totp_secret())
+        # FIND-B-G (4.1.2 3-runtime retest): cleanup previously reused
+        # `client` -- the SAME clean_authed_client fixture object captured
+        # at TEST-SETUP time, whose session cookie is the process-wide
+        # cached admin1 session (conftest._session_cookie_cache /
+        # _api_get_session_cookies). If ANYTHING ELSE in this pytest
+        # process (this file or another, e.g. test_webui_conformance_full.py
+        # TestSessionLifecycle's deliberate logout test — see FIND-B-A) has
+        # since invalidated that shared session, `client`'s cookie is dead
+        # and the step-up call inside _delete_credential() 401s with
+        # session_expired_or_invalid, masking the actual test verdict
+        # (registration/login already asserted above by this point).
+        # _get_authed_client() re-verifies its session against a real
+        # protected endpoint and force-refreshes once on 401 before
+        # returning, so cleanup here is guaranteed to run against a LIVE
+        # admin1 session regardless of what happened to `client` earlier in
+        # this test or in an unrelated one sharing the same process.
+        cleanup_client = _get_authed_client()
+        _delete_credential(cleanup_client, credential_id, _admin1_totp_secret())
 
 
 @skip_no_stack
@@ -1049,7 +1066,26 @@ def test_wa_login_03_session_grants_authenticated_access(
                 f"Location: {location}. Session was not accepted."
             )
     finally:
-        _delete_credential(client, credential_id, _admin1_totp_secret())
+        # FIND-B-WA-CASCADE (Ava, 2026-08-06, Tier-B webauthn order-leak RCA):
+        # same class as FIND-B-G (test_wa_login_02, above) -- this test's OWN
+        # successful WebAuthn login (r_finish, via anon_client) calls
+        # SessionStore.create() server-side (src/yashigani/auth/session.py
+        # create() -> invalidate_all_for_account()), which evicts EVERY other
+        # live session for admin1's account_id, including the cached session
+        # captured in `client` (clean_authed_client) at the START of this
+        # test, BEFORE the WebAuthn login ran. Reusing that now-dead `client`
+        # here 401'd on the stepup call inside _delete_credential
+        # ("session_expired_or_invalid"), which happens BEFORE the actual
+        # DELETE call -- so the credential was never revoked. Confirmed live
+        # (Ava, single-file in-order run, 2026-08-06): this is the trigger for
+        # a 9-test cascade (undeleted "E2E WA-LOGIN-03"/"WA-LOGIN-04"
+        # credentials -> account throttle escalation + WebAuthn
+        # excludeCredentials collisions in every downstream test). Re-deriving
+        # a fresh authed client (self-heals via _get_authed_client()'s
+        # probe-then-force-refresh-once) fixes this the same way FIND-B-G
+        # fixed WA-LOGIN-02.
+        cleanup_client = _get_authed_client()
+        _delete_credential(cleanup_client, credential_id, _admin1_totp_secret())
 
 
 @skip_no_stack
@@ -1100,8 +1136,22 @@ def test_wa_login_04_audit_event_webauthn_login_success(
             f"WA-LOGIN-04 FAIL: login/finish failed: {r_finish.status_code}"
         )
 
-        # Assert audit event (search with the authed client — it can read audit log).
-        event = _wait_for_audit_event(client, "WEBAUTHN_LOGIN_SUCCESS", timeout_s=5.0)
+        # FIND-B-WA-CASCADE (Ava, 2026-08-06, Tier-B webauthn order-leak RCA):
+        # `client` (clean_authed_client) was captured BEFORE the WebAuthn
+        # login above -- that login's success (r_finish) calls
+        # SessionStore.create() server-side, which evicts every OTHER live
+        # session for admin1's account_id, including `client`'s. Polling the
+        # audit log with the now-dead `client` 401s on every attempt inside
+        # _wait_for_audit_event() (it treats any non-200 as "no match yet"
+        # and returns None at the 5s timeout), which previously FAILED THIS
+        # TEST'S OWN PRIMARY ASSERTION ("event is not None") regardless of
+        # whether the server actually emitted the event -- masking the real
+        # verdict. Confirmed live (Ava, single-file in-order run, 2026-08-06).
+        # Re-derive a fresh, live admin1 client (self-heals via
+        # _get_authed_client()'s probe-then-force-refresh-once) before
+        # reading the audit log, same fix class as FIND-B-G.
+        audit_client = _get_authed_client()
+        event = _wait_for_audit_event(audit_client, "WEBAUTHN_LOGIN_SUCCESS", timeout_s=5.0)
         assert event is not None, (
             "WA-LOGIN-04 FAIL: WEBAUTHN_LOGIN_SUCCESS audit event not found within 5 s. "
             "PR #62 commit 6892907 must emit this event_type on login success."
@@ -1112,7 +1162,10 @@ def test_wa_login_04_audit_event_webauthn_login_success(
             f"B5 fix (commit 6892907) aligns wire-format event_type with route label."
         )
     finally:
-        _delete_credential(client, credential_id, _admin1_totp_secret())
+        # See FIND-B-WA-CASCADE above — same stale-client-after-self-eviction
+        # class; re-derive rather than reuse `client`.
+        cleanup_client = _get_authed_client()
+        _delete_credential(cleanup_client, credential_id, _admin1_totp_secret())
 
 
 # ---------------------------------------------------------------------------
@@ -1315,7 +1368,12 @@ def test_wa_fail_03_replayed_challenge_returns_401(
             f"ASVS V2.8 requires single-use challenges. Body: {r_finish2.text[:200]}"
         )
     finally:
-        _delete_credential(client, credential_id, _admin1_totp_secret())
+        # FIND-B-WA-CASCADE (Ava, 2026-08-06): r_finish1 above is a REAL
+        # successful WebAuthn login (by design — it's the one the replay is
+        # tested against), which evicts `client`'s cached session server-side
+        # the same way WA-LOGIN-02/03/04 do. Re-derive rather than reuse.
+        cleanup_client = _get_authed_client()
+        _delete_credential(cleanup_client, credential_id, _admin1_totp_secret())
 
 
 @skip_no_stack
@@ -1691,9 +1749,20 @@ def test_wa_multi_02_03_both_credentials_usable(
                 f"returned {r_finish.status_code}. Body: {r_finish.text[:200]}"
             )
     finally:
+        # FIND-B-WA-CASCADE (Ava, 2026-08-06): each successful WebAuthn login
+        # in the loop above evicts `client`'s cached session server-side (see
+        # FIND-B-WA-CASCADE on WA-LOGIN-03/04). The bare `try/except: pass`
+        # here previously SWALLOWED the resulting 401 silently instead of
+        # crashing -- meaning cleanup didn't just fail loudly, it failed
+        # QUIETLY, leaving these credentials undeleted and feeding the same
+        # cross-test cascade (throttle escalation + WebAuthn excludeCredentials
+        # collisions in every subsequent register call) confirmed live on
+        # 2026-08-06. Re-deriving a fresh client before EACH delete actually
+        # fixes the cleanup instead of just hiding its failure.
         for cred_id in registered_ids:
             try:
-                _delete_credential(client, cred_id, totp_secret)
+                cleanup_client = _get_authed_client()
+                _delete_credential(cleanup_client, cred_id, totp_secret)
             except Exception:
                 pass
 
@@ -1768,9 +1837,16 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
             f"{r_finish.status_code}. Body: {r_finish.text[:200]}"
         )
     finally:
+        # FIND-B-WA-CASCADE (Ava, 2026-08-06): the WebAuthn login above
+        # (credential B) evicts `client`'s cached session server-side. `id_a`
+        # is already revoked by this point (via the still-live `client`
+        # earlier in the test, before the eviction), so only `id_b`'s delete
+        # here is actually load-bearing -- but it needs a live session too.
+        # Same silent-swallow-then-leak problem as WA-MULTI-02_03; re-derive.
         for cred_id in registered_ids:
             try:
-                _delete_credential(client, cred_id, totp_secret)
+                cleanup_client = _get_authed_client()
+                _delete_credential(cleanup_client, cred_id, totp_secret)
             except Exception:
                 pass
 

@@ -51,6 +51,11 @@ import httpx
 import pytest
 
 from tests.e2e.conftest import _CA_CERT_PATH  # noqa: F401  (TLS anchor for the real hop)
+from tests.e2e.conftest import (  # negative control only — see TestOllamaRingfenceNegativeControl
+    _YTF_PROJ,
+    _YTF_SEP,
+    runtime_run,
+)
 
 BASE_URL = os.getenv("YASHIGANI_ADMIN_URL") or os.getenv(
     "YASHIGANI_HEALTH_URL", "https://localhost:8443"
@@ -214,4 +219,40 @@ class TestLocalInferenceOnUserPath:
         assert "agent_unreachable" not in text, (
             "agent reported unreachable on the user path — see YSG-RISK-200 "
             f"(egress secret-detector false-positive): {text[:400]}"
+        )
+
+
+class TestOllamaRingfenceNegativeControl:
+    """YSG-RISK-193 positive assert, ported from the container-exec suite.
+
+    Convergence note (integ/v412-unified-20260813): the rest of this file was
+    deliberately rewritten by x8x (c683bc2a) to drive sensitivity and local
+    inference over the REAL USER PATHWAY instead of `runtime_run` container-exec,
+    per YTF §5.4 (no-bypass) — that rewrite supersedes the mac-air
+    `TestOllamaSensitivity`/`TestOllamaLive` classes, whose value was correcting
+    expectations for probes this file no longer performs.
+
+    This ONE test is carried over, because it is not a bypass: it asserts a path
+    is CLOSED. There is by construction no user pathway to a ring-fenced socket,
+    so the only way to prove the ring-fence holds is to attempt the direct
+    connection from inside the gateway. Dropping it would have silently retired a
+    security-control assert during the merge.
+    """
+
+    def test_direct_ollama_socket_is_ringfenced(self):
+        """Direct http://ollama:11434 from the gateway MUST be closed (DNS
+        failure or connection refused). The pre-2026-08-06 version of this file
+        asserted this control BACKWARDS — a reachable direct socket is the
+        failure mode, not the success mode."""
+        result = runtime_run(f"{_YTF_PROJ}{_YTF_SEP}gateway{_YTF_SEP}1", """
+import urllib.request
+try:
+    urllib.request.urlopen("http://ollama:11434/api/tags", timeout=5)
+    print("RINGFENCE-OPEN")
+except Exception as e:
+    print(f"RINGFENCE-CLOSED:{type(e).__name__}")
+""", timeout=20)
+        assert "RINGFENCE-CLOSED" in result, (
+            f"Direct ollama:11434 socket is REACHABLE from the gateway — "
+            f"YSG-RISK-193 ring-fence regression: {result}"
         )

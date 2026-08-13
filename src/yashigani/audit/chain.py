@@ -378,21 +378,37 @@ class AuditChainService:
                 event_count = len(rows)
                 hashes = [r["event_hash"] for r in rows]
 
-                # Count chain breaks: a break occurs when a row's prev_hash does
-                # not match the event_hash of the immediately preceding row.
-                chain_breaks = 0
-                for i in range(1, len(rows)):
-                    expected_prev = rows[i - 1]["event_hash"]
-                    actual_prev = rows[i]["prev_hash"]
-                    if actual_prev != expected_prev:
-                        chain_breaks += 1
-                        logger.warning(
-                            "audit-chain: chain break detected at event index %d "
-                            "for tenant %s on %s (expected prev=%s, got %s)",
-                            i, tenant_id, date_str,
-                            expected_prev[:16] + "...",
-                            (actual_prev or "NULL")[:16] + "...",
-                        )
+                # Chain-break detection wired into verify_chain_segment()
+                # (Iris finding, v4.1.2 retest: verify_event()/
+                # verify_chain_segment() had zero production call sites --
+                # the daily checkpoint is the natural production home for
+                # verify_chain_segment since it already has the ordered
+                # (prev_hash, event_hash) pairs in hand at no extra query
+                # cost). This also fixes a real gap in the old inline loop
+                # below (kept in history only): it started at index 1 and
+                # never checked the FIRST event of the day against the day
+                # anchor, so a corrupted prev_hash on day-event-zero was
+                # silently missed. verify_chain_segment() checks index 0
+                # against day_anchor(date_str) like every other index.
+                events_for_verify = [dict(r) for r in rows]
+                _chain_ok, break_indices = self.verify_chain_segment(
+                    events_for_verify, date_str
+                )
+                chain_breaks = len(break_indices)
+                for i in break_indices:
+                    expected_prev = (
+                        day_anchor(date_str)
+                        if i == 0
+                        else events_for_verify[i - 1]["event_hash"]
+                    )
+                    actual_prev = events_for_verify[i]["prev_hash"]
+                    logger.warning(
+                        "audit-chain: chain break detected at event index %d "
+                        "for tenant %s on %s (expected prev=%s, got %s)",
+                        i, tenant_id, date_str,
+                        expected_prev[:16] + "...",
+                        (actual_prev or "NULL")[:16] + "...",
+                    )
 
                 root = _merkle_root(hashes)
 
@@ -462,6 +478,22 @@ class AuditChainService:
     def verify_event(self, event_dict: dict, stored_event_hash: str) -> bool:
         """Verify that an event's stored event_hash matches the computed hash.
 
+        Intentionally library-only (no production call site as of v4.1.2 --
+        Iris finding, retest 2026-08-03): this is a per-event content-hash
+        recompute, so a production caller needs the event's FULL payload
+        columns, not just (prev_hash, event_hash). The daily checkpoint
+        (run_daily_checkpoint(), above) deliberately fetches ONLY the two
+        hash columns for every event of the day -- pulling full payloads for
+        every row, every day, at scale, to re-verify content that a tamper-
+        evident hash chain (verify_chain_segment(), now wired into the
+        checkpoint) already protects structurally, is not worth the cost.
+        verify_event() remains the primitive for TARGETED forensic
+        re-verification of one specific event (e.g. an "verify this event"
+        admin/CLI action investigating a single audit_events row) --
+        exercised today by the unit suite (test_lu_amend_01_audit_chain.py)
+        and left as a ready-to-wire building block for that future
+        single-event admin action, which is out of scope for this fix.
+
         Args:
             event_dict — the event as stored (may include prev_hash/event_hash
                 columns; they are excluded from the canonical form).
@@ -477,6 +509,11 @@ class AuditChainService:
         self, events: list[dict], date_str: str
     ) -> tuple[bool, list[int]]:
         """Verify the hash chain for a sequence of events.
+
+        Production call site (v4.1.2, Iris finding fixed 2026-08-06):
+        run_daily_checkpoint(), above, calls this against the (prev_hash,
+        event_hash) pairs it already fetched for the merkle root, replacing
+        an inline duplicate of this same break-detection loop.
 
         Args:
             events — list of event dicts ordered by seq (LU-AMEND-01 wave-3

@@ -159,22 +159,37 @@ services:
   #
   # This fix removes the target of the wait instead of making it trivially
   # satisfiable: `profiles: [mac-metal-host-ollama-only]` — a profile value
-  # never passed via --profile anywhere in install.sh — drops the service
-  # from the merged compose model entirely (confirmed empirically against
-  # both `docker compose config --services`, list-field REPLACE semantics,
-  # and the vendored podman-compose-ysg fork's own `_resolve_profiles()`).
-  # With ollama absent from the model, the original RESTART-005 hang cannot
-  # occur in the first place: gateway.depends_on.ollama is marked
-  # required:false below, and the fork's check_dep_conditions()
-  # (podman_compose.py:3254-3262, AS-FIX-3) explicitly skips — no
-  # `podman wait` call is ever issued — for a required:false dependency
-  # whose name is absent from container_names_by_service (the fork's own
-  # documented mechanism for "excluded by --profile", already exercised
-  # elsewhere for ollama-init/demo-mcp). container_to_args()'s --requires=
-  # builder (podman_compose.py:1182) independently no-ops the same way
-  # (`.get(dep_srv.name, [])` on an absent service yields nothing to add).
+  # never passed via --profile anywhere in install.sh.
+  #
+  # FIND-OLLAMA-MAC-2-RESIDUAL (2026-08-04, Su — CORRECTS the "REPLACE
+  # semantics, confirmed empirically" claim this comment used to make): a
+  # plain `profiles:` key in an override file MERGES (concatenates/dedups)
+  # with the base list, it does not replace it — this is true for both
+  # Docker Compose (list-field merge rule) and this fork's own
+  # rec_merge_one() (`value.extend(value2)` for list-typed fields,
+  # podman_compose.py ~2054). So on a real install where langflow/letta/
+  # openclaw IS active (the only realistic Mac-Metal case with an agent
+  # bundle selected), the base file's profile entries survive the "override"
+  # and ollama/ollama-init come right back into the merged model —
+  # reproduced live on both podman/macOS and docker/macOS in the 3-runtime
+  # retest (ollama-init created + ran despite this comment's exclusion
+  # claim).
+  #
+  # Fix: the `!override` YAML merge tag. Both Docker Compose v2.24+ and this
+  # fork implement it (OverrideTag class + rec_merge_one's `isinstance(...,
+  # OverrideTag)` branch, podman_compose.py:1645-1668 / 2033-2038) — it
+  # forces a true field replace instead of the default merge, for exactly
+  # this case. With the tag applied, `--profile letta` (or any agent bundle)
+  # no longer resurrects ollama/ollama-init; only the sentinel profile
+  # itself (never passed by install.sh) would.
+  #
+  # The rest of this comment (podman wait / check_dep_conditions /
+  # AS-FIX-3 / container_to_args --requires=) is unaffected by this
+  # correction: those mechanisms only matter once the service is genuinely
+  # absent from the merged model, which is exactly what `!override` now
+  # guarantees instead of merely claiming.
   ollama:
-    profiles:
+    profiles: !override
       - mac-metal-host-ollama-only
 
   # gateway.depends_on.ollama must be marked required:false — ollama is no
@@ -190,10 +205,10 @@ services:
   # ollama-init is already profile-gated in the base file to
   # [langflow, letta, openclaw] (SF-011). On Mac Metal, models are managed
   # on the host ollama, so ollama-init must never run regardless of which
-  # agent bundle is active. `profiles:` here REPLACES the base list (same
-  # mechanism as above), so the same sentinel unconditionally excludes
-  # ollama-init from every Mac-Metal Podman install — agent bundle active
-  # or not.
+  # agent bundle is active. FIND-OLLAMA-MAC-2-RESIDUAL: same `!override` fix
+  # as `ollama` above — without the tag this key merges with (does not
+  # replace) the base list, which is exactly why ollama-init was still
+  # created on every Mac-Metal Podman install with an agent bundle active.
   ollama-init:
-    profiles:
+    profiles: !override
       - mac-metal-host-ollama-only

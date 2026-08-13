@@ -589,12 +589,34 @@ async def enable_user(username: str, session: StepUpAdminSession):
     one could push the deployment over the licensed seat limit.
     LAURA-V400-NEW-001 (ASVS V6.8.4): step-up TOTP required — re-enabling a
     disabled account restores full access; equivalent impact to account creation.
+
+    FIND-IRIS-SEAT-REENABLE (2026-08-04): the seat-limit pre-check above assumed
+    disable_user() removes the target's HUMAN identity from the seat-counted
+    population — it does not. disable_user() only calls
+    _suspend_identity_registry_for_account() (a soft status flip; suspend() is
+    documented as "a HOLD, not a release" — see IdentityRegistry.suspend()),
+    never IdentityRegistry.deactivate() (the only op that SREMs
+    identity:index:kind:human, per FIND-SEAT-LEAK). So a disabled-but-not-deleted
+    account's identity is ALWAYS already present in count_canonical_end_users()'s
+    Pool 1 — comparing that count against the ceiling before re-enabling the
+    SAME row double-counts it against itself: at max_end_users, every re-enable
+    of an already-registered account was refused with 402, even though
+    re-enabling adds zero new occupants. Fix: skip the seat-limit check when the
+    target already holds a seat (resolved via its own HUMAN identity, which
+    disable never released); only apply the check for accounts that have never
+    registered an identity (never logged in) or whose identity registry is
+    unavailable, where the pre-existing check remains the safety net.
     """
     state = backoffice_state
     assert state.auth_service is not None  # set unconditionally at startup
     assert state.audit_writer is not None  # set unconditionally at startup
 
-    # Check seat limit before re-enable — same limit as new user creation.
+    record = await state.auth_service.get_account(username)
+    if record is None or record.account_tier != "user":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
+
+    # Check seat limit before re-enable — same limit as new user creation —
+    # UNLESS the target already occupies a seat (FIND-IRIS-SEAT-REENABLE).
     from yashigani.licensing.enforcer import (
         check_end_user_limit,
         count_canonical_end_users,
@@ -602,18 +624,63 @@ async def enable_user(username: str, session: StepUpAdminSession):
         license_limit_exceeded_response,
     )
 
-    try:
-        check_end_user_limit(count_canonical_end_users())
-    except LicenseLimitExceeded as exc:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=license_limit_exceeded_response(exc),
-        )
+    if not _account_already_holds_seat(record):
+        try:
+            check_end_user_limit(count_canonical_end_users())
+        except LicenseLimitExceeded as exc:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=license_limit_exceeded_response(exc),
+            )
 
     if not await state.auth_service.enable(username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"error": "account_not_found"})
     state.audit_writer.write(_config_event(session.account_id, "user_account_enabled", username, "enabled", account_tier=session.account_tier))
     return {"status": "ok"}
+
+
+def _account_already_holds_seat(record) -> bool:
+    """Return True if *record* already occupies a licensed end-user seat.
+
+    FIND-IRIS-SEAT-REENABLE: a HUMAN identity remains a member of
+    identity:index:kind:human (the set count_canonical_end_users()/the
+    registration Lua script's seat accounting reads) from the moment it is
+    first registered on login until IdentityRegistry.deactivate() is called —
+    disable/suspend never removes it (see IdentityRegistry.suspend()
+    docstring: "a HOLD, not a release"). So an account that has ever logged
+    in already holds its seat whether it is currently enabled, disabled, or
+    suspended; re-enabling it cannot increase the seat population and must
+    not be compared against the seat ceiling.
+
+    Resolution mirrors _deactivate_identity_registry_for_account /
+    reactivate_user (email->slug->get_by_slug) rather than
+    suspend_owned_by(account_id) — the latter indexes identity:index:org:*,
+    which is never populated for local-auth HUMAN identities (org_id="");
+    see FIND-IRIS-SUSPEND-ORGID.
+
+    Fail-open (returns False) on any registry error or when identity_registry
+    is unavailable (community tier without it wired) — the caller then falls
+    back to the pre-existing seat-limit check.
+    """
+    state = backoffice_state
+    registry = getattr(state, "identity_registry", None)
+    if registry is None:
+        return False
+    try:
+        from yashigani.backoffice.routes.auth import _auth_email_to_slug
+        email = record.email or f"{record.username}@yashigani.local"
+        slug = _auth_email_to_slug(email)
+        identity = registry.get_by_slug(slug)
+        if identity is None:
+            return False
+        return identity.get("kind", "human") == "human"
+    except Exception as exc:
+        _log.warning(
+            "FIND-IRIS-SEAT-REENABLE: seat-hold check failed for account %s: %s "
+            "— falling back to the seat-limit check",
+            record.username, exc,
+        )
+        return False
 
 
 @router.post("/{username}/reactivate")
@@ -804,43 +871,72 @@ async def admin_issue_user_api_key(username: str, session: StepUpAdminSession):
 
 
 def _suspend_identity_registry_for_account(account_id: str) -> None:
-    """Suspend all identity-registry entries owned by account_id.
+    """Suspend the identity-registry entry linked to account_id.
 
     LF-DISABLE-PARTIAL (2026-04-27): disable_user must suspend API keys /
     agent tokens registered under the same account, not only browser sessions.
     This prevents a disabled user's API key from remaining usable.
 
-    SEC-240-7: now delegates to suspend_owned_by() — O(1) org_id index lookup
-    instead of a full registry scan + Python filter.
+    FIND-IRIS-SUSPEND-ORGID (2026-08-04): previously delegated to
+    registry.suspend_owned_by(account_id) (SEC-240-7) — but suspend_owned_by()
+    is a BULK op keyed on identity:index:org:{org_id} ("suspend every identity
+    under this org"), and org_id is a distinct axis from account_id: local-auth
+    HUMAN identities always register with org_id="" (see
+    auth.py:_register_human_identity_on_login, which never sets org_id) — so
+    suspend_owned_by(account_id) short-circuited to 0 immediately (org_id=""
+    guard) for every local-auth user, and even for SSO/SCIM-provisioned users
+    the identity is indexed under the IdP's real org_id, not the account_id,
+    so the lookup missed there too. Net effect: this call has been a silent
+    no-op for every account tier since it was introduced — a disabled
+    account's identity-registry API key stayed live and usable (only the
+    browser session was actually invalidated).
 
-    Fail-soft: if identity_registry is unavailable (e.g. community tier with
-    no IdentityRegistry wired), log a warning and continue — the session
-    invalidation has already executed.
+    Fix: resolve the account's OWN identity directly via the account_id link
+    (identity:account:{account_id} -> identity_id, populated by
+    IdentityRegistry.link_account_id() on every login/registration) and
+    suspend just that one identity — the correct, single-account-scoped
+    primitive for this call site (an org-wide bulk suspend was never the
+    right operation for "disable this one user").
+
+    Fail-soft: if identity_registry is unavailable, or no identity was ever
+    registered for this account (never logged in), log and continue — the
+    session invalidation has already executed either way.
     """
-    state = backoffice_state
-    registry = state.identity_registry
-    if registry is None:
-        import logging as _log
+    import logging as _log
 
+    registry = backoffice_state.identity_registry
+    if registry is None:
         _log.getLogger(__name__).warning(
             "LF-DISABLE-PARTIAL: identity_registry not available — API keys for account %s NOT suspended",
             account_id,
         )
         return
     try:
-        suspended = registry.suspend_owned_by(account_id)
-        import logging as _log
-
-        _log.getLogger(__name__).info(
-            "LF-DISABLE-PARTIAL: suspended %d identity-registry entries for account %s",
-            suspended,
-            account_id,
-        )
+        identity = registry.get_by_account_id(account_id)
+        if identity is None:
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: no identity-registry entry linked to account %s "
+                "— nothing to suspend (account may never have logged in)",
+                account_id,
+            )
+            return
+        identity_id = identity["identity_id"]
+        if identity.get("status") == "active":
+            registry.suspend(identity_id)
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: suspended identity %s for account %s "
+                "(FIND-IRIS-SUSPEND-ORGID fix — account_id link, not org_id)",
+                identity_id, account_id,
+            )
+        else:
+            _log.getLogger(__name__).info(
+                "LF-DISABLE-PARTIAL: identity %s for account %s already non-active "
+                "(status=%s) — no change",
+                identity_id, account_id, identity.get("status"),
+            )
     except Exception as exc:
-        import logging as _log
-
         _log.getLogger(__name__).error(
-            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entries for account %s: %s",
+            "LF-DISABLE-PARTIAL: failed to suspend identity-registry entry for account %s: %s",
             account_id,
             exc,
         )
