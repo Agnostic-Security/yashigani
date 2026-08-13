@@ -393,3 +393,97 @@ See `tests/MATRIX.yaml` for the machine-readable version (this is the human summ
 | podman-6 | macos | A, B, C | the one podman-mac leg that actually runs |
 | podman-6 | linux | A, B, C | x8x |
 | k8s (k3s+Cilium) | linux | A, B, C | x8x-only, Cilium-gated (vanilla Docker-Desktop k8s can't test NetworkPolicy enforcement / CoreDNS DoT) |
+
+## 5.7 SIGKILLing an install poisons every later install (added 2026-08-12)
+
+**This is a TEST-RIG discipline note, not an installer defect.** The installer was working
+correctly throughout; the damage was self-inflicted by `kill -9` on a hung install.
+
+`install.sh` holds an flock at `/run/lock/yashigani-install.lock` for its lifetime and releases
+it on exit. When the installer is SIGKILLed it never reaches that exit path, and its orphaned
+children (observed: `tee`, `python3`, plus `conmon`/`pasta`) were still holding the lock 20 hours
+later. Every subsequent install — podman 4.9, 5.1.2, 6.0.1 alike — then died immediately after
+the banner with exit 1 and a ~510-byte log. Clearing the orphans restored normal installs
+immediately, with no change to `install.sh`.
+
+**Do:** stop a stuck install with SIGTERM first and let it unwind. Reserve `kill -9` for when
+that fails, and clean up after it.
+
+**Before diagnosing any "install fails instantly" symptom:**
+```bash
+fuser -v /run/lock/yashigani-install.lock     # who holds it
+flock -n /run/lock/yashigani-install.lock -c true && echo FREE
+```
+
+**Open question, NOT yet a finding:** install.sh:19285 states the lock fd is FD_CLOEXEC so
+children never inherit it, yet `tee` was observed holding it after SIGKILL. That may be a real
+gap in the guarantee or an artefact of how the log pipeline is set up. It needs a controlled
+test before anyone files it as a defect — do not cite this note as proof that CLOEXEC is broken.
+
+## 5.8 `$?` must be captured IMMEDIATELY, and never after a pipeline (added 2026-08-12)
+
+Three separate false-greens in one campaign, all the same bug:
+- `USERS_INSTALLER_EXIT=$?` after `python … | tail -25` captured **tail's** status → a dead users
+  installer reported 0. Fixed with `${PIPESTATUS[0]}`.
+- `install-podman.sh` printed `INSTALL_EXIT_CODE=$?` at the end of the script → a failed install
+  reported 0, and a proof run recorded "install exit=0" while `healthz` was 000.
+- A wrapper read `$?` of a `nohup … &` launcher and reported the job as complete.
+
+Rule: capture into `rc=$?` on the line IMMEDIATELY after the command, use `${PIPESTATUS[0]}` for
+pipelines, and `exit $rc` so the status propagates. A tier/leg/install that cannot prove its own
+exit status is NOT RUN, not GREEN (same principle as YSG-RISK-206).
+
+## 5.9 Podman 5.x/6.x healthchecks need the storage flags (added 2026-08-12)
+
+Podman generates healthcheck systemd units as `ExecStart=<binary> healthcheck run <id>` — the
+BARE binary, with only `PATH` in the unit environment. The side-by-side 5.x/6.x prefixes rely on
+`--root/--runroot` for isolation (5.1.2 ignores storage.conf's `runroot`), so every generated
+healthcheck ran against the DEFAULT storage, failed `no such container`, and left every
+container `(starting)` forever — `install.sh` then waited on convergence that could never
+happen (20h lost, 2026-08-11).
+
+Fix: a shim at the exact binary path the units invoke
+(`podman-versions/podman-<v>/usr/bin/podman`) that injects `--root/--runroot` and execs
+`podman.real`. Verified: the failing `healthcheck run` command exits 0 and the container reports
+`healthy`.
+
+## 5.10 One TOTP secret = ONE window record (added 2026-08-12)
+
+The anti-replay ledger was keyed on the PURPOSE of the code, not the identity that
+owns it: `do_admin_stepup()` waited on `stepup:admin1`, while the admin login path kept
+private state (`_api_totp_last_used`) and published to the shared ledger not at all.
+So a login spent a code, step-up saw an empty ledger, ran inside the SAME 30s window,
+and the server rejected the replay -> `401 invalid_totp_code`.
+
+**The server is correct. Anti-replay is a control.** Never "fix" this by widening the
+server's replay window or by retrying until a code sticks.
+
+**Required:** every path that consumes a TOTP code for identity X — browser login, API
+login, step-up, a diagnostic script — waits on and marks the SAME ledger key for X.
+
+**Corollary for operators:** do not run a manual login/verification script next to a
+live test run. The ledger is per-process, so an external script silently spends the
+window the suite is about to use and the suite fails with a credential error that looks
+like a product fault. This cost several false diagnoses on 2026-08-12.
+
+## 5.11 Provision test users through BOTH pathways (added 2026-08-12)
+
+`test_user_provisioning_mixed.py` creates 3 end users through the real admin UI form and
+2 through `POST /admin/users`, then asserts the cap refuses the 6th.
+
+Rationale (Tiago, 2026-08-12): a suite that only ever creates users over the API proves
+the endpoint and nothing about the form. That is the blind spot behind LAURA-001 (broken
+chat UI shipped three times, every API test green) and YSG-RISK-137 (browser step-up
+universally broken, because step-up was only ever verified by direct `/auth/stepup`
+calls). Creating through the UI drives the ui4 step-up modal end-to-end, which is the
+only way that path is covered.
+
+Every UI creation is confirmed by a subsequent API read — a form that appears to succeed
+but persists nothing must FAIL (effect-verified, 5.3).
+
+**Do not delete this in favour of the API-only version because it is slower or flakier.**
+The UI path is the one that has repeatedly shipped broken.
+
+**populate-demo.py stays the demo seeder** (Tiago, 2026-08-12: "keep the populate script
+for demos don't erase it"). This test provisions users for TEST runs; it does not replace
+demo seeding.
