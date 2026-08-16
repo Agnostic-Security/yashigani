@@ -292,7 +292,7 @@ _OPENAI_ROUTER_ATTR = "openai_router"
 
 @pytest.fixture(autouse=True)
 def _restore_openai_router_module_identity():
-    """YSG-RISK-131 follow-up (2026-08-16): ``_load_router_with_env`` (below)
+    """YSG-RISK-139 follow-up (2026-08-16): ``_load_router_with_env`` (below)
     deliberately does ``del sys.modules[...]`` + a fresh ``import_module`` --
     that forced re-exec is load-bearing, it is the ONLY way to make the
     OWUI slug-map / default-slug / internal-bearer module-level config

@@ -507,13 +507,13 @@ class EventType(str, Enum):
     # LAURA-4.0-S1-001 (MEDIUM): startup reconcile rewrites stale email/slug
     # scope_ids in policy bindings to the canonical idnt_ PK so they enforce.
     BINDING_SCOPE_ID_RECONCILE = "BINDING_SCOPE_ID_RECONCILE"
-    # YSG-RISK-108 / T-3: an unauthenticated caller on the mesh port (:8081)
+    # YSG-RISK-252 / T-3: an unauthenticated caller on the mesh port (:8081)
     # presented X-Forwarded-User (or X-Yashigani-Identity-Id) without proving
     # internal mesh identity via the per-install bearer or Caddy-verified secret.
     # The header is stripped and the request is logged as an attempted header-spoof.
     # ASVS V1.4.5 / OWASP A07:2021 / CWE-290 (Authentication Bypass by Spoofing).
     MESH_IDENTITY_HEADER_REJECTED = "MESH_IDENTITY_HEADER_REJECTED"
-    # YSG-RISK-108 / T-4: an unauthenticated caller on the mesh port (:8081)
+    # YSG-RISK-252 / T-4: an unauthenticated caller on the mesh port (:8081)
     # presented X-Yashigani-Orchestration-Depth to attempt promotion to the
     # privileged "gateway:orchestrator" identity without proving internal mesh
     # identity.  The promotion is suppressed and the header is logged.
@@ -3877,7 +3877,7 @@ class McpDecommissionedEvent(AuditEvent):
                               re-onboard) or "nuke" (operator intends full
                               removal) — informational only; backoffice has
                               NO docker/podman socket access (LAURA-30-001 /
-                              YSG-RISK-080) and therefore performs the
+                              YSG-RISK-234) and therefore performs the
                               application-layer reversal only. The response
                               carries the exact scoped compose/helm commands
                               for the operator (or install.sh) to run for the
@@ -4488,7 +4488,7 @@ class DataProtectionWeakenRejectedEvent(AuditEvent):
 
 
 # ---------------------------------------------------------------------------
-# YSG-RISK-108 — Mesh port identity-header trust gate rejection events (4.0)
+# YSG-RISK-252 — Mesh port identity-header trust gate rejection events (4.0)
 # ---------------------------------------------------------------------------
 
 
@@ -4501,7 +4501,7 @@ class MeshIdentityHeaderRejectedEvent(AuditEvent):
 
     Severity: HIGH.  The header is stripped and the caller is treated as
     anonymous (user_id = "unknown").  Any appearance in the audit chain is a
-    regression canary for T-3 of YSG-RISK-108 (header-spoof on mesh port).
+    regression canary for T-3 of YSG-RISK-252 (header-spoof on mesh port).
 
     The claimed_value field is truncated to 64 chars (never raw user data).
 
@@ -4528,7 +4528,7 @@ class MeshOrchDepthForgedEvent(AuditEvent):
 
     Severity: HIGH.  The promotion is suppressed; the caller retains their
     real (unauthenticated) identity.  Any appearance in the audit chain is a
-    regression canary for T-4 of YSG-RISK-108 (orchestration-depth forge).
+    regression canary for T-4 of YSG-RISK-252 (orchestration-depth forge).
 
     ASVS V4.1.1 / CWE-269 (Improper Privilege Management) / CWE-290.
     """
