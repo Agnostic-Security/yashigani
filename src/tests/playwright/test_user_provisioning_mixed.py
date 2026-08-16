@@ -47,8 +47,15 @@ pytestmark = pytest.mark.skipif(
     reason="Yashigani stack not reachable or playwright not installed",
 )
 
-UI_USERS = 3
-API_USERS = 2
+# FIND-0813-010: these used to be hardcoded 3 + 2 = 5, which exactly equals the
+# COMMUNITY end-user cap — leaving no room for the residual account the product
+# refuses to delete (409 USER_MINIMUM_VIOLATION). residual(1) + 3 + 2 = 6 > 5, so
+# the second API create 402'd and the suite read a working licence control as a
+# failure. Counts are now derived from the LIVE cap (GET /admin/license ->
+# limits.end_users.maximum) minus whatever cannot be cleared, so the test is
+# correct on community (5) and on any larger tier without editing it.
+UI_USERS = 3          # upper bound; trimmed to fit available capacity at runtime
+API_USERS = 2         # ditto — the remainder after the UI share
 _MARK = "prov"  # emails are prov-<hex>@example.com so cleanup can never touch a real account
 
 
@@ -80,17 +87,58 @@ def _free_all_capacity(cookies: dict) -> int:
     # outlive one elevation — observed 2026-08-12: 4 of 5 deleted, the last failed,
     # leaving only 4 free slots so the API half of this test hit the cap. Re-elevate
     # and retry rather than assuming one step-up covers the whole loop.
+    # FIND-0813-010: the product REFUSES to delete the final end-user account —
+    # DELETE /admin/users/{u} returns 409 USER_MINIMUM_VIOLATION "Cannot delete
+    # the last user account". That is a working control, not a failure. The
+    # "4 of 5 deleted, the last failed" note above was misattributed to step-up
+    # expiry; verified live 2026-08-16 with a fresh elevation, the 5th delete
+    # still 409s. So a fully empty population is UNREACHABLE by design and
+    # retrying for it just burns TOTP windows.
     for _attempt in range(3):
         remaining = _list_end_users(cookies)
-        if not remaining:
-            break
+        if len(remaining) <= 1:
+            break                      # 1 residual is the floor, not a failure
         with _client(cookies) as c:
             for u in remaining:
                 if delete_end_user(c, u.get("username")):
                     deleted += 1
-        if _list_end_users(cookies):
+        if len(_list_end_users(cookies)) > 1:
             do_admin_stepup(cookies, admin=1)
     return deleted
+
+
+def _end_user_cap(cookies: dict) -> "int | None":
+    """Live end-user cap from GET /admin/license (limits.end_users.maximum).
+
+    Returns None for an unlimited/unknown cap, in which case the caller keeps
+    the nominal UI_USERS/API_USERS split.
+    """
+    try:
+        with _client(cookies) as c:
+            r = c.get(f"{BASE_URL}/admin/license")
+        if r.status_code != 200:
+            return None
+        blk = (r.json().get("limits") or {}).get("end_users") or {}
+        return None if blk.get("unlimited") else blk.get("maximum")
+    except Exception:
+        return None
+
+
+def _plan_provisioning(cookies: dict) -> "tuple[int, int]":
+    """(ui_count, api_count) that FIT under the live cap after the residual.
+
+    The cap is a CONTROL this suite deliberately exercises (test_05 asserts the
+    next create is 402), so the plan must fill capacity exactly — not overflow
+    it, which is what made test_03/test_04 fail on community tier.
+    """
+    cap = _end_user_cap(cookies)
+    residual = len(_list_end_users(cookies))
+    if cap is None:
+        return UI_USERS, API_USERS
+    available = max(cap - residual, 0)
+    ui = min(UI_USERS, available)
+    api = max(available - ui, 0)
+    return ui, api
 
 
 @pytest.fixture(scope="class")
@@ -112,7 +160,15 @@ def admin_page():
 
 
 class TestMixedUserProvisioning:
-    """3 users created through the real admin UI, 2 through the API, then the cap."""
+    """Users created through the real admin UI and the API, then the cap.
+
+    Counts are derived at runtime from the live licence cap (see
+    _plan_provisioning) — nominally 3 via UI + 2 via API, trimmed to fit
+    whatever capacity the deployment's tier actually allows.
+    """
+
+    PLAN_UI = UI_USERS
+    PLAN_API = API_USERS
 
     def test_01_clear_capacity(self, admin_page):
         ctx, _ = admin_page
@@ -120,15 +176,29 @@ class TestMixedUserProvisioning:
         do_admin_stepup(cookies, admin=1)
         freed = _free_all_capacity(cookies)
         remaining = _list_end_users(cookies)
-        assert not remaining, f"could not clear end users, {len(remaining)} remain"
-        print(f"  cleared {freed} end users — quota is now empty")
+        # FIND-0813-010: asserting `not remaining` asserted that the
+        # USER_MINIMUM_VIOLATION control does NOT exist. The floor is 1.
+        assert len(remaining) <= 1, (
+            f"could not clear end users, {len(remaining)} remain "
+            f"(1 residual is expected — the product refuses to delete the last "
+            f"account with 409 USER_MINIMUM_VIOLATION)"
+        )
+        print(f"  cleared {freed} end users — {len(remaining)} residual (floor is 1)")
+        ui, api = _plan_provisioning(cookies)
+        TestMixedUserProvisioning.PLAN_UI = ui
+        TestMixedUserProvisioning.PLAN_API = api
+        cap = _end_user_cap(cookies)
+        print(f"  cap={cap} residual={len(remaining)} -> provisioning {ui} via UI + {api} via API")
+        assert ui + api >= 1, (
+            f"no end-user capacity available to provision (cap={cap}, "
+            f"residual={len(remaining)}) — cannot exercise this suite")
 
     def test_02_create_three_users_via_webui(self, admin_page):
         """THE USER PATHWAY: fill the real form, click the real button, drive the real
         step-up modal, then prove each user persisted via an API read."""
         ctx, page = admin_page
         created = []
-        for i in range(UI_USERS):
+        for i in range(self.PLAN_UI):
             email = f"{_MARK}-ui-{uuid.uuid4().hex[:8]}@example.com"
             page.goto(f"{BASE_URL}/admin/#users")
             page.wait_for_timeout(1200)
@@ -152,7 +222,7 @@ class TestMixedUserProvisioning:
                 f"user {email} was created through the UI form but does NOT exist via "
                 f"GET /admin/users — the form did not persist it. Present: {emails}")
             created.append(email)
-        assert len(created) == UI_USERS
+        assert len(created) == self.PLAN_UI
         print(f"  created {len(created)} users through the WebUI form")
 
     def test_03_create_two_users_via_api(self, admin_page):
@@ -161,14 +231,14 @@ class TestMixedUserProvisioning:
         do_admin_stepup(cookies, admin=1)
         created = []
         with _client(cookies) as c:
-            for _ in range(API_USERS):
+            for _ in range(self.PLAN_API):
                 email = f"{_MARK}-api-{uuid.uuid4().hex[:8]}@example.com"
                 r = c.post(f"{BASE_URL}/admin/users", json={"email": email})
                 assert r.status_code == 200, f"API create failed: {r.status_code} {r.text[:200]}"
                 body = r.json()
                 assert body.get("temporary_password") and body.get("totp_secret")
                 created.append(email)
-        assert len(created) == API_USERS
+        assert len(created) == self.PLAN_API
         print(f"  created {len(created)} users through the API")
 
     def test_04_five_users_present(self, admin_page):
@@ -176,11 +246,11 @@ class TestMixedUserProvisioning:
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
         users = [u for u in _list_end_users(cookies)
                  if (u.get("email") or "").startswith(f"{_MARK}-")]
-        assert len(users) == UI_USERS + API_USERS, (
-            f"expected {UI_USERS + API_USERS} provisioned users, found {len(users)}")
+        assert len(users) == self.PLAN_UI + self.PLAN_API, (
+            f"expected {self.PLAN_UI + self.PLAN_API} provisioned users, found {len(users)}")
         ui = [u for u in users if "-ui-" in (u.get("email") or "")]
         api = [u for u in users if "-api-" in (u.get("email") or "")]
-        assert len(ui) == UI_USERS and len(api) == API_USERS
+        assert len(ui) == self.PLAN_UI and len(api) == self.PLAN_API
 
     def test_05_sixth_user_is_refused_402(self, admin_page):
         """The licence cap as a CONTROL. At the cap the next create must be refused."""
