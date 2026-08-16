@@ -485,7 +485,7 @@ like a product fault. This cost several false diagnoses on 2026-08-12.
 
 Rationale (Tiago, 2026-08-12): a suite that only ever creates users over the API proves
 the endpoint and nothing about the form. That is the blind spot behind LAURA-001 (broken
-chat UI shipped three times, every API test green) and YSG-RISK-137 (browser step-up
+chat UI shipped three times, every API test green) and YSG-RISK-262 (browser step-up
 universally broken, because step-up was only ever verified by direct `/auth/stepup`
 calls). Creating through the UI drives the ui4 step-up modal end-to-end, which is the
 only way that path is covered.
@@ -569,8 +569,17 @@ reports a result it did not earn. It is not excused by the runner exiting 0.
 1. **Verification is a barrier.** Land the concurrent work first, then run the tier once on a
    still tree. Do not overlap them to save wall-clock.
 2. If a tier MUST run while work is in flight, run it against an isolated checkout at a named
-   commit — a git worktree under `~/Documents/Claude/` per CLAUDE.md, removed when finished —
+   commit — a **git worktree** under `~/Documents/Claude/` per CLAUDE.md, removed when finished —
    never against the shared tree. State the commit in the verdict line.
+
+   **Use a worktree, NOT `git archive`.** An export tarball has no `.git`, and tests that assert
+   repository context behave differently in one. Demonstrated 2026-08-16: a Tier-A run against a
+   `git archive` export returned `verdict=FAIL` on
+   `tests/security/test_authonce_harness_selfcheck.py` — two guards asserting the auth-once
+   harness REFUSES to write output inside a git repo (the CLAUDE.md directory rule, enforced as a
+   test). With no `.git` present the guard could not fire, so "refused" was false. The same file
+   is 46/46 green in a real checkout. A worktree carries repo context and does not have this
+   failure mode.
 3. **A run interrupted by tree mutation is discarded, not interpreted.** Do not salvage a
    subset, do not report "N passed before it got noisy", do not attribute individual failures
    to specific agents. Kill it and re-run.
