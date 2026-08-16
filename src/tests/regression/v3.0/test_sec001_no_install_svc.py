@@ -132,6 +132,20 @@ async def test_human_admin_bootstrap_not_blocked_by_svc_account():
             # real signature so this mock doesn't drift from the interface it stands in for.
             self.totp_algorithm = algorithm
 
+    # Lu P2 (2026-08-16): _bootstrap_admin_accounts now writes an
+    # AdminAccountBootstrappedEvent via state.audit_writer.write() BEFORE
+    # create_admin() — see backoffice/app.py docstring. _MockState previously
+    # had no audit_writer attribute at all, which would now raise
+    # AttributeError on the `assert state.audit_writer is not None` guard.
+    # Mirror the real AuditLogWriter surface just enough (a synchronous
+    # .write(event) that records the event) to exercise the real code path.
+    class _MockAuditWriter:
+        def __init__(self):
+            self.events: list = []
+
+        def write(self, event):
+            self.events.append(event)
+
     # Build a minimal mock state with _auth_bootstrap context
     import tempfile, os
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -150,11 +164,29 @@ async def test_human_admin_bootstrap_not_blocked_by_svc_account():
                 "initial_admin_password": "s3cr3t",
                 "secrets_dir": tmpdir,
             }
+            audit_writer = _MockAuditWriter()
 
         from yashigani.backoffice.app import _bootstrap_admin_accounts
 
         auth_svc = _MockAuthService()
-        await _bootstrap_admin_accounts(auth_svc, _MockState())
+        mock_state = _MockState()
+        await _bootstrap_admin_accounts(auth_svc, mock_state)
+
+    # Lu P2: the bootstrap must have emitted the typed audit event for admin1
+    # BEFORE create_admin(), not silently.
+    from yashigani.audit.schema import AdminAccountBootstrappedEvent
+
+    bootstrap_events = [
+        e for e in mock_state.audit_writer.events
+        if isinstance(e, AdminAccountBootstrappedEvent)
+    ]
+    assert len(bootstrap_events) == 1, (
+        "Lu P2 REGRESSION: _bootstrap_admin_accounts must emit exactly one "
+        "AdminAccountBootstrappedEvent for admin1 on fresh boot."
+    )
+    assert bootstrap_events[0].bootstrapped_username == "admin1"
+    assert bootstrap_events[0].admin_slot == "primary"
+    assert bootstrap_events[0].totp_provisioned is True
 
     # Admin-tier bootstrap must provision the admin-tier TOTP algorithm (Phase 13,
     # 9d47affe) — not just accept the kwarg without honouring it.

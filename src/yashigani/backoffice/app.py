@@ -135,9 +135,24 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
     passwords and re-enrolled TOTPs persist.
 
     Resolves P0-2 (YCS-20260423-v2.23.1-OWASP-3X).
+
+    Lu P2 (2026-08-16): this is the single most privileged act in the
+    system's lifetime — minting the accounts that can do everything — so
+    each account now emits a typed AdminAccountBootstrappedEvent into the
+    tamper-evident audit chain (schema class + full rationale: audit/
+    schema.py). Written BEFORE auth_service.create_admin() for that
+    account, and the write() call is deliberately left un-try/excepted —
+    AuditLogWriter.write() is documented to raise AuditWriteError on a sink
+    failure ("the caller MUST abort their operation"); here that means
+    lifespan startup aborts rather than minting an unaudited admin (CLAUDE.md
+    SOP 1 fail-closed lifespan discipline). Because the write happens first
+    and total_admin_count() == 0 still holds if create_admin() never ran, a
+    crash-restart retries this function cleanly.
     """
     import logging as _lg
     import os as _os
+
+    from yashigani.audit.schema import AdminAccountBootstrappedEvent
 
     _log = _lg.getLogger("yashigani.backoffice.auth_bootstrap")
     ctx = getattr(state, "_auth_bootstrap", None)
@@ -148,24 +163,40 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
         _log.info("Bootstrap: admin accounts already present — skipping seed")
         return
 
+    # set unconditionally at startup (entrypoint.py:505), well before
+    # lifespan (and therefore this function) ever runs.
+    assert state.audit_writer is not None
+
     admin_username = ctx["admin_username"]
     initial_admin_password = ctx["initial_admin_password"]
     secrets_dir = ctx["secrets_dir"]
+
+    totp_file = _os.path.join(secrets_dir, "admin1_totp_secret")
+    totp_secret = ""
+    if _os.path.exists(totp_file):
+        totp_secret = open(totp_file).read().strip()
+
+    # Fail-closed: audit record written before the privileged action it
+    # describes — see docstring above and AdminAccountBootstrappedEvent.
+    state.audit_writer.write(
+        AdminAccountBootstrappedEvent(
+            bootstrapped_username=admin_username,
+            admin_slot="primary",
+            totp_provisioned=bool(totp_secret),
+        )
+    )
 
     await auth_service.create_admin(
         username=admin_username,
         auto_generate=False,
         plaintext_password=initial_admin_password,
     )
-    totp_file = _os.path.join(secrets_dir, "admin1_totp_secret")
-    if _os.path.exists(totp_file):
-        totp_secret = open(totp_file).read().strip()
-        if totp_secret:
-            # installer-privileged bootstrap path — see docstring on
-            # PostgresLocalAuthService.set_totp_secret_direct.
-            # Phase 13: admin accounts use SHA-512/8-digit TOTP.
-            await auth_service.set_totp_secret_direct(admin_username, totp_secret, algorithm="SHA512")
-            _log.info("Bootstrap: TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
+    if totp_secret:
+        # installer-privileged bootstrap path — see docstring on
+        # PostgresLocalAuthService.set_totp_secret_direct.
+        # Phase 13: admin accounts use SHA-512/8-digit TOTP.
+        await auth_service.set_totp_secret_direct(admin_username, totp_secret, algorithm="SHA512")
+        _log.info("Bootstrap: TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
     _log.info("Bootstrap: initial admin account created — %s", admin_username)
 
     # --- Admin 2 (backup — anti-lockout) -------------------------------------
@@ -175,18 +206,28 @@ async def _bootstrap_admin_accounts(auth_service, state) -> None:
         admin2_username = open(admin2_user_file).read().strip()
         admin2_password = open(admin2_pwd_file).read().strip()
         if admin2_username and admin2_password:
+            totp2_file = _os.path.join(secrets_dir, "admin2_totp_secret")
+            totp2_secret = ""
+            if _os.path.exists(totp2_file):
+                totp2_secret = open(totp2_file).read().strip()
+
+            state.audit_writer.write(
+                AdminAccountBootstrappedEvent(
+                    bootstrapped_username=admin2_username,
+                    admin_slot="backup",
+                    totp_provisioned=bool(totp2_secret),
+                )
+            )
+
             await auth_service.create_admin(
                 username=admin2_username,
                 auto_generate=False,
                 plaintext_password=admin2_password,
             )
-            totp2_file = _os.path.join(secrets_dir, "admin2_totp_secret")
-            if _os.path.exists(totp2_file):
-                totp2_secret = open(totp2_file).read().strip()
-                if totp2_secret:
-                    # Phase 13: admin tier → SHA-512/8-digit TOTP.
-                    await auth_service.set_totp_secret_direct(admin2_username, totp2_secret, algorithm="SHA512")
-                    _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
+            if totp2_secret:
+                # Phase 13: admin tier → SHA-512/8-digit TOTP.
+                await auth_service.set_totp_secret_direct(admin2_username, totp2_secret, algorithm="SHA512")
+                _log.info("Bootstrap: admin2 TOTP pre-provisioned from installer secret (SHA-512/8-digit)")
             _log.info("Bootstrap: backup admin account created — %s", admin2_username)
 
 
