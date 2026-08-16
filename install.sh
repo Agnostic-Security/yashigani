@@ -3934,7 +3934,7 @@ _write_aes_key_to_env() {
   # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
   # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
   # model and enable response inspection so the egress block fires and renders in
-  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-221) — production/
   # enterprise leave it OFF; demo turns it ON to showcase the injection block.
   if [[ "$DEPLOY_MODE" == "demo" ]]; then
     _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
@@ -11258,10 +11258,10 @@ register_agent_bundles() {
   # The Python script reads secrets from /run/secrets/, computes TOTP,
   # authenticates, checks the live registry, and registers each unregistered
   # agent (Postgres + Redis db/3). The raw per-agent PSK is printed to stdout
-  # (OK: line) for HOST-SIDE capture — see YSG-RISK-133 below for why it is
+  # (OK: line) for HOST-SIDE capture — see YSG-RISK-258 below for why it is
   # never written to a file from inside this container.
   #
-  # YSG-RISK-133 (2026-07-27): this Python block used to also open()
+  # YSG-RISK-258 (2026-07-27): this Python block used to also open()
   # /run/secrets/<profile>_token for writing (a "3. Token file for gateway"
   # step). FINDING-V412-RESTART-012 (2026-07-21) made backoffice's
   # /run/secrets mount a PURE :ro bind — see docker-compose.yml — so that
@@ -11589,7 +11589,7 @@ for agent_spec in agents_spec:
             kind=akind,
             sensitivity_ceiling=aceiling,
         )
-        # YSG-RISK-133: NO container-side write against /run/secrets here
+        # YSG-RISK-258: NO container-side write against /run/secrets here
         # (see the register_agent_bundles() header comment above for the full
         # RESTART-012 rationale). The backoffice /run/secrets mount is a pure
         # :ro mount by design -- this container never attempts to write to
@@ -12429,7 +12429,7 @@ _gen_totp_uri() {
   # algorithm= and digits= URI parameters. Classic Google Authenticator (SHA-1 only)
   # is NOT compatible with SHA-512/8-digit TOTP and MUST NOT be used.
   #
-  # YSG-RISK-078 context: the original SHA-256 reversion was driven by SHA-1-only
+  # YSG-RISK-232 context: the original SHA-256 reversion was driven by SHA-1-only
   # apps failing silently. Phase 13 mandates agnosticOTP specifically to avoid this.
   local username="$1"
   local secret="$2"
@@ -15768,7 +15768,7 @@ k8s_helm_install() {
   # Merge order note: these -f land AFTER -f .env.helm — distinct key
   # (egressForwarders, additive per-system map keys), no collision; --set
   # still wins over both.
-  # YSG-RISK-130 fix: layer the INGRESS-front overlay (values-<agent>-
+  # YSG-RISK-138 fix: layer the INGRESS-front overlay (values-<agent>-
   # ingress.yaml) alongside the pre-existing egress-forwarder overlay. This
   # overlay was already fully authored (agentIngressFronts map -> templates/
   # agent-ingress-fronts.yaml's yashigani-caddy-mesh Service + 4 NetworkPolicies
@@ -15801,14 +15801,14 @@ k8s_helm_install() {
       _hb_ingress_overlay="${chart_dir}/values-${_hb_agent}-ingress.yaml"
       if [[ ! -f "$_hb_ingress_overlay" ]]; then
         # Fail-closed: without the ingress front, gateway has no mTLS-verified
-        # path to this agent — registering it anyway (YSG-RISK-130) would
+        # path to this agent — registering it anyway (YSG-RISK-138) would
         # ship a registration that fails closed at the TLS handshake on
         # every dispatch.
         log_error "${_hb_agent} bundle requested (--agent-bundles) but ingress-front overlay not found: ${_hb_ingress_overlay}"
         exit 1
       fi
       helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay" -f "$_hb_ingress_overlay")
-      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-130 / unified-sidecar v4.1)"
+      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-138 / unified-sidecar v4.1)"
     fi
   done
 
@@ -15963,7 +15963,7 @@ k8s_verify_image_provenance() {
 
 # STEP 9c (k8s): register agent bundles with gateway's durable registry
 #
-# YSG-RISK-130: register_agent_bundles() (compose/Podman path, "Step 11b",
+# YSG-RISK-138: register_agent_bundles() (compose/Podman path, "Step 11b",
 # called from compose_up only) is the ONLY place any deployment populates
 # gateway's durable agent registry (Postgres AgentDurableStore + Redis db/3
 # AgentRegistry). k8s had no equivalent — agent bundle pods ran healthy but
@@ -16012,7 +16012,7 @@ k8s_verify_image_provenance() {
 # (kubectl exec -i ... <<<"$agents_json"), NOT via -e/env or a CLI arg —
 # keeps it out of `ps` on the host and off the kubectl exec command line.
 k8s_register_agent_bundles() {
-  set_step "9c" "register agent bundles (k8s, YSG-RISK-130)"
+  set_step "9c" "register agent bundles (k8s, YSG-RISK-138)"
 
   local _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
   if [[ "$_hb_ab" == ",," ]]; then
@@ -16026,7 +16026,7 @@ k8s_register_agent_bundles() {
   fi
 
   require_cmd "kubectl"
-  log_step "9c/${TOTAL_STEPS}" "Registering agent bundles with gateway (k8s, YSG-RISK-130)..."
+  log_step "9c/${TOTAL_STEPS}" "Registering agent bundles with gateway (k8s, YSG-RISK-138)..."
 
   local _bo_pod
   _bo_pod="$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=yashigani-backoffice \
@@ -16132,7 +16132,7 @@ k8s_register_agent_bundles() {
 
   local reg_output
   reg_output="$(kubectl exec -i -n "$NAMESPACE" "$_bo_pod" -- python3 -c '
-# YSG-RISK-130: k8s equivalent of register_agent_bundles() (compose). Same
+# YSG-RISK-138: k8s equivalent of register_agent_bundles() (compose). Same
 # durable-store + Redis db/3 upsert, idempotent by name — but the token is
 # READ from stdin (already Helm-Secret-stable), never generated, and no
 # container restart follows.
@@ -20791,7 +20791,7 @@ main() {
     k8s_verify_image_provenance
 
     # Step 9c: register agent bundles with gateway's durable registry
-    # (YSG-RISK-130) — k8s equivalent of the compose path's Step 11b
+    # (YSG-RISK-138) — k8s equivalent of the compose path's Step 11b
     # register_agent_bundles(). Must run AFTER rollout/provenance so gateway
     # and backoffice are confirmed healthy and running the correct image.
     k8s_register_agent_bundles
@@ -21434,7 +21434,7 @@ main() {
     # The script is idempotent (IF NOT EXISTS guards) — safe to re-run; no-op on
     # fresh installs where postgres init already executed it automatically.
     #
-    # YSG-RISK-050 (v2.24.0): pgbouncer authenticator now uses dedicated
+    # YSG-RISK-218 (v2.24.0, id re-issued from 050 on 2026-08-16): pgbouncer authenticator now uses dedicated
     # pgbouncer-auth_client.{crt,key} on the postgres-facing connection
     # (separate from pgbouncer_client.{crt,key} on the client-facing side).
     # Cert issuance happens automatically via PKI iterator reading
@@ -21455,7 +21455,7 @@ main() {
       log_warn "(The script is idempotent — safe to re-run; no-op on fresh installs"
       log_warn "  where the init script already executed.)"
       log_warn "v2.24.x cert-separation upgrade: this also removes the pg_hba A2 carveout"
-      log_warn "(YSG-RISK-050) — pgbouncer-auth now uses a dedicated client cert."
+      log_warn "(YSG-RISK-218) — pgbouncer-auth now uses a dedicated client cert."
     fi
 
     # Step 10: docker compose up -d
