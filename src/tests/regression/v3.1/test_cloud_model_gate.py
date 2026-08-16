@@ -38,11 +38,25 @@ Wiring:
   W2  _state.permission_store is set by configure().
   W3  _state.permission_strict is set by configure() from env.
 
-Last updated: 2026-06-28T00:00:00+00:00
+NOTE on async style (2026-08-16, FIND-0813 batch): the H-class helper tests
+(H1-H5) and the OPA-coupling tests (G5-G7) originally drove the async
+``_opa_cloud_model_policy_check`` helper via
+``asyncio.get_event_loop().run_until_complete(...)`` inside plain ``def``
+test methods. Python 3.14 removed implicit event-loop auto-creation, so
+``asyncio.get_event_loop()`` now raises ``RuntimeError: There is no current
+event loop`` outside a running loop — these 8 tests started failing purely
+because the interpreter moved from 3.12 to 3.14, not because product code
+regressed (``_opa_cloud_model_policy_check`` in
+``yashigani/gateway/openai_router.py`` is unchanged plain ``async def``).
+Fixed by converting to native ``async def`` test methods, consistent with
+the documented style in ``src/tests/unit/test_admin_models_default.py``
+(project ``pyproject.toml`` sets ``asyncio_mode = "auto"``, so pytest-asyncio
+schedules native coroutines directly — no manual loop management needed).
+
+Last updated: 2026-08-16T00:00:00+00:00
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import pytest
@@ -173,7 +187,7 @@ class TestWiring:
 
 class TestOpaCloudModelPolicyCheck:
 
-    def test_h1_dev_opt_in_no_opa_url(self):
+    async def test_h1_dev_opt_in_no_opa_url(self):
         """H1: YASHIGANI_OPA_OPTIONAL=true + no opa_url → allow=True (dev opt-in)."""
         import os as _os
         fn = _import_gate_fn()
@@ -183,14 +197,12 @@ class TestOpaCloudModelPolicyCheck:
             _r._state.opa_url = ""
             _os.environ["YASHIGANI_OPA_OPTIONAL"] = "true"
             _os.environ["YASHIGANI_ENV"] = "development"
-            result = asyncio.get_event_loop().run_until_complete(
-                fn(
-                    "yashigani/cloud_model/gpt4o",
-                    identity=_fake_identity(),
-                    model="gpt-4o",
-                    provider="openai",
-                    sensitivity_level="PUBLIC",
-                )
+            result = await fn(
+                "yashigani/cloud_model/gpt4o",
+                identity=_fake_identity(),
+                model="gpt-4o",
+                provider="openai",
+                sensitivity_level="PUBLIC",
             )
             assert result["allow"] is True
             assert "dev_opt_in" in result.get("reason", "")
@@ -199,28 +211,26 @@ class TestOpaCloudModelPolicyCheck:
             _os.environ.pop("YASHIGANI_OPA_OPTIONAL", None)
             _os.environ.pop("YASHIGANI_ENV", None)
 
-    def test_h2_invalid_policy_ref_blocked(self):
+    async def test_h2_invalid_policy_ref_blocked(self):
         """H2: policy_ref with invalid chars → allow=False (path-injection guard)."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
         orig_url = _r._state.opa_url
         try:
             _r._state.opa_url = "https://policy:8181"
-            result = asyncio.get_event_loop().run_until_complete(
-                fn(
-                    "yashigani/../etc/passwd",
-                    identity=_fake_identity(),
-                    model="gpt-4o",
-                    provider="openai",
-                    sensitivity_level="PUBLIC",
-                )
+            result = await fn(
+                "yashigani/../etc/passwd",
+                identity=_fake_identity(),
+                model="gpt-4o",
+                provider="openai",
+                sensitivity_level="PUBLIC",
             )
             assert result["allow"] is False
             assert result.get("reason") == "invalid_policy_ref"
         finally:
             _r._state.opa_url = orig_url
 
-    def test_h3_path_traversal_blocked(self):
+    async def test_h3_path_traversal_blocked(self):
         """H3: policy_ref containing '..' chars rejected."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
@@ -228,21 +238,19 @@ class TestOpaCloudModelPolicyCheck:
         try:
             _r._state.opa_url = "https://policy:8181"
             for bad_ref in ["../secrets", "ok/../../etc", "x;y", "x y"]:
-                result = asyncio.get_event_loop().run_until_complete(
-                    fn(
-                        bad_ref,
-                        identity=_fake_identity(),
-                        model="gpt-4o",
-                        provider="openai",
-                        sensitivity_level="PUBLIC",
-                    )
+                result = await fn(
+                    bad_ref,
+                    identity=_fake_identity(),
+                    model="gpt-4o",
+                    provider="openai",
+                    sensitivity_level="PUBLIC",
                 )
                 assert result["allow"] is False, f"Expected DENY for ref={bad_ref!r}"
                 assert result.get("reason") == "invalid_policy_ref"
         finally:
             _r._state.opa_url = orig_url
 
-    def test_h4_opa_unreachable_fail_closed(self):
+    async def test_h4_opa_unreachable_fail_closed(self):
         """H8 proxy: OPA unreachable → allow=False (fail-closed)."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
@@ -250,34 +258,30 @@ class TestOpaCloudModelPolicyCheck:
         try:
             # Use an obviously unreachable URL
             _r._state.opa_url = "https://127.0.0.1:19999"
-            result = asyncio.get_event_loop().run_until_complete(
-                fn(
-                    "yashigani/cloud_model/gpt4o",
-                    identity=_fake_identity(),
-                    model="gpt-4o",
-                    provider="openai",
-                    sensitivity_level="PUBLIC",
-                )
+            result = await fn(
+                "yashigani/cloud_model/gpt4o",
+                identity=_fake_identity(),
+                model="gpt-4o",
+                provider="openai",
+                sensitivity_level="PUBLIC",
             )
             assert result["allow"] is False
         finally:
             _r._state.opa_url = orig_url
 
-    def test_h5_empty_policy_ref_blocked(self):
+    async def test_h5_empty_policy_ref_blocked(self):
         """H2b: empty policy_ref → allow=False."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
         orig_url = _r._state.opa_url
         try:
             _r._state.opa_url = "https://policy:8181"
-            result = asyncio.get_event_loop().run_until_complete(
-                fn(
-                    "",
-                    identity=_fake_identity(),
-                    model="gpt-4o",
-                    provider="openai",
-                    sensitivity_level="PUBLIC",
-                )
+            result = await fn(
+                "",
+                identity=_fake_identity(),
+                model="gpt-4o",
+                provider="openai",
+                sensitivity_level="PUBLIC",
             )
             assert result["allow"] is False
         finally:
@@ -384,7 +388,7 @@ class TestCloudModelGate:
     # G5/G6/G7/G8 — OPA coupling: tested via _opa_cloud_model_policy_check (H class above)
     # Direct mocked tests below confirm the gate wiring:
 
-    def test_g5_opa_coupling_opa_returns_deny(self):
+    async def test_g5_opa_coupling_opa_returns_deny(self):
         """G5: OPA data-protection policy returns allow=False → fail-closed deny."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
@@ -405,21 +409,19 @@ class TestCloudModelGate:
                 mock_client.post = AsyncMock(return_value=mock_resp)
                 mock_ctx.return_value = mock_client
 
-                result = asyncio.get_event_loop().run_until_complete(
-                    fn(
-                        "yashigani/cloud_model/gpt4o",
-                        identity=_fake_identity(),
-                        model="gpt-4o",
-                        provider="openai",
-                        sensitivity_level="PUBLIC",
-                    )
+                result = await fn(
+                    "yashigani/cloud_model/gpt4o",
+                    identity=_fake_identity(),
+                    model="gpt-4o",
+                    provider="openai",
+                    sensitivity_level="PUBLIC",
                 )
             assert result["allow"] is False
             assert result.get("reason") == "data_class_blocked"
         finally:
             _r._state.opa_url = orig_url
 
-    def test_g6_opa_coupling_opa_returns_allow(self):
+    async def test_g6_opa_coupling_opa_returns_allow(self):
         """G6: OPA data-protection policy returns allow=True → coupling PASSES."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
@@ -440,20 +442,18 @@ class TestCloudModelGate:
                 mock_client.post = AsyncMock(return_value=mock_resp)
                 mock_ctx.return_value = mock_client
 
-                result = asyncio.get_event_loop().run_until_complete(
-                    fn(
-                        "yashigani/cloud_model/gpt4o",
-                        identity=_fake_identity(),
-                        model="gpt-4o",
-                        provider="openai",
-                        sensitivity_level="PUBLIC",
-                    )
+                result = await fn(
+                    "yashigani/cloud_model/gpt4o",
+                    identity=_fake_identity(),
+                    model="gpt-4o",
+                    provider="openai",
+                    sensitivity_level="PUBLIC",
                 )
             assert result["allow"] is True
         finally:
             _r._state.opa_url = orig_url
 
-    def test_g7_opa_coupling_empty_result_fail_closed(self):
+    async def test_g7_opa_coupling_empty_result_fail_closed(self):
         """G7: OPA returns {} (policy path not in bundle) → allow=False (fail-closed)."""
         fn = _import_gate_fn()
         from yashigani.gateway import openai_router as _r
@@ -475,14 +475,12 @@ class TestCloudModelGate:
                 mock_client.post = AsyncMock(return_value=mock_resp)
                 mock_ctx.return_value = mock_client
 
-                result = asyncio.get_event_loop().run_until_complete(
-                    fn(
-                        "yashigani/cloud_model/gpt4o",
-                        identity=_fake_identity(),
-                        model="gpt-4o",
-                        provider="openai",
-                        sensitivity_level="PUBLIC",
-                    )
+                result = await fn(
+                    "yashigani/cloud_model/gpt4o",
+                    identity=_fake_identity(),
+                    model="gpt-4o",
+                    provider="openai",
+                    sensitivity_level="PUBLIC",
                 )
             # Empty result dict: `not result` is True → policy_not_found
             assert result["allow"] is False
