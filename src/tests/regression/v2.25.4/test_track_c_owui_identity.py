@@ -83,6 +83,66 @@ class _FakeRegistry:
         return self._by_key.get(key)
 
 
+_OPENAI_ROUTER_PREFIX = "yashigani.gateway.openai_router"
+_OPENAI_ROUTER_PARENT = "yashigani.gateway"
+_OPENAI_ROUTER_ATTR = "openai_router"
+
+
+@pytest.fixture(autouse=True)
+def _restore_openai_router_module_identity():
+    """YSG-RISK-131 follow-up (2026-08-16): ``_load_router_with_env`` (below)
+    deliberately does ``del sys.modules[...]`` + a fresh ``import_module`` --
+    that forced re-exec is load-bearing, it is the only way to make the OWUI
+    slug-map / default-slug / internal-bearer module-level config re-evaluate
+    per T1..T9 (see this file's docstring). This fixture does not remove that
+    capability -- it only ensures the swap does not outlive the test that
+    requested it.
+
+    Same root cause and same fix shape as the sibling helper in
+    ``test_obs_pin_and_forwarded_user.py`` (also v2.25.4, also swaps
+    ``yashigani.gateway.openai_router`` and never restored it): FIND-0813-012
+    wired all of ``src/tests/regression/`` into one shared Tier-A pytest
+    process, so this file's swap now outlives this file's tests and rebinds
+    the module every OTHER file's frozen collection-time `import` still
+    points at the old object for (confirmed symptom + workaround documented
+    in ``src/tests/regression/v4.1.2/test_ysg_risk_131_gateway_redis_selfheal.py``
+    ``_gw_oai()``).
+
+    Restoring ``sys.modules`` alone is NOT sufficient (live-confirmed while
+    building this fix): ``from yashigani.gateway import openai_router`` --
+    the exact form ``gateway/redis_selfheal.py`` uses at CALL time in its
+    ``ensure_*()``/``maybe_selfheal()`` functions -- resolves via
+    ``getattr(sys.modules["yashigani.gateway"], "openai_router")`` first,
+    and only falls back to ``sys.modules["yashigani.gateway.openai_router"]``
+    if that attribute is absent. Python's import machinery sets that
+    attribute on the parent package as a side effect of every
+    ``importlib.import_module("yashigani.gateway.openai_router")`` call
+    inside ``_load_router_with_env`` -- so it must be snapshotted and put
+    back too, or every dynamic-resolution call site keeps reading the
+    swapped-in module even after ``sys.modules`` is restored.
+    """
+    saved_modules = {
+        k: v for k, v in sys.modules.items()
+        if k == _OPENAI_ROUTER_PREFIX or k.startswith(_OPENAI_ROUTER_PREFIX + ".")
+    }
+    parent = sys.modules.get(_OPENAI_ROUTER_PARENT)
+    had_parent_attr = parent is not None and _OPENAI_ROUTER_ATTR in vars(parent)
+    saved_parent_attr = getattr(parent, _OPENAI_ROUTER_ATTR, None) if had_parent_attr else None
+    try:
+        yield
+    finally:
+        for k in list(sys.modules.keys()):
+            if k == _OPENAI_ROUTER_PREFIX or k.startswith(_OPENAI_ROUTER_PREFIX + "."):
+                if k not in saved_modules:
+                    del sys.modules[k]
+        sys.modules.update(saved_modules)
+        if parent is not None:
+            if had_parent_attr:
+                setattr(parent, _OPENAI_ROUTER_ATTR, saved_parent_attr)
+            elif _OPENAI_ROUTER_ATTR in vars(parent):
+                delattr(parent, _OPENAI_ROUTER_ATTR)
+
+
 def _load_router_with_env(env: dict[str, str]):
     """Reload openai_router with the given env so module-level OWUI config
     (slug map, default slug, enabled flag, internal bearer) re-evaluates."""
@@ -92,7 +152,7 @@ def _load_router_with_env(env: dict[str, str]):
     }
     base.update(env)
     for key in list(sys.modules.keys()):
-        if key.startswith("yashigani.gateway.openai_router"):
+        if key.startswith(_OPENAI_ROUTER_PREFIX):
             del sys.modules[key]
     with mock.patch.dict(os.environ, base, clear=True):
         mod = importlib.import_module("yashigani.gateway.openai_router")
