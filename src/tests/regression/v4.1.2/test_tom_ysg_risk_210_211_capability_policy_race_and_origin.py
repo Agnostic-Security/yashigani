@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import re as _re3
 import shutil
 import subprocess
 
@@ -122,7 +123,7 @@ class TestYsgRisk210LostUpdateRaceGuard:
         """The historical bug: _fetchScope() ran `this._rows =
         this._buildRows(...)` unconditionally after the GET resolved. The
         fix must gate that assignment on `this._dirty` being false."""
-        m = re.search(r"async _fetchScope\(\)\s*\{.*?\n  \}\n", src, re.DOTALL)
+        m = re.search(r"async _fetchScope\([^)]*\)\s*\{.*?\n  \}\n", src, re.DOTALL)
         assert m, "could not locate _fetchScope() body"
         body = m.group(0)
         assert "this._dirty" in body, (
@@ -142,7 +143,7 @@ class TestYsgRisk210LostUpdateRaceGuard:
         )
 
     def test_fetch_scope_has_reentrancy_guard(self, src):
-        m = re.search(r"async _fetchScope\(\)\s*\{(.*?)\n  \}\n", src, re.DOTALL)
+        m = re.search(r"async _fetchScope\([^)]*\)\s*\{(.*?)\n  \}\n", src, re.DOTALL)
         assert m
         body = m.group(1)
         assert re.search(r"if\s*\(\s*this\._fetchInFlight\s*\)\s*return", body), (
@@ -176,10 +177,18 @@ class TestYsgRisk210LostUpdateRaceGuard:
 
 class TestFind0805003SuccessBadgeNotDead:
     def test_fetch_scope_no_longer_nulls_result(self, src):
-        m = re.search(r"async _fetchScope\(\)\s*\{(.*?)\n  \}\n", src, re.DOTALL)
+        m = re.search(r"async _fetchScope\([^)]*\)\s*\{(.*?)\n  \}\n", src, re.DOTALL)
         assert m
         body = m.group(1)
-        assert "this._result = null" not in body, (
+        # FIND-0813-012: this forbade the SUBSTRING "this._result = null", which
+        # structurally accepted only x8x's solution (never touch _result) and
+        # rejected mac-air's equally-valid one (clear it only when the CALLER
+        # wants it: `if (clearResult) this._result = null;`). Both close
+        # FIND-0805-003. Assert the PROPERTY: the reset must not be
+        # unconditional, so a _save()/_delete() refresh cannot wipe the badge.
+        import re as _re2
+        _unconditional = _re2.search(r"^\s*this\._result = null", body, _re2.M)
+        assert _unconditional is None, (
             "_fetchScope() nulls _result again -- this is exactly what made "
             "the 'Saved.' badge dead code (FIND-0805-003); _save()/_delete() "
             "set _result then call _fetchScope() in the same tick, and Lit "
@@ -196,7 +205,9 @@ class TestFind0805003SuccessBadgeNotDead:
         body = m.group(1)
         assert "this._dirty = false" in body
         dirty_idx = body.index("this._dirty = false")
-        fetch_idx = body.index("await this._fetchScope()")
+        _m_call = _re3.search(r"await this\._fetchScope\([^)]*\)", body)
+        assert _m_call, "no `await this._fetchScope(...)` refresh call"
+        fetch_idx = _m_call.start()
         assert dirty_idx < fetch_idx, (
             "_save() clears _dirty AFTER calling _fetchScope() -- ordering "
             "must be dirty-clear then refresh"
@@ -208,7 +219,9 @@ class TestFind0805003SuccessBadgeNotDead:
         body = m.group(1)
         assert "this._dirty = false" in body
         dirty_idx = body.index("this._dirty = false")
-        fetch_idx = body.index("await this._fetchScope()")
+        _m_call = _re3.search(r"await this\._fetchScope\([^)]*\)", body)
+        assert _m_call, "no `await this._fetchScope(...)` refresh call"
+        fetch_idx = _m_call.start()
         assert dirty_idx < fetch_idx
 
 

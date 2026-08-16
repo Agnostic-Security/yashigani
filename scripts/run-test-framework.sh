@@ -293,6 +293,28 @@ run_tier_a() {
     rc=1
   fi
 
+  # FIND-0813-012 — src/tests/regression/ (140 files) was referenced by NO tier,
+  # so its red state was INVISIBLE to the release gate: the 4.1.2 regression
+  # suites for YSG-RISK-210/211, 180, FIND-B-E and FIND-B-F could all be failing
+  # and nothing reported it. Run as its OWN suite with its own verdict line so
+  # its result is never silently folded into the conformance number.
+  # Live-stack-dependent modules are deselected — Tier-A is matrix-invariant and
+  # offline by definition (YTF §3); those belong to Tier-C.
+  _info "pytest: src/tests/regression/ (per-risk regression guards — in-process only)"
+  local _rrc=0
+  PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/regression" \
+    -q --tb=short --junitxml="${evidence_dir}/pytest-junit-regression.xml" \
+    | tee "${evidence_dir}/pytest-regression.log" || _rrc=$?
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-regression.xml" \
+       --rc "$_rrc" --tier a --suite regression \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "src/tests/regression"
+  else
+    _fail "src/tests/regression (see ${evidence_dir}/pytest-regression.log + VERDICT.txt)"
+    rc=1
+  fi
+
   _info "opa test: policy/ (in-process rego unit tests for every live-loaded template + system policy)"
   local opa_rc=0
   if command -v opa >/dev/null 2>&1; then
