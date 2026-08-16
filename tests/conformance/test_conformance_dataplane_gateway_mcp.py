@@ -1456,7 +1456,14 @@ def test_agents_valid_token_passes_middleware():
 
     registry = MagicMock()
     registry.verify_token.return_value = True
-    registry.get.return_value = None
+    # FIND-0813-013 (Nico, 2026-08-13): a verified token is no longer sufficient
+    # on its own. verify_token() reads agent:token:{id}; get() reads
+    # agent:reg:{id} — two different keys — so the middleware now also requires
+    # the caller's registry entry to exist AND be status == "active", failing
+    # closed on get() -> None (an orphaned token key with no registration row).
+    # This mock previously returned None purely to skip the IP-CIDR branch,
+    # which under the new contract means "unknown caller, reject".
+    registry.get.return_value = {"status": "active", "allowed_cidrs": []}
     app.add_middleware(AgentAuthMiddleware, agent_registry=registry, audit_writer=MagicMock())
     tc = TestClient(app, raise_server_exceptions=False)
     r = tc.get(
@@ -1465,6 +1472,39 @@ def test_agents_valid_token_passes_middleware():
     )
     assert r.status_code == 200
     assert seen["caller_type"] == "agent"
+
+
+@pytest.mark.parametrize(
+    "caller_record,why",
+    [
+        (None, "orphaned agent:token:{id} with no agent:reg:{id} row"),
+        ({"status": "inactive", "allowed_cidrs": []}, "deactivated agent"),
+        ({"status": "revoked", "allowed_cidrs": []}, "revoked agent"),
+        ({"allowed_cidrs": []}, "registry row with no status field at all"),
+    ],
+)
+def test_agents_valid_token_but_non_active_caller_rejected(caller_record, why):
+    """FIND-0813-013 fail-closed contract, in the conformance matrix rather than
+    only in the v4.1.2 regression file: bcrypt-verifying the PSK is NOT enough.
+    Every state that is not an explicit active registration must 401, or a
+    deactivated agent's token keeps working (the original finding)."""
+    from yashigani.gateway.agent_auth import AgentAuthMiddleware
+    app = FastAPI()
+
+    @app.get("/agents/target/tools/list")
+    async def _h():
+        return {"ok": True}
+
+    registry = MagicMock()
+    registry.verify_token.return_value = True  # token itself is genuinely valid
+    registry.get.return_value = caller_record
+    app.add_middleware(AgentAuthMiddleware, agent_registry=registry, audit_writer=MagicMock())
+    tc = TestClient(app, raise_server_exceptions=False)
+    r = tc.get(
+        "/agents/target/tools/list",
+        headers={"Authorization": "Bearer " + "a" * 64, "X-Yashigani-Caller-Agent-Id": "caller"},
+    )
+    assert r.status_code == 401, why
 
 
 @pytest.mark.asyncio

@@ -163,13 +163,19 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
         # verify_token()'s own fail-closed posture ("Always returns False on
         # any error").
         #
-        # `.get("status", "active")` (not a bare `agent.get("status")`) is
-        # deliberate: AgentRegistry._decode_agent() ALWAYS populates a
-        # "status" key on every real registry.get() return (defaulting to ""
-        # when the underlying Redis hash field is genuinely absent, never
-        # omitting the key) -- so in production this default NEVER masks a
-        # missing/blank status; "" != "active" still rejects. The default only
-        # matters for hand-built dicts that don't model status at all.
+        # The default here is "" (reject), NOT "active". AgentRegistry.
+        # _decode_agent() does always populate a "status" key on every real
+        # registry.get() return -- defaulting to "" when the Redis hash field
+        # is genuinely absent, never omitting the key -- so today a missing
+        # key is unreachable through the real registry either way. But an
+        # authn decision must not depend on an invariant maintained in a
+        # DIFFERENT file: a routine "drop empty fields from the decoded dict"
+        # refactor of _decode_agent(), or any alternative object injected as
+        # `agent_registry`, would silently turn a fail-open default into an
+        # auth bypass. Defaulting to reject costs nothing (verified: no test
+        # or call site relies on the permissive default) and removes the
+        # coupling. Consistent with verify_token()'s own posture ("Always
+        # returns False on any error").
         agent = registry.get(caller_agent_id)
         if agent is None:
             return await self._reject(
@@ -179,7 +185,7 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 reason="caller_agent_not_found",
                 status=401,
             )
-        if agent.get("status", "active") != "active":
+        if agent.get("status", "") != "active":
             return await self._reject(
                 request,
                 caller_agent_id=caller_agent_id,
