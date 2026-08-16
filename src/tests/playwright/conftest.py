@@ -2266,6 +2266,40 @@ def pytest_collection_modifyitems(config, items):
     # unbounded. method="thread" (not the Unix default "signal") so it
     # reliably interrupts alongside Playwright's own I/O/event-loop use on
     # both macOS and Linux — see pyproject.toml's pinned pytest-timeout dep.
+    # FIND-0813-011 (2026-08-16): the "~90s" TOTP allowance above was never
+    # measured against the REAL wait budget, and the ceiling had never actually
+    # been enforced — pytest-timeout was absent from uv.lock (FIND-0813-004), so
+    # this marker was inert. The moment it was provisioned it killed the headed
+    # Tier-B leg at 17%.
+    #
+    # The arithmetic: one fresh login can wait up to 62s for the anti-replay
+    # window (_wait_for_fresh_code / wait_for_fresh_totp: `62 - elapsed`, plus a
+    # window-edge nudge). A test that authenticates ~5 times therefore burns
+    # ~310s in SLEEPS ALONE and blows a 300s ceiling deterministically — it is
+    # not a hang, and killing it hides a real result.
+    #
+    # Multi-identity tests (admin1 + admin2 + user, rotation/re-login) are
+    # exactly that shape, so they get a budget that accounts for the waits they
+    # are REQUIRED to perform. Everything else keeps the tight 300s ceiling: the
+    # point of the guard is to bound a genuine hang, and a uniform generous
+    # ceiling would restore the 45-minute-orphan failure it exists to prevent.
+    #
+    # The real fix is to stop paying the wait at all — seeded distinct TOTP
+    # secrets per identity (SOP §4.17 Rule 7, _load_seeded_users below) so
+    # logins do not serialise on one identity's window. Until every suite uses
+    # them, this keeps the ceiling honest instead of arbitrary.
+    _TOTP_WAIT_WORST_CASE_S = 62          # measured: conftest.py `62 - elapsed`
+    _MULTI_IDENTITY_HINTS = (
+        "bootstrap", "rotation", "both_admins", "admin2",
+        "provisioning", "mixed", "relogin", "seeded",
+    )
     for item in items:
-        if not any(m.name == "timeout" for m in item.iter_markers()):
-            item.add_marker(pytest.mark.timeout(300, method="thread"))
+        if any(m.name == "timeout" for m in item.iter_markers()):
+            continue
+        _nid = item.nodeid.lower()
+        if any(h in _nid for h in _MULTI_IDENTITY_HINTS):
+            # 300s of real work + the logins this shape must serialise on.
+            _budget = 300 + (_TOTP_WAIT_WORST_CASE_S * 5)
+        else:
+            _budget = 300
+        item.add_marker(pytest.mark.timeout(_budget, method="thread"))
