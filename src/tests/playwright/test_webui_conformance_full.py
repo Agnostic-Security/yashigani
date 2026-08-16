@@ -330,6 +330,14 @@ class TestAdminBootstrapBothAdmins:
     that coverage explicitly rather than assume it still happens here.
     """
 
+    # FIND-0813-011 / NB-3 (2026-08-16): explicit marker replacing the
+    # nodeid-substring dispatch ("bootstrap" + "both_admins" both matched
+    # this class's name; "relogin" + "rotation" also matched the one test
+    # method below) -- see conftest.py's pytest_collection_modifyitems. This
+    # test drives a full rotation + re-login for admin1 AND admin2, the
+    # multi-identity shape the extended 610s budget exists for.
+    pytestmark = pytest.mark.multi_identity
+
     # 2026-08-08: was `[1]`. The docstring above correctly states that
     # admin1-only coverage does NOT satisfy retro v2.23.1 A2 ("BOTH admins,
     # full 5-step, every sweep ... skipping this for either admin = false

@@ -2238,6 +2238,13 @@ def pytest_configure(config):
         "markers",
         "security_probe: marks adversarial / purple-team security tests",
     )
+    config.addinivalue_line(
+        "markers",
+        "multi_identity: test serialises multiple fresh TOTP logins (admin1+"
+        "admin2+user, rotation/re-login, mixed provisioning) and needs the "
+        "extended per-test timeout budget below (FIND-0813-011) instead of "
+        "the default 300s ceiling.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2288,16 +2295,25 @@ def pytest_collection_modifyitems(config, items):
     # secrets per identity (SOP §4.17 Rule 7, _load_seeded_users below) so
     # logins do not serialise on one identity's window. Until every suite uses
     # them, this keeps the ceiling honest instead of arbitrary.
+    #
+    # 2026-08-16 (NB-3 of the pre-push code-quality review): the budget used
+    # to be dispatched by substring-matching `item.nodeid.lower()` against a
+    # hint tuple ("bootstrap", "mixed", "admin2", ...). nodeid INCLUDES the
+    # file path, so an unrelated directory rename could silently change every
+    # test's timeout underneath it with no code change — exactly the
+    # "spelling heuristic" anti-pattern this campaign has been fighting,
+    # applied to a budget instead of an assertion. Dispatch is now on the
+    # explicit, greppable `@pytest.mark.multi_identity` marker (registered in
+    # pytest_configure above) instead. The two currently-affected surfaces
+    # (test_user_provisioning_mixed.py's module-level pytestmark and
+    # TestAdminBootstrapBothAdmins's class-level pytestmark in
+    # test_webui_conformance_full.py) were converted to carry it explicitly
+    # -- same budget, same tests, stable trigger.
     _TOTP_WAIT_WORST_CASE_S = 62          # measured: conftest.py `62 - elapsed`
-    _MULTI_IDENTITY_HINTS = (
-        "bootstrap", "rotation", "both_admins", "admin2",
-        "provisioning", "mixed", "relogin", "seeded",
-    )
     for item in items:
         if any(m.name == "timeout" for m in item.iter_markers()):
             continue
-        _nid = item.nodeid.lower()
-        if any(h in _nid for h in _MULTI_IDENTITY_HINTS):
+        if item.get_closest_marker("multi_identity") is not None:
             # 300s of real work + the logins this shape must serialise on.
             _budget = 300 + (_TOTP_WAIT_WORST_CASE_S * 5)
         else:
