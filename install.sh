@@ -14100,12 +14100,23 @@ generate_secrets() {
 # The actual password NEVER leaves the system.
 # See: https://haveibeenpwned.com/API/v3#SearchingPwnedPasswordsByRange
 
+# _hibp_check_single sets _HIBP_LAST_STATUS as a side-channel to distinguish
+# WHY it returned 0 — "clean" (positively verified against the breach corpus)
+# vs "unchecked-*" (never actually queried: no curl, no hashing tool, or the
+# API was unreachable). Both used to collapse to the same "proceed" signal,
+# which is how _hibp_check_passwords ended up printing "all passwords clean"
+# for installs where nothing was ever checked (see that function's header
+# comment). return-code semantics are unchanged (0=proceed, 1=confirmed
+# breached — retry loops still work exactly as before); only the NEW
+# _HIBP_LAST_STATUS variable is added, read by the callers below to build an
+# honest final summary.
 _hibp_check_single() {
   local label="$1"
   local password="$2"
 
   # Skip if no curl or no internet
   if ! command -v curl >/dev/null 2>&1; then
+    _HIBP_LAST_STATUS="unchecked-no-curl"
     return 0
   fi
 
@@ -14118,6 +14129,7 @@ _hibp_check_single() {
   elif command -v openssl >/dev/null 2>&1; then
     sha1_hash="$(printf '%s' "$password" | openssl dgst -sha1 | awk '{print toupper($NF)}')"
   else
+    _HIBP_LAST_STATUS="unchecked-no-hash-tool"
     return 0  # Can't hash — skip silently
   fi
 
@@ -14131,7 +14143,12 @@ _hibp_check_single() {
     "https://api.pwnedpasswords.com/range/${prefix}" 2>/dev/null || echo "")"
 
   if [[ -z "$response" ]]; then
-    return 0  # API unreachable — skip silently (air-gapped, offline, etc.)
+    # API unreachable — do NOT claim a check happened. This is a legitimate
+    # state (air-gapped, offline, corporate egress ring-fence, transient
+    # network failure) but it is NOT "verified clean" and must never be
+    # reported as such.
+    _HIBP_LAST_STATUS="unchecked-unreachable"
+    return 0
   fi
 
   # Check if our suffix appears in the response
@@ -14140,10 +14157,38 @@ _hibp_check_single() {
 
   if [[ -n "$match_count" && "$match_count" -gt 0 ]]; then
     log_warn "HIBP: ${label} password found in ${match_count} data breach(es) — regenerating..."
+    _HIBP_LAST_STATUS="breached"
     return 1  # Compromised
   fi
 
+  _HIBP_LAST_STATUS="clean"
   return 0  # Clean
+}
+
+# _hibp_tally_result: read the just-set _HIBP_LAST_STATUS for one credential's
+# FINAL check attempt (i.e. called once per credential, after its retry loop
+# has concluded) and fold it into the three run-level counters below. Global
+# counters (not `local`) so both the inline admin1/admin2 loops in
+# _hibp_check_passwords and _hibp_check_and_regen can share them.
+_hibp_tally_result() {
+  case "${_HIBP_LAST_STATUS:-}" in
+    clean)
+      _HIBP_CLEAN_COUNT=$(( _HIBP_CLEAN_COUNT + 1 ))
+      ;;
+    breached)
+      # Retry loop gave up after max_retries while still breached — the
+      # (breached) password was used anyway. Must not be reported as clean.
+      _HIBP_BREACHED_COUNT=$(( _HIBP_BREACHED_COUNT + 1 ))
+      ;;
+    unchecked-*)
+      _HIBP_UNCHECKED_COUNT=$(( _HIBP_UNCHECKED_COUNT + 1 ))
+      ;;
+    *)
+      # Defensive: an unexpected/missing status is treated as unchecked,
+      # never as clean — fail closed on the reporting side too.
+      _HIBP_UNCHECKED_COUNT=$(( _HIBP_UNCHECKED_COUNT + 1 ))
+      ;;
+  esac
 }
 
 _hibp_check_passwords() {
@@ -14162,6 +14207,13 @@ _hibp_check_passwords() {
 
   local max_retries=3
 
+  # Run-level tally — see _hibp_tally_result. Distinguishes "checked, none
+  # breached" from "could not check" from "still breached, used anyway" so
+  # the final summary line never asserts a check that never happened.
+  _HIBP_CLEAN_COUNT=0
+  _HIBP_UNCHECKED_COUNT=0
+  _HIBP_BREACHED_COUNT=0
+
   # Check admin1 — regenerate if compromised (extremely unlikely for 36-char random)
   local attempt=0
   while ! _hibp_check_single "Admin 1 (${GEN_ADMIN1_USERNAME})" "$GEN_ADMIN1_PASSWORD"; do
@@ -14173,6 +14225,7 @@ _hibp_check_passwords() {
     GEN_ADMIN1_PASSWORD="$(_gen_password)"
     printf "%s" "$GEN_ADMIN1_PASSWORD" > "${WORK_DIR}/docker/secrets/admin1_password"
   done
+  _hibp_tally_result
 
   # Check admin2
   attempt=0
@@ -14184,13 +14237,35 @@ _hibp_check_passwords() {
     GEN_ADMIN2_PASSWORD="$(_gen_password)"
     printf "%s" "$GEN_ADMIN2_PASSWORD" > "${WORK_DIR}/docker/secrets/admin2_password"
   done
+  _hibp_tally_result
 
   # Check service passwords (postgres, redis, grafana)
   _hibp_check_and_regen "postgres" "$GEN_POSTGRES_PASSWORD" "${WORK_DIR}/docker/secrets/postgres_password" $max_retries
   _hibp_check_and_regen "redis" "$GEN_REDIS_PASSWORD" "${WORK_DIR}/docker/secrets/redis_password" $max_retries
   _hibp_check_and_regen "grafana" "$GEN_GRAFANA_PASSWORD" "${WORK_DIR}/docker/secrets/grafana_admin_password" $max_retries
 
-  log_success "HIBP breach check complete — all passwords clean"
+  # Honest summary: only claim "all clean" when every credential was
+  # POSITIVELY verified. "Unreachable" (air-gapped, offline, egress
+  # ring-fence, transient network failure — the general online-install case,
+  # not just --air-gap/--offline which already return early above) and
+  # "still breached after max retries" are both reported distinctly and
+  # never folded into a false "clean" claim.
+  local _hibp_total=$(( _HIBP_CLEAN_COUNT + _HIBP_UNCHECKED_COUNT + _HIBP_BREACHED_COUNT ))
+  if [[ "$_HIBP_BREACHED_COUNT" -gt 0 ]]; then
+    log_warn "HIBP breach check: ${_HIBP_BREACHED_COUNT} of ${_hibp_total} password(s) remained flagged as breached"
+    log_warn "  after ${max_retries} regeneration attempts and were used anyway. Rotate these credentials."
+    if [[ "$_HIBP_UNCHECKED_COUNT" -gt 0 ]]; then
+      log_warn "  ${_HIBP_UNCHECKED_COUNT} other password(s) could not be checked at all (see below)."
+    fi
+  elif [[ "$_HIBP_UNCHECKED_COUNT" -gt 0 ]]; then
+    log_warn "HIBP breach check: could not verify ${_HIBP_UNCHECKED_COUNT} of ${_hibp_total} password(s)"
+    log_warn "  against api.pwnedpasswords.com (network unreachable, or curl/hashing tool missing)."
+    log_warn "  These passwords were NOT confirmed clean. If a breach is suspected, rotate them"
+    log_warn "  once connectivity is restored — see docs/operations/air-gap-install.md 'HIBP in"
+    log_warn "  air-gap mode' for the rotation procedure (applies equally here)."
+  else
+    log_success "HIBP breach check complete — all ${_hibp_total} passwords verified clean via api.pwnedpasswords.com"
+  fi
 }
 
 _hibp_check_and_regen() {
@@ -14208,6 +14283,7 @@ _hibp_check_and_regen() {
     password="$(_gen_password)"
     printf "%s" "$password" > "$secret_file"
   done
+  _hibp_tally_result
 
   # Update the module-level variable
   local upper_label
