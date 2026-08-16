@@ -163,6 +163,16 @@ _require_k8s_tools() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker/docker-compose.yml"
 REMOVE_VOLUMES="false"
+# YSG-RISK-197 follow-up (2026-08-16): count of anonymous dangling volumes the
+# ANON-VOL-LEAK reconciliation pass found but did NOT remove (cannot be
+# positively attributed to this project — Docker/Podman anonymous volumes
+# carry no project label; see the reconciliation pass below and
+# CROSS-ORG-DANGLING-VOL-2026-07-22 for why blind-removal is unsafe on a
+# shared/multi-org host). Declared here, unconditionally, so it is always
+# defined under `set -u` by the time the final summary line reads it —
+# the reconciliation pass itself only runs when REMOVE_VOLUMES=true and
+# RUNTIME_SUBTYPE != k8s.
+_ysg_unattributed_dangling_total=0
 RUNTIME="${RUNTIME:-}"
 YES="false"
 # Multi-instance (3.0 — scoping-draft §4a): explicit --project=<name> override to
@@ -2230,6 +2240,10 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
         echo "  [WARN] project label/name) — NOT removing (may belong to another org on a shared" >&2
         echo "  [WARN] host, or predate this fix). Review manually:" >&2
         echo "  [WARN]   ${RUNTIME} volume ls --filter dangling=true" >&2
+        # YSG-RISK-197 follow-up: carry the count to the final summary line so
+        # "All volumes deleted." is never printed while volumes the operator
+        # was just WARNed about are still sitting on the daemon, unremoved.
+        _ysg_unattributed_dangling_total=$(( _ysg_unattributed_dangling_total + _unattributed_count ))
     fi
 
     if [ "$_dangling_pruned" -eq 0 ] && [ "$_unattributed_count" -eq 0 ]; then
@@ -2303,4 +2317,25 @@ fi
 
 echo ""
 echo "Yashigani stopped."
-[ "$REMOVE_VOLUMES" = "true" ] && echo "All volumes deleted." || echo "Data volumes preserved."
+# YSG-RISK-197 follow-up (2026-08-16): "All volumes deleted." used to fire
+# unconditionally whenever --remove-volumes was passed, even when the
+# ANON-VOL-LEAK reconciliation pass just WARNed about unattributed anonymous
+# dangling volumes it deliberately left in place (see above — they cannot be
+# safely attributed to this project and must never be blind-removed, same
+# posture as CROSS-ORG-DANGLING-VOL-2026-07-22). This project's OWN
+# anonymous volumes are removed at the source now (_remove_containers -v)
+# and by `compose down --volumes`, so this count is either 0 (this run's
+# volumes are actually gone) or represents pre-existing/foreign dangling
+# volumes that are genuinely out of scope for an automated nuke — report
+# that honestly instead of claiming "all" when some were left untouched.
+if [ "$REMOVE_VOLUMES" = "true" ]; then
+    if [ "${_ysg_unattributed_dangling_total:-0}" -gt 0 ] 2>/dev/null; then
+        echo "This project's volumes deleted. ${_ysg_unattributed_dangling_total} unattributed dangling volume(s)"
+        echo "on this daemon were left in place (not safely attributable to this project — see WARN"
+        echo "above); review manually with: ${RUNTIME:-docker} volume ls --filter dangling=true"
+    else
+        echo "All volumes deleted."
+    fi
+else
+    echo "Data volumes preserved."
+fi
