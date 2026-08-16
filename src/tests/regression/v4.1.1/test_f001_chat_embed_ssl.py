@@ -290,100 +290,82 @@ class TestChatNonStreamHttpsOllamaUrl:
 # ---------------------------------------------------------------------------
 # F. Chat completions — streaming (SSE) path, https ollama_url
 #
-# Strategy: set opa_url="" so the "use_streaming=False if opa_url" gate does
-# not disable streaming (line 2598).  The _sse_generator is lazy; we consume
-# it by iterating the StreamingResponse body_iterator.  The Ollama CM is set
-# up to raise httpx.ConnectError inside _client.stream() — the generator
-# catches it and yields error + [DONE], completing cleanly.  After consumption
-# we verify ollama_async_client was called with the correct args.
+# STALE-TEST NOTE (2026-08-16, resolved as part of wiring src/tests/regression
+# into Tier-A): this class originally asserted that stream=True routed to a
+# raw incremental-token branch (the old _sse_generator) whose Ollama call used
+# ``_client.stream(...)``. commit c2928878 (SEC-FIX-YSG-STREAM-INSPECTION-
+# BYPASS, 2026-08-06, CRITICAL) made that raw-streaming branch UNREACHABLE
+# for governed (non-agent) chat completions: `use_streaming` is now
+# unconditionally forced False (openai_router.py ~3583-3590), so EVERY
+# stream=True request is answered by generating the response through the
+# IDENTICAL buffered Ollama call the stream=False path uses (``.post()`` via
+# ollama_async_client, see the "7b-local" branch), running it through full
+# response-side inspection, and only THEN wrapping it as a single-chunk SSE
+# stream (_sse_from_completion) so the client-visible OpenAI streaming
+# contract is preserved. gateway/streaming.py's StreamingInspector/
+# stream_response are retained but are no longer reachable from this
+# endpoint (see v4.1.2/test_streaming_inspection_bypass.py, which asserts
+# ``.stream()`` is never invoked and ``.post()`` always is — that property
+# is NOT re-asserted here to avoid duplicating a control already gated
+# elsewhere).
+#
+# What F-001 is actually about — SSL-safe transport (ollama_async_client vs
+# bare httpx.AsyncClient) for https ollama_url — still holds true for
+# stream=True, because stream=True now runs through the exact same
+# ollama_async_client(_state.ollama_url, timeout=120.0) call as stream=False.
+# Rewritten below to mock the (now buffered) ``.post()`` call — mirroring
+# TestChatNonStreamHttpsOllamaUrl — while still asserting the property this
+# class exists to protect: (a) ollama_async_client (not bare httpx) is used
+# for the https transport, with the correct timeout, and (b) stream=True
+# still yields a StreamingResponse (the F-STREAM client-visible contract).
 # ---------------------------------------------------------------------------
-
-def _make_sse_ollama_cm() -> tuple[MagicMock, MagicMock]:
-    """
-    Return (outer_cm, mock_ollama_ac_factory) where outer_cm is an async CM
-    whose inner client's .stream() context manager raises httpx.ConnectError
-    on __aenter__.  This triggers the generator's ConnectError handler cleanly.
-    """
-    # Inner stream CM raises ConnectError
-    stream_cm = MagicMock()
-    stream_cm.__aenter__ = AsyncMock(side_effect=httpx.ConnectError("test-cert-error"))
-    stream_cm.__aexit__ = AsyncMock(return_value=False)
-
-    # Client that .stream() returns the above CM
-    mock_client = AsyncMock()
-    mock_client.stream = MagicMock(return_value=stream_cm)
-
-    # Outer CM (the ollama_async_client result)
-    outer_cm = MagicMock()
-    outer_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    outer_cm.__aexit__ = AsyncMock(return_value=False)
-
-    return outer_cm
 
 
 class TestChatStreamHttpsOllamaUrl:
-    """_sse_generator must use ollama_async_client for https ollama_url."""
+    """stream=True (https ollama_url) must still use ollama_async_client for
+    the underlying Ollama call, and must still return an SSE StreamingResponse
+    to the client (F-STREAM contract), even though — post SEC-FIX-YSG-STREAM-
+    INSPECTION-BYPASS — that call is now the buffered ``.post()`` call shared
+    with the stream=False path, not a raw incremental ``.stream()`` call."""
 
     @pytest.mark.asyncio
     async def test_sse_https_routes_through_ollama_async_client(self):
         """
         When _state.ollama_url is https://caddy:11435/ollama and stream=True,
-        the _sse_generator MUST call ollama_async_client, not bare httpx.AsyncClient.
+        chat_completions MUST call ollama_async_client for the Ollama request
+        (not bare httpx.AsyncClient), and MUST still hand the client an SSE
+        StreamingResponse.
 
-        Regression: the old code in _sse_generator did
-            async with httpx.AsyncClient(timeout=120.0) as _client:
-                async with _client.stream("POST", ...) as _upstream:
-        which fails CERTIFICATE_VERIFY_FAILED on mTLS-Ollama fronts.
-
-        We set opa_url="" so the OPA streaming-disable gate at line 2598 does
-        not force use_streaming=False.  The generator is consumed to completion
-        via the ConnectError path (short-circuits cleanly).
+        Regression this guards: the original bug (pre-F-001) was bare
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(f"{_state.ollama_url}/api/chat", ...)
+        which fails CERTIFICATE_VERIFY_FAILED on mTLS-Ollama fronts. That
+        property is unchanged by SEC-FIX-YSG-STREAM-INSPECTION-BYPASS: the
+        buffered call stream=True now shares with stream=False still goes
+        through ollama_async_client, never bare httpx.
         """
         import contextlib
+        from starlette.responses import StreamingResponse
         from yashigani.gateway.openai_router import (
             ChatCompletionRequest,
             ChatMessage,
         )
 
         https_url = "https://caddy:11435/ollama"
-        outer_cm = _make_sse_ollama_cm()
 
-        mock_ollama_ac = MagicMock(return_value=outer_cm)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value=_make_chat_response_json())
+        mock_cm = _make_async_client_cm_post(mock_resp)
 
-        # For streaming we set opa_url="" to avoid the "disable-streaming-if-opa"
-        # gate, and streaming_enabled=True.
-        patches = [
-            patch(
-                "yashigani.inspection._ollama_transport.ollama_async_client",
-                mock_ollama_ac,
-            ),
-            patch(
-                "yashigani.gateway.openai_router._state",
-                _make_mock_state(https_url, opa_url="", streaming_enabled=True),
-            ),
-            patch(
-                "yashigani.gateway.openai_router._resolve_identity",
-                MagicMock(return_value=_mock_identity()),
-            ),
-            patch(
-                "yashigani.gateway.openai_router._opa_v1_check",
-                AsyncMock(return_value={
-                    "allow": True,
-                    "model_allowed": True,
-                    "reason": "ok",
-                }),
-            ),
-            patch(
-                "yashigani.gateway.openai_router.evaluate_client_policies",
-                AsyncMock(return_value={"allow": True}),
-            ),
-            # StreamingInspector is lazily imported from yashigani.gateway.streaming
-            # at line 2614 — patch the source module so the import picks it up.
-            patch(
-                "yashigani.gateway.streaming.StreamingInspector",
-                MagicMock(return_value=MagicMock()),
-            ),
-        ]
+        # opa_url="" — the response-leg OPA check (8c) is skipped, matching
+        # the existing non-stream tests' patch surface (no _opa_response_check
+        # patch needed); streaming_enabled=True documents that streaming is
+        # still nominally "on" (SEC-FIX forces use_streaming=False internally
+        # regardless — see class docstring).
+        mock_ollama_ac, patches = _base_chat_patches(
+            https_url, mock_cm, opa_url="", streaming_enabled=True,
+        )
 
         body = ChatCompletionRequest(
             model="llama3.2:3b",
@@ -391,29 +373,19 @@ class TestChatStreamHttpsOllamaUrl:
             stream=True,
         )
 
-        # IMPORTANT: consume the body_iterator INSIDE the patch context.
-        # The _sse_generator is lazy; it runs when iterated.  If the patches
-        # have been undone before iteration, the REAL ollama_async_client runs.
-        from starlette.responses import StreamingResponse
-
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
             from yashigani.gateway.openai_router import chat_completions
             result = await chat_completions(body, _make_mock_request())
 
-            assert isinstance(result, StreamingResponse), (
-                f"stream=True must return StreamingResponse; got {type(result)}"
-            )
+        assert isinstance(result, StreamingResponse), (
+            f"stream=True must return StreamingResponse; got {type(result)}"
+        )
 
-            # Consume the generator while patches are still active
-            chunks = []
-            async for chunk in result.body_iterator:
-                chunks.append(chunk)
-
-        # After consuming (still within assertions), check mock was called
         assert mock_ollama_ac.call_count >= 1, (
-            "_sse_generator must call ollama_async_client, not bare httpx.AsyncClient"
+            "chat_completions (stream=True) must call ollama_async_client, "
+            "not bare httpx.AsyncClient, for the underlying Ollama request"
         )
         actual_url = mock_ollama_ac.call_args_list[0][0][0]
         assert actual_url == https_url, (
@@ -423,27 +395,21 @@ class TestChatStreamHttpsOllamaUrl:
 
     @pytest.mark.asyncio
     async def test_sse_https_uses_correct_timeout(self):
-        """The SSE generator must call ollama_async_client with timeout=120.0."""
+        """stream=True must still call ollama_async_client with timeout=120.0
+        (same budget as the stream=False buffered path it now shares)."""
         import contextlib
+        from starlette.responses import StreamingResponse
         from yashigani.gateway.openai_router import ChatCompletionRequest, ChatMessage
 
         https_url = "https://caddy:11435/ollama"
-        outer_cm = _make_sse_ollama_cm()
-        mock_ollama_ac = MagicMock(return_value=outer_cm)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value=_make_chat_response_json())
+        mock_cm = _make_async_client_cm_post(mock_resp)
 
-        patches = [
-            patch("yashigani.inspection._ollama_transport.ollama_async_client", mock_ollama_ac),
-            patch("yashigani.gateway.openai_router._state",
-                  _make_mock_state(https_url, opa_url="", streaming_enabled=True)),
-            patch("yashigani.gateway.openai_router._resolve_identity",
-                  MagicMock(return_value=_mock_identity())),
-            patch("yashigani.gateway.openai_router._opa_v1_check",
-                  AsyncMock(return_value={"allow": True, "model_allowed": True})),
-            patch("yashigani.gateway.openai_router.evaluate_client_policies",
-                  AsyncMock(return_value={"allow": True})),
-            patch("yashigani.gateway.streaming.StreamingInspector",
-                  MagicMock(return_value=MagicMock())),
-        ]
+        mock_ollama_ac, patches = _base_chat_patches(
+            https_url, mock_cm, opa_url="", streaming_enabled=True,
+        )
 
         body = ChatCompletionRequest(
             model="llama3.2:3b",
@@ -451,23 +417,18 @@ class TestChatStreamHttpsOllamaUrl:
             stream=True,
         )
 
-        from starlette.responses import StreamingResponse
-
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
             from yashigani.gateway.openai_router import chat_completions
             result = await chat_completions(body, _make_mock_request())
 
-            assert isinstance(result, StreamingResponse)
-            # Consume inside context so patches are active when generator runs
-            async for _ in result.body_iterator:
-                pass
-
-        assert mock_ollama_ac.call_count >= 1
-        timeout = mock_ollama_ac.call_args_list[0][1].get("timeout")
+        assert isinstance(result, StreamingResponse)
+        call_kwargs = mock_ollama_ac.call_args_list[0][1]
+        timeout = call_kwargs.get("timeout")
         assert timeout == 120.0, (
-            f"SSE generator must call ollama_async_client with timeout=120.0; got {timeout!r}"
+            f"stream=True chat completion must call ollama_async_client with "
+            f"timeout=120.0; got {timeout!r}"
         )
 
 
