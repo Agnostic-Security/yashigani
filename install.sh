@@ -12025,6 +12025,13 @@ symbols = "!*,-._~"
 alphabet = string.ascii_letters + string.digits + symbols
 while True:
     pw = "".join(secrets.choice(alphabet) for _ in range(36))
+    # YSG-RISK-198: a password STARTING with '-' is parsed as an option flag by
+    # CLI/automation consumers (psql, curl, kubectl, getopt-based scripts), so a
+    # valid generated credential could break tooling non-deterministically —
+    # ~1/47 of runs with this alphabet. Reject leading '-' rather than removing
+    # it from the alphabet (which would cut entropy for every other position).
+    if pw[0] == "-":
+        continue
     if (any(c.isupper() for c in pw)
         and any(c.islower() for c in pw)
         and any(c.isdigit() for c in pw)
@@ -12039,7 +12046,10 @@ PY
     local _pw _i
     for _i in 1 2 3 4 5 6 7 8; do
       _pw="$(LC_ALL=C tr -dc 'A-Za-z0-9!*,._~-' < /dev/urandom 2>/dev/null | head -c 36)"
-      if [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
+      # YSG-RISK-198: reject a leading '-' — CLI/automation consumers parse it
+      # as an option flag. Same guard as the python3 path above.
+      if [[ "$_pw" != -* ]] \
+         && [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
         printf "%s" "$_pw"
         return 0
       fi
@@ -12050,7 +12060,10 @@ PY
     local _pw _i
     for _i in 1 2 3 4 5 6 7 8; do
       _pw="$(LC_ALL=C tr -dc 'A-Za-z0-9!*,._~-' < /dev/urandom | head -c 36)"
-      if [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
+      # YSG-RISK-198: reject a leading '-' — CLI/automation consumers parse it
+      # as an option flag. Same guard as the python3 path above.
+      if [[ "$_pw" != -* ]] \
+         && [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
         printf "%s" "$_pw"
         return 0
       fi
