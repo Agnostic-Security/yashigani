@@ -18,6 +18,68 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# sys.modules identity restore (775a05a1 pattern, applied here per the
+# 2026-08-16 pre-push code-quality review NB-1). Every test in this file
+# reloads yashigani.gateway.proxy and/or yashigani.gateway.agent_auth with a
+# test-specific TRUSTED_PROXY_CIDRS baked in at module-import time and never
+# restored -- unlike the openai_router hazard 775a05a1 fixed, no production
+# call site currently resolves either module via the 2-segment
+# `from yashigani.gateway import <name>` form (grep-confirmed), so this is
+# not a parent-attribute identity-split bug today. It IS a real, live
+# pollution bug: sys.modules[<dotted name>] is left holding the LAST test's
+# reloaded module (baked with that test's TRUSTED_PROXY_CIDRS), and because
+# that key is present (not evicted), any later code in the same process that
+# does `import yashigani.gateway.proxy` / `.agent_auth` gets the wrongly
+# -configured object instead of triggering a fresh, correctly-configured
+# import. This file is not currently wired into the shared Tier-A session
+# (src/tests/regression only), but pyproject.toml's `testpaths = ["src/tests"]`
+# means a bare `pytest` collects it into the same process as everything else,
+# and the review flagged it for the same treatment ahead of any future merge.
+_RESTORE_MODULE_PREFIXES = (
+    "yashigani.gateway.proxy",
+    "yashigani.gateway.agent_auth",
+)
+_RESTORE_PARENT = "yashigani.gateway"
+_RESTORE_ATTRS = ("proxy", "agent_auth")
+
+
+@pytest.fixture(autouse=True)
+def _restore_proxy_and_agent_auth_module_identity():
+    saved_modules = {
+        k: v for k, v in sys.modules.items()
+        if any(k == p or k.startswith(p + ".") for p in _RESTORE_MODULE_PREFIXES)
+    }
+    parent = sys.modules.get(_RESTORE_PARENT)
+    saved_attrs = {}
+    for attr in _RESTORE_ATTRS:
+        had = parent is not None and attr in vars(parent)
+        saved_attrs[attr] = (had, getattr(parent, attr, None) if had else None)
+    try:
+        yield
+    finally:
+        for k in list(sys.modules.keys()):
+            if any(k == p or k.startswith(p + ".") for p in _RESTORE_MODULE_PREFIXES):
+                if k not in saved_modules:
+                    del sys.modules[k]
+        sys.modules.update(saved_modules)
+        # Re-resolve the parent package at teardown time, not the pre-import
+        # snapshot -- if "yashigani.gateway" itself did not exist yet the
+        # first time this fixture ran, `parent` above was None and the
+        # reload below CREATED it as a side effect of importing "proxy"/
+        # "agent_auth". Restoring against a stale `None` reference would
+        # skip cleanup of the now-real parent's leaked attribute entirely
+        # (mutation-verified 2026-08-16 on the entrypoint sibling of this
+        # fix, test_tom_ysg_risk_180_pool_manager_prod_failclosed.py).
+        parent = sys.modules.get(_RESTORE_PARENT)
+        if parent is not None:
+            for attr, (had, value) in saved_attrs.items():
+                if had:
+                    setattr(parent, attr, value)
+                elif attr in vars(parent):
+                    delattr(parent, attr)
+
+
+# ---------------------------------------------------------------------------
 # Helpers: build a minimal Starlette Request-like object
 # ---------------------------------------------------------------------------
 
