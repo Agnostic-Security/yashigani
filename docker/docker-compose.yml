@@ -3,7 +3,7 @@
 # Last updated: 2026-06-15T00:00:00+01:00 (fix(postgres,letta): LETTA-002 — agent-db-init one-shot job ensures letta DB + pgvector exist on EVERY up, not just first initdb)
 # Last updated: 2026-06-13T00:00:00+01:00 (fix(redis): B1 — enable AOF+volatile-lru on main redis; identities/agents/allocations survive --upgrade container recreate)
 # Last updated: 2026-05-24T12:00:00+01:00 (security(secrets): PROBE-AG1 — per-key Docker named-secrets on langflow/letta/letta-pgbouncer; openclaw /run/secrets mount removed; closes NICO-V241-001 + YSG-RISK-060)
-# Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-055 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
+# Last updated: 2026-05-24T00:00:00+01:00 (feat(security): YSG-RISK-219 UA-10 — per-agent bridge isolation; langflow→letta and langflow→openclaw lateral TCP severed at L2)
 # Last updated: 2026-05-20T12:00:00+01:00 (fix(compose): revert AGENT-RUNTIME-003d — restore read_only:true on letta + single-file bind mount for openapi_letta.json + tmpfs /root/nltk_data)
 # Last updated: 2026-05-20T10:50:00+01:00 (fix(compose): AGENT-RUNTIME-003c drop sslmode=require from LETTA_PG_URI — pg8000 alembic path)
 # Last updated: 2026-05-20T10:30:00+01:00 (fix(compose): AGENT-RUNTIME-003b drop cd /tmp from letta shim + langflow ALEMBIC_LOG_TO_STDOUT)
@@ -498,7 +498,7 @@ services:
   # real admin socket with what it itself rendered — no secrets, no PKI
   # material, no other mount. Only backoffice can reach it at all
   # (caddy_broker_route_sock — caddy is NOT a peer). Design precedent:
-  # extractor-svc (LAURA-30-001 / YSG-RISK-080) — a pre-spawned, hardened,
+  # extractor-svc (LAURA-30-001 / YSG-RISK-234) — a pre-spawned, hardened,
   # single-purpose HTTP service that replaces a raw privileged API with a
   # narrow, validated contract.
   caddy-config-broker:
@@ -677,14 +677,14 @@ services:
       YASHIGANI_PII_MODE: ${YASHIGANI_PII_MODE:-log}
       # Cloud bypass OFF by default — admin must explicitly enable to allow PII to cloud LLMs
       YASHIGANI_PII_CLOUD_BYPASS: ${YASHIGANI_PII_CLOUD_BYPASS:-false}
-      # YSG-RISK-057 — response inspection is OFF by default (design-by-pairing).
+      # YSG-RISK-221 — response inspection is OFF by default (design-by-pairing).
       # Compliance customers (CMMC / ISO 27001 / SOC 2) MUST set BOTH:
       #   YASHIGANI_INSPECT_RESPONSES=true   (activates ResponseInspectionPipeline)
       #   YASHIGANI_OPA_URL=https://policy:8181  (already set above — OPA must be deployed)
       # Without inspection OPA never receives a sensitivity label, ceiling check
       # operates on PUBLIC by default (benign for non-compliance deployments).
       # Without OPA, inspection produces a classification with nothing to consume it.
-      # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-057 for rationale.
+      # See docs/operator-guide.md §2 for the opt-in recipe and YSG-RISK-221 for rationale.
       YASHIGANI_INSPECT_RESPONSES: ${YASHIGANI_INSPECT_RESPONSES:-false}
       # YASHIGANI_ORCH_AUTO_MODELS: comma-separated virtual model name(s) that,
       #   when selected in ui4, auto-trigger the qwen-brain orchestration executor
@@ -894,7 +894,7 @@ services:
     # EX-231-10: gateway joins caddy_internal (Caddy→gateway:8080) AND data
     # (gateway→redis, policy, ollama, pgbouncer outbound).
     # Does NOT join obs or edge.
-    # YSG-RISK-055 UA-10: gateway also joins all per-agent isolated bridges so
+    # YSG-RISK-219 UA-10: gateway also joins all per-agent isolated bridges so
     # it can reach each agent on the registered-upstream dispatch path.
     # Agents cannot reach each other via these bridges (each bridge has only
     # the agent service + gateway as members).
@@ -1114,7 +1114,7 @@ services:
       # leaf (internal_httpx_client / backoffice_client.crt) to the front — same as
       # the gateway change above. Front fails closed at the handshake until it does.
       OLLAMA_BASE_URL: https://caddy:11435/ollama
-      # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-080 fix, 2026-06-16).
+      # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-234 fix, 2026-06-16).
       # Backoffice calls the pre-spawned extractor-svc container over plain HTTP.
       # NO docker socket, NO socket-proxy, NO container API access in backoffice.
       # A compromised backoffice can only POST document bytes to extractor-svc:8090.
@@ -1282,7 +1282,7 @@ services:
       # Source: docker/secrets/audit-signing/ (gitignored, populated by
       # install.sh _provision_audit_signing_key).
       - ./secrets/audit-signing:/run/audit-signing:ro
-      # LAURA-30-001 / YSG-RISK-080 fix (Design A): NO docker socket mounted here.
+      # LAURA-30-001 / YSG-RISK-234 fix (Design A): NO docker socket mounted here.
       # Backoffice reaches the extractor via HTTP (extractor-svc:8090 on extractor_svc
       # internal bridge). The host-escape primitive is fully eliminated.
       #
@@ -1446,7 +1446,7 @@ services:
   # ---------------------------------------------------------------------------
   # Extractor Service — pre-spawned hardened document extraction worker
   #
-  # LAURA-30-001 / YSG-RISK-080 fix (Design A, 2026-06-16):
+  # LAURA-30-001 / YSG-RISK-234 fix (Design A, 2026-06-16):
   #   The previous design (commit 6fc10fc) used a tecnativa socket-proxy to filter
   #   docker socket calls. Laura proved that CONTAINERS=1 + POST=1 allows
   #   POST /containers/create with arbitrary HostConfig.Binds — the proxy is
@@ -2276,7 +2276,7 @@ services:
     # the full rationale now that every service inherits the same setting.
     dns_search: ["."]
     environment:
-      # YSG-RISK-073 cycle 7 / YSG-RISK-077 (BUG-C7-001): cert auth + pg_ident.
+      # YSG-RISK-227 cycle 7 / YSG-RISK-231 (BUG-C7-001): cert auth + pg_ident.
       # pgbouncer authenticates to postgres as auth_user via TLS client cert
       # (pgbouncer-auth_client.crt, CN=pgbouncer-auth) — no password exchange.
       # pg_hba carveout: `hostssl yashigani pgbouncer_authenticator 0.0.0.0/0 cert map=pgb-auth-map`
@@ -2290,17 +2290,17 @@ services:
       POOL_MODE: transaction
       MAX_CLIENT_CONN: "100"
       DEFAULT_POOL_SIZE: "20"
-    # Cycle 7 fix (YSG-RISK-073): DATABASE_URL exported without password.
+    # Cycle 7 fix (YSG-RISK-227): DATABASE_URL exported without password.
     # No secret read required — cert auth replaces password auth for auth_user.
     # edoburu entrypoint still needs DATABASE_URL to start; password component omitted.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        # YSG-RISK-073 cycle 7: cert auth — no password in DATABASE_URL.
+        # YSG-RISK-227 cycle 7: cert auth — no password in DATABASE_URL.
         # pgbouncer_authenticator auth_user authenticates to postgres via cert
         # (pgbouncer-auth_client.crt, CN=pgbouncer-auth, mapped via pg_ident).
-        # YSG-RISK-077: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
+        # YSG-RISK-231: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
         export AUTH_TYPE=scram-sha-256
         export DATABASE_URL="postgresql://pgbouncer_authenticator@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
@@ -2311,7 +2311,7 @@ services:
       - ./pki-key-mask/denied.mask:/run/secrets/ca_root.key:ro
       - ./pki-key-mask/denied.mask:/run/secrets/ca_intermediate.key:ro
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      # YSG-RISK-073 cycle 7: pgbouncer_authenticator_password redundant mount removed.
+      # YSG-RISK-227 cycle 7: pgbouncer_authenticator_password redundant mount removed.
       # ./secrets:/run/secrets:ro bulk mount above provides all needed certs.
       # Password secret no longer read (cert auth replaces SCRAM for auth_user).
     healthcheck:
@@ -2928,7 +2928,7 @@ services:
     mem_limit: 64m
     cpus: 0.2
     environment:
-      # YSG-RISK-073 cycle 7 / YSG-RISK-077 (BUG-C7-001): cert auth + pg_ident.
+      # YSG-RISK-227 cycle 7 / YSG-RISK-231 (BUG-C7-001): cert auth + pg_ident.
       # Same fix as main pgbouncer service. letta-pgbouncer authenticates to postgres
       # as auth_user via TLS client cert (letta-pgbouncer_client.crt, CN=letta-pgbouncer).
       # pg_ident map pgb-auth-map maps CN=letta-pgbouncer → pgbouncer_authenticator.
@@ -2940,23 +2940,23 @@ services:
       POOL_MODE: session
       MAX_CLIENT_CONN: "50"
       DEFAULT_POOL_SIZE: "20"
-    # Cycle 7 fix (YSG-RISK-073): DATABASE_URL exported without password.
+    # Cycle 7 fix (YSG-RISK-227): DATABASE_URL exported without password.
     # No secret read required — cert auth replaces password auth for auth_user.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        # YSG-RISK-073 cycle 7: cert auth — no password in DATABASE_URL.
+        # YSG-RISK-227 cycle 7: cert auth — no password in DATABASE_URL.
         # letta-pgbouncer auth_user authenticates to postgres via cert
         # (letta-pgbouncer_client.crt, CN=letta-pgbouncer, mapped via pg_ident).
-        # YSG-RISK-077: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
+        # YSG-RISK-231: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
         export AUTH_TYPE=scram-sha-256
         export DATABASE_URL="postgresql://pgbouncer_authenticator@postgres:5432/yashigani"
         exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
     volumes:
       - ./pgbouncer/pgbouncer-letta.ini:/etc/pgbouncer/pgbouncer.ini:ro
     # PROBE-AG1 fix: per-key Docker named-secrets — replaces wholesale ./secrets mount.
-    # YSG-RISK-073 cycle 7: pgbouncer_authenticator_password no longer mounted.
+    # YSG-RISK-227 cycle 7: pgbouncer_authenticator_password no longer mounted.
     # cert auth means no password is read — least-privilege: drop the secret from scope.
     # letta-pgbouncer needs exactly 3 secrets:
     #   ca_root.crt                      — server_tls_ca_file in pgbouncer-letta.ini
@@ -3985,7 +3985,7 @@ networks:
     driver: bridge
     enable_ipv6: false
     internal: true
-  # YSG-RISK-055 UA-10: per-agent isolated bridges (v2.24.1).
+  # YSG-RISK-219 UA-10: per-agent isolated bridges (v2.24.1).
   # v4.1 three-agent wrap (2026-07-07): AGENTS NO LONGER JOIN these bridges —
   # they live on the §2.6 split ringfences below. The *_isolated definitions
   # are retained TRANSITIONALLY because gateway (all three) and backoffice
@@ -4056,7 +4056,7 @@ networks:
     driver: bridge
     enable_ipv6: false
     internal: true
-  # Extractor service network (LAURA-30-001 / YSG-RISK-080 fix, Design A):
+  # Extractor service network (LAURA-30-001 / YSG-RISK-234 fix, Design A):
   # extractor-svc ↔ backoffice only. No other service joins this bridge.
   # internal:true — no internet reachability for extractor-svc (belt-and-suspenders
   # on top of the extractor service's own egress=none design: no outbound at all).

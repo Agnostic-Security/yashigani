@@ -1,5 +1,5 @@
 """
-Regression tests — YSG-RISK-131 (Iris systemic review, following the
+Regression tests — YSG-RISK-139 (Iris systemic review, following the
 live-reproduced 4.1.2 k8s chat blocker):
 
 ## The finding

@@ -531,7 +531,7 @@ def _agent_container_deploy_hint(
     separation between "register the capability envelope + broker route"
     (this transaction — an app-tier action) and "start the container" (a
     host-tier action) IS deliberate — backoffice has no docker/podman socket
-    access (LAURA-30-001 / YSG-RISK-080, the SAME boundary
+    access (LAURA-30-001 / YSG-RISK-234, the SAME boundary
     ``_agent_container_teardown_hint`` documents for decommission). That
     separation is not the gap.
 
@@ -609,7 +609,7 @@ def _agent_container_deploy_hint(
         ],
         "note": (
             "backoffice has no docker/podman socket access by design "
-            "(LAURA-30-001 / YSG-RISK-080) — this envelope/route registration "
+            "(LAURA-30-001 / YSG-RISK-234) — this envelope/route registration "
             "does NOT start the container. Run this from the host/operator "
             "shell. SCOPED explicitly to the 3 services this override "
             "touches: %r (the agent), %r (its svid-sidecar), and caddy "
@@ -1289,7 +1289,7 @@ def _agent_container_teardown_hint(
     the container+volume layer.
 
     Backoffice deliberately has NO docker/podman socket access
-    (LAURA-30-001 / YSG-RISK-080 — the container-API surface was a proven
+    (LAURA-30-001 / YSG-RISK-234 — the container-API surface was a proven
     privilege-escalation vector; see docker-compose.yml's backoffice service
     comment). This function therefore never executes anything — it returns
     command GUIDANCE (the operator's real invocation combines this override
@@ -1334,7 +1334,7 @@ def _agent_container_teardown_hint(
         ],
         "note": (
             "backoffice has no docker/podman socket access by design "
-            "(LAURA-30-001 / YSG-RISK-080) — run this from the host/operator "
+            "(LAURA-30-001 / YSG-RISK-234) — run this from the host/operator "
             "shell (or install.sh's remove-agent op), scoped to server_id=%r "
             "only via the -f override file and network name; no other "
             "agent or core service is named in these commands."
@@ -1405,7 +1405,7 @@ async def run_decommission_transaction(
     retry (every step is independently idempotent).
 
     Container/volume teardown is INTENTIONALLY NOT performed here —
-    backoffice has no docker/podman socket (LAURA-30-001 / YSG-RISK-080).
+    backoffice has no docker/podman socket (LAURA-30-001 / YSG-RISK-234).
     ``container_teardown_mode`` only selects which scoped command guidance
     ``_agent_container_teardown_hint()`` returns for the operator to run.
     """

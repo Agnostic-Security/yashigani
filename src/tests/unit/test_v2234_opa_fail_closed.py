@@ -420,7 +420,7 @@ class TestAnonymousCallerRejected:
 
 class TestOpaUndefinedResultFailClosed:
     """
-    LAURA-V243-001 (YSG-RISK-071): If OPA returns HTTP 200 with body
+    LAURA-V243-001 (YSG-RISK-225): If OPA returns HTTP 200 with body
     {"result": {}} (undefined rule — bundle mismatch or partially-loaded
     bundle), the absent "allow" key must default to False (DENY), not True
     (ALLOW).
@@ -431,7 +431,7 @@ class TestOpaUndefinedResultFailClosed:
     openai_router.py resolved to allow=True, silently letting the response
     through regardless of sensitivity ceiling.
 
-    Closes LAURA-V243-001 / YSG-RISK-071.
+    Closes LAURA-V243-001 / YSG-RISK-225.
     """
 
     def _make_async_client_mock(self, post_return=None):

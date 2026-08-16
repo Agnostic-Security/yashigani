@@ -1,6 +1,6 @@
 # Last updated: 2026-05-25T00:00:00+00:00
 """
-Podman seccomp override contract tests — BUG-NEW-002 / YSG-RISK-074.
+Podman seccomp override contract tests — BUG-NEW-002 / YSG-RISK-228.
 
 podman-compose 1.5.0 MERGES security_opt lists from override files (does not
 replace). The base docker-compose.yml carries: no-new-privileges:true,
@@ -29,7 +29,7 @@ These tests assert:
   5. install.sh sets YASHIGANI_SECCOMP_PROFILE to an absolute path (not relative).
   6. The escape hatch (YASHIGANI_SECCOMP_PROFILE=unconfined) is documented.
 
-YSG-RISK-074: BUG-NEW-002 — Podman seccomp env-var absolute-path form documented.
+YSG-RISK-228: BUG-NEW-002 — Podman seccomp env-var absolute-path form documented.
 """
 from __future__ import annotations
 
@@ -62,13 +62,13 @@ def test_base_compose_has_env_var_seccomp() -> None:
 
     install.sh sets YASHIGANI_SECCOMP_PROFILE to an absolute path at install time.
     The env-var form allows the operator to override with 'unconfined' if needed.
-    YSG-RISK-074.
+    YSG-RISK-228.
     """
     content = _read(BASE_COMPOSE)
     assert "seccomp=${YASHIGANI_SECCOMP_PROFILE" in content, (
         "Base docker-compose.yml: env-var seccomp form not found. "
         "The base compose must use seccomp=${YASHIGANI_SECCOMP_PROFILE:-./seccomp/yashigani.json} "
-        "to allow operator override with 'unconfined'. YSG-RISK-074."
+        "to allow operator override with 'unconfined'. YSG-RISK-228."
     )
 
 
@@ -80,12 +80,12 @@ def test_seccomp_profile_file_exists() -> None:
     """The seccomp profile must exist at docker/seccomp/yashigani.json.
 
     install.sh sets YASHIGANI_SECCOMP_PROFILE to the absolute path of this file.
-    YSG-RISK-074.
+    YSG-RISK-228.
     """
     assert SECCOMP_PROFILE.exists(), (
         f"Seccomp profile not found at {SECCOMP_PROFILE}. "
         "install.sh sets YASHIGANI_SECCOMP_PROFILE to this file's absolute path. "
-        "The file must exist for seccomp enforcement to work. YSG-RISK-074."
+        "The file must exist for seccomp enforcement to work. YSG-RISK-228."
     )
 
 
@@ -93,7 +93,7 @@ def test_seccomp_profile_is_valid_json() -> None:
     """The seccomp profile must be valid JSON.
 
     A corrupt or empty seccomp profile causes podman/docker to fail at container start.
-    YSG-RISK-074.
+    YSG-RISK-228.
     """
     content = _read(SECCOMP_PROFILE)
     try:
@@ -101,11 +101,11 @@ def test_seccomp_profile_is_valid_json() -> None:
     except json.JSONDecodeError as e:
         pytest.fail(
             f"Seccomp profile {SECCOMP_PROFILE} is not valid JSON: {e}. "
-            "YSG-RISK-074."
+            "YSG-RISK-228."
         )
     assert isinstance(parsed, dict), (
         f"Seccomp profile {SECCOMP_PROFILE} parsed to {type(parsed)}, expected dict. "
-        "A valid OCI seccomp profile is a JSON object. YSG-RISK-074."
+        "A valid OCI seccomp profile is a JSON object. YSG-RISK-228."
     )
 
 
@@ -113,13 +113,13 @@ def test_seccomp_profile_has_default_action() -> None:
     """The seccomp profile must have a defaultAction field.
 
     A seccomp profile without defaultAction is invalid (OCI spec requirement).
-    YSG-RISK-074.
+    YSG-RISK-228.
     """
     content = _read(SECCOMP_PROFILE)
     parsed = json.loads(content)
     assert "defaultAction" in parsed, (
         f"Seccomp profile {SECCOMP_PROFILE} missing 'defaultAction' field. "
-        "OCI seccomp profile must specify defaultAction. YSG-RISK-074."
+        "OCI seccomp profile must specify defaultAction. YSG-RISK-228."
     )
 
 
@@ -134,7 +134,7 @@ def test_podman_override_no_duplicate_seccomp() -> None:
     Adding seccomp= in the override creates a duplicate that confuses Podman:
     two --security-opt seccomp=... flags, with the relative path in the override
     failing because Podman resolves it from the VM's CWD, not the compose file dir.
-    The override only needs label=disable (for SELinux). YSG-RISK-074.
+    The override only needs label=disable (for SELinux). YSG-RISK-228.
     """
     content = _read(PODMAN_OVERRIDE)
     # Check for seccomp= entries in active (non-comment) lines
@@ -147,7 +147,7 @@ def test_podman_override_no_duplicate_seccomp() -> None:
                 f"Podman override line {i+1}: seccomp= entry found: '{stripped}'. "
                 "The override must NOT add seccomp= entries — podman-compose 1.5.0 "
                 "merges lists, creating duplicates. Base compose already sets seccomp "
-                "via YASHIGANI_SECCOMP_PROFILE. YSG-RISK-074."
+                "via YASHIGANI_SECCOMP_PROFILE. YSG-RISK-228."
             )
 
 
@@ -161,7 +161,7 @@ def test_install_sh_sets_seccomp_absolute_path() -> None:
     The absolute path (e.g. /path/to/yashigani/docker/seccomp/yashigani.json)
     is passed directly to `podman run --security-opt seccomp=/abs/path`, which
     Podman resolves correctly. Relative paths fail because Podman resolves them
-    from the VM's CWD, not the compose file directory. YSG-RISK-074.
+    from the VM's CWD, not the compose file directory. YSG-RISK-228.
     """
     content = _read(INSTALL_SH)
     # install.sh should set YASHIGANI_SECCOMP_PROFILE to WORK_DIR-based absolute path
@@ -169,13 +169,13 @@ def test_install_sh_sets_seccomp_absolute_path() -> None:
     assert "WORK_DIR" in content and "YASHIGANI_SECCOMP_PROFILE" in content and "seccomp" in content, (
         "install.sh: YASHIGANI_SECCOMP_PROFILE setting not found. "
         "install.sh must set YASHIGANI_SECCOMP_PROFILE to "
-        "${WORK_DIR}/docker/seccomp/yashigani.json (absolute path). YSG-RISK-074."
+        "${WORK_DIR}/docker/seccomp/yashigani.json (absolute path). YSG-RISK-228."
     )
     # Specifically check it uses WORK_DIR-based path (not relative)
     assert "_seccomp_profile=" in content or "YASHIGANI_SECCOMP_PROFILE" in content, (
         "install.sh: YASHIGANI_SECCOMP_PROFILE not set using WORK_DIR. "
         "Must be an absolute path like ${WORK_DIR}/docker/seccomp/yashigani.json. "
-        "YSG-RISK-074."
+        "YSG-RISK-228."
     )
 
 
@@ -188,28 +188,28 @@ def test_install_sh_documents_unconfined_escape_hatch() -> None:
 
     When a host kernel or Podman version rejects the seccomp profile,
     the operator can set YASHIGANI_SECCOMP_PROFILE=unconfined in the .env file
-    to disable the profile. This must be documented in install.sh. YSG-RISK-074.
+    to disable the profile. This must be documented in install.sh. YSG-RISK-228.
     """
     content = _read(INSTALL_SH)
     assert "unconfined" in content and "YASHIGANI_SECCOMP_PROFILE" in content, (
         "install.sh: unconfined escape hatch not documented for YASHIGANI_SECCOMP_PROFILE. "
         "Operators need to know they can set YASHIGANI_SECCOMP_PROFILE=unconfined "
-        "if the seccomp profile is rejected. YSG-RISK-074."
+        "if the seccomp profile is rejected. YSG-RISK-228."
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 6: YSG-RISK-074 reference in override file
+# Test 6: YSG-RISK-228 reference in override file
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_podman_override_references_ysg_risk_074() -> None:
-    """Podman override must reference YSG-RISK-074 in its comments.
+    """Podman override must reference YSG-RISK-228 in its comments.
 
     Ensures the override is correctly updated for v2.24.3 BUG-NEW-002 documentation.
     """
     content = _read(PODMAN_OVERRIDE)
-    assert "YSG-RISK-074" in content, (
-        "Podman override: YSG-RISK-074 reference not found. "
+    assert "YSG-RISK-228" in content, (
+        "Podman override: YSG-RISK-228 reference not found. "
         "The override must document the BUG-NEW-002 fix rationale. BUG-NEW-002."
     )
 

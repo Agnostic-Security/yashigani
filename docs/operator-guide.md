@@ -14,7 +14,7 @@ inline in `docker-compose.yml` or `docker-compose.override.yml`.
 
 ## 2. Enabling OPA + Response Inspection Pairing (Compliance Customers)
 
-> **Authority:** YSG-RISK-057 (risk-register.yml, accepted 2026-05-24, Tiago).
+> **Authority:** YSG-RISK-221 (risk-register.yml, accepted 2026-05-24, Tiago).
 > **Controls:** ASVS V14.1.1, CMMC SC.L2-3.13.10, ISO 27001 A.8.3.
 
 ### 2.1 What the pairing does
@@ -230,7 +230,7 @@ If your SSO IdP (OIDC or SAML) uses the same email address for both admin and us
 
 ## 6. PoolManager — Per-Identity Pod Spawning in Kubernetes
 
-> **Authority:** YSG-RISK-070 (risk-register.yml, accepted 2026-05-25, Tiago).
+> **Authority:** YSG-RISK-224 (risk-register.yml, accepted 2026-05-25, Tiago).
 > **Closes:** Tom #56 commit `7e653b1` option (b) — K8s API backend.
 
 ### 6.1 What the K8s backend does
@@ -387,7 +387,7 @@ tool call whose argument trips the bundled rogue `demo-mcp` causes the upstream 
 return a credential-exfil payload, which the gateway's ResponseInspection + egress
 OPA **block** before it reaches the user. A benign tool call passes through normally.
 This requires `YASHIGANI_INSPECT_RESPONSES=true` (demo mode sets it; off by default
-in prod — YSG-RISK-057).
+in prod — YSG-RISK-221).
 
 ---
 
@@ -399,7 +399,7 @@ Merkle checkpoints), and forwards events to your SIEM (Wazuh/Splunk/Elasticsearc
 
 Some log/audit records intentionally retain sensitive material **in clear text**
 for forensics — e.g. the flagged high-entropy tokens that floored a request to
-RESTRICTED (YSG-RISK-092). This is required: support + the SIEM need the values
+RESTRICTED (YSG-RISK-237). This is required: support + the SIEM need the values
 as-is to investigate *what* was flagged.
 
 **Operator requirement — encrypt log + audit storage at rest.** Because logs can

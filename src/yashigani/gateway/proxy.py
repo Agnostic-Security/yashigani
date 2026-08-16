@@ -322,7 +322,7 @@ def create_gateway_app(
         lifespan=_lifespan,
     )
 
-    # YSG-RISK-131: expose the SAME `_state` dict every middleware/route in
+    # YSG-RISK-139: expose the SAME `_state` dict every middleware/route in
     # this module already reads live (`state["key"]` / `state.get("key")`) so
     # `gateway/redis_selfheal.py` can repopulate it after a cold-boot Redis
     # failure without this module needing to know anything about self-heal.
@@ -373,7 +373,7 @@ def create_gateway_app(
                 logger.debug("cap_policy: gateway security_headers failed: %s", _pp_exc)
         return response
 
-    # YSG-RISK-131 self-heal: bounded lazy reconnect for every Redis-backed
+    # YSG-RISK-139 self-heal: bounded lazy reconnect for every Redis-backed
     # gateway subsystem that failed to connect at cold boot (e.g. k8s
     # boot-order race — yashigani-gateway scheduled before yashigani-redis,
     # see gateway/redis_selfheal.py docstring for full context). Registered
@@ -713,7 +713,7 @@ async def _proxy_request_body(
     #
     # YSG-RISK-140 (CRITICAL, T-3): this header is ONLY trustworthy when the caller
     # has proven a trusted transport — matching the SAME gate
-    # mcp_router_runtime._handle_mcp_call_inner already enforces (YSG-RISK-108
+    # mcp_router_runtime._handle_mcp_call_inner already enforces (YSG-RISK-252
     # T-3/T-4: X-Caddy-Verified-Secret validated, OR the per-install internal mesh
     # bearer). On gateway:8080 (public/Caddy-fronted) CaddyVerifiedMiddleware
     # already rejects every request without a valid secret before this code runs,
@@ -1017,7 +1017,7 @@ async def _proxy_request_body(
     if pipeline is not None and body_bytes:
         raw_query = _decode_body_safe(body_bytes)
         if raw_query:
-            # YSG-RISK-113: pipeline.process() performs a SYNCHRONOUS blocking
+            # YSG-RISK-257: pipeline.process() performs a SYNCHRONOUS blocking
             # httpx call to the classifier backend (Ollama et al). Calling it
             # directly here would hold the single-threaded asyncio event loop
             # hostage for the full backend timeout — starving every other
@@ -1189,7 +1189,7 @@ async def _proxy_request_body(
                 # 3.1 Phase 3 — pass agent_registry so caller allowed_tools
                 # can be resolved from the identity registry at call time.
                 agent_registry=state.get("agent_registry"),
-                # YSG-RISK-108 — pass audit_writer so mesh identity-header
+                # YSG-RISK-252 — pass audit_writer so mesh identity-header
                 # rejection events (T-3/T-4) reach the tamper-evident chain.
                 audit_writer=state.get("audit_writer"),
                 # RESTART-013 gap #1 — the SAME document_pipeline step 4d
@@ -1756,7 +1756,7 @@ def _proxy_response_sensitivity(
 
     When the ResponseInspectionPipeline is configured and the content is
     non-empty, attempt to classify response sensitivity.  Fall back to
-    "PUBLIC" when pipeline is absent (default per YSG-RISK-057) or when
+    "PUBLIC" when pipeline is absent (default per YSG-RISK-221) or when
     classification fails.
 
     Returns one of PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED.
@@ -1885,7 +1885,7 @@ async def _opa_proxy_response_check(
             # undefined for this input shape), the absent "allow" key MUST resolve
             # to DENY, not ALLOW. Mirrors openai_router._opa_response_check and the
             # MCP broker _opa.py. Closes LAURA-OPA-004 (same class as
-            # LAURA-V243-001 / YSG-RISK-071).
+            # LAURA-V243-001 / YSG-RISK-225).
             opa_allow = bool(result.get("allow", False))
             opa_reason = result.get("reason", "ok")
 

@@ -1006,7 +1006,7 @@ def step7d_set_sensitivity_ceilings(user_creds: dict[str, dict]) -> None:
     The rule blocks when rank(response_content) > rank(user.sensitivity_ceiling).
     Without a ceiling there is nothing to compare against, so the control cannot
     fire even when an operator has deliberately enabled it. This does NOT change the
-    product's safe-adoption default (response inspection stays opt-in per YSG-RISK-057
+    product's safe-adoption default (response inspection stays opt-in per YSG-RISK-221
     / install.sh — untouched); it only completes the *demo configuration* so that an
     operator who turns on inspection+OPA sees the cloud-9 MCP-injection result (which
     classifies RESTRICTED) blocked for these CONFIDENTIAL/INTERNAL-ceiling users.

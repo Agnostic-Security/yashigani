@@ -1,6 +1,6 @@
 # Podman rootless overrides — applied automatically by install.sh when RUNTIME=podman
 # Usage: podman compose -f docker/docker-compose.yml -f docker/docker-compose.podman-override.yml up -d
-# Last updated: 2026-05-25T00:00:00+00:00 (fix(podman): BUG-NEW-002 — seccomp relative path in override; no env-var interpolation — YSG-RISK-074)
+# Last updated: 2026-05-25T00:00:00+00:00 (fix(podman): BUG-NEW-002 — seccomp relative path in override; no env-var interpolation — YSG-RISK-228)
 #
 # P-9 healthcheck strategy (podman-healthcheck-silent-drop):
 #   Podman silently drops image-baked OCI HEALTHCHECK directives when compose
@@ -44,7 +44,7 @@ services:
   # container's internal USER directive switches to UID 1001 normally.
   gateway:
     security_opt:
-      # BUG-NEW-002 / YSG-RISK-074 (v2.24.3): seccomp path handling.
+      # BUG-NEW-002 / YSG-RISK-228 (v2.24.3): seccomp path handling.
       # podman-compose 1.5.0 MERGES security_opt lists from override files (not replace).
       # The base compose carries: no-new-privileges:true, seccomp=${YASHIGANI_SECCOMP_PROFILE:-...},
       # apparmor=${YASHIGANI_APPARMOR_PROFILE:-...}.
@@ -55,12 +55,12 @@ services:
       # resolves correctly (both Mac/Podman VirtioFS mount and Linux Podman native).
       # Note: if podman-compose 1.5.0 produces ENAMETOOLONG on a specific host, override
       # YASHIGANI_SECCOMP_PROFILE=unconfined in the .env file to disable the profile.
-      # YSG-RISK-074.
+      # YSG-RISK-228.
       - label=disable
 
   backoffice:
     security_opt:
-      # Same as gateway above — see BUG-NEW-002 / YSG-RISK-074 comment.
+      # Same as gateway above — see BUG-NEW-002 / YSG-RISK-228 comment.
       - label=disable
     # Parity with docker-compose.yml: YASHIGANI_AGENT_UPSTREAM_HOSTNAMES must be
     # set on both runtimes so the SSRF guard permits canonical bundle registrations

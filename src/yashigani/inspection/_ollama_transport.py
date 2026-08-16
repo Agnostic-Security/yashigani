@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Default request timeout mirrors the classifier's historical default.
 _DEFAULT_TIMEOUT = 30.0
 
-# YSG-RISK-113: hard ceiling on the CONNECT phase, decoupled from the (often
+# YSG-RISK-257: hard ceiling on the CONNECT phase, decoupled from the (often
 # much longer) read timeout that a caller passes for model-generation latency.
 # A backend that is completely unreachable (TCP refused / host down / no
 # listener) must fail in seconds, not wait out the full read timeout meant
@@ -58,7 +58,7 @@ def _is_mesh_url(base_url: str) -> bool:
 
 def _build_timeout(timeout: float | httpx.Timeout) -> httpx.Timeout:
     """Normalize *timeout* into an explicit httpx.Timeout with a fast-failing
-    connect phase (YSG-RISK-113 fail-fast hardening).
+    connect phase (YSG-RISK-257 fail-fast hardening).
 
     A bare float applies the SAME duration to connect/read/write/pool, which
     means a fully dead backend (nothing listening) waits just as long as a
@@ -83,7 +83,7 @@ def ollama_sync_client(
     ``timeout`` accepts a plain float or an ``httpx.Timeout`` (needed by the
     long-running model-pull stream). A bare float is normalized via
     :func:`_build_timeout` so the connect phase fails fast even when the
-    read timeout is long (YSG-RISK-113).
+    read timeout is long (YSG-RISK-257).
     """
     timeout = _build_timeout(timeout)
     if _is_mesh_url(base_url):

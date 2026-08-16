@@ -11,7 +11,7 @@ across Docker SDK, Podman SDK, and Kubernetes API. Falls back gracefully:
 Security: container-per-identity isolation is a CIAA compliance
 requirement. Stub mode should only be used in tests.
 
-K8s backend notes (YSG-RISK-070):
+K8s backend notes (YSG-RISK-224):
   - Detects in-cluster via KUBERNETES_SERVICE_HOST env + service account token file.
   - Pod creation uses CoreV1Api.create_namespaced_pod().
   - Pod naming matches Docker/Podman pattern: ysg-<service>-<short_id>-<random>.
@@ -24,7 +24,7 @@ K8s backend notes (YSG-RISK-070):
     helm/yashigani/templates/rbac-pool-manager.yaml). Least privilege — no
     cluster-wide permissions, no other resource types.
 
-Extractor backend (LAURA-30-001 / YSG-RISK-080 fix):
+Extractor backend (LAURA-30-001 / YSG-RISK-234 fix):
   HttpExtractorBackend calls the pre-spawned extractor service over plain HTTP.
   This completely eliminates the docker socket from backoffice — a compromised
   backoffice has only one capability: POST document bytes to the extractor service.
@@ -1028,7 +1028,7 @@ class KubernetesPodHandle:
 
 
 class HttpExtractorBackend:
-    """Pre-spawned extractor service backend (Design A, LAURA-30-001 / YSG-RISK-080).
+    """Pre-spawned extractor service backend (Design A, LAURA-30-001 / YSG-RISK-234).
 
     Instead of creating ephemeral containers per job (which required docker socket
     access and the body-blind tecnativa socket-proxy), backoffice calls the
@@ -1289,7 +1289,7 @@ def create_extractor_backend() -> Optional[
 ]:
     """Pick the backend that runs the EXTRACTOR sandbox.
 
-    LAURA-30-001 / YSG-RISK-080 — Design A (preferred):
+    LAURA-30-001 / YSG-RISK-234 — Design A (preferred):
       When YASHIGANI_EXTRACTOR_WORKER_URL is set (install.sh / compose sets this to
       http://extractor-svc:8090), use HttpExtractorBackend. This is the complete fix:
       backoffice has NO docker socket, NO container API access — it can only POST

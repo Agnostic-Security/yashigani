@@ -401,7 +401,7 @@ async def _classify_sensitivity(text: str) -> str:
     Fail-closed: if the classifier is unavailable OR raises, return RESTRICTED so
     an unclassifiable fragment cannot pass an egress sensitivity ceiling silently.
 
-    YSG-RISK-113: classify_decoded() is a SYNCHRONOUS blocking classifier call.
+    YSG-RISK-257: classify_decoded() is a SYNCHRONOUS blocking classifier call.
     Run it via asyncio.to_thread so a slow/dead backend cannot block this
     event loop's /healthz probe (DoS class — orchestrator agent-upstream leg).
     """
@@ -487,7 +487,7 @@ async def _inspect_result(text: str, identity, request_id: str):
     pipeline is enabled (YASHIGANI_INSPECT_RESPONSES=true), which is what makes the
     cloud-9 block fire.
 
-    YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier call. Run it
+    YSG-RISK-257: .inspect() is a SYNCHRONOUS blocking classifier call. Run it
     via asyncio.to_thread so a slow/dead backend cannot block this event
     loop's /healthz probe (DoS class — orchestrator agent-upstream leg).
     """

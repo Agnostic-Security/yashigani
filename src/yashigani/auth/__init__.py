@@ -34,7 +34,7 @@ from yashigani.auth.hibp_config import (
     mask_hibp_key, validate_hibp_key_format,
     resolve_hibp_api_key, get_hibp_key_status,
 )
-# YSG-RISK-109: per-tenant JWT signing key isolation
+# YSG-RISK-253: per-tenant JWT signing key isolation
 from yashigani.auth._jwt import derive_tenant_ec_key, TenantJwtKeyStore
 
 __all__ = [
@@ -62,6 +62,6 @@ __all__ = [
     "AuthSettingsStore",
     "mask_hibp_key", "validate_hibp_key_format",
     "resolve_hibp_api_key", "get_hibp_key_status",
-    # YSG-RISK-109: per-tenant JWT signing key isolation
+    # YSG-RISK-253: per-tenant JWT signing key isolation
     "derive_tenant_ec_key", "TenantJwtKeyStore",
 ]

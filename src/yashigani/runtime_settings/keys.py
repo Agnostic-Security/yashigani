@@ -55,7 +55,7 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         description=(
             "Per-authenticated-user token bucket refill rate (requests/second). "
             "Burst = 2x this value. Lower to throttle heavy users; raise for "
-            "high-volume API consumers. YSG-RISK-058."
+            "high-volume API consumers. YSG-RISK-222."
         ),
         allowed_type="float",
         env_var="YASHIGANI_RATE_LIMIT_PER_USER_RPS",
@@ -70,7 +70,7 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         description=(
             "Maximum requests from a single IP within the DDoS window before the "
             "IP is throttled (HTTP 429). Raise for large NAT deployments; lower "
-            "for stricter DDoS posture. YSG-RISK-056."
+            "for stricter DDoS posture. YSG-RISK-220."
         ),
         allowed_type="int",
         env_var="YASHIGANI_DDOS_PER_IP_LIMIT",
@@ -83,7 +83,7 @@ KNOWN_SETTINGS: list[SettingMeta] = [
         description=(
             "Fixed-window duration (seconds) for DDoS per-IP counter. "
             "Shorter = tighter burst window; longer = rolling average. "
-            "YSG-RISK-056."
+            "YSG-RISK-220."
         ),
         allowed_type="int",
         env_var="YASHIGANI_DDOS_WINDOW_SECONDS",

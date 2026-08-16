@@ -34,7 +34,7 @@
 # ClusterIP Service exposing the per-agent Caddy mesh-listener ports —
 # NEVER on the public LoadBalancer Service (see header rationale).
 #
-# YSG-RISK-128 fix: also exposes the Ollama mesh-mTLS front (:11435,
+# YSG-RISK-136 fix: also exposes the Ollama mesh-mTLS front (:11435,
 # configmaps.yaml's `:11435 {` block, gated on .Values.ollama.enabled) —
 # same "internal-only ClusterIP, never the public LoadBalancer" rationale
 # as the per-agent mesh ports above. Prior to this fix the yashigani-caddy
@@ -114,7 +114,7 @@ spec:
 # Gateway + backoffice egress: to the caddy pod on the {{ $system }} mesh
 # front. Registered-upstream dispatch (gateway) and the backoffice langflow
 # flow-create path both ride the front — the direct-to-agent egress allows
-# (YSG-RISK-055 UA-10) become transitional and retire with the K8s
+# (YSG-RISK-219 UA-10) become transitional and retire with the K8s
 # split-ringfence parity step.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

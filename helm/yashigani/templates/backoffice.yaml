@@ -352,7 +352,7 @@ spec:
             {{- end }}
             - name: YASHIGANI_OPA_URL
               value: "https://yashigani-policy:8181"
-            # YSG-RISK-125 fix (compose<->k8s name-resolution parity): user_ui.py
+            # YSG-RISK-133 fix (compose<->k8s name-resolution parity): user_ui.py
             # and user_agents.py's chat/agent proxy default to
             # os.environ.get("YASHIGANI_GATEWAY_MESH_URL", "http://gateway:8081/v1")
             # — the bare "gateway" hostname only resolves in Compose, where the
@@ -484,11 +484,11 @@ spec:
             # (backoffice MCP import screen). Same Ollama backend as the gateway.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default "true" | quote }}
-            # YSG-RISK-128 fix: backoffice never set OLLAMA_BASE_URL at all, so
+            # YSG-RISK-136 fix: backoffice never set OLLAMA_BASE_URL at all, so
             # entrypoint.py/routes/models.py fell back to their own Python
             # default "http://ollama:11434" — wrong on two counts on k8s: (1)
             # bare "ollama" doesn't resolve (compose-only hostname convention,
-            # same class of gap as YSG-RISK-125), and (2) even
+            # same class of gap as YSG-RISK-133), and (2) even
             # "yashigani-ollama:11434" is NetworkPolicy-blocked for backoffice
             # (allow-ollama-ingress only admits the caddy pod — v4.1 Phase
             # 1b-ii / LAURA-I1-01). Reuses gateway.env.ollamaUrl (single

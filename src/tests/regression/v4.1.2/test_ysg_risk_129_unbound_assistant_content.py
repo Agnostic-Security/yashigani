@@ -1,9 +1,9 @@
 """
-Regression tests — YSG-RISK-129: chat_completions() crashed with
+Regression tests — YSG-RISK-137: chat_completions() crashed with
 `UnboundLocalError: cannot access local variable 'assistant_content'`
 (also affects `backend_body`) instead of returning a clean error when a
 backend LLM/agent call failed. Found by Captain during k8s chat
-verification alongside the YSG-RISK-113 fix — same request path: a
+verification alongside the YSG-RISK-257 fix — same request path: a
 dead/slow backend must fail CLEANLY, never crash the handler.
 
 ## Root cause
@@ -37,7 +37,7 @@ fell through to the response-inspection section which references
      guard immediately after it raises a clean HTTPException(502) if either
      is still None — converting ANY future branch-completeness gap in that
      dispatch block into a clean error instead of a crash, composing with
-     the YSG-RISK-113 timeout/circuit-breaker fix so a dead/slow/misrouted
+     the YSG-RISK-257 timeout/circuit-breaker fix so a dead/slow/misrouted
      backend always fails clean.
 
 Each test below would crash with UnboundLocalError on the pre-fix code.
@@ -176,10 +176,10 @@ class TestRisk129AgentRegistryUnavailable:
             result = await chat_completions(body, _make_request())
 
         assert isinstance(result, JSONResponse), (
-            f"YSG-RISK-129: expected a clean JSONResponse, got {type(result)}"
+            f"YSG-RISK-137: expected a clean JSONResponse, got {type(result)}"
         )
         assert result.status_code == 503, (
-            f"YSG-RISK-129: expected 503 (agent_registry_unavailable), "
+            f"YSG-RISK-137: expected 503 (agent_registry_unavailable), "
             f"got {result.status_code}. Body: {result.body}"
         )
         body_json = json.loads(result.body)
@@ -212,7 +212,7 @@ class TestRisk129AgentRegistryUnavailable:
 
 
 class TestRisk129LocalOllamaBackendFailsClean:
-    """Composition with YSG-RISK-113: a dead/slow local Ollama backend must
+    """Composition with YSG-RISK-257: a dead/slow local Ollama backend must
     fail with a clean 502/503/504, never UnboundLocalError, and
     assistant_content must never be referenced while unbound."""
 

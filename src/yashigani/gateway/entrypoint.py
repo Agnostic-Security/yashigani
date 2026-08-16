@@ -284,7 +284,7 @@ def _build_app(mesh_mode: bool = False):
     # RBAC store, Agent registry, Capability-Policy store, Permission store —
     # Redis DB 3 (shared instance, separate key namespaces).
     #
-    # YSG-RISK-131 (Iris, live k8s @ 4.1.2, 17h uptime / 0 restarts, permanently
+    # YSG-RISK-139 (Iris, live k8s @ 4.1.2, 17h uptime / 0 restarts, permanently
     # degraded): a single-attempt try/except here left every one of these four
     # objects `None` for the pod's ENTIRE lifetime whenever `yashigani-redis`
     # Service-DNS wasn't resolvable at this exact instant (k8s boot-order race
@@ -329,7 +329,7 @@ def _build_app(mesh_mode: bool = False):
                 logger.warning(
                     "RBAC/Agent Redis unavailable after %d attempts (%s) — RBAC and "
                     "agent routing disabled at startup; a bounded lazy reconnect will "
-                    "keep retrying at request time (YSG-RISK-131 self-heal, "
+                    "keep retrying at request time (YSG-RISK-139 self-heal, "
                     "gateway/redis_selfheal.py)",
                     _RBAC_MAX_ATTEMPTS, exc,
                 )
@@ -699,7 +699,7 @@ def _build_app(mesh_mode: bool = False):
     # DDoS protector — Redis DB 5 (free, separate namespace from rl: and ddos: siblings).
     # Per-IP limit scales with licensed max_end_users — formula: max(5000, max_end_users*25).
     # Enterprise/unlimited → 100 000.  Caddy timeouts are the primary flood defence;
-    # this is a second-line per-IP extreme-volume gate only (YSG-RISK-056).
+    # this is a second-line per-IP extreme-volume gate only (YSG-RISK-220).
     # Tiago 2026-05-24: "tie the threshold to the number of users so you don't block
     # big deployments".
     # Override via YASHIGANI_DDOS_PER_IP_LIMIT / YASHIGANI_DDOS_WINDOW_SECONDS /

@@ -473,7 +473,7 @@ async def route_agent_call(request: Request, path: str, state: dict) -> Response
         try:
             resp_ct = upstream_resp.headers.get("content-type", "application/octet-stream")
             resp_body_text = upstream_resp.text
-            # YSG-RISK-113: .inspect() performs a SYNCHRONOUS blocking
+            # YSG-RISK-257: .inspect() performs a SYNCHRONOUS blocking
             # classifier call. Offload to a thread so a slow/dead backend
             # cannot block this event loop's /healthz probe (DoS class).
             resp_insp = await asyncio.to_thread(

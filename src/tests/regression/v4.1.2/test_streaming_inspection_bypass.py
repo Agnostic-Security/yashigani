@@ -386,7 +386,7 @@ class TestStreamingInspectionBypassClosed:
 class TestStreamingDecisionSourceGuard:
     """Guard against a future refactor silently reintroducing the
     config-dependent gate (mirrors the source-inspection style used by
-    YSG-RISK-129's regression suite)."""
+    YSG-RISK-137's regression suite)."""
 
     def test_source_does_not_gate_buffering_on_opa_url_truthiness(self):
         from yashigani.gateway import openai_router

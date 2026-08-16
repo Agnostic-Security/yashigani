@@ -1,5 +1,5 @@
 """
-YSG-RISK-109 — Per-tenant JWT signing key isolation (test suite).
+YSG-RISK-253 — Per-tenant JWT signing key isolation (test suite).
 
 Proves that HKDF-based per-tenant key derivation correctly isolates MCP
 identity JWTs across tenants so that:
@@ -372,7 +372,7 @@ class TestSecurityInvariants:
     def test_f1_cross_tenant_forgery_impossible(self, monkeypatch):
         """F1: Cross-tenant forgery is cryptographically impossible.
 
-        This is the regression proof for YSG-RISK-109:
+        This is the regression proof for YSG-RISK-253:
           - Before the fix: all tenants shared the same signing key, so a token
             from tenant A was verifiable with 'tenant B's key' (same key).
           - After the fix: HKDF derives distinct keys per tenant, so tenant A's

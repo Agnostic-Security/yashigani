@@ -675,7 +675,7 @@ async def import_mcp_server(
         # FINDING-V412-ONBOARDING-ROBUSTNESS #5 (Tom, 2026-07-21): this
         # ceremony registers the capability envelope + broker route but does
         # NOT start the agent's container — backoffice has no docker/podman
-        # socket access by design (LAURA-30-001 / YSG-RISK-080, the same
+        # socket access by design (LAURA-30-001 / YSG-RISK-234, the same
         # boundary #4's decommission `container_teardown` field documents).
         # `deploy` surfaces the exact scoped command the operator runs next,
         # closing the "what do I do now" documentation gap without backoffice
@@ -727,7 +727,7 @@ async def decommission_mcp_server(
     guidance the response's ``container_teardown`` field carries for the
     CONTAINER + VOLUME layer. Backoffice performs NO container-level action
     itself — it has no docker/podman socket access by design (LAURA-30-001 /
-    YSG-RISK-080; see docker-compose.yml's backoffice service comment). The
+    YSG-RISK-234; see docker-compose.yml's backoffice service comment). The
     operator (or install.sh) runs the returned scoped compose/helm command.
 
     Returns: {server_id, tenant_id, already_decommissioned, steps,

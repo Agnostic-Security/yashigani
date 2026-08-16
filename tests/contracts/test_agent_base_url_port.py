@@ -26,7 +26,7 @@ These tests:
   - Are added to the CI gate (ci.yml unit-test run) so they catch regression
     before any compose change ships
 
-Extended (BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076): cover JSON config files
+Extended (BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230): cover JSON config files
 (openclaw.json baseUrl) and Helm env vars (OPENCLAW_UPSTREAM_URL) per
 [[feedback_brief_cue_adjacent_abstractions]] — assertion scope is now
 "every gateway-URL reference in any agent config (env var, JSON, YAML) uses
@@ -36,7 +36,7 @@ A1 amendment principle: absence of a dispatch test = SKIP, not PASS.
 Prior E2E sweeps proved container-healthy and route-existence but NOT the
 OPENAI_API_BASE callback leg.  This gate closes that assumption gap.
 
-YSG-RISK-059 / YSG-RISK-076 / OWASP ASVS v5 V11.1 / A1 amendment.
+YSG-RISK-059 / YSG-RISK-230 / OWASP ASVS v5 V11.1 / A1 amendment.
 
 Last updated: 2026-05-25T00:00:00+00:00
 """
@@ -327,7 +327,7 @@ class TestHelmAgentBaseUrlPort:
         the mTLS handshake on :8080. OPENCLAW_UPSTREAM_URL is the Helm-side
         equivalent of openclaw.json baseUrl; both must target :8081.
 
-        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076.
+        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230.
         """
         text = self._helm_text()
         match = re.search(r'OPENCLAW_UPSTREAM_URL:\s*"?(http://[^"\s]+)"?', text)
@@ -338,7 +338,7 @@ class TestHelmAgentBaseUrlPort:
         assert f":{_MTLS_PORT}" not in url, (
             f"Helm OPENCLAW_UPSTREAM_URL uses mTLS port {_MTLS_PORT}: {url}\n"
             f"  Fix: change to http://yashigani-gateway:{_MESH_PORT}\n"
-            f"  BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076"
+            f"  BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230"
         )
         assert f":{_MESH_PORT}" in url, (
             f"Helm OPENCLAW_UPSTREAM_URL uses unexpected port: {url}\n"
@@ -361,7 +361,7 @@ class TestOpenclawJsonConfig:
     agent gateway-URL routing MUST cover ALL config surfaces — env var,
     JSON, YAML — not just the one format tested first.
 
-    YSG-RISK-076.
+    YSG-RISK-230.
     """
 
     _OPENCLAW_JSON = _REPO_ROOT / "docker" / "openclaw" / "openclaw.json"
@@ -384,7 +384,7 @@ class TestOpenclawJsonConfig:
         FAILS pre-Su-fix: "baseUrl": "http://gateway:8080/v1"
         PASSES post-Su-fix: "baseUrl": "http://gateway:8081/v1"
 
-        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076.
+        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230.
         """
         if not self._OPENCLAW_JSON.exists():
             pytest.skip("openclaw.json not found")
@@ -441,7 +441,7 @@ class TestOpenclawJsonConfig:
         Catches future additions of new provider blocks or endpoint overrides that
         inadvertently point at the mTLS-only port.
 
-        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076 — class-level assertion.
+        BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230 — class-level assertion.
         """
         if not self._OPENCLAW_JSON.exists():
             pytest.skip("openclaw.json not found")
@@ -450,5 +450,5 @@ class TestOpenclawJsonConfig:
         assert f"gateway:{_MTLS_PORT}" not in raw, (
             f"openclaw.json contains gateway:{_MTLS_PORT} reference.\n"
             f"  All gateway URLs must use port {_MESH_PORT} (plain-HTTP mesh).\n"
-            f"  BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-076"
+            f"  BUG-V241-OPENCLAW-EXTENDED / YSG-RISK-230"
         )

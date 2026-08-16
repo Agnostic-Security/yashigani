@@ -14,7 +14,7 @@ Two paths tested end-to-end:
         Authorization: Bearer <_INTERNAL_BEARER> AND X-Yashigani-Orchestration-Depth present
         → ctx.caller_agent_id == "gateway:orchestrator"
         → OPA input["caller"]["agent_id"] == "gateway:orchestrator"
-        (YSG-RISK-108/T-4: depth header alone is insufficient — internal bearer required)
+        (YSG-RISK-252/T-4: depth header alone is insufficient — internal bearer required)
 
 Phase 1 is ADDITIVE PLUMBING ONLY: no enforcement, no default-deny, no
 behavior change.  Unbound OPA policies that do not reference input.caller
@@ -536,7 +536,7 @@ class TestMcpRuntimeCallerFromOrchestrationHeader:
 
         req = MagicMock()
         req.state = MagicMock(spec=[])  # no agent_id
-        # YSG-RISK-108: legitimate orchestrator self-call carries internal bearer
+        # YSG-RISK-252: legitimate orchestrator self-call carries internal bearer
         # AND depth header.  Depth header alone is no longer sufficient (T-4 fix).
         from yashigani.gateway.openai_router import _INTERNAL_BEARER as _bearer
         req.headers = {

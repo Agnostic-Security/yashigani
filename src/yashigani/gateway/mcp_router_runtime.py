@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 def _mesh_caller_is_internal(request: Request) -> bool:
     """Return True iff the request proves internal mesh identity.
 
-    YSG-RISK-108 / T-3 + T-4 trust gate.
+    YSG-RISK-252 / T-3 + T-4 trust gate.
 
     The per-install YASHIGANI_INTERNAL_BEARER is present on ALL legitimate
     mesh callers (orchestrator self-calls, the 4.0 native ui4 chat path).
@@ -166,7 +166,7 @@ async def dispatch_mcp_call(
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None — for ceiling lookup
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3 tool permit
-    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108 mesh audit
+    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-252 mesh audit
     document_pipeline: Optional[object] = None,  # DocumentInspectionPipeline | None — RESTART-013 gap #1
     opa_url: str = "",  # RESTART-013 gap #1 — needed by the document bridge's OPA decision
 ) -> Response:
@@ -214,7 +214,7 @@ async def dispatch_mcp_call(
         tool restriction applies.  3.1 Phase 3 — tool allow-list enforcement.
     audit_writer:
         Optional AuditLogWriter instance.  When provided, mesh identity-header
-        rejection events (YSG-RISK-108 T-3/T-4) are emitted to the tamper-
+        rejection events (YSG-RISK-252 T-3/T-4) are emitted to the tamper-
         evident audit chain.  When absent, rejections are logged only (WARNING).
     document_pipeline:
         Optional DocumentInspectionPipeline instance (RESTART-013 gap #1).
@@ -255,7 +255,7 @@ async def _handle_mcp_call_inner(
     response_inspection_pipeline: Optional[object] = None,  # ResponseInspectionPipeline | None
     identity_registry: Optional[object] = None,  # IdentityRegistry | None
     agent_registry: Optional[object] = None,  # AgentRegistry | None — 3.1 Phase 3
-    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-108
+    audit_writer: Optional[object] = None,  # AuditLogWriter | None — YSG-RISK-252
     document_pipeline: Optional[object] = None,  # DocumentInspectionPipeline | None — RESTART-013 gap #1
     opa_url: str = "",  # RESTART-013 gap #1
 ) -> Response:
@@ -265,7 +265,7 @@ async def _handle_mcp_call_inner(
 
     agent_name is the path component — NEVER read from the request body.
     """
-    # ── YSG-RISK-108 / T-3 + T-4 — Mesh port identity-header trust gate ─────
+    # ── YSG-RISK-252 / T-3 + T-4 — Mesh port identity-header trust gate ─────
     #
     # Runs BEFORE any resource lookup so that spoof attempts against any path
     # (including non-existent agents that would 404) are caught and audited.
@@ -297,7 +297,7 @@ async def _handle_mcp_call_inner(
     _iid_raw = request.headers.get("x-yashigani-identity-id", "").strip()
     if _iid_raw and not _caller_is_trusted:
         logger.warning(
-            "mcp-runtime: YSG-RISK-108/T-3: unauthenticated caller on mesh port "
+            "mcp-runtime: YSG-RISK-252/T-3: unauthenticated caller on mesh port "
             "presented X-Yashigani-Identity-Id=%r without internal bearer or Caddy secret — "
             "stripped; caller treated as anonymous. path=%r",
             _iid_raw[:64],
@@ -330,7 +330,7 @@ async def _handle_mcp_call_inner(
                 _caller_agent_id = "gateway:orchestrator"
             else:
                 logger.warning(
-                    "mcp-runtime: YSG-RISK-108/T-4: unauthenticated caller on mesh port "
+                    "mcp-runtime: YSG-RISK-252/T-4: unauthenticated caller on mesh port "
                     "presented X-Yashigani-Orchestration-Depth=%r without internal bearer "
                     "or Caddy secret — NOT promoted to gateway:orchestrator. path=%r",
                     str(_depth_hdr)[:16],
@@ -456,7 +456,7 @@ async def _handle_mcp_call_inner(
     msg_id = msg.get("id")  # None for notifications
     is_notification = msg_id is None
 
-    # ── Identity settled above (top-of-function gate, YSG-RISK-108) ──────────
+    # ── Identity settled above (top-of-function gate, YSG-RISK-252) ──────────
     # 4.1 SEC-GAP-1: identity_id comes from request.state.ysg_principal (set by
     # the proxy.py boundary resolver or openai_router) as the authoritative source.
     # Falls back to the trust-gated X-Yashigani-Identity-Id header (_iid_raw).
@@ -782,7 +782,7 @@ async def _handle_mcp_call_inner(
 
         try:
             if response_inspection_pipeline is not None and upstream_response:
-                # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+                # YSG-RISK-257: .inspect() is a SYNCHRONOUS blocking classifier
                 # call — offload to a thread so a slow/dead backend cannot
                 # block this event loop's /healthz probe (DoS class).
                 resp_insp = await asyncio.to_thread(  # type: ignore[union-attr]

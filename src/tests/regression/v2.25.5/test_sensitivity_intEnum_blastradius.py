@@ -66,7 +66,7 @@ _LEVEL_CASES = [
 class TestSiteA:
     """orchestrator._classify_sensitivity() must return a string (legacy label).
 
-    YSG-RISK-113: _classify_sensitivity is now async (offloads the blocking
+    YSG-RISK-257: _classify_sensitivity is now async (offloads the blocking
     classifier call via asyncio.to_thread) — every call site below awaits it.
     """
 

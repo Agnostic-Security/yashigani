@@ -585,7 +585,7 @@ class PiiDetector:
 # WITHOUT depending on whether an operator has ``PiiDetector``
 # (``_state.pii_detector``) or the optional ``ResponseInspectionPipeline``
 # (``_state.response_inspection_pipeline`` — a performance toggle, see
-# YSG-RISK-057) configured/enabled. "Absolute" per the PCI DSS control means
+# YSG-RISK-221) configured/enabled. "Absolute" per the PCI DSS control means
 # this check cannot be turned off by an unrelated admin config toggle.
 # Decode-before-scan (``detect_decoded``) so an encoded PAN is caught too.
 # ---------------------------------------------------------------------------

@@ -428,7 +428,7 @@ gateway:
   #
   # Key spec (Nico mcp-identity-jwt-spec-20260529.md §2, LOCKED): EC P-384,
   # single root key per installation, per-tenant keys HKDF-derived at runtime
-  # (YSG-RISK-109) — never generate per-tenant Secrets. Non-KMS default
+  # (YSG-RISK-253) — never generate per-tenant Secrets. Non-KMS default
   # storage = PEM file, gateway UID only. Default rotation cadence 90 days,
   # via an explicit operator-triggered rotation — NEVER silently on
   # helm upgrade/reinstall (would desync JWKS across replicas and invalidate
@@ -460,7 +460,7 @@ gateway:
   env:
     upstreamUrl: ""
     opaUrl: "https://yashigani-policy:8181"
-    # YSG-RISK-128 fix: this MUST match docker-compose.yml's gateway/backoffice
+    # YSG-RISK-136 fix: this MUST match docker-compose.yml's gateway/backoffice
     # OLLAMA_BASE_URL (https://caddy:11435/ollama) — the NetworkPolicy hardening
     # in networkpolicy.yaml (v4.1 Phase 1b-ii / LAURA-I1-01) removed the direct
     # gateway/backoffice -> yashigani-ollama:11434 ingress rule; ONLY the caddy
@@ -475,7 +475,7 @@ gateway:
     # no code change needed. See caddy.yaml Service (port 11435 added) +
     # networkpolicy.yaml (already correct, unchanged by this fix).
     #
-    # YSG-RISK-128 FOLLOW-UP (live-verification catch, same day): the first cut
+    # YSG-RISK-136 FOLLOW-UP (live-verification catch, same day): the first cut
     # of this fix pointed at hostname "yashigani-caddy" — but that's the MAIN
     # LoadBalancer Service (public edge, only ports 80/443, deliberately never
     # carries the internal mesh port — see agent-ingress-fronts.yaml's own
@@ -2000,7 +2000,7 @@ pgbouncer:
   #   Option C isolation: dedicated Secret, NOT merged into yashigani-postgres-secrets.
   #   See secrets.yaml comment block for full provisioning instructions.
   authSecretName: ""
-  # authNetworkCidr REMOVED (YSG-RISK-050 close v2.24.0): the pg_hba A2 CIDR
+  # authNetworkCidr REMOVED (YSG-RISK-218 close v2.24.0): the pg_hba A2 CIDR
   # carveout is gone. pgbouncer_authenticator now presents pgbouncer-auth_client.crt
   # (dedicated outbound cert); the catch-all hostssl rule applies uniformly.
   # No CIDR override is needed. See iris-v240-ysg-risk-050-cert-separation-design.md.
@@ -2103,7 +2103,7 @@ modelAliases:
   #     forceLocal: true
 
 # ---------------------------------------------------------------------------
-# PoolManager — per-identity container spawning (YSG-RISK-070)
+# PoolManager — per-identity container spawning (YSG-RISK-224)
 # ---------------------------------------------------------------------------
 # The PoolManager provides container-per-identity isolation for agents registered
 # with upstream_url="pool://<image>". In K8s deployments, the KubernetesBackend
@@ -2113,7 +2113,7 @@ modelAliases:
 #   - Creates rbac-pool-manager.yaml Role + RoleBinding granting the gateway
 #     ServiceAccount pods CRUD in this namespace.
 #   - Creates NetworkPolicy rules allowing gateway → pool-pod dispatch and
-#     enforcing inter-pod isolation (UA-10, YSG-RISK-055).
+#     enforcing inter-pod isolation (UA-10, YSG-RISK-219).
 #   - Does NOT apply in Docker/Podman deployments (auto-detected in pool/backend.py).
 #
 # agentPort: the port pool-managed pods listen on. Must match the port declared

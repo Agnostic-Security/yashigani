@@ -2369,7 +2369,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     agent_upstream = None
     agent_protocol = "openai"
     if is_agent_call and not _state.agent_registry:
-        # YSG-RISK-129: is_agent_call=True but the agent_registry dependency
+        # YSG-RISK-137: is_agent_call=True but the agent_registry dependency
         # itself is unavailable (e.g. Redis-backed registry down/not yet
         # initialized). Without this guard, agent_upstream stays None, the
         # resolution block below is skipped entirely (its own `if not
@@ -3589,7 +3589,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             "config-independent for every governed chat completion."
         )
 
-    # YSG-RISK-129: assistant_content/backend_body are only ever assigned
+    # YSG-RISK-137: assistant_content/backend_body are only ever assigned
     # inside individual success-path branches of the try block below (agent
     # letta/langflow/openai-compat, cloud openai/anthropic, local ollama).
     # Every branch either assigns them, returns a JSONResponse directly, or
@@ -3838,7 +3838,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if env_token:
                     agent_headers["Authorization"] = f"Bearer {env_token}"
 
-                # YSG-RISK-139: registered upstreams under the v4.1 unified-sidecar
+                # YSG-RISK-264: registered upstreams under the v4.1 unified-sidecar
                 # dispatch repoint (§2.5) are the agent's Caddy INGRESS front —
                 # https://caddy:<mesh_port>/agents/<tenant>/<system> on compose,
                 # https://yashigani-caddy-mesh:<mesh_port>/agents/<tenant>/<system>
@@ -4100,7 +4100,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             detail="Backend communication error",
         )
 
-    # YSG-RISK-129: fail-closed backstop. The try block above either assigns
+    # YSG-RISK-137: fail-closed backstop. The try block above either assigns
     # assistant_content/backend_body on a success path, returns a JSONResponse
     # directly, or raises HTTPException (which exits the function immediately
     # via the except clauses above and never reaches this line). Reaching here
@@ -4130,7 +4130,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # v2.24.1 — GAP-3 / SEC-5: response-CONTENT sensitivity.
     # When pipeline is enabled and not skipped, this is set from the pipeline's
     # sensitivity classification of the response body.  When pipeline is off
-    # (default, YSG-RISK-057) it stays None so _opa_response_check falls back
+    # (default, YSG-RISK-221) it stays None so _opa_response_check falls back
     # to prompt sensitivity (explicitly documented fallback per the updated
     # v1_routing.rego MAX(prompt_sensitivity, response_sensitivity) rule).
     response_content_sensitivity: Optional[str] = None
@@ -4141,7 +4141,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             resp_session_id = identity.get("identity_id", request_id) if identity else request_id
             resp_agent_id = identity.get("slug", "openai-router") if identity else "openai-router"
 
-            # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+            # YSG-RISK-257: .inspect() is a SYNCHRONOUS blocking classifier
             # call (Ollama et al.). Run off the event loop so a slow/dead
             # backend cannot starve /healthz and every other coroutine on
             # this worker (DoS class — see risk register).
@@ -4200,7 +4200,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 7b-ii. Always-on MCP/agent result injection pattern scan (I5 invariant) ──
     # INDEPENDENT of YASHIGANI_INSPECT_RESPONSES — MCP/agent results are UNTRUSTED.
-    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-057),
+    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-221),
     # but injection pattern detection on untrusted agent results is MANDATORY.
     # Closes LAURA-30-002 / I5 invariant violation.
     if response_verdict == "clean" and assistant_content:
@@ -4365,7 +4365,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
         # Fail-closed (False default): an absent "allow" key means OPA returned an
         # undefined result (e.g. bundle partially loaded). Treat as DENY per
-        # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-071.
+        # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-225.
         if not resp_opa.get("allow", False):
             resp_opa_reason = resp_opa.get("reason", "response_policy_denied")
             # ── G-ORCH-OPA-3: evaluate-AND-LOG on the brain-REASONING leg ───
@@ -4427,7 +4427,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the "pci" data_tag is
     # derived from an ALWAYS-ON, config-independent Luhn-valid PAN scan
     # (yashigani.pii.contains_pci_pan) — NOT from the optional
-    # response_inspection_pipeline / pii_detector toggles (YSG-RISK-057).
+    # response_inspection_pipeline / pii_detector toggles (YSG-RISK-221).
     # POL-009 (pci_data_block, bound wildcard to every human, both
     # directions) must block a PAN in the response for EVERY human caller
     # regardless of their sensitivity_ceiling — a RESTRICTED ceiling
@@ -5949,7 +5949,7 @@ async def gate_relaxed_final(
         try:
             rid = identity.get("identity_id", request_id) if identity else request_id
             aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
-            # YSG-RISK-113: offload the blocking classifier call — see the
+            # YSG-RISK-257: offload the blocking classifier call — see the
             # chat_completions call site above for the full rationale.
             resp_result = await asyncio.to_thread(
                 _state.response_inspection_pipeline.inspect,
@@ -6110,7 +6110,7 @@ async def _opa_response_check(
     v2.24.1 — GAP-3 / SEC-5:
         `response_sensitivity` is the response-CONTENT sensitivity (from the
         ResponseInspectionPipeline).  It may be None when the pipeline is
-        disabled (default per YSG-RISK-057).
+        disabled (default per YSG-RISK-221).
         `prompt_sensitivity` is the REQUEST (prompt) sensitivity from step 3.
         OPA receives both; v1_routing.rego evaluates MAX(prompt, response)
         — the stricter of the two.
@@ -6207,7 +6207,7 @@ async def _opa_response_check(
                 # {"result": {}} (undefined rule — bundle mismatch or partial load),
                 # the absent "allow" key must resolve to DENY, not ALLOW. The Rego
                 # rule always sets allow explicitly in normal operation so this has
-                # no impact when OPA is healthy. Closes LAURA-V243-001 / YSG-RISK-071.
+                # no impact when OPA is healthy. Closes LAURA-V243-001 / YSG-RISK-225.
                 "allow": bool(result.get("allow", False)),
                 "reason": result.get("reason", "ok"),
             }

@@ -1,6 +1,6 @@
 {{- if .Values.poolManager.k8sBackend.enabled }}
 {{- /*
-  PoolManager K8s backend RBAC — YSG-RISK-070 (2026-05-25)
+  PoolManager K8s backend RBAC — YSG-RISK-224 (2026-05-25)
 
   The gateway pod spawns per-identity pods via the Kubernetes API when
   running in-cluster (KubernetesBackend in pool/backend.py). This requires
@@ -14,7 +14,7 @@
       once created; we kill-and-replace rather than mutate)
     - Subject: the existing `yashigani` ServiceAccount (gateway pod)
 
-  Trade-off documented in YSG-RISK-070:
+  Trade-off documented in YSG-RISK-224:
     - Gateway SA gains pods CRUD → compromise of the gateway pod allows
       arbitrary pod creation in the namespace.
     - Mitigation: Kyverno admission policies (admission-policies.yaml) enforce
@@ -35,9 +35,9 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: pool-manager
   annotations:
-    # YSG-RISK-070: gateway SA gains pods CRUD in namespace for per-identity pod spawning.
+    # YSG-RISK-224: gateway SA gains pods CRUD in namespace for per-identity pod spawning.
     # Kyverno admission policies enforce security context on all spawned pods.
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 rules:
   # ONLY pods. No services, secrets, configmaps, or other resources.
   - apiGroups: [""]
@@ -54,7 +54,7 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: pool-manager
   annotations:
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 subjects:
   - kind: ServiceAccount
     # Reuse the existing `yashigani` ServiceAccount (serviceaccount.yaml).

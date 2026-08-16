@@ -7,7 +7,7 @@ fail-closed result (PROMPT_INJECTION_ONLY, confidence=1.0).
 
 Thread-safe: swap() uses a lock so live config changes are atomic.
 
-YSG-RISK-113 (circuit breaker): a backend that has just failed
+YSG-RISK-257 (circuit breaker): a backend that has just failed
 ``_BREAKER_FAILURE_THRESHOLD`` times in a row is short-circuited — skipped
 without attempting another blocking network call — for
 ``_BREAKER_COOLDOWN_SECONDS``. This bounds worst-case per-request latency
@@ -42,7 +42,7 @@ _FAIL_CLOSED_RESULT = ClassifierResult(
     latency_ms=0,
 )
 
-# YSG-RISK-113 circuit-breaker tuning. Consecutive-failure count that opens
+# YSG-RISK-257 circuit-breaker tuning. Consecutive-failure count that opens
 # the circuit, and how long it stays open before a single half-open trial
 # attempt is allowed through.
 _BREAKER_FAILURE_THRESHOLD = 3
@@ -74,7 +74,7 @@ class BackendRegistry:
         self._audit = audit_writer
         self._lock = threading.Lock()
 
-        # YSG-RISK-113 circuit breaker state, keyed by backend name.
+        # YSG-RISK-257 circuit breaker state, keyed by backend name.
         self._breaker_lock = threading.Lock()
         self._breaker_failures: dict[str, int] = {}
         self._breaker_opened_at: dict[str, float] = {}
@@ -173,7 +173,7 @@ class BackendRegistry:
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _circuit_is_open(self, name: str) -> bool:
-        """YSG-RISK-113: True if *name*'s circuit is open and still cooling down.
+        """YSG-RISK-257: True if *name*'s circuit is open and still cooling down.
 
         A cooled-down circuit (elapsed >= _BREAKER_COOLDOWN_SECONDS since it
         opened) returns False here so exactly one half-open trial attempt is
@@ -208,12 +208,12 @@ class BackendRegistry:
         """
         Attempt classification on a single backend.
         Returns ClassifierResult on success, None on BackendUnavailableError
-        or when the backend's circuit is open (YSG-RISK-113).
+        or when the backend's circuit is open (YSG-RISK-257).
         Appends backend name to backends_tried regardless of outcome.
         """
         backends_tried.append(backend.name)
 
-        # YSG-RISK-113: skip the blocking network call entirely for a backend
+        # YSG-RISK-257: skip the blocking network call entirely for a backend
         # that has just failed repeatedly — every request during an outage
         # would otherwise re-pay the full connect/read timeout sequentially.
         if self._circuit_is_open(backend.name):

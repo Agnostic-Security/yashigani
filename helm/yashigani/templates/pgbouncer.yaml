@@ -53,7 +53,7 @@ spec:
             - name: pgbouncer
               containerPort: 5432
               protocol: TCP
-          # YSG-RISK-073 cycle 7 / YSG-RISK-077 (BUG-C7-001): cert auth + pg_ident.
+          # YSG-RISK-227 cycle 7 / YSG-RISK-231 (BUG-C7-001): cert auth + pg_ident.
           # pgbouncer authenticates to postgres as auth_user via TLS client cert
           # (pgbouncer-auth_client.crt, CN=pgbouncer-auth) — no password exchange.
           # DATABASE_URL still required for edoburu entrypoint (writes userlist.txt);
@@ -63,14 +63,14 @@ spec:
           args:
             - |
               set -e
-              # YSG-RISK-073 cycle 7: cert auth — no password in DATABASE_URL.
+              # YSG-RISK-227 cycle 7: cert auth — no password in DATABASE_URL.
               # pgbouncer_authenticator auth_user authenticates via cert (pgbouncer-auth_client.crt).
-              # YSG-RISK-077: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
+              # YSG-RISK-231: avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug.
               export AUTH_TYPE=scram-sha-256
               export DATABASE_URL="postgresql://pgbouncer_authenticator@${POSTGRES_HOST}:5432/yashigani"
               exec /entrypoint.sh pgbouncer /etc/pgbouncer/pgbouncer.ini
           env:
-            # YSG-RISK-073 cycle 7: DATABASE_URL exported without password.
+            # YSG-RISK-227 cycle 7: DATABASE_URL exported without password.
             # No secret read required — cert auth replaces password auth for auth_user.
             # pgbouncer-auth-secret volume mount REMOVED (not needed for cert auth).
             # YSG-SECRETS-DIST-002 blast radius REDUCED — auth secret no longer mounted.
@@ -127,7 +127,7 @@ spec:
               mountPath: /etc/pgbouncer/pgbouncer.ini
               subPath: pgbouncer.ini
               readOnly: true
-            # YSG-RISK-073 cycle 7: pgbouncer-auth-secret volume removed.
+            # YSG-RISK-227 cycle 7: pgbouncer-auth-secret volume removed.
             # cert auth means no password secret needed in pgbouncer container.
           {{- end }}
       {{- if .Values.mtls.enabled }}
@@ -140,7 +140,7 @@ spec:
             # own leaf + pgbouncer-auth leaf + libssl trust anchor only.
             # DOCUMENTED CROSS-IDENTITY EXCEPTION: pgbouncer legitimately
             # PRESENTS pgbouncer-auth_client.{crt,key} — cert-auth as auth_user
-            # to postgres (YSG-RISK-073 cycle 7 / YSG-RISK-077), referenced by
+            # to postgres (YSG-RISK-227 cycle 7 / YSG-RISK-231), referenced by
             # files/pgbouncer.ini. No other leaf keys / bootstrap tokens /
             # caddy_internal_hmac.
             items:
@@ -157,7 +157,7 @@ spec:
         - name: pgbouncer-config
           configMap:
             name: yashigani-pgbouncer-config
-        # YSG-RISK-073 cycle 7: pgbouncer-auth-secret volume removed.
+        # YSG-RISK-227 cycle 7: pgbouncer-auth-secret volume removed.
         # pgbouncer authenticates via cert (pgbouncer-auth_client.crt in pki-certs).
         # No separate auth password Secret required.
       {{- end }}

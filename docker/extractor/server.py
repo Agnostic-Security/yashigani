@@ -2,7 +2,7 @@
 """
 Yashigani sandboxed-extractor HTTP SERVER — runs INSIDE the long-lived extractor container.
 
-DESIGN (LAURA-30-001 / YSG-RISK-080 fix — Design A):
+DESIGN (LAURA-30-001 / YSG-RISK-234 fix — Design A):
   This server eliminates the host-escape primitive completely. Previously the extractor
   sandbox spawned ephemeral containers per job, requiring backoffice to reach the Docker
   socket (even through a socket-proxy). The tecnativa proxy is path/method-only — it

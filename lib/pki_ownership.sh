@@ -66,7 +66,7 @@
 # cap_drop:[ALL] + CAP_DAC_OVERRIDE interaction: compose lines 588–590.
 #
 # When adding a new service that reads a secret already owned by another UID,
-# prefer a per-consumer dedicated bind-mount (YSG-RISK-049/050 pattern) rather
+# prefer a per-consumer dedicated bind-mount (YSG-RISK-049/218 pattern) rather
 # than widening to a shared group. Only use GID-based sharing if per-consumer
 # mounts are architecturally infeasible — document the reason in this file.
 #
@@ -124,7 +124,7 @@ _YSG_PKI_SERVICE_MAP=(
   # Postgres: official image UID 999. 05-enable-ssl.sh reads key via `install`
   # as the postgres user after chown. Retro #3ad — v2.23.1.
   "postgres:999:0600"
-  # pgbouncer-auth: dedicated outbound cert for pgbouncer→postgres (YSG-RISK-050 close).
+  # pgbouncer-auth: dedicated outbound cert for pgbouncer→postgres (YSG-RISK-218 close).
   # UID 70 = pgbouncer container user. Mode 0600. Both pgbouncer instances read this cert
   # (pgbouncer and pgbouncer-letta share the same outbound server_tls_* cert pair).
   # CN=pgbouncer-auth; clientcert=verify-ca (not verify-full) is required on the pg_hba

@@ -115,7 +115,7 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
             )
 
         # Registry must be available.
-        # YSG-RISK-131: self._registry is snapshotted BY VALUE at __init__
+        # YSG-RISK-139: self._registry is snapshotted BY VALUE at __init__
         # time (gateway-app build). If the cold-boot RBAC/Agent Redis init
         # raced a k8s DNS-not-ready window and failed, this stays None for
         # the process lifetime unless something else keeps trying — fall

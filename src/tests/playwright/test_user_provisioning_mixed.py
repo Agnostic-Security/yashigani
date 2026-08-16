@@ -8,7 +8,7 @@ Why this shape:
   endpoint and says NOTHING about the admin UI's create form — the same blind spot
   that let LAURA-001 ship a broken chat UI three times while every API test stayed
   green, and that QA SOP 4.17 Rule 6 forbids ("no test may bypass the user pathway").
-- Creating through the UI also drives the ui4 step-up modal end-to-end. YSG-RISK-137
+- Creating through the UI also drives the ui4 step-up modal end-to-end. YSG-RISK-262
   ("admin step-up is universally broken from the browser") shipped precisely because
   step-up was only ever verified by direct API calls to /auth/stepup and never by
   typing a code into the real modal. This test closes that gap.
@@ -42,10 +42,19 @@ try:
 except ImportError:
     _PW_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(
-    not STACK_RUNNING or not _PW_AVAILABLE,
-    reason="Yashigani stack not reachable or playwright not installed",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not STACK_RUNNING or not _PW_AVAILABLE,
+        reason="Yashigani stack not reachable or playwright not installed",
+    ),
+    # FIND-0813-011 / NB-3 (2026-08-16): this file used to get the extended
+    # 610s timeout budget via a nodeid substring match ("provisioning" +
+    # "mixed" both hit the file path) -- see conftest.py's
+    # pytest_collection_modifyitems. Explicit now: 5/6 identities created
+    # here (3 UI + 2 API + the residual admin) each drive a fresh TOTP login,
+    # the exact multi-identity shape the extended budget exists for.
+    pytest.mark.multi_identity,
+]
 
 # FIND-0813-010: these used to be hardcoded 3 + 2 = 5, which exactly equals the
 # COMMUNITY end-user cap — leaving no room for the residual account the product
@@ -208,7 +217,7 @@ class TestMixedUserProvisioning:
 
             # ui4 routes mutations through ApiClient.mutate(), which raises the shared
             # step-up modal on 401 step_up_required. Type a REAL code into it — this is
-            # the browser path YSG-RISK-137 shipped broken because nothing tested it.
+            # the browser path YSG-RISK-262 shipped broken because nothing tested it.
             modal_input = page.locator('input[autocomplete="one-time-code"]')
             if modal_input.count() and modal_input.first.is_visible():
                 modal_input.first.fill(get_admin_totp_code())

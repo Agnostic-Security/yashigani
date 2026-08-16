@@ -1,5 +1,5 @@
 """
-BUG-C838004-CADDY-COPY / YSG-RISK-072 Contract Tests
+BUG-C838004-CADDY-COPY / YSG-RISK-226 Contract Tests
 Captain: Dockerfile COPY path validation against build.context.
 
 Regression guard for the bug introduced in commit c838004 where
@@ -122,7 +122,7 @@ class TestDockerfileCopyPathsResolveFromRepoRoot:
             f"build context (repo root = {REPO}):\n"
             + "\n".join(missing)
             + "\n\nThis is the bug class documented as BUG-C838004-CADDY-COPY / "
-            "YSG-RISK-072. The path must include the 'docker/' prefix when the "
+            "YSG-RISK-226. The path must include the 'docker/' prefix when the "
             "build context is the repo root."
         )
 
@@ -159,7 +159,7 @@ class TestDockerfileCopyPathsResolveFromRepoRoot:
                 f"'{ENTRYPOINT_CORRECT_COPY_SOURCE}'. "
                 "Build context is repo root (..); bare 'caddy/' prefix "
                 "resolves to a non-existent path. "
-                "Bug: BUG-C838004-CADDY-COPY / YSG-RISK-072."
+                "Bug: BUG-C838004-CADDY-COPY / YSG-RISK-226."
             )
 
 

@@ -970,7 +970,7 @@ def _gen_compose_override(
     ] + init_stanza_lines + [
         rootless_note.rstrip("\n") if rootless_note else "",
         "",
-        "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-055)",
+        "# W3-F1: isolated ringfence bridge — L2 default-deny containment (YSG-RISK-219)",
         "networks:",
         "  %s:" % ringfence_bridge,
         "    driver: bridge",

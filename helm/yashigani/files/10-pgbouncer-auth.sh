@@ -1,14 +1,14 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 # Yashigani v2.24.0 — pgbouncer auth_query postgres-side setup.
-# Last updated: 2026-05-25 (fix: YSG-RISK-073 cycle 7 — cert auth + pg_ident CN map)
+# Last updated: 2026-05-25 (fix: YSG-RISK-227 cycle 7 — cert auth + pg_ident CN map)
 #
 # YSG-RISK-049 architectural close — ref:
 #   internal-docs/yashigani/iris-v240-pgbouncer-auth-query-design.md
 #   internal-docs/yashigani/laura-v240-pgbouncer-auth-query-threat-model.md
-# YSG-RISK-050 closed — ref:
+# YSG-RISK-218 closed — ref:
 #   internal-docs/yashigani/iris-v240-ysg-risk-050-cert-separation-design.md
-# YSG-RISK-073 cycle 7 closed — cert auth + pg_ident; YSG-RISK-077 (platform SCRAM bug).
+# YSG-RISK-227 cycle 7 closed — cert auth + pg_ident; YSG-RISK-231 (platform SCRAM bug).
 #
 # Runs ONCE on first initdb (postgres entrypoint executes
 # /docker-entrypoint-initdb.d/*.sh alphabetically before starting the server).
@@ -28,7 +28,7 @@
 #   3. REVOKE EXECUTE from PUBLIC, GRANT EXECUTE to pgbouncer_authenticator only.
 #   4. REVOKE CONNECT on databases that pgbouncer_authenticator must not access.
 #   5. Writes pg_ident.conf CN mapping (pgb-auth-map).
-#   6. Inserts cert auth pg_hba carveout for pgbouncer_authenticator (YSG-RISK-073 cycle 7).
+#   6. Inserts cert auth pg_hba carveout for pgbouncer_authenticator (YSG-RISK-227 cycle 7).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -40,7 +40,7 @@ echo "[10-pgbouncer-auth] Starting pgbouncer auth_query postgres-side setup"
 # Grants: LOGIN + CONNECT to yashigani only + EXECUTE on ysg_pgbouncer_get_auth.
 # No table grants, no schema grants, no access to letta or postgres databases.
 #
-# NOTE on pg_hba auth method (YSG-RISK-073 cycle 7 — cert + pg_ident):
+# NOTE on pg_hba auth method (YSG-RISK-227 cycle 7 — cert + pg_ident):
 # The pg_hba carveout uses `cert map=pgb-auth-map`. Single-factor cert auth:
 # - cert method: pg16 requires verify-full (CN verified against pg_ident map).
 # - pg_ident map pgb-auth-map:
@@ -48,20 +48,20 @@ echo "[10-pgbouncer-auth] Starting pgbouncer auth_query postgres-side setup"
 #     letta-pgbouncer   → pgbouncer_authenticator  (letta sidecar pgbouncer)
 # - NO PASSWORD required: cert is the sole credential.
 #
-# WHY NOT scram-sha-256 (cycle 6 approach — broken on Mac/Podman / YSG-RISK-077):
+# WHY NOT scram-sha-256 (cycle 6 approach — broken on Mac/Podman / YSG-RISK-231):
 # pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug.
 # It computes incorrect SCRAM proofs when authenticating outbound as auth_user
 # on ARM64 Linux (including Mac Podman's ARM64 container runtime). The bug was
 # confirmed on Mac/Podman (cycle 7 failure) and the cycle 6 "live test PASS" was
 # run on the Linux VM only — same pgbouncer binary, different Podman network stack.
-# Platform SCRAM root cause documented in YSG-RISK-077.
+# Platform SCRAM root cause documented in YSG-RISK-231.
 #
 # WHY cert + pg_ident is SECURE (not a downgrade from SCRAM):
 # - cert method implies verify-full: full chain + CN verified (stronger than
 #   the old trust+clientcert=verify-ca which was only verify-ca).
 # - pg_ident mapping restricts to CN=pgbouncer-auth AND CN=letta-pgbouncer ONLY.
 #   Any other cert (even CA-signed) cannot authenticate as pgbouncer_authenticator.
-# - YSG-RISK-075 (Laura cycle 5): lateral-pivot attack via trust+clientcert allowed
+# - YSG-RISK-229 (Laura cycle 5): lateral-pivot attack via trust+clientcert allowed
 #   ANY CA-cert holder to impersonate pgbouncer_authenticator (11 certs on data net).
 #   cert+pg_ident closes this: only the two named CNs are mapped. All other data-
 #   network services hold certs with different CNs — none can impersonate.
@@ -156,12 +156,12 @@ $$;
 REVOKE CONNECT ON DATABASE template1 FROM pgbouncer_authenticator;
 SQL
 
-# ─── 4. pg_ident.conf CN map + cert pg_hba carveout (YSG-RISK-073 cycle 7) ──
-# BUG-NEW-001 / YSG-RISK-073: History of the pgbouncer_authenticator pg_hba carveout.
+# ─── 4. pg_ident.conf CN map + cert pg_hba carveout (YSG-RISK-227 cycle 7) ──
+# BUG-NEW-001 / YSG-RISK-227: History of the pgbouncer_authenticator pg_hba carveout.
 #
-# CYCLE 7 FIX: cert auth via pg_ident CN mapping (YSG-RISK-077 root cause).
+# CYCLE 7 FIX: cert auth via pg_ident CN mapping (YSG-RISK-231 root cause).
 #
-# ROOT CAUSE (YSG-RISK-077): pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM
+# ROOT CAUSE (YSG-RISK-231): pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM
 # client-side computation bug on ARM64 Linux. It sends incorrect SCRAM proofs
 # when authenticating outbound as auth_user. This affects Mac/Podman (ARM64
 # container runtime). Cycle 6 "live test PASS" was Linux VM only (same binary,
@@ -176,13 +176,13 @@ SQL
 # - NO PASSWORD: pgbouncer presents its TLS client cert; no SCRAM exchange.
 # - pgbouncer_authenticator role has no password (PASSWORD NULL).
 #
-# SECURITY vs TRUST+CLIENTCERT (Laura cycle 5 finding — YSG-RISK-075):
+# SECURITY vs TRUST+CLIENTCERT (Laura cycle 5 finding — YSG-RISK-229):
 # - cycle 5 trust+clientcert=verify-ca: ANY CA-cert holder can impersonate
 #   pgbouncer_authenticator (11 certs on data network; one compromise = full DB).
 #   Laura confirmed attack chain. Unacceptable.
 # - cycle 7 cert+pg_ident: ONLY certs with CN=pgbouncer-auth OR CN=letta-pgbouncer
 #   map to pgbouncer_authenticator. All other certs (11 on data net) have different
-#   CNs and cannot impersonate. YSG-RISK-075 lateral-pivot CLOSED.
+#   CNs and cannot impersonate. YSG-RISK-229 lateral-pivot CLOSED.
 #
 # SECURITY vs SCRAM+CLIENTCERT (cycle 6 — broken on Mac/Podman):
 # - cycle 6 scram-sha-256+clientcert=verify-ca: two-factor (cert + password).
@@ -223,7 +223,7 @@ sed -i '/^pgb-auth-map/d' "${_ident}"
 #   CN=pgbouncer-auth   (main pgbouncer — pgbouncer-auth_client.crt)
 #   CN=letta-pgbouncer  (letta sidecar — letta-pgbouncer_client.crt)
 {
-  printf '# YSG-RISK-073 cycle 7: pgbouncer cert CN → pgbouncer_authenticator (cert auth map)\n'
+  printf '# YSG-RISK-227 cycle 7: pgbouncer cert CN → pgbouncer_authenticator (cert auth map)\n'
   printf '# Both pgbouncer instances authenticate via cert; pg_ident maps their CN to the role.\n'
   printf 'pgb-auth-map  pgbouncer-auth    pgbouncer_authenticator\n'
   printf 'pgb-auth-map  letta-pgbouncer   pgbouncer_authenticator\n'
@@ -235,7 +235,13 @@ echo "[10-pgbouncer-auth] pg_ident.conf pgb-auth-map written"
 if grep -q "pgbouncer_authenticator" "${PGDATA}/pg_hba.conf"; then
   sed -i '/pgbouncer_authenticator/d' "${PGDATA}/pg_hba.conf"
   sed -i '/Amendment A2.*YSG-RISK-049/d' "${PGDATA}/pg_hba.conf"
+  sed -i '/YSG-RISK-227/d' "${PGDATA}/pg_hba.conf"
+  # Legacy marker sweep: this carveout was stamped YSG-RISK-073/075 before the
+  # 2026-08-16 register unification re-issued those ids to 227/229. An existing
+  # deployment's pg_hba.conf still carries the OLD markers, so upgrades must
+  # delete both forms or stale comment lines accumulate on every re-run.
   sed -i '/YSG-RISK-073/d' "${PGDATA}/pg_hba.conf"
+  sed -i '/YSG-RISK-075/d' "${PGDATA}/pg_hba.conf"
   sed -i '/TWO-FACTOR.*clientcert/d' "${PGDATA}/pg_hba.conf"
   sed -i '/pgbouncer 1.25.1.*SCRAM/d' "${PGDATA}/pg_hba.conf"
   sed -i '/Closes Laura cycle/d' "${PGDATA}/pg_hba.conf"
@@ -250,17 +256,17 @@ fi
 # awk inserts before the FIRST hostssl all match only (avoids duplicates for
 # the two catch-all lines 0.0.0.0/0 + ::/0 in pg_hba.conf).
 # awk is available in the pgvector/pgvector:pg16 Debian base image.
-echo "[10-pgbouncer-auth] Inserting cert+pg_ident carveout for pgbouncer_authenticator (YSG-RISK-073 cycle 7)"
+echo "[10-pgbouncer-auth] Inserting cert+pg_ident carveout for pgbouncer_authenticator (YSG-RISK-227 cycle 7)"
 if grep -q "^hostssl all" "${PGDATA}/pg_hba.conf"; then
   _hba="${PGDATA}/pg_hba.conf"
   _tmp="${PGDATA}/pg_hba.conf.new.$$"
   awk '
     /^hostssl all/ && !inserted {
-      print "# YSG-RISK-073 cycle 7: pgbouncer_authenticator auth_query -- cert auth via pg_ident CN map."
+      print "# YSG-RISK-227 cycle 7: pgbouncer_authenticator auth_query -- cert auth via pg_ident CN map."
       print "# cert method: PG16 verify-full (full chain + CN mapped via pg_ident pgb-auth-map)."
       print "# CN=pgbouncer-auth (main pgbouncer) + CN=letta-pgbouncer (sidecar) → pgbouncer_authenticator."
-      print "# NO password. Avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug (YSG-RISK-077)."
-      print "# Stronger than trust+clientcert: verify-full + CN-specific pg_ident map. YSG-RISK-075 CLOSED."
+      print "# NO password. Avoids pgbouncer 1.25.1 ARM64 SCRAM computation bug (YSG-RISK-231)."
+      print "# Stronger than trust+clientcert: verify-full + CN-specific pg_ident map. YSG-RISK-229 CLOSED."
       print "hostssl yashigani pgbouncer_authenticator 0.0.0.0/0  cert  map=pgb-auth-map"
       print "hostssl yashigani pgbouncer_authenticator ::/0        cert  map=pgb-auth-map"
       inserted = 1
@@ -270,7 +276,7 @@ if grep -q "^hostssl all" "${PGDATA}/pg_hba.conf"; then
   chown postgres:postgres "${_tmp}"
   chmod 0600 "${_tmp}"
   mv "${_tmp}" "${_hba}"
-  echo "[10-pgbouncer-auth] Inserted cert+pg_ident carveout for pgbouncer_authenticator (YSG-RISK-073 cycle 7)"
+  echo "[10-pgbouncer-auth] Inserted cert+pg_ident carveout for pgbouncer_authenticator (YSG-RISK-227 cycle 7)"
 else
   echo "[10-pgbouncer-auth] WARNING: no hostssl catch-all found — carveout will be needed at startup"
 fi
@@ -293,6 +299,6 @@ echo "  - Function yashigani.ysg_pgbouncer_get_auth: created/updated"
 echo "  - EXECUTE: pgbouncer_authenticator only (PUBLIC revoked)"
 echo "  - CONNECT letta: revoked from pgbouncer_authenticator"
 echo "  - pg_ident.conf pgb-auth-map: CN=pgbouncer-auth + CN=letta-pgbouncer → pgbouncer_authenticator"
-echo "  - pg_hba cert+pg_ident carveout: inserted for pgbouncer_authenticator (YSG-RISK-073 cycle 7)"
+echo "  - pg_hba cert+pg_ident carveout: inserted for pgbouncer_authenticator (YSG-RISK-227 cycle 7)"
 echo "  - pg_hba catch-all (scram-sha-256 clientcert=verify-ca): applies to all other roles"
-echo "  - YSG-RISK-073: CLOSED (cycle 7). YSG-RISK-075: CLOSED. YSG-RISK-077: documented (ARM64 SCRAM bug)."
+echo "  - YSG-RISK-227: CLOSED (cycle 7). YSG-RISK-229: CLOSED. YSG-RISK-231: documented (ARM64 SCRAM bug)."

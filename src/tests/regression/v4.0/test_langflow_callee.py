@@ -14,7 +14,7 @@ Verifies at config/structural level (no live deploy required):
 
 4.  Network isolation proof: the langflow service in docker-compose.yml joins ONLY
     langflow_isolated — NOT internet_egress, NOT data, NOT caddy_internal — so
-    every model call re-enters the gateway (UA-10 / YSG-RISK-055 invariant).
+    every model call re-enters the gateway (UA-10 / YSG-RISK-219 invariant).
 
 5.  Phase 5 caps in install.sh: the case for langflow sets _name="agent__langflow",
     allowed_paths contains "/v1/chat/completions", sensitivity_ceiling="INTERNAL".
@@ -436,7 +436,7 @@ class TestNetworkIsolationProof:
     def test_langflow_does_not_join_internet_egress(self):
         block = self._langflow_block()
         assert "internet_egress" not in block, (
-            "langflow must NOT join internet_egress network (UA-10 / YSG-RISK-055)"
+            "langflow must NOT join internet_egress network (UA-10 / YSG-RISK-219)"
         )
 
     def test_langflow_does_not_join_data_network(self):

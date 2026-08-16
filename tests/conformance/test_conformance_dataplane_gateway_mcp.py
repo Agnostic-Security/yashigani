@@ -1558,7 +1558,7 @@ async def test_mcp_dispatch_unknown_agent_name_404_not_500():
 
 
 def test_mcp_mesh_caller_is_internal_requires_valid_bearer_not_header_alone():
-    """YSG-RISK-108 T-3/T-4 trust gate: presenting an identity-forwarding
+    """YSG-RISK-252 T-3/T-4 trust gate: presenting an identity-forwarding
     header WITHOUT the per-install internal bearer must NOT be treated as an
     internal mesh caller -- proves the trust chain is bearer-anchored, not
     header-trusting."""
