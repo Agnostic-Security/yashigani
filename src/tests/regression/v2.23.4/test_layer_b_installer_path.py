@@ -91,8 +91,36 @@ class TestSec001NoAdminApiDurablePath:
     """SEC-001: registration writes DIRECTLY to the durable stores. It must not
     reacquire the admin HTTP path the original 401 bug lived on."""
 
+    @staticmethod
+    def _code_only(body: str) -> str:
+        """Strip comment lines before scanning.
+
+        Required in BOTH directions, which is why every test in this class now
+        routes through it:
+
+        - Negative assertions: the SEC-001 payload DOCUMENTS what it removed
+          ("no install_svc service account"), so a raw scan matches the
+          explanation and reports a regression that is not there.
+        - Positive assertions: a comment NAMING the thing satisfies the scan
+          just as well as the code doing it. Applying this to only the negative
+          half (as this file originally did) leaves the positive half hollow.
+
+        Proven, not assumed — FIND-0813-016, pre-push code-quality review
+        (Change Management 4.4): with SEC-001's durable path deleted outright
+        from install.sh and only the explanatory comment left behind, all four
+        tests still passed. The assertion was satisfied by install.sh:11430,
+        a comment inside the extracted function.
+        """
+        return "\n".join(
+            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
+        )
+
+    def _payload(self) -> str:
+        """The registration function's CODE — never its prose."""
+        return self._code_only(_extract_function("register_agent_bundles"))
+
     def test_uses_durable_store_and_registry(self):
-        body = _extract_function("register_agent_bundles")
+        body = self._payload()
         assert "AgentDurableStore" in body, (
             "SEC-001: registration must write via AgentDurableStore (Postgres). "
             "If this is gone, the no-admin-API path has been reverted."
@@ -101,22 +129,9 @@ class TestSec001NoAdminApiDurablePath:
             "SEC-001: registration must populate AgentRegistry (Redis db/3)."
         )
 
-    @staticmethod
-    def _code_only(body: str) -> str:
-        """Strip comment lines before scanning.
-
-        The SEC-001 payload DOCUMENTS what it removed ("no install_svc service
-        account"), so a raw substring scan matches the explanation and reports a
-        regression that is not there. Scanning prose instead of code is the exact
-        failure this file was rewritten to stop repeating.
-        """
-        return "\n".join(
-            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
-        )
-
     def test_no_admin_login_or_totp_or_stepup(self):
         """The backdoor-shaped surfaces SEC-001 removed must stay removed."""
-        body = self._code_only(_extract_function("register_agent_bundles"))
+        body = self._payload()
         for forbidden, why in (
             ("/auth/login",  "an admin session"),
             ("/auth/stepup", "a step-up elevation"),
@@ -137,7 +152,7 @@ class TestSec001NoAdminApiDurablePath:
         old one would have demanded the return of a credential the current
         design deliberately does without.
         """
-        body = _extract_function("register_agent_bundles")
+        body = self._payload()
         assert "X-Caddy-Verified-Secret" not in body, (
             "register_agent_bundles() sends X-Caddy-Verified-Secret again — that "
             "header only matters on the admin HTTP path SEC-001 removed. Its return "
@@ -147,7 +162,7 @@ class TestSec001NoAdminApiDurablePath:
     def test_runs_inside_the_mesh_isolated_backoffice_container(self):
         """The security argument for skipping HTTP auth is that this Python runs
         INSIDE backoffice (compose exec), on the data network only."""
-        body = _extract_function("register_agent_bundles")
+        body = self._payload()
         assert "python3 -c" in body, "registration payload is no longer executed in-container"
         assert re.search(r"exec\b.*backoffice|backoffice.*exec", body), (
             "registration must run via compose exec INSIDE the backoffice container — "

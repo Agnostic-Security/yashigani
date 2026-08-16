@@ -168,7 +168,18 @@ tr:hover { background: #f8fafc; }
 .txt-totp-note { font-size: 0.75rem; color: #94a3b8; margin-top: 8px; margin-bottom: 0; }
 
 /* ── Policies page (moved off inline styles — strict CSP, v2.25.3) ── */
-.is-hidden { display: none; }
+/* Visibility utility. `!important` is deliberate and load-bearing, not laziness:
+   this is a single-purpose utility competing with COMPONENT rules of identical
+   specificity (one class each), so without it the cascade is decided purely by
+   which rule appears later in the file — and every component rule below this
+   point wins by default. That silently defeated .dp-protection-banner (:414),
+   .cap-scope-picker (:619) and .pol-row (:174): all three render permanently
+   visible, and classList.add('is-hidden') is a no-op on them. The
+   .dp-protection-banner case meant the red "data-protection controls weakened"
+   warning could never be dismissed; the other two predate that change.
+   Caught in pre-push code-quality review, not by a test — the CSP guard counts
+   inline style= attributes, so it cannot see a cascade defect. */
+.is-hidden { display: none !important; }
 .mt-sm { margin-top: 8px; }
 .mt-xs { margin-top: 6px; }
 .pol-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
