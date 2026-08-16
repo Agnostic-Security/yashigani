@@ -315,6 +315,33 @@ run_tier_a() {
     rc=1
   fi
 
+  # Pre-push review round 2 (§4.4, 2026-08-17): same FIND-0813-012 class —
+  # tests/invariants/ (the release-gate structural invariant suite, incl.
+  # I11 CWE-732 secrets-mode) is in neither pyproject.toml's `testpaths`
+  # (["src/tests"] only) nor any tier here, so a bare `pytest` AND every
+  # prior YTF run both silently skipped it. A guard nothing executes is the
+  # same defect class as the regression tree was before FIND-0813-012.
+  # Wired here rather than into `testpaths`: this repo's convention keeps
+  # `testpaths` scoped to `src/tests` and invokes each `tests/<dir>` tier
+  # explicitly (conformance/security above, regression above) so ad hoc
+  # `pytest` runs during development don't silently pull in the full
+  # release-gate matrix — invariants follow that same explicit-tier pattern,
+  # own suite, own verdict line, never folded into another number.
+  _info "pytest: tests/invariants/ (release-gate structural invariants — in-process only)"
+  local _irc=0
+  PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$VENV_PY" -m pytest "${REPO_DIR}/tests/invariants" \
+    -q --tb=short --junitxml="${evidence_dir}/pytest-junit-invariants.xml" \
+    | tee "${evidence_dir}/pytest-invariants.log" || _irc=$?
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-invariants.xml" \
+       --rc "$_irc" --tier a --suite invariants \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "tests/invariants"
+  else
+    _fail "tests/invariants (see ${evidence_dir}/pytest-invariants.log + VERDICT.txt)"
+    rc=1
+  fi
+
   _info "opa test: policy/ (in-process rego unit tests for every live-loaded template + system policy)"
   local opa_rc=0
   if command -v opa >/dev/null 2>&1; then

@@ -81,6 +81,9 @@ is no regression surface to guard.
 """
 from __future__ import annotations
 
+import ast
+import inspect
+
 import pytest
 
 from yashigani.auth.broker import _TIER_IDP_LIMITS, IdentityBroker
@@ -290,9 +293,98 @@ class TestFullTierSweepCoverage:
         assert TIER_DEFAULTS["academic_nonprofit"]["max_agents"] == -1
 
     def test_backoffice_license_route_tier_order_already_correct(self):
-        # backoffice/routes/license.py keys _TIER_ORDER/_TIER_DISPLAY on
-        # LicenseTier enum members directly (not string literals) -- no
-        # key/enum divergence is possible there. Confirmed by source
-        # inspection; asserted here via the enum itself for stability.
-        for t in LicenseTier:
-            assert isinstance(t.value, str)
+        """backoffice/routes/license.py's _TIER_ORDER/_TIER_DISPLAY (inside
+        get_license_entitlements(), R23) key on LicenseTier ENUM MEMBERS
+        (``LicenseTier.COMMUNITY``) directly, not string literals
+        (``"community"``) -- so the exact TB-07 defect class (a stale/
+        missing string key silently diverging from the enum) is impossible
+        there by construction, never merely detected. That is the property
+        this test's name promises.
+
+        CQ-3 (Lu pre-push review, round 2): the previous body was
+        ``for t in LicenseTier: assert isinstance(t.value, str)`` -- a
+        tautology true of any ``LicenseTier(str, Enum)`` regardless of what
+        license.py does, which cannot fail even if _TIER_ORDER/_TIER_DISPLAY
+        were rewritten with string-literal keys (the actual regression this
+        test exists to catch).
+
+        These structures are LOCAL to get_license_entitlements() (not
+        module-level exports), so they cannot be imported and inspected as
+        values. Fix: parse the function's own source with ``ast`` and assert
+        every _TIER_ORDER element / _TIER_DISPLAY key is an
+        ``ast.Attribute`` of the form ``LicenseTier.<MEMBER>`` -- never an
+        ``ast.Constant`` string. This DOES fail if the code regresses to
+        string literals (proven below via a mutation-verify companion in
+        this same test run -- see the module docstring's mutation-verify
+        note in the commit body)."""
+        from yashigani.backoffice.routes import license as license_route_module
+
+        src = inspect.getsource(license_route_module.get_license_entitlements)
+        tree = ast.parse(src)
+
+        def _is_license_tier_member(node: ast.expr) -> bool:
+            return (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "LicenseTier"
+            )
+
+        found_tier_order = False
+        found_tier_display = False
+
+        for node in ast.walk(tree):
+            # _TIER_DISPLAY carries a type annotation
+            # (``_TIER_DISPLAY: dict[LicenseTier, str] = {...}``), which
+            # parses as ast.AnnAssign, not ast.Assign -- _TIER_ORDER has no
+            # annotation and parses as plain ast.Assign. Handle both.
+            if isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                value = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                targets = [node.target.id]
+                value = node.value
+            else:
+                continue
+            if value is None:
+                continue
+
+            if "_TIER_ORDER" in targets:
+                found_tier_order = True
+                assert isinstance(value, ast.List), (
+                    "_TIER_ORDER is no longer a list literal -- update this "
+                    "AST-shape assertion to match the new structure."
+                )
+                non_enum = [
+                    ast.dump(elt) for elt in value.elts
+                    if not _is_license_tier_member(elt)
+                ]
+                assert non_enum == [], (
+                    f"TB-07 regression: _TIER_ORDER contains non-LicenseTier-"
+                    f"member element(s) {non_enum} -- this reintroduces the "
+                    f"exact defect class TB-07 fixed (a tier keyed on a raw "
+                    f"string literal that can silently diverge from "
+                    f"LicenseTier.value)."
+                )
+
+            if "_TIER_DISPLAY" in targets:
+                found_tier_display = True
+                assert isinstance(value, ast.Dict), (
+                    "_TIER_DISPLAY is no longer a dict literal -- update "
+                    "this AST-shape assertion to match the new structure."
+                )
+                non_enum_keys = [
+                    ast.dump(k) for k in value.keys
+                    if k is not None and not _is_license_tier_member(k)
+                ]
+                assert non_enum_keys == [], (
+                    f"TB-07 regression: _TIER_DISPLAY has non-LicenseTier-"
+                    f"member key(s) {non_enum_keys} -- same defect class as "
+                    f"_TIER_ORDER above."
+                )
+
+        assert found_tier_order and found_tier_display, (
+            "TB-07 regression: get_license_entitlements() no longer defines "
+            "_TIER_ORDER/_TIER_DISPLAY under those names -- either the "
+            "route was refactored (update this test's target names) or the "
+            "guard was silently dropped."
+        )

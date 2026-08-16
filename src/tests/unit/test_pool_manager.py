@@ -39,11 +39,32 @@ class TestTierLimits:
         limits = TierLimits.from_tier("enterprise")
         assert limits.total_concurrent == 9999
 
-    def test_academic_same_as_community(self):
-        academic = TierLimits.from_tier("academic")
+    def test_academic_nonprofit_is_unlimited_not_community(self):
+        """TB-07 (Lu, 4.1.2): this test previously called
+        TierLimits.from_tier("academic") and asserted COMMUNITY-equivalent
+        limits -- that was itself an instance of the stale-key defect it
+        should have caught. LicenseTier.ACADEMIC_NONPROFIT.value is
+        "academic_nonprofit"; "academic" is not a real tier string. Pre-fix,
+        this passed because _TIER_LIMITS carried a literal "academic" key
+        mapping to community limits (coincidence, not coverage). Post-fix,
+        "academic" is an unrecognised key hitting the fail-closed default
+        (which also equals community) -- the assertion kept passing for a
+        reason unrelated to its name, while asserting a product claim the
+        TB-07 fix made false: academic_nonprofit is Unlimited (999/9999
+        sentinel, matching enterprise) per README.md Sec.8, not
+        community-equivalent (1/3). Re-aimed at the real tier string and
+        the real (unlimited) entitlement -- see
+        test_tom_tb07_license_tier_key_enum_divergence.py for the full
+        root-cause writeup and
+        TestPoolManagerTierLimitsTB07.test_from_tier_resolves_academic_nonprofit_correctly
+        for the equivalent assertion in the new regression suite."""
+        academic_nonprofit = TierLimits.from_tier("academic_nonprofit")
+        enterprise = TierLimits.from_tier("enterprise")
         community = TierLimits.from_tier("community")
-        assert academic.per_service_per_identity == community.per_service_per_identity
-        assert academic.total_concurrent == community.total_concurrent
+        assert academic_nonprofit.per_service_per_identity == enterprise.per_service_per_identity
+        assert academic_nonprofit.total_concurrent == enterprise.total_concurrent
+        assert academic_nonprofit.per_service_per_identity != community.per_service_per_identity
+        assert academic_nonprofit.total_concurrent != community.total_concurrent
 
     def test_unknown_tier_defaults(self):
         limits = TierLimits.from_tier("nonexistent")
