@@ -128,9 +128,18 @@ _dr_is_rootless_podman() {
 #    7   | NO             | NO              | NO              | —     | —           | unknown
 #
 # Notes:
-#   Case 6: when both Podman and Docker are reachable, Podman wins (rootless-first
-#           security posture per install.sh). Docker is ignored for 4-way detection.
-#           install.sh's YSG_RUNTIME explicit-choice wins over this default if set.
+#   Case 6: when both Podman and Docker are reachable and NO explicit YSG_RUNTIME
+#           hint was set, Podman wins (rootless-first security posture per
+#           install.sh). install.sh's YSG_RUNTIME explicit-choice (docker|podman|
+#           k8s, set by --runtime or auto-resolved via resolve_compose_cmd()
+#           before _detect_runtime is called) is checked FIRST and wins over this
+#           default when set and actually reachable — fixed 2026-08-16 (L10-RUNTIME-HINT-2026-08-16):
+#           previously the hint was read into _legacy_hint but only ever consulted
+#           for the k8s case, so a `--runtime docker` install on a host that also
+#           had Podman installed silently mislabelled itself podman-rootless,
+#           producing both a false "L1 containment NOT active" warning and a real
+#           L1 ring-fence gap for anything onboarded afterwards (codegen.py gates
+#           ring-fence emission on YSG_RUNTIME_4WAY == "podman-rootless").
 #   Case 4: rootful Podman (uid=0) — L1 iptables containment is available.
 #   Cases 2+3: rootless Podman — L1 gap; codegen annotates artifact with gap warning.
 #   Case 7: unknown — codegen emits an error and refuses to generate artifacts.
@@ -208,8 +217,68 @@ _detect_runtime() {
         return 0
     fi
 
+    # ── Case docker from hint (L10-RUNTIME-HINT-2026-08-16 / L10) ────────────────────────
+    # install.sh already resolved the compose driver via resolve_compose_cmd()
+    # / _ysg_compose_engine_bin() (operator --runtime docker, or auto-select
+    # when only Docker is usable) BEFORE calling _detect_runtime — that
+    # resolution is authoritative for this install run. Prior to this fix,
+    # only the k8s hint was honoured here; docker/podman hints were silently
+    # dropped and the function re-probed reachability from scratch, which
+    # prefers Podman whenever both runtimes are installed on the host (Case
+    # 6 below) — exactly contradicting the truth-table's own documented
+    # Case 6 note ("install.sh's YSG_RUNTIME explicit-choice wins over this
+    # default if set"), which was never actually implemented. On any host
+    # with both Docker and Podman present (e.g. this dev/test box), a
+    # `--runtime docker` install mislabelled itself podman-rootless: a false
+    # "L1 containment NOT active" warning during install, and — because
+    # src/yashigani/manifest/codegen.py gates ~15 ring-fence emission sites
+    # on `runtime == "podman-rootless"` — a REAL, silent L1 ring-fence gap
+    # for any agent onboarded afterwards via `install.sh --onboard`, even
+    # though the actual runtime (Docker) has full L1 iptables capability.
+    # Falls through to the generic auto-detect below if the hint doesn't
+    # pan out (daemon not actually reachable despite the hint) rather than
+    # failing outright, preserving prior best-effort behaviour.
+    if [ "${_legacy_hint}" = "docker" ]; then
+        if _dr_docker_reachable; then
+            YSG_RUNTIME_4WAY="docker"
+            YSG_RUNTIME_4WAY_NOTE="Docker: YSG_RUNTIME=docker explicit (install.sh-resolved compose driver for this run). Full L1 containment available (iptables + ip6tables). NET_ADMIN required on ringfence-init container. Podman may also be installed on this host but is ignored per the operator's explicit runtime choice."
+            export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+            _dr_log "Detected: docker (from YSG_RUNTIME hint)"
+            return 0
+        fi
+        _dr_warn "YSG_RUNTIME=docker but the Docker daemon is not reachable — falling back to auto-detect."
+    fi
+
+    # ── Case podman from hint ──────────────────────────────────────────────
+    # Same rationale as the docker-hint case above: still must disambiguate
+    # rootful vs rootless (that split is this function's whole purpose), so
+    # route into the same reachability + rootless check used by the generic
+    # path, just without letting a co-installed Docker daemon override it.
+    if [ "${_legacy_hint}" = "podman" ]; then
+        if _dr_podman_reachable; then
+            _uid_for_note="$(id -u 2>/dev/null || printf '?')"
+            if _dr_is_rootless_podman; then
+                YSG_RUNTIME_4WAY="podman-rootless"
+                YSG_RUNTIME_4WAY_NOTE="Podman rootless (uid=${_uid_for_note}, user-namespace remapping; YSG_RUNTIME=podman explicit). L1-GAP: iptables init-sidecar cannot apply L1 containment. L2+L3 active. Upgrade to rootful Podman or K8s for full L1."
+                export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+                _dr_warn "podman-rootless detected — L1 network-plane containment NOT available (ROOTLESS-PODMAN-L1-GAP)"
+                _dr_warn "L2 (Caddy egress) + L3 (OPA) remain active. Codegen will annotate artifacts with gap warning."
+            else
+                YSG_RUNTIME_4WAY="podman-rootful"
+                YSG_RUNTIME_4WAY_NOTE="Podman rootful (uid=${_uid_for_note}; YSG_RUNTIME=podman explicit). Full L1 containment available (iptables + ip6tables). NET_ADMIN required on ringfence-init container."
+                export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+                _dr_log "Detected: podman-rootful (from YSG_RUNTIME hint)"
+            fi
+            return 0
+        fi
+        _dr_warn "YSG_RUNTIME=podman but Podman is not reachable — falling back to auto-detect."
+    fi
+
     # ── Cases 2-4: Podman ────────────────────────────────────────────────
-    # Podman preferred over Docker when both are reachable.
+    # Podman preferred over Docker when both are reachable and no explicit
+    # YSG_RUNTIME hint was given (rootless-first security posture, install.sh
+    # default when both runtimes are usable and the operator did not pass
+    # --runtime).
     if _dr_podman_reachable; then
         # SC2312: capture id output separately
         _uid_for_note="$(id -u 2>/dev/null || printf '?')"

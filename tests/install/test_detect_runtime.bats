@@ -213,6 +213,71 @@ setup() {
     [ "${YSG_RUNTIME_4WAY}" = "podman-rootful" ]
 }
 
+# ── L10-RUNTIME-HINT-2026-08-16: explicit YSG_RUNTIME hint must win over Case-6 Podman
+# preference on a host where both runtimes are reachable ─────────────────────
+# Regression coverage for the bug: _legacy_hint (YSG_RUNTIME, set by
+# install.sh's `--runtime docker` / resolve_compose_cmd()) was read but never
+# consulted for docker/podman, only k8s — so a Docker install on a dual-
+# runtime host mislabelled itself podman-rootless and produced a real L1
+# ring-fence gap in codegen for anything onboarded afterwards.
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=docker hint wins over Case 6 Podman preference" {
+    _stub_no_k8s
+    _stub_podman    # Podman also reachable — would win Case 6 without the hint
+    _stub_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "docker" ]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=docker hint -> NOTE explains Podman ignored" {
+    _stub_no_k8s
+    _stub_podman
+    _stub_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    _detect_runtime
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"ignored"* ]]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=docker hint but Docker unreachable -> falls back to auto-detect (Podman)" {
+    _stub_no_k8s
+    _stub_podman
+    _stub_no_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "podman-rootless" ]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=podman hint still disambiguates rootful vs rootless" {
+    _stub_no_k8s
+    _stub_podman
+    _stub_docker
+    _stub_rootful
+    export YSG_RUNTIME=podman
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "podman-rootful" ]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=podman hint but Podman unreachable -> falls back to auto-detect (Docker)" {
+    _stub_no_k8s
+    _stub_no_podman
+    _stub_docker
+    export YSG_RUNTIME=podman
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "docker" ]
+}
+
 # ── Case 7: Unknown ────────────────────────────────────────────────────────────
 
 @test "Case 7: No runtime reachable -> unknown (returns 1)" {
