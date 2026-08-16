@@ -11431,10 +11431,39 @@ register_agent_bundles() {
 # no step-up, no install_svc service account. Eliminates LAURA-2255-001 (human
 # admin bootstrap regression) and the install_svc standing-admin backdoor.
 #
-# Security: this Python runs INSIDE the backoffice container (compose exec),
-# which is mesh-isolated (data-network only). We use the same env vars
-# (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) that the in-process app uses.
-# The HTTP stack is not touched — no admin session, no TOTP, no HMAC secret.
+# Security (FIND-0813-013 item 4, Captain red-review, 2026-08-16 — REPLACES
+# a prior claim here that this container is "mesh-isolated (data-network
+# only)". That claim was FALSE and has been removed: backoffice is a member
+# of SEVEN docker networks (docker-compose.yml, backoffice service
+# networks: block), including caddy_internal -- the SAME bridge Caddy (the
+# internet-facing reverse proxy, on the edge network) sits on. Network
+# topology was never the control that made this safe.
+#
+# The ACTUAL trust basis is host/cluster EXEC AUTHORIZATION, and it is NOT
+# uniform across runtimes:
+#   - Rootful Docker (this hosts default runtime): the docker socket is
+#     root:docker 0660: membership in the docker group is already
+#     root-equivalent host access. Anyone who can `compose exec` into this
+#     container could equally read YASHIGANI_DB_DSN out of its environment,
+#     read ${secrets_dir}/*_token off the host filesystem, or connect to
+#     Postgres directly with psql and run the exact INSERT/UPDATE this
+#     script runs -- bypassing this script entirely. Exec access already
+#     equals "can read this containers live secrets and talk to its
+#     backing stores directly": that is the real boundary, not the network.
+#   - Rootless Podman: the podman socket is USER-owned, not root-equivalent.
+#     A rootless-podman operator who can `compose exec` does NOT
+#     automatically have host root -- for that principal this durable-write
+#     path grants something genuinely new relative to the admin HTTP API:
+#     unauthenticated, unaudited agent registration gated only by "can run
+#     podman commands as this unprivileged user", a materially lower bar
+#     than a compromised admin session. This asymmetry is real; it is not
+#     closed by this comment, only named accurately (see FIND-0813-013 item
+#     2 for the audit-trail mitigation this path gained instead).
+#
+# We use the same env vars (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) the
+# in-process app uses. The HTTP stack is not touched — no admin session, no
+# TOTP, no HMAC secret — but that was never the load-bearing property
+# either; exec authorization always was.
 import json, os, sys, secrets as _sec_mod
 sys.path.insert(0, "/app/src")
 

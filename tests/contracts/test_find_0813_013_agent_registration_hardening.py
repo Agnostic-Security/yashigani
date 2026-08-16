@@ -388,6 +388,71 @@ class TestItem3K8sParity:
         )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Item 4 (Captain) -- the "mesh-isolated (data-network only)" security
+# comment was factually false (backoffice is on 7 networks, including
+# caddy_internal, shared with the internet-facing Caddy edge proxy) and
+# must be replaced with the real trust basis (host/cluster exec
+# authorization, which differs between rootful Docker and rootless Podman).
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestItem4CommentAccuracy:
+    def test_false_mesh_isolated_claim_removed_from_install_sh(self) -> None:
+        payload = _compose_python_payload(_compose_register_body())
+        assert "mesh-isolated (data-network only)" not in payload, (
+            "FIND-0813-013 item 4 REGRESSION: the false 'mesh-isolated "
+            "(data-network only)' security justification is still present in "
+            "register_agent_bundles(). Captain REFUTED this claim (backoffice "
+            "is on 7 networks including caddy_internal, shared with the "
+            "internet-facing Caddy edge proxy) -- it must be replaced, not "
+            "merely reworded around."
+        )
+
+    def test_real_trust_basis_documented_in_install_sh(self) -> None:
+        payload = _compose_python_payload(_compose_register_body())
+        assert "exec authorization" in payload or "EXEC AUTHORIZATION" in payload, (
+            "FIND-0813-013 item 4 REGRESSION: the corrected comment must name "
+            "the ACTUAL control (host/cluster exec authorization), not just "
+            "delete the false claim and say nothing."
+        )
+        assert "rootless" in payload.lower() and "rootful" in payload.lower(), (
+            "FIND-0813-013 item 4 REGRESSION: the corrected comment must "
+            "distinguish rootful Docker (exec access already root-equivalent) "
+            "from rootless Podman (exec access is NOT root-equivalent -- a "
+            "real, not merely latent, capability gap per Captain's review) -- "
+            "a single blanket justification across both runtimes is exactly "
+            "the defect Captain found in the original comment."
+        )
+
+    def test_docker_compose_caddy_internal_comment_corrected(self) -> None:
+        text = COMPOSE_YML.read_text(encoding="utf-8")
+        # Extract the caddy_internal: network definition block.
+        idx = text.find("caddy_internal:")
+        assert idx != -1, "caddy_internal: network definition not found in docker-compose.yml"
+        block = text[idx:idx + 2000]
+        assert "FIND-0813-013" in block, (
+            "FIND-0813-013 item 4 REGRESSION: docker-compose.yml's "
+            "caddy_internal network definition does not reference the "
+            "corrected trust-basis writeup -- a future reader could still "
+            "independently re-derive the false 'internal: true == isolated "
+            "from the internet' claim from this file alone."
+        )
+        assert "internet" in block.lower(), (
+            "FIND-0813-013 item 4 REGRESSION: the caddy_internal comment must "
+            "explicitly clarify that Caddy (internet-facing) is a member of "
+            "this bridge -- internal: true does not mean internet-isolated."
+        )
+
+    def test_yaml_still_parses(self) -> None:
+        import yaml
+        with open(COMPOSE_YML) as f:
+            doc = yaml.safe_load(f)
+        assert "caddy_internal" in doc["networks"], (
+            "docker-compose.yml no longer parses correctly after the item-4 "
+            "comment edit, or the caddy_internal network definition was lost."
+        )
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

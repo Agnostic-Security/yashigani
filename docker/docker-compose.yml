@@ -3943,6 +3943,23 @@ networks:
     internal: true
     # Only Caddy, backoffice, gateway are members.
     # Caddy → backoffice:8443 and Caddy → gateway:8080 happen here.
+    #
+    # FIND-0813-013 item 4 (Captain red-review, 2026-08-16): `internal: true`
+    # means THIS bridge has no direct route to the internet — but do not
+    # read that as "backoffice/gateway are network-isolated from the
+    # internet." Caddy is a member of BOTH this bridge and `edge` (the
+    # internet-facing one, external ACME access below). That makes
+    # caddy_internal the bridge that carries traffic FROM the
+    # internet-facing reverse proxy INWARD, one hop away, not an
+    # isolation boundary in itself. A prior comment inside install.sh
+    # (register_agent_bundles(), the SEC-001 durable agent-registration
+    # payload) claimed backoffice was "mesh-isolated (data-network only)"
+    # as its security justification — that claim was false (backoffice is
+    # on SEVEN networks total, this one included) and has been corrected
+    # there. The real control for that payload is host/cluster exec
+    # authorization, not network topology — see install.sh for the full
+    # writeup. Do not re-derive a network-isolation argument for
+    # backoffice/gateway from this `internal: true` flag alone.
   data:
     driver: bridge
     enable_ipv6: false
