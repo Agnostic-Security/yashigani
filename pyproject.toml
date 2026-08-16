@@ -151,6 +151,23 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]
 asyncio_mode = "auto"
+# Custom markers, registered so `--strict-markers` is adoptable and a typo in a
+# marker name stops being silently ignored. All four were already in use and
+# NONE were registered; `multi_identity` was merely the one a review happened to
+# catch (register-sweep review, FIND-0813-014).
+#
+# NOTE: `testpaths` covers src/tests ONLY. tests/conformance, tests/security,
+# tests/contracts, tests/install and tests/invariants are NOT collected by a bare
+# `pytest` — which is why the YTF runner passes those paths explicitly, and why
+# an invariant placed in tests/invariants/ runs only under the runner. Left as
+# is deliberately: widening testpaths changes what every bare pytest invocation
+# executes, which is not a change to make mid-release. Tracked, not fixed here.
+markers = [
+    "conformance: API/behaviour conformance checks (Tier-A)",
+    "integration: cross-component integration checks",
+    "security_probe: authored adversarial probe (static or against a live target)",
+    "multi_identity: exercises more than one identity in a single test, so it must absorb the TOTP window wait budget (see src/tests/playwright/conftest.py)",
+]
 
 [tool.coverage.run]
 source = ["yashigani"]
