@@ -11725,18 +11725,42 @@ for r in results:
           # reinstall wiped the Docker volumes while the secrets dir survived
           # (the exact scenario YSG-AGENT-REG-001's header comment above
           # documents). Either way: never blindly clobber a pre-existing
-          # token — preserve it and warn loudly so an operator can tell the
-          # two cases apart via /admin/agents, instead of silently losing
-          # access to whichever agent_id the old token pointed at.
+          # token without a trace — but also never PRESERVE it in plaintext.
+          #
+          # FIND-0813-013 item 5 (Nico red-review, 2026-08-16, CONFIRMED —
+          # "sharpest finding"): the prior disposition here (`cp -p` to
+          # "${secrets_dir}/${_profile}_token.dup-<ts>") kept the OLD raw PSK
+          # readable forever in the LIVE secrets dir, 0640, with no TTL and no
+          # code path that ever deleted it — "a permanent, unencrypted copy
+          # of a still-valid raw PSK on the host filesystem." Nico further
+          # traced that even the documented remediation (deactivate the
+          # stale agent via /admin/agents) does not revoke the token on the
+          # registry.py this shipped against (verify_token() does not check
+          # status; deactivate() does not delete agent:token:{agent_id}) —
+          # i.e. the OLD token stayed live and readable indefinitely.
+          #
+          # Correct disposition: do NOT persist the raw value anywhere.
+          # Compute a short SHA-256 fingerprint for operator log-correlation
+          # ONLY (irreversible — cannot be used to authenticate as the old
+          # agent) and securely remove the plaintext file immediately. This
+          # intentionally forfeits "roll back to the old agent_id" as an
+          # option: an operator who wants to keep the OLD registration
+          # should deactivate the NEW duplicate via /admin/agents instead of
+          # relying on a standing plaintext credential file as an undo
+          # button. This is independently correct regardless of whether
+          # deactivate() has been fixed to actually revoke the Redis token
+          # key — it does not depend on that fix landing.
           if [[ -s "${secrets_dir}/${_profile}_token" ]]; then
-            local _dup_backup
-            _dup_backup="${secrets_dir}/${_profile}_token.dup-$(date -u +%Y%m%dT%H%M%SZ)"
-            if cp -p "${secrets_dir}/${_profile}_token" "${_dup_backup}" 2>/dev/null; then
-              chmod 0640 "${_dup_backup}" 2>/dev/null || true
-              log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed. Old token preserved at ${_dup_backup} — NOT overwritten silently. Check /admin/agents for duplicate active rows named '${_agent_name}' (either deactivate the stale one, or confirm this was an intentional full-volume reinstall) before relying on @${_agent_name} chat dispatch."
-            else
-              log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} re-registered with an existing token file present, but the pre-registration backup copy FAILED — proceeding to overwrite anyway (old token content is now unrecoverable). Check /admin/agents for duplicate active rows named '${_agent_name}'."
+            local _dup_fp="unavailable"
+            if command -v sha256sum >/dev/null 2>&1; then
+              _dup_fp="$(sha256sum "${secrets_dir}/${_profile}_token" 2>/dev/null | cut -d' ' -f1 | head -c 16)"
             fi
+            if command -v shred >/dev/null 2>&1; then
+              shred -u -n 1 -- "${secrets_dir}/${_profile}_token" 2>/dev/null || rm -f -- "${secrets_dir}/${_profile}_token"
+            else
+              rm -f -- "${secrets_dir}/${_profile}_token"
+            fi
+            log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed (fingerprint sha256:${_dup_fp}...). The prior token has been securely removed — it is NOT retained in plaintext (FIND-0813-013 item 5). Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch; the deactivated agent's old credential cannot be recovered."
           elif [[ "$_ysg_agent_pre_existing" == *",${_agent_name},"* ]]; then
             log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
           fi

@@ -453,6 +453,75 @@ class TestItem4CommentAccuracy:
         )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Item 5 (Nico) -- the ".dup-<ts>" re-registration backup must not leave a
+# live, un-TTL'd, unencrypted PSK sitting in the live secrets dir forever.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestItem5DupTokenDisposition:
+    @pytest.fixture(scope="class")
+    def register_body(self) -> str:
+        return _compose_register_body()
+
+    def test_plaintext_cp_backup_removed(self, register_body: str) -> None:
+        """Nico CONFIRMED (sharpest finding): `cp -p ... .dup-<ts>` left a
+        permanent, unencrypted, un-TTL'd copy of a still-valid raw PSK in the
+        live secrets dir with no code path that ever deleted it. The
+        plaintext-preserving cp -p must be gone."""
+        assert 'cp -p "${secrets_dir}' not in register_body, (
+            "FIND-0813-013 item 5 REGRESSION: register_agent_bundles() still "
+            "invokes `cp -p` to preserve the stale raw token in plaintext at "
+            "${secrets_dir}/${_profile}_token.dup-<ts> -- Nico's CONFIRMED "
+            "finding (a permanent, unencrypted, un-TTL'd live credential on "
+            "disk) is unresolved."
+        )
+        assert '_dup_backup=' not in register_body, (
+            "FIND-0813-013 item 5 REGRESSION: the .dup-<ts> backup filename "
+            "variable (_dup_backup) is still assigned -- the stale plaintext "
+            "token must not be written to a new file at all, not just "
+            "renamed (mentioning the old pattern in an explanatory comment "
+            "about what was removed is fine; actually constructing the "
+            "filename is not)."
+        )
+
+    def test_stale_token_securely_removed(self, register_body: str) -> None:
+        """The old plaintext token file must actually be deleted (shred
+        preferred, rm -f fallback), not left on disk under any name."""
+        assert re.search(r"shred\s+-u.*token", register_body) or \
+               re.search(r'rm\s+-f\s+--\s+"\$\{secrets_dir\}/\$\{_profile\}_token"', register_body), (
+            "FIND-0813-013 item 5 REGRESSION: no secure-delete (shred -u, or "
+            "rm -f fallback) of the stale token file found -- the old "
+            "plaintext PSK must be actively removed, not merely left in "
+            "place under its original name either."
+        )
+
+    def test_fingerprint_logged_not_raw_token(self, register_body: str) -> None:
+        """A SHA-256 fingerprint (irreversible, cannot authenticate) may be
+        logged for operator correlation -- the raw token value itself must
+        never appear in a log line."""
+        assert "sha256sum" in register_body, (
+            "FIND-0813-013 item 5: no SHA-256 fingerprint computed for "
+            "operator log-correlation before the stale token is destroyed -- "
+            "an operator has zero way to correlate the log entry to the "
+            "credential that was removed."
+        )
+        # The fingerprint variable, not the raw $_token, must be what is logged.
+        assert "_dup_fp" in register_body, (
+            "FIND-0813-013 item 5 REGRESSION: fingerprint variable not found "
+            "in the FIND-IRIS-DUP-AGENT log_error message."
+        )
+
+    def test_operator_guidance_still_present(self, register_body: str) -> None:
+        """The existing /admin/agents remediation guidance must be preserved
+        (not just the plaintext removed) -- an operator still needs to know
+        HOW to resolve the duplicate registration."""
+        assert "/admin/agents" in register_body, (
+            "FIND-0813-013 item 5 REGRESSION: /admin/agents remediation "
+            "guidance was lost when the plaintext-preservation branch was "
+            "rewritten."
+        )
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
