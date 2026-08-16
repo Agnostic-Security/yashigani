@@ -11,13 +11,21 @@ Reviewed by the internal GRC audit function. Findings reference: YCS-20260502-v2
 
 ## Controls summary
 
-| File | Control class | Status |
-|------|--------------|--------|
-| `scripts/partition_maintenance.py` | Parameterised identifiers + DDL date-literal exception | PASS (internal re-audit) |
-| `src/yashigani/db/migrations/` | Alembic `op.drop_table()` native API | PASS (YSG-RISK-002) |
-| All gateway routes | asyncpg parameterised queries (`$1`, `$2`, …) | PASS |
+These are statements of implementation state, re-checked against the 4.1.2 tree on
+2026-08-16. They are **not** framework compliance verdicts — this repository publishes no
+per-control PASS verdicts (see `docs/compliance-reports/README.md`).
 
-ASVS coverage: V5.3.4, V5.3.5, V5.1.4. Framework: CWE-89, CAPEC-66, NIST SP 800-53 r5 SI-10/SI-15.
+| File | Control class | State (checked 2026-08-16) |
+|------|--------------|--------|
+| `scripts/partition_maintenance.py` | Parameterised identifiers + DDL date-literal exception | Identifiers quoted via `_quote_ident()` (`scripts/partition_maintenance.py:40`, applied at `:146-147`); no f-string SQL found |
+| `src/yashigani/db/migrations/` | Alembic `op.drop_table()` native API | Native API in use (2 call sites); no `op.execute(f"…")` found |
+| All gateway routes | asyncpg parameterised queries (`$1`, `$2`, …) | Parameterised style used; **not exhaustively re-audited for 4.1.2** — treat as NEEDS REVIEW rather than as an assurance that every route is covered |
+
+Related weakness and control references: CWE-89, CAPEC-66, NIST SP 800-53 r5 SI-10/SI-15.
+
+ASVS mapping: the identifiers previously listed here (`V5.3.4`, `V5.3.5`, `V5.1.4`) are **ASVS
+v4** controls. Under ASVS v5 the injection controls moved to `V2 Validation and Business Logic`.
+The v5 mapping has not been re-derived and is deliberately not asserted.
 
 ---
 
@@ -131,5 +139,7 @@ commit `9d867be`.
 
 ---
 
-*For controls not covered here, refer to [`docs/compliance-reports/per-framework/owasp-asvs-v5.md`](../compliance-reports/per-framework/owasp-asvs-v5.md) (ASVS v5 L3 mapping)
-and the internal compliance archive.*
+*This document covers the SQL-injection surface only. Yashigani 4.1.2 has not been assessed
+against ASVS or any other framework, and
+[`docs/compliance-reports/`](../compliance-reports/README.md) publishes no control verdicts —
+it records the withdrawal of the verdicts previously published there.*

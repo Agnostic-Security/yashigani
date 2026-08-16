@@ -136,40 +136,100 @@ For deployment topology diagrams and the full per-runtime breakdown, see [Archit
 
 ## 5. Verifying a Release
 
-All Yashigani releases from v2.23.1 onward are cryptographically signed. Two signatures are provided for each release:
+Yashigani release tags are **SSH-signed** (not GPG). Signing uses a hardware-backed `ed25519`
+key held by the maintainer; the allowed-signers file ships in-repo at
+`docs/release-signing-key.pub`. See [Release Signing](docs/security/release-signing.md) for the
+full scheme and key-rotation procedure.
 
-**Git tag signature (GPG)** — verifies the source commit is authentic and unchanged:
+### Verifying a git tag
 
 ```sh
-# Import the Agnostic Security release signing public key (once):
-gpg --import docs/release-signing-key.asc
+# Point git at the in-repo allowed-signers file (once, per clone):
+git config gpg.ssh.allowedSignersFile docs/release-signing-key.pub
 
 # Fetch tags (in case a tag was updated):
 git fetch --tags --force origin
 
 # Verify:
-git tag -v v2.23.2
-# Expected: "Good signature from 'Agnostic Security Releases <releases@agnosticsec.com>'"
+git tag -v <tag>
 ```
 
-**Container image signature (cosign / Sigstore)** — verifies the published container images match the release tag:
+**A tag is verified only if the command exits 0 and prints
+`Good "git" signature for <signer> with ED25519 key SHA256:...`.**
 
-```sh
-cosign verify \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
-  --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
-```
+Two outcomes are *not* success, and you should treat both as unverified:
 
-For SBOM attestation, every release artifact carries a Sigstore-signed SBOM published as a GitHub Release asset alongside the tag.
+- `error: no signature found` — the tag is unsigned.
+- `Good "git" signature with ED25519 key SHA256:...` followed by `No principal matched.` —
+  the tag carries a valid signature from a key that is **not listed** in the allowed-signers
+  file, so the signer cannot be attributed. `git tag -v` exits non-zero in this case.
+
+### What is signed today
+
+Signing coverage is incomplete, and we would rather state that than publish a procedure that
+fails. Verified against `docs/release-signing-key.pub` at this commit:
+
+| Tags | Result of `git tag -v` |
+|---|---|
+| v0.9.4 – v2.23.2 | **Unsigned.** Signing was introduced at v2.23.3. |
+| v2.23.3 – v2.25.3 | **Verifies.** Signed by `maxine@agnosticsec.com`, key `SHA256:y5RP8TQfAFKBECUDgqP300d8CrdY4njSRS8HzxIQdJE`. |
+| v2.25.3.1, v3.0.0 – v3.1.2 | **Signed, but not attributable.** Signed with a second maintainer key (`SHA256:nrTH8N+nyrCYkeVVlQh39YBOc+M1NCSaI+4JUWs+jpY`) that was never added to the allowed-signers file. Verification reports `No principal matched` and exits non-zero. |
+| v2.25.4, v2.25.5, v4.1.0 | **Unsigned.** |
+
+The most recent tag that verifies cleanly with the shipped key file is **v2.25.3**. The
+allowed-signers file is missing the second maintainer key; publishing it is tracked as a
+release-process defect and, once the key is confirmed and committed as a second entry, the
+v2.25.3.1 and v3.x tags will verify without any change to the tags themselves.
+
+If a tag you rely on falls in the unsigned or unattributable rows, verify the release by
+another route — compare against the published source tree, or request a signed attestation —
+and please report it to `security@agnosticsec.com`.
+
+### Container images and SBOM
+
+**Images published for 4.1.2 are not signed, and the `cosign verify` command published in
+earlier revisions of this README will not succeed.**
+
+The signing pipeline exists and is complete — `release.yml` signs each image with keyless
+cosign (Fulcio + Rekor) and attaches the SBOM as a cosign attestation — but the entire GitHub
+Actions workflow directory was disabled on 2026-05-27 and now sits at
+`.github/workflows-disabled-2026-05-27/`. Nothing has run it since. The capability is built and
+unwired, not absent; re-enabling it is a release-process task, not a development one.
+
+Until it is re-enabled:
+
+- Do not rely on image signatures. There are none to verify.
+- An SBOM is still generated (`scripts/generate_sbom.py`), but it carries no signature and no
+  attestation. Treat it as an inventory, not as provenance.
 
 ---
 
 ## 6. Compliance and Security Posture
 
-Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in the risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
+**Yashigani 4.1.2 has not been assessed against any compliance framework, and this release
+publishes no compliance rate and no per-control PASS verdicts.**
 
-For a more detailed explanation, see the [Compliance Reports](docs/compliance/README.md).
+Per-control verdicts previously published under `docs/compliance-reports/` for 20 frameworks
+were withdrawn on 2026-08-16: the majority were produced by an automated keyword scan rather
+than by assessment, and they described release v2.23.2 regardless. The reports remain in place
+recording that withdrawal and enumerating each framework's control scope. See
+[Compliance Reports](docs/compliance-reports/README.md) for the full account of what was
+withdrawn and what a future assessment must satisfy.
+
+What this repository does give you, and what you can check yourself without trusting a claim in
+a document:
+
+- **Architectural invariant suite** — `tests/invariants/`, 11 executable assertions (I1–I10)
+  covering OPA every-hop fail-closed behaviour, admin-plane authorisation, trust-domain
+  isolation, the capability envelope, signed principals and PKI chain of continuity.
+- **Per-release regression suites** — `src/tests/regression/`; each closed security finding has
+  a test that fails if the defect returns.
+- **Control design documentation** — `docs/security/`, per surface (authentication, SSRF, SQL
+  injection, XFF trust boundary, audit-DB least privilege, agent image scanning, release
+  signing).
+- **Open findings** — `docs/risk-register.yml`, with severity and status.
+
+Run them. We would rather you verified the product than believed a percentage.
 
 ---
 
@@ -255,7 +315,7 @@ v2.23.2 is a security and quality hardening release on top of v2.23.1. It closes
 
 **Caddy Reverse Proxy Coverage: All 73 Blocks** -- The Caddy verified-secret header (`X-Caddy-Verified-Secret`) is now injected on all 73 `reverse_proxy` blocks across all Caddyfile variants (selfsigned, ACME, CA, WAF) and the Kubernetes ConfigMap. A contract test asserts this on every CI run; a missing injection causes a test failure with a precise diff identifying the missing block.
 
-**GPG Release Tag Signing** -- All releases from v2.23.1 onward are GPG-signed. The signing public key is published in-repo at `docs/release-signing-key.asc`. Verification: `git tag -v v2.23.2`.
+**Release Tag Signing (SSH, not GPG)** -- Release tags are SSH-signed with a hardware-backed ed25519 key; the allowed-signers file is published in-repo at `docs/release-signing-key.pub`. GPG signing was referenced in earlier changelogs but was never implemented, and no `docs/release-signing-key.asc` exists. Signing coverage is incomplete -- see [§5 Verifying a Release](#5-verifying-a-release) for the per-tag status table and the verification procedure that actually works.
 
 **Supply-Chain Hardening** -- GitHub Actions workflow steps are pinned to SHA digest (not just tag). The `pip` package manager is removed from runtime images to reduce the CVE surface. A CI job annotates every Trivy scan with the exact image digest that was scanned. SBOM generation includes a service-identity SHA gate.
 

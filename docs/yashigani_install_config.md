@@ -567,7 +567,7 @@ log in interactively and would otherwise be disabled after the threshold.
 
 ### 4.3 TLS Configuration
 
-> **Post-quantum TLS (since v0.9.0):** A hybrid X25519+ML-KEM-768 Caddyfile configuration is included in the repository as a commented block (`caddy/Caddyfile.pq`). This requires Caddy 2.10 (not yet released). Enable it once Caddy 2.10 ships to provide quantum-resistant key exchange while maintaining full backward compatibility with classical TLS clients.
+> **Post-quantum TLS — active by default.** Edge TLS negotiates hybrid post-quantum key exchange (`x25519mlkem768`) with classical fallback, giving harvest-now-decrypt-later protection without breaking classical clients. No operator action is required and there is no separate file to enable. The `curves x25519mlkem768 x25519 secp384r1 secp256r1` directive is live in every Caddyfile variant — ACME, CA, self-signed and WAF (e.g. `docker/Caddyfile.acme:214`, `docker/caddy/Caddyfile.waf:75`) — and the shipped Caddy is 2.11.4 (`docker/caddy/Dockerfile.caddy:32`). Earlier documentation described this as a commented block in `caddy/Caddyfile.pq` pending Caddy 2.10; that has not been accurate since the configuration went live, and no such file exists.
 
 #### ACME Mode (Production — Let's Encrypt)
 
