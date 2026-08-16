@@ -543,3 +543,45 @@ the exact class of false signal this framework exists to eliminate.
 files, with refresh driven by the `_admin_session_dirty`/`_user_session_dirty` eviction flags
 rather than elapsed time. Until that lands, Tier-B legs must at minimum run the adversarial
 suite as a separate final stage — which is what the 4.1.2 Linux legs now do.
+
+## 5.13 A verification run requires a QUIESCENT tree (added 2026-08-16 — Tiago directive, applied to Tier-A)
+
+**Rule: never run a tier against a working tree that anything else is concurrently mutating.
+The result of such a run is not a weak signal — it is not a signal at all, and must not be
+reported as one.**
+
+This is Tiago's standing "don't do parallel test unless they can be fully isolated" applied to
+Tier-A, not just to deploy stacks. Parallel *fixing* is encouraged and fast. Parallel fixing
+*during* a verification run is a measurement of a moving target.
+
+### What triggered it
+2026-08-16: a full Tier-A run (`tests/conformance tests/security tests/contracts tests/install
+src/tests`) was started, and five fix agents were then dispatched into the SAME working tree.
+The run began clean and accumulated 40+ failures as files changed underneath it. None of those
+failures was a product defect. Had that number been reported, it would have been a fabricated
+regression — and worse, the inverse is equally possible: an agent's mid-run edit can make a
+genuinely failing test pass. A concurrent-tree run can report EITHER direction wrongly.
+
+This is the same defect class the framework already names in §5.6 and FIND-0813-012: a run that
+reports a result it did not earn. It is not excused by the runner exiting 0.
+
+### Required practice
+1. **Verification is a barrier.** Land the concurrent work first, then run the tier once on a
+   still tree. Do not overlap them to save wall-clock.
+2. If a tier MUST run while work is in flight, run it against an isolated checkout at a named
+   commit — a git worktree under `~/Documents/Claude/` per CLAUDE.md, removed when finished —
+   never against the shared tree. State the commit in the verdict line.
+3. **A run interrupted by tree mutation is discarded, not interpreted.** Do not salvage a
+   subset, do not report "N passed before it got noisy", do not attribute individual failures
+   to specific agents. Kill it and re-run.
+4. A per-agent suite run (an agent checking its own change) is exempt only for the files that
+   agent owns; it is NOT a substitute for the gate run, and its pass/fail count must not be
+   quoted as the tier verdict.
+5. Corollary for agent reports: when a subagent reports a failure in a file outside its own
+   scope while other agents are active, treat that as UNVERIFIED. Re-run on a quiescent tree
+   before filing it as a finding or routing it to another owner.
+
+### Why this matters beyond tidiness
+Tier-A is matrix-invariant (§3) — it runs once per head and its verdict is inherited by every
+runtime leg. A polluted Tier-A verdict therefore propagates to docker, podman and k8s
+simultaneously, and it propagates SILENTLY.
