@@ -147,9 +147,30 @@ def test_caddyfile_csp_no_unsafe_inline_style(caddyfile: Path) -> None:
     (not 2.25.3-blocking).
     """
     content = _read(caddyfile)
+    # 4.0-phase1 refactor: the CSP header values were extracted into the
+    # `(csp-policies)` named snippet in docker/Caddyfile.csp — the single source
+    # of truth — and each vhost now does `import /etc/caddy/Caddyfile.csp`
+    # (drift-guarded by scripts/check-caddyfile-csp-parity.sh). This test still
+    # grepped the vhost files directly and so reported "CSP missing" on three
+    # Caddyfiles that are in fact strictly protected. Follow the import instead
+    # of asserting where the bytes happen to live — the property is that a
+    # strict CSP applies to this vhost, not which file spells it out.
+    if "Caddyfile.csp" in content:
+        content = content + "\n" + _read(DOCKER_DIR / "Caddyfile.csp")
     # Lenient matcher names that carry the documented, scoped CSP relaxation.
     # The guard only asserts the STRICT (@strict_ui / global) line is clean.
-    _lenient_matchers = ("@subapp_ui", "@lenient_ui", "@lenient_subapp")
+    # Kept in step with docker/Caddyfile.csp's documented matcher list (its
+    # header block: "DO NOT add new paths here without a recorded
+    # justification"). This tuple had drifted BOTH ways: it still named
+    # @lenient_ui, which Caddyfile.csp records as REMOVED ("There is NO
+    # catch-all lenient fallback — @lenient_ui has been removed"), and it did
+    # not know about @redoc_ui, added for the ReDoc API docs and scoped to two
+    # explicit paths (`path /admin/api-redoc /redoc`, no wildcard) with a
+    # recorded rationale ("Needs worker-src blob: + unsafe-inline").
+    # The guard is unchanged in strength: any CSP line NOT bound to one of
+    # these narrowly-scoped matchers — i.e. the strict/global line — still
+    # fails on 'unsafe-inline'.
+    _lenient_matchers = ("@subapp_ui", "@lenient_subapp", "@redoc_ui")
     csp_lines = [
         ln.strip()
         for ln in content.splitlines()

@@ -791,9 +791,9 @@ async function loadDpProtectionStatus() {
                 return '⚠ ' + escapeHtml(w.message);
             }).join(' | ');
             bannerText.textContent = msgs;
-            banner.style.display = '';
+            banner.classList.remove('is-hidden');
         } else {
-            banner.style.display = 'none';
+            banner.classList.add('is-hidden');
         }
     }
 
@@ -805,9 +805,9 @@ async function loadDpProtectionStatus() {
         if (n > 0) {
             pendingText.textContent = n + ' data-protection weaken request' +
                 (n === 1 ? '' : 's') + ' pending second-admin approval.';
-            pendingBanner.style.display = '';
+            pendingBanner.classList.remove('is-hidden');
         } else {
-            pendingBanner.style.display = 'none';
+            pendingBanner.classList.add('is-hidden');
         }
     }
 
