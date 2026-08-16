@@ -41,6 +41,10 @@ import './modules/policies-opa.js';
 // YSG-RISK-163: capability-policy admin view existed since 3.0
 // (routes/capability_policy.py) but was never wired into the ui4 nav.
 import './modules/capability-policy.js';
+// YSG-RISK-212: the unified Resource Permission Grant admin surface existed
+// since 3.1 Phase 8 (routes/permissions.py + static/js/permissions.js) but was
+// never wired into the ui4 nav — same class of gap as YSG-RISK-163 above.
+import './modules/permissions-grants.js';
 import './modules/workflows-admin.js';
 import './modules/audit.js';
 import './modules/sensitivity-pii.js';
