@@ -19426,11 +19426,24 @@ handle_onboard_subcommand() {
 
   # Wire _detect_runtime (W2/L10) — resolve the 4-way runtime BEFORE codegen.
   # Wrong-runtime codegen silently produces no ring-fence (L10).
+  #
+  # §4.4 pre-push review (Captain, 2026-08-17): this call site has NONE of
+  # resolve_compose_cmd()'s earlier reachability validation — --onboard is a
+  # short-circuit dispatch that runs before that function is ever called
+  # (confirmed: zero references to resolve_compose_cmd anywhere in
+  # handle_onboard_subcommand). It is therefore the one call site where
+  # _detect_runtime's own fail-closed behaviour (an explicitly-named-but-
+  # unreachable runtime returns YSG_RUNTIME_4WAY=unknown, not a silently
+  # substituted runtime — see lib/detect_runtime.sh) is the ONLY guard, and
+  # discarding its stderr here (`2>/dev/null`, as this line used to read)
+  # threw away the one diagnostic that would tell the operator WHY. No
+  # longer redirected — `_dr_warn`/`_dr_log` write to stderr, which install.sh's
+  # own log capture already tees to install.log same as every other step.
   if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
     # shellcheck source=lib/detect_runtime.sh
     # shellcheck disable=SC1091
     source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
-    _detect_runtime 2>/dev/null || true
+    _detect_runtime || true
     log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown} — ${YSG_RUNTIME_4WAY_NOTE:-}"
   else
     log_warn "lib/detect_runtime.sh not found — YSG_RUNTIME_4WAY will be inferred from YSG_RUNTIME"
@@ -19446,6 +19459,9 @@ handle_onboard_subcommand() {
 
   if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "unknown" ]]; then
     log_error "Runtime detection failed. Set YSG_RUNTIME_4WAY=docker|podman-rootful|podman-rootless|k8s"
+    if [[ -n "${YSG_RUNTIME_4WAY_NOTE:-}" ]]; then
+      log_error "Reason: ${YSG_RUNTIME_4WAY_NOTE}"
+    fi
     exit 1
   fi
 

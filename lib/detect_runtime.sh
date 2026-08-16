@@ -217,7 +217,7 @@ _detect_runtime() {
         return 0
     fi
 
-    # ── Case docker from hint (L10-RUNTIME-HINT-2026-08-16 / L10) ────────────────────────
+    # ── Case docker from hint (2026-08-16 fix, ops register YSG-RISK-217) ──
     # install.sh already resolved the compose driver via resolve_compose_cmd()
     # / _ysg_compose_engine_bin() (operator --runtime docker, or auto-select
     # when only Docker is usable) BEFORE calling _detect_runtime — that
@@ -235,9 +235,26 @@ _detect_runtime() {
     # on `runtime == "podman-rootless"` — a REAL, silent L1 ring-fence gap
     # for any agent onboarded afterwards via `install.sh --onboard`, even
     # though the actual runtime (Docker) has full L1 iptables capability.
-    # Falls through to the generic auto-detect below if the hint doesn't
-    # pan out (daemon not actually reachable despite the hint) rather than
-    # failing outright, preserving prior best-effort behaviour.
+    #
+    # FAIL CLOSED on an unreachable named hint (§4.4 pre-push review,
+    # Captain, 2026-08-17): the first cut of this fix fell through to the
+    # generic auto-detect below when the named runtime wasn't reachable —
+    # which silently substitutes a DIFFERENT runtime than the one the
+    # operator explicitly asked for. That is the original defect reproduced
+    # on the error path: this whole fix exists so `--runtime docker` never
+    # silently ends up on podman; auto-detect is only correct when NO hint
+    # was given. Trigger scenario: `YSG_RUNTIME=docker` still exported (or
+    # `--runtime docker` passed again) from a prior install, but the Docker
+    # daemon is transiently unreachable (daemon restart, socket-permission
+    # hiccup, wrong shell session) when `install.sh --onboard` runs later —
+    # the exact call site (`handle_onboard_subcommand`) this fix's own
+    # narrative centres on, which has none of `resolve_compose_cmd()`'s
+    # earlier exit-1 reachability gate. A guessed runtime is worse than an
+    # aborted onboard for a security-relevant label that gates ring-fence
+    # emission — so a named-but-unreachable hint now returns unknown/1, not
+    # a substituted runtime. Callers already gate on unknown (e.g.
+    # install.sh's `if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "unknown" ]];
+    # then ... exit 1; fi` immediately after the onboard call site).
     if [ "${_legacy_hint}" = "docker" ]; then
         if _dr_docker_reachable; then
             YSG_RUNTIME_4WAY="docker"
@@ -246,7 +263,11 @@ _detect_runtime() {
             _dr_log "Detected: docker (from YSG_RUNTIME hint)"
             return 0
         fi
-        _dr_warn "YSG_RUNTIME=docker but the Docker daemon is not reachable — falling back to auto-detect."
+        YSG_RUNTIME_4WAY="unknown"
+        YSG_RUNTIME_4WAY_NOTE="YSG_RUNTIME=docker was explicitly requested but the Docker daemon is NOT reachable. Refusing to silently substitute a different runtime (e.g. auto-detected Podman) for a security-relevant label that gates ring-fence emission — that is the exact defect this detector was fixed to close. Fix Docker reachability (daemon running, socket permissions, correct shell/session) and re-run, or set YSG_RUNTIME_4WAY explicitly if you intend to switch runtimes."
+        export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+        _dr_warn "YSG_RUNTIME=docker but the Docker daemon is not reachable — FAILING CLOSED (not falling back to another runtime)."
+        return 1
     fi
 
     # ── Case podman from hint ──────────────────────────────────────────────
@@ -254,6 +275,8 @@ _detect_runtime() {
     # rootful vs rootless (that split is this function's whole purpose), so
     # route into the same reachability + rootless check used by the generic
     # path, just without letting a co-installed Docker daemon override it.
+    # Same fail-closed contract on an unreachable hint — see the docker case
+    # above for the full rationale.
     if [ "${_legacy_hint}" = "podman" ]; then
         if _dr_podman_reachable; then
             _uid_for_note="$(id -u 2>/dev/null || printf '?')"
@@ -271,7 +294,11 @@ _detect_runtime() {
             fi
             return 0
         fi
-        _dr_warn "YSG_RUNTIME=podman but Podman is not reachable — falling back to auto-detect."
+        YSG_RUNTIME_4WAY="unknown"
+        YSG_RUNTIME_4WAY_NOTE="YSG_RUNTIME=podman was explicitly requested but Podman is NOT reachable. Refusing to silently substitute a different runtime (e.g. auto-detected Docker) for a security-relevant label that gates ring-fence emission. Fix Podman reachability and re-run, or set YSG_RUNTIME_4WAY explicitly if you intend to switch runtimes."
+        export YSG_RUNTIME_4WAY YSG_RUNTIME_4WAY_NOTE
+        _dr_warn "YSG_RUNTIME=podman but Podman is not reachable — FAILING CLOSED (not falling back to another runtime)."
+        return 1
     fi
 
     # ── Cases 2-4: Podman ────────────────────────────────────────────────
