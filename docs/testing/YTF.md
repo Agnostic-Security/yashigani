@@ -585,3 +585,40 @@ reports a result it did not earn. It is not excused by the runner exiting 0.
 Tier-A is matrix-invariant (§3) — it runs once per head and its verdict is inherited by every
 runtime leg. A polluted Tier-A verdict therefore propagates to docker, podman and k8s
 simultaneously, and it propagates SILENTLY.
+
+## 5.14 A fix is not verified until the bench FAILS without it (added 2026-08-16 — Tiago challenge)
+
+**Rule: "the suite passes with the fix" is not evidence. The only evidence that a guard exists
+is that reverting the fix's PRODUCT code makes the bench fail. Every fix landed in a campaign
+must be mutation-checked before its finding is closed.**
+
+### What triggered it
+2026-08-16, Tiago: *"zero failures even when we set test to fail and that is the role of those
+tests?"* — against a report in which a pre-fix comparison run had been presented as reassuring.
+It was worthless: the file set it ran did not contain the guard for the reverted change, so it
+could only ever have come back green. The conclusion drawn from it ("not my collateral") was
+correct; the reassurance attached to it was not.
+
+### Method
+1. Restore ONLY the product file(s) to pre-fix content (`git show <fix>^:<file>`).
+2. Leave every test file at HEAD. Reverting the guard alongside the thing it guards proves
+   nothing, and is the easiest way to fake this check.
+3. Run the tests that CLAIM to guard the fix. Require a non-zero failure count, and record the
+   actual number — "it failed" without a count hides a collapse-to-one-error.
+4. Restore and assert the tree is byte-identical (`git diff` empty). A mutation check that
+   leaves the tree dirty has corrupted the next measurement.
+5. Record the numbers in the findings file. A fix with a passing bench and no mutation number is
+   UNVERIFIED, and must be reported as such.
+
+Harness: `testing_runs/yashigani/ytf-412-20260813/verify_guards.sh`.
+
+### Consequences that follow from this rule
+- **A subagent's own claim that "N tests fail pre-fix" is not the check.** It is a claim to be
+  independently reproduced by the coordinator. Delegate execution, own integrity.
+- **Scope is part of the result.** A guard "holds" only within the scope it was pointed at.
+  Record the scope alongside the number, because a fix can hold in one file and have zero
+  coverage everywhere else.
+- **If reverting the fix fails NOTHING, the fix shipped untested** — regardless of a green
+  board. That is a finding in its own right, not a gap to quietly fill.
+- Files under concurrent edit cannot be mutation-checked (§5.13). Defer them to the quiescent
+  run rather than reporting a number from a moving tree.
