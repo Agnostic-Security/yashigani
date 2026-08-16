@@ -828,7 +828,11 @@ services:
       # SECURITY: read-only mount, gateway runs as non-root (UID 1001).
       # Pool Manager uses only: containers.run(), .get(), .kill(), .remove().
       # No host filesystem access. Podman rootless provides additional isolation.
-      # To disable: set CONTAINER_SOCKET_ENABLED=false — Pool Manager falls back to stub mode.
+      # To disable: set CONTAINER_SOCKET_ENABLED=false — Pool Manager falls back to
+      # stub mode. IMPLEMENTED 2026-08-16 (gateway/entrypoint.py::_socket_enabled);
+      # this comment documented the escape for months while it existed nowhere in src/.
+      # Not needed just to run without agents: the fail-closed guard is now conditional
+      # on pool-managed (pool://) agents actually being registered.
       # macOS Podman: socket can't be mounted from host — Pool Manager uses stub mode.
       # NOTE: the extractor sandbox (document enforcement, backoffice only) does NOT
       # use this socket. It goes via the socket-proxy service (extractor_proxy network).

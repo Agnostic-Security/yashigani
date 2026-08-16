@@ -45,6 +45,8 @@ def _pool_manager_prod_fail_closed(
     *,
     ysg_env: "str | None" = None,
     os_name: "str | None" = None,
+    pool_agents_configured: "bool | None" = None,
+    socket_enabled: "bool | None" = None,
 ) -> bool:
     """YSG-RISK-180: True iff a missing pool-manager container backend must
     fail closed (production Linux runtime) rather than silently degrade to
@@ -63,7 +65,71 @@ def _pool_manager_prod_fail_closed(
     """
     _env = (ysg_env if ysg_env is not None else os.getenv("YASHIGANI_ENV", "")).strip().lower()
     _os_name = os_name if os_name is not None else platform.system()
+
+    # ── Tiago directive 2026-08-16: agents are a CHOICE, not mandatory ──────
+    # "that should be a choice not mandatory to install any agents" /
+    # "the client might want to deploy their own with the wrapper".
+    #
+    # CIAA (container-per-identity isolation) only means anything for
+    # POOL-MANAGED agents (upstream_url = pool://<image>). This predicate used
+    # to key ONLY on (no backend, Linux, production), so a deployment with ZERO
+    # agents — including the documented lean path `install.sh --no-agents` /
+    # `--agent-bundles none`, and a client wrapping their OWN agents — refused
+    # to boot demanding isolation for agents that do not exist.
+    #
+    # Two escapes, in precedence order. Both return False (do NOT fail closed);
+    # neither weakens the guard for a deployment that IS relying on isolation.
+    #
+    # 1. Explicit operator opt-out. docker/docker-compose.yml has told operators
+    #    since 4.x: "To disable: set CONTAINER_SOCKET_ENABLED=false — Pool
+    #    Manager falls back to stub mode." That variable was NEVER implemented
+    #    (comment-only, zero references in src/) so the documented way out did
+    #    not exist. It does now.
+    if not _socket_enabled(socket_enabled):
+        return False
+
+    # 2. Nothing to isolate. When the caller can tell us no pool-managed agents
+    #    are configured, CIAA is not required and stub mode is correct.
+    #    None = "caller could not determine" → preserve the original
+    #    conservative behaviour (assume isolation is required).
+    if pool_agents_configured is False:
+        return False
+
     return container_backend is None and _os_name == "Linux" and _env == "production"
+
+
+def _socket_enabled(explicit: "bool | None" = None) -> bool:
+    """CONTAINER_SOCKET_ENABLED — the opt-out docker-compose.yml documents.
+
+    Defaults to True (enabled) so existing deployments are unchanged; only an
+    explicit false-y value disables the Pool Manager container backend.
+    """
+    if explicit is not None:
+        return explicit
+    return os.getenv("CONTAINER_SOCKET_ENABLED", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
+def _pool_agents_configured(agent_registry) -> "bool | None":
+    """True/False if we can tell whether any POOL-MANAGED agent is registered.
+
+    Pool-managed agents carry ``upstream_url = pool://<image>`` (synthesised
+    from ``pool_image`` — see backoffice/routes/agents.py). Returns None when
+    the registry is unavailable or unreadable, so the caller falls back to the
+    conservative "assume isolation is required" behaviour rather than silently
+    disabling a control on an error path.
+    """
+    if agent_registry is None:
+        return None
+    try:
+        for agent in agent_registry.list_all():
+            upstream = (agent.get("upstream_url") or "") if isinstance(agent, dict) else ""
+            if str(upstream).startswith("pool://"):
+                return True
+        return False
+    except Exception:
+        return None
 
 
 def _build_app(mesh_mode: bool = False):
@@ -581,7 +647,17 @@ def _build_app(mesh_mode: bool = False):
 
         _container_backend = _create_backend()
 
-        if _pool_manager_prod_fail_closed(_container_backend):
+        _pool_agents = _pool_agents_configured(agent_registry)
+        if _pool_agents is False:
+            logger.info(
+                "Pool Manager: no pool-managed (pool://) agents registered — "
+                "container-per-identity isolation not required; stub mode is "
+                "correct for this deployment (agents are optional: install.sh "
+                "--no-agents / client-supplied agents via the wrapper)."
+            )
+        if _pool_manager_prod_fail_closed(
+            _container_backend, pool_agents_configured=_pool_agents
+        ):
             raise RuntimeError(
                 "Pool Manager: no container backend (Docker/Podman/Kubernetes) "
                 "reachable on a PRODUCTION Linux deployment (YASHIGANI_ENV="
