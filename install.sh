@@ -11457,6 +11457,7 @@ for agent_spec in agents_spec:
         from yashigani.agents.registry import AgentRegistry
         from yashigani.agents.durable_store import AgentDurableStore
         from yashigani.gateway._redis_url import build_redis_url
+        from yashigani.licensing.enforcer import LicenseLimitExceeded
         import redis as _redis
 
         _redis_url = build_redis_url(
@@ -11466,8 +11467,29 @@ for agent_spec in agents_spec:
             client_cert_name="backoffice_client",
         )
         _rc = _redis.from_url(_redis_url, decode_responses=True)
-        registry = AgentRegistry(_rc)
         durable  = AgentDurableStore()
+        # FIND-0813-013 item 1 (Tom red-review, 2026-08-16): pass
+        # durable_store= so register() performs its OWN atomic dual-write --
+        # the SAME primitive routes/agents.py::register_agent uses
+        # (registry.py:510-518). The previous hand-rolled pair below this
+        # comment (removed) called durable.upsert() + restore_from_durable()
+        # directly, which (a) bypassed max_agents licence enforcement
+        # entirely -- restore_from_durable() docstring says "Does not
+        # enforce the licence limit: this is a restore of already-licensed
+        # registrations, not a new registration" -- and (b) committed
+        # Postgres BEFORE Redis inside one try/except, so a Redis failure
+        # immediately after a successful Postgres commit produced a
+        # permanently-stuck "active" row with an unrecoverable plaintext
+        # token (the installer own FIND-IRIS-DUP-AGENT pre-check would
+        # then refuse to offer the name again). register() closes both: it
+        # writes Redis FIRST via an atomic Lua script (SCARD -> licence
+        # check -> HSET+SADD, fails loud) and mirrors to Postgres SECOND
+        # (best-effort, logs loudly on failure, never rolls back a live
+        # Redis registration) -- the same order every other AgentRegistry
+        # mutator (register/update/deactivate/rotate_token) already uses;
+        # this installer payload was the only call site with the order
+        # inverted.
+        registry = AgentRegistry(_rc, durable_store=durable)
 
         # Skip if agent is already registered by name (idempotent; preserves token)
         existing_names = {a.get("name", "") for a in registry.list_all()}
@@ -11475,32 +11497,23 @@ for agent_spec in agents_spec:
             results.append("SKIP:" + aname + ":" + profile)
             continue
 
-        # Generate PSK token + bcrypt hash (mirrors POST /admin/agents)
-        import bcrypt as _bcrypt
-        raw_token = "ysg-" + _sec_mod.token_hex(32)
-        token_hash = _bcrypt.hashpw(raw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
-        agent_id = "agnt_" + _sec_mod.token_hex(8)
-
-        agent_data = {
-            "agent_id": agent_id,
-            "name": aname,
-            "upstream_url": aurl,
-            "protocol": aproto,
-            "status": "active",
-            "groups": agroups,
-            "allowed_caller_groups": acaller_groups,
-            "allowed_paths": apaths,
-            "allowed_cidrs": [],
+        # FIND-0813-013 item 1: register() mirrors POST /admin/agents exactly
+        # (routes/agents.py:510-518) -- mints agent_id + 256-bit PSK, atomic
+        # Redis write, licence-limit enforced, best-effort Postgres mirror.
+        # Replaces the old manual bcrypt/secrets.token_hex minting above.
+        agent_id, raw_token = registry.register(
+            name=aname,
+            upstream_url=aurl,
+            groups=agroups,
+            allowed_caller_groups=acaller_groups,
+            allowed_paths=apaths,
+            allowed_cidrs=[],
+            protocol=aproto,
             # Phase 5 §C: callee-class fields (registry.py additive extension).
-            "kind": akind,
-            "sensitivity_ceiling": aceiling,
-        }
-
-        # 1. Durable write (Postgres) — survives redis recreate
-        durable.upsert(agent_data, token_hash=token_hash)
-        # 2. Fast write (Redis db/3) — request-time source of truth
-        registry.restore_from_durable(agent_data, token_hash)
-        # 3. YSG-RISK-133: NO container-side write against /run/secrets here
+            kind=akind,
+            sensitivity_ceiling=aceiling,
+        )
+        # YSG-RISK-133: NO container-side write against /run/secrets here
         # (see the register_agent_bundles() header comment above for the full
         # RESTART-012 rationale). The backoffice /run/secrets mount is a pure
         # :ro mount by design -- this container never attempts to write to
@@ -11510,6 +11523,8 @@ for agent_spec in agents_spec:
         # filesystem and chmods it 0640 -- the same install-time-secret
         # pattern used for every other generated credential.
         results.append("OK:" + aname + ":" + profile + ":" + raw_token)
+    except LicenseLimitExceeded as e:
+        results.append("FAIL:" + aname + ":license_limit_exceeded:" + str(e))
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
