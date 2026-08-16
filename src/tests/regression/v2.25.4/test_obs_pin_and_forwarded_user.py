@@ -37,13 +37,41 @@ CaddyVerifiedMiddleware is NOT active, so a raw in-mesh caller could set
 identity-reassignment primitive.  (Caddy strips it at the public edge, so it is
 not edge-exploitable today; the latent asymmetry is closed regardless.)
 
-THE FIX: honour X-Forwarded-User ONLY when the request also carries a VALID
-X-Caddy-Verified-Secret (the per-install caddy_internal_hmac) — the SAME
-cryptographic trust proof that anchors the legitimate Caddy forward_auth path.
-``validate_caddy_secret`` fail-closes when the secret is unloaded, so this never
-fail-opens.
+THE FIX (2026-06-11, v2.25.4): honour X-Forwarded-User ONLY when the request
+also carries a VALID X-Caddy-Verified-Secret (the per-install caddy_internal_hmac)
+— the SAME cryptographic trust proof that anchors the legitimate Caddy
+forward_auth path. ``validate_caddy_secret`` fail-closes when the secret is
+unloaded, so this never fail-opens.
 
-  T_obsb_1 — X-Forwarded-User + VALID secret -> resolves the SSO user
+SUPERSEDED (2026-07-12, SEC-GAP-1 — commits 2797509e, 99f6c8eb): the
+X-Forwarded-User / email-slug identity-forwarding path was REMOVED from
+``_resolve_identity`` entirely (RBAC/permission grants must key on the
+canonical identity_id (idnt_ PK), never a spoofable email/slug — see
+``openai_router.py`` module docstring "X-Forwarded-User / X-OpenWebUI-User-
+Email paths REMOVED in 4.1" and ``_resolve_identity``'s own docstring).
+Identity-forwarding for the SSO/browser-session path now flows exclusively
+via ``X-Yashigani-Identity-Id`` (an opaque idnt_ PK, not a human-readable
+username/slug), pre-resolved by ``proxy.py``'s 0b-pre boundary block into
+``request.state.ysg_principal`` BEFORE ``_resolve_identity`` runs (which
+merely reads the pre-resolved principal — see ``openai_router.py`` ~5576).
+
+The underlying LAURA-OBS-B PROPERTY — a caller-forwarded identity claim must
+NEVER be honoured without proof of a valid X-Caddy-Verified-Secret (or the
+internal mesh bearer) — is INTACT and enforced on the successor header: see
+``proxy.py`` ~733-821 (YSG-RISK-140, "bind boundary identity to trusted
+transport, not raw header") and its dedicated regression coverage in
+``src/tests/regression/v4.1.2/test_ysg_risk_140_boundary_identity_spoof.py``
+(4/4 passing at this commit). That file is the CURRENT authority for the
+trust-gate property against the live header; it is not duplicated here.
+
+T_obsb_1 below is inverted (2026-08-16) to lock in the SEC-GAP-1 removal as a
+permanent regression guard: X-Forwarded-User must NEVER resolve an identity
+again, even accompanied by a valid secret — reintroducing that path would
+resurrect the exact email/slug RBAC-bypass class SEC-GAP-1 closed.
+
+  T_obsb_1 — X-Forwarded-User + VALID secret -> STILL IGNORED (path removed;
+             SSO identity now flows via X-Yashigani-Identity-Id + proxy.py
+             boundary resolver only — see YSG-RISK-140 coverage above)
   T_obsb_2 — X-Forwarded-User + NO secret    -> IGNORED (no impersonation)
   T_obsb_3 — X-Forwarded-User + WRONG secret -> IGNORED (no impersonation)
   T_obsb_4 — X-Forwarded-User + secret UNLOADED (None) -> IGNORED (fail-closed)
@@ -281,7 +309,17 @@ def _mk_user(slug):
     }
 
 
-def test_t_obsb_1_forwarded_user_with_valid_secret_resolves_sso_user():
+def test_t_obsb_1_forwarded_user_path_stays_removed_even_with_valid_secret():
+    """SEC-GAP-1 (2026-07-12, commits 2797509e/99f6c8eb) removed the
+    X-Forwarded-User identity-forwarding path from ``_resolve_identity``
+    entirely -- RBAC/permission grants must key on the canonical idnt_
+    identity_id, never a spoofable email/slug. A valid X-Caddy-Verified-Secret
+    no longer resurrects this header: SSO identity now flows exclusively via
+    X-Yashigani-Identity-Id, pre-resolved by proxy.py's boundary block into
+    request.state.ysg_principal (itself gated behind the SAME secret -- see
+    proxy.py ~733-821 / YSG-RISK-140 / test_ysg_risk_140_boundary_identity_spoof.py).
+    This test locks in the removal: it must keep failing (out is not None) if
+    X-Forwarded-User handling is ever reintroduced into _resolve_identity."""
     mod = _load_router_with_env({})
     mod._state.identity_registry = _FakeRegistry(by_slug={"coderuser": _mk_user("coderuser")})
     import yashigani.auth.caddy_verified as cv
@@ -291,7 +329,13 @@ def test_t_obsb_1_forwarded_user_with_valid_secret_resolves_sso_user():
             "X-Caddy-Verified-Secret": SECRET,
         })
         out = mod._resolve_identity(req)
-    assert out is not None and out["identity_id"] == "id-coderuser"
+    assert out is None, (
+        "X-Forwarded-User must NOT resolve an identity even with a valid "
+        "secret -- SEC-GAP-1 removed this path from _resolve_identity in "
+        "favour of X-Yashigani-Identity-Id (idnt_ PK) resolved upstream in "
+        "proxy.py's boundary block; a non-None result here means the "
+        "removed email/slug RBAC-bypass-prone path has been reintroduced"
+    )
 
 
 def test_t_obsb_2_forwarded_user_without_secret_is_ignored():
