@@ -8,6 +8,27 @@ Verifies:
      can no longer occupy the first slot and block human admin creation).
 
 These tests are unit-level (no DB / Redis required).
+
+2026-08-16: test 3's ``_MockAuthService.set_totp_secret_direct`` signature was
+stale against ``PostgresLocalAuthService.set_totp_secret_direct`` (real impl at
+src/yashigani/auth/pg_auth.py:730), which gained an ``algorithm: str =
+LEGACY_TOTP_ALGO`` parameter in 9d47affe ("feat(3.1 P13): role-tiered TOTP —
+SHA-256/6 users, SHA-512/8 admins", 2026-06-28) — two weeks after this test was
+authored (832e4d4a, 2026-06-14) and never re-run since src/tests/regression/
+was wired into no YTF tier until today. `_bootstrap_admin_accounts` (app.py)
+now calls ``set_totp_secret_direct(admin_username, totp_secret,
+algorithm="SHA512")`` to match the admin-tier algorithm; the mock didn't accept
+the kwarg and raised ``TypeError``. Unrelated to the SEC-001 property itself
+(no install_svc): tests 1/2/4 (AST-based, checking for the deleted
+_bootstrap_service_account function/call/literal) already passed unmodified —
+the mock repair below only restores fidelity to the real auth-service
+interface so test 3 can exercise the bootstrap path again. Also unrelated to
+the concurrent FIND-0813-013 red-team review of the SEC-001 "no-admin-API
+durable path" for agent registration (install.sh register_agent_bundles /
+AgentDurableStore) — that is a different code surface
+(src/yashigani/backoffice/app.py:_bootstrap_admin_accounts, human admin
+bootstrap) from the one under review (install.sh, agent registration); this
+fix does not depend on and does not pre-empt that review's conclusion.
 """
 from __future__ import annotations
 
@@ -105,8 +126,11 @@ async def test_human_admin_bootstrap_not_blocked_by_svc_account():
         async def get_account(self, username):
             return None
 
-        async def set_totp_secret_direct(self, username, secret):
-            pass
+        async def set_totp_secret_direct(self, username, secret, algorithm="SHA1"):
+            # Phase 13 (9d47affe): real PostgresLocalAuthService.set_totp_secret_direct
+            # takes an `algorithm` kwarg (admin bootstrap passes "SHA512"). Mirror the
+            # real signature so this mock doesn't drift from the interface it stands in for.
+            self.totp_algorithm = algorithm
 
     # Build a minimal mock state with _auth_bootstrap context
     import tempfile, os
@@ -129,7 +153,15 @@ async def test_human_admin_bootstrap_not_blocked_by_svc_account():
 
         from yashigani.backoffice.app import _bootstrap_admin_accounts
 
-        await _bootstrap_admin_accounts(_MockAuthService(), _MockState())
+        auth_svc = _MockAuthService()
+        await _bootstrap_admin_accounts(auth_svc, _MockState())
+
+    # Admin-tier bootstrap must provision the admin-tier TOTP algorithm (Phase 13,
+    # 9d47affe) — not just accept the kwarg without honouring it.
+    assert getattr(auth_svc, "totp_algorithm", None) == "SHA512", (
+        "_bootstrap_admin_accounts must call set_totp_secret_direct(..., "
+        "algorithm='SHA512') for admin-tier accounts (Phase 13 role-tiered TOTP)."
+    )
 
     # admin1 must have been created
     assert "admin1" in created, (
