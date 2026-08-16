@@ -2019,6 +2019,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # therefore the OPA ceiling) exactly as the plaintext would.  classify_decoded
     # is a superset of classify for non-encoded text (raw view alone decides).
     sensitivity_level = "PUBLIC"
+    # NOT dead: consumed far below by _derive_pci_data_tags(sensitivity_triggers)
+    # on the PCI data-tags path. Removed by 6b482dd2 as an unused-assignment lint
+    # cleanup, which left that use undefined -> NameError. Restored 2026-08-16.
+    sensitivity_triggers = []
     s_result = None
     if _state.sensitivity_classifier:
         s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
@@ -2028,6 +2032,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         # the expected "PUBLIC"/"INTERNAL"/"CONFIDENTIAL"/"RESTRICTED" label.
         from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
         sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
+        sensitivity_triggers = s_result.triggers
     if s_result is None:
         from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
         s_result = SensitivityResult(level=SensitivityLevel.PUBLIC)
