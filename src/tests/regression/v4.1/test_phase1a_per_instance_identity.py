@@ -392,6 +392,19 @@ class _FakeRedis:
                 v if isinstance(v, bytes) else str(v).encode()
             )
 
+    def delete(self, *keys) -> int:
+        """FIND-0813-013: AgentRegistry.deactivate() now calls self._r.delete()
+        directly (not only via a pipeline) to revoke agent:token:{id} /
+        agent:token:grace:{id}. Mirrors real redis-py's DEL semantics closely
+        enough for these tests: removes each key from the flat string store,
+        returns the count actually removed."""
+        removed = 0
+        for k in keys:
+            if k in self._store:
+                del self._store[k]
+                removed += 1
+        return removed
+
     def scard(self, key: str) -> int:
         return len(self._sets.get(key, set()))
 
@@ -492,6 +505,13 @@ def test_deactivate_clears_nhi_active_index_and_token_map() -> None:
     assert token not in reg.get_nhi_token_map(), (
         "deactivated NHI token must leave the gateway token map immediately"
     )
+    # FIND-0813-013 (Nico, 2026-08-13): deactivate() must also revoke the
+    # agent:token:{id} bcrypt-hash key it now deletes (the fix that closed
+    # "deactivate() doesn't actually revoke" for the PSK-authenticated
+    # /agents/* path). NHIs mint under nhi_id, not agnt_id, so no such key
+    # was ever written here -- this asserts the delete is a correct
+    # (harmless) no-op for NHIs, not that it silently swallowed an error.
+    assert reg._r.get(f"agent:token:{nhi_id}") is None
 
 
 def test_approve_threads_instance_id_and_binding_into_mint(
@@ -585,3 +605,7 @@ def test_deactivate_route_revokes_nhi_manifest_entry(
         "instance_id": nhi_id,
     }
     assert reg.get(nhi_id)["status"] == "inactive"
+    # FIND-0813-013: the admin deactivate ROUTE must reach AgentRegistry
+    # .deactivate()'s token-revocation path too, not just the PKI revoke call
+    # this test primarily targets -- prove the full call chain, not a mock.
+    assert reg._r.get(f"agent:token:{nhi_id}") is None

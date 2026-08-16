@@ -345,17 +345,36 @@ return 1
                     )
 
     def deactivate(self, agent_id: str) -> None:
-        """Set status=inactive and remove from active indexes.
+        """Set status=inactive, remove from active indexes, AND revoke the PSK.
 
         v4.1 Phase 1a (GAP-4 adjacency): NHIs must ALSO leave
         ``nhi:index:active`` — ``get_nhi_token_map()`` reads that index, so a
         deactivated NHI whose id lingered there kept a live gateway token.
+
+        FIND-0813-013 / SEC-001 (Nico, 2026-08-13): pre-fix, this method only
+        flipped ``status`` + index membership. ``verify_token()`` looks up
+        ``agent:token:{agent_id}`` directly and never consulted ``status`` or
+        ``agent:index:active`` — so a "deactivated" agent's bcrypt-hashed PSK
+        kept authenticating forever. This is the ONLY documented manual
+        remediation an operator has for an orphaned/duplicate-name row
+        (migration 0017 deliberately drops agent-NAME uniqueness — MUST-FIX-2,
+        Iris 2026-06-10 — so a re-registration under a colliding name does
+        not itself revoke the superseded row's credential; agent_id stays the
+        real key). Deleting the token material here — not just flipping a
+        flag — is what makes deactivate() actually revoke access. The grace
+        key (``agent:token:grace:{agent_id}``, token_rotation.py's rotation
+        grace window) is deleted too: it is the same credential family and
+        would otherwise remain a live fallback secret past a deliberate
+        deactivate.
         """
         reg_key = f"agent:reg:{agent_id}"
         self._r.hset(reg_key, b"status", b"inactive")
         self._r.srem("agent:index:active", agent_id.encode("utf-8"))
         self._r.srem("nhi:index:active", agent_id.encode("utf-8"))
-        logger.info("AgentRegistry: deactivated %s", agent_id)
+        # FIND-0813-013: revoke the credential material itself.
+        self._r.delete(f"agent:token:{agent_id}")
+        self._r.delete(f"agent:token:grace:{agent_id}")
+        logger.info("AgentRegistry: deactivated %s (token material revoked)", agent_id)
         # ISSUE-AGENT-REG-DURABILITY: mirror the status change into Postgres.
         if self._durable is not None:
             try:
@@ -421,12 +440,27 @@ return 1
             })
         pipe = self._r.pipeline()
         pipe.hset(reg_key, mapping=mapping)
-        pipe.set(token_key, token_hash.encode("utf-8"))
-        pipe.sadd("agent:index:all", agent_id.encode("utf-8"))
+        # FIND-0813-013 (Nico, 2026-08-13): do NOT unconditionally restore the
+        # token key. AgentDurableStore.set_status() (called by deactivate())
+        # updates status/is_active in Postgres but deliberately RETAINS the
+        # historical token_hash column (audit/rotation trail) -- deactivate()
+        # itself deletes the LIVE Redis token key, not the Postgres column. If
+        # this reconciler blindly restored token_hash for every row regardless
+        # of status, a Redis db/3 wipe (appendonly no / save "") followed by a
+        # reconcile would silently RESURRECT a deliberately-revoked agent's
+        # PSK -- the exact "manual deactivate doesn't actually revoke" gap
+        # this fix closes, reopened one layer down. Only live/active agents
+        # get their token key restored; an inactive row's token key is
+        # explicitly deleted (idempotent — restore_from_durable() only runs
+        # when the key is already absent, but this keeps the invariant
+        # explicit rather than implicit).
         if status == "active":
+            pipe.set(token_key, token_hash.encode("utf-8"))
             pipe.sadd("agent:index:active", agent_id.encode("utf-8"))
         else:
+            pipe.delete(token_key)
             pipe.srem("agent:index:active", agent_id.encode("utf-8"))
+        pipe.sadd("agent:index:all", agent_id.encode("utf-8"))
         pipe.execute()
         logger.info("AgentRegistry: restored %s (%s) into Redis db/3 from durable store",
                     agent_id, agent.get("name", ""))

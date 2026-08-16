@@ -57,8 +57,14 @@ class TestAgentAuthMiddleware:
 
         mock_registry = MagicMock()
         mock_registry.verify_token.return_value = True
-        # Return None from .get() so the IP allowlist check is skipped (no CIDRs configured)
-        mock_registry.get.return_value = None
+        # FIND-0813-013 (Nico, 2026-08-13): AgentAuthMiddleware now also
+        # requires a caller-status check (registry.get() -> status == "active")
+        # before authenticating, fail-closed on an unresolvable caller — so
+        # this active-agent test can no longer stub .get() -> None (that now
+        # means "unknown caller, reject" per the fix). Return an active agent
+        # with no CIDRs configured, which still exercises the "IP allowlist
+        # check skipped when allowed_cidrs is empty" path this test targets.
+        mock_registry.get.return_value = {"status": "active", "allowed_cidrs": []}
         mock_audit = MagicMock()
         app.add_middleware(AgentAuthMiddleware, agent_registry=mock_registry, audit_writer=mock_audit)
 

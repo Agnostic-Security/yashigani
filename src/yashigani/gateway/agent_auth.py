@@ -146,20 +146,60 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 status=401,
             )
 
-        # IP allowlist check — only if the agent has CIDRs configured
+        # FIND-0813-013 / SEC-001 (Nico, 2026-08-13): verify_token() is a pure
+        # bcrypt.checkpw against agent:token:{agent_id} -- it never consulted
+        # `status`. Migration 0017 deliberately allows a superseded agent row
+        # (same name, different agent_id) to stay active alongside a fresh
+        # re-registration (MUST-FIX-2, Iris 2026-06-10 -- names may legitimately
+        # collide, agent_id is the only unique key), and the ONLY documented
+        # manual remediation for the superseded row is "deactivate the stale
+        # one" -- which, before AgentRegistry.deactivate() was fixed in this
+        # same change, didn't even delete the token key. Both links are now
+        # closed: deactivate() deletes agent:token:{agent_id}, and this check
+        # rejects a caller whose token still happens to verify (e.g. reconcile
+        # race, cache) but whose registration is not status="active". Fail
+        # CLOSED: an unresolvable caller (registry.get() -> None) is rejected
+        # exactly like a status != "active" caller, consistent with
+        # verify_token()'s own fail-closed posture ("Always returns False on
+        # any error").
+        #
+        # `.get("status", "active")` (not a bare `agent.get("status")`) is
+        # deliberate: AgentRegistry._decode_agent() ALWAYS populates a
+        # "status" key on every real registry.get() return (defaulting to ""
+        # when the underlying Redis hash field is genuinely absent, never
+        # omitting the key) -- so in production this default NEVER masks a
+        # missing/blank status; "" != "active" still rejects. The default only
+        # matters for hand-built dicts that don't model status at all.
         agent = registry.get(caller_agent_id)
-        if agent is not None:
-            allowed_cidrs = agent.get("allowed_cidrs") or []
-            if allowed_cidrs:
-                source_ip = _get_client_ip(request)
-                if not _ip_in_cidrs(source_ip, allowed_cidrs):
-                    return await self._reject_ip(
-                        request,
-                        caller_agent_id=caller_agent_id,
-                        path=path,
-                        source_ip=source_ip,
-                        allowed_cidrs=allowed_cidrs,
-                    )
+        if agent is None:
+            return await self._reject(
+                request,
+                caller_agent_id=caller_agent_id,
+                path=path,
+                reason="caller_agent_not_found",
+                status=401,
+            )
+        if agent.get("status", "active") != "active":
+            return await self._reject(
+                request,
+                caller_agent_id=caller_agent_id,
+                path=path,
+                reason="caller_agent_inactive",
+                status=401,
+            )
+
+        # IP allowlist check — only if the agent has CIDRs configured
+        allowed_cidrs = agent.get("allowed_cidrs") or []
+        if allowed_cidrs:
+            source_ip = _get_client_ip(request)
+            if not _ip_in_cidrs(source_ip, allowed_cidrs):
+                return await self._reject_ip(
+                    request,
+                    caller_agent_id=caller_agent_id,
+                    path=path,
+                    source_ip=source_ip,
+                    allowed_cidrs=allowed_cidrs,
+                )
 
         # Authentication successful — attach state and proceed
         request.state.agent_id = caller_agent_id
