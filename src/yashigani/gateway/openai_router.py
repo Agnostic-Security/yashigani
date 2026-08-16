@@ -726,7 +726,8 @@ def _service_account_full_list_enabled() -> bool:
         return _SA_FULL_LIST_CACHE["value"]
     value = False
     try:
-        import psycopg2, json as _json
+        import psycopg2
+        import json as _json
         from yashigani.runtime_settings.keys import KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST as _K
         dsn = os.getenv("YASHIGANI_DB_DSN", "")
         if dsn and "${POSTGRES_PASSWORD}" not in dsn:
@@ -1993,7 +1994,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     brain_reasoning_relaxed = False
 
     # ── 2. Extract prompt text for classification ─────────────────────
-    prompt_text = "\n".join(m.content for m in body.messages if m.content)
+    prompt_text = "\n".join(m.content for m in body.messages if m.content)  # type: ignore[misc]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
 
     # ── 2b. Content relay detection (agent-to-agent laundering) ──────
     if _state.content_relay_detector and prompt_text:
@@ -2018,7 +2019,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # therefore the OPA ceiling) exactly as the plaintext would.  classify_decoded
     # is a superset of classify for non-encoded text (raw view alone decides).
     sensitivity_level = "PUBLIC"
-    sensitivity_triggers = []
     s_result = None
     if _state.sensitivity_classifier:
         s_result = _state.sensitivity_classifier.classify_decoded(prompt_text)
@@ -2028,7 +2028,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         # the expected "PUBLIC"/"INTERNAL"/"CONFIDENTIAL"/"RESTRICTED" label.
         from yashigani.optimization.sensitivity_classifier import _LEVEL_TO_LEGACY_STRING
         sensitivity_level = _LEVEL_TO_LEGACY_STRING.get(int(s_result.level), "RESTRICTED")
-        sensitivity_triggers = s_result.triggers
     if s_result is None:
         from yashigani.optimization.sensitivity_classifier import SensitivityLevel, SensitivityResult
         s_result = SensitivityResult(level=SensitivityLevel.PUBLIC)
@@ -2045,7 +2044,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         c_result = ComplexityResult(level=ComplexityLevel.MEDIUM, token_count=token_estimate, heuristic_score=0.0, reasons=[])
 
     # ── 5. Budget check ───────────────────────────────────────────────
-    budget_signal = "normal"
     budget_pct = 0
     budget_used = 0
     budget_total = 0
@@ -2063,7 +2061,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             group_ids=identity.get("groups") or [],
             org_id=identity.get("org_id", "") or "",
         )
-        budget_signal = budget_state.signal.value
         budget_pct = budget_state.pct
         budget_used = budget_state.used
         budget_total = budget_state.total
@@ -3048,6 +3045,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         from yashigani.permissions import DEFAULT_ORG_ID as _PERM_ORG_ID
 
         _perm_org_id = _PERM_ORG_ID
+        # TODO(remediation): typed ResolvedGroups — group membership is read
+        # here as an untyped dict lookup (identity.get("groups", [])) with no
+        # schema/type guarantee on the list contents (group-id shape, dedup,
+        # provenance). Council remediation (2026-07-15) scoped this as a
+        # follow-up newtype refactor (typed ResolvedGroups wrapping validated
+        # group-id membership), not part of the mechanical Phase-0/1 CI-gate
+        # work landed in this PR. See opengrep-rules/authz/ for the adjacent
+        # WARN-severity deny-without-allow heuristic this same council review
+        # produced.
         _perm_groups: list = identity.get("groups", []) if identity else []
         # User-level grants for narrowing — only for human/user principals.
         # Service/agent/gateway identities use org+group tiers only.
@@ -3513,7 +3519,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                     )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
-                            m.content for m in body.messages if m.content
+                            m.content for m in body.messages if m.content  # type: ignore[misc]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
                         )
 
     # ── 7. Forward to backend ─────────────────────────────────────────
@@ -3747,7 +3753,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
                     backend_body = agent_resp
                     route_reason = f"agent:{selected_model[1:]}:letta"
-                except Exception as exc:
+                except Exception:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Letta agent %s failed", selected_model)
                     return JSONResponse(
@@ -3774,7 +3780,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
                     backend_body = agent_resp
                     route_reason = f"agent:{selected_model[1:]}:langflow"
-                except Exception as exc:
+                except Exception:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Langflow agent %s failed", selected_model)
                     return JSONResponse(
@@ -3861,7 +3867,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             json=agent_body,
                             headers=agent_headers,
                         )
-                except Exception as exc:
+                except Exception:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Agent %s unreachable", selected_model)
                     return JSONResponse(
@@ -3982,7 +3988,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     anthropic_messages = []
                     for m in body.messages:
                         if m.role == "system":
-                            system_text = m.content or ""
+                            system_text = m.content or ""  # type: ignore[assignment]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
                         else:
                             anthropic_messages.append(
                                 {"role": m.role, "content": m.content or ""}

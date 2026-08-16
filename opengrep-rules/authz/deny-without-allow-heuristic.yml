@@ -1,0 +1,95 @@
+# Last updated: 2026-07-15T00:00:00+00:00
+# Council remediation (2026-07-15, Tiago-approved) — mechanical Phase-1 win.
+#
+# HEURISTIC, NOT PROOF. This rule flags a SHAPE that has repeatedly produced
+# real bypasses in this codebase (LAURA-412-001: THREE proven live deny
+# bypasses — openai:gpt-4o. / openai::gpt-4o / openai://gpt-4o — all slipped
+# a subtractive denylist normalizer that only handled ONE separator form and
+# was fixed by six rounds of whack-a-mole before the eventual robust
+# canonicalize-then-check rewrite, commit 4ef626cd). It is severity WARNING
+# — a human-review gate, not a hard block — because it WILL false-positive
+# on legitimate defensive canonicalization (e.g. collapsing separators
+# BEFORE matching against injection patterns to defeat evasion, which is the
+# CORRECT direction for that use case — see
+# src/yashigani/mcp/_content_filter.py::_collapse_separators).
+#
+# What it looks for: a function in a security-decision module (authz / RBAC
+# / OPA-input / routing / model-selection) that performs subtractive
+# sanitisation (.replace / .strip / re.sub) AND whose name suggests it feeds
+# a deny/block/reject/gate decision, with no allow/permit/schema-validate
+# keyword anywhere in the same function body. The absence of that keyword is
+# NOT proof the function is unsafe — it is a prompt for a human reviewer to
+# confirm the canonicalization is complete (collapses ALL separator/
+# punctuation variants) and, ideally, that the final check is a POSITIVE
+# match against a known-good form (allowlist/schema) rather than a negative
+# match against a known-bad form (denylist), which is what closed
+# LAURA-412-001 for good.
+rules:
+  - id: deny-without-allow-heuristic
+    message: >
+      Subtractive sanitisation (.replace/.strip/re.sub) feeds what looks
+      like a deny/block/reject gate decision in this function, with no
+      allow/permit/schema-validate check visible in the same function body.
+      This is the exact shape behind LAURA-412-001 (six-round deny-bypass
+      whack-a-mole, commit 4ef626cd) — a partial denylist normalizer missed
+      a separator/punctuation variant and let a should-be-denied request
+      through. HEURISTIC ONLY: verify by hand that (a) the sanitisation
+      collapses every separator/punctuation variant an attacker could use,
+      and (b) prefer a positive allowlist/schema check over a negative
+      denylist check for the final gate decision. Not a hard block — WARN
+      severity, human-review gate.
+    severity: WARNING
+    languages: [python]
+    paths:
+      include:
+        - "src/yashigani/rbac/**/*.py"
+        - "src/yashigani/models/**/*.py"
+        - "src/yashigani/mcp/_content_filter.py"
+        - "src/yashigani/mcp/_opa.py"
+        - "src/yashigani/mcp/broker.py"
+        - "src/yashigani/mcp/_egress_grants.py"
+        - "src/yashigani/gateway/openai_router.py"
+        - "src/yashigani/gateway/orchestrator.py"
+        - "src/yashigani/documents/opa_decision.py"
+        - "src/yashigani/documents/opa_push.py"
+        - "src/yashigani/policy_bindings/**/*.py"
+    patterns:
+      - pattern-either:
+          - pattern: $VAR = $X.replace(...)
+          - pattern: $VAR = $X.strip(...)
+          - pattern: $VAR = re.sub(...)
+      - pattern-inside: |
+          def $FUNC(...):
+              ...
+      - metavariable-pattern:
+          metavariable: $FUNC
+          patterns:
+            - pattern-regex: (?i).*(deny|denied|denies|block|forbid|reject|gate|banned).*
+      # Excludes the case where the SAME function also contains a positive
+      # allow/permit/valid-named membership check (the intended safe
+      # pattern: canonicalize once, then check a positive allowlist).
+      - pattern-not-inside:
+          patterns:
+            - pattern: |
+                def $FUNC(...):
+                    ...
+                    if $M in $ALLOWSET:
+                        ...
+                    ...
+            - metavariable-pattern:
+                metavariable: $ALLOWSET
+                patterns:
+                  - pattern-regex: (?i).*(allow|permit|valid).*
+    metadata:
+      cwe: "CWE-184"  # Incomplete list of disallowed inputs
+      category: "security"
+      confidence: "LOW"
+      references:
+        - "commit 4ef626cd (LAURA-412-001: robust deny canonicalization ends whack-a-mole)"
+      owasp: "A01:2021 — Broken Access Control"
+      fix: >
+        Prefer a positive allowlist/schema check (does the canonical form
+        match a known-good entry?) over a negative denylist check (does the
+        canonical form NOT match a known-bad pattern?). If a denylist check
+        is unavoidable, verify the canonicalization step collapses every
+        separator/punctuation/case/encoding variant before the comparison.
