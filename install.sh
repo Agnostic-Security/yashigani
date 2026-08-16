@@ -11906,6 +11906,19 @@ run_health_check() {
   # 127.0.0.11 — dead on Podman). FATAL, not a warning: a green install that
   # cannot dispatch to any onboarded agent is a false green.
   _check_agent_dispatch_smoke "${WORK_DIR}/docker"
+
+  # YSG-RISK-196: apparmor_parser -r succeeding (or being skipped) at env-setup
+  # time only proves the profile was accepted into the HOST's policy cache (or
+  # that install.sh made a documented unconfined decision) at THAT moment — it
+  # proves nothing about what the RUNNING containers actually got at container-
+  # start time, which can happen much later (image pulls, DB init) and is a
+  # separate host/runtime code path (the compose engine, not apparmor_parser).
+  # Same defect class as FINDING-V412-RESTART-012 (RO-mount): a declared
+  # intent was never checked against runtime reality. Non-fatal per documented
+  # design (docs/yashigani_install_config.md §26.4: AppArmor is "Optional" —
+  # defense-in-depth, not a blocking control like the PKI RO-mount), but the
+  # actual state is now verified live and reported loudly either way.
+  _verify_apparmor_confinement
 }
 
 # _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
@@ -12145,6 +12158,126 @@ _check_agent_dispatch_smoke() {
 
   if [[ "$_had_failure" == "true" ]]; then
     exit 1
+  fi
+}
+
+# _verify_apparmor_confinement — YSG-RISK-196.
+#
+# install.sh's env-setup phase (docker/.env AES key + security-profile
+# override block, ~line 3885) decides YASHIGANI_APPARMOR_PROFILE and logs
+# that decision — but that log line only reflects what `apparmor_parser -r`
+# did to the HOST's policy cache (or the deliberate Podman/host-unavailable
+# unconfined fallback) at env-setup time, BEFORE the compose stack is ever
+# started. Nothing previously re-checked the actually-running containers
+# after `compose up`, so a profile that failed to attach for any reason
+# downstream of that decision (host reboot mid-install, a runtime that
+# silently drops an unrecognised security_opt, TOCTOU between the two
+# steps) produced a container running unconfined with install.sh still
+# reporting the profile as "loaded" — the exact "did no work, reported
+# success" defect class this codebase has been fixing all week
+# (FINDING-V412-RESTART-012 is the RO-mount instance of the same pattern).
+#
+# This function reads back the LIVE per-process AppArmor state from the
+# container's own view — /proc/<pid>/attr/apparmor/current (falls back to
+# the pre-LSM-namespaced /proc/<pid>/attr/current on older kernels) — which
+# is authoritative for both Docker and Podman. `docker inspect
+# --format .AppArmorProfile` is used as a secondary display value only:
+# live-verified 2026-08-16 (testing_runs/yashigani/converge-20260813/
+# su-item2-anonvol/) that Docker populates it correctly (docker-default /
+# unconfined / <profile>) but Podman's compat-inspect leaves it empty for
+# every container regardless of actual confinement, so it cannot be trusted
+# as the sole signal on Podman — the /proc read is required for parity.
+#
+# Docker + Podman both differ from what the OLD env-setup-time log implied:
+#   - Podman (rootful or rootless): install.sh ALWAYS sets unconfined here
+#     by design (see the YSG_PODMAN_RUNTIME branch above this function) —
+#     genuinely no AppArmor confinement is applied. This function confirms
+#     that is what actually happened rather than silently trusting the
+#     declared intent, and says so explicitly rather than implying
+#     confinement that was never there.
+#   - Docker on Linux: the profile is expected to be genuinely enforcing.
+#
+# Non-fatal (does not exit 1) — docs/yashigani_install_config.md §26.4
+# documents AppArmor as "Optional" defense-in-depth, not a blocking control
+# the way the PKI RO-mount is. But every outcome is reported accurately and
+# loudly; nothing is silently swallowed.
+_verify_apparmor_confinement() {
+  # K8s/Helm has its own PodSecurityContext / AppArmor annotation mechanism,
+  # not this compose security_opt wiring — not applicable here.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "_verify_apparmor_confinement (skipped in dry-run)"
+    return 0
+  fi
+
+  local _rt="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _rt="podman"
+
+  local _env_file="${WORK_DIR}/docker/.env"
+  local _declared="unconfined"
+  if [[ -f "$_env_file" ]]; then
+    local _declared_raw
+    _declared_raw="$(grep -m1 '^YASHIGANI_APPARMOR_PROFILE=' "$_env_file" 2>/dev/null | cut -d= -f2- || true)"
+    [[ -n "$_declared_raw" ]] && _declared="$_declared_raw"
+  fi
+
+  local _svc _ctr _pid _live _any_checked=false _mismatch=false
+  for _svc in gateway backoffice extractor-svc; do
+    _ctr="$("$_rt" ps --filter "name=${_svc}" --format '{{.Names}}' 2>/dev/null | head -1 || true)"
+    if [[ -z "$_ctr" ]]; then
+      log_warn "AppArmor verification (YSG-RISK-196): ${_svc} container not found — skipping (not yet up)"
+      continue
+    fi
+    _any_checked=true
+
+    _pid="$("$_rt" inspect "$_ctr" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    _live=""
+    if [[ -n "$_pid" && "$_pid" != "0" ]]; then
+      if [[ -r "/proc/${_pid}/attr/apparmor/current" ]]; then
+        _live="$(cat "/proc/${_pid}/attr/apparmor/current" 2>/dev/null || true)"
+      elif [[ -r "/proc/${_pid}/attr/current" ]]; then
+        _live="$(cat "/proc/${_pid}/attr/current" 2>/dev/null || true)"
+      fi
+    fi
+
+    if [[ -z "$_live" ]]; then
+      log_warn "AppArmor verification (YSG-RISK-196): could not read live confinement state for ${_ctr} (pid=${_pid:-unknown}, ${_rt}) — AppArmor LSM may not be exposed to this host/runtime (e.g. nested container, gVisor, kernel without securityfs). UNVERIFIED — treat as NOT confirmed, not as confirmed-confined."
+      continue
+    fi
+
+    if [[ "$_declared" == "unconfined" ]]; then
+      if [[ "$_live" == *"unconfined"* ]]; then
+        log_success "AppArmor (${_ctr}): confirmed UNCONFINED at runtime — matches install-time decision (${_rt}, YASHIGANI_APPARMOR_PROFILE=unconfined). No AppArmor confinement is applied to this container; this is expected on this runtime/host."
+      else
+        log_info "AppArmor (${_ctr}): declared unconfined but live state is '${_live}' (more confined than declared — harmless, not a security gap; runtime default profile is doing incidental work install.sh did not request)."
+      fi
+    else
+      if [[ "$_live" == *"$_declared"* && "$_live" != *"unconfined"* ]]; then
+        log_success "AppArmor (${_ctr}): CONFIRMED enforcing '${_declared}' at runtime (live: ${_live})."
+      else
+        _mismatch=true
+        log_error "################################################################"
+        log_error "AppArmor CONFINEMENT MISMATCH — YSG-RISK-196"
+        log_error "  ${_ctr} was declared to run under AppArmor profile '${_declared}'"
+        log_error "  (docker/.env YASHIGANI_APPARMOR_PROFILE) but its LIVE runtime"
+        log_error "  state is actually: '${_live:-<empty>}'."
+        log_error "  This container is running with WEAKER confinement than the"
+        log_error "  install reported. Checked: ${_rt} inspect ${_ctr} -> pid ${_pid}"
+        log_error "  -> /proc/${_pid}/attr/apparmor/current"
+        log_error "################################################################"
+      fi
+    fi
+  done
+
+  if [[ "$_any_checked" == "false" ]]; then
+    log_info "AppArmor verification (YSG-RISK-196): no gateway/backoffice/extractor-svc containers found — skipped"
+    return 0
+  fi
+
+  if [[ "$_mismatch" == "true" ]]; then
+    log_warn "AppArmor: one or more containers are running with weaker confinement than install declared (see above). NOT blocking this install — AppArmor is documented as optional defense-in-depth (docs/yashigani_install_config.md §26.4), not a hard security gate. Investigate before relying on it as a control."
   fi
 }
 

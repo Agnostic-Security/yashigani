@@ -507,6 +507,29 @@ _list_project_networks() {
 # BUG-UNINSTALL-DEPEND-ORDER-2026-05-26: --depend FIRST is mandatory.
 # See Maxine's commit 82f356c for root-cause analysis.
 #
+# YSG-RISK-197 (2026-08-16): this is the belt-and-braces fallback removal
+# path — the documented reliable fallback for podman-compose ≤1.3.x parity
+# gaps and restart-policy=always respawn races (see the "Step 1/2/3" comments
+# in the teardown_* functions below). `rm -f` WITHOUT `-v`/`--volumes` does
+# NOT remove anonymous volumes attached to the container — Docker/Podman
+# leave them as genuinely dangling, unlabelled local volumes (confirmed live:
+# a compose-created anonymous volume survives `docker rm -f` and is then
+# INVISIBLE to `docker volume prune --filter label=com.docker.compose.project=
+# ...` because Compose never stamps that label on anonymous volumes — only on
+# named ones — so the two bugs compounded: the belt-and-braces path leaked
+# the volume, and the "ANON-VOL-LEAK" dangling-prune pass further down could
+# never have found it even in principle. Reproduced + fixed in
+# testing_runs/yashigani/converge-20260813/su-item2-anonvol/.
+#
+# Only pass -v when $REMOVE_VOLUMES=true — a plain `uninstall.sh` (no
+# --remove-volumes) must still preserve data volumes; _remove_containers is
+# also called on that non-destructive path (container teardown always
+# happens; volume removal is opt-in). `$REMOVE_VOLUMES` is the same global
+# every other volume-destructive branch in this script already reads
+# directly (e.g. the linger-disable gate above, the named-volume loop
+# below) — following that existing pattern rather than threading a new
+# parameter through every call site.
+#
 # Args: $1 = runtime binary
 #       $2 = newline-separated container IDs
 # Side-effects: prints per-container result to stdout/stderr.
@@ -517,6 +540,11 @@ _remove_containers() {
   local _ids="${2:-}"
   [ -z "$_ids" ] && return 0
 
+  local -a _vol_flag=()
+  if [ "${REMOVE_VOLUMES:-false}" = "true" ]; then
+    _vol_flag=("-v")
+  fi
+
   local _count
   _count="$(printf '%s\n' "$_ids" | grep -c '.' || true)"
   echo "  [stop] Stopping ${_count} container(s)..."
@@ -525,14 +553,18 @@ _remove_containers() {
     "$_rt" stop --time 0 "$_cid" >/dev/null 2>&1 || true
   done <<< "$_ids"
 
-  echo "  [rm] Force-removing ${_count} container(s) (--depend first)..."
+  if [ "${#_vol_flag[@]}" -gt 0 ]; then
+    echo "  [rm] Force-removing ${_count} container(s) (--depend first, -v to also remove their anonymous volumes)..."
+  else
+    echo "  [rm] Force-removing ${_count} container(s) (--depend first)..."
+  fi
   while IFS= read -r _cid; do
     [ -z "$_cid" ] && continue
     local _cname
     _cname="$("$_rt" inspect --format '{{.Name}}' "$_cid" 2>/dev/null | sed 's|^/||' || echo "$_cid")"
-    if "$_rt" rm -f --depend "$_cid" >/dev/null 2>&1; then
+    if "$_rt" rm -f --depend "${_vol_flag[@]}" "$_cid" >/dev/null 2>&1; then
       echo "  [removed] ${_cname} (${_cid})"
-    elif "$_rt" rm -f "$_cid" >/dev/null 2>&1; then
+    elif "$_rt" rm -f "${_vol_flag[@]}" "$_cid" >/dev/null 2>&1; then
       # --depend unsupported (Docker / older Podman) — plain rm -f fallback
       echo "  [removed] ${_cname} (${_cid})"
     else
@@ -2068,32 +2100,69 @@ fi
 # filter matched nothing, fell through to `volume ls --filter dangling=true`
 # with NO project scoping at all and removed EVERY dangling volume on the
 # shared daemon — including anonymous volumes belonging to other orgs on a
-# multi-org host. Compose labels its own anonymous volumes the same as named
-# ones, so the label filter is the correct and sufficient signal; an
-# unlabeled dangling volume cannot be safely attributed to this project by
-# name (anonymous volumes have no project-prefixed name to anchor on) and
-# must NEVER be blind-removed. Fix: WARN + skip instead of blind-removing —
-# same posture as the CNI "foreign config" handling above (list, never nuke
-# what cannot be positively attributed to this project).
+# multi-org host. Fix: WARN + skip instead of blind-removing — same posture
+# as the CNI "foreign config" handling above (list, never nuke what cannot
+# be positively attributed to this project). That WARN-only posture for
+# unattributed volumes stays correct and is now applied to BOTH runtimes
+# below (previously Docker-only silently "succeeded").
+#
+# YSG-RISK-197 (2026-08-16): the claim this section's original comment made —
+# "Compose labels its own anonymous volumes the same as named ones, so the
+# label filter is the correct and sufficient signal" — is FALSE on Docker,
+# live-verified in testing_runs/yashigani/converge-20260813/su-item2-anonvol/:
+#   $ docker volume inspect <compose-anon-vol-id> --format '{{json .Labels}}'
+#   {"com.docker.volume.anonymous":""}
+# Docker Compose anonymous volumes carry ONLY `com.docker.volume.anonymous`
+# — NEVER `com.docker.compose.project`. The docker branch's
+# `--filter "label=com.docker.compose.project=..."` therefore matched ZERO
+# anonymous volumes, always, on every uninstall that ever ran it.
+#
+# A second, compounding bug: as of the Docker Engine version this host runs
+# (29.1.3), `docker volume prune` WITHOUT `-a`/`--all` only considers
+# ANONYMOUS volumes as prune candidates in the first place — but this
+# section's filter demanded a label anonymous volumes never carry. The two
+# defaults contradicted each other: default mode = anonymous-only candidate
+# set, filter = named-only signal. Net effect proven live: the docker branch
+# always pruned exactly zero volumes and always printed
+# "Total reclaimed space: 0B" — text which STILL contains the substring
+# "Total reclaimed space", so the old `grep -q "Total reclaimed space"`
+# success check fired every single time regardless of whether anything was
+# actually removed. This is the exact "reports volumes deleted while
+# anonymous volumes survive" defect from the finding: the report was true by
+# accident of grep matching boilerplate output, not because anything was
+# checked.
+#
+# The real fix for the LEAK itself lives at the source: _remove_containers()
+# above now passes -v/--volumes to `rm -f` (gated on $REMOVE_VOLUMES) so
+# Docker/Podman remove each container's anonymous volumes atomically, using
+# their own authoritative container->volume bookkeeping — no label
+# heuristics required, and it also covers containers from compose files not
+# passed to `down` (e.g. docker-compose.wazuh.yml), since _remove_containers
+# is the belt-and-braces path used for all of them. `compose down --volumes`
+# (Step 1, above) already handled anonymous volumes correctly for the
+# graceful-shutdown path — live-verified the same session, same evidence
+# dir. This section is therefore now honestly scoped as a SECOND-LAYER
+# reconciliation pass for pre-existing orphaned volumes left by an EARLIER,
+# already-failed uninstall run (this run's own containers should have
+# nothing left by the time we get here) — never the primary mechanism.
 # ---------------------------------------------------------------------------
 if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
-    echo "=== Dangling volume prune (ANON-VOL-LEAK) ==="
+    echo "=== Dangling volume prune (ANON-VOL-LEAK reconciliation pass) ==="
     _dangling_pruned=0
+    _unattributed_count=0
 
     if [ "$RUNTIME" = "podman" ]; then
+        # NOTE: whether native podman-compose stamps io.podman.compose.project
+        # on the anonymous volumes it creates could not be live-verified on
+        # this host (vendored podman-compose fork not runnable here — Python
+        # distutils removed from this host's Python 3.12; tracked separately,
+        # not this finding's scope). Treated as unconfirmed rather than
+        # assumed true, per the same Docker assumption having just been
+        # proven false. If the label filter matches nothing below, the
+        # unattributed-dangling WARN path still runs, so no anonymous volume
+        # is ever silently reported as handled when it was not.
         _dangling_ids="$("$RUNTIME" volume ls --noheading -q --filter dangling=true \
             --filter "label=io.podman.compose.project=${_PROJECT_PREFIX}" 2>/dev/null || true)"
-        if [ -z "$_dangling_ids" ]; then
-            _unattributed_dangling="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
-                | grep -E "^[0-9a-f]{64}$" || true)"
-            if [ -n "$_unattributed_dangling" ]; then
-                _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || true)"
-                echo "  [WARN] ${_unattributed_count} unlabeled dangling volume(s) found on this daemon —" >&2
-                echo "  [WARN] cannot attribute to project '${_PROJECT_PREFIX}' (no project label) — NOT removing" >&2
-                echo "  [WARN] (may belong to another org on a shared host). Review manually:" >&2
-                echo "  [WARN]   ${RUNTIME} volume ls --filter dangling=true" >&2
-            fi
-        fi
         if [ -n "$_dangling_ids" ]; then
             while IFS= read -r _vid; do
                 [ -z "$_vid" ] && continue
@@ -2105,19 +2174,67 @@ if [ "$REMOVE_VOLUMES" = "true" ] && [ "$RUNTIME_SUBTYPE" != "k8s" ]; then
                 fi
             done <<< "$_dangling_ids"
         fi
+        _unattributed_dangling="$("$RUNTIME" volume ls --noheading -q --filter dangling=true 2>/dev/null \
+            | grep -E "^[0-9a-f]{64}$" || true)"
+        if [ -n "$_unattributed_dangling" ]; then
+            _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || true)"
+        fi
     elif [ "$RUNTIME" = "docker" ]; then
-        _docker_prune_out="$("$RUNTIME" volume prune \
+        # -a/--all: without it, prune only considers anonymous volumes as
+        # candidates (Docker 26+ default) which combined with a
+        # project-label filter that anonymous volumes never carry always
+        # matched zero. With -a the candidate set includes named volumes
+        # too, so this now genuinely catches any leftover NAMED volume that
+        # carries this project's label but was missed by _CANONICAL_VOLUMES
+        # (defense-in-depth, not the primary named-volume removal path —
+        # that is the explicit loop above). It still cannot match anonymous
+        # volumes, because they never carry the label — that gap is closed
+        # at the source (_remove_containers -v) and reconciled below via the
+        # honest unattributed-count path, not by this filtered prune call.
+        _docker_prune_out="$("$RUNTIME" volume prune -a \
             --filter "label=com.docker.compose.project=${_PROJECT_PREFIX}" \
             -f 2>/dev/null || true)"
-        if echo "$_docker_prune_out" | grep -q "Total reclaimed space"; then
-            _dangling_pruned=1
-            echo "  [pruned] docker dangling volumes: ${_docker_prune_out}"
+        _deleted_names="$(printf '%s\n' "$_docker_prune_out" \
+            | sed -n '/^Deleted Volumes:/,/^Total reclaimed/p' \
+            | grep -v '^Deleted Volumes:' | grep -v '^Total reclaimed' \
+            | grep -v '^$' || true)"
+        if [ -n "$_deleted_names" ]; then
+            _dangling_pruned="$(printf '%s\n' "$_deleted_names" | grep -c '.' || true)"
+            echo "  [pruned] docker named-volume safety net removed ${_dangling_pruned}:"
+            printf '%s\n' "$_deleted_names" | sed 's/^/    - /'
+        fi
+        # Anonymous volumes are never project-labelled on Docker (proven
+        # above) — enumerate them by their OWN anonymous marker instead so a
+        # genuine leftover is reported honestly rather than silently
+        # skipped. Cannot be safely attributed to THIS project by name
+        # (anonymous volumes have no project-prefixed name to anchor on,
+        # same constraint as the Podman branch above), so list-only, never
+        # blind-removed — identical cross-org-safe posture.
+        # NOTE: -q alone suppresses the header on Docker's CLI (unlike
+        # Podman, Docker has no --noheading flag — it errors "unknown flag"
+        # and exit 125; caught live in
+        # testing_runs/yashigani/converge-20260813/su-item2-anonvol/proof/
+        # while proving this exact code path, where the swallowed error
+        # (2>/dev/null || true) silently produced an empty result and would
+        # have made this WARN path itself a second silent no-op).
+        _unattributed_dangling="$("$RUNTIME" volume ls -q --filter dangling=true \
+            --filter "label=com.docker.volume.anonymous" 2>/dev/null || true)"
+        if [ -n "$_unattributed_dangling" ]; then
+            _unattributed_count="$(printf '%s\n' "$_unattributed_dangling" | grep -c '.' || true)"
         fi
     fi
 
-    if [ "$_dangling_pruned" -eq 0 ]; then
+    if [ "$_unattributed_count" -gt 0 ] 2>/dev/null; then
+        echo "  [WARN] ${_unattributed_count} anonymous dangling volume(s) found on this daemon —" >&2
+        echo "  [WARN] cannot attribute to project '${_PROJECT_PREFIX}' (anonymous volumes carry no" >&2
+        echo "  [WARN] project label/name) — NOT removing (may belong to another org on a shared" >&2
+        echo "  [WARN] host, or predate this fix). Review manually:" >&2
+        echo "  [WARN]   ${RUNTIME} volume ls --filter dangling=true" >&2
+    fi
+
+    if [ "$_dangling_pruned" -eq 0 ] && [ "$_unattributed_count" -eq 0 ]; then
         echo "  [ok]    No dangling project volumes found."
-    else
+    elif [ "$_dangling_pruned" -gt 0 ]; then
         echo "  Dangling volumes pruned: ${_dangling_pruned}."
     fi
 fi
