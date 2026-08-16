@@ -54,7 +54,46 @@ _DEFAULT_SECRETS_DIR = "/run/secrets"
 _DEFAULT_MANIFEST_PATH = "/etc/yashigani/service_identities.yaml"
 
 _VALID_CA_MODES = {"yashigani_generated", "byo_intermediate", "byo_root", "remote_acme"}
-_TIER_ORDER = ["community", "starter", "professional", "enterprise"]
+
+# TB-07 (Lu, 4.1.2): this list was missing "igniter" and "professional_plus"
+# entirely — added to LicenseTier by 8073620a (retro #42, 2026-05-06), which
+# swept licensing/model.py's TIER_DEFAULTS but never touched this manifest
+# validator/ordering list (same root cause as the sibling defects in
+# auth/broker.py's _TIER_IDP_LIMITS and pool/manager.py's _TIER_LIMITS).
+# Two distinct live consequences of the gap:
+#   1. _parse_ca_source() (below) rejects any service_identities.yaml that
+#      sets min_license_tier to "igniter" or "professional_plus" with a
+#      ManifestError at manifest-LOAD time (blocks every service in the
+#      manifest, not just the affected ca_source entry).
+#   2. tier_at_least() — see below — silently returned False (deny) for any
+#      *actual* deployed tier of "igniter" or "professional_plus" against
+#      even the lowest bar ("community"), because ValueError from
+#      .index("igniter") was caught by the existing fail-closed try/except.
+#      An Igniter customer was denied "yashigani_generated" (the
+#      free/default CA mode) despite Community-tier deployments passing.
+#
+# "academic_nonprofit" is intentionally listed but handled via the
+# short-circuit in tier_at_least() below, not via list position — it is a
+# PARALLEL unlimited tier (same as enterprise), not a linear step above
+# enterprise, mirroring the identical "Enterprise and academic_nonprofit
+# always qualify" special-case already established in
+# backoffice/routes/license.py::_tier_gte(). It still needs list membership
+# here because _parse_ca_source() also uses this list to validate that a
+# manifest's min_license_tier VALUE names a real tier.
+#
+# LicenseTier.CANARY ("never issued to customers" per model.py) is
+# deliberately NOT in this list — the existing `except ValueError: return
+# False` in tier_at_least() already denies it, and canary must never
+# satisfy any minimum-tier gate. Fail-closed convention kept unchanged.
+_TIER_ORDER = [
+    "community",
+    "igniter",
+    "starter",
+    "professional",
+    "professional_plus",
+    "enterprise",
+    "academic_nonprofit",
+]
 
 
 class ManifestError(ValueError):
@@ -539,7 +578,18 @@ def _verify_bootstrap_token(identity: ServiceIdentity, path: Path) -> None:
 
 
 def tier_at_least(actual: str, required: str) -> bool:
-    """Return True if licensed tier *actual* meets *required* or higher."""
+    """Return True if licensed tier *actual* meets *required* or higher.
+
+    "enterprise" and "academic_nonprofit" are parallel unlimited tiers, not
+    a linear order (mirrors backoffice/routes/license.py::_tier_gte's
+    "Enterprise and academic_nonprofit always qualify" special-case) — both
+    always satisfy any *required* tier. Everything else is resolved via
+    _TIER_ORDER position; an unrecognised *actual* string (including the
+    internal-only "canary" sentinel, deliberately excluded from
+    _TIER_ORDER) fails closed to False via the ValueError catch below.
+    """
+    if actual in ("enterprise", "academic_nonprofit"):
+        return True
     try:
         return _TIER_ORDER.index(actual) >= _TIER_ORDER.index(required)
     except ValueError:

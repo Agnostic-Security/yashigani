@@ -509,9 +509,21 @@ class TestTierTable:
         )
 
     def test_tier_table_includes_professional_tiers(self):
-        """Starter/Professional/Professional Plus/Academic all present."""
+        """Starter/Professional/Professional Plus/Non-profit&Education all
+        present.
+
+        TB-07 (Lu, 4.1.2): this test previously asserted the STALE string
+        "academic" -- which was itself an instance of the bug it should
+        have caught. LicenseTier.ACADEMIC_NONPROFIT.value ==
+        "academic_nonprofit"; the old assertion passed only because the
+        buggy dict happened to carry a key spelled "academic" (unreachable
+        via the real enum value), not because the real tier was covered.
+        Corrected to the real enum value -- see
+        test_tom_tb07_license_tier_key_enum_divergence.py for the full
+        root-cause writeup and fix.
+        """
         limits = self._get_tier_limits()
-        for tier in ("starter", "professional", "professional_plus", "academic"):
+        for tier in ("starter", "professional", "professional_plus", "academic_nonprofit"):
             assert tier in limits, f"Tier '{tier}' missing from _TIER_IDP_LIMITS"
 
     def test_professional_supports_oidc_and_saml(self):

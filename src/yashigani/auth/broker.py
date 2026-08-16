@@ -7,13 +7,15 @@ Yashigani IS the identity broker (Decision 11). Supports OIDC and SAML v2
 with multiple IdPs per deployment. Caddy delegates auth to the backoffice,
 which resolves identity and sets session cookies.
 
-Tier gating:
-  Community:         Local auth + API keys only
-  Starter:           1 OIDC
-  Professional:      1 OIDC + 1 SAML
-  Professional Plus: 5 IdPs (any mix)
-  Enterprise:        Unlimited
-  Academic:          1 OIDC
+Tier gating (source of truth: README.md Sec.8 Feature Matrix by Tier,
+"Multi-IdP Identity Broker" row — mirrors agnosticsec.com/pricing):
+  Community:              Local auth + API keys only
+  Igniter:                1 OIDC
+  Starter:                1 OIDC
+  Professional:           1 OIDC + 1 SAML
+  Professional Plus:      5 IdPs (any mix)
+  Enterprise:              Unlimited
+  Non-profit & Education: Unlimited (LicenseTier.ACADEMIC_NONPROFIT)
 
 Login flow:
   1. User hits /chat/* -> Caddy redirects unauthenticated to /auth/sso/select
@@ -104,14 +106,39 @@ class SSOResult:
     raw_claims: dict = field(default_factory=dict)  # ID token claims (acr, amr, etc.)
 
 
-# Tier limits for IdP count
+# Tier limits for IdP count.
+#
+# TB-07 (Lu, 4.1.2): this dict previously keyed the top tier on the STRING
+# "academic" while LicenseTier.ACADEMIC_NONPROFIT.value == "academic_nonprofit"
+# (added by 8073620a, retro #42, 2026-05-06 — that commit swept
+# licensing/model.py's TIER_DEFAULTS to match the website pricing table but
+# never touched this dict). `.get(tier, 0)` silently fell back to the
+# fail-closed default of 0 for every academic_nonprofit deployment, directly
+# contradicting the "Unlimited IdPs" claim in README.md Sec.8. `igniter` was
+# never added here at all (same commit added LicenseTier.IGNITER) — Igniter
+# customers also silently got 0 IdPs instead of the advertised 1.
+#
+# Fix: key on every LicenseTier.value (all 7 non-canary tiers, explicit —
+# not derived from the enum — so a future tier addition here is a visible
+# diff, not another silent gap). Values source: README.md Sec.8 "Multi-IdP
+# Identity Broker" row. `academic_nonprofit` gets the same 999 "unlimited"
+# sentinel as `enterprise` (both rows read "Unlimited").
+#
+# Fail-closed convention preserved: `.get(tier, 0)` — an unrecognised tier
+# string (including the internal-only LicenseTier.CANARY, deliberately
+# omitted below, "never issued to customers" per model.py) still denies
+# (0 IdPs), never grants by accident. This mirrors the same fail-closed
+# default already established in this file before this fix, and the
+# equivalent `_tier_gte()` deny-on-unknown pattern in
+# backoffice/routes/license.py.
 _TIER_IDP_LIMITS = {
     "community": 0,
+    "igniter": 1,
     "starter": 1,
     "professional": 2,
     "professional_plus": 5,
     "enterprise": 999,
-    "academic": 1,
+    "academic_nonprofit": 999,
 }
 
 

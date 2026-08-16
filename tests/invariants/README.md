@@ -38,6 +38,7 @@ Helm/OPA binary required — CI-portable, mirroring `tests/contracts/`.)
 | I6 | Signed orchestration principal — verified claim only; forged / replayed / wrong-audience ⇒ reject fail-closed | `test_i6_signed_principal.py` | Lu §2.2; `gateway/principal_token.py` |
 | I7 | Fail-closed everywhere — extraction-fail/incomplete ⇒ BLOCK; the 4 document actions' default-BLOCK posture | `test_i7_fail_closed_document.py` | Lu §2.1; `policy/document.rego` |
 | I8 | Rego bundle parity — compose↔helm policy files byte-identical (the drift class Iris fixed twice; LAURA-OPA-002) | `test_i8_rego_bundle_parity.py` | Iris drift map; `tests/contracts/test_helm_opa_bundle_parity.py` |
+| I11 | `docker/secrets/` file modes never regress to world-readable/writable (CWE-732) — install.sh's `_fix_config_perms()` self-heals then **fails closed** (`exit 1`) on any residual non-cert world-readable secret, on both Docker and Podman (compose-only surface, mode bits are runtime-identical) | `test_i11_secrets_file_modes.py` | Lu ASVS L3 audit (needs-review — no test existed); v2.23.1 retro §6.B/#64 + LIVE-BACKUP-PERMS-001 (regressed twice) |
 
 ## Code-asserted-here vs live-VM (#44) proof
 
@@ -57,3 +58,4 @@ live proof is flagged as a **#44 / VM item** in each file's module docstring und
 | I6 | sign/verify forge+replay+audience rejection in code | live forged/replayed claim over the wire |
 | I7 | `default action := "BLOCK"` + BLOCK-on-incomplete in rego | live doc round-trip post-converge |
 | I8 | byte-identical compose↔helm (fully proven here — no live gap) | — |
+| I11 | `_fix_config_perms()` self-heal + fail-closed contract present in install.sh source (both runtimes, function is not runtime-branched) | real on-disk octal-mode walk against a live-installed `docker/secrets/` — code-asserted here via the same file's `TestLiveSecretsDirModes`/`TestLiveSecretsCaddyDirModes` classes (skipped in a bare checkout, NOT skipped on a live install/VM smoke run — set `YASHIGANI_TEST_SECRETS_DIR`) |
