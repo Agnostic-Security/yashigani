@@ -15755,6 +15755,45 @@ k8s_register_agent_bundles() {
     return 0
   fi
 
+  # FIND-0813-013 item 3 (Iris red-review, 2026-08-16): belt-and-braces
+  # durable-Postgres pre-check -- the k8s TWIN of register_agent_bundles()'s
+  # (compose) pre-check above. Iris CONFIRMED this as real cross-runtime
+  # drift: k8s previously relied SOLELY on the in-pod Python step's
+  # Redis-based `existing_names` check (registry.list_all()) -- exactly the
+  # single, racy layer the compose pre-check exists to backstop (Redis db/3
+  # runs appendonly no / save "" and is empty immediately after any redis
+  # recreate, until reconcile_agents_from_durable() catches up). Without
+  # this pre-check the k8s leg was MORE exposed to the FIND-IRIS-DUP-AGENT
+  # race than compose, not equally exposed. Fail-open by the SAME documented
+  # invariant as the compose guard (install.sh, register_agent_bundles()
+  # header, "FIND-IRIS-DUP-AGENT-REGRESSION"): on a query failure,
+  # `_ysg_agent_pre_existing` MUST stay exactly "," so the membership test
+  # below can never match ANY profile -- a pre-check failure skips NOBODY,
+  # it only means this pre-check could not PROACTIVELY exclude an
+  # already-registered name (the in-pod Redis-based check is still the
+  # authoritative skip decision either way).
+  local _ysg_agent_pre_existing=","
+  local _k8s_pg_pod _k8s_existing_names_raw
+  _k8s_pg_pod="$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=postgres \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -n "$_k8s_pg_pod" ]]; then
+    if _k8s_existing_names_raw="$(kubectl exec -i -n "$NAMESPACE" "$_k8s_pg_pod" -- \
+        psql -U yashigani_admin -d yashigani -tAc \
+        "SELECT agent_name FROM agent_registry WHERE tenant_id = '00000000-0000-0000-0000-000000000000' AND status = 'active' AND agent_name <> '';" \
+        2>/dev/null)"; then
+      local _k8s_en_line
+      while IFS= read -r _k8s_en_line; do
+        _k8s_en_line="$(printf '%s' "$_k8s_en_line" | tr -d ' \r')"
+        [[ -n "$_k8s_en_line" ]] && _ysg_agent_pre_existing="${_ysg_agent_pre_existing}${_k8s_en_line},"
+      done <<< "$_k8s_existing_names_raw"
+    else
+      log_warn "FIND-IRIS-DUP-AGENT pre-check (k8s): could not query durable agent_registry (non-fatal — falling back to the in-pod skip check only)"
+    fi
+  else
+    log_warn "FIND-IRIS-DUP-AGENT pre-check (k8s): no running postgres pod found in namespace ${NAMESPACE} (non-fatal — falling back to the in-pod skip check only)"
+  fi
+
   local agents_json='['
   local first=true
   local _agent _name _url _proto _mesh_port _tenant _secret_name _raw_token
@@ -15778,6 +15817,15 @@ k8s_register_agent_bundles() {
       letta)     _name="letta"     _proto="letta"   _mesh_port="9775"  _tenant="default"  _secret_name="yashigani-letta-token" ;;
       openclaw)  _name="openclaw"  _proto="openai"  _mesh_port="9671"  _tenant="default"  _secret_name="yashigani-openclaw-token" ;;
     esac
+
+    # FIND-IRIS-DUP-AGENT pre-check (k8s): already durably registered under
+    # this canonical name — never even offer it to the in-pod registration
+    # step. Mirrors the compose-side guard (install.sh,
+    # register_agent_bundles()).
+    if [[ "$_ysg_agent_pre_existing" == *",${_name},"* ]]; then
+      log_info "  ${_name}: already registered (durable Postgres) — skipping (FIND-IRIS-DUP-AGENT guard, k8s)"
+      continue
+    fi
 
     _raw_token="$(kubectl get secret "$_secret_name" -n "$NAMESPACE" \
       -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)"
@@ -15811,6 +15859,22 @@ sys.path.insert(0, "/app/src")
 agents_spec = json.load(sys.stdin)
 results = []
 
+# FIND-0813-013 item 2/3 (Laura/Iris/Tom red-review, 2026-08-16): same audit
+# gap as the compose twin -- see register_agent_bundles() (compose) for the
+# full rationale. Construct ONE AuditLogWriter for this whole run.
+_audit_writer = None
+try:
+    from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.scope import MaskingScopeConfig
+    _audit_writer = AuditLogWriter(
+        config=AuditConfig.from_env(),
+        masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
+    )
+except Exception as _awe:
+    results.append("AUDIT_WARN:writer_init:" + str(_awe))
+
 for agent_spec in agents_spec:
     aname          = agent_spec["name"]
     aurl           = agent_spec["url"]
@@ -15826,6 +15890,7 @@ for agent_spec in agents_spec:
         from yashigani.agents.registry import AgentRegistry
         from yashigani.agents.durable_store import AgentDurableStore
         from yashigani.gateway._redis_url import build_redis_url
+        from yashigani.licensing.enforcer import get_license, LicenseLimitExceeded
         import redis as _redis
         import bcrypt as _bcrypt
         import secrets as _sec_mod
@@ -15837,14 +15902,36 @@ for agent_spec in agents_spec:
             client_cert_name="backoffice_client",
         )
         _rc = _redis.from_url(_redis_url, decode_responses=True)
-        registry = AgentRegistry(_rc)
         durable  = AgentDurableStore()
+        # FIND-0813-013 item 1 (k8s twin, Tom red-review): this path CANNOT
+        # switch to registry.register() the way the compose payload does --
+        # register() always mints its OWN fresh PSK (registry.py:176), but
+        # this k8s token is READ from a pre-provisioned Helm Secret and must
+        # be preserved bit-for-bit (the agent workload was already deployed
+        # presenting THIS token; minting a different one here would desync
+        # it from what the running agent pod actually holds). Passed
+        # durable_store= anyway for construction consistency with the
+        # compose payload, though restore_from_durable() below does not
+        # itself consult self._durable.
+        registry = AgentRegistry(_rc, durable_store=durable)
 
         # Skip if already registered by name (idempotent; preserves token hash).
         existing_names = {a.get("name", "") for a in registry.list_all()}
         if aname in existing_names:
             results.append("SKIP:" + aname)
             continue
+
+        # FIND-0813-013 item 1 (k8s twin): register() Lua script enforces
+        # max_agents atomically; restore_from_durable() explicitly does not
+        # (registry.py:381-384 docstring). Since register() cannot be used
+        # here (token must be preserved, see above), replicate the SAME
+        # licence-limit check register() performs, as defence-in-depth,
+        # against the SAME get_license() source of truth.
+        _lic = get_license()
+        _limit = _lic.max_agents
+        _current_active = registry.count("active")
+        if _limit != -1 and _current_active >= _limit:
+            raise LicenseLimitExceeded(limit_name="max_agents", current=_current_active, max_val=_limit)
 
         token_hash = _bcrypt.hashpw(araw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
         agent_id = "agnt_" + _sec_mod.token_hex(8)
@@ -15863,9 +15950,41 @@ for agent_spec in agents_spec:
             "sensitivity_ceiling": aceiling,
         }
 
-        durable.upsert(agent_data, token_hash=token_hash)
+        # FIND-0813-013 item 1 (k8s twin): Redis FIRST (request-time source
+        # of truth, fails loud -- an exception here aborts this agent with
+        # FAIL:), Postgres SECOND (best-effort durability mirror, logged
+        # non-fatally on failure). Same order register() uses and every
+        # other AgentRegistry mutator already uses; the OLD k8s code (like
+        # the old compose code) had Postgres first / Redis second, which
+        # could leave a permanently-stuck "active" Postgres row with no
+        # matching Redis entry if the Redis write then failed.
         registry.restore_from_durable(agent_data, token_hash)
+        try:
+            durable.upsert(agent_data, token_hash=token_hash)
+        except Exception as _de:
+            results.append("DURABLE_WARN:" + aname + ":" + str(_de))
+
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AgentRegisteredEvent
+                _audit_writer.write(
+                    AgentRegisteredEvent(
+                        agent_id=agent_id,
+                        agent_name=aname,
+                        upstream_url=aurl,
+                        groups=agroups,
+                        allowed_caller_groups=acaller_groups,
+                        allowed_paths=apaths,
+                        account_tier="system",
+                        admin_account="install:system",
+                    )
+                )
+            except Exception as _ae:
+                results.append("AUDIT_WARN:" + aname + ":" + str(_ae))
+
         results.append("OK:" + aname)
+    except LicenseLimitExceeded as e:
+        results.append("FAIL:" + aname + ":license_limit_exceeded:" + str(e))
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
@@ -15897,8 +16016,26 @@ async def _mint_bundled_envelopes():
 try:
     for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
         results.append("ENVELOPE_MINTED:" + _pid)
+        # FIND-0813-013 item 2 (k8s twin): same partial fix as compose --
+        # base AuditEvent, no dedicated schema class in this task scope; the
+        # provenance_id correlation stays in the stdout log line only.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AuditEvent as _AuditEventBase
+                _audit_writer.write(
+                    _AuditEventBase(event_type="MCP_ENVELOPE_MINTED", account_tier="system"),
+                    component="install:bootstrap_bundled_agent_envelopes",
+                )
+            except Exception as _ae2:
+                results.append("AUDIT_WARN:envelope:" + str(_ae2))
 except Exception as _me:
     results.append("ENVELOPE_WARN:" + str(_me))
+
+if _audit_writer is not None:
+    try:
+        _audit_writer.close()
+    except Exception:
+        pass
 
 for r in results:
     print(r)
@@ -15911,6 +16048,18 @@ for r in results:
       FAIL:*)            log_warn "  ${line#FAIL:}" ;;
       ENVELOPE_MINTED:*) log_success "  envelope minted: ${line#ENVELOPE_MINTED:}" ;;
       ENVELOPE_WARN:*)   log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}" ;;
+      DURABLE_WARN:*)
+        # FIND-0813-013 item 1 (k8s twin): the Postgres mirror write failed
+        # AFTER a successful Redis write — the agent IS live now but will
+        # not survive a redis recreate until re-registered. Non-fatal by
+        # design (matches register() best-effort mirror semantics in
+        # registry.py) but loud, since it is a durability gap, not a
+        # failure.
+        log_warn "  durable mirror write failed (agent IS live in Redis): ${line#DURABLE_WARN:}"
+        ;;
+      AUDIT_WARN:*)
+        log_warn "  audit write failed (registration unaffected): ${line#AUDIT_WARN:}"
+        ;;
       *)                 [[ -n "$line" ]] && log_warn "  agent-register: ${line}" ;;
     esac
   done <<< "$reg_output"

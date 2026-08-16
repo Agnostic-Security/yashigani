@@ -234,12 +234,6 @@ class TestItem2AuditEventsBothPaths:
             "this as equally unaudited to the agent-registration gap itself."
         )
 
-    @pytest.mark.xfail(
-        reason="FIND-0813-013 item 3 (k8s parity) lands in the NEXT commit -- "
-        "this test documents the gap now and must start passing there, not be "
-        "quietly deleted.",
-        strict=True,
-    )
     def test_k8s_payload_references_audit_writer(self, k8s_payload: str) -> None:
         """Same gap, same fix, k8s twin. Landed in the item-3 commit."""
         assert "AuditLogWriter" in k8s_payload and "AgentRegisteredEvent" in k8s_payload, (
@@ -248,10 +242,6 @@ class TestItem2AuditEventsBothPaths:
             "1+2 to apply to BOTH the compose and k8s paths."
         )
 
-    @pytest.mark.xfail(
-        reason="FIND-0813-013 item 3 (k8s parity) lands in the NEXT commit.",
-        strict=True,
-    )
     def test_k8s_payload_audits_envelope_mint(self, k8s_payload: str) -> None:
         assert "MCP_ENVELOPE_MINTED" in k8s_payload, (
             "FIND-0813-013 item 2/3 REGRESSION: k8s envelope-mint step is "
@@ -280,6 +270,121 @@ class TestItem2AuditEventsBothPaths:
             "FIND-0813-013 item 2 REGRESSION: bash result parser in "
             "register_agent_bundles() has no AUDIT_WARN:* case -- an audit-only "
             "warning line would fall through unrecognised."
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Item 3 (Iris) -- k8s parity: belt-and-braces durable-Postgres pre-check +
+# the closest achievable equivalent of item 1 for the token-preservation-
+# constrained k8s payload (licence-limit check + Redis-first/Postgres-second
+# write order).
+#
+# NOTE on scope-honesty: register_agent_bundles() (compose) can switch
+# wholesale to registry.register() because it always mints a brand-new
+# token. k8s_register_agent_bundles() cannot -- its raw PSK is READ from a
+# pre-provisioned Helm Secret and must be preserved bit-for-bit (the agent
+# workload is already deployed presenting that exact token). register()
+# always mints its own token internally with no way to inject a
+# caller-supplied one, so calling it here would desync the registered
+# bcrypt hash from what the running agent pod actually presents, breaking
+# k8s agent auth outright. This class tests the CLOSEST correct equivalent,
+# not a literal register() call.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestItem3K8sParity:
+    @pytest.fixture(scope="class")
+    def k8s_body(self) -> str:
+        return _k8s_register_body()
+
+    @pytest.fixture(scope="class")
+    def k8s_payload(self, k8s_body: str) -> str:
+        return _k8s_python_payload(k8s_body)
+
+    def test_belt_and_braces_postgres_precheck_present(self, k8s_body: str) -> None:
+        """Iris CONFIRMED: k8s_register_agent_bundles() lacked the
+        durable-Postgres pre-check register_agent_bundles() (compose) has,
+        leaving k8s MORE exposed to the FIND-IRIS-DUP-AGENT race than
+        compose. Must gain an equivalent pre-check querying agent_registry
+        directly via the postgres pod, with the SAME fail-open invariant
+        (a query failure must exclude nobody)."""
+        assert "_ysg_agent_pre_existing" in k8s_body, (
+            "FIND-0813-013 item 3 REGRESSION: k8s_register_agent_bundles() has "
+            "no durable-Postgres pre-check (_ysg_agent_pre_existing) -- the "
+            "cross-runtime asymmetry Iris found is unresolved."
+        )
+        assert "agent_registry" in k8s_body and "psql" in k8s_body, (
+            "FIND-0813-013 item 3 REGRESSION: k8s pre-check does not query the "
+            "durable agent_registry table via psql."
+        )
+
+    def test_precheck_gates_before_token_fetch(self, k8s_body: str) -> None:
+        """The pre-check skip must happen BEFORE the (network-costly, and in
+        the token-not-found case log-noisy) kubectl get secret call, not
+        after -- mirroring the compose ordering where the pre-check gates
+        entry into the per-profile body before any further work."""
+        precheck_pos = k8s_body.find("FIND-IRIS-DUP-AGENT guard, k8s")
+        token_fetch_pos = k8s_body.find("kubectl get secret")
+        assert precheck_pos != -1, "pre-check skip branch not found"
+        assert token_fetch_pos != -1, "kubectl get secret token fetch not found"
+        assert precheck_pos < token_fetch_pos, (
+            "FIND-0813-013 item 3: the pre-check skip must gate BEFORE the "
+            "kubectl get secret token fetch, not after."
+        )
+
+    def test_fail_open_invariant_preserved(self, k8s_body: str) -> None:
+        """FIND-IRIS-DUP-AGENT-REGRESSION invariant (compose comment, must
+        hold for k8s too): on a pre-check query failure, the pre-existing
+        set must stay empty (fail-open, excludes nobody) -- never populated
+        with a poisoned value that would cause every profile to be
+        (wrongly) treated as pre-existing."""
+        assert 'local _ysg_agent_pre_existing=","' in k8s_body, (
+            "FIND-0813-013 item 3 REGRESSION: _ysg_agent_pre_existing must be "
+            "seeded to the empty-membership sentinel \",\" -- any other seed "
+            "value risks the fail-open invariant."
+        )
+
+    def test_license_limit_check_present(self, k8s_payload: str) -> None:
+        """Item 1 (k8s twin): register() cannot be used here (token must be
+        preserved), so the SAME licence-limit enforcement register() performs
+        atomically must be replicated as an explicit defence-in-depth check
+        against the same get_license() source of truth."""
+        assert "get_license" in k8s_payload and "LicenseLimitExceeded" in k8s_payload, (
+            "FIND-0813-013 item 1/3 REGRESSION: k8s payload has no licence-limit "
+            "check -- restore_from_durable() does not enforce max_agents "
+            "(registry.py docstring), and this path cannot call register() "
+            "(token-preservation constraint), so it must replicate the check "
+            "explicitly."
+        )
+
+    def test_redis_before_postgres_write_order(self, k8s_payload: str) -> None:
+        """Item 1 (k8s twin): restore_from_durable() (Redis) must run BEFORE
+        durable.upsert() (Postgres) -- the old order (Postgres first, Redis
+        second, both inside one try/except) could leave a permanently-stuck
+        active Postgres row with no Redis entry if the Redis write then
+        failed. This matches register()s Redis-first/Postgres-second
+        semantics and every other AgentRegistry mutator."""
+        redis_pos = k8s_payload.find("registry.restore_from_durable(")
+        postgres_pos = k8s_payload.find("durable.upsert(")
+        assert redis_pos != -1 and postgres_pos != -1, "both calls must be present"
+        assert redis_pos < postgres_pos, (
+            "FIND-0813-013 item 1/3 REGRESSION: k8s payload still writes "
+            "Postgres (durable.upsert) BEFORE Redis (restore_from_durable) -- "
+            "must be reordered Redis-first to match register()s semantics and "
+            "avoid a permanently-stuck active-Postgres/absent-Redis split."
+        )
+
+    def test_postgres_mirror_failure_is_non_fatal(self, k8s_payload: str) -> None:
+        """The Postgres mirror write (durable.upsert, now SECOND) must be
+        wrapped in its own try/except -- a Postgres failure must not cause a
+        successful Redis registration to be reported as FAIL:."""
+        assert re.search(
+            r"try:\s*\n\s*durable\.upsert\(agent_data, token_hash=token_hash\)\s*\n\s*except Exception as _de:\s*\n\s*results\.append\(\"DURABLE_WARN:",
+            k8s_payload,
+        ), (
+            "FIND-0813-013 item 1/3 REGRESSION: durable.upsert() in the k8s "
+            "payload is not wrapped in its own non-fatal except clause -- a "
+            "Postgres mirror failure must not roll back a successful Redis "
+            "registration into a reported FAIL:."
         )
 
 
