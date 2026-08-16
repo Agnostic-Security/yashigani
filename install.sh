@@ -11441,6 +11441,32 @@ sys.path.insert(0, "/app/src")
 agents_spec = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
 
+# FIND-0813-013 item 2 (Laura/Iris/Tom red-review, 2026-08-16): install-time
+# agent registration wrote ZERO audit events -- routes/agents.py::register_agent
+# writes an AgentRegisteredEvent (agents.py:533-549) on every admin-API
+# registration; this durable path (SEC-001, no admin session, by design)
+# wrote nothing to the tamper-evident chain. Construct ONE AuditLogWriter for
+# this whole run (same construction routes.entrypoint.py uses:
+# AuditLogWriter(config=AuditConfig.from_env(), ...)) -- it opens the SAME
+# volume-mounted log file and cross-process flock the running backoffice app
+# process already writes through, so events from this short-lived exec
+# process interleave correctly into the SAME hash chain. Non-fatal: an audit
+# writer that fails to construct or write must never block a real
+# registration from completing (matches routes/agents.py:533-549s own
+# try/except-log pattern) -- this is a NEW recording surface, not a new gate.
+_audit_writer = None
+try:
+    from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.scope import MaskingScopeConfig
+    _audit_writer = AuditLogWriter(
+        config=AuditConfig.from_env(),
+        masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
+    )
+except Exception as _awe:
+    results.append("AUDIT_WARN:writer_init:" + str(_awe))
+
 for agent_spec in agents_spec:
     profile        = agent_spec["profile"]
     aname          = agent_spec["name"]
@@ -11522,6 +11548,31 @@ for agent_spec in agents_spec:
         # which writes ${secrets_dir}/${_profile}_token directly on the host
         # filesystem and chmods it 0640 -- the same install-time-secret
         # pattern used for every other generated credential.
+        #
+        # FIND-0813-013 item 2: AgentRegisteredEvent, same schema
+        # routes/agents.py:533-549 writes. No admin session exists on this
+        # path (SEC-001 removed the standing install_svc account on
+        # purpose) so admin_account is attributed to a named system actor,
+        # not a session.account_id, and account_tier is "system" not
+        # "admin" -- an honest record of how this mutation actually
+        # happened, not a fabricated admin session.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AgentRegisteredEvent
+                _audit_writer.write(
+                    AgentRegisteredEvent(
+                        agent_id=agent_id,
+                        agent_name=aname,
+                        upstream_url=aurl,
+                        groups=agroups,
+                        allowed_caller_groups=acaller_groups,
+                        allowed_paths=apaths,
+                        account_tier="system",
+                        admin_account="install:system",
+                    )
+                )
+            except Exception as _ae:
+                results.append("AUDIT_WARN:" + aname + ":" + str(_ae))
         results.append("OK:" + aname + ":" + profile + ":" + raw_token)
     except LicenseLimitExceeded as e:
         results.append("FAIL:" + aname + ":license_limit_exceeded:" + str(e))
@@ -11569,8 +11620,35 @@ async def _mint_bundled_envelopes():
 try:
     for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
         results.append("ENVELOPE_MINTED:" + _pid)
+        # FIND-0813-013 item 2 (Laura): bundled_envelopes.py/envelope_service.py
+        # mint zero audit references on ANY call site (installer or admin
+        # API) -- there is no dedicated AuditEvent subclass for envelope
+        # minting to reuse (schema.py has no MCP_ENVELOPE_MINTED class; this
+        # task is install.sh-scoped and adding one is out of scope here). The
+        # base AuditEvent still lands a tamper-evident, hash-chained record
+        # of WHEN a mint happened and at what account_tier -- an honest
+        # partial fix: it does not carry the provenance_id inline (no field
+        # for it on the base schema); that correlation stays in the
+        # ENVELOPE_MINTED: stdout install log line only. Route: Iris/Tom
+        # follow-up to add a typed McpEnvelopeMintedEvent if closer
+        # correlation is needed.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AuditEvent as _AuditEventBase
+                _audit_writer.write(
+                    _AuditEventBase(event_type="MCP_ENVELOPE_MINTED", account_tier="system"),
+                    component="install:bootstrap_bundled_agent_envelopes",
+                )
+            except Exception as _ae2:
+                results.append("AUDIT_WARN:envelope:" + str(_ae2))
 except Exception as _me:
     results.append("ENVELOPE_WARN:" + str(_me))
+
+if _audit_writer is not None:
+    try:
+        _audit_writer.close()
+    except Exception:
+        pass
 
 for r in results:
     print(r)
@@ -11684,6 +11762,15 @@ for r in results:
       ENVELOPE_WARN:*)
         # Non-fatal: fail-closed (verify-mcp denies until next boot retries).
         log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
+        _any_recognized_line=true
+        ;;
+      AUDIT_WARN:*)
+        # FIND-0813-013 item 2: audit-chain write failed (writer init or a
+        # single event write). Non-fatal per routes/agents.py:533-549s own
+        # pattern -- the registration/envelope-mint itself already
+        # succeeded and must not be rolled back for an audit-sink failure.
+        # Loud so an operator notices the tamper-evident chain has a gap.
+        log_warn "  audit write failed (registration unaffected): ${line#AUDIT_WARN:}"
         _any_recognized_line=true
         ;;
     esac

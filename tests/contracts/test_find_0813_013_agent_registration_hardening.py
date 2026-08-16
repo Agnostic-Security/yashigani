@@ -194,6 +194,95 @@ class TestItem1ComposeUsesRegisterAPI:
         )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Item 2 (Laura/Iris) -- audit events on BOTH compose and k8s payloads.
+# k8s-side assertions in this class are expected to FAIL until the item-3
+# commit lands the k8s twin of this fix (item 3 requires items 1+2 to apply
+# to both paths; this commit lands item 2 on the compose path first).
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestItem2AuditEventsBothPaths:
+    @pytest.fixture(scope="class")
+    def compose_payload(self) -> str:
+        return _compose_python_payload(_compose_register_body())
+
+    @pytest.fixture(scope="class")
+    def k8s_payload(self) -> str:
+        return _k8s_python_payload(_k8s_register_body())
+
+    def test_compose_payload_references_audit_writer(self, compose_payload: str) -> None:
+        """Laura CONFIRMED (2026-08-16): 'grep -c ... for "audit" -> 0' across
+        the whole compose payload span. Must now construct an AuditLogWriter
+        and write AgentRegisteredEvent."""
+        assert "AuditLogWriter" in compose_payload, (
+            "FIND-0813-013 item 2 REGRESSION: compose payload does not construct "
+            "an AuditLogWriter -- install-time agent registration still has zero "
+            "audit references (Laura's CONFIRMED finding)."
+        )
+        assert "AgentRegisteredEvent" in compose_payload, (
+            "FIND-0813-013 item 2 REGRESSION: compose payload does not write an "
+            "AgentRegisteredEvent -- must mirror routes/agents.py:533-549."
+        )
+
+    def test_compose_payload_audits_envelope_mint(self, compose_payload: str) -> None:
+        """Laura: bundled_envelopes.py/envelope_service.py mint zero audit
+        references on ANY call site -- the envelope-mint step must also land
+        a record in the tamper-evident chain."""
+        assert "MCP_ENVELOPE_MINTED" in compose_payload, (
+            "FIND-0813-013 item 2 REGRESSION: the capability-envelope mint step "
+            "(SEC-ENVELOPE-001) writes no audit event -- Laura's finding names "
+            "this as equally unaudited to the agent-registration gap itself."
+        )
+
+    @pytest.mark.xfail(
+        reason="FIND-0813-013 item 3 (k8s parity) lands in the NEXT commit -- "
+        "this test documents the gap now and must start passing there, not be "
+        "quietly deleted.",
+        strict=True,
+    )
+    def test_k8s_payload_references_audit_writer(self, k8s_payload: str) -> None:
+        """Same gap, same fix, k8s twin. Landed in the item-3 commit."""
+        assert "AuditLogWriter" in k8s_payload and "AgentRegisteredEvent" in k8s_payload, (
+            "FIND-0813-013 item 2/3 REGRESSION: k8s_register_agent_bundles() "
+            "payload does not audit agent registration -- item 3 requires items "
+            "1+2 to apply to BOTH the compose and k8s paths."
+        )
+
+    @pytest.mark.xfail(
+        reason="FIND-0813-013 item 3 (k8s parity) lands in the NEXT commit.",
+        strict=True,
+    )
+    def test_k8s_payload_audits_envelope_mint(self, k8s_payload: str) -> None:
+        assert "MCP_ENVELOPE_MINTED" in k8s_payload, (
+            "FIND-0813-013 item 2/3 REGRESSION: k8s envelope-mint step is "
+            "unaudited -- must match the compose fix."
+        )
+
+    def test_audit_write_failure_is_non_fatal(self, compose_payload: str) -> None:
+        """Audit is defence-in-depth here (matches routes/agents.py:533-549's
+        own try/except-log pattern) -- an audit-writer failure must never
+        cause a real, successful registration to be reported as FAIL."""
+        # The AgentRegisteredEvent write must be inside its own try/except,
+        # separate from the registration try/except that produces OK:/FAIL:.
+        assert re.search(r"except Exception as _ae:\s*\n\s*results\.append\(\"AUDIT_WARN:", compose_payload), (
+            "FIND-0813-013 item 2: AgentRegisteredEvent write is not wrapped in "
+            "its own non-fatal except clause -- an audit-sink failure must not "
+            "cause a successful registration to be reported as FAIL:."
+        )
+
+    def test_bash_parser_recognises_audit_warn_lines(self) -> None:
+        """AUDIT_WARN: lines must be a recognised case in the bash result
+        parser, or the FIND-IRIS-DUP-AGENT-REGRESSION loud-failure guard
+        would (harmlessly but confusingly) treat a run that ONLY produced
+        AUDIT_WARN: lines as an unrecognised infra failure."""
+        body = _compose_register_body()
+        assert "AUDIT_WARN:*" in body, (
+            "FIND-0813-013 item 2 REGRESSION: bash result parser in "
+            "register_agent_bundles() has no AUDIT_WARN:* case -- an audit-only "
+            "warning line would fall through unrecognised."
+        )
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
