@@ -6742,19 +6742,40 @@ load_airgap_bundle() {
       # _fips_sha256 routes through OpenSSL FIPS Provider when FIPS_MODE=1
       # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2); falls back to sha256sum
       # or shasum when FIPS_MODE is unset/0.
+      #
+      # YSG-RISK-037/038/039 (ops risk register) name "Bundle SHA256 verified
+      # at load time" as a compensating control underpinning the air-gap
+      # image-digest CVA rulings, with a binding re-check clause: "Emergency
+      # update if any of the primary integrity controls (bundle SHA256
+      # verification at load ...) are removed or weakened." The two branches
+      # below used to trip that trigger silently: on a digest-computation
+      # failure they set actual_sha="$expected_sha" — manufacturing a match
+      # against whatever the (possibly-tampered) sidecar claims — then fell
+      # through to the equality check and log_success below, so the operator
+      # saw "Bundle SHA256 verified" for a bundle that was never hashed.
+      # An integrity control a risk acceptance depends on must fail CLOSED:
+      # if the digest cannot be computed, the bundle must not load.
       local actual_sha
       if [ "${FIPS_MODE:-0}" = "1" ] || openssl version 2>/dev/null | grep -qi 'fips'; then
         actual_sha="$(_fips_sha256 "${AIR_GAP_BUNDLE}")" || {
-          log_warn "FIPS SHA-256 computation failed for bundle — skipping integrity check"
-          actual_sha="$expected_sha"
+          log_error "BUNDLE INTEGRITY CHECK FAILED"
+          log_error "  FIPS SHA-256 computation failed for ${AIR_GAP_BUNDLE} — cannot verify integrity."
+          log_error "  Refusing to load an air-gap bundle whose digest could not be computed"
+          log_error "  (fail-closed per ops risk register YSG-RISK-038 re-check trigger)."
+          exit 1
         }
       elif command -v sha256sum >/dev/null 2>&1; then
         actual_sha="$(sha256sum "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
       elif command -v shasum >/dev/null 2>&1; then
         actual_sha="$(shasum -a 256 "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
       else
-        log_warn "sha256sum / shasum not available — skipping bundle integrity check"
-        actual_sha="$expected_sha"
+        log_error "BUNDLE INTEGRITY CHECK FAILED"
+        log_error "  Neither sha256sum nor shasum is available — cannot verify bundle integrity."
+        log_error "  Install one of these tools (or set FIPS_MODE=1 with openssl available) and re-run."
+        log_error "  Refusing to load an unverified air-gap bundle (fail-closed per ops risk"
+        log_error "  register YSG-RISK-038 re-check trigger: a primary integrity control that"
+        log_error "  cannot execute must not be treated as passed)."
+        exit 1
       fi
       if [[ "$actual_sha" != "$expected_sha" ]]; then
         log_error "BUNDLE INTEGRITY FAILURE"
