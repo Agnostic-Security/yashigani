@@ -365,7 +365,13 @@ def test_agent_auth_middleware_falls_back_to_gateway_fallback_state():
             return agent_id == "caller-1" and token == "good-token"
 
         def get(self, agent_id):
-            return {"allowed_cidrs": []}
+            # FIND-0813-013: the middleware requires an ACTIVE registration in
+            # addition to a verifying token, and defaults to reject when the
+            # status field is absent. This stub models a real active agent so
+            # the test still exercises what it is actually about — the
+            # gateway_fallback_state recovery path — rather than tripping the
+            # status gate before it gets there.
+            return {"status": "active", "allowed_cidrs": []}
 
     async def handler(request):
         return PlainTextResponse("ok")
