@@ -117,6 +117,14 @@ dev     = [
     # -e ".[dev]"` always brings this in; src/tests/playwright/conftest.py's
     # pytest_collection_modifyitems() wires a default 300s per-test ceiling.
     "pytest-timeout>=2.3",
+    # FIND-0813-004 (2026-08-16): playwright was referenced ONLY in the comment
+    # below and declared nowhere, so `uv sync --all-groups --all-extras` never
+    # installed it and the whole Tier-B suite (491 test IDs x 2 browser modes)
+    # could not run — the first Tier-B invocation of the 4.1.2 Linux campaign
+    # collected 0 tests in BOTH modes. Declared here so the release-gate tier is
+    # provisionable from committed code. Browsers still need an explicit
+    # `playwright install chromium` (binaries are not pip-installable).
+    "playwright>=1.47",
 ]
 
 [tool.setuptools.packages.find]

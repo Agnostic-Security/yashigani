@@ -145,8 +145,45 @@ fi
 
 VENV_PY="${YTF_PYTHON:-${REPO_DIR}/.venv/bin/python3}"
 if [ ! -x "$VENV_PY" ]; then
-  VENV_PY="$(command -v python3)"
+  # FIND-0813-004: this fallback used to be SILENT. On the 4.1.2 Linux campaign
+  # it fell through to system python, which had no pytest at all — Tier-B
+  # collected 0 tests in BOTH browser modes and only the YSG-RISK-206 verdict
+  # gate stopped that being recorded as a pass. Announce it.
+  _fb="$(command -v python3 || true)"
+  printf '  !!  WARNING: project venv not found at %s — falling back to %s\n' \
+         "$VENV_PY" "${_fb:-<none>}" >&2
+  printf '  !!  Provision it with: uv sync --frozen --all-groups --all-extras\n' >&2
+  VENV_PY="$_fb"
 fi
+
+# FIND-0813-004 — a tier MUST prove its own prerequisites before executing.
+# The root cause was a stale uv.lock: pytest-timeout / playwright / zaproxy were
+# declared in pyproject but ABSENT from the lock, so `uv sync --frozen` installed
+# a subset WITHOUT WARNING. Three separate symptoms followed (Tier-B 0-executed;
+# 3 Tier-A zap_driver failures; a hung run whose 300s ceiling was silently inert
+# because pytest-timeout was missing). Same invariant as YSG-RISK-206: prove the
+# precondition, never infer it later from a junit that isn't there.
+_ytf_require_python_deps() {
+  local tier="$1" missing="" mod
+  local required="pytest pytest_timeout"
+  case "$tier" in
+    a) required="$required zapv2" ;;          # tests/security ZAP driver self-checks
+    b) required="$required playwright" ;;     # WebUI suite
+    c) required="$required playwright" ;;
+  esac
+  for mod in $required; do
+    "$VENV_PY" -c "import $mod" >/dev/null 2>&1 || missing="$missing $mod"
+  done
+  if [ -n "$missing" ]; then
+    printf '\n  XX  Tier-%s cannot run — missing Python module(s):%s\n' "$tier" "$missing" >&2
+    printf '  XX  Interpreter: %s\n' "$VENV_PY" >&2
+    printf '  XX  Fix: uv sync --frozen --all-groups --all-extras' >&2
+    case " $missing " in *" playwright "*) printf ' && "%s" -m playwright install chromium' "$VENV_PY" >&2 ;; esac
+    printf '\n  XX  Refusing to execute a tier on an under-provisioned interpreter (FIND-0813-004).\n\n' >&2
+    return 1
+  fi
+  return 0
+}
 
 OVERALL_RC=0
 # VERDICT.txt files produced by THIS run (truncated at tier start so stale
@@ -231,6 +268,7 @@ _assert_executed() {
 # ---------------------------------------------------------------------------
 run_tier_a() {
   printf "\n%b=== Tier-A: in-process conformance + OPA + wiring-audit + static pentest ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps a || return 1
   local rc=0
   local evidence_dir="${EVIDENCE_ROOT}/tier-a"
   mkdir -p "$evidence_dir"
@@ -287,6 +325,7 @@ run_tier_a() {
 # ---------------------------------------------------------------------------
 run_tier_b() {
   printf "\n%b=== Tier-B: live WebUI Playwright (conformance + adversarial) ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps b || return 1
   # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
   # --version/--platform are still mandatory (evidence-path labelling).
   if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
@@ -392,6 +431,7 @@ run_tier_b() {
 # ---------------------------------------------------------------------------
 run_tier_c() {
   printf "\n%b=== Tier-C: live integration / lifecycle / chaos / parity ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps c || return 1
   # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
   # --version/--platform are still mandatory (evidence-path labelling).
   if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
