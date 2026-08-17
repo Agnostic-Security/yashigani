@@ -4623,3 +4623,40 @@ risks:
   superseded_by: YSG-RISK-139
   canonical_register_entry: 'YSG-RISK-131 — API-key revoke is a silent no-op: `/me/api-keys` list+revoke use session_store (DB1) while key issue+verify use IdentityRegistry (DB3) → a "revoked" key still
     authenticates (CWE-613/CWE-863) — CONFIRMED 2026-07-26 (x8x, live); fix committed-not-pushed'
+- id: YSG-RISK-265
+  description: 'FIND-IRIS-DUP-AGENT-FALSEPOS — install.sh''s FIND-IRIS-DUP-AGENT guard (register_agent_bundles(), install.sh ~11834) false-positived on EVERY clean install. Live 4.1.2 docker e2e leg (Iris,
+    2026-08-17): a verified-clean install (0 containers, 0 volumes, docker/secrets ABSENT before install) logged "!! ERROR: FIND-IRIS-DUP-AGENT: agent__langflow was registered AGAIN ... (fingerprint
+    sha256:5eab8af2a221cdff...)" and the identical fingerprint for letta. Two proofs it was false: (1) both agents reported the IDENTICAL fingerprint — impossible for two independently generated random
+    tokens to collide; hashing install.sh''s own placeholder string ("# placeholder — auto-generated at first bootstrap") with sha256sum reproduces exactly sha256:5eab8af2a221cdff... — the guard was fingerprinting its OWN
+    placeholder string (written by this same function''s step-8d/safety-net loops, install.sh:9908/21305), not a real secret. (2) live query against the running stack (`SELECT agent_id, agent_name, status
+    FROM agent_registry`) showed exactly ONE active row per name — no duplicate ever existed. Root cause: the clobber-guard used `[[ -s "${secrets_dir}/${_profile}_token" ]]` (non-emptiness only), which
+    cannot distinguish install.sh''s own placeholder file from a genuine prior credential — both are non-empty. Impact beyond noise: trains operators to ignore a red ERROR on a successful install; makes
+    the genuine duplicate-registration case (the ORIGINAL FIND-IRIS-DUP-AGENT, filed 2026-08-04 as commit 53154c69, which really does happen on repeated `--upgrade`) indistinguishable from the false one;
+    fires an ERROR-level line that a log-scraping CI/release gate could treat as install failure. Prior art read before fixing: git log -S"FIND-IRIS-DUP-AGENT" (53154c69 decode_responses bug, 264296c6
+    zero-agents regression, e84711d5 residual live-verify, 500fab2a/9d783dc1/4836425d/81db850d/643e0e2b FIND-0813-013 items 1-5) and git log -S"Created token placeholder" (d98d7e59 INSTALLER-BUG-AGENT-TOKENS,
+    2d30f459). Confirmed this file''s own `_secret_is_valid` predicate (F-001 self-heal, Su 2026-06-14, install.sh:13092) already exists as the codebase''s canonical placeholder-vs-real-secret content
+    check (file exists, non-empty, first byte not "#") and is used elsewhere (yashigani_internal_bearer, CADDY_INTERNAL_HMAC, langflow token) for exactly this class of bug.'
+  severity: low
+  controls_impacted:
+  - Operational integrity — false ERROR on every clean install desensitises operators to the genuine duplicate-registration warning and can fail a log-scraping release gate
+  - No security boundary crossed — this is a false-positive diagnostic, not an authz/authn gap; the underlying registration is correct (exactly 1 active row per bundled agent)
+  compensating_controls:
+  - Live Postgres agent_registry query always shows ground truth (1 active row per name) regardless of the log line
+  - The guard is non-fatal either way — install completes and the new agent registration is fully functional
+  fix:
+    summary: 'register_agent_bundles() dup-disposition guard now calls `_secret_is_valid` instead of bare `[[ -s ]]` — a content check (exists, non-empty, first byte not "#") that correctly treats
+      install.sh''s own placeholder as absent while still recognising a genuine prior token. Also downgraded the guard''s log_error -> log_warn for the true-positive case (non-fatal, operator-action
+      condition, install continues — consistent with every other non-fatal condition this same function already logs at WARN).'
+    file: install.sh
+    function: register_agent_bundles()
+    commit: PENDING (staged, not yet committed at time of filing)
+    tests: tests/install/test_agent_dup_registration_guard.bats (mutation-verified both directions — see Iris integration report)
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-11-17'
+  closure_evidence: 'bats tests/install/test_agent_dup_registration_guard.bats 25/25 GREEN post-fix; 8/25 correctly FAIL when install.sh is reverted to pre-fix (mutation-verify, both directions:
+    placeholder -> no false ERROR; genuine prior token -> guard still fires).'
+  last_threat_model_review: '2026-08-17'
+  filed_by: Iris (integration auditor)
+  owner: Iris

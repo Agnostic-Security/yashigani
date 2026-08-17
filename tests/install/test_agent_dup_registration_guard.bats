@@ -48,6 +48,26 @@ _extract_fn() {
   ' "${INSTALL_SH}"
 }
 
+# FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris): the dup-disposition block
+# now calls `_secret_is_valid` (a separate function, defined elsewhere in
+# install.sh) instead of inlining a bare `[[ -s ... ]]` test. Extracting the
+# dup-disposition block alone is no longer sufficient to execute it
+# standalone — this pulls the REAL, CURRENT `_secret_is_valid` function body
+# out of install.sh (same brace-counting technique as _extract_fn) so tests
+# exercise the actual product predicate, never a hand-typed reimplementation
+# that could silently drift from it.
+_extract_secret_is_valid_fn() {
+  awk '
+    $0 == "_secret_is_valid() {" { f=1 }
+    f {
+      print
+      d += gsub(/{/, "{")
+      d -= gsub(/}/, "}")
+      if (f && d <= 0) { exit }
+    }
+  ' "${INSTALL_SH}"
+}
+
 # ---------------------------------------------------------------------------
 # G-SYNTAX
 # ---------------------------------------------------------------------------
@@ -84,10 +104,60 @@ _extract_fn() {
   [ "$status" -eq 0 ]
 }
 
-@test "G-SYNTAX: token-write path never blindly clobbers an existing non-empty token file" {
+@test "G-SYNTAX: token-write path never blindly clobbers an existing VALID (non-placeholder) token file" {
+  # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17): the guard now runs
+  # `_secret_is_valid` (content check: exists, non-empty, not a "#"
+  # placeholder comment) rather than a bare `-s` non-emptiness test, so it
+  # no longer treats install.sh's OWN placeholder ("# placeholder —
+  # auto-generated at first bootstrap", written above by step 8d /
+  # the safety-net loop) as a genuine prior credential.
   local count
-  count="$(_extract_fn | grep -c -- '-s "\${secrets_dir}/\${_profile}_token"' || true)"
+  count="$(_extract_fn | grep -c -- '_secret_is_valid "\${secrets_dir}/\${_profile}_token"' || true)"
   [ "${count:-0}" -ge 1 ]
+  # The old bare-`-s` clobber guard at THIS exact site must be gone —
+  # `-s` alone cannot distinguish a placeholder from a real secret.
+  count="$(_extract_fn | grep -c -- 'if \[\[ -s "\${secrets_dir}/\${_profile}_token" \]\]; then' || true)"
+  [ "${count:-0}" -eq 0 ]
+}
+
+@test "G-LOGIC (FIND-IRIS-DUP-AGENT-FALSEPOS): _secret_is_valid rejects install.sh's own placeholder string" {
+  local secret_valid_fn
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
+  [ -n "$secret_valid_fn" ]
+  local secrets_dir="${MOCK_ROOT}/secrets_placeholder"
+  mkdir -p "$secrets_dir"
+  printf '%s' "# placeholder — auto-generated at first bootstrap" > "${secrets_dir}/langflow_token"
+  run bash -c "
+    ${secret_valid_fn}
+    _secret_is_valid '${secrets_dir}/langflow_token'
+  "
+  [ "$status" -eq 1 ]
+}
+
+@test "G-LOGIC (FIND-IRIS-DUP-AGENT-FALSEPOS): _secret_is_valid rejects a zero-byte token file" {
+  local secret_valid_fn
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
+  local secrets_dir="${MOCK_ROOT}/secrets_empty"
+  mkdir -p "$secrets_dir"
+  : > "${secrets_dir}/langflow_token"
+  run bash -c "
+    ${secret_valid_fn}
+    _secret_is_valid '${secrets_dir}/langflow_token'
+  "
+  [ "$status" -eq 1 ]
+}
+
+@test "G-LOGIC (FIND-IRIS-DUP-AGENT-FALSEPOS): _secret_is_valid accepts a real (non-placeholder) token" {
+  local secret_valid_fn
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
+  local secrets_dir="${MOCK_ROOT}/secrets_real"
+  mkdir -p "$secrets_dir"
+  printf '%s' "REAL_RANDOM_TOKEN_VALUE_abc123" > "${secrets_dir}/langflow_token"
+  run bash -c "
+    ${secret_valid_fn}
+    _secret_is_valid '${secrets_dir}/langflow_token'
+  "
+  [ "$status" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -165,7 +235,7 @@ _extract_fn() {
 _extract_dup_disposition_block() {
   awk '
     BEGIN { f = 0; d = 0; zero_hits = 0 }
-    /^[[:space:]]*if \[\[ -s "\$\{secrets_dir\}\/\$\{_profile\}_token" \]\]; then$/ { f = 1 }
+    /^[[:space:]]*if _secret_is_valid "\$\{secrets_dir\}\/\$\{_profile\}_token"; then$/ { f = 1 }
     f {
       print
       if ($0 ~ /^[[:space:]]*if /) { d++ }
@@ -184,7 +254,11 @@ _extract_dup_disposition_block() {
   local extracted
   extracted="$(_extract_dup_disposition_block)"
   [ -n "$extracted" ]
-  [[ "$extracted" == *'if [[ -s "${secrets_dir}/${_profile}_token" ]]; then'* ]]
+  # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17): the site now guards on
+  # `_secret_is_valid` (content check) rather than bare `-s`
+  # (non-emptiness only) — `-s` alone could not distinguish install.sh's
+  # own placeholder token from a genuine prior credential.
+  [[ "$extracted" == *'if _secret_is_valid "${secrets_dir}/${_profile}_token"; then'* ]]
   # sanity: both sibling statements (old-token disposition + new-token
   # write) were captured, proving the depth-counting extraction closed on
   # the correct second "fi", not the first.
@@ -214,14 +288,16 @@ _extract_dup_disposition_block() {
   printf 'OLD_TOKEN_VALUE' > "${secrets_dir}/langflow_token"
   chmod 0640 "${secrets_dir}/langflow_token"
 
-  local block
+  local block secret_valid_fn
   block="$(_extract_dup_disposition_block)"
   [ -n "$block" ]
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
 
   run bash -c "
     set -euo pipefail
     log_error() { echo \"ERROR: \$1\"; }
     log_warn()  { echo \"WARN: \$1\"; }
+    ${secret_valid_fn}
     secrets_dir='${secrets_dir}'
     _profile=langflow
     _agent_name=agent__langflow
@@ -274,13 +350,15 @@ _extract_dup_disposition_block() {
   mkdir -p "$secrets_dir"
   printf 'ANOTHER_OLD_TOKEN' > "${secrets_dir}/letta_token"
 
-  local block
+  local block secret_valid_fn
   block="$(_extract_dup_disposition_block)"
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
 
   run bash -c "
     set -euo pipefail
     log_error() { echo \"ERROR: \$1\"; }
     log_warn()  { echo \"WARN: \$1\"; }
+    ${secret_valid_fn}
     secrets_dir='${secrets_dir}'
     _profile=letta
     _agent_name=letta
@@ -320,13 +398,15 @@ _extract_dup_disposition_block() {
     ln -sf "$real_path" "${minimal_bin}/${bin}"
   done
 
-  local block
+  local block secret_valid_fn
   block="$(_extract_dup_disposition_block)"
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
 
   run env PATH="${minimal_bin}" bash -c "
     set -euo pipefail
     log_error() { echo \"ERROR: \$1\"; }
     log_warn()  { echo \"WARN: \$1\"; }
+    ${secret_valid_fn}
     secrets_dir='${secrets_dir}'
     _profile=langflow
     _agent_name=agent__langflow
@@ -346,6 +426,110 @@ _extract_dup_disposition_block() {
   [ "$status" -ne 0 ]
   run cat "${secrets_dir}/langflow_token"
   [ "$output" = "NEW_TOKEN_NO_SHRED" ]
+}
+
+# ---------------------------------------------------------------------------
+# FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris) — the live 4.1.2 docker e2e
+# leg logged FIND-IRIS-DUP-AGENT ERROR for agent__langflow AND letta on a
+# VERIFIED-CLEAN install (0 containers, 0 volumes, docker/secrets ABSENT
+# before install). Both fingerprints were IDENTICAL
+# (sha256:5eab8af2a221cdff...) — impossible for two independently generated
+# random tokens, and proven to be `sha256sum` of install.sh's own placeholder
+# string ("# placeholder — auto-generated at first bootstrap", written by
+# this same function's step-8d/safety-net loops at install.sh:9908/21305).
+# Live query against the running stack showed exactly ONE active row per
+# name — no duplicate. Root cause: the guard used `[[ -s ]]` (non-emptiness
+# only), which cannot distinguish install.sh's own placeholder from a
+# genuine prior credential. Fixed by reusing `_secret_is_valid` (F-001
+# self-heal predicate, already the codebase's canonical placeholder-vs-real
+# content check). These two tests prove BOTH directions against the REAL
+# extracted install.sh code (not a hand-typed reproduction):
+#   1. placeholder present -> the dup-guard does NOT fire (false positive
+#      gone), the placeholder is silently overwritten with the real token.
+#   2. genuine prior token present -> the dup-guard STILL fires (true
+#      positive preserved) — this is `_extract_dup_disposition_block`'s
+#      preceding test at "running install.sh's REAL dup-disposition code
+#      leaves no plaintext copy of the old token anywhere on disk", which
+#      already exercises a real (non-placeholder) OLD_TOKEN_VALUE and
+#      asserts the FIND-IRIS-DUP-AGENT line still logs — re-affirmed here
+#      by content, not by revert, since revert-and-confirm-fail is done at
+#      the shell level (see MUTATION-VERIFY notes in the Iris report).
+# ---------------------------------------------------------------------------
+
+@test "G-LOGIC (FIND-IRIS-DUP-AGENT-FALSEPOS): install.sh's OWN placeholder does NOT trigger the dup-agent guard" {
+  local secrets_dir="${MOCK_ROOT}/secrets_placeholder_e2e"
+  mkdir -p "$secrets_dir"
+  # Exactly the placeholder string install.sh writes at 9908/21305.
+  printf '%s' "# placeholder — auto-generated at first bootstrap" > "${secrets_dir}/langflow_token"
+  chmod 0640 "${secrets_dir}/langflow_token"
+
+  local block secret_valid_fn
+  block="$(_extract_dup_disposition_block)"
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
+
+  run bash -c "
+    set -euo pipefail
+    log_error() { echo \"ERROR: \$1\"; }
+    log_warn()  { echo \"WARN: \$1\"; }
+    ${secret_valid_fn}
+    secrets_dir='${secrets_dir}'
+    _profile=langflow
+    _agent_name=agent__langflow
+    _token=REAL_NEW_TOKEN_VALUE
+    _ysg_agent_pre_existing=','
+    _run_extracted_block() {
+      ${block}
+    }
+    _run_extracted_block
+  "
+  [ "$status" -eq 0 ]
+  # The false-positive guard must NOT fire on a placeholder.
+  [[ "$output" != *"FIND-IRIS-DUP-AGENT"* ]]
+  [[ "$output" != *"securely removed"* ]]
+  # Registration proceeds normally: the placeholder is overwritten with the
+  # real token, same as if the file had never existed.
+  run cat "${secrets_dir}/langflow_token"
+  [ "$output" = "REAL_NEW_TOKEN_VALUE" ]
+}
+
+@test "G-LOGIC (FIND-IRIS-DUP-AGENT-FALSEPOS): a genuine prior token STILL triggers the dup-agent guard (true positive preserved)" {
+  local secrets_dir="${MOCK_ROOT}/secrets_real_dup_e2e"
+  mkdir -p "$secrets_dir"
+  printf '%s' "REAL_PRIOR_CREDENTIAL_abc123xyz" > "${secrets_dir}/letta_token"
+  chmod 0640 "${secrets_dir}/letta_token"
+
+  local block secret_valid_fn
+  block="$(_extract_dup_disposition_block)"
+  secret_valid_fn="$(_extract_secret_is_valid_fn)"
+
+  run bash -c "
+    set -euo pipefail
+    log_error() { echo \"ERROR: \$1\"; }
+    log_warn()  { echo \"WARN: \$1\"; }
+    ${secret_valid_fn}
+    secrets_dir='${secrets_dir}'
+    _profile=letta
+    _agent_name=letta
+    _token=REAL_NEW_TOKEN_VALUE_2
+    _ysg_agent_pre_existing=','
+    _run_extracted_block() {
+      ${block}
+    }
+    _run_extracted_block
+  "
+  [ "$status" -eq 0 ]
+  # The true-positive guard MUST still fire on a genuine prior credential.
+  [[ "$output" == *"FIND-IRIS-DUP-AGENT"* ]]
+  [[ "$output" == *"securely removed"* ]]
+  # Severity: WARN, not ERROR (FIND-IRIS-DUP-AGENT-FALSEPOS severity
+  # downgrade — non-fatal, operator-action condition, install continues).
+  [[ "$output" == *"WARN: FIND-IRIS-DUP-AGENT"* ]]
+  [[ "$output" != *"ERROR: FIND-IRIS-DUP-AGENT"* ]]
+  # Old value gone from disk; new value written.
+  run bash -c "grep -rl 'REAL_PRIOR_CREDENTIAL_abc123xyz' '${secrets_dir}' 2>/dev/null"
+  [ "$status" -ne 0 ]
+  run cat "${secrets_dir}/letta_token"
+  [ "$output" = "REAL_NEW_TOKEN_VALUE_2" ]
 }
 
 @test "G-LOGIC: no pre-existing token file and no pre-check hit => no backup noise on a genuinely fresh registration" {

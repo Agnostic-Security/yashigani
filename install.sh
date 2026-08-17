@@ -11831,7 +11831,39 @@ for r in results:
           # button. This is independently correct regardless of whether
           # deactivate() has been fixed to actually revoke the Redis token
           # key — it does not depend on that fix landing.
-          if [[ -s "${secrets_dir}/${_profile}_token" ]]; then
+          # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris): `[[ -s ]]` treats
+          # install.sh's OWN safety-net placeholder ("# placeholder —
+          # auto-generated at first bootstrap", written by this same
+          # function's step-8d/safety-net loops above, install.sh:9908 /
+          # 21305) as if it were a genuine prior credential — the placeholder
+          # is non-empty, so `-s` is true, and every clean install that ever
+          # passed through the placeholder-write path fires this ERROR with
+          # a fingerprint that is identical across every profile (it is a
+          # hash of the constant placeholder STRING, not of any secret:
+          # `printf '%s' "# placeholder — auto-generated at first bootstrap"
+          # | sha256sum` = 5eab8af2a221cdff..., matching the false positives
+          # reported live on a verified-clean install, 0 containers/volumes,
+          # docker/secrets ABSENT before install). Reuse `_secret_is_valid`
+          # (F-001 self-heal predicate, defined above — Su, 2026-06-14):
+          # already the codebase's single canonical "real secret vs
+          # placeholder/absent/empty" check, used for this exact class of
+          # placeholder for yashigani_internal_bearer/CADDY_INTERNAL_HMAC/
+          # langflow token elsewhere in this file. It is a content check
+          # (file exists, non-empty, first byte is not "#"), not a
+          # hash-string special-case, so it also correctly treats a
+          # zero-byte file as absent (no false ERROR) and any real
+          # placeholder-shaped-but-different comment as a placeholder too —
+          # more robust than pinning the one known SHA-256. Placeholder and
+          # a real token cannot legitimately coexist in the same file (the
+          # placeholder IS the file's entire content until step 8d/this
+          # write-loop overwrites it with the real token; the write is a
+          # full overwrite, never an append) so there is no straddling case
+          # to handle. The TRUE positive (repeat --upgrade re-registering an
+          # already-active agent while a REAL prior token — not a
+          # placeholder — is still on disk) still fires: `_secret_is_valid`
+          # returns true for any non-placeholder non-empty content,
+          # identically to `-s` for that case.
+          if _secret_is_valid "${secrets_dir}/${_profile}_token"; then
             local _dup_fp="unavailable"
             if command -v sha256sum >/dev/null 2>&1; then
               _dup_fp="$(sha256sum "${secrets_dir}/${_profile}_token" 2>/dev/null | cut -d' ' -f1 | head -c 16)"
@@ -11841,9 +11873,25 @@ for r in results:
             else
               rm -f -- "${secrets_dir}/${_profile}_token"
             fi
-            log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed (fingerprint sha256:${_dup_fp}...). The prior token has been securely removed — it is NOT retained in plaintext (FIND-0813-013 item 5). Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch; the deactivated agent's old credential cannot be recovered."
+            # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris): severity
+            # downgraded ERROR -> WARN. This branch is reached only when
+            # `_secret_is_valid` has already confirmed a REAL prior token
+            # (not the placeholder) — the true-positive case. It is still
+            # non-fatal (execution continues, any_registered=true below,
+            # install completes, the NEW registration is fully functional)
+            # and needs an operator cleanup action, not an install failure.
+            # Matches the severity this same function already uses for
+            # every other non-fatal/actionable condition on this guard
+            # (the pre-check-query-failed warnings a few lines above use
+            # log_warn) — ERROR is reserved for the genuinely catastrophic,
+            # distinct case added by 264296c6 (the compose-exec call never
+            # reached the container at all). A log-scraping gate that greps
+            # install output for "ERROR:" must not flag a successful,
+            # fully-functional install for a condition the installer itself
+            # does not treat as fatal.
+            log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed (fingerprint sha256:${_dup_fp}...). The prior token has been securely removed — it is NOT retained in plaintext (FIND-0813-013 item 5). Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch; the deactivated agent's old credential cannot be recovered."
           elif [[ "$_ysg_agent_pre_existing" == *",${_agent_name},"* ]]; then
-            log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
+            log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
           fi
           # ISSUE-027 (2026-05-19): Docker-rootful fallback — Python inside the
           # container may fail to write the token (EACCES) and fall through to
