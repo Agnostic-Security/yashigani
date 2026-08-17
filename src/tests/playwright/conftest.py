@@ -991,6 +991,120 @@ def clear_auth_throttle() -> int:
         return 0
 
 
+def expire_session_stepup(token: str) -> bool:
+    """Directly clear a live admin session's ``last_totp_verified_at`` in
+    Redis so a "session without a fresh step-up" probe is genuinely true,
+    without sleeping out ``YASHIGANI_STEPUP_TTL_SECONDS`` (up to 300s+).
+
+    2026-08-17 (Ava, TIER-B-BLOCKED-STEPUP-EXPIRE fix). Root cause of the
+    blocker: test_v233_webauthn_e2e.py's ``_expire_stepup()`` POSTed to
+    ``/auth/stepup/expire`` expecting 200/204, then fell back to
+    ``time.sleep(min(ttl + 5, 310))`` on anything else. Verified live: that
+    endpoint 404s, and ``grep -rn "stepup/expire\\|stepup_expire" src/yashigani/``
+    finds nothing -- it was never implemented, so the sleep fired on EVERY
+    run. 310s > pytest_collection_modifyitems's default 300s per-test budget
+    (conftest.py ~line 2320, `method="thread"`) -- pytest-timeout's thread
+    method cannot safely interrupt an arbitrary thread, so on expiry it dumps
+    tracebacks and calls ``os._exit()``, killing the WHOLE pytest process
+    before the junitxml plugin's session-end hook ever runs. That is why the
+    runner reported ``executed=0`` for a leg where 100+ tests had genuinely
+    run and mostly passed -- not a flaky test, a session-ending crash.
+
+    Mechanism (real invalidation, not a skipped wait): the session store is
+    Redis-backed (``yashigani:session:{token}`` hash, DB 1 -- see
+    ``src/yashigani/backoffice/entrypoint.py`` "Session store (Redis db/1)"
+    and ``src/yashigani/auth/session.py:SessionStore``). The SAME redis
+    instance/DB backs ``_apply_auth_throttle`` (``backoffice_state.
+    session_store._redis``, ``src/yashigani/backoffice/routes/auth.py:451``),
+    which is exactly what ``clear_auth_throttle()`` above already reaches via
+    ``docker/podman exec <redis> redis-cli -n 1`` with the container's own
+    TLS client cert -- this function reuses that identical, already-proven
+    runtime/container-detection + redis-cli pattern rather than inventing a
+    second one.
+
+    ``has_fresh_stepup()`` (src/yashigani/auth/stepup.py) is a pure
+    ``age_seconds < STEPUP_TTL_SECONDS`` check against the stored timestamp,
+    so writing a timestamp comfortably older than the TTL genuinely drops
+    the session below the fresh-step-up threshold server-side -- this is not
+    a test-harness fiction, it is the exact same state a real 300s-idle
+    step-up would leave behind, produced instantly.
+
+    Returns True ONLY on POSITIVE evidence the mutation took: the HSET
+    reported success AND a follow-up HGET read back a timestamp whose age is
+    already >= the TTL. Per Ava's standing rule (A1): absence of proof is a
+    FAIL, not a PASS, so this never returns True on a guess -- an
+    unreachable/misconfigured redis returns False and the caller must not
+    proceed with a "without step-up" assertion built on unverified state.
+    """
+    import os
+    import subprocess
+    import time
+
+    runtime = _detect_container_runtime()
+    if runtime is None:
+        return False
+    redis_container = _find_redis_container(runtime)
+    if redis_container is None:
+        return False
+
+    try:
+        pw_result = subprocess.run(
+            [runtime, "exec", redis_container, "cat", "/run/secrets/redis_password"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if pw_result.returncode != 0:
+            return False
+        redis_pw = pw_result.stdout.strip()
+
+        def _redis_cli(*args: str) -> "subprocess.CompletedProcess":
+            return subprocess.run(
+                [
+                    runtime, "exec", redis_container, "redis-cli",
+                    "-p", "6380",
+                    "--tls",
+                    "--cert", "/run/secrets/redis_client.crt",
+                    "--key", "/run/secrets/redis_client.key",
+                    "--cacert", "/run/secrets/ca_root.crt",
+                    "--user", "default",
+                    "--pass", redis_pw,
+                    "-n", "1",
+                    *args,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+        _warning_line = (
+            "Warning: Using a password with '-a' or '-u' option on the "
+            "command line interface may not be safe."
+        )
+
+        key = f"yashigani:session:{token}"
+        ttl = int(os.getenv("YASHIGANI_STEPUP_TTL_SECONDS", "300"))
+        stale_ts = time.time() - ttl - 30  # comfortably past expiry, never negative in practice
+
+        hset_result = _redis_cli("HSET", key, "last_totp_verified_at", str(stale_ts))
+        if hset_result.returncode != 0:
+            return False
+
+        # Positive verification: read the value back rather than trusting the
+        # write. A silent no-op HSET (e.g. wrong DB, wrong key) must not be
+        # reported as success.
+        hget_result = _redis_cli("HGET", key, "last_totp_verified_at")
+        value = hget_result.stdout.replace(_warning_line, "").strip()
+        try:
+            stored = float(value)
+        except ValueError:
+            return False
+        age = time.time() - stored
+        return age >= ttl
+    except Exception:
+        return False
+
+
 def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> dict:
     """
     Obtain session cookies via the httpx API client (not the browser).

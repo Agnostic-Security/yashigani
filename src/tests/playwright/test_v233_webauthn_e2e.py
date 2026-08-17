@@ -1563,19 +1563,58 @@ def test_wa_revoke_03_audit_event_credential_revoked(
 def _expire_stepup(client) -> None:
     """Drop any fresh step-up on this session so a 'without step-up' probe is honest.
 
-    Preferred: an explicit invalidation endpoint if the product exposes one.
-    Fallback: wait out YASHIGANI_STEPUP_TTL_SECONDS. The wait is bounded and is
-    only paid by the handful of tests that genuinely need a stepped-down session
-    — far cheaper than an assertion that silently cannot fail.
-    """
-    import os
-    import time
+    2026-08-17 (Ava, TIER-B-BLOCKED-STEPUP-EXPIRE). This previously POSTed to
+    ``/auth/stepup/expire`` and, on anything but 200/204, fell back to
+    ``time.sleep(min(ttl + 5, 310))``. Verified live: that endpoint 404s, and
+    ``grep -rn "stepup/expire\\|stepup_expire" src/yashigani/`` finds
+    nothing -- there is no product endpoint to invalidate a step-up (see the
+    design-gap note in test_wa_revoke_04's docstring below), so the
+    "preferred" branch NEVER fired and every run paid the full ~310s sleep.
+    That sleep exceeds this
+    suite's default 300s per-test budget (conftest.py
+    pytest_collection_modifyitems, ``method="thread"``); pytest-timeout's
+    thread method cannot safely interrupt an arbitrary thread, so it hard-
+    kills the whole pytest PROCESS on expiry (``os._exit`` under the hood),
+    before junitxml's session-end hook can write anything. That crash --
+    not this test's own assertion -- is what turned a leg with 100+
+    genuinely-run, mostly-passing tests into ``executed=0``.
 
-    r = client.post(f"{BASE_URL}/auth/stepup/expire")
-    if r.status_code in (200, 204):
-        return
-    ttl = int(os.getenv("YASHIGANI_STEPUP_TTL_SECONDS", "300"))
-    time.sleep(min(ttl + 5, 310))
+    The premise this fixture protects is real and unchanged from the
+    2026-08-08 fix (see the docstring on test_wa_revoke_04 below): a
+    "DELETE without step-up" probe against a session that just got a REAL
+    step-up (clean_authed_client's cleanup performs one) is not testing what
+    it claims to test -- "an assertion that silently cannot fail" is worse
+    than a slow test. That reasoning is preserved; only the mechanism for
+    making the premise true changes here, from "wait it out" to "prove it
+    directly false" via the session's own stored state.
+
+    Real mechanism: clears ``last_totp_verified_at`` for this session
+    directly in Redis (session store, DB 1) via
+    conftest.expire_session_stepup(), which requires POSITIVE evidence
+    (a follow-up HGET showing the stored timestamp is already past TTL)
+    before returning True -- see that function's docstring for the full
+    chain (same redis instance/DB as clear_auth_throttle() above,
+    same TLS redis-cli pattern, no new infra). This asserts on that
+    evidence rather than silently trusting the write, so a broken/
+    unreachable redis fails LOUD here instead of producing a test that
+    looks green for the wrong reason.
+    """
+    from tests.playwright.conftest import expire_session_stepup
+
+    token = client.cookies.get("__Host-yashigani_admin_session")
+    assert token, (
+        "_expire_stepup: no '__Host-yashigani_admin_session' cookie on this "
+        "client -- cannot locate the Redis session record to expire."
+    )
+    ok = expire_session_stepup(token)
+    assert ok, (
+        "_expire_stepup: could not VERIFY the session's step-up was "
+        "genuinely cleared in Redis (container/redis unreachable, HSET "
+        "failed, or the post-write HGET did not show an expired "
+        "timestamp). Refusing to proceed to a 'without step-up' assertion "
+        "built on unverified state -- see A1: absence of proof is a FAIL, "
+        "not a PASS."
+    )
 
 def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_page_with_va):
     """
@@ -1584,6 +1623,22 @@ def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_pa
 
     ASVS V6.8.4: step-up MUST be enforced, not just documented.
     OWASP A01: broken access control probe.
+
+    PRODUCT DESIGN GAP (2026-08-17, reported separately, NOT fixed here per
+    dispatch scope): there is no product mechanism to invalidate a step-up
+    elevation before its TTL naturally expires -- no endpoint, nothing in
+    src/yashigani/. That is why THIS TEST has to reach into Redis directly
+    (_expire_stepup -> conftest.expire_session_stepup) to prove "without
+    step-up" is true; a real operator who believes their own elevated
+    session is compromised has no equivalent self-service action short of
+    logging out (which also drops the base session, not just the
+    elevation) or having a SECOND stepped-up admin disable/force-reset
+    their account (session_store.invalidate_all_for_account(), also
+    all-or-nothing). Step-up gates destructive ops (uninstall, policy
+    weakening, credential revocation) specifically because a compromised
+    *session* might not mean a compromised *step-up event* -- so the
+    inability to surgically revoke just the elevation is a real gap, not
+    only a test inconvenience.
     """
     client = clean_authed_client
     page, cdp, auth_id = browser_page_with_va
