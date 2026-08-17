@@ -4311,16 +4311,21 @@ run_wizard() {
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
     log_step "6/${TOTAL_STEPS}" "Skipping wizard (--non-interactive)"
 
-    local missing=()
-    [[ -z "$DOMAIN" ]]       && missing+=("--domain")
-    [[ -z "$ADMIN_EMAIL" ]]  && missing+=("--admin-email")
-    [[ -z "$UPSTREAM_URL" ]] && missing+=("--upstream-url")
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-      log_warn "Non-interactive mode: the following flags were not provided: ${missing[*]}"
-      log_warn "Defaults or empty values will be used; reconfigure via your .env file."
+    # --- Reuse persisted values from docker/.env BEFORE deciding what is
+    # genuinely missing. This must run first: on --upgrade an operator should
+    # not have to re-pass a flag that is already configured (75ead401 —
+    # UPSTREAM_MCP_URL reuse, "the upgrade path"). Extended here to DOMAIN for
+    # parity: _apply_deploy_defaults (YSG-RISK-165) already reuses a persisted
+    # YASHIGANI_TLS_DOMAIN, but only inside the demo-mode branch — production
+    # and enterprise/k8s never got the equivalent, so they were exposed to the
+    # exact same "silently exports empty" failure DOMAIN's demo-mode reuse was
+    # built to prevent. Unconditional file-exists check (no UPGRADE gate),
+    # matching the existing UPSTREAM_MCP_URL pattern below: a fresh install
+    # never has docker/.env yet, so this is a no-op on a genuine first run.
+    if [[ -z "$DOMAIN" && -f "${WORK_DIR}/docker/.env" ]]; then
+      DOMAIN="$(grep -m1 '^YASHIGANI_TLS_DOMAIN=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
+      [[ -n "$DOMAIN" ]] && log_info "Reusing existing YASHIGANI_TLS_DOMAIN from .env"
     fi
-
     # On upgrade, reuse an existing UPSTREAM_MCP_URL from .env rather than exporting an
     # empty value. Compose declares it required (${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}),
     # so a blank export breaks `up` even though the value is already configured — this is
@@ -4329,6 +4334,61 @@ run_wizard() {
       UPSTREAM_URL="$(grep -m1 '^UPSTREAM_MCP_URL=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
       [[ -n "$UPSTREAM_URL" ]] && log_info "Reusing existing UPSTREAM_MCP_URL from .env (upgrade)"
     fi
+
+    # --- Fail CLOSED on flags docker-compose.yml declares required with no
+    # fallback (`${VAR:?...}`, no `:-`) and which have no safe default outside
+    # --deploy demo. Verified by reading docker/docker-compose.yml directly:
+    #   :193 YASHIGANI_TLS_DOMAIN: ${YASHIGANI_TLS_DOMAIN:?set YASHIGANI_TLS_DOMAIN}
+    #   :613 YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+    # (the `:-localhost` at line 1004 is a DIFFERENT, non-gateway service —
+    # it does not save the gateway build). DOMAIN's only real default lives in
+    # _apply_deploy_defaults' demo-mode branch ("localhost"); UPSTREAM_URL's
+    # only real default lives in the step-5 demo-mode block (demo-mcp
+    # upstream) — both demo-only, by design (a production gateway must never
+    # be silently pointed at the bundled demo-mcp upstream). Previously this
+    # just logged a reassuring "defaults will be used" warning and continued;
+    # three steps later `docker compose build` died on interpolation, naming
+    # neither the missing --flag nor an example value. Scoped to non-k8s
+    # (compose + vm) modes: docker-compose.yml is the actual requiredness
+    # source here, and the k8s Helm chart already carries its own (softer)
+    # defaults (values.yaml global.tlsDomain / gateway.env.upstreamUrl) —
+    # changing k8s requiredness is out of scope for this fix.
+    local hard_missing=()
+    local soft_missing=()
+    if [[ "$MODE" == "k8s" ]]; then
+      [[ -z "$DOMAIN" ]]       && soft_missing+=("--domain")
+      [[ -z "$UPSTREAM_URL" ]] && soft_missing+=("--upstream-url")
+    else
+      [[ -z "$DOMAIN" ]]       && hard_missing+=("--domain <hostname>   e.g. --domain gateway.example.com (or --domain localhost for local/self-signed)")
+      [[ -z "$UPSTREAM_URL" ]] && hard_missing+=("--upstream-url <url>  e.g. --upstream-url https://mcp.example.com")
+    fi
+    if [[ ${#hard_missing[@]} -gt 0 ]]; then
+      log_error "Non-interactive --deploy ${DEPLOY_MODE} install is missing required configuration:"
+      local _hm
+      for _hm in "${hard_missing[@]}"; do
+        log_error "  ${_hm}"
+      done
+      log_error "Neither flag has a default outside --deploy demo, and docker-compose.yml"
+      log_error "declares both required — the install would otherwise fail later, inside"
+      log_error "'docker compose build', with a less actionable interpolation error."
+      log_error "Pass the flag(s) explicitly, or (on --upgrade) leave them unset to reuse"
+      log_error "the value already configured in docker/.env."
+      exit 1
+    fi
+
+    # --- Flags with a genuine safe default, or with no downstream
+    # requirement at all: warn and continue is correct. --admin-email is
+    # written to docker/.env (YASHIGANI_ADMIN_EMAIL) for operator reference
+    # only — verified by grep: it is not interpolated by docker-compose.yml,
+    # not templated by any Helm chart, and not read by any application code
+    # (`grep -rn YASHIGANI_ADMIN_EMAIL --include=*.py .` returns nothing) —
+    # so nothing downstream can fail on it being empty.
+    [[ -z "$ADMIN_EMAIL" ]] && soft_missing+=("--admin-email")
+    if [[ ${#soft_missing[@]} -gt 0 ]]; then
+      log_warn "Non-interactive mode: the following flags were not provided: ${soft_missing[*]}"
+      log_warn "Defaults or empty values will be used; reconfigure via your .env file."
+    fi
+
     export YASHIGANI_TLS_DOMAIN="$DOMAIN"
     # v4.1 username-fix: do NOT export YASHIGANI_ADMIN_USERNAME here.
     # The admin username is a generated handle (hawk/orchid/etc.) produced by
