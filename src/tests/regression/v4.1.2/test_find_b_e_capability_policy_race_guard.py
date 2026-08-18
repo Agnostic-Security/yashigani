@@ -181,6 +181,8 @@ class FakeCtx {{
     this._result = null;
     this._policy = null;
     this._rows = null;
+    this._dirty = false;
+    this._fetchInFlight = false;
     this.api = {{ get: null }};
   }}
   {scope_url_src}
