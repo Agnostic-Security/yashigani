@@ -34,6 +34,7 @@ from tests.playwright.conftest import (
     get_admin_totp_code,
     playwright_login_admin,
     launch_chromium,
+    _admin_session_needs_refresh,
 )
 
 try:
@@ -156,8 +157,20 @@ def admin_page():
         browser = launch_chromium(pw)
         ctx = browser.new_context(ignore_https_errors=True)
         page = ctx.new_page()
-        playwright_login_admin(page, admin=1, force_fresh=True)
-        # The browser login consumes a TOTP code. do_admin_stepup() in the tests below
+        # YTF §5.12 (2026-08-13 call-site audit): was force_fresh=True
+        # unconditionally. This fixture is class-scoped (one real login for
+        # the whole TestMixedUserProvisioning class already, not per-test),
+        # but a hardcoded True still forced a redundant real login even when
+        # the process-wide admin1 session (e.g. from admin_ctx or an earlier
+        # file in the same run) was still perfectly valid. Nothing about
+        # user provisioning requires a BRAND NEW admin1 session -- only a
+        # valid one -- so this now asks the same staleness question
+        # refresh_admin_context_if_stale()/get_admin_session_cookies() ask
+        # (dirty or past the 600s safety margin) instead of always paying
+        # for a fresh one.
+        playwright_login_admin(page, admin=1, force_fresh=_admin_session_needs_refresh(admin=1))
+        # The browser login consumes a TOTP code IF force_fresh resolved True above.
+        # do_admin_stepup() in the tests below
         # needs a code the server has NOT seen: inside the same 30s window it is a
         # replay and the server returns 401 invalid_totp_code (observed 2026-08-12 --
         # capacity never cleared, so every later create hit the full quota). Block on

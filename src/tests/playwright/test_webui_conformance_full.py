@@ -249,6 +249,10 @@ class TestAdminLoginForm:
             ctx.close()
             browser.close()
 
+    # YTF §5.12 (2026-08-13, Tiago directive): deliberate bad-credential
+    # login attempts -- auth-abuse-shaped, adversarial-lane (run via
+    # `pytest -m security_probe`, run_tier_b()'s LAST stage).
+    @pytest.mark.security_probe
     def test_wrong_password_and_wrong_username_give_same_error(self):
         """User-enumeration prevention: identical error text/status for
         wrong-username vs wrong-password."""
@@ -731,6 +735,10 @@ class TestSensitivityPiiAdversarial:
     escaped; prompt-injection canaries must not alter classifier behaviour
     into leaking config."""
 
+    # YTF §5.12 ("...all but the brute force testing or injections"): XSS/SQLi
+    # injection canaries -- adversarial-lane, run via `pytest -m security_probe`.
+    pytestmark = pytest.mark.security_probe
+
     @pytest.mark.parametrize("canary", XSS_CANARIES)
     def test_sensitivity_sample_xss_canary_not_reflected_unescaped(self, admin_ctx, canary):
         ctx, page = admin_ctx
@@ -759,6 +767,8 @@ class TestDocumentsAdversarial:
     path-traversal (CWE-22, already server-guarded per user_ui.py
     _guard_filename) -- re-verified from the UI's perspective."""
 
+    # YTF §5.12: XSS injection canary -- adversarial-lane.
+    @pytest.mark.security_probe
     def test_admin_inspect_xss_canary(self, admin_ctx):
         ctx, _ = admin_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
@@ -768,7 +778,12 @@ class TestDocumentsAdversarial:
                        headers=_cookie_header(cookies))
         assert r.status_code in (200, 400, 409, 422), f"unexpected {r.status_code}"
 
+    # YTF §5.12: path-traversal injection canary -- adversarial-lane. (The
+    # other two tests in this class -- oversized upload, bad MIME -- are
+    # validation checks, not injection canaries, and stay in the functional
+    # sweep.)
     @pytest.mark.parametrize("bad_filename", PATH_TRAVERSAL_CANARIES)
+    @pytest.mark.security_probe
     def test_user_upload_path_traversal_filename_rejected(self, user_ctx, bad_filename):
         ctx, _ = user_ctx
         cookies = {c["name"]: c["value"] for c in ctx.cookies()}
@@ -829,6 +844,9 @@ class TestSSRFCanaries:
     """Webhook/SIEM-target URL fields (#al-slack, #audit-add-target, MCP
     #import-url) -- API7/A10 SSRF surface."""
 
+    # YTF §5.12: SSRF injection canaries -- adversarial-lane.
+    pytestmark = pytest.mark.security_probe
+
     SSRF_TARGETS = [
         "http://169.254.169.254/latest/meta-data/",  # cloud metadata
         "http://localhost:6379/",                     # internal redis
@@ -888,10 +906,21 @@ class TestConversationBOLA:
     # Root cause is the YTF 5.12 gap: the suite re-authenticates per test
     # instead of reusing one login session. Until 5.12 lands, any test that
     # bootstraps 2+ fresh identities MUST carry this marker.
+    # YTF §5.12 (2026-08-13 call-site audit): force_fresh=True dropped here.
+    # "bola-user-a"/"bola-user-b" are cache_keys never used anywhere else in
+    # the suite (grep-confirmed) -- the FIRST call for each is a guaranteed
+    # cache-miss and does a real bootstrap regardless of force_fresh, so
+    # force_fresh=True was a no-op on THIS test's own login count. Isolation
+    # between user A and B comes from the two distinct cache_keys, not from
+    # the flag (see bootstrap_user_session()'s docstring). Dropping it only
+    # matters if this exact cache_key is ever reused (e.g. a rerun in the
+    # same process) -- correctness hygiene, not a count reduction today; kept
+    # here (not removed from the audit) because it was the exact pattern
+    # flagged as "defensive habit" for this file.
     @pytest.mark.multi_identity
     def test_cross_user_conversation_delete_rejected(self):
-        user_a = bootstrap_user_session(cache_key="bola-user-a", force_fresh=True)
-        user_b = bootstrap_user_session(cache_key="bola-user-b", force_fresh=True)
+        user_a = bootstrap_user_session(cache_key="bola-user-a")
+        user_b = bootstrap_user_session(cache_key="bola-user-b")
         with _http_client() as c:
             create_resp = c.post(f"{BASE_URL}/user/conversations", json={},
                                   headers=_cookie_header(user_a["cookies"]))
@@ -938,10 +967,15 @@ class TestUserAgentBOLA:
     # Root cause is the YTF 5.12 gap: the suite re-authenticates per test
     # instead of reusing one login session. Until 5.12 lands, any test that
     # bootstraps 2+ fresh identities MUST carry this marker.
+    # YTF §5.12 (2026-08-13 call-site audit): same reasoning as
+    # TestConversationBOLA above -- "bola-agent-a"/"bola-agent-b" are unique
+    # cache_keys, so force_fresh=True was a no-op on this test's own login
+    # count (isolation comes from the distinct keys). Dropped for the same
+    # correctness-hygiene reason.
     @pytest.mark.multi_identity
     def test_cross_user_agent_delete_rejected(self):
-        user_a = bootstrap_user_session(cache_key="bola-agent-a", force_fresh=True)
-        user_b = bootstrap_user_session(cache_key="bola-agent-b", force_fresh=True)
+        user_a = bootstrap_user_session(cache_key="bola-agent-a")
+        user_b = bootstrap_user_session(cache_key="bola-agent-b")
         with _http_client() as c:
             create_resp = c.post(f"{BASE_URL}/user/agents", json={
                 "name": f"ava-bola-probe-{uuid.uuid4().hex[:6]}",
@@ -993,6 +1027,9 @@ class TestAgentGeneratePromptInjection:
     """agent-generate.js / workflow-composer.js free-text description fields
     -- LLM Top-10 prompt-injection-adjacent surface."""
 
+    # YTF §5.12: prompt-injection canary -- adversarial-lane.
+    pytestmark = pytest.mark.security_probe
+
     @pytest.mark.parametrize("canary", PROMPT_INJECTION_CANARIES)
     def test_agent_generate_prompt_injection_canary(self, user_ctx, canary):
         ctx, _ = user_ctx
@@ -1041,6 +1078,10 @@ class TestAgentGeneratePromptInjection:
 # ===========================================================================
 
 class TestSQLiCanaryOnLogin:
+    # YTF §5.12: SQLi injection canary against the LOGIN endpoint (also
+    # deliberately submits bad credentials) -- adversarial-lane.
+    pytestmark = pytest.mark.security_probe
+
     def test_sqli_canary_behaves_like_bad_password(self):
         username, _ = get_admin_credentials()
         with _http_client() as c:
@@ -1053,6 +1094,12 @@ class TestSQLiCanaryOnLogin:
 
 class TestRateLimitLoginBurst:
     """Burst 20 login attempts/sec -> 429 (fail2ban / rate-limit throttle)."""
+
+    # YTF §5.12 ("...you run all but the brute force testing"): textbook
+    # brute-force probe, deliberately trips the IP-keyed throttle --
+    # adversarial-lane, MUST NOT interleave with the functional sweep (this
+    # is exactly the class of test the §5.12 fix exists to isolate).
+    pytestmark = pytest.mark.security_probe
 
     def test_burst_login_throttled(self):
         clear_auth_throttle()

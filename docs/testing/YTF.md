@@ -536,13 +536,41 @@ the exact class of false signal this framework exists to eliminate.
   once there is only one login: the wait is paid once, not per test.
 - **§5.4 (no bypass)** is unaffected — one session still reaches the product the way a user does.
 
-### Conformance gap in the CURRENT suite (action item, not yet fixed)
-`src/tests/playwright/` re-authenticates extensively (`_api_get_session_cookies`,
-`playwright_login_admin`, `bootstrap_user_session`, per-fixture `force_fresh=True`,
-`refresh_*_context_if_stale`). Bringing it to this rule means session-scoped auth reused across
-files, with refresh driven by the `_admin_session_dirty`/`_user_session_dirty` eviction flags
-rather than elapsed time. Until that lands, Tier-B legs must at minimum run the adversarial
-suite as a separate final stage — which is what the 4.1.2 Linux legs now do.
+### Implemented (2026-08-18)
+- **Session-scoped auth, refresh on dirty/stale ONLY.** `admin_ctx`/`user_ctx` (session-scoped
+  fixtures) + `_keep_shared_sessions_fresh` (autouse) were already the target shape; the
+  2026-08-13 call-site audit of all 27 `force_fresh=True` sites converted the defensive-habit
+  ones to reuse (`test_pki_admin_ui.py`'s `_login()` — 7 always-fresh logins/file → 1 in the
+  common case via the new `get_admin_session_cookies()`; the BOLA cross-user tests' redundant
+  `force_fresh=True` on already-unique `cache_key`s; `test_user_provisioning_mixed.py`'s
+  `admin_page` fixture) and kept the genuinely-necessary ones (the refresh mechanism's own
+  internals, rare 401-retry-once paths, and tests that are themselves testing login/rotation).
+  `_admin_session_needs_refresh()`/`_user_session_needs_refresh()` factor the shared
+  dirty-or-600s-stale predicate out of `refresh_*_context_if_stale()` so both the
+  ctx-mutating and the plain-cookie-returning (`get_*_session_cookies()`) callers ask the
+  identical question. `pytest_sessionfinish` now prints `YTF-LOGIN-COUNT:
+  real_admin_logins=<n> real_user_bootstraps=<n>` every run — proof, not assertion.
+- **Adversarial lane run LAST, as its own pytest process, via a real marker split.**
+  `run_tier_b()` now runs `-m "not security_probe"` (functional) then `-m "security_probe"`
+  (adversarial) as two separate invocations per browser mode — genuinely two processes, two
+  session-scoped logins, never interleaved. Every brute-force/auth-abuse/injection-canary/
+  WebAuthn-login-ceremony test now carries `@pytest.mark.security_probe` explicitly (module-wide
+  on `test_pentest_webui_adversarial.py`; per-class/per-test elsewhere) instead of the marker
+  being registered but barely used.
+
+### Still open — do not overclaim
+- **§4.17 Rule 5's source-IP half is NOT implemented.** The stage split above removes the
+  interleaving harm (measured cause of the ~50% F/E), but every request in this runner —
+  functional or adversarial stage — still shares one host-originated source IP;
+  `_real_client_ip()` resolves to the TCP peer regardless of which pytest process sent the
+  request. True separation needs a container/netns this runner does not provision. This is a
+  pre-existing, tracked gap, not something the 2026-08-13 fix closes — report it as open, don't
+  infer it's solved from the stage split.
+- **Registration/revocation-only WebAuthn tests** (`WA-REG-*`, `WA-REVOKE-01/03/04`,
+  `WA-MULTI-01`) stayed in the functional stage: they reuse an already-authenticated
+  `authed_client`/`clean_authed_client` session and never drive a real `/login/start`+`/finish`
+  ceremony, so they don't touch the auth throttle the way `WA-LOGIN-*`/`WA-FAIL-*`/the
+  multi-credential login loops do.
 
 ## 5.13 A verification run requires a QUIESCENT tree (added 2026-08-16 — Tiago directive, applied to Tier-A)
 

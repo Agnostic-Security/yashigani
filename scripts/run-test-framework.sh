@@ -8,8 +8,13 @@
 #   Tier-A — IN-PROCESS, matrix-INVARIANT (no stack). Conformance API + OPA +
 #            wiring/config audit + static pentest. Runs ONCE per code head;
 #            the result applies to every runtime/platform leg simultaneously.
-#   Tier-B — LIVE, per-deployment. WebUI Playwright (conformance + adversarial),
-#            both headed AND headless, screenshot-every-change. Needs --target.
+#   Tier-B — LIVE, per-deployment. WebUI Playwright, both headed AND headless,
+#            screenshot-every-change. Needs --target. Two REAL stages per mode
+#            (YTF §5.12, 2026-08-13): functional/conformance first (one login
+#            session, reused for the whole stage), adversarial LAST and
+#            separate (brute-force, auth-abuse, injection canaries, WebAuthn
+#            login ceremonies — selected via the `security_probe` marker).
+#            Never interleaved.
 #   Tier-C — LIVE, per-deployment. Integration/data-flow seam, full lifecycle
 #            (install/upgrade/uninstall/reinstall), failure-injection/chaos,
 #            cross-runtime parity, egress ring-fence + prompt-injection (both
@@ -373,7 +378,7 @@ run_tier_a() {
 # saved per-leg under EVIDENCE_ROOT/<runtime>-<platform>/screenshots/.
 # ---------------------------------------------------------------------------
 run_tier_b() {
-  printf "\n%b=== Tier-B: live WebUI Playwright (conformance + adversarial) ===%b\n\n" "$BOLD" "$RESET"
+  printf "\n%b=== Tier-B: live WebUI Playwright (functional stage, then adversarial stage LAST — YTF §5.12) ===%b\n\n" "$BOLD" "$RESET"
   _ytf_require_python_deps b || return 1
   # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
   # --version/--platform are still mandatory (evidence-path labelling).
@@ -412,8 +417,42 @@ run_tier_b() {
     headless) modes=(headless); mode_coverage_incomplete=1 ;;
   esac
 
+  # YTF §5.12 (2026-08-13, Tiago directive: "login once, test it all, no more
+  # login again and again and again. One login session you run all but the
+  # brute force testing or injections"): this used to be ONE pytest
+  # invocation covering the whole src/tests/playwright directory --
+  # conformance/functional and adversarial (brute-force, auth-abuse,
+  # injection canaries, WebAuthn login ceremonies) interleaved in a single
+  # collection. That is a NOMINAL split at best (the header comment above
+  # said "conformance + adversarial" but nothing actually separated them).
+  # Measured cost of interleaving (docs/testing/YTF.md §5.12): the adversarial
+  # lane's deliberate bad-credential probes drive the account+IP-keyed auth
+  # throttle, and because the delay served is max(acct_level, ip_level), a
+  # single legitimate account failure in the functional lane inherits the
+  # full IP-driven severity -- ~50% F/E interleaved vs 365/378 clean split.
+  #
+  # Now genuinely TWO pytest invocations per browser mode, functional FIRST
+  # (its own session-scoped admin_ctx/user_ctx login, reused for the whole
+  # stage), adversarial LAST (its own separate process/session, deliberately
+  # isolated so its throttle-tripping and injection canaries can never touch
+  # the functional stage's cached session). Selection is via the
+  # `security_probe` marker (pyproject.toml; registered in conftest.py
+  # pytest_configure) -- every file/class/test in the adversarial lane
+  # (test_pentest_webui_adversarial.py module-wide, WebAuthn login-ceremony
+  # tests, brute-force/SQLi/XSS/SSRF/prompt-injection canaries in
+  # test_webui_conformance_full.py, test_backup_api.py's pre-existing 5) now
+  # carries it explicitly -- see the 2026-08-13 call-site audit.
+  #
+  # HONEST LIMIT (do not silently pretend this is complete): §4.17 Rule 5
+  # requires lane separation by identity AND SOURCE IP. This split is
+  # PROCESS/STAGE separation (functional then adversarial, never
+  # interleaved) -- it does NOT give the adversarial lane a different source
+  # IP. _real_client_ip() resolves to the TCP peer, and every host-originated
+  # request in this runner shares one address regardless of which pytest
+  # process sent it; true IP separation needs a container/netns this runner
+  # does not provision. Stage-order separation removes the interleaving harm
+  # (measured above); it does not close the identity-plus-IP requirement.
   for mode in "${modes[@]}"; do
-    _info "Playwright ${mode}: WebUI conformance (39 pages/34 forms/137 buttons, 2x2 admin+user x WebUI+API) + adversarial"
     # NOTE (2026-07-30, Ava): "--headed" is not a registered pytest CLI option
     # in this suite (no pytest-playwright plugin, no pytest_addoption) -- it
     # was previously being passed as a bare pytest arg and would raise a
@@ -422,7 +461,6 @@ run_tier_b() {
     # YTF_HEADED env var instead. Fixed here to match.
     local headed_env="0"
     [ "$mode" = "headed" ] && headed_env="1"
-    local mode_rc=0
     # FIND-B-TARGET: TARGET may be empty (--target now optional). Exporting
     # YASHIGANI_ADMIN_URL="" is safe here (NOT an array, so no bash-3.2
     # "unbound variable" pitfall under set -u): conftest.py's
@@ -432,26 +470,58 @@ run_tier_b() {
     # exactly as if the var were unset. Verified: macOS ships bash 3.2
     # (/usr/bin/env bash), which mishandles `"${empty_array[@]}"` under
     # `set -u` -- a plain empty-string scalar has no such issue.
+
+    _info "Playwright ${mode} — STAGE 1/2 (functional): WebUI conformance (39 pages/34 forms/137 buttons, 2x2 admin+user x WebUI+API), -m 'not security_probe'"
+    local func_rc=0
     YASHIGANI_ADMIN_URL="$TARGET" \
     YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
     YTF_LEG="$leg" \
     YTF_HEADED="$headed_env" \
     PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
       "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
+      -m "not security_probe" \
       -q --tb=short \
-      --junitxml="${evidence_dir}/pytest-junit-${mode}.xml" \
-      | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=$?
+      --junitxml="${evidence_dir}/pytest-junit-functional-${mode}.xml" \
+      | tee "${evidence_dir}/pytest-functional-${mode}.log" || func_rc=$?
     # YSG-RISK-206: verdict derived from the junit XML, not the exit code —
     # an all-skipped run (unreachable stack, YSG-RISK-207) exits 0 but
     # executes nothing and must FAIL here.
-    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-${mode}.xml" \
-         --rc "$mode_rc" --tier b --suite playwright --leg "$leg" --mode "$mode" \
+    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-functional-${mode}.xml" \
+         --rc "$func_rc" --tier b --suite playwright-functional --leg "$leg" --mode "$mode" \
          --out "${evidence_dir}/VERDICT.txt"; then
-      _pass "Playwright ${mode} — leg ${leg}"
+      _pass "Playwright ${mode} functional — leg ${leg}"
     else
-      _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log + VERDICT.txt)"
+      _fail "Playwright ${mode} functional — leg ${leg} (see ${evidence_dir}/pytest-functional-${mode}.log + VERDICT.txt)"
       rc=1
     fi
+
+    _info "Playwright ${mode} — STAGE 2/2 (adversarial, LAST, own session): brute-force/auth-abuse/injection canaries + WebAuthn login flows, -m security_probe"
+    local adv_rc=0
+    YASHIGANI_ADMIN_URL="$TARGET" \
+    YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
+    YTF_LEG="$leg" \
+    YTF_HEADED="$headed_env" \
+    PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+      "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
+      -m "security_probe" \
+      -q --tb=short \
+      --junitxml="${evidence_dir}/pytest-junit-adversarial-${mode}.xml" \
+      | tee "${evidence_dir}/pytest-adversarial-${mode}.log" || adv_rc=$?
+    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-adversarial-${mode}.xml" \
+         --rc "$adv_rc" --tier b --suite playwright-adversarial --leg "$leg" --mode "$mode" \
+         --out "${evidence_dir}/VERDICT.txt"; then
+      _pass "Playwright ${mode} adversarial — leg ${leg}"
+    else
+      _fail "Playwright ${mode} adversarial — leg ${leg} (see ${evidence_dir}/pytest-adversarial-${mode}.log + VERDICT.txt)"
+      rc=1
+    fi
+
+    # YTF-LOGIN-COUNT lines (conftest.py pytest_sessionfinish) — one per
+    # stage/process; surface both so a leg's total real-login count is
+    # greppable from this runner's own stdout, not just the per-stage logs.
+    grep -h "YTF-LOGIN-COUNT:" "${evidence_dir}/pytest-functional-${mode}.log" \
+      "${evidence_dir}/pytest-adversarial-${mode}.log" 2>/dev/null \
+      | sed "s/^/  [${mode}] /" || true
   done
 
   local shot_count

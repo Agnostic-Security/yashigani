@@ -461,6 +461,21 @@ def get_admin2_totp_code() -> str:
 
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
 
+# YTF §5.12 (2026-08-13, Tiago directive: "login once, test it all, no more
+# login again and again and again"): counters proving how many times this
+# process actually performed a REAL login (past any cache-hit), one per
+# tier. Incremented at the single choke point each tier's real-login work
+# funnels through (_api_get_session_cookies for admin, bootstrap_user_session
+# for user/end-user) -- every higher-level helper (playwright_login_admin,
+# playwright_login_user, get_authed_context, get_authed_user_context,
+# refresh_admin_context_if_stale, refresh_user_context_if_stale) delegates to
+# one of these two, so counting here (not at every call site) can't
+# under/over-count from a helper this file adds later. Printed by
+# pytest_sessionfinish below so a run PROVES its login count instead of
+# asserting it went down.
+_real_admin_login_count = 0
+_real_user_bootstrap_count = 0
+
 
 # ---------------------------------------------------------------------------
 # FIND-B-TOTP-CROSSPROC (4.1.2 3-runtime retest, 2026-08-04): the admin-tier
@@ -1120,9 +1135,13 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
 
     Last updated: 2026-05-09 (v2.23.3: new helper for cookie injection; add cache)
     """
-    global _session_cookie_cache
+    global _session_cookie_cache, _real_admin_login_count
     if not force_fresh and admin in _session_cookie_cache:
         return _session_cookie_cache[admin]
+
+    # YTF §5.12: this line is the ONE place a real admin login happens in this
+    # whole suite -- every call site above (cache hit) returns before here.
+    _real_admin_login_count += 1
 
     import hashlib
     import time
@@ -1398,14 +1417,78 @@ def assert_user_chat_reached(page) -> None:
     )
 
 
+def _admin_session_needs_refresh(admin: int = 1,
+                                  threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """Shared staleness predicate: True if admin{N}'s tracked session is
+    dirty (see invalidate_cached_session() / the _admin_session_dirty
+    module-level comment for why the plain elapsed-time check below is not
+    race-safe on its own) OR older than `threshold` seconds (default 600s,
+    safely under the server's 900s/15-min idle timeout --
+    src/yashigani/auth/session.py _IDLE_TIMEOUT_SECONDS).
+
+    Factored out of refresh_admin_context_if_stale() (YTF §5.12, 2026-08-13
+    call-site audit) so a caller with NO long-lived BrowserContext to mutate
+    in place -- e.g. test_pki_admin_ui.py's _login(), which creates a brand
+    new context/page per test and only needs fresh-enough cookie VALUES --
+    can ask the same question via get_admin_session_cookies() below instead
+    of importing force_fresh=True as a blanket default (that file's own
+    prior version called _api_get_session_cookies(force_fresh=True)
+    unconditionally on all 7 of its tests: 7 always-fresh logins, each
+    paying the 62s anti-replay wait, where at most one was ever actually
+    necessary)."""
+    import time as _t
+
+    return admin in _admin_session_dirty or (
+        _t.time() - _admin_session_established_at.get(admin, 0.0) > threshold
+    )
+
+
+def _user_session_needs_refresh(cache_key: str = "default",
+                                 threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """User-tier equivalent of _admin_session_needs_refresh()."""
+    import time as _t
+
+    return cache_key in _user_session_dirty or (
+        _t.time() - _user_session_established_at.get(cache_key, 0.0) > threshold
+    )
+
+
+def get_admin_session_cookies(*, admin: int = 1,
+                               threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> dict:
+    """Return admin{N}'s session cookies: a real re-login (force_fresh=True)
+    ONLY if _admin_session_needs_refresh() says the tracked session is dirty
+    or past `threshold`, else the cached cookies as-is (a plain cache hit,
+    zero network/TOTP cost). This is the "do I need a NEW session at all"
+    half of refresh_admin_context_if_stale() (below), for callers that
+    don't hold a long-lived BrowserContext to refresh in place -- they just
+    need fresh-enough cookie VALUES to inject into a context/page they
+    create themselves each call."""
+    if not _admin_session_needs_refresh(admin, threshold):
+        return _api_get_session_cookies(admin=admin, force_fresh=False)
+    cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
+    _admin_session_dirty.discard(admin)
+    return cookies
+
+
+def get_user_session_cookies(*, cache_key: str = "default",
+                              threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> dict:
+    """User-tier equivalent of get_admin_session_cookies()."""
+    if not _user_session_needs_refresh(cache_key, threshold):
+        return bootstrap_user_session(cache_key=cache_key, force_fresh=False)["cookies"]
+    creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
+    _user_session_dirty.discard(cache_key)
+    return creds["cookies"]
+
+
 def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
                                     threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
-    """If admin{N}'s tracked session is older than `threshold` seconds
-    (default 600s, safely under the server's 900s/15-min idle timeout --
-    src/yashigani/auth/session.py _IDLE_TIMEOUT_SECONDS), force a fresh
-    login and re-inject the new cookies into `ctx` (a long-lived Playwright
-    BrowserContext), overwriting the old ones in place. No-ops (returns
-    False) if the session is still fresh.
+    """If admin{N}'s tracked session is stale per _admin_session_needs_refresh()
+    (dirty, or older than `threshold` seconds -- default 600s, safely under
+    the server's 900s/15-min idle timeout, src/yashigani/auth/session.py
+    _IDLE_TIMEOUT_SECONDS), force a fresh login and re-inject the new
+    cookies into `ctx` (a long-lived Playwright BrowserContext), overwriting
+    the old ones in place. No-ops (returns False) if the session is still
+    fresh.
 
     This is the mid-file counterpart to admin_ctx/get_authed_context's
     force_fresh=True at CREATION time: a long-running file (e.g.
@@ -1418,15 +1501,11 @@ def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
     FIND-B-A fix (2026-08-04): ALSO forces a refresh if `admin` is in
     _admin_session_dirty (set by invalidate_cached_session() after a
     deliberate logout elsewhere in the run), even if the plain elapsed-time
-    check below would otherwise say "still fresh". See the
-    _admin_session_dirty module-level comment for why the timestamp alone
-    is not race-safe against a concurrent unrelated real login for the same
-    admin number.
+    check would otherwise say "still fresh". See the _admin_session_dirty
+    module-level comment for why the timestamp alone is not race-safe
+    against a concurrent unrelated real login for the same admin number.
     """
-    import time as _t
-
-    is_dirty = admin in _admin_session_dirty
-    if not is_dirty and _t.time() - _admin_session_established_at.get(admin, 0.0) <= threshold:
+    if not _admin_session_needs_refresh(admin, threshold):
         return False
     cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
     try:
@@ -1442,10 +1521,7 @@ def refresh_user_context_if_stale(ctx, *, cache_key: str = "default",
                                    threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
     """User-tier equivalent of refresh_admin_context_if_stale(). Also
     dirty-flag aware (see invalidate_cached_user_session())."""
-    import time as _t
-
-    is_dirty = cache_key in _user_session_dirty
-    if not is_dirty and _t.time() - _user_session_established_at.get(cache_key, 0.0) <= threshold:
+    if not _user_session_needs_refresh(cache_key, threshold):
         return False
     creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
     try:
@@ -1803,13 +1879,30 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
 
     Cached per cache_key for the pytest session so multiple test modules can
     share one throwaway user without re-provisioning (and without exhausting
-    the 62s TOTP replay window on every test file). Use force_fresh=True for
-    tests that need an ISOLATED user (e.g. BOLA cross-user probes need TWO
-    distinct users — call with two different cache_key values).
+    the 62s TOTP replay window on every test file).
+
+    YTF §5.12 (2026-08-13 audit): isolation between two identities is a
+    property of using two different cache_key values (each unseen key is a
+    guaranteed cache-miss -> a genuinely NEW throwaway account is created),
+    NOT of force_fresh=True. force_fresh=True only matters for RE-USING a
+    cache_key that may already be stale/dirty (see
+    refresh_user_context_if_stale() below) -- passing it on the FIRST-ever
+    call for a brand-new cache_key (e.g. BOLA's "bola-user-a"/"bola-user-b")
+    is a no-op that costs a redundant real bootstrap if that key was ever
+    warmed by an earlier run in the same process for any reason. Callers
+    that need an isolated identity should pick a unique cache_key and leave
+    force_fresh at its default (False); force_fresh=True is for a caller
+    that already knows ITS OWN previously-cached session under this exact
+    key is no longer good enough (e.g. refresh_user_context_if_stale()).
     """
-    global _user_session_cache
+    global _user_session_cache, _real_user_bootstrap_count
     if not force_fresh and cache_key in _user_session_cache:
         return _user_session_cache[cache_key]
+
+    # YTF §5.12: this is the ONE place a real user-tier bootstrap (provision +
+    # forced password change + rotated re-login) happens in this suite --
+    # every call site above (cache hit) returns before here.
+    _real_user_bootstrap_count += 1
 
     # PROTOCOL: under a capped licence, reuse a seeded differential identity
     # rather than self-provisioning (which 402s once the seed fills the seats).
@@ -2433,3 +2526,25 @@ def pytest_collection_modifyitems(config, items):
         else:
             _budget = 300
         item.add_marker(pytest.mark.timeout(_budget, method="thread"))
+
+
+# ---------------------------------------------------------------------------
+# pytest_sessionfinish — YTF §5.12 proof-not-assertion: report real login counts
+# ---------------------------------------------------------------------------
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Print the real-login counters (see _real_admin_login_count /
+    _real_user_bootstrap_count module-level comment) at the end of every
+    run. YTF §5.12 / Ava A1 (retro v2.23.1 §6.C): "absence of an artefact is
+    SKIPPED, never PASS" — a claim that this consolidation reduced login
+    count is not evidence; a printed, greppable count from the run itself
+    is. `grep -c "YTF-LOGIN-COUNT"` against the run's pytest log gives one
+    line per process (one per browser mode in run_tier_b()); sum across
+    modes for the whole leg's total."""
+    print(
+        f"\nYTF-LOGIN-COUNT: real_admin_logins={_real_admin_login_count} "
+        f"real_user_bootstraps={_real_user_bootstrap_count} "
+        f"total={_real_admin_login_count + _real_user_bootstrap_count}",
+        flush=True,
+    )

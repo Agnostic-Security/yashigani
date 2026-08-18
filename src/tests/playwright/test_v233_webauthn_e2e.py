@@ -420,10 +420,31 @@ class _AuthenticatorRotator:
         self._current = initial_auth_id
 
     def next_key(self, index: int) -> str:
-        """Ensure registration `index` is answered by a distinct authenticator."""
+        """Ensure registration `index` is answered by a distinct authenticator.
+
+        Harness fix (2026-08-18, YTF §5.12 companion fix -- reported live as
+        `CDPSession.send: Protocol error (WebAuthn.addVirtualAuthenticator):
+        The Virtual Authenticator Environment has not been enabled for this
+        session`, x4): previously called _disable_virtual_authenticator()
+        here, which sends BOTH WebAuthn.removeVirtualAuthenticator AND
+        WebAuthn.disable -- the latter tears down the WHOLE virtual-
+        authenticator ENVIRONMENT on this CDP session, not just the one
+        authenticator. The very next call, _add_extra_virtual_authenticator()
+        -> WebAuthn.addVirtualAuthenticator, then fails: CDP requires
+        WebAuthn.enable to be called again before any add is valid on that
+        session. Rotation only ever needs to swap which authenticator answers
+        the NEXT ceremony, never to tear down and rebuild the whole domain --
+        _remove_virtual_authenticator() (below) does the "remove one
+        authenticator" half only, leaving WebAuthn.enable's effect intact for
+        the session. _disable_virtual_authenticator() (full teardown,
+        including WebAuthn.disable) remains correct and unchanged for its
+        ONE other call site: browser_page_with_va's fixture-teardown
+        `finally:` block, where tearing down the whole environment is
+        exactly what a browser/page close should do.
+        """
         if index == 0:
             return self._current
-        _disable_virtual_authenticator(self._cdp, self._current)
+        _remove_virtual_authenticator(self._cdp, self._current)
         self._current = _add_extra_virtual_authenticator(self._cdp)
         return self._current
 
@@ -455,8 +476,30 @@ def _enable_virtual_authenticator(cdp_session) -> str:
     return result["authenticatorId"]
 
 
+def _remove_virtual_authenticator(cdp_session, authenticator_id: str) -> None:
+    """Remove ONE virtual authenticator, WITHOUT disabling the WebAuthn
+    environment on this CDP session (see _AuthenticatorRotator.next_key()'s
+    docstring for why: WebAuthn.disable tears down the whole domain, and a
+    subsequent WebAuthn.addVirtualAuthenticator on the same session then
+    fails with 'The Virtual Authenticator Environment has not been enabled
+    for this session'). Use during rotation; use
+    _disable_virtual_authenticator() (full teardown) only at actual
+    fixture/page teardown."""
+    try:
+        cdp_session.send(
+            "WebAuthn.removeVirtualAuthenticator",
+            {"authenticatorId": authenticator_id},
+        )
+    except Exception:
+        pass
+
+
 def _disable_virtual_authenticator(cdp_session, authenticator_id: str) -> None:
-    """Remove the virtual authenticator and disable the virtual environment."""
+    """Remove the virtual authenticator AND disable the virtual environment
+    on this CDP session. Full teardown -- use ONLY when the session itself
+    is going away (browser_page_with_va's fixture `finally:` block). Rotation
+    mid-session must use _remove_virtual_authenticator() instead (see
+    _AuthenticatorRotator.next_key())."""
     try:
         cdp_session.send(
             "WebAuthn.removeVirtualAuthenticator",
@@ -871,6 +914,13 @@ def test_wa_reg_03_audit_event_emitted_on_registration(
 # ---------------------------------------------------------------------------
 
 @skip_no_stack
+# YTF §5.12 (2026-08-13, Tiago directive): performs a REAL WebAuthn login
+# ceremony (POST /api/v1/admin/webauthn/login/start+/finish), not a cached-
+# session reuse. "WebAuthn login flows... belong in the final adversarial
+# stage, not the functional sweep" -- run via `pytest -m security_probe`
+# (run_tier_b()'s second, LAST stage), never interleaved with the cached-
+# session functional sweep.
+@pytest.mark.security_probe
 def test_wa_login_01_login_start_returns_options(clean_authed_client, browser_page_with_va):
     """
     WA-LOGIN-01: POST /api/v1/admin/webauthn/login/start for enrolled user
@@ -922,6 +972,8 @@ def test_wa_login_01_login_start_returns_options(clean_authed_client, browser_pa
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_02_login_finish_issues_session_cookie(
     clean_authed_client, browser_page_with_va
 ):
@@ -1008,6 +1060,8 @@ def test_wa_login_02_login_finish_issues_session_cookie(
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_03_session_grants_authenticated_access(
     clean_authed_client, browser_page_with_va
 ):
@@ -1089,6 +1143,8 @@ def test_wa_login_03_session_grants_authenticated_access(
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_04_audit_event_webauthn_login_success(
     clean_authed_client, browser_page_with_va
 ):
@@ -1175,6 +1231,9 @@ def test_wa_login_04_audit_event_webauthn_login_success(
 # ---------------------------------------------------------------------------
 
 @skip_no_stack
+# YTF §5.12 ("...all but the brute force testing or injections"): deliberate
+# bad-credential login attempt -- auth-abuse-shaped, adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_01_malformed_credential_response_returns_401(clean_authed_client):
     """
     WA-FAIL-01: login/finish with a malformed credential_response → 401.
@@ -1239,6 +1298,8 @@ def test_wa_fail_01_malformed_credential_response_returns_401(clean_authed_clien
 
 
 @skip_no_stack
+# YTF §5.12: deliberate bad-credential login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_02_unknown_username_returns_401(clean_authed_client):
     """
     WA-FAIL-02: login/start with unknown username returns 400 (no credentials),
@@ -1298,6 +1359,8 @@ def test_wa_fail_02_unknown_username_returns_401(clean_authed_client):
 
 
 @skip_no_stack
+# YTF §5.12: deliberate replayed-challenge login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_03_replayed_challenge_returns_401(
     clean_authed_client, browser_page_with_va
 ):
@@ -1377,6 +1440,8 @@ def test_wa_fail_03_replayed_challenge_returns_401(
 
 
 @skip_no_stack
+# YTF §5.12: deliberate bad-credential login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_04_audit_event_webauthn_login_failure(clean_authed_client):
     """
     WA-FAIL-04: WEBAUTHN_LOGIN_FAILURE audit event emitted on failed assertion.
@@ -1470,6 +1535,10 @@ def test_wa_revoke_01_delete_credential_returns_200(
 
 
 @skip_no_stack
+# YTF §5.12: deliberate post-revocation login attempt (expected 401) -- a
+# real login/start ceremony against a now-invalid credential, same
+# adversarial shape as the WA-FAIL-* group.
+@pytest.mark.security_probe
 def test_wa_revoke_02_login_fails_after_revocation(
     clean_authed_client, browser_page_with_va
 ):
@@ -1742,6 +1811,9 @@ def test_wa_multi_01_register_two_credentials_both_listed(
 
 
 @skip_no_stack
+# YTF §5.12: performs two real WebAuthn login ceremonies -- adversarial-lane,
+# same shape as WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_multi_02_03_both_credentials_usable(
     clean_authed_client, browser_page_with_va
 ):
@@ -1823,6 +1895,8 @@ def test_wa_multi_02_03_both_credentials_usable(
 
 
 @skip_no_stack
+# YTF §5.12: performs real WebAuthn login ceremonies -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_multi_04_revoke_one_does_not_affect_other(
     clean_authed_client, browser_page_with_va
 ):
@@ -1907,6 +1981,8 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
 
 
 @skip_no_stack
+# YTF §5.12: performs a real WebAuthn login ceremony -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_multi_05_revoke_all_leaves_empty_list(
     clean_authed_client, browser_page_with_va
 ):
