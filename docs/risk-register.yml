@@ -4660,3 +4660,162 @@ risks:
   last_threat_model_review: '2026-08-17'
   filed_by: Iris (integration auditor)
   owner: Iris
+- id: YSG-RISK-266
+  description: 'INSTALL-NONINTERACTIVE-WARN-THEN-DIE — install.sh run_wizard() (install.sh:4310-4322) detected missing required flags in --non-interactive mode, logged "Defaults or empty values will be used;
+    reconfigure via your .env file", and CONTINUED. For UPSTREAM_MCP_URL no default exists outside --deploy demo (install.sh:3922-3931), and docker-compose.yml:613 declares it hard-required
+    (${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}). So the reassuring message was false and the install died three steps later at 9/13 with "error while interpolating
+    services.gateway.environment.YASHIGANI_UPSTREAM_URL: required variable UPSTREAM_MCP_URL is missing a value", followed by "ERROR: Failed to build gateway/backoffice images. Check Dockerfiles." — which
+    blames the Dockerfiles for a variable-interpolation failure. Reproduced live on the 4.1.2 docker e2e leg (2026-08-17) with the exact invocation the --help text gives as its own non-interactive example.
+    Same defect class as YSG-RISK-265 and the air-gap/HIBP/uninstall fail-opens fixed the same day: a check that DETECTS the condition, reports something reassuring, and continues. Su also identified three
+    further warn-then-continue sites not fixed here (install.sh:13489, :13523, :13871 — generate_secrets() "already in .env, preserving" branches that warn on a READ FAILURE without verifying a value exists).'
+  severity: medium
+  controls_impacted:
+  - Operator experience / installability — a documented non-interactive invocation cannot complete, and the terminal error names neither the missing flag nor the fix
+  - Diagnostic integrity — the failure is attributed to Dockerfiles, sending the operator to the wrong surface
+  compensating_controls:
+  - Install fails closed rather than producing a misconfigured stack — no insecure state results
+  - Passing --upstream-url explicitly works
+  fix:
+    summary: 'run_wizard() now separates flags with a genuine downstream default from those without. Reuse-from-.env runs FIRST (preserving and extending the documented upgrade path to DOMAIN as well), then
+      a hard fail at step 6 naming the flag and an example value, scoped to non-k8s modes. --admin-email verified to have no downstream requirement and correctly stays warn-and-continue.'
+    file: install.sh
+    function: run_wizard()
+    commit: 530047ea
+    tests: tests/install/test_run_wizard_hard_required_flags.bats
+  status: fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-11-18'
+  closure_evidence: '10 new bats tests 10/10 GREEN post-fix; reverted via git stash gives 4/10 FAIL (tests 2/3/4/6 — the exact regression cases); install.sh restored byte-identical.'
+  last_threat_model_review: '2026-08-17'
+  filed_by: Su (installer engineer)
+  owner: Su
+  open_followup: 'Whether a production install should require --upstream-url AT ALL is an unresolved design question (Tiago: "it should be fire and install"). A gateway with no external MCP upstream is
+    arguably a legitimate state, same argument as agents being optional (commit fccbf4cb). Relaxing docker-compose.yml:613 from hard-required is a design decision, NOT actioned.'
+
+- id: YSG-RISK-267
+  description: 'TIER-B-JUNIT-DESTROYED-BY-ONE-SLOW-TEST — a single test exceeding the per-test timeout destroys the ENTIRE Tier-B leg''s recorded result. src/tests/playwright/conftest.py applies
+    pytest.mark.timeout(budget, method="thread"); pytest-timeout''s thread method cannot interrupt an arbitrary thread, so on expiry it dumps tracebacks and hard-kills the interpreter via os._exit —
+    BEFORE junitxml''s session-end hook writes. The YTF runner then correctly but uninformatively reports "collected=0 executed=0 passed=0 failed=0 verdict=FAIL reason=junit-missing-or-unparseable" for the
+    whole leg. Measured on the live 4.1.2 docker leg (2026-08-17/18): 100+ tests ran and mostly passed, recorded as ZERO, three times in a row. Three distinct tests breached the ceiling in sequence, each
+    fixed individually while the next surfaced: test_wa_revoke_04 (a literal time.sleep(310) fallback because POST /auth/stepup/expire returns 404 — the endpoint does not exist), the two 2-identity BOLA
+    probes (each bootstrap_user_session(force_fresh=True) serialises on a fresh TOTP window), and _delete_credential via test_v233_webauthn_e2e. Root cause of all three is the YTF 5.12 gap: the suite
+    re-authenticates per test rather than reusing one session, so every fresh identity costs up to 62s (conftest.py _wait_for_fresh_totp_window). The 300s base budget accounted for NO TOTP wait at all.'
+  severity: high
+  controls_impacted:
+  - Release-gate integrity — a leg that cannot report its own result cannot gate a release; "collected=0" is indistinguishable from "nothing ran"
+  - Evidence integrity — Tier-B verdicts have been unreportable across multiple sessions, which is consistent with prior campaigns reporting 4.1.2 as chat-blocked without clean numbers
+  compensating_controls:
+  - The runner''s min_executed=1 rule correctly refuses to call collected=0 a PASS — the truthful-verdict logic works; it is the input that is missing
+  fix:
+    summary: 'Two fixes landed: (1) 828d6d47 replaced the 310s sleep with a Redis-based step-up expiry that reads back the stored value to confirm the session is genuinely stepped-down before asserting;
+      (2) dd403819 marked the two 2-identity BOLA probes @pytest.mark.multi_identity, verified by a collection-time probe reporting timeout=610 rather than merely that the marker is present. The systemic
+      fix is YTF 5.12 (one login session per run) — IN PROGRESS, not complete.'
+    file: src/tests/playwright/conftest.py, src/tests/playwright/test_v233_webauthn_e2e.py, src/tests/playwright/test_webui_conformance_full.py
+    commit: 828d6d47, dd403819
+    tests: single-test junit at testing_runs/yashigani/ytf-412-20260813/stepup-fix-verify/
+  status: partially-fixed
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-09-18'
+  closure_evidence: 'test_wa_revoke_04 PASSED in 62s (was: interpreter kill at ~310s). Both BOLA probes verified multi_identity=True timeout=610 at collection. NOT yet closed: the underlying 5.12 gap
+    remains, and a full Tier-B run has not yet produced a GREEN verdict.'
+  last_threat_model_review: '2026-08-18'
+  filed_by: coordinator
+  owner: Ava
+  open_followup: 'The catastrophic failure mode itself is unfixed — one slow test can still zero a leg. Consider making the runner fall back to parsing pytest progress output when junit is absent, so a
+    hard kill degrades to a partial result rather than no result.'
+
+- id: YSG-RISK-268
+  description: 'CHAT-E2E-ASSERTS-AGAINST-UNINSTALLED-AGENT — src/tests/playwright/test_chat_live_e2e.py:287 iterates a hardcoded list of three bundled agents (letta, openclaw, agent_langflow) with NO guard
+    that the agent is actually registered. On the 4.1.2 docker leg the run reported "openclaw: assistant bubble rendered but contains an error string, not a real model response: (stream error: stream HTTP
+    502)". Ground truth from the live stack: no openclaw container existed, and SELECT agent_name FROM agent_registry returned exactly two rows (agent__langflow, letta). openclaw is NOT a default bundle —
+    install.sh defaults to langflow+letta and ships openclaw only via --agent-bundles all/openclaw. The 502 was the gateway correctly failing to route to an agent that does not exist. The test file''s own
+    docstring (:24) states "@openclaw -> gateway''s own egress-eval gate DENIES openclaw''s outbound" — a previous session''s root cause, now baked into the suite as documentation. Session memory carries the
+    same claim (2026-07-30) and 4.1.2 has been reported chat-blocked across multiple sessions. On any leg that did not install openclaw this test fails identically whether or not an egress-deny bug exists,
+    so the two are indistinguishable without checking the registry first. This does NOT disprove the egress-deny hypothesis — it establishes that the evidence for it is contaminated.'
+  severity: high
+  controls_impacted:
+  - Evidence integrity — a chat blocker attributed to egress policy across multiple sessions may be an absent agent; the finding must be re-established on a leg where openclaw is genuinely deployed
+  compensating_controls:
+  - Ground truth is one SQL query away (SELECT agent_name, status FROM agent_registry) and one docker ps
+  fix:
+    summary: 'NOT YET FIXED. Required: (1) guard the parametrised agent list against the live registry and skip with an explicit reason naming the missing agent; (2) correct the :24 docstring so the next
+      reader does not inherit an unverified root cause; (3) re-run with --agent-bundles all before any claim about openclaw chat behaviour is filed or closed.'
+    file: src/tests/playwright/test_chat_live_e2e.py
+    function: TestChatLiveE2E::test_agent_via_real_mention
+    commit: null
+    tests: null
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-25'
+  closure_evidence: null
+  last_threat_model_review: '2026-08-18'
+  filed_by: coordinator
+  owner: Ava
+
+- id: YSG-RISK-269
+  description: 'STEPUP-ELEVATION-CANNOT-BE-REVOKED — there is no product mechanism to invalidate a step-up elevation before its TTL expires. POST /auth/stepup/expire returns 404 and grep -rn
+    "stepup/expire|stepup_expire" over src/yashigani/ finds nothing. There is also no session-listing endpoint and no per-session kill primitive anywhere (grep for GET/DELETE .../sessions in
+    backoffice/routes/ returns nothing). An operator who believes their own elevated session is compromised has exactly two blunt options: (a) POST /auth/logout (AnySession-gated) which kills the ENTIRE
+    session rather than just the elevation, or (b) a SECOND stepped-up admin calling POST /admin/accounts/{username}/disable or force_reset, both of which call session_store.invalidate_all_for_account() and
+    nuke every session for that account org-wide. Step-up exists specifically to gate destructive operations (uninstall''s MI-4 safety stop, policy weakening, credential revocation) against a compromised
+    session — so an elevation that cannot be surgically dropped is a gap in the control''s own threat model. Discovered while root-causing why a Playwright test slept 310s waiting out the TTL: the test had
+    a "preferred: use an explicit invalidation endpoint if the product exposes one" branch that has never once fired.'
+  severity: medium
+  controls_impacted:
+  - Step-up (ASVS V6.8.4) — the control gating destructive lifecycle and policy operations cannot be revoked once granted, only waited out
+  - Incident response — no per-session visibility or kill; containment requires nuking all sessions for the account
+  compensating_controls:
+  - Step-up TTL is short (YASHIGANI_STEPUP_TTL_SECONDS default 300s), bounding exposure
+  - A second admin can invalidate all sessions for the account (dual-admin break-glass design is intact)
+  - Step-up requires a fresh TOTP, so re-elevation by an attacker needs the TOTP secret, not just the session cookie
+  fix:
+    summary: 'NOT FIXED — design decision for Tiago. Candidate: a self-service POST /auth/stepup/expire that drops the elevation without ending the session, plus session listing and per-session revoke.
+      Filing this as a gap, not implementing a security-surface design unasked.'
+    file: null
+    function: null
+    commit: null
+    tests: null
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-09-18'
+  closure_evidence: null
+  last_threat_model_review: '2026-08-18'
+  filed_by: Ava (QA) via coordinator
+  owner: Tiago (design decision)
+- id: YSG-RISK-270
+  description: 'DISPATCH-SMOKE-GUARD-UNREACHABLE — install.sh''s agent-dispatch smoke test (install.sh:12258-12281) can never report failure, because its own fallback corrupts the value it tests.
+    The probe is: _code="$($_rt exec $_fwd_ctr curl -s -o /dev/null -w ''%{http_code}'' --max-time 5 http://127.0.0.1:9400/llm/__ysg_dispatch_smoke__ 2>/dev/null || printf ''000'')". On a connection
+    failure curl PRINTS "000" to stdout AND exits non-zero, so the `|| printf ''000''` fires and appends a second "000" — _code becomes the literal "000000". The guard is `case "$_code" in 000|502|504)
+    log_error FATAL ... ;; *) log_success "reachable (HTTP ${_code})" ;; esac`. "000000" does not match "000", so a connection failure falls through to the SUCCESS branch. Observed live on the 4.1.2
+    docker leg (2026-08-18): all three agents logged "ok Agent-dispatch smoke (langflow|letta|openclaw): egress-X -> caddy:18790 reachable (HTTP 000000)". The FATAL branch''s own text reads "Agent dispatch
+    (@profile) is BROKEN even though every other health check above passed" — this guard exists precisely to catch YSG-RISK-166, and it is unreachable. IMPORTANT SCOPE: on this leg dispatch was NOT
+    actually broken. Re-probing after the stack settled returned HTTP 403 with exit 0 for all three (403 = the hop completed and OPA denied the synthetic path, which the code''s own comment states is the
+    expected/acceptable outcome — it "only cares whether THAT hop completed"). The install-time 000 was a transient not-yet-ready sidecar. So this is a broken DETECTOR, not a broken data path. The risk is
+    that a genuine YSG-RISK-166 regression would be reported as "reachable" and ship.'
+  severity: high
+  controls_impacted:
+  - YSG-RISK-166 regression detection — the only automated guard for a broken egress-forwarder data path cannot fire
+  - Install-time assurance — a FATAL condition is reported as ok, so a log-scraping gate sees a healthy install
+  compensating_controls:
+  - The failure is detectable by hand (docker exec <egress-sidecar> curl ... and reading the exit code separately from stdout)
+  - Tier-B/Tier-C chat tests would surface genuinely broken dispatch downstream, though without attributing it
+  fix:
+    summary: 'NOT YET FIXED. Capture curl exit status separately from its stdout rather than concatenating a fallback into the value under test — e.g. assign _code from curl, then test $? explicitly and
+      set _code=000 only when the command failed. Additionally the smoke test should not run before the forwarder is ready: it fired during startup here and got a transient 000 that the bug then masked.
+      Add a readiness wait (or retry) so a transient is not indistinguishable from a real failure.'
+    file: install.sh
+    function: agent-dispatch smoke (install.sh:12258-12281)
+    commit: null
+    tests: null
+  status: open
+  accepted_by: null
+  accepted_at: null
+  review_by: '2026-08-25'
+  closure_evidence: null
+  last_threat_model_review: '2026-08-18'
+  filed_by: coordinator (live 4.1.2 docker leg)
+  owner: Su
