@@ -874,6 +874,21 @@ class TestConversationBOLA:
     """F6: user A's conversation must not be readable/renamable/deletable by
     user B via direct ID reference (OWASP API1 BOLA)."""
 
+    # FIND-0813-011 / TIER-B-BLOCKED-BOLA: this test bootstraps TWO fresh
+    # user identities, and each fresh bootstrap serialises on a fresh TOTP
+    # window (_wait_for_fresh_totp_window) plus a step-up. Two of those
+    # exceed the default 300s per-test ceiling, and pytest-timeout's
+    # method="thread" cannot interrupt the sleep — it hard-kills the
+    # interpreter via os._exit BEFORE junitxml writes, so the ENTIRE Tier-B
+    # leg reports collected=0 / verdict=FAIL. One unmarked test therefore
+    # destroys the results of every other test in the run.
+    # The marker raises the budget to 300 + (62 * 5) = 610s (conftest.py
+    # :2431). This is a harness budget fix, NOT a weakened assertion — the
+    # BOLA probe itself is unchanged.
+    # Root cause is the YTF 5.12 gap: the suite re-authenticates per test
+    # instead of reusing one login session. Until 5.12 lands, any test that
+    # bootstraps 2+ fresh identities MUST carry this marker.
+    @pytest.mark.multi_identity
     def test_cross_user_conversation_delete_rejected(self):
         user_a = bootstrap_user_session(cache_key="bola-user-a", force_fresh=True)
         user_b = bootstrap_user_session(cache_key="bola-user-b", force_fresh=True)
@@ -909,6 +924,21 @@ class TestUserAgentBOLA:
     """Parity re-check of v4.0's test_user_agents_bola.py against 4.1.2's
     agent-manager.js surface (webui-inventory.md Sec3.2)."""
 
+    # FIND-0813-011 / TIER-B-BLOCKED-BOLA: this test bootstraps TWO fresh
+    # user identities, and each fresh bootstrap serialises on a fresh TOTP
+    # window (_wait_for_fresh_totp_window) plus a step-up. Two of those
+    # exceed the default 300s per-test ceiling, and pytest-timeout's
+    # method="thread" cannot interrupt the sleep — it hard-kills the
+    # interpreter via os._exit BEFORE junitxml writes, so the ENTIRE Tier-B
+    # leg reports collected=0 / verdict=FAIL. One unmarked test therefore
+    # destroys the results of every other test in the run.
+    # The marker raises the budget to 300 + (62 * 5) = 610s (conftest.py
+    # :2431). This is a harness budget fix, NOT a weakened assertion — the
+    # BOLA probe itself is unchanged.
+    # Root cause is the YTF 5.12 gap: the suite re-authenticates per test
+    # instead of reusing one login session. Until 5.12 lands, any test that
+    # bootstraps 2+ fresh identities MUST carry this marker.
+    @pytest.mark.multi_identity
     def test_cross_user_agent_delete_rejected(self):
         user_a = bootstrap_user_session(cache_key="bola-agent-a", force_fresh=True)
         user_b = bootstrap_user_session(cache_key="bola-agent-b", force_fresh=True)
