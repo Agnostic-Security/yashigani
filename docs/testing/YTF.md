@@ -659,3 +659,66 @@ Harness: `testing_runs/yashigani/ytf-412-20260813/verify_guards.sh`.
   board. That is a finding in its own right, not a gap to quietly fill.
 - Files under concurrent edit cannot be mutation-checked (§5.13). Defer them to the quiescent
   run rather than reporting a number from a moving tree.
+
+## 5.15 SIEM forwarding must be VERIFIED on every live leg, not assumed (added 2026-08-18 — Tiago directive)
+
+**Rule: every live leg that installs a SIEM must prove, against the SIEM's own store, that
+Yashigani's audit events actually arrived — event count, event types, and chain fields. A
+configured `YASHIGANI_SIEM_TARGETS` is not evidence that anything is being forwarded.**
+
+Tiago, 2026-08-18: *"lets see what logs that generates and what goes in to wazuh — check that
+as part of the testing protocol."*
+
+### Why this needed adding
+`tests/MATRIX.yaml`'s Tier-C category `audit_observability_integrity` already claims "events
+emitted + immutable/Merkle + SIEM-forward; no swallowed failures". Its implementation is a
+**2-test scaffold**. Before this section, `wazuh` appeared ZERO times in YTF.md and
+`tests/MATRIX.yaml`; the single `siem` match was an incidental code reference. So the most
+security-relevant output of the system — the tamper-evident record an auditor would ask for —
+had no runtime verification on any leg.
+
+### The check, and the traps in it
+Run against the SIEM's real store, not a proxy for it. On the bundled Wazuh leg:
+
+```bash
+PW=$(grep -a "^WAZUH_INDEXER_PASSWORD=" docker/.env | cut -d= -f2-)
+# 1. the index must EXIST and hold documents
+docker exec <proj>-wazuh-indexer-1 sh -lc \
+  "curl -sk -u admin:'$PW' 'https://localhost:9200/yashigani-audit/_count'"
+# 2. compare against the product's own chain
+docker exec <proj>-postgres-1 sh -lc \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "select count(*) from audit_events;"'
+# 3. inspect a document: chain + masking fields must be present
+docker exec <proj>-wazuh-indexer-1 sh -lc \
+  "curl -sk -u admin:'$PW' 'https://localhost:9200/yashigani-audit/_search?pretty&size=1'"
+```
+
+Three traps that produced WRONG conclusions when this was first run manually — all avoidable:
+
+1. **Do not look in the Wazuh manager's `alerts.json`.** The target is
+   `https://wazuh-indexer:9200/_bulk`, so events land in an OpenSearch index. `alerts.json`
+   contains the manager's own host CIS/SCA findings (nosuid/nodev/auditd), which are unrelated.
+   Grepping it for `yashigani` returns 0 and looks exactly like total forwarding failure.
+2. **Do not trust `_cat/indices` `docs.count`.** OpenSearch indexing is near-real-time; the
+   count read 1 while `_count` on the same index read 101. A "1 document" reading looks exactly
+   like a broken forwarder.
+3. **Do not `q=yashigani`.** No FIELD contains that literal token, so a full-text search returns
+   0 hits on a perfectly healthy index. Query the index by name, or aggregate on `event_type`.
+
+Each of these produces a false HIGH finding that is indistinguishable from a real outage. State
+which store you queried and how, in the evidence.
+
+### Pass criteria
+- `yashigani-audit` index exists and its `_count` is within a small delta of `audit_events`
+  (they drift by in-flight events during an active run — a persistent large gap is the finding).
+- Forwarded documents carry `prev_event_hash` (chain), `masking_applied`, `audit_event_id`,
+  `subject_spiffe_id`, `tenant_id`.
+- Event TYPES are diverse and match what the leg exercised — not just one startup event. A
+  single repeated type means the forwarder fired once and stopped.
+- Zero swallowed failures: a forwarding error must appear somewhere, not be logged and dropped.
+
+### Baseline measured on the 4.1.2 docker leg (2026-08-18, demo mode, all agents + wazuh)
+`audit_events` 100 / `yashigani-audit` 105 during an active populate run; documents
+hash-chained and masked; `YASHIGANI_SIEM_TARGETS` =
+`elastic_opensearch → https://wazuh-indexer:9200/_bulk`, `mesh_mtls: true`. Forwarding VERIFIED
+working. This is the first leg in the campaign on which that claim rests on evidence.
