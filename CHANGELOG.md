@@ -34,6 +34,30 @@ For full release narratives, design rationale, and per-feature detail, see [`REA
 
 ---
 
+## [4.1.2] — 2026-08-19 — Patch
+
+Security and reliability patch. All items detected during 4.1.1 validation (pentest + council review) or as infrastructure tech debt.
+
+### Security
+- **Improved model authorization:** hardened model-string validation with positive-allowlist (rejects invalid model identifiers at parse time)
+- **RBAC group-membership handling:** fixed a seam where group-tier access grants were not properly enforced in the chat API
+- **Model alias resolution:** cloud-model aliases now resolve to their canonical target before RBAC gates, preventing alias-based bypass attempts
+- **Session handling:** improved logout to properly invalidate all active session types and correct session-cookie clearance
+- **Dual-control hardening:** cloud-override approval now binds to confirming fingerprint and persists audit logs durably
+
+### Platform
+- **Podman 6.x support:** compose tool selection now adapts to podman version (6.x uses native `podman compose` v2; older versions use `podman-compose`)
+- **Firewall assistance:** optional `--secure-backend-firewall` flag auto-detects and applies per-OS firewall rules for inference-backend security (macOS `pf`, Linux `ufw`/`firewalld`/etc.)
+
+### Documentation
+- **Operator guide:** new `docs/security/securing-inference-backend.md` covers securing a self-hosted inference backend (firewall rules, loopback binding, egress mediation)
+
+### Testing
+- Full validation matrix: macOS (docker, podman 6.0.0), Linux (docker, podman 4.9, podman 5.x)
+- Adversarial security testing: 90+ vectors across RBAC/model-authorization changes
+
+---
+
 ## [3.0.0] — 2026-06-25 — GA (combined 3.0 + 3.1 + 2.25.5 convergence)
 
 First public 3.x GA. Folds the 2.25.5 finalization line into the 3.x line (which
