@@ -1,4 +1,4 @@
-<!-- last-updated: 2026-05-08T00:00:00+01:00 -->
+<!-- last-updated: 2026-08-19T00:00:00+00:00 -->
 # Yashigani
 ---
 
@@ -16,19 +16,12 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v2.23.4 (2026-05-21) — cleanup-system architectural close (state file + container-fallback rm + cross-UID handlers across install/uninstall), `letta-pgbouncer` mTLS sidecar closing YSG-RISK-048, KMS-architectural posture documented for credentials, Open WebUI in-mesh path through gateway, `/me/api-key` self-service Bearer issuance, OPA fail-closed posture; see `CHANGELOG.md` for the release entry.
-
-> **Upgrade notice:** v2.23.4 carries a behavioural change — OPA now fails-CLOSED on every exception path (timeout, 5xx, connection refused). Operators with intermittently-reachable OPA should alert on `yashigani_opa_response_check_failures_total`. Dev opt-in to prior fail-open behaviour: `YASHIGANI_OPA_OPTIONAL=true` (non-production only).
-
-> **Notable behaviour changes in v2.23.4:**
-> - **OPA fails closed** on every exception path (was prior `allow:True` in some paths). New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}`.
-> - **letta postgres** now routes through dedicated `letta-pgbouncer` mTLS sidecar — clean pg_hba `clientcert=verify-ca` catch-all, no carveouts.
-> - **Cleanup system** — `docker/.yashigani-install-state` file written at install completion; uninstall reads it for cross-UID runtime selection. Required for correct dual-runtime / multi-user host behaviour.
+**Latest Tagged Release:** v4.1.2 (2026-08-19) — Security and platform hardening. Improved model authorization (positive-allowlist validation), RBAC group-membership enforcement fix, session security improvements, dual-control hardening for cloud-override, Podman 6.x support, optional firewall auto-configuration. Full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x); see `CHANGELOG.md` for release details.
 
 ---
-**Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
+**Single branch:** `main` — all features, all tiers. Langflow and Letta are bundled and gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-05-07
+**Document Date:** 2026-08-19
 ---
 **Classification:** ***Public — Product Overview***
 ---

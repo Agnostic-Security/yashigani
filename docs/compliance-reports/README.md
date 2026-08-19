@@ -1,7 +1,7 @@
-# Yashigani Compliance Reports — v2.23.2
+# Yashigani Compliance Reports — v4.1.2
 
-**Release:** v2.23.2 (tag commit `4ff2dd5`)
-**Last regenerated:** 2026-05-08
+**Release:** v4.1.2 (tag commit `15c4166d`)
+**Last regenerated:** 2026-08-19
 **Source-of-truth audit dates:** 2026-05-07 (ASVS L3 refresh sweep) / 2026-05-08 (ACS automated scan post-fix)
 **Source commit:** `4d28192` (2.23.x tip; ACS scan target tag `v2.23.2` = `4ff2dd5`; ACS HEAD `3ddeb00`)
 **Taxonomy:** PASS / FAIL / MANUAL / N/A — three-class plus genuine FAIL only. **No PARTIAL.** **No PASS-WITH-COMPENSATING.**
