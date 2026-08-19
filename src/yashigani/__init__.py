@@ -11,6 +11,6 @@ Modules:
   yashigani.auth        — Local auth: Argon2id passwords, TOTP, session store
   yashigani.sso         — SAMLv2 and OIDC identity provider integration
 """
-# Last updated: 2026-06-26T00:00:00+01:00 (v3.0.1: post-GA hardening bump — SSRF/installer/risk-register)
+# Last updated: 2026-08-19T00:00:00Z (v4.1.2: First public release of Yashigani 4.x platform)
 
-__version__ = "3.1.2"
+__version__ = "4.1.2"

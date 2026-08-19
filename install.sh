@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# last-updated: 2026-05-29T00:00:00+01:00 (feat(p3): MCP bridge-join + P-384 signing key generation — YSG-P3-MCP-SIGKEY / YSG-P3-MCP-BRIDGE-JOIN)
+# last-updated: 2026-08-19T00:00:00Z (release: v4.1.2 — First public release of Yashigani 4.x platform stack)
 # last-updated: 2026-05-28T00:00:00+01:00 (fix(backup): DRIFT-B5-COMPOSE-AGENT-BACKUP — snapshot langflow_data/letta_data/openclaw_data named volumes in _backup_existing_data; warn-only on absent volume; Docker+Podman parity via alpine tar pattern; 0600 tarballs; K8s-gated)
 # last-updated: 2026-05-23T00:00:00+00:00 (fix(install): BYOCA-BUG-001/002/003/004 — _fp init + podman unshare BYO staging + EC key gate + podman unshare YAML update)
 # last-updated: 2026-05-19T00:00:00+01:00 (fix(install): inject X-SPIFFE-ID on POST /admin/agents — close ISSUE-019)
@@ -92,7 +92,7 @@ fi
 #   ./install.sh --mode k8s --namespace yashigani
 # =============================================================================
 
-YASHIGANI_VERSION="3.1.2"
+YASHIGANI_VERSION="4.1.2"
 # GIT_SHA: git short-hash of the current source tree used as a cache-busting
 # build arg (--build-arg GIT_SHA=...) for first-party images (gateway,
 # backoffice, extractor). Consumed as ARG GIT_SHA / LABEL revision in each
