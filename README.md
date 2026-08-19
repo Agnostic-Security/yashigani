@@ -1,11 +1,11 @@
-<!-- last-updated: 2026-07-11T00:00:00+00:00 -->
+<!-- last-updated: 2026-08-19T00:00:00+00:00 -->
 # Yashigani
 ---
 
 <html>
 <body>
 <div>
-  <img src="https://github.com/Agnostic-Security/yashigani_img/blob/main/Yashigani8bit.png" alt="Yashigani" style="width:100%">
+  <img src="https://github.com/agnosticsec-com/yashigani_img/blob/main/Yashiganymaster.png" alt="Yashigani" style="width:100%">
 </div>
 </body>
 </html>
@@ -16,17 +16,12 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v3.1.2 (2026-07-11) — Podman init-container ordering deadlock fix, PII enforcement wired at ingress+egress (data_tags + obligations contract; POL-004 now blocks unredacted PII), POL-001/002/003 RBAC group checks read from data.yashigani.rbac, OWUI verify-user corrected to identity-ID membership, step-up gate on all RBAC group mutations, os-scope-shadow fix in chat_completions, Helm rbac.rego aligned to identity_id for K8s parity, org migration to Agnostic-Security on all references; see `CHANGELOG.md` for the release entry.
-
-> **Behaviour changes in v3.1.x:**
-> - **Role-tiered TOTP** — admin accounts: HMAC-SHA-512, 8-digit codes; user accounts: HMAC-SHA-256, 6-digit codes. Use an authenticator that reads `otpauth://` URI algorithm and digits parameters (agnosticOTP, Authy, Raivo). Pre-3.1 accounts are migrated at first login (force-reprovision flow).
-> - **PII enforcement now BLOCKS** at request ingress when `data_tags` + `obligations` are wired — PII destined for cloud models is rejected, not merely logged.
-> - **RBAC group mutations require step-up** — `update_group` and `remove_member` now demand a fresh TOTP step-up alongside the existing mutations.
+**Latest Tagged Release:** v4.1.2 (2026-08-19) — Security and platform hardening. Improved model authorization (positive-allowlist validation), RBAC group-membership enforcement fix, session security improvements, dual-control hardening for cloud-override, Podman 6.x support, optional firewall auto-configuration. Full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x); see `CHANGELOG.md` for release details.
 
 ---
-**Single branch:** `main` — all features, all tiers. Open WebUI, Wazuh, agent bundles, and the optional Smallstep step-ca runtime ACME service are all gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
+**Single branch:** `main` — all features, all tiers. Langflow and Letta are bundled and gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
 ---
-**Document Date:** 2026-07-11
+**Document Date:** 2026-08-19
 ---
 **Classification:** ***Public — Product Overview***
 ---
@@ -88,7 +83,7 @@ Cloud LLM costs spiral without visibility or limits. A single team can burn thro
 
 Sensitive data — PII, PCI cardholder data, intellectual property, PHI — is sent to cloud LLM APIs without detection or classification. Once transmitted, data may be retained, logged, or used for training. Traditional DLP solutions were not designed for LLM payloads: they do not understand prompt structure, they cannot classify at inference speed, and they cannot enforce routing decisions based on sensitivity.
 
-**Yashigani's response:** The three-layer sensitivity pipeline classifies every prompt before routing. Layer 1: regex pattern matching catches structured sensitive data (credit card numbers, SSNs, API keys). Layer 2: scikit-learn ML classifier (TF-IDF + LogisticRegression, joblib serialised) detects semantic sensitivity at under 5ms, fully offline. Layer 3: Ollama LLM classification provides deep contextual analysis for ambiguous cases. Data classified as CONFIDENTIAL or RESTRICTED is routed to local models only — enforced by the Optimization Engine as a default-immutable rule. No isolated admin can bypass it and no configuration silently disables it: the only exception is a dual-admin break-glass override — one admin proposes with a mandatory justification, a second, different admin must approve within a short window, and the resulting grant is scoped to a specific model, time-boxed, and fully audited (`optimization/cloud_override.py`). CHS additionally strips credential-shaped patterns from payloads before any AI inspection backend sees them. The dedicated PII detection module (since v2.20) adds 10 entity types (SSN, credit card with Luhn validation, email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth) with three enforcement modes: LOG (detect and audit), REDACT (replace with `[REDACTED:TYPE]` before forwarding to cloud), and BLOCK (reject requests containing PII destined for cloud models). PII filtering runs on both request and response paths — bidirectional, on all traffic, by default. Cloud bypass requires explicit admin opt-in.
+**Yashigani's response:** The three-layer sensitivity pipeline classifies every prompt before routing. Layer 1: regex pattern matching catches structured sensitive data (credit card numbers, SSNs, API keys). Layer 2: scikit-learn ML classifier (TF-IDF + LogisticRegression, joblib serialised) detects semantic sensitivity at under 5ms, fully offline. Layer 3: Ollama LLM classification provides deep contextual analysis for ambiguous cases. Data classified as CONFIDENTIAL or RESTRICTED is routed to local models only — this is an immutable rule enforced by the Optimization Engine. No override exists. No admin can bypass it. No configuration can disable it. CHS additionally strips credential-shaped patterns from payloads before any AI inspection backend sees them. The dedicated PII detection module (since v2.20) adds 10 entity types (SSN, credit card with Luhn validation, email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth) with three enforcement modes: LOG (detect and audit), REDACT (replace with `[REDACTED:TYPE]` before forwarding to cloud), and BLOCK (reject requests containing PII destined for cloud models). PII filtering runs on both request and response paths — bidirectional, on all traffic, by default. Cloud bypass requires explicit admin opt-in.
 
 ### 2.5 Routing Opacity
 
@@ -136,20 +131,17 @@ For deployment topology diagrams and the full per-runtime breakdown, see [Archit
 
 ## 5. Verifying a Release
 
-All Yashigani releases from v2.23.1 onward are cryptographically signed. Two signatures are provided for each release:
+All Yashigani releases from v4.1.2 onward are cryptographically signed with SSH keys. Two signatures are provided for each release:
 
-**Git tag signature (GPG)** — verifies the source commit is authentic and unchanged:
+**Git tag signature (SSH)** — verifies the source commit is authentic and unchanged:
 
 ```sh
-# Import the Agnostic Security release signing public key (once):
-gpg --import docs/release-signing-key.asc
-
 # Fetch tags (in case a tag was updated):
 git fetch --tags --force origin
 
-# Verify:
-git tag -v v2.23.2
-# Expected: "Good signature from 'Agnostic Security Releases <releases@agnosticsec.com>'"
+# Verify the v4.1.2 tag signature:
+git tag -v v4.1.2
+# Expected: "Good signature from 'Maxine <maxine@agnosticsec.com>'" (SSH key)
 ```
 
 **Container image signature (cosign / Sigstore)** — verifies the published container images match the release tag:
@@ -158,7 +150,7 @@ git tag -v v2.23.2
 cosign verify \
   --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2
+  ghcr.io/Agnostic-Security/yashigani-gateway:4.1.2
 ```
 
 For SBOM attestation, every release artifact carries a Sigstore-signed SBOM published as a GitHub Release asset alongside the tag.
@@ -167,59 +159,59 @@ For SBOM attestation, every release artifact carries a Sigstore-signed SBOM publ
 
 ## 6. Compliance and Security Posture
 
-Yashigani publishes per-control compliance evidence. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in the risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
+Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in the risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
+
+For a more detailed explanation, see the [Compliance Reports](docs/compliance/README.md).
 
 ---
 
 ## 7. Current Release Highlights
 
-v3.1.2 is the current release (2026-07-11). The 3.x line introduces document-content data protection (doc-OPA), every-hop OPA agent orchestration, MCP hardening, unified identity-ID authorization, role-tiered TOTP, capability-envelope MCP import ceremony, connection allow-list for MCP and agents, and FIDO2/WebAuthn. For the complete per-version feature history, see `CHANGELOG.md`.
+### Yashigani 4.x — First-Party Platform Stack (4.0, 4.1, 4.1.1, 4.1.2)
 
-### v3.1.2 — PII Enforcement, RBAC Hardening, Podman Deadlock Fix, Org Migration
+Yashigani 4.0 introduced a complete rearchitecture around a first-class native platform experience we build and own — not dependent on third-party UIs. Every agent runs in a uniform security sidecar with its own identity. Every action is policy-governed at ingress and egress. Compliance evidence is produced by enforcement, not assembled before audits.
 
-v3.1.2 is a security and reliability hardening release on top of v3.1.0 (the last GA release; v3.1.1 was an internal tag). Gate: Ava e2e + Laura (Fable5) 0 Crit / 0 High.
+**4.x Platform Features:**
+- **Native UI & control plane** — First-class Yashigani experience: chat with agents and models, no-code visual agent builder (Langflow), stateful agent runtime (Letta), workflow composer with document policy verification
+- **Uniform agent security sidecar** — Every agent wrapped with its own identity, governed both directions: ingress (what reaches it) and egress (what it can reach)
+- **Agent orchestration with human-in-the-loop** — Agents, LLMs, APIs, MCPs all mediated through the gateway; every inter-entity hop adjudicated at ingress and egress
+- **Multi-platform GPU support** — NVIDIA, AMD, Apple Silicon (Metal), Intel across Linux and macOS
+- **Usage metering & caps** — Monitor usage per agent or enforce hard limits
+- **Cloud-safe inference** — Self-hosted inference backend (ollama/LM Studio) with optional firewall auto-configuration and egress mediation through the gateway
 
-**PII Enforcement** — `input.data_tags` and `input.obligations` are now wired at both ingress and egress OPA calls. POL-004 blocks requests containing unredacted PII (including dash-separated, spaced, encoded, and cross-message split patterns) destined for cloud models. Fail-closed Rego: any OPA exception on the PII path blocks rather than logs.
+**4.x Release Lineage:**
+- **v4.0** — Initial release of the unified platform stack with native UI, agent orchestration framework, and human-in-the-loop control
+- **v4.1** — Security hardening cycle; model authorization improvements; RBAC enforcement fixes; session security enhancements
+- **v4.1.1** — Interim patch building toward v4.1.2; prepared for council review and validation
+- **v4.1.2** (current) — **First public 4.x release**; production-ready platform with full security validation, multi-platform support (macOS docker/podman, Linux docker/podman 4.9/5.x), adversarial security testing (90+ vectors), and clean pentest (36 pass, BOLA GREEN, 0 Critical/High)
 
-**RBAC Group Checks** — POL-001, POL-002, and POL-003 now read group membership from `data.yashigani.rbac` (the server-side policy bundle) instead of `input.identity.groups`, which was always empty. This restores group-based policy enforcement that was silently no-ops since 3.1.0.
+### v4.1.2 — Security Hardening & Platform Maturity
 
-**OWUI Verify-User** — OpenWebUI membership check now compares by identity-ID (`identity_id`) rather than email. The prior email-vs-ID mismatch resulted in HTTP 403 for all OpenWebUI users.
+v4.1.2 is the first public release of the Yashigani 4.x platform stack. This release consolidates security hardening and platform maturity improvements detected during 4.1.1 validation, council review, and adversarial security testing.
 
-**RBAC Step-Up** — `update_group` and `remove_member` endpoints now require a fresh TOTP step-up, matching the gate already on `create_group` and `add_member`. Helm rbac.rego aligned to use `identity_id` (K8s deployment parity with compose).
+**Security Fixes:**
+- **Model authorization hardening** — Positive-allowlist validation rejects invalid model identifiers at parse time (no silent fallback to local defaults)
+- **RBAC group-membership enforcement** — Fixed seam in chat API where group-tier access grants were not properly enforced
+- **Model alias resolution** — Cloud-model aliases resolve to canonical target before RBAC gates, preventing alias-based bypass attempts
+- **Session security improvements** — Complete logout with proper token invalidation across all active session types and correct session-cookie clearance
+- **Dual-control hardening** — Cloud-override approval now binds to confirming fingerprint with durable audit log persistence
 
-**Podman Init-Container Ordering Deadlock** — Resolved a race condition where the PKI issuer init-container could deadlock against the service containers during Podman start-up, causing clean installs to hang indefinitely.
+**Platform Improvements:**
+- **Podman 6.x support** — Compose tool selection adapts to Podman version (6.x uses native `podman compose` v2; older versions use `podman-compose`)
+- **Firewall auto-configuration** — Optional `--secure-backend-firewall` flag auto-detects and applies per-OS firewall rules for inference-backend security (macOS `pf`, Linux `ufw`/`firewalld`/etc.)
+- **Operator documentation** — New guide `docs/security/securing-inference-backend.md` covers securing self-hosted inference backends (firewall rules, loopback binding, egress mediation)
 
-**os-scope-shadow fix** — `ysg_principal` no longer resolves to anonymous in `chat_completions` due to a local variable shadowing the gateway scope.
+**Validation & Testing:**
+- **Full test matrix GREEN** — macOS (Docker, Podman 6.0.0), Linux (Docker, Podman 4.9, Podman 5.x)
+- **Adversarial security testing** — 90+ vectors across RBAC and model-authorization changes (6-round pentest, re-verify cycles)
+- **Pentest clear** — Laura: 36 pass, BOLA GREEN, 0 Critical/High findings
 
-**Org migration** — All installer and doc references updated from `agnosticsec-com` to `Agnostic-Security` (GitHub org transfer).
+**Release Discipline:**
+- SSH-signed tag with full release notes on GitHub
+- Complete version consistency (code + documentation + installer)
+- Pre-release gates: installation validation, documentation audit, artifact integrity
 
-### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe (prior release)
-
-v2.23.4 closes the v2.23.3 follow-up backlog and lands an architectural close of the install/uninstall cleanup-system class (state file + container-fallback rm + cross-UID handlers across the entire lifecycle). It ships the `letta-pgbouncer` mTLS sidecar (closing YSG-RISK-048), the Open WebUI in-mesh path through the gateway, `/me/api-key` self-service Bearer issuance, HUMAN identity registration on local-auth login, and the OPA fail-closed posture. Ava 13/13 E2E PASS at tag (Phase 1 + Phase 2 + crucible test of the `.env` cross-UID handler). Tag SSH-signed.
-
-**Cleanup-System Architectural Close** -- Install and uninstall now share a persisted state file (`docker/.yashigani-install-state`, mode 0644, key=value with `RUNTIME` / `INSTALL_UID` / `INSTALL_USER`), eliminating runtime-detection and ownership-assumption heuristics. uninstall.sh's container-fallback `rm` (Alpine-image based, sudo-free) handles cross-UID chown'd dirs (`docker/{data,certs,logs}`) and secrets (`docker/secrets/*`) without requiring `sudo` on non-PTY SSH sessions. Dotfile-aware wipe glob (`.[!.]* + ..?*`) prevents `.pki-status` from surviving the wipe. `.env` cross-UID handler skips-with-WARN when host-side read fails; `docker compose down` proceeds via Docker socket. `_do_chgrp` hoisted to script scope. Closes BACKLOG-V240-003 / -004 / -006 and the architectural root cause of five cascading uninstall blockers.
-
-**`letta-pgbouncer` mTLS Sidecar** -- Letta's postgres connection now routes through a dedicated session-mode pgbouncer sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, `read_only:true`, `cap_drop:[ALL]`, `no-new-privileges`). The sidecar presents `letta-pgbouncer_client.crt` to postgres over mTLS; postgres `pg_hba.conf` catch-all (`hostssl all all 0.0.0.0/0 scram-sha-256 clientcert=verify-ca`) applies uniformly with no letta carveout. Closes the asyncpg+pg8000 client-cert-URI-param limitation at the sidecar boundary. Closes YSG-RISK-048.
-
-**KMS-Architectural Posture for Credentials** -- The cleartext `userlist.txt` is documented at `docs/yashigani_install_config.md` §6.1 as the non-KMS dev/standalone posture (YSG-RISK-049 ACCEPTED-LOW). Production deployments configure a KMS provider via `YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper`; the providers in `src/yashigani/kms/` fetch credentials at runtime, bypassing the cleartext-on-disk path entirely. The yashigani-internal Bearer is per-install (32-char charset-compliant token at `docker/secrets/yashigani_internal_bearer`, mode 0600) — the literal string `yashigani-internal` is gone from production source.
-
-**Open WebUI → Gateway In-Mesh Path** -- The gateway exposes a dual-port surface: `:8080` for mTLS edge traffic and `:8081` for plain-HTTP in-mesh traffic carrying an `Authorization: Bearer yashigani-internal` token. Open WebUI joins the `caddy_internal` network and routes chat completions via the gateway rather than direct to Ollama, so OPA policy + identity-binding apply to UI traffic the same way they apply to API traffic. The Ollama default model `qwen2.5:3b` auto-pulls on first install with `--with-openwebui` so the chat UI works out of the box.
-
-**`/me/api-key` Self-Service Bearer Issuance** -- Users can mint, list, and revoke their own API keys from the user UI. Step-up TOTP required for issuance (ASVS V6.8.4); `/auth/stepup` widened from admin-only to accept user sessions while preserving every existing guard (anonymous-rejection, replay-cache, per-session failure counter, cross-tenant guard, audit-event emission). API-key strings are hash-stored; `last4` shown in UI for identification.
-
-**HUMAN Identity Registration on Local-Auth Login** -- Local password+TOTP users now get an identity-registry entry created automatically on first login, with tier-aware metadata. Closes the design gap where local-auth users had no identity-registry presence (previously only SSO-registered users were tracked).
-
-**OPA Fail-Closed Posture** -- The OPA response-check in `gateway/openai_router.py` now returns `allow: False` on every exception path (timeout, 5xx, connection refused, `opa_not_configured`) instead of the prior `allow: True`. Helm enforces it at deploy-time via the `OPA-URL-001` violation when `global.environment=production` and `gateway.env.YASHIGANI_OPA_URL` is empty. New Prometheus counter `yashigani_opa_response_check_failures_total{outcome, reason}` registered. Behavioural break for upgrades from v2.23.3 with intermittently-reachable OPA (see CHANGELOG `Breaking Changes` for the dev opt-in via `YASHIGANI_OPA_OPTIONAL=true`).
-
-**SAML BYOK Config-Load Surface** -- `broker.add_idp()` accepts SAML identity-provider configurations via `YASHIGANI_IDP_<N>_SAML_*` environment variables. `_assert_rsa_sp_key()` runs at config-load time, rejecting non-RSA SP keys at container startup rather than at first signature attempt. Mitigates the libgcrypt ECDH heap-overflow class (CVE-2026-41989) at the config-load boundary.
-
-**Container Auto-Start on Host Reboot** -- Compose installs provision a user-scoped `systemd --user` unit under `loginctl enable-linger` so the gateway and backoffice come back up after a host reboot without operator intervention. Helm path already handled by Kubernetes.
-
-**OPA + Helm Policy Bundle Alignment** -- The K8s helm chart previously shipped a stub OPA ConfigMap with package `yashigani.v1_routing` and no `decision` / `allow_v1` rules — the gateway read `result.get("allow", False)` against the empty result, returning 403 on every K8s chat request. Replaced with the verbatim compose `policy/{yashigani,v1_routing,rbac,agents}.rego` bundle so K8s and compose make the same policy decisions.
-
-**Iris+Laura Design-Review-First Sequencing** -- Every cross-component / security-touching / architectural change in the v2.23.4 close-out arc went through an Iris design review and a Laura threat-model before any implementer dispatch. 10+ review cycles persisted as design docs at `internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`. The pattern produced zero "ship-then-rework" cycles after adoption; cascading regressions in the pre-pattern era (5 layers of stunnel workarounds before the pgbouncer reframe) became the failure mode that the rule was designed to prevent.
-
-### v2.23.3 — DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, and Password-History Reuse Rejection (prior release)
+### v2.23.3 — DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, and Password-History Reuse Rejection
 
 v2.23.3 is a security and supply-chain hardening release on top of v2.23.2. It adds DNS-rebinding defence for outbound HTTP, a PKI admin UI with a BYO-CA driver for operator-controlled cert chains, full air-gap deployment support, OWASP API3 BOPLA per-property allowlists, age-encrypted backups, password-reuse history (CMMC L2 IA.L2-3.5.8), and a swap of the abandoned `fasttext-wheel` dependency in the prompt-injection classifier to scikit-learn. Tag SSH-signed.
 
@@ -239,7 +231,7 @@ v2.23.3 is a security and supply-chain hardening release on top of v2.23.2. It a
 
 **N-1 Upgrade Validation (v2.23.2 → v2.23.3)** -- The install-and-upgrade smoke matrix (introduced in v2.23.2) now validates the v2.23.2 → v2.23.3 upgrade path on the same four platform combinations (macOS Podman / macOS Docker / Linux Podman / Linux Docker). Backup, upgrade, restore, and both-admin reachability verified at every CI run.
 
-### v2.23.2 — Security Hardening, Supply-Chain Controls, and ASVS L3 92% (prior release)
+### v2.23.2 — Security Hardening, Supply-Chain Controls, and ASVS L3 92%
 
 v2.23.2 is a security and quality hardening release on top of v2.23.1. It closes the remaining deferred findings from the v2.23.1 release cycle, strengthens the supply chain, hardens container and network posture, and introduces continuous install-and-upgrade validation. ASVS v5 L3 coverage reaches 92% (166/180) with zero release-blocking failures.
 
