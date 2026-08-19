@@ -167,6 +167,8 @@ For a more detailed explanation, see the [Compliance Reports](docs/compliance/RE
 
 ## 7. Current Release Highlights
 
+v4.1.2 is the current release (2026-08-19). Yashigani 4.x introduces a complete rearchitecture around a first-class native platform experience: native UI, agent orchestration with human-in-the-loop, no-code workflow composer, multi-platform GPU support, and usage metering with caps. For the complete per-version feature history, see `CHANGELOG.md`.
+
 ### Yashigani 4.x — First-Party Platform Stack (4.0, 4.1, 4.1.1, 4.1.2)
 
 Yashigani 4.0 introduced a complete rearchitecture around a first-class native platform experience we build and own — not dependent on third-party UIs. Every agent runs in a uniform security sidecar with its own identity. Every action is policy-governed at ingress and egress. Compliance evidence is produced by enforcement, not assembled before audits.
@@ -211,7 +213,23 @@ v4.1.2 is the first public release of the Yashigani 4.x platform stack. This rel
 - Complete version consistency (code + documentation + installer)
 - Pre-release gates: installation validation, documentation audit, artifact integrity
 
-### v2.23.3 — DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, and Password-History Reuse Rejection
+### v3.1.2 — PII Enforcement, RBAC Hardening, Podman Deadlock Fix, Org Migration (prior release)
+
+v3.1.2 is a security and reliability hardening release on top of v3.1.0. It adds PII enforcement at both ingress and egress, fixes RBAC group membership handling, corrects OpenWebUI identity verification, adds step-up to RBAC mutations, resolves Podman deadlock conditions, and migrates to the new GitHub org. Gate: Ava e2e + Laura 0 Crit / 0 High.
+
+**PII Enforcement** — `input.data_tags` and `input.obligations` wired at both ingress and egress OPA calls. POL-004 blocks unredacted PII (dash-separated, spaced, encoded patterns) destined for cloud models. Fail-closed: OPA exception blocks rather than logs.
+
+**RBAC Group Checks** — POL-001/002/003 now read group membership from `data.yashigani.rbac` instead of empty `input.identity.groups`. Restores group-based policy enforcement.
+
+**OWUI Verify-User** — Membership check now uses identity-ID instead of email, fixing login failures.
+
+**RBAC Step-Up** — `update_group` and `remove_member` require fresh TOTP step-up. Helm rbac.rego aligned with compose for K8s parity.
+
+**Podman Init-Container Deadlock** — Resolved race condition in PKI issuer causing clean installs to hang.
+
+**Org Migration** — All references updated from `agnosticsec-com` to `Agnostic-Security`.
+
+### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe (prior release)
 
 v2.23.3 is a security and supply-chain hardening release on top of v2.23.2. It adds DNS-rebinding defence for outbound HTTP, a PKI admin UI with a BYO-CA driver for operator-controlled cert chains, full air-gap deployment support, OWASP API3 BOPLA per-property allowlists, age-encrypted backups, password-reuse history (CMMC L2 IA.L2-3.5.8), and a swap of the abandoned `fasttext-wheel` dependency in the prompt-injection classifier to scikit-learn. Tag SSH-signed.
 
