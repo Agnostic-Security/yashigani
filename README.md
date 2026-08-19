@@ -16,7 +16,7 @@
 *Yashigani — Security enforcement for agentic AI. Every call inspected. Every policy enforced. Every action audited.*
 ---
 ---
-**Latest Tagged Release:** v4.1.2 (2026-08-19) — Security and platform hardening. Improved model authorization (positive-allowlist validation), RBAC group-membership enforcement fix, session security improvements, dual-control hardening for cloud-override, Podman 6.x support, optional firewall auto-configuration. Full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x); see `CHANGELOG.md` for release details.
+**Latest Tagged Release:** v4.1.2 (2026-08-19) — First public release of Yashigani 4.x platform stack. Native UI, agent orchestration with human-in-the-loop, no-code workflow composer, multi-platform GPU support (NVIDIA/AMD/Apple Silicon/Intel), usage metering & caps, core-plane mTLS default-on with in-tree two-tier PKI, Langflow & Letta bundled behind compose profiles, single-branch deployment model. v4.1.2 adds security hardening: improved model authorization (positive-allowlist validation), RBAC group-membership enforcement, session security, dual-control hardening, Podman 6.x support, optional firewall auto-configuration. Full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x); see `CHANGELOG.md` for complete details.
 
 ---
 **Single branch:** `main` — all features, all tiers. Langflow and Letta are bundled and gated behind compose profiles / install flags. **Core-plane mTLS is default-on**: per-service leaf certificates are issued at install time by the in-tree two-tier PKI (`src/yashigani/pki/issuer.py`) — no optional services required.
