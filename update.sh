@@ -20,8 +20,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURRENT_VERSION="2.1.0"
-REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/agnosticsec-com/yashigani.git}"
-RELEASES_API="https://api.github.com/repos/agnosticsec-com/yashigani/releases/latest"
+REPO_URL="${YASHIGANI_REPO_URL:-https://github.com/Agnostic-Security/yashigani.git}"
+RELEASES_API="https://api.github.com/repos/Agnostic-Security/yashigani/releases/latest"
 
 # ---------------------------------------------------------------------------
 # Color output
@@ -308,7 +308,7 @@ pull_update() {
   # Tarball-based update
   elif command -v curl >/dev/null 2>&1; then
     log_info "Updating via tarball download..."
-    local tarball_url="https://github.com/agnosticsec-com/yashigani/archive/refs/tags/v${TARGET_VERSION}.tar.gz"
+    local tarball_url="https://github.com/Agnostic-Security/yashigani/archive/refs/tags/v${TARGET_VERSION}.tar.gz"
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
@@ -462,7 +462,7 @@ verify_health() {
 # TODO(v2.24.0 #47): Wire YASHIGANI_BACKUPS_DIR + POST /admin/backup/verify here.
 # Rollback currently invokes restore.sh directly via shell; the backoffice
 # container is not guaranteed to be running during an upgrade window.
-# Track: https://github.com/agnosticsec-com/yashigani/issues/47
+# Track: https://github.com/Agnostic-Security/yashigani/issues/47
 do_rollback() {
   log_step "1/3" "Finding latest backup..."
 

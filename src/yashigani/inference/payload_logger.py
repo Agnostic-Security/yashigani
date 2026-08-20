@@ -6,8 +6,10 @@ The write is enqueued to an asyncio.Queue and drained in batches of 50
 by a background task — the gateway request path is never blocked by PG I/O.
 
 SHA-256 hash of the payload is stored in the clear (indexed for deduplication).
-Payload content and response content are AES-256-GCM encrypted via pgcrypto
-inside the INSERT SQL (pgp_sym_encrypt uses current_setting('app.aes_key')).
+Payload content and response content are AES-256-CFB (OpenPGP) encrypted via
+pgcrypto inside the INSERT SQL (pgp_sym_encrypt with cipher-algo=aes256 uses
+current_setting('app.aes_key')).  pgcrypto uses OpenPGP symmetric format, not
+AES-GCM; the cipher pin is applied via PGP_SYM_OPTS in db/postgres.py.
 """
 from __future__ import annotations
 

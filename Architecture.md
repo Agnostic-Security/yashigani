@@ -1,5 +1,4 @@
-<!-- last-updated: 2026-05-15T12:00:00+01:00 (docs: also clean v0.6.0 version-table cell — Linux/macOS/cloud/VM → Linux/macOS — v2.23.4) -->
-<!-- last-updated: 2026-05-15T11:30:00+01:00 (docs: remove unimplemented bare-metal/no-container install claims — v2.23.4) -->
+<!-- last-updated: 2026-08-20T12:30:00+00:00 (docs: update 4.1.2 architecture — native UI replaces Open WebUI, KUROSHIO replaces Ollama, add 5.0 details) -->
 # Yashigani Architecture and Feature History
 
 ---
@@ -24,14 +23,28 @@ This document is the long-form companion to the top-level [README.md](README.md)
 
 Yashigani is structured as a two-plane system: a **data plane** that handles the real-time request path, and a **control plane** (backoffice) that manages configuration, identity, policies, and audit storage.
 
-### 1.1 Request Flow
+### 1.1 Three-Layer Sensitivity Detection & Prompt Injection Protection
+
+Yashigani enforces a fail-closed, three-layer sensitivity detection pipeline on ALL requests and responses:
+
+1. **Regex Detection** — Structured pattern matching for known sensitive formats (PII, credentials, API keys)
+2. **scikit-learn ML Classifier** — TF-IDF + LogisticRegression semantic analysis (<5ms offline, baked into every image)
+3. **LLM-based Deep Inspection** — KUROSHIO (v5.0+, local) or cloud LLM for nuanced semantic understanding
+
+**Prompt Injection Protection:** Multi-LLM adjudication on OPA routing safety net (second OPA pass) + LLM policy review detects and blocks injection attempts. Fail-closed: rejected on any LLM disagreement.
+
+**Redaction & Pseudonymization** (v4.1.2+): Reversible pseudonymization with anti-known-text-attacks protection applied bidirectionally (request + response paths).
+
+---
+
+### 1.2 Request Flow
 
 ```
-AI Agent / Human (via Open WebUI or API)
+AI Agent / Human (via Native UI or API)
         |
         v
 [ Caddy TLS Edge ]          <-- ACME / CA-signed / self-signed
-        |                       /chat/* → Open WebUI
+        |                       /chat/* → Native UI
         |                       /admin/* → Backoffice
         |                       /v1/*, /agents/*, /* → Gateway
         v
@@ -45,12 +58,14 @@ AI Agent / Human (via Open WebUI or API)
         |
         v
 [ PII Detection ]           <-- 10 PII types, LOG/REDACT/BLOCK (since v2.20)
-        |                       Bidirectional, cloud bypass opt-in
+        |                       Bidirectional (request + response paths)
+        |                       Redaction + pseudonymization rules (v4.1.2+)
+        |                       Cloud bypass opt-in
         v
 [ Sensitivity Pipeline ]    <-- Three layers (all ON by default):
         |                       1. Regex pattern matching
-        |                       2. scikit-learn ML classifier (<5ms, v2.23.3: TF-IDF + LogisticRegression replaces FastText; baked into image)
-        |                       3. Ollama LLM classification
+        |                       2. scikit-learn ML classifier (<5ms, TF-IDF + LogisticRegression; baked into image)
+        |                       3. KUROSHIO/GGUF LLM classification (local inference, v5.0+) or cloud LLM fallback
         |                       + CHS credential detection
         |                       + Payload masking before AI send
         v
@@ -67,14 +82,16 @@ AI Agent / Human (via Open WebUI or API)
 [ Rate Limiting ]           <-- Redis fixed-window, per-endpoint
         |
         v
-[ OPA Routing Safety Net ]  <-- Second OPA pass on routing decisions
+[ OPA Routing Safety Net ]  <-- Second OPA pass on routing decisions + prompt injection detection
+        |                       + Multi-LLM adjudication for prompt injection (fail-closed)
         |                       + LLM policy review (since v2.0)
         v
-[ Upstream LLM / MCP ]      <-- Cloud API / Ollama / MCP tool server
+[ Upstream LLM / MCP ]      <-- Cloud API / KUROSHIO (local inference, v5.0+) / Ollama (v4.x) / MCP tool server
         |
         v
 [ Response Inspection ]     <-- Sensitivity + PII scan on response (since v2.20)
         |                       Streaming: chunk-level inspection (since v2.20)
+        |                       Bidirectional redaction + pseudonymization enforcement
         |
         v
 [ Audit Write ]             <-- File + PostgreSQL + SIEM (async)
@@ -87,17 +104,20 @@ AI Agent / Human (response)
 
 ## 2. Components
 
+### 2.0 Core Components (Bundled by Default)
+
 | Component | Role |
 |---|---|
 | **Gateway (data plane)** | Reverse proxy, TLS, auth, inspection, rate limiting, routing, Optimization Engine |
 | **Backoffice (control plane)** | Admin UI/API, identity management, policy editor, license validation, budget admin |
-| **Open WebUI** | Chat interface at /chat/*, internal network only, all LLM calls through gateway (since v2.0) |
+| **Native UI** | Chat interface at /chat/*, built-in to Yashigani (v4.0+), all LLM calls through gateway |
 | **Optimization Engine** | Four-dimensional routing: sensitivity + complexity + budget + cost; P1-P9 priority matrix (since v2.0) |
 | **Identity Broker** | Multi-IdP identity broker: OIDC + SAML v2; Caddy delegates auth (since v2.0) |
 | **Pool Manager** | Per-identity container lifecycle: create, route, health, replace, scale, postmortem forensics (since v2.0) |
 | **OPA Policy Engine** | Declarative, version-controlled authorization for every tool call; routing safety net with LLM policy review (since v2.0) |
-| **Sensitivity Pipeline** | Three-layer classification: regex + scikit-learn ML + Ollama; all ON by default (since v2.0; ML backend swapped FastText → scikit-learn TF-IDF + LogisticRegression in v2.23.3) |
-| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel |
+| **Sensitivity Pipeline** | Three-layer classification: regex + scikit-learn ML + KUROSHIO (v5.0+) or cloud LLM; all ON by default (v4.x uses Ollama; ML backend swapped to scikit-learn TF-IDF + LogisticRegression in v2.23.3) |
+| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel; bidirectional request/response redaction + pseudonymization |
+| **PII Detection & Redaction** | 10 PII entity types (v2.20+); LOG/REDACT/BLOCK modes; bidirectional enforcement; reversible pseudonymization with anti-known-text protection (v4.1.2+) |
 | **Audit Pipeline** | Multi-sink writer: file, PostgreSQL, Splunk, Elasticsearch, Wazuh; P1-P5 alert severity with SIEM integration (since v2.0) |
 | **PgBouncer** | PostgreSQL connection pooler, prevents connection exhaustion (password from .env since v1.09.5) |
 | **Redis** | Rate limiting, response caching, anomaly detection sliding windows |
@@ -107,18 +127,25 @@ AI Agent / Human (response)
 | **Loki / Promtail** | Log aggregation and shipping |
 | **Alertmanager** | 3-channel escalation: Slack/email → PagerDuty |
 | **OpenTelemetry / Jaeger** | Distributed tracing across gateway, inspection, and upstream |
-| **Wazuh SIEM** | Full stack (manager + indexer + dashboard), optional compose profile (`--wazuh`) |
-| **Optional ACME runtime CA (Smallstep)** | step-ca compose service for runtime ACME cert management; opt-in via `--with-internal-ca`. Not required for default-on mTLS — the in-tree PKI issuer handles install-time cert generation. |
 
-### 2.1 Network Isolation (EX-231-10 — v2.23.1)
+### 2.1 Optional Components (Compose Profiles)
 
-**Caddy is the sole ingress to backoffice and gateway.** No peer in the mesh reaches `:8443` or `:8080` directly.
+| Component | Role | Opt-in |
+|---|---|---|
+| **Langflow** | Visual agent builder for no-code workflow composition | `--with-langflow` |
+| **Letta** | Stateful agent orchestration framework | `--with-letta` |
+| **Wazuh SIEM** | Full-stack SIEM (manager + indexer + dashboard) for advanced audit visualization and alerting | `--wazuh` |
+| **ACME Runtime CA (Smallstep)** | step-ca service for runtime ACME cert management; optional because in-tree PKI issuer handles install-time cert generation (not required for default-on mTLS) | `--with-internal-ca` |
 
-**Compose:** four networks enforce this posture — `edge` (Caddy + host ports), `caddy_internal` (Caddy + gateway + backoffice; the only network where their listeners exist), `data` (backoffice/gateway outbound + all data deps), and `obs` (prometheus/grafana/loki/alertmanager/otel-collector/jaeger). Services on `data` or `obs` that do not share `caddy_internal` cannot resolve gateway/backoffice by name (Docker DNS scopes to shared networks), and Docker bridge L2 segmentation removes the ARP reachability path.
+### 2.2 Network Isolation (EX-231-10 — v4.1.2 current posture)
 
-**Kubernetes:** `NetworkPolicy` resources enforce this at the kernel level. The `allow-backoffice-ingress` and `allow-gateway-ingress` policies admit only `yashigani-caddy` pods (plus nginx-ingress when `tlsMode=nginx`). Prometheus scrapes go exclusively through Caddy's SPIFFE-gated internal metrics listeners (`:8444`/`:8445`) — direct pod scrape egress is only emitted when those listeners are explicitly disabled.
+**Caddy is the sole ingress to backoffice and gateway.** No peer in the mesh reaches the gateway data plane (`:8443` mTLS or `:8080` in-mesh), the backoffice control plane (`:9443` mTLS or `:9080` in-mesh), or pool-manager container orchestration endpoints directly.
 
-**Belt-and-braces:** application-layer mTLS + SPIFFE middleware remains active on both listeners as a second layer of defence.
+**Compose (v4.1.2):** four networks enforce this posture — `edge` (Caddy + host ports 443/80 + optional 9443 admin ingress), `caddy_internal` (Caddy + gateway + backoffice; the only network where their listeners exist), `data` (backoffice/gateway outbound + all data deps: postgres, redis, kms, audit sinks), and `obs` (prometheus/grafana/loki/alertmanager/otel-collector/jaeger). Services on `data` or `obs` that do not share `caddy_internal` cannot resolve gateway/backoffice by name (Docker DNS scopes to shared networks), and Docker bridge L2 segmentation removes the ARP reachability path. Optional Langflow/Letta/Wazuh services connect exclusively via `data` network with credentials from .env secrets.
+
+**Kubernetes (v4.1.2 Helm):** `NetworkPolicy` resources enforce this at the kernel level. The `allow-backoffice-ingress` and `allow-gateway-ingress` policies admit only `yashigani-caddy` pods (plus nginx-ingress when `tlsMode=nginx`). Prometheus scrapes go exclusively through Caddy's SPIFFE-gated internal metrics listeners (`:8444` gateway + `:8445` backoffice) — direct pod scrape egress is only emitted when those listeners are explicitly disabled. Pod-to-pod egress requires explicit `allow-outbound` policies per data sink (postgres, redis, etc.).
+
+**Belt-and-braces (v4.1.2):** core-plane mTLS default-on (in-tree two-tier PKI: root CA → intermediate → per-service leaf certs with SPIFFE-style URIs) + SPIFFE middleware on all internal listeners provide fail-closed authentication and encryption between all services. Service certificate rotation is automatic. The optional Smallstep step-ca service (`--with-internal-ca`) provides separate runtime ACME-style cert management for external integrations.
 
 ---
 
@@ -138,6 +165,11 @@ The current release narrative (v2.23.0 + v2.23.1 + v2.23.2 + v2.23.3 + v2.23.4) 
 
 | Version | Theme | Key Additions |
 |---|---|---|
+| **v5.0** | **KUROSHIO First-Party Inference Engine, Complete Security Sovereignty** | **KUROSHIO Linux-native inference engine (production-ready), runs GGUF models from Hugging Face/Ollama/compatible sources, zero third-party runtime dependency, offline-capable, air-gapped operation, macOS Metal acceleration (7.0 Q4), Kubernetes Helm support, complete autonomy over inference layer, tamper-proof SHA-384 Merkle audit chains, multi-sink SIEM audit delivery (Splunk/Elasticsearch/Wazuh)** |
+| **v4.1.2** | **First Public 4.x Release, Security Hardening** | **Native UI in production, agent orchestration with human-in-the-loop, no-code workflow composer, multi-platform GPU (NVIDIA/AMD/Apple Silicon/Intel), usage metering & caps, core-plane mTLS default-on, Langflow & Letta bundled, improved model authorization (positive-allowlist validation), RBAC group-membership enforcement, session security, dual-control hardening, Podman 6.x support, optional firewall auto-configuration, full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x)** |
+| **v4.0** | **Native UI Release, Complete UI Control** | **First-class native Yashigani UI (built-in, owned and controlled by Agnostic Security), replaced Open WebUI dependency, first-party chat interface at /chat/*, full integration with gateway inspection pipeline, visual agent builder, natural-language agent generator, workflow composer, policy verification on document ingestion** |
+| **v3.1.2** | **Installer Audit-Signing Bug Remediation** | **Fixed audit-signing bug in macOS installer (binary signature verification + notarization pathway); macOS rootless install verified working; non-root installation hardened** |
+| **v3.0** | **Major Release Milestone** | **Structured release with core gateway + inspection pipeline + OPA integration; foundation for future v4.x UI transition** |
 | **v2.23.4** | **Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, KMS Posture Reframe** | **Cleanup-system architectural close (state file `docker/.yashigani-install-state` mode 0644 records RUNTIME/UID/USER for cross-UID handoff; uninstall.sh state-file-beats-heuristic; container-fallback rm for `docker/{data,certs,logs}` and sudo-free secrets wipe; dotfile-aware wipe glob `.[!.]*` + `..?*`; rmdir after wipe; `.env` cross-UID skip-with-WARN; `log_info` helper restored; `_do_chgrp` hoisted to script scope — closes BACKLOG-V240-003/004/006 and root cause of 5 cascading uninstall blockers); `letta-pgbouncer` mTLS sidecar (`edoburu/pgbouncer:v1.25.1-p0`, UID 70, read_only:true, cap_drop:[ALL], session-mode, presents client cert to postgres — pg_hba catch-all `hostssl all all clientcert=verify-ca` applies with no letta carveout; closes YSG-RISK-048); KMS-architectural reframe for credentials (cleartext userlist.txt documented as non-KMS dev posture at `docs/yashigani_install_config.md` §6.1, YSG-RISK-049 ACCEPTED-LOW; production configures `YASHIGANI_KMS_PROVIDER=vault|azure|aws|gcp|keeper` to fetch via `src/yashigani/kms/` providers); Open WebUI in-mesh path (gateway dual-port :8080 mTLS edge + :8081 plain in-mesh w/ Bearer); Ollama default-model auto-pull on `--with-openwebui`; `/me/api-key` self-service Bearer issuance (step-up TOTP, ASVS V6.8.4); HUMAN identity registration on local-auth login; OPA fail-closed posture (all exception paths return `allow:False`, Prometheus `yashigani_opa_response_check_failures_total` counter, Helm validate-security `OPA-URL-001`); `yashigani-internal` Bearer rotated to per-install 36-char secret (literal gone from source); SAML BYOK config-load surface (`YASHIGANI_IDP_<N>_SAML_*`, RSA-key enforcement at __init__); container auto-start on host reboot (`systemd --user` + `loginctl enable-linger`); install.sh:5101 `\|\| true` cp-fallback guard; air-gap install Step 9 `.Id`-fallback for image-digest verification (docker load doesn't populate RepoDigests — closes YSG-RISK-038); uninstall.sh runtime detection prefers Podman with liveness probe (closes YSG-RISK-004); dead-code `fasttext_backend.py` removed (LU-YSG-009); air-gap docs `config/` added (closes YSG-RISK-039); pgbouncer admin console lockdown (`admin_users` empty + `stats_users` empty on yashigani-pgbouncer, Laura F2 sibling); Iris+Laura design-review-first sequencing across 10+ cycles persisted at `internal-docs/yashigani/iris-v234-*.md` + `laura-v234-*.md`; Ava E2E 13/13 PASS at tag (Phase 1 6/6 + Phase 2 6/6 + crucible test of `.env` cross-UID class-of-bug close).** |
 | **v2.23.3** | **DNS-Rebinding Defence, PKI Admin UI + BYO-CA, Air-Gap Deployment, API3 BOPLA, Encrypted Backups, Password-History Reuse Rejection** | **DNS-rebinding defence for outbound HTTP (`yashigani.net.pinned_resolver` resolves hostname once at context entry, verifies against SSRF allow/block, patches `socket.getaddrinfo` for the transport so subsequent DNS changes can't redirect; OWUI agent push wired through; new audit event `SSRF_PINNED_RESOLVER_USED`; security doc `docs/security/ssrf.md`; closes issue #91 / OWASP API7); PKI admin UI + BYO-CA driver (`/api/v1/admin/pki/*` chain inspection / leaf rotation step-up TOTP / bundle download / status — private key never included; BYO-CA driver `YASHIGANI_PKI_CA_MODE=byo` issues EC P-256 CSR against external signing endpoint w/ step-ca/Vault PKI, validates chain, atomic install; auth modes token/mtls/none; fail-closed on driver error; closes #51 + #53); air-gap deployment support (`scripts/prepare-airgap-bundle.sh` builds offline bundle from pinned `airgap/manifest.yml`; `install.sh --air-gap --bundle <path>`; per-image digest verification fail-closed; zstd-compressed tar + SHA256 sidecar; pre-flight G20 gate; closes #58); OWASP API3 BOPLA per-property allowlist (explicit deny-by-default Pydantic public-view schemas w/ `model_config extra='forbid'` for admin/user accounts + SIEM target + IdP + JWT config/test — sensitive fields never serialised; 54 regression tests; ASVS V4.2.1, CWE-213); age-encrypted backups (`scripts/backup.sh` produces `<timestamp>.tar.gz.age` via AES-256-GCM/age X25519; `restore.sh --encrypted`; Helm `backup-cronjob.yaml`; closes CMMC L2 MP.L2-3.8.9 / CWE-312); password reuse history (`password_history` table migration 0010; default 12 Argon2id hashes range 1-24; HTTP 422 `password_reuse` + `PASSWORD_REUSE_REJECTED` audit; CMMC L2 IA.L2-3.5.8); `fasttext-wheel` → scikit-learn swap in prompt-injection classifier (closes YSG-RISK-040 abandoned dep); N-1 upgrade matrix v2.23.2→v2.23.3 across macOS+Linux × Podman+Docker.** |
 | **v2.23.2** | **Security Hardening, Supply-Chain Controls, ASVS L3 92%** | **XFF spoofing closed (right-to-left XFF chain-walk in app code with `TRUSTED_PROXY_CIDRS`; see `docs/security/xff-trust-boundary.md`); rate-limiter fail-closed default with `Retry-After` on 503; login throttle `Retry-After` header (RFC 6585); OPA and Jaeger mTLS on Docker Compose and Kubernetes Helm; Kyverno admission policies (non-root UID, read-only root filesystem, no-new-privileges, dropped caps); all Ollama containers migrated to UID 1000; all 73 Caddy `reverse_proxy` blocks carry `X-Caddy-Verified-Secret` injection; Caddyfile contract test in CI (asserts inject-caddy-verified count, TLS 1.3 presence, client_auth placement); Release tag signing infrastructure landed (CI workflow `tag-sign.yml` + public key in-repo; GPG path was aspirational — maintainer's hardware-backed Yubikey key cannot sign in CI; SSH-only scheme formally declared 2026-05-25; see `docs/security/release-signing.md`); GitHub Actions steps SHA-pinned; pip removed from runtime images (CVE surface reduction); SBOM service-identity SHA gate; install + N-1 upgrade smoke matrix (macOS Podman / macOS Docker / Linux Podman / Linux Docker); backslash open-redirect patch on admin `next=` with regression tests; safe_error_envelope for all error responses; host /tmp eliminated from install.sh + restore.sh + CI; OWASP ASVS v5 L3 92% (166/180), zero release-blocking FAILs** |

@@ -129,6 +129,56 @@ def _get_store():
     return store
 
 
+def _resolve_identity_id_from_email(email: str) -> str:
+    """
+    Resolve email → identity_id (idnt_{12hex}) via the identity registry.
+
+    3.1 UID unification: RBAC store is now keyed by identity_id, not email.
+    Admin routes that accept an email (the human-readable handle) must resolve
+    it before touching the store.
+
+    Raises HTTPException(404) if the email cannot be resolved.
+    Raises HTTPException(503) if the identity registry is not available.
+    """
+    id_reg = getattr(backoffice_state, "identity_registry", None)
+    if id_reg is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "identity_registry_not_configured"},
+        )
+    try:
+        rec = id_reg.get_by_email(email)
+    except Exception as exc:
+        logger.warning("rbac route: identity registry lookup failed for email=%r: %s", email, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "identity_registry_unavailable"},
+        )
+    if rec is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "identity_not_found",
+                "message": (
+                    f"No identity found for email={email!r}. "
+                    "Register the user in the identity registry before adding to RBAC groups."
+                ),
+            },
+        )
+    identity_id = (
+        rec.get("identity_id") if isinstance(rec, dict) else getattr(rec, "identity_id", None)
+    )
+    if not identity_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error": "identity_missing_id",
+                "message": f"Identity record for email={email!r} has no identity_id field.",
+            },
+        )
+    return identity_id
+
+
 def _push(store, admin_account: str) -> None:
     """Fire-and-forget OPA push. Logs and audits on failure; never raises."""
     from yashigani.rbac.opa_push import push_rbac_data
@@ -299,8 +349,11 @@ async def add_member(
     session: StepUpAdminSession,
 ):
     store = _get_store()
+    # 3.1 UID unification: resolve email → identity_id before calling the store.
+    # The store is keyed by identity_id (idnt_{12hex}) after the startup migration.
+    identity_id = _resolve_identity_id_from_email(body.email)
     try:
-        store.add_member(group_id, body.email)
+        store.add_member(group_id, identity_id)
     except KeyError:
         raise HTTPException(status_code=404, detail={"error": "group_not_found"})
 
@@ -313,7 +366,7 @@ async def add_member(
         admin_account=session.account_id,
     ))
     _push(store, session.account_id)
-    return {"group_id": group_id, "email": body.email, "action": "added"}
+    return {"group_id": group_id, "email": body.email, "identity_id": identity_id, "action": "added"}
 
 
 @router.delete("/groups/{group_id}/members/{email}", status_code=status.HTTP_204_NO_CONTENT)
@@ -323,8 +376,10 @@ async def remove_member(
     session: StepUpAdminSession,
 ):
     store = _get_store()
+    # 3.1 UID unification: resolve email → identity_id before calling the store.
+    identity_id = _resolve_identity_id_from_email(email)
     try:
-        store.remove_member(group_id, email)
+        store.remove_member(group_id, identity_id)
     except KeyError:
         raise HTTPException(status_code=404, detail={"error": "group_not_found"})
 
@@ -342,9 +397,12 @@ async def remove_member(
 @router.get("/users/{email}/groups")
 async def get_user_groups(email: str, session: AdminSession):
     store = _get_store()
-    groups = store.get_user_groups(email)
+    # 3.1 UID unification: resolve email → identity_id before querying the store.
+    identity_id = _resolve_identity_id_from_email(email)
+    groups = store.get_user_groups(identity_id)
     return {
         "email": email,
+        "identity_id": identity_id,
         "groups": [_group_to_response(g) for g in groups],
     }
 
