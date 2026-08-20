@@ -371,8 +371,8 @@ services:
       - obs
       # v4.1 Phase 1b-ii (LAURA-I1-01): Caddy is the ONLY other member of the
       # Ollama ringfence bridge. Sole path to Ollama's :11434 is the :11435
-      # mesh front above → ringfence → ollama. No shared-bridge L3 side-door.
-      - ollama_ringfence
+      # mesh front above → ringfence → kuroshio. No shared-bridge L3 side-door.
+      - kuroshio_ringfence
       # v4.1 three-agent wrap (2026-07-07): the former openclaw_ringfence is
       # SUBSUMED by the template-standard INGRESS ringfence (design §2.6):
       # ringfence_openclaw_in = EXACTLY {caddy, openclaw}. Carries both
@@ -429,7 +429,7 @@ services:
       # AsyncClient to internal_httpx_client() (mesh identity) so it presents
       # gateway_client.crt/key to Caddy — same client the OPA path already uses.
       # Until that lands the front 401s at the TLS handshake (fail-closed, correct).
-      OLLAMA_BASE_URL: https://caddy:11435/ollama
+      KUROSHIO_BASE_URL: https://caddy:11435/kuroshio
       REDIS_HOST: redis
       REDIS_PORT: "6380"                     # TLS-only port
       REDIS_USE_TLS: "true"
@@ -505,7 +505,7 @@ services:
       # Default ON: every MCP tool import is screened by the LLM semantic-intent
       # classifier before approval (tool-poisoning / day-one-poison close).
       # Set YASHIGANI_SEMANTIC_INTENT_SIDECAR=false in docker/.env to disable.
-      # Backend: same OLLAMA_BASE_URL (http://ollama:11434) as the PII classifier.
+      # Backend: same OLLAMA_BASE_URL (http://kuroshio:11434) as the PII classifier.
       YASHIGANI_SEMANTIC_INTENT_SIDECAR: ${YASHIGANI_SEMANTIC_INTENT_SIDECAR:-true}
       # Extractor sandbox: gateway does NOT spawn containers — only backoffice does.
       # These knobs are kept here only for completeness (MAX_OUTPUT_BYTES is read by
@@ -647,7 +647,7 @@ services:
       retries: 5
       start_period: 30s
     # EX-231-10: gateway joins caddy_internal (Caddy→gateway:8080) AND data
-    # (gateway→redis, policy, ollama, pgbouncer outbound).
+    # (gateway→redis, policy, kuroshio, pgbouncer outbound).
     # Does NOT join obs or edge.
     # YSG-RISK-055 UA-10: gateway also joins all per-agent isolated bridges so
     # it can reach each agent on the registered-upstream dispatch path.
@@ -709,11 +709,11 @@ services:
       YASHIGANI_ADMIN_MIN_ACTIVE: "2"
       YASHIGANI_ADMIN_SOFT_TARGET: "3"
       YASHIGANI_SECRETS_DIR: /run/secrets
-      YASHIGANI_INSPECTION_DEFAULT_BACKEND: ${YASHIGANI_INSPECTION_DEFAULT_BACKEND:-ollama}
+      YASHIGANI_INSPECTION_DEFAULT_BACKEND: ${YASHIGANI_INSPECTION_DEFAULT_BACKEND:-kuroshio}
       # v2.2: gemini removed from default fallback to prevent unredacted content reaching
       # cloud providers before PII filtering. Admins who explicitly want cloud fallback
       # can set this var; ensure YASHIGANI_PII_MODE=redact or block first.
-      YASHIGANI_INSPECTION_FALLBACK_CHAIN: ${YASHIGANI_INSPECTION_FALLBACK_CHAIN:-ollama,fail_closed}
+      YASHIGANI_INSPECTION_FALLBACK_CHAIN: ${YASHIGANI_INSPECTION_FALLBACK_CHAIN:-kuroshio,fail_closed}
       # Postgres via PgBouncer — TLS verify-ca + client cert.
       YASHIGANI_DB_DSN: postgresql://yashigani_app:${POSTGRES_PASSWORD_URLENC}@pgbouncer:5432/yashigani?sslmode=verify-ca&sslrootcert=/run/secrets/ca_root.crt&sslcert=/run/secrets/backoffice_client.crt&sslkey=/run/secrets/backoffice_client.key
       # v2.23.3 (B4 fix, PR #60): Direct-to-postgres DSN, bypassing pgbouncer.
@@ -850,7 +850,7 @@ services:
       # SEAM (Tom, Issue-1): backoffice semantic-intent client must present its mesh
       # leaf (internal_httpx_client / backoffice_client.crt) to the front — same as
       # the gateway change above. Front fails closed at the handshake until it does.
-      OLLAMA_BASE_URL: https://caddy:11435/ollama
+      KUROSHIO_BASE_URL: https://caddy:11435/kuroshio
       # Extractor sandbox — Design A (LAURA-30-001 / YSG-RISK-080 fix, 2026-06-16).
       # Backoffice calls the pre-spawned extractor-svc container over plain HTTP.
       # NO docker socket, NO socket-proxy, NO container API access in backoffice.
@@ -1320,13 +1320,13 @@ services:
     mem_limit: ${YASHIGANI_OLLAMA_MEM_LIMIT:-4096m}
     cpus: ${YASHIGANI_OLLAMA_CPU_LIMIT:-2.0}
     volumes:
-      # ollama_data mounted at /root/.ollama — the standard ollama-in-container path.
+      # kuroshio_models mounted at /root/.ollama — the standard ollama-in-container path.
       # Ollama writes models, node identity, and partials all under ~/.ollama (= /root/.ollama
       # because user:0:0). Earlier override redirected via OLLAMA_MODELS env to /data/models
       # without moving the volume, which left model partials trying to write to a tmpfs at
       # /root/.ollama (8MB) → "no space left on device" on pull. Aligning volume + default
       # path makes models persist across container restarts and removes the env-redirect.
-      - ollama_data:/root/.ollama
+      - kuroshio_models:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0"
       # WARMUP-001: keep models resident in VRAM indefinitely (idle-eviction disabled).
@@ -1356,11 +1356,11 @@ services:
     # FIND-3.1-F1 fix (2026-06-29): `edge` removed from the long-running ollama
     # service. Model pulls are now handled entirely by ollama-init, which runs a
     # self-contained `ollama serve` in its own edge-attached container, writes
-    # models to the shared ollama_data volume, and exits before this service starts.
+    # models to the shared kuroshio_models volume, and exits before this service starts.
     # Long-running ollama has zero internet egress post-install. cap_drop:[ALL]
     # and no NET_ADMIN (L2 posture unchanged).
     # v4.1 Phase 1b-ii (LAURA-I1-01, High/Bypass close): Ollama leaves the shared
-    # `data` bridge and joins ONLY `ollama_ringfence` (internal:true; Caddy is the
+    # `data` bridge and joins ONLY `kuroshio_ringfence` (internal:true; Caddy is the
     # sole other member). Its :11434 listener is no longer L3-reachable by any
     # `data`-net peer. Mesh clients (gateway/backoffice) reach Ollama exclusively
     # via the Caddy :11435 mesh front (require_and_verify), never directly.
@@ -1370,14 +1370,14 @@ services:
         # openclaw]. When no AI profile is active this dependency is skipped and
         # ollama starts immediately (base install: no models, but service is up).
         # When a profile IS active, ollama waits for ollama-init to exit 0 (models
-        # fully written to ollama_data) before starting — ensures strict sequential
+        # fully written to kuroshio_models) before starting — ensures strict sequential
         # volume access (no two ollama processes on the same volume at once).
         condition: service_completed_successfully
         required: false
     networks:
       # v4.1 Phase 1b-ii (LAURA-I1-01): ringfence bridge ONLY — Caddy is the sole
       # peer. Ollama is unreachable except through the Caddy :11435 mesh front.
-      - ollama_ringfence
+      - kuroshio_ringfence
     # Uncomment for NVIDIA GPU:
     # deploy:
     #   resources:
@@ -1404,7 +1404,7 @@ services:
     # FIND-3.1-F1: ollama-init now runs a self-contained `ollama serve` (not a
     # thin API client). It needs enough memory to stage model layer decompression
     # in /tmp (tmpfs 512 m). 256 m covers the serve overhead; the model data itself
-    # is written to the ollama_data volume via /root/.ollama, not held in container RAM.
+    # is written to the kuroshio_models volume via /root/.ollama, not held in container RAM.
     mem_limit: ${YASHIGANI_OLLAMA_INIT_MEM_LIMIT:-256m}
     cpus: ${YASHIGANI_OLLAMA_INIT_CPU_LIMIT:-0.25}
     environment:
@@ -1419,17 +1419,17 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-skip}
     volumes:
-      # FIND-3.1-F1: mount the shared ollama_data volume so the self-contained
+      # FIND-3.1-F1: mount the shared kuroshio_models volume so the self-contained
       # local serve can write pulled models here. The long-running `ollama`
       # service reads the same volume after ollama-init exits. Access is strictly
       # sequential (ollama.depends_on: ollama-init: service_completed_successfully).
-      - ollama_data:/root/.ollama
+      - kuroshio_models:/root/.ollama
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         # FIND-3.1-F1 fix (2026-06-29): self-contained model pull.
         # ollama-init now runs its own temporary `ollama serve` (in this container,
-        # on the edge network) and pulls models directly to the ollama_data volume
+        # on the edge network) and pulls models directly to the kuroshio_models volume
         # mounted at /root/.ollama. The long-running `ollama` service (data network
         # only, no internet) starts after this container exits 0. Volume access is
         # strictly sequential — no two ollama processes on the same volume at once.
@@ -1501,11 +1501,11 @@ services:
           fi
         fi
         echo "Model pull complete: ${OLLAMA_MODEL:-qwen2.5:3b}"
-        # Stop local serve cleanly before exiting so ollama_data volume is consistent.
+        # Stop local serve cleanly before exiting so kuroshio_models volume is consistent.
         echo "Stopping local ollama serve..."
         kill "$$_SERVE_PID" 2>/dev/null || true
         wait "$$_SERVE_PID" 2>/dev/null || true
-        echo "Done. Models written to /root/.ollama (ollama_data volume). Long-running ollama service may now start."
+        echo "Done. Models written to /root/.ollama (kuroshio_models volume). Long-running ollama service may now start."
     read_only: true
     tmpfs:
       # YSG-RISK-008 (v2.23.4): ollama-init is a one-shot pull job.
@@ -3133,7 +3133,7 @@ volumes:
   # backs the runtime data-root. The full local model set can exceed 80 GB —
   # install.sh preflights free space (YASHIGANI_OLLAMA_MIN_DISK_GB, default 80).
   # For a dedicated disk, relocate the Docker/Podman data-root onto it.
-  ollama_data:
+  kuroshio_models:
     driver: local
   prometheus_data:
     driver: local
@@ -3441,7 +3441,7 @@ networks:
   # Ollama is the Caddy :11435 mesh front (require_and_verify). This is the
   # "no component on a shared bridge with a non-loopback listener except behind
   # Caddy" invariant applied to the LLM plane.
-  ollama_ringfence:
+  kuroshio_ringfence:
     driver: bridge
     enable_ipv6: false
     internal: true
@@ -3450,3 +3450,104 @@ networks:
   # template-standard `ringfence_openclaw_in` above (same two members, same
   # two directions: caddy → openclaw:18789 webhook delivery and the
   # transitional direct openclaw → caddy:18790 overlap path).
+
+  kuroshio-classifier:
+    image: ${YASHIGANI_KUROSHIO_CLASSIFIER_IMAGE:-yashigani/kuroshio:latest-classifier-cpu}
+    restart: unless-stopped
+    user: "1002:1002"
+    mem_limit: ${YSG_KUROSHIO_CLASSIFIER_MEM_LIMIT:-4096m}
+    mem_swappiness: 0
+    pids_limit: 256
+    cpus: ${YSG_KUROSHIO_CLASSIFIER_CPU_LIMIT:-2.0}
+    read_only: true
+    tmpfs:
+      - /data/scratch:size=2g
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - kuroshio_model_store:/data/model-store:ro
+    environment:
+      YSG_KUROSHIO_ROLE: classifier
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_KEEP_ALIVE_PIN: "true"
+      YSG_KUROSHIO_MAX_CTX: "2048"
+      YSG_KUROSHIO_MAX_CONCURRENCY: "8"
+      YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST: "512"
+      YSG_KUROSHIO_IDLE_UNLOAD_SECONDS: "0"
+      YSG_KUROSHIO_MAX_RESIDENT_MODELS: "1"
+    networks:
+      - kuroshio_ringfence
+    depends_on:
+      kuroshio-puller:
+        condition: service_healthy
+
+  kuroshio-chat:
+    image: ${YASHIGANI_KUROSHIO_CHAT_IMAGE:-yashigani/kuroshio:latest-chat-cpu}
+    restart: unless-stopped
+    user: "1002:1002"
+    mem_limit: ${YSG_KUROSHIO_CHAT_MEM_LIMIT:-16384m}
+    mem_swappiness: 0
+    pids_limit: 512
+    cpus: ${YSG_KUROSHIO_CHAT_CPU_LIMIT:-4.0}
+    read_only: true
+    tmpfs:
+      - /data/scratch:size=4g
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - kuroshio_model_store:/data/model-store:ro
+    environment:
+      YSG_KUROSHIO_ROLE: chat
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_KEEP_ALIVE_PIN: "true"
+      YSG_KUROSHIO_MAX_CTX: "4096"
+      YSG_KUROSHIO_MAX_CONCURRENCY: "16"
+      YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST: "2048"
+      YSG_KUROSHIO_IDLE_UNLOAD_SECONDS: "900"
+      YSG_KUROSHIO_MAX_RESIDENT_MODELS: "2"
+    networks:
+      - kuroshio_ringfence
+    depends_on:
+      kuroshio-puller:
+        condition: service_healthy
+
+  kuroshio-puller:
+    image: ${YASHIGANI_KUROSHIO_PULLER_IMAGE:-yashigani/kuroshio:latest-puller}
+    restart: unless-stopped
+    user: "1002:1002"
+    mem_limit: ${YSG_KUROSHIO_PULLER_MEM_LIMIT:-2048m}
+    mem_swappiness: 0
+    pids_limit: 128
+    cpus: ${YSG_KUROSHIO_PULLER_CPU_LIMIT:-1.0}
+    read_only: true
+    tmpfs:
+      - /data/scratch:size=1g
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - kuroshio_model_store:/data/model-store
+      - kuroshio_puller_scratch:/data/scratch
+    environment:
+      YSG_KUROSHIO_ROLE: puller
+      YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store
+      YSG_KUROSHIO_PULLER_SCRATCH_ROOT: /data/scratch
+      YSG_KUROSHIO_INITIAL_MODELS: "qwen2.5:7b-instruct-q4_k_m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - kuroshio_ringfence
+
+networks:
+  kuroshio_ringfence:
+    internal: true
+
+volumes:
+  kuroshio_model_store:
+  kuroshio_puller_scratch:
