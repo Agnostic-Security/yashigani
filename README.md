@@ -182,11 +182,70 @@ For SBOM attestation, every release artifact carries a Sigstore-signed SBOM publ
 
 ---
 
-## 6. Compliance and Security Posture
+## 6. Security Architecture & Design Hardening
 
-Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 Level 3 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence; open exceptions are tracked in the risk register (5×5 matrix with quantitative analysis). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry before any tag is created.
+Yashigani's security posture is built into the design, not bolted on afterward. Every major component is threat-modeled, every attack surface is instrumented, and every policy decision is auditable. This section outlines our architectural security commitments.
 
-For a more detailed explanation, see the [Compliance Reports](docs/compliance/README.md).
+### 6.1 OWASP ASVS v5 Level 3 Alignment
+
+Yashigani aligns with OWASP Application Security Verification Standard (ASVS) v5 Level 3 across all 17 verification chapters:
+
+- **V1 Architecture, Design & Threat Modeling** — Every component has a threat model documented; all data flows charted; attack surfaces identified and controlled
+- **V2 Authentication** — Multi-factor authentication mandatory (TOTP), password history tracked, constant-time comparisons on all auth paths, step-up gates on sensitive operations
+- **V3 Session Management** — Session rotation on password change, token invalidation on logout, secure cookie flags, CSRF tokens on all state-changing operations
+- **V4 Access Control** — Fine-grained RBAC enforced at every hop via OPA, unified identity model (humans + agents + services), positive-allowlist authorization (deny-by-default)
+- **V5 Input Validation** — All inputs validated at API boundaries; Pydantic schemas enforce strict types; per-endpoint body-size limits; log-injection sanitization
+- **V6 Cryptography** — AES-256-GCM for data at rest, TLS 1.3 mandatory for data in transit, ECDSA P-256 (SHA-384) for audit chain tamper-evidence, fail-closed on crypto failures
+- **V7 User Authentication & Password Management** — Password policies PCI-compliant (≤90 day expiry), symbol-bearing generated credentials, HIBP k-anonymity breach check
+- **V8 Data Protection** — Column-level encryption for sensitive fields, reversible pseudonymization with anti-known-text protection, secure deletion (cryptoshred), bidirectional inspection on all data flows
+- **V9 Communications** — mTLS default-on for core plane, Caddy edge security (XFF spoofing closed, verified-secret injection on all 73 reverse proxies, CSP explicit script-src)
+- **V10 Malicious Code** — SBOM attestation (CycloneDX + CryptoBoM), keyless image signing (Sigstore cosign), GitHub Actions SHA-pinned, supply-chain scanning
+- **V11 Business Logic** — Budget enforcement with graceful degradation (never reject on budget exhaustion), sensitivity-aware routing with immutable P1 rules
+- **V12 File & Resource Access** — Read-only root filesystem for all containers, seccomp profiles, AppArmor enforcement, no mounted host sockets in backoffice
+- **V13 API & Web Services** — Per-endpoint authentication/authorization, rate limiting fail-closed (Retry-After on 503), safe-error-envelopes (no stack traces), CORS locked to same-origin
+- **V14 Configuration** — Secrets rotatable without restart, environment-variable validation, configuration drift detection, pre-release gate enforces clean install
+- **V15 File Upload** — Document policy verification on ingestion (via OPA), file-type validation, size limits, antivirus scan optional via SIEM integration
+- **V16 General Cryptographic Security** — Algorithm allowlist (ES256 for ECDSA, no downgrades), constant-time comparisons (TOTP, HMAC), entropy-sourced credential generation
+- **V17 Error Handling & Logging** — Structured audit logs to multiple sinks (file, Postgres, SIEM), log encryption at rest, tamper-proof SHA-384 Merkle chaining, fail-closed on logging failure
+
+### 6.2 Post-Quantum Cryptography (PQC) Roadmap
+
+Yashigani is preparing for the post-quantum era. Current status and roadmap:
+
+- **ML-KEM (Kyber) Key Exchange — LIVE (v4.1.2):** End-to-end encryption between agent contexts uses ML-KEM hybrid construction (combining classical ECDH with ML-KEM to defend against both quantum and classical attacks). All agent-to-agent encrypted channels use this hybrid.
+- **ML-DSA (Dilithium) Signatures — ROADMAP (v5.0):** Mesh identity certificates will transition from ECDSA P-256 to ML-DSA for service-to-service mutual TLS. Planned for Yashigani v5.0 / KUROSHIO release (Q4 2026).
+- **Hybrid Transition Strategy:** New deployments will issue dual certificates (classical + PQC) to future-proof against quantum key recording attacks. Existing installations can rotate certificates without changing policy logic.
+
+This aligns with NIST SP 800-252 Post-Quantum Cryptography Migration roadmap. We monitor NIST standardization progress and will adopt finalized standards.
+
+### 6.3 Industry Best Practices
+
+**Defense-in-Depth:** Yashigani employs defense-in-depth across every layer:
+- Network: Container isolation, network policies, egress mediation
+- Application: Input validation, output encoding, OPA policy enforcement
+- Data: Column-level encryption, reversible pseudonymization, secure deletion
+- Audit: Multi-sink logging, Merkle chaining, fail-closed on log failure
+- Identity: Unified model, RBAC + MFA, step-up gates on sensitive operations
+
+**Principle of Least Privilege:** Every identity (human, agent, service) gets exactly the permissions it needs, no more. OPA enforces this uniformly across all entities. Denied access is the default.
+
+**Fail-Closed Security:** When any inspection backend is unavailable (OPA, classifier, SIEM), the system blocks requests rather than allowing them through. Rate limiter unavailable → reject with 503. Crypto key unavailable → fail to start. Policy engine down → all requests denied until it recovers.
+
+**Immutable Security Rules:** Highest-sensitivity data (classified as CONFIDENTIAL/RESTRICTED) is routed to local inference only. This rule cannot be overridden by admins, disabled by configuration, or bypassed by policy. It is an architectural invariant.
+
+**Audit Trail Integrity:** Every security decision produces an audit event. Events are signed with SHA-384 Merkle chaining, making post-hoc tampering detectable. Events are written to multiple sinks simultaneously (local file + Postgres + SIEM) so loss of one sink does not erase the evidence.
+
+**Zero-Trust on Agent Self-Reports:** Agent behavior is verified by the gateway, never trusted at face value. Every LLM response is re-inspected for PII/credentials before returning to the user. Agents cannot bypass inspection even if they are compromised.
+
+### 6.4 Transparency & Accountability
+
+Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence.
+
+Open exceptions (PARTIAL/FAIL) are tracked in the risk register (5×5 quantitative matrix). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry with documented compensating controls before any tag is created.
+
+For detailed control mappings and evidence, see [Compliance Reports](docs/compliance/README.md).
+
+---
 
 ---
 
