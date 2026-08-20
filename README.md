@@ -167,6 +167,15 @@ New attack classes on LLM systems emerge constantly. Yashigani's architecture is
 - **Audit trail proves replication attempts** — Every agent operation logged (v2.0+). Suspicious patterns (e.g., repeated tool calls with similar parameters, attempts to call tools outside allowlist) are immediately visible to operators.
 - **Fail-closed on unknown tools** — If an agent attempts to request a tool not in the allowlist, the request is blocked by OPA (v2.0+). Agents cannot exploit tool discovery.
 
+**Prompt Injection Worms via Communication Channels** — Zero-day prompt injections targeting email, SMS, web forms, and messaging platforms where agents parse user inputs. Attackers craft injections that evade top models, embed multi-stage payloads (exfiltrate credentials, export data), and self-propagate to other victims via the same communication channels (Miessler, Aug 2026). Attack scales to terabytes when ubiquitous agent adoption normalizes AI parsing of all user inputs. **Yashigani's defense:**
+- **Input inspection at ingestion** — All external inputs (email, web forms, messages) pass through the three-layer sensitivity pipeline (v2.0+) and prompt-injection detection (v2.0+) before reaching any agent.
+- **OPA data exfiltration policies** — Policies (v2.0+) control what data agents can send and where. Agents cannot send sensitive data to arbitrary external addresses or unauthorized recipients. Attempts are blocked and audited.
+- **Bidirectional inspection catches propagation** — Response inspection (v2.20+) blocks agent-generated payloads before they're sent via email/SMS/messaging. Even if an agent is compromised, its outbound communications are re-inspected for policy violations.
+- **Rate limiting on communication** — Per-user RPS caps (v2.24.1+) and per-agent output limits prevent rapid mass-propagation of payloads to contacts.
+- **Audit trail proves exfiltration** — Every data access and outbound communication logged (v2.0+). Operators see exactly what data was accessed, when, and where it was sent. Post-breach forensics reveal the full attack chain.
+- **Identity-based policy enforcement** — OPA (v2.0+) knows which user/agent is accessing data and sending communications. Can block cross-user data flows (agent for User A cannot exfiltrate User B's data).
+- **Container isolation prevents cross-user contamination** — Even if one user's agent is compromised, container-per-identity isolation (v2.0+) means other users' agents and data are untouched. Blast radius is single-user, not multi-tenant.
+
 ---
 
 ## 3. Pre-flight Checklist
