@@ -158,6 +158,15 @@ New attack classes on LLM systems emerge constantly. Yashigani's architecture is
 
 **Speculative Decoding / Early Exit Exploitation** — Attackers exploit models using speculative decoding or early-exit mechanisms to trigger unintended behavior or bypass inspection. **Yashigani's defense:** Response inspection applied to all model outputs regardless of generation mechanism (v2.20+). Sensitivity classification of outputs (v2.0+) independent of how tokens were generated. Audit logging captures model behavior markers (v2.0+) allowing detection of unusual patterns.
 
+**Self-Replicating AI Worms** — LLM-powered autonomous worms that use the model itself as an attack engine to compromise network infrastructure, generate dynamic exploit payloads, and replicate across 6-7 generations of hosts (Toronto worm research, June 2026). Unlike traditional worms with fixed payloads, these adapt to specific host vulnerabilities. **Yashigani's defense:**
+- **Host isolation via containers** — Agents run in isolated containers (v2.0+) with no capability to directly access or compromise host infrastructure. Agents cannot execute arbitrary OS commands or system exploits.
+- **Network sandboxing** — OPA policies (v2.0+) restrict agent outbound network access to explicitly allowlisted MCP servers. Agents cannot scan the network, probe for vulnerabilities, or attempt lateral movement.
+- **Tool allowlisting** — Positive-allowlist model (v4.1.2+) means agents can only call pre-approved tools. Agents cannot request new tools or exploit discovery of new vulnerabilities.
+- **Capability boundary** — Agents operate within a capability boundary: they can call allowed tools, but cannot spawn processes, execute code, or modify host state. The LLM cannot "become" an exploit engine; it's confined to API calls.
+- **Rate limiting prevents rapid replication** — Per-user RPS caps (v2.24.1+) prevent rapid exploitation attempts. An autonomous worm cannot generate and deploy 6-7 generations of replicants at attack speed.
+- **Audit trail proves replication attempts** — Every agent operation logged (v2.0+). Suspicious patterns (e.g., repeated tool calls with similar parameters, attempts to call tools outside allowlist) are immediately visible to operators.
+- **Fail-closed on unknown tools** — If an agent attempts to request a tool not in the allowlist, the request is blocked by OPA (v2.0+). Agents cannot exploit tool discovery.
+
 ---
 
 ## 3. Pre-flight Checklist
