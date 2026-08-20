@@ -20,6 +20,10 @@
 **Latest Tagged Release:** v4.1.2 (2026-08-19) — First public release of Yashigani 4.x platform stack. Native UI, agent orchestration with human-in-the-loop, no-code workflow composer, multi-platform GPU support (NVIDIA/AMD/Apple Silicon/Intel), usage metering & caps, core-plane mTLS default-on with in-tree two-tier PKI, Langflow & Letta bundled behind compose profiles, single-branch deployment model. v4.1.2 adds security hardening: improved model authorization (positive-allowlist validation), RBAC group-membership enforcement, session security, dual-control hardening, Podman 6.x support, optional firewall auto-configuration. Full test matrix GREEN (macOS docker+podman, Linux docker+podman 4.9+5.x); see `CHANGELOG.md` for complete details.
 
 ---
+
+---
+*Comming Soon - Yashigani v5 Kuroshio*
+---
 <div>
   <img src="https://github.com/Agnostic-Security/yashigani_img/blob/main/Yashiganic5-Kuroshio.png" alt="Kuroshio" style="width:100%">
 </div>
