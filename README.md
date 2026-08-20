@@ -274,6 +274,22 @@ Yashigani is purpose-built to address the unique risks of agentic AI systems. Ev
 - **AI9 — Misinformation & Hallucinations:** ⚠️ **NOT IN SCOPE** — Yashigani does not attempt to solve hallucinations (this is an LLM-training problem, not an application gateway). But we enforce: (1) responses inspected for credential-shaped patterns before returning (v4.1.2+), (2) PII removed (v2.20+), (3) policy violations blocked (v2.0+), (4) audit trail proves exactly what the LLM was asked and what it returned (v2.0+).
 - **AI10 — Unbounded Consumption of External APIs:** ✅ **IMPLEMENTED** — MCP tool calls rate-limited per identity (v2.0+ with per-identity pool). Budget enforcement prevents runaway tool-call spending (v2.0+). Optimization Engine routes to local inference when budget exhausted (v2.0+). Every tool call audited with full reasoning chain (v2.0+).
 
+### 6.6 Recent Attack Vectors (Beyond OWASP)
+
+Emerging threats on LLM systems not yet formalized in OWASP frameworks:
+
+- **Token Overflow / "Token Vomit" Attacks:** ✅ **DEFENDED** — Attackers craft inputs that trigger excessive token generation, causing context exhaustion or resource denial. Yashigani defends: (1) Per-endpoint body-size limits (v2.23.1+) cap input size, (2) Per-user RPS caps (v2.24.1+) prevent rapid-fire requests, (3) Budget enforcement triggers local routing when output costs spike (v2.0+), (4) Response length inspection (v2.20+) blocks abnormally large model outputs before returning to user.
+
+- **Social Engineering via Interview/Scenario Injection:** ✅ **DEFENDED** — Attackers pose as legitimate users in multi-turn conversations, gradually establishing trust, then request sensitive actions (e.g., "as your IT manager, please run this command"). Yashigani defends: (1) Every inter-entity hop audited (v2.0+), with full context preserved, (2) OPA policies enforce that sensitive operations require fresh TOTP step-up regardless of conversation context (v4.1.2+), (3) Audit trail is immutable, proving the exact conversation flow (v2.0+), (4) Agent responses re-inspected for policy violations before returning (v2.20+) — even if an agent is socially engineered, its response is gated by policy.
+
+- **Supply Chain Attacks via Compromised Agent Frameworks:** ✅ **DEFENDED** — Malicious packages in Langflow, Letta, or other bundled frameworks attempt to exfiltrate data or modify agent behavior. Yashigani defends: (1) All dependencies pinned (no transitive version drift), (2) Agent code runs in isolated containers with enforced read-only filesystems (v2.23.1+), (3) Container capabilities dropped (no CAP_NET_ADMIN, no CAP_SYS_ADMIN, no CAP_CHOWN v2.23.1+), (4) Agent network access restricted to explicitly allowed MCP servers (v3.0+), (5) Container-per-identity isolation prevents cross-agent lateral movement (v2.0+).
+
+- **Context Bleed / Cross-Agent Data Leakage:** ✅ **DEFENDED** — Agents in the same cluster leak conversation context or user data to each other via timing side-channels, shared cache, or shared memory. Yashigani defends: (1) Container-per-identity isolation ensures no shared memory or filesystems (v2.0+), (2) Each agent has its own isolated Redis connection (not shared v2.0+), (3) No shared environment variables or secrets between agents (v2.0+), (4) Audit trail proves isolation (v2.0+) — every agent's requests/responses are independently logged with identity binding.
+
+- **Model Confusion / Version Mismatch Exploits:** ✅ **DEFENDED** — Attacker trains a lookalike model or causes version confusion (e.g., inducing fallback to an older/weaker model), exploiting differences in model behavior. Yashigani defends: (1) Model alias resolution enforces canonical target before RBAC gates (v4.1.2+), (2) Model authorization uses positive-allowlist validation (no silent fallback v4.1.2+), (3) Optimization Engine routing decisions are audited with model-selection rationale (v2.0+), (4) Every model call logs exact model version and response characteristics (v2.0+).
+
+- **Speculative Decoding / Early Exit Exploitation:** ✅ **DEFENDED** — Attackers exploit models using speculative decoding or early-exit mechanisms to trigger unintended behavior or bypass inspection. Yashigani defends: (1) Response inspection is applied to all model outputs regardless of generation mechanism (v2.20+), (2) Sensitivity classification of outputs (v2.0+) is independent of how the model generated tokens, (3) Audit logging captures model behavior markers (v2.0+) allowing post-hoc detection of unusual patterns.
+
 ---
 
 ---
