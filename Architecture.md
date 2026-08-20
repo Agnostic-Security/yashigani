@@ -23,7 +23,21 @@ This document is the long-form companion to the top-level [README.md](README.md)
 
 Yashigani is structured as a two-plane system: a **data plane** that handles the real-time request path, and a **control plane** (backoffice) that manages configuration, identity, policies, and audit storage.
 
-### 1.1 Request Flow
+### 1.1 Three-Layer Sensitivity Detection & Prompt Injection Protection
+
+Yashigani enforces a fail-closed, three-layer sensitivity detection pipeline on ALL requests and responses:
+
+1. **Regex Detection** — Structured pattern matching for known sensitive formats (PII, credentials, API keys)
+2. **scikit-learn ML Classifier** — TF-IDF + LogisticRegression semantic analysis (<5ms offline, baked into every image)
+3. **LLM-based Deep Inspection** — KUROSHIO (v5.0+, local) or cloud LLM for nuanced semantic understanding
+
+**Prompt Injection Protection:** Multi-LLM adjudication on OPA routing safety net (second OPA pass) + LLM policy review detects and blocks injection attempts. Fail-closed: rejected on any LLM disagreement.
+
+**Redaction & Pseudonymization** (v4.1.2+): Reversible pseudonymization with anti-known-text-attacks protection applied bidirectionally (request + response paths).
+
+---
+
+### 1.2 Request Flow
 
 ```
 AI Agent / Human (via Native UI or API)
@@ -68,7 +82,8 @@ AI Agent / Human (via Native UI or API)
 [ Rate Limiting ]           <-- Redis fixed-window, per-endpoint
         |
         v
-[ OPA Routing Safety Net ]  <-- Second OPA pass on routing decisions
+[ OPA Routing Safety Net ]  <-- Second OPA pass on routing decisions + prompt injection detection
+        |                       + Multi-LLM adjudication for prompt injection (fail-closed)
         |                       + LLM policy review (since v2.0)
         v
 [ Upstream LLM / MCP ]      <-- Cloud API / KUROSHIO (local inference, v5.0+) / Ollama (v4.x) / MCP tool server
