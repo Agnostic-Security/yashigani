@@ -237,6 +237,36 @@ This aligns with NIST SP 800-252 Post-Quantum Cryptography Migration roadmap. We
 
 **Zero-Trust on Agent Self-Reports:** Agent behavior is verified by the gateway, never trusted at face value. Every LLM response is re-inspected for PII/credentials before returning to the user. Agents cannot bypass inspection even if they are compromised.
 
+### 6.4 OWASP API Security Top 10 Compliance
+
+Yashigani is built as an API-first system. All operations available through the REST API (`/v1/*`) are also available through the Web UI (`/user/*`), and both are subject to identical policy enforcement. OWASP API Security Top 10 mitigations are architectural, not optional:
+
+- **API1:2023 — Broken Object Level Authorization (BOLA):** OPA enforces per-identity authorization on all object access. Identity-bound audit trails prove who accessed what and when. Pentest verified: BOLA GREEN.
+- **API2:2023 — Broken Authentication:** Multi-factor authentication mandatory (TOTP), password history tracked (CMMC L2 IA.L2-3.5.8), constant-time comparisons, step-up gates on sensitive operations (password change, cloud override, group mutations).
+- **API3:2023 — Broken Object Property Level Authorization (BOPLA):** Explicit deny-by-default Pydantic schemas (`model_config extra='forbid'`) on all list endpoints. Sensitive fields never serialized (password_hash, totp_secret, client_secret, private_key, PII claims).
+- **API4:2023 — Unrestricted Resource Consumption:** Per-endpoint rate limiting fail-closed (Retry-After on 503), per-user RPS caps (100 RPS default), budget governance with graceful degradation, body-size limits per endpoint.
+- **API5:2023 — Broken Function Level Authorization:** Every API operation requires OPA authorization at ingress. Endpoints do not leak existence via 401 vs 404 differentiation. Admin-only operations are uniformly gated.
+- **API6:2023 — Unrestricted Access to Sensitive Business Flows:** Cloud LLM routing decisions are policy-enforced (Optimization Engine gated by OPA). Budget exhaustion triggers local routing, never rejection. PII-containing requests never reach cloud models unless explicitly authorized.
+- **API7:2023 — Server-Side Request Forgery (SSRF):** DNS-rebinding defense via pinned-resolver (hostname resolved once at entry, verified against SSRF allowlist, socket.getaddrinfo patched for the transport). Centralised outbound HTTP allowlist enforced per destination category. New audit event `SSRF_PINNED_RESOLVER_USED`.
+- **API8:2023 — Security Misconfiguration:** Fail-closed on missing secrets (no silent dev-mode fallback), pre-flight gate enforces clean install, configuration drift detection, TLS 1.3 mandatory.
+- **API9:2023 — Improper Inventory Management:** SBOM attestation on all release artifacts (CycloneDX + CryptoBoM), keyless image signing (Sigstore cosign), GitHub Actions SHA-pinned, supply-chain scanning on every CI run.
+- **API10:2023 — Unsafe Consumption of APIs:** All upstream API calls routed through Yashigani gateway inspection; external LLM calls inspected for PII/credentials before transmission; responses re-inspected before returning to caller.
+
+### 6.5 OWASP Agentic AI / LLM Top 10 Mitigation
+
+Yashigani is purpose-built to address the unique risks of agentic AI systems. Every major threat from OWASP Agentic AI / LLM Top 10 is mitigated by architecture:
+
+- **AI1 — Prompt Injection:** Three-layer defense: (1) regex pattern detection, (2) scikit-learn ML classifier (TF-IDF + LogisticRegression, sub-5ms, offline), (3) KUROSHIO LLM-based deep inspection. Multi-LLM adjudication on OPA routing safety net (fail-closed). Bidirectional protection on both request and response paths.
+- **AI2 — Insecure Output Handling:** Every LLM response inspected for PII, credentials, and policy violations before returning to user. Sensitive data redacted or pseudonymized based on policy. Response inspection pipeline fail-closed.
+- **AI3 — Training Data Poisoning:** Yashigani operates as a ring-fence, not a data aggregator. No base-model training on user data. Per-tenant data isolation (container-per-identity) with cryptographic separation ensures no cross-contamination.
+- **AI4 — Model Denial of Service:** Budget enforcement with hard caps at org/group/individual tiers. Graceful degradation to local inference when budget exhausted (never rejection). Rate limiting fail-closed (503 on unavailable rate-limit backend). Per-user 100 RPS default cap.
+- **AI5 — Supply Chain Vulnerabilities:** All dependencies pinned. Runtime dependencies removed from container images (no `pip` in production images). Trivy scanning on all images. SBOM attestation with signed artifacts. CVE tracking and coordinated disclosure process.
+- **AI6 — Sensitive Information Disclosure:** Reversible pseudonymization with anti-known-text protection for regulated workflows. Irreversible redaction option when compliance requires anonymization. Column-level encryption for sensitive fields. Audit logs encrypted at rest.
+- **AI7 — Insecure Agent Handoff:** Every agent runs in isolated container with its own identity. Uniform security sidecar applied to all agents. Agent-to-agent communication audited at ingress and egress. No shared filesystems or context bleed.
+- **AI8 — Excessive Agency:** OPA policies define what tools each agent can reach. Positive-allowlist enforcement (deny-by-default). Every tool call inspected for policy compliance. Agents cannot exceed their declared capabilities.
+- **AI9 — Misinformation & Hallucinations:** Yashigani does not attempt to solve hallucinations (this is an LLM-training problem, not an application gateway problem). But we enforce: (1) responses inspected for credential-shaped patterns before returning, (2) PII removed, (3) policy violations blocked, (4) audit trail proves exactly what the LLM was asked and what it returned.
+- **AI10 — Unbounded Consumption of External APIs:** MCP tool calls rate-limited per identity. Budget enforcement prevents runaway tool-call spending. Optimization Engine routes to local inference when budget exhausted. Every tool call audited with full reasoning chain.
+
 ---
 
 ---
