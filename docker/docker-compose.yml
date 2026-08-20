@@ -3544,10 +3544,4 @@ networks:
     networks:
       - kuroshio_ringfence
 
-networks:
-  kuroshio_ringfence:
-    internal: true
-
-volumes:
-  kuroshio_model_store:
   kuroshio_puller_scratch:
