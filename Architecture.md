@@ -99,7 +99,8 @@ AI Agent / Human (response)
 | **Pool Manager** | Per-identity container lifecycle: create, route, health, replace, scale, postmortem forensics (since v2.0) |
 | **OPA Policy Engine** | Declarative, version-controlled authorization for every tool call; routing safety net with LLM policy review (since v2.0) |
 | **Sensitivity Pipeline** | Three-layer classification: regex + scikit-learn ML + KUROSHIO (v5.0+) or cloud LLM; all ON by default (v4.x uses Ollama; ML backend swapped to scikit-learn TF-IDF + LogisticRegression in v2.23.3) |
-| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel |
+| **Inspection Pipeline** | scikit-learn ML + multi-backend LLM inspection with fail-closed sentinel; bidirectional request/response redaction + pseudonymization |
+| **PII Detection & Redaction** | 10 PII entity types (v2.20+); LOG/REDACT/BLOCK modes; bidirectional enforcement; reversible pseudonymization with anti-known-text protection (v4.1.2+) |
 | **Audit Pipeline** | Multi-sink writer: file, PostgreSQL, Splunk, Elasticsearch, Wazuh; P1-P5 alert severity with SIEM integration (since v2.0) |
 | **PgBouncer** | PostgreSQL connection pooler, prevents connection exhaustion (password from .env since v1.09.5) |
 | **Redis** | Rate limiting, response caching, anomaly detection sliding windows |
