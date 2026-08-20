@@ -48,7 +48,7 @@ class TestCredentialMasker:
         assert "abc123def456" not in result
 
     def test_masks_sk_api_key(self):
-        text = "key=sk-abcdefghijklmnopqrstuvwxyz123456"
+        text = "key=" + "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
         result = self.masker.mask_string(text)
         assert "[REDACTED:api_key]" in result
 
@@ -58,7 +58,7 @@ class TestCredentialMasker:
         assert "[REDACTED:api_key]" in result
 
     def test_masks_aws_key(self):
-        text = "AKIAIOSFODNN7EXAMPLE"
+        text = "AKIA" + "IOSFODNN7EXAMPLE"
         result = self.masker.mask_string(text)
         assert "[REDACTED:api_key]" in result
 

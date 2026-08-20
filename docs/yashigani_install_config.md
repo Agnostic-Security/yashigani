@@ -207,7 +207,7 @@ If you prefer to review every file before running anything, use the manual quick
 **Step 1.** Clone the repository:
 
 ```bash
-git clone https://github.com/agnosticsec-com/yashigani
+git clone https://github.com/Agnostic-Security/yashigani
 cd yashigani
 ```
 
@@ -366,12 +366,12 @@ All services are manageable from the admin panel via API after installation. The
   Admin 1 Username : phoenix
   Admin 1 Password : <36-char random>
   Admin 1 TOTP Key : <base32 secret>
-  Admin 1 TOTP URI : otpauth://totp/Yashigani%3Aphoenix?secret=...&algorithm=SHA256&digits=6&period=30
+  Admin 1 TOTP URI : otpauth://totp/Yashigani%3Aphoenix?secret=...&algorithm=SHA512&digits=8&period=30
 
   Admin 2 Username : condor
   Admin 2 Password : <36-char random>
   Admin 2 TOTP Key : <base32 secret>
-  Admin 2 TOTP URI : otpauth://totp/Yashigani%3Acondor?secret=...&algorithm=SHA256&digits=6&period=30
+  Admin 2 TOTP URI : otpauth://totp/Yashigani%3Acondor?secret=...&algorithm=SHA512&digits=8&period=30
 
   Postgres Password : <36-char random>
   Redis Password    : <36-char random>
@@ -398,15 +398,15 @@ This section is for operators who prefer full control over every configuration o
 **Step 1.** Clone the repository and enter the project directory:
 
 ```bash
-git clone https://github.com/agnosticsec-com/yashigani
+git clone https://github.com/Agnostic-Security/yashigani
 cd yashigani
 ```
 
 **Step 2.** Verify the release tag matches the version you intend to deploy:
 
 ```bash
-git tag --list | grep "v2."
-git checkout v2.23.2
+git tag --list | grep "v3."
+git checkout v3.1.2
 ```
 
 **Step 3.** Verify file integrity (if the project provides checksums):
@@ -935,8 +935,8 @@ AWS_DEFAULT_REGION=us-east-1
 **Step 2b.** If using static credentials (not recommended for production):
 
 ```dotenv
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+AWS_ACCESS_KEY_ID=AKIA_EXAMPLE_REPLACE_THIS
+AWS_SECRET_ACCESS_KEY=YOUR_SECRET_ACCESS_KEY_HERE
 ```
 
 All secrets are stored under the prefix `yashigani/` in Secrets Manager.
@@ -2903,24 +2903,24 @@ Images are signed with cosign using keyless signing (Sigstore Fulcio CA + Rekor 
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2
 ```
 
 **Verify backoffice image:**
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-backoffice:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-backoffice:3.1.2
 ```
 
 A successful verification prints:
 
 ```
-Verification for ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 --
+Verification for ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 --
 The following checks were performed on each of these signatures:
   - The cosign claims were validated
   - Existence of the claims in the transparency log was verified offline
@@ -2934,9 +2934,9 @@ The SBOM is attached as a cosign attestation with predicate type `cyclonedx`. Re
 ```bash
 cosign verify-attestation \
   --type cyclonedx \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
   | jq '.[0].payload | @base64d | fromjson'
 ```
 
@@ -2945,9 +2945,9 @@ To extract just the component list:
 ```bash
 cosign verify-attestation \
   --type cyclonedx \
-  --certificate-identity-regexp='https://github.com/agnosticsec-com/.*' \
+  --certificate-identity-regexp='https://github.com/Agnostic-Security/.*' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
   | jq '.[0].payload | @base64d | fromjson | .predicate.components[] | {name,version,purl}'
 ```
 
@@ -2956,21 +2956,21 @@ cosign verify-attestation \
 The SBOM and CryptoBoM are also attached directly to each GitHub release:
 
 ```bash
-# Download SBOM for v2.23.2
-gh release download v2.23.2 \
-  --repo agnosticsec-com/yashigani \
+# Download SBOM for v3.1.2
+gh release download v3.1.2 \
+  --repo Agnostic-Security/yashigani \
   --pattern 'sbom-yashigani-*.cdx.json' \
   --dir ./dist
 
-# Download CryptoBoM for v2.23.2
-gh release download v2.23.2 \
-  --repo agnosticsec-com/yashigani \
+# Download CryptoBoM for v3.1.2
+gh release download v3.1.2 \
+  --repo Agnostic-Security/yashigani \
   --pattern 'cryptobom-yashigani-*.json' \
   --dir ./dist
 ```
 
 Or download from the GitHub releases page at:
-`https://github.com/agnosticsec-com/yashigani/releases`
+`https://github.com/Agnostic-Security/yashigani/releases`
 
 ### 27.6 CryptoBoM — Cryptographic Algorithm Inventory
 
@@ -2985,7 +2985,7 @@ The CryptoBoM (`cryptobom-yashigani-<version>.json`) lists every cryptographic a
 To query which algorithms are not post-quantum resistant:
 
 ```bash
-cat dist/cryptobom-yashigani-2.23.2.json \
+cat dist/cryptobom-yashigani-3.1.2.json \
   | jq '.algorithms[] | select(.pq_status == "not_resistant") | {id, name, usage}'
 ```
 
@@ -2999,11 +2999,11 @@ cosign generate-key-pair
 
 # Sign with local key
 COSIGN_PASSWORD=<passphrase> bash scripts/sign_image.sh \
-  ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2 \
-  ghcr.io/agnosticsec-com/yashigani-backoffice:2.23.2
+  ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2 \
+  ghcr.io/Agnostic-Security/yashigani-backoffice:3.1.2
 
 # Verify with public key
-cosign verify --key cosign.pub ghcr.io/agnosticsec-com/yashigani-gateway:2.23.2
+cosign verify --key cosign.pub ghcr.io/Agnostic-Security/yashigani-gateway:3.1.2
 ```
 
 The `sign_image.sh` script detects signing mode automatically: if `COSIGN_PRIVATE_KEY` is set or `cosign.key` is present it uses local-key mode; otherwise it falls back to keyless.

@@ -346,6 +346,16 @@ spec:
             - name: YASHIGANI_AUDIT_RETENTION_DAYS
               value: {{ .Values.auditLog.retentionDays | quote }}
             {{- end }}
+            # DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
+            # Backoffice reads OLLAMA_BASE_URL to reach the Ollama service
+            # (same backend as the gateway; K8s service name is yashigani-ollama).
+            # Without an explicit value the code default "http://ollama:11434" does
+            # not resolve in K8s — this env var wires the correct K8s DNS name.
+            - name: OLLAMA_BASE_URL
+              value: {{ .Values.backoffice.ollamaUrl | default "http://yashigani-ollama:11434" | quote }}
+            # Default ON (DP-Y-003 coherence fix). Override via backoffice.semanticIntentSidecar.
+            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
+              value: {{ .Values.backoffice.semanticIntentSidecar | default true | toString | quote }}
           envFrom:
             - secretRef:
                 name: {{ .Values.backoffice.existingSecretName | default "yashigani-backoffice-secrets" }}

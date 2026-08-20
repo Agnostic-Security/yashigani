@@ -22,3 +22,8 @@ button:disabled { background: #93c5fd; cursor: not-allowed; }
 .admin-link { text-align: center; margin-top: 12px; }
 .admin-link a { color: #64748b; font-size: 0.75rem; text-decoration: none; }
 .admin-link a:hover { color: #2563eb; }
+/* WebAuthn section */
+.divider { display: flex; align-items: center; gap: 8px; margin: 1.25rem 0; color: #94a3b8; font-size: 0.8rem; }
+.divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #e2e8f0; }
+.btn-secondary { background: #fff; color: #1e293b; border: 1.5px solid #cbd5e1; }
+.btn-secondary:hover { background: #f8fafc; border-color: #94a3b8; }

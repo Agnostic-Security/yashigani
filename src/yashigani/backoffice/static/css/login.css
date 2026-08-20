@@ -24,3 +24,8 @@ button:disabled { background: #93c5fd; cursor: not-allowed; }
 .branding-tagline { font-size: 0.7rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; }
 .powered-by { position: fixed; bottom: 16px; left: 0; right: 0; text-align: center; font-size: 0.7rem; color: #64748b; }
 .powered-by a { color: #64748b; text-decoration: none; }
+/* WebAuthn section */
+.divider { display: flex; align-items: center; gap: 8px; margin: 1.25rem 0; color: #94a3b8; font-size: 0.8rem; }
+.divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #e2e8f0; }
+.btn-secondary { background: #fff; color: #1e293b; border: 1.5px solid #cbd5e1; }
+.btn-secondary:hover { background: #f8fafc; border-color: #94a3b8; }
