@@ -44,7 +44,9 @@ AI Agent / Human (via Native UI or API)
         |
         v
 [ PII Detection ]           <-- 10 PII types, LOG/REDACT/BLOCK (since v2.20)
-        |                       Bidirectional, cloud bypass opt-in
+        |                       Bidirectional (request + response paths)
+        |                       Redaction + pseudonymization rules (v4.1.2+)
+        |                       Cloud bypass opt-in
         v
 [ Sensitivity Pipeline ]    <-- Three layers (all ON by default):
         |                       1. Regex pattern matching
@@ -74,6 +76,7 @@ AI Agent / Human (via Native UI or API)
         v
 [ Response Inspection ]     <-- Sensitivity + PII scan on response (since v2.20)
         |                       Streaming: chunk-level inspection (since v2.20)
+        |                       Bidirectional redaction + pseudonymization enforcement
         |
         v
 [ Audit Write ]             <-- File + PostgreSQL + SIEM (async)
