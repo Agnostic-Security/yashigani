@@ -1,0 +1,34 @@
+Yashigani 6.0 inference engine ({{ .Values.backend }} backend) — pre-integration chart.
+
+  helm.sh/chart: {{ include "yashigani-kuroshio.chart" . }}
+  Release:       {{ .Release.Name }}
+  Namespace:     {{ .Values.namespace }}
+
+This is a STANDALONE, pre-integration chart (feat/6.0-inference-engine). It has NOT been
+merged into the main helm/yashigani chart and has NOT been installed against a live cluster
+this session — offline `helm lint` / `helm template` verification only.
+
+Topology deployed:
+  {{ include "yashigani-kuroshio.fullname" . }}-classifier   (mandatory sensitivity classifier, own pod)
+  {{ include "yashigani-kuroshio.fullname" . }}-chat          (user-facing models, own pod)
+  {{ include "yashigani-kuroshio.fullname" . }}-puller        (blob-store write path only, no llama-server binary)
+{{- if and .Values.kuroshioInit.enabled (ne .Values.kuroshioInit.model "") }}
+  {{ include "yashigani-kuroshio.fullname" . }}-init          (one-shot day-one model pull: {{ .Values.kuroshioInit.model }})
+{{- else }}
+
+NOTE: kuroshioInit.model is empty — this deploy ships MODEL-LESS by design (no day-one auto-pull
+Job rendered). Set kuroshioInit.model (and choose/sign a default model's provenance manifest
+first — see infer/deploy/README.md "day-one models") to enable it.
+{{- end }}
+
+Ring-fence: default-deny egress on every yashigani.kuroshio.managed=true pod except the puller's
+scoped HF/OCI-mirror egress rule. Ingress restricted to {{ .Values.caddy.serviceName }} only.
+
+Before any live install:
+  1. Resolve every image digest (infer/deploy/scripts/resolve-and-pin-digests.sh) — the
+     values.yaml image tags default to ":local", not a resolved/pinned reference.
+  2. Confirm Kyverno is installed if admissionPolicies.enabled=true.
+  3. Confirm the main helm/yashigani release's Caddy front is configured with
+     Caddyfile.kuroshio-front (see configmap-caddy-kuroshio-front.yaml — this chart renders the
+     ConfigMap; wiring it into the main release's Caddy pod's mounted config is a
+     convergence-time integration step, not automatic from installing this chart alone).

@@ -1,0 +1,48 @@
+# Backend-selection overlay — CUDA (NVIDIA). Iris F4/F5 corrected image-SWAP logic: this
+# overlay SETS the image for kuroshio-classifier/kuroshio-chat (a genuine swap), it does NOT add a
+# device block onto a shared fat image (platform doc §9 — the R1 premise that per-backend
+# images "drop into the existing GPU overlays" the way ollama's additive-device pattern does
+# was FALSE; per-backend images need real image-selection logic).
+#
+# install.sh detects NVIDIA GPU + Docker/Podman runtime and adds this overlay to
+# compose_files alongside docker-compose.kuroshio.yml (never docker-compose.kuroshio.{rocm,vulkan,cpu}.yml
+# at the same time — mutually exclusive backend selection, operator override supported via
+# YSG_KUROSHIO_BACKEND_OVERRIDE).
+#
+# CDI device grant (same mechanism as docker/docker-compose.gpu.yml's ollama CDI wiring —
+# Docker↔Podman parity from one device syntax; docker-compose.kuroshio.podman-override.yml
+# does NOT need a separate device block, only the read_only relaxation CDI hooks require).
+#
+# Captain finding #3 (Red Council 2026-07-29, MEDIUM): previously both kuroshio-classifier and
+# kuroshio-chat shared the SAME YSG_GPU_CDI env var, both defaulting to nvidia.com/gpu=all — on
+# a single-GPU host harmless, but on any multi-GPU host this grants EVERY kuroshio container
+# CDI access to EVERY physical GPU, widening the blast radius for the one component this
+# design explicitly treats as hostile (kuroshio-chat runs untrusted, byte-authentic-but-
+# behaviourally-poisoned models). Fixed: independent per-service env vars, each defaulting
+# to GPU index 0 (still correct/harmless on the common single-GPU host) rather than `all`.
+# Multi-GPU hosts MUST override both vars independently to pin distinct indices/UUIDs, e.g.
+# YSG_KUROSHIO_GPU_CDI_CLASSIFIER=nvidia.com/gpu=0 YSG_KUROSHIO_GPU_CDI_CHAT=nvidia.com/gpu=1.
+# install.sh-side GPU-count/index detection to set these automatically is deferred (5.0-side
+# cutover work, out of scope for this infer/deploy-only dispatch) — documented, not silent.
+services:
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_CUDA:-yashigani/kuroshio-cuda:local}
+    devices:
+      - "${YSG_KUROSHIO_GPU_CDI_CLASSIFIER:-nvidia.com/gpu=0}"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_KUROSHIO_BACKEND: cuda
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CLASSIFIER_N_GPU_LAYERS:-999}
+
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_CUDA:-yashigani/kuroshio-cuda:local}
+    devices:
+      - "${YSG_KUROSHIO_GPU_CDI_CHAT:-nvidia.com/gpu=0}"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_KUROSHIO_BACKEND: cuda
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CHAT_N_GPU_LAYERS:-999}
+      # MoE expert-offload passthrough (platform doc §11.2 differentiator) — empty by
+      # default; operator sets e.g. YSG_KUROSHIO_OVERRIDE_TENSOR='\.ffn_.*_exps\.weight=CPU'
+      # for VRAM-limited hosts running a MoE model.
+      YSG_KUROSHIO_OVERRIDE_TENSOR: ${YSG_KUROSHIO_OVERRIDE_TENSOR:-}

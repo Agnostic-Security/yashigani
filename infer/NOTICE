@@ -1,0 +1,59 @@
+Yashigani Inference Engine — Control Plane
+Copyright 2026 Agnostic Security Ltd
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Boundary discipline (design doc `inference-engine-council-review-20260714.md`
+§1b, `inference-engine-design-20260714.md` §4/§9): this package is our own
+original control-plane IP (source-adapter layer, content-addressed blob store,
+GGUF header parser, supervisor, ollama-API shim, HTTP app). It is licensed
+Apache-2.0 by Agnostic Security Ltd. It does NOT vendor or embed llama.cpp
+source. At runtime it supervises a separately-distributed `llama-server`
+binary/process (invoked out-of-process via the injectable ProcessRunner
+interface) and communicates with it over plain HTTP/loopback.
+
+------------------------------------------------------------------------------
+Third-party notices — llama.cpp (referenced runtime dependency, NOT vendored)
+------------------------------------------------------------------------------
+
+llama.cpp
+https://github.com/ggml-org/llama.cpp
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml / llama.cpp authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Note: the exact llama.cpp release tag pinned for build/distribution and the
+recorded build flags + sha256 manifest are tracked at packaging time (design
+doc §4/§14 open decision — "llama.cpp tag to pin at build start"). Any build
+pipeline that packages the `llama-server` binary alongside this control plane
+MUST ship this MIT notice next to it, per MIT's redistribution/NOTICE duty.
+
+------------------------------------------------------------------------------
+Trademark disclaimer
+------------------------------------------------------------------------------
+"Ollama" and "LM Studio" are trademarks of their respective owners. This
+project provides API-compatibility shims and local-store import adapters that
+reference these names descriptively (nominative use) for interoperability.
+Agnostic Security Ltd is not affiliated with, sponsored by, or endorsed by
+Ollama Inc., Element Labs Inc. (LM Studio), Meta Platforms Inc., or Hugging
+Face Inc.

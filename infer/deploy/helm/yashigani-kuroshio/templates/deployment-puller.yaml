@@ -1,0 +1,92 @@
+{{- /*
+Captain finding #4 write-path isolation: the ONLY workload with blob-store WRITE access and
+a wired pull_resolver. Built from Dockerfile.kuroshio-puller — NO llama-server binary at all.
+Caddyfile.kuroshio-front routes /kuroshio/pull to this Service exclusively; it must never receive
+/kuroshio/chat|generate|embeddings traffic (enforced at the Caddy routing layer, not here).
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-puller
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-puller
+    yashigani.kuroshio.managed: "true"
+spec:
+  replicas: {{ .Values.puller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-puller
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-kuroshio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kuroshio-puller
+        yashigani.kuroshio.managed: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1002
+        runAsGroup: 1002
+        fsGroup: 1002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kuroshio-puller
+          image: "{{ .Values.images.puller.repository }}:{{ .Values.images.puller.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: YSG_KUROSHIO_ROLE
+              value: "puller"
+            - name: YSG_KUROSHIO_BLOB_STORE_ROOT
+              value: "/data/model-store"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.puller.resources | nindent 12 }}
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/model-store
+              readOnly: false
+            - name: scratch
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: {{ include "yashigani-kuroshio.fullname" . }}-blobs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-puller
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-puller
+spec:
+  selector:
+    {{- include "yashigani-kuroshio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-puller
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http

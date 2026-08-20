@@ -1,0 +1,73 @@
+{{- /*
+C1 first-parse jail (Red-Council C1 / Captain finding #1's sibling) — K8s side.
+This is a TEMPLATE Job manifest: the real invocation is one Job PER untrusted model's first
+parse, created dynamically by whatever component gains the ContainerOrchestrationHook
+implementation (not built in this dispatch — Python control-plane work). This static
+rendering exists so:
+  (a) `helm template`/`helm lint` can verify the shape (security context, ephemeral TTL,
+      zero network) offline, and
+  (b) the exact manifest shape a dynamic creator should reuse is committed and reviewed,
+      not improvised ad hoc at runtime.
+
+ttlSecondsAfterFinished guarantees teardown by the controller — "process exits so it's
+fine" is explicitly NOT the containment story here (Captain finding #5 analog for the
+parse jail). restartPolicy: Never — a crashing parse is a signal (quarantine, don't retry
+blindly into the same hostile input).
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-first-parse-jail-example
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: first-parse-jail
+  annotations:
+    yashigani.kuroshio.note: >-
+      Template/example manifest — real invocations are created dynamically per untrusted
+      model by the (not-yet-built) orchestration seam. helm.sh/hook not set: this is not a
+      helm-lifecycle hook, it is a shape reference. Consider `helm template --show-only` to
+      inspect without installing.
+spec:
+  ttlSecondsAfterFinished: {{ .Values.firstParseJail.ttlSecondsAfterFinished }}
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-kuroshio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: first-parse-jail
+        # Deliberately NOT yashigani.kuroshio.managed=true — this is not a supervisor-lifecycle
+        # inference pod, it is the standalone parse-jail whose own hardening comes from the
+        # seccomp-strict + network=none spec below, not the supervisor RBAC/admission chain.
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # Zero network namespace — stricter than the serving ring-fence (Su HIGH: "Convert-job
+      # sandbox: one-way write boundary + ZERO network namespace ... stricter than the
+      # engine Caddy-only" — same principle applied to the parse jail).
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]  # unreachable stub — no real resolver configured
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1003
+        runAsGroup: 1003
+        seccompProfile:
+          type: RuntimeDefault  # kuroshio-first-parse-jail.json (stricter, network-free) is the
+                                 # compose-side profile; k8s Localhost provisioning for THIS
+                                 # profile is deferred — see infer/deploy/README.md.
+      containers:
+        - name: first-parse-jail
+          image: "{{ .Values.images.firstParseJail.repository }}:{{ .Values.images.firstParseJail.tag }}"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.firstParseJail.resources | nindent 12 }}
+      # NetworkPolicy default-deny-egress (networkpolicy-kuroshio.yaml) applies to every pod in
+      # the namespace including this one, and grants it NO egress rule at all (it is not
+      # listed as a source in any "allow-*-egress" rule below) — belt-and-suspenders on top
+      # of dnsPolicy: None.

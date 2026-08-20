@@ -1,0 +1,17 @@
+# Backend-selection overlay — CPU (universal fallback; also the Mac-in-VM / M-k8s dev-cell
+# image). No GPU device grant at all. See docker-compose.kuroshio.cuda.yml header for the
+# Iris F4/F5 image-SWAP rationale.
+services:
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_CPU:-yashigani/kuroshio-cpu:local}
+    environment:
+      YSG_KUROSHIO_BACKEND: cpu
+      YSG_KUROSHIO_EXPECT_GPU: "false"
+      YSG_KUROSHIO_N_GPU_LAYERS: "0"
+
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_CPU:-yashigani/kuroshio-cpu:local}
+    environment:
+      YSG_KUROSHIO_BACKEND: cpu
+      YSG_KUROSHIO_EXPECT_GPU: "false"
+      YSG_KUROSHIO_N_GPU_LAYERS: "0"

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: yashigani-kuroshio
+description: >-
+  Yashigani 6.0 first-party commodity inference engine (llama.cpp/GGUF control plane) —
+  pre-integration deploy chart. Standalone so it can be helm-lint/template verified
+  independently of the main helm/yashigani chart while the Python foundation is still
+  a feature-branch spike (feat/6.0-inference-engine). Merges into helm/yashigani at
+  convergence — see infer/deploy/README.md.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - inference
+  - llama.cpp
+  - gguf
+  - gpu
+maintainers:
+  - name: Yashigani Platform Team
+home: https://github.com/agnosticsec-com/yashigani-mustui
