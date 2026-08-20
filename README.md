@@ -99,14 +99,16 @@ Sensitive data — PII, PCI cardholder data, intellectual property, PHI — is s
 
 1. **Credential Harvesting Suppression (CHS)** — Detects and removes credential-shaped patterns (API keys, passwords, SSH keys, tokens, secrets) from prompts and responses before any AI inspection backend or cloud model sees them. Every removal is audited with identity + timestamp + target model context.
 
-2. **PII Detection & Enforcement (v4.1.2+)** — The dedicated PII module detects 10 entity types: SSN, credit card (with Luhn validation), email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth. Runs on both request and response paths — bidirectional, on all traffic, by default. Offers three distinct enforcement strategies:
+2. **PII Detection & Enforcement (v4.1.2+)** — The dedicated PII module detects 10 entity types: SSN, credit card (with Luhn validation), email, phone, IBAN, passport, NHS number, driver's licence, IP address, date of birth. Runs on both request and response paths — bidirectional, on all traffic, by default. Offers five distinct enforcement modes:
    - **LOG mode:** Detect and audit; data passes through unchanged. Compliance teams see what PII was present, when, and from which identity.
    - **REDACT mode:** Replace identified PII with `[REDACTED:TYPE]` before forwarding to cloud models or external systems. Original data is discarded. Irreversible — useful when compliance requires data anonymization.
    - **PSEUDONYMIZE mode (v4.1.2+):** Replace PII with reversible tokens (gateway-bound, identity-bound, cryptographically keyed). The gateway maintains the reversibility mapping and can restore original values when needed for authorized downstream systems. Anti-known-text attack protection ensures dictionary attacks cannot crack pseudonym mappings. Useful for regulated workflows that require both anonymity (external systems see tokens) and audit traceability (internal systems can correlate back to source identity).
+   - **ALLOW mode:** Explicitly permit PII in requests destined for authorized cloud models. Requires explicit policy configuration; default is deny. Used when the PII-containing request has compliance clearance.
+   - **DENY mode:** Block requests containing PII before reaching cloud models. Fail-closed enforcement. The request is rejected with audit trail recording the PII type detected and blocking reason.
 
-   Cloud-model bypass: when PII is detected in a prompt classified as cloud-destined, the system forces local routing by policy override — this is independent of the Optimization Engine's sensitivity decision. Critical for sectors where known PII cannot touch external APIs regardless of classification.
+   Cloud-model bypass: when PII is detected in a prompt classified as cloud-destined, the system forces local routing by policy override — this is independent of the Optimization Engine's sensitivity decision. Critical for sectors where known PII cannot touch external APIs regardless of classification. ALLOW mode can override this when explicitly authorized.
 
-   Admin opt-out is available only when explicitly configured (default: deny). Every configuration change is audited.
+   Admin configuration: all five modes are policy-configurable. Default is DENY for maximum protection. Every configuration change is audited.
 
 ### 2.5 Routing Opacity
 
