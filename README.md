@@ -236,6 +236,22 @@ v4.1.2 is the first public release of the Yashigani 4.x platform stack. This rel
 - Complete version consistency (code + documentation + installer)
 - Pre-release gates: installation validation, documentation audit, artifact integrity
 
+### v4.0.0 — Native UI Release, Complete UI Control (major milestone)
+
+v4.0.0 introduced the native Yashigani UI, replacing the Open WebUI dependency. This marked the transition from infrastructure management to product control.
+
+**Core Features:**
+- **Native UI** — First-class Yashigani chat interface at `/chat/*`. Built-in, owned and controlled by Agnostic Security. Rules defined, changes owned, interface fully under our control.
+- **Visual Agent Builder** — No-code workflow composition through native UI
+- **Natural-Language Agent Generator** — Create agents by describing intent
+- **Policy Verification on Document Ingestion** — Documents checked against OPA policies before ingestion into agent context
+- **Full Gateway Integration** — Native UI routes all LLM calls through gateway inspection pipeline
+- **Bundled Langflow & Letta** — Agent orchestration frameworks available via compose profiles
+
+**Strategic Milestone:** v4.0 represented the inflection point where Yashigani owned the entire user-facing layer, eliminating dependency on upstream UI projects and enabling rapid policy enforcement and security posture changes without waiting for external releases.
+
+---
+
 ### v3.1.2 — PII Enforcement, RBAC Hardening, Podman Deadlock Fix, Org Migration (prior release)
 
 v3.1.2 is a security and reliability hardening release on top of v3.1.0. It adds PII enforcement at both ingress and egress, fixes RBAC group membership handling, corrects OpenWebUI identity verification, adds step-up to RBAC mutations, resolves Podman deadlock conditions, and migrates to the new GitHub org. Gate: Ava e2e + Laura 0 Crit / 0 High.
@@ -251,6 +267,21 @@ v3.1.2 is a security and reliability hardening release on top of v3.1.0. It adds
 **Podman Init-Container Deadlock** — Resolved race condition in PKI issuer causing clean installs to hang.
 
 **Org Migration** — All references updated from `agnosticsec-com` to `Agnostic-Security`.
+
+### v3.0.0 — Document-Content Data Protection, Agent Orchestration, MCP Hardening (GA milestone)
+
+v3.0.0 was the first public 3.x GA release, consolidating foundational agent orchestration, document-level policy enforcement, and MCP security hardening.
+
+**Core Features:**
+- **Document-Content Data Protection (doc-OPA)** — Policy-driven enforcement on document content: pass / redact (delete) / pseudonymise (reversible) / block. Self-describing verdict actions for compliance workflows.
+- **Agent Orchestration with Every-Hop OPA** — Every inter-entity hop (agent↔agent, agent↔LLM, agent↔human, agent↔API, agent↔MCP) adjudicated at ingress AND egress. Gateway acts as sole mediator; no in-process shortcuts.
+- **MCP Hardening** — Identity-JWT broker, import-binding verification, egress OPA enforcement, tool-poisoning / shadowing / confused-deputy mitigations. Demonstrated via cloud-9 MCP-injection demo with ResponseInspection egress block.
+- **OpenWebUI at ROOT** — OpenWebUI served at `/` (not `/app/webui`) behind verify-user + owui-users access gate. Default user role enforced. RAG embeddings via `nomic-embed-text`.
+- **Exhaustive QA Gate** — 83/83 Ava assertions (admin UI, user UI, API/WebUI parity, 4 demo scenarios, 11 security/adversarial tests). Clean-from-scratch install verified green.
+
+**Release Discipline:** SSH-signed tag. Full pre-release security gate (Laura SAST+DAST+pentest: RELEASE-CLEAR).
+
+---
 
 ### v2.23.4 — Cleanup-System Architectural Close, pgbouncer mTLS Sidecar, and KMS Posture Reframe (prior release)
 
