@@ -237,14 +237,6 @@ This aligns with NIST SP 800-252 Post-Quantum Cryptography Migration roadmap. We
 
 **Zero-Trust on Agent Self-Reports:** Agent behavior is verified by the gateway, never trusted at face value. Every LLM response is re-inspected for PII/credentials before returning to the user. Agents cannot bypass inspection even if they are compromised.
 
-### 6.4 Transparency & Accountability
-
-Yashigani publishes per-control compliance evidence under `docs/compliance/`. The compliance suite covers OWASP ASVS v5 (all chapters), OWASP API Security, OWASP Agentic AI / LLM Top 10, plus framework-specific reports. Per-control verdicts are PASS / PARTIAL / FAIL / N/A with file:line evidence.
-
-Open exceptions (PARTIAL/FAIL) are tracked in the risk register (5×5 quantitative matrix). Pre-release gate: all PARTIAL/FAIL items must have an accepted-exception entry with documented compensating controls before any tag is created.
-
-For detailed control mappings and evidence, see [Compliance Reports](docs/compliance/README.md).
-
 ---
 
 ---
