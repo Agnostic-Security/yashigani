@@ -2736,6 +2736,46 @@ check_installer_preflight() {
     printf "       Override the threshold with YASHIGANI_OLLAMA_MIN_DISK_GB.\n\n"
   fi
 
+  # --- Check 1e: macOS Ollama API availability preflight ----------------------
+  # On macOS, Yashigani 5.0+ delegates inference to the host's pre-installed Ollama
+  # (no containerized inference engine). The installer must verify that Ollama is
+  # running and reachable on the configured port (default: localhost:11434) before
+  # proceeding. If Ollama is not found, prompt the operator to start it or provide
+  # the custom port via --ollama-port flag.
+  # Linux deployments skip this check (they use containerized KUROSHIO instead).
+  if [[ "${YSG_OS:-}" == "macos" ]] && [[ "${MODE:-}" == "compose" || "${YSG_RUNTIME:-}" == "docker" ]]; then
+    # Determine the Ollama port: explicit --ollama-port flag, env var, or default 11434.
+    local _ollama_port="${YASHIGANI_HOST_OLLAMA_PORT:-11434}"
+    local _ollama_check_url="http://127.0.0.1:${_ollama_port}/api/tags"
+
+    # Attempt to reach Ollama API (3-second timeout, silent on error).
+    if ! curl -s --connect-timeout 3 "$_ollama_check_url" >/dev/null 2>&1; then
+      printf "\n"
+      printf "${C_YELLOW}[WARN] Ollama is NOT running on 127.0.0.1:${_ollama_port}${C_RESET}\n"
+      printf "\n"
+      printf "Yashigani 5.0+ on macOS requires Ollama (host-native inference engine).\n"
+      printf "\n"
+      printf "To fix this, you can:\n"
+      printf "\n"
+      printf "  1. Start Ollama on the default port (11434):\n"
+      printf "       OLLAMA_HOST=127.0.0.1:11434 ollama serve\n"
+      printf "\n"
+      printf "  2. If Ollama is already running on a different port, provide it:\n"
+      printf "       ./install.sh --ollama-port <port>\n"
+      printf "       OR:\n"
+      printf "       YASHIGANI_HOST_OLLAMA_PORT=<port> ./install.sh\n"
+      printf "\n"
+      printf "  3. Verify Ollama is reachable (should return model list):\n"
+      printf "       curl http://127.0.0.1:${_ollama_port}/api/tags\n"
+      printf "\n"
+      printf "Continuing without Ollama will fail at runtime. Press Ctrl+C to abort.\n"
+      printf "Resuming in 5 seconds...\n\n"
+      sleep 5
+    else
+      log_info "Ollama API available on 127.0.0.1:${_ollama_port}"
+    fi
+  fi
+
   # --- Check 1c: rootless Podman linger pre-flight ---------------------------
   # loginctl linger must be enabled for the install user BEFORE install runs;
   # without it the user's systemd instance is killed on logout and the

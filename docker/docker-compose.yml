@@ -433,6 +433,10 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6380"                     # TLS-only port
       REDIS_USE_TLS: "true"
+      # MCP broker nonce store: gateway requires Redis connectivity for RedisNonceStore
+      # (prevents token-reuse attacks in non-dev deployments). The connection uses TLS
+      # with client certs (gateway_client.crt/key) and connects to db/4 (nonce namespace).
+      REDIS_URL: "rediss://:${REDIS_PASSWORD_URLENC}@redis:6380/4?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/ca_root.crt&ssl_certfile=/run/secrets/gateway_client.crt&ssl_keyfile=/run/secrets/gateway_client.key"
       YASHIGANI_SECRETS_DIR: /run/secrets
       YASHIGANI_AGENT_ROUTING_ENABLED: "true"
       YASHIGANI_AGENT_PATH_PREFIX: "/agents"
