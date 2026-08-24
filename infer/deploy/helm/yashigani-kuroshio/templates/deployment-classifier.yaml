@@ -1,0 +1,179 @@
+{{- /*
+Captain finding #4 (MUST, not "ideally"): the mandatory sensitivity classifier runs in its
+OWN Deployment/pod — never co-scheduled with chat models. Own cgroup (container boundary),
+own PID namespace (k8s default, no hostPID), own seccomp instance. Blob store mounted
+READ-ONLY without exception, including this pod.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-classifier
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-classifier
+    yashigani.kuroshio.managed: "true"
+spec:
+  replicas: {{ .Values.classifier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "yashigani-kuroshio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kuroshio-classifier
+  template:
+    metadata:
+      labels:
+        {{- include "yashigani-kuroshio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kuroshio-classifier
+        yashigani.kuroshio.managed: "true"
+    spec:
+      {{- if .Values.gpu.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.gpu.nodeSelector | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1002
+        runAsGroup: 1002
+        fsGroup: 1002
+        seccompProfile:
+          {{- if .Values.seccomp.installViaDaemonSet }}
+          type: Localhost
+          localhostProfile: profiles/kuroshio-llama-server.json
+          {{- else }}
+          type: RuntimeDefault
+          {{- end }}
+      # Tom's integration-seam fix: `BlobStore.__init__` creates `<root>/blobs/` AND
+      # `<root>/meta/` under YSG_KUROSHIO_BLOB_STORE_ROOT. This container mounts the PVC
+      # READ-ONLY (finding #4 — no exception, including the classifier) — on a brand-new,
+      # empty PVC that mkdir would fail closed (EROFS) before any model has ever been
+      # pulled. This initContainer mounts the SAME PVC read-write (fsGroup 1002 makes it
+      # group-writable to the same non-root UID the main container runs as) and pre-creates
+      # both subdirectories once, so the main container's own BlobStore(root) construction
+      # (mkdir(..., exist_ok=True)) is a no-op against already-existing directories.
+      initContainers:
+        - name: init-model-store-dirs
+          image: busybox:1.36@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME
+          command: ["sh", "-c", "mkdir -p /data/model-store/blobs /data/model-store/meta"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1002
+            runAsGroup: 1002
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/model-store
+              readOnly: false
+      containers:
+        - name: kuroshio-classifier
+          image: {{ include "yashigani-kuroshio.image" . }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: YSG_KUROSHIO_ROLE
+              value: "classifier"
+            - name: YSG_KUROSHIO_BLOB_STORE_ROOT
+              value: "/data/model-store"
+            - name: YSG_KUROSHIO_KEEP_ALIVE_PIN
+              value: {{ .Values.classifier.keepAlivePin | quote }}
+            - name: YSG_KUROSHIO_MAX_CTX
+              value: {{ .Values.classifier.maxCtx | quote }}
+            - name: YSG_KUROSHIO_MAX_CONCURRENCY
+              value: {{ .Values.classifier.maxConcurrency | quote }}
+            - name: YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST
+              value: {{ .Values.classifier.maxTokensPerRequest | quote }}
+            - name: YSG_KUROSHIO_MAX_RESIDENT_MODELS
+              value: {{ .Values.classifier.maxResidentModels | quote }}
+            - name: YSG_KUROSHIO_EXPECT_GPU
+              # Captain finding #7 (Red Council 2026-07-29): backend: cpu MUST cascade
+              # expectGpu: false regardless of classifier.expectGpu's own default -- mirrors
+              # docker-compose.kuroshio.cpu.yml's YSG_KUROSHIO_EXPECT_GPU: "false" override, which
+              # already gets this right. Without this cascade, a stock `helm install` (no
+              # --set backend=..., no GPU) ships classifier.expectGpu's top-level default
+              # (true) into the env-var contract Tom's entrypoint/gpu-engaged healthcheck
+              # consume, hard-failing /healthz out of the box on the CPU backend.
+              value: {{ if eq .Values.backend "cpu" }}"false"{{ else }}{{ .Values.classifier.expectGpu | quote }}{{ end }}
+            - name: YSG_KUROSHIO_EXPECTED_VRAM_MB
+              value: {{ .Values.classifier.expectedVramMb | quote }}
+            {{- if .Values.gpu.resourceName }}
+            - name: YSG_KUROSHIO_N_GPU_LAYERS
+              value: "999"
+            {{- else }}
+            - name: YSG_KUROSHIO_N_GPU_LAYERS
+              value: "0"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.classifier.resources | nindent 12 }}
+            {{- if .Values.gpu.resourceName }}
+            limits:
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count }}
+            {{- end }}
+          volumeMounts:
+            - name: blobs
+              mountPath: /data/model-store
+              readOnly: true
+            - name: scratch
+              mountPath: /data/scratch
+            {{- if and (eq .Values.backend "vulkan") .Values.gpu.vulkanIcdHostPath }}
+            # H6 (Captain finding #1, Red Council 2026-07-29): Vulkan ICD host-mount — see
+            # values.yaml gpu.vulkanIcdHostPath comment for why this is required alongside
+            # gpu.resourceName for the Vulkan/Intel backend to actually engage a GPU.
+            - name: vulkan-icd
+              mountPath: /usr/share/vulkan/icd.d
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+      volumes:
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: {{ include "yashigani-kuroshio.fullname" . }}-blobs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 2Gi
+        {{- if and (eq .Values.backend "vulkan") .Values.gpu.vulkanIcdHostPath }}
+        - name: vulkan-icd
+          hostPath:
+            path: {{ .Values.gpu.vulkanIcdHostPath }}
+            type: Directory
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-classifier
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-classifier
+spec:
+  selector:
+    {{- include "yashigani-kuroshio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kuroshio-classifier
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http

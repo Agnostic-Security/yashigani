@@ -1,0 +1,73 @@
+# Podman init-dependency reset overlay — FINDING-1 fix (3.1.1)
+#
+# PURPOSE: podman-compose 1.6.0 passes every depends_on entry to Podman's
+# native container dependency graph via --requires flags at container create
+# time. Podman 4.9.3 throws a fatal error when starting a container whose
+# --requires chain includes an ALREADY-EXITED init container:
+#
+#   Error: unable to start container "<id>": generating dependency graph for
+#   container <id>: container <init-id> depends on container <svc-id> not
+#   found in input list: no such container
+#
+# Root cause: the init container (e.g. agent-db-init) exited after its
+# one-shot job completed. When podman-compose later calls `podman start`
+# for letta, Podman traverses letta's --requires graph, finds agent-db-init,
+# then tries to resolve agent-db-init's own --requires (postgres). But
+# postgres is already running (not in the current input list), so Podman
+# errors. Docker handles this gracefully; Podman 4.9.3 does not.
+#
+# FIX STRATEGY (two-file, podman-compose 1.6.0 compatible):
+#   This file uses !reset to REMOVE the depends_on from the affected services.
+#   The companion docker-compose.podman-override.yml then RE-ADDS the correct
+#   depends_on WITHOUT the init-container entries. The two-file split is
+#   required because podman-compose 1.6.0 normalises each file BEFORE merge,
+#   and !reset works correctly only at the depends_on key level (not at the
+#   individual entry level where it breaks normalisation).
+#
+#   Load order in install.sh Podman path (after base + wazuh overlays):
+#     -f docker-compose.podman-init-deps.yml   ← this file (reset)
+#     -f docker-compose.podman-override.yml    ← companion (re-add)
+#
+# FINDING-5 partial: also resets promtail's Docker-specific volumes and
+# disabled-profile so docker-compose.podman-override.yml can re-wire promtail
+# for journald collection. See that file for the re-add and promtail-podman.yml
+# for the journald scrape config.
+#
+# Docker path: docker-compose.yml is UNTOUCHED. This file is NEVER loaded on
+# the Docker runtime.
+
+services:
+
+  # ── FINDING-1: init-container dep removal ──────────────────────────────
+  letta:
+    # Remove depends_on entirely so podman-override.yml can re-add it cleanly
+    # without the agent-db-init: service_completed_successfully entry.
+    # The !reset tag is handled by rec_merge_one (adds key to remove set);
+    # depends_on normalisation returns early when it sees ResetTag so no
+    # AttributeError from v.setdefault on a non-dict.
+    depends_on: !reset
+
+  letta-pgbouncer:
+    # Same reason as letta — remove agent-db-init dep from --requires chain.
+    depends_on: !reset
+
+  wazuh-manager:
+    # Remove wazuh-security-init: service_completed_successfully dep.
+    # This entry comes from docker-compose.wazuh.yml; the reset here clears it
+    # before podman-override.yml re-adds only wazuh-indexer: service_healthy.
+    depends_on: !reset
+
+  # ── FINDING-5: promtail Docker-specific mounts reset ───────────────────
+  promtail:
+    # Remove the promtail-disabled profile so promtail actually starts on the
+    # Podman path (docker-compose.podman-override.yml previously set
+    # profiles: [promtail-disabled] which kept it inactive).
+    profiles: !reset
+    # Remove Docker-specific volume mounts:
+    #   /var/lib/docker/containers  — does not exist on rootless Podman
+    #   /var/run/docker.sock        — Podman socket is at a different path
+    #   ../config/promtail/promtail.yml — replaced by promtail-podman.yml
+    # These are re-added (correctly) in docker-compose.podman-override.yml.
+    volumes: !reset
+    # Drop the docker_sd_configs command path — promtail-podman.yml uses journald.
+    command: !reset

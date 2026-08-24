@@ -1,7 +1,7 @@
 # Last updated: 2026-05-02T00:00:00+01:00 (RETRO-R4-2: expose connect_with_retry_sync)
-from yashigani.db.postgres import create_pool, close_pool, tenant_transaction, get_pool, connect_with_retry_sync
+from yashigani.db.postgres import create_pool, close_pool, tenant_transaction, get_pool, connect_with_retry_sync, PGP_SYM_OPTS
 
-__all__ = ["create_pool", "close_pool", "tenant_transaction", "get_pool", "run_migrations", "connect_with_retry_sync"]
+__all__ = ["create_pool", "close_pool", "tenant_transaction", "get_pool", "run_migrations", "connect_with_retry_sync", "PGP_SYM_OPTS"]
 
 
 # Stable 64-bit advisory-lock key for Yashigani schema/bootstrap operations.

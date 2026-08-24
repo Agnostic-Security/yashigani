@@ -1,0 +1,28 @@
+{{- /*
+Single-source Caddyfile.kuroshio-front, rendered byte-identically via .Files.Get (Iris F5
+correction — NOT the ollama-front hand-sync antipattern; matches the proven
+Caddyfile.openclaw-egress .Files.Get pattern in helm/yashigani/templates/configmaps.yaml).
+The mirror at files/Caddyfile.kuroshio-front is maintained ONLY by
+scripts/sync-kuroshio-deploy-artifacts-to-helm.sh — never hand-edited.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-caddy-front
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+data:
+  Caddyfile.kuroshio-front: |
+{{ .Files.Get "files/Caddyfile.kuroshio-front" | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-seccomp-llama-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+data:
+  kuroshio-llama-server.json: |
+{{ .Files.Get "files/seccomp/kuroshio-llama-server.json" | indent 4 }}

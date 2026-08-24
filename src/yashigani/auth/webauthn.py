@@ -16,6 +16,19 @@ from typing import Optional
 def _import_webauthn():
     try:
         import webauthn
+        # py-webauthn >= 2.x moved structs to webauthn.helpers.structs and no
+        # longer re-exports them at the top-level module.  Patch them back so
+        # call-sites that do ``webauthn.AuthenticatorSelectionCriteria(...)``
+        # keep working regardless of installed version.
+        if not hasattr(webauthn, "AuthenticatorSelectionCriteria"):
+            from webauthn.helpers.structs import (
+                AuthenticatorSelectionCriteria,
+                UserVerificationRequirement,
+                AttestationConveyancePreference,
+            )
+            webauthn.AuthenticatorSelectionCriteria = AuthenticatorSelectionCriteria
+            webauthn.UserVerificationRequirement = UserVerificationRequirement
+            webauthn.AttestationConveyancePreference = AttestationConveyancePreference
         return webauthn
     except ImportError as exc:
         raise ImportError(

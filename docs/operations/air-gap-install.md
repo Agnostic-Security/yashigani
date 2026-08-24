@@ -53,7 +53,7 @@ is listed in this manifest at matching `name:tag@sha256:digest`.
 Clone the Yashigani repository and checkout v2.23.3:
 
 ```bash
-git clone https://github.com/agnosticsec-com/yashigani.git
+git clone https://github.com/Agnostic-Security/yashigani.git
 cd yashigani
 git checkout v2.23.3
 ```

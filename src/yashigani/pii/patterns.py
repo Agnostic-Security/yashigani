@@ -29,8 +29,11 @@ class PatternSet(NamedTuple):
 # ---------------------------------------------------------------------------
 
 SSN_PATTERNS: list[re.Pattern[str]] = [
-    # Formatted:  123-45-6789
+    # Formatted with dashes:  123-45-6789
     re.compile(r"\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"),
+    # Formatted with spaces: 123 45 6789 (LAURA-31DR-002 — spaced-digit variant
+    # not previously covered; must be detected before reaching OPA).
+    re.compile(r"\b(?!000|666|9\d{2})\d{3}\s(?!00)\d{2}\s(?!0000)\d{4}\b"),
     # Unformatted 9-digit block — only flag when surrounded by non-digits
     # to avoid matching credit card sub-sequences.
     re.compile(r"(?<!\d)(?!000|666|9\d{2})\d{3}(?!00)\d{2}(?!0000)\d{4}(?!\d)"),

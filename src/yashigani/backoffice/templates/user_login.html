@@ -44,10 +44,26 @@
             <button type="submit" id="pw-btn">Change Password</button>
         </form>
 
+        <!-- WebAuthn / FIDO2 hardware key option
+             Default hidden; webauthn_user_login.js reveals it only when the
+             browser confirms PublicKeyCredential support.
+             Username field is shared with the TOTP form above. -->
+        <div id="webauthn-section" class="hidden">
+            <div class="divider"><span>or</span></div>
+            <button type="button" id="webauthn-login-btn" class="btn-secondary">
+                Sign in with Security Key
+            </button>
+            <p class="hint webauthn-hint">
+                Touch your FIDO2 / YubiKey when prompted.
+                If you have lost all keys, use the password + TOTP form above.
+            </p>
+        </div>
+
         <div class="admin-link"><a href="/admin/login">System administration</a></div>
         <p class="footer">Yashigani v{{ yashigani_version }} &mdash; Agnostic Security</p>
     </div>
 
     <script src="/static/js/user_login.js"></script>
+    <script src="/static/js/webauthn_user_login.js"></script>
 </body>
 </html>

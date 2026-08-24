@@ -1,0 +1,24 @@
+# Backend-selection overlay — Vulkan (Intel/broad-GPU + arm64 GPU fallback). See
+# docker-compose.kuroshio.cuda.yml header for the Iris F4/F5 image-SWAP rationale.
+# The Vulkan ICD (actual GPU driver) is host-mounted — never baked into the image
+# (Dockerfile.kuroshio-vulkan ships only libvulkan1, the loader).
+services:
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_VULKAN:-yashigani/kuroshio-vulkan:local}
+    devices:
+      - /dev/dri
+    volumes:
+      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+    environment:
+      YSG_KUROSHIO_BACKEND: vulkan
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CLASSIFIER_N_GPU_LAYERS:-999}
+
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_VULKAN:-yashigani/kuroshio-vulkan:local}
+    devices:
+      - /dev/dri
+    volumes:
+      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+    environment:
+      YSG_KUROSHIO_BACKEND: vulkan
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CHAT_N_GPU_LAYERS:-999}

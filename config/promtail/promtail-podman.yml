@@ -1,0 +1,96 @@
+# Promtail — Podman rootless path (journald log collection)
+# FINDING-5 fix (3.1.1)
+#
+# Docker path (config/promtail/promtail.yml) uses docker_sd_configs +
+# /var/lib/docker/containers bind-mount, which does NOT work on rootless Podman:
+#   - /var/lib/docker/containers does not exist
+#   - /var/run/docker.sock is at /run/user/<uid>/podman/podman.sock
+#
+# Podman rootless uses the journald log driver (verified: `podman info` reports
+# logDriver=journald). Container stdout/stderr is routed to the system journal
+# (/var/log/journal/<machine-id>/) with structured fields:
+#   CONTAINER_NAME        — container name (e.g. yashigani-local_gateway_1)
+#   CONTAINER_ID_FULL     — full container ID
+#   CONTAINER_TAG         — image tag
+#   PRIORITY              — log priority (6=info, 3=err, …)
+#
+# Required bind-mounts (set in docker-compose.podman-override.yml):
+#   /var/log/journal → /var/log/journal (persistent system journal; read-only)
+#   /etc/machine-id  → /etc/machine-id  (journald client machine identification)
+#
+# Access: /var/log/journal/<machine-id>/ has ACL group:adm:r-x. On this host
+# max (UID 1000) is in the adm group. Rootless Podman maps container root to
+# host UID 1000, so the promtail container can read the journal files.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  # Persist read positions so promtail resumes from last offset on restart.
+  # Matches the named-volume mount in docker-compose.yml (promtail_positions).
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  - url: https://loki:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+    timeout: 10s
+    backoff_config:
+      min_period: 100ms
+      max_period: 10s
+      max_retries: 10
+    # mTLS to Loki (retro #84): Promtail presents its own leaf cert.
+    # Trust anchor: ca_intermediate.crt (Pattern B).
+    tls_config:
+      cert_file: /run/secrets/promtail_client.crt
+      key_file:  /run/secrets/promtail_client.key
+      ca_file:   /run/secrets/ca_intermediate.crt
+
+scrape_configs:
+  - job_name: containers
+    journal:
+      # Read from the mounted system journal. The path is the journal directory;
+      # promtail discovers the machine-ID-named sub-directory automatically.
+      path: /var/log/journal
+      # max_age: how far back to read on first start / position loss.
+      max_age: 12h
+      json: false
+      labels:
+        job: containers
+    relabel_configs:
+      # Map CONTAINER_NAME to the 'container' label (matches Docker path output).
+      - source_labels: ['__journal_CONTAINER_NAME']
+        regex: (.+)
+        target_label: container
+      # Extract compose service name: strip project prefix + instance suffix
+      # e.g. yashigani-local_gateway_1 → gateway
+      - source_labels: ['__journal_CONTAINER_NAME']
+        regex: '[^_]+_([^_]+)_\d+$'
+        target_label: service
+      # Extract compose project name: first token before first underscore
+      - source_labels: ['__journal_CONTAINER_NAME']
+        regex: '([^_]+)_.*'
+        target_label: project
+      # Only keep entries that have a container name (skip non-container journal entries).
+      - source_labels: ['__journal_CONTAINER_NAME']
+        regex: .+
+        action: keep
+    pipeline_stages:
+      # Try to parse structured JSON logs from Python services (gateway, backoffice).
+      # Non-JSON logs pass through unchanged (the stage is fault-tolerant).
+      - json:
+          expressions:
+            level: levelname
+            msg: message
+            logger: name
+            ts: asctime
+      - labels:
+          level:
+          logger:
+      - timestamp:
+          source: ts
+          format: "2006-01-02T15:04:05"
+      - output:
+          source: msg

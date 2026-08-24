@@ -1,0 +1,102 @@
+# Yashigani inference engine — CUDA backend
+# Lean per-backend image (NOT the fat GGML_BACKEND_DL image — platform doc §3, R1 rejected).
+#
+# OFFLINE-AUTHORED (2026-07-22, Captain, feat/6.0-inference-engine). Every FROM digest below
+# is a PLACEHOLDER — resolve with `scripts/resolve-and-pin-digests.sh` on a rig before any
+# live build (Verification Protocol #7: never guess a version). Do not `docker build` this
+# file until the placeholders are replaced with resolved digests + LLAMA_CPP_COMMIT_SHA.
+#
+# Build-flag record: infer/deploy/manifests/llama-cpp-build-manifest.md (source of truth for
+# CMake flags; keep this file's RUN line in sync with that doc, not the other way round).
+
+# ── Stage 1: llama.cpp CUDA build ───────────────────────────────────────────
+# Base: nvidia/cuda:<CUDA_VER>-devel-ubuntu24.04
+# RESOLVE-DIGEST: run scripts/resolve-and-pin-digests.sh to fill this in.
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME AS builder
+
+ARG LLAMA_CPP_TAG=PIN-ME
+ARG LLAMA_CPP_COMMIT_SHA=PIN-ME
+ARG CUDA_ARCHITECTURES="75;80;86;89;90"
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+RUN apt-get update \
+    && apt-get -y --no-install-recommends install \
+        git ca-certificates cmake build-essential ninja-build \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+# Pinned-tag, verified-commit checkout (no `master`/`HEAD` builds — supply-chain finding #7).
+RUN git clone --depth 1 --branch "${LLAMA_CPP_TAG}" https://github.com/ggml-org/llama.cpp.git src \
+    && test "$(git -C src rev-parse HEAD)" = "${LLAMA_CPP_COMMIT_SHA}" || \
+        { echo "FATAL: checked-out commit does not match pinned LLAMA_CPP_COMMIT_SHA — refusing to build" >&2; exit 1; }
+
+WORKDIR /build/src
+RUN cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+        -DLLAMA_CURL=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+    && cmake --build build --config Release -j"$(nproc)" --target llama-server
+
+# ── Stage 2: kuroshio wheel build (pure Python, no torch — pyproject.toml) ──
+FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS wheel-builder
+WORKDIR /wheel
+COPY infer/pyproject.toml ./
+COPY infer/src/ ./src/
+RUN pip install --no-cache-dir --upgrade "pip==26.0.1" build \
+    && python -m build --wheel --outdir /dist
+
+# ── Stage 3: runtime (CUDA runtime-only — no devel toolchain, no compiler) ──
+# RESOLVE-DIGEST: run scripts/resolve-and-pin-digests.sh to fill this in.
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME AS runtime
+
+RUN groupadd --gid 1002 yashigani-kuroshio \
+    && useradd --uid 1002 --gid 1002 --no-create-home --shell /bin/false yashigani-kuroshio
+
+RUN apt-get update \
+    && apt-get -y --no-install-recommends install python3.12-minimal libcurl4 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /build/src/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /build/src/build/bin/*.so /usr/local/lib/
+RUN ldconfig
+COPY --from=wheel-builder /dist/*.whl /tmp/
+RUN pip3 install --no-cache-dir --break-system-packages /tmp/*.whl \
+    && rm -f /tmp/*.whl
+
+COPY infer/deploy/docker/entrypoint/kuroshio-entrypoint.sh /usr/local/bin/kuroshio-entrypoint.sh
+# nvidia-smi is NOT baked into this image — it is injected by the CDI device grant at
+# runtime (same mechanism as docker/docker-compose.gpu.yml's `nvidia.com/gpu` device ref;
+# the CDI hook bind-mounts the host driver's nvidia-smi binary + libs into the container).
+# healthcheck-gpu-engaged.sh (finding #6) expects it to be resolvable on PATH at probe time.
+COPY infer/deploy/gpu/healthcheck-gpu-engaged.sh /usr/local/bin/healthcheck-gpu-engaged.sh
+RUN chmod 0555 /usr/local/bin/kuroshio-entrypoint.sh /usr/local/bin/llama-server /usr/local/bin/healthcheck-gpu-engaged.sh \
+    && mkdir -p /data/model-store /data/scratch \
+    && chown -R yashigani-kuroshio:yashigani-kuroshio /data
+
+USER yashigani-kuroshio
+EXPOSE 8000
+ENV YSG_KUROSHIO_BACKEND=cuda \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1
+
+# GPU-engaged healthcheck: live re-measure (Captain finding #6 / RED-COUNCIL) — never a
+# cached load-time value. Cross-checks against the per-model offload policy.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD /usr/local/bin/kuroshio-entrypoint.sh --healthcheck || exit 1
+
+ARG GIT_SHA=dev
+LABEL org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
+      yashigani.kuroshio.backend="cuda"
+
+ENTRYPOINT ["/usr/local/bin/kuroshio-entrypoint.sh"]

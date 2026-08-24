@@ -125,15 +125,17 @@ approval basis, and its status under FIPS_MODE=1.
 | SHA-256 | Install-time integrity checks | FIPS 180-4 | APPROVED — `openssl dgst -sha256` via CMVP #4985 |
 | PBKDF2-HMAC-SHA384 | KDF for backup key wrap#2 | SP 800-132 | APPROVED — via Python `cryptography` + CMVP #4985 |
 | ECDH P-256 | TLS key exchange (mTLS, leaf certs) | FIPS 186-5; SP 800-56A rev 3 | APPROVED — via CMVP #4985 |
-| SHA-256 TOTP | MFA (HMAC-SHA256 per RFC 6238) | FIPS 180-4 / FIPS 198-1 | APPROVED — SHA-256 variant; see note below |
+| SHA-512/SHA-256 TOTP (role-tiered) | MFA (HMAC-SHA512 admin / HMAC-SHA256 user, per RFC 6238) | FIPS 180-4 / FIPS 198-1 | APPROVED — both SHA-256 and SHA-512 variants; see note below |
 | argon2id | Admin password hash | Not FIPS-approved | BLOCKED in FIPS mode — wrap#1 absent by design |
 | cosign/Sigstore | Manifest signature verification | Go `crypto` (BoringCrypto #3678 expired) | BLOCKED in FIPS mode — see §4 |
 
-**TOTP note.** Yashigani uses HMAC-SHA256 for TOTP (`digest=hashlib.sha256` at
-`src/yashigani/auth/totp.py:84,125`). SHA-256 is FIPS 180-4 approved and routes
-through CMVP #4985 when FIPS Provider is active. Provisioning URIs include
-`algorithm=SHA256`. Do not use authenticator apps that default to SHA-1 without
-explicit SHA-256 support.
+**TOTP note.** Yashigani uses role-tiered TOTP since v3.1: admin accounts use
+HMAC-SHA-512 with 8-digit codes (`algorithm=SHA512&digits=8`); user accounts use
+HMAC-SHA-256 with 6-digit codes (`algorithm=SHA256&digits=6`). Both SHA-256 and
+SHA-512 are FIPS 180-4 / FIPS 198-1 approved and route through CMVP #4985 when
+FIPS Provider is active. Do not use authenticator apps that default to SHA-1
+without reading the `algorithm=` parameter from the provisioning URI. agnosticOTP,
+Authy, and Raivo all support both SHA-256 and SHA-512.
 
 **argon2id note.** argon2id is a memory-hard function, not a FIPS-approved KDF.
 Under `FIPS_MODE=1`, the admin password wrap#1 (argon2id path) is absent by design

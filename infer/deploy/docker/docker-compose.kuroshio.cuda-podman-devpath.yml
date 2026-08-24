@@ -1,0 +1,77 @@
+# Podman + CUDA CDI-failure fallback overlay — Iris RC-5 (Red Council 2026-07-29).
+#
+# Mirrors ollama's established docker-compose.gpu-podman-devpath.yml pattern (docker/
+# docker-compose.gpu-podman-devpath.yml in the main yashigani repo): some rootless-Podman +
+# NVIDIA driver combinations fail `nvidia-ctk cdi generate` / `podman run --device
+# nvidia.com/gpu=N` outright — install.sh already probes for exactly this class of failure
+# for ollama (`podman run --rm --device nvidia.com/gpu=0 ... echo probe`, ~install.sh:2302-
+# 2420) and falls back to direct device-node passthrough when the probe fails. Before this
+# file, the kuroshio engine's CUDA backend had NO equivalent — a CDI-failure host had zero
+# documented recovery path for kuroshio-classifier/kuroshio-chat (confirmed real, not hypothetical,
+# by Iris's 2026-07-23 cutover-prep map, and re-confirmed by this design-review pass — the
+# fallback file simply did not exist anywhere in the tree).
+#
+# STANDALONE, NOT layered on top of docker-compose.kuroshio.cuda.yml — verified this session
+# that Docker/Podman Compose merges (appends) `devices:` lists across files rather than
+# replacing them, so layering this file on top of cuda.yml would leave BOTH the (broken) CDI
+# device entry AND the devpath entries present simultaneously, which would still fail
+# container creation on a genuine CDI-failure host. Apply this file INSTEAD OF
+# docker-compose.kuroshio.cuda.yml, alongside docker-compose.kuroshio.yml (base) — same
+# mutually-exclusive-overlay convention docker-compose.kuroshio.cuda.yml's own header already
+# establishes for cuda/rocm/vulkan/cpu backend selection, extended here to the Podman
+# CDI-vs-devpath choice within the CUDA backend specifically. install.sh (5.0-side, out of
+# scope for this infer/deploy-only dispatch) is the natural home for the same CDI probe
+# ollama already runs, selecting this file INSTEAD OF docker-compose.kuroshio.cuda.yml when the
+# probe fails on a Podman host — a documented non-goal (CDI-failure hosts unsupported) is
+# acceptable per Iris RC-5's own fix guidance; silence was not, which is why this file exists.
+#
+# Least-privilege, per-service (Captain finding #3 companion — this fallback path gets the
+# SAME per-container GPU scoping the CDI path was just fixed to have, not a shared blanket
+# grant):
+#   YSG_KUROSHIO_GPU_DEV_CLASSIFIER / YSG_KUROSHIO_GPU_DEV_CHAT — /dev/nvidia<N> device node for
+#     each container; defaults to GPU 0 for both (safe on the common single-GPU host;
+#     override per-service independently on multi-GPU hosts).
+#   YSG_KUROSHIO_GPU_INDEX_CLASSIFIER / YSG_KUROSHIO_GPU_INDEX_CHAT — matching
+#     NVIDIA_VISIBLE_DEVICES index passed to each container's driver runtime.
+#
+# read_only: unlike the CDI path, direct device-node passthrough does NOT invoke Podman's
+# nvidia-cdi-hook createContainer hook (the hook that writes driver-lib symlinks/ld.so.cache
+# into the container rootfs at start time — the reason docker-compose.kuroshio.podman-
+# override.yml relaxes read_only for the CDI path). This file deliberately does NOT set
+# read_only — the base file's (docker-compose.kuroshio.yml) read_only: true stands, tighter than
+# the CDI path requires, matching ollama's own docker-compose.gpu-podman-devpath.yml (which
+# likewise never touches read_only). If YSG-RISK-074 (podman compose v2 wrapper resetting
+# seccomp to unconfined) is ever observed on a devpath host too, operators can still layer
+# docker-compose.kuroshio.podman-override.yml's security_opt reassertion alongside this file —
+# set YSG_KUROSHIO_PODMAN_CUDA_READ_ONLY=true when doing so (security_opt is a scalar-per-list-
+# entry merge that behaves safely here; only devices required the standalone-file approach).
+services:
+  kuroshio-classifier:
+    image: ${YSG_KUROSHIO_IMAGE_CUDA:-yashigani/kuroshio-cuda:local}
+    devices:
+      - "${YSG_KUROSHIO_GPU_DEV_CLASSIFIER:-/dev/nvidia0}"
+      - "/dev/nvidiactl"
+      - "/dev/nvidia-uvm"
+      - "/dev/nvidia-uvm-tools"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${YSG_KUROSHIO_GPU_INDEX_CLASSIFIER:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_KUROSHIO_BACKEND: cuda
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CLASSIFIER_N_GPU_LAYERS:-999}
+
+  kuroshio-chat:
+    image: ${YSG_KUROSHIO_IMAGE_CUDA:-yashigani/kuroshio-cuda:local}
+    devices:
+      - "${YSG_KUROSHIO_GPU_DEV_CHAT:-/dev/nvidia0}"
+      - "/dev/nvidiactl"
+      - "/dev/nvidia-uvm"
+      - "/dev/nvidia-uvm-tools"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${YSG_KUROSHIO_GPU_INDEX_CHAT:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      YSG_KUROSHIO_BACKEND: cuda
+      YSG_KUROSHIO_N_GPU_LAYERS: ${YSG_KUROSHIO_CHAT_N_GPU_LAYERS:-999}
+      # MoE expert-offload passthrough (platform doc §11.2 differentiator) — empty by
+      # default; operator sets e.g. YSG_KUROSHIO_OVERRIDE_TENSOR='\.ffn_.*_exps\.weight=CPU'
+      # for VRAM-limited hosts running a MoE model.
+      YSG_KUROSHIO_OVERRIDE_TENSOR: ${YSG_KUROSHIO_OVERRIDE_TENSOR:-}

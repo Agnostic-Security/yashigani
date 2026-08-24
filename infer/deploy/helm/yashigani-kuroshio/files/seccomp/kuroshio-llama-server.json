@@ -1,0 +1,75 @@
+{
+  "_comment": "Yashigani kuroshio-* serving container seccomp profile (Captain finding #2 / Red-Council HIGH). SCMP_ACT_ERRNO default means every syscall not in the allow-list below is blocked with EPERM — the explicit second 'names' block naming the standard post-RCE recon/escape toolkit (ptrace, process_vm_readv/writev, unshare/clone-with-new-namespaces, mount family, keyctl family, bpf, perf_event_open, kexec_load, module-load/unload, iopl/ioperm, syslog) is REDUNDANT with the default-deny but kept explicit and documented, matching Docker's own default-profile convention, so the deny set is self-documenting rather than implicit. This profile is applied to kuroshio-classifier/kuroshio-chat/kuroshio-puller containers via compose security_opt / k8s seccompProfile.localhostProfile. Podman 6 'podman compose' v2 wrapper risk (YSG-RISK-074, finding #8): this file MUST be referenced by an explicit path in the compose overlay, never relying on default injection — see docker-compose.kuroshio.podman-override.yml.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "_comment": "allow-list: the syscall set llama-server + its Python control-plane sibling actually need — I/O, memory management (mmap/madvise/mprotect/futex for the model-load + inference compute path), networking (loopback to the ring-fence bridge only, enforced by the network layer not this profile), and standard process bookkeeping.",
+      "names": [
+        "accept", "accept4", "access", "arch_prctl", "bind", "brk",
+        "capget", "chdir", "clock_getres", "clock_gettime", "clock_nanosleep",
+        "clone", "close", "connect", "copy_file_range", "dup", "dup2", "dup3",
+        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_wait",
+        "eventfd", "eventfd2", "execve", "exit", "exit_group",
+        "faccessat", "faccessat2", "fadvise64", "fallocate",
+        "fcntl", "fdatasync", "fgetxattr", "flock",
+        "fstat", "fstatfs", "fsync", "ftruncate", "futex", "futex_waitv",
+        "getcwd", "getdents", "getdents64",
+        "getegid", "geteuid", "getgid", "getgroups", "getitimer",
+        "getpeername", "getpgid", "getpgrp", "getpid", "getppid",
+        "getpriority", "getrandom", "getrlimit", "getrusage",
+        "getsid", "getsockname", "getsockopt", "gettid", "gettimeofday",
+        "getuid", "getxattr",
+        "ioctl", "kill",
+        "lseek", "lstat",
+        "madvise", "membarrier", "memfd_create", "mkdir", "mkdirat", "mmap",
+        "mprotect", "munmap", "nanosleep", "newfstatat",
+        "open", "openat", "openat2", "pipe", "pipe2",
+        "poll", "ppoll", "prctl", "pread64", "preadv", "preadv2",
+        "prlimit64", "pwrite64", "pwritev", "pwritev2",
+        "read", "readlink", "readlinkat", "readv", "recv",
+        "recvfrom", "recvmmsg", "recvmsg",
+        "restart_syscall", "rseq", "rt_sigaction",
+        "rt_sigprocmask", "rt_sigreturn", "rt_sigsuspend",
+        "rt_sigtimedwait", "sched_getaffinity", "sched_getparam",
+        "sched_getscheduler", "sched_yield", "select", "send",
+        "sendmmsg", "sendmsg", "sendto",
+        "set_robust_list", "set_tid_address", "setitimer",
+        "setsockopt", "shutdown", "sigaltstack",
+        "socket", "socketpair", "stat", "statfs", "statx",
+        "sysinfo", "tgkill", "time",
+        "timerfd_create", "timerfd_gettime", "timerfd_settime",
+        "times", "truncate", "uname", "unlink", "unlinkat",
+        "wait4", "waitid", "write", "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "explicit deny — documented as the closed post-RCE recon/escape toolkit even though the default action already blocks these (Captain finding #2 hardening requirement, enumerated not implied).",
+      "names": [
+        "ptrace", "process_vm_readv", "process_vm_writev", "personality",
+        "unshare", "setns", "mount", "umount2", "pivot_root",
+        "keyctl", "add_key", "request_key",
+        "bpf", "perf_event_open",
+        "kexec_load", "kexec_file_load",
+        "init_module", "delete_module", "finit_module",
+        "iopl", "ioperm", "syslog",
+        "reboot", "swapon", "swapoff", "acct", "quotactl",
+        "clock_settime", "clock_adjtime", "settimeofday", "adjtimex",
+        "chroot", "pkey_mprotect"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

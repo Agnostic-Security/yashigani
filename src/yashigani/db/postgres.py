@@ -10,15 +10,19 @@ Design:
   transaction boundary.
 - All queries use asyncpg's $1/$2 parameterized syntax. No f-strings in SQL.
 
-AES-GCM nonce / IV uniqueness guarantee (ASVS 11.3.4):
-  All column-level encryption uses PostgreSQL's pgcrypto extension via
-  pgp_sym_encrypt(). pgcrypto generates a unique random IV for every call
-  using OpenSSL's CSPRNG — this is a PostgreSQL guarantee documented in the
-  pgcrypto source (src/contrib/pgcrypto/pgp-encrypt.c: pgp_create_pkt_writer
-  calls px_get_random_bytes for each session key packet).
-  There is no application-level AES-GCM cipher usage outside pgcrypto;
-  all symmetric encryption is delegated to pgp_sym_encrypt/pgp_sym_decrypt.
-  No manual nonce management is required or performed.
+AES-256-CFB (OpenPGP) IV uniqueness guarantee (ASVS 11.3.4):
+  Column-level encryption in this module uses PostgreSQL's pgcrypto extension
+  via pgp_sym_encrypt() with cipher-algo=aes256 (see PGP_SYM_OPTS below).
+  This produces AES-256-CFB in OpenPGP format, NOT AES-GCM.  pgcrypto
+  generates a unique random session-key IV for every call using OpenSSL's
+  CSPRNG — documented in the pgcrypto source (src/contrib/pgcrypto/
+  pgp-encrypt.c: pgp_create_pkt_writer calls px_get_random_bytes for each
+  session key packet).  No manual IV management is required.
+  pgp_sym_decrypt() reads the cipher algorithm from the OpenPGP packet header,
+  so rows written with the default (AES-128) before this pin was applied
+  remain decryptable — the cipher upgrade is write-path only.
+  Application-level AES-256-GCM (AESGCM via the cryptography library) is used
+  separately in documents/pseudonymize.py and backoffice/routes/backup.py.
 
 Restart resilience (RETRO-R4-2):
   asyncpg pools drop broken connections automatically: when postgres restarts,
@@ -49,6 +53,17 @@ logger = logging.getLogger(__name__)
 
 _pool: Pool | None = None
 _AES_KEY_ENV = "YASHIGANI_DB_AES_KEY"
+
+# Issue #144 — pin AES-256 cipher on all pgp_sym_encrypt() call-sites.
+# pgcrypto's default (no options arg) is AES-128 CFB.  Passing this options
+# string upgrades every new write to AES-256-CFB (OpenPGP).
+# compress-algo=0 disables compression (cleaner; symmetric payloads gain no
+# useful compression and avoiding it removes any CRIME-style oracle surface
+# even though the threat is negligible for symmetric-only data).
+# pgp_sym_DECRYPT does NOT need this — it reads the cipher from the OpenPGP
+# packet header.  Old AES-128 rows remain decryptable after the upgrade.
+# All pgp_sym_encrypt() call-sites MUST pass this as the 3rd argument.
+PGP_SYM_OPTS: str = "cipher-algo=aes256, compress-algo=0"
 
 # Per-connection establishment timeout. asyncpg's default is 60 s; we reduce
 # to 15 s so a postgres restart (which causes pgbouncer to return connection

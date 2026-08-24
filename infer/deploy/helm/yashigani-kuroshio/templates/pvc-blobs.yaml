@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "yashigani-kuroshio.fullname" . }}-blobs
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "yashigani-kuroshio.labels" . | nindent 4 }}
+  annotations:
+    # Mirrors UNIVERSAL-001 (resource-policy: keep) so helm upgrade/uninstall don't silently
+    # prune the model blob store.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.blobStore.size | default "100Gi" }}
+  {{- if .Values.blobStore.storageClassName }}
+  storageClassName: {{ .Values.blobStore.storageClassName }}
+  {{- end }}
