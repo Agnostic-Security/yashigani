@@ -146,7 +146,13 @@ SKIPS on macOS rather than reporting a false green.
 
 Real pulls are OPT-IN so a routine leg does not drag weights over the network:
 ```bash
-export KUROSHIO_BASE_URL=https://localhost:8443/kuroshio
+# NOTE (Iris seam audit, 2026-08-24): the engine's own Caddy front listens on
+# :11436 (infer/deploy/docker/Caddyfile.kuroshio-front:41), NOT the :11435
+# ollama-front. infer/deploy/docker/ is a complete, self-contained deployment
+# package that install.sh currently wires into NOTHING, so on a stock stack
+# there is no endpoint to point this at and the category SKIPS. Point it at a
+# hand-started engine, or wait for the cutover (FIND-0824-KUROSHIO-UNWIRED).
+export KUROSHIO_BASE_URL=https://localhost:11436
 export YTF_KUROSHIO_IMPORT_MODEL=qwen2.5:3b            # Ollama-format import
 export YTF_KUROSHIO_HF_REPO=<org>/<repo>               # HF GGUF import
 export YTF_KUROSHIO_HF_REVISION=<pinned-40-hex-commit> # floating refs are refused
