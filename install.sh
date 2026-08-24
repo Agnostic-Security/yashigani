@@ -10164,7 +10164,23 @@ except Exception as e:
         log_warn "            regardless of this pre-flight). Set YASHIGANI_BUILD_CHANNEL=official only for the"
         log_warn "            genuine Agnostic Security release pipeline."
       elif echo "${_placeholder_check_out}" | grep -q 'ERROR:'; then
+        # LAURA-V50-002 (Laura, 2026-08-24): this branch warned-and-proceeded for
+        # EVERY build channel, including 'official' — contradicting both S11's own
+        # documented hard-abort promise for official builds (the PLACEHOLDER_FOUND
+        # branch above) and the IMPL-02 fail-closed branch immediately below, which
+        # aborts regardless of channel when it cannot determine the image's state.
+        # An exception raised while inspecting _integrity.py is exactly that case:
+        # "could not determine", NOT "known-good". On an official build that is the
+        # one channel where proceeding is least defensible.
+        if [[ "${_build_channel}" == "official" ]]; then
+          log_error "FATAL: could not inspect _integrity.py in ${_backoffice_image} (${_placeholder_check_out})"
+          log_error "       Build channel is 'official' — refusing to proceed on an image whose chain"
+          log_error "       constants could not be verified (S11 / IMPL-02 fail-closed)."
+          log_error "       Set YASHIGANI_BUILD_CHANNEL=community if this is a deliberate community/self-build."
+          return 1
+        fi
         log_warn "Pre-flight: could not inspect _integrity.py in image (${_placeholder_check_out}) — proceeding (image may be freshly pulled)"
+        log_warn "            Build channel is '${_build_channel}' (not 'official') — non-fatal."
       elif [[ -z "${_placeholder_check_out}" ]] || ! echo "${_placeholder_check_out}" | grep -q 'OK'; then
         # docker run itself failed (daemon unreachable, image missing, etc.) —
         # output is empty or doesn't contain the expected OK sentinel.
