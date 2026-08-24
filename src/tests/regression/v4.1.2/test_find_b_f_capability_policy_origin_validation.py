@@ -92,14 +92,45 @@ class TestFindBFOriginValidationOrderUi4:
     (normaliseOrigin call appears before the isValidOrigin call)."""
 
     def test_addorigin_validates_before_normalising(self):
+        # Accepts EITHER `row.input` directly or a raw alias (`const raw =
+        # (row.input || '').trim()`), matching the idiom the legacy twin below
+        # has always used (`_capValidateOrigin(raw)`). What is asserted is the
+        # property FIND-B-F is about — the SAME un-normalised expression is
+        # validated, and validation happens BEFORE normalisation. An alias is
+        # only accepted if it is derived from row.input by trim alone; anything
+        # that routes through normaliseOrigin() first still fails.
         source = _UI4_MODULE.read_text(encoding="utf-8")
         method = _extract_method(source, "_addOrigin")
-        validate_idx = method.find("isValidOrigin(row.input)")
-        normalise_idx = method.find("normaliseOrigin(row.input)")
-        assert validate_idx != -1, "_addOrigin must call isValidOrigin(row.input) on the RAW input"
-        assert normalise_idx != -1, "_addOrigin must call normaliseOrigin(row.input) on the RAW input"
+
+        m = re.search(r"isValidOrigin\(\s*([A-Za-z_$][\w.$]*)\s*\)", method)
+        assert m, "_addOrigin must call isValidOrigin(...) on the RAW input"
+        arg = m.group(1)
+        validate_idx = m.start()
+
+        n = re.search(r"normaliseOrigin\(\s*" + re.escape(arg) + r"\s*\)", method)
+        assert n, (
+            f"_addOrigin must call normaliseOrigin({arg}) — the SAME expression it "
+            f"validated; normalising a different value reopens FIND-B-F"
+        )
+        normalise_idx = n.start()
+
+        if arg != "row.input":
+            alias = re.search(
+                r"(?:const|let|var)\s+" + re.escape(arg) + r"\s*=\s*\(?\s*row\.input\b[^;]*;",
+                method,
+            )
+            assert alias, (
+                f"isValidOrigin({arg}) is validating an alias that is not visibly "
+                f"derived from row.input — FIND-B-F requires the RAW input"
+            )
+            assert "normaliseOrigin" not in alias.group(0), (
+                f"alias `{arg}` is normalised before validation — this is exactly "
+                f"the FIND-B-F ordering bug in a new shape"
+            )
+            assert alias.start() < validate_idx, f"alias `{arg}` must be assigned before use"
+
         assert validate_idx < normalise_idx, (
-            "FIND-B-F: _addOrigin must validate row.input BEFORE normalising it — "
+            "FIND-B-F: _addOrigin must validate the raw input BEFORE normalising it — "
             "validating an already-normalised value lets a path-bearing origin "
             "silently pass (path is stripped by normalisation first)"
         )

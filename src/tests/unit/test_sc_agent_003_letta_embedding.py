@@ -608,7 +608,7 @@ class TestComposeEnvVarRename:
 
 
 # ---------------------------------------------------------------------------
-# YSG-RISK-138 — LLM side must mirror the embedding-config fix: an explicit
+# YSG-RISK-263 — LLM side must mirror the embedding-config fix: an explicit
 # llm_config object (bypasses Letta's own handle-resolution catalog), not a
 # bare "model": "<provider>/<model>" handle string that 404s with
 # "Handle <provider>/<model> not found" because we never register a provider
@@ -616,7 +616,7 @@ class TestComposeEnvVarRename:
 # ---------------------------------------------------------------------------
 
 class TestLlmConfigShape:
-    """YSG-RISK-138: _letta_llm_config() returns a gateway-pointing full config."""
+    """YSG-RISK-263: _letta_llm_config() returns a gateway-pointing full config."""
 
     def test_strips_provider_prefix(self, monkeypatch):
         """model field must be the bare Ollama name, not 'openai-proxy/...'."""
@@ -669,7 +669,7 @@ class TestLlmConfigShape:
 
 
 class TestCreateAgentPayloadUsesLlmConfig:
-    """YSG-RISK-138: all 3 create-agent call sites send llm_config, not model."""
+    """YSG-RISK-263: all 3 create-agent call sites send llm_config, not model."""
 
     @pytest.mark.asyncio
     async def test_ensure_agent_sends_llm_config_not_model_handle(self, monkeypatch):

@@ -72,7 +72,7 @@ dependencies = [
     # kubernetes-client is a soft dep: only imported when running in-cluster.
     # Listed in core deps so the gateway image includes it without an extra;
     # the K8s backend gracefully falls back to Docker/Podman if import fails.
-    "kubernetes>=30.1",  # K8s API backend — YSG-RISK-070
+    "kubernetes>=30.1",  # K8s API backend — YSG-RISK-224
 ]
 
 [project.optional-dependencies]
@@ -118,6 +118,14 @@ dev     = [
     # -e ".[dev]"` always brings this in; src/tests/playwright/conftest.py's
     # pytest_collection_modifyitems() wires a default 300s per-test ceiling.
     "pytest-timeout>=2.3",
+    # FIND-0813-004 (2026-08-16): playwright was referenced ONLY in the comment
+    # below and declared nowhere, so `uv sync --all-groups --all-extras` never
+    # installed it and the whole Tier-B suite (491 test IDs x 2 browser modes)
+    # could not run — the first Tier-B invocation of the 4.1.2 Linux campaign
+    # collected 0 tests in BOTH modes. Declared here so the release-gate tier is
+    # provisionable from committed code. Browsers still need an explicit
+    # `playwright install chromium` (binaries are not pip-installable).
+    "playwright>=1.47",
 ]
 
 [tool.setuptools.packages.find]
@@ -144,6 +152,23 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]
 asyncio_mode = "auto"
+# Custom markers, registered so `--strict-markers` is adoptable and a typo in a
+# marker name stops being silently ignored. All four were already in use and
+# NONE were registered; `multi_identity` was merely the one a review happened to
+# catch (register-sweep review, FIND-0813-014).
+#
+# NOTE: `testpaths` covers src/tests ONLY. tests/conformance, tests/security,
+# tests/contracts, tests/install and tests/invariants are NOT collected by a bare
+# `pytest` — which is why the YTF runner passes those paths explicitly, and why
+# an invariant placed in tests/invariants/ runs only under the runner. Left as
+# is deliberately: widening testpaths changes what every bare pytest invocation
+# executes, which is not a change to make mid-release. Tracked, not fixed here.
+markers = [
+    "conformance: API/behaviour conformance checks (Tier-A)",
+    "integration: cross-component integration checks",
+    "security_probe: authored adversarial probe (static or against a live target)",
+    "multi_identity: exercises more than one identity in a single test, so it must absorb the TOTP window wait budget (see src/tests/playwright/conftest.py)",
+]
 
 [tool.coverage.run]
 source = ["yashigani"]

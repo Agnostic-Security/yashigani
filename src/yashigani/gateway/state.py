@@ -2,7 +2,7 @@
 Yashigani Gateway — process-wide fallback state for components that
 snapshot a Redis-backed dependency BY VALUE at construction time.
 
-YSG-RISK-131: most gateway consumers of the RBAC/Agent-registry Redis stack
+YSG-RISK-139: most gateway consumers of the RBAC/Agent-registry Redis stack
 already read a live, mutable container at request time (``openai_router``'s
 module-level ``_state``, and ``proxy.py``'s per-app ``_state`` dict exposed
 via ``app.state.internal_state``) — self-heal just needs to write into those

@@ -32,8 +32,22 @@ class TestAgentBundleHealth:
     def test_openclaw_running(self):
         assert container_running(f"{_YTF_PROJ}{_YTF_SEP}openclaw{_YTF_SEP}1")
 
-    def test_langgraph_running(self):
-        assert container_running(f"{_YTF_PROJ}{_YTF_SEP}langgraph{_YTF_SEP}1")
+    @pytest.mark.parametrize("bundle", ["langflow", "letta", "openclaw"])
+    def test_shipped_agent_bundle_running(self, bundle):
+        """Every bundle the installer actually ships must be up.
+
+        2026-08-06: this replaced `test_langgraph_running`, which asserted a
+        container named `<proj>-langgraph-1`. No such bundle exists in this
+        product version — `grep -rn langgraph install.sh docker/` returns
+        nothing, so the test could never pass on any leg, on any runtime. It was
+        not detecting a regression; it was asserting a service that was never
+        shipped. Replaced with the bundles `--agent-bundles all` genuinely
+        installs, derived from install.sh's own registration list.
+        """
+        assert container_running(f"{_YTF_PROJ}{_YTF_SEP}{bundle}{_YTF_SEP}1"), (
+            f"agent bundle '{bundle}' is not running — expected container "
+            f"{_YTF_PROJ}{_YTF_SEP}{bundle}{_YTF_SEP}1"
+        )
 
 
 class TestAgentRegistration:

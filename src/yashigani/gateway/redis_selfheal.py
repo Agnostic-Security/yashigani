@@ -2,7 +2,7 @@
 Yashigani Gateway — bounded lazy reconnect for every Redis-backed control-plane
 dependency the gateway builds at cold boot.
 
-YSG-RISK-131 (Iris systemic review, following the live-reproduced chat
+YSG-RISK-139 (Iris systemic review, following the live-reproduced chat
 blocker): ``gateway/entrypoint.py`` builds 13 distinct Redis-dependent
 subsystems, each in its own one-shot try/except at cold boot (no retry, no
 self-heal). On k8s, ``yashigani-redis`` Service-DNS is not always resolvable

@@ -1,8 +1,8 @@
-# Last updated: 2026-05-25T00:00:00+00:00 (cycle 8: cert+pg_ident carveout; YSG-RISK-073/075/077)
+# Last updated: 2026-05-25T00:00:00+00:00 (cycle 8: cert+pg_ident carveout; YSG-RISK-227/229/231)
 """
-pg_hba.conf cert+pg_ident carveout tests — BUG-NEW-001 / YSG-RISK-073 / YSG-RISK-075 / YSG-RISK-077.
+pg_hba.conf cert+pg_ident carveout tests — BUG-NEW-001 / YSG-RISK-227 / YSG-RISK-229 / YSG-RISK-231.
 
-YSG-RISK-073 history:
+YSG-RISK-227 history:
 
   Cycle 3: `cert clientcert=verify-ca` — WRONG on two layers:
     BUG-C4-001 Layer A: PG16 rejects `clientcert=verify-ca` with `cert` auth method.
@@ -16,11 +16,11 @@ YSG-RISK-073 history:
     the `data` network holding a CA-signed cert can impersonate pgbouncer_authenticator
     and call ysg_pgbouncer_get_auth — no password needed with trust auth.
     The blast radius is full postgres DB compromise via SCRAM verifier retrieval.
-    YSG-RISK-075 documents this class. Cycle 5 carveout is REPLACED here.
+    YSG-RISK-229 documents this class. Cycle 5 carveout is REPLACED here.
 
   Cycle 6: `scram-sha-256 clientcert=verify-ca` — TWO-FACTOR RESTORED:
     Broke on ARM64/Mac Podman due to pgbouncer 1.25.1 SCRAM client-side computation bug
-    (YSG-RISK-077). Cycle 6 "live test PASS" was Linux VM only (different Podman network
+    (YSG-RISK-231). Cycle 6 "live test PASS" was Linux VM only (different Podman network
     stack). Superseded by cycle 7.
 
   Cycle 7 / cycle 8 (this commit): `cert map=pgb-auth-map` — FINAL CLOSE:
@@ -29,8 +29,8 @@ YSG-RISK-073 history:
       CN=pgbouncer-auth    → pgbouncer_authenticator  (main pgbouncer instance)
       CN=letta-pgbouncer   → pgbouncer_authenticator  (letta sidecar pgbouncer)
     All 11 other data-network cert holders have different CNs — none can impersonate.
-    No SCRAM computation — avoids YSG-RISK-077 ARM64 SCRAM bug entirely.
-    YSG-RISK-075 CLOSED: CN-specific pg_ident map closes the lateral-pivot attack chain.
+    No SCRAM computation — avoids YSG-RISK-231 ARM64 SCRAM bug entirely.
+    YSG-RISK-229 CLOSED: CN-specific pg_ident map closes the lateral-pivot attack chain.
     Stronger than cycle 6 (verify-full + CN-binding vs verify-ca + broken SCRAM password).
 
 This test suite asserts the correct form in the two pg_hba-producing scripts:
@@ -42,19 +42,19 @@ Tests also assert:
   - `cert map=pgb-auth-map` carveout precedes the catch-all in 10-pgbouncer-auth.sh
   - pg_ident.conf `pgb-auth-map` map contains both pgbouncer-auth and letta-pgbouncer bindings
   - `trust` (bare or with clientcert=) is NOT the auth method for pgbouncer_authenticator
-  - `scram-sha-256` is NOT the auth method for pgbouncer_authenticator (YSG-RISK-077 guard)
+  - `scram-sha-256` is NOT the auth method for pgbouncer_authenticator (YSG-RISK-231 guard)
   - `cert` without `map=` is NOT the auth method for pgbouncer_authenticator (bare-cert guard)
   - `md5` is NOT the auth method for pgbouncer_authenticator (cycle 5 guard)
   - 05-enable-ssl.sh does NOT write the pgbouncer_authenticator carveout (BUG-C4-002 guard)
   - Helm pg_hba sources contain the matching cert+pg_ident carveout
 
 YSG-RISK-049: SECURITY DEFINER ysg_pgbouncer_get_auth + pgbouncer_authenticator role.
-YSG-RISK-050: dedicated pgbouncer-auth_client.crt for postgres-facing identity.
-YSG-RISK-073: cert+pg_ident carveout for pgbouncer_authenticator auth_query
+YSG-RISK-218: dedicated pgbouncer-auth_client.crt for postgres-facing identity.
+YSG-RISK-227: cert+pg_ident carveout for pgbouncer_authenticator auth_query
               (cycle 7/8 — cert method via pg_ident CN map; closes SCRAM ARM64 bug).
-YSG-RISK-075: trust-auth-without-CN-binding is insufficient when multiple containers
+YSG-RISK-229: trust-auth-without-CN-binding is insufficient when multiple containers
               hold CA-signed certs — closed by pg_ident CN-specific map (cycle 7/8).
-YSG-RISK-077: pgbouncer 1.25.1 ARM64 SCRAM client-side computation bug — avoids SCRAM
+YSG-RISK-231: pgbouncer 1.25.1 ARM64 SCRAM client-side computation bug — avoids SCRAM
               entirely by using cert method (no SCRAM exchange needed).
 """
 from __future__ import annotations
@@ -90,13 +90,13 @@ _BARE_TRUST_CARVEOUT_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+trust(?!\s+clientcert=)"
 )
 
-# The forbidden trust+clientcert form (cycle 5 — one-factor; YSG-RISK-075)
+# The forbidden trust+clientcert form (cycle 5 — one-factor; YSG-RISK-229)
 # Any trust carveout for pgbouncer_authenticator is forbidden; cert+pg_ident is required.
 _TRUST_CLIENTCERT_FOR_PGBOUNCER_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+trust\s+clientcert="
 )
 
-# The forbidden scram-sha-256 form (cycle 6 — ARM64 SCRAM bug; YSG-RISK-077)
+# The forbidden scram-sha-256 form (cycle 6 — ARM64 SCRAM bug; YSG-RISK-231)
 _SCRAM_CARVEOUT_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+scram-sha-256"
 )
@@ -177,7 +177,7 @@ def test_enable_ssl_no_bare_trust_carveout() -> None:
     """05-enable-ssl.sh must NOT contain a bare-trust carveout for pgbouncer_authenticator.
 
     The v2.24.0 A2 carveout used bare `trust` (no clientcert= option). That carveout
-    was weaker than the cycle 5 trust+clientcert approach and was removed by YSG-RISK-050.
+    was weaker than the cycle 5 trust+clientcert approach and was removed by YSG-RISK-218.
     Any remaining bare-trust carveout (trust without clientcert=verify-ca) is a regression.
     Note: the cert+pg_ident carveout lives ONLY in 10-pgbouncer-auth.sh (single source of truth).
     05-enable-ssl.sh must not write any pgbouncer_authenticator carveout at all.
@@ -186,7 +186,7 @@ def test_enable_ssl_no_bare_trust_carveout() -> None:
     matches = _BARE_TRUST_CARVEOUT_RE.findall(content)
     assert not matches, (
         f"05-enable-ssl.sh: found bare-trust carveout for pgbouncer_authenticator: {matches}. "
-        "YSG-RISK-073: bare trust (without clientcert=) is a security regression. "
+        "YSG-RISK-227: bare trust (without clientcert=) is a security regression. "
         "The cert+pg_ident carveout belongs ONLY in 10-pgbouncer-auth.sh."
     )
 
@@ -221,12 +221,12 @@ def test_enable_ssl_no_cert_auth_method_for_pgbouncer_authenticator() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_pgbouncer_auth_script_inserts_cert_pgident_carveout() -> None:
-    """10-pgbouncer-auth.sh must insert a `cert map=pgb-auth-map` carveout — YSG-RISK-073 cycle 7/8.
+    """10-pgbouncer-auth.sh must insert a `cert map=pgb-auth-map` carveout — YSG-RISK-227 cycle 7/8.
 
     v2.24.0 step 4 REMOVED the carveout. v2.24.3 cycle 3 INSERTED cert carveout (wrong form).
     v2.24.3 cycle 4 committed cert+verify-ca (7f296a1 — broken; PG16 syntax + CN mismatch).
-    v2.24.3 cycle 5 INSERTED trust clientcert=verify-ca — SINGLE-FACTOR SECURITY GAP (YSG-RISK-075).
-    v2.24.3 cycle 6 INSERTED scram-sha-256 clientcert=verify-ca — broke on ARM64/Mac (YSG-RISK-077).
+    v2.24.3 cycle 5 INSERTED trust clientcert=verify-ca — SINGLE-FACTOR SECURITY GAP (YSG-RISK-229).
+    v2.24.3 cycle 6 INSERTED scram-sha-256 clientcert=verify-ca — broke on ARM64/Mac (YSG-RISK-231).
     v2.24.3 cycle 7/8 INSERTS cert map=pgb-auth-map — FINAL CLOSE: verify-full + CN-binding.
     Verify the script contains the cert+pg_ident carveout insertion logic.
     """
@@ -235,16 +235,16 @@ def test_pgbouncer_auth_script_inserts_cert_pgident_carveout() -> None:
     assert "cert  map=pgb-auth-map" in content or "cert map=pgb-auth-map" in content, (
         "10-pgbouncer-auth.sh: cert+pg_ident carveout insertion text not found. "
         "Step 4c must insert 'hostssl yashigani pgbouncer_authenticator ... cert  map=pgb-auth-map' "
-        "before the catch-all. YSG-RISK-073 cycle 7/8 (cert+pg_ident, not trust, scram, or md5). "
-        "YSG-RISK-077: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
-        "YSG-RISK-075: cert+pg_ident closes lateral-pivot via CN-specific map."
+        "before the catch-all. YSG-RISK-227 cycle 7/8 (cert+pg_ident, not trust, scram, or md5). "
+        "YSG-RISK-231: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
+        "YSG-RISK-229: cert+pg_ident closes lateral-pivot via CN-specific map."
     )
 
 
 def test_pgbouncer_auth_script_no_scram_for_pgbouncer_authenticator() -> None:
     """10-pgbouncer-auth.sh must NOT insert scram-sha-256 for pgbouncer_authenticator.
 
-    YSG-RISK-077: pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug.
+    YSG-RISK-231: pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug.
     It sends incorrect SCRAM proofs when authenticating outbound as auth_user on ARM64 Linux
     (Mac Podman ARM64 container runtime). Cycle 6 "live test PASS" was Linux VM only —
     same pgbouncer binary, different Podman network stack (10.89.7.x vs 10.89.0.x).
@@ -267,7 +267,7 @@ def test_pgbouncer_auth_script_no_scram_for_pgbouncer_authenticator() -> None:
                 pytest.fail(
                     f"10-pgbouncer-auth.sh line {i+1}: scram-sha-256 form found in awk insertion "
                     f"block for pgbouncer_authenticator: '{stripped}'. "
-                    "YSG-RISK-077: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
+                    "YSG-RISK-231: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
                     "Use `cert map=pgb-auth-map` (cert method avoids SCRAM computation). "
                     "Cycle 7/8 fix: cert method + pg_ident CN map."
                 )
@@ -276,7 +276,7 @@ def test_pgbouncer_auth_script_no_scram_for_pgbouncer_authenticator() -> None:
 def test_pgbouncer_auth_script_no_trust_clientcert_for_pgbouncer_authenticator() -> None:
     """10-pgbouncer-auth.sh must NOT insert trust+clientcert for pgbouncer_authenticator.
 
-    YSG-RISK-075: `trust clientcert=verify-ca` for pgbouncer_authenticator is a confirmed
+    YSG-RISK-229: `trust clientcert=verify-ca` for pgbouncer_authenticator is a confirmed
     security gap. Any container on the `data` network holding a CA-signed cert can connect
     to postgres claiming role pgbouncer_authenticator and call ysg_pgbouncer_get_auth without
     a password. Laura cycle 5 release gate confirmed the full attack chain.
@@ -299,7 +299,7 @@ def test_pgbouncer_auth_script_no_trust_clientcert_for_pgbouncer_authenticator()
                 pytest.fail(
                     f"10-pgbouncer-auth.sh line {i+1}: trust+clientcert form found in awk insertion "
                     f"block for pgbouncer_authenticator: '{stripped}'. "
-                    "YSG-RISK-075: trust+clientcert is a one-factor security gap — any CA-cert "
+                    "YSG-RISK-229: trust+clientcert is a one-factor security gap — any CA-cert "
                     "holder can impersonate pgbouncer_authenticator. "
                     "Use `cert map=pgb-auth-map` (cert method + pg_ident CN binding). "
                     "Laura cycle 5 confirmed the attack chain."
@@ -322,7 +322,7 @@ def test_pgbouncer_auth_script_no_remove_only() -> None:
     ), (
         "10-pgbouncer-auth.sh: carveout insertion logic not found. "
         "Step 4c must insert the cert+pg_ident carveout before the catch-all (first match only). "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
 
 
@@ -330,7 +330,7 @@ def test_pgbouncer_auth_script_no_bare_trust_carveout_inserted() -> None:
     """10-pgbouncer-auth.sh must not insert a BARE trust carveout (trust without clientcert=).
 
     The v2.24.0 A2 carveout was `trust` with no clientcert requirement — weakest because
-    any client could connect without presenting a cert. YSG-RISK-073 cycle 7/8 uses
+    any client could connect without presenting a cert. YSG-RISK-227 cycle 7/8 uses
     `cert map=pgb-auth-map` — the correct form with CN-binding.
     This test guards against bare `trust` (without clientcert=) being inserted.
     """
@@ -380,7 +380,7 @@ def test_pgbouncer_auth_script_no_bare_cert_without_map_inserted() -> None:
                     f"10-pgbouncer-auth.sh line {i+1}: `cert` used as auth method for "
                     f"pgbouncer_authenticator without `map=` clause in active code: '{stripped}'. "
                     "BUG-C4-001: bare `cert` fails CN check (CN=pgbouncer-auth != rolename). "
-                    "YSG-RISK-075: without map=, any CA-cert holder could craft a matching CN. "
+                    "YSG-RISK-229: without map=, any CA-cert holder could craft a matching CN. "
                     "Use `cert map=pgb-auth-map` — the only correct cycle 7/8 form."
                 )
 
@@ -420,23 +420,23 @@ def test_pgbouncer_auth_script_writes_pg_ident_map() -> None:
     Both CNs must be mapped:
       pgb-auth-map  pgbouncer-auth    pgbouncer_authenticator   (main pgbouncer)
       pgb-auth-map  letta-pgbouncer   pgbouncer_authenticator   (letta sidecar)
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
     assert "pgb-auth-map" in content, (
         "10-pgbouncer-auth.sh: `pgb-auth-map` reference not found. "
         "Step 4a must write pg_ident.conf entries for the pgb-auth-map. "
-        "YSG-RISK-073 cycle 7/8: cert map=pgb-auth-map requires pg_ident entries."
+        "YSG-RISK-227 cycle 7/8: cert map=pgb-auth-map requires pg_ident entries."
     )
     assert "pgbouncer-auth" in content, (
         "10-pgbouncer-auth.sh: `pgbouncer-auth` CN mapping not found. "
         "pg_ident.conf must map CN=pgbouncer-auth → pgbouncer_authenticator. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
     assert "letta-pgbouncer" in content, (
         "10-pgbouncer-auth.sh: `letta-pgbouncer` CN mapping not found. "
         "pg_ident.conf must map CN=letta-pgbouncer → pgbouncer_authenticator. "
-        "Both pgbouncer instances must be covered. YSG-RISK-073 cycle 7/8."
+        "Both pgbouncer instances must be covered. YSG-RISK-227 cycle 7/8."
     )
 
 
@@ -448,7 +448,7 @@ def test_pgbouncer_auth_script_pg_ident_maps_both_cns_to_role() -> None:
       pgb-auth-map  letta-pgbouncer   pgbouncer_authenticator
     Both lines must be present: the main pgbouncer instance AND the letta sidecar.
     Missing either means that instance cannot authenticate as auth_user.
-    YSG-RISK-073 cycle 7/8 — CN-specific mapping closes YSG-RISK-075.
+    YSG-RISK-227 cycle 7/8 — CN-specific mapping closes YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
     # Look for printf/echo lines that write the actual pg_ident entries
@@ -464,35 +464,35 @@ def test_pgbouncer_auth_script_pg_ident_maps_both_cns_to_role() -> None:
         "`pgb-auth-map  pgbouncer-auth  pgbouncer_authenticator` not found. "
         "Step 4a must write this entry to pg_ident.conf. "
         "Without it, the main pgbouncer cannot authenticate as pgbouncer_authenticator. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
     assert letta_pgbouncer_mapped, (
         "10-pgbouncer-auth.sh: pg_ident mapping "
         "`pgb-auth-map  letta-pgbouncer  pgbouncer_authenticator` not found. "
         "Step 4a must write this entry to pg_ident.conf. "
         "Without it, the letta sidecar pgbouncer cannot authenticate as pgbouncer_authenticator. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
 
 
 def test_pgbouncer_auth_script_references_ysg_risk_073_and_077() -> None:
-    """10-pgbouncer-auth.sh must reference YSG-RISK-073, YSG-RISK-075, and YSG-RISK-077.
+    """10-pgbouncer-auth.sh must reference YSG-RISK-227, YSG-RISK-229, and YSG-RISK-231.
 
     Ensures the script is correctly updated for v2.24.3 cycle 7/8 and not a stale version.
-    YSG-RISK-075: lateral-pivot class documented by Laura cycle 5, closed by cycle 7/8.
-    YSG-RISK-077: ARM64 SCRAM computation bug — root cause for switching from cycle 6 scram.
+    YSG-RISK-229: lateral-pivot class documented by Laura cycle 5, closed by cycle 7/8.
+    YSG-RISK-231: ARM64 SCRAM computation bug — root cause for switching from cycle 6 scram.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT)
-    assert "YSG-RISK-073" in content, (
-        "10-pgbouncer-auth.sh: YSG-RISK-073 reference not found. "
+    assert "YSG-RISK-227" in content, (
+        "10-pgbouncer-auth.sh: YSG-RISK-227 reference not found. "
         "The script must be updated to v2.24.3 cert+pg_ident carveout logic (cycle 7/8)."
     )
-    assert "YSG-RISK-075" in content, (
-        "10-pgbouncer-auth.sh: YSG-RISK-075 reference not found. "
+    assert "YSG-RISK-229" in content, (
+        "10-pgbouncer-auth.sh: YSG-RISK-229 reference not found. "
         "The script must document the lateral-pivot class (Laura cycle 5) that cycle 7/8 closes."
     )
-    assert "YSG-RISK-077" in content, (
-        "10-pgbouncer-auth.sh: YSG-RISK-077 reference not found. "
+    assert "YSG-RISK-231" in content, (
+        "10-pgbouncer-auth.sh: YSG-RISK-231 reference not found. "
         "The script must document the ARM64 SCRAM bug that necessitated the pivot from cycle 6."
     )
 
@@ -507,7 +507,7 @@ def test_helm_pghba_has_cert_pgident_carveout() -> None:
     Compose-Helm parity: the cert+pg_ident carveout in docker/postgres/10-pgbouncer-auth.sh
     must also appear in helm/yashigani/files/10-pgbouncer-auth.sh (the Helm copy).
     If no Helm pg_hba file exists, this test is skipped with a clear reason.
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     helm_content = None
     for path in HELM_PG_HBA_SOURCES:
@@ -520,12 +520,12 @@ def test_helm_pghba_has_cert_pgident_carveout() -> None:
             "No Helm pg_hba source found at expected paths "
             f"({[str(p) for p in HELM_PG_HBA_SOURCES]}). "
             "Add helm/yashigani/files/pg_hba.conf or update HELM_PG_HBA_SOURCES "
-            "when the Helm chart embeds pg_hba.conf as a ConfigMap. YSG-RISK-073."
+            "when the Helm chart embeds pg_hba.conf as a ConfigMap. YSG-RISK-227."
         )
 
     matches = _CERT_PGIDENT_CARVEOUT_RE.findall(helm_content)
     assert len(matches) >= 1, (
         f"Helm pg_hba source: cert+pg_ident carveout for pgbouncer_authenticator not found. "
         "Compose-Helm parity requires the `cert map=pgb-auth-map` carveout in Helm too. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )

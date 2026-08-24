@@ -9,7 +9,7 @@ undefined for the input shape). This re-fails on the original bug: with the
 fix, the absent "allow" key must resolve to DENY.
 
 Mirrors the LAURA-V243-001 fix in openai_router (True -> False).
-ASVS V4.1.3. Class-identical to the already-accepted LAURA-V243-001 / YSG-RISK-071.
+ASVS V4.1.3. Class-identical to the already-accepted LAURA-V243-001 / YSG-RISK-225.
 """
 from __future__ import annotations
 

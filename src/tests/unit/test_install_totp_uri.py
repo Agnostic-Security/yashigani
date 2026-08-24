@@ -9,7 +9,7 @@ Context (Phase 13, Yashigani 3.1):
   - Required authenticator: agnosticOTP (iOS/Android) or Aegis.
 
 History:
-  - YSG-RISK-078 (2026-06-14) reverted from SHA-256 to SHA-1 due to
+  - YSG-RISK-232 (2026-06-14) reverted from SHA-256 to SHA-1 due to
     authenticator-app compatibility. Phase 13 supersedes that reversion by
     mandating agnosticOTP (SHA-256/512 capable) as the required app.
 
@@ -117,7 +117,7 @@ class TestInstallShTotpUri:
 
     def test_does_not_contain_sha1(self):
         """
-        URI must NOT revert to SHA-1 (YSG-RISK-078 reversion is superseded by Phase 13).
+        URI must NOT revert to SHA-1 (YSG-RISK-232 reversion is superseded by Phase 13).
         """
         uri = self._get_uri()
         # algorithm=SHA1 or no algorithm param (which implies SHA-1) are both wrong

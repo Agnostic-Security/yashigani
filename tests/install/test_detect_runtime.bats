@@ -213,6 +213,94 @@ setup() {
     [ "${YSG_RUNTIME_4WAY}" = "podman-rootful" ]
 }
 
+# ── L10-RUNTIME-HINT-2026-08-16: explicit YSG_RUNTIME hint must win over Case-6 Podman
+# preference on a host where both runtimes are reachable ─────────────────────
+# Regression coverage for the bug: _legacy_hint (YSG_RUNTIME, set by
+# install.sh's `--runtime docker` / resolve_compose_cmd()) was read but never
+# consulted for docker/podman, only k8s — so a Docker install on a dual-
+# runtime host mislabelled itself podman-rootless and produced a real L1
+# ring-fence gap in codegen for anything onboarded afterwards.
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=docker hint wins over Case 6 Podman preference" {
+    _stub_no_k8s
+    _stub_podman    # Podman also reachable — would win Case 6 without the hint
+    _stub_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "docker" ]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=docker hint -> NOTE explains Podman ignored" {
+    _stub_no_k8s
+    _stub_podman
+    _stub_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    _detect_runtime
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"ignored"* ]]
+}
+
+@test "FAIL-CLOSED (§4.4 review 2026-08-17): YSG_RUNTIME=docker hint but Docker unreachable -> unknown/1, NEVER substitutes Podman" {
+    # THE ORIGINAL DEFECT REPRODUCED ON THE ERROR PATH: the first cut of this
+    # fix fell through to the generic auto-detect here and silently returned
+    # podman-rootless — a DIFFERENT runtime than the one explicitly named.
+    # That is precisely the bug this fix exists to close (a named runtime
+    # must never be silently substituted), just triggered by transient
+    # unreachability instead of dual-install ambiguity. A guessed runtime is
+    # worse than an aborted onboard for a label that gates ring-fence
+    # emission (codegen.py) — must fail closed, not fall back.
+    _stub_no_k8s
+    _stub_podman    # Podman IS reachable — must NOT be silently substituted
+    _stub_no_docker
+    _stub_rootless
+    export YSG_RUNTIME=docker
+    # `if` context, not a bare call: bats runs test bodies under errexit-like
+    # semantics, so a bare nonzero-returning `_detect_runtime` (which is what
+    # this test correctly expects) would abort the test before `$?` is ever
+    # read. Same reasoning as the pre-existing "Case 7" test's use of `run`
+    # — here we need the exported vars too, so `run`'s subshell (which loses
+    # them, per this file's documented bats-version scoping issue) isn't an
+    # option; the `if` guard is the propagation-safe equivalent.
+    if _detect_runtime; then _rc=0; else _rc=$?; fi
+    [ "$_rc" -eq 1 ]
+    [ "${YSG_RUNTIME_4WAY}" = "unknown" ]
+    [ "${YSG_RUNTIME_4WAY}" != "podman-rootless" ]
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"docker"* ]]
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"NOT reachable"* ]]
+}
+
+@test "L10-RUNTIME-HINT-2026-08-16: YSG_RUNTIME=podman hint still disambiguates rootful vs rootless" {
+    _stub_no_k8s
+    _stub_podman
+    _stub_docker
+    _stub_rootful
+    export YSG_RUNTIME=podman
+    _detect_runtime
+    _rc=$?
+    [ "$_rc" -eq 0 ]
+    [ "${YSG_RUNTIME_4WAY}" = "podman-rootful" ]
+}
+
+@test "FAIL-CLOSED (§4.4 review 2026-08-17): YSG_RUNTIME=podman hint but Podman unreachable -> unknown/1, NEVER substitutes Docker" {
+    # Same class as the docker case above, mirrored: an operator who pinned
+    # YSG_RUNTIME=podman and hits a transient Podman-unreachable window must
+    # not silently land on Docker instead — that changes which containment
+    # layers apply just as much as the reverse substitution does.
+    _stub_no_k8s
+    _stub_no_podman
+    _stub_docker    # Docker IS reachable — must NOT be silently substituted
+    export YSG_RUNTIME=podman
+    if _detect_runtime; then _rc=0; else _rc=$?; fi
+    [ "$_rc" -eq 1 ]
+    [ "${YSG_RUNTIME_4WAY}" = "unknown" ]
+    [ "${YSG_RUNTIME_4WAY}" != "docker" ]
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"podman"* ]]
+    [[ "${YSG_RUNTIME_4WAY_NOTE}" == *"NOT reachable"* ]]
+}
+
 # ── Case 7: Unknown ────────────────────────────────────────────────────────────
 
 @test "Case 7: No runtime reachable -> unknown (returns 1)" {

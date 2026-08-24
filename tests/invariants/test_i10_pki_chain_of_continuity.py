@@ -43,6 +43,7 @@ already up (skipped otherwise — see test_i9's "live adversarial probe" split).
 """
 from __future__ import annotations
 
+import difflib
 import re
 import shutil
 import subprocess
@@ -249,20 +250,82 @@ def test_05_enable_ssl_reads_attestation_from_dedicated_dir() -> None:
         )
 
 
+_CHOWN_DROP_RE = re.compile(r'^\s*chown postgres:postgres\b')
+_INSTALL_OWNERSHIP_FLAGS_RE = re.compile(
+    r'^(\s*install\s+-m\s+\S+\s+)-o postgres -g postgres\s+(.*)$'
+)
+
+
+def _is_comment_or_blank(line: str) -> bool:
+    s = line.strip()
+    return s == "" or s.startswith("#")
+
+
+def _hunk_is_k8s_pg_ssl_ownership_delta(a_chunk: list[str], b_chunk: list[str]) -> bool:
+    """True iff a diffing docker-vs-helm hunk reduces to nothing once the two
+    documented, allowlisted exceptions are accounted for:
+
+    1. The one pre-existing cosmetic doc-comment file-extension typo
+       (`.py` vs `.sh` in a `# see tests/invariants/...` comment) — any
+       comment/blank-only hunk is prose, not the executed contract, and is
+       allowed to reword freely (mirrors the original normalise() behaviour).
+    2. FINDING-V412-K8S-PG-SSL (2026-07-24, commit `5a00c14f`): the k8s copy
+       deliberately drops every `chown postgres:postgres ...` call and every
+       `-o postgres -g postgres` install-ownership flag, because
+       templates/postgres.yaml pins runAsUser/runAsGroup/fsGroup: 999 to
+       match the pgvector image's real postgres UID/GID exactly — every file
+       this script creates on k8s is already owned uid999:gid999 by
+       construction, so an explicit chown/-o/-g is both redundant and is the
+       exact CAP_CHOWN failure mode that broke k8s postgres TLS before this
+       fix. The compose copy is DELIBERATELY unchanged (compose's
+       `user: "999:999"` pin makes its chown calls a same-UID no-op, so
+       they're not broken there and are not touched) — this is the ONE
+       intended functional delta between the two copies.
+
+    Any residual, non-comment content left after stripping (1) comment/blank
+    lines, (2) docker-only `chown postgres:postgres` lines, and (3) the
+    `-o postgres -g postgres` flags off `install` lines must still match
+    exactly — this is what keeps the assertion from degrading into a blanket
+    skip: any OTHER functional divergence still fails loudly.
+    """
+    a_code = [l for l in a_chunk if not _is_comment_or_blank(l)]
+    b_code = [l for l in b_chunk if not _is_comment_or_blank(l)]
+    a_code = [l for l in a_code if not _CHOWN_DROP_RE.match(l)]
+    a_code = [_INSTALL_OWNERSHIP_FLAGS_RE.sub(r"\1\2", l) for l in a_code]
+    return a_code == b_code
+
+
 def test_docker_and_helm_ssl_scripts_stay_in_parity() -> None:
-    """Verification Protocol #4 — two copies of the same file must not drift.
-    The one pre-existing, unrelated cosmetic line (a doc-comment file
-    extension typo, `.py` vs `.sh`, in a `# see tests/invariants/...` comment)
-    is normalised away before comparing."""
-    docker_text = DOCKER_SSL_SH.read_text(encoding="utf-8")
-    helm_text = HELM_SSL_SH.read_text(encoding="utf-8")
-    normalise = lambda t: t.replace(
-        "test_i10_pki_chain_of_continuity.sh", "test_i10_pki_chain_of_continuity.py"
-    )
-    assert normalise(docker_text) == normalise(helm_text), (
+    """Verification Protocol #4 — two copies of the same file must not drift,
+    except for the two DOCUMENTED, DELIBERATE exceptions named in
+    `_hunk_is_k8s_pg_ssl_ownership_delta` above: the pre-existing cosmetic
+    .py/.sh doc-comment typo, and FINDING-V412-K8S-PG-SSL's chown/-o/-g
+    ownership-flag removal on the k8s copy. Every other line, in every other
+    hunk, must still be byte-identical — this is a named allowlist, not a
+    blanket skip; any unrelated functional drift between the two runtimes'
+    SSL init scripts still fails this test."""
+    docker_lines = DOCKER_SSL_SH.read_text(encoding="utf-8").splitlines()
+    helm_lines = HELM_SSL_SH.read_text(encoding="utf-8").splitlines()
+
+    sm = difflib.SequenceMatcher(a=docker_lines, b=helm_lines, autojunk=False)
+    unexplained: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        a_chunk = docker_lines[i1:i2]
+        b_chunk = helm_lines[j1:j2]
+        if _hunk_is_k8s_pg_ssl_ownership_delta(a_chunk, b_chunk):
+            continue
+        unexplained.append(
+            f"docker[{i1}:{i2}]={a_chunk!r} vs helm[{j1}:{j2}]={b_chunk!r}"
+        )
+
+    assert not unexplained, (
         "docker/postgres/05-enable-ssl.sh and "
         "helm/yashigani/files/postgres-05-enable-ssl.sh have drifted beyond "
-        "the one known cosmetic difference — Verification Protocol #4"
+        "the two documented exceptions (cosmetic .py/.sh typo; "
+        "FINDING-V412-K8S-PG-SSL chown/-o/-g removal) — Verification "
+        "Protocol #4. Unexplained hunks:\n" + "\n".join(unexplained)
     )
 
 

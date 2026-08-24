@@ -1,5 +1,5 @@
 """
-Unit tests for per-user rate limit (YSG-RISK-058, Tiago 2026-05-24).
+Unit tests for per-user rate limit (YSG-RISK-222, Tiago 2026-05-24).
 
 Coverage:
   1. 100 sequential requests pass; 101st returns 429 (user dimension blocked).
@@ -11,7 +11,7 @@ Coverage:
   6. Integration: RateLimiter.check() respects per_user_rps=1.0 with a real fakeredis
      instance — first request allowed; second (no time elapsed) blocked on user dimension.
 
-Reference: docs/risk-register.yml YSG-RISK-058
+Reference: docs/risk-register.yml YSG-RISK-222
 """
 from __future__ import annotations
 

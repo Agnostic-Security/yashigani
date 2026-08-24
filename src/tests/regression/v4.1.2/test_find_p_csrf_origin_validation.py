@@ -165,3 +165,106 @@ class TestFindPCsrfOriginRefererValidation:
             )
             assert _csrf_error(response) != "csrf_origin_mismatch"
 
+
+class TestFindLaura412CsrfUserPlane:
+    """FIND-LAURA-412-CSRF-USER-PLANE (MED, still open as of the
+    2026-08-08 merged head): `_CSRF_CHECKED_PREFIXES` excluded "/user/*",
+    so a cross-origin POST /user/conversations with a valid
+    __Host-yashigani_session cookie sailed through unchecked — same shape
+    as the original admin FIND-P-CSRF bypass, just on the user plane.
+
+    Fix: "/user/" added to `_CSRF_CHECKED_PREFIXES`. The check still only
+    fires when a session cookie (admin OR user) is present
+    (`has_session_cookie`), so this is a scope extension of the existing
+    check, not a new code path — a caller that authenticates without a
+    session cookie (no Bearer/API-key /user/* path exists in this app
+    today; see middleware._resolve_user_token, cookie-only) is unaffected,
+    matching the existing /admin/ and /auth/ behaviour exactly.
+    """
+
+    def test_foreign_origin_state_changing_user_request_rejected(self):
+        """The exact user-plane analogue of Laura's admin bypass: foreign
+        Origin + valid user session cookie + no CSRF token on
+        POST /user/conversations must now be rejected 403 csrf_origin_mismatch
+        — BEFORE the route's own auth/DB dependencies ever run."""
+        with _caddy_bypass() as secret:
+            _app, client = _make_client()
+            client.cookies.set("__Host-yashigani_session", "some-user-token")
+            response = client.post(
+                "/user/conversations",
+                json={"title": "csrf-probe"},
+                headers={
+                    "X-Caddy-Verified-Secret": secret,
+                    "Origin": "https://evil.example",
+                },
+            )
+            assert response.status_code == 403
+            assert _csrf_error(response) == "csrf_origin_mismatch"
+
+    def test_foreign_referer_state_changing_user_request_rejected(self):
+        with _caddy_bypass() as secret:
+            _app, client = _make_client()
+            client.cookies.set("__Host-yashigani_session", "some-user-token")
+            response = client.post(
+                "/user/conversations",
+                json={"title": "csrf-probe"},
+                headers={
+                    "X-Caddy-Verified-Secret": secret,
+                    "Referer": "https://evil.example/attack.html",
+                },
+            )
+            assert response.status_code == 403
+            assert _csrf_error(response) == "csrf_origin_mismatch"
+
+    def test_same_origin_user_request_not_blocked_by_csrf_check(self):
+        with _caddy_bypass() as secret:
+            _app, client = _make_client()
+            client.cookies.set("__Host-yashigani_session", "some-user-token")
+            response = client.post(
+                "/user/conversations",
+                json={"title": "csrf-probe"},
+                headers={
+                    "X-Caddy-Verified-Secret": secret,
+                    "Origin": "http://testserver",
+                },
+            )
+            assert _csrf_error(response) != "csrf_origin_mismatch"
+
+    def test_no_session_cookie_user_request_not_csrf_checked(self):
+        """No session cookie at all — mirrors the admin-plane
+        "not CSRF-exploitable without a cookie" scope decision. This is the
+        brief's "bearer/API-key with no Origin still works" caveat: without
+        a session cookie, the CSRF layer never engages, regardless of
+        Origin, so a non-cookie-authenticated caller is never blocked HERE
+        (any 401/403 it receives comes from the route's own auth check,
+        never from csrf_origin_mismatch)."""
+        with _caddy_bypass() as secret:
+            _app, client = _make_client()
+            response = client.post(
+                "/user/conversations",
+                json={"title": "csrf-probe"},
+                headers={
+                    "X-Caddy-Verified-Secret": secret,
+                    "Origin": "https://evil.example",
+                },
+            )
+            assert _csrf_error(response) != "csrf_origin_mismatch"
+
+    def test_admin_session_cookie_on_user_route_also_checked(self):
+        """An admin session cookie browsing a /user/* path (before
+        require_user_session's wrong_plane 403 even runs) must also be
+        CSRF-checked — has_session_cookie checks BOTH cookie names."""
+        with _caddy_bypass() as secret:
+            _app, client = _make_client()
+            client.cookies.set("__Host-yashigani_admin_session", "some-admin-token")
+            response = client.post(
+                "/user/conversations",
+                json={"title": "csrf-probe"},
+                headers={
+                    "X-Caddy-Verified-Secret": secret,
+                    "Origin": "https://evil.example",
+                },
+            )
+            assert response.status_code == 403
+            assert _csrf_error(response) == "csrf_origin_mismatch"
+

@@ -303,6 +303,24 @@ def _delete_credential(client, credential_id: str, totp_secret: str) -> int:
         f"{BASE_URL}/auth/stepup",
         json={"totp_code": totp_code},
     )
+    # 2026-08-08: this hard-asserted 200 and produced
+    # "Step-up failed before revocation: 401 session_expired_or_invalid" on 4
+    # tests in the long (3h) Tier-B run. _get_authed_client() already
+    # self-heals an expired session on ACQUISITION, but a session can expire
+    # between acquisition and this call, and this helper had no such handling —
+    # so a session-lifetime artefact of a long suite was reported as a test
+    # failure. Refresh once and retry, exactly as the acquisition path does.
+    # A 401 that survives the refresh is still a hard failure.
+    if su.status_code == 401:
+        cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+        client.cookies.update(cookies)
+        _wait_for_fresh_totp_window(admin=1)
+        totp_code = _current_totp(totp_secret)
+        _api_totp_last_used[1] = time.time()
+        su = client.post(
+            f"{BASE_URL}/auth/stepup",
+            json={"totp_code": totp_code},
+        )
     assert su.status_code == 200, (
         f"Step-up failed before revocation: {su.status_code} {su.text[:200]}"
     )
@@ -348,6 +366,89 @@ def _wait_for_audit_event(
 # CDP / virtual authenticator helpers (Playwright-based)
 # ---------------------------------------------------------------------------
 
+
+def _add_extra_virtual_authenticator(cdp_session) -> str:
+    """Add a SECOND virtual authenticator to an existing CDP session.
+
+    Multi-credential tests register two credentials for the SAME user. A single
+    authenticator cannot satisfy that: the RP sends the first credential in
+    `excludeCredentials` on the second registration, and the authenticator
+    correctly refuses with "the user attempted to register an authenticator that
+    contains one of the credentials already registered with the relying party".
+    That is WebAuthn behaving to spec — a real hardware key would refuse
+    identically — so the tests, not the product, were wrong. They had been
+    failing for the whole 4.1.2 campaign, mis-attributed to "virtual
+    authenticator not provisioned".
+
+    Two credentials means two authenticators, exactly as a user registering a
+    laptop and a phone would have.
+    """
+    result = cdp_session.send(
+        "WebAuthn.addVirtualAuthenticator",
+        {
+            "options": {
+                "protocol": "ctap2",
+                "transport": "usb",
+                "hasResidentKey": True,
+                "hasUserVerification": True,
+                "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }
+        },
+    )
+    return result["authenticatorId"]
+
+
+
+class _AuthenticatorRotator:
+    """Give each credential registration its own virtual authenticator.
+
+    WebAuthn does not allow one authenticator to hold two credentials for the
+    same user: the RP lists existing credentials in `excludeCredentials` and the
+    authenticator refuses. A real hardware key refuses identically. Every
+    multi-credential test in this module registered two credentials against ONE
+    authenticator and had therefore been failing since the suite was written —
+    mis-triaged for the whole 4.1.2 campaign as "virtual authenticator not
+    provisioned".
+
+    Rotating one authenticator per key models what the test is actually about:
+    a user enrolling a laptop AND a phone.
+    """
+
+    def __init__(self, cdp_session, initial_auth_id: str) -> None:
+        self._cdp = cdp_session
+        self._current = initial_auth_id
+
+    def next_key(self, index: int) -> str:
+        """Ensure registration `index` is answered by a distinct authenticator.
+
+        Harness fix (2026-08-18, YTF §5.12 companion fix -- reported live as
+        `CDPSession.send: Protocol error (WebAuthn.addVirtualAuthenticator):
+        The Virtual Authenticator Environment has not been enabled for this
+        session`, x4): previously called _disable_virtual_authenticator()
+        here, which sends BOTH WebAuthn.removeVirtualAuthenticator AND
+        WebAuthn.disable -- the latter tears down the WHOLE virtual-
+        authenticator ENVIRONMENT on this CDP session, not just the one
+        authenticator. The very next call, _add_extra_virtual_authenticator()
+        -> WebAuthn.addVirtualAuthenticator, then fails: CDP requires
+        WebAuthn.enable to be called again before any add is valid on that
+        session. Rotation only ever needs to swap which authenticator answers
+        the NEXT ceremony, never to tear down and rebuild the whole domain --
+        _remove_virtual_authenticator() (below) does the "remove one
+        authenticator" half only, leaving WebAuthn.enable's effect intact for
+        the session. _disable_virtual_authenticator() (full teardown,
+        including WebAuthn.disable) remains correct and unchanged for its
+        ONE other call site: browser_page_with_va's fixture-teardown
+        `finally:` block, where tearing down the whole environment is
+        exactly what a browser/page close should do.
+        """
+        if index == 0:
+            return self._current
+        _remove_virtual_authenticator(self._cdp, self._current)
+        self._current = _add_extra_virtual_authenticator(self._cdp)
+        return self._current
+
+
 def _enable_virtual_authenticator(cdp_session) -> str:
     """
     Enable the WebAuthn virtual environment on the CDP session and add a
@@ -375,8 +476,30 @@ def _enable_virtual_authenticator(cdp_session) -> str:
     return result["authenticatorId"]
 
 
+def _remove_virtual_authenticator(cdp_session, authenticator_id: str) -> None:
+    """Remove ONE virtual authenticator, WITHOUT disabling the WebAuthn
+    environment on this CDP session (see _AuthenticatorRotator.next_key()'s
+    docstring for why: WebAuthn.disable tears down the whole domain, and a
+    subsequent WebAuthn.addVirtualAuthenticator on the same session then
+    fails with 'The Virtual Authenticator Environment has not been enabled
+    for this session'). Use during rotation; use
+    _disable_virtual_authenticator() (full teardown) only at actual
+    fixture/page teardown."""
+    try:
+        cdp_session.send(
+            "WebAuthn.removeVirtualAuthenticator",
+            {"authenticatorId": authenticator_id},
+        )
+    except Exception:
+        pass
+
+
 def _disable_virtual_authenticator(cdp_session, authenticator_id: str) -> None:
-    """Remove the virtual authenticator and disable the virtual environment."""
+    """Remove the virtual authenticator AND disable the virtual environment
+    on this CDP session. Full teardown -- use ONLY when the session itself
+    is going away (browser_page_with_va's fixture `finally:` block). Rotation
+    mid-session must use _remove_virtual_authenticator() instead (see
+    _AuthenticatorRotator.next_key())."""
     try:
         cdp_session.send(
             "WebAuthn.removeVirtualAuthenticator",
@@ -791,6 +914,13 @@ def test_wa_reg_03_audit_event_emitted_on_registration(
 # ---------------------------------------------------------------------------
 
 @skip_no_stack
+# YTF §5.12 (2026-08-13, Tiago directive): performs a REAL WebAuthn login
+# ceremony (POST /api/v1/admin/webauthn/login/start+/finish), not a cached-
+# session reuse. "WebAuthn login flows... belong in the final adversarial
+# stage, not the functional sweep" -- run via `pytest -m security_probe`
+# (run_tier_b()'s second, LAST stage), never interleaved with the cached-
+# session functional sweep.
+@pytest.mark.security_probe
 def test_wa_login_01_login_start_returns_options(clean_authed_client, browser_page_with_va):
     """
     WA-LOGIN-01: POST /api/v1/admin/webauthn/login/start for enrolled user
@@ -842,6 +972,8 @@ def test_wa_login_01_login_start_returns_options(clean_authed_client, browser_pa
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_02_login_finish_issues_session_cookie(
     clean_authed_client, browser_page_with_va
 ):
@@ -928,6 +1060,8 @@ def test_wa_login_02_login_finish_issues_session_cookie(
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_03_session_grants_authenticated_access(
     clean_authed_client, browser_page_with_va
 ):
@@ -1009,6 +1143,8 @@ def test_wa_login_03_session_grants_authenticated_access(
 
 
 @skip_no_stack
+# YTF §5.12: real WebAuthn login ceremony -- adversarial-lane, see WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_login_04_audit_event_webauthn_login_success(
     clean_authed_client, browser_page_with_va
 ):
@@ -1095,6 +1231,9 @@ def test_wa_login_04_audit_event_webauthn_login_success(
 # ---------------------------------------------------------------------------
 
 @skip_no_stack
+# YTF §5.12 ("...all but the brute force testing or injections"): deliberate
+# bad-credential login attempt -- auth-abuse-shaped, adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_01_malformed_credential_response_returns_401(clean_authed_client):
     """
     WA-FAIL-01: login/finish with a malformed credential_response → 401.
@@ -1159,6 +1298,8 @@ def test_wa_fail_01_malformed_credential_response_returns_401(clean_authed_clien
 
 
 @skip_no_stack
+# YTF §5.12: deliberate bad-credential login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_02_unknown_username_returns_401(clean_authed_client):
     """
     WA-FAIL-02: login/start with unknown username returns 400 (no credentials),
@@ -1218,6 +1359,8 @@ def test_wa_fail_02_unknown_username_returns_401(clean_authed_client):
 
 
 @skip_no_stack
+# YTF §5.12: deliberate replayed-challenge login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_03_replayed_challenge_returns_401(
     clean_authed_client, browser_page_with_va
 ):
@@ -1297,6 +1440,8 @@ def test_wa_fail_03_replayed_challenge_returns_401(
 
 
 @skip_no_stack
+# YTF §5.12: deliberate bad-credential login attempt -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_fail_04_audit_event_webauthn_login_failure(clean_authed_client):
     """
     WA-FAIL-04: WEBAUTHN_LOGIN_FAILURE audit event emitted on failed assertion.
@@ -1390,6 +1535,10 @@ def test_wa_revoke_01_delete_credential_returns_200(
 
 
 @skip_no_stack
+# YTF §5.12: deliberate post-revocation login attempt (expected 401) -- a
+# real login/start ceremony against a now-invalid credential, same
+# adversarial shape as the WA-FAIL-* group.
+@pytest.mark.security_probe
 def test_wa_revoke_02_login_fails_after_revocation(
     clean_authed_client, browser_page_with_va
 ):
@@ -1479,6 +1628,63 @@ def test_wa_revoke_03_audit_event_credential_revoked(
 
 
 @skip_no_stack
+
+def _expire_stepup(client) -> None:
+    """Drop any fresh step-up on this session so a 'without step-up' probe is honest.
+
+    2026-08-17 (Ava, TIER-B-BLOCKED-STEPUP-EXPIRE). This previously POSTed to
+    ``/auth/stepup/expire`` and, on anything but 200/204, fell back to
+    ``time.sleep(min(ttl + 5, 310))``. Verified live: that endpoint 404s, and
+    ``grep -rn "stepup/expire\\|stepup_expire" src/yashigani/`` finds
+    nothing -- there is no product endpoint to invalidate a step-up (see the
+    design-gap note in test_wa_revoke_04's docstring below), so the
+    "preferred" branch NEVER fired and every run paid the full ~310s sleep.
+    That sleep exceeds this
+    suite's default 300s per-test budget (conftest.py
+    pytest_collection_modifyitems, ``method="thread"``); pytest-timeout's
+    thread method cannot safely interrupt an arbitrary thread, so it hard-
+    kills the whole pytest PROCESS on expiry (``os._exit`` under the hood),
+    before junitxml's session-end hook can write anything. That crash --
+    not this test's own assertion -- is what turned a leg with 100+
+    genuinely-run, mostly-passing tests into ``executed=0``.
+
+    The premise this fixture protects is real and unchanged from the
+    2026-08-08 fix (see the docstring on test_wa_revoke_04 below): a
+    "DELETE without step-up" probe against a session that just got a REAL
+    step-up (clean_authed_client's cleanup performs one) is not testing what
+    it claims to test -- "an assertion that silently cannot fail" is worse
+    than a slow test. That reasoning is preserved; only the mechanism for
+    making the premise true changes here, from "wait it out" to "prove it
+    directly false" via the session's own stored state.
+
+    Real mechanism: clears ``last_totp_verified_at`` for this session
+    directly in Redis (session store, DB 1) via
+    conftest.expire_session_stepup(), which requires POSITIVE evidence
+    (a follow-up HGET showing the stored timestamp is already past TTL)
+    before returning True -- see that function's docstring for the full
+    chain (same redis instance/DB as clear_auth_throttle() above,
+    same TLS redis-cli pattern, no new infra). This asserts on that
+    evidence rather than silently trusting the write, so a broken/
+    unreachable redis fails LOUD here instead of producing a test that
+    looks green for the wrong reason.
+    """
+    from tests.playwright.conftest import expire_session_stepup
+
+    token = client.cookies.get("__Host-yashigani_admin_session")
+    assert token, (
+        "_expire_stepup: no '__Host-yashigani_admin_session' cookie on this "
+        "client -- cannot locate the Redis session record to expire."
+    )
+    ok = expire_session_stepup(token)
+    assert ok, (
+        "_expire_stepup: could not VERIFY the session's step-up was "
+        "genuinely cleared in Redis (container/redis unreachable, HSET "
+        "failed, or the post-write HGET did not show an expired "
+        "timestamp). Refusing to proceed to a 'without step-up' assertion "
+        "built on unverified state -- see A1: absence of proof is a FAIL, "
+        "not a PASS."
+    )
+
 def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_page_with_va):
     """
     WA-REVOKE-04 (additional security probe): DELETE /credentials/{id} without
@@ -1486,9 +1692,41 @@ def test_wa_revoke_04_without_stepup_returns_401(clean_authed_client, browser_pa
 
     ASVS V6.8.4: step-up MUST be enforced, not just documented.
     OWASP A01: broken access control probe.
+
+    PRODUCT DESIGN GAP (2026-08-17, reported separately, NOT fixed here per
+    dispatch scope): there is no product mechanism to invalidate a step-up
+    elevation before its TTL naturally expires -- no endpoint, nothing in
+    src/yashigani/. That is why THIS TEST has to reach into Redis directly
+    (_expire_stepup -> conftest.expire_session_stepup) to prove "without
+    step-up" is true; a real operator who believes their own elevated
+    session is compromised has no equivalent self-service action short of
+    logging out (which also drops the base session, not just the
+    elevation) or having a SECOND stepped-up admin disable/force-reset
+    their account (session_store.invalidate_all_for_account(), also
+    all-or-nothing). Step-up gates destructive ops (uninstall, policy
+    weakening, credential revocation) specifically because a compromised
+    *session* might not mean a compromised *step-up event* -- so the
+    inability to surgically revoke just the elevation is a real gap, not
+    only a test inconvenience.
     """
     client = clean_authed_client
     page, cdp, auth_id = browser_page_with_va
+
+    # 2026-08-08 — THE PREMISE OF THIS TEST WAS INVALIDATED BY ITS OWN FIXTURE.
+    #
+    # `clean_authed_client` revokes leftover 'E2E*' credentials during setup via
+    # `_delete_credential()`, and that helper performs a REAL step-up to do it.
+    # Step-up TTL is 300s (YASHIGANI_STEPUP_TTL_SECONDS), so by the time this
+    # test asserted "DELETE *without* step-up returns 401", the session it had
+    # been handed carried a step-up seconds old. The route returned 200 because
+    # step-up IS enforced and WAS satisfied — the test was asserting something
+    # its own setup had made untrue, and it stayed red through a fix to a
+    # different route entirely.
+    #
+    # The control being probed (ASVS V6.8.4) is real and worth probing, so this
+    # is NOT relaxed — instead the step-up is explicitly expired first, so
+    # "without step-up" is true when the assertion runs.
+    _expire_stepup(client)
 
     # Register credential.
     options_reg = _do_webauthn_register_via_api(client, "E2E WA-REVOKE-04")
@@ -1540,7 +1778,9 @@ def test_wa_multi_01_register_two_credentials_both_listed(
     registered_ids = []
 
     try:
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-01 Key {i+1}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1571,6 +1811,9 @@ def test_wa_multi_01_register_two_credentials_both_listed(
 
 
 @skip_no_stack
+# YTF §5.12: performs two real WebAuthn login ceremonies -- adversarial-lane,
+# same shape as WA-LOGIN-01.
+@pytest.mark.security_probe
 def test_wa_multi_02_03_both_credentials_usable(
     clean_authed_client, browser_page_with_va
 ):
@@ -1591,8 +1834,10 @@ def test_wa_multi_02_03_both_credentials_usable(
     registered_ids = []
 
     try:
-        # Register both credentials.
+        # Register both credentials — one authenticator each (_AuthenticatorRotator).
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-0{i+2}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1650,6 +1895,8 @@ def test_wa_multi_02_03_both_credentials_usable(
 
 
 @skip_no_stack
+# YTF §5.12: performs real WebAuthn login ceremonies -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_multi_04_revoke_one_does_not_affect_other(
     clean_authed_client, browser_page_with_va
 ):
@@ -1666,7 +1913,9 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
 
     try:
         # Register two credentials.
+        _rotator = _AuthenticatorRotator(cdp, auth_id)
         for i in range(2):
+            _rotator.next_key(i)
             options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-04 Key {i+1}")
             cred_resp = _browser_complete_registration(page, cdp, options_reg)
             r_reg = client.post(
@@ -1732,6 +1981,8 @@ def test_wa_multi_04_revoke_one_does_not_affect_other(
 
 
 @skip_no_stack
+# YTF §5.12: performs a real WebAuthn login ceremony -- adversarial-lane.
+@pytest.mark.security_probe
 def test_wa_multi_05_revoke_all_leaves_empty_list(
     clean_authed_client, browser_page_with_va
 ):
@@ -1748,7 +1999,9 @@ def test_wa_multi_05_revoke_all_leaves_empty_list(
     registered_ids = []
 
     # Register two credentials.
+    _rotator = _AuthenticatorRotator(cdp, auth_id)
     for i in range(2):
+        _rotator.next_key(i)
         options_reg = _do_webauthn_register_via_api(client, f"E2E WA-MULTI-05 Key {i+1}")
         cred_resp = _browser_complete_registration(page, cdp, options_reg)
         r_reg = client.post(

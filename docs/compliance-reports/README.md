@@ -1,80 +1,79 @@
-# Yashigani Compliance Reports — v2.23.2
+# Yashigani Compliance Reports — 4.1.2
 
-**Release:** v2.23.2 (tag commit `4ff2dd5`)
-**Last regenerated:** 2026-05-08
-**Source-of-truth audit dates:** 2026-05-07 (ASVS L3 refresh sweep) / 2026-05-08 (ACS automated scan post-fix)
-**Source commit:** `4d28192` (2.23.x tip; ACS scan target tag `v2.23.2` = `4ff2dd5`; ACS HEAD `3ddeb00`)
-**Taxonomy:** PASS / FAIL / MANUAL / N/A — three-class plus genuine FAIL only. **No PARTIAL.** **No PASS-WITH-COMPENSATING.**
-**Headline math:** `PASS / (PASS + FAIL)` on the applicable subset. MANUAL and N/A reported separately, excluded from the denominator.
+**Status: Yashigani 4.1.2 has not been assessed against any compliance framework.**
+No report in this directory asserts that any control passes. No compliance rate is published.
 
-## What this directory is
+## What happened to the previous contents
 
-This directory holds the per-release compliance evidence summary that ships with Yashigani v2.23.2. It is regenerated on every release tag from authoritative source artefacts:
+Until 2026-08-16 this directory published per-control verdicts for 20 frameworks — 1,062 PASS
+verdicts and 24 headline percentages, including 100.0% figures for FedRAMP Moderate, CMMC 2.0
+Level 2, the HIPAA Security Rule and DORA.
 
-- OWASP ASVS v5 L3 per-chapter manual sweep (senior GRC auditor, GRC auditor)
-- OWASP per-framework manual evidence packs (Web Top 10, API Top 10, LLM Top 10, Agentic AI Top 10)
-- Automated Compliance Scanner (ACS) scan output for 18 framework keys
-- Canonical OWASP LLM Governance Checklist YAML
+Those verdicts and percentages are **withdrawn in full** under finding
+`YCS-20260816-v4.1.2-TB-01`. The reasons, in order of severity:
 
-Per `feedback_no_fake_compliance_docs.md`, every PASS is grounded in a code citation; every MANUAL has an evidence-request justification; every N/A has an out-of-scope reason. Genuine FAILs are reported honestly with the ACS evidence string verbatim.
+1. **Roughly 700 of the 1,062 PASS verdicts were not assessments.** Their entire evidence was a
+   keyword substring match in an unrelated repository file. The published example that makes
+   the class clearest: `CC6.6 Encryption in transit | PASS | Found 'https' in
+   scripts/generate_training_data.py`. In the worst-affected reports the share reached 99%
+   (NIST SP 800-53 Moderate) and 98% (ISO/IEC 27001:2022).
 
-## Layout
+2. **Four frameworks were published at 100.0% that could not have been at any figure.**
+   Yashigani holds no FedRAMP ATO, has had no CMMC C3PAO assessment, and runs no Business
+   Associate Agreement programme.
 
-```
-docs/compliance-reports/
-├── README.md                              <- this file
-├── aggregate.md                           <- cross-framework executive summary
-└── per-framework/                         <- one file per framework
-    ├── owasp-asvs-v5.md                   (180 controls, manual L3 sweep)
-    ├── owasp-top-10-web.md                (OWASP Web Top 10 2021, automated subset)
-    ├── owasp-top-10-api.md                (OWASP API Top 10 2023, automated subset)
-    ├── owasp-api-security.md              (technical baseline, ACS automated)
-    ├── owasp-agentic-ai.md                (OWASP Agentic AI Top 10 2025)
-    ├── owasp-llm-top-10.md                (OWASP LLM Top 10 2025, manual evidence)
-    ├── owasp-llm-governance-checklist.md  (OWASP LLM Governance v1.0)
-    ├── pci-dss-v4.md                      (PCI DSS v4.0)
-    ├── soc2-type2.md                      (SOC 2 Type II)
-    ├── iso-27001-2022.md                  (ISO/IEC 27001:2022)
-    ├── nist-800-53-moderate.md            (NIST SP 800-53 Rev 5 Moderate)
-    ├── nist-csf-2-0.md                    (NIST CSF 2.0)
-    ├── fedramp-moderate.md                (FedRAMP Moderate)
-    ├── hipaa-security.md                  (HIPAA Security Rule)
-    ├── gdpr.md                            (GDPR)
-    ├── eu-ai-act.md                       (EU AI Act)
-    ├── dora.md                            (DORA — Regulation EU 2022/2554)
-    ├── nis2.md                            (NIS 2 Directive — EU 2022/2555)
-    ├── cmmc-l2.md                         (CMMC 2.0 Level 2)
-    └── infrastructure.md                  (Infrastructure Security baseline)
-```
+3. **The OWASP ASVS report was mislabelled.** It was published as ASVS v5 while using the ASVS
+   v4 chapter taxonomy, and 38% of its control identifiers are not ASVS v5 controls.
 
-## How to read these reports
+4. **At least one cited evidence file does not exist.** `docs/incident_response_plan.md`, cited
+   as the evidence for SOC 2 CC7.4, is not present in this repository.
 
-Each per-framework file lists:
+5. **The whole set described v2.23.2** (assessed 2026-05-08) and shipped unchanged through five
+   subsequent releases without re-verification.
 
-1. **Headline:** PASS rate over applicable subset (PASS + FAIL only).
-2. **Counts:** PASS / FAIL / MANUAL / N/A.
-3. **Per-control table:** canonical control ID + canonical control name + verdict + evidence citation or out-of-scope justification.
-4. **Open findings / coverage notes:** any FAIL with remediation context.
+The files remain in place, each stating NOT ASSESSED and enumerating its control scope, so that
+the withdrawal is visible to anyone who previously relied on the figures. The withdrawn
+assessment and its working papers are retained in Agnostic Security's internal compliance
+archive, outside this repository, for audit-trail purposes.
 
-## Frameworks split: manual auditor sweep vs ACS automated scan
+## What evidence does exist for 4.1.2
 
-Four frameworks have authoritative manual evidence packs in addition to (or in place of) the ACS automated subset:
+None of the following is a compliance verdict. Each is a runnable or readable artefact in this
+repository that a reader can check without trusting a claim in a document:
 
-| Framework | Source |
-|---|---|
-| OWASP ASVS v5 (180 L3 controls) | Manual sweep — `asvs-coverage-2026-05-07/summary.md` (refresh) + per-chapter `asvs-coverage-2026-05-02/asvs-v{1..17}.md` |
-| OWASP Agentic AI Top 10 | Manual pack `agentic-ai-top-10-evidence.md` + ACS automated cross-validation |
-| OWASP LLM Top 10 | Manual pack `llm-top-10-evidence.md` (no ACS framework key for this) |
-| OWASP LLM Governance Checklist | Canonical YAML (`acs-work/.../owasp_llm_governance_checklist.yml`) — **not yet in ACS scan output**, reported as MANUAL/N/A |
+| Artefact | Path | What it gives you |
+|---|---|---|
+| Architectural invariant suite | `tests/invariants/` (11 tests, I1–I10) | Executable assertions on OPA every-hop fail-closed, admin-plane authorisation, trust-domain isolation, capability envelope, signed principal, PKI chain of continuity, Rego bundle parity |
+| Regression suites | `src/tests/regression/` (per release; 77 files for v4.1.2) | Each closed security finding has a test that fails if the defect returns |
+| Control design notes | `docs/security/` | Per-surface design documentation — authentication, SSRF, SQL injection, XFF trust boundary, audit-DB least privilege, agent image scanning, release signing |
+| Open findings | `docs/risk-register.yml` | Findings that are open, mitigated, or accepted, with severity |
+| Version consistency | `pyproject.toml:8`, `src/yashigani/__init__.py:16` | Both declare `4.1.2`; enforced by `scripts/check-version-consistency.sh` |
 
-The other 16 frameworks are sourced from the ACS automated scan output at `Internal/Compliance/yashigani/v2.23.2/acs-scan-2026-05-08-postfix/` — automated subset only.
+Run the invariant suite and the regression suites yourself; do not take a report's word for it.
+
+## What is required before verdicts are republished
+
+1. Control text taken from the canonical published framework source, at the correct framework
+   version, using canonical control identifiers.
+2. Every verdict citing a `file:line` in this repository, at the assessed commit, that a reader
+   can open and check without access to any internal or non-shipped document.
+3. The cited code read, not pattern-matched, with the attacker scenario recorded against which
+   the control was tested.
+4. Absence of an expected artefact recorded as NEEDS REVIEW, never as PASS.
+5. Any rate recomputed from the verdicts in the same file at the same commit — and no
+   cross-framework headline percentage at all.
+6. Re-assessment on every release. A verdict inherited across a release boundary without
+   re-verification is an unverified claim, not an inherited one.
+
+No automated gate currently regenerates this directory. Earlier revisions of this file claimed
+regeneration "on every release-tag cut, per release-process gate G17"; no such gate exists
+anywhere in the repository, and the directory's own five-release staleness disproved it. That
+claim is removed rather than softened.
 
 ## Disclaimer
 
-These reports are generated by Agnostic Security Ltd against its own product. For independent verification engage a qualified third-party auditor using these reports as a baseline. Automated checks verify code-level evidence only and do not replace a full security assessment.
+Reports in this directory are produced by Agnostic Security Ltd against its own product and are
+not a substitute for independent assessment. For an audit opinion, engage a qualified
+third-party auditor.
 
-> *We don't replace your auditor — we make their job easier and your audit faster.*
-
-## Regeneration
-
-Per release-process gate G17, this directory is regenerated on every release-tag cut by replacing the entire `docs/compliance-reports/` contents from the source-of-truth evidence directory. Owner: compliance auditor (role-based).
+> *We don't replace your auditor — we make their job easier.*

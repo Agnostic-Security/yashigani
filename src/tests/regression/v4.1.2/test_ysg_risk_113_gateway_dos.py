@@ -1,5 +1,5 @@
 """
-Regression tests — YSG-RISK-113: a single unhealthy Ollama backend blocks the
+Regression tests — YSG-RISK-257: a single unhealthy Ollama backend blocks the
 gateway's ASGI event loop, taking /healthz down with it (availability/DoS).
 
 ## The finding (Ava, live k8s e2e, 2026-07-28)
@@ -180,7 +180,7 @@ class TestEventLoopStaysResponsiveDuringBackendHang:
         # proof the loop was never blocked by the concurrent classify() call.
         assert healthz_times[-1] < 1.0, (
             f"healthz polling took {healthz_times[-1]:.2f}s while classify() blocked "
-            f"for 2.0s — the event loop was starved (YSG-RISK-113 regression)"
+            f"for 2.0s — the event loop was starved (YSG-RISK-257 regression)"
         )
         # The slow backend call itself still completes (correctness preserved).
         assert elapsed >= 2.0
@@ -221,7 +221,7 @@ class TestEventLoopStaysResponsiveDuringBackendHang:
         assert healthz_fired_at[0] < 1.0, (
             f"healthz fired at {healthz_fired_at[0]:.2f}s while the response "
             f"classify() was blocked for 2.0s — the event loop was starved "
-            f"(YSG-RISK-113 regression)"
+            f"(YSG-RISK-257 regression)"
         )
         resp_result = results[0]
         assert resp_result.verdict == "CLEAN"
@@ -233,7 +233,7 @@ class TestEventLoopStaysResponsiveDuringBackendHang:
 # ---------------------------------------------------------------------------
 
 class TestBackendRegistryCircuitBreaker:
-    """YSG-RISK-113 bonus hardening: bound worst-case latency during a
+    """YSG-RISK-257 bonus hardening: bound worst-case latency during a
     sustained backend outage by short-circuiting a backend that has just
     failed _BREAKER_FAILURE_THRESHOLD times in a row."""
 

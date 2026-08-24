@@ -1,5 +1,5 @@
 """
-Regression tests — YSG-RISK-108: mesh port (:8081) identity-header authn bypass.
+Regression tests — YSG-RISK-252: mesh port (:8081) identity-header authn bypass.
 
 T-3: anonymous POST :8081/mcp/<agent> + X-Forwarded-User: <victim>
      → user_id MUST be "unknown"; MESH_IDENTITY_HEADER_REJECTED audit event emitted.
@@ -11,7 +11,7 @@ T-4: forged X-Yashigani-Orchestration-Depth without internal bearer
 T-3 POSITIVE: internal bearer present + X-Forwarded-User → user_id = the slug.
 T-4 POSITIVE: internal bearer present + depth header → promoted to gateway:orchestrator.
 
-Reference: docs/risk-register.yml YSG-RISK-108 / Laura findings T-3/T-4.
+Reference: docs/risk-register.yml YSG-RISK-252 / Laura findings T-3/T-4.
 """
 from __future__ import annotations
 

@@ -35,8 +35,8 @@ from tests.playwright.conftest import (
     capture_screenshot,
     get_admin_credentials,
     playwright_login_admin,
-    _api_get_session_cookies,
     _api_totp_last_used,
+    get_admin_session_cookies,
 )
 
 # Pessimistically assume a TOTP code was used just before this module loaded
@@ -82,22 +82,29 @@ def _login(page, username: str = "", password: str = "") -> None:
     The username/password args are kept for API compatibility but are ignored.
     Fix: v2.23.3 — original helper didn't supply TOTP, causing silent auth failure.
 
-    QA-fix (Ava, Tier-B triage 2026-08-02): force_fresh=True — this file runs
-    LAST in this suite's collection order. _api_get_session_cookies() caches
-    its result process-wide with no TTL awareness; a cookie obtained near the
-    START of a ~40min Tier-B run can outlive the server's own admin-session
-    TTL by the time THIS file's fixtures run, producing "nav link not found
-    at all" (the page silently bounces back to /admin/login, before any
-    selector assertion even fires) rather than a clean auth error. Confirmed
-    candidate cause: this file's own login mechanism is otherwise correct
-    (unlike the browser-form-driven bug fixed elsewhere this session), so a
-    stale cache is the remaining explanation for its failures on the
-    ytf-docker-macos-29d9c9d8-20260731 run. force_fresh here costs one extra
-    ~62s TOTP-replay wait per PKI test (each test opens a fresh
-    sync_playwright() context and calls _login independently) in exchange for
-    a session that is provably live for this specific test's lifetime.
+    QA-fix (Ava, Tier-B triage 2026-08-02): this file runs LAST in this
+    suite's collection order. _api_get_session_cookies() caches its result
+    process-wide with no TTL awareness; a cookie obtained near the START of
+    a ~40min Tier-B run can outlive the server's own admin-session TTL by
+    the time THIS file's fixtures run, producing "nav link not found at
+    all" (the page silently bounces back to /admin/login, before any
+    selector assertion even fires) rather than a clean auth error.
+
+    YTF §5.12 (2026-08-13 call-site audit): this previously called
+    _api_get_session_cookies(admin=1, force_fresh=True) unconditionally —
+    every one of this file's 7 tests opens a fresh sync_playwright()
+    context and calls _login() independently, so that was 7 always-fresh
+    logins per file (each paying the 62s anti-replay wait) purely to guard
+    against the ONE genuinely-stale-by-then case. Now uses
+    get_admin_session_cookies(), which performs a real re-login ONLY when
+    the shared _admin_session_established_at/_admin_session_dirty staleness
+    check (conftest.py's _admin_session_needs_refresh(), the same one
+    refresh_admin_context_if_stale() uses for admin_ctx) says the cached
+    session is dirty or older than the 600s safety margin — same guarantee
+    (never injects a session provably too old to be live), one real login
+    for this file in the common case instead of seven.
     """
-    cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+    cookies = get_admin_session_cookies(admin=1)
     ctx = page.context
     for name, value in cookies.items():
         # __Host- cookies require Secure=True, Path=/ and no explicit Domain.

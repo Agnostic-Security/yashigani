@@ -78,6 +78,11 @@ export class YsAdminCapabilityPolicy extends LitElement {
     _result: { state: true },        // {ok, message} | null
     _effUser: { state: true },
     _effResult: { state: true },     // {ok, message, effective} | null
+    // YSG-RISK-210 / FIND-B-E: lost-update race guard state (see
+    // _fetchScope() below — two independently-found and complementary
+    // guards against the same class of race, both kept).
+    _dirty: { state: true },         // true if _rows has an unsaved edit since the last fetch/save
+    _fetchInFlight: { state: true }, // true while a _fetchScope() GET is pending
   };
 
   constructor() {
@@ -93,12 +98,16 @@ export class YsAdminCapabilityPolicy extends LitElement {
     this._result = null;
     this._effUser = '';
     this._effResult = null;
+    this._dirty = false;
+    this._fetchInFlight = false;
     // FIND-B-E (v4.1.2 retest, lost-update race): monotonic token bumped at
     // the START of every _fetchScope() call. A response is only applied if
     // its token still matches _fetchSeq when the await resolves — any older,
     // still-in-flight fetch that resolves LATER (out of order) is a no-op
     // instead of clobbering whatever a newer scope-type/scope-id selection
-    // already rendered.
+    // already rendered. Kept alongside the _fetchInFlight guard above (which
+    // normally prevents overlap at entry) as defence-in-depth, and because
+    // it also protects against the DOM-mutation ordering gap described below.
     this._fetchSeq = 0;
   }
 
@@ -123,49 +132,73 @@ export class YsAdminCapabilityPolicy extends LitElement {
     return `/admin/api/capability-policy/users/${encodeURIComponent(this._scopeId)}`;
   }
 
+  // YSG-RISK-210 / FIND-B-E (lost-update race, root-caused by Ava 2026-08-03
+  // in test_capability_policy_ui.py::test_save_org_policy_camera_off;
+  // live-confirmed two independent ways, incl. a raw DOM dispatchEvent
+  // bypassing Playwright — independently re-found in the v4.1.2 retest as
+  // FIND-B-E). Guards now applied, all kept together (union, not either/or):
+  //   1. `_fetchInFlight` — a second overlapping call (e.g. a rapid
+  //      double-click on Load, or a scope-type change firing while a prior
+  //      fetch for a different scope hasn't settled) is dropped rather than
+  //      letting two in-flight GETs race each other for who writes _rows last.
+  //   2. `_dirty` — if the user edited a row (see _onValueChange / _addOrigin /
+  //      _removeOrigin) *after* this fetch started but *before* it resolved,
+  //      the edit is KEPT (never silently discarded) and the user is told via
+  //      a visible `.ys-badge` instead. Callers that intend to abandon the
+  //      current draft (_onScopeTypeChange on an actual change, _onLoadScope)
+  //      clear `_dirty` synchronously before starting the new fetch cycle, so
+  //      only edits racing THIS fetch are protected.
+  //   3. Local `scopeType`/`scopeId`/`seq` capture + `_fetchSeq` monotonic
+  //      token (FIND-B-E) — closes a gap the `_fetchInFlight` guard alone
+  //      does NOT cover: `_onScopeTypeChange` mutates `this._scopeType` /
+  //      `this._scopeId` synchronously and unconditionally (it doesn't wait
+  //      on `_fetchInFlight`), so an in-flight fetch that re-read
+  //      `this._scopeType` AFTER its await could apply an old response using
+  //      a NEW scope's label/branch (wrong "overrides" vs "org" key
+  //      parsing). Capturing locals before the `await`, and bailing if
+  //      `_fetchSeq` moved on, makes stale responses a no-op regardless of
+  //      how they went stale.
+  // Also: this does not unconditionally null `_result` (FIND-CAPPOLICY-RACE-
+  // NOT-FIXED, 2026-08-06 — `_save()`/`_delete()` set a success/error
+  // `_result` then call this to refresh rows; an unconditional
+  // `this._result = null` here ran SYNCHRONOUSLY before the `await` yielded,
+  // so Lit's microtask-batched render only ever saw the later null and the
+  // "Saved."/"Override removed." badge never painted). `clearResult`
+  // defaults to `true` for fresh, user-initiated loads (_onScopeTypeChange,
+  // _onLoadScope, initial _load()); `_save()`/`_delete()` pass `false` to
+  // preserve the badge they just set.
   async _fetchScope(clearResult = true) {
-    // FIND-CAPPOLICY-RACE-NOT-FIXED (2026-08-06): this reset used to run
-    // UNCONDITIONALLY. _save()/_delete() set `this._result` to the
-    // success/error badge and then `await` this same method to refresh the
-    // row data from the server — but the `this._result = null` below ran
-    // SYNCHRONOUSLY, before the `await` a few lines down ever yields to the
-    // event loop. Lit batches synchronous reactive-property writes into a
-    // single microtask render, so the render that actually painted only
-    // ever saw the LATER value (null) — the "Saved."/"Override removed."
-    // badge never appeared, not even briefly. The in-flight sequence-token
-    // guard a few lines below (`seq !== this._fetchSeq`) is a SEPARATE
-    // mechanism protecting `_rows`/`_policy` correctness on out-of-order
-    // responses and is unaffected by this — it still fires unconditionally.
-    // Callers that are refreshing data AFTER already setting `_result`
-    // themselves (_save, _delete) now pass clearResult=false to preserve
-    // their own badge; callers starting a fresh, user-initiated scope load
-    // (_onScopeTypeChange, _onLoadScope, initial _load()) keep the default
-    // `true` so a stale badge from a previous scope doesn't linger.
+    if (this._fetchInFlight) return;
+    this._fetchInFlight = true;
     if (clearResult) this._result = null;
-    // FIND-B-E (v4.1.2 retest, lost-update race): capture the scope this
-    // call is FOR before the await — a rapid scope-type change (e.g. org
-    // -> group -> user in quick succession) previously re-read
-    // this._scopeType/_scopeId AFTER the network round-trip, which could
-    // (a) apply an older response using the label/branch of a NEWER,
-    // unrelated scope (wrong "overrides" vs "org" key parsing), and
-    // (b) let responses that resolve out of order clobber each other with
-    // no ordering guarantee at all.
     const scopeType = this._scopeType;
     const scopeId = this._scopeId;
     const seq = ++this._fetchSeq;
-    if (scopeType !== 'org' && !scopeId) {
-      this._policy = {};
-      this._rows = {};
-      return;
+    try {
+      if (scopeType !== 'org' && !scopeId) {
+        this._policy = {};
+        this._rows = {};
+        this._dirty = false;
+        return;
+      }
+      const data = await this.api.get(this._scopeUrl());
+      if (seq !== this._fetchSeq) return; // superseded by a newer fetch — stale response, no-op
+      if (this._dirty) {
+        // An edit landed while this GET was in flight. Do not clobber it —
+        // keep `_rows` exactly as the user left them and say so.
+        this._result = {
+          ok: false,
+          message: 'Scope data was refreshed from the server while you had an unsaved edit — your edit was kept. Save it, or reload the scope to discard it.',
+        };
+        return;
+      }
+      const key = scopeType === 'org' ? 'org' : 'overrides';
+      this._policy = (data && data[key]) ? data[key] : {};
+      this._rows = this._buildRows(this._policy);
+      this._dirty = false;
+    } finally {
+      this._fetchInFlight = false;
     }
-    const data = await this.api.get(this._scopeUrl());
-    // In-flight guard: a newer _fetchScope() call (bumping _fetchSeq again)
-    // started while this one was awaiting the network. Discard this now-
-    // stale response instead of applying it.
-    if (seq !== this._fetchSeq) return;
-    const key = scopeType === 'org' ? 'org' : 'overrides';
-    this._policy = (data && data[key]) ? data[key] : {};
-    this._rows = this._buildRows(this._policy);
   }
 
   _buildRows(policy) {
@@ -186,8 +219,15 @@ export class YsAdminCapabilityPolicy extends LitElement {
   // ── Scope picker ──────────────────────────────────────────────────────────
 
   _onScopeTypeChange(e) {
+    // YSG-RISK-210: the <select>'s @change handler used to re-fetch
+    // unconditionally, even when the value hadn't actually changed
+    // (confirmed live: re-selecting "org" re-triggers _fetchScope() and can
+    // still silently revert an in-progress edit). Guard on an actual change.
+    if (e.target.value === this._scopeType) return;
     this._scopeType = e.target.value;
     this._scopeId = '';
+    this._result = null;
+    this._dirty = false; // starting a fresh fetch cycle for a different scope
     this._fetchScope();
   }
 
@@ -200,6 +240,8 @@ export class YsAdminCapabilityPolicy extends LitElement {
       this._result = { ok: false, message: this._scopeType === 'group' ? 'Select a group first.' : 'Enter a user email first.' };
       return;
     }
+    this._result = null;
+    this._dirty = false; // explicit reload — starting a fresh fetch cycle
     await this._fetchScope();
     this.requestUpdate();
   }
@@ -208,33 +250,42 @@ export class YsAdminCapabilityPolicy extends LitElement {
 
   _onValueChange(cap, e) {
     this._rows = { ...this._rows, [cap]: { ...this._rows[cap], value: e.target.value } };
+    this._dirty = true; // YSG-RISK-210: mark unsaved-edit so an in-flight fetch can't clobber it
   }
 
   _onOriginInput(cap, e) {
+    // Draft text only (not yet committed to the row's origins list via
+    // _addOrigin) — not tracked as `_dirty`; it isn't part of what
+    // _collectPolicy() persists.
     this._rows = { ...this._rows, [cap]: { ...this._rows[cap], input: e.target.value, error: '' } };
   }
 
   _addOrigin(cap) {
     const row = this._rows[cap];
-    // FIND-B-F (2026-08-04): validate the RAW input first, THEN normalise.
-    // The previous order (normalise, then validate the normalised value)
-    // let normaliseOrigin() silently reconstruct a bare "scheme://host"
-    // from ANY successfully-parsed URL before isValidOrigin() ever saw the
-    // original string — so "https://example.com/some/path" parsed fine,
-    // normaliseOrigin() rebuilt it as "https://example.com" (path silently
-    // dropped), and THAT clean value passed isValidOrigin() with no error
-    // shown at all: a path-bearing (or query/hash/credentials-bearing)
-    // origin was silently accepted-with-correction instead of rejected,
-    // even though isValidOrigin() itself correctly rejects a path when given
-    // the raw string. Validating raw-then-normalising closes this without
-    // weakening isValidOrigin() itself (wildcard rejection was already
-    // correct either way — '*' survives URL parsing into the host and is
-    // explicitly checked for).
-    if (!isValidOrigin(row.input)) {
+    // YSG-RISK-211 / FIND-B-F (independently found by both v4.1.2 sessions,
+    // same root cause): this used to call normaliseOrigin(row.input) BEFORE
+    // validating, then validate the *normalised* value. That's backwards and
+    // let both invalid shapes through:
+    //   - "https://example.com/some/path" -> normaliseOrigin() rebuilds the
+    //     origin from `${url.protocol}//${url.host}`, which silently DROPS
+    //     the path. isValidOrigin() then ran on the already-pathless value
+    //     and passed it.
+    //   - "https://*.example.com" -> normaliseOrigin() round-trips the string
+    //     through `new URL()`, which percent-encodes '*' to '%2A' in
+    //     url.host. isValidOrigin()'s `indexOf('*')` check then ran on
+    //     "https://%2A.example.com", which no longer contains a literal '*',
+    //     so it passed too.
+    // Live-confirmed both bypasses in a headless-Chromium eval before fixing.
+    // Fix: validate the RAW trimmed input (where '*' is still literal and the
+    // path is still present) and only normalise a value that already passed.
+    // Server-side (capability_policy/model.py _HTTPS_ORIGIN_RE) was checked
+    // and already rejects both shapes correctly — this was a client-only gap.
+    const raw = (row.input || '').trim();
+    if (!isValidOrigin(raw)) {
       this._rows = { ...this._rows, [cap]: { ...row, error: 'Must be https://hostname[:port] — no path, no wildcard.' } };
       return;
     }
-    const origin = normaliseOrigin(row.input);
+    const origin = normaliseOrigin(raw);
     if (row.origins.includes(origin)) {
       this._rows = { ...this._rows, [cap]: { ...row, error: 'Origin already in the list.' } };
       return;
@@ -244,11 +295,13 @@ export class YsAdminCapabilityPolicy extends LitElement {
       return;
     }
     this._rows = { ...this._rows, [cap]: { ...row, origins: [...row.origins, origin], input: '', error: '' } };
+    this._dirty = true; // YSG-RISK-210
   }
 
   _removeOrigin(cap, origin) {
     const row = this._rows[cap];
     this._rows = { ...this._rows, [cap]: { ...row, origins: row.origins.filter((o) => o !== origin) } };
+    this._dirty = true; // YSG-RISK-210
   }
 
   // ── Save / delete ─────────────────────────────────────────────────────────
@@ -278,6 +331,11 @@ export class YsAdminCapabilityPolicy extends LitElement {
     const res = await this.api.mutate(this._scopeUrl(), { method: 'PUT', body: policy });
     if (res.ok) {
       this._result = { ok: true, message: 'Saved.' };
+      // FIND-0805-003: the edit is now persisted server-side, so it's no
+      // longer "dirty" -- clear it BEFORE the refresh below so _fetchScope()
+      // takes the normal rebuild path (and, per YSG-RISK-210 fix, no longer
+      // nulls `_result` itself, so this "Saved." badge actually paints).
+      this._dirty = false;
       this.app?.toast('Capability policy saved.', 'success');
       // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — this refresh must
       // not wipe the "Saved." badge we just set (see _fetchScope() comment).
@@ -300,6 +358,7 @@ export class YsAdminCapabilityPolicy extends LitElement {
     const res = await this.api.mutate(url, { method: 'DELETE' });
     if (res.ok) {
       this._result = { ok: true, message: 'Override removed.' };
+      this._dirty = false; // FIND-0805-003 / YSG-RISK-210 — see _save() above
       this.app?.toast('Capability policy override removed.', 'success');
       // FIND-CAPPOLICY-RACE-NOT-FIXED: clearResult=false — preserve the
       // "Override removed." badge through the refresh (see _fetchScope()).
@@ -328,10 +387,17 @@ export class YsAdminCapabilityPolicy extends LitElement {
   // ── Render ────────────────────────────────────────────────────────────────
 
   _renderScopePicker() {
+    // YSG-RISK-210: disable the scope-switching controls while a fetch is
+    // in flight (defence-in-depth alongside the _dirty guard in
+    // _fetchScope() -- this stops a second overlapping fetch from being
+    // triggered via the UI in the first place; the _dirty guard is what
+    // actually protects against the raw-DOM-dispatchEvent bypass Ava found,
+    // since a `disabled` control still delivers synthetic events).
     return html`
       <div class="ys-field">
         <label class="ys-label">Scope</label>
-        <select class="ys-input" id="cap-scope-type" .value=${this._scopeType} @change=${(e) => this._onScopeTypeChange(e)}>
+        <select class="ys-input" id="cap-scope-type" .value=${this._scopeType} ?disabled=${this._fetchInFlight}
+          @change=${(e) => this._onScopeTypeChange(e)}>
           <option value="org">Organisation (default)</option>
           <option value="group">Group</option>
           <option value="user">User</option>
@@ -340,7 +406,8 @@ export class YsAdminCapabilityPolicy extends LitElement {
       ${this._scopeType === 'group' ? html`
         <div class="ys-field">
           <label class="ys-label">Group</label>
-          <select class="ys-input" id="cap-group-id" .value=${this._scopeId} @change=${(e) => this._onScopeIdChange(e)}>
+          <select class="ys-input" id="cap-group-id" .value=${this._scopeId} ?disabled=${this._fetchInFlight}
+            @change=${(e) => this._onScopeIdChange(e)}>
             <option value="">${this._groups.length ? 'Select a group…' : 'No groups configured'}</option>
             ${this._groups.map((g) => html`<option value="${g.id}">${g.display_name || g.id} (${g.id})</option>`)}
           </select>
@@ -348,10 +415,10 @@ export class YsAdminCapabilityPolicy extends LitElement {
       ${this._scopeType === 'user' ? html`
         <div class="ys-field">
           <label class="ys-label">User email</label>
-          <input class="ys-input" id="cap-user-email" type="text" .value=${this._scopeId}
+          <input class="ys-input" id="cap-user-email" type="text" .value=${this._scopeId} ?disabled=${this._fetchInFlight}
             @input=${(e) => this._onScopeIdChange(e)} placeholder="user@example.com">
         </div>` : nothing}
-      <button class="ys-btn" id="cap-scope-load" @click=${() => this._onLoadScope()}>Load</button>
+      <button class="ys-btn" id="cap-scope-load" ?disabled=${this._fetchInFlight} @click=${() => this._onLoadScope()}>Load</button>
     `;
   }
 

@@ -355,6 +355,15 @@ YASHIGANI_HOST_OLLAMA_PORT="${YASHIGANI_HOST_OLLAMA_PORT:-}"
 # The function never breaks an install — errors warn + point at the doc and continue.
 SECURE_BACKEND_FIREWALL=false
 
+# YSG-RISK-202 — mandatory-LLM-on-CPU fail-closed gate.
+# Default false: a GPU-DETECTED host (YSG_GPU_TYPE != none) whose GPU cannot be
+# PROVEN live in the inference container (CDI probe, Podman /etc/cdi shadow check,
+# or the post-deploy library=cuda effect check) FAILS the install/upgrade instead
+# of silently degrading to CPU-only ollama. See _setup_podman_cdi_gpu,
+# compose_up()'s CDI-probe branch, and _verify_inference_backend_effect().
+# --allow-cpu-inference flips this to warn-and-continue (explicit operator opt-in).
+YSG_ALLOW_CPU_INFERENCE=false
+
 # P1 W4 — onboard / offboard actions (short-circuit like PKI_ACTION).
 ONBOARD_MANIFEST=""       # --onboard <manifest.yaml>
 OFFBOARD_AGENT=""         # --offboard <agent-name>
@@ -514,6 +523,21 @@ OPTIONS
                        Auto-detected via lspci when native GPU drivers absent.
                        Overlay: docker-compose.gpu-vulkan.yml [untested on hardware here].
     CPU-only         — Default when no GPU detected. ollama logs library=cpu.
+  --allow-cpu-inference                   YSG-RISK-202: on a GPU-DETECTED host, the
+                                          installer FAILS CLOSED (non-zero exit) if the
+                                          GPU device cannot be proven live in the ollama
+                                          container (CDI probe fail, Podman /etc/cdi
+                                          shadow, or the inference-backend effect check
+                                          reporting library=cpu) — the mandatory LLM
+                                          layer running on CPU is a silent-degrade
+                                          product-policy violation
+                                          (project_yashigani_llm_is_mandatory), not an
+                                          acceptable default. Pass this flag to
+                                          explicitly accept CPU-only inference and let
+                                          the install proceed with a WARN instead of a
+                                          hard failure. No effect on hosts with no GPU
+                                          detected (YSG_GPU_TYPE=none) — nothing to fail
+                                          closed on.
   --non-interactive                       Skip all interactive prompts
   --runtime <docker|podman|k8s>          Lock the container runtime (admin-must-choose
                                           rule per feedback_runtime_choice.md;
@@ -936,6 +960,13 @@ parse_args() {
         # LAURA-411-001: non-interactive consent gate for inference-backend firewall.
         # In interactive mode the operator is prompted; this flag forces apply without prompt.
         SECURE_BACKEND_FIREWALL=true
+        shift
+        ;;
+      --allow-cpu-inference)
+        # YSG-RISK-202: explicit operator opt-in to accept CPU-only inference on a
+        # GPU-detected host. Without this flag, a GPU-detected host whose GPU cannot
+        # be proven live in the ollama container fails the install/upgrade closed.
+        YSG_ALLOW_CPU_INFERENCE=true
         shift
         ;;
       --help|-h)         usage; exit 0 ;;
@@ -2430,43 +2461,62 @@ _format_gpu_vram_mb() {
 # =============================================================================
 # Podman GPU CDI provisioning — no host sudo (ROOTLESS-CDI-001)
 # =============================================================================
-# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0. Podman 4.9.3 (Ubuntu)
-# hardcodes /etc/cdi as its ONLY CDI scan directory — cdi_spec_dirs in
-# containers.conf is NOT effective on this version (empirically verified: even
-# with cdi_spec_dirs pointing only to ~/.config/cdi, podman still reads /etc/cdi
-# and ignores the user dir). No /etc/cdi scan means no CDI device resolution.
+# nvidia-ctk 1.19.1 always emits cdiVersion 0.7.0.
 #
-# Two blockers from the prior broken attempt:
-#   A. The minimal 0.5.0 spec had no library mounts → ollama sees library=cpu.
-#      A working CDI spec MUST include the containerEdits that mount libcuda.so,
-#      libnvidia-ml.so etc. — what nvidia-ctk normally discovers and emits.
-#   B. /etc/cdi/nvidia.yaml was written 0600 (root-only) → rootless podman
-#      gets EACCES on the CDI registry refresh → all CDI devices unresolvable.
+# YSG-RISK-202 (2026-08-05/07 campaign) ADJUDICATED a contradiction this file used
+# to carry in two places: an early note here said podman 4.9.3 hardcodes /etc/cdi
+# as its ONLY scan directory and ignores cdi_spec_dirs; the shipping design below
+# (_setup_podman_cdi_gpu) claimed the opposite — that user-space cdi_spec_dirs
+# alone was "proven" sufficient, no /etc/cdi involvement. Both were half-right:
+# commit 4f3858d0 (2026-06-27) verified user-space cdi_spec_dirs works live on
+# 4.9.3 with NO /etc/cdi/nvidia.yaml present at all. The 2026-08 campaign then hit
+# a HOST with a STALE root-owned /etc/cdi/nvidia.yaml left over from an earlier
+# manual/older-design install, dated before an NVIDIA driver upgrade removed the
+# libcuda.so version it referenced. With that stale file present, podman 4.9.3's
+# CDI probe failed even though the correct spec existed at ~/.config/cdi/nvidia.yaml
+# and cdi_spec_dirs pointed at it. Adjudication: cdi_spec_dirs DOES work on 4.9.3
+# when /etc/cdi/nvidia.yaml is absent; a stale /etc/cdi/nvidia.yaml SHADOWS it
+# (podman's default scan list is /etc/cdi + /var/run/cdi + configured dirs; a
+# device name defined in more than one spec resolves to whichever is found first,
+# and /etc/cdi apparently wins on 4.9.3 regardless of cdi_spec_dirs ordering).
+# Podman 5.x/6.x CDI directory-scan precedence is UNTESTED by Agnostic Security —
+# do not assume it matches 4.9.3; the runtime CDI probe in compose_up() is the
+# authoritative arbiter on every version, this comment documents the mechanism,
+# not a promise of behaviour on versions we have not tested.
 #
-# Correct fix (no interactive sudo):
-#   1. Run nvidia-ctk cdi generate to produce the COMPLETE 0.7.0 spec including
-#      all CUDA library mounts and hooks. This is the only reliable source for
-#      the correct host library paths and device nodes.
-#   2. Transform 0.7.0 → 0.6.0 in-process (Python3, no extra deps):
-#        - set cdiVersion: "0.6.0"
-#        - strip per-device additionalGids: blocks (0.7.0 addition)
-#        - strip gid: fields from deviceNodes (0.7.0 addition)
-#        - KEEP all hooks, mounts, library containerEdits intact
-#      Podman 4.9.3 accepts 0.6.0 (confirmed via binary string scan: v0.6.0
-#      present; v0.7.0 absent). The stripped fields are display/GID-namespace
-#      features not needed for headless CUDA compute.
-#   3. Write the 0.6.0 spec to /etc/cdi/nvidia.yaml with chmod 0644 via the
-#      Docker Engine daemon (rootful — no interactive user sudo). Without 0644,
-#      rootless podman cannot read the spec and the CDI registry refresh fails.
-#      /etc/cdi/ is created via Docker if it does not exist.
+# _setup_podman_cdi_gpu therefore does two things, in order:
+#   1. Provision the CORRECT transformed spec into the USER CDI dir
+#      (~/.config/cdi/nvidia.yaml) via cdi_spec_dirs in the user containers.conf —
+#      no /etc/cdi write, no Docker daemon, no sudo (ROOTLESS-CDI-001 original
+#      design; kept — this is what makes rootless-Podman GPU work with zero host
+#      privilege on a clean host).
+#   2. Call _check_stale_etc_cdi_shadow to detect whether a PRE-EXISTING
+#      /etc/cdi/nvidia.yaml (root-owned, predating this install run, NOT written
+#      by step 1) references a driver library that no longer exists on disk. If
+#      so, this is the YSG-RISK-202 shadow bug: WARN/refresh if writable
+#      (uncommon — /etc/cdi is normally root:root), otherwise FAIL LOUD with the
+#      exact `sudo install -m 0644 ...` remediation rather than letting the
+#      runtime CDI probe fail silently into an unexplained CPU-only fallback.
 #
-# Podman ≥5.0 accepts cdiVersion 0.7.0 natively → skip the transform and
-# write the raw nvidia-ctk output directly to /etc/cdi/nvidia.yaml (still with
-# 0644 via Docker, so rootless podman can read it).
+# Older prior-broken-attempt blockers this design also fixes (unchanged from the
+# original ROOTLESS-CDI-001 fix, commit 4f3858d0):
+#   A. A minimal 0.5.0 spec had no library mounts → ollama saw library=cpu even
+#      when the CDI probe itself passed. A working spec MUST include the
+#      containerEdits that mount libcuda.so, libnvidia-ml.so etc. — nvidia-ctk's
+#      generated output has these; a hand-rolled minimal spec does not.
+#   B. A previous /etc/cdi/nvidia.yaml written 0600 (root-only) gave rootless
+#      podman EACCES on the CDI registry refresh — hence the 0644 requirement
+#      whenever /etc/cdi is the effective target.
+#
+# The 0.7.0 → 0.6.0 transform (podman <5.0 cannot parse 0.7.0; confirmed via
+# binary string scan: v0.6.0 present, v0.7.0 absent) is LOAD-BEARING regardless
+# of which directory ends up being the effective one — keep it. Podman ≥5.0
+# accepts cdiVersion 0.7.0 natively; skip the transform on that branch.
 #
 # If nvidia-ctk is missing: WARN loudly and return (CDI unavailable; the
-# install.sh CDI probe will fail → devpath fallback WARNS that GPU is CPU-only).
-# If Docker daemon unavailable: same — WARN and return; do not silently proceed.
+# install.sh CDI probe will fail). Whether that failure then aborts the install
+# or degrades to CPU-only depends on --allow-cpu-inference / YSG_ALLOW_CPU_INFERENCE
+# — see compose_up()'s CDI-probe branch. Default is fail-closed (YSG-RISK-202).
 
 # _transform_cdi_spec_060 <input-070-path> <output-060-path>
 # Read a cdiVersion 0.7.0 spec and write a 0.6.0-compatible version by:
@@ -2528,8 +2578,13 @@ PYEOF
 # Generate a complete podman-compatible CDI spec via nvidia-ctk, transform it
 # to cdiVersion 0.6.0 (podman <5.0 compatible) and deploy it to the USER CDI dir
 # (~/.config/cdi), wiring podman to it via cdi_spec_dirs in the USER containers.conf.
-# NO /etc/cdi, NO Docker daemon, NO sudo — pure user-space (proven on podman 4.9.3:
-# libcuda + nvidia-smi visible in-container via cdi_spec_dirs alone).
+# NO /etc/cdi write, NO Docker daemon, NO sudo for THIS step — pure user-space, and
+# sufficient on a clean host (verified live on podman 4.9.3 with no pre-existing
+# /etc/cdi/nvidia.yaml: commit 4f3858d0). YSG-RISK-202 (2026-08 campaign) proved a
+# pre-existing /etc/cdi/nvidia.yaml can shadow this and must be separately
+# reconciled — see _check_stale_etc_cdi_shadow, called at the end of this function.
+# Podman ≥5.0 CDI precedence is untested; the runtime probe in compose_up() is the
+# real arbiter on every version — this function only provisions inputs to it.
 # MUST be called before the CDI probe in compose_up() so the probe passes.
 _setup_podman_cdi_gpu() {
   if [[ "${YSG_GPU_TYPE:-none}" != "nvidia" ]]; then return 0; fi
@@ -2595,7 +2650,86 @@ _setup_podman_cdi_gpu() {
     printf '[engine]\ncdi_spec_dirs = ["%s"]\n' "${_cdi_dir}" >> "${_cc}"
     log_info "  wrote [engine] cdi_spec_dirs to ${_cc}"
   fi
-  log_success "Podman GPU CDI ready — user-space spec, no /etc/cdi, no docker, no sudo"
+  # NOTE: this is NOT the final success signal — the runtime CDI probe in
+  # compose_up() is the actual arbiter (YSG-RISK-202: this line used to be
+  # log_success and printed BEFORE the probe that then disproved it).
+  log_info "Podman GPU CDI spec provisioned (user-space) — pending runtime probe"
+
+  # YSG-RISK-202: reconcile/detect a stale pre-existing /etc/cdi/nvidia.yaml
+  # that would shadow the correct spec above. Exports YSG_CDI_ETC_SHADOW_STALE
+  # for the CDI-probe branch in compose_up() to reference in its remediation.
+  _check_stale_etc_cdi_shadow "${_cdi_out}" "${_podman_major:-4}"
+}
+
+# _check_stale_etc_cdi_shadow <correct-user-space-spec-path> <podman-major-version>
+# YSG-RISK-202: podman's default CDI scan list includes /etc/cdi regardless of
+# cdi_spec_dirs. A pre-existing, root-owned /etc/cdi/nvidia.yaml — left over from
+# an earlier install attempt, an older installer design, or a manual operator
+# step — can reference a driver library (libcuda.so.<version>) that a subsequent
+# NVIDIA driver upgrade removed. When that happens the CDI probe fails with an
+# error naming the STALE version, while the correct, freshly-generated spec sits
+# unused in the user CDI dir. This function detects that specific condition and:
+#   - does nothing if /etc/cdi/nvidia.yaml does not exist (nothing to shadow)
+#   - refreshes it in place if writable by the current user (uncommon — /etc/cdi
+#     is normally root:root 0755; this covers hosts where an operator has
+#     deliberately relaxed that)
+#   - otherwise FAILS LOUD with the exact non-interactive remediation command,
+#     and exports YSG_CDI_ETC_SHADOW_STALE=true so the CDI-probe branch in
+#     compose_up() can name this specific, operator-fixable cause instead of a
+#     generic "GPU unavailable" message
+# Never touches /etc/cdi if the referenced libraries all resolve — a valid,
+# current /etc/cdi/nvidia.yaml (e.g. hand-provisioned by an operator, or written
+# by a prior run of this same function on a host where /etc/cdi IS writable) is
+# left alone.
+_check_stale_etc_cdi_shadow() {
+  local _correct_spec="$1" _podman_major="${2:-4}"
+  # Test hook only — unset in every real install path (bats regression tests
+  # inject a scratch path here so this function never touches the real
+  # /etc/cdi in CI/dev; production behaviour is unchanged).
+  local _etc_spec="${YSG_CDI_ETC_SPEC_OVERRIDE:-/etc/cdi/nvidia.yaml}"
+  YSG_CDI_ETC_SHADOW_STALE=false
+
+  [[ -f "$_etc_spec" ]] || { log_info "  ${_etc_spec} does not exist — no shadow risk"; return 0; }
+
+  # Extract every host library path referenced by hostPath: entries pointing at
+  # a libcuda/libnvidia shared object, and stat each. Any that fails to stat is
+  # a stale reference (the file the spec depends on no longer exists on disk).
+  local _missing=()
+  local _line _path
+  while IFS= read -r _line; do
+    _path="$(printf '%s' "$_line" | sed -E 's/^[[:space:]]*-?[[:space:]]*hostPath:[[:space:]]*//')"
+    [[ -n "$_path" ]] || continue
+    [[ -e "$_path" ]] || _missing+=("$_path")
+  done < <(grep -E 'hostPath:.*lib(cuda|nvidia)[^[:space:]]*\.so' "$_etc_spec" 2>/dev/null || true)
+
+  if [[ ${#_missing[@]} -eq 0 ]]; then
+    log_info "  ${_etc_spec} present and all referenced libraries resolve — not stale"
+    return 0
+  fi
+
+  # Stale — the file is a shadow risk. Version-aware framing: confirmed-broken
+  # on podman <5 (YSG-RISK-202); untested (not "known safe") on podman >=5.
+  if [[ "$_podman_major" -lt 5 ]]; then
+    log_warn "STALE ${_etc_spec}: references missing driver librar$([[ ${#_missing[@]} -eq 1 ]] && echo y || echo ies): ${_missing[*]}"
+    log_warn "podman ${_podman_major}.x's CDI scan includes /etc/cdi regardless of cdi_spec_dirs (YSG-RISK-202) — this WILL shadow the correct spec at ${_correct_spec}"
+  else
+    log_warn "STALE ${_etc_spec}: references missing driver librar$([[ ${#_missing[@]} -eq 1 ]] && echo y || echo ies): ${_missing[*]}"
+    log_warn "podman ${_podman_major}.x CDI directory-scan precedence is UNTESTED by Agnostic Security — treating this defensively as a shadow risk"
+  fi
+
+  if [[ -w "$_etc_spec" ]]; then
+    if install -m 0644 "$_correct_spec" "$_etc_spec" 2>/dev/null; then
+      log_success "  refreshed ${_etc_spec} from the current spec (writable — no sudo needed)"
+      return 0
+    fi
+    log_warn "  ${_etc_spec} appeared writable but the refresh write failed — treating as unresolved"
+  fi
+
+  log_error "Stale ${_etc_spec} is NOT writable by this user and could not be auto-refreshed."
+  log_error "Remediation (run once, outside this installer): sudo install -m 0644 \"${_correct_spec}\" \"${_etc_spec}\""
+  log_error "Until that runs, the CDI probe below will likely fail and ollama will run CPU-only unless --allow-cpu-inference is set."
+  YSG_CDI_ETC_SHADOW_STALE=true
+  return 0
 }
 
 # =============================================================================
@@ -3177,6 +3311,19 @@ run_preflight() {
 # NOTE: do NOT use this for the onboard/offboard AUTH gate — use
 # _is_installed_or_running() instead (residuals-based, fail-closed).
 _is_existing_yashigani_running() {
+  # YSG-RISK-204b (Iris pre-push review, 2026-08-07): this helper is reachable
+  # from the k8s branch of main() (run_preflight -> check_installer_preflight)
+  # BEFORE any project-name resolution — that logic is compose-only and runs
+  # later. On k8s the project therefore fell back to the literal "docker" and
+  # this function probed `docker ps` / `podman ps` on the HOST, which has
+  # nothing to do with a k8s deployment. A stray host compose stack named
+  # "docker" would match, return 0, and silently suppress the port-80/443
+  # preflight for a FRESH k8s install — exactly the check that must not be
+  # skipped there. Compose-container evidence is meaningless on k8s: answer NO
+  # and let the port check run.
+  if [[ "${MODE:-}" == "k8s" ]]; then
+    return 1
+  fi
   local _secrets_dir="${WORK_DIR}/docker/secrets"
   # Secrets dir must exist and contain the root CA cert (written by PKI bootstrap;
   # indicates a completed prior install, not just a partial one).
@@ -3192,15 +3339,45 @@ _is_existing_yashigani_running() {
   # Label filter: works even without compose CLI installed.
   # Multi-instance (3.0): scope the label filter to THIS install's project, not a
   # hardcoded "docker" — otherwise a 2nd named instance false-matches the first.
-  local _proj="${COMPOSE_PROJECT_NAME:-docker}"
-  if docker ps --filter "label=com.docker.compose.project=${_proj}" \
-       --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    return 0
+  # YSG-RISK-204 (fixed 2026-08-07). This resolved COMPOSE_PROJECT_NAME with a
+  # "docker" fallback, but check_installer_preflight() (install.sh:19551) runs
+  # BEFORE `export COMPOSE_PROJECT_NAME="$PROJECT"` (install.sh:19590). So on any
+  # install whose project is DERIVED from --domain (i.e. every multi-instance and
+  # every non-default-domain deployment), _proj was literally "docker" here, the
+  # label filter matched nothing, this function returned 1, and BUG-B+-001's
+  # --skip-ports carve-out never fired — making `install.sh --upgrade` fail its own
+  # preflight on the ports its own running deployment was holding.
+  #
+  # Fix: resolve the project the same way the rest of the installer does
+  # (COMPOSE_PROJECT_NAME -> PROJECT -> the tree's own .env), and additionally match
+  # on the compose working_dir label, which identifies THIS install tree
+  # unambiguously regardless of project naming.
+  local _proj="${COMPOSE_PROJECT_NAME:-${PROJECT:-}}"
+  if [[ -z "$_proj" && -f "${WORK_DIR}/docker/.env" ]]; then
+    _proj="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "${WORK_DIR}/docker/.env" 2>/dev/null | cut -d= -f2-)"
   fi
-  if podman ps --filter "label=io.podman.compose.project=${_proj}" \
-       --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    return 0
-  fi
+  _proj="${_proj:-docker}"
+
+  local _rt
+  for _rt in docker podman; do
+    command -v "$_rt" >/dev/null 2>&1 || continue
+    # Project label — docker compose and podman-compose both emit the
+    # com.docker.compose.* set; podman-compose additionally emits io.podman.*.
+    if "$_rt" ps --filter "label=com.docker.compose.project=${_proj}" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    if "$_rt" ps --filter "label=io.podman.compose.project=${_proj}" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    # Working-dir label — project-name-independent, so it still identifies this
+    # tree's stack when the project has not been resolved yet.
+    if "$_rt" ps --filter "label=com.docker.compose.project.working_dir=${WORK_DIR}/docker" \
+         --format '{{.Names}}' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  done
   # Compose ps fallback (slower — requires parsing the compose file)
   if docker compose -f "$_compose_file" ps 2>/dev/null | grep -qE "Up|running"; then
     return 0
@@ -3777,7 +3954,7 @@ _write_aes_key_to_env() {
   # Codifies the cloud-9 wiring so `install.sh --deploy demo` + populate-demo.py
   # reproduce it with zero manual steps: expose the cloud9-orchestrate virtual
   # model and enable response inspection so the egress block fires and renders in
-  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-057) — production/
+  # the chat UI. INSPECT_RESPONSES is opt-in by design (YSG-RISK-221) — production/
   # enterprise leave it OFF; demo turns it ON to showcase the injection block.
   if [[ "$DEPLOY_MODE" == "demo" ]]; then
     _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
@@ -4154,16 +4331,21 @@ run_wizard() {
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
     log_step "6/${TOTAL_STEPS}" "Skipping wizard (--non-interactive)"
 
-    local missing=()
-    [[ -z "$DOMAIN" ]]       && missing+=("--domain")
-    [[ -z "$ADMIN_EMAIL" ]]  && missing+=("--admin-email")
-    [[ -z "$UPSTREAM_URL" ]] && missing+=("--upstream-url")
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-      log_warn "Non-interactive mode: the following flags were not provided: ${missing[*]}"
-      log_warn "Defaults or empty values will be used; reconfigure via your .env file."
+    # --- Reuse persisted values from docker/.env BEFORE deciding what is
+    # genuinely missing. This must run first: on --upgrade an operator should
+    # not have to re-pass a flag that is already configured (75ead401 —
+    # UPSTREAM_MCP_URL reuse, "the upgrade path"). Extended here to DOMAIN for
+    # parity: _apply_deploy_defaults (YSG-RISK-165) already reuses a persisted
+    # YASHIGANI_TLS_DOMAIN, but only inside the demo-mode branch — production
+    # and enterprise/k8s never got the equivalent, so they were exposed to the
+    # exact same "silently exports empty" failure DOMAIN's demo-mode reuse was
+    # built to prevent. Unconditional file-exists check (no UPGRADE gate),
+    # matching the existing UPSTREAM_MCP_URL pattern below: a fresh install
+    # never has docker/.env yet, so this is a no-op on a genuine first run.
+    if [[ -z "$DOMAIN" && -f "${WORK_DIR}/docker/.env" ]]; then
+      DOMAIN="$(grep -m1 '^YASHIGANI_TLS_DOMAIN=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
+      [[ -n "$DOMAIN" ]] && log_info "Reusing existing YASHIGANI_TLS_DOMAIN from .env"
     fi
-
     # On upgrade, reuse an existing UPSTREAM_MCP_URL from .env rather than exporting an
     # empty value. Compose declares it required (${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}),
     # so a blank export breaks `up` even though the value is already configured — this is
@@ -4172,6 +4354,61 @@ run_wizard() {
       UPSTREAM_URL="$(grep -m1 '^UPSTREAM_MCP_URL=' "${WORK_DIR}/docker/.env" | cut -d= -f2- || true)"
       [[ -n "$UPSTREAM_URL" ]] && log_info "Reusing existing UPSTREAM_MCP_URL from .env (upgrade)"
     fi
+
+    # --- Fail CLOSED on flags docker-compose.yml declares required with no
+    # fallback (`${VAR:?...}`, no `:-`) and which have no safe default outside
+    # --deploy demo. Verified by reading docker/docker-compose.yml directly:
+    #   :193 YASHIGANI_TLS_DOMAIN: ${YASHIGANI_TLS_DOMAIN:?set YASHIGANI_TLS_DOMAIN}
+    #   :613 YASHIGANI_UPSTREAM_URL: ${UPSTREAM_MCP_URL:?set UPSTREAM_MCP_URL}
+    # (the `:-localhost` at line 1004 is a DIFFERENT, non-gateway service —
+    # it does not save the gateway build). DOMAIN's only real default lives in
+    # _apply_deploy_defaults' demo-mode branch ("localhost"); UPSTREAM_URL's
+    # only real default lives in the step-5 demo-mode block (demo-mcp
+    # upstream) — both demo-only, by design (a production gateway must never
+    # be silently pointed at the bundled demo-mcp upstream). Previously this
+    # just logged a reassuring "defaults will be used" warning and continued;
+    # three steps later `docker compose build` died on interpolation, naming
+    # neither the missing --flag nor an example value. Scoped to non-k8s
+    # (compose + vm) modes: docker-compose.yml is the actual requiredness
+    # source here, and the k8s Helm chart already carries its own (softer)
+    # defaults (values.yaml global.tlsDomain / gateway.env.upstreamUrl) —
+    # changing k8s requiredness is out of scope for this fix.
+    local hard_missing=()
+    local soft_missing=()
+    if [[ "$MODE" == "k8s" ]]; then
+      [[ -z "$DOMAIN" ]]       && soft_missing+=("--domain")
+      [[ -z "$UPSTREAM_URL" ]] && soft_missing+=("--upstream-url")
+    else
+      [[ -z "$DOMAIN" ]]       && hard_missing+=("--domain <hostname>   e.g. --domain gateway.example.com (or --domain localhost for local/self-signed)")
+      [[ -z "$UPSTREAM_URL" ]] && hard_missing+=("--upstream-url <url>  e.g. --upstream-url https://mcp.example.com")
+    fi
+    if [[ ${#hard_missing[@]} -gt 0 ]]; then
+      log_error "Non-interactive --deploy ${DEPLOY_MODE} install is missing required configuration:"
+      local _hm
+      for _hm in "${hard_missing[@]}"; do
+        log_error "  ${_hm}"
+      done
+      log_error "Neither flag has a default outside --deploy demo, and docker-compose.yml"
+      log_error "declares both required — the install would otherwise fail later, inside"
+      log_error "'docker compose build', with a less actionable interpolation error."
+      log_error "Pass the flag(s) explicitly, or (on --upgrade) leave them unset to reuse"
+      log_error "the value already configured in docker/.env."
+      exit 1
+    fi
+
+    # --- Flags with a genuine safe default, or with no downstream
+    # requirement at all: warn and continue is correct. --admin-email is
+    # written to docker/.env (YASHIGANI_ADMIN_EMAIL) for operator reference
+    # only — verified by grep: it is not interpolated by docker-compose.yml,
+    # not templated by any Helm chart, and not read by any application code
+    # (`grep -rn YASHIGANI_ADMIN_EMAIL --include=*.py .` returns nothing) —
+    # so nothing downstream can fail on it being empty.
+    [[ -z "$ADMIN_EMAIL" ]] && soft_missing+=("--admin-email")
+    if [[ ${#soft_missing[@]} -gt 0 ]]; then
+      log_warn "Non-interactive mode: the following flags were not provided: ${soft_missing[*]}"
+      log_warn "Defaults or empty values will be used; reconfigure via your .env file."
+    fi
+
     export YASHIGANI_TLS_DOMAIN="$DOMAIN"
     # v4.1 username-fix: do NOT export YASHIGANI_ADMIN_USERNAME here.
     # The admin username is a generated handle (hawk/orchid/etc.) produced by
@@ -5249,7 +5486,7 @@ check_existing_installation() {
       _backup_existing_data
       log_info "Fresh install: stopping existing containers..."
       local compose_file="${WORK_DIR}/docker/docker-compose.yml"
-      "${COMPOSE_CMD[@]}" -f "$compose_file" down -v 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" -f "$compose_file" down -v 2>/dev/null || true
       log_success "Previous deployment stopped and volumes removed"
       ;;
     3|*)
@@ -6317,7 +6554,7 @@ except Exception:
         _bo_ok=$(docker image inspect yashigani/backoffice:latest >/dev/null 2>&1 && echo yes || echo no)
         if [[ "$_gw_ok" == "no" || "$_bo_ok" == "no" ]]; then
           log_warn "--skip-pull + Docker: gateway/backoffice absent — building from source"
-          "${COMPOSE_CMD[@]}" -f "${WORK_DIR}/docker/docker-compose.yml" build gateway backoffice || {
+          _compose "${COMPOSE_CMD[@]}" -f "${WORK_DIR}/docker/docker-compose.yml" build gateway backoffice || {
             log_error "Build failed — cannot continue with --skip-pull and missing images"
             exit 1
           }
@@ -6528,9 +6765,9 @@ ghcr.io/openclaw/openclaw:2026.3.1" ;;
     fi
   else
     log_info "Pulling remote container images..."
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-buildable 2>/dev/null || \
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-pull-failures 2>/dev/null || \
-    "${COMPOSE_CMD[@]}" -f "$compose_file" pull 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-buildable 2>/dev/null || \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull --ignore-pull-failures 2>/dev/null || \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" pull 2>/dev/null || true
     log_success "Container images ready"
   fi
 }
@@ -6585,19 +6822,40 @@ load_airgap_bundle() {
       # _fips_sha256 routes through OpenSSL FIPS Provider when FIPS_MODE=1
       # (CMMC SC.L2-3.13.11 + FIPS 140-3 §6.4 — N2); falls back to sha256sum
       # or shasum when FIPS_MODE is unset/0.
+      #
+      # YSG-RISK-037/038/039 (ops risk register) name "Bundle SHA256 verified
+      # at load time" as a compensating control underpinning the air-gap
+      # image-digest CVA rulings, with a binding re-check clause: "Emergency
+      # update if any of the primary integrity controls (bundle SHA256
+      # verification at load ...) are removed or weakened." The two branches
+      # below used to trip that trigger silently: on a digest-computation
+      # failure they set actual_sha="$expected_sha" — manufacturing a match
+      # against whatever the (possibly-tampered) sidecar claims — then fell
+      # through to the equality check and log_success below, so the operator
+      # saw "Bundle SHA256 verified" for a bundle that was never hashed.
+      # An integrity control a risk acceptance depends on must fail CLOSED:
+      # if the digest cannot be computed, the bundle must not load.
       local actual_sha
       if [ "${FIPS_MODE:-0}" = "1" ] || openssl version 2>/dev/null | grep -qi 'fips'; then
         actual_sha="$(_fips_sha256 "${AIR_GAP_BUNDLE}")" || {
-          log_warn "FIPS SHA-256 computation failed for bundle — skipping integrity check"
-          actual_sha="$expected_sha"
+          log_error "BUNDLE INTEGRITY CHECK FAILED"
+          log_error "  FIPS SHA-256 computation failed for ${AIR_GAP_BUNDLE} — cannot verify integrity."
+          log_error "  Refusing to load an air-gap bundle whose digest could not be computed"
+          log_error "  (fail-closed per ops risk register YSG-RISK-038 re-check trigger)."
+          exit 1
         }
       elif command -v sha256sum >/dev/null 2>&1; then
         actual_sha="$(sha256sum "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
       elif command -v shasum >/dev/null 2>&1; then
         actual_sha="$(shasum -a 256 "${AIR_GAP_BUNDLE}" | awk '{print $1}')"
       else
-        log_warn "sha256sum / shasum not available — skipping bundle integrity check"
-        actual_sha="$expected_sha"
+        log_error "BUNDLE INTEGRITY CHECK FAILED"
+        log_error "  Neither sha256sum nor shasum is available — cannot verify bundle integrity."
+        log_error "  Install one of these tools (or set FIPS_MODE=1 with openssl available) and re-run."
+        log_error "  Refusing to load an unverified air-gap bundle (fail-closed per ops risk"
+        log_error "  register YSG-RISK-038 re-check trigger: a primary integrity control that"
+        log_error "  cannot execute must not be treated as passed)."
+        exit 1
       fi
       if [[ "$actual_sha" != "$expected_sha" ]]; then
         log_error "BUNDLE INTEGRITY FAILURE"
@@ -8668,6 +8926,14 @@ _ysg_assemble_compose_files() {
         YSG_COMPOSE_FILE_ARGS+=("-f" "$_gpu_overlay_mac_metal")
         log_info "Applying Mac/Metal GPU overlay (docker-compose.gpu-mac-metal.yml) — reconverge-safe (FIND-OLLAMA-MAC-2)"
       fi
+      # FIND-DEMO-MCP-AMD64-ON-ARM64: on Apple Silicon, force demo-mcp to build
+      # native-arm64 instead of consuming the prebuilt amd64 image (which runs
+      # under Rosetta2/QEMU — a Docker Desktop crash aggravator, 2026-08-07).
+      local _demo_mcp_native="${WORK_DIR}/docker/docker-compose.demo-mcp-native.yml"
+      if [[ -f "$_demo_mcp_native" ]] && [[ "$(uname -m)" == "arm64" ]]; then
+        YSG_COMPOSE_FILE_ARGS+=("-f" "$_demo_mcp_native")
+        log_info "Applying Apple-Silicon demo-mcp native-arm64 build overlay (docker-compose.demo-mcp-native.yml) — avoids amd64/Rosetta emulation (FIND-DEMO-MCP-AMD64-ON-ARM64)"
+      fi
     else
       local _gpu_overlay_mac_metal_podman="${WORK_DIR}/docker/docker-compose.gpu-mac-metal-podman.yml"
       if [[ -f "$_gpu_overlay_mac_metal_podman" ]]; then
@@ -8676,6 +8942,246 @@ _ysg_assemble_compose_files() {
       fi
     fi
   fi
+}
+
+# ---------------------------------------------------------------------------
+# _compose — YSG-RISK-203b (2026-08-07, after pre-push review)
+#
+# Runs a compose command with the install-lock fd CLOSED for that command only.
+#
+# Why not "release the lock before compose": three reviewers converged on the
+# same objection, and the code proves them right. compose_up() interleaves
+# container starts with secret/PKI work — `up -d postgres` at ~9438, then
+# postgres cert injection and chowns at ~9454-9499, then the real
+# `up -d --remove-orphans` at ~9672. There is therefore NO placement that both
+# (a) precedes every container start and (b) follows every secret/PKI write.
+# Any release point leaves one of the two unprotected.
+#
+# So the lock stays held for the whole install — the critical section is fully
+# covered — and the fd is closed per-command for compose invocations only, so
+# rootless podman's slirp4netns / aardvark-dns / rootlessport cannot inherit it
+# and pin it for the lifetime of the stack. (Confirmed by Su: bash 5.2's
+# {var}> assignment does NOT set FD_CLOEXEC, so a child does inherit it —
+# validating the original diagnosis while invalidating the original fix.)
+# ---------------------------------------------------------------------------
+_compose() {
+  if [[ -n "${YSG_INSTALL_LOCK_FD:-}" ]]; then
+    "$@" {YSG_INSTALL_LOCK_FD}>&-
+  else
+    "$@"
+  fi
+}
+
+# =============================================================================
+# YSG-RISK-205 — container-recreation-effect convergence helpers
+# =============================================================================
+# install.sh --upgrade reported SUCCESS for a container-level config change it
+# never applied: the CDI probe passed, the overlay was SELECTED, both existing
+# convergence probes were GREEN, and exit code was 0 — but `podman inspect`
+# showed the ollama container Created at the PREVIOUS install with no GPU
+# devices wired. `compose up` selected the new config but did not recreate the
+# container to apply it. Isolated by controlled comparison: a fresh install
+# (uninstall --remove-volumes + install) with the identical spec DID work —
+# proving the overlay/spec were correct and the bug is upgrade-path-specific
+# (the container-recreation decision, not the config itself).
+#
+# The class is broader than GPU: any upgrade changing devices, seccomp,
+# capabilities, resource limits or mounts can get a false green with the old
+# container still running, including SECURITY config. These helpers are
+# runtime/service-agnostic — they hash the FULL resolved compose config per
+# service and assert recreation for ANY service whose hash changed, not just
+# ollama. See compose_up() for the call sites (snapshot before down/up,
+# assertion before "Services started").
+#
+# Portability: install.sh must run on bash 3.2 (macOS default — see
+# scripts/test-installer.sh test_bash_compat) — NO bash-4-only associative
+# arrays, so state is plain "service hash" lines in a file, looked up with
+# awk/grep rather than a hash-map variable. Timestamp parsing goes through
+# python3 (_ysg_iso_to_epoch) rather than `date -d`/`date -j` — GNU and BSD
+# date flags are incompatible and this check must work on both.
+# =============================================================================
+
+# _ysg_compose_service_hashes <compose-file-args...>
+# Prints "<service> <sha256>" one per line, sorted by service name. Renders the
+# full resolved compose config via the ALREADY-SELECTED compose tool (docker
+# compose or the podman-compose-ysg fork — both print YAML to stdout for a bare
+# `config` subcommand, so this is runtime-agnostic) and hashes each service's
+# resolved definition (image, devices, cap_add/drop, security_opt, resource
+# limits, volumes/mounts, environment — everything compose config resolves).
+# Any change to any of those changes the hash. Returns non-zero (prints
+# nothing) if compose config fails or PyYAML is unavailable — callers must
+# treat empty output as "cannot verify this run", not as "nothing changed".
+_ysg_compose_service_hashes() {
+  local _raw
+  _raw="$(_compose "${COMPOSE_CMD[@]}" "$@" config 2>/dev/null)" || return 1
+  [[ -n "$_raw" ]] || return 1
+  printf '%s' "$_raw" | python3 -c '
+import sys, hashlib, json
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(1)
+
+try:
+    doc = yaml.safe_load(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+
+services = (doc or {}).get("services") or {}
+lines = []
+for name, spec in sorted(services.items()):
+    canon = json.dumps(spec, sort_keys=True, default=str)
+    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    lines.append("%s %s" % (name, digest))
+if lines:
+    sys.stdout.write("\n".join(lines) + "\n")
+' 2>/dev/null
+}
+
+# _ysg_iso_to_epoch <RFC3339-timestamp>
+# Converts a container-inspect Created timestamp (RFC3339, arbitrary fractional-
+# second precision, Z or +HH:MM offset — both podman and docker inspect emit
+# this shape) to a Unix epoch integer. Pure python3 — no `date -d` (GNU-only)
+# or `date -j` (BSD-only) — this runs identically on Linux and macOS.
+# Prints nothing and returns non-zero on any parse failure.
+_ysg_iso_to_epoch() {
+  local _ts="$1"
+  [[ -n "$_ts" ]] || return 1
+  python3 -c '
+import sys, re, datetime
+
+s = sys.argv[1].strip()
+if not s:
+    sys.exit(1)
+if s.endswith("Z"):
+    s = s[:-1] + "+00:00"
+m = re.match(r"^(.*?\.)(\d+)(([+-]\d{2}:\d{2})?)$", s)
+if m:
+    s = m.group(1) + m.group(2)[:6] + m.group(3)
+try:
+    dt = datetime.datetime.fromisoformat(s)
+except ValueError:
+    sys.exit(1)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+print(int(dt.timestamp()))
+' "$_ts" 2>/dev/null
+}
+
+# _ysg_verify_compose_recreation_effect <start_epoch> <state_file> <current_hashes>
+# <current_hashes> is the multi-line "service hash" output of
+# _ysg_compose_service_hashes, captured BEFORE down/up ran. Loads the PREVIOUS
+# run's hashes from <state_file> (if any — first run after this feature ships
+# has no baseline, so nothing to compare and nothing is asserted, avoiding a
+# false failure on the very first upgrade after this ships); for every service
+# present in both with a DIFFERENT hash, asserts its container's Created
+# timestamp is newer than <start_epoch>. Fails loud (return 1) on the first
+# service that fails this — no downgrade to warn, this is a false-green class
+# bug per the header comment above. On success, persists <current_hashes> as
+# the new baseline for the next run.
+_ysg_verify_compose_recreation_effect() {
+  local _start_epoch="$1" _state_file="$2" _current="$3"
+  local _changed=""
+
+  if [[ -f "$_state_file" ]]; then
+    local _svc _hash _old
+    while IFS=' ' read -r _svc _hash; do
+      [[ -n "$_svc" ]] || continue
+      _old="$(awk -v s="$_svc" '$1==s {print $2; exit}' "$_state_file" 2>/dev/null)"
+      if [[ -n "$_old" && "$_old" != "$_hash" ]]; then
+        _changed="${_changed}${_svc}
+"
+      fi
+    done <<< "$_current"
+  fi
+
+  local _fail=0
+  if [[ -z "$_changed" ]]; then
+    log_info "Convergence check (YSG-RISK-205): no service's effective compose definition changed since the last recorded run"
+  else
+    log_info "Convergence check (YSG-RISK-205): verifying container recreation for changed service(s):$(printf '%s' "$_changed" | tr '\n' ' ')"
+    local _inspect_bin="docker"
+    [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _inspect_bin="podman"
+    local _svc3 _cid _created _created_epoch
+    while IFS= read -r _svc3; do
+      [[ -n "$_svc3" ]] || continue
+      _cid="$(_compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ps -q "$_svc3" 2>/dev/null | head -1)"
+      if [[ -z "$_cid" ]]; then
+        log_error "YSG-RISK-205: service '${_svc3}' changed config this run but has NO container after compose up"
+        _fail=1
+        continue
+      fi
+      _created="$("$_inspect_bin" inspect -f '{{.Created}}' "$_cid" 2>/dev/null)"
+      _created_epoch="$(_ysg_iso_to_epoch "$_created")"
+      if [[ -z "$_created_epoch" ]] || [[ "$_created_epoch" -le "$_start_epoch" ]]; then
+        log_error "YSG-RISK-205 FAIL: service '${_svc3}' effective compose config changed (devices/seccomp/capabilities/resource-limits/mounts/image) but its container was NOT recreated (Created=${_created:-unknown}, upgrade started at epoch ${_start_epoch}). The new config was never applied to a running container."
+        _fail=1
+      else
+        log_success "  ${_svc3}: recreated (Created=${_created})"
+      fi
+    done <<< "$_changed"
+  fi
+
+  if [[ "$_fail" -eq 1 ]]; then
+    log_error "Aborting: at least one service's changed compose config was not applied to a fresh container — false-green upgrade (YSG-RISK-205)."
+    return 1
+  fi
+
+  # Persist this run's hashes as the baseline for the next run — only after a
+  # clean check, so a failed run never poisons the next comparison.
+  printf '%s' "$_current" > "$_state_file" 2>/dev/null || true
+  chmod 600 "$_state_file" 2>/dev/null || true
+  return 0
+}
+
+# _ysg_verify_inference_backend_effect
+# YSG-RISK-205 (d): post-deploy effect check specific to the inference backend.
+# The hash-based check above proves the CONTAINER was recreated when config
+# changed; it does not prove the new config took effect FUNCTIONALLY. This is
+# the exact signal (ollama's own "library=cuda" vs "library=cpu" startup log
+# line) the campaign used to isolate YSG-RISK-205 in the first place — check it
+# directly. Scoped to nvidia/CUDA (the documented regression); other GPU types
+# (amd_rocm, vulkan, apple_metal) do not have an established library= log
+# convention verified in this codebase and are intentionally left for a
+# follow-up rather than guessed at here.
+_ysg_verify_inference_backend_effect() {
+  [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] || return 0
+  [[ "$DRY_RUN" != "true" ]] || return 0
+
+  local _lib="" _tries=0
+  while [[ "$_tries" -lt 15 ]]; do
+    _lib="$(_compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --no-color --tail=300 ollama 2>/dev/null \
+             | grep -oE 'library=[a-zA-Z0-9_]+' | tail -1 | cut -d= -f2)"
+    [[ -n "$_lib" ]] && break
+    _tries=$((_tries + 1))
+    sleep 2
+  done
+
+  if [[ -z "$_lib" ]]; then
+    log_warn "Inference-backend effect check: no library= line seen in ollama logs after 30s — cannot confirm GPU state (probe timeout, not a pass)"
+    return 0
+  fi
+
+  # Case-insensitive: ollama emits `library=CUDA` (uppercase) on 0.23.x, while
+  # earlier builds emitted `cuda`. The first version of this check compared
+  # case-sensitively and FAILED a correctly GPU-accelerated install — the live
+  # line was `library=CUDA compute=8.6 name=CUDA0 ... RTX 3060`, i.e. the very
+  # state the check exists to confirm. Fail-closed was the right default, but a
+  # check that rejects the healthy case is a false alarm, not a guard.
+  local _lib_lc="${_lib,,}"
+  if [[ "$_lib_lc" == "cuda" || "$_lib_lc" == rocm* || "$_lib_lc" == "vulkan" || "$_lib_lc" == "metal" ]]; then
+    log_success "Inference-backend effect check: ollama reports library=${_lib} — GPU acceleration confirmed live"
+    return 0
+  fi
+
+  log_error "YSG-RISK-205 inference-backend effect check FAILED: GPU detected (${YSG_GPU_TYPE}) but ollama reports library=${_lib} (expected a GPU backend: cuda/rocm/vulkan/metal, case-insensitive) — running WITHOUT GPU acceleration despite an apparently-green install."
+  if [[ "${YSG_ALLOW_CPU_INFERENCE:-false}" != "true" ]]; then
+    log_error "Aborting: pass --allow-cpu-inference to accept this, or investigate why the GPU config did not take effect (YSG-RISK-205: container may not have been recreated)."
+    return 1
+  fi
+  log_warn "--allow-cpu-inference set — accepting CPU-only ollama despite GPU detection (explicit operator opt-in)"
+  return 0
 }
 
 compose_up() {
@@ -8715,10 +9221,13 @@ compose_up() {
   #   none       — CPU-only (no overlay applied; ollama runs library=cpu)
   # ─────────────────────────────────────────────────────────────────────────────
   # Podman GPU: CDI devices (nvidia.com/gpu=N), not the docker `runtime: nvidia` path.
-  # ROOTLESS-CDI-001: Provision a complete podman-compatible CDI spec in /etc/cdi/
-  # BEFORE the probe. Spec is generated by nvidia-ctk (full library mounts included),
-  # transformed 0.7.0 → 0.6.0 for podman 4.9.3, then written to /etc/cdi/nvidia.yaml
-  # with 0644 perms via Docker daemon (no interactive sudo). See _setup_podman_cdi_gpu.
+  # ROOTLESS-CDI-001 / YSG-RISK-202: provision a user-space CDI spec (no /etc/cdi
+  # write, no Docker daemon, no sudo) via _setup_podman_cdi_gpu BEFORE the probe.
+  # That same call also runs _check_stale_etc_cdi_shadow, which detects (and, where
+  # writable, refreshes) a pre-existing root-owned /etc/cdi/nvidia.yaml that would
+  # otherwise shadow the correct spec (see the ROOTLESS-CDI-001 block comment near
+  # _setup_podman_cdi_gpu's definition for the full adjudication). The probe below
+  # is the actual arbiter — provisioning success here does not guarantee it passes.
   if [[ "${YSG_GPU_TYPE:-none}" == "nvidia" ]] && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
     _setup_podman_cdi_gpu
   fi
@@ -8734,17 +9243,36 @@ compose_up() {
     if [[ "$_cdi_probe_ok" == "true" ]] && [[ -f "$_gpu_overlay_podman" ]]; then
       compose_files+=("-f" "$_gpu_overlay_podman")
       log_info "CDI probe OK — applying Podman CDI GPU overlay (docker-compose.gpu-podman.yml) — ollama on ${YSG_GPU_CDI:-nvidia.com/gpu=all}"
-    elif [[ -f "$_gpu_overlay_podman_devpath" ]]; then
-      # CDI unavailable (probe failed or _setup_podman_cdi_gpu returned early).
-      # devpath overlay passes device nodes only — NO library mounts.
-      # ollama WILL run CPU-only on this path: library=cpu, not library=cuda.
-      log_warn "WARN: CDI probe failed — falling back to device-path passthrough (#ROOTLESS-CDI-001)"
-      log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
-      log_warn "WARN: GPU acceleration NOT active. Fix: ensure nvidia-ctk + Docker daemon are available."
-      log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
-      compose_files+=("-f" "$_gpu_overlay_podman_devpath")
     else
-      log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+      # CDI unavailable (probe failed, or neither overlay file was found).
+      # devpath overlay passes device nodes only — NO library mounts — ollama
+      # WILL run CPU-only on that path: library=cpu, not library=cuda.
+      #
+      # YSG-RISK-202: this used to warn and silently fall through to devpath
+      # (or to no overlay at all) and still exit 0. A GPU was DETECTED on this
+      # host — the mandatory LLM layer running CPU-only here is a silent
+      # product-policy violation (project_yashigani_llm_is_mandatory), not an
+      # acceptable default. Fail closed unless the operator explicitly opted
+      # in via --allow-cpu-inference / YSG_ALLOW_CPU_INFERENCE.
+      log_warn "WARN: CDI probe failed — GPU acceleration NOT active for ollama (#ROOTLESS-CDI-001 / YSG-RISK-202)"
+      if [[ "${YSG_CDI_ETC_SHADOW_STALE:-false}" == "true" ]]; then
+        log_error "Cause: a stale /etc/cdi/nvidia.yaml is shadowing the correct spec — see the remediation command logged above by _check_stale_etc_cdi_shadow."
+      else
+        log_warn "Fix: confirm nvidia-ctk is installed and the NVIDIA driver matches the CDI spec (check /etc/cdi/nvidia.yaml is absent or current, and ~/.config/cdi/nvidia.yaml + cdi_spec_dirs in ~/.config/containers/containers.conf)."
+      fi
+      if [[ "${YSG_ALLOW_CPU_INFERENCE:-false}" != "true" ]]; then
+        log_error "Aborting: GPU detected but not provable live in ollama, and --allow-cpu-inference was not passed."
+        log_error "Re-run with --allow-cpu-inference to explicitly accept CPU-only inference instead."
+        return 1
+      fi
+      log_warn "--allow-cpu-inference set — proceeding with degraded inference backend (explicit operator opt-in)"
+      if [[ -f "$_gpu_overlay_podman_devpath" ]]; then
+        log_warn "WARN: Device-path overlay has NO library mounts → ollama will run CPU-only (library=cpu)"
+        log_info "Applying Podman device-path GPU overlay (docker-compose.gpu-podman-devpath.yml) — ollama on ${YSG_GPU_DEV:-/dev/nvidia0}"
+        compose_files+=("-f" "$_gpu_overlay_podman_devpath")
+      else
+        log_warn "GPU overlay not applied — neither CDI nor devpath overlay found; ollama will run CPU-only"
+      fi
     fi
   fi
 
@@ -9617,10 +10145,29 @@ except Exception as e:
     fi
   fi
 
+  # ---------------------------------------------------------------------------
+  # YSG-RISK-205: snapshot the effective per-service compose config BEFORE
+  # down/up, so we can prove after up that any service whose EFFECTIVE config
+  # changed (devices, seccomp, cap_add/drop, resource limits, mounts, image —
+  # anything compose config resolves) actually got a fresh container. Compare
+  # against the previous run's persisted snapshot (this run's snapshot is only
+  # persisted after a clean check, at the bottom of this function). Captured
+  # here — with the FULLY assembled compose_files array — not deferred, so the
+  # "start" timestamp genuinely precedes down/up.
+  # ---------------------------------------------------------------------------
+  local _ysg_state_file="${WORK_DIR}/docker/.ysg_service_config_hashes"
+  local _ysg_pre_up_hashes
+  _ysg_pre_up_hashes="$(_ysg_compose_service_hashes "${compose_files[@]}" 2>/dev/null || true)"
+  if [[ -z "$_ysg_pre_up_hashes" ]]; then
+    log_warn "YSG-RISK-205: could not resolve per-service compose config this run — recreation-effect convergence check will be skipped"
+  fi
+  local _ysg_upgrade_start_epoch
+  _ysg_upgrade_start_epoch="$(date -u +%s)"
+
   # Clean up any stale containers/networks from failed previous runs.
   # NEVER use -v (--volumes) — that destroys user data (Postgres, Redis, audit logs).
   log_info "Stopping any existing containers (preserving data volumes)..."
-  "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} down 2>/dev/null || true
+  _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${profile_args[@]+"${profile_args[@]}"} down 2>/dev/null || true
 
   if [[ "$UPGRADE" == "true" ]]; then
     # V232-SMOKE-004 (2026-05-03): podman-compose 1.5.x implements depends_on
@@ -9642,7 +10189,7 @@ except Exception as e:
     # only applies to the Podman path.
     if [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]]; then
       log_info "Upgrade + Podman: pre-starting postgres for SSL injection (V232-SMOKE-004)..."
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" up ${_pull_flag[@]+"${_pull_flag[@]}"} -d postgres 2>/dev/null || true
       # Wait up to 60s for postgres to accept connections.
       local _pg_ready=0 _pg_i
       for _pg_i in $(seq 1 30); do
@@ -9731,7 +10278,7 @@ except Exception as e:
         rm -f "$_tmp_bundle"
 
         # chown + chmod the copied files to postgres:postgres (UID 70 in pgvector image)
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 chown postgres:postgres \"\$PGDATA/server.crt\" \"\$PGDATA/server.key\" \"\$PGDATA/root.crt\"
@@ -9746,7 +10293,7 @@ echo '[postgres-ssl-upgrade] certs injected via podman cp + chown'
         # Append ssl settings + pg_hba.conf + restart postgres
         # (same steps 2-4 from _upgrade_postgres_ssl, but skipping step 1 since
         # we already placed the certs in PGDATA via podman cp above)
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 if grep -q '^ssl = on' \"\$PGDATA/postgresql.conf\" 2>/dev/null; then
@@ -9757,7 +10304,7 @@ printf \"\n# Yashigani internal mTLS (added by install.sh --upgrade)\nssl = on\n
 echo '[postgres-ssl-upgrade] ssl settings appended to postgresql.conf'
 " 2>&1 || { log_error "postgresql.conf update failed"; return 1; }
 
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata}'
 cat > \"\$PGDATA/pg_hba.conf\" << 'HBAEOF'
@@ -9776,7 +10323,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 " 2>&1 || { log_error "pg_hba.conf update failed"; return 1; }
 
         log_info "  Restarting postgres to activate SSL config (cp path)..."
-        "${COMPOSE_CMD[@]}" "${compose_files[@]}" restart postgres 2>&1 || true
+        _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" restart postgres 2>&1 || true
         # Wait for postgres to come back with SSL on
         local _ssl_ok=0 _ssl_i
         for _ssl_i in $(seq 1 30); do
@@ -9800,7 +10347,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
         _pg_pass="$(_safe_read_secret "${WORK_DIR}/docker/secrets/postgres_password" \
                     "POSTGRES_PASSWORD" "${WORK_DIR}/docker/.env" 2>/dev/null || echo "")"
         if [[ -n "$_pg_pass" ]]; then
-          "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
+          _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" exec -T postgres \
               psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
               -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>/dev/null || true
           log_info "  SCRAM re-hash applied (cp path)"
@@ -9876,7 +10423,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose")"
     fi
-    "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
+    _compose "${COMPOSE_CMD[@]}" "${_compose_files_up[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d --remove-orphans || true
     # Clean up temp compose file if it was created
     if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose:-}" 2>/dev/null || true
@@ -9921,7 +10468,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
       done
       log_info "  temp compose file: $(basename "$_digest_stripped_compose2")"
     fi
-    "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
+    _compose "${COMPOSE_CMD[@]}" "${_compose_files_up2[@]}" ${profile_args[@]+"${profile_args[@]}"} up ${_pull_flag[@]+"${_pull_flag[@]}"} -d || true
     if [[ "${YASHIGANI_COMPOSE_PULL_POLICY:-}" == "never" ]]; then
       rm -f "${_digest_stripped_compose2:-}" 2>/dev/null || true
     fi
@@ -9953,6 +10500,38 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
     log_error "LETTA TIER FAILED TO START — see 'Letta wait-loop' errors above for the exact stage that failed"
     log_error "Core services (gateway/backoffice/postgres/etc.) are unaffected; re-run with --letta or retry 'podman start ${COMPOSE_PROJECT_NAME:-docker}_letta_1' after investigating"
   fi
+
+  # ---------------------------------------------------------------------------
+  # YSG-RISK-205: container-recreation-effect convergence gate.
+  #
+  # install.sh --upgrade was observed to log "CDI probe OK — applying Podman CDI
+  # GPU overlay", both existing convergence probes GREEN, and exit 0 — while
+  # `podman inspect` showed the ollama container Created at the PREVIOUS install,
+  # HostConfig.Devices empty, still library=cpu. The overlay was SELECTED but
+  # never APPLIED: `compose up` did not recreate the container. The class is
+  # broader than GPU — any upgrade changing devices, seccomp, capabilities,
+  # resource limits or mounts can get a false green with the old container still
+  # running, including security config.
+  #
+  # This asserts every service whose EFFECTIVE resolved compose config changed
+  # since the last recorded run (via _ysg_pre_up_hashes, snapshotted before
+  # down/up above) now has a container Created timestamp newer than
+  # _ysg_upgrade_start_epoch. FAILS the upgrade (non-zero, no downgrade to warn)
+  # if any changed service was not actually recreated — this is a false-green
+  # class bug, not a candidate for a soft warning. Runs BEFORE "Services
+  # started" so a real convergence failure is never reported as success.
+  # ---------------------------------------------------------------------------
+  if [[ -n "$_ysg_pre_up_hashes" ]]; then
+    _ysg_verify_compose_recreation_effect "$_ysg_upgrade_start_epoch" "$_ysg_state_file" "$_ysg_pre_up_hashes" || return 1
+  fi
+
+  # YSG-RISK-205 (d): post-deploy effect check for the inference backend
+  # specifically. The hash-based check above proves the CONTAINER was
+  # recreated; it does not prove the NEW config took effect functionally. This
+  # is the exact signal (ollama's own library=cuda|cpu startup log line) the
+  # campaign used to isolate YSG-RISK-205 in the first place — check it
+  # directly rather than trusting that "recreated" implies "GPU active".
+  _ysg_verify_inference_backend_effect || return 1
 
   log_success "Services started"
 
@@ -10183,7 +10762,7 @@ _verify_gateway_healthz() {
       _sh_profile_args+=("--profile" "$_p")
     done
     log_warn "Convergence gate: gateway not healthy yet — one self-heal re-converge (YSG-RISK-084)"
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" ${_sh_profile_args[@]+"${_sh_profile_args[@]}"} up -d >/dev/null 2>&1 || true
     local _deadline_sh=$(( $(date +%s) + _timeout_s ))
     while [[ "$(date +%s)" -lt "$_deadline_sh" ]]; do
       # shellcheck disable=SC2086  # intentional word-splitting for _curl_tls_opt
@@ -10207,9 +10786,9 @@ _verify_gateway_healthz() {
     log_error "  - Caddy TLS certificate not yet provisioned"
     log_error ""
     log_error "=== Last 50 lines: gateway logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 gateway 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 gateway 2>/dev/null || true
     log_error "=== Last 50 lines: postgres logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
     exit 1
   fi
 
@@ -10237,9 +10816,9 @@ _verify_gateway_healthz() {
     log_error "Convergence gate FAILED: backoffice /login did not return 200 within ${_timeout_s}s"
     log_error "Backoffice may have failed to connect to the database."
     log_error "=== Last 50 lines: backoffice logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 backoffice 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 backoffice 2>/dev/null || true
     log_error "=== Last 50 lines: postgres logs ==="
-    "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
+    _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" logs --tail=50 postgres 2>/dev/null || true
     exit 1
   fi
 
@@ -10756,7 +11335,7 @@ _upgrade_postgres_ssl() {
   log_info "  PGDATA: ${_pgdata_path}"
 
   # Step 1: Install server cert + key into PGDATA.
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 install -m 0644 -o postgres -g postgres /run/secrets/postgres_client.crt \"\$PGDATA/server.crt\"
@@ -10772,7 +11351,7 @@ echo '[postgres-ssl-upgrade] Server cert + trust bundle installed'
   }
 
   # Step 2: Append ssl settings to postgresql.conf (only if not already present).
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 if grep -q '^ssl = on' \"\$PGDATA/postgresql.conf\" 2>/dev/null; then
@@ -10787,7 +11366,7 @@ echo '[postgres-ssl-upgrade] ssl settings appended to postgresql.conf'
   }
 
   # Step 3: Overwrite pg_hba.conf to require TLS + clientcert (same as 05-enable-ssl.sh).
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres bash -c "
 set -euo pipefail
 PGDATA='${_pgdata_path}'
 cat > \"\$PGDATA/pg_hba.conf\" << 'HBAEOF'
@@ -10815,7 +11394,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
 
   # Step 4: Restart postgres to pick up new config.
   log_info "  Restarting postgres to activate SSL config..."
-  "${COMPOSE_CMD[@]}" -f "$compose_file" restart postgres 2>&1 || {
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" restart postgres 2>&1 || {
     log_error "postgres SSL upgrade: failed to restart postgres"
     return 1
   }
@@ -10850,7 +11429,7 @@ echo '[postgres-ssl-upgrade] pg_hba.conf updated'
   if [[ -z "$_pg_pass" ]]; then
     log_warn "postgres SSL upgrade: could not read postgres_password — skipping SCRAM re-hash"
   else
-    "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
+    _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T postgres \
         psql -U yashigani_admin -d yashigani -h 127.0.0.1 \
         -c "ALTER USER yashigani_app WITH PASSWORD '${_pg_pass}';" 2>&1 || {
       log_warn "postgres SSL upgrade: SCRAM re-hash failed — pgbouncer auth may fail"
@@ -10893,7 +11472,7 @@ bootstrap_postgres() {
   done
 
   # Run Alembic migrations + seed data via the backoffice container
-  "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T backoffice python -m alembic upgrade head 2>&1 || {
+  _compose "${COMPOSE_CMD[@]}" -f "$compose_file" exec -T backoffice python -m alembic upgrade head 2>&1 || {
     log_warn "Alembic migrations failed — database may already be bootstrapped"
   }
 
@@ -10935,10 +11514,10 @@ register_agent_bundles() {
   # The Python script reads secrets from /run/secrets/, computes TOTP,
   # authenticates, checks the live registry, and registers each unregistered
   # agent (Postgres + Redis db/3). The raw per-agent PSK is printed to stdout
-  # (OK: line) for HOST-SIDE capture — see YSG-RISK-133 below for why it is
+  # (OK: line) for HOST-SIDE capture — see YSG-RISK-258 below for why it is
   # never written to a file from inside this container.
   #
-  # YSG-RISK-133 (2026-07-27): this Python block used to also open()
+  # YSG-RISK-258 (2026-07-27): this Python block used to also open()
   # /run/secrets/<profile>_token for writing (a "3. Token file for gateway"
   # step). FINDING-V412-RESTART-012 (2026-07-21) made backoffice's
   # /run/secrets mount a PURE :ro bind — see docker-compose.yml — so that
@@ -11133,15 +11712,70 @@ register_agent_bundles() {
 # no step-up, no install_svc service account. Eliminates LAURA-2255-001 (human
 # admin bootstrap regression) and the install_svc standing-admin backdoor.
 #
-# Security: this Python runs INSIDE the backoffice container (compose exec),
-# which is mesh-isolated (data-network only). We use the same env vars
-# (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) that the in-process app uses.
-# The HTTP stack is not touched — no admin session, no TOTP, no HMAC secret.
+# Security (FIND-0813-013 item 4, Captain red-review, 2026-08-16 — REPLACES
+# a prior claim here that this container is "mesh-isolated (data-network
+# only)". That claim was FALSE and has been removed: backoffice is a member
+# of SEVEN docker networks (docker-compose.yml, backoffice service
+# networks: block), including caddy_internal -- the SAME bridge Caddy (the
+# internet-facing reverse proxy, on the edge network) sits on. Network
+# topology was never the control that made this safe.
+#
+# The ACTUAL trust basis is host/cluster EXEC AUTHORIZATION, and it is NOT
+# uniform across runtimes:
+#   - Rootful Docker (this hosts default runtime): the docker socket is
+#     root:docker 0660: membership in the docker group is already
+#     root-equivalent host access. Anyone who can `compose exec` into this
+#     container could equally read YASHIGANI_DB_DSN out of its environment,
+#     read ${secrets_dir}/*_token off the host filesystem, or connect to
+#     Postgres directly with psql and run the exact INSERT/UPDATE this
+#     script runs -- bypassing this script entirely. Exec access already
+#     equals "can read this containers live secrets and talk to its
+#     backing stores directly": that is the real boundary, not the network.
+#   - Rootless Podman: the podman socket is USER-owned, not root-equivalent.
+#     A rootless-podman operator who can `compose exec` does NOT
+#     automatically have host root -- for that principal this durable-write
+#     path grants something genuinely new relative to the admin HTTP API:
+#     unauthenticated, unaudited agent registration gated only by "can run
+#     podman commands as this unprivileged user", a materially lower bar
+#     than a compromised admin session. This asymmetry is real; it is not
+#     closed by this comment, only named accurately (see FIND-0813-013 item
+#     2 for the audit-trail mitigation this path gained instead).
+#
+# We use the same env vars (YASHIGANI_DB_DSN, REDIS_USE_TLS, etc.) the
+# in-process app uses. The HTTP stack is not touched — no admin session, no
+# TOTP, no HMAC secret — but that was never the load-bearing property
+# either; exec authorization always was.
 import json, os, sys, secrets as _sec_mod
 sys.path.insert(0, "/app/src")
 
 agents_spec = json.loads(os.environ.get("AGENTS_JSON", "[]"))
 results = []
+
+# FIND-0813-013 item 2 (Laura/Iris/Tom red-review, 2026-08-16): install-time
+# agent registration wrote ZERO audit events -- routes/agents.py::register_agent
+# writes an AgentRegisteredEvent (agents.py:533-549) on every admin-API
+# registration; this durable path (SEC-001, no admin session, by design)
+# wrote nothing to the tamper-evident chain. Construct ONE AuditLogWriter for
+# this whole run (same construction routes.entrypoint.py uses:
+# AuditLogWriter(config=AuditConfig.from_env(), ...)) -- it opens the SAME
+# volume-mounted log file and cross-process flock the running backoffice app
+# process already writes through, so events from this short-lived exec
+# process interleave correctly into the SAME hash chain. Non-fatal: an audit
+# writer that fails to construct or write must never block a real
+# registration from completing (matches routes/agents.py:533-549s own
+# try/except-log pattern) -- this is a NEW recording surface, not a new gate.
+_audit_writer = None
+try:
+    from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.scope import MaskingScopeConfig
+    _audit_writer = AuditLogWriter(
+        config=AuditConfig.from_env(),
+        masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
+    )
+except Exception as _awe:
+    results.append("AUDIT_WARN:writer_init:" + str(_awe))
 
 for agent_spec in agents_spec:
     profile        = agent_spec["profile"]
@@ -11159,6 +11793,7 @@ for agent_spec in agents_spec:
         from yashigani.agents.registry import AgentRegistry
         from yashigani.agents.durable_store import AgentDurableStore
         from yashigani.gateway._redis_url import build_redis_url
+        from yashigani.licensing.enforcer import LicenseLimitExceeded
         import redis as _redis
 
         _redis_url = build_redis_url(
@@ -11168,8 +11803,29 @@ for agent_spec in agents_spec:
             client_cert_name="backoffice_client",
         )
         _rc = _redis.from_url(_redis_url, decode_responses=True)
-        registry = AgentRegistry(_rc)
         durable  = AgentDurableStore()
+        # FIND-0813-013 item 1 (Tom red-review, 2026-08-16): pass
+        # durable_store= so register() performs its OWN atomic dual-write --
+        # the SAME primitive routes/agents.py::register_agent uses
+        # (registry.py:510-518). The previous hand-rolled pair below this
+        # comment (removed) called durable.upsert() + restore_from_durable()
+        # directly, which (a) bypassed max_agents licence enforcement
+        # entirely -- restore_from_durable() docstring says "Does not
+        # enforce the licence limit: this is a restore of already-licensed
+        # registrations, not a new registration" -- and (b) committed
+        # Postgres BEFORE Redis inside one try/except, so a Redis failure
+        # immediately after a successful Postgres commit produced a
+        # permanently-stuck "active" row with an unrecoverable plaintext
+        # token (the installer own FIND-IRIS-DUP-AGENT pre-check would
+        # then refuse to offer the name again). register() closes both: it
+        # writes Redis FIRST via an atomic Lua script (SCARD -> licence
+        # check -> HSET+SADD, fails loud) and mirrors to Postgres SECOND
+        # (best-effort, logs loudly on failure, never rolls back a live
+        # Redis registration) -- the same order every other AgentRegistry
+        # mutator (register/update/deactivate/rotate_token) already uses;
+        # this installer payload was the only call site with the order
+        # inverted.
+        registry = AgentRegistry(_rc, durable_store=durable)
 
         # Skip if agent is already registered by name (idempotent; preserves token)
         existing_names = {a.get("name", "") for a in registry.list_all()}
@@ -11177,32 +11833,23 @@ for agent_spec in agents_spec:
             results.append("SKIP:" + aname + ":" + profile)
             continue
 
-        # Generate PSK token + bcrypt hash (mirrors POST /admin/agents)
-        import bcrypt as _bcrypt
-        raw_token = "ysg-" + _sec_mod.token_hex(32)
-        token_hash = _bcrypt.hashpw(raw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
-        agent_id = "agnt_" + _sec_mod.token_hex(8)
-
-        agent_data = {
-            "agent_id": agent_id,
-            "name": aname,
-            "upstream_url": aurl,
-            "protocol": aproto,
-            "status": "active",
-            "groups": agroups,
-            "allowed_caller_groups": acaller_groups,
-            "allowed_paths": apaths,
-            "allowed_cidrs": [],
+        # FIND-0813-013 item 1: register() mirrors POST /admin/agents exactly
+        # (routes/agents.py:510-518) -- mints agent_id + 256-bit PSK, atomic
+        # Redis write, licence-limit enforced, best-effort Postgres mirror.
+        # Replaces the old manual bcrypt/secrets.token_hex minting above.
+        agent_id, raw_token = registry.register(
+            name=aname,
+            upstream_url=aurl,
+            groups=agroups,
+            allowed_caller_groups=acaller_groups,
+            allowed_paths=apaths,
+            allowed_cidrs=[],
+            protocol=aproto,
             # Phase 5 §C: callee-class fields (registry.py additive extension).
-            "kind": akind,
-            "sensitivity_ceiling": aceiling,
-        }
-
-        # 1. Durable write (Postgres) — survives redis recreate
-        durable.upsert(agent_data, token_hash=token_hash)
-        # 2. Fast write (Redis db/3) — request-time source of truth
-        registry.restore_from_durable(agent_data, token_hash)
-        # 3. YSG-RISK-133: NO container-side write against /run/secrets here
+            kind=akind,
+            sensitivity_ceiling=aceiling,
+        )
+        # YSG-RISK-258: NO container-side write against /run/secrets here
         # (see the register_agent_bundles() header comment above for the full
         # RESTART-012 rationale). The backoffice /run/secrets mount is a pure
         # :ro mount by design -- this container never attempts to write to
@@ -11211,7 +11858,34 @@ for agent_spec in agents_spec:
         # which writes ${secrets_dir}/${_profile}_token directly on the host
         # filesystem and chmods it 0640 -- the same install-time-secret
         # pattern used for every other generated credential.
+        #
+        # FIND-0813-013 item 2: AgentRegisteredEvent, same schema
+        # routes/agents.py:533-549 writes. No admin session exists on this
+        # path (SEC-001 removed the standing install_svc account on
+        # purpose) so admin_account is attributed to a named system actor,
+        # not a session.account_id, and account_tier is "system" not
+        # "admin" -- an honest record of how this mutation actually
+        # happened, not a fabricated admin session.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AgentRegisteredEvent
+                _audit_writer.write(
+                    AgentRegisteredEvent(
+                        agent_id=agent_id,
+                        agent_name=aname,
+                        upstream_url=aurl,
+                        groups=agroups,
+                        allowed_caller_groups=acaller_groups,
+                        allowed_paths=apaths,
+                        account_tier="system",
+                        admin_account="install:system",
+                    )
+                )
+            except Exception as _ae:
+                results.append("AUDIT_WARN:" + aname + ":" + str(_ae))
         results.append("OK:" + aname + ":" + profile + ":" + raw_token)
+    except LicenseLimitExceeded as e:
+        results.append("FAIL:" + aname + ":license_limit_exceeded:" + str(e))
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
@@ -11256,8 +11930,35 @@ async def _mint_bundled_envelopes():
 try:
     for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
         results.append("ENVELOPE_MINTED:" + _pid)
+        # FIND-0813-013 item 2 (Laura): bundled_envelopes.py/envelope_service.py
+        # mint zero audit references on ANY call site (installer or admin
+        # API) -- there is no dedicated AuditEvent subclass for envelope
+        # minting to reuse (schema.py has no MCP_ENVELOPE_MINTED class; this
+        # task is install.sh-scoped and adding one is out of scope here). The
+        # base AuditEvent still lands a tamper-evident, hash-chained record
+        # of WHEN a mint happened and at what account_tier -- an honest
+        # partial fix: it does not carry the provenance_id inline (no field
+        # for it on the base schema); that correlation stays in the
+        # ENVELOPE_MINTED: stdout install log line only. Route: Iris/Tom
+        # follow-up to add a typed McpEnvelopeMintedEvent if closer
+        # correlation is needed.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AuditEvent as _AuditEventBase
+                _audit_writer.write(
+                    _AuditEventBase(event_type="MCP_ENVELOPE_MINTED", account_tier="system"),
+                    component="install:bootstrap_bundled_agent_envelopes",
+                )
+            except Exception as _ae2:
+                results.append("AUDIT_WARN:envelope:" + str(_ae2))
 except Exception as _me:
     results.append("ENVELOPE_WARN:" + str(_me))
+
+if _audit_writer is not None:
+    try:
+        _audit_writer.close()
+    except Exception:
+        pass
 
 for r in results:
     print(r)
@@ -11305,20 +12006,92 @@ for r in results:
           # reinstall wiped the Docker volumes while the secrets dir survived
           # (the exact scenario YSG-AGENT-REG-001's header comment above
           # documents). Either way: never blindly clobber a pre-existing
-          # token — preserve it and warn loudly so an operator can tell the
-          # two cases apart via /admin/agents, instead of silently losing
-          # access to whichever agent_id the old token pointed at.
-          if [[ -s "${secrets_dir}/${_profile}_token" ]]; then
-            local _dup_backup
-            _dup_backup="${secrets_dir}/${_profile}_token.dup-$(date -u +%Y%m%dT%H%M%SZ)"
-            if cp -p "${secrets_dir}/${_profile}_token" "${_dup_backup}" 2>/dev/null; then
-              chmod 0640 "${_dup_backup}" 2>/dev/null || true
-              log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed. Old token preserved at ${_dup_backup} — NOT overwritten silently. Check /admin/agents for duplicate active rows named '${_agent_name}' (either deactivate the stale one, or confirm this was an intentional full-volume reinstall) before relying on @${_agent_name} chat dispatch."
-            else
-              log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} re-registered with an existing token file present, but the pre-registration backup copy FAILED — proceeding to overwrite anyway (old token content is now unrecoverable). Check /admin/agents for duplicate active rows named '${_agent_name}'."
+          # token without a trace — but also never PRESERVE it in plaintext.
+          #
+          # FIND-0813-013 item 5 (Nico red-review, 2026-08-16, CONFIRMED —
+          # "sharpest finding"): the prior disposition here (`cp -p` to
+          # "${secrets_dir}/${_profile}_token.dup-<ts>") kept the OLD raw PSK
+          # readable forever in the LIVE secrets dir, 0640, with no TTL and no
+          # code path that ever deleted it — "a permanent, unencrypted copy
+          # of a still-valid raw PSK on the host filesystem." Nico further
+          # traced that even the documented remediation (deactivate the
+          # stale agent via /admin/agents) does not revoke the token on the
+          # registry.py this shipped against (verify_token() does not check
+          # status; deactivate() does not delete agent:token:{agent_id}) —
+          # i.e. the OLD token stayed live and readable indefinitely.
+          #
+          # Correct disposition: do NOT persist the raw value anywhere.
+          # Compute a short SHA-256 fingerprint for operator log-correlation
+          # ONLY (irreversible — cannot be used to authenticate as the old
+          # agent) and securely remove the plaintext file immediately. This
+          # intentionally forfeits "roll back to the old agent_id" as an
+          # option: an operator who wants to keep the OLD registration
+          # should deactivate the NEW duplicate via /admin/agents instead of
+          # relying on a standing plaintext credential file as an undo
+          # button. This is independently correct regardless of whether
+          # deactivate() has been fixed to actually revoke the Redis token
+          # key — it does not depend on that fix landing.
+          # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris): `[[ -s ]]` treats
+          # install.sh's OWN safety-net placeholder ("# placeholder —
+          # auto-generated at first bootstrap", written by this same
+          # function's step-8d/safety-net loops above, install.sh:9908 /
+          # 21305) as if it were a genuine prior credential — the placeholder
+          # is non-empty, so `-s` is true, and every clean install that ever
+          # passed through the placeholder-write path fires this ERROR with
+          # a fingerprint that is identical across every profile (it is a
+          # hash of the constant placeholder STRING, not of any secret:
+          # `printf '%s' "# placeholder — auto-generated at first bootstrap"
+          # | sha256sum` = 5eab8af2a221cdff..., matching the false positives
+          # reported live on a verified-clean install, 0 containers/volumes,
+          # docker/secrets ABSENT before install). Reuse `_secret_is_valid`
+          # (F-001 self-heal predicate, defined above — Su, 2026-06-14):
+          # already the codebase's single canonical "real secret vs
+          # placeholder/absent/empty" check, used for this exact class of
+          # placeholder for yashigani_internal_bearer/CADDY_INTERNAL_HMAC/
+          # langflow token elsewhere in this file. It is a content check
+          # (file exists, non-empty, first byte is not "#"), not a
+          # hash-string special-case, so it also correctly treats a
+          # zero-byte file as absent (no false ERROR) and any real
+          # placeholder-shaped-but-different comment as a placeholder too —
+          # more robust than pinning the one known SHA-256. Placeholder and
+          # a real token cannot legitimately coexist in the same file (the
+          # placeholder IS the file's entire content until step 8d/this
+          # write-loop overwrites it with the real token; the write is a
+          # full overwrite, never an append) so there is no straddling case
+          # to handle. The TRUE positive (repeat --upgrade re-registering an
+          # already-active agent while a REAL prior token — not a
+          # placeholder — is still on disk) still fires: `_secret_is_valid`
+          # returns true for any non-placeholder non-empty content,
+          # identically to `-s` for that case.
+          if _secret_is_valid "${secrets_dir}/${_profile}_token"; then
+            local _dup_fp="unavailable"
+            if command -v sha256sum >/dev/null 2>&1; then
+              _dup_fp="$(sha256sum "${secrets_dir}/${_profile}_token" 2>/dev/null | cut -d' ' -f1 | head -c 16)"
             fi
+            if command -v shred >/dev/null 2>&1; then
+              shred -u -n 1 -- "${secrets_dir}/${_profile}_token" 2>/dev/null || rm -f -- "${secrets_dir}/${_profile}_token"
+            else
+              rm -f -- "${secrets_dir}/${_profile}_token"
+            fi
+            # FIND-IRIS-DUP-AGENT-FALSEPOS (2026-08-17, Iris): severity
+            # downgraded ERROR -> WARN. This branch is reached only when
+            # `_secret_is_valid` has already confirmed a REAL prior token
+            # (not the placeholder) — the true-positive case. It is still
+            # non-fatal (execution continues, any_registered=true below,
+            # install completes, the NEW registration is fully functional)
+            # and needs an operator cleanup action, not an install failure.
+            # Matches the severity this same function already uses for
+            # every other non-fatal/actionable condition on this guard
+            # (the pre-check-query-failed warnings a few lines above use
+            # log_warn) — ERROR is reserved for the genuinely catastrophic,
+            # distinct case added by 264296c6 (the compose-exec call never
+            # reached the container at all). A log-scraping gate that greps
+            # install output for "ERROR:" must not flag a successful,
+            # fully-functional install for a condition the installer itself
+            # does not treat as fatal.
+            log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) while a prior token file already existed (fingerprint sha256:${_dup_fp}...). The prior token has been securely removed — it is NOT retained in plaintext (FIND-0813-013 item 5). Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch; the deactivated agent's old credential cannot be recovered."
           elif [[ "$_ysg_agent_pre_existing" == *",${_agent_name},"* ]]; then
-            log_error "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
+            log_warn "FIND-IRIS-DUP-AGENT: ${_agent_name} was registered AGAIN (new agent_id, new token) even though the durable-Postgres pre-check found it already active — this is the race the pre-check exists to catch and it still lost. Check /admin/agents for duplicate active rows named '${_agent_name}' and deactivate the stale one before relying on @${_agent_name} chat dispatch."
           fi
           # ISSUE-027 (2026-05-19): Docker-rootful fallback — Python inside the
           # container may fail to write the token (EACCES) and fall through to
@@ -11373,6 +12146,15 @@ for r in results:
         log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}"
         _any_recognized_line=true
         ;;
+      AUDIT_WARN:*)
+        # FIND-0813-013 item 2: audit-chain write failed (writer init or a
+        # single event write). Non-fatal per routes/agents.py:533-549s own
+        # pattern -- the registration/envelope-mint itself already
+        # succeeded and must not be rolled back for an audit-sink failure.
+        # Loud so an operator notices the tamper-evident chain has a gap.
+        log_warn "  audit write failed (registration unaffected): ${line#AUDIT_WARN:}"
+        _any_recognized_line=true
+        ;;
     esac
   done <<< "$reg_output"
 
@@ -11381,7 +12163,7 @@ for r in results:
     log_info "Restarting agent containers with new tokens..."
     for _profile in "${COMPOSE_PROFILES[@]+"${COMPOSE_PROFILES[@]}"}"; do
       [[ -z "$_profile" ]] && continue
-      "${COMPOSE_CMD[@]}" "${compose_files[@]}" --profile "$_profile" restart "$_profile" 2>/dev/null || true
+      _compose "${COMPOSE_CMD[@]}" "${compose_files[@]}" --profile "$_profile" restart "$_profile" 2>/dev/null || true
     done
     log_success "Agent bundle registration complete"
 
@@ -11453,6 +12235,19 @@ run_health_check() {
   # 127.0.0.11 — dead on Podman). FATAL, not a warning: a green install that
   # cannot dispatch to any onboarded agent is a false green.
   _check_agent_dispatch_smoke "${WORK_DIR}/docker"
+
+  # YSG-RISK-196: apparmor_parser -r succeeding (or being skipped) at env-setup
+  # time only proves the profile was accepted into the HOST's policy cache (or
+  # that install.sh made a documented unconfined decision) at THAT moment — it
+  # proves nothing about what the RUNNING containers actually got at container-
+  # start time, which can happen much later (image pulls, DB init) and is a
+  # separate host/runtime code path (the compose engine, not apparmor_parser).
+  # Same defect class as FINDING-V412-RESTART-012 (RO-mount): a declared
+  # intent was never checked against runtime reality. Non-fatal per documented
+  # design (docs/yashigani_install_config.md §26.4: AppArmor is "Optional" —
+  # defense-in-depth, not a blocking control like the PKI RO-mount), but the
+  # actual state is now verified live and reported loudly either way.
+  _verify_apparmor_confinement
 }
 
 # _verify_backoffice_secrets_ro_mount — FINDING-V412-RESTART-012.
@@ -11695,6 +12490,126 @@ _check_agent_dispatch_smoke() {
   fi
 }
 
+# _verify_apparmor_confinement — YSG-RISK-196.
+#
+# install.sh's env-setup phase (docker/.env AES key + security-profile
+# override block, ~line 3885) decides YASHIGANI_APPARMOR_PROFILE and logs
+# that decision — but that log line only reflects what `apparmor_parser -r`
+# did to the HOST's policy cache (or the deliberate Podman/host-unavailable
+# unconfined fallback) at env-setup time, BEFORE the compose stack is ever
+# started. Nothing previously re-checked the actually-running containers
+# after `compose up`, so a profile that failed to attach for any reason
+# downstream of that decision (host reboot mid-install, a runtime that
+# silently drops an unrecognised security_opt, TOCTOU between the two
+# steps) produced a container running unconfined with install.sh still
+# reporting the profile as "loaded" — the exact "did no work, reported
+# success" defect class this codebase has been fixing all week
+# (FINDING-V412-RESTART-012 is the RO-mount instance of the same pattern).
+#
+# This function reads back the LIVE per-process AppArmor state from the
+# container's own view — /proc/<pid>/attr/apparmor/current (falls back to
+# the pre-LSM-namespaced /proc/<pid>/attr/current on older kernels) — which
+# is authoritative for both Docker and Podman. `docker inspect
+# --format .AppArmorProfile` is used as a secondary display value only:
+# live-verified 2026-08-16 (testing_runs/yashigani/converge-20260813/
+# su-item2-anonvol/) that Docker populates it correctly (docker-default /
+# unconfined / <profile>) but Podman's compat-inspect leaves it empty for
+# every container regardless of actual confinement, so it cannot be trusted
+# as the sole signal on Podman — the /proc read is required for parity.
+#
+# Docker + Podman both differ from what the OLD env-setup-time log implied:
+#   - Podman (rootful or rootless): install.sh ALWAYS sets unconfined here
+#     by design (see the YSG_PODMAN_RUNTIME branch above this function) —
+#     genuinely no AppArmor confinement is applied. This function confirms
+#     that is what actually happened rather than silently trusting the
+#     declared intent, and says so explicitly rather than implying
+#     confinement that was never there.
+#   - Docker on Linux: the profile is expected to be genuinely enforcing.
+#
+# Non-fatal (does not exit 1) — docs/yashigani_install_config.md §26.4
+# documents AppArmor as "Optional" defense-in-depth, not a blocking control
+# the way the PKI RO-mount is. But every outcome is reported accurately and
+# loudly; nothing is silently swallowed.
+_verify_apparmor_confinement() {
+  # K8s/Helm has its own PodSecurityContext / AppArmor annotation mechanism,
+  # not this compose security_opt wiring — not applicable here.
+  if [[ "${MODE:-compose}" == "k8s" || "${YSG_RUNTIME:-}" == "k8s" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_print "_verify_apparmor_confinement (skipped in dry-run)"
+    return 0
+  fi
+
+  local _rt="docker"
+  command -v podman >/dev/null 2>&1 && [[ "${YSG_PODMAN_RUNTIME:-false}" == "true" ]] && _rt="podman"
+
+  local _env_file="${WORK_DIR}/docker/.env"
+  local _declared="unconfined"
+  if [[ -f "$_env_file" ]]; then
+    local _declared_raw
+    _declared_raw="$(grep -m1 '^YASHIGANI_APPARMOR_PROFILE=' "$_env_file" 2>/dev/null | cut -d= -f2- || true)"
+    [[ -n "$_declared_raw" ]] && _declared="$_declared_raw"
+  fi
+
+  local _svc _ctr _pid _live _any_checked=false _mismatch=false
+  for _svc in gateway backoffice extractor-svc; do
+    _ctr="$("$_rt" ps --filter "name=${_svc}" --format '{{.Names}}' 2>/dev/null | head -1 || true)"
+    if [[ -z "$_ctr" ]]; then
+      log_warn "AppArmor verification (YSG-RISK-196): ${_svc} container not found — skipping (not yet up)"
+      continue
+    fi
+    _any_checked=true
+
+    _pid="$("$_rt" inspect "$_ctr" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    _live=""
+    if [[ -n "$_pid" && "$_pid" != "0" ]]; then
+      if [[ -r "/proc/${_pid}/attr/apparmor/current" ]]; then
+        _live="$(cat "/proc/${_pid}/attr/apparmor/current" 2>/dev/null || true)"
+      elif [[ -r "/proc/${_pid}/attr/current" ]]; then
+        _live="$(cat "/proc/${_pid}/attr/current" 2>/dev/null || true)"
+      fi
+    fi
+
+    if [[ -z "$_live" ]]; then
+      log_warn "AppArmor verification (YSG-RISK-196): could not read live confinement state for ${_ctr} (pid=${_pid:-unknown}, ${_rt}) — AppArmor LSM may not be exposed to this host/runtime (e.g. nested container, gVisor, kernel without securityfs). UNVERIFIED — treat as NOT confirmed, not as confirmed-confined."
+      continue
+    fi
+
+    if [[ "$_declared" == "unconfined" ]]; then
+      if [[ "$_live" == *"unconfined"* ]]; then
+        log_success "AppArmor (${_ctr}): confirmed UNCONFINED at runtime — matches install-time decision (${_rt}, YASHIGANI_APPARMOR_PROFILE=unconfined). No AppArmor confinement is applied to this container; this is expected on this runtime/host."
+      else
+        log_info "AppArmor (${_ctr}): declared unconfined but live state is '${_live}' (more confined than declared — harmless, not a security gap; runtime default profile is doing incidental work install.sh did not request)."
+      fi
+    else
+      if [[ "$_live" == *"$_declared"* && "$_live" != *"unconfined"* ]]; then
+        log_success "AppArmor (${_ctr}): CONFIRMED enforcing '${_declared}' at runtime (live: ${_live})."
+      else
+        _mismatch=true
+        log_error "################################################################"
+        log_error "AppArmor CONFINEMENT MISMATCH — YSG-RISK-196"
+        log_error "  ${_ctr} was declared to run under AppArmor profile '${_declared}'"
+        log_error "  (docker/.env YASHIGANI_APPARMOR_PROFILE) but its LIVE runtime"
+        log_error "  state is actually: '${_live:-<empty>}'."
+        log_error "  This container is running with WEAKER confinement than the"
+        log_error "  install reported. Checked: ${_rt} inspect ${_ctr} -> pid ${_pid}"
+        log_error "  -> /proc/${_pid}/attr/apparmor/current"
+        log_error "################################################################"
+      fi
+    fi
+  done
+
+  if [[ "$_any_checked" == "false" ]]; then
+    log_info "AppArmor verification (YSG-RISK-196): no gateway/backoffice/extractor-svc containers found — skipped"
+    return 0
+  fi
+
+  if [[ "$_mismatch" == "true" ]]; then
+    log_warn "AppArmor: one or more containers are running with weaker confinement than install declared (see above). NOT blocking this install — AppArmor is documented as optional defense-in-depth (docs/yashigani_install_config.md §26.4), not a hard security gate. Investigate before relying on it as a control."
+  fi
+}
+
 # =============================================================================
 # STEP 8b: Generate all service secrets
 # =============================================================================
@@ -11727,6 +12642,13 @@ symbols = "!*,-._~"
 alphabet = string.ascii_letters + string.digits + symbols
 while True:
     pw = "".join(secrets.choice(alphabet) for _ in range(36))
+    # YSG-RISK-198: a password STARTING with '-' is parsed as an option flag by
+    # CLI/automation consumers (psql, curl, kubectl, getopt-based scripts), so a
+    # valid generated credential could break tooling non-deterministically —
+    # ~1/47 of runs with this alphabet. Reject leading '-' rather than removing
+    # it from the alphabet (which would cut entropy for every other position).
+    if pw[0] == "-":
+        continue
     if (any(c.isupper() for c in pw)
         and any(c.islower() for c in pw)
         and any(c.isdigit() for c in pw)
@@ -11741,7 +12663,10 @@ PY
     local _pw _i
     for _i in 1 2 3 4 5 6 7 8; do
       _pw="$(LC_ALL=C tr -dc 'A-Za-z0-9!*,._~-' < /dev/urandom 2>/dev/null | head -c 36)"
-      if [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
+      # YSG-RISK-198: reject a leading '-' — CLI/automation consumers parse it
+      # as an option flag. Same guard as the python3 path above.
+      if [[ "$_pw" != -* ]] \
+         && [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
         printf "%s" "$_pw"
         return 0
       fi
@@ -11752,7 +12677,10 @@ PY
     local _pw _i
     for _i in 1 2 3 4 5 6 7 8; do
       _pw="$(LC_ALL=C tr -dc 'A-Za-z0-9!*,._~-' < /dev/urandom | head -c 36)"
-      if [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
+      # YSG-RISK-198: reject a leading '-' — CLI/automation consumers parse it
+      # as an option flag. Same guard as the python3 path above.
+      if [[ "$_pw" != -* ]] \
+         && [[ "$_pw" =~ [A-Z] ]] && [[ "$_pw" =~ [a-z] ]] && [[ "$_pw" =~ [0-9] ]] && [[ "$_pw" =~ [\!\*,._~-] ]]; then
         printf "%s" "$_pw"
         return 0
       fi
@@ -11809,7 +12737,7 @@ _gen_totp_uri() {
   # algorithm= and digits= URI parameters. Classic Google Authenticator (SHA-1 only)
   # is NOT compatible with SHA-512/8-digit TOTP and MUST NOT be used.
   #
-  # YSG-RISK-078 context: the original SHA-256 reversion was driven by SHA-1-only
+  # YSG-RISK-232 context: the original SHA-256 reversion was driven by SHA-1-only
   # apps failing silently. Phase 13 mandates agnosticOTP specifically to avoid this.
   local username="$1"
   local secret="$2"
@@ -13480,12 +14408,23 @@ generate_secrets() {
 # The actual password NEVER leaves the system.
 # See: https://haveibeenpwned.com/API/v3#SearchingPwnedPasswordsByRange
 
+# _hibp_check_single sets _HIBP_LAST_STATUS as a side-channel to distinguish
+# WHY it returned 0 — "clean" (positively verified against the breach corpus)
+# vs "unchecked-*" (never actually queried: no curl, no hashing tool, or the
+# API was unreachable). Both used to collapse to the same "proceed" signal,
+# which is how _hibp_check_passwords ended up printing "all passwords clean"
+# for installs where nothing was ever checked (see that function's header
+# comment). return-code semantics are unchanged (0=proceed, 1=confirmed
+# breached — retry loops still work exactly as before); only the NEW
+# _HIBP_LAST_STATUS variable is added, read by the callers below to build an
+# honest final summary.
 _hibp_check_single() {
   local label="$1"
   local password="$2"
 
   # Skip if no curl or no internet
   if ! command -v curl >/dev/null 2>&1; then
+    _HIBP_LAST_STATUS="unchecked-no-curl"
     return 0
   fi
 
@@ -13498,6 +14437,7 @@ _hibp_check_single() {
   elif command -v openssl >/dev/null 2>&1; then
     sha1_hash="$(printf '%s' "$password" | openssl dgst -sha1 | awk '{print toupper($NF)}')"
   else
+    _HIBP_LAST_STATUS="unchecked-no-hash-tool"
     return 0  # Can't hash — skip silently
   fi
 
@@ -13511,7 +14451,12 @@ _hibp_check_single() {
     "https://api.pwnedpasswords.com/range/${prefix}" 2>/dev/null || echo "")"
 
   if [[ -z "$response" ]]; then
-    return 0  # API unreachable — skip silently (air-gapped, offline, etc.)
+    # API unreachable — do NOT claim a check happened. This is a legitimate
+    # state (air-gapped, offline, corporate egress ring-fence, transient
+    # network failure) but it is NOT "verified clean" and must never be
+    # reported as such.
+    _HIBP_LAST_STATUS="unchecked-unreachable"
+    return 0
   fi
 
   # Check if our suffix appears in the response
@@ -13520,10 +14465,38 @@ _hibp_check_single() {
 
   if [[ -n "$match_count" && "$match_count" -gt 0 ]]; then
     log_warn "HIBP: ${label} password found in ${match_count} data breach(es) — regenerating..."
+    _HIBP_LAST_STATUS="breached"
     return 1  # Compromised
   fi
 
+  _HIBP_LAST_STATUS="clean"
   return 0  # Clean
+}
+
+# _hibp_tally_result: read the just-set _HIBP_LAST_STATUS for one credential's
+# FINAL check attempt (i.e. called once per credential, after its retry loop
+# has concluded) and fold it into the three run-level counters below. Global
+# counters (not `local`) so both the inline admin1/admin2 loops in
+# _hibp_check_passwords and _hibp_check_and_regen can share them.
+_hibp_tally_result() {
+  case "${_HIBP_LAST_STATUS:-}" in
+    clean)
+      _HIBP_CLEAN_COUNT=$(( _HIBP_CLEAN_COUNT + 1 ))
+      ;;
+    breached)
+      # Retry loop gave up after max_retries while still breached — the
+      # (breached) password was used anyway. Must not be reported as clean.
+      _HIBP_BREACHED_COUNT=$(( _HIBP_BREACHED_COUNT + 1 ))
+      ;;
+    unchecked-*)
+      _HIBP_UNCHECKED_COUNT=$(( _HIBP_UNCHECKED_COUNT + 1 ))
+      ;;
+    *)
+      # Defensive: an unexpected/missing status is treated as unchecked,
+      # never as clean — fail closed on the reporting side too.
+      _HIBP_UNCHECKED_COUNT=$(( _HIBP_UNCHECKED_COUNT + 1 ))
+      ;;
+  esac
 }
 
 _hibp_check_passwords() {
@@ -13542,6 +14515,13 @@ _hibp_check_passwords() {
 
   local max_retries=3
 
+  # Run-level tally — see _hibp_tally_result. Distinguishes "checked, none
+  # breached" from "could not check" from "still breached, used anyway" so
+  # the final summary line never asserts a check that never happened.
+  _HIBP_CLEAN_COUNT=0
+  _HIBP_UNCHECKED_COUNT=0
+  _HIBP_BREACHED_COUNT=0
+
   # Check admin1 — regenerate if compromised (extremely unlikely for 36-char random)
   local attempt=0
   while ! _hibp_check_single "Admin 1 (${GEN_ADMIN1_USERNAME})" "$GEN_ADMIN1_PASSWORD"; do
@@ -13553,6 +14533,7 @@ _hibp_check_passwords() {
     GEN_ADMIN1_PASSWORD="$(_gen_password)"
     printf "%s" "$GEN_ADMIN1_PASSWORD" > "${WORK_DIR}/docker/secrets/admin1_password"
   done
+  _hibp_tally_result
 
   # Check admin2
   attempt=0
@@ -13564,13 +14545,35 @@ _hibp_check_passwords() {
     GEN_ADMIN2_PASSWORD="$(_gen_password)"
     printf "%s" "$GEN_ADMIN2_PASSWORD" > "${WORK_DIR}/docker/secrets/admin2_password"
   done
+  _hibp_tally_result
 
   # Check service passwords (postgres, redis, grafana)
   _hibp_check_and_regen "postgres" "$GEN_POSTGRES_PASSWORD" "${WORK_DIR}/docker/secrets/postgres_password" $max_retries
   _hibp_check_and_regen "redis" "$GEN_REDIS_PASSWORD" "${WORK_DIR}/docker/secrets/redis_password" $max_retries
   _hibp_check_and_regen "grafana" "$GEN_GRAFANA_PASSWORD" "${WORK_DIR}/docker/secrets/grafana_admin_password" $max_retries
 
-  log_success "HIBP breach check complete — all passwords clean"
+  # Honest summary: only claim "all clean" when every credential was
+  # POSITIVELY verified. "Unreachable" (air-gapped, offline, egress
+  # ring-fence, transient network failure — the general online-install case,
+  # not just --air-gap/--offline which already return early above) and
+  # "still breached after max retries" are both reported distinctly and
+  # never folded into a false "clean" claim.
+  local _hibp_total=$(( _HIBP_CLEAN_COUNT + _HIBP_UNCHECKED_COUNT + _HIBP_BREACHED_COUNT ))
+  if [[ "$_HIBP_BREACHED_COUNT" -gt 0 ]]; then
+    log_warn "HIBP breach check: ${_HIBP_BREACHED_COUNT} of ${_hibp_total} password(s) remained flagged as breached"
+    log_warn "  after ${max_retries} regeneration attempts and were used anyway. Rotate these credentials."
+    if [[ "$_HIBP_UNCHECKED_COUNT" -gt 0 ]]; then
+      log_warn "  ${_HIBP_UNCHECKED_COUNT} other password(s) could not be checked at all (see below)."
+    fi
+  elif [[ "$_HIBP_UNCHECKED_COUNT" -gt 0 ]]; then
+    log_warn "HIBP breach check: could not verify ${_HIBP_UNCHECKED_COUNT} of ${_hibp_total} password(s)"
+    log_warn "  against api.pwnedpasswords.com (network unreachable, or curl/hashing tool missing)."
+    log_warn "  These passwords were NOT confirmed clean. If a breach is suspected, rotate them"
+    log_warn "  once connectivity is restored — see docs/operations/air-gap-install.md 'HIBP in"
+    log_warn "  air-gap mode' for the rotation procedure (applies equally here)."
+  else
+    log_success "HIBP breach check complete — all ${_hibp_total} passwords verified clean via api.pwnedpasswords.com"
+  fi
 }
 
 _hibp_check_and_regen() {
@@ -13588,6 +14591,7 @@ _hibp_check_and_regen() {
     password="$(_gen_password)"
     printf "%s" "$password" > "$secret_file"
   done
+  _hibp_tally_result
 
   # Update the module-level variable
   local upper_label
@@ -15072,7 +16076,7 @@ k8s_helm_install() {
   # Merge order note: these -f land AFTER -f .env.helm — distinct key
   # (egressForwarders, additive per-system map keys), no collision; --set
   # still wins over both.
-  # YSG-RISK-130 fix: layer the INGRESS-front overlay (values-<agent>-
+  # YSG-RISK-138 fix: layer the INGRESS-front overlay (values-<agent>-
   # ingress.yaml) alongside the pre-existing egress-forwarder overlay. This
   # overlay was already fully authored (agentIngressFronts map -> templates/
   # agent-ingress-fronts.yaml's yashigani-caddy-mesh Service + 4 NetworkPolicies
@@ -15105,14 +16109,14 @@ k8s_helm_install() {
       _hb_ingress_overlay="${chart_dir}/values-${_hb_agent}-ingress.yaml"
       if [[ ! -f "$_hb_ingress_overlay" ]]; then
         # Fail-closed: without the ingress front, gateway has no mTLS-verified
-        # path to this agent — registering it anyway (YSG-RISK-130) would
+        # path to this agent — registering it anyway (YSG-RISK-138) would
         # ship a registration that fails closed at the TLS handshake on
         # every dispatch.
         log_error "${_hb_agent} bundle requested (--agent-bundles) but ingress-front overlay not found: ${_hb_ingress_overlay}"
         exit 1
       fi
       helm_args+=(--set "agentBundles.${_hb_agent}.enabled=true" -f "$_hb_overlay" -f "$_hb_ingress_overlay")
-      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-130 / unified-sidecar v4.1)"
+      log_info "${_hb_agent} bundle enabled (K8s): agentBundles.${_hb_agent}.enabled=true + egress-forwarder overlay + ingress-front overlay (YSG-RISK-138 / unified-sidecar v4.1)"
     fi
   done
 
@@ -15267,7 +16271,7 @@ k8s_verify_image_provenance() {
 
 # STEP 9c (k8s): register agent bundles with gateway's durable registry
 #
-# YSG-RISK-130: register_agent_bundles() (compose/Podman path, "Step 11b",
+# YSG-RISK-138: register_agent_bundles() (compose/Podman path, "Step 11b",
 # called from compose_up only) is the ONLY place any deployment populates
 # gateway's durable agent registry (Postgres AgentDurableStore + Redis db/3
 # AgentRegistry). k8s had no equivalent — agent bundle pods ran healthy but
@@ -15316,7 +16320,7 @@ k8s_verify_image_provenance() {
 # (kubectl exec -i ... <<<"$agents_json"), NOT via -e/env or a CLI arg —
 # keeps it out of `ps` on the host and off the kubectl exec command line.
 k8s_register_agent_bundles() {
-  set_step "9c" "register agent bundles (k8s, YSG-RISK-130)"
+  set_step "9c" "register agent bundles (k8s, YSG-RISK-138)"
 
   local _hb_ab=",${AGENT_BUNDLES//[[:space:]]/},"
   if [[ "$_hb_ab" == ",," ]]; then
@@ -15330,7 +16334,7 @@ k8s_register_agent_bundles() {
   fi
 
   require_cmd "kubectl"
-  log_step "9c/${TOTAL_STEPS}" "Registering agent bundles with gateway (k8s, YSG-RISK-130)..."
+  log_step "9c/${TOTAL_STEPS}" "Registering agent bundles with gateway (k8s, YSG-RISK-138)..."
 
   local _bo_pod
   _bo_pod="$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=yashigani-backoffice \
@@ -15340,6 +16344,45 @@ k8s_register_agent_bundles() {
     log_warn "No Running backoffice pod found — cannot register agent bundles."
     log_warn "Register manually via /admin/agents once the pod is healthy."
     return 0
+  fi
+
+  # FIND-0813-013 item 3 (Iris red-review, 2026-08-16): belt-and-braces
+  # durable-Postgres pre-check -- the k8s TWIN of register_agent_bundles()'s
+  # (compose) pre-check above. Iris CONFIRMED this as real cross-runtime
+  # drift: k8s previously relied SOLELY on the in-pod Python step's
+  # Redis-based `existing_names` check (registry.list_all()) -- exactly the
+  # single, racy layer the compose pre-check exists to backstop (Redis db/3
+  # runs appendonly no / save "" and is empty immediately after any redis
+  # recreate, until reconcile_agents_from_durable() catches up). Without
+  # this pre-check the k8s leg was MORE exposed to the FIND-IRIS-DUP-AGENT
+  # race than compose, not equally exposed. Fail-open by the SAME documented
+  # invariant as the compose guard (install.sh, register_agent_bundles()
+  # header, "FIND-IRIS-DUP-AGENT-REGRESSION"): on a query failure,
+  # `_ysg_agent_pre_existing` MUST stay exactly "," so the membership test
+  # below can never match ANY profile -- a pre-check failure skips NOBODY,
+  # it only means this pre-check could not PROACTIVELY exclude an
+  # already-registered name (the in-pod Redis-based check is still the
+  # authoritative skip decision either way).
+  local _ysg_agent_pre_existing=","
+  local _k8s_pg_pod _k8s_existing_names_raw
+  _k8s_pg_pod="$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=postgres \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -n "$_k8s_pg_pod" ]]; then
+    if _k8s_existing_names_raw="$(kubectl exec -i -n "$NAMESPACE" "$_k8s_pg_pod" -- \
+        psql -U yashigani_admin -d yashigani -tAc \
+        "SELECT agent_name FROM agent_registry WHERE tenant_id = '00000000-0000-0000-0000-000000000000' AND status = 'active' AND agent_name <> '';" \
+        2>/dev/null)"; then
+      local _k8s_en_line
+      while IFS= read -r _k8s_en_line; do
+        _k8s_en_line="$(printf '%s' "$_k8s_en_line" | tr -d ' \r')"
+        [[ -n "$_k8s_en_line" ]] && _ysg_agent_pre_existing="${_ysg_agent_pre_existing}${_k8s_en_line},"
+      done <<< "$_k8s_existing_names_raw"
+    else
+      log_warn "FIND-IRIS-DUP-AGENT pre-check (k8s): could not query durable agent_registry (non-fatal — falling back to the in-pod skip check only)"
+    fi
+  else
+    log_warn "FIND-IRIS-DUP-AGENT pre-check (k8s): no running postgres pod found in namespace ${NAMESPACE} (non-fatal — falling back to the in-pod skip check only)"
   fi
 
   local agents_json='['
@@ -15366,6 +16409,15 @@ k8s_register_agent_bundles() {
       openclaw)  _name="openclaw"  _proto="openai"  _mesh_port="9671"  _tenant="default"  _secret_name="yashigani-openclaw-token" ;;
     esac
 
+    # FIND-IRIS-DUP-AGENT pre-check (k8s): already durably registered under
+    # this canonical name — never even offer it to the in-pod registration
+    # step. Mirrors the compose-side guard (install.sh,
+    # register_agent_bundles()).
+    if [[ "$_ysg_agent_pre_existing" == *",${_name},"* ]]; then
+      log_info "  ${_name}: already registered (durable Postgres) — skipping (FIND-IRIS-DUP-AGENT guard, k8s)"
+      continue
+    fi
+
     _raw_token="$(kubectl get secret "$_secret_name" -n "$NAMESPACE" \
       -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)"
     if [[ -z "$_raw_token" ]]; then
@@ -15388,7 +16440,7 @@ k8s_register_agent_bundles() {
 
   local reg_output
   reg_output="$(kubectl exec -i -n "$NAMESPACE" "$_bo_pod" -- python3 -c '
-# YSG-RISK-130: k8s equivalent of register_agent_bundles() (compose). Same
+# YSG-RISK-138: k8s equivalent of register_agent_bundles() (compose). Same
 # durable-store + Redis db/3 upsert, idempotent by name — but the token is
 # READ from stdin (already Helm-Secret-stable), never generated, and no
 # container restart follows.
@@ -15397,6 +16449,22 @@ sys.path.insert(0, "/app/src")
 
 agents_spec = json.load(sys.stdin)
 results = []
+
+# FIND-0813-013 item 2/3 (Laura/Iris/Tom red-review, 2026-08-16): same audit
+# gap as the compose twin -- see register_agent_bundles() (compose) for the
+# full rationale. Construct ONE AuditLogWriter for this whole run.
+_audit_writer = None
+try:
+    from yashigani.audit.writer import AuditLogWriter, siem_targets_from_env
+    from yashigani.audit.config import AuditConfig
+    from yashigani.audit.scope import MaskingScopeConfig
+    _audit_writer = AuditLogWriter(
+        config=AuditConfig.from_env(),
+        masking_scope=MaskingScopeConfig(),
+        siem_targets=siem_targets_from_env(),
+    )
+except Exception as _awe:
+    results.append("AUDIT_WARN:writer_init:" + str(_awe))
 
 for agent_spec in agents_spec:
     aname          = agent_spec["name"]
@@ -15413,6 +16481,7 @@ for agent_spec in agents_spec:
         from yashigani.agents.registry import AgentRegistry
         from yashigani.agents.durable_store import AgentDurableStore
         from yashigani.gateway._redis_url import build_redis_url
+        from yashigani.licensing.enforcer import get_license, LicenseLimitExceeded
         import redis as _redis
         import bcrypt as _bcrypt
         import secrets as _sec_mod
@@ -15424,14 +16493,36 @@ for agent_spec in agents_spec:
             client_cert_name="backoffice_client",
         )
         _rc = _redis.from_url(_redis_url, decode_responses=True)
-        registry = AgentRegistry(_rc)
         durable  = AgentDurableStore()
+        # FIND-0813-013 item 1 (k8s twin, Tom red-review): this path CANNOT
+        # switch to registry.register() the way the compose payload does --
+        # register() always mints its OWN fresh PSK (registry.py:176), but
+        # this k8s token is READ from a pre-provisioned Helm Secret and must
+        # be preserved bit-for-bit (the agent workload was already deployed
+        # presenting THIS token; minting a different one here would desync
+        # it from what the running agent pod actually holds). Passed
+        # durable_store= anyway for construction consistency with the
+        # compose payload, though restore_from_durable() below does not
+        # itself consult self._durable.
+        registry = AgentRegistry(_rc, durable_store=durable)
 
         # Skip if already registered by name (idempotent; preserves token hash).
         existing_names = {a.get("name", "") for a in registry.list_all()}
         if aname in existing_names:
             results.append("SKIP:" + aname)
             continue
+
+        # FIND-0813-013 item 1 (k8s twin): register() Lua script enforces
+        # max_agents atomically; restore_from_durable() explicitly does not
+        # (registry.py:381-384 docstring). Since register() cannot be used
+        # here (token must be preserved, see above), replicate the SAME
+        # licence-limit check register() performs, as defence-in-depth,
+        # against the SAME get_license() source of truth.
+        _lic = get_license()
+        _limit = _lic.max_agents
+        _current_active = registry.count("active")
+        if _limit != -1 and _current_active >= _limit:
+            raise LicenseLimitExceeded(limit_name="max_agents", current=_current_active, max_val=_limit)
 
         token_hash = _bcrypt.hashpw(araw_token.encode(), _bcrypt.gensalt(rounds=12)).decode()
         agent_id = "agnt_" + _sec_mod.token_hex(8)
@@ -15450,9 +16541,41 @@ for agent_spec in agents_spec:
             "sensitivity_ceiling": aceiling,
         }
 
-        durable.upsert(agent_data, token_hash=token_hash)
+        # FIND-0813-013 item 1 (k8s twin): Redis FIRST (request-time source
+        # of truth, fails loud -- an exception here aborts this agent with
+        # FAIL:), Postgres SECOND (best-effort durability mirror, logged
+        # non-fatally on failure). Same order register() uses and every
+        # other AgentRegistry mutator already uses; the OLD k8s code (like
+        # the old compose code) had Postgres first / Redis second, which
+        # could leave a permanently-stuck "active" Postgres row with no
+        # matching Redis entry if the Redis write then failed.
         registry.restore_from_durable(agent_data, token_hash)
+        try:
+            durable.upsert(agent_data, token_hash=token_hash)
+        except Exception as _de:
+            results.append("DURABLE_WARN:" + aname + ":" + str(_de))
+
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AgentRegisteredEvent
+                _audit_writer.write(
+                    AgentRegisteredEvent(
+                        agent_id=agent_id,
+                        agent_name=aname,
+                        upstream_url=aurl,
+                        groups=agroups,
+                        allowed_caller_groups=acaller_groups,
+                        allowed_paths=apaths,
+                        account_tier="system",
+                        admin_account="install:system",
+                    )
+                )
+            except Exception as _ae:
+                results.append("AUDIT_WARN:" + aname + ":" + str(_ae))
+
         results.append("OK:" + aname)
+    except LicenseLimitExceeded as e:
+        results.append("FAIL:" + aname + ":license_limit_exceeded:" + str(e))
     except Exception as e:
         results.append("FAIL:" + aname + ":" + str(e))
 
@@ -15484,8 +16607,26 @@ async def _mint_bundled_envelopes():
 try:
     for _pid in (_asyncio.run(_mint_bundled_envelopes()) or []):
         results.append("ENVELOPE_MINTED:" + _pid)
+        # FIND-0813-013 item 2 (k8s twin): same partial fix as compose --
+        # base AuditEvent, no dedicated schema class in this task scope; the
+        # provenance_id correlation stays in the stdout log line only.
+        if _audit_writer is not None:
+            try:
+                from yashigani.audit.schema import AuditEvent as _AuditEventBase
+                _audit_writer.write(
+                    _AuditEventBase(event_type="MCP_ENVELOPE_MINTED", account_tier="system"),
+                    component="install:bootstrap_bundled_agent_envelopes",
+                )
+            except Exception as _ae2:
+                results.append("AUDIT_WARN:envelope:" + str(_ae2))
 except Exception as _me:
     results.append("ENVELOPE_WARN:" + str(_me))
+
+if _audit_writer is not None:
+    try:
+        _audit_writer.close()
+    except Exception:
+        pass
 
 for r in results:
     print(r)
@@ -15498,6 +16639,18 @@ for r in results:
       FAIL:*)            log_warn "  ${line#FAIL:}" ;;
       ENVELOPE_MINTED:*) log_success "  envelope minted: ${line#ENVELOPE_MINTED:}" ;;
       ENVELOPE_WARN:*)   log_warn "  envelope bootstrap: ${line#ENVELOPE_WARN:}" ;;
+      DURABLE_WARN:*)
+        # FIND-0813-013 item 1 (k8s twin): the Postgres mirror write failed
+        # AFTER a successful Redis write — the agent IS live now but will
+        # not survive a redis recreate until re-registered. Non-fatal by
+        # design (matches register() best-effort mirror semantics in
+        # registry.py) but loud, since it is a durability gap, not a
+        # failure.
+        log_warn "  durable mirror write failed (agent IS live in Redis): ${line#DURABLE_WARN:}"
+        ;;
+      AUDIT_WARN:*)
+        log_warn "  audit write failed (registration unaffected): ${line#AUDIT_WARN:}"
+        ;;
       *)                 [[ -n "$line" ]] && log_warn "  agent-register: ${line}" ;;
     esac
   done <<< "$reg_output"
@@ -18581,11 +19734,24 @@ handle_onboard_subcommand() {
 
   # Wire _detect_runtime (W2/L10) — resolve the 4-way runtime BEFORE codegen.
   # Wrong-runtime codegen silently produces no ring-fence (L10).
+  #
+  # §4.4 pre-push review (Captain, 2026-08-17): this call site has NONE of
+  # resolve_compose_cmd()'s earlier reachability validation — --onboard is a
+  # short-circuit dispatch that runs before that function is ever called
+  # (confirmed: zero references to resolve_compose_cmd anywhere in
+  # handle_onboard_subcommand). It is therefore the one call site where
+  # _detect_runtime's own fail-closed behaviour (an explicitly-named-but-
+  # unreachable runtime returns YSG_RUNTIME_4WAY=unknown, not a silently
+  # substituted runtime — see lib/detect_runtime.sh) is the ONLY guard, and
+  # discarding its stderr here (`2>/dev/null`, as this line used to read)
+  # threw away the one diagnostic that would tell the operator WHY. No
+  # longer redirected — `_dr_warn`/`_dr_log` write to stderr, which install.sh's
+  # own log capture already tees to install.log same as every other step.
   if [[ -f "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh" ]]; then
     # shellcheck source=lib/detect_runtime.sh
     # shellcheck disable=SC1091
     source "${_YSG_SCRIPT_DIR}/lib/detect_runtime.sh"
-    _detect_runtime 2>/dev/null || true
+    _detect_runtime || true
     log_info "Runtime 4-way: ${YSG_RUNTIME_4WAY:-unknown} — ${YSG_RUNTIME_4WAY_NOTE:-}"
   else
     log_warn "lib/detect_runtime.sh not found — YSG_RUNTIME_4WAY will be inferred from YSG_RUNTIME"
@@ -18601,6 +19767,9 @@ handle_onboard_subcommand() {
 
   if [[ "${YSG_RUNTIME_4WAY:-unknown}" == "unknown" ]]; then
     log_error "Runtime detection failed. Set YSG_RUNTIME_4WAY=docker|podman-rootful|podman-rootless|k8s"
+    if [[ -n "${YSG_RUNTIME_4WAY_NOTE:-}" ]]; then
+      log_error "Reason: ${YSG_RUNTIME_4WAY_NOTE}"
+    fi
     exit 1
   fi
 
@@ -19396,7 +20565,7 @@ PYREPLACE
           log_step "-" "Shape-C: recreating gateway with updated YASHIGANI_MCP_SERVERS env"
           if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
             local _gw_up_rc=0
-            "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
+            _compose "${COMPOSE_CMD[@]}" "${_onboard_compose_files[@]}" up --no-deps -d gateway 2>&1 || _gw_up_rc=$?
             if [[ "$_gw_up_rc" -ne 0 ]]; then
               log_error "Gateway recreate failed (exit ${_gw_up_rc})."
               log_error "  The YASHIGANI_MCP_SERVERS env change requires a gateway restart to take effect."
@@ -19787,9 +20956,30 @@ main() {
     local _lockdir="/run/lock"; [[ -w "$_lockdir" ]] || _lockdir="${YSG_INSTALL_DIR:-$HOME}"
     local _lockfile="${_lockdir}/yashigani-install.lock"
     local _lock_fd
-    # {_lock_fd} auto-assigns a high fd WITH FD_CLOEXEC — children never inherit it.
-    # Held for the lifetime of this process; released on exit (or exec).
-    if exec {_lock_fd}>"$_lockfile" 2>/dev/null; then
+    # YSG-RISK-203 (fixed 2026-08-07). TWO bugs lived on the next line, one hiding
+    # the other:
+    #
+    #  (1) `exec {_lock_fd}>"$_lockfile" 2>/dev/null` has NO command word, so ALL of
+    #      its redirections — including `2>/dev/null` — were applied to the SHELL,
+    #      permanently. That discarded every stderr diagnostic in the remaining
+    #      ~4,000 lines of this script. Measured cost: three separate failures in one
+    #      campaign (inherited lock fd, preflight port check, podman runtime
+    #      unreachable) each presenting as a bare `exit 1` with no output, each
+    #      needing a different excavation technique to recover the real message.
+    #      Repro: bash -c 'exec {fd}>/x.lock 2>/dev/null; echo hi >&2; ls /nope'
+    #      -> prints nothing.
+    #      Fix: scope the suppression to a subshell probe; never redirect the shell.
+    #
+    #  (2) The comment below claimed "children never inherit it". They do. `lsof` on
+    #      a box where the install finished HOURS earlier showed slirp4netns,
+    #      aardvark-dns and rootlessport — the long-lived rootless-podman network
+    #      daemons this installer itself starts — all holding the lock fd, so
+    #      `flock -n` failed for the lifetime of the stack and `--upgrade` could
+    #      never run again. Fix: close the fd before handing off to compose (see
+    #      _release_install_lock below), so the lock covers the critical section
+    #      rather than the process lifetime.
+    if ( exec {_lock_fd}>"$_lockfile" ) 2>/dev/null && exec {_lock_fd}>"$_lockfile"; then
+      YSG_INSTALL_LOCK_FD="$_lock_fd"
       if ! flock -n "$_lock_fd"; then
         log_error "Another Yashigani install/uninstall already holds the lock:"
         log_error "  ${_lockfile}"
@@ -19925,7 +21115,7 @@ main() {
     k8s_verify_image_provenance
 
     # Step 9c: register agent bundles with gateway's durable registry
-    # (YSG-RISK-130) — k8s equivalent of the compose path's Step 11b
+    # (YSG-RISK-138) — k8s equivalent of the compose path's Step 11b
     # register_agent_bundles(). Must run AFTER rollout/provenance so gateway
     # and backoffice are confirmed healthy and running the correct image.
     k8s_register_agent_bundles
@@ -20568,7 +21758,7 @@ main() {
     # The script is idempotent (IF NOT EXISTS guards) — safe to re-run; no-op on
     # fresh installs where postgres init already executed it automatically.
     #
-    # YSG-RISK-050 (v2.24.0): pgbouncer authenticator now uses dedicated
+    # YSG-RISK-218 (v2.24.0, id re-issued from 050 on 2026-08-16): pgbouncer authenticator now uses dedicated
     # pgbouncer-auth_client.{crt,key} on the postgres-facing connection
     # (separate from pgbouncer_client.{crt,key} on the client-facing side).
     # Cert issuance happens automatically via PKI iterator reading
@@ -20589,7 +21779,7 @@ main() {
       log_warn "(The script is idempotent — safe to re-run; no-op on fresh installs"
       log_warn "  where the init script already executed.)"
       log_warn "v2.24.x cert-separation upgrade: this also removes the pg_hba A2 carveout"
-      log_warn "(YSG-RISK-050) — pgbouncer-auth now uses a dedicated client cert."
+      log_warn "(YSG-RISK-218) — pgbouncer-auth now uses a dedicated client cert."
     fi
 
     # Step 10: docker compose up -d

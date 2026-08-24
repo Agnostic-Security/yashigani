@@ -147,13 +147,37 @@ class TierLimits:
         return _TIER_LIMITS.get(tier.lower(), cls())
 
 
+# TB-07 (Lu, 4.1.2): this dict previously keyed the top tier on the STRING
+# "academic" while LicenseTier.ACADEMIC_NONPROFIT.value == "academic_nonprofit"
+# (added by 8073620a, retro #42, 2026-05-06 — that commit swept
+# licensing/model.py's TIER_DEFAULTS to match the website pricing table but
+# never touched this dict, same root cause as the sibling defect in
+# auth/broker.py's _TIER_IDP_LIMITS). "igniter" was never added here at all.
+# Both gaps meant `from_tier()`'s `.get(tier.lower(), cls())` fallback
+# silently applied the community-level default (1/3) to both Igniter AND
+# Non-profit/Education deployments, instead of README.md Sec.8's
+# "Container Pool Manager" row values (Igniter: 1/identity,5 total;
+# Non-profit & Education: Unlimited).
+#
+# Fix: key on every LicenseTier.value (all 7 non-canary tiers, explicit).
+# academic_nonprofit gets the same 999/9999 "unlimited" sentinel as
+# enterprise (both rows read "Unlimited").
+#
+# Fail-closed convention preserved: `TierLimits.from_tier()`'s
+# `.get(tier.lower(), cls())` fallback for an unrecognised tier string
+# (including LicenseTier.CANARY, deliberately omitted below — "never issued
+# to customers" per model.py) still yields the MOST RESTRICTIVE limits
+# (community-equivalent 1/3, the TierLimits() dataclass default), never a
+# permissive default — this is the existing convention in this file, kept
+# unchanged by this fix.
 _TIER_LIMITS = {
     "community": TierLimits(per_service_per_identity=1, total_concurrent=3),
-    "academic": TierLimits(per_service_per_identity=1, total_concurrent=3),
+    "igniter": TierLimits(per_service_per_identity=1, total_concurrent=5),
     "starter": TierLimits(per_service_per_identity=1, total_concurrent=5),
     "professional": TierLimits(per_service_per_identity=3, total_concurrent=15),
     "professional_plus": TierLimits(per_service_per_identity=5, total_concurrent=50),
     "enterprise": TierLimits(per_service_per_identity=999, total_concurrent=9999),
+    "academic_nonprofit": TierLimits(per_service_per_identity=999, total_concurrent=9999),
 }
 
 

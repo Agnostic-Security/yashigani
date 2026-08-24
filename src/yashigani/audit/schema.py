@@ -38,6 +38,15 @@ class EventType(str, Enum):
     ADMIN_SESSION_INVALIDATED = "ADMIN_SESSION_INVALIDATED"
     FULL_RESET_TOTP_FAILURE = "FULL_RESET_TOTP_FAILURE"
     ADMIN_SESSION_INVALIDATED_TOTP_LOCKOUT = "ADMIN_SESSION_INVALIDATED_TOTP_LOCKOUT"
+    # ADMIN_ACCOUNT_BOOTSTRAPPED: emitted by backoffice.app._bootstrap_admin_accounts
+    # the single most privileged act in the system's lifetime (minting the
+    # admin1/admin2 break-glass pair from installer secrets on first boot).
+    # Distinct from CONFIG_CHANGED's "admin_account_created" (routes/
+    # accounts.py — manual, admin-session-attributed creation via the API):
+    # this event ONLY ever fires from the once-only, total_admin_count()==0
+    # gated bootstrap path, before any admin session exists. Lu P2 finding
+    # (2026-08-16): bootstrap previously had zero audit events.
+    ADMIN_ACCOUNT_BOOTSTRAPPED = "ADMIN_ACCOUNT_BOOTSTRAPPED"
     # v2.23.3 — ACS gap #95: auth_log missing events
     # AUTH_LOGIN_ATTEMPT: emitted at the start of every login handler call
     # (before auth result) to provide a complete attempt timeline for forensics
@@ -456,6 +465,16 @@ class EventType(str, Enum):
     # step-up re-approval).  The invocation gate also emits this on a stale /
     # unpinned tool surface at call time.
     MCP_ENVELOPE_BLOCKED = "MCP_ENVELOPE_BLOCKED"
+    # FIND-0813-013 item 2 (4836425d) / Lu P3 follow-up (2026-08-16): a
+    # capability envelope is minted for a bundled/imported MCP server on the
+    # durable compose install path (install.sh register_agent_bundles()).
+    # Value matches the string literal install.sh's inline Python payload
+    # already writes via a bare AuditEvent(event_type="MCP_ENVELOPE_MINTED")
+    # — this enum entry + McpEnvelopeMintedEvent below give that event a
+    # typed schema class; wiring install.sh to construct the typed class
+    # instead of the bare AuditEvent is a separate install.sh-scoped change
+    # (out of scope here, routed to Su).
+    MCP_ENVELOPE_MINTED = "MCP_ENVELOPE_MINTED"
     # Shared privileged-mutation gate fired (envelope re-approval / #4 / #5).
     PRIVILEGED_MUTATION = "PRIVILEGED_MUTATION"
     # AUDIT-GAP-001 (v3.0) — Sensitivity / DLP config changes.
@@ -601,13 +620,13 @@ class EventType(str, Enum):
     # LAURA-4.0-S1-001 (MEDIUM): startup reconcile rewrites stale email/slug
     # scope_ids in policy bindings to the canonical idnt_ PK so they enforce.
     BINDING_SCOPE_ID_RECONCILE = "BINDING_SCOPE_ID_RECONCILE"
-    # YSG-RISK-108 / T-3: an unauthenticated caller on the mesh port (:8081)
+    # YSG-RISK-252 / T-3: an unauthenticated caller on the mesh port (:8081)
     # presented X-Forwarded-User (or X-Yashigani-Identity-Id) without proving
     # internal mesh identity via the per-install bearer or Caddy-verified secret.
     # The header is stripped and the request is logged as an attempted header-spoof.
     # ASVS V1.4.5 / OWASP A07:2021 / CWE-290 (Authentication Bypass by Spoofing).
     MESH_IDENTITY_HEADER_REJECTED = "MESH_IDENTITY_HEADER_REJECTED"
-    # YSG-RISK-108 / T-4: an unauthenticated caller on the mesh port (:8081)
+    # YSG-RISK-252 / T-4: an unauthenticated caller on the mesh port (:8081)
     # presented X-Yashigani-Orchestration-Depth to attempt promotion to the
     # privileged "gateway:orchestrator" identity without proving internal mesh
     # identity.  The promotion is suppressed and the header is logged.
@@ -1009,6 +1028,58 @@ class ConfigChangedEvent(AuditEvent):
     previous_value: str = ""
     new_value: str = ""
     below_risk_threshold: bool = False
+
+
+@dataclass
+class AdminAccountBootstrappedEvent(AuditEvent):
+    """
+    Emitted by backoffice.app._bootstrap_admin_accounts when it seeds an
+    admin account from installer-provisioned secrets on first boot.
+
+    This is the single most privileged act in the system's lifetime — the
+    accounts minted here can do everything — so a tamper-evident record
+    MUST exist even though no admin session exists yet to attribute the
+    write to (feedback_compliance_events_in_audit_chain.md: compliance/
+    security-relevant events land in the hash chain, never app logs alone).
+    Lu P2 finding (2026-08-16): this path previously had zero audit events.
+
+    Ordering / fail-closed (CLAUDE.md SOP 1 — lifespan discipline): the
+    caller writes this event BEFORE calling auth_service.create_admin(), and
+    deliberately does NOT wrap the write() call in try/except. write() is
+    documented (audit/writer.py) to raise AuditWriteError on a sink failure
+    — "the caller MUST abort their operation" — so a failed audit write
+    aborts the whole lifespan startup rather than minting an unaudited
+    admin account. Because the write happens first and
+    total_admin_count() == 0 still holds if create_admin() never ran, a
+    crash-restart retries this function cleanly with no half-seeded,
+    unaudited account able to persist across the cycle. Mirrors the
+    ordering established in 3ee5ca5bf4b (dual-admin maker-checker: "Audit
+    written BEFORE apply so record exists even if apply raises").
+
+    bootstrap_path is always "initial_bootstrap" from this call site today
+    — the total_admin_count()==0 guard means _bootstrap_admin_accounts
+    itself never runs a "recovery" branch (dual-admin recovery is a normal
+    *login* via the already-provisioned admin2 account, not a re-invocation
+    of bootstrap). The field exists so the event schema can distinguish a
+    future re-provisioning/recovery path from this one without a breaking
+    schema change, and so a reader never has to infer origin from
+    event_type alone.
+
+    Never carries password or TOTP secret material — only the username
+    being bootstrapped and a totp_provisioned boolean.
+
+    NIST AU-2/AU-3, SOC 2 CC7.2, ISO 27001 A.8.15, CMMC AU.L2-3.3.1,
+    ASVS V7.1.1/V7.1.3.
+    """
+
+    event_type: str = EventType.ADMIN_ACCOUNT_BOOTSTRAPPED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    actor_account_id: str = "system:backoffice_bootstrap"
+    bootstrapped_username: str = ""
+    admin_slot: str = ""       # "primary" | "backup"
+    bootstrap_path: str = "initial_bootstrap"
+    totp_provisioned: bool = False
 
 
 @dataclass
@@ -3831,6 +3902,47 @@ class McpEnvelopeBlockedEvent(AuditEvent):
 
 
 @dataclass
+class McpEnvelopeMintedEvent(AuditEvent):
+    """
+    Emitted when a capability envelope is minted for a bundled/imported MCP
+    server on the durable compose install path (install.sh's inline Python
+    ``register_agent_bundles()`` payload).
+
+    Lu P3 follow-up to 4836425d (2026-08-16): that commit could only emit a
+    bare ``AuditEvent(event_type="MCP_ENVELOPE_MINTED", account_tier=
+    "system")`` from install.sh because adding a typed schema class was out
+    of that task's file scope (install.sh + docker-compose.yml comment
+    only) — its own commit body named the missing ``provenance_id``
+    correlation as a follow-up: "a typed McpEnvelopeMintedEvent is a
+    follow-up (route: Iris/Tom) if tighter correlation is needed."
+
+    This class is deliberately schema-only in the change that introduced
+    it: rewiring install.sh's payload to construct THIS class instead of
+    the bare AuditEvent is an install.sh-scoped edit and is intentionally
+    NOT done here (file-ownership constraint — routed to Su). Once wired,
+    ``provenance_id`` lets an auditor join this event to
+    ``McpEnvelopeBenignUpdateEvent`` / ``McpEnvelopeBlockedEvent`` for the
+    same envelope's full lifecycle. Field shape mirrors
+    ``McpEnvelopeBenignUpdateEvent`` for consistency.
+    """
+
+    event_type: str = EventType.MCP_ENVELOPE_MINTED
+    account_tier: str = AccountTier.SYSTEM
+    masking_applied: bool = True
+    tenant_id: str = ""
+    server_id: str = ""
+    provenance_id: str = ""              # H(server_id ‖ pin-material)
+    envelope_version: int = 0
+    agent_id: str = ""
+    rule_id: str = "yashigani.mcp.capability-envelope"
+    user_message: str = (
+        "A new imported tool's capability envelope was minted and recorded "
+        "for audit."
+    )
+    code: int = 200
+
+
+@dataclass
 class PrivilegedMutationEvent(AuditEvent):
     """
     Shared privileged-mutation audit shape (Iris §5.2 / Laura R3-9).
@@ -4332,7 +4444,7 @@ class McpDecommissionedEvent(AuditEvent):
                               re-onboard) or "nuke" (operator intends full
                               removal) — informational only; backoffice has
                               NO docker/podman socket access (LAURA-30-001 /
-                              YSG-RISK-080) and therefore performs the
+                              YSG-RISK-234) and therefore performs the
                               application-layer reversal only. The response
                               carries the exact scoped compose/helm commands
                               for the operator (or install.sh) to run for the
@@ -4943,7 +5055,7 @@ class DataProtectionWeakenRejectedEvent(AuditEvent):
 
 
 # ---------------------------------------------------------------------------
-# YSG-RISK-108 — Mesh port identity-header trust gate rejection events (4.0)
+# YSG-RISK-252 — Mesh port identity-header trust gate rejection events (4.0)
 # ---------------------------------------------------------------------------
 
 
@@ -4956,7 +5068,7 @@ class MeshIdentityHeaderRejectedEvent(AuditEvent):
 
     Severity: HIGH.  The header is stripped and the caller is treated as
     anonymous (user_id = "unknown").  Any appearance in the audit chain is a
-    regression canary for T-3 of YSG-RISK-108 (header-spoof on mesh port).
+    regression canary for T-3 of YSG-RISK-252 (header-spoof on mesh port).
 
     The claimed_value field is truncated to 64 chars (never raw user data).
 
@@ -4983,7 +5095,7 @@ class MeshOrchDepthForgedEvent(AuditEvent):
 
     Severity: HIGH.  The promotion is suppressed; the caller retains their
     real (unauthenticated) identity.  Any appearance in the audit chain is a
-    regression canary for T-4 of YSG-RISK-108 (orchestration-depth forge).
+    regression canary for T-4 of YSG-RISK-252 (orchestration-depth forge).
 
     ASVS V4.1.1 / CWE-269 (Improper Privilege Management) / CWE-290.
     """

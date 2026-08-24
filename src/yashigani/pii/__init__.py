@@ -8,6 +8,8 @@ Public surface:
     PiiMode      — LOG | REDACT | BLOCK
     PiiType      — SSN | CREDIT_CARD | EMAIL | PHONE | IBAN | PASSPORT |
                    NHS_NUMBER | DRIVERS_LICENCE | IP_ADDRESS | DATE_OF_BIRTH
+    contains_pci_pan — always-on, config-independent Luhn-valid PAN scan
+                   (FIND-PCI-EGRESS-CEILING-BYPASS, 2026-08-07)
 """
 from yashigani.pii.detector import (
     PiiDetector,
@@ -15,6 +17,7 @@ from yashigani.pii.detector import (
     PiiMode,
     PiiResult,
     PiiType,
+    contains_pci_pan,
 )
 
 __all__ = [
@@ -23,4 +26,5 @@ __all__ = [
     "PiiMode",
     "PiiResult",
     "PiiType",
+    "contains_pci_pan",
 ]

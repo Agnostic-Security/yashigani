@@ -311,7 +311,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# TEST (9): YSG-RISK-133 — no container-side write against /run/secrets;
+# TEST (9): YSG-RISK-258 — no container-side write against /run/secrets;
 #           token persistence is HOST-SIDE only.
 #
 # RELEASE-BLOCKER regression (2026-07-27, confirmed live by Ava on a fresh
@@ -342,7 +342,7 @@ fi
 #         gated behind a try/except around a file write) so the host-side
 #         capture path always receives it.
 # ---------------------------------------------------------------------------
-_section "TEST (9): YSG-RISK-133 — no container-side /run/secrets write for agent tokens"
+_section "TEST (9): YSG-RISK-258 — no container-side /run/secrets write for agent tokens"
 
 # Extract the register_agent_bundles Python heredoc body (between the
 # `python3 -c '` that follows the AGENTS_JSON exec and the closing `' 2>&1`).
@@ -361,14 +361,14 @@ fi
 
 # (9.1) No open(token_path, "w") in the extracted block
 if echo "$_py_block" | grep -q 'open(token_path'; then
-    _fail "(9.1) open(token_path, ...) STILL present in Python block — YSG-RISK-133 not fixed (container-side write reintroduced)"
+    _fail "(9.1) open(token_path, ...) STILL present in Python block — YSG-RISK-258 not fixed (container-side write reintroduced)"
 else
     _pass "(9.1) No open(token_path, ...) in Python block — container-side write removed"
 fi
 
 # (9.2) No token_path assigned from /run/secrets at all
 if echo "$_py_block" | grep -q 'token_path = os.path.join("/run/secrets"'; then
-    _fail "(9.2) token_path still derived from /run/secrets in Python block — YSG-RISK-133 regression"
+    _fail "(9.2) token_path still derived from /run/secrets in Python block — YSG-RISK-258 regression"
 else
     _pass "(9.2) Python block does not derive a /run/secrets token_path — no doomed :ro write path"
 fi
@@ -417,8 +417,8 @@ fi
 # ---------------------------------------------------------------------------
 printf "\n=== RESULTS: PASS=%d FAIL=%d SKIP=%d ===\n" "$PASS" "$FAIL" "$SKIP"
 if [[ "$FAIL" -gt 0 ]]; then
-    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-133)\n" "$FAIL"
+    printf "\nRESULT: FAIL — %d check(s) failed. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-258)\n" "$FAIL"
     exit 1
 fi
-printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-133)\n" "$PASS" "$SKIP"
+printf "\nRESULT: PASS — %d checks passed, %d skipped. (YSG-AGENT-REG-001 + ISSUE-024 + YSG-RISK-258)\n" "$PASS" "$SKIP"
 exit 0

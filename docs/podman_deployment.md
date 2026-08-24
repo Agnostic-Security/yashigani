@@ -60,6 +60,40 @@ No rootful requirement on Linux -- user namespaces handle isolation.
 - **Stub mode is NEVER acceptable in production** -- it disables container-per-
   identity isolation and breaks CIAA compliance claims.
 
+## GPU (NVIDIA CDI) troubleshooting
+
+Rootless Podman GPU passthrough uses CDI (Container Device Interface), provisioned
+automatically by `install.sh` (`_setup_podman_cdi_gpu`, ROOTLESS-CDI-001) into
+`~/.config/cdi/nvidia.yaml` — no host sudo, no `/etc/cdi` write, no Docker daemon
+involvement for that step.
+
+**YSG-RISK-202**: a *pre-existing* `/etc/cdi/nvidia.yaml` (root-owned, left over from
+an earlier install attempt, an older installer design, or a manual operator step) can
+shadow the correct user-space spec on podman 4.9.3 — its CDI directory scan includes
+`/etc/cdi` regardless of `cdi_spec_dirs`. If an NVIDIA driver upgrade has since removed
+the `libcuda.so` version that stale file references, the CDI probe fails and ollama
+silently falls back to CPU-only inference. `install.sh` now detects this
+(`_check_stale_etc_cdi_shadow`): if `/etc/cdi/nvidia.yaml` exists and references a
+missing library, it is refreshed automatically when writable, or the installer prints
+the exact remediation command and — by default — **fails the install/upgrade closed**
+rather than silently degrading. Podman 5.x/6.x CDI directory-scan precedence has not
+been verified by Agnostic Security; treat any messaging that assumes 4.9.3 behaviour on
+a newer podman as unverified, not confirmed-safe.
+
+**A GPU-detected host that cannot prove GPU inference is live fails the install by
+default** (`project_yashigani_llm_is_mandatory`, `feedback_gpu_usage_for_test_stacks`:
+CPU-only Ollama is a product-policy violation, not an acceptable silent default). Pass
+`--allow-cpu-inference` to explicitly accept CPU-only inference and let the install
+proceed with a warning instead of a hard failure. This has no effect on hosts where no
+GPU was detected in the first place.
+
+Manual remediation for a stale `/etc/cdi/nvidia.yaml` that the installer could not
+refresh itself (not writable by the installing user):
+
+```bash
+sudo install -m 0644 ~/.config/cdi/nvidia.yaml /etc/cdi/nvidia.yaml
+```
+
 ## Storage Management
 
 Rootless Podman accumulates image layers and build cache over time, particularly during active development and release cycles. When disk usage becomes a concern, operators should follow the prune SOP:

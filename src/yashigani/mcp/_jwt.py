@@ -217,7 +217,7 @@ class McpJwtIssuer:
             scoped to self._tenant_id (see yashigani.auth._jwt.derive_tenant_ec_key).
             The root key is used ONLY as HKDF input key material — it is never
             stored in self._key.  Each distinct tenant_id yields a
-            cryptographically independent signing key (YSG-RISK-109).
+            cryptographically independent signing key (YSG-RISK-253).
           - stable_generated_at: file mtime for kid stability (path #2), else None.
 
         Key loading order (root key source):
@@ -237,7 +237,7 @@ class McpJwtIssuer:
         not at module import, so monkeypatching the env var takes effect without
         importlib.reload().
 
-        YSG-RISK-109: per-tenant key isolation via HKDF derivation.
+        YSG-RISK-253: per-tenant key isolation via HKDF derivation.
         """
         from yashigani.auth._jwt import derive_tenant_ec_key as _derive_tenant_key
 
@@ -248,7 +248,7 @@ class McpJwtIssuer:
             derived = _derive_tenant_key(root, self._tenant_id)
             logger.debug(
                 "mcp-broker: derived per-tenant signing key for tenant_id=%r "
-                "(YSG-RISK-109: install-wide root → per-tenant HKDF-SHA384)",
+                "(YSG-RISK-253: install-wide root → per-tenant HKDF-SHA384)",
                 self._tenant_id,
             )
             return derived

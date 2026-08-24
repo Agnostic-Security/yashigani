@@ -29,6 +29,32 @@ These tests would fail on the original code:
   - Static: ``require_admin_session`` would be found instead of
     ``require_stepup_admin_session``.
   - Behavioural: handlers would not raise 401; config would be mutated.
+
+2026-08-16 — stale-vs-real triage on the two "succeeds_with_stepup" tests:
+  ``test_put_pii_config_succeeds_with_stepup`` and
+  ``test_put_pii_cloud_bypass_succeeds_with_stepup`` called the handlers with
+  WEAKEN-direction payloads (mode="log"; enabled=True). At the time this file
+  was authored (9b6adcc9, 2026-07-02 01:49, single-admin step-up fix) that was
+  correct — weaken and strengthen both applied immediately once step-up was
+  presented. Later the same morning, 3ee5ca5b (2026-07-02 09:39, "dual-admin
+  (maker-checker) for data-protection weakening") changed the WEAKEN branch of
+  both handlers to create a pending DpWeakenPendingStore request (202, requires
+  >=2 active admins, backoffice_state.auth_service wired) instead of applying
+  immediately. This file's mocks don't wire auth_service/dp_weaken_store, so
+  the WEAKEN-direction payloads now 503 before reaching the mutation this test
+  meant to observe. STALE, not a regression: the underlying LAURA-V400-R2-001
+  property (step-up required) still holds — and now holds an *additional*
+  dual-admin gate on top for the weaken direction, which is a strengthening,
+  not a weakening, of the control. The dual-admin mechanics (pending/approve/
+  reject/403 self-approval/409 insufficient-admins) already have dedicated
+  coverage in test_laura_v400_r2_dual_admin.py — this file's job is narrowly
+  "step-up gates the mutation", so the two tests below were switched to
+  STRENGTHEN-direction payloads (mode="redact"; enabled=False), which still
+  exercise the single-admin step-up-gated immediate-apply path these handlers
+  share with the weaken path, and were tightened to assert the actual
+  backoffice_state mutation (not just the echoed response body) so a future
+  regression that returns "ok" without calling _set_config/_set_cloud_bypass
+  is still caught.
 """
 
 from __future__ import annotations
@@ -209,16 +235,24 @@ class TestLauraV400R2001Behavioural:
     @pytest.mark.asyncio
     async def test_put_pii_config_succeeds_with_stepup(self):
         """
-        PUT /admin/pii/config succeeds (returns 200) when step-up is present.
+        PUT /admin/pii/config succeeds (returns 200) when step-up is present,
+        for the STRENGTHEN direction (mode=redact) which — like the weaken
+        direction — applies only once step-up has been verified; unlike weaken
+        (see test_laura_v400_r2_dual_admin.py, LAURA-V400-R2-001 hardening
+        3ee5ca5b) it applies immediately rather than via dual-admin approval.
 
-        assert_fresh_stepup returns normally (no exception).  We also verify
-        a ConfigChangedEvent is written to the audit chain.
+        assert_fresh_stepup returns normally (no exception). We verify BOTH
+        that the returned payload reflects the change AND that
+        backoffice_state.pii_config was actually mutated (not just echoed),
+        and that a ConfigChangedEvent is written to the audit chain.
         """
-        from yashigani.backoffice.routes.pii import update_pii_config, PiiConfigRequest
+        from yashigani.backoffice.routes.pii import (
+            update_pii_config, PiiConfigRequest, _get_config,
+        )
         from yashigani.backoffice.state import backoffice_state
 
         session = self._make_session()
-        body = PiiConfigRequest(mode="log", enabled_types=[])
+        body = PiiConfigRequest(mode="redact", enabled_types=[])
 
         mock_writer = MagicMock()
         backoffice_state.audit_writer = mock_writer
@@ -227,7 +261,13 @@ class TestLauraV400R2001Behavioural:
             result = await update_pii_config(body=body, session=session)
 
         assert result["status"] == "ok"
-        assert result["mode"] == "log"
+        assert result["mode"] == "redact"
+        # The mutation must actually have landed in backoffice_state, not just
+        # been echoed back in the response body.
+        assert _get_config()["mode"] == "redact", (
+            "PUT /admin/pii/config (strengthen) returned status=ok but did not "
+            "mutate backoffice_state.pii_config — _set_config was not effective."
+        )
         # Audit chain must have been written
         assert mock_writer.write.called, (
             "ConfigChangedEvent must be written to the audit chain "
@@ -238,14 +278,23 @@ class TestLauraV400R2001Behavioural:
     async def test_put_pii_cloud_bypass_succeeds_with_stepup(self):
         """
         PUT /admin/pii/cloud-bypass succeeds and writes a ConfigChangedEvent
-        to the tamper-evident audit chain when step-up is present.
+        to the tamper-evident audit chain when step-up is present, for the
+        STRENGTHEN direction (enabled=False -> disable bypass) which applies
+        immediately. (The weaken direction, enabled=True, now requires
+        dual-admin approval — see test_laura_v400_r2_dual_admin.py.)
+
+        Pre-seeds cloud_bypass=True so the assertion proves an actual flip,
+        not an idempotent no-op.
         """
-        from yashigani.backoffice.routes.pii import update_pii_cloud_bypass, PiiCloudBypassRequest
+        from yashigani.backoffice.routes.pii import (
+            update_pii_cloud_bypass, PiiCloudBypassRequest, _get_cloud_bypass,
+        )
         from yashigani.backoffice.state import backoffice_state
 
         session = self._make_session()
-        body = PiiCloudBypassRequest(enabled=True)
+        body = PiiCloudBypassRequest(enabled=False)
 
+        backoffice_state.pii_cloud_bypass = True  # prior (weakened) state
         mock_writer = MagicMock()
         backoffice_state.audit_writer = mock_writer
 
@@ -253,7 +302,12 @@ class TestLauraV400R2001Behavioural:
             result = await update_pii_cloud_bypass(body=body, session=session)
 
         assert result["status"] == "ok"
-        assert result["cloud_bypass_enabled"] is True
+        assert result["cloud_bypass_enabled"] is False
+        # The mutation must actually have landed, not just been echoed back.
+        assert _get_cloud_bypass() is False, (
+            "PUT /admin/pii/cloud-bypass (strengthen) returned status=ok but "
+            "did not mutate backoffice_state.pii_cloud_bypass."
+        )
         # Audit chain must have been written
         assert mock_writer.write.called, (
             "ConfigChangedEvent must be written to the audit chain "

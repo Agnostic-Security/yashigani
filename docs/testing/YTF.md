@@ -193,6 +193,87 @@ This applies in both tiers: Tier-A verifies state in-process (real fakeredis-bac
 reads, not just the HTTP response body); Tier-B verifies state via headed+headless +
 screenshot of each resulting state.
 
+## 5.4 NO TEST MAY BYPASS THE USER PATHWAY (added 2026-08-07 — Tiago directive)
+
+**Every test reaches the product the way a user reaches it.** No `docker exec` /
+`kubectl exec` into a container to call an internal port, no direct instantiation of a
+product class, no internal service bearer, no reading a secret off a host path to skip
+authentication.
+
+This is not a style preference. §5.3 already required *effect-verified*, but nothing forbade
+producing that effect by reaching past the layers under test — so tests did, and they were
+green while the product was broken:
+
+| module | what it did | what it reported | truth |
+|---|---|---|---|
+| `test_ollama_sensitivity.py` | `docker exec` gateway → `SensitivityClassifier().classify()` | **9 passed** | every real request on that path was failing |
+| `test_agent_dispatch_e2e.py` | internal bearer → gateway's own mesh port from inside the gateway | 4 failures with **empty output** | a harness `PermissionError`, mistaken for a product defect on two runtimes |
+| `test_egress_ringfence_injection.py` | unauthenticated probe; `GET /healthz == 200` under a prompt-injection name | pass | the named security category verified **nothing** |
+
+A test that bypasses a layer cannot see any defect in that layer — which is most of them. It
+also produces *false information*, which is worse than no test, because a gate consumes it.
+
+**Required shape:** real account → real `POST /auth/login` with a fresh, never-replayed TOTP →
+the same endpoint the browser calls (`/user/chat/completions`; direct `/v1/chat/completions`
+from a browser 401s by design) → assert the EFFECT.
+
+**Permitted exceptions, both narrow:**
+1. **Verification by observation.** The ACTION goes through the user pathway; the EVIDENCE may
+   come from the product's own record (audit chain, decision log, DB row). Nothing there drives
+   the product.
+2. **Properties with no user-plane surface.** L1 netns default-deny is a network-namespace fact.
+   Assert it directly, and SKIP with a reason where it cannot be read — never pass by inference.
+
+**When a control cannot be exercised from the user plane on a given profile, SKIP with the
+reason.** Never assert a weaker property and report it as the stronger one.
+
+## 5.5 Deploy-mode coverage (added 2026-08-07)
+
+The matrix must state the deploy mode per leg, and must not be satisfied entirely by
+`--deploy demo`. `install.sh` sets `YASHIGANI_ENV=dev` for demo and `production` otherwise, and
+several controls only engage in production — the pool manager runs `backend=stub` under demo, so
+per-identity container isolation is never exercised. A matrix of demo-only legs proves those
+paths by code-reading, not by runtime. At least one leg per runtime family must be non-demo.
+
+## 5.6 A tier must PROVE its target, and never invent one (added 2026-08-09)
+
+**Rule:** a tier that cannot resolve the stack it was told to test must FAIL, naming what it
+tried. It must never fall back to a default address, and it must never accept a bare status
+code as proof of life.
+
+This rule exists because its absence cost an entire campaign. `run_tier_b()` validated
+`--target` and then never exported it to the tests. `_resolve_base_url()` therefore probed
+`localhost:8443` → `localhost` → `localhost:8080` and, when none was the stack, **returned the
+hardcoded default anyway**. Two things answered `200` on those ports — a leftover
+`rootlessport` from a torn-down leg, and Caddy itself, which routes by Host and returns an
+empty `200` catch-all for `localhost` — so the probe "succeeded".
+
+Consequences, measured:
+* Every Tier-B test on every leg ran against an endpoint that returns `200` with an empty body
+  to everything, including `/healthz`.
+* Login returned `200`, zero-length, no `Set-Cookie`; the browser never got a session; every
+  `admin_ctx` fixture landed on `/admin/login`.
+* **110 fixture errors per leg**, identical on docker and podman, headed and headless, across
+  ~6 full runs ≈ 660 phantom failures and ~18 hours of browser wall-clock.
+* Three successive wrong diagnoses (auth throttle, `SameSite=Strict`, HTTP client), each with a
+  fix that changed nothing. `curl` "worked" and `httpx` "failed" because they were pointed at
+  different hosts.
+
+**Required of every tier:**
+1. The runner MUST export the resolved target to the tests (`YASHIGANI_ADMIN_URL`). Accepting
+   `--target` and not passing it on is a defect, not an omission.
+2. Liveness MUST be content-verified — a non-empty `/healthz` body that identifies the product.
+   A status code alone proves only that *something* is listening.
+3. On failure, RAISE and list every candidate tried. Silence plus a default is how a suite
+   spends 18 hours testing nothing.
+4. The leg pre-flight (§YSG-RISK-207) checks the SAME resolution path the tests use. A
+   pre-flight that passes while the suite resolves elsewhere — which is exactly what happened
+   here — provides false assurance.
+
+**Corollary for triage:** when many tests fail identically across runtimes AND browser modes,
+suspect the shared input (target, credentials, fixture) before any product subsystem. A defect
+that is invariant across every axis you vary is not in the thing you are varying.
+
 ## 6. Findings register (this build — routed, not fixed)
 
 Framework-build discipline: Iris builds and runs the framework, does not fix product code
@@ -324,3 +405,320 @@ See `tests/MATRIX.yaml` for the machine-readable version (this is the human summ
 | podman-6 | macos | A, B, C | the one podman-mac leg that actually runs |
 | podman-6 | linux | A, B, C | x8x |
 | k8s (k3s+Cilium) | linux | A, B, C | x8x-only, Cilium-gated (vanilla Docker-Desktop k8s can't test NetworkPolicy enforcement / CoreDNS DoT) |
+
+## 5.7 SIGKILLing an install poisons every later install (added 2026-08-12)
+
+**This is a TEST-RIG discipline note, not an installer defect.** The installer was working
+correctly throughout; the damage was self-inflicted by `kill -9` on a hung install.
+
+`install.sh` holds an flock at `/run/lock/yashigani-install.lock` for its lifetime and releases
+it on exit. When the installer is SIGKILLed it never reaches that exit path, and its orphaned
+children (observed: `tee`, `python3`, plus `conmon`/`pasta`) were still holding the lock 20 hours
+later. Every subsequent install — podman 4.9, 5.1.2, 6.0.1 alike — then died immediately after
+the banner with exit 1 and a ~510-byte log. Clearing the orphans restored normal installs
+immediately, with no change to `install.sh`.
+
+**Do:** stop a stuck install with SIGTERM first and let it unwind. Reserve `kill -9` for when
+that fails, and clean up after it.
+
+**Before diagnosing any "install fails instantly" symptom:**
+```bash
+fuser -v /run/lock/yashigani-install.lock     # who holds it
+flock -n /run/lock/yashigani-install.lock -c true && echo FREE
+```
+
+**Open question, NOT yet a finding:** install.sh:19285 states the lock fd is FD_CLOEXEC so
+children never inherit it, yet `tee` was observed holding it after SIGKILL. That may be a real
+gap in the guarantee or an artefact of how the log pipeline is set up. It needs a controlled
+test before anyone files it as a defect — do not cite this note as proof that CLOEXEC is broken.
+
+## 5.8 `$?` must be captured IMMEDIATELY, and never after a pipeline (added 2026-08-12)
+
+Three separate false-greens in one campaign, all the same bug:
+- `USERS_INSTALLER_EXIT=$?` after `python … | tail -25` captured **tail's** status → a dead users
+  installer reported 0. Fixed with `${PIPESTATUS[0]}`.
+- `install-podman.sh` printed `INSTALL_EXIT_CODE=$?` at the end of the script → a failed install
+  reported 0, and a proof run recorded "install exit=0" while `healthz` was 000.
+- A wrapper read `$?` of a `nohup … &` launcher and reported the job as complete.
+
+Rule: capture into `rc=$?` on the line IMMEDIATELY after the command, use `${PIPESTATUS[0]}` for
+pipelines, and `exit $rc` so the status propagates. A tier/leg/install that cannot prove its own
+exit status is NOT RUN, not GREEN (same principle as YSG-RISK-206).
+
+## 5.9 Podman 5.x/6.x healthchecks need the storage flags (added 2026-08-12)
+
+Podman generates healthcheck systemd units as `ExecStart=<binary> healthcheck run <id>` — the
+BARE binary, with only `PATH` in the unit environment. The side-by-side 5.x/6.x prefixes rely on
+`--root/--runroot` for isolation (5.1.2 ignores storage.conf's `runroot`), so every generated
+healthcheck ran against the DEFAULT storage, failed `no such container`, and left every
+container `(starting)` forever — `install.sh` then waited on convergence that could never
+happen (20h lost, 2026-08-11).
+
+Fix: a shim at the exact binary path the units invoke
+(`podman-versions/podman-<v>/usr/bin/podman`) that injects `--root/--runroot` and execs
+`podman.real`. Verified: the failing `healthcheck run` command exits 0 and the container reports
+`healthy`.
+
+## 5.10 One TOTP secret = ONE window record (added 2026-08-12)
+
+The anti-replay ledger was keyed on the PURPOSE of the code, not the identity that
+owns it: `do_admin_stepup()` waited on `stepup:admin1`, while the admin login path kept
+private state (`_api_totp_last_used`) and published to the shared ledger not at all.
+So a login spent a code, step-up saw an empty ledger, ran inside the SAME 30s window,
+and the server rejected the replay -> `401 invalid_totp_code`.
+
+**The server is correct. Anti-replay is a control.** Never "fix" this by widening the
+server's replay window or by retrying until a code sticks.
+
+**Required:** every path that consumes a TOTP code for identity X — browser login, API
+login, step-up, a diagnostic script — waits on and marks the SAME ledger key for X.
+
+**Corollary for operators:** do not run a manual login/verification script next to a
+live test run. The ledger is per-process, so an external script silently spends the
+window the suite is about to use and the suite fails with a credential error that looks
+like a product fault. This cost several false diagnoses on 2026-08-12.
+
+## 5.11 Provision test users through BOTH pathways (added 2026-08-12)
+
+`test_user_provisioning_mixed.py` creates 3 end users through the real admin UI form and
+2 through `POST /admin/users`, then asserts the cap refuses the 6th.
+
+Rationale (Tiago, 2026-08-12): a suite that only ever creates users over the API proves
+the endpoint and nothing about the form. That is the blind spot behind LAURA-001 (broken
+chat UI shipped three times, every API test green) and YSG-RISK-262 (browser step-up
+universally broken, because step-up was only ever verified by direct `/auth/stepup`
+calls). Creating through the UI drives the ui4 step-up modal end-to-end, which is the
+only way that path is covered.
+
+Every UI creation is confirmed by a subsequent API read — a form that appears to succeed
+but persists nothing must FAIL (effect-verified, 5.3).
+
+**Do not delete this in favour of the API-only version because it is slower or flakier.**
+The UI path is the one that has repeatedly shipped broken.
+
+**populate-demo.py stays the demo seeder** (Tiago, 2026-08-12: "keep the populate script
+for demos don't erase it"). This test provisions users for TEST runs; it does not replace
+demo seeding.
+
+## 5.12 ONE login session per run; brute-force and injection lanes run LAST (added 2026-08-13 — Tiago directive)
+
+**Rule, verbatim:** *"login once, test it all, no more login again and again and again. One
+login session you run all but the brute force testing or injections."*
+
+1. **Authenticate ONCE per identity per run** and reuse that session for the entire functional
+   sweep. Session-scoped auth fixtures, not function-scoped. Refresh ONLY on genuine
+   expiry/server-side eviction — never on a timer, never per test/class/file.
+2. **Brute-force, auth-abuse and injection lanes run LAST**, as their own stage, after the
+   functional sweep has completed and its evidence is captured. Never interleaved.
+
+### Why — both halves are measured, not theoretical (4.1.2 docker leg, 2026-08-13)
+
+**Cost of re-login.** Every fresh login pays the TOTP anti-replay wait — up to **62s**
+(`conftest.py:1910-1913`, `max(62 - elapsed, …)`) under the one-code-per-identity-per-window
+rule (§5.10). A test doing ~5 fresh logins burns ~310s in sleeps alone. That is what blew the
+300s per-test ceiling and killed the headed leg at 17% (FIND-0813-011), and it is why Tier-B
+takes ~1h17m per browser mode.
+
+**Cost of interleaving.** The auth throttle is keyed on account **AND source IP** (correct
+anti-enumeration design). The adversarial lane's deliberate bad-credential probes drove
+`ip_level=5 delay=900s`, and because the delay served is `max(acct_level, ip_level)`
+(`auth.py:710`), a single legitimate account failure in the functional lane inherited the full
+IP-driven severity. Measured: interleaved → ~50% F/E by 42%; same suite with the adversarial
+lane split out → **365/378 clean**. Those failures were self-inflicted, not product defects —
+the exact class of false signal this framework exists to eliminate.
+
+### How this interacts with rules already in force
+- **§4.17 Rule 5 (lane separation by identity AND source IP)** still applies to the adversarial
+  stage — running it last does not remove the requirement that it come from a different source
+  IP (a container/netns), because `_real_client_ip()` resolves to the TCP peer, so every
+  host-originated request shares one address regardless of process.
+- **§5.10 (one TOTP secret = one window record)** becomes largely moot for the functional sweep
+  once there is only one login: the wait is paid once, not per test.
+- **§5.4 (no bypass)** is unaffected — one session still reaches the product the way a user does.
+
+### Implemented (2026-08-18)
+- **Session-scoped auth, refresh on dirty/stale ONLY.** `admin_ctx`/`user_ctx` (session-scoped
+  fixtures) + `_keep_shared_sessions_fresh` (autouse) were already the target shape; the
+  2026-08-13 call-site audit of all 27 `force_fresh=True` sites converted the defensive-habit
+  ones to reuse (`test_pki_admin_ui.py`'s `_login()` — 7 always-fresh logins/file → 1 in the
+  common case via the new `get_admin_session_cookies()`; the BOLA cross-user tests' redundant
+  `force_fresh=True` on already-unique `cache_key`s; `test_user_provisioning_mixed.py`'s
+  `admin_page` fixture) and kept the genuinely-necessary ones (the refresh mechanism's own
+  internals, rare 401-retry-once paths, and tests that are themselves testing login/rotation).
+  `_admin_session_needs_refresh()`/`_user_session_needs_refresh()` factor the shared
+  dirty-or-600s-stale predicate out of `refresh_*_context_if_stale()` so both the
+  ctx-mutating and the plain-cookie-returning (`get_*_session_cookies()`) callers ask the
+  identical question. `pytest_sessionfinish` now prints `YTF-LOGIN-COUNT:
+  real_admin_logins=<n> real_user_bootstraps=<n>` every run — proof, not assertion.
+- **Adversarial lane run LAST, as its own pytest process, via a real marker split.**
+  `run_tier_b()` now runs `-m "not security_probe"` (functional) then `-m "security_probe"`
+  (adversarial) as two separate invocations per browser mode — genuinely two processes, two
+  session-scoped logins, never interleaved. Every brute-force/auth-abuse/injection-canary/
+  WebAuthn-login-ceremony test now carries `@pytest.mark.security_probe` explicitly (module-wide
+  on `test_pentest_webui_adversarial.py`; per-class/per-test elsewhere) instead of the marker
+  being registered but barely used.
+
+### Still open — do not overclaim
+- **§4.17 Rule 5's source-IP half is NOT implemented.** The stage split above removes the
+  interleaving harm (measured cause of the ~50% F/E), but every request in this runner —
+  functional or adversarial stage — still shares one host-originated source IP;
+  `_real_client_ip()` resolves to the TCP peer regardless of which pytest process sent the
+  request. True separation needs a container/netns this runner does not provision. This is a
+  pre-existing, tracked gap, not something the 2026-08-13 fix closes — report it as open, don't
+  infer it's solved from the stage split.
+- **Registration/revocation-only WebAuthn tests** (`WA-REG-*`, `WA-REVOKE-01/03/04`,
+  `WA-MULTI-01`) stayed in the functional stage: they reuse an already-authenticated
+  `authed_client`/`clean_authed_client` session and never drive a real `/login/start`+`/finish`
+  ceremony, so they don't touch the auth throttle the way `WA-LOGIN-*`/`WA-FAIL-*`/the
+  multi-credential login loops do.
+
+## 5.13 A verification run requires a QUIESCENT tree (added 2026-08-16 — Tiago directive, applied to Tier-A)
+
+**Rule: never run a tier against a working tree that anything else is concurrently mutating.
+The result of such a run is not a weak signal — it is not a signal at all, and must not be
+reported as one.**
+
+This is Tiago's standing "don't do parallel test unless they can be fully isolated" applied to
+Tier-A, not just to deploy stacks. Parallel *fixing* is encouraged and fast. Parallel fixing
+*during* a verification run is a measurement of a moving target.
+
+### What triggered it
+2026-08-16: a full Tier-A run (`tests/conformance tests/security tests/contracts tests/install
+src/tests`) was started, and five fix agents were then dispatched into the SAME working tree.
+The run began clean and accumulated 40+ failures as files changed underneath it. None of those
+failures was a product defect. Had that number been reported, it would have been a fabricated
+regression — and worse, the inverse is equally possible: an agent's mid-run edit can make a
+genuinely failing test pass. A concurrent-tree run can report EITHER direction wrongly.
+
+This is the same defect class the framework already names in §5.6 and FIND-0813-012: a run that
+reports a result it did not earn. It is not excused by the runner exiting 0.
+
+### Required practice
+1. **Verification is a barrier.** Land the concurrent work first, then run the tier once on a
+   still tree. Do not overlap them to save wall-clock.
+2. If a tier MUST run while work is in flight, run it against an isolated checkout at a named
+   commit — a **git worktree** under `~/Documents/Claude/` per CLAUDE.md, removed when finished —
+   never against the shared tree. State the commit in the verdict line.
+
+   **Use a worktree, NOT `git archive`.** An export tarball has no `.git`, and tests that assert
+   repository context behave differently in one. Demonstrated 2026-08-16: a Tier-A run against a
+   `git archive` export returned `verdict=FAIL` on
+   `tests/security/test_authonce_harness_selfcheck.py` — two guards asserting the auth-once
+   harness REFUSES to write output inside a git repo (the CLAUDE.md directory rule, enforced as a
+   test). With no `.git` present the guard could not fire, so "refused" was false. The same file
+   is 46/46 green in a real checkout. A worktree carries repo context and does not have this
+   failure mode.
+3. **A run interrupted by tree mutation is discarded, not interpreted.** Do not salvage a
+   subset, do not report "N passed before it got noisy", do not attribute individual failures
+   to specific agents. Kill it and re-run.
+4. A per-agent suite run (an agent checking its own change) is exempt only for the files that
+   agent owns; it is NOT a substitute for the gate run, and its pass/fail count must not be
+   quoted as the tier verdict.
+5. Corollary for agent reports: when a subagent reports a failure in a file outside its own
+   scope while other agents are active, treat that as UNVERIFIED. Re-run on a quiescent tree
+   before filing it as a finding or routing it to another owner.
+
+### Why this matters beyond tidiness
+Tier-A is matrix-invariant (§3) — it runs once per head and its verdict is inherited by every
+runtime leg. A polluted Tier-A verdict therefore propagates to docker, podman and k8s
+simultaneously, and it propagates SILENTLY.
+
+## 5.14 A fix is not verified until the bench FAILS without it (added 2026-08-16 — Tiago challenge)
+
+**Rule: "the suite passes with the fix" is not evidence. The only evidence that a guard exists
+is that reverting the fix's PRODUCT code makes the bench fail. Every fix landed in a campaign
+must be mutation-checked before its finding is closed.**
+
+### What triggered it
+2026-08-16, Tiago: *"zero failures even when we set test to fail and that is the role of those
+tests?"* — against a report in which a pre-fix comparison run had been presented as reassuring.
+It was worthless: the file set it ran did not contain the guard for the reverted change, so it
+could only ever have come back green. The conclusion drawn from it ("not my collateral") was
+correct; the reassurance attached to it was not.
+
+### Method
+1. Restore ONLY the product file(s) to pre-fix content (`git show <fix>^:<file>`).
+2. Leave every test file at HEAD. Reverting the guard alongside the thing it guards proves
+   nothing, and is the easiest way to fake this check.
+3. Run the tests that CLAIM to guard the fix. Require a non-zero failure count, and record the
+   actual number — "it failed" without a count hides a collapse-to-one-error.
+4. Restore and assert the tree is byte-identical (`git diff` empty). A mutation check that
+   leaves the tree dirty has corrupted the next measurement.
+5. Record the numbers in the findings file. A fix with a passing bench and no mutation number is
+   UNVERIFIED, and must be reported as such.
+
+Harness: `testing_runs/yashigani/ytf-412-20260813/verify_guards.sh`.
+
+### Consequences that follow from this rule
+- **A subagent's own claim that "N tests fail pre-fix" is not the check.** It is a claim to be
+  independently reproduced by the coordinator. Delegate execution, own integrity.
+- **Scope is part of the result.** A guard "holds" only within the scope it was pointed at.
+  Record the scope alongside the number, because a fix can hold in one file and have zero
+  coverage everywhere else.
+- **If reverting the fix fails NOTHING, the fix shipped untested** — regardless of a green
+  board. That is a finding in its own right, not a gap to quietly fill.
+- Files under concurrent edit cannot be mutation-checked (§5.13). Defer them to the quiescent
+  run rather than reporting a number from a moving tree.
+
+## 5.15 SIEM forwarding must be VERIFIED on every live leg, not assumed (added 2026-08-18 — Tiago directive)
+
+**Rule: every live leg that installs a SIEM must prove, against the SIEM's own store, that
+Yashigani's audit events actually arrived — event count, event types, and chain fields. A
+configured `YASHIGANI_SIEM_TARGETS` is not evidence that anything is being forwarded.**
+
+Tiago, 2026-08-18: *"lets see what logs that generates and what goes in to wazuh — check that
+as part of the testing protocol."*
+
+### Why this needed adding
+`tests/MATRIX.yaml`'s Tier-C category `audit_observability_integrity` already claims "events
+emitted + immutable/Merkle + SIEM-forward; no swallowed failures". Its implementation is a
+**2-test scaffold**. Before this section, `wazuh` appeared ZERO times in YTF.md and
+`tests/MATRIX.yaml`; the single `siem` match was an incidental code reference. So the most
+security-relevant output of the system — the tamper-evident record an auditor would ask for —
+had no runtime verification on any leg.
+
+### The check, and the traps in it
+Run against the SIEM's real store, not a proxy for it. On the bundled Wazuh leg:
+
+```bash
+PW=$(grep -a "^WAZUH_INDEXER_PASSWORD=" docker/.env | cut -d= -f2-)
+# 1. the index must EXIST and hold documents
+docker exec <proj>-wazuh-indexer-1 sh -lc \
+  "curl -sk -u admin:'$PW' 'https://localhost:9200/yashigani-audit/_count'"
+# 2. compare against the product's own chain
+docker exec <proj>-postgres-1 sh -lc \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "select count(*) from audit_events;"'
+# 3. inspect a document: chain + masking fields must be present
+docker exec <proj>-wazuh-indexer-1 sh -lc \
+  "curl -sk -u admin:'$PW' 'https://localhost:9200/yashigani-audit/_search?pretty&size=1'"
+```
+
+Three traps that produced WRONG conclusions when this was first run manually — all avoidable:
+
+1. **Do not look in the Wazuh manager's `alerts.json`.** The target is
+   `https://wazuh-indexer:9200/_bulk`, so events land in an OpenSearch index. `alerts.json`
+   contains the manager's own host CIS/SCA findings (nosuid/nodev/auditd), which are unrelated.
+   Grepping it for `yashigani` returns 0 and looks exactly like total forwarding failure.
+2. **Do not trust `_cat/indices` `docs.count`.** OpenSearch indexing is near-real-time; the
+   count read 1 while `_count` on the same index read 101. A "1 document" reading looks exactly
+   like a broken forwarder.
+3. **Do not `q=yashigani`.** No FIELD contains that literal token, so a full-text search returns
+   0 hits on a perfectly healthy index. Query the index by name, or aggregate on `event_type`.
+
+Each of these produces a false HIGH finding that is indistinguishable from a real outage. State
+which store you queried and how, in the evidence.
+
+### Pass criteria
+- `yashigani-audit` index exists and its `_count` is within a small delta of `audit_events`
+  (they drift by in-flight events during an active run — a persistent large gap is the finding).
+- Forwarded documents carry `prev_event_hash` (chain), `masking_applied`, `audit_event_id`,
+  `subject_spiffe_id`, `tenant_id`.
+- Event TYPES are diverse and match what the leg exercised — not just one startup event. A
+  single repeated type means the forwarder fired once and stopped.
+- Zero swallowed failures: a forwarding error must appear somewhere, not be logged and dropped.
+
+### Baseline measured on the 4.1.2 docker leg (2026-08-18, demo mode, all agents + wazuh)
+`audit_events` 100 / `yashigani-audit` 105 during an active populate run; documents
+hash-chained and masked; `YASHIGANI_SIEM_TARGETS` =
+`elastic_opensearch → https://wazuh-indexer:9200/_bulk`, `mesh_mtls: true`. Forwarding VERIFIED
+working. This is the first leg in the campaign on which that claim rests on evidence.

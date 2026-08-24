@@ -342,7 +342,7 @@ spec:
 ---
 # Policy 6/7: restrict PKI trust-plane access (FINDING-V412-UNIVERSAL-003, CRITICAL)
 #
-# The gateway ServiceAccount holds pods:create in-namespace (YSG-RISK-070,
+# The gateway ServiceAccount holds pods:create in-namespace (YSG-RISK-224,
 # rbac-pool-manager.yaml) so it can spawn per-identity pool pods. Policies 1-5
 # stop those pods being PRIVILEGED, but NONE of them stop a compromised gateway
 # from creating a Pod that (a) assumes the yashigani-pki ServiceAccount — which
@@ -389,7 +389,7 @@ metadata:
       private-key Secret (volume/projected/env), closing the gateway pods:create
       -> CA-key -> mTLS-forgery path.
     yashigani.io/finding: "FINDING-V412-UNIVERSAL-003"
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 spec:
   validationFailureAction: {{ .Values.admissionPolicies.validationFailureAction }}
   # background: false — request.userInfo (the gate below) is only present in the

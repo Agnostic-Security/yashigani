@@ -8,8 +8,13 @@
 #   Tier-A — IN-PROCESS, matrix-INVARIANT (no stack). Conformance API + OPA +
 #            wiring/config audit + static pentest. Runs ONCE per code head;
 #            the result applies to every runtime/platform leg simultaneously.
-#   Tier-B — LIVE, per-deployment. WebUI Playwright (conformance + adversarial),
-#            both headed AND headless, screenshot-every-change. Needs --target.
+#   Tier-B — LIVE, per-deployment. WebUI Playwright, both headed AND headless,
+#            screenshot-every-change. Needs --target. Two REAL stages per mode
+#            (YTF §5.12, 2026-08-13): functional/conformance first (one login
+#            session, reused for the whole stage), adversarial LAST and
+#            separate (brute-force, auth-abuse, injection canaries, WebAuthn
+#            login ceremonies — selected via the `security_probe` marker).
+#            Never interleaved.
 #   Tier-C — LIVE, per-deployment. Integration/data-flow seam, full lifecycle
 #            (install/upgrade/uninstall/reinstall), failure-injection/chaos,
 #            cross-runtime parity, egress ring-fence + prompt-injection (both
@@ -145,14 +150,121 @@ fi
 
 VENV_PY="${YTF_PYTHON:-${REPO_DIR}/.venv/bin/python3}"
 if [ ! -x "$VENV_PY" ]; then
-  VENV_PY="$(command -v python3)"
+  # FIND-0813-004: this fallback used to be SILENT. On the 4.1.2 Linux campaign
+  # it fell through to system python, which had no pytest at all — Tier-B
+  # collected 0 tests in BOTH browser modes and only the YSG-RISK-206 verdict
+  # gate stopped that being recorded as a pass. Announce it.
+  _fb="$(command -v python3 || true)"
+  printf '  !!  WARNING: project venv not found at %s — falling back to %s\n' \
+         "$VENV_PY" "${_fb:-<none>}" >&2
+  printf '  !!  Provision it with: uv sync --frozen --all-groups --all-extras\n' >&2
+  VENV_PY="$_fb"
 fi
+
+# FIND-0813-004 — a tier MUST prove its own prerequisites before executing.
+# The root cause was a stale uv.lock: pytest-timeout / playwright / zaproxy were
+# declared in pyproject but ABSENT from the lock, so `uv sync --frozen` installed
+# a subset WITHOUT WARNING. Three separate symptoms followed (Tier-B 0-executed;
+# 3 Tier-A zap_driver failures; a hung run whose 300s ceiling was silently inert
+# because pytest-timeout was missing). Same invariant as YSG-RISK-206: prove the
+# precondition, never infer it later from a junit that isn't there.
+_ytf_require_python_deps() {
+  local tier="$1" missing="" mod
+  local required="pytest pytest_timeout"
+  case "$tier" in
+    a) required="$required zapv2" ;;          # tests/security ZAP driver self-checks
+    b) required="$required playwright" ;;     # WebUI suite
+    c) required="$required playwright" ;;
+  esac
+  for mod in $required; do
+    "$VENV_PY" -c "import $mod" >/dev/null 2>&1 || missing="$missing $mod"
+  done
+  if [ -n "$missing" ]; then
+    printf '\n  XX  Tier-%s cannot run — missing Python module(s):%s\n' "$tier" "$missing" >&2
+    printf '  XX  Interpreter: %s\n' "$VENV_PY" >&2
+    printf '  XX  Fix: uv sync --frozen --all-groups --all-extras' >&2
+    case " $missing " in *" playwright "*) printf ' && "%s" -m playwright install chromium' "$VENV_PY" >&2 ;; esac
+    printf '\n  XX  Refusing to execute a tier on an under-provisioned interpreter (FIND-0813-004).\n\n' >&2
+    return 1
+  fi
+  return 0
+}
 
 OVERALL_RC=0
 # VERDICT.txt files produced by THIS run (truncated at tier start so stale
 # lines from a previous run in the same evidence root can never satisfy or
 # poison this run's summary).
 YTF_VERDICT_FILES=""
+
+
+
+# ---------------------------------------------------------------------------
+# _leg_preflight — YSG-RISK-207 gate (2026-08-07)
+#
+# A leg must PROVE it can reach AND authenticate to its target before it is
+# allowed to generate evidence. Four separate times this campaign, harness state
+# pointed at a deployment that no longer existed and the tier produced hours of
+# meaningless output:
+#   * Tier-C resolved the CA against the TEST checkout, not the deployment ->
+#     41/41 skipped "no live stack" while the stack answered healthz 200.
+#   * YTF_SECRETS_DIR still held the previous stack's credentials after a
+#     destroy-and-reinstall -> 6 of the first 9 Tier-B tests failed on login.
+#     That failure is VISUALLY IDENTICAL to the real IP-throttle lane-bleed, so
+#     rig artefact and genuine SOP gap cannot be told apart after the fact.
+#   * FIND-0805-002 (rotated password written to the wrong dir).
+#   * RIG-002 (podman prefix unusable after reboot; the product's own error for
+#     it is invisible, see YSG-RISK-203).
+#
+# Distinct abort reasons per cause so the two are never confused again.
+# ---------------------------------------------------------------------------
+_leg_preflight() {
+  local target="$1"
+  local pf_script="${REPO_DIR}/../ytf-preflight.sh"
+  [ -f "$pf_script" ] || pf_script="${YTF_PREFLIGHT:-}"
+  if [ -z "$pf_script" ] || [ ! -f "$pf_script" ]; then
+    _warn "leg pre-flight script not found — proceeding WITHOUT an auth proof (YSG-RISK-207)."
+    _warn "  Set YTF_PREFLIGHT=/path/to/ytf-preflight.sh to enforce it."
+    return 0
+  fi
+  YTF_TARGET="$target" YTF_SECRETS_DIR="${YTF_SECRETS_DIR:-}" bash "$pf_script" || {
+    _fail "leg pre-flight FAILED — refusing to generate evidence against an unusable target"
+    return 1
+  }
+}
+
+# ---------------------------------------------------------------------------
+# _assert_executed — YSG-RISK-206 gate (2026-08-07)
+#
+# pytest exits 0 when EVERY test skips, so "everything skipped" and "everything
+# passed" were the same signal to this runner. Tier-C reported
+# "PASS / All requested tiers GREEN" on 41 collected / 41 skipped / 0 EXECUTED,
+# against a live, healthy stack. Tier-C is the tier carrying lifecycle,
+# failure-injection, egress ring-fence, prompt-injection, audit integrity,
+# data-plane byte-proof and multi-tenant licensing — a leg could be declared
+# GREEN having verified none of them.
+#
+# Ava A1 / Lu L1: absence of an artefact is SKIPPED, never PASS. A tier that
+# executed nothing is not GREEN; it is NOT RUN, which gates treat as FAIL.
+#
+# Usage: _assert_executed <junit.xml> <label>   -> 0 if it genuinely ran
+# ---------------------------------------------------------------------------
+_assert_executed() {
+  local xml="$1" label="$2"
+  [ -f "$xml" ] || { _fail "${label}: no junit XML at ${xml} — cannot prove anything ran"; return 1; }
+  local tests skipped errors failures executed
+  tests=$(grep -o 'tests="[0-9]*"'    "$xml" | head -1 | tr -dc '0-9'); tests=${tests:-0}
+  skipped=$(grep -o 'skipped="[0-9]*"' "$xml" | head -1 | tr -dc '0-9'); skipped=${skipped:-0}
+  errors=$(grep -o 'errors="[0-9]*"'   "$xml" | head -1 | tr -dc '0-9'); errors=${errors:-0}
+  failures=$(grep -o 'failures="[0-9]*"' "$xml" | head -1 | tr -dc '0-9'); failures=${failures:-0}
+  executed=$(( tests - skipped ))
+  printf "  ....  %s: collected=%s executed=%s skipped=%s failed=%s errors=%s\n" \
+    "$label" "$tests" "$executed" "$skipped" "$failures" "$errors"
+  if [ "$executed" -le 0 ]; then
+    _fail "${label}: 0 tests EXECUTED (${skipped} skipped) — NOT RUN, not GREEN (YSG-RISK-206)"
+    return 1
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Tier-A — in-process, matrix-invariant. Runs ONCE regardless of runtime/
@@ -161,6 +273,7 @@ YTF_VERDICT_FILES=""
 # ---------------------------------------------------------------------------
 run_tier_a() {
   printf "\n%b=== Tier-A: in-process conformance + OPA + wiring-audit + static pentest ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps a || return 1
   local rc=0
   local evidence_dir="${EVIDENCE_ROOT}/tier-a"
   mkdir -p "$evidence_dir"
@@ -182,6 +295,55 @@ run_tier_a() {
     _pass "tests/conformance + tests/security"
   else
     _fail "tests/conformance + tests/security (see ${evidence_dir}/pytest.log + VERDICT.txt)"
+    rc=1
+  fi
+
+  # FIND-0813-012 — src/tests/regression/ (140 files) was referenced by NO tier,
+  # so its red state was INVISIBLE to the release gate: the 4.1.2 regression
+  # suites for YSG-RISK-210/211, 180, FIND-B-E and FIND-B-F could all be failing
+  # and nothing reported it. Run as its OWN suite with its own verdict line so
+  # its result is never silently folded into the conformance number.
+  # Live-stack-dependent modules are deselected — Tier-A is matrix-invariant and
+  # offline by definition (YTF §3); those belong to Tier-C.
+  _info "pytest: src/tests/regression/ (per-risk regression guards — in-process only)"
+  local _rrc=0
+  PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/regression" \
+    -q --tb=short --junitxml="${evidence_dir}/pytest-junit-regression.xml" \
+    | tee "${evidence_dir}/pytest-regression.log" || _rrc=$?
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-regression.xml" \
+       --rc "$_rrc" --tier a --suite regression \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "src/tests/regression"
+  else
+    _fail "src/tests/regression (see ${evidence_dir}/pytest-regression.log + VERDICT.txt)"
+    rc=1
+  fi
+
+  # Pre-push review round 2 (§4.4, 2026-08-17): same FIND-0813-012 class —
+  # tests/invariants/ (the release-gate structural invariant suite, incl.
+  # I11 CWE-732 secrets-mode) is in neither pyproject.toml's `testpaths`
+  # (["src/tests"] only) nor any tier here, so a bare `pytest` AND every
+  # prior YTF run both silently skipped it. A guard nothing executes is the
+  # same defect class as the regression tree was before FIND-0813-012.
+  # Wired here rather than into `testpaths`: this repo's convention keeps
+  # `testpaths` scoped to `src/tests` and invokes each `tests/<dir>` tier
+  # explicitly (conformance/security above, regression above) so ad hoc
+  # `pytest` runs during development don't silently pull in the full
+  # release-gate matrix — invariants follow that same explicit-tier pattern,
+  # own suite, own verdict line, never folded into another number.
+  _info "pytest: tests/invariants/ (release-gate structural invariants — in-process only)"
+  local _irc=0
+  PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$VENV_PY" -m pytest "${REPO_DIR}/tests/invariants" \
+    -q --tb=short --junitxml="${evidence_dir}/pytest-junit-invariants.xml" \
+    | tee "${evidence_dir}/pytest-invariants.log" || _irc=$?
+  if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-invariants.xml" \
+       --rc "$_irc" --tier a --suite invariants \
+       --out "${evidence_dir}/VERDICT.txt"; then
+    _pass "tests/invariants"
+  else
+    _fail "tests/invariants (see ${evidence_dir}/pytest-invariants.log + VERDICT.txt)"
     rc=1
   fi
 
@@ -216,7 +378,8 @@ run_tier_a() {
 # saved per-leg under EVIDENCE_ROOT/<runtime>-<platform>/screenshots/.
 # ---------------------------------------------------------------------------
 run_tier_b() {
-  printf "\n%b=== Tier-B: live WebUI Playwright (conformance + adversarial) ===%b\n\n" "$BOLD" "$RESET"
+  printf "\n%b=== Tier-B: live WebUI Playwright (functional stage, then adversarial stage LAST — YTF §5.12) ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps b || return 1
   # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
   # --version/--platform are still mandatory (evidence-path labelling).
   if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then
@@ -237,14 +400,59 @@ run_tier_b() {
   local rc=0
 
   local modes=()
+  # YTF §2 hard requirement: "Headed AND headless, both. A leg's WebUI Tier-B
+  # cell is not GREEN until BOTH modes pass." Nothing previously enforced that —
+  # a leg run with --browser-mode headless produced an exit code that looked
+  # identical to a full two-mode run, and one was declared on that basis this
+  # campaign. Single-mode runs are still allowed (useful for triage) but they can
+  # no longer report GREEN: the leg is marked INCOMPLETE and the runner exits
+  # non-zero, so a gate cannot mistake partial coverage for a pass.
+  # (The "rig cannot do headed" belief that motivated single-mode runs was false:
+  # xvfb-run works — 8 headed navigations in 0.7s, then a full 494-test headed
+  # sweep in 3h03 with 110 errors, identical to headless.)
+  local mode_coverage_incomplete=0
   case "$BROWSER_MODE" in
     both) modes=(headed headless) ;;
-    headed) modes=(headed) ;;
-    headless) modes=(headless) ;;
+    headed) modes=(headed); mode_coverage_incomplete=1 ;;
+    headless) modes=(headless); mode_coverage_incomplete=1 ;;
   esac
 
+  # YTF §5.12 (2026-08-13, Tiago directive: "login once, test it all, no more
+  # login again and again and again. One login session you run all but the
+  # brute force testing or injections"): this used to be ONE pytest
+  # invocation covering the whole src/tests/playwright directory --
+  # conformance/functional and adversarial (brute-force, auth-abuse,
+  # injection canaries, WebAuthn login ceremonies) interleaved in a single
+  # collection. That is a NOMINAL split at best (the header comment above
+  # said "conformance + adversarial" but nothing actually separated them).
+  # Measured cost of interleaving (docs/testing/YTF.md §5.12): the adversarial
+  # lane's deliberate bad-credential probes drive the account+IP-keyed auth
+  # throttle, and because the delay served is max(acct_level, ip_level), a
+  # single legitimate account failure in the functional lane inherits the
+  # full IP-driven severity -- ~50% F/E interleaved vs 365/378 clean split.
+  #
+  # Now genuinely TWO pytest invocations per browser mode, functional FIRST
+  # (its own session-scoped admin_ctx/user_ctx login, reused for the whole
+  # stage), adversarial LAST (its own separate process/session, deliberately
+  # isolated so its throttle-tripping and injection canaries can never touch
+  # the functional stage's cached session). Selection is via the
+  # `security_probe` marker (pyproject.toml; registered in conftest.py
+  # pytest_configure) -- every file/class/test in the adversarial lane
+  # (test_pentest_webui_adversarial.py module-wide, WebAuthn login-ceremony
+  # tests, brute-force/SQLi/XSS/SSRF/prompt-injection canaries in
+  # test_webui_conformance_full.py, test_backup_api.py's pre-existing 5) now
+  # carries it explicitly -- see the 2026-08-13 call-site audit.
+  #
+  # HONEST LIMIT (do not silently pretend this is complete): §4.17 Rule 5
+  # requires lane separation by identity AND SOURCE IP. This split is
+  # PROCESS/STAGE separation (functional then adversarial, never
+  # interleaved) -- it does NOT give the adversarial lane a different source
+  # IP. _real_client_ip() resolves to the TCP peer, and every host-originated
+  # request in this runner shares one address regardless of which pytest
+  # process sent it; true IP separation needs a container/netns this runner
+  # does not provision. Stage-order separation removes the interleaving harm
+  # (measured above); it does not close the identity-plus-IP requirement.
   for mode in "${modes[@]}"; do
-    _info "Playwright ${mode}: WebUI conformance (39 pages/34 forms/137 buttons, 2x2 admin+user x WebUI+API) + adversarial"
     # NOTE (2026-07-30, Ava): "--headed" is not a registered pytest CLI option
     # in this suite (no pytest-playwright plugin, no pytest_addoption) -- it
     # was previously being passed as a bare pytest arg and would raise a
@@ -253,7 +461,6 @@ run_tier_b() {
     # YTF_HEADED env var instead. Fixed here to match.
     local headed_env="0"
     [ "$mode" = "headed" ] && headed_env="1"
-    local mode_rc=0
     # FIND-B-TARGET: TARGET may be empty (--target now optional). Exporting
     # YASHIGANI_ADMIN_URL="" is safe here (NOT an array, so no bash-3.2
     # "unbound variable" pitfall under set -u): conftest.py's
@@ -263,26 +470,58 @@ run_tier_b() {
     # exactly as if the var were unset. Verified: macOS ships bash 3.2
     # (/usr/bin/env bash), which mishandles `"${empty_array[@]}"` under
     # `set -u` -- a plain empty-string scalar has no such issue.
+
+    _info "Playwright ${mode} — STAGE 1/2 (functional): WebUI conformance (39 pages/34 forms/137 buttons, 2x2 admin+user x WebUI+API), -m 'not security_probe'"
+    local func_rc=0
     YASHIGANI_ADMIN_URL="$TARGET" \
     YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
     YTF_LEG="$leg" \
     YTF_HEADED="$headed_env" \
     PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
       "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
+      -m "not security_probe" \
       -q --tb=short \
-      --junitxml="${evidence_dir}/pytest-junit-${mode}.xml" \
-      | tee "${evidence_dir}/pytest-${mode}.log" || mode_rc=$?
+      --junitxml="${evidence_dir}/pytest-junit-functional-${mode}.xml" \
+      | tee "${evidence_dir}/pytest-functional-${mode}.log" || func_rc=$?
     # YSG-RISK-206: verdict derived from the junit XML, not the exit code —
     # an all-skipped run (unreachable stack, YSG-RISK-207) exits 0 but
     # executes nothing and must FAIL here.
-    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-${mode}.xml" \
-         --rc "$mode_rc" --tier b --suite playwright --leg "$leg" --mode "$mode" \
+    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-functional-${mode}.xml" \
+         --rc "$func_rc" --tier b --suite playwright-functional --leg "$leg" --mode "$mode" \
          --out "${evidence_dir}/VERDICT.txt"; then
-      _pass "Playwright ${mode} — leg ${leg}"
+      _pass "Playwright ${mode} functional — leg ${leg}"
     else
-      _fail "Playwright ${mode} — leg ${leg} (see ${evidence_dir}/pytest-${mode}.log + VERDICT.txt)"
+      _fail "Playwright ${mode} functional — leg ${leg} (see ${evidence_dir}/pytest-functional-${mode}.log + VERDICT.txt)"
       rc=1
     fi
+
+    _info "Playwright ${mode} — STAGE 2/2 (adversarial, LAST, own session): brute-force/auth-abuse/injection canaries + WebAuthn login flows, -m security_probe"
+    local adv_rc=0
+    YASHIGANI_ADMIN_URL="$TARGET" \
+    YTF_SCREENSHOT_DIR="${shots_dir}/${mode}" \
+    YTF_LEG="$leg" \
+    YTF_HEADED="$headed_env" \
+    PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+      "$VENV_PY" -m pytest "${REPO_DIR}/src/tests/playwright" \
+      -m "security_probe" \
+      -q --tb=short \
+      --junitxml="${evidence_dir}/pytest-junit-adversarial-${mode}.xml" \
+      | tee "${evidence_dir}/pytest-adversarial-${mode}.log" || adv_rc=$?
+    if "${SCRIPT_DIR}/ytf-verdict.sh" --junit "${evidence_dir}/pytest-junit-adversarial-${mode}.xml" \
+         --rc "$adv_rc" --tier b --suite playwright-adversarial --leg "$leg" --mode "$mode" \
+         --out "${evidence_dir}/VERDICT.txt"; then
+      _pass "Playwright ${mode} adversarial — leg ${leg}"
+    else
+      _fail "Playwright ${mode} adversarial — leg ${leg} (see ${evidence_dir}/pytest-adversarial-${mode}.log + VERDICT.txt)"
+      rc=1
+    fi
+
+    # YTF-LOGIN-COUNT lines (conftest.py pytest_sessionfinish) — one per
+    # stage/process; surface both so a leg's total real-login count is
+    # greppable from this runner's own stdout, not just the per-stage logs.
+    grep -h "YTF-LOGIN-COUNT:" "${evidence_dir}/pytest-functional-${mode}.log" \
+      "${evidence_dir}/pytest-adversarial-${mode}.log" 2>/dev/null \
+      | sed "s/^/  [${mode}] /" || true
   done
 
   local shot_count
@@ -293,6 +532,12 @@ run_tier_b() {
     rc=1
   fi
 
+  if [ "$mode_coverage_incomplete" -eq 1 ]; then
+    _fail "Tier-B leg ${leg}: browser-mode coverage INCOMPLETE (ran '${BROWSER_MODE}' only)."
+    _fail "  YTF §2: a leg's WebUI cell is not GREEN until BOTH headed and headless pass."
+    _fail "  Headed is runnable here — wrap the runner in: xvfb-run -a --server-args=\"-screen 0 1920x1080x24\""
+    rc=1
+  fi
   printf "\nTier-B evidence (leg %s): %s\n" "$leg" "$evidence_dir"
   return "$rc"
 }
@@ -305,6 +550,7 @@ run_tier_b() {
 # ---------------------------------------------------------------------------
 run_tier_c() {
   printf "\n%b=== Tier-C: live integration / lifecycle / chaos / parity ===%b\n\n" "$BOLD" "$RESET"
+  _ytf_require_python_deps c || return 1
   # FIND-B-TARGET: --target is optional (see usage banner) — --runtime/
   # --version/--platform are still mandatory (evidence-path labelling).
   if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ -z "$PLATFORM" ]; then

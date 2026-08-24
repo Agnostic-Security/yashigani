@@ -1,5 +1,5 @@
 """
-Regression tests — YSG-RISK-131 (Iris systemic review, following the
+Regression tests — YSG-RISK-139 (Iris systemic review, following the
 live-reproduced 4.1.2 k8s chat blocker):
 
 ## The finding
@@ -53,15 +53,71 @@ Last updated: 2026-07-28T00:00:00+00:00
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 
 import pytest
 
 from yashigani.common import redis_selfheal as common_selfheal
 from yashigani.gateway import redis_selfheal as gw_selfheal
-from yashigani.gateway import openai_router as oai
 from yashigani.gateway import egress_proxy
 from yashigani.gateway.state import GatewayFallbackState, gateway_fallback_state
+
+
+def _gw_oai():
+    """Resolve the LIVE ``yashigani.gateway.openai_router`` module via
+    ``sys.modules`` rather than trusting a frozen collection-time binding.
+
+    2026-08-16 (item 3 of the pre-push code-quality review, ruff F811 x5):
+    this file used to also carry a module-level
+    ``from yashigani.gateway import openai_router as oai`` -- every test
+    then shadowed it with a local ``oai = _gw_oai()`` (F811, redefinition of
+    an unused import). Simply DELETING that import (first attempt here)
+    broke the file when run in isolation: the import was not merely
+    decorative -- it was the only thing that guaranteed
+    ``sys.modules["yashigani.gateway.openai_router"]`` existed before this
+    function's plain dict lookup ran (KeyError otherwise; masked when the
+    shared Tier-A session happens to import openai_router via some earlier
+    file first, mutation-caught by running this file alone). Fixed properly
+    by making this function self-sufficient -- it imports the module itself
+    if the cache is empty, instead of depending on an outside import for a
+    side effect. Every local is named ``live_oai`` (not ``oai``) so nothing
+    shadows anything.
+
+    FIND-0813-012 wired all of ``src/tests/regression/`` into one Tier-A
+    pytest session (previously it was referenced by no tier at all, so this
+    was invisible). In that shared session,
+    ``v2.25.4/test_obs_pin_and_forwarded_user.py``'s ``_load_router_with_env()``
+    does ``del sys.modules["yashigani.gateway.openai_router"]`` +
+    ``importlib.import_module(...)`` to get itself an isolated fresh module
+    per test case, and never restores the original entry afterwards -- so
+    for the rest of the session ``sys.modules["yashigani.gateway.openai_router"]``
+    points at a DIFFERENT module object than the one this file bound at
+    collection time (`import` binds once; collection for every file happens
+    before any test body runs).
+
+    ``gateway/redis_selfheal.py``'s ``ensure_*()``/``maybe_selfheal()``
+    functions all resolve ``openai_router`` via a function-LOCAL import at
+    CALL time (by design -- see that module's docstring: it must always
+    read/write the live singleton). Call time is after the swap, so those
+    functions correctly dual-write into the swapped-in module -- the
+    self-heal code is not broken. A test file that instead asserts against
+    a stale collection-time ``oai`` reference is checking the WRONG object
+    and fails even though the product code behaved correctly. In the real
+    running gateway process nothing ever reloads this module, so this
+    divergence cannot occur outside a shared-process, multi-file pytest
+    session -- it is a Tier-A test-harness hazard, not a product regression
+    (see per-test docstrings/report for the confirmed repro + isolation
+    proof). Resolving fresh here, at the point each test/fixture actually
+    needs it, keeps every assertion in this file pinned to the SAME object
+    the production code under test is currently writing into, regardless of
+    what any sibling file does to ``sys.modules`` -- without changing what
+    is asserted.
+    """
+    if "yashigani.gateway.openai_router" not in sys.modules:
+        import importlib
+        importlib.import_module("yashigani.gateway.openai_router")
+    return sys.modules["yashigani.gateway.openai_router"]
 
 
 @pytest.fixture(autouse=True)
@@ -69,14 +125,19 @@ def _reset_gateway_selfheal_state():
     """Isolate every test: fresh openai_router._state fields this suite
     touches, fresh gateway_fallback_state, fresh egress_proxy._state, and a
     fresh module-level cooldown-gate map (shared across ALL call-sites of the
-    common primitive, so tests must not leak timing state into each other)."""
+    common primitive, so tests must not leak timing state into each other).
+
+    Resolves openai_router via ``_gw_oai()`` (never a frozen collection-time
+    binding) so this reset targets whichever module object is CURRENTLY live -- see
+    ``_gw_oai()`` docstring for why a frozen reference is unsafe in the
+    shared Tier-A session."""
     _fields = [
         "agent_registry", "rbac_store", "permission_store", "identity_registry",
         "budget_enforcer", "optimization_engine", "model_allocation_store",
         "model_alias_store", "ddos_protector", "audit_writer",
     ]
     for f in _fields:
-        setattr(oai._state, f, None)
+        setattr(_gw_oai()._state, f, None)
 
     fresh_fallback = GatewayFallbackState()
     for f in fresh_fallback.__dataclass_fields__:
@@ -87,7 +148,7 @@ def _reset_gateway_selfheal_state():
     common_selfheal.reset_cooldowns()
     yield
     for f in _fields:
-        setattr(oai._state, f, None)
+        setattr(_gw_oai()._state, f, None)
     for f in fresh_fallback.__dataclass_fields__:
         setattr(gateway_fallback_state, f, getattr(fresh_fallback, f))
     egress_proxy._state.egress_limit_enforcer = None
@@ -215,6 +276,7 @@ def test_rbac_agent_stack_reconnects_and_populates_every_consumer(monkeypatch, a
     check reads this live), gateway_fallback_state (AgentAuthMiddleware's
     fallback), and app_state (proxy.py's `_state` dict, exposed via
     app.state.internal_state to every other proxy.py consumer)."""
+    live_oai = _gw_oai()  # live module — see _gw_oai() docstring
     calls = {"n": 0}
 
     def _fails_then_succeeds(url):
@@ -229,15 +291,15 @@ def test_rbac_agent_stack_reconnects_and_populates_every_consumer(monkeypatch, a
     monkeypatch.setattr(
         "yashigani.gateway._redis_url.build_redis_url", lambda *a, **k: "redis://fake"
     )
-    monkeypatch.setattr(oai, "_load_token_role_map", lambda registry: None)
+    monkeypatch.setattr(live_oai, "_load_token_role_map", lambda registry: None)
 
     # Pre-fix shape: chat_completions's exact live gate — "agent_registry_unavailable".
-    assert oai._state.agent_registry is None
+    assert live_oai._state.agent_registry is None
 
     # Attempt 1 — Redis still down (mirrors t=0..31s of the k8s boot race,
     # after the startup retry loop already gave up).
     assert gw_selfheal.ensure_rbac_agent_stack(app_state, cooldown_s=0.01) is False
-    assert oai._state.agent_registry is None
+    assert live_oai._state.agent_registry is None
 
     time.sleep(0.02)
 
@@ -245,9 +307,9 @@ def test_rbac_agent_stack_reconnects_and_populates_every_consumer(monkeypatch, a
     assert gw_selfheal.ensure_rbac_agent_stack(app_state, cooldown_s=0.01) is True
 
     # The confirmed blocker: chat's live gate is now satisfied.
-    assert oai._state.agent_registry == "agent_registry::reconnected"
-    assert oai._state.rbac_store == "rbac_store::reconnected"
-    assert oai._state.permission_store == "permission_store::reconnected"
+    assert live_oai._state.agent_registry == "agent_registry::reconnected"
+    assert live_oai._state.rbac_store == "rbac_store::reconnected"
+    assert live_oai._state.permission_store == "permission_store::reconnected"
 
     # AgentAuthMiddleware's fallback (gateway/agent_auth.py).
     assert gateway_fallback_state.agent_registry == "agent_registry::reconnected"
@@ -264,6 +326,7 @@ def test_rbac_agent_stack_reconnects_and_populates_every_consumer(monkeypatch, a
 
 
 def test_rbac_agent_stack_healthy_path_never_calls_builder(monkeypatch, app_state):
+    live_oai = _gw_oai()  # live module — see _gw_oai() docstring
     calls = {"n": 0}
 
     def _should_never_run(url):
@@ -273,7 +336,7 @@ def test_rbac_agent_stack_healthy_path_never_calls_builder(monkeypatch, app_stat
     monkeypatch.setattr(
         "yashigani.gateway.rbac_stack.build_rbac_agent_stack", _should_never_run
     )
-    oai._state.agent_registry = "already-healthy"
+    live_oai._state.agent_registry = "already-healthy"
 
     assert gw_selfheal.ensure_rbac_agent_stack(app_state, cooldown_s=0.01) is True
     assert calls["n"] == 0
@@ -335,7 +398,13 @@ def test_agent_auth_middleware_falls_back_to_gateway_fallback_state():
             return agent_id == "caller-1" and token == "good-token"
 
         def get(self, agent_id):
-            return {"allowed_cidrs": []}
+            # FIND-0813-013: the middleware requires an ACTIVE registration in
+            # addition to a verifying token, and defaults to reject when the
+            # status field is absent. This stub models a real active agent so
+            # the test still exercises what it is actually about — the
+            # gateway_fallback_state recovery path — rather than tripping the
+            # status gate before it gets there.
+            return {"status": "active", "allowed_cidrs": []}
 
         def _update_last_seen(self, agent_id):
             pass  # no-op — last-seen bookkeeping isn't under test here
@@ -427,13 +496,14 @@ def test_ensure_egress_limit_enforcer_reconnects(monkeypatch):
 def test_ensure_ddos_protector_dual_writes_both_consumers(monkeypatch, app_state):
     """#12 — dual-consumer: openai_router._state.ddos_protector AND
     proxy.py's app_state["ddos_protector"] must BOTH get the rebuilt object."""
+    live_oai = _gw_oai()  # live module — see _gw_oai() docstring
     def _build():
         return "ddos_protector::reconnected"
 
     monkeypatch.setattr(gw_selfheal, "_build_ddos_protector", _build)
 
     assert gw_selfheal.ensure_ddos_protector(app_state, cooldown_s=0.01) is True
-    assert oai._state.ddos_protector == "ddos_protector::reconnected"
+    assert live_oai._state.ddos_protector == "ddos_protector::reconnected"
     assert app_state["ddos_protector"] == "ddos_protector::reconnected"
 
 
@@ -445,6 +515,7 @@ def test_ensure_ddos_protector_dual_writes_both_consumers(monkeypatch, app_state
 
 @pytest.mark.asyncio
 async def test_maybe_selfheal_dispatches_only_unhealthy_subsystems(monkeypatch, app_state):
+    live_oai = _gw_oai()  # live module — see _gw_oai() docstring
     call_log: list[str] = []
 
     def _mk(tag, value):
@@ -455,11 +526,11 @@ async def test_maybe_selfheal_dispatches_only_unhealthy_subsystems(monkeypatch, 
 
     # Mark everything except rbac_agent_stack as already healthy so only ONE
     # dispatch should fire.
-    oai._state.identity_registry = "already-healthy"
-    oai._state.budget_enforcer = "already-healthy"
-    oai._state.model_allocation_store = "already-healthy"
-    oai._state.model_alias_store = "already-healthy"
-    oai._state.ddos_protector = "already-healthy"
+    live_oai._state.identity_registry = "already-healthy"
+    live_oai._state.budget_enforcer = "already-healthy"
+    live_oai._state.model_allocation_store = "already-healthy"
+    live_oai._state.model_alias_store = "already-healthy"
+    live_oai._state.ddos_protector = "already-healthy"
     egress_proxy._state.egress_limit_enforcer = "already-healthy"
     app_state["rate_limiter"] = "already-healthy"
     app_state["endpoint_rate_limiter"] = "already-healthy"
@@ -483,13 +554,14 @@ async def test_maybe_selfheal_starts_workflow_scheduler_on_event_loop(monkeypatc
     itself, after the (thread-dispatched) ensure_workflow_scheduler() call
     returns, rather than calling it inside the builder.
     """
+    live_oai = _gw_oai()  # live module — see _gw_oai() docstring
     # Every OTHER subsystem already healthy so only workflow_scheduler dispatches.
-    oai._state.agent_registry = "already-healthy"
-    oai._state.identity_registry = "already-healthy"
-    oai._state.budget_enforcer = "already-healthy"
-    oai._state.model_allocation_store = "already-healthy"
-    oai._state.model_alias_store = "already-healthy"
-    oai._state.ddos_protector = "already-healthy"
+    live_oai._state.agent_registry = "already-healthy"
+    live_oai._state.identity_registry = "already-healthy"
+    live_oai._state.budget_enforcer = "already-healthy"
+    live_oai._state.model_allocation_store = "already-healthy"
+    live_oai._state.model_alias_store = "already-healthy"
+    live_oai._state.ddos_protector = "already-healthy"
     egress_proxy._state.egress_limit_enforcer = "already-healthy"
     app_state["rate_limiter"] = "already-healthy"
     app_state["endpoint_rate_limiter"] = "already-healthy"

@@ -1,0 +1,62 @@
+# Council remediation (2026-07-15, Tiago-approved) — mechanical Phase-0/1
+# win. This repo had ZERO CI wiring before this workflow. Runs the exact
+# same hooks as .pre-commit-config.yaml, scoped to the PR diff (not the
+# whole repo) — this is a legacy codebase with pre-existing lint/type debt
+# (708 ruff findings, 37 mypy errors as of 2026-07-15) that is explicitly
+# OUT OF SCOPE for this change; diff-scoping holds new/changed code to the
+# gate without retroactively failing every PR on unrelated pre-existing
+# debt. `pre-commit/action` computes the diff against the PR base ref
+# automatically (same mechanism pre-commit.ci uses).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned opengrep release — bump deliberately, not via floating "latest".
+  # SHA256 verified locally against the published release asset at pin time
+  # (2026-07-15). REQUIRES TIAGO: cosign/sigstore verification of the
+  # accompanying .sig/.cert is a stronger supply-chain guarantee than a
+  # pinned SHA256 alone — flagged as a follow-up, not blocking this PR.
+  OPENGREP_VERSION: "v1.25.0"
+  OPENGREP_SHA256: "9ac4aebb47ba3f7b0d8fc641ac8749cb6c2f253f616131a67d9631e00d4bea33"
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (editable, dev extras)
+        run: pip install -e ".[dev]" pre-commit
+
+      - name: Install opengrep (pinned binary, SHA256-verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          curl -fsSL -o /usr/local/bin/opengrep "$url"
+          echo "${OPENGREP_SHA256}  /usr/local/bin/opengrep" | sha256sum -c -
+          chmod +x /usr/local/bin/opengrep
+          opengrep --version
+
+      - name: pre-commit (PR-diff scoped)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            pre-commit run --show-diff-on-failure \
+              --from-ref "${{ github.event.pull_request.base.sha }}" \
+              --to-ref "${{ github.sha }}"
+          else
+            pre-commit run --show-diff-on-failure --from-ref HEAD~1 --to-ref HEAD
+          fi

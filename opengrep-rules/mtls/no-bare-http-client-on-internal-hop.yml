@@ -1,0 +1,86 @@
+# Last updated: 2026-07-15T00:00:00+00:00
+# Council remediation (2026-07-15, Tiago-approved) — mechanical Phase-1 win.
+#
+# F-001-class regression guard: the internal Ollama-mesh hop MUST be dialled
+# through yashigani.inspection._ollama_transport (ollama_get_json /
+# ollama_post_json / ollama_sync_client / ollama_async_client), which in turn
+# selects yashigani.pki.client.internal_httpx_client for https:// mesh
+# fronts. A bare httpx/requests client bypasses the mesh mTLS SSL context
+# entirely and either (a) CERTIFICATE_VERIFY_FAILED-fails closed against the
+# Caddy mesh front (availability bug — see commit a404c29d, F-001-class) or
+# (b), worse, silently succeeds against a plaintext http:// front with no
+# client identity presented (confidentiality/integrity bypass — the
+# original F-001 finding).
+#
+# This finding was fixed once already (df769869, 3f53d41b, 6ab8fd16,
+# b3fda934, a404c29d — five separate commits chasing the same regression
+# class across different call sites) and reintroduced at least once more in
+# the interim. This rule exists to make reintroduction fail CI instead of
+# waiting for the next pentest/Captain re-validation to catch it.
+#
+# SCOPE (intentionally narrow):
+# paths.include is restricted to the CLOSED set of modules that are the
+# documented consumers of _ollama_transport (per that module's own
+# docstring) and whose ENTIRE purpose is talking to the Ollama mesh front.
+# It does NOT cover src/yashigani/gateway/openai_router.py or
+# orchestrator.py — those are multi-purpose router/orchestrator files that
+# ALSO make legitimate bare-httpx calls to non-mesh internal-Docker-network
+# agent containers (agent_upstream, plain http://, no mTLS by design) and to
+# external cloud providers (OpenAI/Anthropic APIs — internet egress,
+# correctly NOT mTLS). Distinguishing the ollama-mesh call sites from those
+# legitimate ones requires dataflow tracking of the URL variable (does it
+# originate from OLLAMA_BASE_URL / _state.ollama_url?), which is beyond a
+# textual/AST opengrep rule. Tracked as a follow-up (dataflow-aware variant,
+# or an explicit per-line allow-comment convention) rather than shipped as a
+# blocking rule that would false-positive on every PR touching those files
+# today.
+rules:
+  - id: no-bare-http-client-on-internal-hop
+    message: >
+      Bare httpx/requests client used on an internal Ollama-mesh-hop module.
+      This bypasses yashigani.pki.client's internal-CA + client-cert mTLS
+      context (F-001 mTLS-bypass class — already reintroduced once, see
+      commit a404c29d). Route this call through
+      yashigani.inspection._ollama_transport (ollama_get_json /
+      ollama_post_json / ollama_sync_client / ollama_async_client) instead
+      of instantiating httpx.Client / httpx.AsyncClient / httpx.get /
+      httpx.post / requests.* directly.
+    severity: ERROR
+    languages: [python]
+    paths:
+      include:
+        - "src/yashigani/inspection/classifier.py"
+        - "src/yashigani/inspection/backends/ollama.py"
+        - "src/yashigani/optimization/sensitivity_classifier.py"
+        - "src/yashigani/backoffice/routes/models.py"
+    patterns:
+      - pattern-either:
+          - pattern: httpx.AsyncClient(...)
+          - pattern: httpx.Client(...)
+          - pattern: httpx.get(...)
+          - pattern: httpx.post(...)
+          - pattern: httpx.put(...)
+          - pattern: httpx.delete(...)
+          - pattern: httpx.patch(...)
+          - pattern: httpx.request(...)
+          - pattern: requests.get(...)
+          - pattern: requests.post(...)
+          - pattern: requests.put(...)
+          - pattern: requests.delete(...)
+          - pattern: requests.patch(...)
+          - pattern: requests.request(...)
+          - pattern: requests.Session(...)
+    metadata:
+      cwe: "CWE-295"
+      category: "security"
+      references:
+        - "commit a404c29d (F-001 class: startup ollama model-list fetch via mTLS transport)"
+        - "commit b3fda934 (F-001-class: openai_router model-list via ollama transport)"
+        - "commit 3f53d41b (F-001: orchestrator brain call TLS verification)"
+      owasp: "A05:2021 — Security Misconfiguration"
+      fix: >
+        Use yashigani.inspection._ollama_transport.ollama_get_json /
+        ollama_post_json / ollama_sync_client / ollama_async_client, which
+        select yashigani.pki.client.internal_httpx_client for https://
+        mesh fronts (internal-CA verify + client cert) and plain httpx for
+        http:// legacy/dev fronts.

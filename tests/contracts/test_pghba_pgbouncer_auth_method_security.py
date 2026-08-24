@@ -1,13 +1,13 @@
-# Last updated: 2026-05-25T00:00:00+00:00 (cycle 8: cert+pg_ident; YSG-RISK-073/075/077)
+# Last updated: 2026-05-25T00:00:00+00:00 (cycle 8: cert+pg_ident; YSG-RISK-227/229/231)
 """
-pg_hba auth-method security contract test — YSG-RISK-073 / YSG-RISK-075 / YSG-RISK-077.
+pg_hba auth-method security contract test — YSG-RISK-227 / YSG-RISK-229 / YSG-RISK-231.
 
 This test module is the dedicated security guard against the class of bug documented
-in YSG-RISK-075 (trust auth without CN binding): any `trust` carveout for
+in YSG-RISK-229 (trust auth without CN binding): any `trust` carveout for
 `pgbouncer_authenticator` that is NOT paired with a `map=` clause is a confirmed
 security gap (Laura cycle 5 adversarial probe).
 
-Attack chain (YSG-RISK-075):
+Attack chain (YSG-RISK-229):
   1. Attacker compromises any container on the `data` network that holds a CA-signed cert.
   2. Opens TLS to postgres:5432, asserts role `pgbouncer_authenticator`, presents stolen cert.
   3. CA validates → `trust` accepts (CA-only check; no CN check; no password).
@@ -18,7 +18,7 @@ Attack chain (YSG-RISK-075):
 
 Cycle 6 attempted fix (scram-sha-256+clientcert) — broken on ARM64/Mac Podman:
   pgbouncer 1.25.1 (edoburu, ARM64) computes incorrect SCRAM proofs when acting as
-  SASL client on ARM64 Linux (YSG-RISK-077). Cycle 6 live test PASS was Linux VM only
+  SASL client on ARM64 Linux (YSG-RISK-231). Cycle 6 live test PASS was Linux VM only
   (10.89.7.x Podman network). Mac Podman uses 10.89.0.x — different runtime, same bug.
   Ava release gate cycle 7 confirmed FATAL error on Mac/Podman ARM64. Superseded below.
 
@@ -28,21 +28,21 @@ Cycle 7/8 fix (cert+pg_ident — FINAL CLOSE):
     CN=pgbouncer-auth    → pgbouncer_authenticator  (main pgbouncer)
     CN=letta-pgbouncer   → pgbouncer_authenticator  (letta sidecar)
   All 11 other data-network cert holders have different CNs — none can impersonate.
-  No SCRAM computation — avoids YSG-RISK-077 ARM64 SCRAM bug entirely.
+  No SCRAM computation — avoids YSG-RISK-231 ARM64 SCRAM bug entirely.
   Stronger than cycle 6: verify-full + CN-specific binding vs verify-ca + broken password.
 
 This module asserts five classes of invariant:
   1. `trust` (unmapped) does NOT appear as auth method for pgbouncer_authenticator.
-  2. `scram-sha-256` does NOT appear as auth method for pgbouncer_authenticator (YSG-RISK-077).
+  2. `scram-sha-256` does NOT appear as auth method for pgbouncer_authenticator (YSG-RISK-231).
   3. `cert` WITHOUT `map=` does NOT appear for pgbouncer_authenticator (bare-cert guard).
   4. `cert map=pgb-auth-map` IS present (positive assertion — cycle 7/8 form).
   5. pg_ident.conf map binds CN → pgbouncer_authenticator (cycle 7/8 closure assertion).
 
 Compose-Helm parity: both docker/ and helm/ copies are checked.
 
-YSG-RISK-073: pgbouncer_authenticator pg_hba carveout history.
-YSG-RISK-075: trust-without-CN-binding class — lateral-pivot from CA-cert-holder to full DB.
-YSG-RISK-077: pgbouncer 1.25.1 ARM64 SCRAM computation bug — avoids SCRAM via cert method.
+YSG-RISK-227: pgbouncer_authenticator pg_hba carveout history.
+YSG-RISK-229: trust-without-CN-binding class — lateral-pivot from CA-cert-holder to full DB.
+YSG-RISK-231: pgbouncer 1.25.1 ARM64 SCRAM computation bug — avoids SCRAM via cert method.
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ _UNMAPPED_TRUST_RE = re.compile(
     re.MULTILINE,
 )
 
-# The forbidden pattern: scram-sha-256 for pgbouncer_authenticator (YSG-RISK-077 guard).
+# The forbidden pattern: scram-sha-256 for pgbouncer_authenticator (YSG-RISK-231 guard).
 # pgbouncer 1.25.1 ARM64 SCRAM computation bug — cert method avoids SCRAM entirely.
 _SCRAM_FOR_PGBOUNCER_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+scram-sha-256",
@@ -87,7 +87,7 @@ _BARE_CERT_WITHOUT_MAP_RE = re.compile(
 # `map=pgb-auth-map`: pg_ident restricts to two specific CNs only (CN=pgbouncer-auth,
 # CN=letta-pgbouncer). Any other cert (even CA-signed) cannot authenticate.
 # Security posture: STRONGER than SCRAM+clientcert (verify-full + CN-specific).
-# YSG-RISK-073 cycle 7/8 / YSG-RISK-077 (ARM64 SCRAM bug bypassed).
+# YSG-RISK-227 cycle 7/8 / YSG-RISK-231 (ARM64 SCRAM bug bypassed).
 _CERT_PGIDENT_RE = re.compile(
     r"hostssl\s+\S+\s+pgbouncer_authenticator\s+\S+\s+cert\s+map=\S+",
     re.MULTILINE,
@@ -138,14 +138,14 @@ def _extract_awk_printed_lines(content: str) -> list[tuple[int, str]]:
 def test_docker_script_no_unmapped_trust_for_pgbouncer_authenticator() -> None:
     """docker/postgres/10-pgbouncer-auth.sh must not insert unmapped trust for pgbouncer_authenticator.
 
-    YSG-RISK-075: `trust clientcert=verify-ca` without `map=` is a confirmed HIGH security gap.
+    YSG-RISK-229: `trust clientcert=verify-ca` without `map=` is a confirmed HIGH security gap.
     Any compromised container on the `data` network with a CA-signed cert can authenticate
     as pgbouncer_authenticator and extract SCRAM verifiers from pg_shadow.
 
     Allowed form: `cert map=pgb-auth-map` (verify-full + CN-bound via pg_ident — cycle 7/8 fix)
 
     Forbidden:
-    - `trust clientcert=verify-ca` (no map= — any CA cert works — YSG-RISK-075)
+    - `trust clientcert=verify-ca` (no map= — any CA cert works — YSG-RISK-229)
     - `trust` (bare — no cert at all — old A2 carveout)
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
@@ -158,7 +158,7 @@ def test_docker_script_no_unmapped_trust_for_pgbouncer_authenticator() -> None:
                 pytest.fail(
                     f"docker/postgres/10-pgbouncer-auth.sh line {lineno}: "
                     f"unmapped trust carveout for pgbouncer_authenticator: '{text}'. "
-                    "YSG-RISK-075: trust without map= allows any CA-cert holder to impersonate "
+                    "YSG-RISK-229: trust without map= allows any CA-cert holder to impersonate "
                     "pgbouncer_authenticator → full DB compromise via ysg_pgbouncer_get_auth. "
                     "Use `cert map=pgb-auth-map` (cycle 7/8 fix)."
                 )
@@ -169,7 +169,7 @@ def test_helm_script_no_unmapped_trust_for_pgbouncer_authenticator() -> None:
 
     Same invariant as test_docker_script_no_unmapped_trust_for_pgbouncer_authenticator.
     Compose-Helm parity: both copies must be secure.
-    YSG-RISK-075.
+    YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
     inserted_lines = _extract_awk_printed_lines(content)
@@ -179,7 +179,7 @@ def test_helm_script_no_unmapped_trust_for_pgbouncer_authenticator() -> None:
                 pytest.fail(
                     f"helm/yashigani/files/10-pgbouncer-auth.sh line {lineno}: "
                     f"unmapped trust carveout for pgbouncer_authenticator: '{text}'. "
-                    "YSG-RISK-075: trust without map= allows any CA-cert holder to impersonate "
+                    "YSG-RISK-229: trust without map= allows any CA-cert holder to impersonate "
                     "pgbouncer_authenticator. Use `cert map=pgb-auth-map` (cycle 7/8 fix)."
                 )
 
@@ -189,26 +189,26 @@ def test_enable_ssl_no_unmapped_trust_for_pgbouncer_authenticator() -> None:
 
     BUG-C4-002 confirmed 05-enable-ssl.sh should NOT write any pgbouncer_authenticator carveout.
     This test additionally guards against a future regression where a trust carveout
-    is accidentally re-added to 05-enable-ssl.sh. YSG-RISK-075.
+    is accidentally re-added to 05-enable-ssl.sh. YSG-RISK-229.
     """
     content = _read(ENABLE_SSL_SCRIPT)
     matches = _UNMAPPED_TRUST_RE.findall(content)
     assert not matches, (
         f"05-enable-ssl.sh: unmapped trust carveout for pgbouncer_authenticator found: {matches}. "
         "05-enable-ssl.sh must NOT write any pgbouncer_authenticator carveout (BUG-C4-002 fix). "
-        "YSG-RISK-075: trust without map= is a confirmed security gap."
+        "YSG-RISK-229: trust without map= is a confirmed security gap."
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 2: `scram-sha-256` MUST NOT appear for pgbouncer_authenticator (YSG-RISK-077)
+# Test 2: `scram-sha-256` MUST NOT appear for pgbouncer_authenticator (YSG-RISK-231)
 # Catches regression to cycle 6 form — broken on ARM64/Mac Podman.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_docker_script_no_scram_for_pgbouncer_authenticator() -> None:
     """docker/postgres/10-pgbouncer-auth.sh must not insert scram-sha-256 for pgbouncer_authenticator.
 
-    YSG-RISK-077: pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug
+    YSG-RISK-231: pgbouncer 1.25.1 (edoburu, ARM64) has a SCRAM client-side computation bug
     on ARM64 Linux. When acting as SASL client (auth_user authenticating to postgres), it
     computes incorrect SCRAM proofs. Affects Mac Podman (ARM64 Lima/QEMU VM) + K8s ARM64 nodes.
     Cycle 6 live test "PASS" was on Linux VM only — confirmed by IP addresses in postgres logs.
@@ -216,7 +216,7 @@ def test_docker_script_no_scram_for_pgbouncer_authenticator() -> None:
 
     The fix is `cert map=pgb-auth-map` — cert method avoids SCRAM computation entirely.
     This test catches regression to the cycle 6 scram-sha-256+clientcert form.
-    YSG-RISK-077.
+    YSG-RISK-231.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
     inserted_lines = _extract_awk_printed_lines(content)
@@ -226,7 +226,7 @@ def test_docker_script_no_scram_for_pgbouncer_authenticator() -> None:
                 pytest.fail(
                     f"docker/postgres/10-pgbouncer-auth.sh line {lineno}: "
                     f"scram-sha-256 carveout for pgbouncer_authenticator found: '{text}'. "
-                    "YSG-RISK-077: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
+                    "YSG-RISK-231: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
                     "Use `cert map=pgb-auth-map` (cycle 7/8 fix — avoids SCRAM computation)."
                 )
 
@@ -236,7 +236,7 @@ def test_helm_script_no_scram_for_pgbouncer_authenticator() -> None:
 
     Same invariant as test_docker_script_no_scram_for_pgbouncer_authenticator.
     Compose-Helm parity: both copies must avoid the ARM64 SCRAM bug.
-    YSG-RISK-077.
+    YSG-RISK-231.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
     inserted_lines = _extract_awk_printed_lines(content)
@@ -246,7 +246,7 @@ def test_helm_script_no_scram_for_pgbouncer_authenticator() -> None:
                 pytest.fail(
                     f"helm/yashigani/files/10-pgbouncer-auth.sh line {lineno}: "
                     f"scram-sha-256 carveout for pgbouncer_authenticator found: '{text}'. "
-                    "YSG-RISK-077: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
+                    "YSG-RISK-231: scram-sha-256 breaks on ARM64/Mac Podman (pgbouncer 1.25.1 bug). "
                     "Use `cert map=pgb-auth-map` (cycle 7/8 fix)."
                 )
 
@@ -270,7 +270,7 @@ def test_docker_script_no_bare_cert_without_map_for_pgbouncer_authenticator() ->
 
     The ONLY correct form is `cert map=pgb-auth-map` — map= clause restricts to the
     explicit CN allowlist (pgbouncer-auth and letta-pgbouncer only).
-    YSG-RISK-073 / YSG-RISK-075.
+    YSG-RISK-227 / YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
     inserted_lines = _extract_awk_printed_lines(content)
@@ -284,7 +284,7 @@ def test_docker_script_no_bare_cert_without_map_for_pgbouncer_authenticator() ->
                     f"docker/postgres/10-pgbouncer-auth.sh line {lineno}: "
                     f"bare cert (no map=) for pgbouncer_authenticator: '{text}'. "
                     "BUG-C4-001: bare cert fails CN check (CN=pgbouncer-auth != rolename). "
-                    "YSG-RISK-075: without map=, CN restriction is not enforced by pg_ident. "
+                    "YSG-RISK-229: without map=, CN restriction is not enforced by pg_ident. "
                     "Use `cert map=pgb-auth-map` — the only correct cycle 7/8 form."
                 )
 
@@ -293,7 +293,7 @@ def test_helm_script_no_bare_cert_without_map_for_pgbouncer_authenticator() -> N
     """helm/yashigani/files/10-pgbouncer-auth.sh must not insert bare `cert` (no map=) for pgbouncer_authenticator.
 
     Same invariant as test_docker_script_no_bare_cert_without_map_for_pgbouncer_authenticator.
-    Compose-Helm parity. YSG-RISK-073 / YSG-RISK-075.
+    Compose-Helm parity. YSG-RISK-227 / YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
     inserted_lines = _extract_awk_printed_lines(content)
@@ -307,7 +307,7 @@ def test_helm_script_no_bare_cert_without_map_for_pgbouncer_authenticator() -> N
                     f"helm/yashigani/files/10-pgbouncer-auth.sh line {lineno}: "
                     f"bare cert (no map=) for pgbouncer_authenticator: '{text}'. "
                     "BUG-C4-001: bare cert fails CN check without pg_ident map. "
-                    "Use `cert map=pgb-auth-map` (cycle 7/8 fix). YSG-RISK-073 / YSG-RISK-075."
+                    "Use `cert map=pgb-auth-map` (cycle 7/8 fix). YSG-RISK-227 / YSG-RISK-229."
                 )
 
 
@@ -321,22 +321,22 @@ def test_docker_script_has_cert_pgident_auth_method_for_pgbouncer_authenticator(
 
     Cycle 7/8 fix: `cert map=pgb-auth-map` — cert method (implies verify-full) + pg_ident
     CN mapping. This is the ONLY secure form that:
-    (a) avoids the ARM64 SCRAM computation bug (YSG-RISK-077)
-    (b) closes the lateral-pivot via CN-specific pg_ident map (YSG-RISK-075)
+    (a) avoids the ARM64 SCRAM computation bug (YSG-RISK-231)
+    (b) closes the lateral-pivot via CN-specific pg_ident map (YSG-RISK-229)
     (c) is valid PG16 syntax (cert method does not require explicit clientcert= option)
 
     This test catches the case where the cert+map form is absent (e.g., step 4c removed
     or contains only trust/scram/md5).
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
     has_cert_map = bool(_CERT_PGIDENT_RE.search(content))
     assert has_cert_map, (
         "docker/postgres/10-pgbouncer-auth.sh: `cert map=pgb-auth-map` for pgbouncer_authenticator not found. "
         "Expected: `hostssl yashigani pgbouncer_authenticator <addr>  cert  map=pgb-auth-map`. "
-        "YSG-RISK-073 cycle 7/8: cert+pg_ident is the final closed form. "
-        "YSG-RISK-077: scram-sha-256 breaks on ARM64/Mac Podman. "
-        "YSG-RISK-075: cert+pg_ident closes lateral-pivot via CN-specific map."
+        "YSG-RISK-227 cycle 7/8: cert+pg_ident is the final closed form. "
+        "YSG-RISK-231: scram-sha-256 breaks on ARM64/Mac Podman. "
+        "YSG-RISK-229: cert+pg_ident closes lateral-pivot via CN-specific map."
     )
 
 
@@ -345,14 +345,14 @@ def test_helm_script_has_cert_pgident_auth_method_for_pgbouncer_authenticator() 
 
     Same invariant as test_docker_script_has_cert_pgident_auth_method_for_pgbouncer_authenticator.
     Compose-Helm parity: both copies must be secure.
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
     has_cert_map = bool(_CERT_PGIDENT_RE.search(content))
     assert has_cert_map, (
         "helm/yashigani/files/10-pgbouncer-auth.sh: `cert map=pgb-auth-map` for pgbouncer_authenticator not found. "
         "Expected: `hostssl yashigani pgbouncer_authenticator <addr>  cert  map=pgb-auth-map`. "
-        "YSG-RISK-073 cycle 7/8 / YSG-RISK-075 / YSG-RISK-077."
+        "YSG-RISK-227 cycle 7/8 / YSG-RISK-229 / YSG-RISK-231."
     )
 
 
@@ -370,7 +370,7 @@ def test_docker_script_writes_pgident_map_for_both_cns() -> None:
       pgb-auth-map  pgbouncer-auth    pgbouncer_authenticator   (main pgbouncer)
       pgb-auth-map  letta-pgbouncer   pgbouncer_authenticator   (letta sidecar)
     Missing either means that pgbouncer instance cannot authenticate as auth_user.
-    YSG-RISK-073 cycle 7/8 — CN-specific mapping is what closes YSG-RISK-075.
+    YSG-RISK-227 cycle 7/8 — CN-specific mapping is what closes YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
     has_pgbouncer_auth_entry = bool(_PGIDENT_PGBOUNCER_AUTH_RE.search(content))
@@ -379,13 +379,13 @@ def test_docker_script_writes_pgident_map_for_both_cns() -> None:
         "docker/postgres/10-pgbouncer-auth.sh: pg_ident.conf entry "
         "`pgb-auth-map  pgbouncer-auth  pgbouncer_authenticator` not found. "
         "Step 4a must write this mapping. Without it, postgres rejects the main pgbouncer's cert. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
     assert has_letta_pgbouncer_entry, (
         "docker/postgres/10-pgbouncer-auth.sh: pg_ident.conf entry "
         "`pgb-auth-map  letta-pgbouncer  pgbouncer_authenticator` not found. "
         "Step 4a must write this mapping. Without it, postgres rejects the letta sidecar's cert. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
 
 
@@ -394,7 +394,7 @@ def test_helm_script_writes_pgident_map_for_both_cns() -> None:
 
     Same invariant as test_docker_script_writes_pgident_map_for_both_cns.
     Compose-Helm parity on pg_ident entries.
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
     has_pgbouncer_auth_entry = bool(_PGIDENT_PGBOUNCER_AUTH_RE.search(content))
@@ -402,12 +402,12 @@ def test_helm_script_writes_pgident_map_for_both_cns() -> None:
     assert has_pgbouncer_auth_entry, (
         "helm/yashigani/files/10-pgbouncer-auth.sh: pg_ident.conf entry "
         "`pgb-auth-map  pgbouncer-auth  pgbouncer_authenticator` not found. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
     assert has_letta_pgbouncer_entry, (
         "helm/yashigani/files/10-pgbouncer-auth.sh: pg_ident.conf entry "
         "`pgb-auth-map  letta-pgbouncer  pgbouncer_authenticator` not found. "
-        "YSG-RISK-073 cycle 7/8."
+        "YSG-RISK-227 cycle 7/8."
     )
 
 
@@ -420,7 +420,7 @@ def test_docker_helm_scripts_agree_on_auth_method() -> None:
 
     If the docker copy uses cert+pg_ident and the helm copy uses trust or scram (or vice versa),
     that is a parity gap — one runtime would have a security/stability gap while the other is hardened.
-    YSG-RISK-073 cycle 7/8.
+    YSG-RISK-227 cycle 7/8.
     """
     docker_content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
     helm_content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
@@ -434,7 +434,7 @@ def test_docker_helm_scripts_agree_on_auth_method() -> None:
         f"helm cert+pg_ident={helm_has_cert_map}. "
         "Both copies must use `cert map=pgb-auth-map`. "
         "A gap in one runtime means a security or stability regression on that deployment path. "
-        "YSG-RISK-073 cycle 7/8 / YSG-RISK-075 / YSG-RISK-077."
+        "YSG-RISK-227 cycle 7/8 / YSG-RISK-229 / YSG-RISK-231."
     )
 
 
@@ -443,58 +443,58 @@ def test_docker_helm_scripts_agree_on_auth_method() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_docker_script_documents_ysg_risk_075() -> None:
-    """docker/postgres/10-pgbouncer-auth.sh must document YSG-RISK-075.
+    """docker/postgres/10-pgbouncer-auth.sh must document YSG-RISK-229.
 
     The script must reference the lateral-pivot class to ensure future maintainers
     understand WHY trust+clientcert without map= is forbidden for this role.
-    YSG-RISK-075.
+    YSG-RISK-229.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
-    assert "YSG-RISK-075" in content, (
-        "docker/postgres/10-pgbouncer-auth.sh: YSG-RISK-075 reference not found. "
+    assert "YSG-RISK-229" in content, (
+        "docker/postgres/10-pgbouncer-auth.sh: YSG-RISK-229 reference not found. "
         "The script must document the lateral-pivot class (Laura cycle 5) that cycle 7/8 closes. "
-        "Add a comment citing YSG-RISK-075 in step 4."
+        "Add a comment citing YSG-RISK-229 in step 4."
     )
 
 
 def test_helm_script_documents_ysg_risk_075() -> None:
-    """helm/yashigani/files/10-pgbouncer-auth.sh must document YSG-RISK-075.
+    """helm/yashigani/files/10-pgbouncer-auth.sh must document YSG-RISK-229.
 
     Same invariant as test_docker_script_documents_ysg_risk_075.
     Compose-Helm parity on documentation.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
-    assert "YSG-RISK-075" in content, (
-        "helm/yashigani/files/10-pgbouncer-auth.sh: YSG-RISK-075 reference not found. "
+    assert "YSG-RISK-229" in content, (
+        "helm/yashigani/files/10-pgbouncer-auth.sh: YSG-RISK-229 reference not found. "
         "The helm copy must also document the lateral-pivot class. "
-        "Add a comment citing YSG-RISK-075 in step 4."
+        "Add a comment citing YSG-RISK-229 in step 4."
     )
 
 
 def test_docker_script_documents_ysg_risk_077() -> None:
-    """docker/postgres/10-pgbouncer-auth.sh must document YSG-RISK-077.
+    """docker/postgres/10-pgbouncer-auth.sh must document YSG-RISK-231.
 
     The script must reference the ARM64 SCRAM bug to ensure future maintainers
     understand WHY scram-sha-256 is forbidden for this role.
-    YSG-RISK-077.
+    YSG-RISK-231.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_DOCKER)
-    assert "YSG-RISK-077" in content, (
-        "docker/postgres/10-pgbouncer-auth.sh: YSG-RISK-077 reference not found. "
+    assert "YSG-RISK-231" in content, (
+        "docker/postgres/10-pgbouncer-auth.sh: YSG-RISK-231 reference not found. "
         "The script must document the ARM64 SCRAM computation bug that necessitated cert+pg_ident. "
-        "Add a comment citing YSG-RISK-077 in step 4."
+        "Add a comment citing YSG-RISK-231 in step 4."
     )
 
 
 def test_helm_script_documents_ysg_risk_077() -> None:
-    """helm/yashigani/files/10-pgbouncer-auth.sh must document YSG-RISK-077.
+    """helm/yashigani/files/10-pgbouncer-auth.sh must document YSG-RISK-231.
 
     Same invariant as test_docker_script_documents_ysg_risk_077.
     Compose-Helm parity on documentation.
     """
     content = _read(PGBOUNCER_AUTH_SCRIPT_HELM)
-    assert "YSG-RISK-077" in content, (
-        "helm/yashigani/files/10-pgbouncer-auth.sh: YSG-RISK-077 reference not found. "
+    assert "YSG-RISK-231" in content, (
+        "helm/yashigani/files/10-pgbouncer-auth.sh: YSG-RISK-231 reference not found. "
         "The helm copy must also document the ARM64 SCRAM bug. "
-        "Add a comment citing YSG-RISK-077 in step 4."
+        "Add a comment citing YSG-RISK-231 in step 4."
     )

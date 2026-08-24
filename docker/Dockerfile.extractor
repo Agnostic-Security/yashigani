@@ -96,7 +96,7 @@ COPY src/yashigani/__init__.py            /app/yashigani/__init__.py
 COPY src/yashigani/documents/__init__marker /app/yashigani/documents/__init__.py
 COPY src/yashigani/documents/bomb_guard.py /app/yashigani/documents/bomb_guard.py
 COPY docker/extractor/worker.py            /app/worker.py
-# LAURA-30-001 / YSG-RISK-080 (Design A): long-running HTTP server mode.
+# LAURA-30-001 / YSG-RISK-234 (Design A): long-running HTTP server mode.
 # The server wraps worker.py: each POST /run forks a worker subprocess and returns
 # the result as JSON. Backoffice calls this service instead of the docker socket.
 COPY docker/extractor/server.py            /app/server.py

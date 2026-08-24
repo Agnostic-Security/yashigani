@@ -2,7 +2,7 @@
 Yashigani — shared bounded lazy-reconnect primitive for Redis-backed
 control-plane state (RBAC, agent registry, rate limiters, caches, ...).
 
-YSG-RISK-131 (Iris systemic review, 2026-07-28, following the live-reproduced
+YSG-RISK-139 (Iris systemic review, 2026-07-28, following the live-reproduced
 gateway chat blocker): gateway and backoffice both build a large number of
 Redis-dependent control-plane objects in one-shot try/except blocks at cold
 boot. On k8s, Service DNS for Redis is not always resolvable at that instant
@@ -12,7 +12,7 @@ attempt then leaves the dependent field ``None`` for the ENTIRE pod lifetime,
 because nothing at request time ever retries. docker/podman compose ordering
 (``depends_on: condition: service_healthy``) hides this class completely,
 which is why it shipped unnoticed until a live k8s deployment reproduced it
-(backoffice: YSG-RISK-122; gateway: YSG-RISK-131, 13 additional Redis-backed
+(backoffice: YSG-RISK-122; gateway: YSG-RISK-139, 13 additional Redis-backed
 subsystems per Iris's remediation map).
 
 This module factors out the *generic* shape first proven in
@@ -105,5 +105,5 @@ def ensure(
         return False
 
     on_success(result)
-    logger.info("%s (YSG-RISK-131 self-heal)", recovered_msg)
+    logger.info("%s (YSG-RISK-139 self-heal)", recovered_msg)
     return True

@@ -95,7 +95,7 @@ spec:
           port: 53
 
 ---
-# YSG-RISK-126 fix: pre-install/pre-upgrade hook Jobs that talk to the k8s API
+# YSG-RISK-134 fix: pre-install/pre-upgrade hook Jobs that talk to the k8s API
 # server (admin-bootstrap-job.yaml's `applier` container, mtls-bootstrap-job.yaml's
 # `applier` container — both run `kubectl apply` to write the Secret they mint)
 # had NO NetworkPolicy egress rule permitting that traffic. default-deny-egress
@@ -157,7 +157,7 @@ metadata:
   labels:
     {{- include "yashigani.labels" . | nindent 4 }}
   annotations:
-    yashigani.io/finding: "YSG-RISK-126"
+    yashigani.io/finding: "YSG-RISK-134"
 spec:
   podSelector:
     matchExpressions:
@@ -261,7 +261,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
-    # YSG-RISK-127 fix: backoffice's user_chat_proxy / user_agents proxy
+    # YSG-RISK-135 fix: backoffice's user_chat_proxy / user_agents proxy
     # (src/yashigani/backoffice/routes/user_ui.py user_chat_proxy,
     # user_agents.py forward-to-gateway helpers — the trusted-forwarder
     # /user/chat/completions and /user/agents/* paths, FIND-4.0-CHAT-001)
@@ -272,7 +272,7 @@ spec:
     # through user_ui.py's generic `except Exception` handler as
     # "stream_error" rather than the more diagnostic "gateway_unreachable"
     # ConnectError path). Found live re-testing all 4 chat targets
-    # (@letta/@langflow/@openclaw/direct model) after fixing YSG-RISK-125 —
+    # (@letta/@langflow/@openclaw/direct model) after fixing YSG-RISK-133 —
     # all 4 share this one proxy code path, so all 4 failed identically.
     - from:
         - podSelector:
@@ -284,7 +284,7 @@ spec:
 
 ---
 # Gateway egress — allow outbound to policy, redis, budget-redis, ollama, postgres (via pgbouncer), OTEL,
-# and agent bundle pods (registered-upstream dispatch path; YSG-RISK-055 UA-10).
+# and agent bundle pods (registered-upstream dispatch path; YSG-RISK-219 UA-10).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -358,7 +358,7 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
-    # YSG-RISK-055 UA-10 (v2.24.1): gateway egress to agent bundle pods.
+    # YSG-RISK-219 UA-10 (v2.24.1): gateway egress to agent bundle pods.
     # Gateway must be able to reach each agent on its registered port for
     # the registered-upstream dispatch path. These are the same ports that
     # allow-agent-bundle-ingress permits as ingress to agent pods.
@@ -556,7 +556,7 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
-    # YSG-RISK-127 fix: backoffice's user_chat_proxy / user_agents proxy
+    # YSG-RISK-135 fix: backoffice's user_chat_proxy / user_agents proxy
     # dials gateway's internal mesh port 8081 directly (see matching ingress
     # rule added to allow-gateway-ingress above, same finding). Missing
     # entirely before this fix — every /user/chat/completions and
@@ -1782,7 +1782,7 @@ spec:
 {{- end }}
 
 ---
-# YSG-RISK-055 UA-10: per-agent isolation NetworkPolicies (v2.24.1).
+# YSG-RISK-219 UA-10: per-agent isolation NetworkPolicies (v2.24.1).
 #
 # INGRESS: each agent accepts inbound ONLY from gateway — not from peer agents.
 # EGRESS: each agent may call gateway:8080 (LLM dispatch) and postgres:5432
@@ -1799,7 +1799,7 @@ spec:
 
 {{- if .Values.agentBundles.langflow.enabled }}
 ---
-# Langflow ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# Langflow ingress — gateway ONLY (YSG-RISK-219 UA-10).
 # No peer agent may initiate a connection to langflow.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1857,7 +1857,7 @@ spec:
 
 {{- if .Values.agentBundles.letta.enabled }}
 ---
-# Letta ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# Letta ingress — gateway ONLY (YSG-RISK-219 UA-10).
 # No peer agent may initiate a connection to letta.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1926,7 +1926,7 @@ spec:
 
 {{- if .Values.agentBundles.openclaw.enabled }}
 ---
-# OpenClaw ingress — gateway ONLY (YSG-RISK-055 UA-10).
+# OpenClaw ingress — gateway ONLY (YSG-RISK-219 UA-10).
 # No peer agent may initiate a connection to openclaw.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -2031,13 +2031,13 @@ spec:
 
 {{- if .Values.poolManager.k8sBackend.enabled }}
 ---
-# PoolManager K8s backend — gateway → pool-managed pod ingress (YSG-RISK-070).
+# PoolManager K8s backend — gateway → pool-managed pod ingress (YSG-RISK-224).
 #
 # Pool-managed pods carry label yashigani.managed=true (set by KubernetesBackend.run()).
 # The gateway must be able to reach them on the agent service port for the
 # dispatch path. This rule permits ONLY gateway as the ingress source.
 #
-# UA-10 isolation (YSG-RISK-055): pool-managed pods cannot reach each other —
+# UA-10 isolation (YSG-RISK-219): pool-managed pods cannot reach each other —
 # the default-deny-ingress policy (top of this file) blocks all ingress unless
 # explicitly allowed, and NO rule allows pod-to-pod traffic within the
 # yashigani.managed=true set. Pool pods also have no egress rule for
@@ -2051,7 +2051,7 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: pool-manager
   annotations:
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 spec:
   podSelector:
     matchLabels:
@@ -2069,7 +2069,7 @@ spec:
           port: {{ .Values.poolManager.k8sBackend.agentPort }}
 
 ---
-# PoolManager K8s backend — pool-managed pod egress (YSG-RISK-070).
+# PoolManager K8s backend — pool-managed pod egress (YSG-RISK-224).
 #
 # Pool-managed pods are user-plane agent containers. Their ONLY permitted
 # egress is to the gateway (all LLM calls route through gateway, same as
@@ -2087,7 +2087,7 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: pool-manager
   annotations:
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 spec:
   podSelector:
     matchLabels:
@@ -2096,7 +2096,7 @@ spec:
     - Egress
   egress:
     # LLM dispatch — gateway:8080 only (all agent calls route through gateway).
-    # OPA inspects this traffic on both legs (YSG-RISK-055 OPA constraint).
+    # OPA inspects this traffic on both legs (YSG-RISK-219 OPA constraint).
     - to:
         - podSelector:
             matchLabels:
@@ -2106,7 +2106,7 @@ spec:
           port: 8080
 
 ---
-# Gateway → pool-managed pod egress extension (YSG-RISK-070).
+# Gateway → pool-managed pod egress extension (YSG-RISK-224).
 #
 # The gateway must be able to reach pool-managed pods (yashigani.managed=true)
 # on the agent port for the dispatch path. This extends allow-gateway-egress
@@ -2120,7 +2120,7 @@ metadata:
     {{- include "yashigani.labels" . | nindent 4 }}
     app.kubernetes.io/component: pool-manager
   annotations:
-    yashigani.io/risk-id: "YSG-RISK-070"
+    yashigani.io/risk-id: "YSG-RISK-224"
 spec:
   podSelector:
     matchLabels:

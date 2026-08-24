@@ -19,7 +19,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from yashigani.backoffice.middleware import AdminSession
+from yashigani.backoffice.middleware import AdminSession, StepUpAdminSession
 from yashigani.backoffice.state import backoffice_state
 from yashigani.common.error_envelope import safe_error_envelope
 
@@ -245,11 +245,29 @@ async def list_credentials(session: AdminSession):
     }
 
 
-@router.delete("/admin/settings/webauthn/credentials/{credential_id}")
-async def delete_credential(credential_id: str, session: AdminSession):
+@router.delete(
+    "/admin/settings/webauthn/credentials/{credential_id}",
+    deprecated=True,
+    summary="DEPRECATED — use DELETE /api/v1/admin/webauthn/credentials/{credential_id}",
+)
+async def delete_credential(credential_id: str, session: StepUpAdminSession):
     """
-    Delete a WebAuthn credential by its UUID.
-    Only the credential's owner can delete it.
+    Delete a WebAuthn credential by its UUID. Only the owner can delete it.
+
+    YSG-RISK-201 (fixed 2026-08-07) — ASVS V6.8.4. This route took a plain
+    ``AdminSession`` while the hardened v1 route
+    (``DELETE /api/v1/admin/webauthn/credentials/{id}``) correctly required
+    ``StepUpAdminSession``. Two surfaces existed for one operation and only one
+    was hardened, so an attacker holding a hijacked-but-not-step-upped admin
+    session could strip a target's passkeys here — removing their strongest
+    authenticator — and then fall back to password+TOTP. Proven live on BOTH
+    runtimes by YTF Tier-B ``test_wa_revoke_04_without_stepup_returns_401``:
+    ``DELETE without step-up returned 200, expected 401``. The test was right
+    and had been sitting in the failure noise.
+
+    Now requires a fresh TOTP step-up, identical to v1. Marked deprecated: two
+    surfaces for one privileged operation is how this drifted in the first
+    place, and the duplicate should be retired once callers have migrated.
     """
     service = _get_service()
     deleted = service.delete_credential(

@@ -149,7 +149,7 @@ async def _fake_egress_allow(identity, server, tool, verdict, response_sensitivi
     return {"allow": True, "reason": "ok"}
 
 
-# YSG-RISK-113: orchestrator._inspect_result is now async (offloads the
+# YSG-RISK-257: orchestrator._inspect_result is now async (offloads the
 # blocking classifier call via asyncio.to_thread).
 async def _fake_inspect_clean(text, identity, rid):
     return "CLEAN", 1.0, None

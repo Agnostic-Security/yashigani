@@ -54,7 +54,7 @@
         <!-- LAURA-V400-R2-001 — Data-protection warning banner -->
         <!-- Shown when any data-protection control is in a weakened state. -->
         <!-- Populated by loadDpProtectionStatus() on DOMContentLoaded + page load. -->
-        <div id="dp-protection-banner" class="dp-protection-banner" style="display:none">
+        <div id="dp-protection-banner" class="dp-protection-banner is-hidden">
             <span class="dp-protection-banner-icon">&#9888;</span>
             <span class="dp-protection-banner-text" id="dp-protection-banner-text"></span>
             <button class="n1-banner-btn" data-action="showPage" data-param="pii">PII Settings</button>
@@ -62,7 +62,7 @@
 
         <!-- LAURA-V400-R2-001 — Pending data-protection weaken requests banner -->
         <!-- Shown to admins when there are weaken requests awaiting a second approval. -->
-        <div id="dp-weaken-pending-banner" class="dp-protection-banner dp-weaken-pending-banner" style="display:none">
+        <div id="dp-weaken-pending-banner" class="dp-protection-banner dp-weaken-pending-banner is-hidden">
             <span class="dp-protection-banner-icon">&#128274;</span>
             <span class="dp-protection-banner-text" id="dp-weaken-pending-text"></span>
             <button class="n1-banner-btn" id="dp-weaken-pending-btn" data-action="showPage" data-param="data-protection">Review</button>

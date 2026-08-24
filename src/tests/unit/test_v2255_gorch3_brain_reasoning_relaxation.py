@@ -26,7 +26,7 @@ from yashigani.gateway import letta_brain
 from yashigani.gateway import orchestrator
 
 
-# YSG-RISK-113: orchestrator._classify_sensitivity is now async (offloads the
+# YSG-RISK-257: orchestrator._classify_sensitivity is now async (offloads the
 # blocking classifier call via asyncio.to_thread) — every monkeypatch below
 # must substitute an awaitable, not a plain sync lambda.
 async def _fake_classify_sensitivity_public(text):

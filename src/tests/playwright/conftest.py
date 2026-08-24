@@ -271,15 +271,41 @@ _CA_CERT_PATH: str | None = _resolve_ca_cert()
 
 
 def _resolve_base_url() -> str:
+    """Resolve the target stack URL.
+
+    2026-08-09 — THIS FUNCTION CAUSED THE 110 FIXTURE ERRORS PER LEG, ALL CAMPAIGN.
+
+    `run_tier_b()` validates `--target` and then never exports it, so
+    YASHIGANI_ADMIN_URL was unset and this fell through to probing
+    localhost:8443 / localhost / localhost:8080. Nothing answers there, and the
+    old code then RETURNED THE HARDCODED DEFAULT ANYWAY. Every request went to a
+    dead address that replies 200 with an empty body to everything — including
+    /healthz — so:
+      * login returned 200, length 0, no Set-Cookie
+      * r.json() raised JSONDecodeError, or the browser got no session
+      * every admin_ctx fixture landed on /admin/login  -> 110 ERRORS
+    It was blamed on the auth throttle, then SameSite, then the HTTP client.
+    curl "worked" and httpx "failed" because they were pointed at DIFFERENT HOSTS.
+
+    Three fixes:
+      1. honour YASHIGANI_TEST_DOMAIN when no explicit URL is given, so the
+         runner's --target reaches the tests (see run-test-framework.sh, which
+         now exports YASHIGANI_ADMIN_URL);
+      2. verify a probe candidate is really our stack — a 200 with an empty body
+         is NOT a healthy stack;
+      3. FAIL LOUD instead of returning a default nothing is listening on. A
+         suite that cannot find its target must not invent one.
+    """
     override = os.getenv("YASHIGANI_ADMIN_URL")
     if override:
         return override.rstrip("/")
-    # Prefer HTTPS; fall back to common installer ports
-    candidates = [
-        "https://localhost:8443",
-        "https://localhost",
-        "http://localhost:8080",
-    ]
+
+    candidates = []
+    domain = os.getenv("YASHIGANI_TEST_DOMAIN", "").strip()
+    if domain:
+        candidates += [f"https://{domain}", f"https://{domain}:8443"]
+    candidates += ["https://localhost:8443", "https://localhost", "http://localhost:8080"]
+
     try:
         import httpx
 
@@ -287,13 +313,22 @@ def _resolve_base_url() -> str:
             verify: bool | str = (_CA_CERT_PATH or False) if url.startswith("https://") else False  # type: ignore[assignment]
             try:
                 r = httpx.get(f"{url}/healthz", verify=verify, timeout=3)
-                if r.status_code == 200:
-                    return url
             except Exception:
                 continue
+            # A live Yashigani /healthz returns a non-empty JSON body. An empty
+            # 200 is something else answering on that port.
+            if r.status_code == 200 and r.content and b"ok" in r.content.lower():
+                return url
     except ImportError:
         pass
-    return "https://localhost:8443"
+
+    raise RuntimeError(
+        "YTF: cannot resolve a live Yashigani stack. Tried: "
+        + ", ".join(candidates)
+        + ". Set YASHIGANI_ADMIN_URL (the runner's --target) or YASHIGANI_TEST_DOMAIN. "
+        "Refusing to fall back to a default address — that is what produced 110 "
+        "phantom fixture errors per leg for an entire campaign."
+    )
 
 
 BASE_URL: str = _resolve_base_url()
@@ -400,8 +435,17 @@ def get_admin_totp_code() -> str:
 
     import pyotp
 
+    # 2026-08-12: admin logins previously bypassed the anti-replay ledger entirely
+    # (only user logins and do_admin_stepup used it), so a browser login spent a code
+    # WITHOUT recording it. do_admin_stepup then found an empty ledger, proceeded in
+    # the SAME 30s window, and the server correctly rejected the replay:
+    # 401 invalid_totp_code. The ledger must be keyed on the IDENTITY (one TOTP
+    # secret = one window), never on the purpose.
     secret = _read_secret("admin1_totp_secret")
-    return pyotp.TOTP(secret, digits=8, digest=hashlib.sha512).now()
+    wait_for_fresh_totp("admin1")
+    code = pyotp.TOTP(secret, digits=8, digest=hashlib.sha512).now()
+    mark_totp_used("admin1")
+    return code
 
 
 def get_admin2_totp_code() -> str:
@@ -416,6 +460,21 @@ def get_admin2_totp_code() -> str:
 
 
 _session_cookie_cache: "dict[int, dict]" = {}  # admin_number → cookies
+
+# YTF §5.12 (2026-08-13, Tiago directive: "login once, test it all, no more
+# login again and again and again"): counters proving how many times this
+# process actually performed a REAL login (past any cache-hit), one per
+# tier. Incremented at the single choke point each tier's real-login work
+# funnels through (_api_get_session_cookies for admin, bootstrap_user_session
+# for user/end-user) -- every higher-level helper (playwright_login_admin,
+# playwright_login_user, get_authed_context, get_authed_user_context,
+# refresh_admin_context_if_stale, refresh_user_context_if_stale) delegates to
+# one of these two, so counting here (not at every call site) can't
+# under/over-count from a helper this file adds later. Printed by
+# pytest_sessionfinish below so a run PROVES its login count instead of
+# asserting it went down.
+_real_admin_login_count = 0
+_real_user_bootstrap_count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +667,25 @@ def invalidate_cached_user_session(cache_key: str = "default") -> None:
     _user_session_established_at.pop(cache_key, None)
     _user_session_dirty.add(cache_key)
 
+# QA-fix (Ava, Tier-B tierb-on-unified consolidation): per-identity "when was
+# this session actually established server-side" ledger, distinct from
+# _session_cookie_cache (which never expires in-process once populated).
+# The server's session idle-timeout is 900s (src/yashigani/auth/session.py
+# _IDLE_TIMEOUT_SECONDS) -- a cookie cached once at the START of a long file
+# (test_webui_conformance_full.py's admin_ctx/user_ctx are module-scoped,
+# shared across ~15 test classes and every TOTP-replay wait those classes
+# incur) can silently outlive that 900s window mid-file, producing "Still on
+# login page" only once some LATER test happens to hit it -- exactly the
+# measured 111+45-error cascade this consolidation fixes. These ledgers let
+# refresh_admin_context_if_stale()/refresh_user_context_if_stale() (below)
+# proactively re-authenticate BEFORE that happens, from one shared per-test
+# autouse guard, instead of each fixture/file inventing its own staleness
+# check (test_pki_admin_ui.py's unconditional force_fresh=True is the
+# unconditional/expensive special case of the same idea).
+_admin_session_established_at: "dict[int, float]" = {}  # admin_number → time.time() of last real (non-cache-hit) login
+_user_session_established_at: "dict[str, float]" = {}  # cache_key → time.time() of last real (non-cache-hit) bootstrap
+_SESSION_REFRESH_THRESHOLD_SECONDS = 600  # safety margin under the server's 900s/15-min idle timeout
+
 # QA-fix (Ava, 2026-07-31, Tier-B v412 fresh-bootstrap smoke): on a genuinely
 # fresh stack (admin creds still INITIAL, force_password_change=True on first
 # login) BOTH playwright_login_admin() and the (now-removed) local duplicates
@@ -669,17 +747,50 @@ def _persist_rotated_password(admin: int, new_password: str) -> None:
     has no logger of its own, loud enough to show up in pytest -s output
     without needing one.
     """
-    try:
-        repo_root = Path(__file__).parents[3]
-        secret_name = "admin1_password" if admin == 1 else f"admin{admin}_password"
-        p = repo_root / "docker" / "secrets" / secret_name
-        p.write_text(new_password, encoding="utf-8")
+    secret_name = "admin1_password" if admin == 1 else f"admin{admin}_password"
+
+    # FIND-0805-002 (ytf-412-20260805): the original FIND-8 fix wrote ONLY to
+    # Path(__file__).parents[3]/docker/secrets, while _read_secret() above prefers
+    # YTF_SECRETS_DIR whenever it is set. YTF_SECRETS_DIR is set on every correctly
+    # configured run (docker/secrets is unreadable to the test user on BOTH runtimes —
+    # that is the whole reason the override exists), so the write always landed
+    # somewhere the harness never reads back: the persist was a no-op exactly when it
+    # mattered. Proven live on the docker-linux leg — after the headed pytest process
+    # rotated admin1, the on-disk credential returned 401 invalid_credentials while
+    # untouched admin2 returned 200, and no file on disk had been updated.
+    #
+    # Consequence: run_tier_b() runs headed and headless as two SEPARATE pytest
+    # processes against one stack and a leg is GREEN only if BOTH pass, so the
+    # mandatory double run could never pass (YTF §2 / QA SOP §4.17 Rule 4).
+    #
+    # Write to every location the read path might use, not just one: the override copy
+    # (what _read_secret returns when set) AND the real repo secrets dir (the fallback,
+    # and what a human operator or diagnostic script reads). Best-effort per target —
+    # the real dir is often unwritable by the test user, which must not fail the run,
+    # since the in-process cache stays authoritative for the rest of THIS process.
+    targets = []
+    _override = os.environ.get("YTF_SECRETS_DIR", "")
+    if _override:
+        targets.append(Path(_override) / secret_name)
+    targets.append(Path(__file__).parents[3] / "docker" / "secrets" / secret_name)
+
+    persisted = 0
+    for p in targets:
         try:
-            p.chmod(0o600)
-        except OSError:
-            pass
-    except OSError as exc:
-        print(f"[conftest] FIND-8: could not persist rotated admin{admin} password to disk: {exc}")
+            p.write_text(new_password, encoding="utf-8")
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
+            persisted += 1
+        except OSError as exc:
+            print(f"[conftest] FIND-8: could not persist rotated admin{admin} password to {p}: {exc}")
+    if persisted == 0:
+        print(
+            f"[conftest] FIND-0805-002: rotated admin{admin} password persisted to NO target "
+            f"({[str(t) for t in targets]}) — the next pytest process will read a stale "
+            f"credential and fail at fixture setup."
+        )
 
 
 def _generate_strong_password() -> str:
@@ -751,13 +862,39 @@ def _find_redis_container(runtime: str) -> Optional[str]:
     except Exception:
         return None
 
+    # YSG-RISK-209 (2026-08-08): the segment match above was still ambiguous.
+    # On a "-"-separated project, "yashigani-demo-internal-budget-redis-1"
+    # splits to [...,'budget','redis','1'] — which CONTAINS an exact "redis"
+    # segment — so the BUDGET redis matched whenever docker listed it first.
+    # Confirmed live: this returned "…-budget-redis-1", so clear_auth_throttle()
+    # drained the wrong instance and reported 0 keys every time. That is why the
+    # 110-error auth lane-bleed survived even though the primitive existed and
+    # was being called.
+    #
+    # Match the compose SERVICE LABEL instead — exact, unambiguous, and
+    # independent of project name and separator convention.
+    for name in candidates:
+        try:
+            svc = subprocess.run(
+                [runtime, "inspect", name, "--format",
+                 "{{index .Config.Labels \"com.docker.compose.service\"}}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            continue
+        if svc == "redis":
+            return name
+
+    # Fallbacks, narrowed: never accept a name whose service segment is a
+    # *-redis sibling (budget-redis, letta-redis, …).
     for sep in ("_", "-"):
         for name in candidates:
-            if any(seg.lower() == "redis" for seg in name.split(sep)):
+            segs = [x.lower() for x in name.split(sep)]
+            if "redis" in segs:
+                i = segs.index("redis")
+                if i > 0 and segs[i - 1] in ("budget", "session", "cache"):
+                    continue
                 return name
-    for name in candidates:
-        if "redis" in name.lower():
-            return name
     return None
 
 
@@ -869,6 +1006,120 @@ def clear_auth_throttle() -> int:
         return 0
 
 
+def expire_session_stepup(token: str) -> bool:
+    """Directly clear a live admin session's ``last_totp_verified_at`` in
+    Redis so a "session without a fresh step-up" probe is genuinely true,
+    without sleeping out ``YASHIGANI_STEPUP_TTL_SECONDS`` (up to 300s+).
+
+    2026-08-17 (Ava, TIER-B-BLOCKED-STEPUP-EXPIRE fix). Root cause of the
+    blocker: test_v233_webauthn_e2e.py's ``_expire_stepup()`` POSTed to
+    ``/auth/stepup/expire`` expecting 200/204, then fell back to
+    ``time.sleep(min(ttl + 5, 310))`` on anything else. Verified live: that
+    endpoint 404s, and ``grep -rn "stepup/expire\\|stepup_expire" src/yashigani/``
+    finds nothing -- it was never implemented, so the sleep fired on EVERY
+    run. 310s > pytest_collection_modifyitems's default 300s per-test budget
+    (conftest.py ~line 2320, `method="thread"`) -- pytest-timeout's thread
+    method cannot safely interrupt an arbitrary thread, so on expiry it dumps
+    tracebacks and calls ``os._exit()``, killing the WHOLE pytest process
+    before the junitxml plugin's session-end hook ever runs. That is why the
+    runner reported ``executed=0`` for a leg where 100+ tests had genuinely
+    run and mostly passed -- not a flaky test, a session-ending crash.
+
+    Mechanism (real invalidation, not a skipped wait): the session store is
+    Redis-backed (``yashigani:session:{token}`` hash, DB 1 -- see
+    ``src/yashigani/backoffice/entrypoint.py`` "Session store (Redis db/1)"
+    and ``src/yashigani/auth/session.py:SessionStore``). The SAME redis
+    instance/DB backs ``_apply_auth_throttle`` (``backoffice_state.
+    session_store._redis``, ``src/yashigani/backoffice/routes/auth.py:451``),
+    which is exactly what ``clear_auth_throttle()`` above already reaches via
+    ``docker/podman exec <redis> redis-cli -n 1`` with the container's own
+    TLS client cert -- this function reuses that identical, already-proven
+    runtime/container-detection + redis-cli pattern rather than inventing a
+    second one.
+
+    ``has_fresh_stepup()`` (src/yashigani/auth/stepup.py) is a pure
+    ``age_seconds < STEPUP_TTL_SECONDS`` check against the stored timestamp,
+    so writing a timestamp comfortably older than the TTL genuinely drops
+    the session below the fresh-step-up threshold server-side -- this is not
+    a test-harness fiction, it is the exact same state a real 300s-idle
+    step-up would leave behind, produced instantly.
+
+    Returns True ONLY on POSITIVE evidence the mutation took: the HSET
+    reported success AND a follow-up HGET read back a timestamp whose age is
+    already >= the TTL. Per Ava's standing rule (A1): absence of proof is a
+    FAIL, not a PASS, so this never returns True on a guess -- an
+    unreachable/misconfigured redis returns False and the caller must not
+    proceed with a "without step-up" assertion built on unverified state.
+    """
+    import os
+    import subprocess
+    import time
+
+    runtime = _detect_container_runtime()
+    if runtime is None:
+        return False
+    redis_container = _find_redis_container(runtime)
+    if redis_container is None:
+        return False
+
+    try:
+        pw_result = subprocess.run(
+            [runtime, "exec", redis_container, "cat", "/run/secrets/redis_password"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if pw_result.returncode != 0:
+            return False
+        redis_pw = pw_result.stdout.strip()
+
+        def _redis_cli(*args: str) -> "subprocess.CompletedProcess":
+            return subprocess.run(
+                [
+                    runtime, "exec", redis_container, "redis-cli",
+                    "-p", "6380",
+                    "--tls",
+                    "--cert", "/run/secrets/redis_client.crt",
+                    "--key", "/run/secrets/redis_client.key",
+                    "--cacert", "/run/secrets/ca_root.crt",
+                    "--user", "default",
+                    "--pass", redis_pw,
+                    "-n", "1",
+                    *args,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+        _warning_line = (
+            "Warning: Using a password with '-a' or '-u' option on the "
+            "command line interface may not be safe."
+        )
+
+        key = f"yashigani:session:{token}"
+        ttl = int(os.getenv("YASHIGANI_STEPUP_TTL_SECONDS", "300"))
+        stale_ts = time.time() - ttl - 30  # comfortably past expiry, never negative in practice
+
+        hset_result = _redis_cli("HSET", key, "last_totp_verified_at", str(stale_ts))
+        if hset_result.returncode != 0:
+            return False
+
+        # Positive verification: read the value back rather than trusting the
+        # write. A silent no-op HSET (e.g. wrong DB, wrong key) must not be
+        # reported as success.
+        hget_result = _redis_cli("HGET", key, "last_totp_verified_at")
+        value = hget_result.stdout.replace(_warning_line, "").strip()
+        try:
+            stored = float(value)
+        except ValueError:
+            return False
+        age = time.time() - stored
+        return age >= ttl
+    except Exception:
+        return False
+
+
 def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> dict:
     """
     Obtain session cookies via the httpx API client (not the browser).
@@ -884,9 +1135,13 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
 
     Last updated: 2026-05-09 (v2.23.3: new helper for cookie injection; add cache)
     """
-    global _session_cookie_cache
+    global _session_cookie_cache, _real_admin_login_count
     if not force_fresh and admin in _session_cookie_cache:
         return _session_cookie_cache[admin]
+
+    # YTF §5.12: this line is the ONE place a real admin login happens in this
+    # whole suite -- every call site above (cache hit) returns before here.
+    _real_admin_login_count += 1
 
     import hashlib
     import time
@@ -922,10 +1177,18 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
                 time.sleep(32 - secs_into)
         code = totp_obj.now()
         _api_totp_last_used[admin] = time.time()
+        # 2026-08-12: this path kept its OWN freshness state (_api_totp_last_used) and
+        # never touched the SHARED ledger, so do_admin_stepup() — which waits on the
+        # shared ledger — saw no record of the code this login had just spent, ran in
+        # the same 30s window, and the server rejected the replay
+        # (401 invalid_totp_code). One TOTP secret must have ONE window record; publish
+        # this use to the shared ledger under the same identity key step-up uses.
+        mark_totp_used(f"admin{admin}")
         return code
 
     # Wait at least 62s since the last TOTP use for this admin to avoid replay.
     # Also wait until we're in the first 27s of a 30s window.
+    wait_for_fresh_totp(f"admin{admin}")   # shared ledger (2026-08-12), then local guard
     totp_code = _wait_for_fresh_code()
     verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
 
@@ -938,6 +1201,30 @@ def _api_get_session_cookies(*, admin: int = 1, force_fresh: bool = False) -> di
                 "totp_code": totp_code,
             },
         )
+        # YSG-RISK-209 (built 2026-08-08): the functional lane was being banned
+        # by the ADVERSARIAL lane. The product's auth throttle is keyed on
+        # account AND source IP (correct anti-enumeration design); QA SOP §4.17
+        # Rule 5 previously separated lanes by identity only, so the pentest
+        # suite's deliberate bogus-credential probes drove the shared-IP counter
+        # and every subsequent legitimate admin login failed. Measured cost: 110
+        # errors per leg, identical on all four runs (docker headless/headed,
+        # podman headless) — and that noise is what hid a genuine HIGH finding
+        # (YSG-RISK-201) for the whole campaign. "Expected errors" in a gate are
+        # not acceptable: they either get fixed or they mask the real signal.
+        #
+        # Fix at source: on a throttle response, clear the TEST-RUN throttle
+        # state and retry ONCE. This does not weaken the control — it clears
+        # counters our own adversarial lane created, in a test deployment. A
+        # 429 that survives the retry is still a hard failure.
+        if r.status_code == 429:
+            cleared = clear_auth_throttle()
+            print(f"auth throttle hit for admin{admin} — cleared {cleared} key(s), retrying once "
+                  f"(YSG-RISK-209 lane-bleed)", flush=True)
+            totp_code = _wait_for_fresh_code()
+            r = c.post(
+                f"{BASE_URL}/auth/login",
+                json={"username": username, "password": password, "totp_code": totp_code},
+            )
         assert r.status_code == 200, f"API login failed for admin{admin}: {r.status_code} {r.text[:200]}"
         data = r.json()
 
@@ -1130,14 +1417,78 @@ def assert_user_chat_reached(page) -> None:
     )
 
 
+def _admin_session_needs_refresh(admin: int = 1,
+                                  threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """Shared staleness predicate: True if admin{N}'s tracked session is
+    dirty (see invalidate_cached_session() / the _admin_session_dirty
+    module-level comment for why the plain elapsed-time check below is not
+    race-safe on its own) OR older than `threshold` seconds (default 600s,
+    safely under the server's 900s/15-min idle timeout --
+    src/yashigani/auth/session.py _IDLE_TIMEOUT_SECONDS).
+
+    Factored out of refresh_admin_context_if_stale() (YTF §5.12, 2026-08-13
+    call-site audit) so a caller with NO long-lived BrowserContext to mutate
+    in place -- e.g. test_pki_admin_ui.py's _login(), which creates a brand
+    new context/page per test and only needs fresh-enough cookie VALUES --
+    can ask the same question via get_admin_session_cookies() below instead
+    of importing force_fresh=True as a blanket default (that file's own
+    prior version called _api_get_session_cookies(force_fresh=True)
+    unconditionally on all 7 of its tests: 7 always-fresh logins, each
+    paying the 62s anti-replay wait, where at most one was ever actually
+    necessary)."""
+    import time as _t
+
+    return admin in _admin_session_dirty or (
+        _t.time() - _admin_session_established_at.get(admin, 0.0) > threshold
+    )
+
+
+def _user_session_needs_refresh(cache_key: str = "default",
+                                 threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
+    """User-tier equivalent of _admin_session_needs_refresh()."""
+    import time as _t
+
+    return cache_key in _user_session_dirty or (
+        _t.time() - _user_session_established_at.get(cache_key, 0.0) > threshold
+    )
+
+
+def get_admin_session_cookies(*, admin: int = 1,
+                               threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> dict:
+    """Return admin{N}'s session cookies: a real re-login (force_fresh=True)
+    ONLY if _admin_session_needs_refresh() says the tracked session is dirty
+    or past `threshold`, else the cached cookies as-is (a plain cache hit,
+    zero network/TOTP cost). This is the "do I need a NEW session at all"
+    half of refresh_admin_context_if_stale() (below), for callers that
+    don't hold a long-lived BrowserContext to refresh in place -- they just
+    need fresh-enough cookie VALUES to inject into a context/page they
+    create themselves each call."""
+    if not _admin_session_needs_refresh(admin, threshold):
+        return _api_get_session_cookies(admin=admin, force_fresh=False)
+    cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
+    _admin_session_dirty.discard(admin)
+    return cookies
+
+
+def get_user_session_cookies(*, cache_key: str = "default",
+                              threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> dict:
+    """User-tier equivalent of get_admin_session_cookies()."""
+    if not _user_session_needs_refresh(cache_key, threshold):
+        return bootstrap_user_session(cache_key=cache_key, force_fresh=False)["cookies"]
+    creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
+    _user_session_dirty.discard(cache_key)
+    return creds["cookies"]
+
+
 def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
                                     threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
-    """If admin{N}'s tracked session is older than `threshold` seconds
-    (default 600s, safely under the server's 900s/15-min idle timeout --
-    src/yashigani/auth/session.py _IDLE_TIMEOUT_SECONDS), force a fresh
-    login and re-inject the new cookies into `ctx` (a long-lived Playwright
-    BrowserContext), overwriting the old ones in place. No-ops (returns
-    False) if the session is still fresh.
+    """If admin{N}'s tracked session is stale per _admin_session_needs_refresh()
+    (dirty, or older than `threshold` seconds -- default 600s, safely under
+    the server's 900s/15-min idle timeout, src/yashigani/auth/session.py
+    _IDLE_TIMEOUT_SECONDS), force a fresh login and re-inject the new
+    cookies into `ctx` (a long-lived Playwright BrowserContext), overwriting
+    the old ones in place. No-ops (returns False) if the session is still
+    fresh.
 
     This is the mid-file counterpart to admin_ctx/get_authed_context's
     force_fresh=True at CREATION time: a long-running file (e.g.
@@ -1150,15 +1501,11 @@ def refresh_admin_context_if_stale(ctx, *, admin: int = 1,
     FIND-B-A fix (2026-08-04): ALSO forces a refresh if `admin` is in
     _admin_session_dirty (set by invalidate_cached_session() after a
     deliberate logout elsewhere in the run), even if the plain elapsed-time
-    check below would otherwise say "still fresh". See the
-    _admin_session_dirty module-level comment for why the timestamp alone
-    is not race-safe against a concurrent unrelated real login for the same
-    admin number.
+    check would otherwise say "still fresh". See the _admin_session_dirty
+    module-level comment for why the timestamp alone is not race-safe
+    against a concurrent unrelated real login for the same admin number.
     """
-    import time as _t
-
-    is_dirty = admin in _admin_session_dirty
-    if not is_dirty and _t.time() - _admin_session_established_at.get(admin, 0.0) <= threshold:
+    if not _admin_session_needs_refresh(admin, threshold):
         return False
     cookies = _api_get_session_cookies(admin=admin, force_fresh=True)
     try:
@@ -1174,10 +1521,7 @@ def refresh_user_context_if_stale(ctx, *, cache_key: str = "default",
                                    threshold: float = _SESSION_REFRESH_THRESHOLD_SECONDS) -> bool:
     """User-tier equivalent of refresh_admin_context_if_stale(). Also
     dirty-flag aware (see invalidate_cached_user_session())."""
-    import time as _t
-
-    is_dirty = cache_key in _user_session_dirty
-    if not is_dirty and _t.time() - _user_session_established_at.get(cache_key, 0.0) <= threshold:
+    if not _user_session_needs_refresh(cache_key, threshold):
         return False
     creds = bootstrap_user_session(cache_key=cache_key, force_fresh=True)
     try:
@@ -1269,6 +1613,28 @@ def playwright_login_admin(page, *, admin: int = 1, force_fresh: bool = False) -
     """
     cookies = _api_get_session_cookies(admin=admin, force_fresh=force_fresh)
     page.context.add_cookies([{"name": k, "value": v, "url": BASE_URL} for k, v in cookies.items()])
+
+    # SameSite=Strict priming navigation (2026-08-08).
+    #
+    # The admin session cookie is set SameSite=Strict
+    # (backoffice/routes/auth.py::_set_session_cookie). Chromium does NOT send
+    # Strict cookies on a navigation with no same-site initiator — and a
+    # page.goto() straight from about:blank is exactly that. So the very first
+    # goto after add_cookies arrived WITHOUT the session, the server redirected
+    # to /admin/login?next=/admin/, and assert_admin_dashboard_reached failed.
+    #
+    # This produced 110 fixture ERRORS per leg — 81 of them from admin_ctx
+    # alone (27 modules x 3 tests) — identically on docker and podman, headed
+    # and headless, on every run of the 4.1.2 campaign. It was repeatedly
+    # mis-attributed to the auth throttle; a throttle fix was written and fired
+    # ZERO times while the 110 stayed put. It is a browser cookie-policy rule,
+    # not a product fault and not a throttle: fixtures that happened to
+    # navigate to the origin first (e.g. browser_page_with_va -> /admin/login)
+    # never showed it.
+    #
+    # One cheap same-origin navigation establishes the site context; the next
+    # navigation is then same-site and carries the Strict cookie.
+    page.goto(f"{BASE_URL}/admin/login", wait_until="domcontentloaded")
     page.goto(f"{BASE_URL}/admin/")
     page.wait_for_timeout(1000)
 
@@ -1310,6 +1676,193 @@ def _admin_headers(admin: int = 1) -> dict:
     return {"X-Yashigani-Plane": "admin"}
 
 
+_seeded_users_cache: "list | None" = None
+_seeded_key_assignment: dict = {}
+
+
+def _load_seeded_users() -> list:
+    """Parse populate-demo's demo-user-creds file (path in env
+    YASHIGANI_SEEDED_CREDS) into a list of pre-seeded @agnosticsec.com
+    user-tier identities. Empty when the env is unset/missing -> callers
+    fall back to self-provisioning. Cached for the process."""
+    global _seeded_users_cache
+    if _seeded_users_cache is not None:
+        return _seeded_users_cache
+    users: list = []
+    path = os.environ.get("YASHIGANI_SEEDED_CREDS")
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8", errors="ignore"):
+            m = _ytf_re.match(
+                r"(\S+@agnosticsec\.com)\s+username=(\S+)\s+pw=(\S+)\s+totp=(\S+)", line
+            )
+            if m:
+                email, uname, pw, totp = m.groups()
+                users.append(
+                    {"email": email, "username": uname, "password": pw, "totp_secret": totp}
+                )
+    _seeded_users_cache = users
+    return users
+
+
+def _maybe_seeded_user_session(cache_key: str) -> "dict | None":
+    """PROTOCOL (coherent-methodology): reuse a pre-seeded differential
+    identity instead of self-provisioning a throwaway 'ava-conf-*' user.
+
+    Self-provisioning POST /admin/users 402s under a capped (Community, 5-seat)
+    licence whose seats are already filled by the differential seed -- which
+    silently starved the ENTIRE live user-plane security sweep (BOLA / path-
+    traversal / injection / admin-reject / ring-fence) on both runtimes. The
+    seeded @agnosticsec.com users ARE real user-tier identities (already through
+    first-login + rotation by populate-demo), so reusing them -- one real login
+    per identity, real OTP -- lets those tests actually execute under Community.
+    Distinct cache_keys deterministically get DISTINCT seeded users (BOLA needs
+    two). Returns None (-> fall back to provisioning) when no seeded creds file
+    is configured, preserving the historical behaviour for uncapped tiers.
+    """
+    import httpx
+    import pyotp
+
+    users = _load_seeded_users()
+    if not users:
+        return None
+    if cache_key not in _seeded_key_assignment:
+        _seeded_key_assignment[cache_key] = len(_seeded_key_assignment) % len(users)
+    u = users[_seeded_key_assignment[cache_key]]
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    totp = pyotp.TOTP(u["totp_secret"], digits=6, digest=_hashlib.sha256)
+    wait_for_fresh_totp(f"user:{u['username']}")
+    with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
+        r = c.post(
+            f"{BASE_URL}/auth/login",
+            json={"username": u["username"], "password": u["password"], "totp_code": totp.now()},
+        )
+        mark_totp_used(f"user:{u['username']}")
+    assert r.status_code == 200, (
+        f"seeded user reuse: login for {u['username']!r} failed: "
+        f"{r.status_code} {r.text[:200]} (YASHIGANI_SEEDED_CREDS stale?)"
+    )
+    return {
+        "username": u["username"],
+        "email": u["email"],
+        "password": u["password"],
+        "totp_secret": u["totp_secret"],
+        "cookies": dict(r.cookies),
+    }
+
+# --- end-user quota hygiene (module level so TESTS can use it, not just
+# bootstrap_user_session) -------------------------------------------------
+# 2026-08-11, FIND-0805-015a: this logic already existed as a CLOSURE inside
+# bootstrap_user_session, where no test could reach it, so the create-user
+# tests could not free a slot and failed with 402 end_user_limit_exceeded once
+# populate-demo.py had seeded its 5 users against the 5-user Community cap
+# (licensing/enforcer.py:95). Promoted rather than duplicated -- the nested
+# version now delegates here, so there is exactly one implementation.
+# Only ever touches this suite's own throwaway markers, never a real account.
+_THROWAWAY_EMAIL_PREFIXES = ("ava-conf-", "ava-quota-", "ava-dup-")
+
+
+def _seeded_user_credentials() -> "list[dict]":
+    """Read the identities populate-demo.py (the users installer) seeded.
+
+    File: $YASHIGANI_DEMO_OUT_DIR/demo-user-creds-*.txt, one user per line:
+      <email>  username=<u>  pw=<p>  totp=<base32>  group=<g>
+
+    Returns [] when the users installer has not run, so callers fall back to
+    creating an account. Added 2026-08-12 (FIND-0805-016): run-users-installer.sh
+    states the suite should "consume real seeded identities instead of each test
+    inventing its own", and QA SOP 4.17 Rule 6 forbids bypassing the user
+    pathway -- a seeded user logging in IS that pathway, whereas minting an
+    account over the admin API is not.
+    """
+    import glob as _glob
+    out_dir = os.getenv("YASHIGANI_DEMO_OUT_DIR") or os.path.join(
+        os.getenv("YTF_RUN_DIR", ""), "demo-out")
+    files = sorted(_glob.glob(os.path.join(out_dir, "demo-user-creds-*.txt")),
+                   key=os.path.getmtime, reverse=True)
+    for path in files:
+        users = []
+        try:
+            for line in open(path):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = dict(
+                    part.split("=", 1) for part in line.split() if "=" in part
+                )
+                if fields.get("username") and fields.get("pw") and fields.get("totp"):
+                    users.append({
+                        "email": line.split()[0],
+                        "username": fields["username"],
+                        "password": fields["pw"],
+                        "totp_secret": fields["totp"],
+                    })
+        except OSError:
+            continue
+        if users:
+            return users
+    return []
+
+
+def _login_seeded_user(candidates: "list[dict]") -> "dict | None":
+    """Log a seeded user in and return the bootstrap_user_session shape.
+
+    User tier is HMAC-SHA-256 / 6-digit (admin tier is SHA-512/8 -- do not
+    confuse them). Tries each candidate so one wedged account cannot strand a
+    whole leg. Returns None if none authenticate, leaving the caller's original
+    402 assertion to fire with its real message rather than masking it.
+    """
+    for user in candidates:
+        try:
+            # user_login_cookies() is the single shared user-tier login primitive
+            # (SHA-256/6-digit + the per-identity anti-replay guard). Do not inline
+            # the POST here -- inlining it is the exact duplication the
+            # tierb-on-unified consolidation removed.
+            cookies = user_login_cookies(
+                user["username"], user["password"], user["totp_secret"])
+        except Exception:
+            continue  # try the next seeded identity; one wedged account must not strand a leg
+        return {
+            "username": user["username"],
+            "email": user["email"],
+            "password": user["password"],
+            "totp_secret": user["totp_secret"],
+            "cookies": cookies,
+        }
+    return None
+
+
+def delete_end_user(client, username: str) -> bool:
+    """DELETE /admin/users/{username} (StepUpAdminSession-gated -- the caller's
+    cookies must already carry a fresh step-up). True if it was deleted."""
+    if not username:
+        return False
+    return client.delete(f"{BASE_URL}/admin/users/{username}").status_code == 200
+
+
+def free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
+    """Delete up to `min_free` of this suite's throwaway end users to free
+    licence capacity. Returns how many were actually deleted."""
+    import httpx  # module-scope import does not exist in this file — import locally
+    verify: "bool | str" = _CA_CERT_PATH if _CA_CERT_PATH else False
+    with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
+        r = c.get(f"{BASE_URL}/admin/users")
+        if r.status_code != 200:
+            return 0
+        throwaway = [
+            u for u in r.json().get("users", [])
+            if (u.get("email") or "").startswith(_THROWAWAY_EMAIL_PREFIXES)
+            and (u.get("email") or "").endswith("@example.com")
+        ]
+        throwaway.sort(key=lambda u: u.get("created_at") or "")
+        deleted = 0
+        for u in throwaway:
+            if deleted >= min_free:
+                break
+            if delete_end_user(c, u.get("username")):
+                deleted += 1
+        return deleted
+
+
 def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = False) -> dict:
     """
     Provision a throwaway user-tier account and complete the full 5-step
@@ -1326,13 +1879,39 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
 
     Cached per cache_key for the pytest session so multiple test modules can
     share one throwaway user without re-provisioning (and without exhausting
-    the 62s TOTP replay window on every test file). Use force_fresh=True for
-    tests that need an ISOLATED user (e.g. BOLA cross-user probes need TWO
-    distinct users — call with two different cache_key values).
+    the 62s TOTP replay window on every test file).
+
+    YTF §5.12 (2026-08-13 audit): isolation between two identities is a
+    property of using two different cache_key values (each unseen key is a
+    guaranteed cache-miss -> a genuinely NEW throwaway account is created),
+    NOT of force_fresh=True. force_fresh=True only matters for RE-USING a
+    cache_key that may already be stale/dirty (see
+    refresh_user_context_if_stale() below) -- passing it on the FIRST-ever
+    call for a brand-new cache_key (e.g. BOLA's "bola-user-a"/"bola-user-b")
+    is a no-op that costs a redundant real bootstrap if that key was ever
+    warmed by an earlier run in the same process for any reason. Callers
+    that need an isolated identity should pick a unique cache_key and leave
+    force_fresh at its default (False); force_fresh=True is for a caller
+    that already knows ITS OWN previously-cached session under this exact
+    key is no longer good enough (e.g. refresh_user_context_if_stale()).
     """
-    global _user_session_cache
+    global _user_session_cache, _real_user_bootstrap_count
     if not force_fresh and cache_key in _user_session_cache:
         return _user_session_cache[cache_key]
+
+    # YTF §5.12: this is the ONE place a real user-tier bootstrap (provision +
+    # forced password change + rotated re-login) happens in this suite --
+    # every call site above (cache hit) returns before here.
+    _real_user_bootstrap_count += 1
+
+    # PROTOCOL: under a capped licence, reuse a seeded differential identity
+    # rather than self-provisioning (which 402s once the seed fills the seats).
+    # No-op (returns None) when YASHIGANI_SEEDED_CREDS is unset -> provisioning.
+    _seeded = _maybe_seeded_user_session(cache_key)
+    if _seeded is not None:
+        _user_session_cache[cache_key] = _seeded
+        _user_session_established_at[cache_key] = _time.time()
+        return _seeded
 
     import httpx
     import pyotp
@@ -1371,46 +1950,47 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
             return stepup_resp, create_resp
 
     def _free_end_user_capacity(cookies: dict, *, min_free: int = 1) -> int:
-        """Delete the oldest throwaway 'ava-conf-*@example.com' end-user
-        accounts (this suite's own test-created marker -- every email this
-        file/class generates uses this prefix) to free up license capacity,
-        via the real DELETE /admin/users/{username} endpoint
-        (StepUpAdminSession-gated -- reuses the stepup elevation already
-        present on `cookies` from the immediately-preceding successful
-        /auth/stepup call, valid for YASHIGANI_STEPUP_TTL_SECONDS).
-
-        Test-environment hygiene, not a product workaround: repeated pytest
-        invocations against the SAME long-lived podman stack accumulate
-        throwaway end-user accounts (this function creates a new one on
-        every force_fresh call / every fresh process, never deletes them) --
-        confirmed live: 402 end_user_limit_exceeded (limit=5, current=5) on
-        a stack that had been up ~10h across many prior test invocations.
-        Only ever touches accounts whose email matches this suite's own
-        'ava-conf-...@example.com' marker -- never a real user account.
-        Returns the number of accounts actually deleted.
+        """Delegates to the module-level free_end_user_capacity() (promoted
+        2026-08-11, FIND-0805-015a, so tests can reach it too). Kept as a thin
+        alias because several call sites inside this function use the old name.
+        Behaviour is unchanged: delete this suite's throwaway
+        'ava-*@example.com' end users via the real DELETE
+        /admin/users/{username}, reusing the step-up already on `cookies`.
+        Confirmed live: 402 end_user_limit_exceeded (limit=5, current=5).
         """
-        with httpx.Client(verify=verify, cookies=cookies, follow_redirects=False, timeout=10) as c:
-            r = c.get(f"{BASE_URL}/admin/users")
-            if r.status_code != 200:
+        return free_end_user_capacity(cookies, min_free=min_free)
+
+    def _free_seat_capacity_with_fresh_admin(*, min_free: int = 1) -> int:
+        """Same hygiene as _free_end_user_capacity, but for the LOGIN-time
+        ACTIVE-SEAT gate (403 seat_limit_exceeded) -- confirmed live
+        2026-08-03 (Tier-B tierb-on-unified consolidation) to be a DIFFERENT
+        accounting bucket from the CREATE-time 402 end_user_limit_exceeded
+        gate _free_end_user_capacity already handles: 5 pre-existing
+        'ava-conf-*@example.com' throwaway accounts from many prior pytest
+        invocations against this same long-lived stack had already exhausted
+        the licence's 5-seat cap, so a BRAND NEW account (itself created
+        successfully -- account creation and seat activation are checked
+        against different limits) failed 403 on its post-rotation re-login
+        with {"error":"seat_limit_exceeded","current":5,"max":5}.
+
+        Forces a fresh admin1 login + fresh step-up before deleting: the
+        step-up taken at the very start of this bootstrap (in
+        _attempt_stepup_and_create above) has, by the time a seat-limit
+        retry is needed here, gone through the ~62s+ TOTP-freshness waits
+        this function's caller already performed and may have aged past
+        YASHIGANI_STEPUP_TTL_SECONDS -- DELETE /admin/users/{username} is
+        itself StepUpAdminSession-gated, so a stale step-up would silently
+        no-op this hygiene rather than actually freeing a seat.
+        """
+        fresh_admin_cookies = _api_get_session_cookies(admin=1, force_fresh=True)
+        _wait_for_fresh_totp_window(admin=1)
+        stepup_code = pyotp.TOTP(admin_totp_secret, digits=8, digest=_hashlib.sha512).now()
+        _api_totp_last_used[1] = _time.time()
+        with httpx.Client(verify=verify, cookies=fresh_admin_cookies, follow_redirects=False, timeout=10) as c:
+            stepup_resp = c.post(f"{BASE_URL}/auth/stepup", json={"totp_code": stepup_code})
+            if stepup_resp.status_code != 200:
                 return 0
-            users = r.json().get("users", [])
-            throwaway = [
-                u for u in users
-                if (u.get("email") or "").startswith("ava-conf-")
-                and (u.get("email") or "").endswith("@example.com")
-            ]
-            throwaway.sort(key=lambda u: u.get("created_at") or "")
-            deleted = 0
-            for u in throwaway:
-                if deleted >= min_free:
-                    break
-                target_username = u.get("username")
-                if not target_username:
-                    continue
-                dr = c.delete(f"{BASE_URL}/admin/users/{target_username}")
-                if dr.status_code == 200:
-                    deleted += 1
-            return deleted
+        return _free_end_user_capacity(fresh_admin_cookies, min_free=min_free)
 
     stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
 
@@ -1438,6 +2018,27 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
     if create_resp is not None and create_resp.status_code == 402:
         if _free_end_user_capacity(admin_cookies, min_free=1):
             stepup_resp, create_resp = _attempt_stepup_and_create(admin_cookies)
+
+    # 2026-08-12, FIND-0805-016: freeing capacity CANNOT work when the users
+    # installer has run. populate-demo.py seeds exactly 5 end users and the
+    # Community/no-licence tier caps end users at 5 (licensing/enforcer.py:95),
+    # so current==limit==5 with ZERO throwaway 'ava-conf-*' accounts to delete --
+    # every slot is a real seeded identity. That produced 43 setup ERRORs on the
+    # podman-4.9 leg and 2 failures on docker, all with the same 402.
+    #
+    # The correct fix is not to free a slot but to stop inventing an account at
+    # all: run-users-installer.sh's own header states it runs "before the test
+    # tiers, so the suite consumes real seeded identities instead of each test
+    # inventing its own". The suite never implemented that half. It does now --
+    # a seeded user is used when one is available, and creation stays as the
+    # fallback for stacks where the users installer has not run.
+    if create_resp is not None and create_resp.status_code == 402:
+        seeded = _seeded_user_credentials()
+        if seeded:
+            session = _login_seeded_user(seeded)
+            if session is not None:
+                _user_session_cache[cache_key] = session
+                return session
 
     assert stepup_resp.status_code == 200, (
         f"stepup failed (even after forcing a fresh admin1 session): "
@@ -1535,15 +2136,42 @@ def bootstrap_user_session(*, cache_key: str = "default", force_fresh: bool = Fa
         # regardless of outcome (a used code is used whether or not the
         # server accepted it).
         mark_totp_used(f"user:{username}")
-        assert relogin_resp.status_code == 200, (
-            f"user re-login after password rotation failed: "
-            f"{relogin_resp.status_code} {relogin_resp.text[:300]}"
-        )
-        relogin_data = relogin_resp.json()
-        assert not relogin_data.get("force_password_change"), (
-            "user still force_password_change=True after completing the change flow"
-        )
-        final_cookies = dict(relogin_resp.cookies)
+
+    # Test-environment hygiene (see _free_seat_capacity_with_fresh_admin
+    # docstring, tierb-on-unified consolidation): the licence's ACTIVE-SEAT
+    # cap is checked at THIS re-login/activation step -- a DIFFERENT
+    # accounting bucket from the end-user-record cap _free_end_user_capacity
+    # already handles at create time. A long-lived stack accumulates this
+    # suite's own throwaway accounts until 403 seat_limit_exceeded blocks
+    # even a freshly created account's first real activation. Free capacity
+    # by deleting the OLDEST throwaway 'ava-conf-*@example.com' accounts
+    # (oldest-first -- never this brand-new one), wait for a fresh TOTP
+    # window for THIS account (the failed attempt's code must not be
+    # replayed on retry), and retry the re-login exactly once.
+    if relogin_resp.status_code == 403:
+        try:
+            _is_seat_limit = relogin_resp.json().get("detail", {}).get("error") == "seat_limit_exceeded"
+        except Exception:
+            _is_seat_limit = False
+        if _is_seat_limit and _free_seat_capacity_with_fresh_admin(min_free=1):
+            wait_for_fresh_totp(f"user:{username}")
+            with httpx.Client(verify=verify, follow_redirects=False, timeout=10) as c:
+                relogin_resp = c.post(
+                    f"{BASE_URL}/auth/login",
+                    json={"username": username, "password": new_password, "totp_code": totp.now()},
+                )
+                mark_totp_used(f"user:{username}")
+
+    assert relogin_resp.status_code == 200, (
+        f"user re-login after password rotation failed (even after freeing "
+        f"seat capacity if seat-limited): "
+        f"{relogin_resp.status_code} {relogin_resp.text[:300]}"
+    )
+    relogin_data = relogin_resp.json()
+    assert not relogin_data.get("force_password_change"), (
+        "user still force_password_change=True after completing the change flow"
+    )
+    final_cookies = dict(relogin_resp.cookies)
 
     result = {
         "username": username,
@@ -1691,7 +2319,7 @@ def do_admin_stepup(cookies: dict, *, admin: int = 1) -> dict:
     import pyotp
 
     totp_secret = _read_secret("admin1_totp_secret" if admin == 1 else f"admin{admin}_totp_secret")
-    key = f"stepup:admin{admin}"
+    key = f"admin{admin}"  # identity-keyed: shared with get_admin_totp_code (2026-08-12)
     wait_for_fresh_totp(key)
     code = pyotp.TOTP(totp_secret, digits=8, digest=hashlib.sha512).now()
     mark_totp_used(key)
@@ -1745,7 +2373,17 @@ def admin_ctx(_shared_pw):
     browser = launch_chromium(_shared_pw)
     ctx = browser.new_context(ignore_https_errors=True)
     page = ctx.new_page()
-    playwright_login_admin(page, admin=1)
+    # force_fresh=True — 2026-08-10. playwright_login_admin's OWN docstring says:
+    # "Use for any fixture (e.g. admin_ctx) that is the FIRST thing to
+    # authenticate in a long file." admin_ctx did not, so it reused the
+    # process-cached session. Any earlier test that logs out
+    # (TestSessionLifecycle::test_logout_redirect_clears_admin_session)
+    # invalidates that shared cookie server-side, and EVERY admin_ctx setup
+    # afterwards then injects a dead cookie and lands on /admin/login.
+    # That is the 110 fixture errors per leg: they run contiguously from the
+    # logout test to the end of the file, on every runtime and both browser
+    # modes, because the cache is process-global and the logout is real.
+    playwright_login_admin(page, admin=1, force_fresh=True)
     yield ctx, page
     ctx.close()
     browser.close()
@@ -1807,6 +2445,13 @@ def pytest_configure(config):
         "markers",
         "security_probe: marks adversarial / purple-team security tests",
     )
+    config.addinivalue_line(
+        "markers",
+        "multi_identity: test serialises multiple fresh TOTP logins (admin1+"
+        "admin2+user, rotation/re-login, mixed provisioning) and needs the "
+        "extended per-test timeout budget below (FIND-0813-011) instead of "
+        "the default 300s ceiling.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1835,6 +2480,71 @@ def pytest_collection_modifyitems(config, items):
     # unbounded. method="thread" (not the Unix default "signal") so it
     # reliably interrupts alongside Playwright's own I/O/event-loop use on
     # both macOS and Linux — see pyproject.toml's pinned pytest-timeout dep.
+    # FIND-0813-011 (2026-08-16): the "~90s" TOTP allowance above was never
+    # measured against the REAL wait budget, and the ceiling had never actually
+    # been enforced — pytest-timeout was absent from uv.lock (FIND-0813-004), so
+    # this marker was inert. The moment it was provisioned it killed the headed
+    # Tier-B leg at 17%.
+    #
+    # The arithmetic: one fresh login can wait up to 62s for the anti-replay
+    # window (_wait_for_fresh_code / wait_for_fresh_totp: `62 - elapsed`, plus a
+    # window-edge nudge). A test that authenticates ~5 times therefore burns
+    # ~310s in SLEEPS ALONE and blows a 300s ceiling deterministically — it is
+    # not a hang, and killing it hides a real result.
+    #
+    # Multi-identity tests (admin1 + admin2 + user, rotation/re-login) are
+    # exactly that shape, so they get a budget that accounts for the waits they
+    # are REQUIRED to perform. Everything else keeps the tight 300s ceiling: the
+    # point of the guard is to bound a genuine hang, and a uniform generous
+    # ceiling would restore the 45-minute-orphan failure it exists to prevent.
+    #
+    # The real fix is to stop paying the wait at all — seeded distinct TOTP
+    # secrets per identity (SOP §4.17 Rule 7, _load_seeded_users below) so
+    # logins do not serialise on one identity's window. Until every suite uses
+    # them, this keeps the ceiling honest instead of arbitrary.
+    #
+    # 2026-08-16 (NB-3 of the pre-push code-quality review): the budget used
+    # to be dispatched by substring-matching `item.nodeid.lower()` against a
+    # hint tuple ("bootstrap", "mixed", "admin2", ...). nodeid INCLUDES the
+    # file path, so an unrelated directory rename could silently change every
+    # test's timeout underneath it with no code change — exactly the
+    # "spelling heuristic" anti-pattern this campaign has been fighting,
+    # applied to a budget instead of an assertion. Dispatch is now on the
+    # explicit, greppable `@pytest.mark.multi_identity` marker (registered in
+    # pytest_configure above) instead. The two currently-affected surfaces
+    # (test_user_provisioning_mixed.py's module-level pytestmark and
+    # TestAdminBootstrapBothAdmins's class-level pytestmark in
+    # test_webui_conformance_full.py) were converted to carry it explicitly
+    # -- same budget, same tests, stable trigger.
+    _TOTP_WAIT_WORST_CASE_S = 62          # measured: conftest.py `62 - elapsed`
     for item in items:
-        if not any(m.name == "timeout" for m in item.iter_markers()):
-            item.add_marker(pytest.mark.timeout(300, method="thread"))
+        if any(m.name == "timeout" for m in item.iter_markers()):
+            continue
+        if item.get_closest_marker("multi_identity") is not None:
+            # 300s of real work + the logins this shape must serialise on.
+            _budget = 300 + (_TOTP_WAIT_WORST_CASE_S * 5)
+        else:
+            _budget = 300
+        item.add_marker(pytest.mark.timeout(_budget, method="thread"))
+
+
+# ---------------------------------------------------------------------------
+# pytest_sessionfinish — YTF §5.12 proof-not-assertion: report real login counts
+# ---------------------------------------------------------------------------
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Print the real-login counters (see _real_admin_login_count /
+    _real_user_bootstrap_count module-level comment) at the end of every
+    run. YTF §5.12 / Ava A1 (retro v2.23.1 §6.C): "absence of an artefact is
+    SKIPPED, never PASS" — a claim that this consolidation reduced login
+    count is not evidence; a printed, greppable count from the run itself
+    is. `grep -c "YTF-LOGIN-COUNT"` against the run's pytest log gives one
+    line per process (one per browser mode in run_tier_b()); sum across
+    modes for the whole leg's total."""
+    print(
+        f"\nYTF-LOGIN-COUNT: real_admin_logins={_real_admin_login_count} "
+        f"real_user_bootstraps={_real_user_bootstrap_count} "
+        f"total={_real_admin_login_count + _real_user_bootstrap_count}",
+        flush=True,
+    )

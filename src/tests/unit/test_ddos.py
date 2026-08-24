@@ -299,7 +299,7 @@ class TestProxyIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Permissive-defaults tests (v2.4.1 wire-up — YSG-RISK-056)
+# Permissive-defaults tests (v2.4.1 wire-up — YSG-RISK-220)
 # ---------------------------------------------------------------------------
 
 class TestPermissiveDefaults:
@@ -377,7 +377,7 @@ class TestPermissiveDefaults:
 
 
 # ---------------------------------------------------------------------------
-# _ddos_default_per_ip_limit — license-scaled defaults (v2.24.1 / YSG-RISK-056)
+# _ddos_default_per_ip_limit — license-scaled defaults (v2.24.1 / YSG-RISK-220)
 # ---------------------------------------------------------------------------
 
 class TestDdosDefaultPerIpLimit:

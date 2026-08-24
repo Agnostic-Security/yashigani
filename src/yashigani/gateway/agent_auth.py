@@ -115,7 +115,7 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
             )
 
         # Registry must be available.
-        # YSG-RISK-131: self._registry is snapshotted BY VALUE at __init__
+        # YSG-RISK-139: self._registry is snapshotted BY VALUE at __init__
         # time (gateway-app build). If the cold-boot RBAC/Agent Redis init
         # raced a k8s DNS-not-ready window and failed, this stays None for
         # the process lifetime unless something else keeps trying — fall
@@ -163,20 +163,66 @@ class AgentAuthMiddleware(BaseHTTPMiddleware):
                 status=401,
             )
 
-        # IP allowlist check — only if the agent has CIDRs configured
+        # FIND-0813-013 / SEC-001 (Nico, 2026-08-13): verify_token() is a pure
+        # bcrypt.checkpw against agent:token:{agent_id} -- it never consulted
+        # `status`. Migration 0017 deliberately allows a superseded agent row
+        # (same name, different agent_id) to stay active alongside a fresh
+        # re-registration (MUST-FIX-2, Iris 2026-06-10 -- names may legitimately
+        # collide, agent_id is the only unique key), and the ONLY documented
+        # manual remediation for the superseded row is "deactivate the stale
+        # one" -- which, before AgentRegistry.deactivate() was fixed in this
+        # same change, didn't even delete the token key. Both links are now
+        # closed: deactivate() deletes agent:token:{agent_id}, and this check
+        # rejects a caller whose token still happens to verify (e.g. reconcile
+        # race, cache) but whose registration is not status="active". Fail
+        # CLOSED: an unresolvable caller (registry.get() -> None) is rejected
+        # exactly like a status != "active" caller, consistent with
+        # verify_token()'s own fail-closed posture ("Always returns False on
+        # any error").
+        #
+        # The default here is "" (reject), NOT "active". AgentRegistry.
+        # _decode_agent() does always populate a "status" key on every real
+        # registry.get() return -- defaulting to "" when the Redis hash field
+        # is genuinely absent, never omitting the key -- so today a missing
+        # key is unreachable through the real registry either way. But an
+        # authn decision must not depend on an invariant maintained in a
+        # DIFFERENT file: a routine "drop empty fields from the decoded dict"
+        # refactor of _decode_agent(), or any alternative object injected as
+        # `agent_registry`, would silently turn a fail-open default into an
+        # auth bypass. Defaulting to reject costs nothing (verified: no test
+        # or call site relies on the permissive default) and removes the
+        # coupling. Consistent with verify_token()'s own posture ("Always
+        # returns False on any error").
         agent = registry.get(caller_agent_id)
-        if agent is not None:
-            allowed_cidrs = agent.get("allowed_cidrs") or []
-            if allowed_cidrs:
-                source_ip = _get_client_ip(request)
-                if not _ip_in_cidrs(source_ip, allowed_cidrs):
-                    return await self._reject_ip(
-                        request,
-                        caller_agent_id=caller_agent_id,
-                        path=path,
-                        source_ip=source_ip,
-                        allowed_cidrs=allowed_cidrs,
-                    )
+        if agent is None:
+            return await self._reject(
+                request,
+                caller_agent_id=caller_agent_id,
+                path=path,
+                reason="caller_agent_not_found",
+                status=401,
+            )
+        if agent.get("status", "") != "active":
+            return await self._reject(
+                request,
+                caller_agent_id=caller_agent_id,
+                path=path,
+                reason="caller_agent_inactive",
+                status=401,
+            )
+
+        # IP allowlist check — only if the agent has CIDRs configured
+        allowed_cidrs = agent.get("allowed_cidrs") or []
+        if allowed_cidrs:
+            source_ip = _get_client_ip(request)
+            if not _ip_in_cidrs(source_ip, allowed_cidrs):
+                return await self._reject_ip(
+                    request,
+                    caller_agent_id=caller_agent_id,
+                    path=path,
+                    source_ip=source_ip,
+                    allowed_cidrs=allowed_cidrs,
+                )
 
         # Authentication successful — attach state and proceed
         request.state.agent_id = caller_agent_id

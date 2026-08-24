@@ -29,7 +29,7 @@ from yashigani.audit.schema import (
 )
 
 
-# YSG-RISK-113: orchestrator._inspect_result / _classify_sensitivity are now
+# YSG-RISK-257: orchestrator._inspect_result / _classify_sensitivity are now
 # async (offload the blocking classifier call via asyncio.to_thread) — every
 # fixture below substitutes an awaitable, not a plain sync callable.
 def _fake_inspect_result(verdict: str, confidence: float):
@@ -342,7 +342,7 @@ def test_args_hash_is_stable_and_redacting():
 async def test_inspection_failclosed_on_exception(monkeypatch):
     """A pipeline exception on untrusted upstream content → treated as BLOCKED.
 
-    YSG-RISK-113: _inspect_result is now async (offloads the blocking
+    YSG-RISK-257: _inspect_result is now async (offloads the blocking
     classifier call via asyncio.to_thread) — await it here.
     """
     class _Boom:

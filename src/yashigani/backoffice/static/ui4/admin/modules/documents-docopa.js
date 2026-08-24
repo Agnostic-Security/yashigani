@@ -195,6 +195,43 @@ export class YsAdminDocuments extends LitElement {
       </div>`;
   }
 
+  // YSG-RISK-213: `_sets` was fetched into state (:84) and never read by
+  // render() — filed as "dead code". It is NOT dead: it is an UNFINISHED PORT.
+  // The backend carries full CRUD (routes/documents.py: GET/POST /sets,
+  // POST /sets/{id}/members, DELETE /sets/{id}) and the legacy admin page
+  // (static/js/documents.js::_docLoadSets) renders the whole table. The ui4
+  // rebuild fetched the data and dropped the panel — same class as
+  // YSG-RISK-212 (Resource Permissions: backend routes, no ui4 surface).
+  //
+  // Ported faithfully from the legacy view: id / name / member_count /
+  // salt-presence / created date. The salt itself is a secret and is NEVER
+  // returned by the API (DocumentSetStore.public_view) — we show only THAT one
+  // exists, never the value, exactly as the legacy page did.
+  //
+  // Read-only for now: create + delete are step-up-gated
+  // (POST /sets = StepUpAdminSession) and are deliberately NOT wired here
+  // without that flow — an un-gated mutation button would be worse than a
+  // missing one. Tracked as remaining work rather than pretended complete.
+  _renderSets() {
+    return html`
+      <div class="ys-panel">
+        <div class="ys-panel-header">Document sets (${this._sets.length})</div>
+        <div class="ys-panel-body">
+          ${this._sets.length === 0
+            ? html`<div class="ys-txt-note">No sets — pseudonymisation uses a per-file salt (max isolation).</div>`
+            : this._sets.map((s) => html`
+                <div class="ys-svc-card">
+                  <span class="ys-badge ${s.has_salt ? 'ys-badge-blue' : ''}">${s.has_salt ? 'sealed' : 'none'}</span>
+                  <div class="ys-svc-meta">
+                    <div class="ys-svc-name">${s.name}</div>
+                    <div class="ys-txt-note"><code>${s.id}</code> · ${s.member_count} member(s)
+                      · ${s.created_at ? new Date(s.created_at * 1000).toISOString().slice(0, 10) : '—'}</div>
+                  </div>
+                </div>`)}
+        </div>
+      </div>`;
+  }
+
   _renderCreate() {
     const n = this._new;
     return html`
@@ -261,6 +298,7 @@ export class YsAdminDocuments extends LitElement {
           ${this._renderPolicies()}
           ${this._renderCreate()}
         </div>
+        ${this._renderSets()}
         ${this._renderInspect()}
       </div>`;
   }

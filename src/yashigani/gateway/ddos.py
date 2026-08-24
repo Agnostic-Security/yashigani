@@ -31,7 +31,7 @@ Default threshold rationale (v2.4.1 → v2.24.1):
   perimeter).  Caddy timeouts remain the first-line flood defence; this
   second-line per-IP throttle fires only on EXTREME volume.
   Override via YASHIGANI_DDOS_PER_IP_LIMIT (env) — env wins over computed
-  default.  Risk register: YSG-RISK-056.
+  default.  Risk register: YSG-RISK-220.
   Tiago 2026-05-24: "tie the threshold to the number of users so you don't
   block big deployments".
 
@@ -54,7 +54,7 @@ ENV_PER_IP_LIMIT = "YASHIGANI_DDOS_PER_IP_LIMIT"
 ENV_WINDOW_SECONDS = "YASHIGANI_DDOS_WINDOW_SECONDS"
 ENV_EXEMPT_PATHS = "YASHIGANI_DDOS_EXEMPT_PATHS"
 
-# Default thresholds — permissive by design (see module docstring / YSG-RISK-056).
+# Default thresholds — permissive by design (see module docstring / YSG-RISK-220).
 # _DEFAULT_MAX_CONNECTIONS_PER_IP is the floor used by _ddos_default_per_ip_limit()
 # and also the fallback when no license is loaded (community / canary / dev).
 # Override via YASHIGANI_DDOS_PER_IP_LIMIT and YASHIGANI_DDOS_WINDOW_SECONDS.
@@ -91,7 +91,7 @@ def _ddos_default_per_ip_limit(max_end_users: int) -> int:
 
     Authority: Tiago 2026-05-24 — "tie the threshold to the number of users
     so you don't block big deployments".
-    Risk register: YSG-RISK-056.
+    Risk register: YSG-RISK-220.
     """
     if max_end_users == -1:
         return 100_000  # enterprise / academic — operator-tuned
@@ -126,7 +126,7 @@ class DDoSProtector:
         INCR, EXPIRE, and GET commands.
     max_connections_per_ip:
         Maximum requests allowed from a single IP within ``window_seconds``.
-        Default: 5000 (permissive — see YSG-RISK-056 / module docstring).
+        Default: 5000 (permissive — see YSG-RISK-220 / module docstring).
         Override via ``YASHIGANI_DDOS_PER_IP_LIMIT`` env var.
     window_seconds:
         Fixed-window duration in seconds.  Default: 60.

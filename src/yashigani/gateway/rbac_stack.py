@@ -2,7 +2,7 @@
 Yashigani Gateway — RBAC / Agent-registry / Capability-Policy / Permission-store
 Redis stack builder.
 
-YSG-RISK-131: extracted from ``entrypoint._build_app()`` so the EXACT SAME
+YSG-RISK-139: extracted from ``entrypoint._build_app()`` so the EXACT SAME
 construction logic can be invoked from two places:
 
   1. Startup (``entrypoint._build_app()``), inside a bounded 1/2/4/8/16s

@@ -266,7 +266,7 @@ class TestExecuteMcpToolSslContext:
         mock_internal = MagicMock(return_value=mock_cm)
         mock_plain = MagicMock(return_value=mock_cm)
 
-        # YSG-RISK-113: _inspect_result / _classify_sensitivity are now async
+        # YSG-RISK-257: _inspect_result / _classify_sensitivity are now async
         # (offload the blocking classifier call via asyncio.to_thread) —
         # mocks must be AsyncMock so `await` on them works.
         with patch("yashigani.gateway.orchestrator._opa_ingress_for_mcp",
@@ -327,7 +327,7 @@ class TestOllamaAsyncClientSchemeSelection:
         mock_factory.assert_called_once(), (
             "ollama_async_client for https:// must call internal_httpx_client"
         )
-        # YSG-RISK-113: a bare float timeout is normalized into an explicit
+        # YSG-RISK-257: a bare float timeout is normalized into an explicit
         # httpx.Timeout with a fast-failing connect phase (fail-fast hardening
         # so a completely dead backend doesn't wait out the full read
         # timeout). The read/write/pool phases still carry the caller's

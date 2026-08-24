@@ -1,5 +1,5 @@
 """
-Per-tenant JWT signing key isolation — YSG-RISK-109.
+Per-tenant JWT signing key isolation — YSG-RISK-253.
 
 Provides HKDF-based derivation of per-tenant ES384 (ECDSA P-384) signing keys
 from a single install-wide root key.  Each tenant gets a cryptographically
@@ -24,14 +24,14 @@ Security properties:
   Deterministic     — same root + tenant_id always yields the same key,
                       enabling consistent kid across replicas (Nico kid-stability).
 
-Residuals (documented in YSG-RISK-109):
+Residuals (documented in YSG-RISK-253):
   Root key compromise — if the install-wide root key is leaked, all tenant keys
     can be re-derived (deterministic construction).  Mitigated by KMS-backed
     root key with HSM binding in production (Nico §2 requirement).
   YASHIGANI_INTERNAL_BEARER — remains install-wide; per-tenant scoping deferred
-    (would require Caddyfile + agent-bundle changes). Tracked as YSG-RISK-109 residual.
+    (would require Caddyfile + agent-bundle changes). Tracked as YSG-RISK-253 residual.
   caddy_internal_hmac — step-up JWTs and operator tokens remain install-wide.
-    Tracked as YSG-RISK-109 residual.
+    Tracked as YSG-RISK-253 residual.
 
 Usage (McpJwtIssuer — mcp/_jwt.py):
   After loading the root key via env / file / ephemeral, call:
@@ -194,7 +194,7 @@ class TenantJwtKeyStore:
         assert key_a != key_b            # cryptographically independent
         assert store.get_key("tenant-a") is key_a  # cached — same object
 
-    Residual (YSG-RISK-109): the root key is held in memory.  Compromise of
+    Residual (YSG-RISK-253): the root key is held in memory.  Compromise of
     the process memory leaks all derived keys.  In production the root key
     should be KMS-backed so the raw private scalar never appears in process
     memory beyond the derivation step.

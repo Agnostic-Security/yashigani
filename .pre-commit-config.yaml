@@ -1,0 +1,55 @@
+# Council remediation (2026-07-15, Tiago-approved) — mechanical Phase-0/1
+# win. This repo previously had ZERO CI/pre-commit wiring. All hooks below
+# are `local` (invoke the project's own pinned toolchain via PATH — ruff/
+# mypy come from `pip install -e ".[dev]"`, opengrep from the system
+# install) rather than remote hook repos, so there is no dependency on a
+# third-party hook repo's tag/version resolving at commit time, and the
+# exact same commands run identically in CI (.github/workflows/ci.yml).
+#
+# Install: pip install -e ".[dev]" && pip install pre-commit && pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        description: Lint (ASVS 16.6.1 log-injection guardrail + pyflakes/pycodestyle subset — see pyproject.toml [tool.ruff]).
+        entry: ruff check
+        language: system
+        types: [python]
+
+      - id: mypy
+        name: mypy
+        description: Type-check changed files against [tool.mypy] in pyproject.toml.
+        entry: mypy
+        language: system
+        types: [python]
+        pass_filenames: true
+
+      - id: opengrep
+        name: opengrep security rules
+        description: >
+          Runs opengrep-rules/ against changed files. ERROR-severity rules
+          block the commit (e.g. no-bare-http-client-on-internal-hop — the
+          F-001 mTLS-bypass class). WARNING-severity rules are informational
+          only (heuristics — human-review gate, never block).
+        entry: scripts/run-opengrep.sh
+        language: system
+        types: [python]
+
+      - id: version-consistency
+        name: version consistency (pyproject.toml == __init__.py)
+        description: Fails if [project].version != yashigani.__version__.
+        entry: scripts/check-version-consistency.sh
+        language: system
+        pass_filenames: false
+        files: '^(pyproject\.toml|src/yashigani/__init__\.py)$'
+
+      - id: pytest-staged-tests
+        name: pytest (staged test files only)
+        description: >
+          Fast per-commit feedback: runs only the test file(s) being
+          committed, not the full suite.
+        entry: scripts/run-staged-pytest.sh
+        language: system
+        pass_filenames: true
+        files: '^src/tests/.*/test_.*\.py$'

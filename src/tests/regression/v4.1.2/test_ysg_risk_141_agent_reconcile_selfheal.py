@@ -1,7 +1,7 @@
 """
 Regression tests — YSG-RISK-141 (self-heal reconnect never re-triggers the
 Postgres->Redis agent reconcile; dispatched as a v4.1.2 chat-blocker
-follow-up to YSG-RISK-131).
+follow-up to YSG-RISK-139).
 
 ## The finding
 
@@ -13,7 +13,7 @@ wired into exactly ONE call-site per process: the gateway/backoffice
 `lifespan` startup hook (`gateway/proxy.py`, `backoffice/app.py`), which runs
 ONCE, before uvicorn starts accepting connections.
 
-YSG-RISK-131/122 added a SEPARATE lazy, cooldown-gated, request-time
+YSG-RISK-139/122 added a SEPARATE lazy, cooldown-gated, request-time
 reconnect path (`gateway/redis_selfheal.py::ensure_rbac_agent_stack` /
 `backoffice/redis_selfheal.py::ensure_rbac_stack`) for the case where Redis
 becomes reachable again mid-life. That path rebuilds a brand-new

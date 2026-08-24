@@ -2,7 +2,7 @@
   "_comment": "Grafana Unified Alerting rule template — per-user rate limit burst admin alert.",
   "_version": "1.0",
   "_last_updated": "2026-05-24T00:00:00+00:00",
-  "_ysg_risk": "YSG-RISK-058",
+  "_ysg_risk": "YSG-RISK-222",
   "apiVersion": 1,
   "groups": [
     {
@@ -13,7 +13,7 @@
       "rules": [
         {
           "uid": "ysg-user-rl-burst-001",
-          "title": "Per-User Rate Limit Burst (YSG-RISK-058)",
+          "title": "Per-User Rate Limit Burst (YSG-RISK-222)",
           "condition": "C",
           "data": [
             {
@@ -82,16 +82,16 @@
           "for": "2m",
           "annotations": {
             "summary": "User {{ $labels.user_id_hash }} is breaching the per-user rate limit",
-            "description": "Prometheus metric yashigani_user_rate_limit_violations_total shows {{ $value }} breaches in the last 5 minutes for user_id_hash={{ $labels.user_id_hash }}. Configured limit: 100 RPS / 200 burst (YSG-RISK-058). Check audit log for USER_RATE_LIMIT_EXCEEDED events to see the full user identifier (admin-only audit chain). Possible causes: runaway agent loop, misconfigured client, abuse.",
+            "description": "Prometheus metric yashigani_user_rate_limit_violations_total shows {{ $value }} breaches in the last 5 minutes for user_id_hash={{ $labels.user_id_hash }}. Configured limit: 100 RPS / 200 burst (YSG-RISK-222). Check audit log for USER_RATE_LIMIT_EXCEEDED events to see the full user identifier (admin-only audit chain). Possible causes: runaway agent loop, misconfigured client, abuse.",
             "runbook_url": "https://docs.yashigani.io/ops/rate-limit-runbook",
-            "ysg_risk": "YSG-RISK-058",
+            "ysg_risk": "YSG-RISK-222",
             "asvs": "V11.1, OWASP API4:2023"
           },
           "labels": {
             "severity": "warning",
             "team": "ops",
             "component": "gateway",
-            "ysg_risk": "YSG-RISK-058"
+            "ysg_risk": "YSG-RISK-222"
           },
           "isPaused": false
         }

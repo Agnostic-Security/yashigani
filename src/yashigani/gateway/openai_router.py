@@ -26,9 +26,11 @@ v1.0: Buffered responses only (Decision 13). Full response collected
 before delivery to enable response inspection and token counting.
 
 v2.2: Streaming support added. When ``body.stream == True`` and
-``YASHIGANI_STREAMING_ENABLED=true`` (default), requests are forwarded
-to Ollama with ``stream=true`` and responses are yielded as SSE chunks
-via FastAPI ``StreamingResponse``.
+``YASHIGANI_STREAMING_ENABLED=true`` (default), requests were forwarded
+to Ollama with ``stream=true`` and responses were yielded as SSE chunks
+via FastAPI ``StreamingResponse``. SEC-FIX-YSG-STREAM-INSPECTION-BYPASS
+(2026-08-06) removed the ability for this incremental-token branch to be
+selected for governed (non-agent) chat completions — see below.
 
 v2.2: PII detection wired into both the request path (before forwarding)
 and the response path (before delivery). PII filtering is ON by default
@@ -45,12 +47,26 @@ Streaming limitations
 - Agent routing (``@agent`` model prefix) always uses the buffered path
   regardless of the ``stream`` flag, because agent upstreams may not
   support SSE.
-- PII mode=log: streaming responses are allowed (request-path PII only).
-  PII mode=block|redact: streaming is force-disabled to enable full
-  response-path inspection. This adds ~2-3s latency but ensures PII
-  cannot leak through streamed responses.
+- SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL): a
+  ``stream:true`` request for a non-agent chat completion is now ALWAYS
+  answered as buffer-then-emit SSE, unconditionally — the response is
+  generated, put through the identical four response-side inspection
+  layers the buffered (``stream:false``) path uses (7b response inspection
+  pipeline, 7b-ii always-on I5 injection/PCI-exfil regex scan, 7c PII
+  detector, 8c OPA response-decision ceiling check), and only then wrapped
+  as a single-chunk ``text/event-stream`` (see ``_sse_from_completion``) —
+  or denied with the same 403 envelope as ``stream:false`` if inspection
+  blocks it. This decision no longer depends on whether OPA / PII-mode
+  happen to be configured (previously, `_state.opa_url` truthiness was the
+  only thing forcing buffered mode in practice, which meant an explicit
+  YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log could
+  reach the raw incremental-streaming branch (`StreamingInspector` in
+  `gateway/streaming.py`), which enforces only a coarse sensitivity-rank
+  ceiling and skips the other three controls entirely). The raw
+  incremental-streaming code path is retained (for future incremental-
+  inspection work) but is no longer reachable from this endpoint.
 """
-# Last updated: 2026-06-09T00:00:00+00:00
+# Last updated: 2026-08-06T00:00:00+00:00
 from __future__ import annotations
 
 import asyncio
@@ -93,8 +109,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _client_enforce_input(identity, request_path, route_reason="", provider="", model=""):
-    """Build the clients-contract input doc shared by ingress + egress (#16)."""
+def _client_enforce_input(
+    identity, request_path, route_reason="", provider="", model="",
+    sensitivity="", data_tags=None,
+):
+    """Build the clients-contract input doc shared by ingress + egress (#16).
+
+    FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): ``sensitivity`` and
+    ``data_tags`` were previously ALWAYS omitted from this contract — every
+    seeded client policy keyed on ``input.routing_decision.sensitivity`` or
+    ``input.data_tags`` (POL-009 pci_data_block, POL-010
+    classified_marking_local) evaluated against undefined input fields, so
+    their ``deny`` rule bodies could structurally never produce a result and
+    ``count(deny) == 0`` (allow) regardless of actual content. Both fields
+    are now populated by the caller from the SAME regex-authoritative
+    sensitivity/PII detection the ingress/egress gates already compute —
+    never solely from the sklearn/ollama ensemble members (see
+    sensitivity_classifier.classify()'s regex floor and
+    FIND-INSPECTION-NONDETERMINISTIC).
+    """
     ident = identity or {}
     return {
         "identity": {
@@ -104,8 +137,43 @@ def _client_enforce_input(identity, request_path, route_reason="", provider="", 
             "groups": ident.get("groups", []),
         },
         "request": {"path": request_path, "method": "POST"},
-        "routing_decision": {"route": route_reason, "provider": provider, "model": model},
+        "routing_decision": {
+            "route": route_reason, "provider": provider, "model": model,
+            "sensitivity": sensitivity,
+        },
+        "data_tags": list(data_tags or []),
     }
+
+
+# FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): trigger-string -> data_tags
+# vocabulary mapping. Deliberately restricted to Layer-1 REGEX triggers
+# (the "regex:" prefix _scan_regex adds) — never sklearn:/ollama: triggers —
+# so a client-policy data_tag ("pci") can only ever be asserted by the
+# deterministic layer, matching the regex-authoritative invariant enforced
+# in sensitivity_classifier.classify().
+#
+# Deliberately narrow: this does NOT emit a generic "pii"/"sensitive"/
+# "classified" tag for every RESTRICTED/SENSITIVE regex hit (SSN, phone,
+# IBAN, admin-defined classification markers) — only "pci", which is what
+# POL-009 (pci_data_block) is precisely scoped to. Emitting a broader tag
+# here would make wildcard-bound (all-humans) client policies newly fire on
+# ordinary RESTRICTED content that a caller's sensitivity_ceiling already
+# legitimately governs. (POL-010 classified_marking_local's OWN
+# `data_tags[_] == "classified"` branch remains unpopulated/no-op — same as
+# before this fix; its admin-defined marking patterns have no data_tags
+# vocabulary today, a separate, pre-existing gap out of scope here. Its
+# bare `sensitivity == "RESTRICTED"` branch was narrowed away in
+# scripts/populate-demo.py for the same reason POL-009's was: it is no
+# longer PCI/classified-specific post-R14/R15 and would have started firing
+# broadly the moment `routing_decision.sensitivity` stopped being always-"".)
+def _derive_pci_data_tags(sensitivity_triggers) -> list[str]:
+    tags: list[str] = []
+    for trig in sensitivity_triggers or []:
+        low = str(trig).lower()
+        if low.startswith("regex:") and "credit/debit card" in low:
+            tags.append("pci")
+            break
+    return tags
 
 
 def _audit_client_policy(direction, identity_id, scope_kind, scope_id, ce_result):
@@ -1247,7 +1315,8 @@ def _service_account_full_list_enabled() -> bool:
         return _SA_FULL_LIST_CACHE["value"]
     value = False
     try:
-        import psycopg2, json as _json
+        import psycopg2
+        import json as _json
         from yashigani.runtime_settings.keys import KEY_MODELS_SERVICE_ACCOUNT_FULL_LIST as _K
         dsn = os.getenv("YASHIGANI_DB_DSN", "")
         if dsn and "${POSTGRES_PASSWORD}" not in dsn:
@@ -2598,7 +2667,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     brain_reasoning_relaxed = False
 
     # ── 2. Extract prompt text for classification ─────────────────────
-    prompt_text = "\n".join(m.content for m in body.messages if m.content)
+    prompt_text = "\n".join(m.content for m in body.messages if m.content)  # type: ignore[misc]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
 
     # ── 2-audio. Transcribe audio → fold into prompt_text (5.0 A6-audio) ──
     # Voice input is transcribed so the SAME text controls (injection, PII,
@@ -2696,6 +2765,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # therefore the OPA ceiling) exactly as the plaintext would.  classify_decoded
     # is a superset of classify for non-encoded text (raw view alone decides).
     sensitivity_level = "PUBLIC"
+    # NOT dead: consumed far below by _derive_pci_data_tags(sensitivity_triggers)
+    # on the PCI data-tags path. Removed by 6b482dd2 as an unused-assignment lint
+    # cleanup, which left that use undefined -> NameError. Restored 2026-08-16.
     sensitivity_triggers = []
     s_result = None
     if _state.sensitivity_classifier:
@@ -2723,7 +2795,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         c_result = ComplexityResult(level=ComplexityLevel.MEDIUM, token_count=token_estimate, heuristic_score=0.0, reasons=[])
 
     # ── 5. Budget check ───────────────────────────────────────────────
-    budget_signal = "normal"
     budget_pct = 0
     budget_used = 0
     budget_total = 0
@@ -2741,7 +2812,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             group_ids=identity.get("groups") or [],
             org_id=identity.get("org_id", "") or "",
         )
-        budget_signal = budget_state.signal.value
         budget_pct = budget_state.pct
         budget_used = budget_state.used
         budget_total = budget_state.total
@@ -3053,7 +3123,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _delegated_ctx_bound_spiffe = ""
     _delegated_ctx_scope: dict = {}
     if is_agent_call and not _state.agent_registry:
-        # YSG-RISK-129: is_agent_call=True but the agent_registry dependency
+        # YSG-RISK-137: is_agent_call=True but the agent_registry dependency
         # itself is unavailable (e.g. Redis-backed registry down/not yet
         # initialized). Without this guard, agent_upstream stays None, the
         # resolution block below is skipped entirely (its own `if not
@@ -3786,6 +3856,15 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         from yashigani.permissions import DEFAULT_ORG_ID as _PERM_ORG_ID
 
         _perm_org_id = _PERM_ORG_ID
+        # TODO(remediation): typed ResolvedGroups — group membership is read
+        # here as an untyped dict lookup (identity.get("groups", [])) with no
+        # schema/type guarantee on the list contents (group-id shape, dedup,
+        # provenance). Council remediation (2026-07-15) scoped this as a
+        # follow-up newtype refactor (typed ResolvedGroups wrapping validated
+        # group-id membership), not part of the mechanical Phase-0/1 CI-gate
+        # work landed in this PR. See opengrep-rules/authz/ for the adjacent
+        # WARN-severity deny-without-allow heuristic this same council review
+        # produced.
         _perm_groups: list = identity.get("groups", []) if identity else []
         # User-level grants for narrowing — only for human/user principals.
         # Service/agent/gateway identities use org+group tiers only.
@@ -4125,7 +4204,14 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _ce_in = await evaluate_client_policies(
         _state, _ce_scope_kind, identity_id, "ingress",
         _client_enforce_input(identity, "/v1/chat/completions", route_reason=route_reason,
-                              provider=selected_provider, model=selected_model),
+                              provider=selected_provider, model=selected_model,
+                              # FIND-PCI-EGRESS-CEILING-BYPASS: wire the request's own
+                              # regex-authoritative sensitivity/data_tags — POL-009
+                              # ("cardholder data must not be sent") and POL-010 both
+                              # key on these fields and previously always saw them
+                              # undefined (structurally could never fire).
+                              sensitivity=sensitivity_level,
+                              data_tags=_derive_pci_data_tags(sensitivity_triggers)),
     )
     if not _ce_in.get("allow", False):
         _ce_reason = (",".join(_ce_in.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -4252,7 +4338,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                                     )
                                 _msg.content = _msg_redacted
                         prompt_text = "\n".join(
-                            m.content for m in body.messages if m.content
+                            m.content for m in body.messages if m.content  # type: ignore[misc]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
                         )
 
     # ── 7. Forward to backend ─────────────────────────────────────────
@@ -4270,21 +4356,54 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         and not is_agent_call
     )
 
-    # OPA enforcement: stream=false when OPA policies are active.
-    # All response content must be inspected before delivery to the user
-    # (human or non-human). Streaming bypasses response-path OPA checks.
-    if use_streaming and _state.opa_url:
+    # SEC-FIX-YSG-STREAM-INSPECTION-BYPASS (2026-08-06, CRITICAL):
+    # Response-side inspection for /v1|/user chat completions is FOUR
+    # independent layers, all of which live ONLY in the buffered code path
+    # below (7b response_inspection_pipeline / 7b-ii always-on I5 injection+
+    # PCI-exfil regex scan / 7c PII detector / 8c OPA response_decision
+    # ceiling+verdict check). The raw incremental-streaming branch (7a,
+    # StreamingInspector) enforces ONLY a coarse sensitivity-rank ceiling —
+    # it never runs the I5 scan, the ML ResponseInspectionPipeline, the PII
+    # detector, or the OPA response check.
+    #
+    # The previous guard only forced buffering when `_state.opa_url`
+    # happened to be truthy (or PII mode was BLOCK/REDACT) — i.e. response
+    # inspection was DE FACTO mandatory in every production deployment
+    # (OPA is required to start in production, and is the default even in
+    # dev), but was NOT an INTRINSIC guarantee: the 7b-ii comment claims the
+    # I5 gate is "ALWAYS-ON... MANDATORY", yet in an explicit
+    # YASHIGANI_OPA_OPTIONAL=true dev/test deployment with PII mode=log (the
+    # default), a stream:true request took the raw-streaming branch and
+    # bypassed all four controls — a caller could receive raw PII/PCI or
+    # injection-flagged content verbatim over SSE that the IDENTICAL
+    # stream:false request would have blocked or redacted (LAURA/Iris
+    # verified — response-side controls MUST apply identically to API and
+    # web-UI callers regardless of the ``stream`` flag AND regardless of
+    # which optional policy layers happen to be configured).
+    #
+    # Fix: full response-side inspection is unconditionally mandatory for
+    # every non-agent chat completion — the decision no longer depends on
+    # `_state.opa_url` / PII-mode config state. This is NOT "disabling
+    # streaming": a stream:true request is still answered with a genuine
+    # ``text/event-stream`` response (see `_sse_from_completion` / the
+    # F-STREAM wrap below) — the client-visible streaming contract is
+    # unchanged. Only the raw token-by-token incremental delivery (which
+    # cannot be un-sent once flushed, so it cannot be reconciled with
+    # "inspect the full response before delivery") is removed. The upstream
+    # response is generated, fully inspected exactly as the buffered path
+    # already does, and only then emitted — a BLOCKED verdict returns the
+    # same 403 envelope as the non-streaming path, before any content bytes
+    # reach the client.
+    if use_streaming:
         use_streaming = False
-        logger.info("Streaming disabled: OPA policies active — response inspection required")
+        logger.debug(
+            "Streaming answered as buffer-then-emit SSE: full response-side "
+            "inspection (I5 injection/PCI-exfil scan, response inspection "
+            "pipeline, PII detector, OPA response ceiling) is mandatory and "
+            "config-independent for every governed chat completion."
+        )
 
-    # PII block/redact modes require full response inspection — force buffered
-    if use_streaming and _state.pii_detector is not None:
-        from yashigani.pii.detector import PiiMode
-        if _state.pii_detector.mode in (PiiMode.BLOCK, PiiMode.REDACT):
-            use_streaming = False
-            logger.info("Streaming disabled: PII mode=%s requires buffered response inspection", _state.pii_detector.mode.value)
-
-    # YSG-RISK-129: assistant_content/backend_body are only ever assigned
+    # YSG-RISK-137: assistant_content/backend_body are only ever assigned
     # inside individual success-path branches of the try block below (agent
     # letta/langflow/openai-compat, cloud openai/anthropic, local ollama).
     # Every branch either assigns them, returns a JSONResponse directly, or
@@ -4588,7 +4707,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     assistant_content = choices[0].get("message", {}).get("content", "") if choices else ""
                     backend_body = agent_resp
                     route_reason = f"agent:{selected_model[1:]}:langflow"
-                except Exception as exc:
+                except Exception:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Langflow agent %s failed", selected_model)
                     return JSONResponse(
@@ -4657,18 +4776,26 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 if _dc_token:
                     agent_headers["X-Yashigani-Session-Id"] = _dc_token
 
-                # YSG-RISK-139 (DIVERGENT-resolution per catch-up audit PR #108:
-                # "generalise 139 regex" — the 4.1.2 path-signature detection
-                # REPLACES 5.0's YSG-GATE-V50-A hostname-anchored regex, which
-                # only matched the compose hostname `caddy:` and broke on k8s
-                # where the front is yashigani-caddy-mesh:<port>): registered
-                # upstreams under the v4.1 unified-sidecar dispatch repoint
-                # (§2.5) are the agent's Caddy INGRESS front. That front
-                # terminates mTLS require_and_verify with a leaf signed by the
-                # INTERNAL CA — a bare httpx.AsyncClient only trusts the
-                # public/certifi bundle and fails CERTIFICATE_VERIFY_FAILED.
-                # Detect a mesh ingress front by the portable
-                # /agents/<tenant>/<system> path signature (hostname differs
+                # YSG-RISK-264 (re-issued from YSG-RISK-139 by the register
+                # unification, f9bfafd6; DIVERGENT-resolution per catch-up audit
+                # PR #108 "generalise the 139 regex" — this 4.1.2 path-signature
+                # detection REPLACES 5.0's YSG-GATE-V50-A hostname-anchored
+                # regex, which only matched the compose hostname `caddy:` and
+                # broke on k8s where the front is yashigani-caddy-mesh:<port>.
+                # Ruling re-affirmed at the 2026-08-24 5.0 reintegration):
+                # registered upstreams under the v4.1 unified-sidecar dispatch
+                # repoint (§2.5) are the agent's Caddy INGRESS front —
+                # https://caddy:<mesh_port>/agents/<tenant>/<system> on compose,
+                # https://yashigani-caddy-mesh:<mesh_port>/agents/<tenant>/<system>
+                # on k8s (install.sh register_agent_bundles / k8s_register_agent_bundles).
+                # That front terminates mTLS require_and_verify with a leaf signed by
+                # the INTERNAL CA — a bare httpx.AsyncClient only trusts the public/
+                # certifi CA bundle and fails the handshake with
+                # CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+                # (openclaw's only path in this generic branch; letta/langflow have
+                # their own dedicated clients above which already use
+                # agent_dispatch_client()). Detect a mesh ingress front by the
+                # portable /agents/<tenant>/<system> path signature (hostname differs
                 # between compose and k8s; the path does not) and present the
                 # internal-PKI mesh leaf via the SAME single-source client the
                 # letta/langflow branches use. Genuine externally-deployed
@@ -4689,7 +4816,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                             json=agent_body,
                             headers=agent_headers,
                         )
-                except Exception as exc:
+                except Exception:
                     # V232-CSCAN-01e: log full exception server-side; safe message to caller.
                     logger.exception("Agent %s unreachable", selected_model)
                     return JSONResponse(
@@ -4810,7 +4937,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     anthropic_messages = []
                     for m in body.messages:
                         if m.role == "system":
-                            system_text = m.content or ""
+                            system_text = m.content or ""  # type: ignore[assignment]  # pre-existing (Message.content: str|list[Any]; council remediation 2026-07-15 did not touch this logic — tracked separately, out of scope)
                         else:
                             anthropic_messages.append(
                                 {"role": m.role, "content": m.content or ""}
@@ -4917,7 +5044,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             detail="Backend communication error",
         )
 
-    # YSG-RISK-129: fail-closed backstop. The try block above either assigns
+    # YSG-RISK-137: fail-closed backstop. The try block above either assigns
     # assistant_content/backend_body on a success path, returns a JSONResponse
     # directly, or raises HTTPException (which exits the function immediately
     # via the except clauses above and never reaches this line). Reaching here
@@ -4947,7 +5074,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # v2.24.1 — GAP-3 / SEC-5: response-CONTENT sensitivity.
     # When pipeline is enabled and not skipped, this is set from the pipeline's
     # sensitivity classification of the response body.  When pipeline is off
-    # (default, YSG-RISK-057) it stays None so _opa_response_check falls back
+    # (default, YSG-RISK-221) it stays None so _opa_response_check falls back
     # to prompt sensitivity (explicitly documented fallback per the updated
     # v1_routing.rego MAX(prompt_sensitivity, response_sensitivity) rule).
     response_content_sensitivity: Optional[str] = None
@@ -4958,7 +5085,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             resp_session_id = identity.get("identity_id", request_id) if identity else request_id
             resp_agent_id = identity.get("slug", "openai-router") if identity else "openai-router"
 
-            # YSG-RISK-113: .inspect() is a SYNCHRONOUS blocking classifier
+            # YSG-RISK-257: .inspect() is a SYNCHRONOUS blocking classifier
             # call (Ollama et al.). Run off the event loop so a slow/dead
             # backend cannot starve /healthz and every other coroutine on
             # this worker (DoS class — see risk register).
@@ -5036,7 +5163,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ── 7b-ii. Always-on MCP/agent result injection pattern scan (I5 invariant) ──
     # INDEPENDENT of YASHIGANI_INSPECT_RESPONSES — MCP/agent results are UNTRUSTED.
-    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-057),
+    # The full ResponseInspectionPipeline is optional (performance toggle, YSG-RISK-221),
     # but injection pattern detection on untrusted agent results is MANDATORY.
     # Closes LAURA-30-002 / I5 invariant violation.
     if response_verdict == "clean" and assistant_content:
@@ -5271,7 +5398,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
         # Fail-closed (False default): an absent "allow" key means OPA returned an
         # undefined result (e.g. bundle partially loaded). Treat as DENY per
-        # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-071.
+        # v2.23.4 fail-closed posture — closes LAURA-V243-001 / YSG-RISK-225.
         if not resp_opa.get("allow", False):
             resp_opa_reason = resp_opa.get("reason", "response_policy_denied")
             # ── G-ORCH-OPA-3: evaluate-AND-LOG on the brain-REASONING leg ───
@@ -5329,10 +5456,30 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # ── 8b-bind. Client-policy enforcement — EGRESS (#16, OPA Phase 2) ──
     # Runs AFTER the core response-OPA gate; deny-only, fail-closed; no-op when
     # the caller has no bound egress policies.
+    #
+    # FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07): the "pci" data_tag is
+    # derived from an ALWAYS-ON, config-independent Luhn-valid PAN scan
+    # (yashigani.pii.contains_pci_pan) — NOT from the optional
+    # response_inspection_pipeline / pii_detector toggles (YSG-RISK-221).
+    # POL-009 (pci_data_block, bound wildcard to every human, both
+    # directions) must block a PAN in the response for EVERY human caller
+    # regardless of their sensitivity_ceiling — a RESTRICTED ceiling
+    # legitimately permits other RESTRICTED content (SSN/phone/IBAN); it
+    # must never permit cardholder data. ``sensitivity`` is passed through
+    # for observability/other client policies but POL-009 itself keys only
+    # on the precise "pci" tag (see scripts/populate-demo.py POL-009 —
+    # narrowed to drop the overbroad bare-"RESTRICTED" branch that used to
+    # collide with the R14/R15 SENSITIVE(5)->legacy-"RESTRICTED" mapping).
+    from yashigani.pii import contains_pci_pan  # noqa: PLC0415
     _ce_eg_kind = scope_kind_for(identity.get("kind") if identity else None)
+    _ce_eg_data_tags = ["pci"] if contains_pci_pan(assistant_content) else []
     _ce_eg = await evaluate_client_policies(
         _state, _ce_eg_kind, identity_id, "egress",
-        _client_enforce_input(identity, "/v1/chat/completions", model=selected_model),
+        _client_enforce_input(
+            identity, "/v1/chat/completions", model=selected_model,
+            sensitivity=response_content_sensitivity or sensitivity_level,
+            data_tags=_ce_eg_data_tags,
+        ),
     )
     if not _ce_eg.get("allow", False):
         _ce_eg_reason = (",".join(_ce_eg.get("deny", []) or ["client_policy_denied"])).encode("ascii", "replace").decode("ascii")
@@ -7197,7 +7344,7 @@ async def gate_relaxed_final(
         try:
             rid = identity.get("identity_id", request_id) if identity else request_id
             aid = identity.get("slug", "orchestrator") if identity else "orchestrator"
-            # YSG-RISK-113: offload the blocking classifier call — see the
+            # YSG-RISK-257: offload the blocking classifier call — see the
             # chat_completions call site above for the full rationale.
             resp_result = await asyncio.to_thread(
                 _state.response_inspection_pipeline.inspect,
@@ -7377,7 +7524,7 @@ async def _opa_response_check(
     v2.24.1 — GAP-3 / SEC-5:
         `response_sensitivity` is the response-CONTENT sensitivity (from the
         ResponseInspectionPipeline).  It may be None when the pipeline is
-        disabled (default per YSG-RISK-057).
+        disabled (default per YSG-RISK-221).
         `prompt_sensitivity` is the REQUEST (prompt) sensitivity from step 3.
         OPA receives both; v1_routing.rego evaluates MAX(prompt, response)
         — the stricter of the two.
@@ -7478,7 +7625,7 @@ async def _opa_response_check(
                 # {"result": {}} (undefined rule — bundle mismatch or partial load),
                 # the absent "allow" key must resolve to DENY, not ALLOW. The Rego
                 # rule always sets allow explicitly in normal operation so this has
-                # no impact when OPA is healthy. Closes LAURA-V243-001 / YSG-RISK-071.
+                # no impact when OPA is healthy. Closes LAURA-V243-001 / YSG-RISK-225.
                 "allow": bool(result.get("allow", False)),
                 "reason": result.get("reason", "ok"),
             }
