@@ -576,12 +576,22 @@ spec:
               value: {{ .Values.auditLog.retentionDays | quote }}
             {{- end }}
             # DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
-            # Backoffice reads OLLAMA_BASE_URL to reach the Ollama service
-            # (same backend as the gateway; K8s service name is yashigani-ollama).
-            # Without an explicit value the code default "http://ollama:11434" does
-            # not resolve in K8s — this env var wires the correct K8s DNS name.
-            - name: OLLAMA_BASE_URL
-              value: {{ .Values.backoffice.ollamaUrl | default "http://yashigani-ollama:11434" | quote }}
+            # LAURA-V50-001 (Laura, 2026-08-24) — REMOVED: a SECOND OLLAMA_BASE_URL
+            # key lived here, stale from v3.1.2 (827c66db), pointing at
+            # .Values.backoffice.ollamaUrl with a "http://yashigani-ollama:11434"
+            # default. Kubernetes applies duplicate env names in order and the LAST
+            # one wins, so this stale entry silently overrode the correct value set
+            # ~80 lines above and REOPENED YSG-RISK-136/128 on every Helm/K8s
+            # deploy: yashigani-ollama:11434 is NetworkPolicy-blocked for backoffice
+            # (allow-ollama-ingress admits only the caddy pod), and no
+            # `backoffice.ollamaUrl` key exists in values.yaml, so it ALWAYS fell to
+            # that broken default. Fail-closed, so an availability regression rather
+            # than a bypass — semantic_intent.py rejects on an unreachable backend,
+            # meaning every MCP import was silently refused by the DP-Y-003
+            # tool-poisoning classifier.
+            # The authoritative value stays the one set above from
+            # .Values.gateway.env.ollamaUrl (the caddy mesh front), per d44f4f20
+            # "restore Ollama mesh-mTLS routing for gateway+backoffice".
             # Default ON (DP-Y-003 coherence fix). Override via backoffice.semanticIntentSidecar.
             - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
               value: {{ .Values.backoffice.semanticIntentSidecar | default true | toString | quote }}
