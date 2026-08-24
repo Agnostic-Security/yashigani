@@ -123,6 +123,7 @@ tier_c:
                                 # OpenWebUI->gateway->langflow/letta->Ollama path,
                                 # test_budget_e2e.py real budget-redis degradation)
     - tests/integration_live/  # NEW: the other 6 categories (scaffold)
+    - tests/integration_live/test_kuroshio_model_import.py  # model_import_provenance (added 2026-08-24, 5.0 reintegration)
   categories:
     - data_flow_seam            # write-on-A, read/verify-on-B, real values
     - lifecycle                 # install -> upgrade N-1->N -> uninstall/partial-nuke/full-nuke -> reinstall; migrations fresh+populated
@@ -132,6 +133,11 @@ tier_c:
     - audit_observability_integrity # events emitted + immutable/Merkle + SIEM-forward; no swallowed failures
     - dataplane_byte_proof      # real transformed bytes (redact/pseudonymize/block), both channels
     - multitenant_licensing     # tenant isolation + activate/tier/restrain/offline licence lifecycle
+    - model_import_provenance   # KUROSHIO: Ollama + HuggingFace-GGUF model import; pinned-revision
+                                # + *.gguf + no-traversal supply-chain guards; import seam
+                                # (pull says OK -> is it REALLY resident AND servable);
+                                # unauthenticated-pull ring-fence. Linux/KUROSHIO legs only
+                                # (macOS serves inference via Ollama directly).
   pass_criteria: >
     pytest exit 0 across tests/integration_live/ for that leg. Every
     data-flow-seam case asserts the value on BOTH ends (write path AND
@@ -142,22 +148,32 @@ tier_c:
     - "CONTROLS dast: PASS"
 
 # ---------------------------------------------------------------------------
-# The full runtime matrix. One row per leg. Tier-A is listed for completeness
+# The full runtime matrix. One row per leg.
+#
+# `inference:` is the model-serving backend that leg runs, and the dimension the
+# tier_c `model_import_provenance` category exercises (added 2026-08-24, 5.0
+# reintegration). macOS serves inference via Ollama directly (Metal); Linux runs
+# the containerised KUROSHIO engine. A leg's model-import cell is only meaningful
+# on its own backend — a macOS leg does not import to KUROSHIO, and the category
+# SKIPS there rather than reporting a false green. Tier-A is listed for completeness
 # but is NEVER re-run per-leg (see tier_a.runtime_invariant above) — its
 # single head-level result is inherited by every row.
 # ---------------------------------------------------------------------------
 legs:
   - runtime: docker
     platform: macos
+    inference: ollama
     tiers: [tier_a, tier_b, tier_c]
     notes: "Primary dev/test rig."
   - runtime: docker
     platform: linux
+    inference: kuroshio
     tiers: [tier_a, tier_b, tier_c]
     notes: "x8x."
 
   - runtime: podman-4.9
     platform: macos
+    inference: ollama
     tiers: [tier_a]
     status: EX
     notes: >
@@ -167,30 +183,36 @@ legs:
       gap: compensating evidence = podman-6 macos GREEN.
   - runtime: podman-4.9
     platform: linux
+    inference: kuroshio
     tiers: [tier_a, tier_b, tier_c]
     notes: "x8x — genuinely distinct engine version, must run for real (no EX on Linux)."
 
   - runtime: podman-5
     platform: macos
+    inference: ollama
     tiers: [tier_a]
     status: EX
     notes: "Same compose-path as podman-6 macOS — EX, compensating evidence = podman-6 macos GREEN."
   - runtime: podman-5
     platform: linux
+    inference: kuroshio
     tiers: [tier_a, tier_b, tier_c]
     notes: "x8x."
 
   - runtime: podman-6
     platform: macos
+    inference: ollama
     tiers: [tier_a, tier_b, tier_c]
     notes: "The one podman-mac leg that actually runs (per Tiago's podman-mac=6-only decision)."
   - runtime: podman-6
     platform: linux
+    inference: kuroshio
     tiers: [tier_a, tier_b, tier_c]
     notes: "x8x."
 
   - runtime: k8s
     platform: linux
+    inference: kuroshio
     tiers: [tier_a, tier_b, tier_c]
     status: "x8x-only, Cilium-gated"
     notes: >

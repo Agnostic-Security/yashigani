@@ -105,6 +105,7 @@ degradation) — see `tests/MATRIX.yaml` `tier_c.paths`.
 | `audit_observability_integrity` | `tests/integration_live/test_audit_observability_integrity.py` | new scaffold (2 tests) |
 | `dataplane_byte_proof` | `tests/integration_live/test_dataplane_byte_proof.py` | new scaffold (2 tests) |
 | `multitenant_licensing` | `tests/integration_live/test_multitenant_licensing.py` | new scaffold (2 tests) |
+| `model_import_provenance` (KUROSHIO: Ollama + HF-GGUF import) | `tests/integration_live/test_kuroshio_model_import.py` | added 2026-08-24 (18 tests) |
 
 **Tier-C status honesty note:** the 6 "new scaffold" categories are REAL, running (not
 placeholder-text) pytest modules — every test issues a real HTTP call and will genuinely
@@ -114,6 +115,45 @@ DEPTH (more scenarios per category are expected as each leg is actually exercise
 authenticity. Author-only per the dispatch brief — **no live run performed this session.**
 
 Invocation: `scripts/run-test-framework.sh --tier c --target https://localhost:8443 --runtime k8s --version 4.1.2 --platform linux`
+
+### Tier-C `model_import_provenance` — KUROSHIO model import (added 2026-08-24)
+
+Covers what Tiago asked the framework to prove at the 5.0 reintegration: that an
+**Ollama model** and a **HuggingFace GGUF model** genuinely import into KUROSHIO.
+
+Positive cases are **effect-verified across the import seam** — a `POST /api/pull`
+returning 200 is not evidence. The evidence is the engine's own `/api/tags` read
+path listing the model afterwards, and `/api/generate` actually serving from it.
+A model that is listed but not servable is the exact write-on-A/read-on-B class
+this tier exists for.
+
+Negative cases carry the supply-chain half, and are the reason the category is
+worth more than a smoke test:
+- floating HF revisions (`main`, `latest`, a tag) are REFUSED — only a pinned
+  7-40 hex commit is accepted (council High finding: with a floating ref the
+  bytes you audited are not the bytes you load)
+- non-`*.gguf` filenames are REFUSED (no pickle/safetensors path into the jail)
+- `../` segments in `repo_id`/`filename` are REFUSED
+- an unconfigured adapter returns an explicit 501, never a silent 200
+- an UNAUTHENTICATED caller cannot reach `/api/pull` through the mesh front —
+  the engine has no auth of its own by design (`infer/src/kuroshio/app.py:259`),
+  so the Caddy mesh-identity front is the whole control. If that ever passes
+  anonymously, an attacker chooses the weights we load.
+
+Backend is a matrix dimension (`inference:` in `tests/MATRIX.yaml`): Linux legs
+run KUROSHIO, macOS legs serve inference via Ollama directly, and the category
+SKIPS on macOS rather than reporting a false green.
+
+Real pulls are OPT-IN so a routine leg does not drag weights over the network:
+```bash
+export KUROSHIO_BASE_URL=https://localhost:8443/kuroshio
+export YTF_KUROSHIO_IMPORT_MODEL=qwen2.5:3b            # Ollama-format import
+export YTF_KUROSHIO_HF_REPO=<org>/<repo>               # HF GGUF import
+export YTF_KUROSHIO_HF_REVISION=<pinned-40-hex-commit> # floating refs are refused
+export YTF_KUROSHIO_HF_FILE=<model>.gguf
+```
+Without them the negatives and the ring-fence still run; only the two network
+positives skip, and they say so.
 
 ### `--full`
 `scripts/run-test-framework.sh --full --target ... --runtime ... --version ... --platform ...`
