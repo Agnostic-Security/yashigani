@@ -25,6 +25,45 @@ These tests verify:
 """
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# FIND-0824-V31-FOSSIL-REGRESSIONS (5.0 reintegration, 2026-08-24)
+#
+# This module pins the v3.1 API (_detect_content_tags, _CONTENT_TAGS_MAX_BYTES)
+# which NO LONGER EXISTS anywhere in src/. It arrived on this head from
+# release/5.0, whose branch point predates the 4.x rework; the canonical 4.1.2
+# line does not carry it. On release/5.0 it was never noticed because that
+# branch has no YTF runner at all.
+#
+# It was not merely failing — it aborted COLLECTION of the whole
+# src/tests/regression/ section, so all 1,781 regression tests silently never
+# ran on any 5.0 head. That is why this guard is a skip and not a deletion:
+# the file is preserved (nothing designed is thrown away) while the section it
+# was blocking is unblocked.
+#
+# What actually happened to the behaviour under test, verified not assumed:
+#   - _client_enforce_input() SURVIVES and still carries data_tags +
+#     sensitivity (openai_router.py:112), hardened since by
+#     FIND-PCI-EGRESS-CEILING-BYPASS (2026-08-07). LAURA-31RT-001's control is
+#     intact, via _derive_pci_data_tags() rather than _detect_content_tags().
+#   - LAURA-31DR-001's "input.obligations" contract is OBSOLETE, not regressed:
+#     ZERO live .rego policies read input.obligations. Obligations are now an
+#     OUTPUT of the aggregate decision (clients_aggregate.rego:60-71), consumed
+#     at _client_enforce.py:90. There is nothing left to omit.
+#
+# Retiring vs rewriting these against the current API is a real piece of work
+# and is routed, not silently done here.
+# ---------------------------------------------------------------------------
+import pytest as _pytest_guard
+
+_pytest_guard.skip(
+    "FIND-0824-V31-FOSSIL-REGRESSIONS: pins the removed v3.1 "
+    "_detect_content_tags API; blocked collection of all 1,781 regression "
+    "tests. Behaviour verified live elsewhere - see module header.",
+    allow_module_level=True,
+)
+
+
+
 import pytest
 
 # ---------------------------------------------------------------------------
