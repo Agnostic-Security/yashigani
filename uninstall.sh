@@ -218,6 +218,15 @@ _CANONICAL_VOLUMES=(
     audit_data
     bootstrap_data
     redis_data
+    # FIND-0824-UNINSTALL-VOLUME-RENAME (Iris, 2026-08-24): docker-compose.yml
+    # declares kuroshio_models (renamed from ollama_data at the infer->kuroshio
+    # rename, 0898a430); this canonical list still named only the OLD volume, so
+    # a --remove-volumes teardown left the models volume behind and fell through
+    # to the fallback sweep, which this script's own comment flags as
+    # unconfirmed on the Podman leg. BOTH names are listed deliberately: the new
+    # one for current deployments, the legacy one so an older stack torn down by
+    # a current uninstall.sh does not orphan its volume either.
+    kuroshio_models
     ollama_data
     prometheus_data
     grafana_data

@@ -657,6 +657,19 @@ services:
       # AsyncClient to internal_httpx_client() (mesh identity) so it presents
       # gateway_client.crt/key to Caddy — same client the OPA path already uses.
       # Until that lands the front 401s at the TLS handshake (fail-closed, correct).
+      OLLAMA_BASE_URL: https://caddy:11435/ollama
+      # FIND-0824-GATEWAY-OLLAMA-URL-LOST (Iris, 2026-08-24): release/5.0
+      # @8b2a1284 swapped this block's OLLAMA_BASE_URL for KUROSHIO_BASE_URL.
+      # That hunk auto-merged with no conflict, so 584cfbbc's stated intent
+      # ("keep OLLAMA_BASE_URL") landed only on the backoffice block below and
+      # was MISSED here. Live effect: the gateway's suspicion-escalated LLM
+      # inspection leg fail-closed with CLASSIFIER_ERROR on every escalated
+      # prompt (docker + podman; k8s unaffected). Restored, same value the
+      # 4.1.2 head carries and consistent with the YSG-RISK-136 fix.
+      # KUROSHIO_BASE_URL is kept alongside but is NOT yet consumed by any
+      # reader in src/ (FIND-0824-KUROSHIO-UNWIRED) — and per Iris's cutover
+      # map its value is wrong on three axes anyway (the engine's own front is
+      # :11436, this path is unrouted, and no kuroshio container runs here).
       KUROSHIO_BASE_URL: https://caddy:11435/kuroshio
       REDIS_HOST: redis
       REDIS_PORT: "6380"                     # TLS-only port
