@@ -236,27 +236,27 @@ _PLACEHOLDER_INTEGRITY = "PLACEHOLDER_YASHIGANI_INTEGRITY"
 
 # VERIFIER_HASH
 # Replace with: sha256sum src/yashigani/licensing/verifier.py | cut -d' ' -f1
-VERIFIER_HASH: str = "672a953affc17dca342506c996d29cca693c8613f453be123acc7d1a7764629d"
+VERIFIER_HASH: str = _PLACEHOLDER_INTEGRITY + "_VERIFIER_HASH"
 
 # ENFORCER_HASH
 # Replace with: sha256sum src/yashigani/licensing/enforcer.py | cut -d' ' -f1
-ENFORCER_HASH: str = "1584d7da63903cfab926aba639bc08c90b3249c3180af9ca0a3864c2e8fa85d1"
+ENFORCER_HASH: str = _PLACEHOLDER_INTEGRITY + "_ENFORCER_HASH"
 
 # LOADER_HASH
 # Replace with: sha256sum src/yashigani/licensing/loader.py | cut -d' ' -f1
-LOADER_HASH: str = "b2210667a345b82969014440d17d8ea2624732793d9c8f528d0ceb2ed4aa7034"
+LOADER_HASH: str = _PLACEHOLDER_INTEGRITY + "_LOADER_HASH"
 
 # INTEGRITY_HASH (self-referential — computed over this file before replacement)
 # Replace with: sha256sum src/yashigani/licensing/_integrity.py | cut -d' ' -f1
-INTEGRITY_HASH: str = "22db5bedd90b24e787c5dfd1ad6efed0001bd62543abc97eab1c35754ee04d64"
+INTEGRITY_HASH: str = _PLACEHOLDER_INTEGRITY + "_INTEGRITY_HASH"
 
 # AGENTS_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/agents/registry.py | cut -d' ' -f1
-AGENTS_REGISTRY_HASH: str = "869174fbc128dddcadde3df98c1f550e1cb42abeedc68864cfe0ab548757e177"
+AGENTS_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_AGENTS_REGISTRY_HASH"
 
 # IDENTITY_REGISTRY_HASH
 # Replace with: sha256sum src/yashigani/identity/registry.py | cut -d' ' -f1
-IDENTITY_REGISTRY_HASH: str = "9e6d516f1e0901b104ee41197bdb69d6da5476907bfe34dda1a80363743cf5bb"
+IDENTITY_REGISTRY_HASH: str = _PLACEHOLDER_INTEGRITY + "_IDENTITY_REGISTRY_HASH"
 
 # ---------------------------------------------------------------------------
 # Point-of-use (POU) protected-file hashes — 2026-07-16, LAURA-V2-001
@@ -266,23 +266,23 @@ IDENTITY_REGISTRY_HASH: str = "9e6d516f1e0901b104ee41197bdb69d6da5476907bfe34dda
 
 # OIDC_MODULE_HASH
 # Replace with: sha256sum src/yashigani/sso/oidc.py | cut -d' ' -f1
-OIDC_MODULE_HASH: str = "95decf0af5940f0883385fd8880a756405eaa15c0a9c50c510e05bf6ad7f38bf"
+OIDC_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_OIDC_MODULE_HASH"
 
 # SAML_MODULE_HASH
 # Replace with: sha256sum src/yashigani/sso/saml.py | cut -d' ' -f1
-SAML_MODULE_HASH: str = "6ec6de22026f3087653eed3374449a612a366271ea1af3eae98354331a9ab98d"
+SAML_MODULE_HASH: str = _PLACEHOLDER_INTEGRITY + "_SAML_MODULE_HASH"
 
 # SSO_ROUTES_HASH
 # Replace with: sha256sum src/yashigani/backoffice/routes/sso.py | cut -d' ' -f1
-SSO_ROUTES_HASH: str = "4220eb6865a35e9badd6f3c680ec307495202f1a95fdb2ea0685d0ea5966536d"
+SSO_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SSO_ROUTES_HASH"
 
 # SCIM_ROUTES_HASH
 # Replace with: sha256sum src/yashigani/backoffice/routes/scim.py | cut -d' ' -f1
-SCIM_ROUTES_HASH: str = "5cba251290f9769553b2a381cfb07806a81a6617b31e507b30cb6d4a3884b530"
+SCIM_ROUTES_HASH: str = _PLACEHOLDER_INTEGRITY + "_SCIM_ROUTES_HASH"
 
 # GATE_MIDDLEWARE_HASH
 # Replace with: sha256sum src/yashigani/licensing/gate_middleware.py | cut -d' ' -f1
-GATE_MIDDLEWARE_HASH: str = "b43d82ed8072e3a2ccbc5429dd1582e03a6a2433ec28ab4c4cbc76d41efa3d0d"
+GATE_MIDDLEWARE_HASH: str = _PLACEHOLDER_INTEGRITY + "_GATE_MIDDLEWARE_HASH"
 
 # ---------------------------------------------------------------------------
 # Mesh FULL topology — Phase D, 2026-07-17 (LAURA-V2-003 RE-VERIFY
