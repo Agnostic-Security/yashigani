@@ -4819,3 +4819,96 @@ risks:
   last_threat_model_review: '2026-08-18'
   filed_by: coordinator (live 4.1.2 docker leg)
   owner: Su
+- id: YSG-RISK-271
+  description: 'FIND-0824-OPA-PUSH-NAMEERROR — push_rbac_data() referenced _OPA_DATA_PATH_RBAC, a module constant the V50-022 refactor deleted, so EVERY call raised NameError and RBAC data never
+    reached OPA. Proven by import: _OPA_DATA_PATH_RBAC defined=False referenced=True, while _OPA_RBAC_PATH and _OPA_AGENTS_PATH are both defined. Introduced by the 2026-08-24 5.0 reintegration
+    merge (584cfbbc): release/5.0''s older pre-V50-022 code was merged ALONGSIDE the newer scoped-PUT implementation rather than replacing it, in a hunk git resolved with no conflict, leaving THREE
+    client.put() calls where there should be two. The surviving stale call was a PARENT-path PUT to /v1/data/yashigani/rbac, which REPLACES the whole document and would have wiped
+    data.yashigani.mcp / .document / .allocations — the sibling addresses V50-022 exists to protect — had the NameError not fired first. A second defect on the same path: agent_doc was assigned
+    inside `if agent_registry is not None:` but referenced unconditionally below (UnboundLocalError on the None path, contradicting YSG-RISK-176).'
+  severity: high
+  controls_impacted:
+  - RBAC/OPA authorization — policy data never pushed; OPA evaluates against a stale or empty rbac document
+  - V50-022 sibling-document isolation — the stale parent-path PUT would clobber mcp/document/allocations
+  status: closed
+  fix: 'Removed the stale parent-path PUT and hoisted agent_doc to always-defined. Commit c29f20e7.'
+  fix_in_version: v5.0
+
+- id: YSG-RISK-272
+  description: 'FIND-0824-INTEGRITY-HASHES-IN-SOURCE — _integrity.py on the 5.0 integration line (09f2449d) carried 11 REAL build-injected SHA-256 constants instead of the _PLACEHOLDER_INTEGRITY
+    sentinels the file''s own convention documents. Committed by 977e936d ("re-run demo build-signing ceremony for this source tree") — a build artefact checked into source. Those hashes go stale the
+    moment any protected file changes, which is precisely what a merge does, so the 7-file anti-tamper mesh correctly reported every peer as tampered, forced COMMUNITY tier and hard-refused SCIM/SSO.
+    This is why the 5.0 line had NEVER passed its own conformance suite. Verified by comparison: the 4.1.2 head (1667403d) carries 7 placeholders / 0 real hashes and release/5.0 carries 7 / 0 — only
+    the 5.0 integration head diverged. NOTE the misdiagnosis worth recording: this was initially reported as needing the pinned M-v5-demo master private key (absent from the box). No key is required —
+    the pipeline injects real values at build time. The question was never "which key signs these" but "why are they in source at all".'
+  severity: high
+  controls_impacted:
+  - Licence anti-tamper mesh (licence-hardening-v2, LAURA-V2-001/002/003) — fires continuously on a clean tree, training operators to ignore a real control
+  - SCIM/SSO licensed features — hard-refused on every 5.0 build
+  status: closed
+  fix: 'Restored all 11 constants to the placeholder form. Conformance+security went 56 -> 35 failures; verifier.get_integrity_status() now False. Commit b0adaca2.'
+  fix_in_version: v5.0
+
+- id: YSG-RISK-273
+  description: 'FIND-0824-DUP-ENV-KEY class (LAURA-V50-001 + FIND-0824-DUP-SEMANTIC-INTENT) — duplicate env keys in a single rendered container spec. Kubernetes applies duplicate env names in order
+    and the LAST one wins, so a later, often stale entry silently becomes authoritative over the value a reader sees first. Two instances: (a) helm backoffice.yaml carried TWO OLLAMA_BASE_URL keys, the
+    surviving one a stale v3.1.2 entry (827c66db) defaulting to http://yashigani-ollama:11434 — NetworkPolicy-blocked for backoffice, and with no backoffice.ollamaUrl key in values.yaml it ALWAYS fell
+    to that broken default, silently REOPENING YSG-RISK-136 (HIGH, status mitigated, fix_in_version v4.1.2) on every Helm/K8s deploy. Introduced by the reintegration merge — all three parents carry 1
+    key, the merge produced 2. (b) gateway.yaml and backoffice.yaml each carried TWO YASHIGANI_SEMANTIC_INTENT_SIDECAR keys (DP-Y-003 tool-poisoning classifier); inherited from release/5.0, which
+    already had 2 while both merge parents had 1. Both rendered "true" so no live divergence, but the two used different template forms, which is how duplicates drift into disagreeing. Both fail CLOSED
+    — availability regressions of controls that report themselves healthy, not bypasses.'
+  severity: medium
+  controls_impacted:
+  - YSG-RISK-136 mesh-mTLS inference routing — silently reopened on Helm/K8s
+  - DP-Y-003 tool-poisoning import classifier — every MCP import silently refused on affected deploys
+  status: closed
+  fix: 'Removed the stale duplicates, tombstoned in place. Built the contract gate YSG-RISK-136 itself prescribed and that was never written (tests/contracts/test_inference_backend_url_contract.py):
+    asserts no duplicate env key in any RENDERED container, no direct :11434 backend URL, and that gateway+backoffice each actually SET one. Verified RED on the pre-fix tree, GREEN after. Commits
+    7c880d3c, 3f0282d7, a2089d52.'
+  fix_in_version: v5.0
+
+- id: YSG-RISK-274
+  description: 'FIND-0824-GATEWAY-OLLAMA-URL-LOST — docker-compose.yml''s gateway env block lost OLLAMA_BASE_URL to release/5.0 @8b2a1284''s KUROSHIO_BASE_URL swap. src/ reads OLLAMA_BASE_URL in 12
+    places and reads KUROSHIO_BASE_URL in ZERO, so the gateway''s suspicion-gate-escalated LLM inspection leg fail-closed with CLASSIFIER_ERROR on every escalated prompt (docker + podman; k8s
+    unaffected). Introduced by the reintegration merge (584cfbbc), whose own commit message stated the intent to KEEP OLLAMA_BASE_URL — that correction landed on the backoffice block only; the gateway
+    block carried the same swap but auto-merged with NO conflict, so it never came under review. Root lesson recorded deliberately: a clean auto-merge is not a reviewed merge. All five CONFLICTED files
+    in that merge resolved correctly; every defect was in a hunk git resolved silently.'
+  severity: medium
+  controls_impacted:
+  - Suspicion-escalated LLM response inspection — escalation path dead (fail-closed, not a bypass)
+  status: closed
+  fix: 'Restored OLLAMA_BASE_URL to the 4.1.2 value; KUROSHIO_BASE_URL retained but annotated as not-yet-consumed. Commit f5327cc6. Regression-gated by YSG-RISK-273''s contract test.'
+  fix_in_version: v5.0
+
+- id: YSG-RISK-275
+  description: 'FIND-0824-KUROSHIO-UNWIRED — the KUROSHIO inference engine merged into release/5.0 as 80 files (infer/) with NO product-code wiring. KUROSHIO_BASE_URL appears in exactly one file
+    (docker-compose.yml) and has zero readers in src/; "ollama" remains the only backend class registered under src/yashigani/inspection/backends/, so release/5.0''s flip of
+    YASHIGANI_INSPECTION_DEFAULT_BACKEND to "kuroshio" selects a backend that does not exist. Iris''s seam audit found the compose value is wrong on three independent axes, not merely unread: the
+    engine''s own Caddy front listens on :11436 (infer/deploy/docker/Caddyfile.kuroshio-front:41), not the :11435 ollama-front; the /kuroshio path is unrouted; and install.sh references
+    infer/deploy/docker/ nowhere, so no kuroshio container runs on a stock stack at all. Also: infer/ carried its own test suite that no YTF tier ran and no MATRIX leg named — model import, which
+    decides WHICH WEIGHTS WE LOAD, was untested end to end.'
+  severity: medium
+  controls_impacted:
+  - Inference backend selection — a default pointing at an unimplemented backend would have shipped as a silently dead path
+  - Model-import supply chain — pinned-revision/gguf/traversal guards existed but were never exercised by any gate
+  status: open
+  compensating_controls:
+  - The reintegration declined to inherit the swap; OLLAMA_BASE_URL and the ollama default are retained, so no live deployment selects the missing backend
+  - Tier-C model_import_provenance authored (18 tests) and wired into tests/MATRIX.yaml with inference as a per-leg dimension
+  fix: 'PARTIAL. Test coverage added (commit 15662ec0) and the broken wiring declined. A real cutover still needs a kuroshio backend class in src/yashigani/inspection/backends/ plus compose/helm/Caddy
+    topology — mapped in Iris''s seam audit §2, NOT implemented. Routed, not closed.'
+
+- id: YSG-RISK-276
+  description: 'FIND-0824-V31-FOSSIL-REGRESSIONS — three v3.1 regression modules inherited from release/5.0 import _detect_content_tags / _CONTENT_TAGS_MAX_BYTES, removed from src/ in the 4.x rework.
+    They did not merely fail: they aborted COLLECTION of src/tests/regression/, so ALL 1,781 regression tests silently never ran on ANY 5.0 head. release/5.0 never noticed because that branch carries
+    no YTF runner at all. Once unblocked the section revealed 155 further failures, of which triage classified 30 as real product regressions and 87 as merge-resolution defects. Structural finding: 14
+    of the 19 failing test files did not exist on the 4.1.2 parent — they arrived from release/5.0 as pure additions and had never passed once, anywhere. Verified NOT a lost control: LAURA-31RT-001''s
+    data_tags wiring is intact via _derive_pci_data_tags (hardened since by FIND-PCI-EGRESS-CEILING-BYPASS), and LAURA-31DR-001''s input.obligations contract is OBSOLETE not regressed — zero live .rego
+    policies read input.obligations; obligations are now an OUTPUT of the aggregate decision.'
+  severity: high
+  controls_impacted:
+  - Entire per-risk regression suite (1,781 tests) — silently unexecuted on every 5.0 head, so any regression it guards could ship undetected
+  status: closed
+  fix: 'Guarded the three fossil modules with an explicit module-level skip (files preserved, nothing deleted) and wired the section back in. Commit a5b6c6c9. Retiring or rewriting them against the
+    current API is routed separately.'
+  fix_in_version: v5.0
