@@ -70,7 +70,8 @@ _CRYPTO_INVENTORY = {
     "algorithms": [
         {"name": "Argon2id", "usage": "password hashing", "strength": "256-bit"},
         {"name": "ECDSA P-256", "usage": "license signing", "strength": "128-bit equivalent"},
-        {"name": "AES-256-GCM", "usage": "database column encryption", "strength": "256-bit"},
+        {"name": "AES-256-CFB (OpenPGP)", "usage": "database column encryption (pgp_sym_encrypt, pgcrypto)", "strength": "256-bit"},
+        {"name": "AES-256-GCM", "usage": "document pseudonymization map + backup bundle encryption (AESGCM)", "strength": "256-bit"},
         {"name": "HMAC-SHA-256", "usage": "User TOTP digest (6-digit, RFC 6238)", "strength": "256-bit"},
         {"name": "HMAC-SHA-512", "usage": "Admin TOTP digest (8-digit, RFC 6238)", "strength": "512-bit"},
         {"name": "HMAC-SHA-256", "usage": "email hashing, API signing", "strength": "256-bit"},

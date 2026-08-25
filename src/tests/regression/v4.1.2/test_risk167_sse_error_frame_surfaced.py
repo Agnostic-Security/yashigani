@@ -69,11 +69,27 @@ def _make_app():
 
 class _FakeUpstreamResponse:
     """Mimics the subset of httpx.Response used by user_chat_proxy's
-    stream=True send() path."""
+    stream=True send() path.
 
-    def __init__(self, status_code: int, body: bytes):
+    FIND-0824-RISK167-V50026-DOUBLE: YSG-RISK-167 (4.1.2, 2026-07-30) and
+    V50-026 (5.0, e2592da1, 2026-07-29) independently fixed the SAME defect —
+    user_chat_proxy returning a fake 200 instead of the gateway's real status.
+    The 2026-08-24 reintegration kept V50-026's implementation, which is a
+    strict superset: as well as forwarding the status it forwards the upstream
+    content-type and the four X-Yashigani-* audit headers (user_ui.py:1089-98).
+    This double predates that and modelled only what the 4.1.2 implementation
+    read, so it raised AttributeError('headers') BEFORE the status assertion
+    this file exists to make could run. `headers` added so the test exercises
+    the merged implementation; the YSG-RISK-167 status-forwarding assertions
+    below are unchanged and still authoritative.
+    """
+
+    def __init__(self, status_code: int, body: bytes, headers: dict | None = None):
         self.status_code = status_code
         self._body = body
+        self.headers = headers if headers is not None else {
+            "content-type": "application/json",
+        }
 
     async def aread(self) -> bytes:
         return self._body

@@ -221,6 +221,10 @@ class TestSeedGateDeny:
             model_alias_store = alias_store
             sensitivity_classifier = None  # PUBLIC, skip
             pii_detector = None
+            audit_writer = None  # FIND-0824-REINTEG-C01: NDC-sweep-E (2026-07-31)
+            # wired an _audit() call into _seed_denied() that this fixture predates;
+            # _state.audit_writer is accessed directly (no getattr default) so an
+            # absent attribute raises AttributeError instead of the intended no-op.
         return _Cls()
 
     def _body(self, model):

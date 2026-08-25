@@ -23,17 +23,6 @@ cache_router = APIRouter(tags=["cache"])
 
 MAX_TTL = 3600
 
-# V50-CACHE-500: cache_config carries ROW LEVEL SECURITY (0001_initial_schema.py)
-# with `USING (tenant_id = current_setting('app.tenant_id')::uuid)`. The pooled
-# connection returned by get_pool() never SETs app.tenant_id, so Postgres raises
-# `unrecognized configuration parameter "app.tenant_id"` before RLS is even
-# evaluated — every call to this handler 500'd unconditionally. Fixed by SETting
-# the platform tenant before the query, matching the established idiom used
-# elsewhere in this codebase (identity/durable_store.py, agents/durable_store.py,
-# audit/chain.py, backoffice/routes/jwt_config.py — all define the same
-# well-known all-zeros UUID locally rather than importing a shared constant).
-_PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000"
-
 
 class CacheConfigRequest(BaseModel):
     enabled: bool = False
@@ -44,29 +33,22 @@ class CacheConfigRequest(BaseModel):
 async def list_cache_configs(session=Depends(require_admin_session)):
     """List every per-tenant cache config.
 
-    YSG-RISK-143: this MUST read from the same store that PUT/GET/DELETE
-    write to (Redis, via ResponseCache) — it previously queried a Postgres
-    ``cache_config`` table that no code path ever wrote to, so a config set
-    via PUT never appeared here. See ResponseCache.list_tenant_configs().
+    YSG-RISK-143 (FIND-0824-CACHE-143-REGRESSION): this MUST read from the
+    SAME store that PUT/GET/DELETE write to (Redis, via ResponseCache) — it
+    previously queried a Postgres ``cache_config`` table that no code path
+    ever wrote to, so a config set via PUT never appeared here (5b1cfe09).
+    The 2026-08-06 catch-up merge (09f2449d) silently reverted this endpoint
+    to the superseded pre-YSG-RISK-143 Postgres/RLS implementation
+    (V50-CACHE-500, e134be64) while keeping this docstring's claim that it
+    reads Redis — restored to call list_tenant_configs() per 5b1cfe09.
     """
     from yashigani.backoffice.state import backoffice_state
     rc = getattr(backoffice_state, "response_cache", None)
     if rc is None:
         return {"tenants": [], "cache_available": False}
     try:
-        from yashigani.db.postgres import get_pool
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # V50-CACHE-500: RLS on cache_config requires app.tenant_id to be
-                # set on this connection before any row is visible/queryable.
-                await conn.execute(
-                    "SELECT set_config('app.tenant_id', $1, true)", _PLATFORM_TENANT_ID
-                )
-                rows = await conn.fetch(
-                    "SELECT tenant_id::text, enabled, ttl_seconds FROM cache_config ORDER BY tenant_id"
-                )
-        return {"tenants": [dict(r) for r in rows], "cache_available": True}
+        tenants = rc.list_tenant_configs()
+        return {"tenants": tenants, "cache_available": True}
     except Exception as exc:
         # V232-CSCAN-01e: log full exception server-side; degrade gracefully to
         # the client rather than a raw 500 — an admin page failing to fetch its

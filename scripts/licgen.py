@@ -62,12 +62,31 @@ from pathlib import Path
 # needed an explicit --keys-dir/--registry to work around it (Ava's finding,
 # 2026-07-15). A stray `YSG/testing_runs/...` tree, if one ever existed,
 # would silently sign against the wrong keys with no error — fixed here.
+#
+# FIND-0824-DEMO-DIR-DEPTH: the fixed hop-count is itself only correct for
+# a checkout exactly two levels under Claude/. A worktree living somewhere
+# else under ~/Documents/Claude/ (e.g. a triage/integration worktree under
+# testing_runs/<product>/, which CLAUDE.md's own directory table sanctions
+# for non-code artifacts) resolves to a doubled, silently-wrong path
+# (.../testing_runs/yashigani/testing_runs/yashigani/...) with no error —
+# the exact silent-wrong-keys failure mode this comment already warns
+# about, just from a different depth than the one Ava caught. Walk up to
+# find the `Claude` workspace-root directory by name first; only fall back
+# to the fixed 4-hop offset (preserving the original behaviour byte-for-
+# byte) if no ancestor is named `Claude`, e.g. this tree was relocated
+# outside the documented workspace convention entirely.
+def _find_claude_workspace_root(start: Path) -> Path | None:
+    for ancestor in start.parents:
+        if ancestor.name == "Claude":
+            return ancestor
+    return None
+
+
+_claude_root = _find_claude_workspace_root(Path(__file__).resolve())
 DEMO_DEFAULT_DIR = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "testing_runs"
-    / "yashigani"
-    / "demo-license-system"
-)
+    _claude_root if _claude_root is not None
+    else Path(__file__).resolve().parent.parent.parent.parent
+) / "testing_runs" / "yashigani" / "demo-license-system"
 
 
 def _repo_root() -> Path:

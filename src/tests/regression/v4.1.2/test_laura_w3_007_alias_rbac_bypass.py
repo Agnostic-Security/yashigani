@@ -80,6 +80,15 @@ def _make_state(
     state.budget_enforcer = None
     state.ddos_protector = None
     state.content_relay_detector = None
+    state.promoted_ruleset = None  # FIND-0824-REINTEG-C01: 5.0 T1 promoted-ruleset gate (openai_router.py getattr(_state, "promoted_ruleset", None)) auto-vivifies as a truthy MagicMock and false-blocks every request with 403 prompt_injection_only if unset
+    state.request_inspection_pipeline = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.content_moderation_guard = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.conversation_risk_tracker = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.sklearn_injection_backend = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.rule_promotion_store = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.system_prompt_leak_guard = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.model_integrity_verifier = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
+    state.delegated_context_store = None  # FIND-0824-REINTEG-C01 (see promoted_ruleset note above)
     state.model_alias_store = alias_store
     state.available_models = [{"id": "qwen2.5:3b"}]
     state.model_allocation_store = None

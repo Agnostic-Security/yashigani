@@ -31,6 +31,7 @@ v2.25.0 / P1 W3 Phase 2b-ii + Phase 2 hardening /
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -713,6 +714,55 @@ class McpBroker:
             self._emit_envelope_blocked_at_invocation(ctx, env_deny)
             return env_decision
 
+        # Step 2f [P8/YSG-RISK-056]: upstream cert/SPIFFE pin verification.
+        #
+        # Restored at the 2026-08-24 5.0 reintegration: verify_upstream() had
+        # ZERO live callers on this trunk — the release/3.1 fix that wired it
+        # into enforce() (33f23979 / a9f3f386, "was design-only") was never
+        # forward-ported past the 3.1/4.x divergence, the same gap class as
+        # FIX-005 above.
+        #
+        # verify_upstream() does a synchronous TLS handshake to check the
+        # upstream server's cert fingerprint or SPIFFE ID against the pinned
+        # config.  It is offloaded to a thread so the event loop is not blocked.
+        # In production/staging: ConnectionError is raised by verify_upstream()
+        # on mismatch or missing pin config — we convert that to a deny
+        # BrokerDecision (upstream_pin_mismatch) so the runtime returns 403,
+        # not 502.  In dev/test: matched=False is logged, call proceeds.
+        #
+        # verify_upstream() already emits the structured pin audit event
+        # (MCP_UPSTREAM_PIN_OK / MCP_UPSTREAM_CERT_PIN_MISMATCH /
+        # pin_not_configured) via _emit_upstream_pin_event() before raising.
+        # We also emit the standard MCP_CALL + OPA_DECISION_ON_MCP witness via
+        # _emit_audit() so Lu has a complete call record.  YSG-RISK-056.
+        if ctx.server_id:
+            try:
+                await asyncio.to_thread(self.verify_upstream, ctx.server_id)
+            except ConnectionError as _pin_exc:
+                _pin_elapsed = int((time.monotonic() - t0) * 1000)
+                _pin_reason = "upstream_pin_mismatch"
+                pin_decision = BrokerDecision(
+                    call_id=call_id,
+                    allow=False,
+                    deny_reason=_pin_reason,
+                    opa_decision=OpaDecision(
+                        allow=False,
+                        deny_reason=_pin_reason,
+                        redact_args=set(),
+                        audit_capture=True,
+                        rate_limit_key=None,
+                    ),
+                    chain_depth=len(chain_for_opa),
+                    elapsed_ms=_pin_elapsed,
+                    error=str(_pin_exc),
+                )
+                logger.warning(
+                    "mcp-broker: [P8] upstream pin DENIED call_id=%s server_id=%s: %s",
+                    call_id, ctx.server_id, _pin_exc,
+                )
+                await self._emit_audit(ctx, pin_decision)
+                return pin_decision
+
         # Step 3: issue gateway-signed JWT (only on OPA allow)
         #
         # FIX-B (Lu FIX-1): ChainDepthExceeded must be caught and emitted with
@@ -1062,7 +1112,12 @@ class McpBroker:
         Returns None (permitted) or a deny_reason string.
 
         Logic:
-          - No permission_store configured → no-op (None), backwards-compatible.
+          - No permission_store configured:
+              • ENFORCING env (production/staging) → DENY
+                "permission_store_unavailable" (FIX-005: fail-closed mandate).
+                Redis MUST be available in production/staging.  A missing store
+                is a misconfiguration, not a silent allow.
+              • Non-enforcing env → no-op (None), backwards-compatible (dev/test).
           - Resolve server key: ctx.mcp_id (v4.0 stable UUID) or ctx.server_id
               or ctx.agent_name (backward compat fallback).
           - Call resolve_boolean_grant(MCP_SERVER, server_key, org_id,
@@ -1078,6 +1133,22 @@ class McpBroker:
         resolve_boolean_grant (it returns False on any error).
         """
         if self._config.permission_store is None:
+            # FIX-005: deny-by-default mandate — permission store must be available
+            # in enforcing envs.  Dev/test get a no-op (warn) for usability. Lost in
+            # the 3.1->4.0 divergence (9654842b never forward-ported); restored here.
+            _env = os.environ.get("YASHIGANI_ENV", "").lower().strip()
+            if _env in self._ENFORCE_PIN_ENVS:
+                logger.error(
+                    "mcp-broker: [FIX-005] permission_store is None in %r env — "
+                    "DENYING call fail-closed (deny-by-default mandate). "
+                    "Restore Redis/permission-store to re-enable MCP access. "
+                    "server=%s caller=%s",
+                    _env,
+                    ctx.server_id or ctx.agent_name,
+                    ctx.caller_agent_id,
+                )
+                return "permission_store_unavailable"
+            # Dev/test: no permission store → no-op (backwards-compatible).
             return None
 
         from yashigani.permissions import ResourceType, resolve_boolean_grant

@@ -86,6 +86,26 @@ def _make_mock_state(
     state.content_relay_detector = None
     state.model_alias_store = None
     state.model_allocation_store = None
+    # FIND-0824-REINTEG-C01 (same class as the LAURA-411-002 note below): the
+    # 5.0 interaction-hardening gate chain (_run_request_leg_inspection,
+    # openai_router.py:656) runs BEFORE model dispatch and did not exist on the
+    # 4.1.2 line this double was written against. Each stage reads its
+    # collaborator off _state via getattr(..., None); on a bare MagicMock every
+    # one auto-vivifies as a TRUTHY mock whose .matches()/.observe() return
+    # truthy mocks too, so the request is 403'd as prompt_injection_only and
+    # never reaches the Ollama dispatch these tests assert on. Pinned to None
+    # (production _GatewayState's own default) so the F001 SSL-routing
+    # assertions below actually execute. Not a product change.
+    state.promoted_ruleset = None
+    state.conversation_risk_tracker = None
+    state.request_inspection_pipeline = None
+    state.content_moderation_guard = None
+    state.sklearn_injection_backend = None
+    state.rule_promotion_store = None
+    state.system_prompt_leak_guard = None
+    state.model_integrity_verifier = None
+    state.delegated_context_store = None
+    state.audio_transcriber = None
     # LAURA-411-002 fix: available_models must be an explicit empty list so that
     # the _is_known_model guard 'alias_store is None AND not available_models →
     # skip 422 check' fires correctly.  Production _GatewayState always inits

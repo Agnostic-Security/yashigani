@@ -1285,6 +1285,34 @@ async def _handle_mcp_call_inner(
             caller_agent_id=_caller_agent_id,
         )
 
+        # [P8/YSG-RISK-056] Upstream pin check — session + notification path.
+        # Restored at the 2026-08-24 5.0 reintegration: this guard (and its
+        # passthrough sibling below) shipped in 33f23979/a9f3f386 on
+        # release/3.1 but was never forward-ported past the 3.1/4.x
+        # divergence — same gap class as broker.enforce()'s Step 2f above.
+        # verify_upstream() is synchronous (TLS socket); run in a thread.
+        # In prod/staging: ConnectionError on mismatch/no-pin → 403, not a
+        # downstream 502/202. In dev: mismatch is warned-and-allowed.
+        # hasattr guard (FIND-0824-P8-146-COLLATERAL): every real McpBroker
+        # unconditionally defines verify_upstream — this only skips for a
+        # deliberately-minimal non-McpBroker stand-in registered by an
+        # unrelated harness (e.g. YSG-RISK-146's malformed-body tests, which
+        # register a bare object() and never reach the enforce() pipeline
+        # either); it never lets a real pin mismatch through.
+        try:
+            if hasattr(broker, "verify_upstream"):
+                await asyncio.to_thread(broker.verify_upstream, agent_name)  # type: ignore[attr-defined]
+        except ConnectionError as _pin_exc:
+            logger.warning(
+                "mcp-runtime: [P8] %s pin denied agent=%r method=%r: %s",
+                "notification" if is_notification else "session",
+                agent_name, method, _pin_exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": "UPSTREAM_PIN_DENIED", "deny_reason": "upstream_pin_mismatch"},
+            )
+
         # Issue a session-level JWT directly (no OPA gate for session messages)
         try:
             issuer = broker._issuer  # type: ignore[attr-defined]
@@ -1439,6 +1467,21 @@ async def _handle_mcp_call_inner(
         logger.debug(
             "mcp-runtime: unknown method=%r agent=%r — pass-through", method, agent_name
         )
+        # [P8/YSG-RISK-056] Upstream pin check — pass-through path. See the
+        # session/notification guard above for provenance (hasattr rationale
+        # included).
+        try:
+            if hasattr(broker, "verify_upstream"):
+                await asyncio.to_thread(broker.verify_upstream, agent_name)  # type: ignore[attr-defined]
+        except ConnectionError as _pin_exc:
+            logger.warning(
+                "mcp-runtime: [P8] passthrough pin denied agent=%r method=%r: %s",
+                agent_name, method, _pin_exc,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"error": "UPSTREAM_PIN_DENIED", "deny_reason": "upstream_pin_mismatch"},
+            )
         try:
             issuer = broker._issuer  # type: ignore[attr-defined]
             passthru_jwt = issuer.issue(
