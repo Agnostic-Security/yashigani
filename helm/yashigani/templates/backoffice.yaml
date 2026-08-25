@@ -592,9 +592,11 @@ spec:
             # The authoritative value stays the one set above from
             # .Values.gateway.env.ollamaUrl (the caddy mesh front), per d44f4f20
             # "restore Ollama mesh-mTLS routing for gateway+backoffice".
-            # Default ON (DP-Y-003 coherence fix). Override via backoffice.semanticIntentSidecar.
-            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
-              value: {{ .Values.backoffice.semanticIntentSidecar | default true | toString | quote }}
+            # FIND-0824-DUP-SEMANTIC-INTENT: a SECOND
+            # YASHIGANI_SEMANTIC_INTENT_SIDECAR declaration lived here and, being
+            # LAST, was the one Kubernetes actually applied. Removed; the
+            # authoritative declaration is the YSG-RISK-076 / DP-Y-003 §3.4 one
+            # ~110 lines above. See the matching note in gateway.yaml.
           envFrom:
             - secretRef:
                 name: {{ .Values.backoffice.existingSecretName | default "yashigani-backoffice-secrets" }}

@@ -265,11 +265,17 @@ spec:
             */}}
             - name: YASHIGANI_MCP_SERVERS
               value: {{ .Values.gateway.mcpServers | default list | toJson | quote }}
-            # DP-Y-003 §3.4 — semantic-intent import classifier sidecar.
-            # Default true (default-on per DP-Y-003 coherence fix).
-            # Set gateway.semanticIntentSidecar: false in values to disable.
-            - name: YASHIGANI_SEMANTIC_INTENT_SIDECAR
-              value: {{ .Values.gateway.semanticIntentSidecar | default true | toString | quote }}
+            # FIND-0824-DUP-SEMANTIC-INTENT: a SECOND, sparser
+            # YASHIGANI_SEMANTIC_INTENT_SIDECAR declaration lived here. Kubernetes
+            # takes the LAST duplicate, so this one was already inert; both
+            # rendered "true", so there was no behavioural difference — but the two
+            # used DIFFERENT template forms (`| default true | toString | quote` vs
+            # `| default "true" | quote`), which is precisely how duplicates drift
+            # into disagreeing and the silent last-wins rule starts deciding a
+            # security control. Same class as LAURA-V50-001. Inherited from
+            # release/5.0 (which already carried 2; both merge parents carried 1).
+            # The authoritative declaration is the YSG-RISK-076 / DP-Y-003 §3.4 one
+            # below.
             # Iris F-2: MCP broker OPA AsyncClient reads this CA path
             # (src/yashigani/mcp/_opa.py:_make_opa_http_client).  Without it on
             # K8s, OPA HTTPS verify falls through to system trust store and
