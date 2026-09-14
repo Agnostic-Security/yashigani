@@ -18,6 +18,8 @@ dropped): `/api/pull` requires an injected resolver to do anything, and the
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -38,6 +40,25 @@ from kuroshio.supervisor.supervisor import LoadConfig, ResourceLimitExceeded, Su
 from kuroshio.upstream import UpstreamClient
 
 
+async def _idle_sweep_loop(supervisor: Supervisor, interval_seconds: float) -> None:
+    """Drive `Supervisor.idle_unload_sweep()` on a timer (YSG-RISK-300).
+
+    The sweep is synchronous and cheap — it walks the resident dict and
+    terminates handles — so it runs inline rather than in an executor. A
+    failure must not kill the task and silently stop all future sweeps, so
+    exceptions are swallowed per-iteration and the loop continues; the next
+    tick retries. Cancellation propagates so shutdown is prompt.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            supervisor.idle_unload_sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed sweep must not stop later sweeps
+            continue
+
+
 def create_app(
     *,
     blob_store: BlobStore,
@@ -46,6 +67,7 @@ def create_app(
     default_load_config: LoadConfig | None = None,
     pull_resolver: Callable[[dict[str, Any]], ResolvedModel] | None = None,
     output_inspection_hook: OutputInspectionHook = noop_output_inspection_hook,
+    idle_sweep_interval_seconds: float | None = 60.0,
 ) -> FastAPI:
     """Build the yashigani-kuroshio HTTP app.
 
@@ -67,8 +89,50 @@ def create_app(
             wiring one).
         output_inspection_hook: containment seam (see `containment/hooks.py`)
             — a no-op identity passthrough in this package.
+        idle_sweep_interval_seconds: how often the background task calls
+            `Supervisor.idle_unload_sweep()`. `None` disables the task (the
+            unit suite does that so no real timer runs); the default wires it.
     """
-    app = FastAPI(title="yashigani-kuroshio", version="0.1.0")
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # YSG-RISK-300: `idle_unload_sweep()` had ZERO callers anywhere in the
+        # tree, so `YSG_KUROSHIO_IDLE_UNLOAD_SECONDS` configured nothing and no
+        # model was ever idle-unloaded on any platform. The function was covered
+        # by unit tests in isolation, which is exactly why it went unnoticed —
+        # the wiring was never tested, only the body.
+        sweeper: asyncio.Task[None] | None = None
+        if idle_sweep_interval_seconds is not None:
+            sweeper = asyncio.create_task(_idle_sweep_loop(supervisor, idle_sweep_interval_seconds))
+        try:
+            yield
+        finally:
+            # YSG-RISK-299: nothing unloaded resident instances on shutdown, so
+            # every `llama-server` child outlived its supervisor. A container
+            # tears the whole process tree down and hides this; launchd
+            # reparents the orphan to init and it keeps running, holding a Metal
+            # context and a port (compounding YSG-RISK-298).
+            #
+            # This covers graceful stop — SIGTERM, `launchctl stop`, `docker
+            # stop`. It CANNOT cover SIGKILL: no hook runs, in any language, on
+            # any platform. The guarantee for that case has to be a
+            # next-startup orphan sweep, which needs a process marker the
+            # supervisor injects at spawn — filed separately, not smuggled in
+            # here.
+            if sweeper is not None:
+                sweeper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sweeper
+            for sha in supervisor.resident_shas:
+                supervisor.unload(sha)
+            # YSG-RISK-296: release the pooled upstream client if this one owns
+            # connections. Duck-typed on purpose — `UpstreamClient` is a narrow
+            # Protocol and test fakes do not implement `aclose`.
+            closer = getattr(upstream, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    app = FastAPI(title="yashigani-kuroshio", version="0.1.0", lifespan=_lifespan)
     app.state.blob_store = blob_store
     app.state.supervisor = supervisor
     app.state.upstream = upstream
