@@ -153,8 +153,33 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"model not found: {name}")
         return model
 
-    def _ensure_loaded(model: ResolvedModel):
-        return supervisor.load(model, load_config)
+    # YSG-RISK-290. `Supervisor.load()` is synchronous and does genuinely
+    # blocking work: the wired `HttpReadinessProbe` polls llama-server's
+    # `/health` in a `time.sleep` loop for up to 60s, and a configured
+    # `ProvenanceVerifier` re-hashes the blob from disk. Called directly from
+    # an `async def` handler — as every route did — that blocks the whole event
+    # loop, so one cold model load froze every other in-flight request across
+    # every tenant, `/healthz` included. Supervisor state is in-memory, so the
+    # process cannot be sharded across uvicorn workers to dilute it.
+    #
+    # `load()` stays synchronous (its own tests and API are sync) and is
+    # offloaded to a worker thread instead. The lock is what makes that safe:
+    # `Supervisor`'s `_instances`/`_inflight` dicts have no internal locking
+    # and were previously protected only by everything running on the single
+    # event-loop thread. Holding an asyncio.Lock means at most one thread is
+    # ever inside `load()`, preserving that invariant without touching
+    # Supervisor.
+    #
+    # One lock, not one per model: a cold load of model B still waits behind a
+    # cold load of model A, exactly as before. What changes — and what the
+    # defect was — is that the event loop is now free throughout, so resident
+    # traffic and health probes are served. Per-model locking is a throughput
+    # refinement, not part of this fix.
+    load_lock = asyncio.Lock()
+
+    async def _ensure_loaded(model: ResolvedModel):
+        async with load_lock:
+            return await asyncio.to_thread(supervisor.load, model, load_config)
 
     def _require_chat_template(model: ResolvedModel) -> None:
         """Red-Council H4 (Ava/Tom, 2026-07-29 design-review): a GGUF with a
@@ -257,7 +282,7 @@ def create_app(
         body = await request.json()
         model = _require_model(body.get("model", ""))
         _require_chat_template(model)
-        instance = _ensure_loaded(model)
+        instance = await _ensure_loaded(model)
         llama_request = translate_chat_request(body, cache_prompt=load_config.cache_prompt)
         _clamp_request_params(llama_request)
         model_name = body.get("model", "")
@@ -285,7 +310,7 @@ def create_app(
     async def api_generate(request: Request) -> StreamingResponse:
         body = await request.json()
         model = _require_model(body.get("model", ""))
-        instance = _ensure_loaded(model)
+        instance = await _ensure_loaded(model)
         llama_request = translate_generate_request(body, cache_prompt=load_config.cache_prompt)
         _clamp_request_params(llama_request)
         model_name = body.get("model", "")
@@ -313,7 +338,7 @@ def create_app(
     async def api_embeddings(request: Request) -> dict[str, Any]:
         body = await request.json()
         model = _require_model(body.get("model", ""))
-        instance = _ensure_loaded(model)
+        instance = await _ensure_loaded(model)
         llama_request = translate_embeddings_request(body)
 
         _acquire_slot_or_429(model.sha256)
@@ -337,7 +362,7 @@ def create_app(
         """
         body = await request.json()
         model = _require_model(body.get("model", ""))
-        instance = _ensure_loaded(model)
+        instance = await _ensure_loaded(model)
         llama_request = translate_embeddings_request(body)
 
         _acquire_slot_or_429(model.sha256)
@@ -404,7 +429,7 @@ def create_app(
             # `/v1/embeddings`, etc. are unaffected).
             if path == "chat/completions":
                 _require_chat_template(model)
-            instance = _ensure_loaded(model)
+            instance = await _ensure_loaded(model)
         else:
             resident = supervisor.resident_shas
             if len(resident) == 0:
