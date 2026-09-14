@@ -29,7 +29,11 @@ from kuroshio.blobstore.store import BlobStore
 from kuroshio.containment.hooks import OutputInspectionHook, noop_output_inspection_hook
 from kuroshio.models import ResolvedModel
 from kuroshio.shim.chat import chat_event_to_ndjson, translate_chat_request
-from kuroshio.shim.embeddings import translate_embeddings_request, translate_embeddings_response
+from kuroshio.shim.embeddings import (
+    translate_embed_response,
+    translate_embeddings_request,
+    translate_embeddings_response,
+)
 from kuroshio.shim.framing import parse_sse_line
 from kuroshio.shim.generate import generate_event_to_ndjson, translate_generate_request
 from kuroshio.shim.ps import PsRow, synthesize_ps
@@ -319,6 +323,30 @@ def create_app(
             supervisor.release_request_slot(model.sha256)
         supervisor.touch(model.sha256)
         return translate_embeddings_response(llama_response)
+
+    @app.post("/api/embed")
+    async def api_embed(request: Request) -> dict[str, Any]:
+        """Newer ollama embeddings endpoint (>= 0.5.x) — YSG-RISK-289.
+
+        This route was missing entirely, and it is the one the Yashigani
+        gateway actually calls (`openai_router.py`: POST `/api/embed` with
+        `{model, input}`). Without it, repointing `OLLAMA_BASE_URL` at this
+        shim 404s here and surfaces as 502 to every `/v1/embeddings` caller —
+        which the gateway's own comment predicted. `/api/embeddings` stays for
+        legacy callers; the two differ only in response shape.
+        """
+        body = await request.json()
+        model = _require_model(body.get("model", ""))
+        instance = _ensure_loaded(model)
+        llama_request = translate_embeddings_request(body)
+
+        _acquire_slot_or_429(model.sha256)
+        try:
+            llama_response = await upstream.request_json(f"{_base_url(instance.port)}/embedding", llama_request)
+        finally:
+            supervisor.release_request_slot(model.sha256)
+        supervisor.touch(model.sha256)
+        return translate_embed_response(llama_response, model=body.get("model", ""))
 
     @app.post("/api/pull")
     async def api_pull(request: Request) -> StreamingResponse:

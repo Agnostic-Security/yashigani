@@ -30,4 +30,33 @@ def translate_embeddings_response(llama_response: dict[str, Any] | list[Any]) ->
     return {"embedding": llama_response.get("embedding", [])}
 
 
-__all__ = ["translate_embeddings_request", "translate_embeddings_response"]
+def translate_embed_response(
+    llama_response: dict[str, Any] | list[Any], *, model: str
+) -> dict[str, Any]:
+    """Response shape for the NEWER `/api/embed` (ollama >= 0.5.x).
+
+    YSG-RISK-289. `/api/embed` and `/api/embeddings` are different endpoints
+    with different response shapes, and the product calls the newer one:
+    `gateway/openai_router.py` POSTs `{model, input}` to `/api/embed` and reads
+    `resp_json["embeddings"]` as a list-of-float-lists, one per input item,
+    plus `resp_json["model"]`. The legacy singular `{"embedding": [...]}` is
+    only its fallback, not what it asks for.
+
+    So this always returns the plural list-of-lists, even for a single input —
+    that is the contract the caller parses, and collapsing a one-element batch
+    to the singular shape would push it down the fallback path for no reason.
+    """
+    if isinstance(llama_response, list):
+        vectors = [item.get("embedding", []) for item in llama_response]
+    elif "embeddings" in llama_response:
+        vectors = list(llama_response["embeddings"])
+    else:
+        vectors = [llama_response.get("embedding", [])]
+    return {"model": model, "embeddings": vectors}
+
+
+__all__ = [
+    "translate_embeddings_request",
+    "translate_embeddings_response",
+    "translate_embed_response",
+]
