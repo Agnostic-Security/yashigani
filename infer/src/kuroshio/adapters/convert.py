@@ -118,6 +118,13 @@ TRUST_REMOTE_CODE = False
 # time, before any subprocess ever runs.
 _COMMIT_HEX_CHARS = frozenset("0123456789abcdef")
 
+# YSG-RISK-297. Default PATH for the conversion subprocess — deliberately
+# restricted, not inherited from os.environ. The Linux job container resolves
+# its toolchain here. Deploys whose toolchain lives elsewhere (Apple Silicon
+# Homebrew is /opt/homebrew/bin) inject their own via `path_dirs=`; that keeps
+# the choice in the deploy layer instead of a sys.platform branch (DoR D24).
+_DEFAULT_PATH_DIRS: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/bin")
+
 
 class PickleRefusedError(ValueError):
     """Raised when a source file is (or looks like) a pickle-based checkpoint.
@@ -346,6 +353,7 @@ class SubprocessConversionInvoker(ConversionInvoker):
         python_binary: str | None = None,
         timeout_seconds: float = 3600.0,
         run: Any = subprocess.run,
+        path_dirs: tuple[str, ...] = _DEFAULT_PATH_DIRS,
     ) -> None:
         commit = tool_commit.strip().lower()
         if not (7 <= len(commit) <= 40) or not set(commit) <= _COMMIT_HEX_CHARS:
@@ -361,6 +369,9 @@ class SubprocessConversionInvoker(ConversionInvoker):
         self._python_binary = python_binary or sys.executable
         self._timeout_seconds = timeout_seconds
         self._run = run
+        if not path_dirs:
+            raise ValueError("path_dirs must not be empty — the subprocess needs a resolvable PATH")
+        self._path_dirs = ":".join(path_dirs)
 
     @property
     def tool_commit(self) -> str:
@@ -373,7 +384,18 @@ class SubprocessConversionInvoker(ConversionInvoker):
             # this makes the tool fail fast + honestly instead of hanging).
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            # YSG-RISK-297: the PATH stays deliberately restricted (a minimal env
+            # is defence-in-depth for a subprocess handling untrusted model
+            # bytes), but the directory list is now injected rather than
+            # hardcoded. The previous literal "/usr/local/bin:/usr/bin:/bin"
+            # cannot find an Apple-Silicon Homebrew toolchain, which installs to
+            # /opt/homebrew/bin — so any tool the convert script resolves via
+            # PATH is simply absent there.
+            #
+            # This is a deploy-layer value, NOT a platform branch in code: the
+            # Mac deploy passes its dirs in, exactly as the Linux job container
+            # relies on the default. Keeps DoR D24 (no sys.platform branching).
+            "PATH": self._path_dirs,
         }
         try:
             result = self._run(

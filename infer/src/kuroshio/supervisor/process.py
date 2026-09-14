@@ -71,11 +71,23 @@ class SubprocessProcessRunner(ProcessRunner):
     """
 
     def spawn(self, *, binary: str, args: list[str], env: dict[str, str]) -> ProcessHandle:
+        # YSG-RISK-295: stdout/stderr must NOT be PIPE. Nothing in this package
+        # ever reads those pipes, so once llama-server's output exceeds the OS
+        # pipe buffer (~64KiB on both Linux and Darwin) the child blocks forever
+        # on its next write. llama-server logs per-request slot/timing lines to
+        # stderr continuously, so that is the steady state, not an edge case —
+        # and `is_alive()` (Popen.poll()) still reports True for a process wedged
+        # on write, so `healthz` would report healthy indefinitely.
+        #
+        # DEVNULL loses nothing that was previously kept: the PIPE contents were
+        # never read by any code path. It is a deadlock fix, not an observability
+        # regression. A container recycled every few hours masked this; a macOS
+        # LaunchAgent with weeks of uptime will not.
         popen = subprocess.Popen(  # noqa: S603 - binary path is operator/config-controlled, not request input
             [binary, *args],
             env=env or None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         return SubprocessProcessHandle(popen)
 

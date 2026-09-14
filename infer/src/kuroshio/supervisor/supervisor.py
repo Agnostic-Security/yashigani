@@ -31,6 +31,7 @@ dependency graph minimal.
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -234,7 +235,6 @@ class Supervisor:
         self._readiness_probe = readiness_probe
         self._instances: dict[str, ModelInstance] = {}
         self._inflight: dict[str, int] = {}
-        self._next_port_offset = 0
         self._port_allocator = port_allocator or self._default_port_allocator
 
     @property
@@ -283,11 +283,22 @@ class Supervisor:
         return self._inflight.get(sha256, 0)
 
     def _default_port_allocator(self) -> int:
-        # Sequential allocator, sufficient for the supervisor's own tests and
-        # for a single-process deploy; a real deploy may inject a
-        # free-port-probing allocator instead.
-        port = 39000 + self._next_port_offset
-        self._next_port_offset += 1
+        # YSG-RISK-298: was a sequential counter from 39000. That is safe inside
+        # a container network namespace, which the engine owns exclusively, and
+        # unsafe on a shared host — a macOS LaunchAgent deploy shares the port
+        # space with everything else the machine runs, so the counter can hand
+        # out a port another process already holds.
+        #
+        # Ask the OS for a free port instead (bind :0, read it back, release).
+        # TOCTOU is real but bounded and already handled downstream: if another
+        # process takes the port between here and llama-server's bind, the child
+        # exits immediately, the readiness probe fails, and `load()` terminates
+        # the handle and raises BackendNotReadyError without recording residency
+        # — fail-closed, and the caller retries. Eliminating the race outright
+        # would need fd-handoff support llama-server does not have.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port: int = probe.getsockname()[1]
         return port
 
     @property

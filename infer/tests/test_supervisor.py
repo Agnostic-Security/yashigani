@@ -96,7 +96,10 @@ def test_load_spawns_via_process_runner(fake_process_runner: FakeProcessRunner, 
     assert supervisor.is_loaded("a" * 64)
     assert len(fake_process_runner.spawned) == 1
     assert "--model" in fake_process_runner.spawned[0]["args"]
-    assert instance.port >= 39000
+    # YSG-RISK-298: the default allocator asks the OS for a free port rather
+    # than counting up from a fixed 39000 base, so assert a valid unprivileged
+    # port, not a range tied to the old counter.
+    assert 1024 < instance.port <= 65535
 
 
 def test_load_is_idempotent_for_an_already_resident_model(
