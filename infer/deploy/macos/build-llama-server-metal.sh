@@ -23,6 +23,12 @@
 # remoting) are disqualified for not being multitenant-safe, not for being
 # impossible.
 #
+# PRIMARY PATH IS NOT THIS SCRIPT. Per D25 both platforms consume the verified
+# upstream prebuilt via `infer/deploy/scripts/fetch-llama-server.sh`. This
+# from-source build is retained for the one job the fetch cannot do: carrying
+# OUR OWN patch when we fix something upstream has not yet released — which is
+# the actual sovereignty argument, and what llama.cpp's SECURITY.md invites.
+#
 # NOT DONE HERE, deliberately:
 #   - codesign / notarize (YSG-RISK-282 + the owed Developer-ID key-custody
 #     model). This script produces an UNSIGNED binary. Signing is a separate,

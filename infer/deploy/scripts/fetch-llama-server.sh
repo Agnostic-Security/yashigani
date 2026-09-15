@@ -2,8 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Agnostic Security Ltd
 #
-# Fetch + verify the UPSTREAM prebuilt `llama-server` for macOS / Apple
-# Silicon (Metal) — Yashigani 6.0. **This is the primary path** (Tiago
+# Fetch + verify the UPSTREAM prebuilt `llama-server` — ALL PLATFORMS.
+#
+# Moved out of `deploy/macos/` because D25 makes this the single sourcing model
+# for Linux AND macOS: Linux stops compiling llama.cpp in
+# `Dockerfile.kuroshio-*` and consumes the same verified artifact. Keeping a
+# Mac-only fetcher next to a Linux-only build would BE the divergence D26
+# eliminates. **This is the primary path** (Tiago
 # 2026-09-15: "it's easier to use the builds for updates"). The from-source
 # build (`build-llama-server-metal.sh`) is kept for the cases that need flag
 # control or a commit with no published release.
@@ -46,13 +51,31 @@ log() { printf '    --> %s\n' "$*"; }
 die() { printf '!!  FATAL: %s\n' "$*" >&2; exit 1; }
 
 # --- pre-flight: every check fails CLOSED ------------------------------------
-[[ "$(uname -s)" == "Darwin" ]] || die "macOS only"
-[[ "$(uname -m)" == "arm64"  ]] || die "Apple Silicon (arm64) required; got $(uname -m)"
+# Host checks apply only when the artifact will be EXECUTED here. Fetching a
+# Linux asset from a Mac build host is legitimate and is how the container
+# images are produced.
+RUN_CHECKS=1
+case "${PLATFORM}" in
+  macos-arm64)
+    if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then RUN_CHECKS=0; fi ;;
+  *) [[ "$(uname -s)" == "Linux" ]] || RUN_CHECKS=0 ;;
+esac
 [[ "${LLAMA_CPP_TAG}" != "PIN-ME" && "${ASSET_SHA256}" != "PIN-ME" ]] \
   || die "LLAMA_CPP_TAG and ASSET_SHA256 must both be pinned — a tag alone is not a pin, release assets can be replaced in place"
 command -v curl >/dev/null || die "curl not found"
 
-ASSET="llama-${LLAMA_CPP_TAG}-bin-macos-arm64.tar.gz"
+# Platform/accelerator selects which asset of the SAME release we take. This is
+# divergence V-2 and nothing more: one upstream release, one pin, one digest
+# per asset, identical verification either side.
+PLATFORM="${PLATFORM:-macos-arm64}"
+case "${PLATFORM}" in
+  macos-arm64|ubuntu-x64|ubuntu-arm64|ubuntu-vulkan-x64|ubuntu-vulkan-arm64| \
+  ubuntu-cuda-12.8-x64|ubuntu-cuda-13.3-x64|ubuntu-cuda-13.3-arm64|ubuntu-rocm-10.0-x64) ;;
+  *) die "unsupported PLATFORM ${PLATFORM}. Supported: macos-arm64, ubuntu-x64, ubuntu-arm64,
+  ubuntu-vulkan-{x64,arm64}, ubuntu-cuda-{12.8-x64,13.3-x64,13.3-arm64}, ubuntu-rocm-10.0-x64" ;;
+esac
+EXT="tar.gz"
+ASSET="llama-${LLAMA_CPP_TAG}-bin-${PLATFORM}.${EXT}"
 URL="https://github.com/${REPO}/releases/download/${LLAMA_CPP_TAG}/${ASSET}"
 
 mkdir -p "${WORK}"
@@ -114,25 +137,48 @@ BIN_DIR="$(dirname "${BIN}")"
 # 24 binaries). llama-server links @rpath/libggml-metal.0.dylib, and it is
 # THAT dylib which links Metal.framework — so checking the executable for
 # Metal.framework is the wrong test and will refuse a good artefact.
-otool -L "${BIN}" | grep -q "libggml-metal" \
-  || die "llama-server does not link libggml-metal — CPU-only artefact, refusing"
-METAL_DYLIB="$(find "${BIN_DIR}" -maxdepth 1 -name 'libggml-metal*.dylib' | head -1)"
-[[ -n "${METAL_DYLIB}" ]] || die "no libggml-metal dylib in the archive"
-otool -L "${METAL_DYLIB}" | grep -qi "Metal.framework" \
-  || die "libggml-metal does not link Metal.framework — refusing"
+# The expected accelerator backend library must be present in the artifact.
+# Checked by NAME on every platform (works cross-host); the deeper "does this
+# machine actually see the device" check needs the target hardware and runs at
+# deploy time, not fetch time. Saying so is better than pretending a Mac can
+# validate a CUDA build.
+case "${PLATFORM}" in
+  macos-arm64)          BACKEND_LIB="libggml-metal" ;;
+  *vulkan*)             BACKEND_LIB="libggml-vulkan" ;;
+  *cuda*)               BACKEND_LIB="libggml-cuda" ;;
+  *rocm*)               BACKEND_LIB="libggml-hip" ;;
+  ubuntu-x64|ubuntu-arm64) BACKEND_LIB="libggml-cpu" ;;
+esac
+find "${BIN_DIR}" -maxdepth 1 -name "${BACKEND_LIB}*" | grep -q . \
+  || die "expected backend library ${BACKEND_LIB}* not found in the ${PLATFORM} artifact — refusing"
+log "backend library present: ${BACKEND_LIB}"
+
+if [[ "${PLATFORM}" == "macos-arm64" && "${RUN_CHECKS}" == "1" ]]; then
+  otool -L "${BIN}" | grep -q "libggml-metal" \
+    || die "llama-server does not link libggml-metal — CPU-only artefact, refusing"
+  otool -L "$(find "${BIN_DIR}" -maxdepth 1 -name 'libggml-metal*.dylib' | head -1)" \
+    | grep -qi "Metal.framework" || die "libggml-metal does not link Metal.framework — refusing"
+fi
 
 # Containment invariant: the engine must never be able to fetch a model
 # itself. Pulls go through the control plane's gated, audited adapters.
+if [[ "${RUN_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
 otool -L "${BIN}" | grep -qi "curl" \
   && die "llama-server links libcurl — the engine could fetch models directly, violating the egress-mediation invariant (D16). Refusing."
+fi
 
 # Strongest available check short of loading a model: ask the binary what it
 # can see. A CPU-only artefact lists no MTL device.
-DEVICES="$("${BIN}" --list-devices 2>&1 || true)"
-grep -qE '^\s*MTL[0-9]+:' <<<"${DEVICES}" \
-  || die "--list-devices reports no Metal device. Output:
+if [[ "${RUN_CHECKS}" == "1" ]]; then
+  DEVICES="$("${BIN}" --list-devices 2>&1 || true)"
+  if [[ "${PLATFORM}" == "macos-arm64" ]]; then
+    grep -qE '^\s*MTL[0-9]+:' <<<"${DEVICES}" || die "--list-devices reports no Metal device:
 ${DEVICES}"
-log "Metal device: $(grep -oE 'MTL[0-9]+: .*' <<<"${DEVICES}" | head -1)"
+  fi
+  log "devices: $(grep -oE '(MTL|CUDA|ROCm|Vulkan)[0-9]*: .*' <<<"${DEVICES}" | head -1)"
+else
+  log "cross-host fetch (${PLATFORM} from $(uname -s)/$(uname -m)) — live device check deferred to deploy time"
+fi
 
 # Record the signature state rather than asserting a level we have not earned.
 SIGSTATE="$(codesign -dv --verbose=2 "${BIN}" 2>&1 | grep -E '^Signature=' | head -1 || true)"
@@ -141,10 +187,16 @@ log "upstream signature: ${SIGSTATE:-none} (Developer-ID re-sign still required)
 # --- publish ------------------------------------------------------------------
 mkdir -p "${OUT_DIR}"
 cp "${BIN}" "${OUT_DIR}/llama-server"
-find "${BIN_DIR}" -maxdepth 1 -name '*.dylib' -exec cp {} "${OUT_DIR}/" \;
+# Shared libraries, whichever extension this platform uses. Copying only
+# *.dylib silently produced an EMPTY library set for every Linux asset — the
+# executable alone cannot start, and nothing would have failed until runtime.
+find "${BIN_DIR}" -maxdepth 1 \( -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) \
+  -exec cp {} "${OUT_DIR}/" \;
+LIBCOUNT="$(find "${OUT_DIR}" -maxdepth 1 \( -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) | wc -l | tr -d ' ')"
+[[ "${LIBCOUNT}" -gt 0 ]] || die "no shared libraries copied from ${BIN_DIR} — the artifact would not start"
 
 DIGEST="$(shasum -a 256 "${OUT_DIR}/llama-server" | awk '{print $1}')"
-FILES="$(cd "${OUT_DIR}" && shasum -a 256 llama-server *.dylib \
+FILES="$(cd "${OUT_DIR}" && shasum -a 256 llama-server $(ls *.dylib *.so *.so.* 2>/dev/null) \
   | awk '{printf "    {\"file\": \"%s\", \"sha256\": \"%s\"},\n", $2, $1}' | sed '$ s/,$//')"
 
 cat > "${OUT_DIR}/llama-server.manifest.json" <<EOF
@@ -174,6 +226,6 @@ ${FILES}
 }
 EOF
 
-log "artifact:  ${OUT_DIR}/llama-server (+ $(ls "${OUT_DIR}"/*.dylib | wc -l | tr -d ' ') dylibs)"
+log "artifact:  ${OUT_DIR}/llama-server (+ ${LIBCOUNT} shared libraries)"
 log "manifest:  ${OUT_DIR}/llama-server.manifest.json"
 log "UNSIGNED by us — Developer-ID re-sign must cover EVERY dylib above (YSG-RISK-282)"
