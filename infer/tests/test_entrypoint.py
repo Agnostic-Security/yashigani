@@ -143,7 +143,12 @@ def test_puller_env_uses_documented_defaults_for_everything_else(tmp_path: Path)
     assert config.engine_config.max_resident_models == default_engine.max_resident_models
     assert config.resource_limits == default_limits
     assert config.default_load_config.keep_alive_pin == default_load.keep_alive_pin is False
-    assert config.default_load_config.expect_gpu == default_load.expect_gpu is False
+    # GPU is a minimum system requirement (YSG-RISK-301), so this default is
+    # True. Asserted against `default_load` rather than a literal because the
+    # entrypoint previously hardcoded its own `default=False` while the
+    # dataclass said otherwise — one contract, two defaults, and production
+    # followed the entrypoint. This is the drift guard.
+    assert config.default_load_config.expect_gpu == default_load.expect_gpu is True
     assert config.default_load_config.n_gpu_layers is None
 
 

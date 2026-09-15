@@ -92,4 +92,74 @@ class SubprocessProcessRunner(ProcessRunner):
         return SubprocessProcessHandle(popen)
 
 
-__all__ = ["ProcessHandle", "ProcessRunner", "SubprocessProcessHandle", "SubprocessProcessRunner"]
+class DeviceProbe:
+    """Ask a llama-server binary which compute devices it can actually see.
+
+    YSG-RISK-301. `healthz` derived `gpu_engaged` from `n_gpu_layers` — the
+    value we PASSED to llama-server, never a value read back — so a host with
+    no GPU, or a binary built without the backend, ran on CPU and reported
+    `gpu_engaged: true, healthy`. CPU-only inference is not a viable
+    deployment, so that is not a slow deployment, it is a dead one showing
+    green.
+
+    `--list-devices` is the only device signal llama-server exposes: its HTTP
+    API carries none (verified against `get_res_props()` in
+    tools/server/server-context.cpp at the pinned tag — no n_gpu_layers, no
+    device, no backend). So the probe runs the binary once, before serving.
+
+    Injectable like ProcessRunner so unit tests never need a real binary.
+    """
+
+    def list_devices(self, binary: str) -> list[str]:
+        raise NotImplementedError
+
+
+class SubprocessDeviceProbe(DeviceProbe):
+    """Real implementation — runs `llama-server --list-devices` once."""
+
+    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
+        self._timeout = timeout_seconds
+
+    def list_devices(self, binary: str) -> list[str]:
+        try:
+            out = subprocess.run(  # noqa: S603 - operator/config-controlled path
+                [binary, "--list-devices"],
+                capture_output=True, text=True, timeout=self._timeout, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Cannot determine -> report nothing seen. The caller fails closed;
+            # an unreadable probe must never be read as "GPU present".
+            return []
+        names: list[str] = []
+        for line in (out.stdout or "") .splitlines() + (out.stderr or "").splitlines():
+            stripped = line.strip()
+            # Device lines look like "MTL0: Apple M4 (16384 MiB, 16383 MiB free)"
+            if ":" in stripped and not stripped.lower().startswith("available"):
+                head = stripped.split(":", 1)[0].strip()
+                if head and " " not in head:
+                    names.append(head)
+        return names
+
+
+# Device-name prefixes that mean a real accelerator rather than the CPU/BLAS
+# fallback. Measured on an M4: `--list-devices` prints "MTL0: Apple M4" for
+# Metal and "BLAS: Accelerate" for the CPU-side fallback — BLAS is NOT an
+# accelerator for our purposes and must not satisfy an expect_gpu deployment.
+ACCELERATOR_PREFIXES = ("MTL", "CUDA", "ROCM", "HIP", "Vulkan", "VK", "SYCL", "CANN", "OPENCL")
+
+
+def is_accelerator(device_name: str) -> bool:
+    n = device_name.strip().upper()
+    return any(n.startswith(p.upper()) for p in ACCELERATOR_PREFIXES)
+
+
+__all__ = [
+    "ACCELERATOR_PREFIXES",
+    "DeviceProbe",
+    "ProcessHandle",
+    "ProcessRunner",
+    "SubprocessDeviceProbe",
+    "SubprocessProcessHandle",
+    "SubprocessProcessRunner",
+    "is_accelerator",
+]

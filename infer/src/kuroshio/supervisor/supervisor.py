@@ -37,7 +37,13 @@ from datetime import datetime, timezone
 from typing import Callable, Protocol
 
 from kuroshio.models import ResolvedModel
-from kuroshio.supervisor.process import ProcessHandle, ProcessRunner
+from kuroshio.supervisor.process import (
+    DeviceProbe,
+    ProcessHandle,
+    ProcessRunner,
+    SubprocessDeviceProbe,
+    is_accelerator,
+)
 
 
 class ProvenanceVerifier(Protocol):
@@ -134,7 +140,13 @@ class LoadConfig:
         keep_alive_pin: if True, this model is exempt from idle-unload and
             LRU eviction — used for the mandatory sensitivity classifier
             (WARMUP-001) so it stays warm while user chat models cycle.
-        expect_gpu: if True, `/healthz` treats `n_gpu_layers == 0` as a hard
+        expect_gpu: GPU is a MINIMUM SYSTEM REQUIREMENT (Tiago 2026-09-15:
+            "we support so many gpu types that supporting cpu usage is not
+            something i want to do, the system minimal requirements must
+            include one gpu"), so this defaults to True and a load is
+            REFUSED outright when no accelerator is present. Opting out is
+            for tests and for deliberate non-serving use only.
+            Historically: if True, `/healthz` treats `n_gpu_layers == 0` as a hard
             failure (a GPU-tagged deployment silently fell back to CPU),
             not a warning (Captain #3 / platform-requirements §4.5).
         context_length: `--ctx-size` passthrough.
@@ -190,7 +202,7 @@ class LoadConfig:
     n_gpu_layers: int | None = None
     override_tensor: tuple[str, ...] = field(default_factory=tuple)
     keep_alive_pin: bool = False
-    expect_gpu: bool = False
+    expect_gpu: bool = True
     context_length: int | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     cache_prompt: bool = False
@@ -226,6 +238,7 @@ class Supervisor:
         clock: Callable[[], datetime] | None = None,
         provenance_verifier: ProvenanceVerifier | None = None,
         readiness_probe: ReadinessProbe | None = None,
+        device_probe: DeviceProbe | None = None,
     ) -> None:
         self._runner = process_runner
         self._binary = llama_server_binary
@@ -233,6 +246,10 @@ class Supervisor:
         self._max_resident_models = max_resident_models
         self._resource_limits = resource_limits or ResourceLimits()
         self._clock = clock or _default_clock
+        self._device_probe = device_probe or SubprocessDeviceProbe()
+        # Devices are a property of (binary, host) and cannot change while we
+        # run, so probe at most once rather than per load.
+        self._device_cache: list[str] | None = None
         self._provenance_verifier = provenance_verifier
         self._readiness_probe = readiness_probe
         self._instances: dict[str, ModelInstance] = {}
@@ -360,6 +377,37 @@ class Supervisor:
         args += list(load_config.extra_args)
         return args
 
+    def _devices(self) -> list[str]:
+        """Devices the llama-server binary can actually see. Probed once."""
+        if self._device_cache is None:
+            self._device_cache = self._device_probe.list_devices(self._binary)
+        return self._device_cache
+
+    def _require_accelerator(self) -> None:
+        """Refuse to serve on a CPU-only host.
+
+        Note this catches BOTH failure modes, which are different faults with
+        the same symptom: a host with no GPU, and a binary built without the
+        GPU backend compiled in. Neither is visible from `n_gpu_layers`, which
+        is only ever what we asked for.
+
+        An unreadable probe returns [] and therefore also refuses: "I could not
+        tell" must never resolve to "GPU present".
+        """
+        devices = self._devices()
+        accelerators = [d for d in devices if is_accelerator(d)]
+        if not accelerators:
+            raise SupervisorError(
+                "refusing to load: no GPU accelerator is available, and GPU is a "
+                "minimum system requirement for Kuroshio. "
+                f"`{self._binary} --list-devices` reported {devices or 'nothing'}. "
+                "CPU-only inference is not a supported configuration — it is not "
+                "slow, it is unusable, and starting anyway would report a healthy "
+                "deployment that cannot serve. Check that the host has a supported "
+                "GPU (Metal / CUDA / ROCm / Vulkan / SYCL / CANN) and that the "
+                "llama-server binary was built with that backend."
+            )
+
     def load(self, resolved_model: ResolvedModel, load_config: LoadConfig) -> ModelInstance:
         """Spawn (or return the existing) instance for this model's digest.
 
@@ -380,6 +428,16 @@ class Supervisor:
         process is terminated and no residency state is recorded: the load
         fails closed rather than hanging or leaking a never-ready process.
         """
+        # GPU is a MINIMUM SYSTEM REQUIREMENT, checked BEFORE provenance and
+        # before any spawn, because there is nothing to serve without one.
+        # Tiago 2026-09-15: "no point in using yashigani, or kuroshio in cpu,
+        # just does not work" / "the system minimal requirements must include
+        # one gpu". So a CPU-only host must REFUSE TO START rather than come
+        # up and quietly serve at unusable speed: a silent CPU fallback is not
+        # a slow deployment, it is a dead one reporting green (YSG-RISK-301).
+        if load_config.expect_gpu:
+            self._require_accelerator()
+
         if self._provenance_verifier is not None:
             self._provenance_verifier.verify(resolved_model)
 
@@ -467,7 +525,13 @@ class Supervisor:
 
         alive = instance.handle.is_alive()
         offloaded_layers = instance.load_config.n_gpu_layers or 0
-        gpu_engaged = offloaded_layers > 0
+        # YSG-RISK-301: `gpu_engaged` used to be `offloaded_layers > 0` — the
+        # value we PASSED to llama-server, never one read back. A host with no
+        # GPU therefore ran on CPU and reported gpu_engaged:true, healthy.
+        # The devices actually visible to the binary are the observed signal.
+        devices = self._devices()
+        accelerators = [d for d in devices if is_accelerator(d)]
+        gpu_engaged = offloaded_layers > 0 and bool(accelerators)
         expect_gpu = instance.load_config.expect_gpu
         healthy = alive and (gpu_engaged if expect_gpu else True)
         return {
@@ -477,6 +541,7 @@ class Supervisor:
             "offloaded_layers": offloaded_layers,
             "expect_gpu": expect_gpu,
             "gpu_engaged": gpu_engaged,
+            "accelerators": accelerators,
             "keep_alive_pin": instance.load_config.keep_alive_pin,
         }
 

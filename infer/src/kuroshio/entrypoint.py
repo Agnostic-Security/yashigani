@@ -45,7 +45,9 @@ Env-var contract (source of truth: the inline comment block in
     YSG_KUROSHIO_MAX_RESIDENT_MODELS      optional int -> Supervisor LRU ceiling.
     YSG_KUROSHIO_KEEP_ALIVE_PIN            optional bool -> LoadConfig.keep_alive_pin ("true"
                                         for the classifier role, WARMUP-001 analog).
-    YSG_KUROSHIO_EXPECT_GPU               optional bool -> LoadConfig.expect_gpu (healthz
+    YSG_KUROSHIO_EXPECT_GPU               optional bool, DEFAULT TRUE -> LoadConfig.expect_gpu.
+                                        GPU is a minimum system requirement; a load on a
+                                        CPU-only host is REFUSED. Also (healthz
                                         hard-fail gate on a GPU-tagged deployment).
     YSG_KUROSHIO_N_GPU_LAYERS             optional int -> LoadConfig.n_gpu_layers.
     YSG_KUROSHIO_OVERRIDE_TENSOR          optional, comma-separated MoE `--override-tensor`
@@ -276,7 +278,15 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
     resource_limits = ResourceLimits(**resource_limits_kwargs)
 
     keep_alive_pin = _parse_optional_bool(env, _KEEP_ALIVE_PIN_ENV, default=False)
-    expect_gpu = _parse_optional_bool(env, _EXPECT_GPU_ENV, default=False)
+    # Defaults to True: GPU is a MINIMUM SYSTEM REQUIREMENT (Tiago 2026-09-15,
+    # YSG-RISK-301). This default MUST track LoadConfig.expect_gpu — it carried
+    # its own `default=False` while the dataclass said otherwise, which is two
+    # sources of truth for one contract and meant production never actually got
+    # the requirement. The drift guard in tests/test_entrypoint.py pins them
+    # together.
+    expect_gpu = _parse_optional_bool(
+        env, _EXPECT_GPU_ENV, default=LoadConfig().expect_gpu
+    )
     n_gpu_layers = _parse_optional_int(env, _N_GPU_LAYERS_ENV)
     override_tensor = _parse_override_tensor(env)
     cache_prompt = _parse_optional_bool(env, _CACHE_PROMPT_ENV, default=False)
