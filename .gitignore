@@ -147,3 +147,8 @@ docker/cryptoshred-keys/*
 install-progress.bar
 install-podman-run.log
 _relaunch.sh
+
+# Inference-engine fetch output — build artifacts, never code (CLAUDE.md:
+# code repos contain ONLY code). The fetch script writes here by default.
+infer/kuroshio-metal-fetch/
+infer/deploy/artifacts/
