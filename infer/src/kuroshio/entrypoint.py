@@ -122,6 +122,66 @@ _FALSE_VALUES = frozenset({"false", "0", "no"})
 _ROLE_ENV = "YSG_KUROSHIO_ROLE"
 _BLOB_STORE_ROOT_ENV = "YSG_KUROSHIO_BLOB_STORE_ROOT"
 _LLAMA_SERVER_BINARY_ENV = "YSG_KUROSHIO_LLAMA_SERVER_BINARY"
+_LICENCE_TIER_ENV = "YSG_KUROSHIO_LICENCE_TIER"
+_PER_USER_CONTEXT_ENV = "YSG_KUROSHIO_PER_USER_CONTEXT"
+
+
+@dataclass(frozen=True)
+class LicenceTier:
+    """Concurrency and per-user context, moved as ONE unit.
+
+    Tiago 2026-09-15: "max_concurrent_requests, default 4 seems very low" /
+    "should be different for every yashigani license type".
+
+    Both are true and they are the same change. llama-server DIVIDES total
+    context across slots (measured: `-c 4096 -np 1` -> 4096/slot, `-np 4` ->
+    1024/slot), so a tier that raises concurrency alone does not add capacity —
+    it silently divides every user's context by the new slot count. That is
+    exactly how the shipped default ended up giving each user 1024 tokens
+    (YSG-RISK-317). Binding them in one object is what makes that
+    un-representable: you cannot express "more seats" without saying what each
+    seat gets.
+
+    THE NUMBERS BELOW ARE PROPOSALS, NOT COMMERCIAL POLICY. Tier values are
+    Tiago's/Nora's call; this module only guarantees the two move together.
+    Override any tier entirely with the explicit env vars, which always win.
+    """
+
+    name: str
+    max_concurrent_requests: int
+    per_user_context: int
+
+
+#: Proposed tiers pending commercial sign-off. `community` is deliberately the
+#: smallest rather than the current default of 4 slots: 4 was never chosen for
+#: a tier, it was the admission ceiling that the slot count happened to inherit.
+LICENCE_TIERS: dict[str, LicenceTier] = {
+    "community": LicenceTier("community", max_concurrent_requests=2, per_user_context=8192),
+    "smb": LicenceTier("smb", max_concurrent_requests=8, per_user_context=8192),
+    "enterprise": LicenceTier("enterprise", max_concurrent_requests=32, per_user_context=16384),
+    "datacenter": LicenceTier("datacenter", max_concurrent_requests=128, per_user_context=16384),
+}
+
+
+def resolve_licence_tier(name: str | None) -> LicenceTier | None:
+    """Look up a tier by name. An unknown name is REFUSED, never defaulted.
+
+    Silently falling back would hand a customer a tier they did not buy — in
+    either direction. A typo in a deploy manifest must stop the deploy.
+    """
+    if name is None or not name.strip():
+        return None
+    key = name.strip().lower()
+    tier = LICENCE_TIERS.get(key)
+    if tier is None:
+        raise EntrypointConfigError(
+            f"unknown licence tier {name!r}. Known tiers: "
+            f"{', '.join(sorted(LICENCE_TIERS))}. Refusing to guess — falling back to a "
+            "default would serve a tier that was never purchased."
+        )
+    return tier
+
+
 _MAX_CTX_ENV = "YSG_KUROSHIO_MAX_CTX"
 _MAX_CONCURRENCY_ENV = "YSG_KUROSHIO_MAX_CONCURRENCY"
 _MAX_TOKENS_PER_REQUEST_ENV = "YSG_KUROSHIO_MAX_TOKENS_PER_REQUEST"
@@ -266,8 +326,13 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
         engine_kwargs["max_resident_models"] = max_resident_models
     engine_config = EngineConfig(**engine_kwargs)
 
+    tier = resolve_licence_tier(env.get(_LICENCE_TIER_ENV))
     max_context_length = _parse_optional_int(env, _MAX_CTX_ENV)
     max_concurrent_requests = _parse_optional_int(env, _MAX_CONCURRENCY_ENV)
+    # Explicit env always beats the tier — an operator who names a number meant
+    # it. The tier only supplies what was not stated.
+    if max_concurrent_requests is None and tier is not None:
+        max_concurrent_requests = tier.max_concurrent_requests
     max_tokens_per_request = _parse_optional_int(env, _MAX_TOKENS_PER_REQUEST_ENV)
     resource_limits_kwargs: dict[str, Any] = {
         "max_context_length": max_context_length,
@@ -291,9 +356,13 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
     override_tensor = _parse_override_tensor(env)
     cache_prompt = _parse_optional_bool(env, _CACHE_PROMPT_ENV, default=False)
     parallel_slots = _parse_optional_int(env, _PARALLEL_SLOTS_ENV)
+    per_user_context = _parse_optional_int(env, _PER_USER_CONTEXT_ENV)
+    if per_user_context is None and tier is not None:
+        per_user_context = tier.per_user_context
     cache_type_k = _parse_kv_cache_type(env, _CACHE_TYPE_K_ENV)
     cache_type_v = _parse_kv_cache_type(env, _CACHE_TYPE_V_ENV)
     default_load_config = LoadConfig(
+        per_user_context=per_user_context,
         n_gpu_layers=n_gpu_layers,
         override_tensor=override_tensor,
         keep_alive_pin=keep_alive_pin,

@@ -204,6 +204,7 @@ class LoadConfig:
     keep_alive_pin: bool = False
     expect_gpu: bool = True
     context_length: int | None = None
+    per_user_context: int | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     cache_prompt: bool = False
     parallel_slots: int | None = None
@@ -336,8 +337,6 @@ class Supervisor:
             args += ["--n-gpu-layers", str(load_config.n_gpu_layers)]
         for rule in load_config.override_tensor:
             args += ["--override-tensor", rule]
-        if load_config.context_length is not None:
-            args += ["--ctx-size", str(load_config.context_length)]
         # Red-Council C1: always emit an explicit slot count rather than
         # relying on the llama-server binary's own compiled-in default,
         # which this codebase never examined before (Tom/Laura/Ava/Iris
@@ -352,6 +351,28 @@ class Supervisor:
             else self._resource_limits.max_concurrent_requests
         )
         args += ["--parallel", str(parallel)]
+        # --ctx-size is emitted AFTER --parallel is known, because llama-server
+        # DIVIDES total context across slots. Measured on the pinned build:
+        #
+        #   -c 4096 -np 1  ->  n_ctx_slot = 4096
+        #   -c 4096 -np 4  ->  n_ctx_slot = 1024
+        #
+        # We shipped `--parallel 4` and NO `--ctx-size`, so llama-server applied
+        # its own 4096 default and quartered it: every user got 1024 tokens of
+        # context (YSG-RISK-317). Nobody chose that — it fell out of the C1
+        # coupling of the admission ceiling to the slot count.
+        #
+        # So `per_user_context` is the number an operator actually reasons about
+        # ("how much context does ONE user get?") and the total is derived from
+        # it. Tiering concurrency without this multiplication does not add
+        # capacity, it silently divides everyone's context by the new slot count.
+        if load_config.context_length is not None:
+            # An explicit total still wins — deploys that already set it keep
+            # their exact behaviour, and it is the escape hatch for anyone who
+            # genuinely wants to reason in totals.
+            args += ["--ctx-size", str(load_config.context_length)]
+        elif load_config.per_user_context is not None:
+            args += ["--ctx-size", str(load_config.per_user_context * parallel)]
         # KV-cache quantization. The single highest-value memory lever we have,
         # and it was not being passed at all.
         #
