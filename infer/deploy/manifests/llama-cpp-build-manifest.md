@@ -33,11 +33,11 @@ not a one-off note — the gate must run on every re-pin, not just the first.
 | `kuroshio-cuda` | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native-or-explicit-list` (explicit arch list recommended for reproducible multi-GPU-generation support, e.g. `75;80;86;89;90`) | build: CUDA devel image; runtime: CUDA runtime-only image (no devel/compiler toolchain shipped) |
 | `kuroshio-rocm` | `-DGGML_HIP=ON -DAMDGPU_TARGETS=<explicit gfx list, e.g. gfx1030;gfx1100;gfx1101>` | build: ROCm dev image; runtime: same ROCm userspace runtime libs only (ROCm does not publish a slim runtime-only image the way CUDA does — rocBLAS/Tensile kernel blobs are inherently large; "lean" here means *lean relative to the fat multi-backend image*, not sub-1GB) |
 | `kuroshio-vulkan` | `-DGGML_VULKAN=ON` (+ `glslc`/shaderc at build time to compile the Vulkan compute shaders) | build: Debian + Vulkan SDK headers/glslc; runtime: `libvulkan1` + loader only — the actual ICD (GPU driver) is host-mounted, never baked into the image |
-| `kuroshio-cpu` | `-DGGML_BLAS=OFF -DGGML_NATIVE=OFF` + explicit `-DGGML_AVX2=ON -DGGML_FMA=ON` baseline (portable baseline; runtime CPU-feature dispatch via `GGML_CPU_ALL_VARIANTS=ON` is preferred if the pinned tag supports it, avoiding a `SIGILL` on older CPUs while still using AVX2/AVX512 where available) | universal fallback; also the Mac-in-VM / M-k8s dev-cell image |
+| ~~`kuroshio-cpu`~~ | **REMOVED 2026-09-15** | GPU is a minimum system requirement (Tiago). The image, its compose overlay, and the `ubuntu-x64`/`ubuntu-arm64` fetch targets were deleted; `backend: cpu` is rejected at Helm template time. There is no universal fallback any more — below a GPU floor the correct outcome is to abort, not to degrade. |
 
 ## Multi-arch
 
-`kuroshio-vulkan` and `kuroshio-cpu` are built as OCI image indexes (`docker buildx build --platform
+`kuroshio-vulkan` is built as an OCI image index (`docker buildx build --platform
 linux/amd64,linux/arm64`) so the same tag resolves per node arch (platform doc §3). `kuroshio-cuda`
 and `kuroshio-rocm` are `linux/amd64` only for v1 (arm64+CUDA/Jetson deferred per platform doc §15).
 

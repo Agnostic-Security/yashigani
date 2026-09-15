@@ -11,7 +11,7 @@
 # deliberately identical to the Linux build contract:
 #
 #   - pin by TAG **and** commit SHA, and refuse to build on any mismatch
-#     (mirrors `Dockerfile.kuroshio-cpu:23-25`);
+#     (mirrors `Dockerfile.kuroshio-cuda`);
 #   - `GGML_NATIVE=OFF` so a build host's own microarchitecture cannot be
 #     baked into a binary that must run on every M-series Mac;
 #   - measure the output and emit a manifest, so the artefact can be verified

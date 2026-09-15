@@ -9,8 +9,16 @@ fullnameOverride: ""
 namespace: yashigani
 
 # Backend selection (Iris F4/F5 corrected image-SWAP logic) — exactly one of
-# cuda | rocm | vulkan | cpu. Node GPU labels/selectors narrow scheduling per platform doc §9.
-backend: cpu
+# cuda | rocm | vulkan. Node GPU labels/selectors narrow scheduling per platform doc §9.
+#
+# `cpu` was REMOVED and is rejected by _helpers.tpl: GPU is a minimum system
+# requirement (Tiago 2026-09-15), the supervisor refuses to serve without an
+# accelerator (YSG-RISK-301), and the CPU image no longer exists.
+#
+# There is deliberately NO default. `cpu` used to be it, so a stock `helm install`
+# with no --set shipped an unsupported CPU deployment. An unset backend now fails
+# the render with a clear message rather than quietly picking one for the operator.
+backend: ""
 
 images:
   cuda:
@@ -21,9 +29,6 @@ images:
     tag: local
   vulkan:
     repository: yashigani/kuroshio-vulkan
-    tag: local
-  cpu:
-    repository: yashigani/kuroshio-cpu
     tag: local
   puller:
     repository: yashigani/kuroshio-puller

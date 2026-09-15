@@ -44,3 +44,20 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $img := index .Values.images $backend -}}
 {{- printf "%s:%s" $img.repository $img.tag -}}
 {{- end }}
+
+{{/*
+Validate the selected backend. GPU is a minimum system requirement (Tiago
+2026-09-15): the supervisor refuses to load without an accelerator
+(YSG-RISK-301), so a CPU render would produce pods that cannot serve. Failing
+at template time gives the operator the message at `helm install`, rather than
+a CrashLoop they have to read logs to explain.
+*/}}
+{{- define "yashigani-kuroshio.validateBackend" -}}
+{{- $b := .Values.backend | default "" -}}
+{{- if eq $b "cpu" -}}
+{{- fail "backend: cpu is not supported — GPU is a minimum system requirement for Kuroshio. CPU-only inference is not slow, it is unusable, and the supervisor refuses to load without an accelerator. Choose one of: cuda, rocm, vulkan." -}}
+{{- end -}}
+{{- if not (has $b (list "cuda" "rocm" "vulkan")) -}}
+{{- fail (printf "backend must be one of cuda, rocm, vulkan (got %q). There is no default: GPU is a minimum system requirement and picking one for you would be picking your hardware for you." $b) -}}
+{{- end -}}
+{{- end -}}

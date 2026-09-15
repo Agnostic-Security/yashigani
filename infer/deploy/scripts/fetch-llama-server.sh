@@ -69,10 +69,15 @@ command -v curl >/dev/null || die "curl not found"
 # per asset, identical verification either side.
 PLATFORM="${PLATFORM:-macos-arm64}"
 case "${PLATFORM}" in
-  macos-arm64|ubuntu-x64|ubuntu-arm64|ubuntu-vulkan-x64|ubuntu-vulkan-arm64| \
+  macos-arm64|ubuntu-vulkan-x64|ubuntu-vulkan-arm64| \
   ubuntu-cuda-12.8-x64|ubuntu-cuda-13.3-x64|ubuntu-cuda-13.3-arm64|ubuntu-rocm-10.0-x64) ;;
-  *) die "unsupported PLATFORM ${PLATFORM}. Supported: macos-arm64, ubuntu-x64, ubuntu-arm64,
-  ubuntu-vulkan-{x64,arm64}, ubuntu-cuda-{12.8-x64,13.3-x64,13.3-arm64}, ubuntu-rocm-10.0-x64" ;;
+  # The CPU-only targets (ubuntu-x64, ubuntu-arm64) are deliberately ABSENT.
+  # GPU is a minimum system requirement (Tiago 2026-09-15) and a CPU-only
+  # artifact cannot satisfy it, so it must not be fetchable at all — the
+  # supervisor would refuse to serve on it anyway (YSG-RISK-301).
+  *) die "unsupported PLATFORM ${PLATFORM}. Supported: macos-arm64,
+  ubuntu-vulkan-{x64,arm64}, ubuntu-cuda-{12.8-x64,13.3-x64,13.3-arm64}, ubuntu-rocm-10.0-x64.
+  CPU-only targets are not supported: GPU is a minimum system requirement." ;;
 esac
 EXT="tar.gz"
 ASSET="llama-${LLAMA_CPP_TAG}-bin-${PLATFORM}.${EXT}"
@@ -147,7 +152,6 @@ case "${PLATFORM}" in
   *vulkan*)             BACKEND_LIB="libggml-vulkan" ;;
   *cuda*)               BACKEND_LIB="libggml-cuda" ;;
   *rocm*)               BACKEND_LIB="libggml-hip" ;;
-  ubuntu-x64|ubuntu-arm64) BACKEND_LIB="libggml-cpu" ;;
 esac
 find "${BIN_DIR}" -maxdepth 1 -name "${BACKEND_LIB}*" | grep -q . \
   || die "expected backend library ${BACKEND_LIB}* not found in the ${PLATFORM} artifact — refusing"

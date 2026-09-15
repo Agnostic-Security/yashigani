@@ -91,8 +91,10 @@ infer/deploy/
    expected), which means no layer in this deploy tree actually gates on host toolkit version.
    The real mitigation is a HOST-SIDE preflight: check the installed
    `nvidia-container-toolkit`/`libnvidia-container` version against a documented minimum-safe
-   floor before selecting the CUDA overlay, failing closed (fall back to `kuroshio-cpu`, or abort
-   with a clear message) below that floor — the natural hook is `install.sh`'s GPU-dispatch
+   floor before selecting the CUDA overlay, failing closed (abort with a clear message) below
+   that floor. Note there is NO CPU fallback to drop to: GPU is a minimum system requirement
+   (Tiago 2026-09-15) and the CPU image/targets were removed, so below the floor the only
+   correct outcome is to stop — the natural hook is `install.sh`'s GPU-dispatch
    function, same lane as the existing ollama CDI-vs-devpath probe
    (`install.sh` ~2302-2420/~7070-7193). **This preflight is explicitly NOT built here** —
    HARD CONSTRAINT for this dispatch is `infer/` files only; the host-toolkit-version gate is
@@ -140,6 +142,14 @@ verified against real hardware.
   `.Values.backend == "cpu"`, regardless of the `expectGpu` value's own top-level default.
   Verified with `helm template --set backend=cpu` (renders `"false"`) vs `--set backend=cuda`
   (renders the configured `"true"` default unchanged).
+
+  **SUPERSEDED 2026-09-15.** GPU became a minimum system requirement (Tiago), so the cascade
+  this finding asked for no longer has a case to serve: `backend: cpu` is now rejected at
+  template time by `yashigani-kuroshio.validateBackend`, and `backend` has no default at all —
+  it was `cpu`, which meant a stock `helm install` shipped an unsupported CPU deployment. The
+  finding is retained because its diagnosis was right and is why the trap was found; only its
+  remedy changed. Verified: `--set backend=cpu` and an unset backend both fail the render;
+  `--set backend=cuda` renders `YSG_KUROSHIO_EXPECT_GPU: "true"`; `helm lint` clean.
 
 - **NVIDIA CDI scoping (Captain finding #3) — least-privilege on multi-GPU hosts.**
   `docker-compose.kuroshio.cuda.yml` previously shared ONE `YSG_GPU_CDI` env var, identically
@@ -410,7 +420,7 @@ beyond extracting its rendered scripts verbatim):**
 | seccomp JSON validity (`jq`) | **PASS** — both profiles + the helm mirror parse and have `defaultAction: SCMP_ACT_ERRNO`. |
 | Helm-mirror byte-parity (`sync-kuroshio-deploy-artifacts-to-helm.sh --check`) | **PASS** — Caddyfile + seccomp JSON mirrors byte-identical to canonical. |
 | Portability fix (this session) | `sync-kuroshio-deploy-artifacts-to-helm.sh` originally used `declare -A` (bash 4+ associative arrays) — **fails on macOS's default bash 3.2**. Rewrote with parallel indexed arrays before first run; verified working on this Mac's actual `/bin/bash 3.2.57`. |
-| `YSG_KUROSHIO_BLOB_STORE_ROOT` present on all 3 compose services | **PASS** — `docker compose -f docker-compose.kuroshio.yml -f docker-compose.kuroshio.cpu.yml config` shows `YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store` on `kuroshio-classifier`, `kuroshio-chat`, `kuroshio-puller`; mount `target: /data/model-store` matches on all three. |
+| `YSG_KUROSHIO_BLOB_STORE_ROOT` present on all 3 compose services | **PASS** — `docker compose -f docker-compose.kuroshio.yml -f docker-compose.kuroshio.cpu.yml config` shows `YSG_KUROSHIO_BLOB_STORE_ROOT: /data/model-store` on `kuroshio-classifier`, `kuroshio-chat`, `kuroshio-puller`; mount `target: /data/model-store` matches on all three. | _(Evidence recorded against `docker-compose.kuroshio.cpu.yml`, deleted 2026-09-15 when CPU support was withdrawn. Row retained as the historical record of what was measured; re-measure against a GPU overlay before citing it again.)_
 | `YSG_KUROSHIO_BLOB_STORE_ROOT` present on all 3 Helm Deployments | **PASS** — `helm template` (cuda variant) shows `value: "/data/model-store"` on `kuroshio-classifier`, `kuroshio-chat`, `kuroshio-puller` containers; `volumeMounts[].mountPath: /data/model-store` matches on all three. |
 
 ### `kuroshio-init` gates (2026-07-23 session — this Mac has live `helm`/`docker`/`kubectl`, used them)
@@ -422,7 +432,7 @@ beyond extracting its rendered scripts verbatim):**
 | `helm template --set kuroshioInit.model=qwen2.5-3b-instruct-q4_k_m` | **PASS** — Job + both NetworkPolicy rules render, hardened (`runAsNonRoot`, `runAsUser: 1000`, cap-drop ALL, `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, `automountServiceAccountToken: false`). Also confirmed with `networkPolicies.enabled=false` — Job renders, zero NetworkPolicy resources. |
 | `kubectl apply --dry-run=server` (Docker Desktop's local cluster, `namespace=default` override) | **PASS** — all 18 rendered resources, including `job.batch/test-yashigani-kuroshio-init` and the two new NetworkPolicy rules, accepted by a real API server. |
 | Both inline Python scripts (`wait-for-puller` initContainer + `kuroshio-init` container + compose equivalent) | **`compile()`-checked, zero SyntaxError** — extracted verbatim from the rendered/`docker compose config` output, not hand-retyped. |
-| `docker compose -f docker-compose.kuroshio.yml -f docker-compose.kuroshio.cpu.yml --profile init config` — `YSG_KUROSHIO_INIT_MODEL` unset and set | **PASS** both ways. |
+| `docker compose -f docker-compose.kuroshio.yml -f docker-compose.kuroshio.cpu.yml --profile init config` — `YSG_KUROSHIO_INIT_MODEL` unset and set | **PASS** both ways. | _(Evidence recorded against `docker-compose.kuroshio.cpu.yml`, deleted 2026-09-15 when CPU support was withdrawn. Row retained as the historical record of what was measured; re-measure against a GPU overlay before citing it again.)_
 | Live functional test — own scratch Docker harness, stub server implementing exactly `app.py`'s `/healthz` + `/api/pull` contract (200-success / 501-no-adapter / unhealthy) | **PASS** all scenarios — see table above. Script extracted verbatim from the rendered Helm Job / `docker compose config` output before running (no hand-retyped copy), matching Verification Protocol #8's "full command must succeed against a running peer" discipline. |
 | Same pull script under full container hardening (`--read-only --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges:true --user 1000:1000`) | **PASS** — matches the Job/compose service's actual runtime security context; no permission errors. |
 

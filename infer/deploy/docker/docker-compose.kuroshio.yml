@@ -62,8 +62,8 @@ volumes:
 # unknown. Set them to a digest-pinned reference built from a verified
 # artifact:
 #
-#   infer/deploy/scripts/fetch-llama-server.sh --platform ubuntu-x64   # verify
-#   docker build -f infer/deploy/docker/Dockerfile.kuroshio-cpu ...    # build
+#   infer/deploy/scripts/fetch-llama-server.sh --platform ubuntu-cuda-13.3-x64  # verify
+#   docker build -f infer/deploy/docker/Dockerfile.kuroshio-cuda ...            # build
 #   export YSG_KUROSHIO_PULLER_IMAGE=yashigani/kuroshio-puller@sha256:...
 #
 # Failing closed on an unset variable is deliberate: an engine image nobody can
