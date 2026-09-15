@@ -195,6 +195,8 @@ class LoadConfig:
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     cache_prompt: bool = False
     parallel_slots: int | None = None
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
 
 
 @dataclass
@@ -333,6 +335,28 @@ class Supervisor:
             else self._resource_limits.max_concurrent_requests
         )
         args += ["--parallel", str(parallel)]
+        # KV-cache quantization. The single highest-value memory lever we have,
+        # and it was not being passed at all.
+        #
+        # Measured on this line of work: model WEIGHTS are shared between two
+        # engine processes running the same GGUF (page-cache-backed mmap, and
+        # `ggml_metal_buffer_map()` wraps that mapping zero-copy rather than
+        # allocating) — a second engine on the same model cost 0.82 GB, not a
+        # second copy of the weights. So under blue/green (D30) the KV cache is
+        # the ONLY thing that genuinely duplicates per slot, and it is also what
+        # scales with context length — which dominates for the dev/science
+        # workloads that are the majority of expected usage.
+        #
+        # `q8_0` roughly halves KV against the f16 default at negligible quality
+        # cost and occasionally improves throughput. `q4_0` quarters it but is
+        # model-dependent and needs per-model validation before it is trusted —
+        # so neither is defaulted here. The deploy layer chooses, because the
+        # right answer differs by model and by hardware tier, and a silent
+        # default would be us making that call on the operator's behalf.
+        if load_config.cache_type_k is not None:
+            args += ["--cache-type-k", load_config.cache_type_k]
+        if load_config.cache_type_v is not None:
+            args += ["--cache-type-v", load_config.cache_type_v]
         args += list(load_config.extra_args)
         return args
 

@@ -56,6 +56,14 @@ Env-var contract (source of truth: the inline comment block in
                                         `kuroshio-chat` instance (see LoadConfig's docstring).
                                         An operator that has adopted the high-assurance
                                         per-tenant-instance posture (C3) may set this true.
+    YSG_KUROSHIO_CACHE_TYPE_K             optional -> LoadConfig.cache_type_k (llama-server
+                                        `--cache-type-k`). KV-cache quantization; `q8_0`
+                                        roughly halves KV vs the f16 default at negligible
+                                        quality cost. NOT defaulted — the right value differs
+                                        by model and hardware tier, and `q4_0` in particular
+                                        is model-dependent and needs per-model validation.
+    YSG_KUROSHIO_CACHE_TYPE_V             optional -> LoadConfig.cache_type_v
+                                        (`--cache-type-v`). Same contract as above.
     YSG_KUROSHIO_PARALLEL_SLOTS           optional int -> LoadConfig.parallel_slots (Red-Council
                                         C1). When unset, `Supervisor.build_args` derives the
                                         llama-server `--parallel` slot count from
@@ -123,6 +131,8 @@ _N_GPU_LAYERS_ENV = "YSG_KUROSHIO_N_GPU_LAYERS"
 _OVERRIDE_TENSOR_ENV = "YSG_KUROSHIO_OVERRIDE_TENSOR"
 _CACHE_PROMPT_ENV = "YSG_KUROSHIO_CACHE_PROMPT"
 _PARALLEL_SLOTS_ENV = "YSG_KUROSHIO_PARALLEL_SLOTS"
+_CACHE_TYPE_K_ENV = "YSG_KUROSHIO_CACHE_TYPE_K"
+_CACHE_TYPE_V_ENV = "YSG_KUROSHIO_CACHE_TYPE_V"
 
 
 class EntrypointConfigError(RuntimeError):
@@ -185,6 +195,33 @@ def _parse_optional_bool(env: Mapping[str, str], name: str, *, default: bool) ->
     raise EntrypointConfigError(f"{name}={raw!r} is not a valid boolean (expected one of true/false/1/0/yes/no)")
 
 
+_KV_CACHE_TYPES = frozenset(
+    {"f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"}
+)
+
+
+def _parse_kv_cache_type(env: Mapping[str, str], name: str) -> str | None:
+    """KV-cache quantization type, positively validated against an allowlist.
+
+    Allowlist rather than pass-through: an unrecognised value is not silently
+    forwarded to llama-server, because the failure mode is a process that
+    either refuses to start or starts with a different cache type than the
+    operator asked for. Both are worse than a config error at boot, and the
+    second is silent. Fails closed, consistent with every other parser here
+    (ISSUE-001: positive validation, never a denylist).
+    """
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip().lower()
+    if value not in _KV_CACHE_TYPES:
+        raise EntrypointConfigError(
+            f"{name}={raw!r} is not a recognised KV-cache type; "
+            f"expected one of {sorted(_KV_CACHE_TYPES)}"
+        )
+    return value
+
+
 def _parse_override_tensor(env: Mapping[str, str]) -> tuple[str, ...]:
     raw = env.get(_OVERRIDE_TENSOR_ENV, "")
     if not raw.strip():
@@ -244,6 +281,8 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
     override_tensor = _parse_override_tensor(env)
     cache_prompt = _parse_optional_bool(env, _CACHE_PROMPT_ENV, default=False)
     parallel_slots = _parse_optional_int(env, _PARALLEL_SLOTS_ENV)
+    cache_type_k = _parse_kv_cache_type(env, _CACHE_TYPE_K_ENV)
+    cache_type_v = _parse_kv_cache_type(env, _CACHE_TYPE_V_ENV)
     default_load_config = LoadConfig(
         n_gpu_layers=n_gpu_layers,
         override_tensor=override_tensor,
@@ -251,6 +290,8 @@ def load_role_config(env: Mapping[str, str]) -> RoleConfig:
         expect_gpu=expect_gpu,
         cache_prompt=cache_prompt,
         parallel_slots=parallel_slots,
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
     )
 
     return RoleConfig(
