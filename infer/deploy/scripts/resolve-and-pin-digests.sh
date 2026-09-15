@@ -71,10 +71,15 @@ case "$mode" in
         check_placeholders
         ;;
     --cve-check)
-        echo "ERROR: --cve-check requires network access to the GitHub advisory/Huntr feeds." >&2
-        echo "       Not runnable in this offline-authoring session. Run on a rig with" >&2
-        echo "       explicit Maxine/Tiago authorisation." >&2
-        exit 3
+        # IMPLEMENTED 2026-09-15 (YSG-RISK-302). Was an unconditional `exit 3`,
+        # which made the CVE re-check that llama-cpp-build-manifest.md declares
+        # MANDATORY unenforceable by any code path.
+        #
+        # Deterministic comparator: upstream publishes GitHub Security
+        # Advisories whose vulnerable_version_range uses the same bNNNN build
+        # tags we pin to. Requires network; blocks on any failure.
+        shift
+        exec python3 "$(dirname "$0")/cve_gate.py" "$@"
         ;;
     --emit-manifest)
         echo "ERROR: --emit-manifest requires a real build (llama.cpp checkout + cmake build)." >&2

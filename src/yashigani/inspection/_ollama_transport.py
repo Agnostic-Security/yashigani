@@ -34,9 +34,60 @@ Fail-closed: no ``verify=False`` path exists here and none may be added.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import httpx
+
+# --- single pivot for the engine URL -----------------------------------------
+# Kuroshio replaces Ollama as the engine, so the variables are renamed to match
+# what they point AT (D25/D40). The protocol stays Ollama-compatible by design
+# (D15 byte-compat shim), which is why this module keeps its protocol-derived
+# name while the destination variables change.
+#
+# WHY A RESOLVER AND NOT A sed: YSG-RISK-274 is precisely this rename done
+# carelessly — KUROSHIO_BASE_URL was put into compose while `src/` had no reader
+# for it, so the gateway's suspicion-escalated inspection leg fail-closed with
+# CLASSIFIER_ERROR on every escalated prompt. The new name is preferred AND the
+# old names keep working, so no deployment breaks on upgrade and no config can
+# point at a name nothing reads.
+#
+# It also collapses a real drift: eight call sites each resolved this URL with a
+# slightly different fallback chain, and two of them read only OLLAMA_BASE_URL
+# while six read YASHIGANI_OLLAMA_URL first. Repointing one and not the other
+# left live paths aimed at the old service.
+_ENGINE_URL_ENV_PRECEDENCE = (
+    "YASHIGANI_KUROSHIO_URL",   # preferred
+    "KUROSHIO_BASE_URL",        # preferred
+    "YASHIGANI_OLLAMA_URL",     # deprecated, still honoured
+    "OLLAMA_BASE_URL",          # deprecated, still honoured
+)
+_DEPRECATED_ENGINE_URL_ENVS = frozenset({"YASHIGANI_OLLAMA_URL", "OLLAMA_BASE_URL"})
+
+# Unset-default is deliberately UNCHANGED. Renaming variables must not also
+# change behaviour for a deployment that sets none of them — that would be two
+# changes wearing one commit, and the second would be silent.
+DEFAULT_ENGINE_URL = "http://ollama:11434"
+
+
+def resolve_engine_url(default: str = DEFAULT_ENGINE_URL) -> str:
+    """Resolve the inference-engine base URL from the environment.
+
+    Single source of truth for every consumer. Prefers the KUROSHIO names,
+    falls back to the OLLAMA ones, warns once per deprecated name so an
+    operator learns the rename exists without anything breaking.
+    """
+    for name in _ENGINE_URL_ENV_PRECEDENCE:
+        value = os.getenv(name)
+        if value and value.strip():
+            if name in _DEPRECATED_ENGINE_URL_ENVS:
+                logging.getLogger(__name__).warning(
+                    "%s is deprecated; use YASHIGANI_KUROSHIO_URL or KUROSHIO_BASE_URL. "
+                    "The old name still works and will continue to.",
+                    name,
+                )
+            return value.strip().rstrip("/")
+    return default
 
 logger = logging.getLogger(__name__)
 

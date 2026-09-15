@@ -17,6 +17,8 @@ OPA Policy API (mTLS, internal CA):
 """
 from __future__ import annotations
 
+from yashigani.inspection._ollama_transport import resolve_engine_url
+
 import json
 import logging
 import os
@@ -418,9 +420,7 @@ async def simulate_policy(body: SimulateRequest, session: AdminSession):  # noqa
         # making the YASHIGANI_OLLAMA_URL/OLLAMA_BASE_URL fallback dead code
         # and pinning this route to the hardcoded literal, bypassing the
         # Caddy mesh. Mirrors routes/models.py's _ollama_base() precedence.
-        ollama_url = (
-            os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
-        ).rstrip("/")
+        ollama_url = resolve_engine_url().rstrip("/")
         from yashigani.inspection._ollama_transport import ollama_async_client
         try:
             model, _ = await _resolve_default_model(ollama_url)
@@ -1055,9 +1055,7 @@ async def generate_policy(body: GeneratePolicyRequest, session: AdminSession):  
     # YSG-RISK-193: see the identical fix + rationale on the ai_explain branch
     # of simulate_policy() above — getattr(backoffice_state, "ollama_url", ...)
     # was dead-code cover for a hardcoded-literal mesh bypass.
-    ollama_url = (
-        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
-    ).rstrip("/")
+    ollama_url = resolve_engine_url().rstrip("/")
     from yashigani.inspection._ollama_transport import ollama_async_client
     model, _ = await _resolve_default_model(ollama_url)
     prompt = (

@@ -21,6 +21,8 @@ in a single atomic action — idempotent (no-op if the alias already exists).
 """
 from __future__ import annotations
 
+from yashigani.inspection._ollama_transport import resolve_engine_url
+
 import logging
 import os
 from typing import Optional
@@ -332,8 +334,7 @@ class PullModelRequest(BaseModel):
 
 
 def _ollama_base() -> str:
-    return (os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL")
-            or "http://ollama:11434").rstrip("/")
+    return resolve_engine_url().rstrip("/")
 
 
 def _model_name_to_alias(name: str) -> str:

@@ -10,6 +10,8 @@ In K8s: endpoints are the per-pod DNS names from the headless Service:
   ollama-1.ollama-headless.yashigani.svc.cluster.local:11434
 """
 from __future__ import annotations
+
+from yashigani.inspection._ollama_transport import resolve_engine_url
 import logging
 import os
 import threading
@@ -125,7 +127,7 @@ class OllamaPool(ClassifierBackend):
         if pool_env:
             endpoints = [ep.strip() for ep in pool_env.split(",") if ep.strip()]
         else:
-            endpoints = [os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")]
+            endpoints = [resolve_engine_url()]
         model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
         return cls(endpoints=endpoints, model=model)
 

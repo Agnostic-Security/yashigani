@@ -20,6 +20,8 @@ Caddy mesh front).
 """
 from __future__ import annotations
 
+from yashigani.inspection._ollama_transport import resolve_engine_url
+
 import json
 import logging
 import os
@@ -171,9 +173,7 @@ async def llm_review(rego: str) -> list[dict]:
     default) and routes through the mesh-mTLS-aware ollama_async_client.
     """
     from yashigani.inspection._ollama_transport import ollama_async_client
-    ollama_url = (
-        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
-    ).rstrip("/")
+    ollama_url = resolve_engine_url().rstrip("/")
     model = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL") or "gemma3:4b"
     prompt = (
         "You are reviewing an OPA Rego authorization policy for risky logic. In 1-3 short "

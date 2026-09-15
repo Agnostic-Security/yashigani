@@ -15,6 +15,8 @@ Last updated: 2026-05-17T00:00:00+00:00
 """
 from __future__ import annotations
 
+from yashigani.inspection._ollama_transport import resolve_engine_url
+
 import logging
 import os
 import time
@@ -228,7 +230,7 @@ def _bootstrap():
         rotation_scheduler.start()
 
     # ── Inspection pipeline ────────────────────────────────────────────────
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    ollama_url = resolve_engine_url()
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     classifier = PromptInjectionClassifier(model=model, ollama_base_url=ollama_url)
     # A10 (5.0): per-identity classifier concurrency cap (see gateway entrypoint).

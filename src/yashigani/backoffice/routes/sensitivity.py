@@ -37,6 +37,8 @@ sensitivity level. Uses the same model-resolution path as the OPA policy generat
 """
 from __future__ import annotations
 
+from yashigani.inspection._ollama_transport import resolve_engine_url
+
 import hashlib as _hashlib
 import json as _json
 import logging
@@ -698,9 +700,7 @@ async def generate_pattern(body: GeneratePatternRequest, session: AdminSession):
     # bypassing the Caddy mesh front. Mirrors routes/models.py's
     # _ollama_base() precedence: YASHIGANI_OLLAMA_URL -> OLLAMA_BASE_URL ->
     # hardcoded dev default.
-    ollama_url = (
-        os.getenv("YASHIGANI_OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL") or "http://ollama:11434"
-    ).rstrip("/")
+    ollama_url = resolve_engine_url().rstrip("/")
 
     # FIND-003 (fix/medlow-findings): resolve model for structured-output tasks.
     # YASHIGANI_OPA_ASSISTANT_MODEL is the operator override (highest priority).
