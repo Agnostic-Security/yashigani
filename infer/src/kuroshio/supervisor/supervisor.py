@@ -205,6 +205,7 @@ class LoadConfig:
     expect_gpu: bool = True
     context_length: int | None = None
     per_user_context: int | None = None
+    slot_save_path: str | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     cache_prompt: bool = False
     parallel_slots: int | None = None
@@ -351,6 +352,8 @@ class Supervisor:
             else self._resource_limits.max_concurrent_requests
         )
         args += ["--parallel", str(parallel)]
+        if load_config.slot_save_path is not None:
+            args += ["--slot-save-path", load_config.slot_save_path]
         # --ctx-size is emitted AFTER --parallel is known, because llama-server
         # DIVIDES total context across slots. Measured on the pinned build:
         #
