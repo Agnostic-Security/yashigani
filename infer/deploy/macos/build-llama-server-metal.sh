@@ -29,7 +29,7 @@
 #     custody-gated step and must not be folded into a build script.
 #   - the CVE gate the Linux build manifest makes mandatory on every re-pin
 #     (`resolve-and-pin-digests.sh --cve-check`) — that subcommand is an
-#     `exit 3` stub today (YSG-RISK-279), so it cannot be invoked honestly.
+#     `exit 3` stub today (YSG-RISK-302), so it cannot be invoked honestly.
 #     Re-pinning without it is a known, recorded gap, not an oversight.
 
 set -euo pipefail
